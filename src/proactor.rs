@@ -1,13 +1,8 @@
 use std::{pin::Pin, future::Future, io};
 use lever::prelude::*;
+use super::syscore::*;
 
 
-pub struct Proactor {
-
-}
-
-
-
-pub struct Processor;
+pub struct Proactor(Processor);
 
 
