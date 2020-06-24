@@ -1,8 +1,3 @@
-// pub struct CompletionHandler;
-
-// impl CompletionHandler {
-//     pub fn 
-// }
 use futures::io::{
     AsyncRead, AsyncWrite, AsyncBufRead, AsyncSeek
 };

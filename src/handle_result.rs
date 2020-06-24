@@ -19,7 +19,7 @@ impl AsyncRead for &Handle<File> {
             let file = unsafe { File::from_raw_fd(raw_fd) };
 
             let buf = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
-            let size = Processor::read_processor(&file, buf).await?;
+            let size = Processor::processor_read(&file, buf).await?;
 
             let _ = ManuallyDrop::new(file);
             Ok(size)
