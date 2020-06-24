@@ -3,6 +3,6 @@ use lever::prelude::*;
 use super::syscore::*;
 
 
-pub struct Proactor(Processor);
+pub struct Proactor();
 
 
