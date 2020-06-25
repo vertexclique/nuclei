@@ -23,14 +23,14 @@ macro_rules! syscall {
 
 type CompletionList = Vec<(usize, oneshot::Sender<usize>)>;
 
-pub struct Proactor {
+pub struct SysProactor {
     /// kqueue_fd
     kqueue_fd: RawFd,
 
-    ///
+    /// Socket half for read events
     read_stream: TTas<UnixStream>,
 
-    ///
+    /// Socket half for write events
     write_stream: UnixStream,
 
     /// Registered events of IOs
@@ -40,14 +40,14 @@ pub struct Proactor {
     completions: TTas<HashMap<RawFd, CompletionList>>
 }
 
-impl Proactor {
-    fn new() -> io::Result<Proactor> {
+impl SysProactor {
+    pub(crate) fn new() -> io::Result<SysProactor> {
         let kqueue_fd = kqueue()?;
         syscall!(fcntl(kqueue_fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
         let (read_stream, write_stream) = UnixStream::pair()?;
         read_stream.set_nonblocking(true)?;
         write_stream.set_nonblocking(true)?;
-        let proactor = Proactor {
+        let proactor = SysProactor {
             kqueue_fd,
             read_stream: TTas::new(read_stream),
             write_stream,
@@ -113,14 +113,14 @@ impl Proactor {
         Ok(())
     }
 
-    pub fn wait(&self, maxsize: usize, timeout: Option<Duration>) -> io::Result<usize> {
+    pub fn wait(&self, max_event_size: usize, timeout: Option<Duration>) -> io::Result<usize> {
         let timeout = timeout.map(|t| libc::timespec {
             tv_sec: t.as_secs() as libc::time_t,
             tv_nsec: t.subsec_nanos() as libc::c_long,
         });
 
-        let mut events: Vec<KEvent> = Vec::with_capacity(maxsize);
-        events.resize(maxsize, unsafe { MaybeUninit::zeroed().assume_init() });
+        let mut events: Vec<KEvent> = Vec::with_capacity(max_event_size);
+        events.resize(max_event_size, unsafe { MaybeUninit::zeroed().assume_init() });
 
         let res = kevent_ts(self.kqueue_fd, &[], events.as_mut_slice(), timeout)?;
         if res < 0 {
@@ -143,18 +143,18 @@ impl Proactor {
         Ok(res)
     }
 
-    pub fn wake(&self) -> io::Result<()> {
+    pub(crate) fn wake(&self) -> io::Result<()> {
         let _ = (&self.write_stream).write(&[1]);
         Ok(())
     }
 
     ///////
 
-    fn register_io(&self, fd: RawFd, evts: usize) -> io::Result<CompletionChan> {
+    pub(crate) fn register_io(&self, fd: RawFd, evts: usize) -> io::Result<CompletionChan> {
         let mut registered = self.registered.lock();
         let mut completions = self.completions.lock();
 
-        // register/reregister events.
+        // register or reregister events.
         {
             let mut evts = evts;
             if let Some(reged_evts) = registered.get_mut(&fd) {

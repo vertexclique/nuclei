@@ -1,8 +1,12 @@
 mod handle;
-mod completion_handler;
-mod handle_result;
+mod submission_handler;
+mod async_io;
 mod sys;
+mod waker;
 mod proactor;
+
+// Wrappers ahead
+mod file;
 
 #[cfg(not(any(
     target_os = "linux",     // epoll, iouring
@@ -44,4 +48,4 @@ mod syscore {
     pub(crate) use windows::*;
 }
 
-use proactor::*;
+pub use proactor::*;

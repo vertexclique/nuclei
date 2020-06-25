@@ -5,25 +5,50 @@ use lever::prelude::*;
 pub type AsyncOp<T> = Pin<Box<dyn Future<Output = io::Result<T>>>>;
 
 pub trait HandleOpRegisterer {
-    fn read(&self) -> Arc<TTas<Option<AsyncOp<usize>>>>;
+    fn read_registerer(&self) -> Arc<TTas<Option<AsyncOp<usize>>>>;
+    fn write_registerer(&self) -> Arc<TTas<Option<AsyncOp<usize>>>>;
 }
 
 pub struct Handle<T> {
     /// IO task element
-    io_task: Option<T>,
+    pub(crate) io_task: Option<T>,
     /// Completion callback for read
-    read: Arc<TTas<Option<AsyncOp<usize>>>>,
+    pub(crate) read: Arc<TTas<Option<AsyncOp<usize>>>>,
+    /// Completion callback for write
+    pub(crate) write: Arc<TTas<Option<AsyncOp<usize>>>>,
+}
+
+impl<T> Handle<T> {
+    pub fn get_ref(&self) -> &T {
+        self.io_task.as_ref().unwrap()
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.io_task.as_mut().unwrap()
+    }
+
+    pub fn into_inner(mut self) -> T {
+        self.io_task.take().unwrap()
+    }
 }
 
 impl<T> HandleOpRegisterer for Handle<T> {
-    fn read(&self) -> Arc<TTas<Option<AsyncOp<usize>>>> {
+    fn read_registerer(&self) -> Arc<TTas<Option<AsyncOp<usize>>>> {
         self.read.clone()
+    }
+
+    fn write_registerer(&self) -> Arc<TTas<Option<AsyncOp<usize>>>> {
+        self.write.clone()
     }
 }
 
 impl<T> HandleOpRegisterer for &Handle<T> {
-    fn read(&self) -> Arc<TTas<Option<AsyncOp<usize>>>> {
+    fn read_registerer(&self) -> Arc<TTas<Option<AsyncOp<usize>>>> {
         self.read.clone()
+    }
+
+    fn write_registerer(&self) -> Arc<TTas<Option<AsyncOp<usize>>>> {
+        self.write.clone()
     }
 }
 
