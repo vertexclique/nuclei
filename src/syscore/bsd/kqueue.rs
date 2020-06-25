@@ -4,6 +4,10 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::{fs::File, os::unix::net::UnixStream, collections::HashMap, time::Duration};
 use crate::sys::event::{kevent_ts, kqueue, KEvent};
 use futures::channel::oneshot;
+use pin_utils::unsafe_pinned;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use lever::prelude::*;
 
 macro_rules! syscall {
@@ -17,7 +21,7 @@ macro_rules! syscall {
     }};
 }
 
-type CompletionList = Vec<(u16, oneshot::Sender<u16>)>;
+type CompletionList = Vec<(usize, oneshot::Sender<usize>)>;
 
 pub struct Proactor {
     /// kqueue_fd
@@ -30,7 +34,7 @@ pub struct Proactor {
     write_stream: UnixStream,
 
     /// Registered events of IOs
-    registered: TTas<HashMap<RawFd, u16>>,
+    registered: TTas<HashMap<RawFd, usize>>,
 
     /// Hashmap for holding interested concrete completion callbacks
     completions: TTas<HashMap<RawFd, CompletionList>>
@@ -64,7 +68,7 @@ impl Proactor {
         Ok(())
     }
 
-    pub fn reregister(&self, fd: RawFd, key: u16) -> io::Result<()> {
+    pub fn reregister(&self, fd: RawFd, key: usize) -> io::Result<()> {
         let mut read_flags = libc::EV_ONESHOT | libc::EV_RECEIPT;
         let mut write_flags = libc::EV_ONESHOT | libc::EV_RECEIPT;
         read_flags |= libc::EV_ADD;
@@ -128,14 +132,12 @@ impl Proactor {
 
         for event in &events[0..res] {
             if event.data() == 0 {
-                // wake signal.
-                let mut buf = vec![0; 8];
-                let _ = rs.read(&mut buf);
+                let _ = rs.read(&mut [0; 64]);
                 res -= 1;
                 continue;
             }
             let raw_fd = event.data() as _;
-            self.dequeue_events_from_io(raw_fd, event.flags());
+            self.dequeue_events(raw_fd, event.udata() as usize);
         }
 
         Ok(res)
@@ -148,10 +150,37 @@ impl Proactor {
 
     ///////
 
-    fn dequeue_events_from_io(&self, fd: RawFd, evts: u16) {
+    fn register_io(&self, fd: RawFd, evts: usize) -> io::Result<CompletionChan> {
+        let mut registered = self.registered.lock();
+        let mut completions = self.completions.lock();
+
+        // register/reregister events.
+        {
+            let mut evts = evts;
+            if let Some(reged_evts) = registered.get_mut(&fd) {
+                evts |= *reged_evts;
+                self.reregister(fd, evts)?;
+                *reged_evts = evts;
+            } else {
+                self.register(fd, evts)?;
+                registered.insert(fd, evts);
+            }
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        let comp = completions
+            .entry(fd)
+            .or_insert(Vec::new());
+
+        comp.push((evts, sender));
+
+        Ok(CompletionChan { recv: receiver })
+    }
+
+    fn dequeue_events(&self, fd: RawFd, evts: usize) {
         // acquire locks.
         let mut regs = self.registered.lock();
-        let mut notifiers = self.completions.lock();
+        let mut completions = self.completions.lock();
 
         // remove flags from interested events.
         let mut remove_regs = false;
@@ -164,21 +193,21 @@ impl Proactor {
             }
         }
 
-        // send notification and pop out interested notifiers
-        let mut remove_notifiers = false;
-        if let Some(notifiers) = notifiers.get_mut(&fd) {
+        // send concrete completion and remove completion interested sources
+        let mut ack_removal = false;
+        if let Some(completions) = completions.get_mut(&fd) {
             let mut i = 0;
-            while i < notifiers.len() {
-                if notifiers[i].0 & evts != 0 {
-                    let (_evts, sender) = notifiers.remove(i);
+            while i < completions.len() {
+                if completions[i].0 & evts != 0 {
+                    let (_evts, sender) = completions.remove(i);
                     let _ = sender.send(evts);
                 } else {
                     i += 1;
                 }
             }
 
-            if notifiers.is_empty() {
-                remove_notifiers = true;
+            if completions.is_empty() {
+                ack_removal = true;
             }
         }
 
@@ -186,8 +215,9 @@ impl Proactor {
             regs.remove(&fd);
             self.deregister(fd);
         }
-        if remove_notifiers {
-            notifiers.remove(&fd);
+
+        if ack_removal {
+            completions.remove(&fd);
         }
 
     }
@@ -229,4 +259,27 @@ pub struct Event {
     pub readable: bool,
     pub writable: bool,
     pub key: usize,
+}
+
+
+
+//////////////////////////////
+//////////////////////////////
+
+pub(crate) struct CompletionChan {
+    recv: oneshot::Receiver<usize>,
+}
+
+impl CompletionChan {
+    unsafe_pinned!(recv: oneshot::Receiver<usize>);
+}
+
+impl Future for CompletionChan {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        self.recv()
+            .poll(cx)
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sender has been canceled"))
+    }
 }
