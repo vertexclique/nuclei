@@ -62,11 +62,38 @@ impl Processor {
     }
 
     pub(crate) async fn processor_recv<R: AsRawFd>(sock: &R, buf: &mut [u8]) -> io::Result<usize> {
-        todo!()
+        Self::recv_with_flags(sock, buf, 0).await
     }
 
     pub(crate) async fn processor_peek<R: AsRawFd>(sock: &R, buf: &mut [u8]) -> io::Result<usize> {
-        todo!()
+        Self::recv_with_flags(sock, buf, libc::MSG_PEEK as _).await
+    }
+
+    async fn recv_with_flags<R: AsRawFd>(
+        socket: &R,
+        buf: &mut [u8],
+        flags: u32,
+    ) -> io::Result<usize> {
+        let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
+        let sock = ManuallyDrop::new(sock);
+
+        // Reregister on block
+        match sock.recv_with_flags(buf, flags as _) {
+            Ok(res) => Ok(res),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let notifier = Proactor::get()
+                    .inner()
+                    .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
+                let events = notifier.await?;
+                if events & (libc::EV_ERROR as usize) != 0 {
+                    // Surely this won't happen, since it is filtered in the evloop.
+                    Err(sock.take_error()?.unwrap())
+                } else {
+                    sock.recv_with_flags(buf, flags as _)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     ///////////////////////////////////
