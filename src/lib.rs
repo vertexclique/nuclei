@@ -5,8 +5,6 @@ mod sys;
 mod waker;
 mod proactor;
 
-// Wrappers ahead
-mod file;
 
 #[cfg(not(any(
     target_os = "linux",     // epoll, iouring

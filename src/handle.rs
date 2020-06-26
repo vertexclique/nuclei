@@ -18,6 +18,9 @@ pub struct Handle<T> {
     pub(crate) write: Arc<TTas<Option<AsyncOp<usize>>>>,
 }
 
+unsafe impl<T> Send for Handle<T> {}
+unsafe impl<T> Sync for Handle<T> {}
+
 impl<T> Handle<T> {
     pub fn get_ref(&self) -> &T {
         self.io_task.as_ref().unwrap()

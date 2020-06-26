@@ -172,8 +172,32 @@ impl Processor {
     ///// TcpListener
     ///////////////////////////////////
 
-    pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
-        todo!()
+    pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(listener: &R) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
+        let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
+        let socket = socket.into_tcp_listener();
+        let socket = ManuallyDrop::new(socket);
+
+        // Reregister on block
+        match socket
+                .accept()
+                .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr)) {
+            Ok(res) => Ok(res),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let notifier = Proactor::get()
+                    .inner()
+                    .register_io(listener.as_raw_fd(), libc::EVFILT_READ as _)?;
+                let events = notifier.await?;
+                if events & (libc::EV_ERROR as usize) != 0 {
+                    // Surely this won't happen, since it is filtered in the evloop.
+                    Err(socket.take_error()?.unwrap())
+                } else {
+                    socket
+                        .accept()
+                        .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     ///////////////////////////////////
