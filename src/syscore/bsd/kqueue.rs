@@ -21,6 +21,49 @@ macro_rules! syscall {
     }};
 }
 
+///////////////////
+///////////////////
+
+use socket2::SockAddr;
+use std::mem;
+
+fn max_len() -> usize {
+    // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
+    // with the man page quoting that if the count of bytes to read is
+    // greater than `SSIZE_MAX` the result is "unspecified".
+    //
+    // On macOS, however, apparently the 64-bit libc is either buggy or
+    // intentionally showing odd behavior by rejecting any read with a size
+    // larger than or equal to INT_MAX. To handle both of these the read
+    // size is capped on both platforms.
+    if cfg!(target_os = "macos") {
+        <libc::c_int>::max_value() as usize - 1
+    } else {
+        <libc::ssize_t>::max_value() as usize
+    }
+}
+
+pub(crate) fn shim_recv_from<A: AsRawFd>(fd: A, buf: &mut [u8], flags: libc::c_int) -> io::Result<(usize, SockAddr)> {
+    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let mut addrlen = mem::size_of_val(&storage) as libc::socklen_t;
+
+    let n = syscall!(recvfrom(
+            fd.as_raw_fd() as _,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            std::cmp::min(buf.len(), max_len()),
+            flags,
+            &mut storage as *mut _ as *mut _,
+            &mut addrlen,
+        ))?;
+    let addr = unsafe { SockAddr::from_raw_parts(&storage as *const _ as *const _, addrlen) };
+    Ok((n as usize, addr))
+}
+
+
+///////////////////
+//// Socket Addr
+///////////////////
+
 type CompletionList = Vec<(usize, oneshot::Sender<usize>)>;
 
 pub struct SysProactor {
@@ -63,14 +106,19 @@ impl SysProactor {
     }
 
     pub fn register(&self, fd: RawFd, _key: usize) -> io::Result<()> {
+        dbg!("REGISTER");
         let flags = syscall!(fcntl(fd, libc::F_GETFL))?;
         syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
         Ok(())
     }
 
     pub fn reregister(&self, fd: RawFd, key: usize) -> io::Result<()> {
-        let mut read_flags = libc::EV_ONESHOT | libc::EV_RECEIPT;
-        let mut write_flags = libc::EV_ONESHOT | libc::EV_RECEIPT;
+        dbg!("REREGISTER");
+        // let mut read_flags = libc::EV_ONESHOT | libc::EV_RECEIPT;
+        // let mut write_flags = libc::EV_ONESHOT | libc::EV_RECEIPT;
+        let mut read_flags = libc::EV_CLEAR | libc::EV_RECEIPT;
+        let mut write_flags = libc::EV_CLEAR | libc::EV_RECEIPT;
+
         read_flags |= libc::EV_ADD;
         write_flags |= libc::EV_ADD;
 
@@ -97,6 +145,7 @@ impl SysProactor {
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
+        dbg!("DEREGISTER");
         let flags = libc::EV_DELETE | libc::EV_RECEIPT;
         let changelist = [
             KEvent::new(fd as _, libc::EVFILT_WRITE, flags, 0, 0, 0),
@@ -114,6 +163,7 @@ impl SysProactor {
     }
 
     pub fn wait(&self, max_event_size: usize, timeout: Option<Duration>) -> io::Result<usize> {
+        dbg!("WAIT");
         let timeout = timeout.map(|t| libc::timespec {
             tv_sec: t.as_secs() as libc::time_t,
             tv_nsec: t.subsec_nanos() as libc::c_long,
@@ -121,8 +171,13 @@ impl SysProactor {
 
         let mut events: Vec<KEvent> = Vec::with_capacity(max_event_size);
         events.resize(max_event_size, unsafe { MaybeUninit::zeroed().assume_init() });
+        let mut events: Box<[KEvent]> = events.into_boxed_slice();
 
-        let res = kevent_ts(self.kqueue_fd, &[], events.as_mut_slice(), timeout)?;
+        dbg!("SENDING EVENT");
+        let res =
+            kevent_ts(self.kqueue_fd, &[], &mut events, timeout)? as isize;
+        dbg!(res);
+        dbg!("EVENT FINISH");
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -131,8 +186,10 @@ impl SysProactor {
         let mut rs = self.read_stream.lock();
 
         for event in &events[0..res] {
+            dbg!(event.data());
             if event.data() == 0 {
                 let _ = rs.read(&mut [0; 64]);
+                dbg!("READ AFTER");
                 res -= 1;
                 continue;
             }
@@ -140,10 +197,13 @@ impl SysProactor {
             self.dequeue_events(raw_fd, event.udata() as usize);
         }
 
+        drop(rs);
+
         Ok(res)
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
+        dbg!("WAKE");
         let _ = (&self.write_stream).write(&[1]);
         Ok(())
     }
@@ -151,6 +211,7 @@ impl SysProactor {
     ///////
 
     pub(crate) fn register_io(&self, fd: RawFd, evts: usize) -> io::Result<CompletionChan> {
+        dbg!("REGISTERED IO");
         let mut registered = self.registered.lock();
         let mut completions = self.completions.lock();
 

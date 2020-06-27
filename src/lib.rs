@@ -4,7 +4,7 @@ mod async_io;
 mod sys;
 mod waker;
 mod proactor;
-
+mod utils;
 
 #[cfg(not(any(
     target_os = "linux",     // epoll, iouring

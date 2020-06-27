@@ -53,5 +53,8 @@ pub fn run<T>(future: impl Future<Output = T>) -> T {
         if let Poll::Ready(val) = future.as_mut().poll(cx) {
             return val;
         }
+
+        dbg!("HIT WAIT");
+        p.wait(10, None);
     }
 }

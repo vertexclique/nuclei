@@ -1,7 +1,7 @@
 use std::io;
 use std::io::{Read, Write};
 use std::{fs::File, os::unix::io::{AsRawFd, FromRawFd}, mem::ManuallyDrop};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs, TcpListener};
 use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
 use std::future::Future;
 use std::path::Path;
@@ -51,7 +51,7 @@ impl Processor {
                     .register_io(socket.as_raw_fd(), libc::EVFILT_WRITE as _)?;
                 let events = notifier.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
-                    // Surely this won't happen, since it is filtered in the evloop.
+                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
                 } else {
                     sock.send(buf)
@@ -86,7 +86,7 @@ impl Processor {
                     .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
                 let events = notifier.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
-                    // Surely this won't happen, since it is filtered in the evloop.
+                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
                 } else {
                     sock.recv_with_flags(buf, flags as _)
@@ -188,7 +188,7 @@ impl Processor {
                     .register_io(listener.as_raw_fd(), libc::EVFILT_READ as _)?;
                 let events = notifier.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
-                    // Surely this won't happen, since it is filtered in the evloop.
+                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(socket.take_error()?.unwrap())
                 } else {
                     socket
@@ -209,15 +209,75 @@ impl Processor {
         buf: &[u8],
         addr: SocketAddr,
     ) -> io::Result<usize> {
-        todo!()
+        Self::send_to_dest(socket, buf, &socket2::SockAddr::from(addr)).await
     }
 
-    pub(crate) async fn processor_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        todo!()
+    async fn send_to_dest<A: AsRawFd>(socket: &A, buf: &[u8], addr: &socket2::SockAddr) -> io::Result<usize> {
+        let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
+        let sock = ManuallyDrop::new(sock);
+
+        // Reregister on block
+        match sock.send_to(buf, addr) {
+            Ok(res) => Ok(res),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let notifier = Proactor::get()
+                    .inner()
+                    .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
+                let events = notifier.await?;
+                if events & (libc::EV_ERROR as usize) != 0 {
+                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
+                    Err(sock.take_error()?.unwrap())
+                } else {
+                    sock.send_to(buf, addr)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    pub(crate) async fn processor_peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        todo!()
+    pub(crate) async fn processor_recv_from<R: AsRawFd>(sock: &R, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Self::recv_from_with_flags(sock, buf, 0)
+            .await
+            .map(|(size, sockaddr)| (size, sockaddr.as_std().unwrap()))
+    }
+
+    pub(crate) async fn processor_peek_from<R: AsRawFd>(sock: &R, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Self::recv_from_with_flags(sock, buf, libc::MSG_PEEK as _)
+            .await
+            .map(|(size, sockaddr)| (size, sockaddr.as_std().unwrap()))
+    }
+
+    async fn recv_from_with_flags<R: AsRawFd>(
+        socket: &R,
+        buf: &mut [u8],
+        flags: u32,
+    ) -> io::Result<(usize, socket2::SockAddr)> {
+        let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
+        // let sockpass = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
+        // let sock = ManuallyDrop::new(sock);
+
+        // Reregister on block
+        match super::shim_recv_from(sock, buf, flags as _)
+            .map(|(size, sockaddr)| (size, sockaddr)) {
+            Ok(res) => Ok(res),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let notifier = Proactor::get()
+                    .inner()
+                    .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
+                let events = notifier.await?;
+                if events & (libc::EV_ERROR as usize) != 0 {
+                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
+                    let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
+                    let sock = ManuallyDrop::new(sock);
+                    Err(sock.take_error()?.unwrap())
+                } else {
+                    let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
+                    super::shim_recv_from(sock, buf, flags as _)
+                        .map(|(size, sockaddr)| (size, sockaddr))
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     ///////////////////////////////////

@@ -1,11 +1,13 @@
+use std::thread;
 use std::net::TcpListener;
 
 use anyhow::Result;
 use futures::prelude::*;
 use http_types::{Request, Response, StatusCode};
 use async_dup::Arc;
-use bastion::executor::spawn;
+use bastion::executor::{spawn, blocking, run as erun};
 use proactor::*;
+use futures::pending;
 
 /// Serves a request and returns a response.
 async fn serve(req: Request) -> http_types::Result<Response> {
@@ -39,10 +41,11 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    // Start HTTP and HTTPS servers.
-    run(async {
-        let http = listen(Handle::<TcpListener>::bind("127.0.0.1:8000")?);
-        http.await?;
+    erun(async {
+        let http = spawn(listen(Handle::<TcpListener>::bind("127.0.0.1:8000")?));
+        let http1 = spawn(listen(Handle::<TcpListener>::bind("127.0.0.1:8001")?));
+
+        future::join(http, http1).await;
         Ok(())
     })
 }

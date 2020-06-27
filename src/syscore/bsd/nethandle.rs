@@ -10,7 +10,7 @@ use std::net::{TcpListener, TcpStream, UdpSocket};
 use lever::sync::prelude::*;
 use futures::Stream;
 
-use crate::Handle;
+use crate::{Handle, Proactor};
 use super::Processor;
 
 
@@ -64,3 +64,4 @@ impl Handle<TcpStream> {
         Processor::processor_peek(self.get_ref(), buf).await
     }
 }
+
