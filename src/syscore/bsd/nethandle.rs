@@ -8,7 +8,7 @@ use std::os::unix::io::AsRawFd;
 
 use std::net::{TcpListener, TcpStream, UdpSocket};
 // Unix specifics
-use std::os::unix::net::{UnixListener, UnixStream, SocketAddr as UnixSocketAddr};
+use std::os::unix::net::{UnixListener, UnixStream, UnixDatagram, SocketAddr as UnixSocketAddr};
 
 use lever::sync::prelude::*;
 use futures::Stream;
@@ -40,10 +40,6 @@ impl<T: AsRawFd> Handle<T> {
 }
 
 impl Handle<TcpListener> {
-    pub fn new_socket(io: TcpListener) -> io::Result<Handle<TcpListener>> {
-        Handle::new(io)
-    }
-
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<TcpListener>> {
         // TODO: (vertexclique): Migrate towards to using initial subscription with callback.
         // Using `new_with_callback`.
@@ -143,21 +139,17 @@ impl Handle<UnixListener> {
 }
 
 impl Handle<UnixStream> {
-    pub fn new_socket(io: UnixStream) -> io::Result<Handle<UnixStream>> {
-        Handle::new(io)
-    }
-
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixStream>> {
         Ok(Processor::processor_connect_unix(path).await?)
     }
 
     pub fn pair() -> io::Result<(Handle<UnixStream>, Handle<UnixStream>)> {
-        let (sock1, sock2) =
+        let (bidi_l, bidi_r) =
             socket2::Socket::pair(socket2::Domain::unix(), socket2::Type::stream(), None)?;
 
         Ok((
-            Self::new_socket(sock1.into_unix_stream())?,
-            Self::new_socket(sock2.into_unix_stream())?,
+            Handle::new(bidi_l.into_unix_stream())?,
+            Handle::new(bidi_r.into_unix_stream())?,
         ))
     }
 
@@ -171,5 +163,45 @@ impl Handle<UnixStream> {
 
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         Processor::processor_peek(self.get_ref(), buf).await
+    }
+}
+
+impl Handle<UnixDatagram> {
+    pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixDatagram>> {
+        Ok(Handle::new(UnixDatagram::bind(path)?)?)
+    }
+
+    pub fn pair() -> io::Result<(Handle<UnixDatagram>, Handle<UnixDatagram>)> {
+        let (bidi_l, bidi_r) =
+            socket2::Socket::pair(socket2::Domain::unix(), socket2::Type::dgram(), None)?;
+
+        Ok((
+            Handle::new(bidi_l.into_unix_datagram())?,
+            Handle::new(bidi_r.into_unix_datagram())?,
+        ))
+    }
+
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        Processor::processor_send(self.get_ref(), buf).await
+    }
+
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        Processor::processor_recv(self.get_ref(), buf).await
+    }
+
+    pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        Processor::processor_peek(self.get_ref(), buf).await
+    }
+
+    pub async fn send_to<P: AsRef<Path>>(&self, buf: &[u8], path: P) -> io::Result<usize> {
+        Processor::processor_send_to_unix(self.get_ref(), buf, path).await
+    }
+
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
+        Processor::processor_recv_from_unix(self.get_ref(), buf).await
+    }
+
+    pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
+        Processor::processor_peek_from_unix(self.get_ref(), buf).await
     }
 }
