@@ -2,7 +2,10 @@ use std::io;
 use std::io::{Read, Write};
 use std::{fs::File, os::unix::io::{AsRawFd, FromRawFd}, mem::ManuallyDrop};
 use std::net::{SocketAddr, ToSocketAddrs, TcpListener};
-use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::net::{
+    SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream,
+};
+use std::net::{SocketAddrV6, SocketAddrV4, Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::future::Future;
 use std::path::Path;
 use std::net::TcpStream;
@@ -167,6 +170,36 @@ impl Processor {
             None => Ok(stream),
             Some(err) => Err(err),
         }
+    }
+
+    pub(crate) async fn connect_udp(addr: SocketAddr) -> io::Result<Handle<UdpSocket>> {
+        let domain = match addr {
+            SocketAddr::V4(_) => socket2::Domain::ipv4(),
+            SocketAddr::V6(_) => socket2::Domain::ipv6(),
+        };
+        let sock = socket2::Socket::new(domain, socket2::Type::dgram(), Some(socket2::Protocol::udp()))?;
+        let sockaddr = socket2::SockAddr::from(addr);
+
+        let unspec = match addr {
+            SocketAddr::V4(_) => {
+                let unspecv4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                socket2::SockAddr::from(unspecv4)
+            }
+            SocketAddr::V6(_) => {
+                let unspecv6 = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+                socket2::SockAddr::from(unspecv6)
+            }
+        };
+
+        // Try to bind to the datagram socket.
+        sock.bind(&unspec)?;
+        sock.set_nonblocking(true)?;
+
+        // Try to connect over the socket
+        sock.connect(&sockaddr)?;
+
+        // Make into udp type and init handler.
+        Ok(Handle::new(sock.into_udp_socket())?)
     }
 
     ///////////////////////////////////

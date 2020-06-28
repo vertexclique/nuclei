@@ -78,3 +78,43 @@ impl Handle<TcpStream> {
     }
 }
 
+impl Handle<UdpSocket> {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<UdpSocket>> {
+        Ok(Handle::new(UdpSocket::bind(addr)?)?)
+    }
+
+    pub async fn connect<A: ToSocketAddrs>(sock_addrs: A) -> io::Result<Handle<UdpSocket>> {
+        Processor::processor_connect(sock_addrs, Processor::connect_udp).await
+    }
+
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        Processor::processor_send(self.get_ref(), buf).await
+    }
+
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        Processor::processor_recv(self.get_ref(), buf).await
+    }
+
+    pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        Processor::processor_peek(self.get_ref(), buf).await
+    }
+
+    pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
+        match addr.to_socket_addrs()?.next() {
+            Some(addr) =>
+                Processor::processor_send_to(self.get_ref(), buf, addr).await,
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "given addresses can't be parsed",
+            )),
+        }
+    }
+
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Processor::processor_recv_from(self.get_ref(), buf).await
+    }
+
+    pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Processor::processor_peek_from(self.get_ref(), buf).await
+    }
+}
