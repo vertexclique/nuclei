@@ -89,6 +89,10 @@ pub mod event {
             })
         }
 
+        pub fn ident(&self) -> libc::uintptr_t {
+            self.0.ident
+        }
+
         pub fn filter(&self) -> EventFilter {
             unsafe { std::mem::transmute(self.0.filter as type_of_event_filter) }
         }

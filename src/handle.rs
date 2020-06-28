@@ -2,6 +2,8 @@ use std::fmt;
 use std::{pin::Pin, future::Future, io, ops::{DerefMut, Deref}, sync::Arc};
 use lever::prelude::*;
 
+use crate::syscore::CompletionChan;
+
 pub type AsyncOp<T> = Pin<Box<dyn Future<Output = io::Result<T>>>>;
 
 pub trait HandleOpRegisterer {
@@ -12,6 +14,8 @@ pub trait HandleOpRegisterer {
 pub struct Handle<T> {
     /// IO task element
     pub(crate) io_task: Option<T>,
+    /// Notification channel
+    pub(crate) chan: Option<CompletionChan>,
     /// Completion callback for read
     pub(crate) read: Arc<TTas<Option<AsyncOp<usize>>>>,
     /// Completion callback for write

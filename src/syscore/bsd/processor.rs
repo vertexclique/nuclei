@@ -9,6 +9,7 @@ use std::net::TcpStream;
 
 use crate::proactor::Proactor;
 use crate::Handle;
+use crate::syscore::shim_to_af_unix;
 
 pub struct Processor;
 
@@ -284,8 +285,32 @@ impl Processor {
     ///// UnixListener
     ///////////////////////////////////
 
-    pub(crate) async fn processor_accept_unix_listener(&self) -> io::Result<(Handle<UnixStream>, UnixSocketAddr)> {
-        todo!()
+    pub(crate) async fn processor_accept_unix_listener<R: AsRawFd>(listener: &R) -> io::Result<(Handle<UnixStream>, UnixSocketAddr)> {
+        let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
+        let socket = socket.into_unix_listener();
+        let socket = ManuallyDrop::new(socket);
+
+        // Reregister on block
+        match socket
+            .accept()
+            .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr)) {
+            Ok(res) => Ok(res),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let notifier = Proactor::get()
+                    .inner()
+                    .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
+                let events = notifier.await?;
+                if events & (libc::EV_ERROR as usize) != 0 {
+                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
+                    Err(socket.take_error()?.unwrap())
+                } else {
+                    socket
+                        .accept()
+                        .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     ///////////////////////////////////
@@ -293,18 +318,49 @@ impl Processor {
     ///////////////////////////////////
 
     pub(crate) async fn processor_connect_unix<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixStream>> {
-        todo!()
+        let sock = socket2::Socket::new(socket2::Domain::unix(), socket2::Type::stream(), None)?;
+        let sockaddr = socket2::SockAddr::unix(path)?;
+
+        sock.set_nonblocking(true)?;
+
+        let stream = Handle::new(sock.into_unix_stream())?;
+
+        let sock = unsafe { socket2::Socket::from_raw_fd(stream.as_raw_fd()) };
+        let sock = ManuallyDrop::new(sock);
+
+        let res = match sock.connect(&sockaddr) {
+            Ok(res) => Ok(res),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let notifier = Proactor::get()
+                    .inner()
+                    .register_io(stream.as_raw_fd(), (libc::EAGAIN | libc::EINPROGRESS) as _)?;
+                let events = notifier.await?;
+                if events & (libc::EV_ERROR as usize) != 0 {
+                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
+                    Err(sock.take_error()?.unwrap())
+                } else {
+                    sock.connect(&sockaddr)
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        res.map(|_| stream)
     }
 
-    pub(crate) async fn processor_send_to_unix<P: AsRef<Path>>(&self, buf: &[u8], path: P) -> io::Result<usize> {
-        todo!()
+    pub(crate) async fn processor_send_to_unix<R: AsRawFd, P: AsRef<Path>>(socket: &R, buf: &[u8], path: P) -> io::Result<usize> {
+        Self::send_to_dest(socket, buf, &socket2::SockAddr::unix(path)?).await
     }
 
-    pub(crate) async fn processor_recv_from_unix(&self, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
-        todo!()
+    pub(crate) async fn processor_recv_from_unix<R: AsRawFd>(socket: &R, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
+        Self::recv_from_with_flags(socket, buf, 0)
+            .await
+            .map(|(size, sockaddr)| (size, shim_to_af_unix(&sockaddr).unwrap()))
     }
 
-    pub(crate) async fn processor_peek_from_unix(&self, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
-        todo!()
+    pub(crate) async fn processor_peek_from_unix<R: AsRawFd>(socket: &R, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
+        Self::recv_from_with_flags(socket, buf, libc::MSG_PEEK as _)
+            .await
+            .map(|(size, sockaddr)| (size, shim_to_af_unix(&sockaddr).unwrap()))
     }
 }

@@ -25,6 +25,7 @@ macro_rules! syscall {
 ///////////////////
 
 use socket2::SockAddr;
+use std::os::unix::net::{SocketAddr as UnixSocketAddr};
 use std::mem;
 
 fn max_len() -> usize {
@@ -59,6 +60,67 @@ pub(crate) fn shim_recv_from<A: AsRawFd>(fd: A, buf: &mut [u8], flags: libc::c_i
     Ok((n as usize, addr))
 }
 
+struct FakeUnixSocketAddr {
+    addr: libc::sockaddr_un,
+    len: libc::socklen_t,
+}
+
+pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr> {
+    let addr = unsafe { &*(sockaddr.as_ptr() as *const libc::sockaddr_un) };
+    if addr.sun_family != libc::AF_UNIX as libc::sa_family_t {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket is not AF_UNIX type",
+        ));
+    }
+
+    let mut len = sockaddr.len();
+    let abst_sock_ident: libc::c_char = unsafe {
+        std::slice::from_raw_parts(
+            &addr.sun_path as *const _ as *const u8,
+            mem::size_of::<libc::c_char>()
+        )
+    }[1] as libc::c_char;
+
+    match (len, abst_sock_ident) {
+        // NOTE: (vertexclique): If it is abstract socket, sa is greater than
+        // sa_family_t, in that case assign len as the sa_family_t size.
+        // https://man7.org/linux/man-pages/man7/unix.7.html
+        (sa, 0) if sa != 0 && sa > mem::size_of::<libc::sa_family_t>() as libc::socklen_t => {
+            len = mem::size_of::<libc::sa_family_t>() as libc::socklen_t;
+        },
+        // If unnamed socket, then addr is always zero,
+        // assign the offset reserved difference as length.
+        (0, _) => {
+            let base = &addr as *const _ as usize;
+            let path = &addr.sun_path as *const _ as usize;
+            let sun_path_offset = path - base;
+            len = sun_path_offset as libc::socklen_t;
+        },
+
+        // Discard rest, they are not special.
+        (_, _) => {}
+    }
+
+    let addr: UnixSocketAddr = unsafe {
+        let mut init = MaybeUninit::<libc::sockaddr_un>::zeroed();
+        // Safety: `*sockaddr` and `&init` are not overlapping and `*sockaddr`
+        // points to valid memory.
+        std::ptr::copy_nonoverlapping(
+            sockaddr.as_ptr(),
+            &mut init as *mut _ as *mut _,
+            len as usize
+        );
+
+        // Safety: We've written the init addr above.
+        std::mem::transmute(FakeUnixSocketAddr {
+            addr: init.assume_init(),
+            len: len as _,
+        })
+    };
+
+    Ok(addr)
+}
 
 ///////////////////
 //// Socket Addr
@@ -186,16 +248,35 @@ impl SysProactor {
         let mut rs = self.read_stream.lock();
 
         for event in &events[0..res] {
-            dbg!(event.data());
-            if event.data() == 0 {
-                let _ = rs.read(&mut [0; 64]);
-                dbg!("READ AFTER");
-                res -= 1;
-                continue;
+            let (flags, data) = (event.flags(), event.data());
+            if (flags & libc::EV_ERROR) == 1
+                && data != 0
+                && data != libc::ENOENT as _
+                && data != libc::EPIPE as _
+            {
+                return Err(io::Error::from_raw_os_error(data as _));
+            } else {
+                if event.ident() == rs.as_raw_fd() as _ {
+                    let _ = rs.read(&mut [0; 64]);
+                    dbg!("READ AFTER");
+
+                    // Skip waker
+                    res -= 1;
+
+                    // ignore to process more.
+                    continue;
+                } else {
+                    // Read user registered entries
+                    let _ = rs.read(&mut [0; 64]);
+                    dbg!("READ ACTUAL");
+                }
             }
-            let raw_fd = event.data() as _;
-            self.dequeue_events(raw_fd, event.udata() as usize);
+
+            dbg!(event.ident());
+
+            self.dequeue_events(event.ident() as _, event.flags() as _)
         }
+        // self.reregister(rs.as_raw_fd(), !0)?;
 
         drop(rs);
 
@@ -220,6 +301,7 @@ impl SysProactor {
             let mut evts = evts;
             if let Some(reged_evts) = registered.get_mut(&fd) {
                 evts |= *reged_evts;
+                dbg!(evts);
                 self.reregister(fd, evts)?;
                 *reged_evts = evts;
             } else {
@@ -239,6 +321,7 @@ impl SysProactor {
     }
 
     fn dequeue_events(&self, fd: RawFd, evts: usize) {
+        dbg!("DEQUEUE EVENTS");
         // acquire locks.
         let mut regs = self.registered.lock();
         let mut completions = self.completions.lock();

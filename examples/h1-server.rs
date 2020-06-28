@@ -41,11 +41,14 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    spawn(async { run(future::pending::<()>()) });
+
     erun(async {
         let http = spawn(listen(Handle::<TcpListener>::bind("127.0.0.1:8000")?));
-        let http1 = spawn(listen(Handle::<TcpListener>::bind("127.0.0.1:8001")?));
-
-        future::join(http, http1).await;
+        // let http1 = spawn(listen(Handle::<TcpListener>::bind("127.0.0.1:8001")?));
+        //
+        // future::join(http, http1).await;
+        http.await;
         Ok(())
     })
 }
