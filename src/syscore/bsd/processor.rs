@@ -23,6 +23,7 @@ impl Processor {
     ///////////////////////////////////
 
     pub(crate) async fn processor_read_file<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
+        // TODO: (vertexclique): Use blocking here.
         let mut file = unsafe { File::from_raw_fd(io.as_raw_fd()) };
         let res = file.read(buf);
         let _ = ManuallyDrop::new(file);
@@ -30,6 +31,7 @@ impl Processor {
     }
 
     pub(crate) async fn processor_write_file<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
+        // TODO: (vertexclique): Use blocking here.
         let mut file = unsafe { File::from_raw_fd(io.as_raw_fd()) };
         let res = file.write(buf);
 
@@ -172,7 +174,7 @@ impl Processor {
         }
     }
 
-    pub(crate) async fn connect_udp(addr: SocketAddr) -> io::Result<Handle<UdpSocket>> {
+    pub(crate) async fn processor_connect_udp(addr: SocketAddr) -> io::Result<Handle<UdpSocket>> {
         let domain = match addr {
             SocketAddr::V4(_) => socket2::Domain::ipv4(),
             SocketAddr::V6(_) => socket2::Domain::ipv6(),

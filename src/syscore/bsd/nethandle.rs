@@ -2,10 +2,13 @@ use std::future::Future;
 use std::io;
 use std::marker::Unpin;
 use std::sync::Arc;
+use std::path::Path;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::io::AsRawFd;
 
 use std::net::{TcpListener, TcpStream, UdpSocket};
+// Unix specifics
+use std::os::unix::net::{UnixListener, UnixStream, SocketAddr as UnixSocketAddr};
 
 use lever::sync::prelude::*;
 use futures::Stream;
@@ -43,7 +46,8 @@ impl Handle<TcpListener> {
 
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<TcpListener>> {
         // TODO: (vertexclique): Migrate towards to using initial subscription with callback.
-        Ok(Handle::new_with_callback(TcpListener::bind(addr)?, libc::EVFILT_READ as _)?)
+        // Using `new_with_callback`.
+        Ok(Handle::new(TcpListener::bind(addr)?)?)
     }
 
     pub async fn accept(&self) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
@@ -53,7 +57,7 @@ impl Handle<TcpListener> {
     pub fn incoming(
         &self,
     ) -> impl Stream<Item = io::Result<Handle<TcpStream>>> + Send + Unpin + '_ {
-        Box::pin(futures::stream::unfold(self, |listener| async move {
+        Box::pin(futures::stream::unfold(self, |listener: &Handle<TcpListener>| async move {
             let res = listener.accept().await.map(|(stream, _)| stream);
             Some((res, listener))
         }))
@@ -84,7 +88,7 @@ impl Handle<UdpSocket> {
     }
 
     pub async fn connect<A: ToSocketAddrs>(sock_addrs: A) -> io::Result<Handle<UdpSocket>> {
-        Processor::processor_connect(sock_addrs, Processor::connect_udp).await
+        Processor::processor_connect(sock_addrs, Processor::processor_connect_udp).await
     }
 
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -116,5 +120,24 @@ impl Handle<UdpSocket> {
 
     pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         Processor::processor_peek_from(self.get_ref(), buf).await
+    }
+}
+
+impl Handle<UnixListener> {
+    pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixListener>> {
+        Ok(Handle::new(UnixListener::bind(path)?)?)
+    }
+
+    pub async fn accept(&self) -> io::Result<(Handle<UnixStream>, UnixSocketAddr)> {
+        Processor::processor_accept_unix_listener(self.get_ref()).await
+    }
+
+    pub fn incoming(
+        &self,
+    ) -> impl Stream<Item = io::Result<Handle<UnixStream>>> + Send + Unpin + '_ {
+        Box::pin(futures::stream::unfold(self, |listener: &Handle<UnixListener>| async move {
+            let res = listener.accept().await.map(|(stream, _)| stream);
+            Some((res, listener))
+        }))
     }
 }
