@@ -65,8 +65,8 @@ impl Handle<TcpListener> {
 }
 
 impl Handle<TcpStream> {
-    pub async fn connect<A: ToSocketAddrs>(addrs: A) -> io::Result<Handle<TcpStream>> {
-        Ok(Processor::processor_connect(addrs, Processor::processor_connect_tcp).await?)
+    pub async fn connect<A: ToSocketAddrs>(sock_addrs: A) -> io::Result<Handle<TcpStream>> {
+        Ok(Processor::processor_connect(sock_addrs, Processor::processor_connect_tcp).await?)
     }
 
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -139,5 +139,37 @@ impl Handle<UnixListener> {
             let res = listener.accept().await.map(|(stream, _)| stream);
             Some((res, listener))
         }))
+    }
+}
+
+impl Handle<UnixStream> {
+    pub fn new_socket(io: UnixStream) -> io::Result<Handle<UnixStream>> {
+        Handle::new(io)
+    }
+
+    pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixStream>> {
+        Ok(Processor::processor_connect_unix(path).await?)
+    }
+
+    pub fn pair() -> io::Result<(Handle<UnixStream>, Handle<UnixStream>)> {
+        let (sock1, sock2) =
+            socket2::Socket::pair(socket2::Domain::unix(), socket2::Type::stream(), None)?;
+
+        Ok((
+            Self::new_socket(sock1.into_unix_stream())?,
+            Self::new_socket(sock2.into_unix_stream())?,
+        ))
+    }
+
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        Processor::processor_send(self.get_ref(), buf).await
+    }
+
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        Processor::processor_recv(self.get_ref(), buf).await
+    }
+
+    pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        Processor::processor_peek(self.get_ref(), buf).await
     }
 }
