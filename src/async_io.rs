@@ -5,10 +5,12 @@ use futures::io::{AsyncRead, AsyncWrite};
 use super::submission_handler::SubmissionHandler;
 use std::io::Read;
 
-use std::net::TcpStream;
+use std::net::{TcpStream};
 
 #[cfg(unix)]
 use std::{mem::ManuallyDrop, os::unix::io::{AsRawFd, FromRawFd}};
+#[cfg(unix)]
+use std::os::unix::net::{UnixStream};
 
 use crate::syscore::Processor;
 
@@ -57,6 +59,12 @@ impl_async_read!(File);
 impl_async_write!(File);
 impl_async_read!(TcpStream);
 impl_async_write!(TcpStream);
+
+#[cfg(unix)]
+impl_async_read!(UnixStream);
+#[cfg(unix)]
+impl_async_write!(UnixStream);
+
 
 ///////////////////////////////////
 ///// File
@@ -146,6 +154,65 @@ impl AsyncWrite for &Handle<TcpStream> {
 
         let completion_dispatcher = async move {
             let sock = unsafe { TcpStream::from_raw_fd(raw_fd) };
+
+            let buf = unsafe { std::slice::from_raw_parts(buf, buf_len) };
+            let size = Processor::processor_send(&sock, buf).await?;
+
+            let _ = ManuallyDrop::new(sock);
+            Ok(size)
+        };
+
+        SubmissionHandler::<Self>::handle_write(self, cx, completion_dispatcher)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+
+#[cfg(unix)]
+impl AsyncRead for &Handle<UnixStream> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let raw_fd = self.as_raw_fd();
+        let buf_len = buf.len();
+        let buf = buf.as_mut_ptr();
+
+        let completion_dispatcher = async move {
+            let sock = unsafe { UnixStream::from_raw_fd(raw_fd) };
+
+            let buf = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
+            let size = Processor::processor_recv(&sock, buf).await?;
+
+            let _ = ManuallyDrop::new(sock);
+            Ok(size)
+        };
+
+        SubmissionHandler::<Self>::handle_read(self, cx, completion_dispatcher)
+    }
+}
+
+#[cfg(unix)]
+impl AsyncWrite for &Handle<UnixStream> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let raw_fd = self.as_raw_fd();
+        let buf_len = buf.len();
+        let buf = buf.as_ptr();
+
+        let completion_dispatcher = async move {
+            let sock = unsafe { UnixStream::from_raw_fd(raw_fd) };
 
             let buf = unsafe { std::slice::from_raw_parts(buf, buf_len) };
             let size = Processor::processor_send(&sock, buf).await?;

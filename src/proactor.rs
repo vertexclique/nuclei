@@ -43,22 +43,26 @@ impl Proactor {
 
 pub fn run<T>(future: impl Future<Output = T>) -> T {
     let p = Proactor::get();
-    // let waker = waker_fn(move || {
-    //     let _ = p.wait(1, None);
-    // });
-    // let cx = &mut Context::from_waker(&waker);
-    // futures_util::pin_mut!(future);
+    let waker = waker_fn(move || {
+        // let _ = p.wait(1, None);
+        p.wake();
+    });
+    let cx = &mut Context::from_waker(&waker);
+    futures_util::pin_mut!(future);
 
     loop {
-        // if let Poll::Ready(val) = future.as_mut().poll(cx) {
-        //     return val;
-        // }
-        p.wake();
+        if let Poll::Ready(val) = future.as_mut().poll(cx) {
+            return val;
+        }
+        // p.wake();
 
-        dbg!("HIT WAIT");
-        let duration = Some(Duration::from_millis(0));
+        cx.waker().wake_by_ref();
+
+        // dbg!("HIT WAIT");
+        // let duration = Some(Duration::from_millis(100));
+        // std::thread::sleep(duration.unwrap());
         let a = p.wait(1, None).unwrap();
-        dbg!(a);
-        dbg!("AFTER WAIT");
+        // dbg!(a);
+        // dbg!("AFTER WAIT");
     }
 }

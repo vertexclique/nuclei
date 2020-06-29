@@ -168,14 +168,14 @@ impl SysProactor {
     }
 
     pub fn register(&self, fd: RawFd, _key: usize) -> io::Result<()> {
-        dbg!("REGISTER");
+        // dbg!("REGISTER");
         let flags = syscall!(fcntl(fd, libc::F_GETFL))?;
         syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
         Ok(())
     }
 
     pub fn reregister(&self, fd: RawFd, key: usize) -> io::Result<()> {
-        dbg!("REREGISTER");
+        // dbg!("REREGISTER");
         // let mut read_flags = libc::EV_ONESHOT | libc::EV_RECEIPT;
         // let mut write_flags = libc::EV_ONESHOT | libc::EV_RECEIPT;
         let mut read_flags = libc::EV_CLEAR | libc::EV_RECEIPT;
@@ -207,7 +207,7 @@ impl SysProactor {
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
-        dbg!("DEREGISTER");
+        // dbg!("DEREGISTER");
         let flags = libc::EV_DELETE | libc::EV_RECEIPT;
         let changelist = [
             KEvent::new(fd as _, libc::EVFILT_WRITE, flags, 0, 0, 0),
@@ -225,7 +225,7 @@ impl SysProactor {
     }
 
     pub fn wait(&self, max_event_size: usize, timeout: Option<Duration>) -> io::Result<usize> {
-        dbg!("WAIT");
+        // dbg!("WAIT");
         let timeout = timeout.map(|t| libc::timespec {
             tv_sec: t.as_secs() as libc::time_t,
             tv_nsec: t.subsec_nanos() as libc::c_long,
@@ -235,11 +235,11 @@ impl SysProactor {
         events.resize(max_event_size, unsafe { MaybeUninit::zeroed().assume_init() });
         let mut events: Box<[KEvent]> = events.into_boxed_slice();
 
-        dbg!("SENDING EVENT");
+        // dbg!("SENDING EVENT");
         let res =
             kevent_ts(self.kqueue_fd, &[], &mut events, timeout)? as isize;
-        dbg!(res);
-        dbg!("EVENT FINISH");
+        // dbg!(res);
+        // dbg!("EVENT FINISH");
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -258,7 +258,7 @@ impl SysProactor {
             } else {
                 if event.ident() == rs.as_raw_fd() as _ {
                     let _ = rs.read(&mut [0; 64]);
-                    dbg!("READ AFTER");
+                    // dbg!("READ AFTER");
 
                     // Skip waker
                     res -= 1;
@@ -268,11 +268,11 @@ impl SysProactor {
                 } else {
                     // Read user registered entries
                     let _ = rs.read(&mut [0; 64]);
-                    dbg!("READ ACTUAL");
+                    // dbg!("READ ACTUAL");
                 }
             }
 
-            dbg!(event.ident());
+            // dbg!(event.ident());
 
             self.dequeue_events(event.ident() as _, event.flags() as _)
         }
@@ -284,7 +284,7 @@ impl SysProactor {
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
-        dbg!("WAKE");
+        // dbg!("WAKE");
         let _ = (&self.write_stream).write(&[1]);
         Ok(())
     }
@@ -292,7 +292,7 @@ impl SysProactor {
     ///////
 
     pub(crate) fn register_io(&self, fd: RawFd, evts: usize) -> io::Result<CompletionChan> {
-        dbg!("REGISTERED IO");
+        // dbg!("REGISTERED IO");
         let mut registered = self.registered.lock();
         let mut completions = self.completions.lock();
 
@@ -301,7 +301,7 @@ impl SysProactor {
             let mut evts = evts;
             if let Some(reged_evts) = registered.get_mut(&fd) {
                 evts |= *reged_evts;
-                dbg!(evts);
+                // dbg!(evts);
                 self.reregister(fd, evts)?;
                 *reged_evts = evts;
             } else {
@@ -321,7 +321,7 @@ impl SysProactor {
     }
 
     fn dequeue_events(&self, fd: RawFd, evts: usize) {
-        dbg!("DEQUEUE EVENTS");
+        // dbg!("DEQUEUE EVENTS");
         // acquire locks.
         let mut regs = self.registered.lock();
         let mut completions = self.completions.lock();
