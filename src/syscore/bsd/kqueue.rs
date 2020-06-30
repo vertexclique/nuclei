@@ -132,10 +132,10 @@ pub struct SysProactor {
     /// kqueue_fd
     kqueue_fd: RawFd,
 
-    /// Socket half for read events
+    /// Waker socket half for read events (loop start)
     read_stream: TTas<UnixStream>,
 
-    /// Socket half for write events
+    /// Waker socket half for write events (trigger)
     write_stream: UnixStream,
 
     /// Registered events of IOs

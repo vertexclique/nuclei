@@ -1,5 +1,9 @@
-mod nethandle;
+#[cfg(feature = "epoll")]
 mod epoll;
-
+#[cfg(feature = "epoll")]
 pub(crate) use epoll::*;
-pub(crate) use nethandle::*;
+
+#[cfg(feature = "iouring")]
+mod iouring;
+#[cfg(feature = "iouring")]
+pub(crate) use iouring::*;
