@@ -1,12 +1,13 @@
 use std::mem::MaybeUninit;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd, FromRawFd};
 use std::{fs::File, os::unix::net::UnixStream, collections::HashMap, time::Duration};
 use futures::channel::oneshot;
 use pin_utils::unsafe_pinned;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use crate::sys::epoll::*;
 use lever::prelude::*;
 
 macro_rules! syscall {
@@ -132,7 +133,7 @@ pub struct SysProactor {
     epoll_fd: RawFd,
 
     /// Waker trigger
-    waker: TTas<UnixStream>,
+    event_fd: TTas<File>,
 
     /// Registered events of IOs
     registered: TTas<HashMap<RawFd, i32>>,
@@ -143,27 +144,67 @@ pub struct SysProactor {
 
 impl SysProactor {
     pub(crate) fn new() -> io::Result<SysProactor> {
-        todo!()
+        let epoll_fd: i32 = epoll_create1()?;
+        let event_fd: i32 = syscall!(eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK))?;
+        if event_fd == !0 {
+            return Err(io::Error::last_os_error());
+        }
+        let event_fd_raw = event_fd;
+        let event_fd = unsafe { File::from_raw_fd(event_fd) };
+        let proactor = SysProactor {
+            epoll_fd,
+            event_fd: TTas::new(event_fd),
+            registered: TTas::new(HashMap::new()),
+            completions: TTas::new(HashMap::new())
+        };
+        proactor.register(event_fd_raw, !0)?;
+
+        let ev = &mut EpollEvent::new(libc::EPOLLIN as _, !0 as u64);
+        epoll_ctl(proactor.epoll_fd, EpollOp::EpollCtlAdd, event_fd_raw, Some(ev))?;
+
+        Ok(proactor)
     }
 
-    pub fn register(&self, fd: RawFd, _key: i32) -> io::Result<()> {
-        todo!()
+    pub fn register(&self, fd: RawFd, events: i32) -> io::Result<()> {
+        let flags = syscall!(fcntl(fd, libc::F_GETFL))?;
+        syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
+        let ev = &mut EpollEvent::new(events | libc::EPOLLET, fd as u64);
+        epoll_ctl(self.epoll_fd, EpollOp::EpollCtlAdd, fd, Some(ev))
     }
 
-    pub fn reregister(&self, fd: RawFd, key: i32) -> io::Result<()> {
-        todo!()
+    pub fn reregister(&self, fd: RawFd, events: i32) -> io::Result<()> {
+        let ev = &mut EpollEvent::new(events | libc::EPOLLIN, !0 as u64);
+        epoll_ctl(self.epoll_fd, EpollOp::EpollCtlMod, fd, Some(ev))
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
-        todo!()
+        epoll_ctl(self.epoll_fd, EpollOp::EpollCtlDel, fd, None)
     }
 
     pub fn wait(&self, max_event_size: usize, timeout: Option<Duration>) -> io::Result<usize> {
-        todo!()
+        let mut events: Vec<EpollEvent> = Vec::with_capacity(max_event_size);
+        events.resize(max_event_size, unsafe { MaybeUninit::zeroed().assume_init() });
+
+        let timeout: isize = timeout.map_or(!0, |d| d.as_millis() as isize);
+        let mut res = epoll_wait(self.epoll_fd, &mut events, timeout)? as usize;
+
+        for event in &events[0..res] {
+            if event.data() == 0 {
+                let mut buf = vec![0; 8];
+                let _ = self.event_fd.lock().read(&mut buf);
+                res -= 1;
+                continue;
+            }
+
+            self.dequeue_events(event.data() as _, event.events());
+        }
+
+        Ok(res)
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
-        todo!()
+        self.event_fd.lock().write_all(&(1 as u64).to_ne_bytes())?;
+        Ok(())
     }
 
     ///////
