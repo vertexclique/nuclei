@@ -240,9 +240,6 @@ impl SysProactor {
             kevent_ts(self.kqueue_fd, &[], &mut events, timeout)? as isize;
         // dbg!(res);
         // dbg!("EVENT FINISH");
-        if res < 0 {
-            return Err(io::Error::last_os_error());
-        }
 
         let mut res = res as usize;
         let mut rs = self.read_stream.lock();
@@ -292,22 +289,18 @@ impl SysProactor {
     ///////
 
     pub(crate) fn register_io(&self, fd: RawFd, evts: usize) -> io::Result<CompletionChan> {
-        // dbg!("REGISTERED IO");
+        let mut evts = evts;
         let mut registered = self.registered.lock();
         let mut completions = self.completions.lock();
 
-        // register or reregister events.
-        {
-            let mut evts = evts;
-            if let Some(reged_evts) = registered.get_mut(&fd) {
-                evts |= *reged_evts;
-                // dbg!(evts);
-                self.reregister(fd, evts)?;
-                *reged_evts = evts;
-            } else {
-                self.register(fd, evts)?;
-                registered.insert(fd, evts);
-            }
+        if let Some(reged_evts) = registered.get_mut(&fd) {
+            evts |= *reged_evts;
+            // dbg!(evts);
+            self.reregister(fd, evts)?;
+            *reged_evts = evts;
+        } else {
+            self.register(fd, evts)?;
+            registered.insert(fd, evts);
         }
 
         let (sender, receiver) = oneshot::channel();
@@ -366,45 +359,6 @@ impl SysProactor {
 
     }
 }
-
-//////////////////////////////
-//////////////////////////////
-
-
-pub struct Events {
-    list: Box<[KEvent]>,
-    len: usize,
-}
-
-impl Events {
-    pub fn new() -> Events {
-        let flags = 0;
-        let event = KEvent::new(0, 0, flags, 0, 0, 0);
-        let list = vec![event; 1000].into_boxed_slice();
-        let len = 0;
-        Events { list, len }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = Event> + '_ {
-        // On some platforms, closing the read end of a pipe wakes up writers, but the
-        // event is reported as EVFILT_READ with the EV_EOF flag.
-        //
-        // https://github.com/golang/go/commit/23aad448b1e3f7c3b4ba2af90120bde91ac865b4
-        self.list[..self.len].iter().map(|ev| Event {
-            readable: ev.filter() == libc::EVFILT_READ,
-            writable: ev.filter() == libc::EVFILT_WRITE
-                || (ev.filter() == libc::EVFILT_READ && (ev.flags() & libc::EV_EOF) != 0),
-            key: ev.udata() as usize,
-        })
-    }
-}
-
-pub struct Event {
-    pub readable: bool,
-    pub writable: bool,
-    pub key: usize,
-}
-
 
 
 //////////////////////////////

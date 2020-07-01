@@ -132,7 +132,7 @@ pub struct SysProactor {
     /// epoll_fd
     epoll_fd: RawFd,
 
-    /// Waker trigger
+    /// Event trigger
     event_fd: TTas<File>,
 
     /// Registered events of IOs
@@ -146,9 +146,6 @@ impl SysProactor {
     pub(crate) fn new() -> io::Result<SysProactor> {
         let epoll_fd: i32 = epoll_create1()?;
         let event_fd: i32 = syscall!(eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK))?;
-        if event_fd == !0 {
-            return Err(io::Error::last_os_error());
-        }
         let event_fd_raw = event_fd;
         let event_fd = unsafe { File::from_raw_fd(event_fd) };
         let proactor = SysProactor {
@@ -157,23 +154,28 @@ impl SysProactor {
             registered: TTas::new(HashMap::new()),
             completions: TTas::new(HashMap::new())
         };
-        proactor.register(event_fd_raw, !0)?;
 
-        let ev = &mut EpollEvent::new(libc::EPOLLIN as _, !0 as u64);
+        let ev = &mut EpollEvent::new(libc::EPOLLIN as _, 0 as u64);
         epoll_ctl(proactor.epoll_fd, EpollOp::EpollCtlAdd, event_fd_raw, Some(ev))?;
 
         Ok(proactor)
     }
 
+    fn default_flags(&self) -> EpollFlags {
+        // Don't use RDHUP as registered with EPOLLIN.
+        // Not all data might read with that.
+        libc::EPOLLHUP | libc::EPOLLPRI | libc::EPOLLET
+    }
+
     pub fn register(&self, fd: RawFd, events: i32) -> io::Result<()> {
         let flags = syscall!(fcntl(fd, libc::F_GETFL))?;
         syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
-        let ev = &mut EpollEvent::new(events | libc::EPOLLET, fd as u64);
+        let ev = &mut EpollEvent::new(events | self.default_flags(), fd as u64);
         epoll_ctl(self.epoll_fd, EpollOp::EpollCtlAdd, fd, Some(ev))
     }
 
     pub fn reregister(&self, fd: RawFd, events: i32) -> io::Result<()> {
-        let ev = &mut EpollEvent::new(events | libc::EPOLLIN, !0 as u64);
+        let ev = &mut EpollEvent::new(events | libc::EPOLLET, !0 as u64);
         epoll_ctl(self.epoll_fd, EpollOp::EpollCtlMod, fd, Some(ev))
     }
 
@@ -182,16 +184,18 @@ impl SysProactor {
     }
 
     pub fn wait(&self, max_event_size: usize, timeout: Option<Duration>) -> io::Result<usize> {
+        // dbg!("WAIT");
         let mut events: Vec<EpollEvent> = Vec::with_capacity(max_event_size);
         events.resize(max_event_size, unsafe { MaybeUninit::zeroed().assume_init() });
 
         let timeout: isize = timeout.map_or(!0, |d| d.as_millis() as isize);
         let mut res = epoll_wait(self.epoll_fd, &mut events, timeout)? as usize;
 
+        let mut ev_fd = self.event_fd.lock();
         for event in &events[0..res] {
             if event.data() == 0 {
                 let mut buf = vec![0; 8];
-                let _ = self.event_fd.lock().read(&mut buf);
+                let _ = ev_fd.read(&mut buf);
                 res -= 1;
                 continue;
             }
@@ -203,18 +207,79 @@ impl SysProactor {
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
+        // dbg!("WAKE");
         self.event_fd.lock().write_all(&(1 as u64).to_ne_bytes())?;
         Ok(())
     }
 
     ///////
 
-    pub(crate) fn register_io(&self, fd: RawFd, evts: i32) -> io::Result<CompletionChan> {
-        todo!()
+    pub(crate) fn register_io(&self, fd: RawFd, events: i32) -> io::Result<CompletionChan> {
+        let mut events = events;
+        let mut registered = self.registered.lock();
+        let mut completions = self.completions.lock();
+
+        if let Some(reged_evts) = registered.get_mut(&fd) {
+            events |= *reged_evts;
+            self.reregister(fd, events)?;
+            *reged_evts = events;
+        } else {
+            // dbg!(events);
+            self.register(fd, events)?;
+            registered.insert(fd, events);
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        let comp = completions
+            .entry(fd)
+            .or_insert(Vec::new());
+
+        comp.push((events, sender));
+
+        Ok(CompletionChan { recv: receiver })
     }
 
     fn dequeue_events(&self, fd: RawFd, evts: i32) {
-        todo!()
+        let mut registered = self.registered.lock();
+        let mut completions = self.completions.lock();
+
+        // remove flags from interested events.
+        let mut remove_regs = false;
+        if let Some(reg_events) = registered.get_mut(&fd) {
+            *reg_events &= !evts;
+            if *reg_events == 0 {
+                remove_regs = true;
+            } else {
+                let _ = self.reregister(fd, *reg_events);
+            }
+        }
+
+        // send concrete completion and remove completion interested sources
+        let mut ack_removal = false;
+        if let Some(completions) = completions.get_mut(&fd) {
+            let mut i = 0;
+            while i < completions.len() {
+                if completions[i].0 & evts != 0 {
+                    let (_evts, sender) = completions.remove(i);
+                    let _ = sender.send(evts);
+                } else {
+                    i += 1;
+                }
+            }
+
+            if completions.is_empty() {
+                ack_removal = true;
+            }
+        }
+
+        if remove_regs {
+            registered.remove(&fd);
+            self.deregister(fd);
+        }
+
+        if ack_removal {
+            completions.remove(&fd);
+        }
     }
 }
 

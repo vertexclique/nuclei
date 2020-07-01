@@ -58,9 +58,9 @@ pub fn run<T>(future: impl Future<Output = T>) -> T {
 
         cx.waker().wake_by_ref();
 
-        // dbg!("HIT WAIT");
-        // let duration = Some(Duration::from_millis(100));
+        let duration = Some(Duration::from_millis(100));
         // std::thread::sleep(duration.unwrap());
+        // let a = p.wait(1, None).unwrap();
         let a = p.wait(1, None).unwrap();
         // dbg!(a);
         // dbg!("AFTER WAIT");

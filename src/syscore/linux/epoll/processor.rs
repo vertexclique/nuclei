@@ -57,7 +57,6 @@ impl Processor {
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as i32)?;
                 let events = notifier.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
-                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
                 } else {
                     sock.send(buf)
@@ -92,7 +91,6 @@ impl Processor {
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as _)?;
                 let events = notifier.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
-                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
                 } else {
                     sock.recv_with_flags(buf, flags as _)
@@ -222,7 +220,6 @@ impl Processor {
                     .register_io(listener.as_raw_fd(), libc::EPOLLIN as _)?;
                 let events = notifier.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
-                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(socket.take_error()?.unwrap())
                 } else {
                     socket
@@ -259,7 +256,6 @@ impl Processor {
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as _)?;
                 let events = notifier.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
-                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
                 } else {
                     sock.send_to(buf, addr)
@@ -300,7 +296,6 @@ impl Processor {
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as _)?;
                 let events = notifier.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
-                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
                     let sock = ManuallyDrop::new(sock);
                     Err(sock.take_error()?.unwrap())
@@ -334,7 +329,6 @@ impl Processor {
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as _)?;
                 let events = notifier.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
-                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(socket.take_error()?.unwrap())
                 } else {
                     socket
@@ -369,7 +363,6 @@ impl Processor {
                     .register_io(stream.as_raw_fd(), libc::EPOLLOUT as _)?;
                 let events = notifier.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
-                    // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
                 } else {
                     sock.connect(&sockaddr)
