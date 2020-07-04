@@ -137,6 +137,7 @@ pub struct SysProactor {
 }
 
 fn submitter<T>(sq: &mut SubmissionQueue<'_>, mut ring_sub: impl FnMut(&mut SubmissionQueueEvent<'_>) -> T) -> Option<T> {
+    // dbg!("SUBMITTER");
     let mut sqe = match sq.next_sqe() {
         Some(sqe) => sqe,
         None => {
@@ -161,18 +162,24 @@ impl SysProactor {
     }
 
     pub(crate) fn register_io(&self, mut io_submit: impl FnMut(&mut SubmissionQueueEvent<'_>)) -> io::Result<CompletionChan> {
+        dbg!("REGISTER IO");
         let sub_comp = {
             let mut r = self.ring.lock();
             let mut sq = r.sq();
 
             let cc = submitter(&mut sq, |sqe| {
-                let id = self.submitter_id.fetch_add(2, Ordering::Relaxed);
+                // dbg!("SUBMITTER");
+                let mut id = self.submitter_id.fetch_add(2, Ordering::Relaxed);
+                if id == uring_sys::LIBURING_UDATA_TIMEOUT {
+                    id = self.submitter_id.fetch_add(2, Ordering::Relaxed);
+                }
                 let (tx, rx) = oneshot::channel();
                 io_submit(sqe);
 
                 {
                     let mut subguard = self.submitters.lock();
                     subguard.insert(id, tx);
+                    dbg!("INSERTED", id);
                 }
                 sqe.set_user_data(id);
 
@@ -186,10 +193,13 @@ impl SysProactor {
             cc
         };
 
+        // dbg!(sub_comp.is_none());
+
         sub_comp.ok_or(io::Error::from(io::ErrorKind::WouldBlock))
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
+        // dbg!("WAKE");
         {
             let mut r = self.ring.lock();
             let mut sq = r.sq();
@@ -199,11 +209,14 @@ impl SysProactor {
                 //     sqe.prep_timeout_remove(0);
                 // }
 
-                let timeout_spec: _ = uring_sys::__kernel_timespec {
-                    tv_sec:  1 as _,
-                    tv_nsec: 0 as _,
-                };
-                unsafe { sqe.prep_timeout(&timeout_spec); }
+                // let timeout_spec: _ = uring_sys::__kernel_timespec {
+                //     tv_sec:  0 as _,
+                //     tv_nsec: 0 as _,
+                // };
+                unsafe {
+                    let sqep = sqe.raw_mut();
+                    uring_sys::io_uring_prep_timeout_remove(sqep, uring_sys::LIBURING_UDATA_TIMEOUT, 0);
+                }
                 sqe.set_user_data(uring_sys::LIBURING_UDATA_TIMEOUT);
             }).map(|c| {
                 sq.submit().unwrap();
@@ -217,22 +230,42 @@ impl SysProactor {
     }
 
     pub(crate) fn wait(&self, max_event_size: usize, duration: Option<Duration>) -> io::Result<usize> {
+        // dbg!("WAIT");
         // let comp_size = (max_event_size as isize).signum().abs() as usize;
         let mut r = self.ring.lock();
+        // dbg!("WAIT lock acq");
         let mut maybe_cqe: Option<CompletionQueueEvent> = None;
 
-        let mut r = self.ring.lock();
         if let Some(d) = duration {
-            maybe_cqe = Option::from(r.wait_for_cqe_with_timeout(d)?);
+            // dbg!("timed cqe");
+            maybe_cqe = r.wait_for_cqe_with_timeout(d).ok();
+        } else {
+            dbg!("non timed cqe");
+            let d = Duration::from_millis(0);
+            maybe_cqe = r.wait_for_cqe_with_timeout(d).ok();
+            // maybe_cqe = match r.wait_for_cqe() {
+            //     Ok(res) => Some(res),
+            //     Err(ref e) if e.raw_os_error().unwrap() == libc::ETIME => {
+            //         dbg!("TIMED OUT");
+            //         return Ok(0)
+            //     },
+            //     Err(ref e) if e.raw_os_error().unwrap() == libc::EAGAIN => {
+            //         dbg!("EAGAIN");
+            //         return Ok(0)
+            //     },
+            //     Err(e) => {
+            //         dbg!("OTher error");
+            //         return Err(e)
+            //     },
+            // }
         }
+        dbg!("maybe_cqe", maybe_cqe.is_some());
 
         let mut cq = r.cq();
-        if duration.is_none() && maybe_cqe.is_none() {
-            maybe_cqe = Option::from(cq.wait_for_cqe()?);
-        }
 
         let mut acquired = 0;
         for i in 0..max_event_size {
+            // dbg!(cq.ready());
             if cq.ready() == 0 {
                 break;
             }
@@ -247,12 +280,14 @@ impl SysProactor {
                     let res = cqe.result()? as i32;
 
                     acquired += 1;
+                    dbg!("ACQUIRED");
 
                     self.submitters.lock()
                         .remove(&udata)
                         .map(|s| s.send(res));
                 }
                 None => {
+                    // dbg!("PEEK");
                     if let Some(cqe) = cq.peek_for_cqe() {
                         maybe_cqe = Some(cqe);
                     } else { break; }

@@ -52,10 +52,10 @@ impl Processor {
         match sock.send(buf) {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EVFILT_WRITE as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
                     // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
@@ -87,10 +87,10 @@ impl Processor {
         match sock.recv_with_flags(buf, flags as _) {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
                     // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
@@ -217,10 +217,10 @@ impl Processor {
                 .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr)) {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(listener.as_raw_fd(), libc::EVFILT_READ as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
                     // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(socket.take_error()?.unwrap())
@@ -254,10 +254,10 @@ impl Processor {
         match sock.send_to(buf, addr) {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
                     // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())
@@ -295,10 +295,10 @@ impl Processor {
             .map(|(size, sockaddr)| (size, sockaddr)) {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
                     // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
@@ -329,10 +329,10 @@ impl Processor {
             .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr)) {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EVFILT_READ as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
                     // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(socket.take_error()?.unwrap())
@@ -364,10 +364,10 @@ impl Processor {
         let res = match sock.connect(&sockaddr) {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(stream.as_raw_fd(), (libc::EAGAIN | libc::EINPROGRESS) as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if events & (libc::EV_ERROR as usize) != 0 {
                     // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
                     Err(sock.take_error()?.unwrap())

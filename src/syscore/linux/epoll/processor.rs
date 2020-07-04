@@ -52,10 +52,10 @@ impl Processor {
         match sock.send(buf) {
             Ok(res) => Ok(res),
             Err(err) if (err.raw_os_error().unwrap() & (libc::EAGAIN | libc::EWOULDBLOCK)) != 0 => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as i32)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
                     Err(sock.take_error()?.unwrap())
                 } else {
@@ -86,10 +86,10 @@ impl Processor {
         match sock.recv_with_flags(buf, flags as _) {
             Ok(res) => Ok(res),
             Err(err) if (err.raw_os_error().unwrap() & (libc::EAGAIN | libc::EWOULDBLOCK)) != 0 => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
                     Err(sock.take_error()?.unwrap())
                 } else {
@@ -215,10 +215,10 @@ impl Processor {
             .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr)) {
             Ok(res) => Ok(res),
             Err(err) if (err.raw_os_error().unwrap() & (libc::EAGAIN | libc::EWOULDBLOCK)) != 0 => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(listener.as_raw_fd(), libc::EPOLLIN as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
                     Err(socket.take_error()?.unwrap())
                 } else {
@@ -251,10 +251,10 @@ impl Processor {
         match sock.send_to(buf, addr) {
             Ok(res) => Ok(res),
             Err(err) if (err.raw_os_error().unwrap() & (libc::EAGAIN | libc::EWOULDBLOCK)) != 0 => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
                     Err(sock.take_error()?.unwrap())
                 } else {
@@ -291,10 +291,10 @@ impl Processor {
             .map(|(size, sockaddr)| (size, sockaddr)) {
             Ok(res) => Ok(res),
             Err(err) if (err.raw_os_error().unwrap() & (libc::EAGAIN | libc::EWOULDBLOCK)) != 0 => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
                     let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
                     let sock = ManuallyDrop::new(sock);
@@ -324,10 +324,10 @@ impl Processor {
             .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr)) {
             Ok(res) => Ok(res),
             Err(err) if (err.raw_os_error().unwrap() & (libc::EAGAIN | libc::EWOULDBLOCK)) != 0 => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(socket.as_raw_fd(), libc::EPOLLIN as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
                     Err(socket.take_error()?.unwrap())
                 } else {
@@ -358,10 +358,10 @@ impl Processor {
         let res = match sock.connect(&sockaddr) {
             Ok(res) => Ok(res),
             Err(err) if (err.raw_os_error().unwrap() & (libc::EAGAIN | libc::EINPROGRESS)) != 0 => {
-                let notifier = Proactor::get()
+                let cc = Proactor::get()
                     .inner()
                     .register_io(stream.as_raw_fd(), libc::EPOLLOUT as _)?;
-                let events = notifier.await?;
+                let events = cc.await?;
                 if (events & libc::EPOLLERR as i32) != 0 {
                     Err(sock.take_error()?.unwrap())
                 } else {

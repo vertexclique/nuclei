@@ -61,7 +61,7 @@ pub fn run<T>(future: impl Future<Output = T>) -> T {
         let duration = Some(Duration::from_millis(100));
         // std::thread::sleep(duration.unwrap());
         // let a = p.wait(1, None).unwrap();
-        let a = p.wait(1, None).unwrap();
+        let a = p.wait(1, None);
         // dbg!(a);
         // dbg!("AFTER WAIT");
     }
