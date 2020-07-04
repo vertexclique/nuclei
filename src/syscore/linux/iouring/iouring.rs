@@ -128,6 +128,7 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
 //// uring impl
 ///////////////////
 
+const MANUAL_TIMEOUT: u64 = u64::max_value() - 1;
 const QUEUE_LEN: u32 = 1 << 6;
 
 pub struct SysProactor {
@@ -147,6 +148,7 @@ fn submitter<T>(sq: &mut SubmissionQueue<'_>, mut ring_sub: impl FnMut(&mut Subm
             sq.next_sqe()?
         }
     };
+
     Some(ring_sub(&mut sqe))
 }
 
@@ -169,8 +171,8 @@ impl SysProactor {
 
             let cc = submitter(&mut sq, |sqe| {
                 // dbg!("SUBMITTER");
-                let mut id = self.submitter_id.fetch_add(2, Ordering::Relaxed);
-                if id == uring_sys::LIBURING_UDATA_TIMEOUT {
+                let mut id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
+                if id == MANUAL_TIMEOUT {
                     id = self.submitter_id.fetch_add(2, Ordering::Relaxed);
                 }
                 let (tx, rx) = oneshot::channel();
@@ -185,7 +187,8 @@ impl SysProactor {
 
                 CompletionChan { rx }
             }).map(|c| {
-                sq.submit().unwrap();
+                let x = sq.submit().unwrap();
+                dbg!("SUBMITTED", x);
 
                 c
             });
@@ -205,19 +208,11 @@ impl SysProactor {
             let mut sq = r.sq();
 
             let res = submitter(&mut sq, |sqe| {
-                // unsafe {
-                //     sqe.prep_timeout_remove(0);
-                // }
-
-                // let timeout_spec: _ = uring_sys::__kernel_timespec {
-                //     tv_sec:  0 as _,
-                //     tv_nsec: 0 as _,
-                // };
                 unsafe {
                     let sqep = sqe.raw_mut();
-                    uring_sys::io_uring_prep_timeout_remove(sqep, uring_sys::LIBURING_UDATA_TIMEOUT, 0);
+                    uring_sys::io_uring_prep_timeout_remove(sqep, MANUAL_TIMEOUT, 0);
                 }
-                sqe.set_user_data(uring_sys::LIBURING_UDATA_TIMEOUT);
+                sqe.set_user_data(MANUAL_TIMEOUT);
             }).map(|c| {
                 sq.submit().unwrap();
                 c
@@ -240,44 +235,37 @@ impl SysProactor {
             // dbg!("timed cqe");
             maybe_cqe = r.wait_for_cqe_with_timeout(d).ok();
         } else {
-            dbg!("non timed cqe");
-            let d = Duration::from_millis(0);
-            maybe_cqe = r.wait_for_cqe_with_timeout(d).ok();
-            // maybe_cqe = match r.wait_for_cqe() {
-            //     Ok(res) => Some(res),
-            //     Err(ref e) if e.raw_os_error().unwrap() == libc::ETIME => {
-            //         dbg!("TIMED OUT");
-            //         return Ok(0)
-            //     },
-            //     Err(ref e) if e.raw_os_error().unwrap() == libc::EAGAIN => {
-            //         dbg!("EAGAIN");
-            //         return Ok(0)
-            //     },
-            //     Err(e) => {
-            //         dbg!("OTher error");
-            //         return Err(e)
-            //     },
-            // }
+            // dbg!("non timed cqe");
+            let d = Duration::from_secs(10);
+            // maybe_cqe = r.wait_for_cqe_with_timeout(d).ok();
+            // maybe_cqe = r.wait_for_cqe().ok();
+            let cqe = r.wait_for_cqe().unwrap();
+            // dbg!(cqe.user_data());
+            maybe_cqe = Some(cqe);
         }
-        dbg!("maybe_cqe", maybe_cqe.is_some());
+        // dbg!("maybe_cqe", maybe_cqe.is_some());
 
         let mut cq = r.cq();
 
         let mut acquired = 0;
         for i in 0..max_event_size {
             // dbg!(cq.ready());
-            if cq.ready() == 0 {
-                break;
-            }
+            // if cq.ready() == 0 {
+            //     break;
+            // }
 
             match maybe_cqe {
                 Some(ref cqe) => {
                     if cqe.is_timeout() {
+                        dbg!("MAYBE CQE WAS TIMEOUT");
                         continue;
                     }
 
                     let udata = cqe.user_data();
                     let res = cqe.result()? as i32;
+                    if udata == MANUAL_TIMEOUT {
+                        continue;
+                    }
 
                     acquired += 1;
                     dbg!("ACQUIRED");
@@ -287,9 +275,20 @@ impl SysProactor {
                         .map(|s| s.send(res));
                 }
                 None => {
-                    // dbg!("PEEK");
+                    dbg!("PEEK");
                     if let Some(cqe) = cq.peek_for_cqe() {
-                        maybe_cqe = Some(cqe);
+                        // maybe_cqe = Some(cqe);
+                        let udata = cqe.user_data();
+                        let res = cqe.result()? as i32;
+                        if udata == MANUAL_TIMEOUT {
+                            continue;
+                        }
+
+                        acquired += 1;
+
+                        self.submitters.lock()
+                            .remove(&udata)
+                            .map(|s| s.send(res));
                     } else { break; }
                 }
             }

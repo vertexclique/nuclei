@@ -190,7 +190,7 @@ impl Processor {
         let mut saddrstor = SockAddrStorage::uninit();
 
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty())
+            sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
         })?;
         dbg!("TCP LISTENER");
 
