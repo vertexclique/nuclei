@@ -229,14 +229,14 @@ impl SysProactor {
             registered.insert(fd, events);
         }
 
-        let (sender, receiver) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let comp = completions
             .entry(fd)
             .or_insert(Vec::new());
 
-        comp.push((events, sender));
+        comp.push((events, tx));
 
-        Ok(CompletionChan { recv: receiver })
+        Ok(CompletionChan { rx })
     }
 
     fn dequeue_events(&self, fd: RawFd, evts: i32) {
@@ -287,19 +287,19 @@ impl SysProactor {
 //////////////////////////////
 
 pub(crate) struct CompletionChan {
-    recv: oneshot::Receiver<i32>,
+    rx: oneshot::Receiver<i32>,
 }
 
 impl CompletionChan {
-    unsafe_pinned!(recv: oneshot::Receiver<i32>);
+    unsafe_pinned!(rx: oneshot::Receiver<i32>);
 }
 
 impl Future for CompletionChan {
     type Output = io::Result<i32>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        self.recv()
+        self.rx()
             .poll(cx)
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sender has been canceled"))
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sender has been cancelled"))
     }
 }
