@@ -14,7 +14,7 @@ async fn serve(req: Request) -> http_types::Result<Response> {
     println!("Serving {}", req.url());
 
     let mut res = Response::new(StatusCode::Ok);
-    res.insert_header("Content-Type", "text/plain")?;
+    res.insert_header("Content-Type", "text/plain");
     res.set_body("Hello from async-h1!");
     Ok(res)
 }
@@ -33,7 +33,7 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
         // Spawn a background task serving this connection.
         let stream = Arc::new(stream);
         spawn(async move {
-            if let Err(err) = async_h1::accept(&host, stream, serve).await {
+            if let Err(err) = async_h1::accept( stream, serve).await {
                 println!("Connection error: {:#?}", err);
             }
         });

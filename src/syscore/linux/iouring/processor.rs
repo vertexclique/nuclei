@@ -58,6 +58,7 @@ impl Processor {
 
         let res = Proactor::get().inner().register_io(|sqe| unsafe {
             let sqep = sqe.raw_mut();
+            dbg!("SEND");
             uring_sys::io_uring_prep_send(sqep, fd, buf.as_ptr() as _, buf.len() as _, 0);
         })?.await?;
 
@@ -81,6 +82,7 @@ impl Processor {
 
         let res = Proactor::get().inner().register_io(|sqe| unsafe {
             let sqep = sqe.raw_mut();
+            dbg!("RECV", sqep.user_data);
             uring_sys::io_uring_prep_recv(sqep, fd, buf.as_ptr() as _, buf.len() as _, flags as _);
         })?.await?;
 
@@ -145,6 +147,7 @@ impl Processor {
         let fd = stream.as_raw_fd() as _;
 
         Proactor::get().inner().register_io(|sqe| unsafe {
+            dbg!("CONNECT TCP");
             sqe.prep_connect(fd, nixsaddr);
         })?.await?;
 
@@ -187,19 +190,75 @@ impl Processor {
 
     pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(listener: &R) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
         let fd = listener.as_raw_fd() as _;
-        let mut saddrstor = SockAddrStorage::uninit();
+        let mut sockaddr = MaybeUninit::<libc::sockaddr_storage>::uninit();
+        let mut sockaddr_len = std::mem::size_of::<libc::sockaddr_storage>() as _;
+
+
+        let mut sockaddr = unsafe {
+            let mut saddr = sockaddr.assume_init();
+            saddr.ss_family = libc::AF_INET as libc::sa_family_t;
+            saddr
+        };
 
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
+            dbg!("SQE CAME");
+            let sqep = sqe.raw_mut();
+            // sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
+            uring_sys::io_uring_prep_accept(sqep,
+                                            fd,
+                                            &mut sockaddr as *mut _ as *mut _,
+                                            &mut sockaddr_len,
+                                            0);
         })?;
+
+        // let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+        //     dbg!("SQE CAME");
+        //     let sqep = sqe.raw_mut();
+        //     // sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
+        //     uring_sys::io_uring_prep_accept(sqep,
+        //                                     fd,
+        //                                     sockaddr.as_mut_ptr() as *mut _,
+        //                                     &mut sockaddr_len,
+        //                                     0);
+        // })?;
+
+        // let mut saddrstor = SockAddrStorage::uninit();
+        //
+        // let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+        //     sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
+        // })?;
         dbg!("TCP LISTENER");
 
         let stream = unsafe { TcpStream::from_raw_fd(cc.await?) };
         dbg!("TCP LISTENER RECEIVED");
+        // let addr = unsafe {
+        //     let nixsa = saddrstor.as_socket_addr()?;
+        //     let (saddr, saddr_len) = nixsa.as_ffi_pair();
+        //     socket2::SockAddr::from_raw_parts(saddr as *const _, saddr_len as _)
+        //         .as_std()
+        //         .unwrap()
+        // };
+
+        // let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
+        // let socket = socket.into_tcp_listener();
+        // let addr = socket.local_addr().unwrap();
+        // let res = socket
+        //     .accept()
+        //     .map(|(_, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))?;
+
+        // let addr = unsafe {
+        //     socket
+        //         .local_addr()
+        //         .unwrap()
+        // };
+
+        // unsafe {
+        //     let mut sockaddr = sockaddr.assume_init();
+        //     sockaddr.ss_family = libc::AF_INET as libc::sa_family_t;
+        // }
+
         let addr = unsafe {
-            let nixsa = saddrstor.as_socket_addr()?;
-            let (saddr, saddr_len) = nixsa.as_ffi_pair();
-            socket2::SockAddr::from_raw_parts(saddr as *const _, saddr_len as _)
+            socket2::SockAddr::from_raw_parts(&sockaddr as *const _ as *const _, sockaddr_len as _)
                 .as_std()
                 .unwrap()
         };
