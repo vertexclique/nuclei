@@ -44,7 +44,8 @@ fn main() -> Result<()> {
     blocking(async { run(future::pending::<()>()) });
 
     erun(async {
-        let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
+        // let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
+        let http = listen(Handle::<TcpListener>::bind("127.0.0.1:8000")?);
         // let http1 = spawn(listen(Handle::<TcpListener>::bind("127.0.0.1:8001")?));
         //
         // future::join(http, http1).await;

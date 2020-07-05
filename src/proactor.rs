@@ -9,6 +9,7 @@ use super::syscore::*;
 use super::waker::*;
 
 pub use super::handle::*;
+use bastion::executor::blocking;
 
 ///
 /// Concrete proactor instance
@@ -44,11 +45,18 @@ impl Proactor {
 pub fn run<T>(future: impl Future<Output = T>) -> T {
     let p = Proactor::get();
     let waker = waker_fn(move || {
-        // let _ = p.wait(1, None);
         p.wake();
     });
     let cx = &mut Context::from_waker(&waker);
     futures_util::pin_mut!(future);
+
+    let driver = blocking(async move {
+        loop {
+            let a = p.wait(1, None).unwrap();
+        }
+    });
+
+    futures_util::pin_mut!(driver);
 
     loop {
         if let Poll::Ready(val) = future.as_mut().poll(cx) {
@@ -61,7 +69,8 @@ pub fn run<T>(future: impl Future<Output = T>) -> T {
 
         let duration = Some(Duration::from_millis(100));
         // std::thread::sleep(duration.unwrap());
-        let a = p.wait(1, None).unwrap();
+
+        driver.as_mut().poll(cx);
         // let a = p.wait(1, duration);
         // dbg!(a);
         // dbg!("AFTER WAIT");

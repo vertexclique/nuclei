@@ -1,5 +1,5 @@
 use std::io;
-use iou::{IoUring, SubmissionQueue, CompletionQueue, SubmissionQueueEvent, CompletionQueueEvent};
+use iou::{IoUring, SubmissionQueue, CompletionQueue, SubmissionQueueEvent, CompletionQueueEvent, Registrar};
 use lever::sync::prelude::*;
 use std::collections::HashMap;
 use futures::channel::oneshot;
@@ -10,7 +10,7 @@ use std::os::unix::io::{AsRawFd, RawFd, FromRawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
 macro_rules! syscall {
     ($fn:ident $args:tt) => {{
@@ -29,6 +29,8 @@ macro_rules! syscall {
 use socket2::SockAddr;
 use std::os::unix::net::{SocketAddr as UnixSocketAddr};
 use std::mem;
+use crate::Proactor;
+use once_cell::sync::Lazy;
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -134,53 +136,76 @@ const QUEUE_LEN: u32 = 1 << 8;
 // const QUEUE_LEN: u32 = 1 << 0;
 
 pub struct SysProactor {
-    ring: TTas<IoUring>,
+    sq: TTas<SubmissionQueue<'static>>,
+    cq: TTas<CompletionQueue<'static>>,
     submitters: TTas<HashMap<u64, oneshot::Sender<i32>>>,
     submitter_id: AtomicU64,
+    waker: AtomicBool,
 }
 
-fn submitter<T>(sq: &mut SubmissionQueue<'_>, mut ring_sub: impl FnMut(&mut SubmissionQueueEvent<'_>) -> T) -> Option<T> {
-    // dbg!("SUBMITTER");
-    let mut sqe = match sq.next_sqe() {
-        Some(sqe) => sqe,
-        None => {
-            if sq.submit().is_err() {
-                return None;
-            }
-            sq.next_sqe()?
-        }
-    };
+pub type RingTypes = (SubmissionQueue<'static>, CompletionQueue<'static>, Registrar<'static>);
 
-    Some(ring_sub(&mut sqe))
-}
+static mut IO_URING: Option<IoUring> = None;
 
 impl SysProactor {
-    pub(crate) fn new() -> io::Result<SysProactor> {
-        let mut ring = IoUring::new(QUEUE_LEN)?;
+    // fn init_ring() -> mut IoUring {
+    //     static mut IO_URING: Lazy<IoUring> = Lazy::new(|| {
+    //         IoUring::new(QUEUE_LEN).expect("uring can't be initialized")
+    //     });
+    //
+    //     &*IO_URING
+    // }
 
-        Ok(SysProactor {
-            ring: TTas::new(ring),
-            submitters: TTas::new(HashMap::default()),
-            submitter_id: AtomicU64::default()
-        })
+    pub(crate) fn new() -> io::Result<SysProactor> {
+        unsafe {
+            IO_URING = Some(iou::IoUring::new(QUEUE_LEN).expect("uring can't be initialized"));
+            let (sq, cq, _) = IO_URING.as_mut().unwrap().queues();
+
+            Ok(SysProactor {
+                sq: TTas::new(sq),
+                cq: TTas::new(cq),
+                submitters: TTas::new(HashMap::default()),
+                submitter_id: AtomicU64::new(1),
+                waker: AtomicBool::default()
+            })
+        }
     }
+
+    fn submitter<T>(&self, sq: &mut SubmissionQueue<'_>, mut ring_sub: impl FnMut(&mut SubmissionQueueEvent<'_>) -> T) -> Option<T> {
+        // dbg!("SUBMITTER");
+        let mut sqe = match sq.next_sqe() {
+            Some(sqe) => sqe,
+            None => {
+                if sq.submit().is_err() {
+                    return None;
+                }
+                sq.next_sqe()?
+            }
+        };
+
+        let mut id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
+        if id == MANUAL_TIMEOUT {
+            id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
+        }
+        sqe.set_user_data(id);
+
+        Some(ring_sub(&mut sqe))
+    }
+
 
     pub(crate) fn register_io(&self, mut io_submit: impl FnMut(&mut SubmissionQueueEvent<'_>)) -> io::Result<CompletionChan> {
         dbg!("REGISTER IO");
         let sub_comp = {
-            let mut r = self.ring.lock();
-            let mut sq = r.sq();
+            dbg!("RIO ENTER");
+            let mut sq = self.sq.lock();
+            dbg!("RIO EXIT");
 
-            let cc = submitter(&mut sq, |sqe| {
+            let cc = self.submitter(&mut sq, |sqe| {
                 // dbg!("SUBMITTER");
-                let mut id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
-                if id == MANUAL_TIMEOUT {
-                    id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
-                }
+                let id = sqe.user_data();
                 let (tx, rx) = oneshot::channel();
 
                 dbg!("SUBMITTER", id);
-                sqe.set_user_data(id);
                 io_submit(sqe);
 
                 {
@@ -188,7 +213,6 @@ impl SysProactor {
                     subguard.insert(id, tx);
                     dbg!("INSERTED", id);
                 }
-                sqe.set_user_data(id);
 
                 CompletionChan { rx }
             }).map(|c| {
@@ -208,102 +232,75 @@ impl SysProactor {
 
     pub(crate) fn wake(&self) -> io::Result<()> {
         // dbg!("WAKE");
-        {
-            let mut r = self.ring.lock();
-            let mut sq = r.sq();
-
-            let res = submitter(&mut sq, |sqe| {
-                // dbg!("submit – timeout remove");
-                unsafe {
-                    let sqep = sqe.raw_mut();
-                    sqep.user_data = MANUAL_TIMEOUT;
-                    uring_sys::io_uring_prep_timeout_remove(sqep, MANUAL_TIMEOUT, 0);
-                }
-                // sqe.set_user_data(MANUAL_TIMEOUT);
-            }).map(|c| {
-                sq.submit().unwrap();
-                c
-            });
-
-            res.ok_or(io::Error::from(io::ErrorKind::WouldBlock))?
-        }
-
+        // {
+        //     let mut sq = self.sq.lock();
+        //
+        //     let res = submitter(&mut sq, |sqe| {
+        //         unsafe {
+        //             let sqep = sqe.raw_mut();
+        //             sqep.user_data = MANUAL_TIMEOUT;
+        //             uring_sys::io_uring_prep_timeout_remove(sqep, MANUAL_TIMEOUT, 0);
+        //         }
+        //     }).map(|c| {
+        //         sq.submit().unwrap();
+        //         c
+        //     });
+        //
+        //     res.ok_or(io::Error::from(io::ErrorKind::WouldBlock))?
+        // }
         Ok(())
     }
 
     pub(crate) fn wait(&self, max_event_size: usize, duration: Option<Duration>) -> io::Result<usize> {
-        // dbg!("WAIT");
-        let evcount = (max_event_size as isize).signum().abs() as usize;
-
-        // dbg!("CQE POLL");
-        match self.cqe_poll(evcount as _, duration) {
-            Ok(_) => (),
-            Err(ref e) if e.raw_os_error().unwrap() == libc::ETIME => return Ok(0),
-            Err(ref e) if e.raw_os_error().unwrap() == libc::EAGAIN => return Ok(0),
-            Err(e) => return Err(e),
-        }
-        // dbg!("RECEIVED");
-
-        let mut r = self.ring.lock();
-        let mut cq = r.cq();
+        dbg!("WAIT ENTER");
+        let mut cq = self.cq.lock();
+        dbg!("CQ ACK");
 
         let mut acquired = 0;
-        for _ in 0..max_event_size {
-            // dbg!(cq.ready());
-            if cq.ready() == 0 {
-                break;
-            }
+
+        dbg!("before wait cqe");
+        while let Ok(cqe) = cq.wait_for_cqe() {
+            dbg!("non cqe");
+            let mut ready = cq.ready() as usize + 1;
+
+            self.cqe_completion(acquired, &cqe);
+            ready -= 1;
 
             while let Some(cqe) = cq.peek_for_cqe() {
-            // while let Ok(cqe) = cq.wait_for_cqe() {
-                // maybe_cqe = Some(cqe);
-                let udata = cqe.user_data();
-                // dbg!("Fetched cqe", udata);
-                let res = cqe.raw_result() as i32;
-                if udata == MANUAL_TIMEOUT {
-                    continue;
+                if ready == 0 {
+                    ready = cq.ready() as usize + 1;
                 }
-                // dbg!("OTHER", udata);
 
-                acquired += 1;
-
-                self.submitters.lock()
-                    .remove(&udata)
-                    .map(|s| s.send(res));
+                self.cqe_completion(acquired, &cqe);
+                ready -= 1;
             }
-            // else { break; }
         }
 
         Ok(acquired)
     }
 
-    fn cqe_poll(&self, evcount: u32, duration: Option<Duration>) -> io::Result<()> {
-        let mut cqep = std::ptr::null_mut();
-        let mut r = self.ring.lock();
-        let (mut sq, mut cq, reg) = r.queues();
-
-        let res = unsafe {
-            if let Some(duration) = duration {
-                let mut timeout_spec: _ = uring_sys::__kernel_timespec {
-                    tv_sec:  duration.as_secs() as _,
-                    tv_nsec: duration.subsec_nanos() as _,
-                };
-
-                submitter(&mut sq, |sqe| {
-                    let sqep = sqe.raw_mut();
-                    sqep.user_data = MANUAL_TIMEOUT;
-                    uring_sys::io_uring_prep_timeout(sqep, &mut timeout_spec, evcount as _, 0);
-                });
-                sq.submit().unwrap();
-            }
-            uring_sys::io_uring_wait_cqe_nr(r.raw_mut() as *mut _, &mut cqep, evcount as _)
-        };
-        if res < 0 {
-            return Err(io::Error::from_raw_os_error(-res));
+    fn cqe_completion(&self, mut acquired: usize, cqe: &CompletionQueueEvent) {
+        if cqe.is_timeout() {
+            dbg!("MAYBE CQE WAS TIMEOUT");
+            return;
         }
 
+        let udata = cqe.user_data();
+        let res = cqe.raw_result() as i32;
+        if udata == MANUAL_TIMEOUT {
+            return;
+        }
 
-        Ok(())
+        acquired += 1;
+        dbg!("ACQUIRED", udata);
+
+        self.submitters.lock()
+            .remove(&udata)
+            .map(|s| {
+                dbg!("CALLBACK SENT");
+                s.send(res)
+            });
+        dbg!("SENT");
     }
 }
 
