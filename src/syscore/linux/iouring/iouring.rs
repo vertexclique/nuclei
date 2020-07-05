@@ -165,7 +165,7 @@ impl SysProactor {
                 sq: TTas::new(sq),
                 cq: TTas::new(cq),
                 submitters: TTas::new(HashMap::default()),
-                submitter_id: AtomicU64::new(1),
+                submitter_id: AtomicU64::default(),
                 waker: AtomicBool::default()
             })
         }
@@ -183,12 +183,6 @@ impl SysProactor {
             }
         };
 
-        let mut id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
-        if id == MANUAL_TIMEOUT {
-            id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
-        }
-        sqe.set_user_data(id);
-
         Some(ring_sub(&mut sqe))
     }
 
@@ -202,7 +196,11 @@ impl SysProactor {
 
             let cc = self.submitter(&mut sq, |sqe| {
                 // dbg!("SUBMITTER");
-                let id = sqe.user_data();
+                let mut id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
+                if id == MANUAL_TIMEOUT {
+                    id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
+                }
+                sqe.set_user_data(id);
                 let (tx, rx) = oneshot::channel();
 
                 dbg!("SUBMITTER", id);
@@ -215,7 +213,7 @@ impl SysProactor {
                 }
 
                 CompletionChan { rx }
-            }).map(|c| {
+            }).map(|c| unsafe {
                 let submitted_io_evcount = sq.submit().unwrap();
                 dbg!(submitted_io_evcount);
 
@@ -252,16 +250,16 @@ impl SysProactor {
     }
 
     pub(crate) fn wait(&self, max_event_size: usize, duration: Option<Duration>) -> io::Result<usize> {
-        dbg!("WAIT ENTER");
+        // dbg!("WAIT ENTER");
         let mut cq = self.cq.lock();
-        dbg!("CQ ACK");
+        // let mut sq = self.sq.lock();
+        // dbg!("CQ ACK");
 
         let mut acquired = 0;
 
-        dbg!("before wait cqe");
-        while let Ok(cqe) = cq.wait_for_cqe() {
-            dbg!("non cqe");
+        while let Some(cqe) = cq.peek_for_cqe() {
             let mut ready = cq.ready() as usize + 1;
+            dbg!(ready, cqe.user_data());
 
             self.cqe_completion(acquired, &cqe);
             ready -= 1;
@@ -275,6 +273,7 @@ impl SysProactor {
                 ready -= 1;
             }
         }
+        // dbg!("EXITING");
 
         Ok(acquired)
     }
@@ -286,8 +285,9 @@ impl SysProactor {
         }
 
         let udata = cqe.user_data();
-        let res = cqe.raw_result() as i32;
+        let res = cqe.result().unwrap() as i32;
         if udata == MANUAL_TIMEOUT {
+            dbg!("manual timeout");
             return;
         }
 
@@ -300,7 +300,6 @@ impl SysProactor {
                 dbg!("CALLBACK SENT");
                 s.send(res)
             });
-        dbg!("SENT");
     }
 }
 

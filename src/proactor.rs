@@ -52,7 +52,7 @@ pub fn run<T>(future: impl Future<Output = T>) -> T {
 
     let driver = blocking(async move {
         loop {
-            let a = p.wait(1, None).unwrap();
+            let _ = p.wait(1, None);
         }
     });
 
