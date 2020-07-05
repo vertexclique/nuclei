@@ -12,7 +12,7 @@ async fn echo(stream: Handle<TcpStream>) -> io::Result<()> {
 fn main() -> io::Result<()> {
     run(async {
         // Create a listener.
-        let listener = Handle::<TcpListener>::bind("127.0.0.1:7000")?;
+        let listener = Handle::<TcpListener>::bind("0.0.0.0:7000")?;
         println!("Listening on {}", listener.get_ref().local_addr()?);
         println!("Now start a TCP client.");
 
