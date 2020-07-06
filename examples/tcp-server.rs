@@ -1,7 +1,5 @@
-use proactor::*;
+use nuclei::*;
 use std::net::{TcpListener, TcpStream};
-
-use bastion::executor::blocking;
 use futures::io;
 
 async fn echo(stream: Handle<TcpStream>) -> io::Result<()> {
@@ -10,7 +8,7 @@ async fn echo(stream: Handle<TcpStream>) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    run(async {
+    block_on(async {
         // Create a listener.
         let listener = Handle::<TcpListener>::bind("127.0.0.1:7000")?;
         println!("Listening on {}", listener.get_ref().local_addr()?);
@@ -22,7 +20,7 @@ fn main() -> io::Result<()> {
             println!("Accepted client: {}", peer_addr);
 
             // Spawn a task that echoes messages from the client back to it.
-            blocking(echo(stream));
+            spawn_blocking(|| echo(stream));
         }
     })
 }

@@ -1,12 +1,10 @@
-use std::thread;
+use nuclei::*;
 use std::net::TcpListener;
 
 use anyhow::Result;
 use futures::prelude::*;
 use http_types::{Request, Response, StatusCode};
 use async_dup::Arc;
-use bastion::executor::{spawn, blocking, run as erun};
-use proactor::*;
 use futures::pending;
 
 /// Serves a request and returns a response.
@@ -41,9 +39,9 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    blocking(async { run(future::pending::<()>()) });
+    spawn_blocking(|| drive(future::pending::<()>()));
 
-    erun(async {
+    block_on(async {
         let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
         // let http1 = spawn(listen(Handle::<TcpListener>::bind("127.0.0.1:8001")?));
         //
