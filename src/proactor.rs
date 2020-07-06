@@ -41,7 +41,7 @@ impl Proactor {
 }
 
 
-pub fn run<T>(future: impl Future<Output = T>) -> T {
+pub fn drive<T>(future: impl Future<Output = T>) -> T {
     let p = Proactor::get();
     let waker = waker_fn(move || {
         // let _ = p.wait(1, None);
@@ -58,11 +58,8 @@ pub fn run<T>(future: impl Future<Output = T>) -> T {
 
         cx.waker().wake_by_ref();
 
-        let duration = Some(Duration::from_millis(100));
-        // std::thread::sleep(duration.unwrap());
-        // let a = p.wait(1, None).unwrap();
-        let a = p.wait(1, None);
-        // dbg!(a);
-        // dbg!("AFTER WAIT");
+        let duration = Duration::from_millis(1);
+        std::thread::sleep(duration);
+        let _ = p.wait(1, None);
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "proactor"
+name = "nuclei"
 version = "0.1.0"
 authors = ["Mahmut Bulut <vertexclique@gmail.com>"]
 edition = "2018"
@@ -7,10 +7,14 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-#default = ["epoll"]
-default = ["iouring"]
+default = ["bastion", "iouring"]
 epoll = []
 iouring = ["iou", "uring-sys"]
+
+bastion = ["agnostik/runtime_bastion"]
+tokio = ["agnostik/runtime_tokio"]
+asyncstd = ["agnostik/runtime_asyncstd"]
+smol = ["agnostik/runtime_smol"]
 
 [dependencies]
 lever = { git = "https://github.com/vertexclique/lever" }
@@ -20,9 +24,10 @@ socket2 = { version = "0.3.12", features = ["pair", "unix"] }
 libc = "0.2"
 pin-utils = "0.1.0"
 once_cell = "1.4.0"
-bastion = { git = "https://github.com/bastion-rs/bastion.git" }
+agnostik = { path = "../agnostik", default-features = false }
 
 # Other backends
+[target.'cfg(target_os = "linux")'.dependencies]
 iou = { version = "0.0.0-ringbahn.1", optional = true }
 uring-sys = { version = "0.6.1", optional = true }
 
@@ -32,4 +37,3 @@ async-h1 = "1.1.2"
 async-dup = "1.1.0"
 http-types = "1.2.0"
 num_cpus = "1.13.0"
-smol = "0.1.18"

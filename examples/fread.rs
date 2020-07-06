@@ -1,4 +1,4 @@
-use proactor::*;
+use nuclei::*;
 use std::{thread, io};
 use std::time::Duration;
 use std::fs::File;
