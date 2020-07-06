@@ -22,7 +22,6 @@ impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {
         Ok(Handle {
             io_task: Some(io),
-            chan: None,
             read: Arc::new(TTas::new(None)),
             write: Arc::new(TTas::new(None)),
         })

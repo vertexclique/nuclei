@@ -14,8 +14,6 @@ pub trait HandleOpRegisterer {
 pub struct Handle<T> {
     /// IO task element
     pub(crate) io_task: Option<T>,
-    /// Notification channel
-    pub(crate) chan: Option<CompletionChan>,
     /// Completion callback for read
     pub(crate) read: Arc<TTas<Option<AsyncOp<usize>>>>,
     /// Completion callback for write

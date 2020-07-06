@@ -3,7 +3,7 @@ use std::{task::Poll, fs::File, pin::Pin, task::Context};
 use super::handle::Handle;
 use futures::io::{AsyncRead, AsyncWrite};
 use super::submission_handler::SubmissionHandler;
-use std::io::Read;
+use std::io::{Read, BufRead};
 
 use std::net::{TcpStream};
 
@@ -13,6 +13,7 @@ use std::{mem::ManuallyDrop, os::unix::io::{AsRawFd, FromRawFd}};
 use std::os::unix::net::{UnixStream};
 
 use crate::syscore::Processor;
+use futures::AsyncBufRead;
 
 //
 // Proxy operations for Future registration via AsyncRead, AsyncWrite and others.
@@ -90,6 +91,17 @@ impl AsyncRead for &Handle<File> {
         SubmissionHandler::<Self>::handle_read(self, cx, completion_dispatcher)
     }
 }
+
+// #[cfg(unix)]
+// impl AsyncBufRead for &Handle<File> {
+//     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+//         Poll::Ready(io::BufRead::fill_buf(self.get_mut()))
+//     }
+//
+//     fn consume(self: Pin<&mut Self>, amt: usize) {
+//         io::BufRead::consume(self.get_mut(), amt)
+//     }
+// }
 
 #[cfg(unix)]
 impl AsyncWrite for &Handle<File> {

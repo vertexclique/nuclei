@@ -22,21 +22,21 @@ impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {
         Ok(Handle {
             io_task: Some(io),
-            chan: None,
             read: Arc::new(TTas::new(None)),
             write: Arc::new(TTas::new(None)),
         })
     }
 
-    pub(crate) fn new_with_callback(io: T, evflags: i32) -> io::Result<Handle<T>> {
-        let fd = io.as_raw_fd();
-        let mut handle = Handle::new(io)?;
-        let register = Proactor::get()
-            .inner()
-            .register_io(fd, evflags)?;
-        handle.chan = Some(register);
-        Ok(handle)
-    }
+    // TODO: (vertexclique): Do with callback
+    // pub(crate) fn new_with_callback(io: T, evflags: i32) -> io::Result<Handle<T>> {
+    //     let fd = io.as_raw_fd();
+    //     let mut handle = Handle::new(io)?;
+    //     let register = Proactor::get()
+    //         .inner()
+    //         .register_io(fd, evflags)?;
+    //     handle.chan = Some(register);
+    //     Ok(handle)
+    // }
 }
 
 impl Handle<TcpListener> {
