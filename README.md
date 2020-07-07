@@ -6,6 +6,7 @@
    Proactive IO & Runtime system
  </strong>
 <hr>
+</div>
 
 <div align="center">
     <!-- CI builds -->
