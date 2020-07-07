@@ -1,3 +1,4 @@
+mod fs;
 mod iouring;
 mod processor;
 mod nethandle;

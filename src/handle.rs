@@ -2,7 +2,7 @@ use std::fmt;
 use std::{pin::Pin, future::Future, io, ops::{DerefMut, Deref}, sync::Arc};
 use lever::prelude::*;
 
-use crate::syscore::CompletionChan;
+use crate::syscore::{CompletionChan, StoreFile};
 
 pub type AsyncOp<T> = Pin<Box<dyn Future<Output = io::Result<T>>>>;
 
@@ -16,6 +16,8 @@ pub struct Handle<T> {
     pub(crate) io_task: Option<T>,
     /// Notification channel
     pub(crate) chan: Option<CompletionChan>,
+    /// File operation storage
+    pub(crate) store_file: Option<StoreFile>,
     /// Completion callback for read
     pub(crate) read: Arc<TTas<Option<AsyncOp<usize>>>>,
     /// Completion callback for write

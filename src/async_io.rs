@@ -13,6 +13,7 @@ use std::{mem::ManuallyDrop, os::unix::io::{AsRawFd, FromRawFd}};
 use std::os::unix::net::{UnixStream};
 
 use crate::syscore::Processor;
+use futures::AsyncBufRead;
 
 //
 // Proxy operations for Future registration via AsyncRead, AsyncWrite and others.
@@ -88,6 +89,24 @@ impl AsyncRead for &Handle<File> {
         };
 
         SubmissionHandler::<Self>::handle_read(self, cx, completion_dispatcher)
+    }
+}
+
+#[cfg(unix)]
+impl AsyncBufRead for &Handle<File> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        // let fd = self.fd;
+        // let (ring, buf, pos) = self.store_file.buf();
+        // buf.fill_buf(|buf| {
+        //     let n = ready!(ring.poll(ctx, true, |sqe| unsafe { sqe.prep_read(fd, buf, *pos) }))?;
+        //     *pos += n;
+        //     Poll::Ready(Ok(n as u32))
+        // })
+        unimplemented!()
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        unimplemented!()
     }
 }
 
