@@ -3,11 +3,35 @@ name = "nuclei"
 version = "0.1.0"
 authors = ["Mahmut Bulut <vertexclique@gmail.com>"]
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Proactive IO & runtime system"
+keywords = ["io", "async", "runtime", "uring", "iouring", "proactor"]
+categories = ["concurrency", "asynchronous"]
+homepage = "https://github.com/vertexclique/nuclei"
+repository = "https://github.com/vertexclique/nuclei"
+documentation = "https://docs.rs/nuclei"
+license = "Apache-2.0/MIT"
+readme = "README.md"
+exclude = [
+    "data/*",
+	".github/*",
+	"examples/*",
+	"graphstore/*",
+	"tests/*",
+	"img/*",
+	"ci/*",
+	"benches/*",
+	"doc/*",
+	"*.png",
+	"*.dot",
+	"*.yml",
+	"*.toml",
+	"*.md"
+]
 
 [features]
 default = ["bastion", "iouring"]
+# Enable this to use epoll on linux.
+#default = ["bastion", "epoll"]
 epoll = []
 iouring = ["iou", "uring-sys"]
 
@@ -33,7 +57,7 @@ uring-sys = { version = "0.6.1", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.31"
-async-h1 = "1.1.2"
+async-h1 = "2.0.2"
 async-dup = "1.1.0"
-http-types = "1.2.0"
+http-types = "2.2.1"
 num_cpus = "1.13.0"

@@ -19,6 +19,17 @@ use iou::{SockFlag, SockAddrStorage};
 use std::mem::MaybeUninit;
 
 
+macro_rules! syscall {
+    ($fn:ident $args:tt) => {{
+        let res = unsafe { libc::$fn $args };
+        if res == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(res)
+        }
+    }};
+}
+
 
 pub struct Processor;
 
@@ -30,9 +41,10 @@ impl Processor {
 
     pub(crate) async fn processor_read_file<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
         let fd = io.as_raw_fd() as _;
+        let mut bufs = [IoSliceMut::new(buf)];
 
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_read_vectored(fd, &mut [IoSliceMut::new(buf)], 0);
+            sqe.prep_read_vectored(fd, &mut bufs, 0);
         })?;
 
         Ok(cc.await? as _)
@@ -40,9 +52,10 @@ impl Processor {
 
     pub(crate) async fn processor_write_file<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
         let fd = io.as_raw_fd() as _;
+        let bufs = &[IoSlice::new(buf)];
 
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_write_vectored(fd, &mut [IoSlice::new(buf)], 0);
+            sqe.prep_write_vectored(fd, bufs, 0);
         })?;
 
         Ok(cc.await? as _)
@@ -81,7 +94,7 @@ impl Processor {
 
         let res = Proactor::get().inner().register_io(|sqe| unsafe {
             let sqep = sqe.raw_mut();
-            uring_sys::io_uring_prep_recv(sqep, fd, buf.as_ptr() as _, buf.len() as _, flags as _);
+            uring_sys::io_uring_prep_recv(sqep as *mut _, fd, buf.as_ptr() as _, buf.len() as _, flags as _);
         })?.await?;
 
         Ok(res as _)
@@ -185,26 +198,100 @@ impl Processor {
     ///// TcpListener
     ///////////////////////////////////
 
+    // TODO: (vcq): need to fix the accept
+    // pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(listener: &R) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
+    //     let fd = listener.as_raw_fd() as _;
+    //     // let flags = syscall!(fcntl(fd, libc::F_GETFL))?;
+    //     // syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
+    //
+    //     // let mut sockaddr = MaybeUninit::<libc::sockaddr_storage>::uninit();
+    //     // let mut sockaddr_len = std::mem::size_of::<libc::sockaddr_storage>() as _;
+    //     //
+    //     //
+    //     // let mut sockaddr = unsafe {
+    //     //     let mut saddr = sockaddr.assume_init();
+    //     //     saddr.ss_family = libc::AF_INET as libc::sa_family_t;
+    //     //     saddr
+    //     // };
+    //
+    //     // let mut saddrstor = SockAddrStorage::uninit();
+    //
+    //     let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+    //         // let sqep = sqe.raw_mut();
+    //         // dbg!(&sqe.user_data());
+    //         // dbg!(&sqep.user_data);
+    //         // sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::SOCK_NONBLOCK);
+    //         sqe.prep_accept(fd, None, iou::SockFlag::empty());
+    //         // uring_sys::io_uring_prep_accept(sqep as *mut _,
+    //         //                                 fd,
+    //         //                                 &mut sockaddr as *mut _ as *mut _,
+    //         //                                 &mut sockaddr_len,
+    //         //                                 0);
+    //     })?;
+    //
+    //     // let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+    //     //     dbg!("SQE CAME");
+    //     //     let sqep = sqe.raw_mut();
+    //     //     // sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
+    //     //     uring_sys::io_uring_prep_accept(sqep,
+    //     //                                     fd,
+    //     //                                     sockaddr.as_mut_ptr() as *mut _,
+    //     //                                     &mut sockaddr_len,
+    //     //                                     0);
+    //     // })?;
+    //
+    //     // let mut saddrstor = SockAddrStorage::uninit();
+    //     //
+    //     // let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+    //     //     sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
+    //     // })?;
+    //     dbg!("TCP LISTENER");
+    //
+    //     let stream = unsafe { TcpStream::from_raw_fd(cc.await?) };
+    //     dbg!("TCP LISTENER RECEIVED");
+    //     // let addr = unsafe {
+    //     //     let nixsa = saddrstor.as_socket_addr()?;
+    //     //     let (saddr, saddr_len) = nixsa.as_ffi_pair();
+    //     //     socket2::SockAddr::from_raw_parts(saddr as *const _, saddr_len as _)
+    //     //         .as_std()
+    //     //         .unwrap()
+    //     // };
+    //
+    //     let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
+    //     let socket = socket.into_tcp_listener();
+    //     let addr = socket.local_addr().unwrap();
+    //     // let res = socket
+    //     //     .accept()
+    //     //     .map(|(_, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))?;
+    //
+    //     // let addr = unsafe {
+    //     //     socket
+    //     //         .local_addr()
+    //     //         .unwrap()
+    //     // };
+    //
+    //     // unsafe {
+    //     //     let mut sockaddr = sockaddr.assume_init();
+    //     //     sockaddr.ss_family = libc::AF_INET as libc::sa_family_t;
+    //     // }
+    //
+    //     // let addr = unsafe {
+    //     //     socket2::SockAddr::from_raw_parts(&sockaddr as *const _ as *const _, sockaddr_len as _)
+    //     //         .as_std()
+    //     //         .unwrap()
+    //     // };
+    //
+    //     Ok((Handle::new(stream)?, addr))
+    // }
+
     pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(listener: &R) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
-        let fd = listener.as_raw_fd() as _;
-        let mut saddrstor = SockAddrStorage::uninit();
+        let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
+        let socket = socket.into_tcp_listener();
+        let socket = ManuallyDrop::new(socket);
 
-        let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
-        })?;
-        dbg!("TCP LISTENER");
-
-        let stream = unsafe { TcpStream::from_raw_fd(cc.await?) };
-        dbg!("TCP LISTENER RECEIVED");
-        let addr = unsafe {
-            let nixsa = saddrstor.as_socket_addr()?;
-            let (saddr, saddr_len) = nixsa.as_ffi_pair();
-            socket2::SockAddr::from_raw_parts(saddr as *const _, saddr_len as _)
-                .as_std()
-                .unwrap()
-        };
-
-        Ok((Handle::new(stream)?, addr))
+        socket
+            .accept()
+            .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))
     }
 
     ///////////////////////////////////

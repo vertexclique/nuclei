@@ -33,7 +33,10 @@ impl Handle<TcpListener> {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<TcpListener>> {
         // TODO: (vertexclique): Migrate towards to using initial subscription with callback.
         // Using `new_with_callback`.
-        Ok(Handle::new(TcpListener::bind(addr)?)?)
+        let listener = TcpListener::bind(addr)?;
+        // listener.set_nonblocking(true)?;
+
+        Ok(Handle::new(listener)?)
     }
 
     pub async fn accept(&self) -> io::Result<(Handle<TcpStream>, SocketAddr)> {

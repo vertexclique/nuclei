@@ -7,6 +7,7 @@ use once_cell::sync::Lazy;
 
 use super::syscore::*;
 use super::waker::*;
+use crate::spawn_blocking;
 
 pub use super::handle::*;
 
@@ -40,26 +41,33 @@ impl Proactor {
     }
 }
 
-
+///
+/// IO driver that drives event systems
 pub fn drive<T>(future: impl Future<Output = T>) -> T {
     let p = Proactor::get();
     let waker = waker_fn(move || {
-        // let _ = p.wait(1, None);
         p.wake();
     });
+
     let cx = &mut Context::from_waker(&waker);
     futures_util::pin_mut!(future);
+
+    let driver = spawn_blocking(move || {
+        loop {
+            let _ = p.wait(1, None);
+        }
+    });
+
+    futures_util::pin_mut!(driver);
 
     loop {
         if let Poll::Ready(val) = future.as_mut().poll(cx) {
             return val;
         }
-        // p.wake();
 
         cx.waker().wake_by_ref();
 
         let duration = Duration::from_millis(1);
-        std::thread::sleep(duration);
-        let _ = p.wait(1, None);
+        driver.as_mut().poll(cx);
     }
 }
