@@ -1,0 +1,3 @@
+struct SysProactor {}
+
+impl SysProactor {}
