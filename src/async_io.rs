@@ -20,6 +20,9 @@ use std::sync::Arc;
 use futures::{AsyncBufRead, AsyncSeek};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use futures_util::pending_once;
+use lever::prelude::TTas;
+use crate::Proactor;
+use std::path::Path;
 
 //
 // Proxy operations for Future registration via AsyncRead, AsyncWrite and others.
@@ -138,11 +141,9 @@ impl AsyncWrite for &Handle<File> {
 impl AsyncRead for Handle<File> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         let mut inner = futures::ready!(self.as_mut().poll_fill_buf(cx))?;
-        dbg!("BEFORE INNER");
         let len = io::Read::read(&mut inner, buf)?;
-        dbg!("AFTER INNER");
         self.consume(len);
-        dbg!(len);
+        println!("LEN – {}", len);
         Poll::Ready(Ok(len))
     }
 }
@@ -153,38 +154,29 @@ const NON_READ: &[u8] = &[];
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncBufRead for Handle<File> {
     fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let fd = self.as_raw_fd();
         let mut store = &mut self.get_mut().store_file;
 
-        store
-            .as_mut()
-            .map_or_else(|| Poll::Ready(Ok(NON_READ)), |store_file| {
-                let fd = store_file.get_fd();
-                let op_state = store_file.op_state();
+        if let Some(mut store_file) = store.as_mut() {
+            let fd = store_file.get_fd();
+            let op_state = store_file.op_state();
+            let (bufp, pos) = store_file.bufpair();
 
-                dbg!("Read");
+            println!("Read: {}", *pos);
 
-                let (bufp, pos) = store_file.bufpair();
-
-                bufp.fill_buf(|buf| {
-                    let fut = Processor::processor_read_file(&fd, buf, *pos);
-                    futures_util::pin_mut!(fut);
-
-                    dbg!("CAME AGAIN");
-
-                    loop {
-                        if let Poll::Ready(n) = fut.as_mut().poll(cx)? {
-                            dbg!(n);
-                            *pos += n;
-                            dbg!("READMORECAME8192");
-                            if n != 0 && n == 8192 {
-                                dbg!("READMORE8192");
-                                op_state.replace_with(|_| Op::ReadMore);
-                            }
-                            break Poll::Ready(Ok(n))
-                        }
-                    }
-                })
-            })
+            let filled_buf = bufp.fill_buf(|buf| Handle::<File>::filler(cx, fd, pos, buf));
+            match filled_buf {
+                Poll::Ready(Err(_)) => {
+                    dbg!(&filled_buf);
+                },
+                _ => {}
+            }
+            filled_buf
+        } else {
+            // Poll::Pending
+            dbg!("NON READ");
+            Poll::Ready(Ok(NON_READ))
+        }
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
@@ -193,6 +185,7 @@ impl AsyncBufRead for Handle<File> {
         store.buf().consume(amt);
     }
 }
+
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncWrite for &Handle<File> {
@@ -358,5 +351,52 @@ impl AsyncWrite for &Handle<UnixStream> {
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+impl Handle<File> {
+    pub async fn open(p: impl AsRef<Path>) -> io::Result<Handle<File>> {
+        let fd = Processor::processor_open_at(p).await?;
+        dbg!(fd);
+        let io = unsafe { File::from_raw_fd(fd as _) };
+
+        Ok(Handle {
+            io_task: Some(io),
+            chan: None,
+            store_file: Some(StoreFile::new(fd as _)),
+            read: Arc::new(TTas::new(None)),
+            write: Arc::new(TTas::new(None)),
+        })
+    }
+
+    fn filler<T: AsRawFd>(cx: &mut Context, fd: T, pos: &mut usize, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        // let mut f = unsafe { File::from_raw_fd(fd.as_raw_fd()) };
+        // let mut buffer = Vec::new();
+        // f.read_to_end(&mut buffer).unwrap();
+        // println!("BUFLEN ::::: {}", buffer.len());
+
+        let fut = Processor::processor_read_file(&fd, buf, *pos);
+        futures_util::pin_mut!(fut);
+
+        let res = loop {
+            match fut.as_mut().poll(cx)? {
+                Poll::Ready(0) => {
+                    dbg!("poll pend");
+                    break Poll::Pending
+                },
+                Poll::Ready(n) => {
+                    dbg!("poll read");
+                    *pos += n;
+                    break Poll::Ready(Ok(n))
+                }
+                _ => {
+                    // break Poll::Pending
+                }
+            }
+        };
+
+        dbg!(&res);
+
+        res
     }
 }

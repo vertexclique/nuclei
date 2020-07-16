@@ -16,6 +16,7 @@ use crate::syscore::Processor;
 pub struct StoreFile {
     fd: RawFd,
     buf: Buffer,
+    pub internal: Vec<u8>,
     op_state: Arc<AtomicBox<Op>>,
     pos: usize,
 }
@@ -37,6 +38,7 @@ impl StoreFile {
             fd,
             op_state: Arc::new(AtomicBox::new(Op::Nothing)),
             buf: Buffer::new(),
+            internal: Vec::with_capacity(8192),
             pos: 0,
         }
     }
@@ -48,10 +50,7 @@ impl StoreFile {
 
     #[inline(always)]
     pub(crate) fn bufpair(&mut self) -> (&mut Buffer, &mut usize) {
-        // unsafe {
-        //     let pinned = Pin::get_unchecked_mut(self);
-            (&mut self.buf, &mut self.pos)
-        // }
+        (&mut self.buf, &mut self.pos)
     }
 
     pub(crate) fn get_fd(&self) -> File {
@@ -104,20 +103,3 @@ impl StoreFile {
         self.buf.cancellation();
     }
 }
-
-// impl Handle<File> {
-//     pub fn new(io: T) -> io::Result<Handle<T>>
-//     where
-//         T: AsRawFd
-//     {
-//         let fd = io.as_raw_fd();
-//
-//         Ok(Handle {
-//             io_task: Some(io),
-//             chan: None,
-//             store_file: Some(StoreFile::new(fd)),
-//             read: Arc::new(TTas::new(None)),
-//             write: Arc::new(TTas::new(None)),
-//         })
-//     }
-// }
