@@ -16,10 +16,14 @@ use futures::Stream;
 use crate::{Handle, Proactor};
 use super::Processor;
 use crate::syscore::CompletionChan;
+use crate::syscore::linux::iouring::fs::store_file::StoreFile;
+
 
 
 impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {
+        let fd = io.as_raw_fd();
+
         Ok(Handle {
             io_task: Some(io),
             chan: None,

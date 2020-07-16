@@ -13,8 +13,8 @@ pub struct Buffer {
     data: NonNull<()>,
     storage: Storage,
     capacity: u32,
-    pos: u32,
-    cap: u32,
+    pos: usize,
+    cap: usize,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -36,6 +36,11 @@ impl Buffer {
     }
 
     #[inline(always)]
+    pub fn current_pos(&self) -> usize {
+        self.pos
+    }
+
+    #[inline(always)]
     pub fn buffered_from_read(&self) -> &[u8] {
         if self.storage == Storage::Buffer {
             unsafe {
@@ -49,11 +54,12 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn fill_buf(&mut self, fill: impl FnOnce(&mut [u8]) -> Poll<io::Result<u32>>)
+    pub fn fill_buf(&mut self, fill: impl FnOnce(&mut [u8]) -> Poll<io::Result<usize>>)
                     -> Poll<io::Result<&[u8]>>
     {
         match self.storage {
             Storage::Buffer => {
+                dbg!("Storage::Buffer", self.pos, self.cap);
                 if self.pos >= self.cap {
                     let buf = unsafe {
                         slice::from_raw_parts_mut(self.data.cast().as_ptr(), self.capacity as usize)
@@ -65,6 +71,7 @@ impl Buffer {
                 Poll::Ready(Ok(self.buffered_from_read()))
             }
             Storage::Nothing => {
+                dbg!("Storage::Nothing");
                 self.cap = ready!(fill(self.alloc_buf()))?;
                 Poll::Ready(Ok(self.buffered_from_read()))
             }
@@ -74,7 +81,7 @@ impl Buffer {
 
     #[inline(always)]
     pub fn consume(&mut self, amt: usize) {
-        self.pos = cmp::min(self.pos + amt as u32, self.cap);
+        self.pos = cmp::min(self.pos + amt as usize, self.cap);
     }
 
     #[inline(always)]

@@ -39,7 +39,46 @@ impl Processor {
     ///// Synchronous File
     ///////////////////////////////////
 
-    pub(crate) async fn processor_read_file<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
+    pub(crate) async fn processor_read_file<R: AsRawFd>(io: &R, buf: &mut [u8], offset: usize) -> io::Result<usize> {
+        let fd = io.as_raw_fd() as _;
+
+        let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+            sqe.prep_read(fd, buf, offset);
+        })?;
+        // dbg!("WAIT BEFORE");
+        let x = cc.await? as _;
+        dbg!(x);
+
+        Ok(x)
+    }
+
+    pub(crate) async fn processor_write_file<R: AsRawFd>(io: &R, buf: &[u8], offset: usize) -> io::Result<usize> {
+        let fd = io.as_raw_fd() as _;
+
+        let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+            sqe.prep_write(fd, buf, offset);
+        })?;
+
+        Ok(cc.await? as _)
+    }
+
+    pub(crate) async fn processor_file_size<R: AsRawFd>(io: &R, statx: *mut libc::statx) -> io::Result<usize> {
+        static EMPTY: libc::c_char = 0;
+        let fd = io.as_raw_fd() as _;
+        let flags = libc::AT_EMPTY_PATH;
+        let mask = libc::STATX_SIZE;
+
+        Proactor::get().inner().register_io(|sqe| unsafe {
+            let sqep = sqe.raw_mut();
+            uring_sys::io_uring_prep_statx(sqep, fd, &EMPTY, flags, mask, statx);
+        })?.await?;
+
+        unsafe {
+            Ok((*statx).stx_size as usize)
+        }
+    }
+
+    pub(crate) async fn processor_read_vectored<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
         let fd = io.as_raw_fd() as _;
         let mut bufs = [IoSliceMut::new(buf)];
 
@@ -50,7 +89,7 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_write_file<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
+    pub(crate) async fn processor_write_vectored<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
         let fd = io.as_raw_fd() as _;
         let bufs = &[IoSlice::new(buf)];
 

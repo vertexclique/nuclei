@@ -52,7 +52,7 @@ Current io_uring implementation needs Linux kernel 5.5+.
 
 * Async TCP, UDP, Unix domain sockets and files...
 * Proactor system doesn't block at all. So no blocking pool needed.
-* Vectored operations.
+* Scatter/Gather operations
 * Less allocation than any other runtime.
 * More expressive than any other runtime.
 * Completely asynchronous I/O system with lock free programming.
