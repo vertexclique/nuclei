@@ -41,6 +41,7 @@ impl Processor {
 
     pub(crate) async fn processor_read_file<R: AsRawFd>(io: &R, buf: &mut [u8], offset: usize) -> io::Result<usize> {
         let fd = io.as_raw_fd() as _;
+        dbg!(fd);
 
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
             sqe.prep_read(fd, buf, offset);

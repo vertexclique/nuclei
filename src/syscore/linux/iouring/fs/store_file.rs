@@ -23,6 +23,7 @@ pub struct StoreFile {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Op {
     Read,
+    ReadMore,
     Write,
     Close,
     Nothing,

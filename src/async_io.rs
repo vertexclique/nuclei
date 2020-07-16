@@ -19,6 +19,7 @@ use crate::syscore::*;
 use std::sync::Arc;
 use futures::{AsyncBufRead, AsyncSeek};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use futures_util::pending_once;
 
 //
 // Proxy operations for Future registration via AsyncRead, AsyncWrite and others.
@@ -153,89 +154,35 @@ const NON_READ: &[u8] = &[];
 impl AsyncBufRead for Handle<File> {
     fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let mut store = &mut self.get_mut().store_file;
-        let state = store.as_ref().unwrap();
 
-        state.op_state().replace_with(|x| {
-            if *x != Op::Pending {
-                Op::Read
-            } else {
-                Op::Pending
-            }
-        });
-
-        if *state.op_state().get() == Op::Read {
-
-        }
         store
             .as_mut()
-            .map_or_else(|| {
-                dbg!("NOTHING");
-                Poll::Ready(Ok(NON_READ))
-            }, |store_file| {
+            .map_or_else(|| Poll::Ready(Ok(NON_READ)), |store_file| {
                 let fd = store_file.get_fd();
                 let op_state = store_file.op_state();
-                // if *op_state.get() == Op::Pending {
-                //     store_file.cancel();
-                // }
 
-                dbg!("CALLED");
+                dbg!("Read");
 
                 let (bufp, pos) = store_file.bufpair();
 
                 bufp.fill_buf(|buf| {
                     let fut = Processor::processor_read_file(&fd, buf, *pos);
                     futures_util::pin_mut!(fut);
+
+                    dbg!("CAME AGAIN");
+
                     loop {
-                        let n = futures::ready!(fut.as_mut().poll(cx)?);
-                        *pos += n;
-                        break Poll::Ready(Ok(n))
+                        if let Poll::Ready(n) = fut.as_mut().poll(cx)? {
+                            dbg!(n);
+                            *pos += n;
+                            dbg!("READMORECAME8192");
+                            if n != 0 && n == 8192 {
+                                dbg!("READMORE8192");
+                                op_state.replace_with(|_| Op::ReadMore);
+                            }
+                            break Poll::Ready(Ok(n))
+                        }
                     }
-
-                    // loop {
-                    //     let mut fut = Processor::processor_read_file(&fd, buf, *pos);
-                    //     futures_util::pin_mut!(fut);
-                    //
-                    //     if let Poll::Ready(n) = fut.as_mut().poll(cx)? {
-                    //         *pos += n;
-                    //         dbg!(*pos);
-                    //         op_state.replace_with(|_| Op::Pending);
-                    //         // fut = Processor::processor_read_file(&fd, buf, *pos);
-                    //         // futures_util::pin_mut!(fut);
-                    //         break Poll::Ready(Ok(n))
-                    //     } else {
-                    //         match *op_state.get() {
-                    //             Op::Pending => {
-                    //                 op_state.replace_with(|_| Op::Read);
-                    //                 break Poll::Pending
-                    //             },
-                    //             // Op::Pending => break Poll::Ready(Ok(8191)),
-                    //             _ => {
-                    //                 dbg!("UNEXPECTED");
-                    //             }
-                    //         }
-                    //         // match *op_state.get() {
-                    //         //     // Op::Pending => break Poll::Ready(Ok(0)),
-                    //         //     Op::Pending => break Poll::Pending,
-                    //         //     // Op::Pending => {
-                    //         //         // op_state.replace_with(|_| Op::Nothing);
-                    //         //         // dbg!("MORE PENDING");
-                    //         //         // break Poll::Pending
-                    //         //     // },
-                    //         //     _ => {}
-                    //         // }
-                    //     }
-                    // }
-                    // fut.as_mut().poll(cx)
-
-                    // let fut = Processor::processor_read_file(&fd, buf, *pos);
-                    //
-                    // futures_util::pin_mut!(fut);
-                    //
-                    // // dbg!("BEFORE READY");
-                    // let n = futures::ready!(fut.as_mut().poll(cx)?);
-                    // dbg!(n);
-                    // *pos += n;
-                    // Poll::Ready(Ok(n))
                 })
             })
     }

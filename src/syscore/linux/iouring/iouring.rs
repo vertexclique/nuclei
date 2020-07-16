@@ -238,7 +238,7 @@ impl SysProactor {
         // let timeout = Duration::from_millis(1);
         while let Ok(cqe) = cq.wait_for_cqe() {
         // while let Some(cqe) = cq.peek_for_cqe() {
-            // dbg!("GOT");
+        //     dbg!("GOT");
             let mut ready = cq.ready() as usize + 1;
             // dbg!(ready, cqe.user_data());
 
@@ -260,20 +260,20 @@ impl SysProactor {
 
     fn cqe_completion(&self, mut acquired: usize, cqe: &CompletionQueueEvent) -> io::Result<()> {
         if cqe.is_timeout() {
-            // dbg!("TIMEOUT");
+            dbg!("TIMEOUT");
             return Ok(());
         }
 
         let udata = cqe.user_data();
-        // dbg!("ACQUIRED", udata);
-        let res = cqe.result()? as i32;
+        dbg!("ACQUIRED", udata);
+        let res = cqe.result().unwrap() as i32;
         // dbg!(res);
         if udata == MANUAL_TIMEOUT {
-            // dbg!("MANUAL_TIMEOUT");
+            dbg!("MANUAL_TIMEOUT");
             return Ok(());
         }
 
-        // dbg!("EVENT LOOKS OK", udata);
+        dbg!("EVENT LOOKS OK", udata);
         acquired += 1;
         // dbg!("ACQUIRED", udata);
 
