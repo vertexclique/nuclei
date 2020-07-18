@@ -26,6 +26,7 @@ pub struct Handle<T> {
     #[cfg(unix)]
     pub(crate) chan: Option<CompletionChan>,
     /// File operation storage
+    #[cfg(unix)]
     pub(crate) store_file: Option<StoreFile>,
     /// Completion callback for read
     pub(crate) read: Arc<TTas<Option<AsyncOp<usize>>>>,

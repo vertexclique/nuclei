@@ -1,23 +1,26 @@
-use futures::io::{
-    AsyncRead, AsyncWrite, AsyncBufRead, AsyncSeek
-};
-use std::marker::PhantomData as marker;
-use std::{task::{Context, Poll}, io, pin::Pin, future::Future, ops::{DerefMut, Deref}};
 use super::handle::{Handle, HandleOpRegisterer};
-
+use futures::io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
+use std::marker::PhantomData as marker;
+use std::{
+    future::Future,
+    io,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 pub struct SubmissionHandler<T>(marker<T>)
 where
-     T: Unpin;
+    T: Unpin;
 
 impl<T> SubmissionHandler<T>
 where
-    T: Unpin + HandleOpRegisterer
+    T: Unpin + HandleOpRegisterer,
 {
     pub fn handle_read(
         handle: Pin<&mut T>,
         cx: &mut Context,
-        completion_dispatcher: impl Future<Output=io::Result<usize>> + 'static
+        completion_dispatcher: impl Future<Output = io::Result<usize>> + 'static,
     ) -> Poll<io::Result<usize>> {
         let handle = handle.get_mut();
         let read_result = handle.read_registerer();
@@ -46,7 +49,7 @@ where
     pub fn handle_write(
         handle: Pin<&mut T>,
         cx: &mut Context,
-        completion_dispatcher: impl Future<Output=io::Result<usize>> + 'static
+        completion_dispatcher: impl Future<Output = io::Result<usize>> + 'static,
     ) -> Poll<io::Result<usize>> {
         let handle = handle.get_mut();
         let write_result = handle.write_registerer();
