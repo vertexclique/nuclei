@@ -138,6 +138,23 @@ impl AsyncWrite for &Handle<File> {
 ///////////////////////////////////
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
+impl Handle<File> {
+    pub async fn open(p: impl AsRef<Path>) -> io::Result<Handle<File>> {
+        let fd = Processor::processor_open_at(p).await?;
+        let io = unsafe { File::from_raw_fd(fd as _) };
+
+        Ok(Handle {
+            io_task: Some(io),
+            chan: None,
+            store_file: Some(StoreFile::new(fd as _)),
+            read: Arc::new(TTas::new(None)),
+            write: Arc::new(TTas::new(None)),
+        })
+    }
+}
+
+
+#[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncRead for Handle<File> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         let mut inner = futures::ready!(self.as_mut().poll_fill_buf(cx))?;
@@ -187,7 +204,7 @@ impl AsyncBufRead for Handle<File> {
 
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
-impl AsyncWrite for &Handle<File> {
+impl AsyncWrite for Handle<File> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         todo!()
     }
@@ -350,20 +367,5 @@ impl AsyncWrite for &Handle<UnixStream> {
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
-    }
-}
-
-impl Handle<File> {
-    pub async fn open(p: impl AsRef<Path>) -> io::Result<Handle<File>> {
-        let fd = Processor::processor_open_at(p).await?;
-        let io = unsafe { File::from_raw_fd(fd as _) };
-
-        Ok(Handle {
-            io_task: Some(io),
-            chan: None,
-            store_file: Some(StoreFile::new(fd as _)),
-            read: Arc::new(TTas::new(None)),
-            write: Arc::new(TTas::new(None)),
-        })
     }
 }
