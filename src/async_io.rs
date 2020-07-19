@@ -205,8 +205,39 @@ impl AsyncBufRead for Handle<File> {
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncWrite for Handle<File> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        todo!()
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, bufslice: &[u8]) -> Poll<io::Result<usize>> {
+        let mut store = &mut self.get_mut().store_file;
+
+        if let Some(mut store_file) = store.as_mut() {
+            let fd: RawFd = store_file.receive_fd();
+            let op_state = store_file.op_state();
+            let (bufp, pos) = store_file.bufpair();
+
+            let data = futures::ready!(bufp.fill_buf(|mut buf| {
+                Poll::Ready(Ok(io::Write::write(&mut buf, bufslice)?))
+            }))?;
+
+            let res = {
+                let fut = Processor::processor_write_file(&fd, data, *pos);
+                futures_util::pin_mut!(fut);
+
+                loop {
+                    match fut.as_mut().poll(cx)? {
+                        Poll::Ready(n) => {
+                            *pos += n;
+                            break Poll::Ready(Ok(n))
+                        }
+                        _ => {}
+                    }
+                }
+            };
+
+            bufp.clear();
+
+            res
+        } else {
+            Poll::Ready(Ok(0))
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -311,6 +342,9 @@ impl AsyncWrite for &Handle<TcpStream> {
     }
 }
 
+///////////////////////////////////
+///// UnixStream
+///////////////////////////////////
 
 #[cfg(unix)]
 impl AsyncRead for &Handle<UnixStream> {

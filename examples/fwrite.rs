@@ -26,7 +26,7 @@ fn main() -> io::Result<()> {
         path.push("data");
         path.push("dark-matter");
 
-        let fo = File::open(&path).unwrap();
+        let fo = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         let mut file = Handle::<File>::new(fo).unwrap();
         let len = file.write(DARK_MATTER.as_bytes()).await.unwrap();
 
