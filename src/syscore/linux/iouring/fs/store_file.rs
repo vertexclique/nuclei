@@ -53,8 +53,12 @@ impl StoreFile {
         (&mut self.buf, &mut self.pos)
     }
 
-    pub(crate) fn get_fd(&self) -> File {
+    pub(crate) fn from_fd_to_file(&self) -> File {
         unsafe { File::from_raw_fd(self.fd) }
+    }
+
+    pub(crate) fn receive_fd(&self) -> RawFd {
+        self.fd
     }
 
     #[inline(always)]
@@ -67,7 +71,7 @@ impl StoreFile {
 
     pub(crate) async fn poll_file_size(&mut self) -> io::Result<usize> {
         self.op_state().replace_with(|_| Op::Statx);
-        let fd = self.get_fd();
+        let fd = self.receive_fd();
         let (buf, _) = self.bufpair();
         let statx = buf.as_statx();
 

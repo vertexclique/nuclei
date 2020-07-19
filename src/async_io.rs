@@ -154,17 +154,16 @@ const NON_READ: &[u8] = &[];
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncBufRead for Handle<File> {
     fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        let fd = self.as_raw_fd();
         let mut store = &mut self.get_mut().store_file;
 
         if let Some(mut store_file) = store.as_mut() {
-            let fd = store_file.get_fd();
+            let fd: RawFd = store_file.receive_fd();
             let op_state = store_file.op_state();
             let (bufp, pos) = store_file.bufpair();
 
             println!("Read: {}", *pos);
 
-            let filled_buf = bufp.fill_buf(|buf| Handle::<File>::filler(cx, fd, pos, buf));
+            let filled_buf = bufp.fill_buf(|buf| Handle::<File>::filler(cx, &fd, pos, buf));
             match filled_buf {
                 Poll::Ready(Err(_)) => {
                     dbg!(&filled_buf);
@@ -369,7 +368,7 @@ impl Handle<File> {
         })
     }
 
-    fn filler<T: AsRawFd>(cx: &mut Context, fd: T, pos: &mut usize, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn filler(cx: &mut Context, fd: &RawFd, pos: &mut usize, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         // let mut f = unsafe { File::from_raw_fd(fd.as_raw_fd()) };
         // let mut buffer = Vec::new();
         // f.read_to_end(&mut buffer).unwrap();
@@ -382,7 +381,8 @@ impl Handle<File> {
             match fut.as_mut().poll(cx)? {
                 Poll::Ready(0) => {
                     dbg!("poll pend");
-                    break Poll::Pending
+                    // break Poll::Pending
+                    break Poll::Ready(Ok(0))
                 },
                 Poll::Ready(n) => {
                     dbg!("poll read");

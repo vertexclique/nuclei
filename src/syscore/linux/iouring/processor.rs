@@ -19,6 +19,7 @@ use iou::{SockFlag, SockAddrStorage};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::ffi::CString;
+use std::os::unix::prelude::RawFd;
 
 
 macro_rules! syscall {
@@ -57,15 +58,15 @@ impl Processor {
         Ok(x)
     }
 
-    pub(crate) async fn processor_read_file<R: AsRawFd>(io: &R, buf: &mut [u8], offset: usize) -> io::Result<usize> {
-        let fd = io.as_raw_fd() as _;
-        let flags = syscall!(fcntl(fd, libc::F_GETFL)).unwrap();
-        syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_CLOEXEC | libc::O_RDONLY)).unwrap();
+    pub(crate) async fn processor_read_file(io: &RawFd, buf: &mut [u8], offset: usize) -> io::Result<usize> {
+        // let fd = *io;
+        // let flags = syscall!(fcntl(fd, libc::F_GETFL)).unwrap();
+        // syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_CLOEXEC | libc::O_RDONLY)).unwrap();
 
         // dbg!(fd);
 
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_read(fd, buf, offset);
+            sqe.prep_read(*io, buf, offset);
         })?;
 
         Ok(cc.await? as _)
@@ -81,15 +82,14 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_file_size<R: AsRawFd>(io: &R, statx: *mut libc::statx) -> io::Result<usize> {
+    pub(crate) async fn processor_file_size(io: &RawFd, statx: *mut libc::statx) -> io::Result<usize> {
         static EMPTY: libc::c_char = 0;
-        let fd = io.as_raw_fd() as _;
         let flags = libc::AT_EMPTY_PATH;
         let mask = libc::STATX_SIZE;
 
         Proactor::get().inner().register_io(|sqe| unsafe {
             let sqep = sqe.raw_mut();
-            uring_sys::io_uring_prep_statx(sqep, fd, &EMPTY, flags, mask, statx);
+            uring_sys::io_uring_prep_statx(sqep, *io, &EMPTY, flags, mask, statx);
         })?.await?;
 
         unsafe {
