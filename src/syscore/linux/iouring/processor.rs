@@ -74,6 +74,15 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
+    pub(crate) async fn processor_close_file(io: &RawFd) -> io::Result<usize> {
+        let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+            let mut sqep = sqe.raw_mut();
+            uring_sys::io_uring_prep_close(sqep, *io);
+        })?;
+
+        Ok(cc.await? as _)
+    }
+
     pub(crate) async fn processor_file_size(io: &RawFd, statx: *mut libc::statx) -> io::Result<usize> {
         static EMPTY: libc::c_char = 0;
         let flags = libc::AT_EMPTY_PATH;
