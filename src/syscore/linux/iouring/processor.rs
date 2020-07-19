@@ -59,12 +59,6 @@ impl Processor {
     }
 
     pub(crate) async fn processor_read_file(io: &RawFd, buf: &mut [u8], offset: usize) -> io::Result<usize> {
-        // let fd = *io;
-        // let flags = syscall!(fcntl(fd, libc::F_GETFL)).unwrap();
-        // syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_CLOEXEC | libc::O_RDONLY)).unwrap();
-
-        // dbg!(fd);
-
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
             sqe.prep_read(*io, buf, offset);
         })?;
@@ -72,11 +66,18 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_write_file<R: AsRawFd>(io: &R, buf: &[u8], offset: usize) -> io::Result<usize> {
-        let fd = io.as_raw_fd() as _;
-
+    pub(crate) async fn processor_write_file(io: &RawFd, buf: &[u8], offset: usize) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_write(fd, buf, offset);
+            sqe.prep_write(*io, buf, offset);
+        })?;
+
+        Ok(cc.await? as _)
+    }
+
+    pub(crate) async fn processor_close_file(io: &RawFd) -> io::Result<usize> {
+        let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+            let mut sqep = sqe.raw_mut();
+            uring_sys::io_uring_prep_close(sqep, *io);
         })?;
 
         Ok(cc.await? as _)

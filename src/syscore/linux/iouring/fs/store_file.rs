@@ -102,7 +102,6 @@ impl StoreFile {
     }
 
     pub(crate) fn cancel(&mut self) {
-        dbg!("CANCEL");
         self.op_state.replace_with(|_| Op::Nothing);
         self.buf.cancellation();
     }
