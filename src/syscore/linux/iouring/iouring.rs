@@ -131,7 +131,7 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
 ///////////////////
 
 const MANUAL_TIMEOUT: u64 = -2 as _;
-const QUEUE_LEN: u32 = 1 << 8;
+const QUEUE_LEN: u32 = 1 << 10;
 
 pub struct SysProactor {
     sq: TTas<SubmissionQueue<'static>>,
@@ -202,8 +202,17 @@ impl SysProactor {
 
                 CompletionChan { rx }
             }).map(|c| unsafe {
-                let submitted_io_evcount = sq.submit().unwrap();
-                // dbg!(submitted_io_evcount);
+                let submitted_io_evcount = sq.submit();
+                // dbg!(&submitted_io_evcount);
+
+                // sq.submit()
+                //     .map_or_else(|_| {
+                //         let id = self.submitter_id.load(Ordering::SeqCst);
+                //         let mut subguard = self.submitters.lock();
+                //         subguard.get(&id).unwrap().send(0);
+                //     }, |submitted_io_evcount| {
+                //         dbg!(submitted_io_evcount);
+                //     });
 
                 c
             });
@@ -225,7 +234,11 @@ impl SysProactor {
         let mut cq = self.cq.lock();
         let mut acquired = 0;
 
+        // dbg!("WAITING FOR CQE");
+        // let timeout = Duration::from_millis(1);
         while let Ok(cqe) = cq.wait_for_cqe() {
+        // while let Some(cqe) = cq.peek_for_cqe() {
+        //     dbg!("GOT");
             let mut ready = cq.ready() as usize + 1;
             // dbg!(ready, cqe.user_data());
 
@@ -247,11 +260,14 @@ impl SysProactor {
 
     fn cqe_completion(&self, mut acquired: usize, cqe: &CompletionQueueEvent) -> io::Result<()> {
         if cqe.is_timeout() {
+            dbg!("TIMEOUT");
             return Ok(());
         }
 
         let udata = cqe.user_data();
-        let res = cqe.result()? as i32;
+        // TODO: (vcq): Propagation of this should be properly.
+        // This is half assed. Need to propagate this without closing the completion channel.
+        let res = cqe.result().unwrap() as i32;
         if udata == MANUAL_TIMEOUT {
             return Ok(());
         }

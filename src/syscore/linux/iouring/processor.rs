@@ -17,6 +17,9 @@ use crate::syscore::shim_to_af_unix;
 use std::io::{IoSliceMut, IoSlice};
 use iou::{SockFlag, SockAddrStorage};
 use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::ffi::CString;
+use std::os::unix::prelude::RawFd;
 
 
 macro_rules! syscall {
@@ -36,10 +39,65 @@ pub struct Processor;
 impl Processor {
     ///////////////////////////////////
     ///// Read Write
-    ///// Synchronous File
     ///////////////////////////////////
 
-    pub(crate) async fn processor_read_file<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
+    pub(crate) async fn processor_open_at(path: impl AsRef<Path>) -> io::Result<usize> {
+        let path = CString::new(path.as_ref().as_os_str().as_bytes()).expect("invalid path");
+        let path = path.as_ptr();
+        let flags = libc::O_CLOEXEC | libc::O_RDONLY;
+        let dfd = libc::AT_FDCWD;
+
+        let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+            let sqep = sqe.raw_mut();
+            uring_sys::io_uring_prep_openat(sqep, dfd, path, flags, 0o666);
+        })?;
+
+        let x = cc.await? as _;
+        dbg!(x);
+
+        Ok(x)
+    }
+
+    pub(crate) async fn processor_read_file(io: &RawFd, buf: &mut [u8], offset: usize) -> io::Result<usize> {
+        // let fd = *io;
+        // let flags = syscall!(fcntl(fd, libc::F_GETFL)).unwrap();
+        // syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_CLOEXEC | libc::O_RDONLY)).unwrap();
+
+        // dbg!(fd);
+
+        let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+            sqe.prep_read(*io, buf, offset);
+        })?;
+
+        Ok(cc.await? as _)
+    }
+
+    pub(crate) async fn processor_write_file<R: AsRawFd>(io: &R, buf: &[u8], offset: usize) -> io::Result<usize> {
+        let fd = io.as_raw_fd() as _;
+
+        let cc = Proactor::get().inner().register_io(|sqe| unsafe {
+            sqe.prep_write(fd, buf, offset);
+        })?;
+
+        Ok(cc.await? as _)
+    }
+
+    pub(crate) async fn processor_file_size(io: &RawFd, statx: *mut libc::statx) -> io::Result<usize> {
+        static EMPTY: libc::c_char = 0;
+        let flags = libc::AT_EMPTY_PATH;
+        let mask = libc::STATX_SIZE;
+
+        Proactor::get().inner().register_io(|sqe| unsafe {
+            let sqep = sqe.raw_mut();
+            uring_sys::io_uring_prep_statx(sqep, *io, &EMPTY, flags, mask, statx);
+        })?.await?;
+
+        unsafe {
+            Ok((*statx).stx_size as usize)
+        }
+    }
+
+    pub(crate) async fn processor_read_vectored<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
         let fd = io.as_raw_fd() as _;
         let mut bufs = [IoSliceMut::new(buf)];
 
@@ -50,7 +108,7 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_write_file<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
+    pub(crate) async fn processor_write_vectored<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
         let fd = io.as_raw_fd() as _;
         let bufs = &[IoSlice::new(buf)];
 

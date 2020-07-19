@@ -23,6 +23,7 @@ impl<T: AsRawFd> Handle<T> {
         Ok(Handle {
             io_task: Some(io),
             chan: None,
+            store_file: None,
             read: Arc::new(TTas::new(None)),
             write: Arc::new(TTas::new(None)),
         })

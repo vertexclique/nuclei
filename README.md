@@ -48,20 +48,20 @@ On Windows, [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) b
 
 Current io_uring implementation needs Linux kernel 5.5+.
 
-# Features
+## Features
 
 * Async TCP, UDP, Unix domain sockets and files...
 * Proactor system doesn't block at all. So no blocking pool needed.
-* Vectored operations.
+* Scatter/Gather operations
 * Less allocation than any other runtime.
 * More expressive than any other runtime.
 * Completely asynchronous I/O system with lock free programming.
 
-# Configurations
+## Configurations
 
-## 
+### 
 
-## Executor
+### Executor
 Executor is by default set to Bastion's executor. If you want to use
 different executor, use one of the available runtimes with one of these features: 
 `bastion`, `asyncstd`, `tokio`, `smol`.

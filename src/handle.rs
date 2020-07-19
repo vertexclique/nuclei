@@ -2,7 +2,8 @@ use std::fmt;
 use std::{pin::Pin, future::Future, io, ops::{DerefMut, Deref}, sync::Arc};
 use lever::prelude::*;
 
-use crate::syscore::CompletionChan;
+use pin_utils::unsafe_unpinned;
+use crate::syscore::{CompletionChan, StoreFile};
 
 pub type AsyncOp<T> = Pin<Box<dyn Future<Output = io::Result<T>>>>;
 
@@ -16,6 +17,8 @@ pub struct Handle<T> {
     pub(crate) io_task: Option<T>,
     /// Notification channel
     pub(crate) chan: Option<CompletionChan>,
+    /// File operation storage
+    pub(crate) store_file: Option<StoreFile>,
     /// Completion callback for read
     pub(crate) read: Arc<TTas<Option<AsyncOp<usize>>>>,
     /// Completion callback for write
@@ -37,6 +40,13 @@ impl<T> Handle<T> {
     pub fn into_inner(mut self) -> T {
         self.io_task.take().unwrap()
     }
+
+    // #[cfg(all(feature = "iouring", target_os = "linux"))]
+    // unsafe_unpinned!(store_file: Option<StoreFile>);
+    //
+    // pub(crate) fn get_file(mut self: Pin<&mut Self>) -> &mut Option<StoreFile> {
+    //     self.store_file()
+    // }
 }
 
 impl<T> HandleOpRegisterer for Handle<T> {
