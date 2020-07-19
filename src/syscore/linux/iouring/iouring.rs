@@ -283,13 +283,12 @@ impl SysProactor {
 
     fn cqe_completion(&self, mut acquired: usize, cqe: &CompletionQueueEvent) -> io::Result<()> {
         if cqe.is_timeout() {
-            dbg!("TIMEOUT");
             return Ok(());
         }
 
         let udata = cqe.user_data();
         // TODO: (vcq): Propagation of this should be properly.
-        // This is half assed. Need to propagate this without closing the completion channel.
+        // This is half assed. Need to propagate this without poisoning the driver state.
         let res = cqe.result().unwrap() as i32;
         if udata == MANUAL_TIMEOUT {
             return Ok(());
