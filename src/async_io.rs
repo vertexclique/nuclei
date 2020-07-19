@@ -241,13 +241,11 @@ impl AsyncWrite for Handle<File> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        dbg!("FLUSH");
         futures::ready!(self.poll_write(cx, &[]))?;
         Poll::Ready(Ok(()))
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        dbg!("CLOSE");
         let mut store = &mut self.get_mut().store_file;
 
         if let Some(mut store_file) = store.as_mut() {
