@@ -18,14 +18,12 @@ fn main() -> io::Result<()> {
         let fo = File::open(&path).unwrap();
         let mut file = Handle::<File>::new(fo).unwrap();
         let mut buffer = String::new();
-        // let mut buffer = Vec::new();
         file.read_to_string(&mut buffer).await;
-        dbg!(&buffer.len());
         buffer
     });
 
-    // println!("LENGTH IS {}", x);
-    println!("LENGTH IS {}", x.len());
+    // println!("Content: {}", x);
+    println!("Length of file is {}", x.len());
 
     Ok(())
 }

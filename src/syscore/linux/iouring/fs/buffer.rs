@@ -59,7 +59,6 @@ impl Buffer {
     {
         match self.storage {
             Storage::Buffer => {
-                dbg!("Storage::Buffer", self.pos, self.cap);
                 if self.pos >= self.cap {
                     let buf = unsafe {
                         slice::from_raw_parts_mut(self.data.cast().as_ptr(), self.capacity as usize)
@@ -71,7 +70,6 @@ impl Buffer {
                 Poll::Ready(Ok(self.buffered_from_read()))
             }
             Storage::Nothing => {
-                dbg!("Storage::Nothing");
                 self.cap = ready!(fill(self.alloc_buf()))?;
                 Poll::Ready(Ok(self.buffered_from_read()))
             }

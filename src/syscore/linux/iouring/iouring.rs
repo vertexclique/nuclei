@@ -265,15 +265,13 @@ impl SysProactor {
         }
 
         let udata = cqe.user_data();
-        dbg!("ACQUIRED", udata);
+        // TODO: (vcq): Propagation of this should be properly.
+        // This is half assed. Need to propagate this without closing the completion channel.
         let res = cqe.result().unwrap() as i32;
-        // dbg!(res);
         if udata == MANUAL_TIMEOUT {
-            dbg!("MANUAL_TIMEOUT");
             return Ok(());
         }
 
-        dbg!("EVENT LOOKS OK", udata);
         acquired += 1;
         // dbg!("ACQUIRED", udata);
 
