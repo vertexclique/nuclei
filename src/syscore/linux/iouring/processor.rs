@@ -98,12 +98,9 @@ impl Processor {
         }
     }
 
-    pub(crate) async fn processor_read_vectored<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
-        let fd = io.as_raw_fd() as _;
-        let mut bufs = [IoSliceMut::new(buf)];
-
+    pub(crate) async fn processor_read_vectored(io: &RawFd, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_read_vectored(fd, &mut bufs, 0);
+            sqe.prep_read_vectored(*io, bufs, 0);
         })?;
 
         Ok(cc.await? as _)
@@ -213,7 +210,8 @@ impl Processor {
             unsafe {
                 &iou::SockAddr::from_libc_sockaddr(sock.local_addr().unwrap().as_ptr()).unwrap()
             };
-        let stream = sock.into_tcp_stream();
+        let mut stream = sock.into_tcp_stream();
+        stream.set_nodelay(true)?;
         let fd = stream.as_raw_fd() as _;
 
         Proactor::get().inner().register_io(|sqe| unsafe {
