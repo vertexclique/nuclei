@@ -1,22 +1,21 @@
-use std::future::Future;
+
 use std::io;
 use std::marker::Unpin;
-use std::sync::Arc;
-use std::path::Path;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
+use std::sync::Arc;
 
 use std::net::{TcpListener, TcpStream, UdpSocket};
 // Unix specifics
-use std::os::unix::net::{UnixListener, UnixStream, UnixDatagram, SocketAddr as UnixSocketAddr};
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
 
-use lever::sync::prelude::*;
 use futures::Stream;
+use lever::sync::prelude::*;
+
+use super::Processor;
 
 use crate::{Handle, Proactor};
-use super::Processor;
-use crate::syscore::CompletionChan;
-
 
 impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {
@@ -32,9 +31,7 @@ impl<T: AsRawFd> Handle<T> {
     pub(crate) fn new_with_callback(io: T, evflags: usize) -> io::Result<Handle<T>> {
         let fd = io.as_raw_fd();
         let mut handle = Handle::new(io)?;
-        let register = Proactor::get()
-            .inner()
-            .register_io(fd, evflags)?;
+        let register = Proactor::get().inner().register_io(fd, evflags)?;
         handle.chan = Some(register);
         Ok(handle)
     }
@@ -54,10 +51,13 @@ impl Handle<TcpListener> {
     pub fn incoming(
         &self,
     ) -> impl Stream<Item = io::Result<Handle<TcpStream>>> + Send + Unpin + '_ {
-        Box::pin(futures::stream::unfold(self, |listener: &Handle<TcpListener>| async move {
-            let res = listener.accept().await.map(|(stream, _)| stream);
-            Some((res, listener))
-        }))
+        Box::pin(futures::stream::unfold(
+            self,
+            |listener: &Handle<TcpListener>| async move {
+                let res = listener.accept().await.map(|(stream, _)| stream);
+                Some((res, listener))
+            },
+        ))
     }
 }
 
@@ -102,8 +102,7 @@ impl Handle<UdpSocket> {
 
     pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
         match addr.to_socket_addrs()?.next() {
-            Some(addr) =>
-                Processor::processor_send_to(self.get_ref(), buf, addr).await,
+            Some(addr) => Processor::processor_send_to(self.get_ref(), buf, addr).await,
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "given addresses can't be parsed",
@@ -132,10 +131,13 @@ impl Handle<UnixListener> {
     pub fn incoming(
         &self,
     ) -> impl Stream<Item = io::Result<Handle<UnixStream>>> + Send + Unpin + '_ {
-        Box::pin(futures::stream::unfold(self, |listener: &Handle<UnixListener>| async move {
-            let res = listener.accept().await.map(|(stream, _)| stream);
-            Some((res, listener))
-        }))
+        Box::pin(futures::stream::unfold(
+            self,
+            |listener: &Handle<UnixListener>| async move {
+                let res = listener.accept().await.map(|(stream, _)| stream);
+                Some((res, listener))
+            },
+        ))
     }
 }
 

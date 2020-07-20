@@ -12,16 +12,21 @@ use std::ops::Deref;
 
 const IOVEC_WIDTH: usize = 1 << 10;
 
-fn main() -> io::Result<()> {
+/// Unfortunately, underlying implementation of writevec have problems.
+/// Ref issue: https://github.com/rust-lang/rust/issues/68041
+/// This should work fine with iouring.
+#[cfg(feature = "iouring")]
+#[test]
+fn write_vectored() {
     let x = drive(async {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("data");
+        path.push("testdata");
         path.push("dark-matter-vect");
 
         let buf1 = [0x41; IOVEC_WIDTH];
         let buf2 = [0x42; IOVEC_WIDTH];
         let buf3 = [0x43; IOVEC_WIDTH];
-        let bufs = [
+        let mut bufs = [
             IoSlice::new(&buf1),
             IoSlice::new(&buf2),
             IoSlice::new(&buf3),
@@ -46,6 +51,4 @@ fn main() -> io::Result<()> {
     assert_eq!(x.matches('C').count(), IOVEC_WIDTH);
 
     println!("SG write was: {}", x);
-
-    Ok(())
 }

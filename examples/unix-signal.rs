@@ -1,8 +1,8 @@
 #[cfg(unix)]
 fn main() -> std::io::Result<()> {
+    use futures::prelude::*;
     use nuclei::*;
     use std::os::unix::net::UnixStream;
-    use futures::prelude::*;
 
     drive(async {
         // Create a Unix stream that receives a byte on each signal occurrence.

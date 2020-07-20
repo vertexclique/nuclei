@@ -1,9 +1,15 @@
-use std::fmt;
-use std::{pin::Pin, future::Future, io, ops::{DerefMut, Deref}, sync::Arc};
 use lever::prelude::*;
+use std::fmt;
+use std::{
+    future::Future,
+    io,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    sync::Arc,
+};
 
-use pin_utils::unsafe_unpinned;
 use crate::syscore::{CompletionChan, StoreFile};
+
 
 pub type AsyncOp<T> = Pin<Box<dyn Future<Output = io::Result<T>>>>;
 
@@ -68,7 +74,6 @@ impl<T> HandleOpRegisterer for &Handle<T> {
         self.write.clone()
     }
 }
-
 
 impl<T> Deref for Handle<T> {
     type Target = T;

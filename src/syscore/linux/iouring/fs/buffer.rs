@@ -1,11 +1,11 @@
+use futures::ready;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
-use std::io;
 use std::cmp;
+use std::io;
 use std::mem;
 use std::ptr::NonNull;
 use std::slice;
 use std::task::Poll;
-use futures::ready;
 
 use super::cancellation::Cancellation;
 
@@ -54,9 +54,10 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn fill_buf(&mut self, fill: impl FnOnce(&mut [u8]) -> Poll<io::Result<usize>>)
-                    -> Poll<io::Result<&[u8]>>
-    {
+    pub fn fill_buf(
+        &mut self,
+        fill: impl FnOnce(&mut [u8]) -> Poll<io::Result<usize>>,
+    ) -> Poll<io::Result<&[u8]>> {
         match self.storage {
             Storage::Buffer => {
                 if self.pos >= self.cap {
@@ -73,7 +74,7 @@ impl Buffer {
                 self.cap = ready!(fill(self.alloc_buf()))?;
                 Poll::Ready(Ok(self.buffered_from_read()))
             }
-            _               => panic!("attempted to fill buf while not holding buffer"),
+            _ => panic!("attempted to fill buf while not holding buffer"),
         }
     }
 
@@ -90,49 +91,43 @@ impl Buffer {
 
     pub fn cancellation(&mut self) -> Cancellation {
         match self.storage {
-            Storage::Buffer     => {
+            Storage::Buffer => {
                 self.clear();
                 self.storage = Storage::Nothing;
                 let data = mem::replace(&mut self.data, NonNull::dangling());
                 unsafe { Cancellation::buffer(data.cast().as_ptr(), self.capacity as usize) }
             }
-            Storage::Statx      => {
+            Storage::Statx => {
                 unsafe fn callback(statx: *mut (), _: usize) {
                     dealloc(statx as *mut u8, Layout::new::<libc::statx>())
                 }
 
                 self.storage = Storage::Nothing;
                 let data = mem::replace(&mut self.data, NonNull::dangling());
-                unsafe {
-                    Cancellation::new(data.cast().as_ptr(), 0, callback)
-                }
+                unsafe { Cancellation::new(data.cast().as_ptr(), 0, callback) }
             }
-            Storage::Nothing    => Cancellation::null(),
+            Storage::Nothing => Cancellation::null(),
         }
     }
 
     pub(crate) fn as_statx(&mut self) -> *mut libc::statx {
         match self.storage {
-            Storage::Statx      => self.data.cast().as_ptr(),
-            Storage::Nothing    => self.alloc_statx(),
-            _                   => panic!("accessed buffer as statx when storing something else"),
+            Storage::Statx => self.data.cast().as_ptr(),
+            Storage::Nothing => self.alloc_statx(),
+            _ => panic!("accessed buffer as statx when storing something else"),
         }
     }
 
     fn alloc_buf(&mut self) -> &mut [u8] {
         self.storage = Storage::Buffer;
         self.alloc();
-        unsafe {
-            slice::from_raw_parts_mut(self.data.cast().as_ptr(), self.capacity as usize)
-        }
+        unsafe { slice::from_raw_parts_mut(self.data.cast().as_ptr(), self.capacity as usize) }
     }
 
     fn alloc_statx(&mut self) -> &mut libc::statx {
         self.storage = Storage::Statx;
         self.alloc();
-        unsafe {
-            &mut *self.data.cast().as_ptr()
-        }
+        unsafe { &mut *self.data.cast().as_ptr() }
     }
 
     fn alloc(&mut self) {
@@ -150,15 +145,15 @@ impl Buffer {
     #[inline(always)]
     fn layout(&self) -> Option<Layout> {
         match self.storage {
-            Storage::Statx      => Some(Layout::new::<libc::statx>()),
-            Storage::Buffer     => Some(Layout::array::<u8>(self.capacity as usize).unwrap()),
-            Storage::Nothing    => None,
+            Storage::Statx => Some(Layout::new::<libc::statx>()),
+            Storage::Buffer => Some(Layout::array::<u8>(self.capacity as usize).unwrap()),
+            Storage::Nothing => None,
         }
     }
 }
 
-unsafe impl Send for Buffer { }
-unsafe impl Sync for Buffer { }
+unsafe impl Send for Buffer {}
+unsafe impl Sync for Buffer {}
 
 impl Drop for Buffer {
     fn drop(&mut self) {

@@ -1,29 +1,34 @@
-use std::io;
-use std::io::{Read, Write};
-use std::{fs::File, os::unix::io::{AsRawFd, FromRawFd}, mem::ManuallyDrop};
-use std::net::{SocketAddr, ToSocketAddrs, TcpListener};
-use std::os::unix::net::{
-    SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream,
-};
-use std::net::{SocketAddrV6, SocketAddrV4, Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::future::Future;
-use std::path::Path;
+use std::io;
+use std::io::{Read, Write, Seek, SeekFrom};
 use std::net::TcpStream;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixStream};
+use std::path::Path;
+use std::{
+    fs::File,
+    mem::ManuallyDrop,
+    os::unix::io::{AsRawFd, FromRawFd},
+};
 
 use crate::proactor::Proactor;
-use crate::Handle;
 use crate::syscore::shim_to_af_unix;
+use crate::Handle;
 
 pub struct Processor;
 
 impl Processor {
     ///////////////////////////////////
-    ///// Read Write
+    ///// Read Write Seek
     ///// Synchronous File
     ///////////////////////////////////
 
-    pub(crate) async fn processor_read_file<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
-        // TODO: (vertexclique): Use blocking here.
+    pub(crate) async fn processor_read_file<R: AsRawFd>(
+        io: &R,
+        buf: &mut [u8],
+    ) -> io::Result<usize> {
+        // TODO: (vertexclique): Use blocking here or in the outer environment.
         let mut file = unsafe { File::from_raw_fd(io.as_raw_fd()) };
         let res = file.read(buf);
         let _ = ManuallyDrop::new(file);
@@ -31,12 +36,21 @@ impl Processor {
     }
 
     pub(crate) async fn processor_write_file<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
-        // TODO: (vertexclique): Use blocking here.
+        // TODO: (vertexclique): Use blocking here or in the outer environment.
         let mut file = unsafe { File::from_raw_fd(io.as_raw_fd()) };
         let res = file.write(buf);
 
         let _ = ManuallyDrop::new(file);
         res
+    }
+
+    pub(crate) async fn processor_seek_file<R: AsRawFd>(io: &R, pos: SeekFrom) -> io::Result<usize> {
+        // TODO: (vertexclique): Use blocking here or in the outer environment.
+        let mut file = unsafe { File::from_raw_fd(io.as_raw_fd()) };
+        let res = file.seek(pos);
+
+        let _ = ManuallyDrop::new(file);
+        res.map(|e| e as usize)
     }
 
     ///////////////////////////////////
@@ -107,10 +121,13 @@ impl Processor {
     ///// Commonality of TcpStream, UdpSocket
     ///////////////////////////////////
 
-    pub(crate) async fn processor_connect<A: ToSocketAddrs, F, Fut, T>(addrs: A, mut f: F) -> io::Result<T>
-        where
-            F: FnMut(SocketAddr) -> Fut,
-            Fut: Future<Output = io::Result<T>>,
+    pub(crate) async fn processor_connect<A: ToSocketAddrs, F, Fut, T>(
+        addrs: A,
+        mut f: F,
+    ) -> io::Result<T>
+    where
+        F: FnMut(SocketAddr) -> Fut,
+        Fut: Future<Output = io::Result<T>>,
     {
         // TODO connect_tcp, connect_udp
         let addrs = match addrs.to_socket_addrs() {
@@ -127,10 +144,7 @@ impl Processor {
         }
 
         Err(tail_err.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "couldn't resolve addresses",
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, "couldn't resolve addresses")
         }))
     }
 
@@ -147,7 +161,11 @@ impl Processor {
         } else {
             socket2::Domain::ipv4()
         };
-        let sock = socket2::Socket::new(domain, socket2::Type::stream(), Some(socket2::Protocol::tcp()))?;
+        let sock = socket2::Socket::new(
+            domain,
+            socket2::Type::stream(),
+            Some(socket2::Protocol::tcp()),
+        )?;
 
         // Begin async connect and ignore the inevitable "in progress" error.
         sock.set_nonblocking(true)?;
@@ -162,7 +180,7 @@ impl Processor {
             }
         })?;
 
-        let mut stream_raw = sock.into_tcp_stream();
+        let stream_raw = sock.into_tcp_stream();
         stream_raw.set_nodelay(true)?;
         let stream = Handle::new(stream_raw)?;
 
@@ -174,9 +192,10 @@ impl Processor {
                 let res = match sock.connect(&addr.into()) {
                     Ok(res) => Ok(res),
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        let cc = Proactor::get()
-                            .inner()
-                            .register_io(stream.as_raw_fd(), (libc::EAGAIN | libc::EINPROGRESS) as _)?;
+                        let cc = Proactor::get().inner().register_io(
+                            stream.as_raw_fd(),
+                            (libc::EAGAIN | libc::EINPROGRESS) as _,
+                        )?;
                         let events = cc.await?;
                         if events & (libc::EV_ERROR as usize) != 0 {
                             // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
@@ -193,7 +212,7 @@ impl Processor {
                         if e.raw_os_error().unwrap() ^ libc::EISCONN == 0 {
                             break;
                         }
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -210,7 +229,11 @@ impl Processor {
             SocketAddr::V4(_) => socket2::Domain::ipv4(),
             SocketAddr::V6(_) => socket2::Domain::ipv6(),
         };
-        let sock = socket2::Socket::new(domain, socket2::Type::dgram(), Some(socket2::Protocol::udp()))?;
+        let sock = socket2::Socket::new(
+            domain,
+            socket2::Type::dgram(),
+            Some(socket2::Protocol::udp()),
+        )?;
         let sockaddr = socket2::SockAddr::from(addr);
 
         let unspec = match addr {
@@ -239,15 +262,18 @@ impl Processor {
     ///// TcpListener
     ///////////////////////////////////
 
-    pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(listener: &R) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
+    pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(
+        listener: &R,
+    ) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
         let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
         let socket = socket.into_tcp_listener();
         let socket = ManuallyDrop::new(socket);
 
         // Reregister on block
         match socket
-                .accept()
-                .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr)) {
+            .accept()
+            .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))
+        {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 let cc = Proactor::get()
@@ -279,7 +305,11 @@ impl Processor {
         Self::send_to_dest(socket, buf, &socket2::SockAddr::from(addr)).await
     }
 
-    async fn send_to_dest<A: AsRawFd>(socket: &A, buf: &[u8], addr: &socket2::SockAddr) -> io::Result<usize> {
+    async fn send_to_dest<A: AsRawFd>(
+        socket: &A,
+        buf: &[u8],
+        addr: &socket2::SockAddr,
+    ) -> io::Result<usize> {
         let sock = unsafe { socket2::Socket::from_raw_fd(socket.as_raw_fd()) };
         let sock = ManuallyDrop::new(sock);
 
@@ -302,13 +332,19 @@ impl Processor {
         }
     }
 
-    pub(crate) async fn processor_recv_from<R: AsRawFd>(sock: &R, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    pub(crate) async fn processor_recv_from<R: AsRawFd>(
+        sock: &R,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr)> {
         Self::recv_from_with_flags(sock, buf, 0)
             .await
             .map(|(size, sockaddr)| (size, sockaddr.as_std().unwrap()))
     }
 
-    pub(crate) async fn processor_peek_from<R: AsRawFd>(sock: &R, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    pub(crate) async fn processor_peek_from<R: AsRawFd>(
+        sock: &R,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr)> {
         Self::recv_from_with_flags(sock, buf, libc::MSG_PEEK as _)
             .await
             .map(|(size, sockaddr)| (size, sockaddr.as_std().unwrap()))
@@ -324,8 +360,8 @@ impl Processor {
         // let sock = ManuallyDrop::new(sock);
 
         // Reregister on block
-        match super::shim_recv_from(sock, buf, flags as _)
-            .map(|(size, sockaddr)| (size, sockaddr)) {
+        match super::shim_recv_from(sock, buf, flags as _).map(|(size, sockaddr)| (size, sockaddr))
+        {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 let cc = Proactor::get()
@@ -351,7 +387,9 @@ impl Processor {
     ///// UnixListener
     ///////////////////////////////////
 
-    pub(crate) async fn processor_accept_unix_listener<R: AsRawFd>(listener: &R) -> io::Result<(Handle<UnixStream>, UnixSocketAddr)> {
+    pub(crate) async fn processor_accept_unix_listener<R: AsRawFd>(
+        listener: &R,
+    ) -> io::Result<(Handle<UnixStream>, UnixSocketAddr)> {
         let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
         let socket = socket.into_unix_listener();
         let socket = ManuallyDrop::new(socket);
@@ -359,7 +397,8 @@ impl Processor {
         // Reregister on block
         match socket
             .accept()
-            .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr)) {
+            .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))
+        {
             Ok(res) => Ok(res),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 let cc = Proactor::get()
@@ -383,7 +422,9 @@ impl Processor {
     ///// UnixStream
     ///////////////////////////////////
 
-    pub(crate) async fn processor_connect_unix<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixStream>> {
+    pub(crate) async fn processor_connect_unix<P: AsRef<Path>>(
+        path: P,
+    ) -> io::Result<Handle<UnixStream>> {
         let sock = socket2::Socket::new(socket2::Domain::unix(), socket2::Type::stream(), None)?;
         let sockaddr = socket2::SockAddr::unix(path)?;
 
@@ -414,17 +455,27 @@ impl Processor {
         res.map(|_| stream)
     }
 
-    pub(crate) async fn processor_send_to_unix<R: AsRawFd, P: AsRef<Path>>(socket: &R, buf: &[u8], path: P) -> io::Result<usize> {
+    pub(crate) async fn processor_send_to_unix<R: AsRawFd, P: AsRef<Path>>(
+        socket: &R,
+        buf: &[u8],
+        path: P,
+    ) -> io::Result<usize> {
         Self::send_to_dest(socket, buf, &socket2::SockAddr::unix(path)?).await
     }
 
-    pub(crate) async fn processor_recv_from_unix<R: AsRawFd>(socket: &R, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
+    pub(crate) async fn processor_recv_from_unix<R: AsRawFd>(
+        socket: &R,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, UnixSocketAddr)> {
         Self::recv_from_with_flags(socket, buf, 0)
             .await
             .map(|(size, sockaddr)| (size, shim_to_af_unix(&sockaddr).unwrap()))
     }
 
-    pub(crate) async fn processor_peek_from_unix<R: AsRawFd>(socket: &R, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
+    pub(crate) async fn processor_peek_from_unix<R: AsRawFd>(
+        socket: &R,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, UnixSocketAddr)> {
         Self::recv_from_with_flags(socket, buf, libc::MSG_PEEK as _)
             .await
             .map(|(size, sockaddr)| (size, shim_to_af_unix(&sockaddr).unwrap()))

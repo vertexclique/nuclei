@@ -1,16 +1,19 @@
-use std::io;
-use iou::{IoUring, SubmissionQueue, CompletionQueue, SubmissionQueueEvent, CompletionQueueEvent, Registrar};
-use lever::sync::prelude::*;
-use std::collections::HashMap;
-use futures::channel::oneshot;
-use pin_utils::unsafe_pinned;
-use std::future::Future;
 use core::mem::MaybeUninit;
-use std::os::unix::io::{AsRawFd, RawFd, FromRawFd};
+use futures::channel::oneshot;
+use iou::{
+    CompletionQueue, CompletionQueueEvent, IoUring, Registrar, SubmissionQueue,
+    SubmissionQueueEvent,
+};
+use lever::sync::prelude::*;
+use pin_utils::unsafe_pinned;
+use std::collections::HashMap;
+use std::future::Future;
+use std::io;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use std::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 
 macro_rules! syscall {
     ($fn:ident $args:tt) => {{
@@ -26,11 +29,11 @@ macro_rules! syscall {
 ///////////////////
 ///////////////////
 
-use socket2::SockAddr;
-use std::os::unix::net::{SocketAddr as UnixSocketAddr};
-use std::mem;
 use crate::Proactor;
 use once_cell::sync::Lazy;
+use socket2::SockAddr;
+use std::mem;
+use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -48,18 +51,22 @@ fn max_len() -> usize {
     }
 }
 
-pub(crate) fn shim_recv_from<A: AsRawFd>(fd: A, buf: &mut [u8], flags: libc::c_int) -> io::Result<(usize, SockAddr)> {
+pub(crate) fn shim_recv_from<A: AsRawFd>(
+    fd: A,
+    buf: &mut [u8],
+    flags: libc::c_int,
+) -> io::Result<(usize, SockAddr)> {
     let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
     let mut addrlen = mem::size_of_val(&storage) as libc::socklen_t;
 
     let n = syscall!(recvfrom(
-            fd.as_raw_fd() as _,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            std::cmp::min(buf.len(), max_len()),
-            flags,
-            &mut storage as *mut _ as *mut _,
-            &mut addrlen,
-        ))?;
+        fd.as_raw_fd() as _,
+        buf.as_mut_ptr() as *mut libc::c_void,
+        std::cmp::min(buf.len(), max_len()),
+        flags,
+        &mut storage as *mut _ as *mut _,
+        &mut addrlen,
+    ))?;
     let addr = unsafe { SockAddr::from_raw_parts(&storage as *const _ as *const _, addrlen) };
     Ok((n as usize, addr))
 }
@@ -82,7 +89,7 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
     let abst_sock_ident: libc::c_char = unsafe {
         std::slice::from_raw_parts(
             &addr.sun_path as *const _ as *const u8,
-            mem::size_of::<libc::c_char>()
+            mem::size_of::<libc::c_char>(),
         )
     }[1] as libc::c_char;
 
@@ -92,7 +99,7 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
         // https://man7.org/linux/man-pages/man7/unix.7.html
         (sa, 0) if sa != 0 && sa > mem::size_of::<libc::sa_family_t>() as libc::socklen_t => {
             len = mem::size_of::<libc::sa_family_t>() as libc::socklen_t;
-        },
+        }
         // If unnamed socket, then addr is always zero,
         // assign the offset reserved difference as length.
         (0, _) => {
@@ -100,7 +107,7 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
             let path = &addr.sun_path as *const _ as usize;
             let sun_path_offset = path - base;
             len = sun_path_offset as libc::socklen_t;
-        },
+        }
 
         // Discard rest, they are not special.
         (_, _) => {}
@@ -113,7 +120,7 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
         std::ptr::copy_nonoverlapping(
             sockaddr.as_ptr(),
             &mut init as *mut _ as *mut _,
-            len as usize
+            len as usize,
         );
 
         // Safety: We've written the init addr above.
@@ -141,7 +148,11 @@ pub struct SysProactor {
     waker: AtomicBool,
 }
 
-pub type RingTypes = (SubmissionQueue<'static>, CompletionQueue<'static>, Registrar<'static>);
+pub type RingTypes = (
+    SubmissionQueue<'static>,
+    CompletionQueue<'static>,
+    Registrar<'static>,
+);
 
 static mut IO_URING: Option<IoUring> = None;
 
@@ -156,12 +167,16 @@ impl SysProactor {
                 cq: TTas::new(cq),
                 submitters: TTas::new(HashMap::default()),
                 submitter_id: AtomicU64::default(),
-                waker: AtomicBool::default()
+                waker: AtomicBool::default(),
             })
         }
     }
 
-    fn submitter<T>(&self, sq: &mut SubmissionQueue<'_>, mut ring_sub: impl FnMut(&mut SubmissionQueueEvent<'_>) -> T) -> Option<T> {
+    fn submitter<T>(
+        &self,
+        sq: &mut SubmissionQueue<'_>,
+        mut ring_sub: impl FnMut(&mut SubmissionQueueEvent<'_>) -> T,
+    ) -> Option<T> {
         // dbg!("SUBMITTER");
         let mut sqe = match sq.next_sqe() {
             Some(sqe) => sqe,
@@ -176,46 +191,50 @@ impl SysProactor {
         Some(ring_sub(&mut sqe))
     }
 
-
-    pub(crate) fn register_io(&self, mut io_submit: impl FnMut(&mut SubmissionQueueEvent<'_>)) -> io::Result<CompletionChan> {
+    pub(crate) fn register_io(
+        &self,
+        mut io_submit: impl FnMut(&mut SubmissionQueueEvent<'_>),
+    ) -> io::Result<CompletionChan> {
         // dbg!("REGISTER IO");
         let sub_comp = {
             let mut sq = self.sq.lock();
 
-            let cc = self.submitter(&mut sq, |sqe| {
-                // dbg!("SUBMITTER");
-                let mut id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
-                if id == MANUAL_TIMEOUT {
-                    id = self.submitter_id.fetch_add(2, Ordering::Relaxed) + 2;
-                }
-                let (tx, rx) = oneshot::channel();
+            let cc = self
+                .submitter(&mut sq, |sqe| {
+                    // dbg!("SUBMITTER");
+                    let mut id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
+                    if id == MANUAL_TIMEOUT {
+                        id = self.submitter_id.fetch_add(2, Ordering::Relaxed) + 2;
+                    }
+                    let (tx, rx) = oneshot::channel();
 
-                // dbg!("SUBMITTER", id);
-                io_submit(sqe);
-                sqe.set_user_data(id);
+                    // dbg!("SUBMITTER", id);
+                    io_submit(sqe);
+                    sqe.set_user_data(id);
 
-                {
-                    let mut subguard = self.submitters.lock();
-                    subguard.insert(id, tx);
-                    // dbg!("INSERTED", id);
-                }
+                    {
+                        let mut subguard = self.submitters.lock();
+                        subguard.insert(id, tx);
+                        // dbg!("INSERTED", id);
+                    }
 
-                CompletionChan { rx }
-            }).map(|c| unsafe {
-                let submitted_io_evcount = sq.submit();
-                // dbg!(&submitted_io_evcount);
+                    CompletionChan { rx }
+                })
+                .map(|c| unsafe {
+                    let submitted_io_evcount = sq.submit();
+                    // dbg!(&submitted_io_evcount);
 
-                // sq.submit()
-                //     .map_or_else(|_| {
-                //         let id = self.submitter_id.load(Ordering::SeqCst);
-                //         let mut subguard = self.submitters.lock();
-                //         subguard.get(&id).unwrap().send(0);
-                //     }, |submitted_io_evcount| {
-                //         dbg!(submitted_io_evcount);
-                //     });
+                    // sq.submit()
+                    //     .map_or_else(|_| {
+                    //         let id = self.submitter_id.load(Ordering::SeqCst);
+                    //         let mut subguard = self.submitters.lock();
+                    //         subguard.get(&id).unwrap().send(0);
+                    //     }, |submitted_io_evcount| {
+                    //         dbg!(submitted_io_evcount);
+                    //     });
 
-                c
-            });
+                    c
+                });
 
             cc
         };
@@ -229,7 +248,11 @@ impl SysProactor {
         Ok(())
     }
 
-    pub(crate) fn wait(&self, max_event_size: usize, duration: Option<Duration>) -> io::Result<usize> {
+    pub(crate) fn wait(
+        &self,
+        max_event_size: usize,
+        duration: Option<Duration>,
+    ) -> io::Result<usize> {
         // dbg!("WAIT ENTER");
         let mut cq = self.cq.lock();
         let mut acquired = 0;
@@ -237,8 +260,8 @@ impl SysProactor {
         // dbg!("WAITING FOR CQE");
         // let timeout = Duration::from_millis(1);
         while let Ok(cqe) = cq.wait_for_cqe() {
-        // while let Some(cqe) = cq.peek_for_cqe() {
-        //     dbg!("GOT");
+            // while let Some(cqe) = cq.peek_for_cqe() {
+            //     dbg!("GOT");
             let mut ready = cq.ready() as usize + 1;
             // dbg!(ready, cqe.user_data());
 
@@ -274,11 +297,7 @@ impl SysProactor {
         acquired += 1;
         // dbg!("ACQUIRED", udata);
 
-        self.submitters.lock()
-            .remove(&udata)
-            .map(|s| {
-                s.send(res)
-            });
+        self.submitters.lock().remove(&udata).map(|s| s.send(res));
 
         Ok(())
     }
