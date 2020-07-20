@@ -1,7 +1,7 @@
 use std::{io, task};
 use std::{task::Poll, fs::File, pin::Pin, task::Context};
 use super::handle::Handle;
-use futures::io::{AsyncRead, AsyncWrite, SeekFrom, ReadVectored, IoSliceMut};
+use futures::io::{AsyncRead, AsyncWrite, SeekFrom, ReadVectored, IoSliceMut, IoSlice};
 use super::submission_handler::SubmissionHandler;
 use std::io::Read;
 
@@ -169,7 +169,7 @@ impl AsyncRead for Handle<File> {
         if let Some(mut store_file) = store.as_mut() {
             let fd: RawFd = store_file.receive_fd();
             let op_state = store_file.op_state();
-            let (bufp, pos) = store_file.bufpair();
+            let (_, pos) = store_file.bufpair();
 
             let fut = Processor::processor_read_vectored(&fd, bufs);
             futures_util::pin_mut!(fut);
@@ -260,6 +260,31 @@ impl AsyncWrite for Handle<File> {
             bufp.clear();
 
             res
+        } else {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        let mut store = &mut self.get_mut().store_file;
+
+        if let Some(mut store_file) = store.as_mut() {
+            let fd: RawFd = store_file.receive_fd();
+            let op_state = store_file.op_state();
+            let (_, pos) = store_file.bufpair();
+
+            let fut = Processor::processor_write_vectored(&fd, bufs);
+            futures_util::pin_mut!(fut);
+
+            loop {
+                match fut.as_mut().poll(cx)? {
+                    Poll::Ready(n) => {
+                        *pos += n;
+                        break Poll::Ready(Ok(n))
+                    }
+                    _ => {}
+                }
+            }
         } else {
             Poll::Ready(Ok(0))
         }
