@@ -1,13 +1,11 @@
 use nuclei::*;
-use std::fs::{File};
+use std::fs::File;
 use std::io;
 use std::path::PathBuf;
-
 
 use futures::io::IoSliceMut;
 
 use futures_util::io::AsyncReadExt;
-
 
 const IOVEC_WIDTH: usize = 1 << 10;
 

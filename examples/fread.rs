@@ -1,9 +1,7 @@
 use nuclei::*;
-use std::fs::{File};
+use std::fs::File;
 use std::io;
 use std::path::PathBuf;
-
-
 
 use futures_util::io::AsyncReadExt;
 
