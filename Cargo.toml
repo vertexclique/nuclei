@@ -54,10 +54,3 @@ agnostik = "0.1.3"
 [target.'cfg(target_os = "linux")'.dependencies]
 iou = { version = "0.0.0-ringbahn.1", optional = true }
 uring-sys = { version = "0.6.1", optional = true }
-
-[dev-dependencies]
-anyhow = "1.0.31"
-async-h1 = "2.0.2"
-async-dup = "1.1.0"
-http-types = "2.2.1"
-num_cpus = "1.13.0"

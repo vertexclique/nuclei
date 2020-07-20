@@ -37,12 +37,12 @@
     </a>
 </div>
 
-Nuclei is a proactive IO system which is runtime agnostic and can work with any runtime. 
+Nuclei is a proactive IO system which is runtime agnostic and can work with any runtime.
 Proactive system's design principles matching to [Boost Asio](https://www.boost.org/doc/libs/1_47_0/doc/html/boost_asio/overview/core/async.html).
 Nuclei is not using reactor, waker system or waking IO. It is completely asynchronous, just because Rust's asynchronous system enforces,
 there is a waker implementation for IO driver.
 
-Nuclei uses [io_uring](https://kernel.dk/io_uring.pdf) on Linux as primary evented IO backend, secondarily you can use 
+Nuclei uses [io_uring](https://kernel.dk/io_uring.pdf) on Linux as primary evented IO backend, secondarily you can use
 [epoll](https://en.wikipedia.org/wiki/Epoll). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
 On Windows, [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend is used.   
 
@@ -59,11 +59,11 @@ Current io_uring implementation needs Linux kernel 5.6+.
 
 ## Configurations
 
-### 
+###
 
 ### Executor
 Executor is by default set to Bastion's executor. If you want to use
-different executor, use one of the available runtimes with one of these features: 
+different executor, you can use one of the available runtimes with one of these features: 
 `bastion`, `asyncstd`, `tokio`, `smol`.
 
 #### License
