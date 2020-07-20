@@ -29,9 +29,9 @@ exclude = [
 ]
 
 [features]
-default = ["bastion", "iouring"]
+#default = ["bastion", "iouring"]
 # Enable this to use epoll on linux.
-#default = ["bastion", "epoll"]
+default = ["bastion", "epoll"]
 epoll = []
 iouring = ["iou", "uring-sys"]
 

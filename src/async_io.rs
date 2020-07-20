@@ -413,6 +413,25 @@ impl AsyncWrite for &Handle<TcpStream> {
 }
 
 ///////////////////////////////////
+///// AsRawFd impls
+///////////////////////////////////
+
+#[cfg(unix)]
+impl<T: AsRawFd> AsRawFd for Handle<T> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.io_task.as_ref().unwrap().as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl<T: IntoRawFd> IntoRawFd for Handle<T> {
+    fn into_raw_fd(self) -> RawFd {
+        self.into_inner().into_raw_fd()
+    }
+}
+
+
+///////////////////////////////////
 ///// UnixStream
 ///////////////////////////////////
 
