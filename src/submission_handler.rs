@@ -1,4 +1,4 @@
-use super::handle::{HandleOpRegisterer};
+use super::handle::HandleOpRegisterer;
 
 use std::marker::PhantomData as marker;
 use std::{
@@ -7,7 +7,6 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use futures::io::Error;
 
 pub struct SubmissionHandler<T>(marker<T>)
 where

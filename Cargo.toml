@@ -31,9 +31,9 @@ autoexamples = false
 
 
 [features]
-#default = ["bastion", "iouring"]
-# Enable this to use epoll on linux.
 default = ["bastion", "epoll"]
+# Devs should enable these features to use iouring on linux.
+#default = ["bastion", "iouring"]
 epoll = []
 iouring = ["iou", "uring-sys"]
 

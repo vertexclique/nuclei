@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::io;
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -44,7 +44,10 @@ impl Processor {
         res
     }
 
-    pub(crate) async fn processor_seek_file<R: AsRawFd>(io: &R, pos: SeekFrom) -> io::Result<usize> {
+    pub(crate) async fn processor_seek_file<R: AsRawFd>(
+        io: &R,
+        pos: SeekFrom,
+    ) -> io::Result<usize> {
         // TODO: (vertexclique): Use blocking here or in the outer environment.
         let mut file = unsafe { File::from_raw_fd(io.as_raw_fd()) };
         let res = file.seek(pos);

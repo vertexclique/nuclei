@@ -1,8 +1,7 @@
 use nuclei::*;
 use std::fs::{File, OpenOptions};
-use std::io;
+
 use std::path::PathBuf;
-use std::time::Duration;
 
 use futures::io::SeekFrom;
 use futures::*;

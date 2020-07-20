@@ -16,10 +16,8 @@ use std::{
     os::unix::prelude::*,
 };
 
-
 use crate::syscore::Processor;
 use futures::AsyncSeek;
-
 
 //
 // Proxy operations for Future registration via AsyncRead, AsyncWrite and others.
@@ -138,7 +136,11 @@ impl AsyncWrite for &Handle<File> {
 
 #[cfg(not(all(feature = "iouring", target_os = "linux")))]
 impl AsyncSeek for Handle<File> {
-    fn poll_seek(self: Pin<&mut Self>, cx: &mut Context<'_>, pos: SeekFrom) -> Poll<io::Result<u64>> {
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<io::Result<u64>> {
         let raw_fd = self.as_raw_fd();
 
         let completion_dispatcher = async move {
@@ -150,7 +152,7 @@ impl AsyncSeek for Handle<File> {
         };
 
         SubmissionHandler::<Self>::handle_read(self, cx, completion_dispatcher)
-            .map(|e| { e.map(|i| i as u64) })
+            .map(|e| e.map(|i| i as u64))
     }
 }
 
@@ -165,14 +167,13 @@ use crate::syscore::StoreFile;
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 use futures::io::{IoSlice, IoSliceMut};
 #[cfg(all(feature = "iouring", target_os = "linux"))]
-use std::path::Path;
-#[cfg(all(feature = "iouring", target_os = "linux"))]
-use std::sync::Arc;
-#[cfg(all(feature = "iouring", target_os = "linux"))]
 use futures::*;
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 use lever::prelude::*;
-
+#[cfg(all(feature = "iouring", target_os = "linux"))]
+use std::path::Path;
+#[cfg(all(feature = "iouring", target_os = "linux"))]
+use std::sync::Arc;
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl Handle<File> {

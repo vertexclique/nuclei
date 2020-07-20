@@ -198,7 +198,7 @@ impl SysProactor {
         for ev in &eventlist {
             // Explanation for ignoring EPIPE: https://github.com/tokio-rs/mio/issues/582
             let (flags, data) = (ev.flags(), ev.data());
-            if (flags & libc::EV_ERROR) == 1
+            if (flags & libc::EV_ERROR) != 0
                 && data != 0
                 && data != libc::ENOENT as _
                 && data != libc::EPIPE as _
@@ -221,7 +221,7 @@ impl SysProactor {
         kevent_ts(self.kqueue_fd, &changelist, &mut eventlist, None)?;
         for ev in &eventlist {
             let (flags, data) = (ev.flags(), ev.data());
-            if (flags & libc::EV_ERROR == 1) && data != 0 && data != libc::ENOENT as _ {
+            if (flags & libc::EV_ERROR != 0) && data != 0 && data != libc::ENOENT as _ {
                 return Err(io::Error::from_raw_os_error(data as _));
             }
         }
@@ -251,7 +251,7 @@ impl SysProactor {
 
         for event in &events[0..res] {
             let (flags, data) = (event.flags(), event.data());
-            if (flags & libc::EV_ERROR) == 1
+            if (flags & libc::EV_ERROR) != 0
                 && data != 0
                 && data != libc::ENOENT as _
                 && data != libc::EPIPE as _
