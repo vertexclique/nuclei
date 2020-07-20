@@ -166,7 +166,38 @@ impl Processor {
         stream_raw.set_nodelay(true)?;
         let stream = Handle::new(stream_raw)?;
 
-        // TODO: Recurse here on Err
+        {
+            let sock = unsafe { socket2::Socket::from_raw_fd(stream.as_raw_fd()) };
+            let sock = ManuallyDrop::new(sock);
+
+            loop {
+                let res = match sock.connect(&addr.into()) {
+                    Ok(res) => Ok(res),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        let cc = Proactor::get()
+                            .inner()
+                            .register_io(stream.as_raw_fd(), (libc::EAGAIN | libc::EINPROGRESS) as _)?;
+                        let events = cc.await?;
+                        if events & (libc::EV_ERROR as usize) != 0 {
+                            // FIXME: (vertexclique): Surely this won't happen, since it is filtered in the evloop.
+                            Err(sock.take_error()?.unwrap())
+                        } else {
+                            sock.connect(&addr.into())
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+
+                match res {
+                    Err(e) => {
+                        if e.raw_os_error().unwrap() ^ libc::EISCONN == 0 {
+                            break;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
 
         match stream.get_ref().take_error()? {
             None => Ok(stream),
