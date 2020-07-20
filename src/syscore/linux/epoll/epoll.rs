@@ -283,7 +283,7 @@ impl SysProactor {
 
         if remove_regs {
             registered.remove(&fd);
-            self.deregister(fd);
+            let _ = self.deregister(fd);
         }
 
         if ack_removal {

@@ -1,11 +1,23 @@
-const IOVEC_WIDTH: usize = 1 << 10;
-
 /// Unfortunately, underlying implementation of writevec have problems.
 /// Ref issue: https://github.com/rust-lang/rust/issues/68041
 /// This should work fine with iouring.
 #[cfg(feature = "iouring")]
 #[test]
 fn write_vectored() {
+    use nuclei::*;
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use futures::io::IoSliceMut;
+    use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt};
+    use futures_util::io::AsyncReadExt;
+    use std::io::{IoSlice, Read, SeekFrom};
+    use std::ops::Deref;
+
+    const IOVEC_WIDTH: usize = 1 << 10;
+
     let x = drive(async {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("testdata");

@@ -353,7 +353,7 @@ impl SysProactor {
 
         if remove_regs {
             regs.remove(&fd);
-            self.deregister(fd);
+            let _ = self.deregister(fd);
         }
 
         if ack_removal {
