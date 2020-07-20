@@ -98,23 +98,17 @@ impl Processor {
         }
     }
 
-    pub(crate) async fn processor_read_vectored<R: AsRawFd>(io: &R, buf: &mut [u8]) -> io::Result<usize> {
-        let fd = io.as_raw_fd() as _;
-        let mut bufs = [IoSliceMut::new(buf)];
-
+    pub(crate) async fn processor_read_vectored(io: &RawFd, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_read_vectored(fd, &mut bufs, 0);
+            sqe.prep_read_vectored(*io, bufs, 0);
         })?;
 
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_write_vectored<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
-        let fd = io.as_raw_fd() as _;
-        let bufs = &[IoSlice::new(buf)];
-
+    pub(crate) async fn processor_write_vectored(io: &RawFd, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_write_vectored(fd, bufs, 0);
+            sqe.prep_write_vectored(*io, bufs, 0);
         })?;
 
         Ok(cc.await? as _)
@@ -225,10 +219,12 @@ impl Processor {
 
         // FIXME: (vcq): iou uses nix, i use socket2, conversions happens over libc.
         // Propose std conversion for nix.
-        let nixsaddr = unsafe {
-            &iou::SockAddr::from_libc_sockaddr(sock.local_addr().unwrap().as_ptr()).unwrap()
-        };
-        let stream = sock.into_tcp_stream();
+        let nixsaddr =
+            unsafe {
+                &iou::SockAddr::from_libc_sockaddr(sock.local_addr().unwrap().as_ptr()).unwrap()
+            };
+        let mut stream = sock.into_tcp_stream();
+        stream.set_nodelay(true)?;
         let fd = stream.as_raw_fd() as _;
 
         Proactor::get()

@@ -1,4 +1,5 @@
 use super::handle::Handle;
+use futures::io::{AsyncRead, AsyncWrite, SeekFrom, ReadVectored, IoSliceMut, IoSlice};
 use super::submission_handler::SubmissionHandler;
 use futures::io::SeekFrom;
 use futures::io::{AsyncRead, AsyncWrite};
@@ -23,9 +24,10 @@ use std::{
 #[cfg(unix)]
 use crate::syscore::Processor;
 use crate::syscore::*;
-use crate::Proactor;
-use futures::{AsyncBufRead, AsyncSeek};
-use futures_util::pending_once;
+use std::sync::Arc;
+use futures::{AsyncBufRead, AsyncSeek, AsyncReadExt};
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use futures_util::{pending_once};
 use lever::prelude::TTas;
 use std::future::Future;
 use std::path::Path;
@@ -179,6 +181,31 @@ impl AsyncRead for Handle<File> {
         self.consume(len);
         Poll::Ready(Ok(len))
     }
+
+    fn poll_read_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &mut [IoSliceMut<'_>]) -> Poll<io::Result<usize>> {
+        let mut store = &mut self.get_mut().store_file;
+
+        if let Some(mut store_file) = store.as_mut() {
+            let fd: RawFd = store_file.receive_fd();
+            let op_state = store_file.op_state();
+            let (_, pos) = store_file.bufpair();
+
+            let fut = Processor::processor_read_vectored(&fd, bufs);
+            futures_util::pin_mut!(fut);
+
+            loop {
+                match fut.as_mut().poll(cx)? {
+                    Poll::Ready(n) => {
+                        *pos += n;
+                        break Poll::Ready(Ok(n))
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            Poll::Ready(Ok(0))
+        }
+    }
 }
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
@@ -251,6 +278,31 @@ impl AsyncWrite for Handle<File> {
             bufp.clear();
 
             res
+        } else {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        let mut store = &mut self.get_mut().store_file;
+
+        if let Some(mut store_file) = store.as_mut() {
+            let fd: RawFd = store_file.receive_fd();
+            let op_state = store_file.op_state();
+            let (_, pos) = store_file.bufpair();
+
+            let fut = Processor::processor_write_vectored(&fd, bufs);
+            futures_util::pin_mut!(fut);
+
+            loop {
+                match fut.as_mut().poll(cx)? {
+                    Poll::Ready(n) => {
+                        *pos += n;
+                        break Poll::Ready(Ok(n))
+                    }
+                    _ => {}
+                }
+            }
         } else {
             Poll::Ready(Ok(0))
         }

@@ -171,7 +171,9 @@ impl Processor {
             }
         })?;
 
-        let stream = Handle::new(sock.into_tcp_stream())?;
+        let mut stream_raw = sock.into_tcp_stream();
+        stream_raw.set_nodelay(true)?;
+        let stream = Handle::new(stream_raw)?;
 
         // TODO: Recurse here on Err
 

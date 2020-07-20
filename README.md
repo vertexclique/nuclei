@@ -46,7 +46,7 @@ Nuclei uses [io_uring](https://kernel.dk/io_uring.pdf) on Linux as primary event
 [epoll](https://en.wikipedia.org/wiki/Epoll). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
 On Windows, [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend is used.   
 
-Current io_uring implementation needs Linux kernel 5.5+.
+Current io_uring implementation needs Linux kernel 5.6+.
 
 ## Features
 
