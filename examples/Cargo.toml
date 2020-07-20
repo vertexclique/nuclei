@@ -1,0 +1,40 @@
+[package]
+name = "nuclei-examples"
+version = "0.0.0"
+authors = ["Mahmut Bulut <vertexclique@gmail.com>"]
+edition = "2018"
+publish = false
+
+[dev-dependencies]
+nuclei = { path = "../" }
+futures = "0.3.5"
+futures-util = "0.3.5"
+anyhow = "1.0.31"
+async-h1 = "2.0.2"
+async-dup = "1.1.0"
+http-types = "2.2.1"
+num_cpus = "1.13.0"
+
+[[example]]
+name = "fread"
+path = "fread.rs"
+
+[[example]]
+name = "fread-vect"
+path = "fread-vect.rs"
+
+[[example]]
+name = "fwrite"
+path = "fwrite.rs"
+
+[[example]]
+name = "fwrite-vect"
+path = "fwrite-vect.rs"
+
+[[example]]
+name = "h1-server"
+path = "h1-server.rs"
+
+[[example]]
+name = "tcp-server"
+path = "tcp-server.rs"
