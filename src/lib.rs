@@ -1,3 +1,11 @@
+//!
+//! # Nuclei
+//!
+//! Proactive IO & runtime system.
+
+// These need to go through time.
+#![allow(dead_code, unused_variables)]
+
 mod async_io;
 mod handle;
 mod proactor;

@@ -1,9 +1,7 @@
 use nuclei::*;
-use std::fs::{File};
-use std::io;
+use std::fs::File;
+
 use std::path::PathBuf;
-
-
 
 use futures_util::io::AsyncReadExt;
 
@@ -17,7 +15,7 @@ fn read_file() {
         let fo = File::open(&path).unwrap();
         let mut file = Handle::<File>::new(fo).unwrap();
         let mut buffer = String::new();
-        file.read_to_string(&mut buffer).await;
+        let _ = file.read_to_string(&mut buffer).await;
         buffer
     });
 

@@ -10,7 +10,6 @@ use std::{
 
 use crate::syscore::{CompletionChan, StoreFile};
 
-
 pub type AsyncOp<T> = Pin<Box<dyn Future<Output = io::Result<T>>>>;
 
 pub trait HandleOpRegisterer {

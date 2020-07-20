@@ -1,13 +1,11 @@
 use nuclei::*;
-use std::fs::{File};
-use std::io;
-use std::path::PathBuf;
+use std::fs::File;
 
+use std::path::PathBuf;
 
 use futures::io::IoSliceMut;
 
 use futures_util::io::AsyncReadExt;
-
 
 const IOVEC_WIDTH: usize = 1 << 10;
 
@@ -34,10 +32,7 @@ fn read_vectored() {
         vec![buf1, buf2, buf3]
     });
 
-    x.iter().enumerate().for_each(|(idx, e)| {
-        assert_eq!(
-            IOVEC_WIDTH,
-            String::from_utf8_lossy(&e[..]).len()
-        );
+    x.iter().enumerate().for_each(|(_idx, e)| {
+        assert_eq!(IOVEC_WIDTH, String::from_utf8_lossy(&e[..]).len());
     });
 }

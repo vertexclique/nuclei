@@ -2,7 +2,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{future::Future, io};
 
-
 use once_cell::sync::Lazy;
 
 use super::syscore::*;
@@ -64,7 +63,8 @@ pub fn drive<T>(future: impl Future<Output = T>) -> T {
 
         cx.waker().wake_by_ref();
 
-        let _duration = Duration::from_millis(1);
-        driver.as_mut().poll(cx);
+        // TODO: (vcq): we don't need this.
+        // let _duration = Duration::from_millis(1);
+        let _ = driver.as_mut().poll(cx);
     }
 }
