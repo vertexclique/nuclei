@@ -38,3 +38,7 @@ path = "h1-server.rs"
 [[example]]
 name = "tcp-server"
 path = "tcp-server.rs"
+
+[[example]]
+name = "tcp-client"
+path = "tcp-client.rs"

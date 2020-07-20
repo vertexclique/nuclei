@@ -15,7 +15,7 @@ use crate::proactor::Proactor;
 use crate::Handle;
 use crate::syscore::shim_to_af_unix;
 use std::io::{IoSliceMut, IoSlice};
-use iou::{SockFlag, SockAddrStorage};
+use iou::{SockFlag, SockAddrStorage, InetAddr, SockAddr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::ffi::CString;
@@ -188,31 +188,28 @@ impl Processor {
     pub(crate) async fn processor_connect_tcp(addr: SocketAddr) -> io::Result<Handle<TcpStream>> {
         let addr = addr.to_string();
         // FIXME: address resolution is always blocking.
-        let addr = addr.to_socket_addrs()?.next().ok_or_else(|| {
+        let addr: SocketAddr = addr.to_socket_addrs()?.next().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "could not resolve the address")
         })?;
 
-        let domain = if addr.is_ipv6() {
-            socket2::Domain::ipv6()
+        let (domain, so) = if addr.is_ipv6() {
+            (socket2::Domain::ipv6(), InetAddr::from_std(&addr))
         } else {
-            socket2::Domain::ipv4()
+            (socket2::Domain::ipv4(), InetAddr::from_std(&addr))
         };
+
         let sock = socket2::Socket::new(domain, socket2::Type::stream(), Some(socket2::Protocol::tcp()))?;
 
         sock.set_nonblocking(true)?;
 
-        // FIXME: (vcq): iou uses nix, i use socket2, conversions happens over libc.
-        // Propose std conversion for nix.
-        let nixsaddr =
-            unsafe {
-                &iou::SockAddr::from_libc_sockaddr(sock.local_addr().unwrap().as_ptr()).unwrap()
-            };
+        let nixsaddr = SockAddr::new_inet(so);
+
         let mut stream = sock.into_tcp_stream();
         stream.set_nodelay(true)?;
         let fd = stream.as_raw_fd() as _;
 
         Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_connect(fd, nixsaddr);
+            sqe.prep_connect(fd, &nixsaddr);
         })?.await?;
 
         Ok(Handle::new(stream)?)
@@ -463,7 +460,7 @@ impl Processor {
 
         sock.set_nonblocking(true)?;
 
-        // FIXME: (vcq): iou uses nix, i use socket2, conversions happens over libc.
+        // FIXME: (vcq): uring lib uses nix, i use socket2, conversions happens over libc.
         // Propose std conversion for nix.
         let nixsaddr =
             unsafe {
