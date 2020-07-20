@@ -11,10 +11,11 @@ use futures_util::io::AsyncReadExt;
 
 const IOVEC_WIDTH: usize = 1 << 10;
 
-fn main() -> io::Result<()> {
+#[test]
+fn read_vectored() {
     let x = drive(async {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("data");
+        path.push("testdata");
         path.push("quark-gluon-plasma");
 
         let mut buf1 = [0; IOVEC_WIDTH];
@@ -34,12 +35,9 @@ fn main() -> io::Result<()> {
     });
 
     x.iter().enumerate().for_each(|(idx, e)| {
-        println!(
-            "::: iovec ::: {}, data ::: \n\n{}\n\n",
-            idx,
-            String::from_utf8_lossy(&e[..])
+        assert_eq!(
+            IOVEC_WIDTH,
+            String::from_utf8_lossy(&e[..]).len()
         );
     });
-
-    Ok(())
 }

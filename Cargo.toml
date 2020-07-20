@@ -27,6 +27,8 @@ exclude = [
 	"*.toml",
 	"*.md"
 ]
+autoexamples = false
+
 
 [features]
 #default = ["bastion", "iouring"]
@@ -54,3 +56,10 @@ agnostik = "0.1.3"
 [target.'cfg(target_os = "linux")'.dependencies]
 iou = { version = "0.0.0-ringbahn.1", optional = true }
 uring-sys = { version = "0.6.1", optional = true }
+
+
+[workspace]
+members = [
+  ".",
+  "examples",
+]

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::io::SeekFrom;
-use futures::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use futures::*;
 
 const DARK_MATTER_TEXT: &'static str = "\
 Dark matter is a form of matter thought to account for approximately \
@@ -22,13 +22,14 @@ to detect.[1]\
 \
 ";
 
-fn main() -> io::Result<()> {
+#[test]
+fn write_file() {
     // Approximately ~75,9 MB
     let dark_matter = vec![DARK_MATTER_TEXT; 100_000].join("\n");
 
     let x = drive(async {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("data");
+        path.push("testdata");
         path.push("dark-matter");
 
         let fo = OpenOptions::new()
@@ -46,7 +47,5 @@ fn main() -> io::Result<()> {
         buf
     });
 
-    println!("Length of file is {}", x.len());
-
-    Ok(())
+    assert_eq!(75899999, x.len());
 }

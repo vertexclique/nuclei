@@ -51,15 +51,30 @@ Current io_uring implementation needs Linux kernel 5.6+.
 ## Features
 
 * Async TCP, UDP, Unix domain sockets and files...
-* Proactor system doesn't block at all. So no blocking pool needed.
+* Proactor system don't block.
 * Scatter/Gather operations
-* Less allocation than any other runtime.
+* Minimal allocation as much as possible.
 * More expressive than any other runtime.
 * Completely asynchronous I/O system with lock free programming.
 
+## Examples
+Please head to `examples` directory to run examples:
+```shell script
+$ cd examples
+$ cargo run --example fread-vect
+```
+
+## Tests
+
+```shell script
+$ cargo test --no-default-features --features=iouring # For iouring
+$ cargo test # For others
+```
+
 ## Configurations
 
-###
+### Evented IO backend
+When `iouring` feature gate is not enabled. On Linux `epoll` would be used.
 
 ### Executor
 Executor is by default set to Bastion's executor. If you want to use

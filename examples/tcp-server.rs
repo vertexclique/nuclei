@@ -1,6 +1,6 @@
+use futures::io;
 use nuclei::*;
 use std::net::{TcpListener, TcpStream};
-use futures::io;
 
 async fn echo(stream: Handle<TcpStream>) -> io::Result<()> {
     io::copy(&stream, &mut &stream).await?;

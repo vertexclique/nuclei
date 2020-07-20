@@ -1,10 +1,10 @@
-mod handle;
-mod submission_handler;
 mod async_io;
-mod sys;
-mod waker;
+mod handle;
 mod proactor;
+mod submission_handler;
+mod sys;
 mod utils;
+mod waker;
 
 #[cfg(not(any(
     target_os = "linux",     // epoll, iouring
@@ -19,7 +19,6 @@ mod utils;
     target_os = "windows",   // iocp
 )))]
 compile_error!("Target OS is not supported");
-
 
 #[cfg(any(
     target_os = "macos",
@@ -46,5 +45,5 @@ mod syscore {
     pub(crate) use windows::*;
 }
 
-pub use proactor::*;
 pub use agnostik::*;
+pub use proactor::*;

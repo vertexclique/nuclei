@@ -25,18 +25,27 @@ impl Cancellation {
     /// as well.
     ///
     /// It must be safe to send the Cancellation type and references to it between threads.
-    pub unsafe fn new(data: *mut (), metadata: usize, drop: unsafe fn(*mut (), usize))
-                      -> Cancellation
-    {
-        Cancellation { data, metadata, drop }
+    pub unsafe fn new(
+        data: *mut (),
+        metadata: usize,
+        drop: unsafe fn(*mut (), usize),
+    ) -> Cancellation {
+        Cancellation {
+            data,
+            metadata,
+            drop,
+        }
     }
 
     /// Construct a null cancellation, which does nothing when it is dropped.
     pub fn null() -> Cancellation {
-        unsafe fn drop(_: *mut (), _: usize) { }
-        Cancellation { data: ptr::null_mut(), metadata: 0, drop }
+        unsafe fn drop(_: *mut (), _: usize) {}
+        Cancellation {
+            data: ptr::null_mut(),
+            metadata: 0,
+            drop,
+        }
     }
-
 
     pub(crate) unsafe fn buffer(data: *mut u8, len: usize) -> Cancellation {
         unsafe fn drop(data: *mut (), len: usize) {
@@ -47,13 +56,11 @@ impl Cancellation {
     }
 }
 
-unsafe impl Send for Cancellation { }
-unsafe impl Sync for Cancellation { }
+unsafe impl Send for Cancellation {}
+unsafe impl Sync for Cancellation {}
 
 impl Drop for Cancellation {
     fn drop(&mut self) {
-        unsafe {
-            (self.drop)(self.data, self.metadata)
-        }
+        unsafe { (self.drop)(self.data, self.metadata) }
     }
 }

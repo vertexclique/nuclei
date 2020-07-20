@@ -7,10 +7,11 @@ use std::path::PathBuf;
 
 use futures_util::io::AsyncReadExt;
 
-fn main() -> io::Result<()> {
+#[test]
+fn read_file() {
     let x = drive(async {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("data");
+        path.push("testdata");
         path.push("quark-gluon-plasma");
 
         let fo = File::open(&path).unwrap();
@@ -20,8 +21,5 @@ fn main() -> io::Result<()> {
         buffer
     });
 
-    // println!("Content: {}", x);
-    println!("Length of file is {}", x.len());
-
-    Ok(())
+    assert_eq!(11587, x.len());
 }

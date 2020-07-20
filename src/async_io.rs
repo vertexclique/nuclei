@@ -1,28 +1,25 @@
-use std::{io, task};
-use std::{task::Poll, fs::File, pin::Pin, task::Context};
 use super::handle::Handle;
-use futures::io::{AsyncRead, AsyncWrite, SeekFrom, ReadVectored, IoSliceMut, IoSlice};
 use super::submission_handler::SubmissionHandler;
-use std::io::Read;
+use futures::io::{AsyncRead, AsyncWrite, SeekFrom};
 
-use std::net::{TcpStream};
+use std::{fs::File, pin::Pin, task::Context, task::Poll};
+use std::{io, task};
+
+use std::net::TcpStream;
 
 #[cfg(unix)]
-use std::{mem::ManuallyDrop, os::unix::io::{AsRawFd, RawFd, FromRawFd}, os::unix::prelude::*};
+use std::os::unix::net::UnixStream;
 #[cfg(unix)]
-use std::os::unix::net::{UnixStream};
+use std::{
+    mem::ManuallyDrop,
+    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::unix::prelude::*,
+};
 
-use std::future::Future;
 
 use crate::syscore::Processor;
-use crate::syscore::*;
-use std::sync::Arc;
-use futures::{AsyncBufRead, AsyncSeek, AsyncReadExt};
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-use futures_util::{pending_once};
-use lever::prelude::TTas;
-use crate::Proactor;
-use std::path::Path;
+use futures::AsyncSeek;
+
 
 //
 // Proxy operations for Future registration via AsyncRead, AsyncWrite and others.
@@ -39,7 +36,7 @@ macro_rules! impl_async_read {
                 Pin::new(&mut &*Pin::get_mut(self)).poll_read(cx, buf)
             }
         }
-    }
+    };
 }
 
 macro_rules! impl_async_write {
@@ -61,7 +58,7 @@ macro_rules! impl_async_write {
                 Pin::new(&mut &*Pin::get_mut(self)).poll_close(cx)
             }
         }
-    }
+    };
 }
 
 #[cfg(not(all(feature = "iouring", target_os = "linux")))]
@@ -77,14 +74,17 @@ impl_async_read!(UnixStream);
 #[cfg(unix)]
 impl_async_write!(UnixStream);
 
-
 ///////////////////////////////////
 ///// Non proactive File
 ///////////////////////////////////
 
 #[cfg(not(all(feature = "iouring", target_os = "linux")))]
 impl AsyncRead for &Handle<File> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let raw_fd = self.as_raw_fd();
         let buf_len = buf.len();
         let buf = buf.as_mut_ptr();
@@ -105,7 +105,11 @@ impl AsyncRead for &Handle<File> {
 
 #[cfg(not(all(feature = "iouring", target_os = "linux")))]
 impl AsyncWrite for &Handle<File> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let raw_fd = self.as_raw_fd();
         let buf_len = buf.len();
         let buf = buf.as_ptr();
@@ -123,19 +127,52 @@ impl AsyncWrite for &Handle<File> {
         SubmissionHandler::<Self>::handle_write(self, cx, completion_dispatcher)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
 
+#[cfg(not(all(feature = "iouring", target_os = "linux")))]
+impl AsyncSeek for Handle<File> {
+    fn poll_seek(self: Pin<&mut Self>, cx: &mut Context<'_>, pos: SeekFrom) -> Poll<io::Result<u64>> {
+        let raw_fd = self.as_raw_fd();
+
+        let completion_dispatcher = async move {
+            let file = unsafe { File::from_raw_fd(raw_fd) };
+            let newpos = Processor::processor_seek_file(&file, pos).await?;
+
+            let _ = ManuallyDrop::new(file);
+            Ok(newpos)
+        };
+
+        SubmissionHandler::<Self>::handle_read(self, cx, completion_dispatcher)
+            .map(|e| { e.map(|i| i as u64) })
+    }
+}
 
 ///////////////////////////////////
 ///// IO URING / Proactive / Linux
 ///////////////////////////////////
+
+// Import stream for io_uring,
+
+#[cfg(all(feature = "iouring", target_os = "linux"))]
+use crate::syscore::StoreFile;
+#[cfg(all(feature = "iouring", target_os = "linux"))]
+use futures::io::{IoSlice, IoSliceMut};
+#[cfg(all(feature = "iouring", target_os = "linux"))]
+use std::path::Path;
+#[cfg(all(feature = "iouring", target_os = "linux"))]
+use std::sync::Arc;
+#[cfg(all(feature = "iouring", target_os = "linux"))]
+use futures::*;
+#[cfg(all(feature = "iouring", target_os = "linux"))]
+use lever::prelude::*;
+
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl Handle<File> {
@@ -153,17 +190,24 @@ impl Handle<File> {
     }
 }
 
-
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncRead for Handle<File> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let mut inner = futures::ready!(self.as_mut().poll_fill_buf(cx))?;
         let len = io::Read::read(&mut inner, buf)?;
         self.consume(len);
         Poll::Ready(Ok(len))
     }
 
-    fn poll_read_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &mut [IoSliceMut<'_>]) -> Poll<io::Result<usize>> {
+    fn poll_read_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
         let mut store = &mut self.get_mut().store_file;
 
         if let Some(mut store_file) = store.as_mut() {
@@ -178,7 +222,7 @@ impl AsyncRead for Handle<File> {
                 match fut.as_mut().poll(cx)? {
                     Poll::Ready(n) => {
                         *pos += n;
-                        break Poll::Ready(Ok(n))
+                        break Poll::Ready(Ok(n));
                     }
                     _ => {}
                 }
@@ -210,7 +254,7 @@ impl AsyncBufRead for Handle<File> {
                     match fut.as_mut().poll(cx)? {
                         Poll::Ready(n) => {
                             *pos += n;
-                            break Poll::Ready(Ok(n))
+                            break Poll::Ready(Ok(n));
                         }
                         _ => {}
                     }
@@ -227,10 +271,13 @@ impl AsyncBufRead for Handle<File> {
     }
 }
 
-
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncWrite for Handle<File> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, bufslice: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufslice: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let mut store = &mut self.get_mut().store_file;
 
         if let Some(mut store_file) = store.as_mut() {
@@ -240,7 +287,8 @@ impl AsyncWrite for Handle<File> {
 
             let data = futures::ready!(bufp.fill_buf(|mut buf| {
                 Poll::Ready(Ok(io::Write::write(&mut buf, bufslice).unwrap()))
-            })).unwrap();
+            }))
+            .unwrap();
 
             let res = {
                 let fut = Processor::processor_write_file(&fd, data, *pos);
@@ -250,7 +298,7 @@ impl AsyncWrite for Handle<File> {
                     match fut.as_mut().poll(cx)? {
                         Poll::Ready(n) => {
                             *pos += n;
-                            break Poll::Ready(Ok(n))
+                            break Poll::Ready(Ok(n));
                         }
                         _ => {}
                     }
@@ -265,7 +313,11 @@ impl AsyncWrite for Handle<File> {
         }
     }
 
-    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
         let mut store = &mut self.get_mut().store_file;
 
         if let Some(mut store_file) = store.as_mut() {
@@ -280,7 +332,7 @@ impl AsyncWrite for Handle<File> {
                 match fut.as_mut().poll(cx)? {
                     Poll::Ready(n) => {
                         *pos += n;
-                        break Poll::Ready(Ok(n))
+                        break Poll::Ready(Ok(n));
                     }
                     _ => {}
                 }
@@ -307,9 +359,7 @@ impl AsyncWrite for Handle<File> {
 
             loop {
                 match fut.as_mut().poll(cx)? {
-                    Poll::Ready(_) => {
-                        break Poll::Ready(Ok(()))
-                    }
+                    Poll::Ready(_) => break Poll::Ready(Ok(())),
                     _ => {}
                 }
             }
@@ -321,23 +371,27 @@ impl AsyncWrite for Handle<File> {
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncSeek for Handle<File> {
-    fn poll_seek(self: Pin<&mut Self>, cx: &mut Context<'_>, pos: SeekFrom) -> Poll<io::Result<u64>> {
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<io::Result<u64>> {
         let mut store = &mut self.get_mut().store_file.as_mut().unwrap();
 
-        let (whence, offset) = match pos {
+        let (cursor, offset) = match pos {
             io::SeekFrom::Start(n) => {
                 *store.pos() = n as usize;
                 return Poll::Ready(Ok(*store.pos() as u64));
             }
             io::SeekFrom::Current(n) => (*store.pos(), n),
-            io::SeekFrom::End(n)     => {
+            io::SeekFrom::End(n) => {
                 let fut = store.poll_file_size();
                 futures::pin_mut!(fut);
                 (futures::ready!(fut.as_mut().poll(cx))?, n)
             }
         };
         let valid_seek = if offset.is_negative() {
-            match whence.checked_sub(offset.abs() as usize) {
+            match cursor.checked_sub(offset.abs() as usize) {
                 Some(valid_seek) => valid_seek,
                 None => {
                     let invalid = io::Error::from(io::ErrorKind::InvalidInput);
@@ -345,7 +399,7 @@ impl AsyncSeek for Handle<File> {
                 }
             }
         } else {
-            match whence.checked_add(offset as usize) {
+            match cursor.checked_add(offset as usize) {
                 Some(valid_seek) => valid_seek,
                 None => {
                     let overflow = io::Error::from_raw_os_error(libc::EOVERFLOW);
@@ -364,7 +418,11 @@ impl AsyncSeek for Handle<File> {
 
 #[cfg(unix)]
 impl AsyncRead for &Handle<TcpStream> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let raw_fd = self.as_raw_fd();
         let buf_len = buf.len();
         let buf = buf.as_mut_ptr();
@@ -430,7 +488,6 @@ impl<T: IntoRawFd> IntoRawFd for Handle<T> {
     }
 }
 
-
 ///////////////////////////////////
 ///// UnixStream
 ///////////////////////////////////
@@ -462,11 +519,7 @@ impl AsyncRead for &Handle<UnixStream> {
 
 #[cfg(unix)]
 impl AsyncWrite for &Handle<UnixStream> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         let raw_fd = self.as_raw_fd();
         let buf_len = buf.len();
         let buf = buf.as_ptr();

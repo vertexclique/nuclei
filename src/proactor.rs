@@ -1,8 +1,8 @@
+use std::task::{Context, Poll};
 use std::time::Duration;
-use std::task::{Poll, Context};
-use std::{pin::Pin, future::Future, io};
+use std::{future::Future, io};
 
-use lever::prelude::*;
+
 use once_cell::sync::Lazy;
 
 use super::syscore::*;
@@ -18,9 +18,8 @@ pub struct Proactor(SysProactor);
 impl Proactor {
     /// Returns a reference to the proactor.
     pub fn get() -> &'static Proactor {
-        static PROACTOR: Lazy<Proactor> = Lazy::new(|| Proactor(
-            SysProactor::new().expect("cannot initialize poll backend")
-        ));
+        static PROACTOR: Lazy<Proactor> =
+            Lazy::new(|| Proactor(SysProactor::new().expect("cannot initialize poll backend")));
 
         &PROACTOR
     }
@@ -52,10 +51,8 @@ pub fn drive<T>(future: impl Future<Output = T>) -> T {
     let cx = &mut Context::from_waker(&waker);
     futures_util::pin_mut!(future);
 
-    let driver = spawn_blocking(move || {
-        loop {
-            let _ = p.wait(1, None);
-        }
+    let driver = spawn_blocking(move || loop {
+        let _ = p.wait(1, None);
     });
 
     futures_util::pin_mut!(driver);
@@ -67,7 +64,7 @@ pub fn drive<T>(future: impl Future<Output = T>) -> T {
 
         cx.waker().wake_by_ref();
 
-        let duration = Duration::from_millis(1);
+        let _duration = Duration::from_millis(1);
         driver.as_mut().poll(cx);
     }
 }
