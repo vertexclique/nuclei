@@ -106,12 +106,9 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_write_vectored<R: AsRawFd>(io: &R, buf: &[u8]) -> io::Result<usize> {
-        let fd = io.as_raw_fd() as _;
-        let bufs = &[IoSlice::new(buf)];
-
+    pub(crate) async fn processor_write_vectored(io: &RawFd, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-            sqe.prep_write_vectored(fd, bufs, 0);
+            sqe.prep_write_vectored(*io, bufs, 0);
         })?;
 
         Ok(cc.await? as _)
