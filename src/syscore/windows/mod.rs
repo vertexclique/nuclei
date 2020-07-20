@@ -1,2 +1,2 @@
-mod nethandle;
-mod iocp;
+pub mod iocp;
+pub mod nethandle;

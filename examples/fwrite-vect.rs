@@ -1,14 +1,14 @@
 use nuclei::*;
-use std::io;
-use std::time::Duration;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use futures::{AsyncRead, AsyncWriteExt, AsyncSeek, AsyncSeekExt};
-use futures_util::io::AsyncReadExt;
 use futures::io::IoSliceMut;
-use std::ops::Deref;
+use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt};
+use futures_util::io::AsyncReadExt;
 use std::io::{IoSlice, Read, SeekFrom};
+use std::ops::Deref;
 
 const IOVEC_WIDTH: usize = 1 << 10;
 
@@ -27,7 +27,11 @@ fn main() -> io::Result<()> {
             IoSlice::new(&buf3),
         ];
 
-        let fo = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let fo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let mut file = Handle::<File>::new(fo).unwrap();
         file.write_vectored(&bufs[..]).await.unwrap();
 

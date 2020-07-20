@@ -1,19 +1,27 @@
-use std::{io, task};
-use std::{task::Poll, fs::File, pin::Pin, task::Context};
 use super::handle::Handle;
 use futures::io::{AsyncRead, AsyncWrite, SeekFrom, ReadVectored, IoSliceMut, IoSlice};
 use super::submission_handler::SubmissionHandler;
+use futures::io::SeekFrom;
+use futures::io::{AsyncRead, AsyncWrite};
 use std::io::Read;
+use std::{fs::File, pin::Pin, task::Context, task::Poll};
+use std::{io, task};
 
-use std::net::{TcpStream};
+use std::net::TcpStream;
 
 #[cfg(unix)]
-use std::{mem::ManuallyDrop, os::unix::io::{AsRawFd, RawFd, FromRawFd}, os::unix::prelude::*};
+use std::{
+    mem::ManuallyDrop,
+    os::unix::io::{AsRawFd, FromRawFd},
+};
 #[cfg(unix)]
-use std::os::unix::net::{UnixStream};
+use std::{
+    mem::ManuallyDrop,
+    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::unix::prelude::*,
+};
 
-use std::future::Future;
-
+#[cfg(unix)]
 use crate::syscore::Processor;
 use crate::syscore::*;
 use std::sync::Arc;
@@ -21,8 +29,10 @@ use futures::{AsyncBufRead, AsyncSeek, AsyncReadExt};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use futures_util::{pending_once};
 use lever::prelude::TTas;
-use crate::Proactor;
+use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 //
 // Proxy operations for Future registration via AsyncRead, AsyncWrite and others.
@@ -39,7 +49,7 @@ macro_rules! impl_async_read {
                 Pin::new(&mut &*Pin::get_mut(self)).poll_read(cx, buf)
             }
         }
-    }
+    };
 }
 
 macro_rules! impl_async_write {
@@ -61,12 +71,12 @@ macro_rules! impl_async_write {
                 Pin::new(&mut &*Pin::get_mut(self)).poll_close(cx)
             }
         }
-    }
+    };
 }
 
-#[cfg(not(all(feature = "iouring", target_os = "linux")))]
+#[cfg(all(not(feature = "iouring"), target_os = "linux"))]
 impl_async_read!(File);
-#[cfg(not(all(feature = "iouring", target_os = "linux")))]
+#[cfg(all(not(feature = "iouring"), target_os = "linux"))]
 impl_async_write!(File);
 
 impl_async_read!(TcpStream);
@@ -77,14 +87,17 @@ impl_async_read!(UnixStream);
 #[cfg(unix)]
 impl_async_write!(UnixStream);
 
-
 ///////////////////////////////////
 ///// Non proactive File
 ///////////////////////////////////
 
-#[cfg(not(all(feature = "iouring", target_os = "linux")))]
+#[cfg(all(not(feature = "iouring"), target_os = "linux"))]
 impl AsyncRead for &Handle<File> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let raw_fd = self.as_raw_fd();
         let buf_len = buf.len();
         let buf = buf.as_mut_ptr();
@@ -103,9 +116,13 @@ impl AsyncRead for &Handle<File> {
     }
 }
 
-#[cfg(not(all(feature = "iouring", target_os = "linux")))]
+#[cfg(all(not(feature = "iouring"), target_os = "linux"))]
 impl AsyncWrite for &Handle<File> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let raw_fd = self.as_raw_fd();
         let buf_len = buf.len();
         let buf = buf.as_ptr();
@@ -132,7 +149,6 @@ impl AsyncWrite for &Handle<File> {
     }
 }
 
-
 ///////////////////////////////////
 ///// IO URING / Proactive / Linux
 ///////////////////////////////////
@@ -153,10 +169,13 @@ impl Handle<File> {
     }
 }
 
-
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncRead for Handle<File> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let mut inner = futures::ready!(self.as_mut().poll_fill_buf(cx))?;
         let len = io::Read::read(&mut inner, buf)?;
         self.consume(len);
@@ -210,7 +229,7 @@ impl AsyncBufRead for Handle<File> {
                     match fut.as_mut().poll(cx)? {
                         Poll::Ready(n) => {
                             *pos += n;
-                            break Poll::Ready(Ok(n))
+                            break Poll::Ready(Ok(n));
                         }
                         _ => {}
                     }
@@ -226,7 +245,6 @@ impl AsyncBufRead for Handle<File> {
         store.buf().consume(amt);
     }
 }
-
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncWrite for Handle<File> {
@@ -321,7 +339,11 @@ impl AsyncWrite for Handle<File> {
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncSeek for Handle<File> {
-    fn poll_seek(self: Pin<&mut Self>, cx: &mut Context<'_>, pos: SeekFrom) -> Poll<io::Result<u64>> {
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<io::Result<u64>> {
         let mut store = &mut self.get_mut().store_file.as_mut().unwrap();
 
         let (whence, offset) = match pos {
@@ -330,7 +352,7 @@ impl AsyncSeek for Handle<File> {
                 return Poll::Ready(Ok(*store.pos() as u64));
             }
             io::SeekFrom::Current(n) => (*store.pos(), n),
-            io::SeekFrom::End(n)     => {
+            io::SeekFrom::End(n) => {
                 let fut = store.poll_file_size();
                 futures::pin_mut!(fut);
                 (futures::ready!(fut.as_mut().poll(cx))?, n)
@@ -364,7 +386,11 @@ impl AsyncSeek for Handle<File> {
 
 #[cfg(unix)]
 impl AsyncRead for &Handle<TcpStream> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let raw_fd = self.as_raw_fd();
         let buf_len = buf.len();
         let buf = buf.as_mut_ptr();
@@ -443,11 +469,7 @@ impl AsyncRead for &Handle<UnixStream> {
 
 #[cfg(unix)]
 impl AsyncWrite for &Handle<UnixStream> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         let raw_fd = self.as_raw_fd();
         let buf_len = buf.len();
         let buf = buf.as_ptr();

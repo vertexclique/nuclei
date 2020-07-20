@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use core::mem::{self, ManuallyDrop};
 use core::task::{RawWaker, RawWakerVTable, Waker};
+use std::sync::Arc;
 
 /// Creates a waker from a wake function.
 ///

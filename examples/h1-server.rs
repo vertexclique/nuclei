@@ -2,10 +2,10 @@ use nuclei::*;
 use std::net::TcpListener;
 
 use anyhow::Result;
-use futures::prelude::*;
-use http_types::{Request, Response, StatusCode};
 use async_dup::Arc;
 use futures::pending;
+use futures::prelude::*;
+use http_types::{Request, Response, StatusCode};
 
 /// Serves a request and returns a response.
 async fn serve(req: Request) -> http_types::Result<Response> {
@@ -30,7 +30,7 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
         // Spawn a background task serving this connection.
         let stream = Arc::new(stream);
         spawn(async move {
-            if let Err(err) = async_h1::accept( stream, serve).await {
+            if let Err(err) = async_h1::accept(stream, serve).await {
                 println!("Connection error: {:#?}", err);
             }
         });

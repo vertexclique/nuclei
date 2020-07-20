@@ -1,12 +1,12 @@
 use nuclei::*;
-use std::io;
-use std::time::Duration;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Duration;
 
 use futures::AsyncRead;
 use futures_util::io::AsyncReadExt;
-
 
 fn main() -> io::Result<()> {
     let x = drive(async {
