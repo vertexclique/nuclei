@@ -20,34 +20,38 @@ impl Processor {
     ///// Synchronous File
     ///////////////////////////////////
 
-    pub(crate) async fn processor_read_file<R: AsRawHandle>(
-        io: &R,
-        buf: &mut [u8],
-    ) -> io::Result<usize> {
+    pub(crate) async fn processor_read_file<R>(io: &mut R, mut buf: &mut [u8]) -> io::Result<usize>
+    where
+        R: std::io::Read + AsRawHandle + Send,
+    {
         let fd = io.as_raw_handle();
-        let bufs = &[IoSlice::new(buf)];
-
-        let mut cc = Proactor::get().inner().register_io(fd)?;
+        let mut cc = Proactor::get().inner().register_io(fd, || {
+            // copy io into bufs
+            io.read(&mut buf);
+        })?;
 
         Ok(cc
-            .try_recv()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-            .unwrap_or(0))
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?)
     }
 
     pub(crate) async fn processor_write_file<R: AsRawHandle>(
-        io: &R,
-        buf: &[u8],
-    ) -> io::Result<usize> {
+        io: &mut R,
+        mut buf: &mut [u8],
+    ) -> io::Result<usize>
+    where
+        R: std::io::Write + AsRawHandle + Send,
+    {
         let fd = io.as_raw_handle();
         let bufs = &[IoSlice::new(buf)];
 
-        let mut cc = Proactor::get().inner().register_io(fd)?;
+        let mut cc = Proactor::get().inner().register_io(fd, || {
+            io.write_all(&mut buf);
+        })?;
 
         Ok(cc
-            .try_recv()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-            .unwrap_or(0))
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?)
     }
 
     // ///////////////////////////////////

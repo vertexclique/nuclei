@@ -14,10 +14,10 @@ use futures::Stream;
 use lever::sync::prelude::*;
 
 use super::Processor;
-use crate::syscore::CompletionChan;
 use crate::syscore::linux::iouring::fs::store_file::StoreFile;
-use std::fs::File;
+use crate::syscore::CompletionChan;
 use crate::{Handle, Proactor};
+use std::fs::File;
 
 impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {

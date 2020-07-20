@@ -17,10 +17,10 @@ use crate::proactor::Proactor;
 use crate::syscore::shim_to_af_unix;
 use crate::Handle;
 use iou::{SockAddrStorage, SockFlag};
+use std::ffi::CString;
 use std::io::{IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::ffi::CString;
 use std::os::unix::prelude::RawFd;
 
 macro_rules! syscall {
@@ -58,7 +58,11 @@ impl Processor {
         Ok(x)
     }
 
-    pub(crate) async fn processor_read_file(io: &RawFd, buf: &mut [u8], offset: usize) -> io::Result<usize> {
+    pub(crate) async fn processor_read_file(
+        io: &RawFd,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
             sqe.prep_read(*io, buf, offset);
         })?;
@@ -66,7 +70,11 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_write_file(io: &RawFd, buf: &[u8], offset: usize) -> io::Result<usize> {
+    pub(crate) async fn processor_write_file(
+        io: &RawFd,
+        buf: &[u8],
+        offset: usize,
+    ) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
             sqe.prep_write(*io, buf, offset);
         })?;
@@ -83,22 +91,29 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_file_size(io: &RawFd, statx: *mut libc::statx) -> io::Result<usize> {
+    pub(crate) async fn processor_file_size(
+        io: &RawFd,
+        statx: *mut libc::statx,
+    ) -> io::Result<usize> {
         static EMPTY: libc::c_char = 0;
         let flags = libc::AT_EMPTY_PATH;
         let mask = libc::STATX_SIZE;
 
-        Proactor::get().inner().register_io(|sqe| unsafe {
-            let sqep = sqe.raw_mut();
-            uring_sys::io_uring_prep_statx(sqep, *io, &EMPTY, flags, mask, statx);
-        })?.await?;
+        Proactor::get()
+            .inner()
+            .register_io(|sqe| unsafe {
+                let sqep = sqe.raw_mut();
+                uring_sys::io_uring_prep_statx(sqep, *io, &EMPTY, flags, mask, statx);
+            })?
+            .await?;
 
-        unsafe {
-            Ok((*statx).stx_size as usize)
-        }
+        unsafe { Ok((*statx).stx_size as usize) }
     }
 
-    pub(crate) async fn processor_read_vectored(io: &RawFd, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+    pub(crate) async fn processor_read_vectored(
+        io: &RawFd,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
             sqe.prep_read_vectored(*io, bufs, 0);
         })?;
@@ -106,7 +121,10 @@ impl Processor {
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_write_vectored(io: &RawFd, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+    pub(crate) async fn processor_write_vectored(
+        io: &RawFd,
+        bufs: &[IoSlice<'_>],
+    ) -> io::Result<usize> {
         let cc = Proactor::get().inner().register_io(|sqe| unsafe {
             sqe.prep_write_vectored(*io, bufs, 0);
         })?;
@@ -219,10 +237,9 @@ impl Processor {
 
         // FIXME: (vcq): iou uses nix, i use socket2, conversions happens over libc.
         // Propose std conversion for nix.
-        let nixsaddr =
-            unsafe {
-                &iou::SockAddr::from_libc_sockaddr(sock.local_addr().unwrap().as_ptr()).unwrap()
-            };
+        let nixsaddr = unsafe {
+            &iou::SockAddr::from_libc_sockaddr(sock.local_addr().unwrap().as_ptr()).unwrap()
+        };
         let mut stream = sock.into_tcp_stream();
         stream.set_nodelay(true)?;
         let fd = stream.as_raw_fd() as _;

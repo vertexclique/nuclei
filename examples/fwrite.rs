@@ -1,11 +1,11 @@
 use nuclei::*;
-use std::io;
-use std::time::Duration;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, AsyncSeek, AsyncSeekExt};
 use futures::io::SeekFrom;
+use futures::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 const DARK_MATTER_TEXT: &'static str = "\
 Dark matter is a form of matter thought to account for approximately \
@@ -31,7 +31,11 @@ fn main() -> io::Result<()> {
         path.push("data");
         path.push("dark-matter");
 
-        let fo = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let fo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let mut file = Handle::<File>::new(fo).unwrap();
         file.write_all(dark_matter.as_bytes()).await.unwrap();
 

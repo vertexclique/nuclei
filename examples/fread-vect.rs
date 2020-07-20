@@ -1,12 +1,12 @@
 use nuclei::*;
-use std::io;
-use std::time::Duration;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use futures::io::IoSliceMut;
 use futures::AsyncRead;
 use futures_util::io::AsyncReadExt;
-use futures::io::IoSliceMut;
 use std::ops::Deref;
 
 const IOVEC_WIDTH: usize = 1 << 10;
@@ -30,18 +30,16 @@ fn main() -> io::Result<()> {
         let mut file = Handle::<File>::new(fo).unwrap();
         file.read_vectored(&mut bufs[..]).await.unwrap();
 
-        vec![
-            buf1,
-            buf2,
-            buf3,
-        ]
+        vec![buf1, buf2, buf3]
     });
 
-    x.iter()
-        .enumerate()
-        .for_each(|(idx, e)| {
-            println!("::: iovec ::: {}, data ::: \n\n{}\n\n", idx, String::from_utf8_lossy(&e[..]));
-        });
+    x.iter().enumerate().for_each(|(idx, e)| {
+        println!(
+            "::: iovec ::: {}, data ::: \n\n{}\n\n",
+            idx,
+            String::from_utf8_lossy(&e[..])
+        );
+    });
 
     Ok(())
 }
