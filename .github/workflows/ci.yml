@@ -1,0 +1,79 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build_and_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - x86_64-unknown-linux-gnu
+          - x86_64-apple-darwin
+        version:
+          - stable
+          - nightly
+        include:
+          - toolchain: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - toolchain: x86_64-apple-darwin
+            os: macOS-latest
+
+    name: ${{ matrix.version }} - ${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@master
+
+      - name: Install ${{ matrix.version }}
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.version }}-${{ matrix.toolchain }}
+          default: true
+
+      - name: check nightly - linux + windows
+        if: matrix.version == 'nightly' && matrix.os != 'macOS-latest'
+        uses: actions-rs/cargo@v1
+        with:
+          command: check
+          args: --features nightly --all --benches --bins --examples --tests
+
+      - name: check stable
+        if: matrix.version == 'stable'
+        uses: actions-rs/cargo@v1
+        with:
+          command: check
+          args: --all --bins --examples --tests
+
+      - name: tests nightly - linux + windows
+        if: matrix.version == 'nightly' && matrix.os != 'macOS-latest'
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features nightly --all
+
+      - name: tests stable
+        if: matrix.version == 'stable'
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all
+
+  check_fmt_and_docs:
+    name: Checking fmt and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+
+      - name: Setup
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          default: true
+          components: rustfmt
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: doc
+        run: cargo doc
