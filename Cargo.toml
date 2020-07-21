@@ -46,6 +46,7 @@ smol = ["agnostik/runtime_smol"]
 lever = "0.1.1-alpha.8"
 futures = "0.3.5"
 futures-io = "0.3.5"
+pin-project = "0.4.22"
 futures-util = "0.3.5"
 socket2 = { version = "0.3.12", features = ["pair", "unix"] }
 libc = "0.2"
