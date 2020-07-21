@@ -10,13 +10,23 @@ use std::{
 
 use crate::syscore::{CompletionChan, StoreFile};
 
+///
+/// Submitted async IO operation type
 pub type AsyncOp<T> = Pin<Box<dyn Future<Output = io::Result<T>>>>;
 
+///
+/// Operation registrar for Proactive IO, represents the outer ring that will send & receive submissions and completions respectively.
 pub trait HandleOpRegisterer {
     fn read_registerer(&self) -> Arc<TTas<Option<AsyncOp<usize>>>>;
     fn write_registerer(&self) -> Arc<TTas<Option<AsyncOp<usize>>>>;
 }
 
+///
+/// Handle that manages IO submitted to proactor system.
+///
+/// This handle wraps io element, its' completion channel, if file, file buffers and input output operations
+/// It is single handedly responsible for dispatching correct operations to IO driver.
+/// Speed of IO bound to speed of executor, handle neither interferes with executor nor tightly coupled.
 pub struct Handle<T> {
     /// IO task element
     pub(crate) io_task: Option<T>,

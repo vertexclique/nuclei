@@ -3,7 +3,7 @@
 </h1>
 <div align="center">
  <strong>
-   Proactive IO & Runtime system
+   Nuclei: Proactive IO & Runtime system
  </strong>
 <hr>
 </div>
@@ -42,8 +42,8 @@ Proactive system's design principles matching to [Boost Asio](https://www.boost.
 Nuclei is not using reactor, waker system or waking IO. It is completely asynchronous, just because Rust's asynchronous system enforces,
 there is a waker implementation for IO driver.
 
-Nuclei uses [io_uring](https://kernel.dk/io_uring.pdf) on Linux as primary evented IO backend, secondarily you can use
-[epoll](https://en.wikipedia.org/wiki/Epoll). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
+Nuclei uses [epoll](https://en.wikipedia.org/wiki/Epoll) on Linux as primary evented IO backend, secondarily (if your system supports) you can use
+[io_uring](https://kernel.dk/io_uring.pdf). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
 On Windows, [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend is used.   
 
 Current io_uring implementation needs Linux kernel 5.6+.
