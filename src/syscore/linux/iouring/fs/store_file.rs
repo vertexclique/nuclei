@@ -105,3 +105,9 @@ impl StoreFile {
         self.buf.cancellation();
     }
 }
+
+impl Drop for StoreFile {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
