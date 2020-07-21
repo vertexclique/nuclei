@@ -3,8 +3,7 @@
 //!
 //! Nuclei is a proactive IO system which is runtime agnostic and can work with any runtime.
 //! Proactive system's design principles matching to [Boost Asio](https://www.boost.org/doc/libs/1_47_0/doc/html/boost_asio/overview/core/async.html).
-//! Nuclei is not using reactor, waker system or waking IO. It is completely asynchronous, just because Rust's asynchronous system enforces,
-//! there is a waker implementation for IO driver.
+//! Nuclei is not using conventional reactor approach. It is completely asynchronous, and it's wrapping poll based IO proactive fashion.
 //!
 //! Nuclei uses [epoll](https://en.wikipedia.org/wiki/Epoll) on Linux as primary evented IO backend, secondarily (if your system supports) you can use
 //! [io_uring](https://kernel.dk/io_uring.pdf). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
