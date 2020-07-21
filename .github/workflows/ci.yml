@@ -36,21 +36,21 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: check
-          args: --features nightly --all --benches --bins --examples --tests
+          args: --all --benches --bins --tests
 
       - name: check stable
         if: matrix.version == 'stable'
         uses: actions-rs/cargo@v1
         with:
           command: check
-          args: --all --bins --examples --tests
+          args: --all --bins --tests
 
       - name: tests nightly - linux + windows
         if: matrix.version == 'nightly' && matrix.os != 'macOS-latest'
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --features nightly --all
+          args: --all
 
       - name: tests stable
         if: matrix.version == 'stable'
