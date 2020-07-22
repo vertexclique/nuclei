@@ -38,26 +38,26 @@
 </div>
 
 Nuclei is a proactive IO system which is runtime agnostic and can work with any runtime.
-Proactive system's design principles matching to [Boost Asio](https://www.boost.org/doc/libs/1_47_0/doc/html/boost_asio/overview/core/async.html).
-Nuclei is not using conventional reactor approach. It is completely asynchronous, and it's wrapping poll based IO proactive fashion.
+The proactive system's design principles are matching [Boost Asio](https://www.boost.org/doc/libs/1_47_0/doc/html/boost_asio/overview/core/async.html).
+Nuclei is not using a conventional reactor approach. It is completely asynchronous, and it's wrapping poll based IO in a proactive fashion.
 
-Nuclei uses [epoll](https://en.wikipedia.org/wiki/Epoll) on Linux as primary evented IO backend, secondarily (if your system supports) you can use
+Nuclei uses [epoll](https://en.wikipedia.org/wiki/Epoll) on Linux as the primary evented IO backend, secondarily (given system support) you can use
 [io_uring](https://kernel.dk/io_uring.pdf). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
-On Windows, [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend is used.   
+On Windows, the [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend is used.   
 
-Current io_uring implementation needs Linux kernel 5.6+.
+The current io_uring implementation needs a modern Linux kernel (5.6+).
 
 ## Features
 
 * Async TCP, UDP, Unix domain sockets and files...
-* Proactor system don't block.
+* The proactor system doesn't block
 * Scatter/Gather operations
-* Minimal allocation as much as possible.
-* More expressive than any other runtime.
-* Completely asynchronous I/O system with lock free programming.
+* Minimal allocation
+* More expressive than any other runtime
+* Completely asynchronous I/O system with lock free programming
 
 ## Examples
-Please head to `examples` directory to run examples:
+Please head to `examples` directory to run the examples:
 ```shell script
 $ cd examples
 $ cargo run --example fread-vect
@@ -73,9 +73,11 @@ $ cargo test # For others
 ## Configurations
 
 ### Evented IO backend
-When `iouring` feature gate is not enabled. On Linux `epoll` would be used.
+
+When the `iouring` feature gate is not enabled, the platforms evented backend is used. For example, on Linux, `epoll` would be used.
 
 ### Executor
+
 Executor is by default set to Bastion's executor. If you want to use
 different executor, you can use one of the available runtimes with one of these features: 
 `bastion`, `asyncstd`, `tokio`, `smol`.
