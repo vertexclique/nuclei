@@ -37,8 +37,8 @@
     </a>
 </div>
 
-Nuclei is a proactive IO system which is runtime agnostic and can work with any runtime.
-The proactive system's design principles are matching [Boost Asio](https://www.boost.org/doc/libs/1_47_0/doc/html/boost_asio/overview/core/async.html).
+Nuclei is a [proactor-based](http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.49.9183) IO system which is runtime agnostic and can work with any runtime.
+The proactor system's design principles are matching [Boost Asio](https://www.boost.org/doc/libs/1_47_0/doc/html/boost_asio/overview/core/async.html).
 Nuclei is not using a conventional reactor approach. It is completely asynchronous, and it's wrapping poll based IO in a proactive fashion.
 
 Nuclei uses [epoll](https://en.wikipedia.org/wiki/Epoll) on Linux as the primary evented IO backend, secondarily (given system support) you can use
