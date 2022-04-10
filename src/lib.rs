@@ -78,5 +78,5 @@ mod syscore {
     pub(crate) use windows::*;
 }
 
-pub use agnostik::*;
+pub use async_global_executor::*;
 pub use proactor::*;
