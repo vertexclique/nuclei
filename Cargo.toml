@@ -31,13 +31,13 @@ autoexamples = false
 
 
 [features]
-default = ["asyncstd", "epoll"]
+default = ["async-exec", "epoll"]
 # Devs should enable these features to use iouring on linux.
 #default = ["asyncstd", "iouring"]
 epoll = []
 iouring = ["iou", "uring-sys"]
 
-asyncstd = ["async-global-executor"]
+async-exec = ["async-global-executor"]
 tokio03 = ["async-global-executor/tokio03"]
 tokio02 = ["async-global-executor/tokio02"]
 tokio = ["async-global-executor/tokio"]
