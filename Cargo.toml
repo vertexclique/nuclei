@@ -31,16 +31,16 @@ autoexamples = false
 
 
 [features]
-default = ["bastion", "epoll"]
+default = ["async-exec", "epoll"]
 # Devs should enable these features to use iouring on linux.
-#default = ["bastion", "iouring"]
+#default = ["asyncstd", "iouring"]
 epoll = []
 iouring = ["iou", "uring-sys"]
 
-bastion = ["agnostik/runtime_bastion"]
-tokio = ["agnostik/runtime_tokio"]
-asyncstd = ["agnostik/runtime_asyncstd"]
-smol = ["agnostik/runtime_smol"]
+async-exec = ["async-global-executor"]
+tokio03 = ["async-global-executor/tokio03"]
+tokio02 = ["async-global-executor/tokio02"]
+tokio = ["async-global-executor/tokio"]
 
 [dependencies]
 lever = "0.1"
@@ -51,7 +51,7 @@ socket2 = { version = "0.3.12", features = ["pair", "unix"] }
 libc = "0.2"
 pin-utils = "0.1.0"
 once_cell = "1.4.0"
-agnostik = "0.2"
+async-global-executor = { version = "2.0", optional = true, features = ["async-io"] }
 
 # Other backends
 [target.'cfg(target_os = "linux")'.dependencies]

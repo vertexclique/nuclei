@@ -24,9 +24,11 @@
 //! For more information about how to use Nuclei with std IO types please head to [examples](https://github.com/vertexclique/nuclei/tree/master/examples).
 //!
 //! ### Executor
-//! Executor is by default set to Bastion's executor. If you want to use
-//! different executor, you can use one of the available runtimes with one of these features:
-//! `bastion`, `asyncstd`, `tokio`, `smol`.
+//! Executor is using `async-global-executor`. Available features are:
+//! * `async-exec`: Uses `async-io` feature of `async-global-executor`.
+//! * `tokio`
+//! * `tokio02`
+//! * `tokio03`
 
 // These need to go through time.
 #![allow(dead_code, unused_variables)]
@@ -78,5 +80,5 @@ mod syscore {
     pub(crate) use windows::*;
 }
 
-pub use agnostik::*;
+pub use async_global_executor::*;
 pub use proactor::*;

@@ -33,7 +33,8 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
             if let Err(err) = async_h1::accept(stream, serve).await {
                 println!("Connection error: {:#?}", err);
             }
-        });
+        })
+        .detach();
     }
 }
 
