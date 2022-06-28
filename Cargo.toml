@@ -44,9 +44,9 @@ tokio = ["async-global-executor/tokio"]
 
 [dependencies]
 lever = "0.1"
-futures = "0.3.5"
-futures-io = "0.3.5"
-futures-util = "0.3.5"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+futures-io = "0.3"
+futures-util = "0.3"
 socket2 = { version = "0.3.12", features = ["pair", "unix"] }
 libc = "0.2"
 pin-utils = "0.1.0"
