@@ -7,8 +7,8 @@ publish = false
 
 [dev-dependencies]
 nuclei = { path = "../" }
-futures = "0.3.5"
-futures-util = "0.3.5"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+futures-util = "0.3"
 anyhow = "1.0.31"
 async-h1 = "2.0.2"
 async-dup = "1.1.0"
