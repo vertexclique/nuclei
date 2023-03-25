@@ -3,7 +3,7 @@ use std::net::TcpListener;
 
 use anyhow::Result;
 use async_dup::Arc;
-use futures::pending;
+
 use futures::prelude::*;
 use http_types::{Request, Response, StatusCode};
 

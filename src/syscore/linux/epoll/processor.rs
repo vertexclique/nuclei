@@ -3,8 +3,8 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
-use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixStream};
 use std::path::Path;
 use std::{
     fs::File,
@@ -181,7 +181,7 @@ impl Processor {
             }
         })?;
 
-        let mut stream_raw = sock.into_tcp_stream();
+        let stream_raw = sock.into_tcp_stream();
         stream_raw.set_nodelay(true)?;
 
         let stream = Handle::new(stream_raw)?;

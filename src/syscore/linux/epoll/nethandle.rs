@@ -1,4 +1,4 @@
-use std::future::Future;
+
 use std::io;
 use std::marker::Unpin;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -14,7 +14,7 @@ use futures::Stream;
 use lever::sync::prelude::*;
 
 use super::Processor;
-use crate::syscore::CompletionChan;
+
 use crate::{Handle, Proactor};
 
 impl<T: AsRawFd> Handle<T> {
