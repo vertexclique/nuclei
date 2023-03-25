@@ -39,12 +39,12 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    spawn_blocking(|| drive(future::pending::<()>()));
+    spawn_blocking(|| drive(future::pending::<()>())).detach();
 
     block_on(async {
         let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
 
-        http.await;
+        http.await?;
         Ok(())
     })
 }
