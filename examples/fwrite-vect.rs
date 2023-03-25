@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 
 use futures::{AsyncSeekExt, AsyncWriteExt};
-use futures_util::io::AsyncReadExt;
+use futures::AsyncReadExt;
 use std::io::{IoSlice, SeekFrom};
 
 

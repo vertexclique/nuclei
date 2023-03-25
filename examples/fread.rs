@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 
-use futures_util::io::AsyncReadExt;
+use futures::AsyncReadExt;
 
 fn main() -> io::Result<()> {
     let x: io::Result<String> = drive(async {
