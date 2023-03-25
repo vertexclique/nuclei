@@ -48,13 +48,13 @@ pub fn drive<T>(future: impl Future<Output = T>) -> T {
     });
 
     let cx = &mut Context::from_waker(&waker);
-    futures_util::pin_mut!(future);
+    futures::pin_mut!(future);
 
     let driver = spawn_blocking(move || loop {
         let _ = p.wait(1, None);
     });
 
-    futures_util::pin_mut!(driver);
+    futures::pin_mut!(driver);
 
     loop {
         if let Poll::Ready(val) = future.as_mut().poll(cx) {

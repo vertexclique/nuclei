@@ -217,7 +217,7 @@ impl AsyncRead for Handle<File> {
             let (_, pos) = store_file.bufpair();
 
             let fut = Processor::processor_read_vectored(&fd, bufs);
-            futures_util::pin_mut!(fut);
+            futures::pin_mut!(fut);
 
             loop {
                 match fut.as_mut().poll(cx)? {
@@ -249,7 +249,7 @@ impl AsyncBufRead for Handle<File> {
 
             bufp.fill_buf(|buf| {
                 let fut = Processor::processor_read_file(&fd, buf, *pos);
-                futures_util::pin_mut!(fut);
+                futures::pin_mut!(fut);
 
                 loop {
                     match fut.as_mut().poll(cx)? {
@@ -293,7 +293,7 @@ impl AsyncWrite for Handle<File> {
 
             let res = {
                 let fut = Processor::processor_write_file(&fd, data, *pos);
-                futures_util::pin_mut!(fut);
+                futures::pin_mut!(fut);
 
                 loop {
                     match fut.as_mut().poll(cx)? {
@@ -327,7 +327,7 @@ impl AsyncWrite for Handle<File> {
             let (_, pos) = store_file.bufpair();
 
             let fut = Processor::processor_write_vectored(&fd, bufs);
-            futures_util::pin_mut!(fut);
+            futures::pin_mut!(fut);
 
             loop {
                 match fut.as_mut().poll(cx)? {
@@ -356,7 +356,7 @@ impl AsyncWrite for Handle<File> {
             let op_state = store_file.op_state();
 
             let fut = Processor::processor_close_file(&fd);
-            futures_util::pin_mut!(fut);
+            futures::pin_mut!(fut);
 
             loop {
                 match fut.as_mut().poll(cx)? {
