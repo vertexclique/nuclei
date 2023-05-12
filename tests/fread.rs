@@ -1,9 +1,7 @@
+use futures::AsyncReadExt;
 use nuclei::*;
 use std::fs::File;
-
 use std::path::PathBuf;
-
-use futures_util::io::AsyncReadExt;
 
 #[test]
 fn read_file() {

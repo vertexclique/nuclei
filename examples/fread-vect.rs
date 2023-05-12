@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use futures::io::IoSliceMut;
 
-use futures_util::io::AsyncReadExt;
+use futures::AsyncReadExt;
 
 const IOVEC_WIDTH: usize = 1 << 10;
 

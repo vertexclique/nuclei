@@ -12,7 +12,7 @@ fn write_vectored() {
 
     use futures::io::IoSliceMut;
     use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt};
-    use futures_util::io::AsyncReadExt;
+    use futures::AsyncReadExt;
     use std::io::{IoSlice, Read, SeekFrom};
     use std::ops::Deref;
 

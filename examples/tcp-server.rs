@@ -20,7 +20,7 @@ fn main() -> io::Result<()> {
             println!("Accepted client: {}", peer_addr);
 
             // Spawn a task that echoes messages from the client back to it.
-            spawn(echo(stream));
+            spawn(echo(stream)).detach();
         }
     })
 }
