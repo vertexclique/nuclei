@@ -1,18 +1,14 @@
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{future::Future, io};
-use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
-use once_cell::sync::OnceCell;
 
 use super::syscore::*;
 use super::waker::*;
 use crate::spawn_blocking;
 
 pub use super::handle::*;
-
-static PROACTOR: OnceCell<Mutex<Proactor>> = OnceCell::new();
 
 ///
 /// Concrete proactor instance
