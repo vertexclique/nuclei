@@ -1,8 +1,10 @@
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{future::Future, io};
+use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 
 use super::syscore::*;
 use super::waker::*;
@@ -10,9 +12,13 @@ use crate::spawn_blocking;
 
 pub use super::handle::*;
 
+static PROACTOR: OnceCell<Mutex<Proactor>> = OnceCell::new();
+
 ///
 /// Concrete proactor instance
 pub struct Proactor(SysProactor);
+unsafe impl Send for Proactor {}
+unsafe impl Sync for Proactor {}
 
 impl Proactor {
     /// Returns a reference to the proactor.

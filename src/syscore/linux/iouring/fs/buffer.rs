@@ -6,6 +6,7 @@ use std::mem;
 use std::ptr::NonNull;
 use std::slice;
 use std::task::Poll;
+use rustix_uring::types::Statx;
 
 use super::cancellation::Cancellation;
 
@@ -99,7 +100,7 @@ impl Buffer {
             }
             Storage::Statx => {
                 unsafe fn callback(statx: *mut (), _: usize) {
-                    dealloc(statx as *mut u8, Layout::new::<libc::statx>())
+                    dealloc(statx as *mut u8, Layout::new::<Statx>())
                 }
 
                 self.storage = Storage::Nothing;
@@ -110,7 +111,7 @@ impl Buffer {
         }
     }
 
-    pub(crate) fn as_statx(&mut self) -> *mut libc::statx {
+    pub(crate) fn as_statx(&mut self) -> *mut Statx {
         match self.storage {
             Storage::Statx => self.data.cast().as_ptr(),
             Storage::Nothing => self.alloc_statx(),
@@ -124,7 +125,7 @@ impl Buffer {
         unsafe { slice::from_raw_parts_mut(self.data.cast().as_ptr(), self.capacity as usize) }
     }
 
-    fn alloc_statx(&mut self) -> &mut libc::statx {
+    fn alloc_statx(&mut self) -> &mut Statx {
         self.storage = Storage::Statx;
         self.alloc();
         unsafe { &mut *self.data.cast().as_ptr() }
@@ -145,7 +146,7 @@ impl Buffer {
     #[inline(always)]
     fn layout(&self) -> Option<Layout> {
         match self.storage {
-            Storage::Statx => Some(Layout::new::<libc::statx>()),
+            Storage::Statx => Some(Layout::new::<Statx>()),
             Storage::Buffer => Some(Layout::array::<u8>(self.capacity as usize).unwrap()),
             Storage::Nothing => None,
         }
