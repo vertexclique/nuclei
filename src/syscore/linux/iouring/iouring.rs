@@ -2,8 +2,9 @@ use core::mem::MaybeUninit;
 use futures::channel::oneshot;
 use lever::sync::prelude::*;
 use pin_utils::unsafe_pinned;
-use std::collections::HashMap;
+use ahash::{AHasher, HashMap, HashMapExt};
 use std::future::Future;
+use std::hash::BuildHasherDefault;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
@@ -138,10 +139,10 @@ const MANUAL_TIMEOUT: u64 = -2 as _;
 const QUEUE_LEN: u32 = 1 << 10;
 
 pub struct SysProactor {
-    sq: Mutex<SubmissionQueue<'static>>,
-    cq: Mutex<CompletionQueue<'static>>,
-    sbmt: Mutex<Submitter<'static>>,
-    submitters: Mutex<HashMap<u64, oneshot::Sender<i32>>>,
+    sq: TTas<SubmissionQueue<'static>>,
+    cq: TTas<CompletionQueue<'static>>,
+    sbmt: TTas<Submitter<'static>>,
+    submitters: TTas<HashMap<u64, oneshot::Sender<i32>>>,
     submitter_id: AtomicU64,
     waker: AtomicBool,
 }
@@ -157,21 +158,19 @@ static mut IO_URING: Option<IoUring> = None;
 impl SysProactor {
     pub(crate) fn new() -> io::Result<SysProactor> {
         unsafe {
-            // nodrop?
             let ring = IoUring::builder()
                 .build(QUEUE_LEN)
                 .expect("nuclei: uring can't be initialized");
 
             IO_URING = Some(ring);
 
-            // IO_URING = Some(IoUring::new(QUEUE_LEN).expect("nuclei: uring can't be initialized"));
             let (submitter, sq, cq) = IO_URING.as_mut().unwrap().split();
 
             Ok(SysProactor {
-                sq: Mutex::new(sq),
-                cq: Mutex::new(cq),
-                sbmt: Mutex::new(submitter),
-                submitters: Mutex::new(HashMap::default()),
+                sq: TTas::new(sq),
+                cq: TTas::new(cq),
+                sbmt: TTas::new(submitter),
+                submitters: TTas::new(HashMap::with_capacity(QUEUE_LEN as usize)),
                 submitter_id: AtomicU64::default(),
                 waker: AtomicBool::default(),
             })
@@ -182,47 +181,34 @@ impl SysProactor {
         &self,
         mut sqe: SQEntry,
     ) -> io::Result<CompletionChan> {
-        dbg!("REGISTER IO");
         let id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        dbg!("self.submitter_id.fetch_add");
 
         sqe = sqe.user_data(id);
-        dbg!("sqe = sqe.user_data(id);");
 
-        let mut subguard = self.submitters.lock().unwrap();
+        let mut subguard = self.submitters.lock();
         subguard.insert(id, tx);
         drop(subguard);
-        dbg!("subguard.insert");
 
-        let mut sq = self.sq.lock().unwrap();
+        let mut sq = self.sq.lock();
         unsafe {
             sq.push(&sqe).expect("nuclei: submission queue is full");
         }
         sq.sync();
-
-        dbg!("pushed - submit was here");
-
-        // drop(sbmt);
-        let sbmt = self.sbmt.lock().unwrap();
-        dbg!("submitting.......................................");
-        sbmt.submit()?;
-        dbg!("submitted.......................................");
-        drop(sbmt);
-
-        sq.sync();
         drop(sq);
 
-        dbg!("leaving");
+        let sbmt = self.sbmt.lock();
+        sbmt.submit()?;
+        drop(sbmt);
 
         Ok(CompletionChan { rx })
-        // sub_comp.ok_or(io::Error::from(io::ErrorKind::WouldBlock))
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
-        let (mut sq, mut cq) = (self.sq.lock().unwrap(), self.cq.lock().unwrap());
-        sq.sync();
-        cq.sync();
+        if let (Some(mut sq), Some(mut cq)) = (self.sq.try_lock(), self.cq.try_lock()) {
+            sq.sync();
+            cq.sync();
+        }
         Ok(())
     }
 
@@ -231,9 +217,7 @@ impl SysProactor {
         max_event_size: usize,
         duration: Option<Duration>,
     ) -> io::Result<usize> {
-        // dbg!("wait");
-
-        let mut cq = self.cq.lock().unwrap();
+        let mut cq = self.cq.lock();
         let mut acc: usize = 0;
 
         // issue cas barrier
@@ -243,23 +227,19 @@ impl SysProactor {
             self.cqe_completion(&cqe)?;
             acc+=1;
         }
-        cq.sync();
 
         Ok(acc)
     }
 
     fn cqe_completion(&self, cqe: &CQEntry) -> io::Result<()> {
         let udata = cqe.user_data();
-        dbg!(&udata);
         let res: i32 = cqe.result();
 
-        dbg!("self.submitters.lock().remov");
-        let mut sbmts = self.submitters.lock().unwrap();
+        let mut sbmts = self.submitters.lock();
         sbmts.remove(&udata).map(|s| {
             dbg!(&res);
-            s.send(res).unwrap()
+            s.send(res)
         });
-        dbg!("self.submitters.lock().removed");
 
         Ok(())
     }

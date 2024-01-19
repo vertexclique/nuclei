@@ -75,10 +75,9 @@ impl Processor {
         offset: usize,
     ) -> io::Result<usize> {
         dbg!(&offset);
-        let mut sqe = OP::Read::new(Fd(*io), buf.as_mut_ptr(), offset as _)
+        let mut sqe = OP::Read::new(Fd(*io), buf.as_mut_ptr(), buf.len() as _)
+            .offset(offset as _)
             .build();
-
-        dbg!("READFILE");
 
         let cc = Proactor::get().inner().register_io(sqe)?;
 
@@ -90,7 +89,8 @@ impl Processor {
         buf: &[u8],
         offset: usize,
     ) -> io::Result<usize> {
-        let mut sqe = OP::Write::new(Fd(*io), buf as *const _ as *const _, offset as _)
+        let mut sqe = OP::Write::new(Fd(*io), buf.as_ptr(), buf.len() as _)
+            .offset(offset as _)
             .build();
 
         let cc = Proactor::get().inner().register_io(sqe)?;
