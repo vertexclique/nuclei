@@ -49,7 +49,7 @@ impl Handle<TcpListener> {
 
     pub fn incoming(
         &self,
-    ) -> impl Stream<Item = io::Result<Handle<TcpStream>>> + Send + Unpin + '_ {
+    ) -> impl Stream<Item = io::Result<Handle<TcpStream>>> + Unpin + '_ {
         Box::pin(futures::stream::unfold(
             self,
             |listener: &Handle<TcpListener>| async move {
@@ -129,7 +129,7 @@ impl Handle<UnixListener> {
 
     pub fn incoming(
         &self,
-    ) -> impl Stream<Item = io::Result<Handle<UnixStream>>> + Send + Unpin + '_ {
+    ) -> impl Stream<Item = io::Result<Handle<UnixStream>>> + Unpin + '_ {
         Box::pin(futures::stream::unfold(
             self,
             |listener: &Handle<UnixListener>| async move {

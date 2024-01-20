@@ -2,7 +2,7 @@
 name = "nuclei"
 version = "0.2.1"
 authors = ["Mahmut Bulut <vertexclique@gmail.com>"]
-edition = "2018"
+edition = "2021"
 description = "Proactive IO & runtime system"
 keywords = ["io", "async", "uring", "iouring", "proactor"]
 categories = ["concurrency", "asynchronous"]
@@ -31,29 +31,29 @@ autoexamples = false
 
 
 [features]
-default = ["async-exec", "epoll"]
+default = ["async-exec", "iouring"]
 # Devs should enable these features to use iouring on linux.
 #default = ["asyncstd", "iouring"]
 epoll = []
-iouring = ["iou", "uring-sys"]
+iouring = ["rustix-uring", "rustix"]
 
 async-exec = ["async-global-executor"]
-tokio03 = ["async-global-executor/tokio03"]
-tokio02 = ["async-global-executor/tokio02"]
 tokio = ["async-global-executor/tokio"]
 
 [dependencies]
 lever = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-socket2 = { version = "0.3.12", features = ["pair", "unix"] }
+socket2 = { version = "0.3.19", features = ["pair", "unix"] }
 pin-utils = "0.1.0"
-once_cell = "1.4.0"
-async-global-executor = { version = "2.0", optional = true, features = ["async-io"] }
+once_cell = "1.19.0"
+os_socketaddr = "0.2.5"
+ahash = "0.8.7"
+async-global-executor = { version = "2.4", optional = true, features = ["async-io"] }
 
 # Other backends
 [target.'cfg(target_os = "linux")'.dependencies]
-iou = { version = "0.0.0-ringbahn.1", optional = true }
-uring-sys = { version = "0.6.1", optional = true }
+rustix = { version = "0.38", optional = true }
+rustix-uring = { version = "0.2.0", optional = true }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 libc = { version = "0.2" }

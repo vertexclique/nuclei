@@ -13,6 +13,8 @@ pub use super::handle::*;
 ///
 /// Concrete proactor instance
 pub struct Proactor(SysProactor);
+unsafe impl Send for Proactor {}
+unsafe impl Sync for Proactor {}
 
 impl Proactor {
     /// Returns a reference to the proactor.

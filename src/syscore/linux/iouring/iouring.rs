@@ -1,13 +1,10 @@
 use core::mem::MaybeUninit;
 use futures::channel::oneshot;
-use iou::{
-    CompletionQueue, CompletionQueueEvent, IoUring, Registrar, SubmissionQueue,
-    SubmissionQueueEvent,
-};
 use lever::sync::prelude::*;
 use pin_utils::unsafe_pinned;
-use std::collections::HashMap;
+use ahash::{HashMap, HashMapExt};
 use std::future::Future;
+use std::hash::BuildHasherDefault;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
@@ -30,10 +27,11 @@ macro_rules! syscall {
 ///////////////////
 
 use crate::Proactor;
-use once_cell::sync::Lazy;
 use socket2::SockAddr;
 use std::mem;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
+use std::sync::{atomic, Mutex};
+use rustix_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter, squeue::Entry as SQEntry, cqueue::Entry as CQEntry};
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -143,6 +141,7 @@ const QUEUE_LEN: u32 = 1 << 10;
 pub struct SysProactor {
     sq: TTas<SubmissionQueue<'static>>,
     cq: TTas<CompletionQueue<'static>>,
+    sbmt: TTas<Submitter<'static>>,
     submitters: TTas<HashMap<u64, oneshot::Sender<i32>>>,
     submitter_id: AtomicU64,
     waker: AtomicBool,
@@ -151,7 +150,7 @@ pub struct SysProactor {
 pub type RingTypes = (
     SubmissionQueue<'static>,
     CompletionQueue<'static>,
-    Registrar<'static>,
+    Submitter<'static>,
 );
 
 static mut IO_URING: Option<IoUring> = None;
@@ -159,92 +158,57 @@ static mut IO_URING: Option<IoUring> = None;
 impl SysProactor {
     pub(crate) fn new() -> io::Result<SysProactor> {
         unsafe {
-            IO_URING = Some(iou::IoUring::new(QUEUE_LEN).expect("uring can't be initialized"));
-            let (sq, cq, _) = IO_URING.as_mut().unwrap().queues();
+            let ring = IoUring::builder()
+                .build(QUEUE_LEN)
+                .expect("nuclei: uring can't be initialized");
+
+            IO_URING = Some(ring);
+
+            let (submitter, sq, cq) = IO_URING.as_mut().unwrap().split();
 
             Ok(SysProactor {
                 sq: TTas::new(sq),
                 cq: TTas::new(cq),
-                submitters: TTas::new(HashMap::default()),
+                sbmt: TTas::new(submitter),
+                submitters: TTas::new(HashMap::with_capacity(QUEUE_LEN as usize)),
                 submitter_id: AtomicU64::default(),
                 waker: AtomicBool::default(),
             })
         }
     }
 
-    fn submitter<T>(
-        &self,
-        sq: &mut SubmissionQueue<'_>,
-        mut ring_sub: impl FnMut(&mut SubmissionQueueEvent<'_>) -> T,
-    ) -> Option<T> {
-        // dbg!("SUBMITTER");
-        let mut sqe = match sq.next_sqe() {
-            Some(sqe) => sqe,
-            None => {
-                if sq.submit().is_err() {
-                    return None;
-                }
-                sq.next_sqe()?
-            }
-        };
-
-        Some(ring_sub(&mut sqe))
-    }
-
     pub(crate) fn register_io(
         &self,
-        mut io_submit: impl FnMut(&mut SubmissionQueueEvent<'_>),
+        mut sqe: SQEntry,
     ) -> io::Result<CompletionChan> {
-        // dbg!("REGISTER IO");
-        let sub_comp = {
-            let mut sq = self.sq.lock();
+        let id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
 
-            let cc = self
-                .submitter(&mut sq, |sqe| {
-                    // dbg!("SUBMITTER");
-                    let mut id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
-                    if id == MANUAL_TIMEOUT {
-                        id = self.submitter_id.fetch_add(2, Ordering::Relaxed) + 2;
-                    }
-                    let (tx, rx) = oneshot::channel();
+        sqe = sqe.user_data(id);
 
-                    // dbg!("SUBMITTER", id);
-                    io_submit(sqe);
-                    sqe.set_user_data(id);
+        let mut subguard = self.submitters.lock();
+        subguard.insert(id, tx);
+        drop(subguard);
 
-                    {
-                        let mut subguard = self.submitters.lock();
-                        subguard.insert(id, tx);
-                        // dbg!("INSERTED", id);
-                    }
+        let mut sq = self.sq.lock();
+        unsafe {
+            sq.push(&sqe).expect("nuclei: submission queue is full");
+        }
+        sq.sync();
+        drop(sq);
 
-                    CompletionChan { rx }
-                })
-                .map(|c| unsafe {
-                    let submitted_io_evcount = sq.submit();
-                    // dbg!(&submitted_io_evcount);
+        let sbmt = self.sbmt.lock();
+        sbmt.submit()?;
+        drop(sbmt);
 
-                    // sq.submit()
-                    //     .map_or_else(|_| {
-                    //         let id = self.submitter_id.load(Ordering::SeqCst);
-                    //         let mut subguard = self.submitters.lock();
-                    //         subguard.get(&id).unwrap().send(0);
-                    //     }, |submitted_io_evcount| {
-                    //         dbg!(submitted_io_evcount);
-                    //     });
-
-                    c
-                });
-
-            cc
-        };
-
-        // dbg!(sub_comp.is_none());
-
-        sub_comp.ok_or(io::Error::from(io::ErrorKind::WouldBlock))
+        Ok(CompletionChan { rx })
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
+        if let (Some(mut sq), Some(mut cq)) = (self.sq.try_lock(), self.cq.try_lock()) {
+            sq.sync();
+            cq.sync();
+        }
         Ok(())
     }
 
@@ -253,51 +217,25 @@ impl SysProactor {
         max_event_size: usize,
         duration: Option<Duration>,
     ) -> io::Result<usize> {
-        // dbg!("WAIT ENTER");
         let mut cq = self.cq.lock();
-        let mut acquired = 0;
+        let mut acc: usize = 0;
 
-        // dbg!("WAITING FOR CQE");
-        // let timeout = Duration::from_millis(1);
-        while let Ok(cqe) = cq.wait_for_cqe() {
-            // while let Some(cqe) = cq.peek_for_cqe() {
-            //     dbg!("GOT");
-            let mut ready = cq.ready() as usize + 1;
-            // dbg!(ready, cqe.user_data());
-
-            self.cqe_completion(acquired, &cqe);
-            ready -= 1;
-
-            while let Some(cqe) = cq.peek_for_cqe() {
-                if ready == 0 {
-                    ready = cq.ready() as usize + 1;
-                }
-
-                self.cqe_completion(acquired, &cqe);
-                ready -= 1;
-            }
+        // issue cas barrier
+        cq.sync();
+        while let Some(cqe) = cq.next() {
+            self.cqe_completion(&cqe)?;
+            acc+=1;
         }
 
-        Ok(acquired)
+        Ok(acc)
     }
 
-    fn cqe_completion(&self, mut acquired: usize, cqe: &CompletionQueueEvent) -> io::Result<()> {
-        if cqe.is_timeout() {
-            return Ok(());
-        }
-
+    fn cqe_completion(&self, cqe: &CQEntry) -> io::Result<()> {
         let udata = cqe.user_data();
-        // TODO: (vcq): Propagation of this should be properly.
-        // This is half assed. Need to propagate this without poisoning the driver state.
-        let res = cqe.result().unwrap() as i32;
-        if udata == MANUAL_TIMEOUT {
-            return Ok(());
-        }
+        let res: i32 = cqe.result();
 
-        acquired += 1;
-        // dbg!("ACQUIRED", udata);
-
-        self.submitters.lock().remove(&udata).map(|s| s.send(res));
+        let mut sbmts = self.submitters.lock();
+        sbmts.remove(&udata).map(|s| s.send(res));
 
         Ok(())
     }
