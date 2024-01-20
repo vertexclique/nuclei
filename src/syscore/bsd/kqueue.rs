@@ -8,7 +8,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use ahash::HashMap;
+use ahash::{HashMap, HashMapExt};
 use std::{os::unix::net::UnixStream, time::Duration};
 
 macro_rules! syscall {

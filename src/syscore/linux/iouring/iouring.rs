@@ -2,7 +2,7 @@ use core::mem::MaybeUninit;
 use futures::channel::oneshot;
 use lever::sync::prelude::*;
 use pin_utils::unsafe_pinned;
-use ahash::{AHasher, HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt};
 use std::future::Future;
 use std::hash::BuildHasherDefault;
 use std::io;
