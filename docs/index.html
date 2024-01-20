@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1.0, shrink-to-fit=no, viewport-fit=cover">
+  <meta name="description" content="">
+  <title></title>
+
+  <!-- Themes (light + dark) -->
+  <link rel="stylesheet" media="(prefers-color-scheme: dark)" href="https://cdn.jsdelivr.net/npm/docsify-themeable@0/dist/css/theme-simple-dark.css">
+
+  <!-- PrismJS theme -->
+  <link rel="stylesheet" href="https://unpkg.com/prism-themes@1.9.0/themes/prism-night-owl.min.css">
+
+  <!-- Custom Styles -->
+  <style>
+    :root {
+      --theme-hue: 120;
+      --theme-color: rgb(106, 25, 205);
+      /* <a href="https://ibb.co/mhM4z6P"><img src="https://i.ibb.co/DwSQK5j/vibrant-obelisk.png" alt="vibrant-obelisk" border="0"></a> */
+      --cover-background-color: #00000000;
+      --cover-background-image: url(https://s13.gifyu.com/images/S0ULN.gif);
+      --cover-button-background: rgb(118, 198, 251);
+      --cover-button-border: rgb(118, 198, 251);
+      --cover-button-border: 1px solid var(--theme-color);
+      --cover-heading-color: rgb(106, 25, 205);
+      --cover-heading-font-size: 100px;
+      --cover-heading-font-size-min: ;
+      --cover-heading-font-size-max: 500px;
+    }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+  // Docsify Configuration
+  window.$docsify = {
+    // GENERAL
+    // -----------------------------------------------------------------
+    name       : 'Nuclei - Proactive IO & Runtime system',
+    repo: 'vertexclique/nuclei',
+    coverpage  : 'coverpage.md',
+    homepage   : 'introduction.md',
+    loadSidebar: 'sidebar.md',
+
+    coverpage: true,
+    themeable: {
+      readyTransition : true, // default
+      responsiveTables: true  // default
+    }
+  };
+</script>
+
+<!-- Required -->
+<script src="https://cdn.jsdelivr.net/npm/docsify@4/lib/docsify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docsify-themeable@0/dist/js/docsify-themeable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docsify-pagination@2.10.1/dist/docsify-pagination.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docsify-tabs@1.6.0/dist/docsify-tabs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docsify-prism@latest/dist/docsify-prism.min.js"></script>
+
+<!-- CDN files for prism -->
+<script src="//unpkg.com/prismjs@1.29/prism.js"></script>
+<script src="//unpkg.com/prismjs@1.29/components/prism-rust.min.js"></script>
+<script src="//unpkg.com/prismjs@1.29/components/prism-toml.min.js"></script>
+<script src="//unpkg.com/prismjs@1.29/components/prism-python.min.js"></script>
+<script src="//unpkg.com/prismjs@1.29/components/prism-json.min.js"></script>
+
+<!-- Recommended -->
+<script src="https://cdn.jsdelivr.net/npm/docsify@4/lib/plugins/search.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docsify@4/lib/plugins/zoom-image.min.js"></script>
+</body>
+</html>
