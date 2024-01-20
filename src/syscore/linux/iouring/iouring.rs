@@ -223,7 +223,6 @@ impl SysProactor {
         // issue cas barrier
         cq.sync();
         while let Some(cqe) = cq.next() {
-            dbg!(&cqe);
             self.cqe_completion(&cqe)?;
             acc+=1;
         }
@@ -236,10 +235,7 @@ impl SysProactor {
         let res: i32 = cqe.result();
 
         let mut sbmts = self.submitters.lock();
-        sbmts.remove(&udata).map(|s| {
-            dbg!(&res);
-            s.send(res)
-        });
+        sbmts.remove(&udata).map(|s| s.send(res));
 
         Ok(())
     }

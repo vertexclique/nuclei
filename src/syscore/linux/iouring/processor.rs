@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::io;
+use std::{io, mem};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
@@ -188,14 +188,10 @@ impl Processor {
         flags: RecvFlags,
     ) -> io::Result<usize> {
         let fd = socket.as_raw_fd() as _;
-        dbg!(&fd);
 
         let mut sqe = OP::Recv::new(Fd(fd), buf.as_mut_ptr(), buf.len() as _)
             .flags(flags)
             .build();
-
-        dbg!("recv_with_flags time");
-        dbg!(&flags);
 
         let res = Proactor::get()
             .inner()
@@ -316,131 +312,25 @@ impl Processor {
     ///// TcpListener
     ///////////////////////////////////
 
-    // TODO: (vcq): need to fix the accept
-    // pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(listener: &R) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
-    //     let fd = listener.as_raw_fd() as _;
-    //     // let flags = syscall!(fcntl(fd, libc::F_GETFL))?;
-    //     // syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK))?;
-    //
-    //     // let mut sockaddr = MaybeUninit::<libc::sockaddr_storage>::uninit();
-    //     // let mut sockaddr_len = std::mem::size_of::<libc::sockaddr_storage>() as _;
-    //     //
-    //     //
-    //     // let mut sockaddr = unsafe {
-    //     //     let mut saddr = sockaddr.assume_init();
-    //     //     saddr.ss_family = libc::AF_INET as libc::sa_family_t;
-    //     //     saddr
-    //     // };
-    //
-    //     // let mut saddrstor = SockAddrStorage::uninit();
-    //
-    //     let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-    //         // let sqep = sqe.raw_mut();
-    //         // dbg!(&sqe.user_data());
-    //         // dbg!(&sqep.user_data);
-    //         // sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::SOCK_NONBLOCK);
-    //         sqe.prep_accept(fd, None, iou::SockFlag::empty());
-    //         // uring_sys::io_uring_prep_accept(sqep as *mut _,
-    //         //                                 fd,
-    //         //                                 &mut sockaddr as *mut _ as *mut _,
-    //         //                                 &mut sockaddr_len,
-    //         //                                 0);
-    //     })?;
-    //
-    //     // let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-    //     //     dbg!("SQE CAME");
-    //     //     let sqep = sqe.raw_mut();
-    //     //     // sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
-    //     //     uring_sys::io_uring_prep_accept(sqep,
-    //     //                                     fd,
-    //     //                                     sockaddr.as_mut_ptr() as *mut _,
-    //     //                                     &mut sockaddr_len,
-    //     //                                     0);
-    //     // })?;
-    //
-    //     // let mut saddrstor = SockAddrStorage::uninit();
-    //     //
-    //     // let cc = Proactor::get().inner().register_io(|sqe| unsafe {
-    //     //     sqe.prep_accept(fd, Some(&mut saddrstor), SockFlag::empty());
-    //     // })?;
-    //     dbg!("TCP LISTENER");
-    //
-    //     let stream = unsafe { TcpStream::from_raw_fd(cc.await?) };
-    //     dbg!("TCP LISTENER RECEIVED");
-    //     // let addr = unsafe {
-    //     //     let nixsa = saddrstor.as_socket_addr()?;
-    //     //     let (saddr, saddr_len) = nixsa.as_ffi_pair();
-    //     //     socket2::SockAddr::from_raw_parts(saddr as *const _, saddr_len as _)
-    //     //         .as_std()
-    //     //         .unwrap()
-    //     // };
-    //
-    //     let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
-    //     let socket = socket.into_tcp_listener();
-    //     let addr = socket.local_addr().unwrap();
-    //     // let res = socket
-    //     //     .accept()
-    //     //     .map(|(_, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))?;
-    //
-    //     // let addr = unsafe {
-    //     //     socket
-    //     //         .local_addr()
-    //     //         .unwrap()
-    //     // };
-    //
-    //     // unsafe {
-    //     //     let mut sockaddr = sockaddr.assume_init();
-    //     //     sockaddr.ss_family = libc::AF_INET as libc::sa_family_t;
-    //     // }
-    //
-    //     // let addr = unsafe {
-    //     //     socket2::SockAddr::from_raw_parts(&sockaddr as *const _ as *const _, sockaddr_len as _)
-    //     //         .as_std()
-    //     //         .unwrap()
-    //     // };
-    //
-    //     Ok((Handle::new(stream)?, addr))
-    // }
-
-    // pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(
-    //     listener: &R
-    // ) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
-    //     let fd = listener.as_raw_fd() as _;
-    //     let sockfd: OwnedFd = unsafe { OwnedFd::from_raw_fd(fd) };
-    //     let sockaddr = rustix::net::getsockname(&sockfd)?;
-    //
-    //     let mut sqe = OP::Accept::new(Fd(fd), null_mut(), null_mut())
-    //         .build();
-    //
-    //     let cc = Proactor::get().inner().register_io(sqe)?;
-    //
-    //     let stream = unsafe { TcpStream::from_raw_fd(cc.await?) };
-    //
-    //     let natsaddr = unsafe {
-    //         let mut sas = std::mem::zeroed::<SocketAddrStorage>();
-    //         sockaddr.write(&mut sas as *mut _ as *mut _);
-    //         let size = std::mem::size_of::<libc::sockaddr_storage>();
-    //         socket2::SockAddr::from_raw_parts(&sas as *const _ as *const _, size as _)
-    //             .as_std()
-    //             .unwrap()
-    //     };
-    //
-    //     Ok((Handle::new(stream).unwrap(), natsaddr))
-    // }
-
     pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(
-        listener: &R,
+        listener: &R
     ) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
-        dbg!(&listener.as_raw_fd());
-        let socket = unsafe { socket2::Socket::from_raw_fd(listener.as_raw_fd()) };
-        let socket = socket.into_tcp_listener();
-        let socket = ManuallyDrop::new(socket);
+        let fd = listener.as_raw_fd() as _;
 
-        dbg!("ACCEPT_TCP");
+        let (mut storage, mut addrlen) = unsafe {
+            let mut addrlen = mem::size_of::<sockaddr>() as socklen_t;
+            let mut storage = MaybeUninit::<sockaddr>::zeroed().assume_init();
+            (storage, addrlen)
+        };
 
-        socket
-            .accept()
-            .map(|(stream, sockaddr)| (Handle::new(stream).unwrap(), sockaddr))
+        let mut sqe = OP::Accept::new(Fd(fd), &mut storage as *mut _ as *mut _, &mut addrlen as *mut _ as *mut _)
+            .build();
+
+        let cc = Proactor::get().inner().register_io(sqe)?;
+        let stream = unsafe { TcpStream::from_raw_fd(cc.await?) };
+        let addr = stream.local_addr()?;
+
+        Ok((Handle::new(stream).unwrap(), addr))
     }
 
     ///////////////////////////////////

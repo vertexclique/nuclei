@@ -2,13 +2,14 @@ use crate::sys::epoll::*;
 use futures::channel::oneshot;
 use lever::prelude::*;
 use pin_utils::unsafe_pinned;
+use ahash::HashMap;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{collections::HashMap, fs::File, time::Duration};
+use std::{fs::File, time::Duration};
 
 macro_rules! syscall {
     ($fn:ident $args:tt) => {{

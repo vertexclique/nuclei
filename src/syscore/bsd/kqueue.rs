@@ -8,7 +8,8 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{collections::HashMap, os::unix::net::UnixStream, time::Duration};
+use ahash::HashMap;
+use std::{os::unix::net::UnixStream, time::Duration};
 
 macro_rules! syscall {
     ($fn:ident $args:tt) => {{
