@@ -3,4 +3,5 @@
 - [Quickstart Guide](quickstart)
 - **Internals**
 - [Design Principles](designprinciples)
-- [Recovery System](recosystem)
+- **Knowledge Base**
+- 
