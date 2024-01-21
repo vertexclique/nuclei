@@ -2,7 +2,7 @@ use crate::sys::epoll::*;
 use futures::channel::oneshot;
 use lever::prelude::*;
 use pin_utils::unsafe_pinned;
-use ahash::HashMap;
+use ahash::{HashMap, HashMapExt};
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;

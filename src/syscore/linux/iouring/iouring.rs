@@ -26,11 +26,9 @@ macro_rules! syscall {
 ///////////////////
 ///////////////////
 
-use crate::Proactor;
 use socket2::SockAddr;
 use std::mem;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
-use std::sync::{atomic, Mutex};
 use rustix_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter, squeue::Entry as SQEntry, cqueue::Entry as CQEntry};
 
 fn max_len() -> usize {
@@ -136,7 +134,7 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
 ///////////////////
 
 const MANUAL_TIMEOUT: u64 = -2 as _;
-const QUEUE_LEN: u32 = 1 << 10;
+const QUEUE_LEN: u32 = 1 << 15;
 
 pub struct SysProactor {
     sq: TTas<SubmissionQueue<'static>>,
@@ -159,12 +157,17 @@ impl SysProactor {
     pub(crate) fn new() -> io::Result<SysProactor> {
         unsafe {
             let ring = IoUring::builder()
+                .setup_sqpoll(2)
+
+                // .setup_coop_taskrun()
+                // .setup_taskrun_flag()
                 .build(QUEUE_LEN)
                 .expect("nuclei: uring can't be initialized");
 
             IO_URING = Some(ring);
 
             let (submitter, sq, cq) = IO_URING.as_mut().unwrap().split();
+            submitter.register_iowq_max_workers(&mut [16, 16])?;
 
             Ok(SysProactor {
                 sq: TTas::new(sq),
@@ -205,10 +208,10 @@ impl SysProactor {
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
-        if let (Some(mut sq), Some(mut cq)) = (self.sq.try_lock(), self.cq.try_lock()) {
-            sq.sync();
-            cq.sync();
-        }
+        // if let (Some(mut sq), Some(mut cq)) = (self.sq.try_lock(), self.cq.try_lock()) {
+        //     sq.sync();
+        //     cq.sync();
+        // }
         Ok(())
     }
 
