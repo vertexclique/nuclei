@@ -41,14 +41,14 @@ Nuclei is a [proactor-based](http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10
 The proactor system's design principles are matching [Boost Asio](https://www.boost.org/doc/libs/1_47_0/doc/html/boost_asio/overview/core/async.html).
 Nuclei is not using a conventional reactor approach. It is completely asynchronous, and it's wrapping poll based IO in a proactive fashion.
 
-Nuclei uses [epoll](https://en.wikipedia.org/wiki/Epoll) on Linux as the primary evented IO backend, secondarily (given system support) you can use
-[io_uring](https://kernel.dk/io_uring.pdf). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
-On Windows, the [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend [will be used](https://github.com/vertexclique/nuclei/pull/3).   
+Nuclei uses [io_uring](https://kernel.dk/io_uring.pdf) on Linux as the primary IO backend, secondarily you can use [epoll](https://en.wikipedia.org/wiki/Epoll). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
+On Windows, the [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend [will be used](https://github.com/vertexclique/nuclei/pull/3).
 
-The current io_uring implementation needs a modern Linux kernel (5.6+).
+The current io_uring implementation needs a modern Linux kernel (5.19+).
 
 ## Features
 
+* Most of the recent IO_URING features are available, ZC and other 6.1+ features are in TODO.
 * Async TCP, UDP, Unix domain sockets and files...
 * The proactor system doesn't block
 * Scatter/Gather operations

@@ -7,7 +7,7 @@ Nuclei is not using a conventional reactor approach. It is completely asynchrono
 Nuclei uses [io_uring](https://kernel.dk/io_uring.pdf) on Linux as the primary IO backend, secondarily you can use [epoll](https://en.wikipedia.org/wiki/Epoll). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
 On Windows, the [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend [will be used](https://github.com/vertexclique/nuclei/pull/3).
 
-Current io_uring implementation needs Linux kernel 5.11+.
+Current io_uring implementation needs Linux kernel 5.19+.
 
 ## Features
 
