@@ -45,6 +45,8 @@ lever = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 socket2 = { version = "0.3.19", features = ["pair", "unix"] }
 pin-utils = "0.1.0"
+pin-project-lite = "0.2"
+crossbeam-channel = "0.5"
 once_cell = "1.19.0"
 os_socketaddr = "0.2.5"
 ahash = "0.8.7"

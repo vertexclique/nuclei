@@ -50,6 +50,10 @@ name = "h1-server"
 path = "h1-server.rs"
 
 [[example]]
+name = "h1-server-multishot"
+path = "h1-server-multishot.rs"
+
+[[example]]
 name = "tcp-server"
 path = "tcp-server.rs"
 

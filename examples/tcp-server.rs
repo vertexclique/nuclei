@@ -17,7 +17,7 @@ fn main() -> io::Result<()> {
         // Accept clients in a loop.
         loop {
             let (stream, peer_addr) = listener.accept().await?;
-            println!("Accepted client: {}", peer_addr);
+            println!("Accepted client: {:?}", peer_addr);
 
             // Spawn a task that echoes messages from the client back to it.
             spawn(echo(stream)).detach();

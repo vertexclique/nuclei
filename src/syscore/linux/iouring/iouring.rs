@@ -29,8 +29,10 @@ macro_rules! syscall {
 use socket2::SockAddr;
 use std::mem;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use rustix::io_uring::IoringOp;
 use rustix_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter, squeue::Entry as SQEntry, cqueue::Entry as CQEntry};
-use rustix_uring::cqueue::sock_nonempty;
+use rustix_uring::cqueue::{more, sock_nonempty};
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -140,7 +142,7 @@ pub struct SysProactor {
     sq: TTas<SubmissionQueue<'static>>,
     cq: TTas<CompletionQueue<'static>>,
     sbmt: TTas<Submitter<'static>>,
-    submitters: TTas<HashMap<u64, oneshot::Sender<i32>>>,
+    submitters: TTas<HashMap<u64, Sender<i32>>>,
     submitter_id: AtomicU64,
 }
 
@@ -162,7 +164,6 @@ impl SysProactor {
 
             IO_URING = Some(ring);
 
-            let np = getrlimit(Resource::Nproc);
             let (submitter, sq, cq) = IO_URING.as_mut().unwrap().split();
             submitter.register_iowq_max_workers(&mut [QUEUE_LEN*8, 16])?;
 
@@ -186,7 +187,7 @@ impl SysProactor {
         mut sqe: SQEntry,
     ) -> io::Result<CompletionChan> {
         let id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = unbounded::<i32>();
 
         sqe = sqe.user_data(id);
 
@@ -224,9 +225,14 @@ impl SysProactor {
         'sock: loop {
             cq.sync();
             while let Some(cqe) = cq.next() {
-                self.cqe_completion(&cqe)?;
+                if more(cqe.flags()) {
+                    self.cqe_completion_multi(&cqe)?;
+                } else {
+                    self.cqe_completion_single(&cqe)?;
+                }
                 acc+=1;
-                if !sock_nonempty(cqe.flags()) {
+
+                if !sock_nonempty(cqe.flags()) || !more(cqe.flags()) {
                     break 'sock;
                 }
             }
@@ -235,31 +241,51 @@ impl SysProactor {
         Ok(acc)
     }
 
-    fn cqe_completion(&self, cqe: &CQEntry) -> io::Result<()> {
+    fn cqe_completion_multi(&self, cqe: &CQEntry) -> io::Result<()> {
         let udata = cqe.user_data();
         let res: i32 = cqe.result();
 
         let mut sbmts = self.submitters.lock();
-        sbmts.remove(&udata).map(|s| s.send(res));
+        sbmts.get(&udata).map(|s| s.send(res));
+        // if atomics are going to be wrapped, channel will be reinserted.
+        // which is ok.
+
+        Ok(())
+    }
+
+    fn cqe_completion_single(&self, cqe: &CQEntry) -> io::Result<()> {
+        let udata = cqe.user_data();
+        let res: i32 = cqe.result();
+
+        let mut sbmts = self.submitters.lock();
+        let x = sbmts.remove(&udata);
+        x.map(|s| s.send(res));
 
         Ok(())
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct CompletionChan {
-    rx: oneshot::Receiver<i32>,
+    rx: Receiver<i32>,
 }
 
 impl CompletionChan {
-    unsafe_pinned!(rx: oneshot::Receiver<i32>);
+    pub fn get_rx(&self) -> Receiver<i32> {
+        self.rx.clone()
+    }
+}
+
+impl CompletionChan {
+    unsafe_pinned!(rx: Receiver<i32>);
 }
 
 impl Future for CompletionChan {
     type Output = io::Result<i32>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        self.rx()
-            .poll(cx)
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sender has been cancelled"))
+        let this = self.rx();
+        Poll::Ready(this.recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sender has been cancelled")))
     }
 }
