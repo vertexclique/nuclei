@@ -7,13 +7,15 @@ use async_dup::Arc;
 use futures::prelude::*;
 use http_types::{Request, Response, StatusCode};
 
+static DATA: &'static str = include_str!("data/quark-gluon-plasma");
+
 /// Serves a request and returns a response.
 async fn serve(req: Request) -> http_types::Result<Response> {
-    println!("Serving {}", req.url());
+    // println!("Serving {}", req.url());
 
     let mut res = Response::new(StatusCode::Ok);
     res.insert_header("Content-Type", "text/plain");
-    res.set_body("Hello from async-h1!");
+    res.set_body(DATA);
     Ok(res)
 }
 

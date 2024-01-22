@@ -2,7 +2,7 @@ use crate::sys::epoll::*;
 use futures::channel::oneshot;
 use lever::prelude::*;
 use pin_utils::unsafe_pinned;
-use ahash::HashMap;
+use ahash::{HashMap, HashMapExt};
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
@@ -194,7 +194,6 @@ impl SysProactor {
     }
 
     pub fn wait(&self, max_event_size: usize, timeout: Option<Duration>) -> io::Result<usize> {
-        // dbg!("WAIT");
         let mut events: Vec<EpollEvent> = Vec::with_capacity(max_event_size);
         events.resize(max_event_size, unsafe {
             MaybeUninit::zeroed().assume_init()
@@ -219,7 +218,6 @@ impl SysProactor {
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
-        // dbg!("WAKE");
         self.event_fd.lock().write_all(&(1 as u64).to_ne_bytes())?;
         Ok(())
     }
@@ -236,7 +234,6 @@ impl SysProactor {
             self.reregister(fd, events)?;
             *reged_evts = events;
         } else {
-            // dbg!(events);
             self.register(fd, events)?;
             registered.insert(fd, events);
         }

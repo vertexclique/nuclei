@@ -18,6 +18,7 @@ use crate::syscore::linux::iouring::fs::store_file::StoreFile;
 use crate::syscore::CompletionChan;
 use crate::{Handle, Proactor};
 use std::fs::File;
+use crate::syscore::linux::iouring::net::multishot::TcpStreamGenerator;
 
 impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {
@@ -38,13 +39,21 @@ impl Handle<TcpListener> {
         // TODO: (vertexclique): Migrate towards to using initial subscription with callback.
         // Using `new_with_callback`.
         let listener = TcpListener::bind(addr)?;
-        // listener.set_nonblocking(true)?;
+        listener.set_nonblocking(true)?;
 
         Ok(Handle::new(listener)?)
     }
 
-    pub async fn accept(&self) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
+    ///
+    /// Single-call accept
+    pub async fn accept(&self) -> io::Result<(Handle<TcpStream>, Option<SocketAddr>)> {
         Processor::processor_accept_tcp_listener(self.get_ref()).await
+    }
+
+    ///
+    /// Multishot accept
+    pub async fn accept_multi(&self) -> io::Result<TcpStreamGenerator> {
+        TcpStreamGenerator::new(self.get_ref())
     }
 
     pub fn incoming(
