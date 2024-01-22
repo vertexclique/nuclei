@@ -38,12 +38,12 @@ impl Handle<TcpListener> {
         // TODO: (vertexclique): Migrate towards to using initial subscription with callback.
         // Using `new_with_callback`.
         let listener = TcpListener::bind(addr)?;
-        // listener.set_nonblocking(true)?;
+        listener.set_nonblocking(true)?;
 
         Ok(Handle::new(listener)?)
     }
 
-    pub async fn accept(&self) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
+    pub async fn accept(&self) -> io::Result<(Handle<TcpStream>, Option<SocketAddr>)> {
         Processor::processor_accept_tcp_listener(self.get_ref()).await
     }
 

@@ -27,11 +27,11 @@ use std::ptr::null_mut;
 use libc::sockaddr_un;
 use os_socketaddr::OsSocketAddr;
 use pin_utils::unsafe_pinned;
-use rustix::io_uring::{msghdr, RecvFlags, SendFlags, sockaddr, sockaddr_storage, SocketFlags};
+use rustix::io_uring::{IoringRecvFlags, msghdr, RecvFlags, SendFlags, sockaddr, sockaddr_storage, SocketFlags};
 use rustix::net::{connect_unix, SocketAddrAny, SocketAddrStorage, SocketAddrUnix};
 use rustix_uring::opcode::RecvMsg;
 use rustix_uring::squeue::Entry;
-use rustix_uring::types::{AtFlags, Mode, OFlags, socklen_t, Statx, StatxFlags};
+use rustix_uring::types::{AtFlags, Fixed, Mode, OFlags, socklen_t, Statx, StatxFlags};
 use socket2::SockAddr;
 
 macro_rules! syscall {
@@ -64,7 +64,6 @@ impl Processor {
         let cc = Proactor::get().inner().register_io(sqe)?;
 
         let x = cc.await? as _;
-        dbg!(x);
 
         Ok(x)
     }
@@ -74,7 +73,6 @@ impl Processor {
         buf: &mut [u8],
         offset: usize,
     ) -> io::Result<usize> {
-        dbg!(&offset);
         let mut sqe = OP::Read::new(Fd(*io), buf.as_mut_ptr(), buf.len() as _)
             .offset(offset as _)
             .build();
@@ -314,7 +312,7 @@ impl Processor {
 
     pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(
         listener: &R
-    ) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
+    ) -> io::Result<(Handle<TcpStream>, Option<SocketAddr>)> {
         let fd = listener.as_raw_fd() as _;
 
         let (mut storage, mut addrlen) = unsafe {
@@ -324,13 +322,13 @@ impl Processor {
         };
 
         let mut sqe = OP::Accept::new(Fd(fd), &mut storage as *mut _ as *mut _, &mut addrlen as *mut _ as *mut _)
+            .flags(SocketFlags::NONBLOCK)
             .build();
 
         let cc = Proactor::get().inner().register_io(sqe)?;
         let stream = unsafe { TcpStream::from_raw_fd(cc.await?) };
-        let addr = stream.local_addr()?;
 
-        Ok((Handle::new(stream).unwrap(), addr))
+        Ok((Handle::new(stream).unwrap(), None))
     }
 
     ///////////////////////////////////
@@ -412,6 +410,7 @@ impl Processor {
 
         let mut sqe = OP::RecvMsg::new(Fd(fd), &mut recvmsg as *mut _ as *mut _)
             .flags(flags)
+            .ioprio((IoringRecvFlags::POLL_FIRST | IoringRecvFlags::MULTISHOT).bits())
             .build();
 
         let res = Proactor::get()

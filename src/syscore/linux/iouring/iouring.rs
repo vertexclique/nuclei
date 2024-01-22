@@ -30,6 +30,7 @@ use socket2::SockAddr;
 use std::mem;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use rustix_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter, squeue::Entry as SQEntry, cqueue::Entry as CQEntry};
+use rustix_uring::cqueue::sock_nonempty;
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -133,8 +134,7 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
 //// uring impl
 ///////////////////
 
-const MANUAL_TIMEOUT: u64 = -2 as _;
-const QUEUE_LEN: u32 = 1 << 15;
+const QUEUE_LEN: u32 = 1 << 11;
 
 pub struct SysProactor {
     sq: TTas<SubmissionQueue<'static>>,
@@ -142,7 +142,6 @@ pub struct SysProactor {
     sbmt: TTas<Submitter<'static>>,
     submitters: TTas<HashMap<u64, oneshot::Sender<i32>>>,
     submitter_id: AtomicU64,
-    waker: AtomicBool,
 }
 
 pub type RingTypes = (
@@ -158,16 +157,14 @@ impl SysProactor {
         unsafe {
             let ring = IoUring::builder()
                 .setup_sqpoll(2)
-
-                // .setup_coop_taskrun()
-                // .setup_taskrun_flag()
                 .build(QUEUE_LEN)
                 .expect("nuclei: uring can't be initialized");
 
             IO_URING = Some(ring);
 
+            let np = getrlimit(Resource::Nproc);
             let (submitter, sq, cq) = IO_URING.as_mut().unwrap().split();
-            submitter.register_iowq_max_workers(&mut [16, 16])?;
+            submitter.register_iowq_max_workers(&mut [QUEUE_LEN*8, 16])?;
 
             Ok(SysProactor {
                 sq: TTas::new(sq),
@@ -175,9 +172,13 @@ impl SysProactor {
                 sbmt: TTas::new(submitter),
                 submitters: TTas::new(HashMap::with_capacity(QUEUE_LEN as usize)),
                 submitter_id: AtomicU64::default(),
-                waker: AtomicBool::default(),
             })
         }
+    }
+
+    pub(crate) fn register_files_sparse(&self, n: u32) -> io::Result<()> {
+        let mut sbmt = self.sbmt.lock();
+        Ok(sbmt.register_files_sparse(n)?)
     }
 
     pub(crate) fn register_io(
@@ -208,10 +209,6 @@ impl SysProactor {
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
-        // if let (Some(mut sq), Some(mut cq)) = (self.sq.try_lock(), self.cq.try_lock()) {
-        //     sq.sync();
-        //     cq.sync();
-        // }
         Ok(())
     }
 
@@ -224,10 +221,15 @@ impl SysProactor {
         let mut acc: usize = 0;
 
         // issue cas barrier
-        cq.sync();
-        while let Some(cqe) = cq.next() {
-            self.cqe_completion(&cqe)?;
-            acc+=1;
+        'sock: loop {
+            cq.sync();
+            while let Some(cqe) = cq.next() {
+                self.cqe_completion(&cqe)?;
+                acc+=1;
+                if !sock_nonempty(cqe.flags()) {
+                    break 'sock;
+                }
+            }
         }
 
         Ok(acc)

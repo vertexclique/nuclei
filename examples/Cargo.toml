@@ -7,7 +7,7 @@ publish = false
 
 [dev-dependencies]
 #nuclei = { path = "../" }
-nuclei = { path = "../", default-features = false, features = ["async-exec", "iouring"]}
+nuclei = { path = "../", default-features = false, features = ["tokio", "iouring"]}
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 futures-util = "0.3"
 anyhow = "1.0.31"
@@ -16,6 +16,17 @@ async-dup = "1.1.0"
 http-types = "2.2.1"
 num_cpus = "1.13.0"
 signal-hook = "0.1.13"
+criterion = { version = "0.3", features = ["async_futures"] }
+surf = "2.3"
+
+[dependencies]
+anyhow = "1.0.79"
+futures = "0.3.30"
+http = "1.0.0"
+
+[[bench]]
+name = "http-server-bench"
+harness = false
 
 
 [[example]]
