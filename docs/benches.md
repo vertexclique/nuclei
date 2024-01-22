@@ -46,4 +46,5 @@ Iteration times of IO_URING multishot vs streaming mode
 Probability Distribution Function of IO_URING multishot vs streaming mode
 ![Probability Distribution Function of IO_URING multishot vs streaming mode](assets/benchres/io_uring_multishot_http_bench/25/report/both/pdf.svg)
 
-If you want to have full benchmark results, [here you can have the full report.](assets/benchres/io_uring_multishot_http_bench/nuclei_http_server_io_uring_multishot_bench_report.pdf)
+
+> If you want to have full HTTP 1.1 Server benchmark results, [here you can have the full report.](https://raw.githubusercontent.com/vertexclique/nuclei/master/docs/assets/benchres/io_uring_multishot_http_bench/nuclei_http_server_io_uring_multishot_bench_report.pdf)
