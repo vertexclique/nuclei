@@ -21,6 +21,7 @@ exclude = [
 	"ci/*",
 	"benches/*",
 	"doc/*",
+	"docs/*",
 	"*.png",
 	"*.dot",
 	"*.yml",
