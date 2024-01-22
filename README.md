@@ -81,8 +81,6 @@ When the `iouring` feature gate is not enabled, the platforms evented backend is
 Executor is using `async-global-executor`. Available features are:
 * `async-exec`: Uses `async-io` feature of `async-global-executor`.
 * `tokio`
-* `tokio02`
-* `tokio03`
 
 #### License
 
