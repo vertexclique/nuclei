@@ -58,7 +58,7 @@ impl Handle<TcpListener> {
 
     pub fn incoming(
         &self,
-    ) -> impl Stream<Item = io::Result<Handle<TcpStream>>> + Unpin + '_ {
+    ) -> impl Stream<Item = io::Result<Handle<TcpStream>>> + Send + Unpin + '_ {
         Box::pin(futures::stream::unfold(
             self,
             |listener: &Handle<TcpListener>| async move {

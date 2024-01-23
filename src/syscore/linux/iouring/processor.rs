@@ -315,13 +315,7 @@ impl Processor {
     ) -> io::Result<(Handle<TcpStream>, Option<SocketAddr>)> {
         let fd = listener.as_raw_fd() as _;
 
-        let (mut storage, mut addrlen) = unsafe {
-            let mut addrlen = mem::size_of::<sockaddr>() as socklen_t;
-            let mut storage = MaybeUninit::<sockaddr>::zeroed().assume_init();
-            (storage, addrlen)
-        };
-
-        let mut sqe = OP::Accept::new(Fd(fd), &mut storage as *mut _ as *mut _, &mut addrlen as *mut _ as *mut _)
+        let mut sqe = OP::Accept::new(Fd(fd), null_mut(), null_mut())
             .flags(SocketFlags::NONBLOCK)
             .build();
 
