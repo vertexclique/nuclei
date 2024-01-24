@@ -87,7 +87,7 @@ pub fn http_server_bench(c: &mut Criterion) {
     let uri = "http://127.0.0.1:8000";
 
     let mut group = c.benchmark_group("http_server_bench");
-    for i in [1_u64, 10_u64, 25_u64, 50_u64].iter() {
+    for i in [1_u64, 10_u64, 25_u64].iter() {
         group.throughput(Throughput::Bytes(DATA.len() as u64 * i));
         group.bench_function(BenchmarkId::from_parameter(i), |b| b.to_async(FuturesExecutor).iter(|| async {
             let tasks = (0..*i).map(|e| surf::get(uri).recv_string()).collect::<Vec<_>>();
