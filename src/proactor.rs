@@ -63,7 +63,7 @@ impl Proactor {
 
     #[cfg(all(feature = "iouring", target_os = "linux"))]
     /// Get IO_URING backend probes
-    pub fn probes(&self) -> &rustix_uring::Parameters {
+    pub fn ring_params(&self) -> &rustix_uring::Parameters {
         unsafe { IO_URING.as_ref().unwrap().params() }
     }
 }
