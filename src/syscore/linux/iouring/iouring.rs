@@ -137,8 +137,6 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
 //// uring impl
 ///////////////////
 
-const QUEUE_LEN: u32 = 1 << 11;
-
 pub struct SysProactor {
     sq: TTas<SubmissionQueue<'static>>,
     cq: TTas<CompletionQueue<'static>>,
@@ -153,7 +151,7 @@ pub type RingTypes = (
     Submitter<'static>,
 );
 
-static mut IO_URING: Option<IoUring> = None;
+pub(crate) static mut IO_URING: Option<IoUring> = None;
 
 impl SysProactor {
     pub(crate) fn new(config: NucleiConfig) -> io::Result<SysProactor> {
@@ -178,7 +176,7 @@ impl SysProactor {
                 sq: TTas::new(sq),
                 cq: TTas::new(cq),
                 sbmt: TTas::new(submitter),
-                submitters: TTas::new(HashMap::with_capacity(QUEUE_LEN as usize)),
+                submitters: TTas::new(HashMap::with_capacity(config.iouring.queue_len as usize)),
                 submitter_id: AtomicU64::default(),
             })
         }

@@ -4,6 +4,7 @@ use std::{future::Future, io};
 use std::ops::DerefMut;
 
 use once_cell::sync::{Lazy, OnceCell};
+use rustix_uring::Parameters;
 use crate::config::NucleiConfig;
 
 use super::syscore::*;
@@ -51,14 +52,20 @@ impl Proactor {
         self.0.wait(max_event_size, duration)
     }
 
+    /// Get the IO backend that is used with Nuclei's proactor.
+    pub fn backend() -> IoBackend {
+        BACKEND
+    }
+
     /// Get underlying proactor instance.
     pub(crate) fn inner(&self) -> &SysProactor {
         &self.0
     }
 
-    /// Get the IO backend that is used with Nuclei's proactor.
-    pub(crate) fn backend() -> IoBackend {
-        BACKEND
+    #[cfg(all(feature = "iouring", target_os = "linux"))]
+    /// Get IO_URING backend probes
+    pub fn probes(&self) -> &Parameters {
+        unsafe { IO_URING.as_ref().unwrap().params() }
     }
 }
 

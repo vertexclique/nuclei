@@ -41,6 +41,7 @@ pub struct IoUringConfiguration {
     /// the current limit.
     ///
     /// **[default]**: If [None] then Nuclei default value of will be used `256`.
+    ///
     /// If [None] passed, by default, the amount of bounded IO workers is limited to how
     /// many SQ entries the ring was setup with, or 4 times the number of
     /// online CPUs in the system, whichever is smaller.
@@ -51,6 +52,7 @@ pub struct IoUringConfiguration {
     /// on sockets. Passing `0` does not change the current limit.
     ///
     /// **[default]**: If [None] then Nuclei default value of will be used `512`.
+    ///
     /// If [None] passed unbounded workers will be limited by the process task limit,
     /// as indicated by the rlimit [RLIMIT_NPROC](https://man7.org/linux/man-pages/man2/getrlimit.2.html) limit.
     pub per_numa_unbounded_worker_count: Option<u32>,
