@@ -40,8 +40,8 @@ pub struct IoUringConfiguration {
     /// that is I/O on regular files or block devices. Passing `0` does not change
     /// the current limit.
     ///
-    /// **[default]**: If [None] then default value of will be used.
-    /// By default, the amount of bounded IO workers is limited to how
+    /// **[default]**: If [None] then Nuclei default value of will be used `256`.
+    /// If [None] passed, by default, the amount of bounded IO workers is limited to how
     /// many SQ entries the ring was setup with, or 4 times the number of
     /// online CPUs in the system, whichever is smaller.
     pub per_numa_bounded_worker_count: Option<u32>,
@@ -50,8 +50,8 @@ pub struct IoUringConfiguration {
     /// which carry out I/O operations that can never complete, for instance I/O
     /// on sockets. Passing `0` does not change the current limit.
     ///
-    /// **[default]**: If [None] then default value of will be used.
-    /// Unbounded workers are only limited by the process task limit,
+    /// **[default]**: If [None] then Nuclei default value of will be used `512`.
+    /// If [None] passed unbounded workers will be limited by the process task limit,
     /// as indicated by the rlimit [RLIMIT_NPROC](https://man7.org/linux/man-pages/man2/getrlimit.2.html) limit.
     pub per_numa_unbounded_worker_count: Option<u32>,
 
@@ -63,8 +63,8 @@ impl Default for IoUringConfiguration {
         Self {
             queue_len: 1 << 11,
             sqpoll_wake_interval: Some(2),
-            per_numa_bounded_worker_count: Some(1 << 13),
-            per_numa_unbounded_worker_count: Some(16),
+            per_numa_bounded_worker_count: Some(1 << 8),
+            per_numa_unbounded_worker_count: Some(1 << 9),
         }
     }
 }
