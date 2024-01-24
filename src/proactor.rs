@@ -7,6 +7,7 @@ use once_cell::sync::Lazy;
 use super::syscore::*;
 use super::waker::*;
 use crate::spawn_blocking;
+use crate::sys::IoBackend;
 
 pub use super::handle::*;
 
@@ -38,6 +39,11 @@ impl Proactor {
     /// Get underlying proactor instance.
     pub(crate) fn inner(&self) -> &SysProactor {
         &self.0
+    }
+
+    /// Get the IO backend that is used with Nuclei's proactor.
+    pub(crate) fn backend() -> IoBackend {
+        BACKEND
     }
 }
 

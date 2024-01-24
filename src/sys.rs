@@ -1,3 +1,14 @@
+///
+/// Backends that are possible to use with Nuclei
+pub enum IoBackend {
+    /// BSD-like backend
+    Kqueue,
+    /// Linux backend
+    Epoll,
+    /// Linux backend
+    IoUring
+}
+
 #[cfg(unix)]
 fn check_err(res: libc::c_int) -> Result<libc::c_int, std::io::Error> {
     if res == -1 {
