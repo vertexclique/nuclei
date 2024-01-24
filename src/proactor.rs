@@ -4,7 +4,6 @@ use std::{future::Future, io};
 use std::ops::DerefMut;
 
 use once_cell::sync::{Lazy, OnceCell};
-use rustix_uring::Parameters;
 use crate::config::NucleiConfig;
 
 use super::syscore::*;
@@ -64,7 +63,7 @@ impl Proactor {
 
     #[cfg(all(feature = "iouring", target_os = "linux"))]
     /// Get IO_URING backend probes
-    pub fn probes(&self) -> &Parameters {
+    pub fn probes(&self) -> &rustix_uring::Parameters {
         unsafe { IO_URING.as_ref().unwrap().params() }
     }
 }
