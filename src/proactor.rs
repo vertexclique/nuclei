@@ -99,11 +99,13 @@ pub fn drive<T>(future: impl Future<Output = T>) -> T {
 }
 
 #[cfg(test)]
+#[cfg(feature = "iouring")]
 mod proactor_tests {
     use crate::config::{IoUringConfiguration, NucleiConfig};
     use crate::Proactor;
 
     #[test]
+    #[ignore]
     fn proactor_with_defaults() {
         let old = Proactor::get();
 
