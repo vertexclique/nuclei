@@ -28,6 +28,7 @@ macro_rules! syscall {
 use socket2::SockAddr;
 use std::mem;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
+use crate::config::NucleiConfig;
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -148,7 +149,7 @@ pub struct SysProactor {
 }
 
 impl SysProactor {
-    pub(crate) fn new() -> io::Result<SysProactor> {
+    pub(crate) fn new(config: NucleiConfig) -> io::Result<SysProactor> {
         let epoll_fd: i32 = epoll_create1()?;
         let event_fd: i32 = syscall!(eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK))?;
         let event_fd_raw = event_fd;

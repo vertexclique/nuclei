@@ -38,6 +38,8 @@ mod submission_handler;
 mod sys;
 mod utils;
 mod waker;
+/// Nuclei's configuration options reside here.
+pub mod config;
 
 #[cfg(not(any(
     target_os = "linux",     // epoll, iouring

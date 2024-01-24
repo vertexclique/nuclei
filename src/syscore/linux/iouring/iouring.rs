@@ -33,6 +33,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use rustix::io_uring::IoringOp;
 use rustix_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter, squeue::Entry as SQEntry, cqueue::Entry as CQEntry};
 use rustix_uring::cqueue::{more, sock_nonempty};
+use crate::config::NucleiConfig;
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -155,17 +156,23 @@ pub type RingTypes = (
 static mut IO_URING: Option<IoUring> = None;
 
 impl SysProactor {
-    pub(crate) fn new() -> io::Result<SysProactor> {
+    pub(crate) fn new(config: NucleiConfig) -> io::Result<SysProactor> {
         unsafe {
-            let ring = IoUring::builder()
-                .setup_sqpoll(2)
-                .build(QUEUE_LEN)
+            let mut rb = IoUring::builder();
+            config.iouring.sqpoll_wake_interval.map(|e| rb.setup_sqpoll(e));
+            let mut ring = rb.build(config.iouring.queue_len)
                 .expect("nuclei: uring can't be initialized");
 
             IO_URING = Some(ring);
 
             let (submitter, sq, cq) = IO_URING.as_mut().unwrap().split();
-            submitter.register_iowq_max_workers(&mut [QUEUE_LEN*8, 16])?;
+
+            match (config.iouring.per_numa_bounded_worker_count, config.iouring.per_numa_unbounded_worker_count) {
+                (Some(bw), Some(ubw)) => submitter.register_iowq_max_workers(&mut [bw, ubw])?,
+                (None, Some(ubw)) => submitter.register_iowq_max_workers(&mut [0, ubw])?,
+                (Some(bw), None) => submitter.register_iowq_max_workers(&mut [bw, 0])?,
+                (None, None) => submitter.register_iowq_max_workers(&mut [0, 0])?,
+            }
 
             Ok(SysProactor {
                 sq: TTas::new(sq),

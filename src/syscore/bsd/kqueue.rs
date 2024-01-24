@@ -28,6 +28,7 @@ macro_rules! syscall {
 use socket2::SockAddr;
 use std::mem;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
+use crate::config::NucleiConfig;
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -151,7 +152,7 @@ pub struct SysProactor {
 }
 
 impl SysProactor {
-    pub(crate) fn new() -> io::Result<SysProactor> {
+    pub(crate) fn new(config: NucleiConfig) -> io::Result<SysProactor> {
         let kqueue_fd = kqueue()?;
         syscall!(fcntl(kqueue_fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
         let (read_stream, write_stream) = UnixStream::pair()?;
