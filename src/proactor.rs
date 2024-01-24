@@ -15,7 +15,7 @@ pub use super::handle::*;
 
 ///
 /// Concrete proactor instance
-pub struct Proactor(SysProactor);
+pub struct Proactor(pub(crate) SysProactor);
 unsafe impl Send for Proactor {}
 unsafe impl Sync for Proactor {}
 
@@ -34,8 +34,8 @@ impl Proactor {
     /// Builds a proactor instance with given config and returns a reference to it.
     pub fn with_config(config: NucleiConfig) -> &'static Proactor {
         unsafe {
-            let proactor = Proactor(SysProactor::new(config.clone()).expect("cannot initialize IO backend"));
-            PROACTOR.set(proactor);
+            let mut proactor = Proactor(SysProactor::new(config.clone()).expect("cannot initialize IO backend"));
+            PROACTOR.set(proactor).map_err(|e| "Proactor instance not being able to set.").unwrap();
             let proactor = Proactor(SysProactor::new(config).expect("cannot initialize IO backend"));
             &PROACTOR.get_or_init(|| proactor)
         }
@@ -95,5 +95,53 @@ pub fn drive<T>(future: impl Future<Output = T>) -> T {
         // TODO: (vcq): we don't need this.
         // let _duration = Duration::from_millis(1);
         let _ = driver.as_mut().poll(cx);
+    }
+}
+
+#[cfg(test)]
+mod proactor_tests {
+    use crate::config::{IoUringConfiguration, NucleiConfig};
+    use crate::Proactor;
+
+    #[test]
+    fn proactor_with_defaults() {
+        let old = Proactor::get();
+
+        let osq = old.0.sq.lock();
+        let olen = osq.capacity();
+        drop(osq);
+        dbg!(olen);
+
+        assert_eq!(olen, 2048);
+    }
+
+    #[test]
+    fn proactor_with_config_rollup() {
+        let config = NucleiConfig {
+            iouring: IoUringConfiguration {
+                queue_len: 10,
+                sqpoll_wake_interval: Some(11),
+                per_numa_bounded_worker_count: Some(12),
+                per_numa_unbounded_worker_count: Some(13),
+            },
+        };
+        let new = Proactor::with_config(config);
+        let old = Proactor::get();
+
+
+        let nsq = new.0.sq.lock();
+        let nlen = nsq.capacity();
+        drop(nsq);
+
+        let osq = old.0.sq.lock();
+        let olen = osq.capacity();
+        drop(osq);
+
+        dbg!(nlen);
+        dbg!(olen);
+
+        assert_eq!(nlen, olen);
+        assert_eq!(nlen, 16);
+        assert_eq!(olen, 16);
     }
 }

@@ -138,8 +138,8 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
 ///////////////////
 
 pub struct SysProactor {
-    sq: TTas<SubmissionQueue<'static>>,
-    cq: TTas<CompletionQueue<'static>>,
+    pub(crate) sq: TTas<SubmissionQueue<'static>>,
+    pub(crate) cq: TTas<CompletionQueue<'static>>,
     sbmt: TTas<Submitter<'static>>,
     submitters: TTas<HashMap<u64, Sender<i32>>>,
     submitter_id: AtomicU64,
