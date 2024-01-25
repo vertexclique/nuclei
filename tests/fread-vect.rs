@@ -9,6 +9,7 @@ use futures::AsyncReadExt;
 const IOVEC_WIDTH: usize = 1 << 10;
 
 #[nuclei::test]
+#[cfg(target_os = "linux")]
 async fn read_vectored() {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("testdata");

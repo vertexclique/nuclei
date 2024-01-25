@@ -2,6 +2,7 @@
 /// Ref issue: https://github.com/rust-lang/rust/issues/68041
 /// This should work fine with iouring.
 #[cfg(feature = "iouring")]
+#[cfg(target_os = "linux")]
 #[nuclei::test]
 async fn write_vectored() {
     use nuclei::*;
