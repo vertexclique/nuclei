@@ -40,13 +40,10 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
     }
 }
 
-fn main() -> Result<()> {
-    spawn_blocking(|| drive(future::pending::<()>())).detach();
+#[nuclei::main]
+async fn main() -> Result<()> {
+    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
 
-    block_on(async {
-        let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
-
-        http.await?;
-        Ok(())
-    })
+    http.await?;
+    Ok(())
 }

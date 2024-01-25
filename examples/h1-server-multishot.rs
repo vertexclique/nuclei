@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
-fn main() -> anyhow::Result<()>  {
+#[nuclei::main]
+async fn main() -> anyhow::Result<()>  {
     use nuclei::*;
     use std::net::TcpListener;
 
@@ -51,14 +52,10 @@ fn main() -> anyhow::Result<()>  {
         Ok(())
     }
 
-    spawn_blocking(|| drive(future::pending::<()>())).detach();
+    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
 
-    block_on(async {
-        let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
-
-        http.await?;
-        Ok(())
-    })
+    http.await?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

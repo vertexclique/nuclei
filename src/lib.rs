@@ -82,3 +82,6 @@ mod syscore {
 
 pub use async_global_executor::*;
 pub use proactor::*;
+
+#[cfg(feature = "attributes")]
+pub use nuclei_attributes::*;

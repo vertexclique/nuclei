@@ -6,23 +6,19 @@ use std::path::PathBuf;
 
 use futures::AsyncReadExt;
 
-fn main() -> io::Result<()> {
-    let x: io::Result<String> = drive(async {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("data");
-        path.push("quark-gluon-plasma");
-        dbg!(&path);
+#[nuclei::main]
+async fn main() -> io::Result<()> {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("data");
+    path.push("quark-gluon-plasma");
 
-        let fo = File::open(&path).unwrap();
-        let mut file = Handle::<File>::new(fo).unwrap();
-        let mut buffer = String::new();
-        file.read_to_string(&mut buffer).await?;
-        Ok(buffer)
-    });
-    let x = x?;
+    let fo = File::open(&path).unwrap();
+    let mut file = Handle::<File>::new(fo).unwrap();
+    let mut buffer = String::new();
+    file.read_to_string(&mut buffer).await?;
 
-    println!("Content: {}", x);
-    println!("Length of file is {}", x.len());
+    println!("Content: {}", buffer);
+    println!("Length of file is {}", buffer.len());
 
     Ok(())
 }

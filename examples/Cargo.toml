@@ -7,7 +7,7 @@ publish = false
 
 [dev-dependencies]
 #nuclei = { path = "../" }
-nuclei = { path = "../", default-features = false, features = ["tokio", "iouring"]}
+nuclei = { path = "../", default-features = false, features = ["tokio", "iouring", "attributes"]}
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 futures-util = "0.3"
 anyhow = "1.0.31"
