@@ -21,30 +21,27 @@ to detect.[1]\
 \
 ";
 
-#[test]
-fn write_file() {
+#[nuclei::test]
+async fn write_file() {
     // Approximately ~75,9 MB
     let dark_matter = vec![DARK_MATTER_TEXT; 100_000].join("\n");
 
-    let x = drive(async {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("testdata");
-        path.push("dark-matter");
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("testdata");
+    path.push("dark-matter");
 
-        let fo = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let mut file = Handle::<File>::new(fo).unwrap();
-        file.write_all(dark_matter.as_bytes()).await.unwrap();
+    let fo = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut file = Handle::<File>::new(fo).unwrap();
+    file.write_all(dark_matter.as_bytes()).await.unwrap();
 
-        let mut buf = vec![];
-        assert!(file.seek(SeekFrom::Start(0)).await.is_ok());
-        assert_eq!(file.read_to_end(&mut buf).await.unwrap(), dark_matter.len());
-        assert_eq!(&buf[0..dark_matter.len()], dark_matter.as_bytes());
-        buf
-    });
+    let mut buf = vec![];
+    assert!(file.seek(SeekFrom::Start(0)).await.is_ok());
+    assert_eq!(file.read_to_end(&mut buf).await.unwrap(), dark_matter.len());
+    assert_eq!(&buf[0..dark_matter.len()], dark_matter.as_bytes());
 
-    assert_eq!(75899999, x.len());
+    assert_eq!(75899999, buf.len());
 }

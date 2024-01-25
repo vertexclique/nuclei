@@ -32,7 +32,7 @@ autoexamples = false
 
 
 [features]
-default = ["async-exec", "iouring"]
+default = ["async-exec", "iouring", "attributes"]
 # Devs should enable these features to use iouring on linux.
 #default = ["asyncstd", "iouring"]
 epoll = []
@@ -41,7 +41,10 @@ iouring = ["rustix-uring", "rustix"]
 async-exec = ["async-global-executor"]
 tokio = ["async-global-executor/tokio"]
 
+attributes = ["nuclei-attributes"]
+
 [dependencies]
+nuclei-attributes = { version = "0.1", optional = true }
 lever = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 socket2 = { version = "0.3.19", features = ["pair", "unix"] }
