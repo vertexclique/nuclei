@@ -11,9 +11,9 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-///
-/// TcpStream generator that is fed by multishot accept with multiple CQEs.
 pin_project! {
+    ///
+    /// TcpStream generator that is fed by multishot accept with multiple CQEs.
     #[derive(Clone)]
     pub struct TcpStreamGenerator {
         listener: RawFd,
