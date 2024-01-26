@@ -3,7 +3,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
 
-
 use futures::io::SeekFrom;
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -43,7 +42,6 @@ async fn main() -> io::Result<()> {
     assert!(file.seek(SeekFrom::Start(0)).await.is_ok());
     assert_eq!(file.read_to_end(&mut buf).await.unwrap(), dark_matter.len());
     assert_eq!(&buf[0..dark_matter.len()], dark_matter.as_bytes());
-
 
     println!("Length of file is {}", buf.len());
 

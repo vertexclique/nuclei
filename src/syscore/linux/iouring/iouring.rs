@@ -1,8 +1,8 @@
+use ahash::{HashMap, HashMapExt};
 use core::mem::MaybeUninit;
 use futures::channel::oneshot;
 use lever::sync::prelude::*;
 use pin_utils::unsafe_pinned;
-use ahash::{HashMap, HashMapExt};
 use std::future::Future;
 use std::hash::BuildHasherDefault;
 use std::io;
@@ -26,14 +26,17 @@ macro_rules! syscall {
 ///////////////////
 ///////////////////
 
+use crate::config::NucleiConfig;
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use rustix::io_uring::IoringOp;
+use rustix_uring::cqueue::{more, sock_nonempty};
+use rustix_uring::{
+    cqueue::Entry as CQEntry, squeue::Entry as SQEntry, CompletionQueue, IoUring, SubmissionQueue,
+    Submitter,
+};
 use socket2::SockAddr;
 use std::mem;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
-use crossbeam_channel::{Receiver, Sender, unbounded};
-use rustix::io_uring::IoringOp;
-use rustix_uring::{CompletionQueue, IoUring, SubmissionQueue, Submitter, squeue::Entry as SQEntry, cqueue::Entry as CQEntry};
-use rustix_uring::cqueue::{more, sock_nonempty};
-use crate::config::NucleiConfig;
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,
@@ -157,15 +160,22 @@ impl SysProactor {
     pub(crate) fn new(config: NucleiConfig) -> io::Result<SysProactor> {
         unsafe {
             let mut rb = IoUring::builder();
-            config.iouring.sqpoll_wake_interval.map(|e| rb.setup_sqpoll(e));
-            let mut ring = rb.build(config.iouring.queue_len)
+            config
+                .iouring
+                .sqpoll_wake_interval
+                .map(|e| rb.setup_sqpoll(e));
+            let mut ring = rb
+                .build(config.iouring.queue_len)
                 .expect("nuclei: uring can't be initialized");
 
             IO_URING = Some(ring);
 
             let (submitter, sq, cq) = IO_URING.as_mut().unwrap().split();
 
-            match (config.iouring.per_numa_bounded_worker_count, config.iouring.per_numa_unbounded_worker_count) {
+            match (
+                config.iouring.per_numa_bounded_worker_count,
+                config.iouring.per_numa_unbounded_worker_count,
+            ) {
                 (Some(bw), Some(ubw)) => submitter.register_iowq_max_workers(&mut [bw, ubw])?,
                 (None, Some(ubw)) => submitter.register_iowq_max_workers(&mut [0, ubw])?,
                 (Some(bw), None) => submitter.register_iowq_max_workers(&mut [bw, 0])?,
@@ -187,10 +197,7 @@ impl SysProactor {
         Ok(sbmt.register_files_sparse(n)?)
     }
 
-    pub(crate) fn register_io(
-        &self,
-        mut sqe: SQEntry,
-    ) -> io::Result<CompletionChan> {
+    pub(crate) fn register_io(&self, mut sqe: SQEntry) -> io::Result<CompletionChan> {
         let id = self.submitter_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = unbounded::<i32>();
 
@@ -235,7 +242,7 @@ impl SysProactor {
                 } else {
                     self.cqe_completion_single(&cqe)?;
                 }
-                acc+=1;
+                acc += 1;
 
                 if !sock_nonempty(cqe.flags()) || !more(cqe.flags()) {
                     break 'sock;
@@ -290,7 +297,9 @@ impl Future for CompletionChan {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.rx();
-        Poll::Ready(this.recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sender has been cancelled")))
+        Poll::Ready(
+            this.recv()
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sender has been cancelled")),
+        )
     }
 }

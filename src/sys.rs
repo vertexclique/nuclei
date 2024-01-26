@@ -6,7 +6,7 @@ pub enum IoBackend {
     /// Linux backend
     Epoll,
     /// Linux backend
-    IoUring
+    IoUring,
 }
 
 #[cfg(unix)]

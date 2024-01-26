@@ -30,7 +30,6 @@ async fn read_vectored() {
 
     let bufs = vec![buf1, buf2, buf3];
 
-
     bufs.iter().enumerate().for_each(|(_idx, e)| {
         assert_eq!(IOVEC_WIDTH, String::from_utf8_lossy(&e[..]).len());
     });

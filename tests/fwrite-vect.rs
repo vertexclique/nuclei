@@ -12,13 +12,12 @@ async fn write_vectored() {
     use std::time::Duration;
 
     use futures::io::IoSliceMut;
-    use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt};
     use futures::AsyncReadExt;
+    use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt};
     use std::io::{IoSlice, Read, SeekFrom};
     use std::ops::Deref;
 
     const IOVEC_WIDTH: usize = 1 << 10;
-
 
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("testdata");
@@ -44,7 +43,6 @@ async fn write_vectored() {
     let mut bufv = String::new();
     assert!(file.seek(SeekFrom::Start(0)).await.is_ok());
     file.read_to_string(&mut bufv).await.unwrap();
-
 
     assert_eq!(bufv.matches('A').count(), IOVEC_WIDTH);
     assert_eq!(bufv.matches('B').count(), IOVEC_WIDTH);

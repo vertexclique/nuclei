@@ -1,12 +1,12 @@
 pub(crate) mod fs;
 mod iouring;
+mod net;
 mod nethandle;
 mod processor;
-mod net;
 
-pub(crate) use net::*;
 pub(crate) use fs::*;
 pub(crate) use iouring::*;
+pub(crate) use net::*;
 pub(crate) use nethandle::*;
 pub(crate) use processor::*;
 

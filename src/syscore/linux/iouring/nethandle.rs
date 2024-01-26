@@ -15,10 +15,10 @@ use lever::sync::prelude::*;
 
 use super::Processor;
 use crate::syscore::linux::iouring::fs::store_file::StoreFile;
+use crate::syscore::linux::iouring::net::multishot::TcpStreamGenerator;
 use crate::syscore::CompletionChan;
 use crate::{Handle, Proactor};
 use std::fs::File;
-use crate::syscore::linux::iouring::net::multishot::TcpStreamGenerator;
 
 impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {
@@ -136,9 +136,7 @@ impl Handle<UnixListener> {
         Processor::processor_accept_unix_listener(self.get_ref()).await
     }
 
-    pub fn incoming(
-        &self,
-    ) -> impl Stream<Item = io::Result<Handle<UnixStream>>> + Unpin + '_ {
+    pub fn incoming(&self) -> impl Stream<Item = io::Result<Handle<UnixStream>>> + Unpin + '_ {
         Box::pin(futures::stream::unfold(
             self,
             |listener: &Handle<UnixListener>| async move {

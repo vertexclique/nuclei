@@ -3,12 +3,9 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
 
-
-
-use futures::{AsyncSeekExt, AsyncWriteExt};
 use futures::AsyncReadExt;
+use futures::{AsyncSeekExt, AsyncWriteExt};
 use std::io::{IoSlice, SeekFrom};
-
 
 const IOVEC_WIDTH: usize = 1 << 10;
 
@@ -38,7 +35,6 @@ async fn main() -> io::Result<()> {
     let mut bufv = String::new();
     assert!(file.seek(SeekFrom::Start(0)).await.is_ok());
     file.read_to_string(&mut bufv).await.unwrap();
-
 
     assert_eq!(bufv.matches('A').count(), IOVEC_WIDTH);
     assert_eq!(bufv.matches('B').count(), IOVEC_WIDTH);
