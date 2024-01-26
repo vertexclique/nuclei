@@ -54,6 +54,10 @@ name = "h1-server-multishot"
 path = "h1-server-multishot.rs"
 
 [[example]]
+name = "proactor-config-fwrite"
+path = "proactor-config-fwrite.rs"
+
+[[example]]
 name = "tcp-server"
 path = "tcp-server.rs"
 

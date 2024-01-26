@@ -1,14 +1,14 @@
 use ahash::{HashMap, HashMapExt};
 use core::mem::MaybeUninit;
-use futures::channel::oneshot;
+
 use lever::sync::prelude::*;
 use pin_utils::unsafe_pinned;
 use std::future::Future;
-use std::hash::BuildHasherDefault;
+
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ macro_rules! syscall {
 
 use crate::config::NucleiConfig;
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use rustix::io_uring::IoringOp;
+
 use rustix_uring::cqueue::{more, sock_nonempty};
 use rustix_uring::{
     cqueue::Entry as CQEntry, squeue::Entry as SQEntry, CompletionQueue, IoUring, SubmissionQueue,
@@ -137,15 +137,16 @@ pub(crate) fn shim_to_af_unix(sockaddr: &SockAddr) -> io::Result<UnixSocketAddr>
 }
 
 ///////////////////
-//// uring impl
+/// uring impl
 ///////////////////
 
 pub struct SysProactor {
     pub(crate) sq: TTas<SubmissionQueue<'static>>,
     pub(crate) cq: TTas<CompletionQueue<'static>>,
-    sbmt: TTas<Submitter<'static>>,
+    sbmt: Submitter<'static>,
     submitters: TTas<HashMap<u64, Sender<i32>>>,
     submitter_id: AtomicU64,
+    aggressive_poll: bool,
 }
 
 pub type RingTypes = (
@@ -164,37 +165,40 @@ impl SysProactor {
                 .iouring
                 .sqpoll_wake_interval
                 .map(|e| rb.setup_sqpoll(e));
-            let mut ring = rb
+            if config.iouring.iopoll_enabled {
+                rb.setup_iopoll();
+            }
+            let ring = rb
                 .build(config.iouring.queue_len)
                 .expect("nuclei: uring can't be initialized");
 
             IO_URING = Some(ring);
 
-            let (submitter, sq, cq) = IO_URING.as_mut().unwrap().split();
+            let (sbmt, sq, cq) = IO_URING.as_mut().unwrap().split();
 
             match (
                 config.iouring.per_numa_bounded_worker_count,
                 config.iouring.per_numa_unbounded_worker_count,
             ) {
-                (Some(bw), Some(ubw)) => submitter.register_iowq_max_workers(&mut [bw, ubw])?,
-                (None, Some(ubw)) => submitter.register_iowq_max_workers(&mut [0, ubw])?,
-                (Some(bw), None) => submitter.register_iowq_max_workers(&mut [bw, 0])?,
-                (None, None) => submitter.register_iowq_max_workers(&mut [0, 0])?,
+                (Some(bw), Some(ubw)) => sbmt.register_iowq_max_workers(&mut [bw, ubw])?,
+                (None, Some(ubw)) => sbmt.register_iowq_max_workers(&mut [0, ubw])?,
+                (Some(bw), None) => sbmt.register_iowq_max_workers(&mut [bw, 0])?,
+                (None, None) => sbmt.register_iowq_max_workers(&mut [0, 0])?,
             }
 
             Ok(SysProactor {
                 sq: TTas::new(sq),
                 cq: TTas::new(cq),
-                sbmt: TTas::new(submitter),
+                sbmt,
                 submitters: TTas::new(HashMap::with_capacity(config.iouring.queue_len as usize)),
                 submitter_id: AtomicU64::default(),
+                aggressive_poll: config.iouring.aggressive_poll,
             })
         }
     }
 
     pub(crate) fn register_files_sparse(&self, n: u32) -> io::Result<()> {
-        let mut sbmt = self.sbmt.lock();
-        Ok(sbmt.register_files_sparse(n)?)
+        Ok(self.sbmt.register_files_sparse(n)?)
     }
 
     pub(crate) fn register_io(&self, mut sqe: SQEntry) -> io::Result<CompletionChan> {
@@ -214,9 +218,7 @@ impl SysProactor {
         sq.sync();
         drop(sq);
 
-        let sbmt = self.sbmt.lock();
-        sbmt.submit()?;
-        drop(sbmt);
+        self.sbmt.submit()?;
 
         Ok(CompletionChan { rx })
     }
@@ -235,8 +237,11 @@ impl SysProactor {
 
         // issue cas barrier
         'sock: loop {
+            if !self.aggressive_poll {
+                self.sbmt.submit_and_wait(1)?;
+            }
             cq.sync();
-            while let Some(cqe) = cq.next() {
+            for cqe in cq.by_ref() {
                 if more(cqe.flags()) {
                     self.cqe_completion_multi(&cqe)?;
                 } else {
@@ -257,7 +262,7 @@ impl SysProactor {
         let udata = cqe.user_data();
         let res: i32 = cqe.result();
 
-        let mut sbmts = self.submitters.lock();
+        let sbmts = self.submitters.lock();
         sbmts.get(&udata).map(|s| s.send(res));
         // if atomics are going to be wrapped, channel will be reinserted.
         // which is ok.

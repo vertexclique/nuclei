@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::io;
 use std::marker::Unpin;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -16,9 +15,8 @@ use lever::sync::prelude::*;
 use super::Processor;
 use crate::syscore::linux::iouring::fs::store_file::StoreFile;
 use crate::syscore::linux::iouring::net::multishot::TcpStreamGenerator;
-use crate::syscore::CompletionChan;
-use crate::{Handle, Proactor};
-use std::fs::File;
+
+use crate::Handle;
 
 impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {
@@ -41,7 +39,7 @@ impl Handle<TcpListener> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
 
-        Ok(Handle::new(listener)?)
+        Handle::new(listener)
     }
 
     ///
@@ -71,7 +69,7 @@ impl Handle<TcpListener> {
 
 impl Handle<TcpStream> {
     pub async fn connect<A: ToSocketAddrs>(sock_addrs: A) -> io::Result<Handle<TcpStream>> {
-        Ok(Processor::processor_connect(sock_addrs, Processor::processor_connect_tcp).await?)
+        Processor::processor_connect(sock_addrs, Processor::processor_connect_tcp).await
     }
 
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
@@ -89,7 +87,7 @@ impl Handle<TcpStream> {
 
 impl Handle<UdpSocket> {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<UdpSocket>> {
-        Ok(Handle::new(UdpSocket::bind(addr)?)?)
+        Handle::new(UdpSocket::bind(addr)?)
     }
 
     pub async fn connect<A: ToSocketAddrs>(sock_addrs: A) -> io::Result<Handle<UdpSocket>> {
@@ -129,7 +127,7 @@ impl Handle<UdpSocket> {
 
 impl Handle<UnixListener> {
     pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixListener>> {
-        Ok(Handle::new(UnixListener::bind(path)?)?)
+        Handle::new(UnixListener::bind(path)?)
     }
 
     pub async fn accept(&self) -> io::Result<(Handle<UnixStream>, UnixSocketAddr)> {
@@ -149,7 +147,7 @@ impl Handle<UnixListener> {
 
 impl Handle<UnixStream> {
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixStream>> {
-        Ok(Processor::processor_connect_unix(path).await?)
+        Processor::processor_connect_unix(path).await
     }
 
     pub fn pair() -> io::Result<(Handle<UnixStream>, Handle<UnixStream>)> {
@@ -177,7 +175,7 @@ impl Handle<UnixStream> {
 
 impl Handle<UnixDatagram> {
     pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixDatagram>> {
-        Ok(Handle::new(UnixDatagram::bind(path)?)?)
+        Handle::new(UnixDatagram::bind(path)?)
     }
 
     pub fn pair() -> io::Result<(Handle<UnixDatagram>, Handle<UnixDatagram>)> {

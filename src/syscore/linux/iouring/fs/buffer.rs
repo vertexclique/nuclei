@@ -47,7 +47,7 @@ impl Buffer {
             unsafe {
                 let data: *mut u8 = self.data.cast().as_ptr();
                 let cap = self.cap - self.pos;
-                slice::from_raw_parts(data.offset(self.pos as isize), cap as usize)
+                slice::from_raw_parts(data.add(self.pos), cap)
             }
         } else {
             &[]
@@ -81,7 +81,7 @@ impl Buffer {
 
     #[inline(always)]
     pub fn consume(&mut self, amt: usize) {
-        self.pos = cmp::min(self.pos + amt as usize, self.cap);
+        self.pos = cmp::min(self.pos + amt, self.cap);
     }
 
     #[inline(always)]
