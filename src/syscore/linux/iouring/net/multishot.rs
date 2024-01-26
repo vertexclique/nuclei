@@ -3,7 +3,7 @@ use crate::{Handle, Proactor};
 use crossbeam_channel::RecvError;
 use futures::Stream;
 use pin_project_lite::pin_project;
-use rustix::io_uring::{IoringOp, SocketFlags};
+use rustix::io_uring::{SocketFlags};
 use rustix_uring::{opcode as OP, types::Fd};
 use std::io;
 use std::net::TcpStream;
@@ -23,7 +23,7 @@ pin_project! {
 
 impl TcpStreamGenerator {
     pub fn new<T: AsRawFd>(listener: &T) -> io::Result<Self> {
-        let mut sqe = OP::AcceptMulti::new(Fd(listener.as_raw_fd()))
+        let sqe = OP::AcceptMulti::new(Fd(listener.as_raw_fd()))
             .flags(SocketFlags::NONBLOCK)
             .build();
 

@@ -1,16 +1,16 @@
-use crate::Handle;
-use lever::sync::prelude::TTas;
+
+
 use std::fs::File;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 
 use super::buffer::Buffer;
 use crate::syscore::Processor;
 use lever::sync::atomics::AtomicBox;
-use pin_utils::unsafe_pinned;
-use std::task::{Context, Poll};
+
+
 
 pub struct StoreFile {
     fd: RawFd,
@@ -87,7 +87,7 @@ impl StoreFile {
         &mut self.pos
     }
 
-    pub(crate) fn guard_op(self: &mut Self, op: Op) {
+    pub(crate) fn guard_op(&mut self, op: Op) {
         // let this = unsafe { Pin::get_unchecked_mut(self) };
         // if *self.op_state.get() != Op::Pending && *self.op_state.get() != op {
         //     self.cancel();

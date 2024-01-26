@@ -55,7 +55,78 @@ pub struct IoUringConfiguration {
     /// If [None] passed unbounded workers will be limited by the process task limit,
     /// as indicated by the rlimit [RLIMIT_NPROC](https://man7.org/linux/man-pages/man2/getrlimit.2.html) limit.
     pub per_numa_unbounded_worker_count: Option<u32>,
+
+    /// This argument allows aggressively waiting on CQ(completion queue) to have low latency of IO completions.
+    /// Basically, this argument polls CQEs(completion queue events) directly on cq at userspace.
+    /// Mind that, using this increase pressure on CPUs from userspace side. By default, nuclei reaps the CQ with
+    /// aggressive wait. This is double polling approach for nuclei where Kernel gets submissions by itself (SQPOLL),
+    /// processes it and puts completions to completion queue and we immediately pick up without latency
+    /// (aggressive_poll).
+    ///
+    /// **[default]**: `true`.
+    pub aggressive_poll: bool,
+
+    /// Perform busy-waiting for I/O completion events, as opposed to getting notifications via an
+    /// asynchronous IRQ (Interrupt Request). This will reduce latency, but increases CPU usage.
+    /// This is only usable on file systems that support polling and files opened with `O_DIRECT`.
+    ///
+    /// **[default]**: `false`.
+    pub iopoll_enabled: bool,
     // XXX: `redrive_kthread_wake` = bool, syncs queue changes so kernel threads got awakened. increased cpu usage.
+}
+
+impl IoUringConfiguration {
+    ///
+    /// Standard way to use IO_URING. No polling, purely IRQ awaken IO completion.
+    /// This is a normal way to process IO, mind that with this approach
+    /// `actual completion time != userland reception of completion`.
+    /// Throughput is low compared to all the other config alternatives.
+    ///
+    /// **NOTE:** If you don't know what to select as configuration, please select this.
+    pub fn interrupt_driven(queue_len: u32) -> Self {
+        Self {
+            queue_len,
+            sqpoll_wake_interval: None,
+            per_numa_bounded_worker_count: None,
+            per_numa_unbounded_worker_count: None,
+            aggressive_poll: false,
+            iopoll_enabled: false,
+        }
+    }
+
+    ///
+    /// Low Latency Driven version of IO_URING, where it is suitable for high traffic environments.
+    /// High throughput low latency solution where it consumes a lot of resources.
+    pub fn low_latency_driven(queue_len: u32) -> Self {
+        Self {
+            queue_len,
+            sqpoll_wake_interval: Some(2),
+            aggressive_poll: true,
+            ..Self::default()
+        }
+    }
+
+    ///
+    /// Kernel poll only version of IO_URING, where it is suitable for high traffic environments.
+    /// This version won't allow aggressive polling on completion queue(CQ).
+    pub fn kernel_poll_only(queue_len: u32) -> Self {
+        Self {
+            queue_len,
+            sqpoll_wake_interval: Some(2),
+            aggressive_poll: true,
+            ..Self::default()
+        }
+    }
+
+    ///
+    /// IOPOLL enabled ring configuration for operating on files with low-latency.
+    pub fn io_poll(queue_len: u32) -> Self {
+        Self {
+            queue_len,
+            iopoll_enabled: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for IoUringConfiguration {
@@ -65,6 +136,8 @@ impl Default for IoUringConfiguration {
             sqpoll_wake_interval: Some(2),
             per_numa_bounded_worker_count: Some(1 << 8),
             per_numa_unbounded_worker_count: Some(1 << 9),
+            aggressive_poll: true,
+            iopoll_enabled: false,
         }
     }
 }

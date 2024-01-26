@@ -209,9 +209,9 @@ impl AsyncRead for Handle<File> {
         cx: &mut Context<'_>,
         bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
-        let mut store = &mut self.get_mut().store_file;
+        let store = &mut self.get_mut().store_file;
 
-        if let Some(mut store_file) = store.as_mut() {
+        if let Some(store_file) = store.as_mut() {
             let fd: RawFd = store_file.receive_fd();
             let op_state = store_file.op_state();
             let (_, pos) = store_file.bufpair();
@@ -239,10 +239,10 @@ const NON_READ: &[u8] = &[];
 
 #[cfg(all(feature = "iouring", target_os = "linux"))]
 impl AsyncBufRead for Handle<File> {
-    fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        let mut store = &mut self.get_mut().store_file;
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let store = &mut self.get_mut().store_file;
 
-        if let Some(mut store_file) = store.as_mut() {
+        if let Some(store_file) = store.as_mut() {
             let fd: RawFd = store_file.receive_fd();
             let op_state = store_file.op_state();
             let (bufp, pos) = store_file.bufpair();
@@ -267,7 +267,7 @@ impl AsyncBufRead for Handle<File> {
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
-        let mut store = self.get_mut().store_file.as_mut().unwrap();
+        let store = self.get_mut().store_file.as_mut().unwrap();
         store.buf().consume(amt);
     }
 }
@@ -279,9 +279,9 @@ impl AsyncWrite for Handle<File> {
         cx: &mut Context<'_>,
         bufslice: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut store = &mut self.get_mut().store_file;
+        let store = &mut self.get_mut().store_file;
 
-        if let Some(mut store_file) = store.as_mut() {
+        if let Some(store_file) = store.as_mut() {
             let fd: RawFd = store_file.receive_fd();
             let op_state = store_file.op_state();
             let (bufp, pos) = store_file.bufpair();
@@ -319,9 +319,9 @@ impl AsyncWrite for Handle<File> {
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        let mut store = &mut self.get_mut().store_file;
+        let store = &mut self.get_mut().store_file;
 
-        if let Some(mut store_file) = store.as_mut() {
+        if let Some(store_file) = store.as_mut() {
             let fd: RawFd = store_file.receive_fd();
             let op_state = store_file.op_state();
             let (_, pos) = store_file.bufpair();
@@ -349,9 +349,9 @@ impl AsyncWrite for Handle<File> {
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut store = &mut self.get_mut().store_file;
+        let store = &mut self.get_mut().store_file;
 
-        if let Some(mut store_file) = store.as_mut() {
+        if let Some(store_file) = store.as_mut() {
             let fd: RawFd = store_file.receive_fd();
             let op_state = store_file.op_state();
 
@@ -377,7 +377,7 @@ impl AsyncSeek for Handle<File> {
         cx: &mut Context<'_>,
         pos: SeekFrom,
     ) -> Poll<io::Result<u64>> {
-        let mut store = &mut self.get_mut().store_file.as_mut().unwrap();
+        let store = &mut self.get_mut().store_file.as_mut().unwrap();
 
         let (cursor, offset) = match pos {
             io::SeekFrom::Start(n) => {
@@ -392,7 +392,7 @@ impl AsyncSeek for Handle<File> {
             }
         };
         let valid_seek = if offset.is_negative() {
-            match cursor.checked_sub(offset.abs() as usize) {
+            match cursor.checked_sub(offset.unsigned_abs() as usize) {
                 Some(valid_seek) => valid_seek,
                 None => {
                     let invalid = io::Error::from(io::ErrorKind::InvalidInput);

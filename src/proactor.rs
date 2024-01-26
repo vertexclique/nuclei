@@ -1,10 +1,10 @@
-use std::ops::DerefMut;
+
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{future::Future, io};
 
 use crate::config::NucleiConfig;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::{OnceCell};
 
 use super::syscore::*;
 use super::waker::*;
@@ -25,7 +25,7 @@ impl Proactor {
     /// Returns a reference to the proactor.
     pub fn get() -> &'static Proactor {
         unsafe {
-            &PROACTOR.get_or_init(|| {
+            PROACTOR.get_or_init(|| {
                 Proactor(
                     SysProactor::new(NucleiConfig::default())
                         .expect("cannot initialize IO backend"),
@@ -37,15 +37,14 @@ impl Proactor {
     /// Builds a proactor instance with given config and returns a reference to it.
     pub fn with_config(config: NucleiConfig) -> &'static Proactor {
         unsafe {
-            let mut proactor =
+            let proactor =
                 Proactor(SysProactor::new(config.clone()).expect("cannot initialize IO backend"));
             PROACTOR
                 .set(proactor)
                 .map_err(|e| "Proactor instance not being able to set.")
                 .unwrap();
-            let proactor =
-                Proactor(SysProactor::new(config).expect("cannot initialize IO backend"));
-            &PROACTOR.get_or_init(|| proactor)
+
+            PROACTOR.wait()
         }
     }
 
@@ -133,6 +132,7 @@ mod proactor_tests {
                 sqpoll_wake_interval: Some(11),
                 per_numa_bounded_worker_count: Some(12),
                 per_numa_unbounded_worker_count: Some(13),
+                ..IoUringConfiguration::default()
             },
         };
         let new = Proactor::with_config(config);

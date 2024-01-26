@@ -1,16 +1,14 @@
 use std::future::Future;
-use std::io::{Read, Write};
+
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
-use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixStream};
 use std::path::Path;
 use std::{
-    fs::File,
-    mem::ManuallyDrop,
     os::unix::io::{AsRawFd, FromRawFd},
 };
-use std::{io, mem};
+use std::{io};
 
 use crate::proactor::Proactor;
 
@@ -18,14 +16,14 @@ use crate::syscore::shim_to_af_unix;
 use crate::Handle;
 use libc::sockaddr_un;
 use os_socketaddr::OsSocketAddr;
-use pin_utils::unsafe_pinned;
+
 use rustix::io_uring::{
-    msghdr, sockaddr, sockaddr_storage, IoringRecvFlags, RecvFlags, SendFlags, SocketFlags,
+    msghdr, IoringRecvFlags, RecvFlags, SendFlags, SocketFlags,
 };
-use rustix::net::{connect_unix, SocketAddrAny, SocketAddrStorage, SocketAddrUnix};
-use rustix_uring::opcode::RecvMsg;
-use rustix_uring::squeue::Entry;
-use rustix_uring::types::{socklen_t, AtFlags, Fixed, Mode, OFlags, Statx, StatxFlags};
+use rustix::net::{SocketAddrAny, SocketAddrUnix};
+
+
+use rustix_uring::types::{socklen_t, AtFlags, Mode, OFlags, Statx, StatxFlags};
 use rustix_uring::{opcode as OP, types::Fd};
 use socket2::SockAddr;
 use std::ffi::CString;
@@ -58,7 +56,7 @@ impl Processor {
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).expect("invalid path");
         let path = path.as_ptr();
         let dfd = libc::AT_FDCWD;
-        let mut sqe = OP::OpenAt::new(Fd(dfd.as_raw_fd()), path)
+        let sqe = OP::OpenAt::new(Fd(dfd.as_raw_fd()), path)
             .flags(OFlags::CLOEXEC | OFlags::RDONLY)
             .mode(Mode::from(0o666))
             .build();
@@ -75,7 +73,7 @@ impl Processor {
         buf: &mut [u8],
         offset: usize,
     ) -> io::Result<usize> {
-        let mut sqe = OP::Read::new(Fd(*io), buf.as_mut_ptr(), buf.len() as _)
+        let sqe = OP::Read::new(Fd(*io), buf.as_mut_ptr(), buf.len() as _)
             .offset(offset as _)
             .build();
 
@@ -89,7 +87,7 @@ impl Processor {
         buf: &[u8],
         offset: usize,
     ) -> io::Result<usize> {
-        let mut sqe = OP::Write::new(Fd(*io), buf.as_ptr(), buf.len() as _)
+        let sqe = OP::Write::new(Fd(*io), buf.as_ptr(), buf.len() as _)
             .offset(offset as _)
             .build();
 
@@ -99,7 +97,7 @@ impl Processor {
     }
 
     pub(crate) async fn processor_close_file(io: &RawFd) -> io::Result<usize> {
-        let mut sqe = OP::Close::new(Fd(*io)).build();
+        let sqe = OP::Close::new(Fd(*io)).build();
 
         let cc = Proactor::get().inner().register_io(sqe)?;
 
@@ -111,7 +109,7 @@ impl Processor {
         let flags = libc::AT_EMPTY_PATH;
         let mask = libc::STATX_SIZE;
 
-        let mut sqe = OP::Statx::new(Fd(*io), &EMPTY, statx)
+        let sqe = OP::Statx::new(Fd(*io), &EMPTY, statx)
             .flags(AtFlags::EMPTY_PATH)
             .mask(StatxFlags::SIZE)
             .build();
@@ -125,7 +123,7 @@ impl Processor {
         io: &RawFd,
         bufs: &mut [IoSliceMut<'_>],
     ) -> io::Result<usize> {
-        let mut sqe = OP::Readv::new(Fd(*io), bufs as *mut _ as *mut _, bufs.len() as _)
+        let sqe = OP::Readv::new(Fd(*io), bufs as *mut _ as *mut _, bufs.len() as _)
             .offset(0_u64)
             .build();
 
@@ -138,7 +136,7 @@ impl Processor {
         io: &RawFd,
         bufs: &[IoSlice<'_>],
     ) -> io::Result<usize> {
-        let mut sqe = OP::Writev::new(Fd(*io), bufs as *const _ as *const _, bufs.len() as _)
+        let sqe = OP::Writev::new(Fd(*io), bufs as *const _ as *const _, bufs.len() as _)
             .offset(0_u64)
             .build();
 
@@ -155,7 +153,7 @@ impl Processor {
     pub(crate) async fn processor_send<R: AsRawFd>(socket: &R, buf: &[u8]) -> io::Result<usize> {
         let fd = socket.as_raw_fd() as _;
 
-        let mut sqe = OP::Send::new(Fd(fd), buf.as_ptr() as _, buf.len() as _)
+        let sqe = OP::Send::new(Fd(fd), buf.as_ptr() as _, buf.len() as _)
             .flags(SendFlags::empty())
             .build();
 
@@ -179,7 +177,7 @@ impl Processor {
     ) -> io::Result<usize> {
         let fd = socket.as_raw_fd() as _;
 
-        let mut sqe = OP::Recv::new(Fd(fd), buf.as_mut_ptr(), buf.len() as _)
+        let sqe = OP::Recv::new(Fd(fd), buf.as_mut_ptr(), buf.len() as _)
             .flags(flags)
             .build();
 
@@ -243,14 +241,14 @@ impl Processor {
 
         let nixsaddr = SockAddr::from(addr);
 
-        let mut stream = sock.into_tcp_stream();
+        let stream = sock.into_tcp_stream();
         stream.set_nodelay(true)?;
         let fd = stream.as_raw_fd() as _;
 
-        let mut ossa: OsSocketAddr = addr.into();
+        let ossa: OsSocketAddr = addr.into();
         let socklen = ossa.len();
 
-        let mut sqe = OP::Connect::new(
+        let sqe = OP::Connect::new(
             Fd(fd),
             unsafe { std::mem::transmute(ossa.as_ptr()) },
             socklen,
@@ -259,7 +257,7 @@ impl Processor {
 
         Proactor::get().inner().register_io(sqe)?.await?;
 
-        Ok(Handle::new(stream)?)
+        Handle::new(stream)
     }
 
     pub(crate) async fn processor_connect_udp(addr: SocketAddr) -> io::Result<Handle<UdpSocket>> {
@@ -293,7 +291,7 @@ impl Processor {
         sock.connect(&sockaddr)?;
 
         // Make into udp type and init handler.
-        Ok(Handle::new(sock.into_udp_socket())?)
+        Handle::new(sock.into_udp_socket())
     }
 
     ///////////////////////////////////
@@ -305,7 +303,7 @@ impl Processor {
     ) -> io::Result<(Handle<TcpStream>, Option<SocketAddr>)> {
         let fd = listener.as_raw_fd() as _;
 
-        let mut sqe = OP::Accept::new(Fd(fd), null_mut(), null_mut())
+        let sqe = OP::Accept::new(Fd(fd), null_mut(), null_mut())
             .flags(SocketFlags::NONBLOCK)
             .build();
 
@@ -333,7 +331,7 @@ impl Processor {
         addr: &socket2::SockAddr,
     ) -> io::Result<usize> {
         // FIXME: (vcq): Wrap into vec?
-        let mut iov = IoSlice::new(buf);
+        let iov = IoSlice::new(buf);
 
         let mut sendmsg = unsafe { MaybeUninit::<msghdr>::zeroed().assume_init() };
         sendmsg.msg_name = addr.as_ptr() as *mut _;
@@ -343,7 +341,7 @@ impl Processor {
 
         let fd = socket.as_raw_fd() as _;
 
-        let mut sqe = OP::SendMsg::new(Fd(fd), &sendmsg as *const _ as *const _)
+        let sqe = OP::SendMsg::new(Fd(fd), &sendmsg as *const _ as *const _)
             .flags(SendFlags::empty())
             .build();
 
@@ -379,7 +377,7 @@ impl Processor {
             unsafe { MaybeUninit::<libc::sockaddr_storage>::zeroed().assume_init() };
 
         // FIXME: (vcq): Wrap into vec?
-        let mut iov = IoSliceMut::new(buf);
+        let iov = IoSliceMut::new(buf);
 
         let mut recvmsg = unsafe { MaybeUninit::<msghdr>::zeroed().assume_init() };
         recvmsg.msg_name = &mut sockaddr_raw as *mut _ as _;
@@ -389,7 +387,7 @@ impl Processor {
 
         let fd = socket.as_raw_fd() as _;
 
-        let mut sqe = OP::RecvMsg::new(Fd(fd), &mut recvmsg as *mut _ as *mut _)
+        let sqe = OP::RecvMsg::new(Fd(fd), &mut recvmsg as *mut _ as *mut _)
             .flags(flags)
             .ioprio((IoringRecvFlags::POLL_FIRST | IoringRecvFlags::MULTISHOT).bits())
             .build();
@@ -421,7 +419,7 @@ impl Processor {
         };
         let mut natsockaddr: ShimSocketAddrUnix = unsafe { std::mem::transmute(sockaddr) };
 
-        let mut sqe = OP::Accept::new(
+        let sqe = OP::Accept::new(
             Fd(fd),
             &mut natsockaddr.unix as *mut _ as *mut _,
             natsockaddr.len as _,
@@ -453,19 +451,19 @@ impl Processor {
         let sock = socket2::Socket::new(socket2::Domain::unix(), socket2::Type::stream(), None)?;
         // let sockaddr = socket2::SockAddr::unix(path)?;
         let sockaddr = SocketAddrUnix::new(path.as_ref())?;
-        let mut sockaddr: ShimSocketAddrUnix = unsafe { std::mem::transmute(sockaddr) };
+        let sockaddr: ShimSocketAddrUnix = unsafe { std::mem::transmute(sockaddr) };
 
         sock.set_nonblocking(true)?;
 
         let stream: UnixStream = sock.into_unix_stream();
         let fd = stream.as_raw_fd() as _;
 
-        let mut sqe =
+        let sqe =
             OP::Connect::new(Fd(fd), &sockaddr.unix as *const _ as *const _, sockaddr.len).build();
 
         Proactor::get().inner().register_io(sqe)?.await?;
 
-        Ok(Handle::new(stream)?)
+        Handle::new(stream)
     }
 
     pub(crate) async fn processor_send_to_unix<R: AsRawFd, P: AsRef<Path>>(
