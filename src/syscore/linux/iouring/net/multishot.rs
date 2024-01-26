@@ -3,7 +3,7 @@ use crate::{Handle, Proactor};
 use crossbeam_channel::RecvError;
 use futures::Stream;
 use pin_project_lite::pin_project;
-use rustix::io_uring::{SocketFlags};
+use rustix::io_uring::SocketFlags;
 use rustix_uring::{opcode as OP, types::Fd};
 use std::io;
 use std::net::TcpStream;

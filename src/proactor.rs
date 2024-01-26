@@ -1,10 +1,9 @@
-
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{future::Future, io};
 
 use crate::config::NucleiConfig;
-use once_cell::sync::{OnceCell};
+use once_cell::sync::OnceCell;
 
 use super::syscore::*;
 use super::waker::*;

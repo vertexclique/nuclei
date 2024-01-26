@@ -1,14 +1,12 @@
 use std::future::Future;
 
+use std::io;
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixStream};
 use std::path::Path;
-use std::{
-    os::unix::io::{AsRawFd, FromRawFd},
-};
-use std::{io};
 
 use crate::proactor::Proactor;
 
@@ -17,11 +15,8 @@ use crate::Handle;
 use libc::sockaddr_un;
 use os_socketaddr::OsSocketAddr;
 
-use rustix::io_uring::{
-    msghdr, IoringRecvFlags, RecvFlags, SendFlags, SocketFlags,
-};
+use rustix::io_uring::{msghdr, IoringRecvFlags, RecvFlags, SendFlags, SocketFlags};
 use rustix::net::{SocketAddrAny, SocketAddrUnix};
-
 
 use rustix_uring::types::{socklen_t, AtFlags, Mode, OFlags, Statx, StatxFlags};
 use rustix_uring::{opcode as OP, types::Fd};

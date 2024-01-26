@@ -1,5 +1,3 @@
-
-
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{FromRawFd, RawFd};
@@ -9,8 +7,6 @@ use std::sync::Arc;
 use super::buffer::Buffer;
 use crate::syscore::Processor;
 use lever::sync::atomics::AtomicBox;
-
-
 
 pub struct StoreFile {
     fd: RawFd,

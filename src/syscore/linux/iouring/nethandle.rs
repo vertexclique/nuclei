@@ -1,4 +1,3 @@
-
 use std::io;
 use std::marker::Unpin;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -17,8 +16,7 @@ use super::Processor;
 use crate::syscore::linux::iouring::fs::store_file::StoreFile;
 use crate::syscore::linux::iouring::net::multishot::TcpStreamGenerator;
 
-use crate::{Handle};
-
+use crate::Handle;
 
 impl<T: AsRawFd> Handle<T> {
     pub fn new(io: T) -> io::Result<Handle<T>> {

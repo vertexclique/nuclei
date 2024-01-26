@@ -6,7 +6,7 @@ use pin_utils::unsafe_pinned;
 use std::future::Future;
 
 use std::io;
-use std::os::unix::io::{AsRawFd};
+use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
