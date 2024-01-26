@@ -1,4 +1,5 @@
 use crate::sys::event::{kevent_ts, kqueue, KEvent};
+use ahash::{HashMap, HashMapExt};
 use futures::channel::oneshot;
 use lever::prelude::*;
 use pin_utils::unsafe_pinned;
@@ -8,7 +9,6 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use ahash::{HashMap, HashMapExt};
 use std::{os::unix::net::UnixStream, time::Duration};
 
 macro_rules! syscall {
@@ -25,10 +25,10 @@ macro_rules! syscall {
 ///////////////////
 ///////////////////
 
+use crate::config::NucleiConfig;
 use socket2::SockAddr;
 use std::mem;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
-use crate::config::NucleiConfig;
 
 fn max_len() -> usize {
     // The maximum read limit on most posix-like systems is `SSIZE_MAX`,

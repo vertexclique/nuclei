@@ -1,7 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput, BenchmarkId};
-use nuclei::block_on;
 use criterion::async_executor::FuturesExecutor;
-
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use nuclei::block_on;
 
 use nuclei::*;
 use std::net::TcpListener;
@@ -42,7 +41,7 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
                 println!("Connection error: {:#?}", err);
             }
         })
-            .detach();
+        .detach();
     }
 }
 
@@ -89,10 +88,14 @@ pub fn http_server_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("http_server_bench");
     for i in [1_u64, 10_u64, 25_u64].iter() {
         group.throughput(Throughput::Bytes(DATA.len() as u64 * i));
-        group.bench_function(BenchmarkId::from_parameter(i), |b| b.to_async(FuturesExecutor).iter(|| async {
-            let tasks = (0..*i).map(|e| surf::get(uri).recv_string()).collect::<Vec<_>>();
-            join_all(tasks).await;
-        }));
+        group.bench_function(BenchmarkId::from_parameter(i), |b| {
+            b.to_async(FuturesExecutor).iter(|| async {
+                let tasks = (0..*i)
+                    .map(|e| surf::get(uri).recv_string())
+                    .collect::<Vec<_>>();
+                join_all(tasks).await;
+            })
+        });
     }
     group.finish();
 

@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::{io, mem};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
@@ -11,12 +10,24 @@ use std::{
     mem::ManuallyDrop,
     os::unix::io::{AsRawFd, FromRawFd},
 };
+use std::{io, mem};
 
 use crate::proactor::Proactor;
 
-use rustix_uring::{opcode as OP, types::Fd};
 use crate::syscore::shim_to_af_unix;
 use crate::Handle;
+use libc::sockaddr_un;
+use os_socketaddr::OsSocketAddr;
+use pin_utils::unsafe_pinned;
+use rustix::io_uring::{
+    msghdr, sockaddr, sockaddr_storage, IoringRecvFlags, RecvFlags, SendFlags, SocketFlags,
+};
+use rustix::net::{connect_unix, SocketAddrAny, SocketAddrStorage, SocketAddrUnix};
+use rustix_uring::opcode::RecvMsg;
+use rustix_uring::squeue::Entry;
+use rustix_uring::types::{socklen_t, AtFlags, Fixed, Mode, OFlags, Statx, StatxFlags};
+use rustix_uring::{opcode as OP, types::Fd};
+use socket2::SockAddr;
 use std::ffi::CString;
 use std::io::{IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
@@ -24,15 +35,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::prelude::RawFd;
 use std::ptr::null_mut;
-use libc::sockaddr_un;
-use os_socketaddr::OsSocketAddr;
-use pin_utils::unsafe_pinned;
-use rustix::io_uring::{IoringRecvFlags, msghdr, RecvFlags, SendFlags, sockaddr, sockaddr_storage, SocketFlags};
-use rustix::net::{connect_unix, SocketAddrAny, SocketAddrStorage, SocketAddrUnix};
-use rustix_uring::opcode::RecvMsg;
-use rustix_uring::squeue::Entry;
-use rustix_uring::types::{AtFlags, Fixed, Mode, OFlags, socklen_t, Statx, StatxFlags};
-use socket2::SockAddr;
 
 macro_rules! syscall {
     ($fn:ident $args:tt) => {{
@@ -97,18 +99,14 @@ impl Processor {
     }
 
     pub(crate) async fn processor_close_file(io: &RawFd) -> io::Result<usize> {
-        let mut sqe = OP::Close::new(Fd(*io))
-            .build();
+        let mut sqe = OP::Close::new(Fd(*io)).build();
 
         let cc = Proactor::get().inner().register_io(sqe)?;
 
         Ok(cc.await? as _)
     }
 
-    pub(crate) async fn processor_file_size(
-        io: &RawFd,
-        statx: *mut Statx,
-    ) -> io::Result<usize> {
+    pub(crate) async fn processor_file_size(io: &RawFd, statx: *mut Statx) -> io::Result<usize> {
         static EMPTY: libc::c_char = 0;
         let flags = libc::AT_EMPTY_PATH;
         let mask = libc::STATX_SIZE;
@@ -118,10 +116,7 @@ impl Processor {
             .mask(StatxFlags::SIZE)
             .build();
 
-        Proactor::get()
-            .inner()
-            .register_io(sqe)?
-            .await?;
+        Proactor::get().inner().register_io(sqe)?.await?;
 
         unsafe { Ok((*statx).stx_size as usize) }
     }
@@ -164,10 +159,7 @@ impl Processor {
             .flags(SendFlags::empty())
             .build();
 
-        let res = Proactor::get()
-            .inner()
-            .register_io(sqe)?
-            .await?;
+        let res = Proactor::get().inner().register_io(sqe)?.await?;
 
         Ok(res as _)
     }
@@ -191,10 +183,7 @@ impl Processor {
             .flags(flags)
             .build();
 
-        let res = Proactor::get()
-            .inner()
-            .register_io(sqe)?
-            .await?;
+        let res = Proactor::get().inner().register_io(sqe)?.await?;
 
         Ok(res as _)
     }
@@ -261,13 +250,14 @@ impl Processor {
         let mut ossa: OsSocketAddr = addr.into();
         let socklen = ossa.len();
 
-        let mut sqe = OP::Connect::new(Fd(fd), unsafe{ std::mem::transmute(ossa.as_ptr()) }, socklen)
-            .build();
+        let mut sqe = OP::Connect::new(
+            Fd(fd),
+            unsafe { std::mem::transmute(ossa.as_ptr()) },
+            socklen,
+        )
+        .build();
 
-        Proactor::get()
-            .inner()
-            .register_io(sqe)?
-            .await?;
+        Proactor::get().inner().register_io(sqe)?.await?;
 
         Ok(Handle::new(stream)?)
     }
@@ -311,7 +301,7 @@ impl Processor {
     ///////////////////////////////////
 
     pub(crate) async fn processor_accept_tcp_listener<R: AsRawFd>(
-        listener: &R
+        listener: &R,
     ) -> io::Result<(Handle<TcpStream>, Option<SocketAddr>)> {
         let fd = listener.as_raw_fd() as _;
 
@@ -357,10 +347,7 @@ impl Processor {
             .flags(SendFlags::empty())
             .build();
 
-        let res = Proactor::get()
-            .inner()
-            .register_io(sqe)?
-            .await?;
+        let res = Proactor::get().inner().register_io(sqe)?.await?;
 
         Ok(res as _)
     }
@@ -407,10 +394,7 @@ impl Processor {
             .ioprio((IoringRecvFlags::POLL_FIRST | IoringRecvFlags::MULTISHOT).bits())
             .build();
 
-        let res = Proactor::get()
-            .inner()
-            .register_io(sqe)?
-            .await?;
+        let res = Proactor::get().inner().register_io(sqe)?.await?;
 
         let sockaddr = unsafe {
             socket2::SockAddr::from_raw_parts(
@@ -433,20 +417,27 @@ impl Processor {
         let sockfd: OwnedFd = unsafe { OwnedFd::from_raw_fd(fd) };
         let sockaddr = match rustix::net::getsockname(&sockfd)? {
             SocketAddrAny::Unix(sockaddr) => sockaddr,
-            _ => return Err(io::Error::last_os_error())
+            _ => return Err(io::Error::last_os_error()),
         };
         let mut natsockaddr: ShimSocketAddrUnix = unsafe { std::mem::transmute(sockaddr) };
 
-        let mut sqe = OP::Accept::new(Fd(fd), &mut natsockaddr.unix as *mut _ as *mut _, natsockaddr.len as _)
-            .flags(SocketFlags::empty())
-            .build();
+        let mut sqe = OP::Accept::new(
+            Fd(fd),
+            &mut natsockaddr.unix as *mut _ as *mut _,
+            natsockaddr.len as _,
+        )
+        .flags(SocketFlags::empty())
+        .build();
 
         let cc = Proactor::get().inner().register_io(sqe)?;
 
         let stream = unsafe { UnixStream::from_raw_fd(cc.await?) };
-        let usa = unsafe { socket2::SockAddr::from_raw_parts(
-            &natsockaddr.unix as *const _ as *const _, natsockaddr.len as _
-        ) };
+        let usa = unsafe {
+            socket2::SockAddr::from_raw_parts(
+                &natsockaddr.unix as *const _ as *const _,
+                natsockaddr.len as _,
+            )
+        };
         let addr = shim_to_af_unix(&usa)?;
 
         Ok((Handle::new(stream)?, addr))
@@ -469,13 +460,10 @@ impl Processor {
         let stream: UnixStream = sock.into_unix_stream();
         let fd = stream.as_raw_fd() as _;
 
-        let mut sqe = OP::Connect::new(Fd(fd), &sockaddr.unix as *const _ as *const _, sockaddr.len)
-            .build();
+        let mut sqe =
+            OP::Connect::new(Fd(fd), &sockaddr.unix as *const _ as *const _, sockaddr.len).build();
 
-        Proactor::get()
-            .inner()
-            .register_io(sqe)?
-            .await?;
+        Proactor::get().inner().register_io(sqe)?.await?;
 
         Ok(Handle::new(stream)?)
     }

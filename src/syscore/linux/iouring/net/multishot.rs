@@ -1,15 +1,15 @@
+use crate::syscore::CompletionChan;
+use crate::{Handle, Proactor};
+use crossbeam_channel::RecvError;
+use futures::Stream;
+use pin_project_lite::pin_project;
+use rustix::io_uring::{IoringOp, SocketFlags};
+use rustix_uring::{opcode as OP, types::Fd};
+use std::io;
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use futures::Stream;
-use pin_project_lite::pin_project;
-use std::io;
-use crossbeam_channel::RecvError;
-use rustix::io_uring::{IoringOp, SocketFlags};
-use crate::{Handle, Proactor};
-use crate::syscore::CompletionChan;
-use rustix_uring::{opcode as OP, types::Fd};
 
 ///
 /// TcpStream generator that is fed by multishot accept with multiple CQEs.
@@ -31,11 +31,10 @@ impl TcpStreamGenerator {
 
         Ok(Self {
             listener: listener.as_raw_fd(),
-            rx
+            rx,
         })
     }
 }
-
 
 impl Stream for TcpStreamGenerator {
     type Item = Handle<TcpStream>;
@@ -50,7 +49,7 @@ impl Stream for TcpStreamGenerator {
                 Poll::Ready(Some(hs))
             }
             Err(e) if e == RecvError => Poll::Ready(None),
-            _ => Poll::Pending
+            _ => Poll::Pending,
         }
     }
 }

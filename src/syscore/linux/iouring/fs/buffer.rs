@@ -1,4 +1,5 @@
 use futures::ready;
+use rustix_uring::types::Statx;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::cmp;
 use std::io;
@@ -6,7 +7,6 @@ use std::mem;
 use std::ptr::NonNull;
 use std::slice;
 use std::task::Poll;
-use rustix_uring::types::Statx;
 
 use super::cancellation::Cancellation;
 

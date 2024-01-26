@@ -1,10 +1,9 @@
-
 ///
 /// Nuclei's proactor configuration.
 #[derive(Clone, Debug, Default)]
 pub struct NucleiConfig {
     /// **IO_URING Configuration** allows you to configure [io_uring](https://unixism.net/loti/what_is_io_uring.html) backend.
-    pub iouring: IoUringConfiguration
+    pub iouring: IoUringConfiguration,
 }
 
 /// **IO_URING Configuration**
@@ -56,7 +55,6 @@ pub struct IoUringConfiguration {
     /// If [None] passed unbounded workers will be limited by the process task limit,
     /// as indicated by the rlimit [RLIMIT_NPROC](https://man7.org/linux/man-pages/man2/getrlimit.2.html) limit.
     pub per_numa_unbounded_worker_count: Option<u32>,
-
     // XXX: `redrive_kthread_wake` = bool, syncs queue changes so kernel threads got awakened. increased cpu usage.
 }
 

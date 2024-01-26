@@ -1,12 +1,12 @@
 #[cfg(target_os = "linux")]
 #[nuclei::main]
-async fn main() -> anyhow::Result<()>  {
+async fn main() -> anyhow::Result<()> {
     use nuclei::*;
     use std::net::TcpListener;
 
-    use futures::stream::StreamExt;
     use anyhow::Result;
     use async_dup::Arc;
+    use futures::stream::StreamExt;
 
     use futures::prelude::*;
     use http_types::{Request, Response, StatusCode};
@@ -16,7 +16,6 @@ async fn main() -> anyhow::Result<()>  {
     ////// If you try to use epoll, it will not compile.
     ////// Reason is: Multishot based IO is only part of io_uring backend.
     /////////////////////////////////////////////////////////////////////////
-
 
     static DATA: &'static str = include_str!("data/quark-gluon-plasma");
 
@@ -46,7 +45,7 @@ async fn main() -> anyhow::Result<()>  {
                     println!("Connection error: {:#?}", err);
                 }
             })
-                .detach();
+            .detach();
         }
 
         Ok(())
