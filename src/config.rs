@@ -113,7 +113,7 @@ impl IoUringConfiguration {
         Self {
             queue_len,
             sqpoll_wake_interval: Some(2),
-            aggressive_poll: fals,
+            aggressive_poll: false,
             ..Self::default()
         }
     }
