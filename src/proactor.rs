@@ -18,33 +18,28 @@ pub struct Proactor(pub(crate) SysProactor);
 unsafe impl Send for Proactor {}
 unsafe impl Sync for Proactor {}
 
-static mut PROACTOR: OnceCell<Proactor> = OnceCell::new();
+static PROACTOR: OnceCell<Proactor> = OnceCell::new();
 
 impl Proactor {
     /// Returns a reference to the proactor.
     pub fn get() -> &'static Proactor {
-        unsafe {
-            PROACTOR.get_or_init(|| {
-                Proactor(
-                    SysProactor::new(NucleiConfig::default())
-                        .expect("cannot initialize IO backend"),
-                )
-            })
-        }
+        PROACTOR.get_or_init(|| {
+            Proactor(
+                SysProactor::new(NucleiConfig::default()).expect("cannot initialize IO backend"),
+            )
+        })
     }
 
     /// Builds a proactor instance with given config and returns a reference to it.
     pub fn with_config(config: NucleiConfig) -> &'static Proactor {
-        unsafe {
-            let proactor =
-                Proactor(SysProactor::new(config.clone()).expect("cannot initialize IO backend"));
-            PROACTOR
-                .set(proactor)
-                .map_err(|e| "Proactor instance not being able to set.")
-                .unwrap();
+        let proactor =
+            Proactor(SysProactor::new(config.clone()).expect("cannot initialize IO backend"));
+        PROACTOR
+            .set(proactor)
+            .map_err(|e| "Proactor instance not being able to set.")
+            .unwrap();
 
-            PROACTOR.wait()
-        }
+        PROACTOR.wait()
     }
 
     /// Wakes the thread waiting on proactor.
@@ -69,6 +64,8 @@ impl Proactor {
 
     #[cfg(all(feature = "iouring", target_os = "linux"))]
     /// Get IO_URING backend probes
+    // vertexia: legacy proactor kept for edition 2024; replaced by the thread-per-core driver rewrite
+    #[allow(static_mut_refs)]
     pub fn ring_params(&self) -> &rustix_uring::Parameters {
         unsafe { IO_URING.as_ref().unwrap().params() }
     }

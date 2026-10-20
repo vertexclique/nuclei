@@ -31,14 +31,27 @@
 // These need to go through time.
 #![allow(dead_code, unused_variables)]
 
+// vertexia: the legacy runtime's executor stack (event-listener, concurrent-queue) has its own
+// `cfg(loom)` paths and cannot build under `--cfg loom`, so a model-checking build leaves the
+// legacy runtime out; removed with the legacy runtime by the thread-per-core driver rewrite.
+#[cfg(not(loom))]
 mod async_io;
 /// Nuclei's configuration options reside here.
+#[cfg(not(loom))]
 pub mod config;
+#[cfg(not(loom))]
 mod handle;
+#[cfg(not(loom))]
 mod proactor;
+#[cfg(not(loom))]
 mod submission_handler;
+/// Runtime-independent synchronization primitives: futures and wakers only, usable from any executor.
+pub mod sync;
+#[cfg(not(loom))]
 mod sys;
+#[cfg(not(loom))]
 mod utils;
+#[cfg(not(loom))]
 mod waker;
 
 #[cfg(not(any(
@@ -55,33 +68,41 @@ mod waker;
 )))]
 compile_error!("Target OS is not supported");
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
+#[cfg(all(
+    not(loom),
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )
 ))]
 mod syscore {
     mod bsd;
     pub(crate) use bsd::*;
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "illumos"))]
+#[cfg(all(
+    not(loom),
+    any(target_os = "linux", target_os = "android", target_os = "illumos")
+))]
 mod syscore {
     mod linux;
     pub(crate) use linux::*;
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(loom), target_os = "windows"))]
 mod syscore {
     mod windows;
     pub(crate) use windows::*;
 }
 
+#[cfg(not(loom))]
 pub use async_global_executor::*;
+#[cfg(not(loom))]
 pub use proactor::*;
 
-#[cfg(feature = "attributes")]
+#[cfg(all(not(loom), feature = "attributes"))]
 pub use nuclei_attributes::*;

@@ -174,6 +174,8 @@ impl SysProactor {
 
             IO_URING = Some(ring);
 
+            // vertexia: legacy proactor kept for edition 2024; replaced by the thread-per-core driver rewrite
+            #[allow(static_mut_refs)]
             let (sbmt, sq, cq) = IO_URING.as_mut().unwrap().split();
 
             match (
