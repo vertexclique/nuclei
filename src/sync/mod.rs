@@ -115,7 +115,13 @@ macro_rules! loom_const_fn {
     };
 }
 
+#[cfg(not(loom))]
+pub(crate) mod atomic_waker;
+#[cfg(loom)]
+#[doc(hidden)]
+pub mod atomic_waker;
 mod barrier;
+mod cancellation;
 mod contend;
 mod event;
 pub(crate) mod internal;
@@ -128,6 +134,7 @@ pub mod loom_model;
 mod mutex;
 mod notify;
 mod once_cell;
+pub mod oneshot;
 mod owned_lock;
 mod owner;
 mod queue;
@@ -142,8 +149,13 @@ mod spin;
 #[cfg(all(test, not(loom)))]
 pub(crate) mod test_support;
 mod waiter;
+pub mod watch;
 
 pub use barrier::{Barrier, BarrierWait, BarrierWaitResult};
+pub use cancellation::{
+    CancellationToken, DropGuard, DropGuardRef, WaitForCancellationFuture,
+    WaitForCancellationFutureOwned,
+};
 pub use contend::MAX_BYPASS;
 pub use event::{Event, EventWait};
 pub use latch::{Latch, LatchWait};
