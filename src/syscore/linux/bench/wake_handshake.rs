@@ -1,4 +1,4 @@
-//! 0d: remote wake fence. A shard parks in `epoll_wait` while foreign threads push to its inbox
+//! The remote wake handshake. A shard parks in `epoll_wait` while foreign threads push to its inbox
 //! and signal its eventfd only when `parked` is set; measures the three store-load barrier
 //! policies (A, B, C) on the park/wake Dekker pair.
 //!
@@ -219,7 +219,7 @@ fn waker_run<P: Protocol>(wk: &Wake<u64>, ctl: &WakeCtl, cfg: &WakeCfg, wi: usiz
     out
 }
 
-// Column indices of a 0d row.
+// Column indices of a wake row.
 const MSGS: usize = 0;
 const LOST: usize = 12;
 const ABORT: usize = 14;
@@ -451,14 +451,14 @@ fn litmus_plain(rounds: u64, cpus: Option<&[usize]>, fenced: bool) -> u64 {
 
 #[test]
 #[ignore]
-fn phase0_wake_fence() {
+fn bench_wake_handshake() {
     let _exclusive = exclusive();
     let clock = Clock::new();
     let reg = membarrier_register();
     for w in [1usize, 4, 16] {
         let cpus = pick_cpus(w + 1);
         banner(
-            &format!("0d wake fence, {w} waker(s), shard on cpu {}", cpus[0]),
+            &format!("wake fence, {w} waker(s), shard on cpu {}", cpus[0]),
             &cpus,
         );
         println!(
@@ -491,7 +491,7 @@ fn phase0_wake_fence() {
             .iter()
             .flat_map(|(n, runs)| spread_rows(n.split(' ').next().unwrap_or(n), runs))
             .collect();
-        let t = format!("0d waker side, {w} waker(s), median of {RUNS} runs (ns unless noted)");
+        let t = format!("waker side, {w} waker(s), median of {RUNS} runs (ns unless noted)");
         table(
             &t,
             &[
@@ -505,7 +505,7 @@ fn phase0_wake_fence() {
             ],
             &rows,
         );
-        let t = format!("0d wake side, {w} waker(s), median of {RUNS} runs (ns unless noted)");
+        let t = format!("wake side, {w} waker(s), median of {RUNS} runs (ns unless noted)");
         table(
             &t,
             &[
@@ -523,7 +523,7 @@ fn phase0_wake_fence() {
             ],
             &rows,
         );
-        let t = format!("0d spread over {RUNS} runs, {w} waker(s) (ns)");
+        let t = format!("spread over {RUNS} runs, {w} waker(s) (ns)");
         table(
             &t,
             &[
@@ -543,7 +543,7 @@ fn phase0_wake_fence() {
         );
     }
     let cpus = pick_cpus(1);
-    banner("0d fast-path micro (single thread, no contention)", &cpus);
+    banner("fast-path micro (single thread, no contention)", &cpus);
     // Pinned on a scoped thread so this test thread keeps its CPU set.
     let rows: Vec<Row> = thread::scope(|sc| {
         sc.spawn(|| {
@@ -559,14 +559,14 @@ fn phase0_wake_fence() {
     });
     table(
         &format!(
-            "0d micro, median of {MICRO_ITERS} reps (ns, includes the {} ns timer floor)",
+            "micro, median of {MICRO_ITERS} reps (ns, includes the {} ns timer floor)",
             num(timer_floor(clock))
         ),
         &[("waker_path", 0), ("shard_arm", 1)],
         &rows,
     );
     let cpus = pick_cpus(2);
-    banner("0d litmus: tight race of the park/wake pair", &cpus);
+    banner("litmus: tight race of the park/wake pair", &cpus);
     let c = Some(&cpus[..]);
     type Case<'a> = (&'a str, Box<dyn Fn() -> u64 + 'a>);
     let cases: [Case<'_>; 5] = [
@@ -601,12 +601,12 @@ fn phase0_wake_fence() {
     }
     table(
         &format!(
-            "0d litmus, {LITMUS_ROUNDS} rounds per run, lost = sleeper saw an empty inbox and the waker saw parked=false; median of {RUNS} runs"
+            "litmus, {LITMUS_ROUNDS} rounds per run, lost = sleeper saw an empty inbox and the waker saw parked=false; median of {RUNS} runs"
         ),
         &[("rounds", 0), ("lost", 1)],
         &rows,
     );
-    table("0d litmus spread over runs", &[("lost", 1)], &spread);
+    table("litmus spread over runs", &[("lost", 1)], &spread);
 }
 
 fn exactly_once<P: Protocol>() {

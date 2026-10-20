@@ -773,7 +773,7 @@ mod tests {
     /// script judges the outcome.
     #[test]
     #[ignore = "prints one line for the sandbox matrix"]
-    fn phase0_probe_report() {
+    fn probe_report() {
         let mode = seccomp_mode().map_or_else(|| "unknown".into(), |m| m.to_string());
         let (probe, path) = probe_with(false);
         let path = match path {

@@ -1,22 +1,22 @@
-//! Phase 0d and 0e measurement experiments for the thread-per-core runtime rewrite.
+//! Measurements behind the shard design, as ignored tests, plus small tests in the normal
+//! suite that pin the measured protocols' correctness.
 //!
-//! Test-only models, no product code. Each experiment is an `#[ignore]` test whose name starts
-//! with `phase0_` and prints a results table (run with
-//! `cargo test -p nuclei --release --lib -- --ignored --nocapture phase0_`); the small
-//! non-ignored tests pin the protocols' correctness in the normal suite.
+//! Run the measurements with
+//! `cargo test -p nuclei --release --lib -- --ignored --nocapture bench_`.
 //!
-//! * 0d, remote wake fence: a shard parks in `epoll_wait` on an edge-triggered eventfd while
+//! * [`wake_handshake`]: a shard parks in `epoll_wait` on an edge-triggered eventfd while
 //!   foreign threads push to its inbox. Parking and waking form a Dekker pair (`parked` flag
-//!   against inbox), so each side needs a store-load barrier. Compared: `fence(SeqCst)` on both
-//!   sides (A), `membarrier` on the rare parking side with a compiler fence on the waker (B), and
-//!   a compiler fence only on both sides (C, the unsound control).
-//! * 0e, handle migration on epoll: one socket used from two shards, either re-registered with
-//!   the shard that uses it (`EPOLL_CTL_DEL`/`ADD` under a generation token) or left on its home
-//!   shard and read through a request/response mailbox.
+//!   against the inbox), so each side needs a store-load barrier. Compared: `fence(SeqCst)` on
+//!   both sides (A), `membarrier` on the rare parking side with a compiler fence on the waker
+//!   (B), and a compiler fence only on both sides (C, the unsound control).
+//! * [`fd_migration`]: one socket used from two shards, either re-registered with the shard that
+//!   uses it (`EPOLL_CTL_DEL`/`ADD` under a generation token) or left on its home shard and read
+//!   through a request/response mailbox.
+//! * `read_path`: how a socket read reaches the caller's buffer (io_uring builds only).
 //!
-//! Layout: this file holds the shared plumbing (syscalls, pinning, clock, statistics, tables) and
-//! the wake protocol; `wake_fence` is 0d and `migration` is 0e, split so no file nears 1000 lines.
-//! Measurements take [`exclusive`] so concurrently scheduled tests never share pinned CPUs.
+//! This file holds the shared plumbing (syscalls, pinning, clock, statistics, tables) and the
+//! wake protocol. Measurements take [`exclusive`] so concurrently scheduled tests never share
+//! pinned CPUs.
 //!
 //! Invariant: every cross-shard message goes through [`Wake`], so both experiments exercise the
 //! same push, fence, load-`parked`, conditional-eventfd-write protocol. Atomics on the protocol
@@ -382,7 +382,7 @@ fn membarrier_register() -> &'static Result<u64, String> {
 }
 
 /// A shard's inbox plus the machinery to park it: `parked`, an eventfd, and an epoll set holding
-/// the eventfd edge-triggered (0e adds the socket to the same set).
+/// the eventfd edge-triggered (the migration measurement adds the socket to the same set).
 struct Wake<M> {
     inbox: SegQueue<M>,
     parked: CachePadded<AtomicBool>,
@@ -461,5 +461,7 @@ impl<M: Send + 'static> Wake<M> {
     }
 }
 
-mod migration;
-mod wake_fence;
+mod fd_migration;
+#[cfg(feature = "iouring")]
+mod read_path;
+mod wake_handshake;

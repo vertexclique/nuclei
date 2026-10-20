@@ -3,7 +3,7 @@
 # that it reports what that sandbox should produce. Prints a table of environment, expected,
 # actual and verdict; exits non-zero on any mismatch or any case that could not run.
 #
-# The probe is the ignored test `phase0_probe_report`, built once as a static musl binary so the
+# The probe is the ignored test `probe_report`, built once as a static musl binary so the
 # same file runs on the host, under systemd and in a container. See benches/reference/README.md.
 set -euo pipefail
 
@@ -11,7 +11,7 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 
 target=x86_64-unknown-linux-musl
-test_name=syscore::linux::probe::tests::phase0_probe_report
+test_name=syscore::linux::probe::tests::probe_report
 image=${PROBE_IMAGE:-alpine:3}
 # Named syscalls: systemd 262 has no `@io-uring` group (these sit in `@aio`), and it ignores an
 # unknown group in a deny list without applying any filter, which the cases below would flag.

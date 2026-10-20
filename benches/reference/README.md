@@ -21,10 +21,10 @@ The Rust side, on the same machine and the same CPU, back to back:
 
 ```sh
 cargo test -p nuclei --release --lib --no-run
-taskset -c 2 cargo test -p nuclei --release --lib -- --ignored --nocapture phase0_nop_round_trip
+taskset -c 2 cargo test -p nuclei --release --lib -- --ignored --nocapture bench_nop_round_trip
 ```
 
-Both print `nop batch=<n> ops=200000 runs=7 median_ns_per_op=<x>`. Phase 0a's kill criterion is the
+Both print `nop batch=<n> ops=200000 runs=7 median_ns_per_op=<x>`. The ring layer's acceptance bound is the
 Rust median more than 10% above the C median for either batch size. Needs Linux 6.1 or newer; both
 programs retry without `NO_SQARRAY` on kernels before 6.6.
 
@@ -33,7 +33,7 @@ programs retry without `NO_SQARRAY` on kernels before 6.6.
 Runs the io_uring availability probe (`src/syscore/linux/probe.rs`) in each sandbox and checks what
 it reports. It builds the lib test binary once for `x86_64-unknown-linux-musl` (static, so the same
 file runs on the host, under systemd and in a container) and runs the ignored test
-`phase0_probe_report` in five environments: the plain host (no seccomp filter, in-process probe),
+`probe_report` in five environments: the plain host (no seccomp filter, in-process probe),
 a user systemd unit that kills io_uring syscalls, the same with `SystemCallErrorNumber=EPERM`,
 Docker's default seccomp profile, and Docker with `seccomp=unconfined`. Needs `jq`, `column`,
 `systemd-run --user` and a running Docker daemon with the `alpine:3` image (override with

@@ -741,7 +741,7 @@ fn msg_ring_reaches_a_ring_on_another_thread() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Measurement 0a: NOP round trips through the ring, to compare with `benches/reference`.
+// NOP round trips through the ring, measured, to compare with `benches/reference`.
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
@@ -749,8 +749,8 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 #[test]
-#[ignore = "measurement: run with --release -- --ignored --nocapture phase0_nop_round_trip"]
-fn phase0_nop_round_trip() {
+#[ignore = "measurement: run with --release -- --ignored --nocapture bench_nop_round_trip"]
+fn bench_nop_round_trip() {
     const OPS: u64 = 200_000;
     const RUNS: usize = 7;
     let Some(mut ring) = ring_with_or_skip(RingConfig::new(256)) else {

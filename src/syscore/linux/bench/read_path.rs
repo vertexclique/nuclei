@@ -1,4 +1,5 @@
-//! Phase 0b: which way a socket read should reach the caller's buffer, measured.
+//! How a socket read reaches the caller's buffer, measured: the provided-buffer pool against
+//! readiness followed by a direct read.
 //!
 //! Three read paths are compared over one loopback TCP connection fed by a writer thread:
 //!
@@ -35,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::iouring::ring::{IORING_CQE_F_MORE, Ring, RingConfig, Sqe, buf_ring::BufRing};
+use super::super::iouring::ring::{IORING_CQE_F_MORE, Ring, RingConfig, Sqe, buf_ring::BufRing};
 
 mod readers;
 mod report;
@@ -103,9 +104,9 @@ struct Cpus {
     writer: usize,
 }
 
-/// Reader and writer CPUs: `PHASE0_READS_CPUS=reader,writer`, else 2 and 3.
+/// Reader and writer CPUs: `NUCLEI_BENCH_CPUS=reader,writer`, else 2 and 3.
 fn cpus() -> Cpus {
-    env::var("PHASE0_READS_CPUS")
+    env::var("NUCLEI_BENCH_CPUS")
         .ok()
         .and_then(|v| {
             let (r, w) = v.split_once(',')?;
@@ -160,7 +161,7 @@ fn loadavg() -> String {
 
 #[test]
 #[ignore = "measurement: run in release with --ignored --nocapture on a quiet machine"]
-fn phase0_reads_measure() {
+fn bench_read_path() {
     if !uring_available() {
         return;
     }
@@ -245,16 +246,16 @@ fn correctness(path: Path) {
 }
 
 #[test]
-fn phase0_reads_correct_pool() {
+fn read_path_pool_is_exact() {
     correctness(Path::Pool);
 }
 
 #[test]
-fn phase0_reads_correct_uring_poll() {
+fn read_path_uring_poll_is_exact() {
     correctness(Path::UringPoll);
 }
 
 #[test]
-fn phase0_reads_correct_epoll() {
+fn read_path_epoll_is_exact() {
     correctness(Path::Epoll);
 }

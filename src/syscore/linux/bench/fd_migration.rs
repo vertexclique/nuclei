@@ -1,4 +1,4 @@
-//! 0e: handle migration on epoll. One socket used from two shards: re-registered with the
+//! Moving a socket between shards' epoll sets. One socket used from two shards: re-registered with the
 //! using shard (strategy 1) or kept on its home shard and read through a mailbox (strategy 2).
 //!
 //! Model: a task reads `total` 1 KiB messages from one loopback socket accepted on shard A; the
@@ -657,11 +657,11 @@ const STEADY_COLS: &[(&str, usize)] = &[
 
 #[test]
 #[ignore]
-fn phase0_migration_steady() {
+fn bench_fd_migration_steady() {
     let _exclusive = exclusive();
     let cpus = pick_cpus(3);
     banner(
-        "0e handle migration, steady state (A=cpu0 of list, B=cpu1, writer=cpu2)",
+        "handle migration, steady state (A=cpu0 of list, B=cpu1, writer=cpu2)",
         &cpus,
     );
     for (regime, total, what) in [
@@ -678,8 +678,8 @@ fn phase0_migration_steady() {
     ] {
         let (mut rows, mut spread) = (vec![], vec![]);
         for (strategy, name) in [
-            (Strategy::Reregister, "S1 re-register"),
-            (Strategy::HomeShard, "S2 home shard"),
+            (Strategy::Reregister, "re-register"),
+            (Strategy::HomeShard, "home shard"),
         ] {
             for sched in [
                 Schedule::Alternate(1),
@@ -702,12 +702,12 @@ fn phase0_migration_steady() {
             }
         }
         table(
-            &format!("0e steady state, {what}, {total} msgs, median of {RUNS} runs"),
+            &format!("steady state, {what}, {total} msgs, median of {RUNS} runs"),
             STEADY_COLS,
             &rows,
         );
         table(
-            &format!("0e steady state spread over {RUNS} runs ({what})"),
+            &format!("steady state spread over {RUNS} runs ({what})"),
             &[
                 ("kops/s", 0),
                 ("op_med", 1),
@@ -728,11 +728,11 @@ fn phase0_migration_steady() {
 
 #[test]
 #[ignore]
-fn phase0_migration_first_use() {
+fn bench_fd_migration_first_use() {
     let _exclusive = exclusive();
     let cpus = pick_cpus(3);
     banner(
-        "0e first use on B after accept on A (A=cpu0 of list, B=cpu1)",
+        "first use on B after accept on A (A=cpu0 of list, B=cpu1)",
         &cpus,
     );
     let (mut rows, mut spread) = (vec![], vec![]);
@@ -742,9 +742,9 @@ fn phase0_migration_first_use() {
             Strategy::Reregister,
             Schedule::OnlyA,
         ),
-        ("S1 re-register A->B", Strategy::Reregister, Schedule::OnlyB),
+        ("re-register A->B", Strategy::Reregister, Schedule::OnlyB),
         (
-            "S2 home shard, used on B",
+            "home shard, used on B",
             Strategy::HomeShard,
             Schedule::OnlyB,
         ),
@@ -757,7 +757,7 @@ fn phase0_migration_first_use() {
     }
     table(
         &format!(
-            "0e first use, {FIRST_USE_REPS} fresh connections per run, median of {RUNS} runs (ns; counts per first use)"
+            "first use, {FIRST_USE_REPS} fresh connections per run, median of {RUNS} runs (ns; counts per first use)"
         ),
         &[
             ("n", 0),
@@ -775,7 +775,7 @@ fn phase0_migration_first_use() {
         &rows,
     );
     table(
-        &format!("0e first use spread over {RUNS} runs (ns)"),
+        &format!("first use spread over {RUNS} runs (ns)"),
         &[("total_med", 1), ("hop_med", 3), ("strat_med", 4)],
         &spread,
     );

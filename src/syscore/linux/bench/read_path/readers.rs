@@ -168,7 +168,7 @@ impl Drop for PoolReader {
         if self.armed
             && let Err(e) = cancel_and_reap(&mut self.ring, RECV_UD)
         {
-            eprintln!("phase0_reads: pool reader teardown failed: {e}");
+            eprintln!("read_path: pool reader teardown failed: {e}");
         }
     }
 }
@@ -233,7 +233,7 @@ impl Drop for UringPoll {
         if self.armed
             && let Err(e) = cancel_and_reap(&mut self.ring, RECV_UD)
         {
-            eprintln!("phase0_reads: poll teardown failed: {e}");
+            eprintln!("read_path: poll teardown failed: {e}");
         }
     }
 }

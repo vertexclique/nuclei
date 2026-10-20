@@ -1,5 +1,5 @@
 /*
- * Reference for the Rust ring layer's NOP round-trip measurement (phase0_nop_round_trip).
+ * Reference for the Rust ring layer's NOP round-trip measurement (bench_nop_round_trip).
  *
  * Raw syscalls only: no liburing. The ring is set up with the same flags as the Rust ring
  * (SINGLE_ISSUER | DEFER_TASKRUN | SUBMIT_ALL | CLAMP | CQSIZE, plus NO_SQARRAY with a retry
