@@ -7,3 +7,6 @@ pub(crate) use epoll::*;
 mod iouring;
 #[cfg(feature = "iouring")]
 pub(crate) use iouring::*;
+
+#[cfg(test)]
+mod phase0;
