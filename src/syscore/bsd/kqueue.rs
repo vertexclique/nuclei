@@ -198,7 +198,8 @@ impl SysProactor {
         let mut eventlist = changelist;
         kevent_ts(self.kqueue_fd, &changelist, &mut eventlist, None)?;
         for ev in &eventlist {
-            // Explanation for ignoring EPIPE: https://github.com/tokio-rs/mio/issues/582
+            // kqueue reports EPIPE for a pipe whose other end is closed; the
+            // registration still took effect, so it is not an error.
             let (flags, data) = (ev.flags(), ev.data());
             if (flags & libc::EV_ERROR) != 0
                 && data != 0
