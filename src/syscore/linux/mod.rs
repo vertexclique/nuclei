@@ -13,3 +13,6 @@ mod phase0;
 
 #[cfg(all(target_os = "linux", feature = "iouring"))]
 pub(crate) mod probe;
+
+#[cfg(all(test, feature = "iouring"))]
+mod phase0_reads;
