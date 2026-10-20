@@ -38,13 +38,13 @@ The proactor system's design principles are matching [Boost Asio](https://www.bo
 Nuclei is not using a conventional reactor approach. It is completely asynchronous, and it's wrapping poll based IO in a proactive fashion.
 
 Nuclei uses [io_uring](https://kernel.dk/io_uring.pdf) on Linux as the primary IO backend, secondarily you can use [epoll](https://en.wikipedia.org/wiki/Epoll). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
-On Windows, the [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend [will be used](https://github.com/vertexclique/nuclei/pull/3).
+On Windows, Nuclei is using [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port).
 
-The current io_uring implementation needs a modern Linux kernel (5.19+).
+The current io_uring implementation needs a modern Linux kernel (6.1+).
 
 ## Features
 
-* Most of the recent IO_URING features are available, ZC and other 6.1+ features are in TODO.
+* Most of the recent IO_URING features are available.
 * Async TCP, UDP, Unix domain sockets and files...
 * The proactor system doesn't block
 * Scatter/Gather operations
@@ -62,21 +62,19 @@ $ cargo run --example fread-vect
 ## Tests
 
 ```shell script
-$ cargo test --no-default-features --features=iouring # For iouring
-$ cargo test # For others
+$ cargo test # io_uring where available, otherwise the platform's evented backend
+$ NUCLEI_BACKEND=epoll cargo test # epoll on Linux
 ```
 
 ## Configurations
 
 ### Evented IO backend
 
-When the `iouring` feature gate is not enabled, the platforms evented backend is used. For example, on Linux, `epoll` would be used.
+When the `iouring` feature gate is not enabled, or io_uring is not available, the platform's evented backend is used. For example, on Linux, `epoll` would be used.
 
 ### Executor
 
-Executor is using `async-global-executor`. Available features are:
-* `async-exec`: Uses `async-io` feature of `async-global-executor`.
-* `tokio`
+Nuclei has its own executor and can still be used with any other runtime.
 
 #### License
 
