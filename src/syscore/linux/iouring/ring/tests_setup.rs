@@ -122,6 +122,8 @@ fn setup_reports_missing_kernel_features_after_two_refusals() {
         err.to_string().contains("lacks the io_uring features"),
         "{err}"
     );
+    let refusal = err.get_ref().and_then(|e| e.downcast_ref::<Refusal>());
+    assert_eq!(refusal, Some(&Refusal::FloorFlags));
 }
 
 #[test]
@@ -141,6 +143,8 @@ fn setup_does_not_retry_other_errors() {
     })
     .unwrap_err();
     assert_eq!((calls, err.kind()), (1, ErrorKind::Unsupported));
+    let refusal = err.get_ref().and_then(|e| e.downcast_ref::<Refusal>());
+    assert_eq!(refusal, Some(&Refusal::NotInKernel));
 }
 
 #[test]

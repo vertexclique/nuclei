@@ -308,14 +308,14 @@ fn an_interrupted_wait_surfaces_as_interrupted() {
         0
     );
     // SAFETY: pthread_self has no preconditions.
-    let waiter = unsafe { libc::pthread_self() };
+    let waiter = unsafe { libc::pthread_self() } as usize;
     let stop = Arc::new(AtomicBool::new(false));
     let poker = {
         let stop = Arc::clone(&stop);
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 // SAFETY: the waiting thread outlives the poker, which is joined below.
-                unsafe { libc::pthread_kill(waiter, libc::SIGUSR2) };
+                unsafe { libc::pthread_kill(waiter as libc::pthread_t, libc::SIGUSR2) };
                 thread::sleep(Duration::from_millis(2));
             }
         })

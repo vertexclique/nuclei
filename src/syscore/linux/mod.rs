@@ -10,3 +10,6 @@ pub(crate) use iouring::*;
 
 #[cfg(test)]
 mod phase0;
+
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+pub(crate) mod probe;

@@ -27,3 +27,26 @@ taskset -c 2 cargo test -p nuclei --release --lib -- --ignored --nocapture phase
 Both print `nop batch=<n> ops=200000 runs=7 median_ns_per_op=<x>`. Phase 0a's kill criterion is the
 Rust median more than 10% above the C median for either batch size. Needs Linux 6.1 or newer; both
 programs retry without `NO_SQARRAY` on kernels before 6.6.
+
+## `probe-matrix.sh`
+
+Runs the io_uring availability probe (`src/syscore/linux/probe.rs`) in each sandbox and checks what
+it reports. It builds the lib test binary once for `x86_64-unknown-linux-musl` (static, so the same
+file runs on the host, under systemd and in a container) and runs the ignored test
+`phase0_probe_report` in five environments: the plain host (no seccomp filter, in-process probe),
+a user systemd unit that kills io_uring syscalls, the same with `SystemCallErrorNumber=EPERM`,
+Docker's default seccomp profile, and Docker with `seccomp=unconfined`. Needs `jq`, `column`,
+`systemd-run --user` and a running Docker daemon with the `alpine:3` image (override with
+`PROBE_IMAGE`).
+
+```sh
+bash benches/reference/probe-matrix.sh
+```
+
+It prints a table of environment, expected, actual and verdict and exits non-zero on any mismatch,
+including a filter that did not apply (the process reports `seccomp=0` where `2` is expected) and a
+case that could not run. The systemd cases name the three syscalls instead of a group because
+systemd 262 has no `@io-uring` group and silently applies no filter for an unknown one. The kill
+case ends the probe's child with `SIGSYS`; the child lowers its own core limit first, so no core
+dump entry is left. To check that after a change, compare `coredumpctl list --no-pager | grep -c probe`
+before and after a run: the count must not grow.

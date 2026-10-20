@@ -27,7 +27,7 @@ mod tests_setup;
 
 use std::{
     ffi::c_void,
-    io,
+    fmt, io,
     marker::PhantomData,
     mem::size_of,
     os::fd::{AsRawFd, OwnedFd, RawFd},
@@ -116,7 +116,7 @@ pub(crate) fn setup_flags(cfg: &RingConfig, no_sqarray: bool) -> u32 {
     flags
 }
 
-fn setup_params(cfg: &RingConfig, no_sqarray: bool) -> IoUringParams {
+pub(crate) fn setup_params(cfg: &RingConfig, no_sqarray: bool) -> IoUringParams {
     IoUringParams {
         flags: setup_flags(cfg, no_sqarray),
         cq_entries: cfg
@@ -125,6 +125,38 @@ fn setup_params(cfg: &RingConfig, no_sqarray: bool) -> IoUringParams {
             .max(cfg.entries.saturating_mul(2)),
         sq_thread_idle: cfg.sqpoll_idle_ms.unwrap_or(0),
         ..IoUringParams::default()
+    }
+}
+
+/// Why the kernel cannot give this runtime a ring. It rides inside the `ErrorKind::Unsupported`
+/// errors of [`Ring::new`], so the backend probe tells the cases apart without reading words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// `io_uring_setup` answered `ENOSYS`.
+    NotInKernel,
+    /// The kernel refused the floor flags even without the submission index array.
+    FloorFlags,
+    /// The kernel's ring lacks a feature every ring requires, named in plain words.
+    Feature(&'static str),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotInKernel => f.write_str("this kernel has no io_uring support"),
+            Self::FloorFlags => {
+                f.write_str("the kernel lacks the io_uring features this runtime needs")
+            }
+            Self::Feature(name) => write!(f, "the kernel's io_uring lacks {name}"),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+impl From<Refusal> for io::Error {
+    fn from(r: Refusal) -> Self {
+        io::Error::new(io::ErrorKind::Unsupported, r)
     }
 }
 
@@ -141,18 +173,12 @@ fn negotiate<T>(
             Ok(v) => return Ok((v, params)),
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "this kernel has no io_uring support",
-                ));
+                return Err(Refusal::NotInKernel.into());
             }
             Err(e) => return Err(e),
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the kernel lacks the io_uring features this runtime needs",
-    ))
+    Err(Refusal::FloorFlags.into())
 }
 
 /// Features every ring requires, with the plain-words name used when one is missing.
@@ -223,10 +249,7 @@ impl Ring {
         let (fd, params) = negotiate(cfg, setup)?;
         for (bit, name) in REQUIRED_FEATURES {
             if params.features & bit == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("the kernel's io_uring lacks {name}"),
-                ));
+                return Err(Refusal::Feature(name).into());
             }
         }
         if !params.sq_entries.is_power_of_two() || !params.cq_entries.is_power_of_two() {
