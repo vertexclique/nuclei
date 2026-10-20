@@ -1,0 +1,25 @@
+name: TLA+
+
+# Models are never listed here by hand: `tla.sh` fetches a checksum-verified tla2tools.jar and
+# runs `proofs/tla/run_tlc.sh all`, which translates the PlusCal of every family under
+# proofs/tla/ and checks each configuration against its EXPECTED.txt, so a new model needs no
+# change to this workflow.
+
+on: [push, pull_request]
+
+jobs:
+  tla:
+    name: TLA+ model checking
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Run TLA+ models
+        run: .github/workflows/tla.sh
