@@ -26,7 +26,6 @@
 //! ### Executor
 //! Executor is using `async-global-executor`. Available features are:
 //! * `async-exec`: Uses `async-io` feature of `async-global-executor`.
-//! * `tokio`: Uses tokio
 
 // These need to go through time.
 #![allow(dead_code, unused_variables)]

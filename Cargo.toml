@@ -40,7 +40,6 @@ epoll = []
 iouring = ["rustix-uring", "rustix"]
 
 async-exec = ["async-global-executor"]
-tokio = ["async-global-executor/tokio"]
 
 attributes = ["nuclei-attributes"]
 
