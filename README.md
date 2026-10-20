@@ -31,10 +31,6 @@
     <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square"
       alt="docs.rs docs" />
     </a>
-    <!-- Discord -->
-    <a href="https://discord.gg/DqRqtRT">
-    <img src="https://img.shields.io/discord/628383521450360842.svg?logo=discord" />
-    </a>
 </div>
 
 Nuclei is a [proactor-based](http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.49.9183) IO system which is runtime agnostic and can work with any runtime.
