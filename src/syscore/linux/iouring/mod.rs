@@ -3,6 +3,7 @@ mod iouring;
 mod net;
 mod nethandle;
 mod processor;
+pub(crate) mod ring;
 
 pub(crate) use fs::*;
 pub(crate) use iouring::*;
