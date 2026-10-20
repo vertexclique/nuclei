@@ -24,6 +24,8 @@
 //! permits, which is `usize::MAX >> 7`. What this module adds is the
 //! [`Event`](crate::sync::Event), the [`Latch`](crate::sync::Latch), the [`Lazy`](crate::sync::Lazy) value, the upgradable read of the
 //! [`RwLock`](crate::sync::RwLock), the reentrant locks and `OnceCell::get_or_init_racy`.
+//! The [`mpsc`] channels follow the same rule for the established channel API,
+//! with their own progress notes.
 //!
 //! # What every primitive guarantees
 //!
@@ -131,6 +133,7 @@ mod list;
 #[cfg(loom)]
 #[doc(hidden)]
 pub mod loom_model;
+pub mod mpsc;
 mod mutex;
 mod notify;
 mod once_cell;

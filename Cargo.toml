@@ -90,6 +90,10 @@ harness = false
 name = "sync_new"
 harness = false
 
+[[bench]]
+name = "sync_mpsc"
+harness = false
+
 # Declaring `loom` keeps `unexpected_cfgs` quiet in the ordinary build
 # without turning the lint off.
 [lints.rust]
