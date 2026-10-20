@@ -1,7 +1,7 @@
 //! The FIFO of waiters a drain pass keeps between passes.
 //!
 //! Only the holder of a primitive's drain role touches its lists, so a list
-//! is a plain singly linked queue threaded through the nodes' own links.
+//! is a plain doubly linked queue threaded through the nodes' own links.
 //! Cancelled waiters stay linked until a pass meets them at the front, or
 //! until enough of them pile up behind a live front that a sweep pays for
 //! itself: [`List::tidy`] sweeps once the cancellations since the last
@@ -46,6 +46,8 @@ impl List {
     pub(super) fn push_back(&mut self, node: NonNull<Waiter>) {
         // SAFETY: the caller hands over the queue's reference to `node`.
         unsafe { node.as_ref() }.set_next(ptr::null_mut());
+        // SAFETY: as above.
+        unsafe { node.as_ref() }.set_prev(self.tail);
         match NonNull::new(self.tail) {
             // SAFETY: the tail is a node this list holds.
             Some(tail) => unsafe { tail.as_ref() }.set_next(node.as_ptr()),
@@ -73,8 +75,24 @@ impl List {
         let node = NonNull::new(self.head)?;
         // SAFETY: the head is a node this list holds.
         self.head = unsafe { node.as_ref() }.next();
-        if self.head.is_null() {
-            self.tail = ptr::null_mut();
+        match NonNull::new(self.head) {
+            // SAFETY: the new head is a node this list holds.
+            Some(head) => unsafe { head.as_ref() }.set_prev(ptr::null_mut()),
+            None => self.tail = ptr::null_mut(),
+        }
+        self.len -= 1;
+        Some(node)
+    }
+
+    /// Takes the back node off the list, with the queue's reference.
+    pub(super) fn pop_back(&mut self) -> Option<NonNull<Waiter>> {
+        let node = NonNull::new(self.tail)?;
+        // SAFETY: the tail is a node this list holds.
+        self.tail = unsafe { node.as_ref() }.prev();
+        match NonNull::new(self.tail) {
+            // SAFETY: the new tail is a node this list holds.
+            Some(tail) => unsafe { tail.as_ref() }.set_next(ptr::null_mut()),
+            None => self.head = ptr::null_mut(),
         }
         self.len -= 1;
         Some(node)
@@ -89,6 +107,20 @@ impl List {
                 return Some(node);
             }
             self.pop_front();
+            release_queued(node, queue);
+        }
+        None
+    }
+
+    /// The newest waiter still waiting, after letting go of every withdrawn
+    /// one behind it.
+    pub(super) fn back(&mut self, queue: &WaitQueue) -> Option<NonNull<Waiter>> {
+        while let Some(node) = NonNull::new(self.tail) {
+            // SAFETY: the tail is a node this list holds.
+            if !unsafe { node.as_ref() }.is_cancelled() {
+                return Some(node);
+            }
+            self.pop_back();
             release_queued(node, queue);
         }
         None
@@ -138,8 +170,10 @@ impl List {
                 Some(prev) => unsafe { prev.as_ref() }.set_next(cursor),
                 None => self.head = cursor,
             }
-            if cursor.is_null() {
-                self.tail = prev;
+            match NonNull::new(cursor) {
+                // SAFETY: `cursor` is a node this list holds.
+                Some(next) => unsafe { next.as_ref() }.set_prev(prev),
+                None => self.tail = prev,
             }
             self.len -= 1;
             release_queued(node, queue);

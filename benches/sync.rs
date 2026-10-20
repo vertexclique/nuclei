@@ -229,7 +229,7 @@ fn uncontended(c: &mut Criterion) {
     });
     let semaphore = Semaphore::new(1);
     group.bench_function("nuclei_semaphore_acquire", |b| {
-        b.iter(|| drop(black_box(&semaphore).try_acquire(1).expect("free")))
+        b.iter(|| drop(black_box(&semaphore).try_acquire().expect("free")))
     });
     let std_mutex = std::sync::Mutex::new(0u64);
     group.bench_function("std_mutex_lock", |b| {

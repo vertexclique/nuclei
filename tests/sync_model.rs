@@ -19,7 +19,10 @@
 //! At the end everything held is released, round after round, and every
 //! waiter must finish: nothing is lost and nothing deadlocks, upgrades
 //! included. Notify keeps its own exact model: it hands notifications over
-//! in order.
+//! in order, from the front for `notify_one` and from the back for
+//! `notify_last`. A closing semaphore has a model of its own: whatever a
+//! schedule does, no permit is lost or made up, nothing is handed out after
+//! the close, and every wait ends.
 //!
 //! Single-threaded schedules cover the protocol's decisions; the loom
 //! models in `tests/sync_loom.rs` cover the interleavings.
@@ -33,8 +36,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use nuclei::sync::{
-    MAX_BYPASS, Mutex, MutexGuard, Notify, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
-    RwLockWriteGuard, Semaphore, SemaphorePermit,
+    AcquireError, MAX_BYPASS, Mutex, MutexGuard, Notify, RwLock, RwLockReadGuard,
+    RwLockUpgradableReadGuard, RwLockWriteGuard, Semaphore, SemaphorePermit, TryAcquireError,
 };
 use proptest::prelude::*;
 
@@ -157,12 +160,17 @@ fn run_semaphore(initial: usize, schedule: &[Step], weighted: bool) -> Result<()
         let mut done = Vec::new();
         match *step {
             Step::Start(n) => {
-                let mut task = Polled::new(sem.acquire(need(n)));
+                let (sem, want) = (&sem, need(n));
+                let mut task = Polled::new(async move {
+                    sem.acquire_many(want as u32)
+                        .await
+                        .expect("the semaphore is open")
+                });
                 match task.poll() {
                     Poll::Ready(permit) => held.push(permit),
                     Poll::Pending => {
                         queued += 1;
-                        needs.push_back((Arc::as_ptr(&task.counter) as usize, need(n)));
+                        needs.push_back((Arc::as_ptr(&task.counter) as usize, want));
                         tasks.push(task);
                     }
                 }
@@ -185,14 +193,14 @@ fn run_semaphore(initial: usize, schedule: &[Step], weighted: bool) -> Result<()
                     drop(held.remove(at));
                 }
             }
-            Step::Try(n) => held.extend(sem.try_acquire(need(n))),
+            Step::Try(n) => held.extend(sem.try_acquire_many(need(n) as u32)),
             Step::Storm(rounds) => {
                 for _ in 0..rounds {
                     if held.is_empty() {
                         break;
                     }
                     drop(held.remove(0));
-                    held.extend(sem.try_acquire(1));
+                    held.extend(sem.try_acquire());
                     run(&mut tasks, &mut done);
                     held.append(&mut done);
                 }
@@ -450,16 +458,27 @@ fn run_rwlock(schedule: &[Step]) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-/// Notify's contract: `notify_one` wakes the oldest waiter or stores one
-/// permit; `notify_waiters` wakes everyone waiting; a dropped waiter that
-/// had been handed a `notify_one` passes it on.
+/// What woke a waiter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum How {
+    /// `notify_one`: the oldest waiter.
+    First,
+    /// `notify_last`: the newest waiter.
+    Last,
+    /// `notify_waiters`.
+    All,
+}
+
+/// Notify's contract: `notify_one` wakes the oldest waiter and `notify_last`
+/// the newest, or either stores one permit; `notify_waiters` wakes everyone
+/// waiting; a dropped waiter that had been handed a `notify_one` or
+/// `notify_last` passes it on the same way.
 fn run_notify(schedule: &[Step]) -> Result<(), TestCaseError> {
     let notify = Notify::new();
     let mut permit = false;
     let mut queue: VecDeque<usize> = VecDeque::new();
-    // Granted waiters, and whether a `notify_one` (rather than a
-    // `notify_waiters`) granted them.
-    let mut granted: Vec<(usize, bool)> = Vec::new();
+    // Granted waiters, and what granted them.
+    let mut granted: Vec<(usize, How)> = Vec::new();
     let mut waiting = Vec::new();
     for (id, step) in schedule.iter().enumerate() {
         match *step {
@@ -489,26 +508,36 @@ fn run_notify(schedule: &[Step]) -> Result<(), TestCaseError> {
                     drop(future);
                     queue.retain(|q| *q != id);
                     if let Some(g) = granted.iter().position(|(g, _)| *g == id) {
-                        let (_, by_one) = granted.remove(g);
-                        if by_one {
-                            match queue.pop_front() {
-                                Some(next) => granted.push((next, true)),
-                                None => permit = true,
-                            }
+                        let (_, how) = granted.remove(g);
+                        let next = match how {
+                            How::First => queue.pop_front(),
+                            How::Last => queue.pop_back(),
+                            How::All => continue,
+                        };
+                        match next {
+                            Some(next) => granted.push((next, how)),
+                            None => permit = true,
                         }
                     }
                 }
             }
-            Step::Release(_) | Step::Add(_) | Step::Storm(_) => {
+            Step::Release(_) | Step::Storm(_) => {
                 notify.notify_one();
                 match queue.pop_front() {
-                    Some(next) => granted.push((next, true)),
+                    Some(next) => granted.push((next, How::First)),
+                    None => permit = true,
+                }
+            }
+            Step::Add(_) => {
+                notify.notify_last();
+                match queue.pop_back() {
+                    Some(next) => granted.push((next, How::Last)),
                     None => permit = true,
                 }
             }
             Step::Try(_) => {
                 notify.notify_waiters();
-                granted.extend(queue.drain(..).map(|id| (id, false)));
+                granted.extend(queue.drain(..).map(|id| (id, How::All)));
             }
         }
         for (id, future) in &waiting {
@@ -519,7 +548,130 @@ fn run_notify(schedule: &[Step]) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// A semaphore that closes mid-schedule and has permits forgotten and added.
+/// `close_at` picks the step that closes it (past the end: never).
+///
+/// - **No permit leaks or is made up:** the permits held, plus the free
+///   ones, are what were created minus what `forget_permits` removed,
+///   closed or not.
+/// - **Nothing is handed out after the close:** a wait or an attempt made
+///   after it fails, and `try_acquire` says `Closed`.
+/// - **Every wait ends:** at the close each queued wait finishes, with the
+///   error or with the permit it was handed before; none outlives the step.
+fn run_closing_semaphore(
+    initial: usize,
+    close_at: usize,
+    schedule: &[Step],
+) -> Result<(), TestCaseError> {
+    type Wait<'a> = Pin<Box<dyn Future<Output = Result<SemaphorePermit<'a>, AcquireError>> + 'a>>;
+    let sem = Semaphore::new(initial);
+    let mut total = initial;
+    let mut tasks: Vec<Polled<Wait<'_>>> = Vec::new();
+    let mut held: Vec<SemaphorePermit<'_>> = Vec::new();
+    let mut closed = false;
+    let want = |n: usize| (1 + n % 3).min(initial) as u32;
+    for (at, step) in schedule.iter().enumerate() {
+        if at == close_at {
+            sem.close();
+            closed = true;
+            prop_assert!(sem.is_closed());
+        }
+        match *step {
+            Step::Start(n) => {
+                let future: Wait<'_> = Box::pin(sem.acquire_many(want(n)));
+                let mut task = Polled::new(future);
+                match task.poll() {
+                    Poll::Ready(Ok(permit)) => {
+                        prop_assert!(!closed, "a wait made after the close got a permit");
+                        held.push(permit);
+                    }
+                    Poll::Ready(Err(_)) => prop_assert!(closed, "a wait failed while open"),
+                    Poll::Pending => tasks.push(task),
+                }
+            }
+            Step::Poll(i) => {
+                if let Some(at) = pick(tasks.len(), i) {
+                    match tasks[at].poll() {
+                        Poll::Ready(Ok(permit)) => {
+                            tasks.remove(at);
+                            held.push(permit);
+                        }
+                        Poll::Ready(Err(_)) => {
+                            prop_assert!(closed, "a wait failed while open");
+                            tasks.remove(at);
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+            }
+            Step::Cancel(i) => {
+                if let Some(at) = pick(tasks.len(), i) {
+                    tasks.remove(at);
+                }
+            }
+            Step::Release(i) => {
+                if let Some(at) = pick(held.len(), i) {
+                    drop(held.remove(at));
+                }
+            }
+            Step::Try(3) => total -= sem.forget_permits(1),
+            Step::Try(n) => match sem.try_acquire_many(want(n)) {
+                Ok(permit) => {
+                    prop_assert!(!closed, "a closed semaphore handed out a permit");
+                    held.push(permit);
+                }
+                Err(TryAcquireError::Closed) => prop_assert!(closed, "closed before the close"),
+                Err(TryAcquireError::NoPermits) => {
+                    prop_assert!(!closed, "a closed semaphore reported only a shortage");
+                }
+            },
+            Step::Storm(_) => {}
+            Step::Add(n) => {
+                sem.add_permits(n);
+                total += n;
+            }
+        }
+        let mut outputs = Vec::new();
+        run(&mut tasks, &mut outputs);
+        for output in outputs {
+            match output {
+                Ok(permit) => held.push(permit),
+                Err(_) => prop_assert!(closed, "a wait failed while open"),
+            }
+        }
+        if closed {
+            prop_assert!(tasks.is_empty(), "{} waits outlived the close", tasks.len());
+        }
+        let out: usize = held.iter().map(SemaphorePermit::num_permits).sum();
+        prop_assert_eq!(out + sem.available_permits(), total, "permits leaked");
+    }
+    if !closed {
+        // Forgotten permits may have left the waiters nothing to wait for.
+        sem.add_permits(3);
+    }
+    for _ in 0..1_000 {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        held.clear();
+        let mut outputs = Vec::new();
+        run(&mut tasks, &mut outputs);
+        held.extend(outputs.into_iter().flatten());
+    }
+    prop_assert!(tasks.is_empty(), "{} waiters never finished", tasks.len());
+    Ok(())
+}
+
 proptest! {
+    #[test]
+    fn a_closing_semaphore_keeps_its_permits_and_ends_every_wait(
+        initial in 1usize..4,
+        close_at in 0usize..100,
+        schedule in steps(),
+    ) {
+        run_closing_semaphore(initial, close_at, &schedule)?;
+    }
+
     #[test]
     fn a_semaphore_keeps_its_permits_and_bounds_every_bypass(
         initial in 1usize..4,
@@ -569,7 +721,7 @@ fn a_storm_drives_a_waiter_to_its_handoff() {
     assert_eq!(tasks[0].losses, MAX_BYPASS as usize);
     held.clear();
     assert!(
-        mutex.try_lock().is_none(),
+        mutex.try_lock().is_err(),
         "the release went straight to the owed waiter"
     );
     run(&mut tasks, &mut done);

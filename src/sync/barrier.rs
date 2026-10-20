@@ -1,13 +1,15 @@
 //! A reusable barrier: every group of `n` waits completes together.
 //!
-//! The barrier word packs the current generation's arrivals (low 32 bits)
-//! with the generation (high 32 bits) in one `AtomicU64`, so an arrival
-//! learns its generation and whether it completes it in one
-//! compare-and-swap. On 64-bit targets that is a word; on armv7 and wasm32
-//! it is their native 64-bit atomic, never an emulated wider one. Waiters
-//! carry their generation; a drain pass grants every waiter of a finished
-//! one. A waiter would miss its generation only if 2^32 generations
-//! finished while one drain pass stood still.
+//! The barrier counts every arrival, ever, in one `AtomicU64`: arrival `i`
+//! (counting from zero) belongs to generation `i / n` and completes it when
+//! `i % n` is `n - 1`. So an arrival learns its generation and whether it
+//! completes it in one `fetch_add`, which cannot fail or retry, whatever
+//! `n` is. On 64-bit targets that is a word; on armv7 and wasm32 it is their
+//! native 64-bit atomic, never an emulated wider one. Waiters carry their
+//! generation; a drain pass grants every waiter of a finished one. A waiter
+//! would miss its generation only if a whole word's worth of generations
+//! finished while one drain pass stood still; the count itself wraps after
+//! 2^64 arrivals, which no process reaches.
 
 #![allow(unsafe_code)]
 
@@ -21,17 +23,10 @@ use super::list::List;
 use super::queue::{Arrivals, Policy, QUEUED, Step, WaitQueue};
 use super::waiter::{Cancel, Wait, WakeList, release_queued};
 
-const COUNT_MASK: u64 = u32::MAX as u64;
-const ONE_GENERATION: u64 = 1 << 32;
-
-fn generation(word: u64) -> u32 {
-    (word >> 32) as u32
-}
-
 struct Waiting {
     list: List,
     /// The generation every waiter in `list` belongs to.
-    generation: u32,
+    generation: usize,
 }
 
 /// A barrier that releases its waiters in groups of `n`.
@@ -58,8 +53,10 @@ struct Waiting {
 /// assert!(first.poll(&mut cx).is_ready());
 /// ```
 pub struct Barrier {
-    n: u32,
-    word: AtomicU64,
+    /// The size of a group; never zero.
+    n: u64,
+    /// Every arrival so far.
+    arrivals: AtomicU64,
     queue: WaitQueue,
     waiting: UnsafeCell<Waiting>,
 }
@@ -71,16 +68,12 @@ unsafe impl Sync for Barrier {}
 
 impl Barrier {
     loom_const_fn! {
-        /// A barrier for groups of `n` waits; `0` acts as `1`.
-        ///
-        /// # Panics
-        ///
-        /// When `n` exceeds `u32::MAX`.
+        /// A barrier for groups of `n` waits; `0` acts as `1`, as it does
+        /// for `std::sync::Barrier`.
         pub fn new(n: usize) -> Self {
-            assert!(n <= u32::MAX as usize, "a barrier holds at most u32::MAX participants");
             Self {
-                n: if n == 0 { 1 } else { n as u32 },
-                word: AtomicU64::new(0),
+                n: if n == 0 { 1 } else { n as u64 },
+                arrivals: AtomicU64::new(0),
                 queue: WaitQueue::new(0),
                 waiting: UnsafeCell::new(Waiting { list: List::new(), generation: 0 }),
             }
@@ -98,24 +91,19 @@ impl Barrier {
 
     /// Counts an arrival: `Ok` when it completes its generation, else the
     /// generation it waits in.
-    fn arrive(&self) -> Result<(), u32> {
-        let mut word = self.word.load(Ordering::Acquire);
-        loop {
-            let leader = (word & COUNT_MASK) + 1 == u64::from(self.n);
-            let next = if leader {
-                (word & !COUNT_MASK).wrapping_add(ONE_GENERATION)
-            } else {
-                word + 1
-            };
-            match self
-                .word
-                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) if leader => return Ok(()),
-                Ok(_) => return Err(generation(word)),
-                Err(actual) => word = actual,
-            }
+    fn arrive(&self) -> Result<(), usize> {
+        let arrival = self.arrivals.fetch_add(1, Ordering::AcqRel);
+        if arrival % self.n == self.n - 1 {
+            Ok(())
+        } else {
+            Err(self.generation_of(arrival))
         }
+    }
+
+    /// The generation arrival number `arrival` belongs to, as the payload of
+    /// a waiter carries it (truncated on a target whose word is narrower).
+    fn generation_of(&self, arrival: u64) -> usize {
+        (arrival / self.n) as usize
     }
 }
 
@@ -126,7 +114,7 @@ impl Policy for Barrier {
 
     fn pass(&self, arrivals: Arrivals, woken: &mut WakeList<'_>, _wake_front: bool) -> usize {
         let pool = &self.queue;
-        let current = generation(self.word.load(Ordering::Acquire));
+        let current = self.generation_of(self.arrivals.load(Ordering::Acquire));
         // SAFETY: only the drain role's holder runs a pass.
         self.waiting.with_mut(|waiting| unsafe {
             let waiting = &mut *waiting;
@@ -139,7 +127,7 @@ impl Policy for Barrier {
             for node in arrivals {
                 if node.as_ref().is_cancelled() {
                     release_queued(node, pool);
-                } else if node.as_ref().payload() as u32 != current {
+                } else if node.as_ref().payload() != current {
                     woken.grant(node);
                 } else {
                     waiting.list.push_back(node);
@@ -166,7 +154,9 @@ impl Drop for Barrier {
 
 impl fmt::Debug for Barrier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Barrier").field("n", &self.n).finish()
+        f.debug_struct("Barrier")
+            .field("n", &self.n)
+            .finish_non_exhaustive()
     }
 }
 
@@ -189,7 +179,7 @@ impl BarrierWaitResult {
 pub struct BarrierWait<'a> {
     barrier: &'a Barrier,
     /// The generation this wait arrived in, once it has.
-    generation: Option<u32>,
+    generation: Option<usize>,
     wait: Wait,
 }
 
@@ -213,7 +203,7 @@ impl Future for BarrierWait<'_> {
                 }
                 Err(generation) => {
                     this.generation = Some(generation);
-                    barrier.enqueue(&mut this.wait, generation as usize, cx.waker());
+                    barrier.enqueue(&mut this.wait, generation, cx.waker());
                     return this
                         .wait
                         .poll(&barrier.queue, None)
@@ -277,6 +267,25 @@ mod tests {
         next.pending();
         assert!(Polled::new(barrier.wait()).ready().is_leader());
         assert!(!next.ready().is_leader());
+    }
+
+    #[test]
+    fn a_barrier_of_nothing_acts_as_one() {
+        let barrier = Barrier::new(0);
+        for _ in 0..3 {
+            assert!(Polled::new(barrier.wait()).ready().is_leader());
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_group_larger_than_u32_max_is_a_group_all_the_same() {
+        // Not reachable by waiting that many parties; the count must not
+        // wrap early, and the first arrival must wait.
+        let barrier = Barrier::new(u32::MAX as usize + 2);
+        let mut first = Polled::new(barrier.wait());
+        first.pending();
+        assert_eq!(barrier.n, u64::from(u32::MAX) + 2);
     }
 
     #[test]

@@ -309,6 +309,22 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
     }
 }
 
+/// `future`'s output, waited for on this thread: what every `blocking_*`
+/// method runs, so they all fail the same way.
+///
+/// It parks the calling thread (a system call) until the future's waker
+/// fires, so it must not run on a thread an executor needs for other tasks.
+///
+/// # Panics
+///
+/// On `wasm32`, when the future is not ready at once: see [`wait_here`].
+pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
+    match wait_here(future) {
+        Ok(output) => output,
+        Err(stuck) => panic!("{stuck}"),
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;

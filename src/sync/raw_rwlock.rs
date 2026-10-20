@@ -4,6 +4,15 @@
 //! The state word holds the reader count, a writer bit, an upgradable bit
 //! and an upgrading bit above the queue's bits.
 //!
+//! - **A bounded reader count.** A lock admits at most `max_readers`
+//!   readers at once, which is the whole reader field unless the lock was
+//!   built with a smaller bound ([`with_max_readers`](RawRwLock::with_max_readers)).
+//!   A reader that finds the bound reached is not admitted: it waits like
+//!   one held back by a writer, and a reader's release wakes the front.
+//! - **Downgrade.** The holder of the write turns it into one read in a
+//!   single step ([`downgrade`](RawRwLock::downgrade)): no writer or upgrade
+//!   gets in between, and the readers queued behind a writer front are
+//!   woken to share, as after a release.
 //! - **Barging with bounded bypass, both ways.** A read enters whenever no
 //!   writer holds the lock and no upgrade is under way; a write whenever
 //!   the lock is free; either even past queued waiters, unless a handoff is
@@ -42,7 +51,8 @@ const UPGRADABLE: usize = 1 << (FIRST_BIT + 1);
 const UPGRADING: usize = 1 << (FIRST_BIT + 2);
 const READER_SHIFT: u32 = FIRST_BIT + 3;
 const ONE_READER: usize = 1 << READER_SHIFT;
-const MAX_READERS: usize = usize::MAX >> READER_SHIFT;
+/// The most readers the reader field holds.
+pub(super) const MAX_READERS: usize = usize::MAX >> READER_SHIFT;
 
 /// What a waiter asks for.
 pub(super) const READ: usize = 0;
@@ -55,25 +65,11 @@ fn readers(state: usize) -> usize {
     state >> READER_SHIFT
 }
 
-/// Whether `kind` could enter a lock in `state`, the owed bit aside.
-fn admits(kind: usize, state: usize) -> bool {
-    match kind {
-        READ => state & (WRITER | UPGRADING) == 0,
-        WRITE => state & (WRITER | UPGRADABLE) == 0 && readers(state) == 0,
-        _ => state & (WRITER | UPGRADABLE) == 0,
-    }
-}
-
-/// `state` with `kind` entered.
+/// `state` with `kind` entered. The caller checked that `kind` is admitted:
+/// a read below `max_readers` leaves the reader field room.
 fn enter(kind: usize, state: usize) -> usize {
     match kind {
-        READ => {
-            assert!(
-                readers(state) < MAX_READERS,
-                "too many readers hold one RwLock"
-            );
-            state + ONE_READER
-        }
+        READ => state + ONE_READER,
         WRITE => state | WRITER,
         _ => state | UPGRADABLE,
     }
@@ -89,6 +85,8 @@ struct Waiting {
 pub(super) struct RawRwLock {
     queue: WaitQueue,
     waiting: UnsafeCell<Waiting>,
+    /// The most readers at once, at least one and at most [`MAX_READERS`].
+    max_readers: usize,
 }
 
 // SAFETY: the waiting list is touched only by the drain role's holder.
@@ -99,9 +97,18 @@ unsafe impl Sync for RawRwLock {}
 impl RawRwLock {
     loom_const_fn! {
         pub(super) fn new() -> Self {
+            Self::with_max_readers(MAX_READERS)
+        }
+    }
+
+    loom_const_fn! {
+        /// A lock that admits at most `max_readers` readers at once. The
+        /// caller keeps it between one and [`MAX_READERS`].
+        pub(super) fn with_max_readers(max_readers: usize) -> Self {
             Self {
                 queue: WaitQueue::new(0),
                 waiting: UnsafeCell::new(Waiting { list: List::new(), upgrade: None }),
+                max_readers,
             }
         }
     }
@@ -113,7 +120,17 @@ impl RawRwLock {
             Self {
                 queue: WaitQueue::without_spin(0),
                 waiting: UnsafeCell::new(Waiting { list: List::new(), upgrade: None }),
+                max_readers: MAX_READERS,
             }
+        }
+    }
+
+    /// Whether `kind` could enter a lock in `state`, the owed bit aside.
+    fn admits(&self, kind: usize, state: usize) -> bool {
+        match kind {
+            READ => state & (WRITER | UPGRADING) == 0 && readers(state) < self.max_readers,
+            WRITE => state & (WRITER | UPGRADABLE) == 0 && readers(state) == 0,
+            _ => state & (WRITER | UPGRADABLE) == 0,
         }
     }
 
@@ -149,9 +166,21 @@ impl RawRwLock {
         }
     }
 
-    /// Turns the held write into a read.
+    /// Turns the held write into a read, in one step: the writer bit goes
+    /// down and the reader count goes up in the same compare-and-swap, so
+    /// no writer or upgrade can enter between the two. The caller holds the
+    /// write, so no reader is inside and the count has room for one.
+    ///
+    /// With somebody queued the step also asks for a pass, as a release
+    /// does: the readers at the front can share now, and a front that cannot
+    /// (a writer) is woken to count its loss and be owed the lock in the
+    /// end.
     pub(super) fn downgrade(&self) {
         self.transition(|state| {
+            debug_assert!(
+                state & WRITER != 0 && readers(state) == 0,
+                "a downgrade without the write"
+            );
             let next = (state & !WRITER) + ONE_READER;
             if state & QUEUED != 0 {
                 Step::Wake(next | WAKE_FRONT)
@@ -234,7 +263,7 @@ impl RawRwLock {
 
 impl Lock for RawRwLock {
     fn admit(&self, state: usize, kind: usize) -> Option<usize> {
-        admits(kind, state).then(|| enter(kind, state))
+        self.admits(kind, state).then(|| enter(kind, state))
     }
 
     fn give_back(&self, kind: usize) {
@@ -305,7 +334,7 @@ impl Policy for RawRwLock {
                 let mut nudges = Nudges::new(woken, queue);
                 for (at, node) in list.iter().enumerate() {
                     let kind = node.as_ref().payload();
-                    let fits = admits(kind, sharing);
+                    let fits = self.admits(kind, sharing);
                     if at == 0 && (fits || wake_front) {
                         nudges.nudge(node);
                     }

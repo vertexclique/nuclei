@@ -4,10 +4,26 @@
 //! Every wait in this module is a [`Future`] built from
 //! futures and wakers only: async code awaits it, and any executor polls it
 //! with its own [`Waker`](core::task::Waker). Every primitive also has
-//! `try_` forms that never wait. Nothing here makes a system call: no
-//! futex, no thread park, no sleep and no clock read. The one exception is
-//! inside kovan's queues, which recycle waiter nodes and yield the thread
-//! when they meet contention.
+//! `try_` forms that never wait. The core of this module makes no system
+//! call: no futex, no thread park, no sleep and no clock read. The one
+//! exception is inside kovan's queues, which recycle waiter nodes and yield
+//! the thread when they meet contention. The other exception is the
+//! `blocking_*` methods, which exist for threads that may block and park
+//! the calling thread until their wait is over; called from inside an async
+//! task they block the thread that task runs on.
+//!
+//! # Names and signatures
+//!
+//! [`Mutex`](crate::sync::Mutex), [`RwLock`](crate::sync::RwLock), [`Semaphore`](crate::sync::Semaphore), [`Notify`](crate::sync::Notify), [`Barrier`](crate::sync::Barrier),
+//! [`OnceCell`](crate::sync::OnceCell) and [`SetOnce`](crate::sync::SetOnce) take the names, signatures, error types and
+//! documented behavior of the established async `sync` API, so code
+//! written against that API compiles against these. The
+//! guards and errors sit at the same paths under `nuclei::sync`, and the
+//! waits are named futures (`Lock`, `Read`, `Acquire`, and so on) rather
+//! than opaque ones. A semaphore holds at most [`Semaphore::MAX_PERMITS`](crate::sync::Semaphore::MAX_PERMITS)
+//! permits, which is `usize::MAX >> 7`. What this module adds is the
+//! [`Event`](crate::sync::Event), the [`Latch`](crate::sync::Latch), the [`Lazy`](crate::sync::Lazy) value, the upgradable read of the
+//! [`RwLock`](crate::sync::RwLock), the reentrant locks and `OnceCell::get_or_init_racy`.
 //!
 //! # What every primitive guarantees
 //!
@@ -32,7 +48,8 @@
 //!   what it waits for directly. Fairness is counted, never timed.
 //! - **Cancellation-safe.** Dropping a pending future withdraws its
 //!   waiter. If something was handed to it concurrently, the drop passes
-//!   it on. No wakeup is lost.
+//!   it on. No wakeup is lost. (A [`Barrier`](crate::sync::Barrier) wait is the one exception: an
+//!   arrival that was counted stays counted.)
 //! - **Reentrancy by [`Owner`](crate::sync::Owner).** The reentrant locks are keyed by an
 //!   owner token rather than a thread, because a task can move between
 //!   threads and many tasks can share one.
@@ -64,11 +81,16 @@
 //! - Uncontended, an acquire and a release are one atomic
 //!   read-modify-write each.
 //! - A call that can make a waiter runnable (a release with waiters, a new
-//!   waiter, a cancellation) may serve the queue itself. It returns after
-//!   one pass over the queue, plus at most one more pass for each of these
-//!   that lands while it works: a waiter that queues, a waiter that
-//!   withdraws, a waiter that claims the handoff it is owed, and a release
-//!   that finds a node queued.
+//!   waiter, a cancellation, a notification, a semaphore's `close`, a write
+//!   guard's `downgrade`, `add_permits`) may serve the queue itself. It
+//!   returns after one pass over the queue, plus at most one more pass for
+//!   each of these that lands while it works: a waiter that queues, a
+//!   waiter that withdraws, a waiter that claims the handoff it is owed, and
+//!   a release that finds a node queued.
+//! - `forget_permits` wakes nobody: it is a compare-and-swap loop on the
+//!   state word, which retries only when another call changed the word
+//!   first. A barrier's arrival is one `fetch_add`, followed, for the
+//!   arrival that completes a group, by the pass that wakes the group.
 //! - A release over an empty queue earns no pass; a release that finds a
 //!   node queued earns one. So releases alone never keep a thread at work.
 //!   Waiters that keep queueing or withdrawing can, one pass each: every
@@ -115,6 +137,7 @@ mod reentrant_mutex;
 mod reentrant_rwlock;
 mod rwlock;
 mod semaphore;
+mod set_once;
 mod spin;
 #[cfg(all(test, not(loom)))]
 pub(crate) mod test_support;
@@ -125,9 +148,12 @@ pub use contend::MAX_BYPASS;
 pub use event::{Event, EventWait};
 pub use latch::{Latch, LatchWait};
 pub use lazy::Lazy;
-pub use mutex::{Lock, LockOwned, Mutex, MutexGuard, OwnedMutexGuard};
-pub use notify::{Notified, Notify};
-pub use once_cell::OnceCell;
+pub use mutex::{
+    Lock, LockOwned, MappedMutexGuard, Mutex, MutexGuard, OwnedMappedMutexGuard, OwnedMutexGuard,
+    TryLockError,
+};
+pub use notify::{Notified, Notify, OwnedNotified};
+pub use once_cell::{OnceCell, SetError};
 // vertexia: the owner-named lock has no consumer in this crate yet; its
 // tests run in `owned_lock`. Trim the re-exports if it stays unused.
 #[cfg(test)]
@@ -142,10 +168,20 @@ pub use reentrant_rwlock::{
     ReentrantWriteGuard,
 };
 pub use rwlock::{
-    OwnedRwLockWriteGuard, Read, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
-    RwLockWriteGuard, UpgradableRead, Upgrade, Write, WriteOwned,
+    OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, Read, ReadOwned,
+    RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard,
+    UpgradableRead, Upgrade, Write, WriteOwned,
 };
-pub use semaphore::{Acquire, AcquireOwned, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+pub use semaphore::{
+    Acquire, AcquireError, AcquireOwned, OwnedSemaphorePermit, Semaphore, SemaphorePermit,
+    TryAcquireError,
+};
+pub use set_once::{SetOnce, SetOnceError};
+
+/// Named future types, at the conventional `sync::futures` path.
+pub mod futures {
+    pub use super::notify::{Notified, OwnedNotified};
+}
 
 pub use kovan::Atom;
 pub use kovan_map::HopscotchMap;
@@ -167,13 +203,19 @@ mod tests {
         send_sync::<LockOwned<u8>>();
         send_sync::<MutexGuard<'static, u8>>();
         send_sync::<OwnedMutexGuard<u8>>();
+        send_sync::<MappedMutexGuard<'static, u8>>();
+        send_sync::<OwnedMappedMutexGuard<u8, u8>>();
         send_sync::<RwLock<u8>>();
         send_sync::<Read<'static, u8>>();
+        send_sync::<ReadOwned<u8>>();
         send_sync::<Write<'static, u8>>();
         send_sync::<RwLockReadGuard<'static, u8>>();
         send_sync::<RwLockWriteGuard<'static, u8>>();
+        send_sync::<RwLockMappedWriteGuard<'static, u8>>();
         send_sync::<WriteOwned<u8>>();
+        send_sync::<OwnedRwLockReadGuard<u8, u8>>();
         send_sync::<OwnedRwLockWriteGuard<u8>>();
+        send_sync::<OwnedRwLockMappedWriteGuard<u8, u8>>();
         send_sync::<RwLockUpgradableReadGuard<'static, u8>>();
         send_sync::<UpgradableRead<'static, u8>>();
         send_sync::<Upgrade<'static, u8>>();
@@ -185,6 +227,13 @@ mod tests {
         send_sync::<OwnedSemaphorePermit>();
         send_sync::<Notify>();
         send_sync::<Notified<'static>>();
+        send_sync::<OwnedNotified>();
+        send_sync::<TryLockError>();
+        send_sync::<AcquireError>();
+        send_sync::<TryAcquireError>();
+        send_sync::<SetError<u8>>();
+        send_sync::<SetOnceError<u8>>();
+        send_sync::<SetOnce<u8>>();
         send_sync::<Event>();
         send_sync::<EventWait<'static>>();
         send_sync::<Latch>();
@@ -209,7 +258,9 @@ mod tests {
     #[test]
     fn async_entry_points_return_send_and_sync_futures() {
         let cell = OnceCell::<u8>::new();
-        future_is_send_sync(&cell.get_or_init(async { 1 }));
-        future_is_send_sync(&cell.get_or_try_init(async { Ok::<u8, ()>(1) }));
+        future_is_send_sync(&cell.get_or_init(|| async { 1 }));
+        future_is_send_sync(&cell.get_or_try_init(|| async { Ok::<u8, ()>(1) }));
+        let once = SetOnce::<u8>::new();
+        future_is_send_sync(&once.wait());
     }
 }

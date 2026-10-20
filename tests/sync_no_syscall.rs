@@ -10,6 +10,9 @@
 //! and the semaphore contended across threads. The parent passes only if
 //! the child exits cleanly; a forbidden call shows up as death by SIGSYS.
 //!
+//! The `blocking_*` methods are left out on purpose: they park the calling
+//! thread, which is a system call by design.
+//!
 //! Waiting threads spin on `sched_yield` and the wakers set a flag, so the
 //! harness itself stays inside the filter. The allocator is taken out of
 //! the measurement: a primitive reaches the allocator when its node pool
@@ -32,8 +35,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use nuclei::sync::{
-    Barrier, Event, Latch, Lazy, Mutex, Notify, OnceCell, Owner, ReentrantMutex, ReentrantRwLock,
-    RwLock, Semaphore,
+    Barrier, Event, Latch, Lazy, MappedMutexGuard, Mutex, MutexGuard, Notify, OnceCell, Owner,
+    ReentrantMutex, ReentrantRwLock, RwLock, RwLockWriteGuard, Semaphore, SetOnce,
 };
 
 const CHILD: &str = "NUCLEI_SYNC_SECCOMP_CHILD";
@@ -239,7 +242,12 @@ fn contend(shared: &Shared, rounds: usize, waker: &Waker, flag: &Flag) {
                 let _ = *spin_on(shared.rwlock.read(), waker, flag);
             }
         }
-        let _permit = spin_on(shared.semaphore.acquire(1 + i % 2), waker, flag);
+        let _permit = spin_on(
+            shared.semaphore.acquire_many(1 + (i % 2) as u32),
+            waker,
+            flag,
+        )
+        .expect("the semaphore is open");
     }
 }
 
@@ -249,6 +257,9 @@ fn single_thread_loops(rounds: usize, waker: &Waker, flag: &Flag) {
     let mutex = Mutex::new(0u64);
     let rwlock = RwLock::new(0u64);
     let semaphore = Semaphore::new(2);
+    let owned_mutex = Arc::new(Mutex::new(0u64));
+    let owned_rwlock = Arc::new(RwLock::new(0u64));
+    let owned_semaphore = Arc::new(Semaphore::new(2));
     let reentrant = ReentrantMutex::new(core::cell::Cell::new(0u64));
     let reentrant_rw = ReentrantRwLock::new(AtomicUsize::new(0));
     let notify = Notify::new();
@@ -272,13 +283,75 @@ fn single_thread_loops(rounds: usize, waker: &Waker, flag: &Flag) {
             drop(read);
             assert!(poll_once(&mut write, waker).is_ready());
         }
-        drop(semaphore.try_acquire(1));
+        drop(semaphore.try_acquire());
         {
-            let all = spin_on(semaphore.acquire(2), waker, flag);
-            let mut one = pin!(semaphore.acquire(1));
+            let all = spin_on(semaphore.acquire_many(2), waker, flag).expect("open");
+            let mut one = pin!(semaphore.acquire());
             assert!(poll_once(&mut one, waker).is_pending());
             drop(all);
             assert!(poll_once(&mut one, waker).is_ready());
+        }
+        {
+            // The new fast paths: the `try_*` forms of every primitive, the
+            // owned and mapped guards, a downgrade, and the permit calls.
+            let guard = Arc::clone(&owned_mutex).try_lock_owned().expect("free");
+            assert!(owned_mutex.try_lock().is_err());
+            drop(guard);
+            let mapped = MutexGuard::map(mutex.try_lock().expect("free"), |count| count);
+            let mapped = MappedMutexGuard::map(mapped, |count| count);
+            assert!(mutex.try_lock().is_err());
+            drop(mapped);
+            let read = Arc::clone(&owned_rwlock).try_read_owned().expect("free");
+            assert!(Arc::clone(&owned_rwlock).try_write_owned().is_err());
+            drop(read);
+            let write = rwlock.try_write().expect("free");
+            let read = RwLockWriteGuard::downgrade(write);
+            assert!(rwlock.try_read().is_ok() && rwlock.try_write().is_err());
+            drop(read);
+            let write = rwlock.try_write().expect("free");
+            let mapped = RwLockWriteGuard::map(write, |value| value);
+            drop(mapped);
+            let owned = Arc::clone(&owned_rwlock).try_write_owned().expect("free");
+            drop(owned.downgrade());
+            let permit = Arc::clone(&owned_semaphore)
+                .try_acquire_many_owned(2)
+                .expect("free");
+            assert!(owned_semaphore.try_acquire().is_err());
+            drop(permit);
+            assert_eq!(semaphore.forget_permits(1), 1);
+            semaphore.add_permits(1);
+        }
+        {
+            let closing = Semaphore::new(1);
+            let held = closing.try_acquire().expect("free");
+            let mut waiting = pin!(closing.acquire());
+            assert!(poll_once(&mut waiting, waker).is_pending());
+            closing.close();
+            assert!(matches!(
+                poll_once(&mut waiting, waker),
+                Poll::Ready(Err(_))
+            ));
+            assert!(closing.try_acquire().is_err() && closing.is_closed());
+            drop(held);
+            assert_eq!(closing.available_permits(), 1);
+        }
+        {
+            notify.notify_last();
+            spin_on(notify.notified(), waker, flag);
+            let mut enabled = pin!(notify.notified());
+            assert!(!enabled.as_mut().enable());
+            notify.notify_one();
+            assert!(enabled.as_mut().enable());
+        }
+        {
+            let once = SetOnce::new();
+            assert!(once.set(i).is_ok() && once.set(i).is_err());
+            assert_eq!(*spin_on(once.wait(), waker, flag), i);
+            let racy = OnceCell::new();
+            assert_eq!(*racy.get_or_init_racy(|| i), i);
+            let mut filled = OnceCell::new();
+            assert_eq!(*spin_on(filled.get_or_init(|| async { i }), waker, flag), i);
+            assert_eq!(filled.take(), Some(i));
         }
         {
             let outer = spin_on(reentrant.lock(&owner), waker, flag);
@@ -378,7 +451,7 @@ fn child() -> ! {
         std::thread::yield_now();
     }
     let expected = (200 + ROUNDS as u64) * THREADS as u64 + ROUNDS as u64;
-    let code = if shared.mutex.try_lock().map(|count| *count) == Some(expected) {
+    let code = if shared.mutex.try_lock().map(|count| *count).ok() == Some(expected) {
         0
     } else {
         3

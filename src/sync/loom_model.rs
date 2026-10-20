@@ -47,7 +47,7 @@ use loom::sync::{Arc, Notify};
 use loom::thread;
 
 use super::contend::{self, Contend, Lock, MAX_BYPASS};
-use super::queue::{Arrivals, FIRST_BIT, HANDOFF, Policy, QUEUED, Step, WaitQueue};
+use super::queue::{Arrivals, HANDOFF, Policy, QUEUED, Step, WaitQueue};
 use super::raw_semaphore::RawSemaphore;
 use super::waiter::{Wait, WakeList};
 
@@ -467,7 +467,7 @@ pub fn calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_wait
     owed_handoff_model(
         "calibration_a_first_attempt_that_ignores_handoff_barges_past_an_owed_waiter",
         |sem| {
-            const ONE: usize = 1 << FIRST_BIT;
+            use super::raw_semaphore::ONE;
             let state = &sem.queue().state;
             let seen = state.load(Ordering::Relaxed);
             if seen >= ONE {

@@ -3,15 +3,41 @@
 #![allow(unsafe_code)]
 
 use core::cell::UnsafeCell;
+use core::error::Error;
 use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
+use core::ptr;
 use core::task::{Context, Poll};
 use std::sync::Arc;
 
+use super::internal;
 use super::raw_semaphore::{PermitWait, RawSemaphore};
+
+/// Error returned from [`Mutex::try_lock`], [`RwLock::try_read`] and
+/// [`RwLock::try_write`] and their `_owned` forms.
+///
+/// `Mutex::try_lock` fails when the mutex is locked, or is owed to a waiter
+/// that was passed over too often. `RwLock::try_read` fails when a writer
+/// holds the lock, an upgrade is under way, or a waiter is owed the lock.
+/// `RwLock::try_write` fails when any reader or writer holds it, or a waiter
+/// is owed it.
+///
+/// [`RwLock::try_read`]: super::RwLock::try_read
+/// [`RwLock::try_write`]: super::RwLock::try_write
+#[derive(Debug)]
+pub struct TryLockError(pub(super) ());
+
+impl fmt::Display for TryLockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("operation would block")
+    }
+}
+
+impl Error for TryLockError {}
 
 /// A mutual-exclusion lock whose wait is a future.
 ///
@@ -24,6 +50,8 @@ use super::raw_semaphore::{PermitWait, RawSemaphore};
 /// An unlock wakes the oldest waiter to try again; a waiter that loses
 /// [`MAX_BYPASS`](super::MAX_BYPASS) times is handed the lock directly,
 /// and `try_lock` fails until it has had it.
+///
+/// It does not poison: a panic in a holder unlocks it.
 ///
 /// ```
 /// use nuclei::sync::Mutex;
@@ -47,6 +75,13 @@ impl<T> Mutex<T> {
     loom_const_fn! {
         /// An unlocked mutex holding `value`.
         pub fn new(value: T) -> Self {
+            Self { sem: RawSemaphore::new(1), value: UnsafeCell::new(value) }
+        }
+    }
+
+    loom_const_fn! {
+        /// An unlocked mutex holding `value`, usable in a `static`.
+        pub fn const_new(value: T) -> Self {
             Self { sem: RawSemaphore::new(1), value: UnsafeCell::new(value) }
         }
     }
@@ -77,15 +112,43 @@ impl<T: ?Sized> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    /// Locks the mutex if it is free and no handoff is owed.
+    /// Takes the permit if it is free and no handoff is owed.
     #[inline]
-    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+    fn try_acquire(&self) -> bool {
         match self.sem.take_one() {
-            Ok(()) => Some(MutexGuard::new(self)),
-            Err(seen) => self
-                .sem
-                .try_acquire_one_from(seen)
-                .then(|| MutexGuard::new(self)),
+            Ok(()) => true,
+            Err(seen) => self.sem.try_acquire_one_from(seen),
+        }
+    }
+
+    /// Locks the mutex if it is free and no handoff is owed.
+    ///
+    /// # Errors
+    ///
+    /// [`TryLockError`] when the mutex is locked or owed to a waiter.
+    #[inline]
+    pub fn try_lock(&self) -> Result<MutexGuard<'_, T>, TryLockError> {
+        if self.try_acquire() {
+            Ok(MutexGuard::new(self))
+        } else {
+            Err(TryLockError(()))
+        }
+    }
+
+    /// [`try_lock`](Self::try_lock) through an `Arc`, so the guard can
+    /// outlive the borrow.
+    ///
+    /// # Errors
+    ///
+    /// [`TryLockError`] when the mutex is locked or owed to a waiter.
+    pub fn try_lock_owned(self: Arc<Self>) -> Result<OwnedMutexGuard<T>, TryLockError> {
+        if self.try_acquire() {
+            Ok(OwnedMutexGuard {
+                mutex: self,
+                _value: PhantomData,
+            })
+        } else {
+            Err(TryLockError(()))
         }
     }
 
@@ -94,6 +157,9 @@ impl<T: ?Sized> Mutex<T> {
     /// lock's spin budget before it queues, and again after a retry it lost,
     /// before it returns `Pending`; it is lock-free, not wait-free: see
     /// [Progress](super#progress).
+    ///
+    /// Dropping the future withdraws the wait, and passes on a lock handed
+    /// to it meanwhile.
     #[inline]
     pub fn lock(&self) -> Lock<'_, T> {
         Lock {
@@ -102,18 +168,47 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
-    /// Waits for the lock through an `Arc`, so the guard can outlive the
+    /// [`lock`](Self::lock) through an `Arc`, so the guard can outlive the
     /// borrow.
-    pub fn lock_owned(self: &Arc<Self>) -> LockOwned<T> {
+    pub fn lock_owned(self: Arc<Self>) -> LockOwned<T> {
         LockOwned {
-            mutex: Arc::clone(self),
+            mutex: self,
             wait: PermitWait::new(),
         }
+    }
+
+    /// [`lock`](Self::lock) for a thread that may block: it parks the
+    /// calling thread until the lock is free. Called from inside an async
+    /// task it blocks that task's executor thread, so do not: the task that
+    /// would unlock may be the one this thread was running.
+    ///
+    /// # Panics
+    ///
+    /// On `wasm32`, where no other thread can unlock, when the lock is held:
+    /// the call could never end.
+    pub fn blocking_lock(&self) -> MutexGuard<'_, T> {
+        internal::blocking(self.lock())
+    }
+
+    /// [`blocking_lock`](Self::blocking_lock) through an `Arc`, so the guard
+    /// can outlive the borrow.
+    ///
+    /// # Panics
+    ///
+    /// As for [`blocking_lock`](Self::blocking_lock).
+    pub fn blocking_lock_owned(self: Arc<Self>) -> OwnedMutexGuard<T> {
+        internal::blocking(self.lock_owned())
     }
 
     /// The value, borrowed mutably; `&mut self` proves no guard exists.
     pub fn get_mut(&mut self) -> &mut T {
         self.value.get_mut()
+    }
+}
+
+impl<T> From<T> for Mutex<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
     }
 }
 
@@ -123,11 +218,14 @@ impl<T: Default> Default for Mutex<T> {
     }
 }
 
-impl<T: ?Sized> fmt::Debug for Mutex<T> {
+impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Mutex")
-            .field("locked", &(self.sem.available() == 0))
-            .finish_non_exhaustive()
+        let mut d = f.debug_struct("Mutex");
+        match self.try_lock() {
+            Ok(inner) => d.field("data", &&*inner),
+            Err(_) => d.field("data", &format_args!("<locked>")),
+        };
+        d.finish()
     }
 }
 
@@ -150,6 +248,59 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
             mutex,
             _value: PhantomData,
         }
+    }
+
+    /// The mutex, once the guard is spent: unlocking is left to whoever
+    /// takes it over.
+    fn into_mutex(self) -> &'a Mutex<T> {
+        ManuallyDrop::new(self).mutex
+    }
+
+    /// A guard for a component of the locked data. It cannot fail: this
+    /// guard already holds the lock.
+    ///
+    /// An associated function, `MutexGuard::map(guard, f)`: a method would
+    /// shadow methods of the locked data.
+    #[inline]
+    pub fn map<U, F>(mut this: Self, f: F) -> MappedMutexGuard<'a, U>
+    where
+        U: ?Sized,
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let data = ptr::from_mut(f(&mut *this));
+        let mutex = this.into_mutex();
+        MappedMutexGuard {
+            sem: &mutex.sem,
+            data,
+            _value: PhantomData,
+        }
+    }
+
+    /// [`map`](Self::map) that gives the guard back when `f` finds no
+    /// component, with the lock still held.
+    #[inline]
+    pub fn try_map<U, F>(mut this: Self, f: F) -> Result<MappedMutexGuard<'a, U>, Self>
+    where
+        U: ?Sized,
+        F: FnOnce(&mut T) -> Option<&mut U>,
+    {
+        let data = match f(&mut *this) {
+            Some(data) => ptr::from_mut(data),
+            None => return Err(this),
+        };
+        let mutex = this.into_mutex();
+        Ok(MappedMutexGuard {
+            sem: &mutex.sem,
+            data,
+            _value: PhantomData,
+        })
+    }
+
+    /// The mutex this guard locks, for a caller that wants to unlock and
+    /// lock again.
+    #[inline]
+    pub fn mutex(this: &Self) -> &'a Mutex<T> {
+        this.mutex
     }
 }
 
@@ -182,6 +333,12 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
     }
 }
 
+impl<T: ?Sized + fmt::Display> fmt::Display for MutexGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
 /// Exclusive access to a [`Mutex`] held through an `Arc`; unlocks on drop.
 /// The release makes the progress [`MutexGuard`]'s does.
 #[must_use = "dropping the guard unlocks the mutex at once"]
@@ -195,9 +352,55 @@ pub struct OwnedMutexGuard<T: ?Sized> {
 unsafe impl<T: ?Sized + Send + Sync> Sync for OwnedMutexGuard<T> {}
 
 impl<T: ?Sized> OwnedMutexGuard<T> {
-    /// The mutex this guard locks.
-    pub fn mutex(&self) -> &Arc<Mutex<T>> {
-        &self.mutex
+    /// The `Arc` this guard keeps the mutex alive through, once the guard is
+    /// spent: unlocking is left to whoever takes it over.
+    fn into_arc(self) -> Arc<Mutex<T>> {
+        let spent = ManuallyDrop::new(self);
+        // SAFETY: `spent` is never dropped, so this is the only read of the
+        // `Arc` and it is moved out exactly once.
+        unsafe { ptr::read(&spent.mutex) }
+    }
+
+    /// A guard for a component of the locked data. It cannot fail: this
+    /// guard already holds the lock.
+    ///
+    /// An associated function, `OwnedMutexGuard::map(guard, f)`: a method
+    /// would shadow methods of the locked data.
+    #[inline]
+    pub fn map<U, F>(mut this: Self, f: F) -> OwnedMappedMutexGuard<T, U>
+    where
+        U: ?Sized,
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let data = ptr::from_mut(f(&mut *this));
+        OwnedMappedMutexGuard {
+            mutex: this.into_arc(),
+            data,
+        }
+    }
+
+    /// [`map`](Self::map) that gives the guard back when `f` finds no
+    /// component, with the lock still held.
+    #[inline]
+    pub fn try_map<U, F>(mut this: Self, f: F) -> Result<OwnedMappedMutexGuard<T, U>, Self>
+    where
+        U: ?Sized,
+        F: FnOnce(&mut T) -> Option<&mut U>,
+    {
+        let data = match f(&mut *this) {
+            Some(data) => ptr::from_mut(data),
+            None => return Err(this),
+        };
+        Ok(OwnedMappedMutexGuard {
+            mutex: this.into_arc(),
+            data,
+        })
+    }
+
+    /// The `Arc` of the mutex this guard locks.
+    #[inline]
+    pub fn mutex(this: &Self) -> &Arc<Mutex<T>> {
+        &this.mutex
     }
 }
 
@@ -227,6 +430,210 @@ impl<T: ?Sized> Drop for OwnedMutexGuard<T> {
 impl<T: ?Sized + fmt::Debug> fmt::Debug for OwnedMutexGuard<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for OwnedMutexGuard<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
+/// A guard for a component of a [`Mutex`]'s value, made by
+/// [`MutexGuard::map`]; unlocks on drop. The release makes the progress
+/// [`MutexGuard`]'s does.
+#[must_use = "dropping the guard unlocks the mutex at once"]
+pub struct MappedMutexGuard<'a, T: ?Sized> {
+    sem: &'a RawSemaphore,
+    data: *mut T,
+    // Tells the borrow checker this guard holds a `&mut T`.
+    _value: PhantomData<&'a mut T>,
+}
+
+// SAFETY: the guard hands out `&T` and `&mut T` to the component only, as a
+// `MutexGuard` does to the whole value, so it shares and moves like a `&T`
+// and a `&mut T`.
+unsafe impl<T: ?Sized + Sync> Sync for MappedMutexGuard<'_, T> {}
+// SAFETY: as above.
+unsafe impl<T: ?Sized + Send> Send for MappedMutexGuard<'_, T> {}
+
+impl<'a, T: ?Sized> MappedMutexGuard<'a, T> {
+    /// The semaphore, once the guard is spent: unlocking is left to whoever
+    /// takes it over.
+    fn into_sem(self) -> &'a RawSemaphore {
+        ManuallyDrop::new(self).sem
+    }
+
+    /// A guard for a component of the component. It cannot fail: this guard
+    /// already holds the lock.
+    ///
+    /// An associated function, `MappedMutexGuard::map(guard, f)`: a method
+    /// would shadow methods of the locked data.
+    #[inline]
+    pub fn map<U, F>(mut this: Self, f: F) -> MappedMutexGuard<'a, U>
+    where
+        U: ?Sized,
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let data = ptr::from_mut(f(&mut *this));
+        MappedMutexGuard {
+            sem: this.into_sem(),
+            data,
+            _value: PhantomData,
+        }
+    }
+
+    /// [`map`](Self::map) that gives the guard back when `f` finds no
+    /// component, with the lock still held.
+    #[inline]
+    pub fn try_map<U, F>(mut this: Self, f: F) -> Result<MappedMutexGuard<'a, U>, Self>
+    where
+        U: ?Sized,
+        F: FnOnce(&mut T) -> Option<&mut U>,
+    {
+        let data = match f(&mut *this) {
+            Some(data) => ptr::from_mut(data),
+            None => return Err(this),
+        };
+        Ok(MappedMutexGuard {
+            sem: this.into_sem(),
+            data,
+            _value: PhantomData,
+        })
+    }
+}
+
+impl<T: ?Sized> Deref for MappedMutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: `data` points into the value of the mutex whose permit
+        // this guard holds.
+        unsafe { &*self.data }
+    }
+}
+
+impl<T: ?Sized> DerefMut for MappedMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`, and `&mut self` makes this borrow unique.
+        unsafe { &mut *self.data }
+    }
+}
+
+impl<T: ?Sized> Drop for MappedMutexGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        self.sem.release(1);
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for MappedMutexGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for MappedMutexGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
+/// A guard for a component `U` of the value of a [`Mutex<T>`] held through
+/// an `Arc`, made by [`OwnedMutexGuard::map`]; unlocks on drop. The release
+/// makes the progress [`MutexGuard`]'s does.
+#[must_use = "dropping the guard unlocks the mutex at once"]
+pub struct OwnedMappedMutexGuard<T: ?Sized, U: ?Sized = T> {
+    mutex: Arc<Mutex<T>>,
+    data: *mut U,
+}
+
+// SAFETY: the guard hands out `&U` and `&mut U` into a value of the mutex it
+// holds the lock of, and carries the `Arc` that keeps the mutex alive.
+unsafe impl<T: ?Sized + Send + Sync, U: ?Sized + Send + Sync> Sync for OwnedMappedMutexGuard<T, U> {}
+// SAFETY: as above.
+unsafe impl<T: ?Sized + Send, U: ?Sized + Send> Send for OwnedMappedMutexGuard<T, U> {}
+
+impl<T: ?Sized, U: ?Sized> OwnedMappedMutexGuard<T, U> {
+    /// The `Arc`, once the guard is spent: unlocking is left to whoever
+    /// takes it over.
+    fn into_arc(self) -> Arc<Mutex<T>> {
+        let spent = ManuallyDrop::new(self);
+        // SAFETY: `spent` is never dropped, so this is the only read of the
+        // `Arc` and it is moved out exactly once.
+        unsafe { ptr::read(&spent.mutex) }
+    }
+
+    /// A guard for a component of the component. It cannot fail: this guard
+    /// already holds the lock.
+    ///
+    /// An associated function, `OwnedMappedMutexGuard::map(guard, f)`: a
+    /// method would shadow methods of the locked data.
+    #[inline]
+    pub fn map<S, F>(mut this: Self, f: F) -> OwnedMappedMutexGuard<T, S>
+    where
+        S: ?Sized,
+        F: FnOnce(&mut U) -> &mut S,
+    {
+        let data = ptr::from_mut(f(&mut *this));
+        OwnedMappedMutexGuard {
+            mutex: this.into_arc(),
+            data,
+        }
+    }
+
+    /// [`map`](Self::map) that gives the guard back when `f` finds no
+    /// component, with the lock still held.
+    #[inline]
+    pub fn try_map<S, F>(mut this: Self, f: F) -> Result<OwnedMappedMutexGuard<T, S>, Self>
+    where
+        S: ?Sized,
+        F: FnOnce(&mut U) -> Option<&mut S>,
+    {
+        let data = match f(&mut *this) {
+            Some(data) => ptr::from_mut(data),
+            None => return Err(this),
+        };
+        Ok(OwnedMappedMutexGuard {
+            mutex: this.into_arc(),
+            data,
+        })
+    }
+}
+
+impl<T: ?Sized, U: ?Sized> Deref for OwnedMappedMutexGuard<T, U> {
+    type Target = U;
+
+    fn deref(&self) -> &U {
+        // SAFETY: `data` points into the value of the mutex whose permit
+        // this guard holds.
+        unsafe { &*self.data }
+    }
+}
+
+impl<T: ?Sized, U: ?Sized> DerefMut for OwnedMappedMutexGuard<T, U> {
+    fn deref_mut(&mut self) -> &mut U {
+        // SAFETY: as in `deref`, and `&mut self` makes this borrow unique.
+        unsafe { &mut *self.data }
+    }
+}
+
+impl<T: ?Sized, U: ?Sized> Drop for OwnedMappedMutexGuard<T, U> {
+    #[inline]
+    fn drop(&mut self) {
+        self.mutex.sem.release(1);
+    }
+}
+
+impl<T: ?Sized, U: ?Sized + fmt::Debug> fmt::Debug for OwnedMappedMutexGuard<T, U> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized, U: ?Sized + fmt::Display> fmt::Display for OwnedMappedMutexGuard<T, U> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
     }
 }
 
@@ -339,7 +746,7 @@ mod tests {
             );
             let mut guard = waiter.ready();
             guard.push(i);
-            assert!(mutex.try_lock().is_none(), "the woken waiter holds it");
+            assert!(mutex.try_lock().is_err(), "the woken waiter holds it");
         }
         assert_eq!(*mutex.try_lock().expect("free"), vec![0, 1, 2]);
     }
@@ -355,7 +762,7 @@ mod tests {
         drop(held);
         drop(first);
         drop(second.ready());
-        assert!(mutex.try_lock().is_some());
+        assert!(mutex.try_lock().is_ok());
     }
 
     #[test]
@@ -383,12 +790,108 @@ mod tests {
         let mut mutex = Mutex::new(1);
         *mutex.get_mut() += 1;
         let mutex = Arc::new(mutex);
-        let guard = block_on(mutex.lock_owned());
-        let mut next = Polled::new(mutex.lock_owned());
+        let guard = block_on(Arc::clone(&mutex).lock_owned());
+        let mut next = Polled::new(Arc::clone(&mutex).lock_owned());
         next.pending();
         assert_eq!(*guard, 2);
         drop(guard);
         assert_eq!(*next.ready(), 2);
+    }
+
+    #[test]
+    fn a_failed_try_lock_reports_it_would_block() {
+        let mutex = Arc::new(Mutex::new(0));
+        let held = Arc::clone(&mutex).try_lock_owned().expect("free");
+        let err = mutex.try_lock().unwrap_err();
+        assert_eq!(err.to_string(), "operation would block");
+        assert_eq!(format!("{err:?}"), "TryLockError(())");
+        assert!(Arc::clone(&mutex).try_lock_owned().is_err());
+        drop(held);
+        assert!(mutex.try_lock().is_ok());
+    }
+
+    #[test]
+    fn a_mapped_guard_keeps_the_lock_until_it_drops() {
+        let mutex = Arc::new(Mutex::new((1, String::from("a"))));
+        let mut number = MutexGuard::map(block_on(mutex.lock()), |pair| &mut pair.0);
+        *number += 1;
+        assert!(mutex.try_lock().is_err(), "the mapped guard holds the lock");
+        let mut waiter = Polled::new(mutex.lock());
+        waiter.pending();
+        drop(number);
+        assert_eq!(waiter.wakes(), 1);
+        assert_eq!(waiter.ready().0, 2);
+
+        let owned = OwnedMutexGuard::map(block_on(Arc::clone(&mutex).lock_owned()), |pair| {
+            &mut pair.1
+        });
+        let mut tail = OwnedMappedMutexGuard::map(owned, |text| text.as_mut_str());
+        tail.make_ascii_uppercase();
+        assert_eq!(&*tail, "A");
+        assert!(mutex.try_lock().is_err());
+        drop(tail);
+        assert_eq!(mutex.try_lock().expect("unlocked").1, "A");
+    }
+
+    #[test]
+    fn try_map_gives_the_guard_back_when_nothing_is_found() {
+        let mutex = Mutex::new(Some(5));
+        let guard = mutex.try_lock().expect("free");
+        let guard = MutexGuard::try_map(guard, |value| value.as_mut().filter(|n| **n > 9))
+            .expect_err("nothing to map");
+        assert!(mutex.try_lock().is_err(), "the lock is still held");
+        let mut mapped =
+            MutexGuard::try_map(guard, |value| value.as_mut()).expect("a five is there");
+        *mapped += 1;
+        let mapped = MappedMutexGuard::try_map(mapped, |n| (*n > 100).then_some(n))
+            .expect_err("six is small");
+        let mut mapped = MappedMutexGuard::map(mapped, |n| n);
+        *mapped += 1;
+        drop(mapped);
+        assert_eq!(mutex.into_inner(), Some(7));
+    }
+
+    #[test]
+    fn a_guard_names_its_mutex() {
+        let mutex = Arc::new(Mutex::new(3));
+        let guard = block_on(mutex.lock());
+        let same = MutexGuard::mutex(&guard);
+        assert!(core::ptr::eq(same, &*mutex));
+        drop(guard);
+        let owned = block_on(Arc::clone(&mutex).lock_owned());
+        assert!(Arc::ptr_eq(OwnedMutexGuard::mutex(&owned), &mutex));
+        assert_eq!(format!("{owned} {owned:?}"), "3 3");
+    }
+
+    #[test]
+    fn blocking_locks_wait_for_the_holder_on_another_thread() {
+        let mutex = Arc::new(Mutex::new(0));
+        let held = mutex.blocking_lock();
+        let waiter = {
+            let mutex = Arc::clone(&mutex);
+            std::thread::spawn(move || {
+                *mutex.blocking_lock() += 1;
+                *Arc::clone(&mutex).blocking_lock_owned() += 1;
+            })
+        };
+        drop(held);
+        waiter.join().expect("waiter");
+        assert_eq!(*mutex.try_lock().expect("free"), 2);
+    }
+
+    #[test]
+    fn a_const_mutex_and_conversions() {
+        static COUNTER: Mutex<u32> = Mutex::const_new(5);
+        *COUNTER.try_lock().expect("free") += 1;
+        assert_eq!(*COUNTER.try_lock().expect("free"), 6);
+        let from: Mutex<u8> = 9.into();
+        assert_eq!(from.into_inner(), 9);
+        assert_eq!(Mutex::<u8>::default().into_inner(), 0);
+        let mutex = Mutex::new(vec![1]);
+        assert_eq!(format!("{mutex:?}"), "Mutex { data: [1] }");
+        let held = mutex.try_lock().expect("free");
+        assert_eq!(format!("{mutex:?}"), "Mutex { data: <locked> }");
+        drop(held);
     }
 
     #[test]

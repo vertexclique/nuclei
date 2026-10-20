@@ -48,6 +48,16 @@ pub const MAX_BYPASS: u32 = 16;
 #[cfg(loom)]
 pub const MAX_BYPASS: u32 = 2;
 
+/// The payload a drain pass leaves on a waiter it granted because the
+/// primitive closed: the grant carries nothing to give back, and the
+/// waiter's wait ends in [`Closed`]. No request, owner name or kind ever
+/// reaches this value.
+pub(super) const CLOSED_GRANT: usize = usize::MAX;
+
+/// How a wait on a primitive that can close ended without taking anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Closed;
+
 /// A primitive whose waits take something and give it back.
 pub(super) trait Lock: Policy {
     /// Whether a contended acquire spins before it queues, and after a
@@ -61,6 +71,13 @@ pub(super) trait Lock: Policy {
 
     /// Gives back what a waiter held, handing it on.
     fn give_back(&self, need: usize);
+
+    /// Whether a failed attempt that saw `state` can never succeed, because
+    /// the primitive closed: the contender then ends in [`Closed`] without
+    /// queueing. A primitive that never closes keeps the default.
+    fn closed(&self, _state: usize) -> bool {
+        false
+    }
 
     /// One attempt to take `need` the way a fresh caller would: whenever it
     /// is free, but never while a handoff is owed. On failure, the state it
@@ -186,7 +203,8 @@ impl Contend {
     }
 
     /// Ready once `need` is taken, by the caller's own attempt or by a
-    /// handoff.
+    /// handoff. For a primitive that never closes.
+    #[inline]
     pub(super) fn poll<L: Lock>(&mut self, lock: &L, need: usize, waker: &Waker) -> Poll<()> {
         self.poll_from(lock, need, waker, None)
     }
@@ -194,6 +212,7 @@ impl Contend {
     /// [`poll`](Self::poll) for a caller that has just read the state word
     /// itself and found it `seen` (a Mutex's inline attempt): a first poll
     /// starts its attempt from that state instead of loading it again.
+    #[inline]
     pub(super) fn poll_from<L: Lock>(
         &mut self,
         lock: &L,
@@ -201,6 +220,28 @@ impl Contend {
         waker: &Waker,
         seen: Option<usize>,
     ) -> Poll<()> {
+        self.poll_closable_from(lock, need, waker, seen)
+            .map(|taken| debug_assert!(taken.is_ok(), "a lock that never closes was closed"))
+    }
+
+    /// [`poll`](Self::poll) for a primitive that can close: ready with
+    /// [`Closed`] when the primitive closed before the wait took anything.
+    pub(super) fn poll_closable<L: Lock>(
+        &mut self,
+        lock: &L,
+        need: usize,
+        waker: &Waker,
+    ) -> Poll<Result<(), Closed>> {
+        self.poll_closable_from(lock, need, waker, None)
+    }
+
+    fn poll_closable_from<L: Lock>(
+        &mut self,
+        lock: &L,
+        need: usize,
+        waker: &Waker,
+        seen: Option<usize>,
+    ) -> Poll<Result<(), Closed>> {
         let queue = lock.queue();
         let mut park = if self.wait.is_queued() {
             self.wait.park(queue, Some(waker))
@@ -213,10 +254,13 @@ impl Contend {
                 None => lock.try_take(need),
             };
             match first {
-                Ok(()) => return Poll::Ready(()),
+                Ok(()) => return Poll::Ready(Ok(())),
                 Err(seen) => {
+                    if lock.closed(seen) {
+                        return Poll::Ready(Err(Closed));
+                    }
                     if L::SPINS && spin_take(lock, need, seen) {
-                        return Poll::Ready(());
+                        return Poll::Ready(Ok(()));
                     }
                 }
             }
@@ -225,10 +269,14 @@ impl Contend {
         };
         loop {
             match park {
-                Park::Granted(_) => {
+                Park::Granted(payload) => {
                     // A nudge may have been pending when the grant came.
                     queue.consume_nudge();
-                    return Poll::Ready(());
+                    return Poll::Ready(if payload == CLOSED_GRANT {
+                        Err(Closed)
+                    } else {
+                        Ok(())
+                    });
                 }
                 Park::Pending => return Poll::Pending,
                 // A nudge means something was freed after this waiter
@@ -252,7 +300,7 @@ impl Contend {
                                 queue.spin.won(0);
                             }
                             self.cancel(lock, need);
-                            return Poll::Ready(());
+                            return Poll::Ready(Ok(()));
                         }
                         // Never past the bound: a waiter that is owed, was
                         // granted, and retries on a nudge left over from
@@ -263,6 +311,9 @@ impl Contend {
                         }
                         Err(_) => {}
                     }
+                    // A primitive that closed meanwhile grants every waiter
+                    // [`CLOSED_GRANT`], so the look below finds it, or the
+                    // wake that comes with it does.
                     park = if L::SPINS {
                         self.wait.spin_park(queue, waker)
                     } else {
@@ -279,9 +330,12 @@ impl Contend {
         match self.wait.cancel(lock.queue()) {
             Cancel::Idle => {}
             Cancel::Withdrawn(woken) => lock.withdrawn(woken),
-            Cancel::Granted(_) => {
+            Cancel::Granted(payload) => {
                 lock.queue().consume_nudge();
-                lock.give_back(need);
+                // A grant made because the primitive closed took nothing.
+                if payload != CLOSED_GRANT {
+                    lock.give_back(need);
+                }
             }
         }
     }
@@ -839,17 +893,19 @@ mod tests {
     }
 
     /// B, the spin's rule for every state word with up to two permits and
-    /// every combination of the queue's six bits: one round takes a permit
-    /// exactly when a fresh caller may (a permit free and no handoff owed)
-    /// and the queue is not settled (waiters queued with nobody holding the
-    /// drain role), and leaves the word as that take would; otherwise it
-    /// changes nothing. A spin that ignored an owed handoff fails here at
-    /// the word with one permit and HANDOFF up.
+    /// every combination of the semaphore's low bits (the queue's six and the
+    /// closed bit): one round takes a permit exactly when a fresh caller may
+    /// (a permit free, no handoff owed, not closed) and the queue is not
+    /// settled (waiters queued with nobody holding the drain role), and
+    /// leaves the word as that take would; otherwise it changes nothing. A
+    /// spin that ignored an owed handoff fails here at the word with one
+    /// permit and HANDOFF up.
     #[test]
     fn the_spin_takes_only_what_a_fresh_caller_may() {
-        const SHIFT: u32 = super::super::queue::FIRST_BIT;
+        use super::super::raw_semaphore::SHIFT;
         const DRAINING_BIT: usize = 1;
         const QUEUED_BIT: usize = 1 << 2;
+        const CLOSED_BIT: usize = 1 << super::super::queue::FIRST_BIT;
         for permits in 0..=2usize {
             for flags in 0..(1usize << SHIFT) {
                 let state = (permits << SHIFT) | flags;
@@ -857,7 +913,7 @@ mod tests {
                 sem.queue().state.store(state, Ordering::Relaxed);
                 let took = spin_take(&sem, 1, state);
                 let settled = flags & (QUEUED_BIT | DRAINING_BIT) == QUEUED_BIT;
-                let may = permits >= 1 && flags & HANDOFF == 0 && !settled;
+                let may = permits >= 1 && flags & (HANDOFF | CLOSED_BIT) == 0 && !settled;
                 assert_eq!(took, may, "state {state:#x}: the spin took the wrong thing");
                 let after = sem.queue().state.load(Ordering::Relaxed);
                 let expected = if took { state - (1 << SHIFT) } else { state };

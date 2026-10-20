@@ -2,13 +2,23 @@
 //! [`Mutex`](super::Mutex), [`ReentrantMutex`](super::ReentrantMutex),
 //! [`OnceCell`](super::OnceCell) and the bounded channel build on too.
 //!
-//! The state word holds the free permits above the queue's bits. A
-//! request takes its permits whenever enough are free and no handoff is
-//! owed, past any waiters (see `contend`). A release nudges the oldest
-//! waiters the freed permits could serve, oldest first and stopping at
-//! the first that does not fit, so a large request at the front is not
+//! The state word holds the free permits above the queue's bits and one
+//! closed bit. A request takes its permits whenever enough are free and no
+//! handoff is owed, past any waiters (see `contend`). A release nudges the
+//! oldest waiters the freed permits could serve, oldest first and stopping
+//! at the first that does not fit, so a large request at the front is not
 //! skipped by the nudges for smaller ones behind it; while a handoff is
 //! owed, it hands permits to the waiters in queue order instead.
+//!
+//! # Closing
+//!
+//! [`close`](RawSemaphore::close) raises the closed bit with a draining
+//! transition, so the pass it ends in sees the bit. A closed semaphore
+//! admits nobody, whatever permits it holds, and its pass grants every
+//! waiter a `CLOSED_GRANT`: the waiter ends in `Closed` and has nothing to
+//! give back. A waiter that queues after the bit went up is granted the same
+//! way by the pass its own enqueue runs. Permits that come back, or are
+//! added, still count: they are only not handed out.
 
 #![allow(unsafe_code)]
 
@@ -16,20 +26,44 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use super::contend::{self, Contend, Lock};
-use super::internal::{Ordering, UnsafeCell};
+use super::contend::{self, CLOSED_GRANT, Closed, Contend, Lock};
+use super::internal::{Ordering, UnsafeCell, fence};
 use super::list::List;
 use super::queue::{
     Arrivals, FIRST_BIT, HANDOFF, Nudges, Policy, QUEUED, Step, WAKE_FRONT, WaitQueue, wants_drain,
 };
 use super::waiter::WakeList;
 
-const SHIFT: u32 = FIRST_BIT;
+/// The semaphore is closed: nothing is admitted and every waiter is granted
+/// the error. The permits sit above it.
+const CLOSED: usize = 1 << FIRST_BIT;
+pub(super) const SHIFT: u32 = FIRST_BIT + 1;
 const FLAGS: usize = (1 << SHIFT) - 1;
 /// One permit, in the units of the state word.
-const ONE: usize = 1 << SHIFT;
-/// The most permits a semaphore can hold.
+pub(super) const ONE: usize = 1 << SHIFT;
+/// The most permits a semaphore can hold: the state word keeps the queue's
+/// bits and the closed bit below them.
 pub(super) const MAX: usize = usize::MAX >> SHIFT;
+
+/// Whether a state word says the semaphore closed.
+pub(super) fn closed_in(state: usize) -> bool {
+    state & CLOSED != 0
+}
+
+/// Whether a state word seen by a failed attempt says the semaphore closed.
+///
+/// An attempt reads the word without ordering, which is all it needs to take
+/// a permit, but a caller told "closed" may go on to read what the closer
+/// published before it closed (the once-cell's value). So a closed word is
+/// followed by an acquire fence: it synchronizes with the closing
+/// transition, and everything the closer did first is visible from here on.
+pub(super) fn observed_closed(state: usize) -> bool {
+    let closed = closed_in(state);
+    if closed {
+        fence(Ordering::Acquire);
+    }
+    closed
+}
 
 /// The permit core: a weighted semaphore with no value attached.
 pub(super) struct RawSemaphore {
@@ -67,13 +101,36 @@ impl RawSemaphore {
         }
     }
 
+    loom_const_fn! {
+        /// A closed semaphore with no permits, whose contended acquires never
+        /// spin: nothing waits on it.
+        pub(super) fn new_closed() -> Self {
+            Self {
+                queue: WaitQueue::without_spin(CLOSED),
+                waiting: UnsafeCell::new(List::new()),
+            }
+        }
+    }
+
     pub(super) fn available(&self) -> usize {
         self.queue.state.load(Ordering::Acquire) >> SHIFT
+    }
+
+    /// Whether [`close`](Self::close) was called.
+    pub(super) fn is_closed(&self) -> bool {
+        closed_in(self.queue.state.load(Ordering::Acquire))
     }
 
     /// Takes `n` permits if they are free and no handoff is owed.
     pub(super) fn try_acquire(&self, n: usize) -> bool {
         self.try_take(n).is_ok()
+    }
+
+    /// [`try_acquire`](Self::try_acquire) that hands the permits back as a
+    /// [`RawPermit`], and on failure the state word it saw, which says
+    /// whether the semaphore closed (see [`observed_closed`]).
+    pub(super) fn try_acquire_permit(&self, n: usize) -> Result<RawPermit<'_>, usize> {
+        self.try_take(n).map(|()| RawPermit { sem: self, n })
     }
 
     /// One permit, attempted inline: a load of the word, then one
@@ -108,7 +165,7 @@ impl RawSemaphore {
                 .compare_exchange(ONE, 0, Ordering::Acquire, Ordering::Relaxed)
                 .map(drop);
         }
-        if seen >= ONE && seen & HANDOFF == 0 {
+        if seen >= ONE && seen & (HANDOFF | CLOSED) == 0 {
             state
                 .compare_exchange(seen, seen - ONE, Ordering::Acquire, Ordering::Relaxed)
                 .map(drop)
@@ -174,21 +231,66 @@ impl RawSemaphore {
             }
         });
     }
+
+    /// Takes up to `n` free permits out of the semaphore for good and
+    /// returns how many it took. Waiters are not told: what they could take
+    /// is only less.
+    pub(super) fn forget(&self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        let state = &self.queue.state;
+        let mut current = state.load(Ordering::Acquire);
+        loop {
+            let free = current >> SHIFT;
+            let taken = free.min(n);
+            match state.compare_exchange_weak(
+                current,
+                current - (taken << SHIFT),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return taken,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Closes the semaphore: every waiter ends in `Closed`, and nothing is
+    /// admitted from now on. Closing twice does nothing.
+    pub(super) fn close(&self) {
+        // Always a draining transition, even with nobody queued: a waiter
+        // that queues concurrently either is seen by this pass or finds the
+        // bit in the pass its own enqueue runs.
+        self.transition(|state| {
+            if closed_in(state) {
+                Step::Keep
+            } else {
+                Step::Drain(state | CLOSED)
+            }
+        });
+    }
 }
 
 impl Lock for RawSemaphore {
     fn admit(&self, state: usize, need: usize) -> Option<usize> {
-        (state >> SHIFT >= need).then(|| state - (need << SHIFT))
+        (state >> SHIFT >= need && state & CLOSED == 0).then(|| state - (need << SHIFT))
     }
 
     fn give_back(&self, need: usize) {
         self.release(need);
     }
 
+    fn closed(&self, state: usize) -> bool {
+        observed_closed(state)
+    }
+
     fn try_take(&self, need: usize) -> Result<(), usize> {
-        // Nothing to take, so nothing to wait for, owed handoff or not.
+        // Nothing to take, so nothing to wait for, owed handoff or not; a
+        // closed semaphore still refuses.
         if need == 0 {
-            return Ok(());
+            let seen = self.queue.state.load(Ordering::Relaxed);
+            return if closed_in(seen) { Err(seen) } else { Ok(()) };
         }
         contend::take(self, need, false)
     }
@@ -206,6 +308,14 @@ impl Policy for RawSemaphore {
             let waiting = &mut *waiting;
             waiting.absorb(arrivals, queue);
             waiting.tidy(queue);
+            if self.is_closed() {
+                while let Some(node) = waiting.front(queue) {
+                    waiting.pop_front();
+                    node.as_ref().set_payload(CLOSED_GRANT);
+                    woken.grant(node);
+                }
+                return QUEUED;
+            }
             if queue.state.load(Ordering::Acquire) & HANDOFF != 0 {
                 while let Some(node) = waiting.front(queue) {
                     let need = node.as_ref().payload();
@@ -283,6 +393,17 @@ impl PermitWait {
 
     pub(super) fn poll(&mut self, sem: &RawSemaphore, n: usize, waker: &Waker) -> Poll<()> {
         self.contend.poll(sem, n, waker)
+    }
+
+    /// [`poll`](Self::poll) for a semaphore that can close: ready with
+    /// [`Closed`] when it closed before the wait took its permits.
+    pub(super) fn poll_closable(
+        &mut self,
+        sem: &RawSemaphore,
+        n: usize,
+        waker: &Waker,
+    ) -> Poll<Result<(), Closed>> {
+        self.contend.poll_closable(sem, n, waker)
     }
 
     /// The wait of a one-permit semaphore (a Mutex). A first poll makes
@@ -367,15 +488,17 @@ impl RawSemaphore {
 }
 
 impl<'a> Future for RawAcquire<'a> {
-    type Output = RawPermit<'a>;
+    type Output = Result<RawPermit<'a>, Closed>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<RawPermit<'a>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.wait
-            .poll(this.sem, this.n, cx.waker())
-            .map(|()| RawPermit {
-                sem: this.sem,
-                n: this.n,
+            .poll_closable(this.sem, this.n, cx.waker())
+            .map(|taken| {
+                taken.map(|()| RawPermit {
+                    sem: this.sem,
+                    n: this.n,
+                })
             })
     }
 }
@@ -425,8 +548,8 @@ mod tests {
             }
             assert_eq!(
                 took.is_ok(),
-                state >> SHIFT >= 1 && state & HANDOFF == 0,
-                "state {state:#x}: a free permit is taken unless a handoff is owed"
+                state >> SHIFT >= 1 && state & (HANDOFF | CLOSED) == 0,
+                "state {state:#x}: a free permit is taken unless a handoff is owed or it is closed"
             );
         }
     }

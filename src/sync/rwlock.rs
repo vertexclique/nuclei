@@ -5,13 +5,24 @@
 
 use core::fmt;
 use core::future::Future;
-use core::marker::PhantomData;
-use core::ops::{Deref, DerefMut};
+use core::ops::Deref;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Arc;
 
-use super::raw_rwlock::{READ, RawRwLock, RwWait, UPGRADABLE_READ, UpgradeWait, WRITE};
+use super::internal;
+use super::mutex::TryLockError;
+use super::raw_rwlock::{
+    MAX_READERS, READ, RawRwLock, RwWait, UPGRADABLE_READ, UpgradeWait, WRITE,
+};
+
+/// The most readers [`RwLock::with_max_readers`] accepts: `u32::MAX >> 3`,
+/// or the reader field of the lock where a word is too narrow for that.
+const MAX_READS: usize = if (u32::MAX >> 3) as usize <= MAX_READERS {
+    (u32::MAX >> 3) as usize
+} else {
+    MAX_READERS
+};
 
 /// A reader-writer lock whose waits are futures.
 ///
@@ -26,7 +37,9 @@ use super::raw_rwlock::{READ, RawRwLock, RwWait, UPGRADABLE_READ, UpgradeWait, W
 /// [`upgradable_read`](Self::upgradable_read) takes a read that can later
 /// become the write without letting a writer in between. One upgradable
 /// read exists at a time; it shares the lock with plain readers, and plain
-/// read guards cannot upgrade.
+/// read guards cannot upgrade. A write guard becomes a read guard, with no
+/// writer in between, through
+/// [`RwLockWriteGuard::downgrade`].
 ///
 /// ```
 /// use nuclei::sync::RwLock;
@@ -34,7 +47,7 @@ use super::raw_rwlock::{READ, RawRwLock, RwWait, UPGRADABLE_READ, UpgradeWait, W
 /// let lock = RwLock::new(5);
 /// let a = lock.try_read().expect("free");
 /// let b = lock.try_read().expect("readers share");
-/// assert!(lock.try_write().is_none());
+/// assert!(lock.try_write().is_err());
 /// drop((a, b));
 /// *lock.try_write().expect("free again") += 1;
 /// assert_eq!(lock.into_inner(), 6);
@@ -55,6 +68,56 @@ impl<T> RwLock<T> {
         /// An unlocked lock holding `value`.
         pub fn new(value: T) -> Self {
             Self { raw: RawRwLock::new(), value: core::cell::UnsafeCell::new(value) }
+        }
+    }
+
+    loom_const_fn! {
+        /// An unlocked lock holding `value`, usable in a `static`.
+        pub fn const_new(value: T) -> Self {
+            Self { raw: RawRwLock::new(), value: core::cell::UnsafeCell::new(value) }
+        }
+    }
+
+    loom_const_fn! {
+        /// An unlocked lock holding `value` that admits at most `max_reads`
+        /// readers at once: a reader that finds them all inside waits for
+        /// one to leave, as one held back by a writer does.
+        ///
+        /// # Panics
+        ///
+        /// When `max_reads` is `0` or is bigger than `u32::MAX >> 3`. (A
+        /// target whose word is narrower than 64 bits caps it lower, at the
+        /// readers its state word can count: `2^23 - 1` on 32 bits.)
+        pub fn with_max_readers(value: T, max_reads: u32) -> Self {
+            assert!(max_reads != 0, "a RwLock may not be created with 0 readers");
+            assert!(
+                max_reads as usize <= MAX_READS,
+                "a RwLock may not be created with more than u32::MAX >> 3 readers"
+            );
+            Self {
+                raw: RawRwLock::with_max_readers(max_reads as usize),
+                value: core::cell::UnsafeCell::new(value),
+            }
+        }
+    }
+
+    loom_const_fn! {
+        /// [`with_max_readers`](Self::with_max_readers), usable in a
+        /// `static`.
+        ///
+        /// # Panics
+        ///
+        /// As for [`with_max_readers`](Self::with_max_readers).
+        pub fn const_with_max_readers(value: T, max_reads: u32) -> Self {
+            assert!(max_reads != 0, "a RwLock may not be created with 0 readers");
+            assert!(
+                max_reads as usize <= MAX_READS,
+                "a RwLock may not be created with more than u32::MAX >> 3 readers"
+            );
+            Self {
+                raw: RawRwLock::with_max_readers(max_reads as usize),
+                value: core::cell::UnsafeCell::new(value),
+            }
         }
     }
 
@@ -83,21 +146,60 @@ impl<T: ?Sized> RwLock<T> {
 }
 
 impl<T: ?Sized> RwLock<T> {
-    /// Shares the lock if no writer holds it, no upgrade is under way and
-    /// no handoff is owed.
-    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
-        self.raw.try_kind(READ).then(|| RwLockReadGuard {
-            lock: self,
-            _value: PhantomData,
-        })
+    /// Shares the lock if no writer holds it, no upgrade is under way, the
+    /// readers have room and no handoff is owed.
+    ///
+    /// # Errors
+    ///
+    /// [`TryLockError`] when any of those fails.
+    pub fn try_read(&self) -> Result<RwLockReadGuard<'_, T>, TryLockError> {
+        if self.raw.try_kind(READ) {
+            Ok(RwLockReadGuard::new(self))
+        } else {
+            Err(TryLockError(()))
+        }
+    }
+
+    /// [`try_read`](Self::try_read) through an `Arc`, so the guard can
+    /// outlive the borrow.
+    ///
+    /// # Errors
+    ///
+    /// [`TryLockError`] when the lock cannot be shared now.
+    pub fn try_read_owned(self: Arc<Self>) -> Result<OwnedRwLockReadGuard<T>, TryLockError> {
+        if self.raw.try_kind(READ) {
+            Ok(OwnedRwLockReadGuard::new(self))
+        } else {
+            Err(TryLockError(()))
+        }
     }
 
     /// Takes the lock alone if nobody holds it and no handoff is owed.
-    pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
-        self.raw.try_kind(WRITE).then(|| RwLockWriteGuard {
-            lock: self,
-            _value: PhantomData,
-        })
+    ///
+    /// # Errors
+    ///
+    /// [`TryLockError`] when any reader or writer holds the lock, or a
+    /// waiter is owed it.
+    pub fn try_write(&self) -> Result<RwLockWriteGuard<'_, T>, TryLockError> {
+        if self.raw.try_kind(WRITE) {
+            Ok(RwLockWriteGuard::new(self))
+        } else {
+            Err(TryLockError(()))
+        }
+    }
+
+    /// [`try_write`](Self::try_write) through an `Arc`, so the guard can
+    /// outlive the borrow.
+    ///
+    /// # Errors
+    ///
+    /// [`TryLockError`] when the lock cannot be taken alone now.
+    pub fn try_write_owned(self: Arc<Self>) -> Result<OwnedRwLockWriteGuard<T>, TryLockError> {
+        if self.raw.try_kind(WRITE) {
+            Ok(OwnedRwLockWriteGuard::new(self))
+        } else {
+            Err(TryLockError(()))
+        }
     }
 
     /// Takes the upgradable read if no writer and no other upgradable read
@@ -111,8 +213,20 @@ impl<T: ?Sized> RwLock<T> {
     /// Waits to share the lock. Uncontended, the first poll is one atomic
     /// read-modify-write. Contended, it is lock-free, not wait-free: see
     /// [Progress](super#progress).
+    ///
+    /// Dropping the future withdraws the wait, and passes on a lock handed
+    /// to it meanwhile.
     pub fn read(&self) -> Read<'_, T> {
         Read {
+            lock: self,
+            wait: RwWait::new(),
+        }
+    }
+
+    /// [`read`](Self::read) through an `Arc`, so the guard can outlive the
+    /// borrow.
+    pub fn read_owned(self: Arc<Self>) -> ReadOwned<T> {
+        ReadOwned {
             lock: self,
             wait: RwWait::new(),
         }
@@ -121,6 +235,9 @@ impl<T: ?Sized> RwLock<T> {
     /// Waits to hold the lock alone. Uncontended, the first poll is one atomic
     /// read-modify-write. Contended, it is lock-free, not wait-free: see
     /// [Progress](super#progress).
+    ///
+    /// Dropping the future withdraws the wait, and passes on a lock handed
+    /// to it meanwhile.
     pub fn write(&self) -> Write<'_, T> {
         Write {
             lock: self,
@@ -131,11 +248,35 @@ impl<T: ?Sized> RwLock<T> {
     /// Waits to hold the lock alone, with a guard that keeps the lock alive
     /// itself, so the future and the guard can outlive the borrow that made
     /// them: a wait kept across calls, or a guard returned to a caller.
-    pub fn write_owned(self: &Arc<Self>) -> WriteOwned<T> {
+    pub fn write_owned(self: Arc<Self>) -> WriteOwned<T> {
         WriteOwned {
-            lock: Arc::clone(self),
+            lock: self,
             wait: RwWait::new(),
         }
+    }
+
+    /// [`read`](Self::read) for a thread that may block: it parks the
+    /// calling thread until the lock can be shared. Called from inside an
+    /// async task it blocks that task's executor thread, so do not: the task
+    /// that would release may be the one this thread was running.
+    ///
+    /// # Panics
+    ///
+    /// On `wasm32`, where no other thread can release, when the lock cannot
+    /// be shared at once: the call could never end.
+    pub fn blocking_read(&self) -> RwLockReadGuard<'_, T> {
+        internal::blocking(self.read())
+    }
+
+    /// [`write`](Self::write) for a thread that may block: see
+    /// [`blocking_read`](Self::blocking_read).
+    ///
+    /// # Panics
+    ///
+    /// On `wasm32`, where no other thread can release, when the lock is held
+    /// at all: the call could never end.
+    pub fn blocking_write(&self) -> RwLockWriteGuard<'_, T> {
+        internal::blocking(self.write())
     }
 
     /// Waits for the upgradable read. It makes the progress
@@ -153,131 +294,26 @@ impl<T: ?Sized> RwLock<T> {
     }
 }
 
+impl<T> From<T> for RwLock<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
 impl<T: Default> Default for RwLock<T> {
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
-impl<T: ?Sized> fmt::Debug for RwLock<T> {
+impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RwLock").finish_non_exhaustive()
-    }
-}
-
-/// Shared access to a [`RwLock`]'s value; releases on drop.
-///
-/// The release is one atomic read-modify-write when no waiter needs telling.
-/// Otherwise it is lock-free, not wait-free: it returns after one pass over
-/// the queue, plus at most one for each operation of another thread that
-/// lands on the queue meanwhile (see [Progress](super#progress)).
-#[must_use = "dropping the guard releases the lock at once"]
-pub struct RwLockReadGuard<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-    _value: PhantomData<&'a T>,
-}
-
-impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        // SAFETY: a read excludes every writer.
-        unsafe { &*self.lock.value.get() }
-    }
-}
-
-impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
-    fn drop(&mut self) {
-        self.lock.raw.read_unlock();
-    }
-}
-
-impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockReadGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-/// Exclusive access to a [`RwLock`]'s value; releases on drop. The release
-/// makes the progress [`RwLockReadGuard`]'s does.
-#[must_use = "dropping the guard releases the lock at once"]
-pub struct RwLockWriteGuard<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-    _value: PhantomData<&'a mut T>,
-}
-
-impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        // SAFETY: the write excludes every other guard.
-        unsafe { &*self.lock.value.get() }
-    }
-}
-
-impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as in `deref`, and `&mut self` makes this borrow unique.
-        unsafe { &mut *self.lock.value.get() }
-    }
-}
-
-impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
-    fn drop(&mut self) {
-        self.lock.raw.write_unlock();
-    }
-}
-
-impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockWriteGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-/// Exclusive access to a [`RwLock`]'s value through an [`Arc`] the guard
-/// holds; releases on drop. Made by [`RwLock::write_owned`].
-#[must_use = "dropping the guard releases the lock at once"]
-pub struct OwnedRwLockWriteGuard<T: ?Sized> {
-    lock: Arc<RwLock<T>>,
-    // `Sync` only when `T: Sync`, since `&OwnedRwLockWriteGuard` reaches `&T`.
-    _value: PhantomData<core::cell::UnsafeCell<T>>,
-}
-
-// SAFETY: sharing the guard shares `&T`, which needs `T: Sync`.
-unsafe impl<T: ?Sized + Send + Sync> Sync for OwnedRwLockWriteGuard<T> {}
-
-impl<T: ?Sized> OwnedRwLockWriteGuard<T> {
-    /// The lock this guard holds.
-    pub fn lock(&self) -> &Arc<RwLock<T>> {
-        &self.lock
-    }
-}
-
-impl<T: ?Sized> Deref for OwnedRwLockWriteGuard<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        // SAFETY: the write excludes every other guard.
-        unsafe { &*self.lock.value.get() }
-    }
-}
-
-impl<T: ?Sized> DerefMut for OwnedRwLockWriteGuard<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as in `deref`, and `&mut self` makes this borrow unique.
-        unsafe { &mut *self.lock.value.get() }
-    }
-}
-
-impl<T: ?Sized> Drop for OwnedRwLockWriteGuard<T> {
-    fn drop(&mut self) {
-        self.lock.raw.write_unlock();
-    }
-}
-
-impl<T: ?Sized + fmt::Debug> fmt::Debug for OwnedRwLockWriteGuard<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
+        let mut d = f.debug_struct("RwLock");
+        match self.try_read() {
+            Ok(inner) => d.field("data", &&*inner),
+            Err(_) => d.field("data", &format_args!("<locked>")),
+        };
+        d.finish()
     }
 }
 
@@ -330,10 +366,7 @@ impl<'a, T: ?Sized> RwLockUpgradableReadGuard<'a, T> {
         }
         let lock = self.lock;
         core::mem::forget(self);
-        Ok(RwLockWriteGuard {
-            lock,
-            _value: PhantomData,
-        })
+        Ok(RwLockWriteGuard::new(lock))
     }
 }
 
@@ -372,10 +405,7 @@ impl<'a, T: ?Sized> Future for Read<'a, T> {
         let this = self.get_mut();
         this.wait
             .poll(&this.lock.raw, READ, cx.waker())
-            .map(|()| RwLockReadGuard {
-                lock: this.lock,
-                _value: PhantomData,
-            })
+            .map(|()| RwLockReadGuard::new(this.lock))
     }
 }
 
@@ -388,6 +418,38 @@ impl<T: ?Sized> Drop for Read<'_, T> {
 impl<T: ?Sized> fmt::Debug for Read<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Read").finish_non_exhaustive()
+    }
+}
+
+/// The future [`RwLock::read_owned`] returns. It keeps its place in the
+/// queue, and the bypasses it counted, for as long as it lives; dropping it
+/// withdraws the wait and passes on a lock handed to it meanwhile.
+#[must_use = "futures do nothing unless polled"]
+pub struct ReadOwned<T: ?Sized> {
+    lock: Arc<RwLock<T>>,
+    wait: RwWait,
+}
+
+impl<T: ?Sized> Future for ReadOwned<T> {
+    type Output = OwnedRwLockReadGuard<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<OwnedRwLockReadGuard<T>> {
+        let this = self.get_mut();
+        this.wait
+            .poll(&this.lock.raw, READ, cx.waker())
+            .map(|()| OwnedRwLockReadGuard::new(Arc::clone(&this.lock)))
+    }
+}
+
+impl<T: ?Sized> Drop for ReadOwned<T> {
+    fn drop(&mut self) {
+        self.wait.cancel(&self.lock.raw, READ);
+    }
+}
+
+impl<T: ?Sized> fmt::Debug for ReadOwned<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadOwned").finish_non_exhaustive()
     }
 }
 
@@ -405,10 +467,7 @@ impl<'a, T: ?Sized> Future for Write<'a, T> {
         let this = self.get_mut();
         this.wait
             .poll(&this.lock.raw, WRITE, cx.waker())
-            .map(|()| RwLockWriteGuard {
-                lock: this.lock,
-                _value: PhantomData,
-            })
+            .map(|()| RwLockWriteGuard::new(this.lock))
     }
 }
 
@@ -440,10 +499,7 @@ impl<T: ?Sized> Future for WriteOwned<T> {
         let this = self.get_mut();
         this.wait
             .poll(&this.lock.raw, WRITE, cx.waker())
-            .map(|()| OwnedRwLockWriteGuard {
-                lock: Arc::clone(&this.lock),
-                _value: PhantomData,
-            })
+            .map(|()| OwnedRwLockWriteGuard::new(Arc::clone(&this.lock)))
     }
 }
 
@@ -515,10 +571,7 @@ impl<'a, T: ?Sized> Future for Upgrade<'a, T> {
         );
         this.wait.poll(&this.lock.raw, cx.waker()).map(|()| {
             this.done = true;
-            RwLockWriteGuard {
-                lock: this.lock,
-                _value: PhantomData,
-            }
+            RwLockWriteGuard::new(this.lock)
         })
     }
 }
@@ -539,227 +592,11 @@ impl<T: ?Sized> fmt::Debug for Upgrade<'_, T> {
     }
 }
 
+mod guards;
+pub use guards::{
+    OwnedRwLockMappedWriteGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard,
+};
+
 #[cfg(all(test, not(loom)))]
-mod tests {
-    use super::*;
-    use crate::sync::MAX_BYPASS;
-    use crate::sync::test_support::{Polled, block_on};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicIsize, Ordering as StdOrdering};
-
-    /// A lock built without spin queues its contended readers and writers at
-    /// once: its budget is zero from the start and stays zero through a
-    /// contended write, its wake and its retry, where a spinning lock's
-    /// starts above zero.
-    #[test]
-    fn a_rwlock_built_without_spin_never_spins() {
-        assert!(RwLock::new(()).spin_rounds() > 0, "a plain lock spins");
-        let lock = RwLock::new_without_spin(0u8);
-        assert_eq!(lock.spin_rounds(), 0);
-        let read = lock.try_read().expect("free");
-        let mut writer = Polled::new(lock.write());
-        writer.pending();
-        drop(read);
-        assert_eq!(writer.wakes(), 1);
-        *writer.ready() += 1;
-        assert_eq!(lock.spin_rounds(), 0, "the lock never spins");
-    }
-
-    const ITERATIONS: usize = if cfg!(miri) { 20 } else { 2_000 };
-
-    #[test]
-    fn readers_share_and_a_writer_excludes() {
-        let lock = RwLock::new(0);
-        let a = lock.try_read().expect("free");
-        let b = lock.try_read().expect("readers share");
-        assert!(lock.try_write().is_none());
-        drop((a, b));
-        let w = lock.try_write().expect("free");
-        assert!(lock.try_read().is_none());
-        drop(w);
-    }
-
-    #[test]
-    fn readers_barge_past_a_waiting_writer_until_it_is_owed() {
-        let lock = RwLock::new(());
-        let mut inside = lock.try_read().expect("free");
-        let mut writer = Polled::new(lock.write());
-        writer.pending();
-        for round in 0..MAX_BYPASS {
-            let next = lock.try_read().expect("a read barges past the writer");
-            drop(inside);
-            inside = next;
-            assert_eq!(
-                writer.wakes() as u32,
-                round + 1,
-                "every release nudges the writer"
-            );
-            writer.pending();
-        }
-        assert!(lock.try_read().is_none(), "the writer is owed the lock now");
-        drop(inside);
-        assert_eq!(writer.wakes() as u32, MAX_BYPASS + 1);
-        drop(writer.ready());
-        assert!(lock.try_read().is_some());
-    }
-
-    #[test]
-    fn a_released_writer_lets_the_queued_readers_in_together() {
-        let lock = RwLock::new(());
-        let w0 = lock.try_write().expect("free");
-        let mut r1 = Polled::new(lock.read());
-        r1.pending();
-        let mut r2 = Polled::new(lock.read());
-        r2.pending();
-        drop(w0);
-        assert_eq!((r1.wakes(), r2.wakes()), (1, 1));
-        let (a, b) = (r1.ready(), r2.ready());
-        drop((a, b));
-    }
-
-    #[test]
-    fn an_owned_write_outlives_the_borrow_and_keeps_its_place() {
-        let lock = Arc::new(RwLock::new(0));
-        let mut inside = lock.try_read().expect("free");
-        // Made from a borrow that ends at once: the future owns the lock.
-        let mut writer = Polled::new(Arc::clone(&lock).write_owned());
-        writer.pending();
-        for _ in 0..MAX_BYPASS {
-            let next = lock.try_read().expect("a read barges past the writer");
-            drop(inside);
-            inside = next;
-            writer.pending();
-        }
-        assert!(
-            lock.try_read().is_none(),
-            "the owned writer counted its bypasses like a borrowed one"
-        );
-        drop(inside);
-        let mut guard = writer.ready();
-        *guard += 1;
-        assert!(lock.try_read().is_none(), "the guard holds the write");
-        drop(guard);
-        assert_eq!(*lock.try_read().expect("released"), 1);
-    }
-
-    #[test]
-    fn a_dropped_owned_write_passes_a_handoff_on() {
-        let lock = Arc::new(RwLock::new(()));
-        let mut inside = lock.try_read().expect("free");
-        let mut writer = Polled::new(lock.write_owned());
-        writer.pending();
-        for _ in 0..MAX_BYPASS {
-            let next = lock.try_read().expect("barge");
-            drop(inside);
-            inside = next;
-            writer.pending();
-        }
-        let mut reader = Polled::new(lock.read());
-        reader.pending();
-        drop(inside);
-        drop(writer);
-        assert_eq!(reader.wakes(), 1, "the dropped handoff reached the reader");
-        drop(reader.ready());
-        assert!(lock.try_write().is_some());
-    }
-
-    #[test]
-    fn a_withdrawn_writer_leaves_nothing_behind() {
-        let lock = RwLock::new(());
-        let r0 = lock.try_read().expect("free");
-        Polled::new(lock.write()).pending();
-        drop(r0);
-        assert!(lock.try_write().is_some());
-    }
-
-    #[test]
-    fn a_writer_handed_the_lock_but_dropped_passes_it_on() {
-        let lock = RwLock::new(());
-        let mut inside = lock.try_read().expect("free");
-        let mut writer = Polled::new(lock.write());
-        writer.pending();
-        for _ in 0..MAX_BYPASS {
-            let next = lock.try_read().expect("barge");
-            drop(inside);
-            inside = next;
-            writer.pending();
-        }
-        let mut reader = Polled::new(lock.read());
-        reader.pending();
-        drop(inside);
-        drop(writer);
-        assert_eq!(reader.wakes(), 1, "the dropped handoff reached the reader");
-        drop(reader.ready());
-        assert!(lock.try_write().is_some());
-    }
-
-    #[test]
-    fn one_upgradable_read_shares_with_readers_and_excludes_writers() {
-        let lock = RwLock::new(1);
-        let up = lock.try_upgradable_read().expect("free");
-        let read = lock.try_read().expect("plain readers share with it");
-        assert!(lock.try_upgradable_read().is_none(), "one at a time");
-        assert!(lock.try_write().is_none());
-        let up = up.try_upgrade().expect_err("a reader is inside");
-        let mut upgrade = Polled::new(up.upgrade());
-        upgrade.pending();
-        assert!(lock.try_read().is_none(), "new readers are held back");
-        drop(read);
-        assert_eq!(upgrade.wakes(), 1);
-        let mut write = upgrade.ready();
-        *write += 1;
-        drop(write);
-        assert_eq!(*lock.try_read().expect("free"), 2);
-    }
-
-    #[test]
-    fn a_dropped_upgrade_releases_the_upgradable_read() {
-        let lock = RwLock::new(());
-        let up = lock.try_upgradable_read().expect("free");
-        let read = lock.try_read().expect("share");
-        Polled::new(up.upgrade()).pending();
-        assert!(lock.try_read().is_some(), "readers are welcome again");
-        drop(read);
-        assert!(lock.try_write().is_some(), "nothing is left held");
-    }
-
-    #[test]
-    fn threads_see_readers_xor_one_writer() {
-        let lock = Arc::new(RwLock::new(()));
-        let inside = Arc::new(AtomicIsize::new(0));
-        let threads: Vec<_> = (0..4)
-            .map(|t| {
-                let (lock, inside) = (Arc::clone(&lock), Arc::clone(&inside));
-                std::thread::spawn(move || {
-                    for i in 0..ITERATIONS {
-                        match (i + t) % 4 {
-                            0 => {
-                                let _w = block_on(lock.write());
-                                assert_eq!(inside.swap(-1, StdOrdering::SeqCst), 0);
-                                std::hint::spin_loop();
-                                assert_eq!(inside.swap(0, StdOrdering::SeqCst), -1);
-                            }
-                            1 => {
-                                let up = block_on(lock.upgradable_read());
-                                assert!(inside.load(StdOrdering::SeqCst) >= 0);
-                                let _w = block_on(up.upgrade());
-                                assert_eq!(inside.swap(-1, StdOrdering::SeqCst), 0);
-                                assert_eq!(inside.swap(0, StdOrdering::SeqCst), -1);
-                            }
-                            _ => {
-                                let _r = block_on(lock.read());
-                                assert!(inside.fetch_add(1, StdOrdering::SeqCst) >= 0);
-                                std::hint::spin_loop();
-                                inside.fetch_sub(1, StdOrdering::SeqCst);
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().expect("worker");
-        }
-        assert!(lock.try_write().is_some());
-    }
-}
+mod tests;
