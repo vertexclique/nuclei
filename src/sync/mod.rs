@@ -126,6 +126,7 @@ mod barrier;
 mod cancellation;
 mod contend;
 mod event;
+mod fair_semaphore;
 pub(crate) mod internal;
 mod latch;
 mod lazy;

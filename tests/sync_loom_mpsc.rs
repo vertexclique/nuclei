@@ -26,6 +26,16 @@
 //! - **The count of senders is exact.** A weak sender's upgrade racing the last
 //!   strong sender's drop either wins, and the channel then stays open until
 //!   the new sender goes, or loses and finds the channel ended.
+//! - **The bounded channel's waiters are served in order, and a waiter that
+//!   leaves passes its share on.** A release racing two waiting reservations
+//!   serves the older one. A reservation dropped while a release grants it
+//!   (whole, or the rest of a share set aside for it) leaves its slots to the
+//!   reservation behind it, which is woken and served, and the capacity ends
+//!   whole. A close racing a grant ends the wait exactly once, either way,
+//!   and every slot comes back. Each of these models also counts the places
+//!   the semaphore handed a share on (a wait granted then dropped, a waiter
+//!   that withdrew as it was granted, a set-aside returned to the free count)
+//!   and fails unless its search reached the ones it is about.
 //!
 //! What the models do not cover. The message queue is kovan's segment queue,
 //! which loom cannot instrument; under `--cfg loom` the channel puts a
@@ -39,7 +49,9 @@
 //! Every calibration expects a failure the protocol does not allow, or an
 //! outcome the model must be able to reach, and must fail: without them a
 //! search that never reached the bad interleaving would pass for the same
-//! reason a correct one does.
+//! reason a correct one does. The fair semaphore's calibrations switch on a
+//! mutation inside the crate (`loom_model::fair_drop_pass_on`) that drops a
+//! leaving waiter's share instead of handing it on, and must fail.
 
 #![cfg(loom)]
 
@@ -47,11 +59,12 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
 use std::task::{Context, Poll};
 
+use loom::sync::Notify as Park;
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use loom::sync::{Arc, Notify as Park};
 use loom::thread;
 
 use nuclei::sync::atomic_waker::AtomicWaker;
+use nuclei::sync::loom_model::{fair_drop_pass_on, fair_handoff_counts};
 use nuclei::sync::mpsc::{
     self,
     error::{SendError, TrySendError},
@@ -418,12 +431,15 @@ fn a_permit_sending_wakes_a_closed_receiver_which_gets_the_value() {
     );
 }
 
+/// The slot is granted to the waiter directly, with no retry or withdrawal
+/// after its wake, so the path has few atomic steps: the search is about 7,000
+/// interleavings at three preemptions.
 #[test]
 fn a_permit_dropping_racing_a_waiting_sender_hands_it_the_slot() {
     explore(
         "a_permit_dropping_racing_a_waiting_sender_hands_it_the_slot",
         3,
-        7000,
+        5000,
         || {
             let (tx, mut rx) = mpsc::channel::<u8>(1);
             let permit = tx.clone().try_reserve_owned().expect("the slot is free");
@@ -584,6 +600,213 @@ fn an_upgrade_racing_the_last_strong_drop_wins_cleanly_or_finds_the_end() {
     );
 }
 
+// ---- the fair semaphore's handshake ----
+
+/// The places the fair semaphore hands a leaving waiter's share on, in the
+/// order `loom_model::fair_handoff_counts` reports them.
+const GRANTED_THEN_DROPPED: usize = 0;
+const WITHDREW_AT_GRANT: usize = 1;
+const RETURNED_TO_WORD: usize = 2;
+
+/// [`explore`], then fails the model unless its search handed a share on at
+/// every place in `places` at least once.
+fn explore_handoffs(
+    name: &str,
+    preemptions: usize,
+    min_interleavings: usize,
+    places: &[usize],
+    model: impl Fn() + Sync + Send + 'static,
+) {
+    fair_handoff_counts();
+    explore(name, preemptions, min_interleavings, model);
+    let counts = fair_handoff_counts();
+    println!(
+        "loom model {name}: shares handed on {} times by a wait granted then dropped, {} by a \
+         waiter that withdrew at its grant, {} back to the free count",
+        counts[GRANTED_THEN_DROPPED], counts[WITHDREW_AT_GRANT], counts[RETURNED_TO_WORD]
+    );
+    for &place in places {
+        assert!(
+            counts[place] > 0,
+            "{name}: the search never handed a share on at place {place}"
+        );
+    }
+}
+
+/// Polls `future` once with a waker that does nothing.
+fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+    std::pin::Pin::new(future).poll(&mut Context::from_waker(std::task::Waker::noop()))
+}
+
+/// Two reservations wait on a full channel of one slot; the slot's permit
+/// drops on another thread while the first reservation is dropped. Whichever
+/// comes first (the grant, the withdrawal, or the withdrawal between the
+/// pass picking the waiter and granting it), the slot reaches the second
+/// reservation, whose waker is called, and the capacity ends whole.
+#[test]
+fn a_reservation_dropped_racing_its_grant_passes_the_slot_on() {
+    explore_handoffs(
+        "a_reservation_dropped_racing_its_grant_passes_the_slot_on",
+        3,
+        200,
+        &[GRANTED_THEN_DROPPED, WITHDREW_AT_GRANT],
+        || {
+            let (tx, rx) = mpsc::channel::<u8>(1);
+            let permit = tx.clone().try_reserve_owned().expect("the slot is free");
+            let mut first = Box::pin(tx.reserve());
+            let mut second = Box::pin(tx.reserve());
+            assert!(poll_once(&mut first).is_pending());
+            assert!(poll_once(&mut second).is_pending());
+            let releaser = thread::spawn(move || drop(permit));
+            drop(first);
+            let served = block_on(second).expect("the receiver is alive");
+            releaser.join().expect("releaser");
+            drop(served);
+            assert_eq!(tx.capacity(), 1, "a slot was lost or made up");
+            drop(rx);
+        },
+    );
+}
+
+/// As above with a share: a request for two slots holds one set aside and
+/// waits for the other, with a single reservation behind it. The second
+/// slot's permit drops on another thread while the request for two is
+/// dropped. The reservation behind is served, and both slots end free.
+#[test]
+fn a_waiting_reserve_many_dropped_racing_its_grant_passes_its_share_on() {
+    explore_handoffs(
+        "a_waiting_reserve_many_dropped_racing_its_grant_passes_its_share_on",
+        3,
+        200,
+        &[GRANTED_THEN_DROPPED, WITHDREW_AT_GRANT, RETURNED_TO_WORD],
+        || {
+            let (tx, rx) = mpsc::channel::<u8>(2);
+            let held = tx
+                .clone()
+                .try_reserve_owned()
+                .expect("the first slot is free");
+            let last = tx
+                .clone()
+                .try_reserve_owned()
+                .expect("the second slot is free");
+            let mut many = Box::pin(tx.reserve_many(2));
+            let mut one = Box::pin(tx.reserve());
+            assert!(poll_once(&mut many).is_pending());
+            assert!(poll_once(&mut one).is_pending());
+            drop(held);
+            assert_eq!(
+                tx.capacity(),
+                0,
+                "the first slot is set aside for the request"
+            );
+            let releaser = thread::spawn(move || drop(last));
+            drop(many);
+            let served = block_on(one).expect("the receiver is alive");
+            releaser.join().expect("releaser");
+            drop(served);
+            assert_eq!(tx.capacity(), 2, "a slot was lost or made up");
+            drop(rx);
+        },
+    );
+}
+
+/// A release on another thread races two waiting reservations of one slot:
+/// the one that began to wait first gets the slot, and the later one waits
+/// until that slot comes back.
+#[test]
+fn a_release_racing_two_waiting_reservations_serves_the_older_one() {
+    explore(
+        "a_release_racing_two_waiting_reservations_serves_the_older_one",
+        3,
+        100,
+        || {
+            let (tx, rx) = mpsc::channel::<u8>(1);
+            let permit = tx.clone().try_reserve_owned().expect("the slot is free");
+            let mut older = Box::pin(tx.reserve());
+            let mut later = Box::pin(tx.reserve());
+            assert!(poll_once(&mut older).is_pending());
+            assert!(poll_once(&mut later).is_pending());
+            let releaser = thread::spawn(move || drop(permit));
+            let first = block_on(older).expect("the receiver is alive");
+            assert!(
+                poll_once(&mut later).is_pending(),
+                "the later reservation got a slot the older one holds"
+            );
+            releaser.join().expect("releaser");
+            drop(first);
+            let second = block_on(later).expect("the receiver is alive");
+            drop(second);
+            assert_eq!(tx.capacity(), 1);
+            drop(rx);
+        },
+    );
+}
+
+/// The receiver closes while another thread's release completes a waiting
+/// request for two slots, one of them already set aside for it. The request
+/// ends exactly once: granted (its two slots then send values the receiver
+/// gets before the end) or failed by the close. Either way every slot comes
+/// back, and the receiver finishes. Both outcomes must be reached.
+#[test]
+fn a_close_racing_a_grant_ends_the_wait_once_and_returns_every_slot() {
+    let granted = std::sync::Arc::new(StdAtomicUsize::new(0));
+    let failed = std::sync::Arc::new(StdAtomicUsize::new(0));
+    let outcomes = (
+        std::sync::Arc::clone(&granted),
+        std::sync::Arc::clone(&failed),
+    );
+    explore_handoffs(
+        "a_close_racing_a_grant_ends_the_wait_once_and_returns_every_slot",
+        3,
+        200,
+        &[RETURNED_TO_WORD],
+        move || {
+            let (tx, mut rx) = mpsc::channel::<u8>(2);
+            let held = tx
+                .clone()
+                .try_reserve_owned()
+                .expect("the first slot is free");
+            let last = tx
+                .clone()
+                .try_reserve_owned()
+                .expect("the second slot is free");
+            let mut many = Box::pin(tx.reserve_many(2));
+            assert!(poll_once(&mut many).is_pending());
+            drop(held);
+            let releaser = thread::spawn(move || drop(last));
+            rx.close();
+            releaser.join().expect("releaser");
+            // Every pass has run: the request has its answer.
+            let sent = match poll_once(&mut many) {
+                Poll::Ready(Ok(permits)) => {
+                    for (permit, value) in permits.zip(1..) {
+                        permit.send(value);
+                    }
+                    outcomes.0.fetch_add(1, StdOrdering::Relaxed);
+                    vec![1, 2]
+                }
+                Poll::Ready(Err(SendError(()))) => {
+                    outcomes.1.fetch_add(1, StdOrdering::Relaxed);
+                    vec![]
+                }
+                Poll::Pending => panic!("the request was neither granted nor failed"),
+            };
+            drop(many);
+            let mut received = Vec::new();
+            while let Some(value) = block_on(rx.recv()) {
+                received.push(value);
+            }
+            assert_eq!(received, sent);
+            assert_eq!(tx.capacity(), 2, "a slot was lost or made up");
+        },
+    );
+    assert!(
+        granted.load(StdOrdering::Relaxed) > 0,
+        "the grant never won"
+    );
+    assert!(failed.load(StdOrdering::Relaxed) > 0, "the close never won");
+}
+
 // ---- calibration ----
 
 /// The receiver's poll without the re-check after the registration: a send
@@ -675,6 +898,88 @@ fn calibration_the_try_send_can_win_against_the_close() {
             sender.join().expect("sender");
             drop(rx);
             assert!(!outcome.load(Ordering::Acquire), "the send came first");
+        },
+    );
+}
+
+/// The cancellation model above, with the mutation that drops a leaving
+/// waiter's share instead of handing it on: a search that reaches a dropped
+/// request's grant, or its withdrawal at the grant, finds the reservation
+/// behind it never served and the capacity short, and must fail.
+#[test]
+#[should_panic(expected = "the share of a dropped reservation was lost")]
+fn calibration_a_share_that_is_not_handed_on_is_lost() {
+    explore(
+        "calibration_a_share_that_is_not_handed_on_is_lost",
+        3,
+        1,
+        || {
+            fair_drop_pass_on(true);
+            let (tx, rx) = mpsc::channel::<u8>(2);
+            let held = tx
+                .clone()
+                .try_reserve_owned()
+                .expect("the first slot is free");
+            let last = tx
+                .clone()
+                .try_reserve_owned()
+                .expect("the second slot is free");
+            let mut many = Box::pin(tx.reserve_many(2));
+            let mut one = Box::pin(tx.reserve());
+            assert!(poll_once(&mut many).is_pending());
+            assert!(poll_once(&mut one).is_pending());
+            drop(held);
+            let releaser = thread::spawn(move || drop(last));
+            drop(many);
+            releaser.join().expect("releaser");
+            // Every pass has run, so a share handed on has reached `one`.
+            let served = poll_once(&mut one).is_ready();
+            drop(one);
+            let capacity = tx.capacity();
+            // A loom `Arc` dropped while the failed assertion unwinds aborts the
+            // process, so the channel goes first.
+            drop((tx, rx));
+            fair_drop_pass_on(false);
+            assert!(
+                served && capacity == 2,
+                "the share of a dropped reservation was lost"
+            );
+        },
+    );
+}
+
+/// The close model above, with the same mutation: the close no longer
+/// returns the slot set aside for the request it fails, so a search that
+/// reaches the close first finds the capacity short, and must fail.
+#[test]
+#[should_panic(expected = "the close kept a set-aside slot")]
+fn calibration_a_close_that_does_not_return_the_set_aside_loses_it() {
+    explore(
+        "calibration_a_close_that_does_not_return_the_set_aside_loses_it",
+        3,
+        1,
+        || {
+            fair_drop_pass_on(true);
+            let (tx, mut rx) = mpsc::channel::<u8>(2);
+            let held = tx
+                .clone()
+                .try_reserve_owned()
+                .expect("the first slot is free");
+            let last = tx
+                .clone()
+                .try_reserve_owned()
+                .expect("the second slot is free");
+            let mut many = Box::pin(tx.reserve_many(2));
+            assert!(poll_once(&mut many).is_pending());
+            drop(held);
+            let releaser = thread::spawn(move || drop(last));
+            rx.close();
+            releaser.join().expect("releaser");
+            drop(many);
+            let capacity = tx.capacity();
+            drop((tx, rx));
+            fair_drop_pass_on(false);
+            assert_eq!(capacity, 2, "the close kept a set-aside slot");
         },
     );
 }

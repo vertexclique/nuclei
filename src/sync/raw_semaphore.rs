@@ -1,6 +1,8 @@
 //! The permit core of [`Semaphore`](super::Semaphore), which
-//! [`Mutex`](super::Mutex), [`ReentrantMutex`](super::ReentrantMutex),
-//! [`OnceCell`](super::OnceCell) and the bounded channel build on too.
+//! [`Mutex`](super::Mutex), [`ReentrantMutex`](super::ReentrantMutex) and
+//! [`OnceCell`](super::OnceCell) build on too. The bounded channel serves its
+//! slots strictly in order instead, through `fair_semaphore`, on the same
+//! state word layout.
 //!
 //! The state word holds the free permits above the queue's bits and one
 //! closed bit. A request takes its permits whenever enough are free and no
@@ -50,6 +52,18 @@ pub(super) fn closed_in(state: usize) -> bool {
     state & CLOSED != 0
 }
 
+/// The transition that closes a semaphore's state word: always a draining
+/// one, even with nobody queued, so a waiter that queues concurrently either
+/// is seen by this pass or finds the bit in the pass its own enqueue runs.
+/// Closing twice does nothing.
+pub(super) fn close_step(state: usize) -> Step {
+    if closed_in(state) {
+        Step::Keep
+    } else {
+        Step::Drain(state | CLOSED)
+    }
+}
+
 /// Whether a state word seen by a failed attempt says the semaphore closed.
 ///
 /// An attempt reads the word without ordering, which is all it needs to take
@@ -90,7 +104,7 @@ impl RawSemaphore {
     loom_const_fn! {
         /// A semaphore whose contended acquires never spin: for permits
         /// their holders keep across long waits of their own (a once-cell's
-        /// initializer turn, a bounded channel's slots), where a spin could
+        /// initializer turn, for example), where a spin could
         /// only burn the caller's time.
         pub(super) fn without_spin(permits: usize) -> Self {
             assert!(permits <= MAX, "a semaphore holds at most Semaphore::MAX_PERMITS permits");
@@ -259,16 +273,7 @@ impl RawSemaphore {
     /// Closes the semaphore: every waiter ends in `Closed`, and nothing is
     /// admitted from now on. Closing twice does nothing.
     pub(super) fn close(&self) {
-        // Always a draining transition, even with nobody queued: a waiter
-        // that queues concurrently either is seen by this pass or finds the
-        // bit in the pass its own enqueue runs.
-        self.transition(|state| {
-            if closed_in(state) {
-                Step::Keep
-            } else {
-                Step::Drain(state | CLOSED)
-            }
-        });
+        self.transition(close_step);
     }
 }
 

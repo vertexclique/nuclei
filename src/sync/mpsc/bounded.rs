@@ -1,29 +1,35 @@
 //! The bounded channel: [`channel`], its [`Sender`] and its [`WeakSender`].
 //!
-//! The channel's admission control is a [`RawSemaphore`] of `buffer` permits.
-//! A send takes one permit (a reservation is exactly that), the receiver gives
-//! one back per value it takes, and a permit dropped unused goes back too. So
-//! the permits free plus the values queued plus the reservations held are
+//! The channel's admission control is a [`FairSemaphore`] of `buffer`
+//! permits. A send takes one permit (a reservation is exactly that), the
+//! receiver gives one back per value it takes, and a permit dropped unused
+//! goes back too. So the permits free, plus the ones set aside for a waiting
+//! reservation, plus the values queued, plus the reservations held, are
 //! always `buffer`, and the queue can never hold more than `buffer` values.
-//! The receiver closing closes the semaphore: waiting senders end at once, and
-//! every later reservation fails.
 //!
-//! The semaphore is the one that never spins (`without_spin`): a slot is held
-//! across the receiver's own pace, which is long next to a spin.
+//! The semaphore serves reservations strictly in the order they began to
+//! wait, as the established API does: a `try_` attempt or a new reservation
+//! never takes a slot while an older one waits, and a reservation for many
+//! slots keeps the ones set aside for it while it waits for the rest. The
+//! receiver closing closes the semaphore: waiting senders end at once, what
+//! was set aside for them comes back, and every later reservation fails.
 
 use core::fmt;
-use core::mem;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use super::chan::{Chan, Limit};
 use super::error::{SendError, TrySendError};
 use super::permit::{OwnedPermit, Permit, PermitIterator};
 use super::receiver::Receiver;
+use crate::sync::fair_semaphore::{FairSemaphore, FairWait};
 use crate::sync::internal::{self, Arc};
-use crate::sync::raw_semaphore::{RawSemaphore, observed_closed};
+use crate::sync::raw_semaphore::observed_closed;
 
 /// The bounded flavor's limit: `bound` permits.
 pub(super) struct Bounded {
-    pub(super) sem: RawSemaphore,
+    pub(super) sem: FairSemaphore,
     pub(super) bound: usize,
 }
 
@@ -88,7 +94,7 @@ impl Limit for Bounded {
 pub fn channel<T: 'static>(buffer: usize) -> (Sender<T>, Receiver<T>) {
     assert!(buffer > 0, "mpsc bounded channel requires buffer > 0");
     let chan = Arc::new(Chan::new(Bounded {
-        sem: RawSemaphore::without_spin(buffer),
+        sem: FairSemaphore::new(buffer),
         bound: buffer,
     }));
     let tx = Sender {
@@ -114,11 +120,19 @@ pub fn channel<T: 'static>(buffer: usize) -> (Sender<T>, Receiver<T>) {
 /// Lock-free, not wait-free: [`try_send`](Self::try_send), the `try_reserve`
 /// family, and every poll of [`send`](Self::send) and the `reserve` family.
 /// A permit is taken with a compare-and-swap that retries when another thread
-/// changed the semaphore first; a contended wait queues a node on the
-/// semaphore's lock-free queue; and the push of a value onto the message queue
-/// retries when it loses a slot to another sender and allocates a segment
-/// when the last one is full. Some thread's call completes whenever any
-/// retries. [`closed`](Self::closed) is lock-free for the same reason.
+/// changed the semaphore first; a wait that has to queue pushes a node on the
+/// semaphore's lock-free arrival stack and may serve the queue (one pass, plus
+/// one for each operation of another thread that lands meanwhile); and the
+/// push of a value onto the message queue retries when it loses a slot to
+/// another sender and allocates a segment when the last one is full. Some
+/// thread's call completes whenever any retries. [`closed`](Self::closed) is
+/// lock-free for the same reason.
+///
+/// A waiting reservation is granted by whichever thread serves the queue once
+/// its slots are free (the receiver taking a value, a permit dropped), so a
+/// thread the scheduler stops while it serves the queue delays that grant
+/// until it runs again; for that moment a `try_` attempt fails as well, even
+/// if the last waiting reservation has just left. No call waits for it.
 ///
 /// `blocking_send` parks the calling thread until there is room.
 pub struct Sender<T: 'static> {
@@ -170,8 +184,9 @@ impl<T: 'static> Sender<T> {
     /// not sent, and the value is dropped. To keep the value, reserve capacity
     /// with [`reserve`](Self::reserve) and send through the [`Permit`].
     ///
-    /// Waiting reservations are served oldest first. Dropping the future gives
-    /// up its place.
+    /// Waiting sends and reservations are served in the order they began to
+    /// wait. Dropping the future gives up its place, and a slot it was handed
+    /// meanwhile goes on to the next one.
     ///
     /// ```
     /// # use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
@@ -229,11 +244,12 @@ impl<T: 'static> Sender<T> {
     /// Sends a value at once, or says why it cannot be sent.
     ///
     /// Unlike [`send`](Self::send) it never waits: a full buffer is an error.
+    /// It never takes a slot ahead of a send or reservation that is waiting.
     ///
     /// # Errors
     ///
-    /// [`TrySendError::Full`] if the buffer holds `buffer` values or
-    /// reservations, [`TrySendError::Closed`] if the receiver closed or was
+    /// [`TrySendError::Full`] if no slot is free or a send or reservation is
+    /// waiting, [`TrySendError::Closed`] if the receiver closed or was
     /// dropped. Both hold the value back.
     ///
     /// ```
@@ -305,8 +321,9 @@ impl<T: 'static> Sender<T> {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future gives up its place in the queue of waiters. No
-    /// slot is held by a dropped future.
+    /// Dropping the future gives up its place in the queue of waiters, and a
+    /// slot it was handed meanwhile goes on to the next one. No slot is held
+    /// by a dropped future.
     ///
     /// ```
     /// # use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
@@ -332,8 +349,11 @@ impl<T: 'static> Sender<T> {
     /// Waits for capacity for `n` messages and reserves them.
     ///
     /// The returned [`PermitIterator`] yields `n` permits; dropping it before
-    /// it is exhausted gives the rest back. The slots are taken together, so a
-    /// request for `n` waits until `n` are free at once.
+    /// it is exhausted gives the rest back. Waiting requests are served in the
+    /// order they began to wait, whatever each asks for: the slots that come
+    /// free are set aside for the oldest one until it has all `n`, and nothing
+    /// behind it is served first. Slots set aside for a request do not count
+    /// in [`capacity`](Self::capacity).
     ///
     /// # Errors
     ///
@@ -344,7 +364,8 @@ impl<T: 'static> Sender<T> {
     ///
     /// # Cancel safety
     ///
-    /// As for [`reserve`](Self::reserve).
+    /// As for [`reserve`](Self::reserve): the slots set aside for a dropped
+    /// request go on to the next one.
     ///
     /// ```
     /// # use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
@@ -385,8 +406,8 @@ impl<T: 'static> Sender<T> {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future gives up its place in the queue of waiters and
-    /// drops the sender it holds.
+    /// Dropping the future gives up its place in the queue of waiters, passes
+    /// on a slot it was handed meanwhile, and drops the sender it holds.
     ///
     /// ```
     /// # use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
@@ -410,11 +431,13 @@ impl<T: 'static> Sender<T> {
     }
 
     /// Reserves capacity for one message if there is any, without waiting.
+    /// It never takes a slot ahead of a send or reservation that is waiting.
     ///
     /// # Errors
     ///
-    /// [`TrySendError::Full`] when no slot is free, [`TrySendError::Closed`]
-    /// when the receiver closed or was dropped.
+    /// [`TrySendError::Full`] when no slot is free or a send or reservation
+    /// is waiting, [`TrySendError::Closed`] when the receiver closed or was
+    /// dropped.
     ///
     /// ```
     /// use nuclei::sync::mpsc;
@@ -435,10 +458,10 @@ impl<T: 'static> Sender<T> {
     ///
     /// # Errors
     ///
-    /// [`TrySendError::Full`] when fewer than `n` slots are free (or `n` is
-    /// more than the channel can ever hold), [`TrySendError::Closed`] when the
-    /// receiver closed or was dropped. `n == 0` succeeds with an empty
-    /// iterator unless the channel is closed.
+    /// [`TrySendError::Full`] when fewer than `n` slots are free, a send or
+    /// reservation is waiting, or `n` is more than the channel can ever hold;
+    /// [`TrySendError::Closed`] when the receiver closed or was dropped.
+    /// `n == 0` succeeds with an empty iterator unless the channel is closed.
     ///
     /// ```
     /// use nuclei::sync::mpsc;
@@ -467,8 +490,9 @@ impl<T: 'static> Sender<T> {
     /// # Errors
     ///
     /// On failure the sender is handed back inside the error:
-    /// [`TrySendError::Full`] when no slot is free, [`TrySendError::Closed`]
-    /// when the receiver closed or was dropped.
+    /// [`TrySendError::Full`] when no slot is free or a send or reservation
+    /// is waiting, [`TrySendError::Closed`] when the receiver closed or was
+    /// dropped.
     ///
     /// ```
     /// use nuclei::sync::mpsc;
@@ -505,7 +529,8 @@ impl<T: 'static> Sender<T> {
     /// The channel's current capacity: the slots that are free.
     ///
     /// It goes down when a value is sent or a slot is reserved, and up when the
-    /// receiver takes a value or a permit is dropped unused. Compare
+    /// receiver takes a value or a permit is dropped unused. A slot set aside
+    /// for a waiting [`reserve_many`](Self::reserve_many) is not free. Compare
     /// [`max_capacity`](Self::max_capacity), which never changes.
     ///
     /// ```
@@ -632,43 +657,62 @@ fn try_reserve_inner<T: 'static>(
     chan: &Chan<T, Bounded>,
     n: usize,
 ) -> Result<(), TrySendError<()>> {
-    match chan.limit.sem.try_acquire_permit(n) {
-        Ok(permit) => {
-            permit.forget();
-            Ok(())
-        }
+    match chan.limit.sem.try_acquire(n) {
+        Ok(()) => Ok(()),
         Err(seen) if observed_closed(seen) => Err(TrySendError::Closed(())),
         Err(_) => Err(TrySendError::Full(())),
     }
 }
 
 /// Waits for `n` slots, which the caller then owns as [`Permit`]s.
-///
-/// A wait that ends without handing its slots on (it failed, or was
-/// cancelled after being handed some) leaves the channel idle at the moment
-/// its permits go back, with no receiver call to notice: so the guard wakes a
-/// receiver that is waiting for a closed channel to go idle.
 async fn reserve_inner<T: 'static>(chan: &Chan<T, Bounded>, n: usize) -> Result<(), SendError<()>> {
-    struct WakeReceiverOnDrop<'a, T: 'static>(&'a Chan<T, Bounded>);
-
-    impl<T: 'static> Drop for WakeReceiverOnDrop<'_, T> {
-        fn drop(&mut self) {
-            self.0.wake_if_finished();
-        }
-    }
-
     if n > chan.limit.bound {
         return Err(SendError(()));
     }
-    let guard = WakeReceiverOnDrop(chan);
-    match chan.limit.sem.acquire(n).await {
-        Ok(permit) => {
-            // The slots are the caller's now: its permits return them.
-            permit.forget();
-            mem::forget(guard);
-            Ok(())
+    Reserve {
+        chan,
+        n,
+        wait: FairWait::new(),
+        taken: false,
+    }
+    .await
+}
+
+/// The wait of [`reserve_inner`].
+///
+/// A wait that ends without its slots becoming the caller's (it failed, or
+/// it was dropped, perhaps just after a grant) can leave a closed channel
+/// idle once what it held is back, with no receiver call to notice: so its
+/// drop wakes a receiver that waits for a closed channel to go idle, after
+/// the wait has left the queue.
+struct Reserve<'a, T: 'static> {
+    chan: &'a Chan<T, Bounded>,
+    n: usize,
+    wait: FairWait,
+    /// The slots are the caller's: they leave with its permits.
+    taken: bool,
+}
+
+impl<T: 'static> Future for Reserve<'_, T> {
+    type Output = Result<(), SendError<()>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.wait
+            .poll(&this.chan.limit.sem, this.n, cx.waker())
+            .map(|taken| {
+                this.taken = taken.is_ok();
+                taken.map_err(|_| SendError(()))
+            })
+    }
+}
+
+impl<T: 'static> Drop for Reserve<'_, T> {
+    fn drop(&mut self) {
+        if !self.taken {
+            self.wait.cancel(&self.chan.limit.sem, self.n);
+            self.chan.wake_if_finished();
         }
-        Err(_) => Err(SendError(())),
     }
 }
 
@@ -693,6 +737,24 @@ mod tests {
     fn a_zero_buffer_is_refused() {
         let refused = std::panic::catch_unwind(|| channel::<u8>(0));
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_reserve_granted_then_dropped_after_the_close_wakes_the_receiver() {
+        let (tx, mut rx) = channel::<()>(1);
+        let held = tx.try_reserve().unwrap();
+        let mut reserve = Polled::new(tx.reserve());
+        reserve.pending();
+        drop(held);
+        assert_eq!(reserve.wakes(), 1, "the slot was granted to the waiter");
+        assert_eq!(tx.capacity(), 0);
+        rx.close();
+        let mut recv = Polled::new(rx.recv());
+        recv.pending();
+        drop(reserve);
+        assert_eq!(tx.capacity(), 1, "the granted slot came back");
+        assert_eq!(recv.wakes(), 1, "and the closed receiver was told");
+        assert_eq!(recv.ready(), None);
     }
 
     #[test]

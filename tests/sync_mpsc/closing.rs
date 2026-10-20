@@ -130,40 +130,29 @@ fn dropping_the_last_permit_iterator_wakes_a_closed_receiver() {
     assert_eq!(recv.ready(), None);
 }
 
-/// A reservation that was handed its slot directly (a waiter that lost
-/// `MAX_BYPASS` retries is owed the next release) holds a slot nobody else
-/// can see. Cancelling it gives the slot back through the semaphore, not
+/// A waiting reservation is handed its slot as soon as the slot is free, and
+/// holds it before it has polled: nobody else can see that slot. Dropping
+/// the reservation then gives the slot back through the semaphore, not
 /// through a permit, so the reservation itself must wake a receiver that is
 /// waiting for the closed channel to go idle.
 #[test]
-fn a_handed_off_slot_returned_by_a_cancelled_reserve_wakes_the_closed_receiver() {
+fn a_handed_slot_returned_by_a_cancelled_reserve_wakes_the_closed_receiver() {
     let (tx, mut rx) = mpsc::channel::<()>(1);
-    let mut held = tx.try_reserve().unwrap();
+    let held = tx.try_reserve().unwrap();
 
     let mut waiter = Task::new(tx.reserve());
     waiter.pending();
 
-    // Let the waiter lose its retries to a caller that barges in each time,
-    // until the next release is handed to it.
-    let mut rounds = 0;
-    loop {
-        drop(held);
-        if tx.capacity() == 0 {
-            break; // The release went straight to the waiter.
-        }
-        held = tx.try_reserve().expect("the slot is free to barge into");
-        waiter.pending();
-        rounds += 1;
-        assert!(rounds < 100, "the waiter was never owed a handoff");
-    }
-    assert!(waiter.is_woken(), "the handoff woke the waiter");
+    drop(held);
+    assert!(waiter.is_woken(), "the freed slot was handed to the waiter");
+    assert_eq!(tx.capacity(), 0, "and it holds the slot before polling");
 
     rx.close();
     let mut recv = Task::new(rx.recv());
     recv.pending();
 
     drop(waiter);
-    assert_eq!(tx.capacity(), 1, "the handed-off slot came back");
+    assert_eq!(tx.capacity(), 1, "the handed slot came back");
     assert!(recv.is_woken(), "and the closed receiver was told");
     assert_eq!(recv.ready(), None);
 }
@@ -219,18 +208,55 @@ fn a_reservation_cancelled_after_the_close_wakes_a_receiver_waiting_for_idle() {
 
     let mut reserve = Task::new(tx.reserve_many(2));
     reserve.pending();
+    assert_eq!(
+        tx.capacity(),
+        0,
+        "the free slot is set aside for the request"
+    );
 
     rx.close();
+    // The close ends the waiting request, and the slot set aside for it
+    // comes back with the close (see the module docs, Differences).
+    assert!(reserve.is_woken());
+    assert_eq!(tx.capacity(), 1);
 
     let mut recv = Task::new(rx.recv());
     recv.pending();
 
-    // This channel's reservations hold nothing while they wait, so the permit
-    // is the last thing outstanding: giving it back ends the receiver's wait.
+    // The permit is the last thing outstanding: giving it back ends the
+    // receiver's wait.
     drop(permit);
     assert!(recv.is_woken());
+    assert!(reserve.ready().is_err());
     drop(reserve);
     assert_eq!(recv.ready(), None);
+    assert_eq!(tx.capacity(), 2);
+}
+
+#[test]
+fn a_waiting_reservation_cancelled_before_the_close_passes_its_share_on() {
+    let (tx, mut rx) = mpsc::channel::<u8>(2);
+
+    let permit = tx.try_reserve().unwrap();
+    let mut many = Task::new(tx.reserve_many(2));
+    many.pending();
+    let mut one = Task::new(tx.reserve());
+    one.pending();
+    assert_eq!(tx.capacity(), 0);
+
+    // The request for two leaves; the slot set aside for it goes on to the
+    // reservation behind it.
+    drop(many);
+    assert!(one.is_woken());
+    let second = one.ready().unwrap();
+
+    rx.close();
+    permit.send(1);
+    second.send(2);
+    assert_eq!(block_on(rx.recv()), Some(1));
+    assert_eq!(block_on(rx.recv()), Some(2));
+    assert_eq!(block_on(rx.recv()), None);
+    assert_eq!(tx.capacity(), 2);
 }
 
 #[test]

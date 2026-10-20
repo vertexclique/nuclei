@@ -36,6 +36,11 @@
 //! found nobody queued drops that request, so it runs one pass. Its
 //! calibration writes the release the old way, raising the dirty bit, and
 //! must fail.
+//!
+//! Last, two entry points for the bounded channel's models in
+//! `tests/sync_loom_mpsc.rs`: the counts of the places the channel's fair
+//! semaphore handed a leaving waiter's share on, and the switch of the
+//! calibration that drops every such share instead.
 
 use core::cell::Cell;
 use core::task::Waker;
@@ -598,4 +603,20 @@ fn node_spin_model(name: &'static str, floors: [usize; 3]) {
         "{name}: {late} marks seen only by the look, below the floor {}",
         floors[2]
     );
+}
+
+/// How often the bounded channel's fair semaphore handed a leaving waiter's
+/// share on since the last call, by place: a wait granted then dropped, a
+/// front waiter that withdrew as it was granted, and a set-aside returned to
+/// the state word. The models in `tests/sync_loom_mpsc.rs` read it to show
+/// their search reached each place.
+pub fn fair_handoff_counts() -> [usize; 3] {
+    super::fair_semaphore::probe::take()
+}
+
+/// The calibration's mutation of the fair semaphore: while on, every share a
+/// leaving waiter held is dropped instead of handed on. A model that turns it
+/// on must fail.
+pub fn fair_drop_pass_on(on: bool) {
+    super::fair_semaphore::probe::drop_pass_on(on);
 }

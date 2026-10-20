@@ -1,8 +1,9 @@
 //! Tests of `nuclei::sync::mpsc`: the behaviour of the established async
 //! channel API it follows, checked call by call (the bounded and the unbounded
-//! flavor, permits, closing, weak senders, receive-many); where this channel
-//! differs on purpose (all-or-nothing reservations, a sender that may barge
-//! past waiters, a `try_recv` that never waits) the test says so; drop
+//! flavor, permits, closing, weak senders, receive-many, and the first come,
+//! first served order of the bounded channel's waiting senders); where this
+//! channel differs on purpose (a `try_recv` that never waits, the slots of a
+//! waiting reservation coming back at the close) the test says so; drop
 //! accounting, wakers, and threads racing sends, receives, closes and drops.
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -26,6 +27,8 @@ mod bounded;
 mod closing;
 #[path = "sync_mpsc/drops.rs"]
 mod drops;
+#[path = "sync_mpsc/fairness.rs"]
+mod fairness;
 #[path = "sync_mpsc/ordering.rs"]
 mod ordering;
 #[path = "sync_mpsc/permits.rs"]

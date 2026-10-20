@@ -213,22 +213,28 @@ fn dropping_a_permit_iterator_unused_frees_its_slots() {
 }
 
 #[test]
-fn a_reserve_many_holds_no_slot_while_it_waits_for_all_of_them() {
-    // The established API holds the free slots while it waits for the rest;
-    // this channel takes all or none, so a smaller request may go ahead.
-    let (tx, mut rx) = mpsc::channel(2);
+fn a_waiting_reserve_many_holds_the_free_slots_while_it_waits_for_the_rest() {
+    let (tx, rx) = mpsc::channel(2);
     let held = tx.try_reserve().unwrap();
 
     let mut many = Task::new(tx.reserve_many(2));
     many.pending();
-    assert_eq!(tx.capacity(), 1, "the waiting request holds nothing");
-    tx.try_send(1).unwrap();
+    assert_eq!(
+        tx.capacity(),
+        0,
+        "the free slot is set aside for the request"
+    );
+    assert_eq!(rx.capacity(), 0);
+    assert!(matches!(tx.try_send(1), Err(TrySendError::Full(1))));
+    assert!(matches!(tx.try_reserve(), Err(TrySendError::Full(()))));
 
     drop(held);
-    assert_eq!(rx.try_recv(), Ok(1));
     assert!(many.is_woken());
     let permits = many.ready().unwrap();
     assert_eq!(permits.len(), 2);
+    assert_eq!(tx.capacity(), 0);
+    drop(permits);
+    assert_eq!(tx.capacity(), 2);
 }
 
 #[test]

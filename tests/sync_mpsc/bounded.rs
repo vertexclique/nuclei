@@ -43,18 +43,21 @@ fn a_full_channel_holds_back_reservations_until_slots_come_back() {
     );
     assert!(!r4.is_woken(), "one slot is for one waiter");
 
-    // Dropping a permit unused frees a slot too. The semaphore has one nudge
-    // on its way already (r3's, not yet polled), so this release leaves the
-    // next wake to the poll that consumes it.
+    // Dropping a permit unused frees a slot too, for the next waiter.
     drop(permit2);
+    assert!(r4.is_woken(), "the dropped permit's slot goes to r4");
 
-    // This channel lets a caller take what is free even while others wait
-    // (see the semaphore), so both waiters find a slot when polled; and the
-    // slot r3 leaves free wakes r4 in turn.
+    // Both slots belong to the two woken reservations, though neither has
+    // polled yet: a new reservation waits behind them.
+    let mut r1 = Task::new(tx1.reserve());
+    r1.pending();
+    assert_eq!(tx1.capacity(), 0);
+
     let permit3 = r3.ready().unwrap();
-    assert!(r4.is_woken(), "a free slot with a waiter queued wakes it");
     let permit4 = r4.ready().unwrap();
-    drop((permit3, permit4));
+    drop(permit3);
+    assert!(r1.is_woken(), "the next slot back goes to the next waiter");
+    drop((permit4, r1.ready().unwrap()));
     assert_eq!(tx1.capacity(), 2);
 }
 
@@ -110,10 +113,11 @@ fn a_send_waits_for_the_receiver_and_is_woken_by_it() {
     assert!(block_on(rx.recv()).is_some());
     assert!(p2.is_woken());
 
-    // The slot the receiver freed is not taken yet, so a direct send finds it.
-    // Reserve first, then prove the channel is full.
+    // The freed slot was handed to the waiting reservation, which has not
+    // polled yet: a direct send does not get ahead of it.
+    assert!(matches!(tx.try_send(1337), Err(TrySendError::Full(1337))));
+
     let permit = p2.ready().unwrap();
-    assert!(tx.try_send(1337).is_err());
     permit.send(2);
     assert!(block_on(rx.recv()).is_some());
 }

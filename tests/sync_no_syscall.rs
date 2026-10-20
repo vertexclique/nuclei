@@ -6,9 +6,14 @@
 //! itself that allows `sched_yield` (kovan's queues yield under
 //! contention) and `exit_group` (to end the child) and kills the process
 //! on anything else. The hot loops then run: every primitive uncontended,
-//! every primitive contended between futures on one thread, and the locks
-//! and the semaphore contended across threads. The parent passes only if
-//! the child exits cleanly; a forbidden call shows up as death by SIGSYS.
+//! every primitive contended between futures on one thread, and the locks,
+//! the semaphore and both `mpsc` channels contended across threads. The
+//! channels run every non-blocking path: `send`, `recv`, `recv_many` and the
+//! reservations polled as futures, their `try_` forms, permits, a waiting
+//! send served by a receive, a waiting `reserve_many` that is dropped and
+//! passes its share on, `closed`, `close`, and weak senders. The parent
+//! passes only if the child exits cleanly; a forbidden call shows up as
+//! death by SIGSYS.
 //!
 //! The `blocking_*` methods are left out on purpose: they park the calling
 //! thread, which is a system call by design.
@@ -34,6 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
+use nuclei::sync::mpsc::{self, error::TrySendError};
 use nuclei::sync::{
     Barrier, Event, Latch, Lazy, MappedMutexGuard, Mutex, MutexGuard, Notify, OnceCell, Owner,
     ReentrantMutex, ReentrantRwLock, RwLock, RwLockWriteGuard, Semaphore, SetOnce,
@@ -226,11 +232,49 @@ struct Shared {
     mutex: Mutex<u64>,
     rwlock: RwLock<u64>,
     semaphore: Semaphore,
+    /// Fewer slots than contending threads, so sends wait for each other.
+    bounded: mpsc::Sender<u64>,
+    bounded_rx: Mutex<mpsc::Receiver<u64>>,
+    unbounded: mpsc::UnboundedSender<u64>,
+    unbounded_rx: Mutex<mpsc::UnboundedReceiver<u64>>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        let (bounded, bounded_rx) = mpsc::channel(2);
+        let (unbounded, unbounded_rx) = mpsc::unbounded_channel();
+        Self {
+            mutex: Mutex::new(0),
+            rwlock: RwLock::new(0),
+            semaphore: Semaphore::new(2),
+            bounded,
+            bounded_rx: Mutex::new(bounded_rx),
+            unbounded,
+            unbounded_rx: Mutex::new(unbounded_rx),
+        }
+    }
 }
 
 /// One thread's share of the cross-thread contention.
+///
+/// Each round sends one value on each channel and then, holding the
+/// receiver's lock, receives one: every receive starts after more sends
+/// completed than receives, so a value is always there for it.
 fn contend(shared: &Shared, rounds: usize, waker: &Waker, flag: &Flag) {
     for i in 0..rounds {
+        spin_on(shared.bounded.send(i as u64), waker, flag).expect("the receiver is alive");
+        shared
+            .unbounded
+            .send(i as u64)
+            .expect("the receiver is alive");
+        {
+            let mut rx = spin_on(shared.bounded_rx.lock(), waker, flag);
+            spin_on(rx.recv(), waker, flag).expect("a value was sent");
+        }
+        {
+            let mut rx = spin_on(shared.unbounded_rx.lock(), waker, flag);
+            spin_on(rx.recv(), waker, flag).expect("a value was sent");
+        }
         *spin_on(shared.mutex.lock(), waker, flag) += 1;
         match i % 4 {
             0 => *spin_on(shared.rwlock.write(), waker, flag) += 1,
@@ -251,9 +295,115 @@ fn contend(shared: &Shared, rounds: usize, waker: &Waker, flag: &Flag) {
     }
 }
 
+/// The channels' non-blocking paths on one thread: each call uncontended,
+/// a send waiting for a slot that a receive frees, and a waiting
+/// `reserve_many` dropped with a slot set aside for it, which passes the
+/// slot to the reservation behind it.
+fn channel_loops(rounds: usize, waker: &Waker, flag: &Flag) {
+    let (tx, mut rx) = mpsc::channel::<u64>(4);
+    let (one_tx, mut one_rx) = mpsc::channel::<u64>(1);
+    let (two_tx, mut two_rx) = mpsc::channel::<u64>(2);
+    let (utx, mut urx) = mpsc::unbounded_channel::<u64>();
+    let mut batch = Vec::with_capacity(4);
+    for i in 0..rounds as u64 {
+        {
+            tx.try_send(i).expect("room");
+            assert_eq!(rx.try_recv(), Ok(i));
+            assert!(poll_once(&mut pin!(tx.send(i)), waker).is_ready());
+            assert!(matches!(
+                poll_once(&mut pin!(rx.recv()), waker),
+                Poll::Ready(Some(_))
+            ));
+            tx.try_reserve().expect("room").send(i);
+            spin_on(tx.reserve(), waker, flag).expect("open").send(i);
+            let mut permits = tx.try_reserve_many(2).expect("room");
+            permits.next().expect("a permit").send(i);
+            drop(permits);
+            assert_eq!(spin_on(rx.recv_many(&mut batch, 4), waker, flag), 3);
+            batch.clear();
+            let mut permits = spin_on(tx.reserve_many(2), waker, flag).expect("open");
+            permits.next().expect("a permit").send(i);
+            drop(permits);
+            let owned = tx.clone().try_reserve_owned().expect("room");
+            let sender = owned.send(i);
+            let owned = spin_on(sender.reserve_owned(), waker, flag).expect("open");
+            drop(owned.release());
+            assert_eq!(spin_on(rx.recv_many(&mut batch, 4), waker, flag), 2);
+            batch.clear();
+            assert_eq!(tx.capacity(), 4);
+            let weak = tx.downgrade();
+            drop(weak.upgrade().expect("a sender lives"));
+        }
+        {
+            // A send waits for the only slot; the receive that frees it hands
+            // it to the waiting send.
+            one_tx.try_send(i).expect("room");
+            let mut waiting = pin!(one_tx.send(i + 1));
+            assert!(poll_once(&mut waiting, waker).is_pending());
+            assert!(matches!(one_tx.try_send(0), Err(TrySendError::Full(0))));
+            assert_eq!(one_rx.try_recv(), Ok(i));
+            assert!(poll_once(&mut waiting, waker).is_ready());
+            assert_eq!(one_rx.try_recv(), Ok(i + 1));
+        }
+        {
+            // A request for both slots waits with one set aside; dropping it
+            // passes that slot to the reservation behind.
+            two_tx.try_send(i).expect("room");
+            two_tx.try_send(i).expect("room");
+            let mut one = pin!(two_tx.reserve());
+            {
+                let mut both = pin!(two_tx.reserve_many(2));
+                assert!(poll_once(&mut both, waker).is_pending());
+                assert!(poll_once(&mut one, waker).is_pending());
+                assert_eq!(two_rx.try_recv(), Ok(i));
+                assert_eq!(two_tx.capacity(), 0);
+            }
+            match poll_once(&mut one, waker) {
+                Poll::Ready(Ok(permit)) => permit.send(i),
+                _ => panic!("the slot set aside for the dropped request was not passed on"),
+            }
+            assert_eq!(two_rx.try_recv(), Ok(i));
+            assert_eq!(two_rx.try_recv(), Ok(i));
+        }
+        {
+            let (closing_tx, mut closing_rx) = mpsc::channel::<u64>(1);
+            let mut closed = pin!(closing_tx.closed());
+            assert!(poll_once(&mut closed, waker).is_pending());
+            closing_rx.close();
+            assert!(poll_once(&mut closed, waker).is_ready());
+            assert!(matches!(
+                closing_tx.try_send(i),
+                Err(TrySendError::Closed(_))
+            ));
+            assert_eq!(spin_on(closing_rx.recv(), waker, flag), None);
+        }
+        {
+            utx.send(i).expect("receiver is alive");
+            assert_eq!(urx.try_recv(), Ok(i));
+            {
+                let mut waiting = pin!(urx.recv());
+                assert!(poll_once(&mut waiting, waker).is_pending());
+                utx.send(i).expect("receiver is alive");
+                assert!(matches!(
+                    poll_once(&mut waiting, waker),
+                    Poll::Ready(Some(_))
+                ));
+            }
+            for value in 0..3 {
+                utx.send(value).expect("receiver is alive");
+            }
+            assert_eq!(spin_on(urx.recv_many(&mut batch, 4), waker, flag), 3);
+            batch.clear();
+            let weak = utx.downgrade();
+            drop(weak.upgrade().expect("a sender lives"));
+        }
+    }
+}
+
 /// Every primitive on one thread, uncontended and contended between
 /// futures.
 fn single_thread_loops(rounds: usize, waker: &Waker, flag: &Flag) {
+    channel_loops(rounds, waker, flag);
     let mutex = Mutex::new(0u64);
     let rwlock = RwLock::new(0u64);
     let semaphore = Semaphore::new(2);
@@ -406,11 +556,7 @@ fn single_thread_loops(rounds: usize, waker: &Waker, flag: &Flag) {
 }
 
 fn child() -> ! {
-    let shared = Arc::new(Shared {
-        mutex: Mutex::new(0),
-        rwlock: RwLock::new(0),
-        semaphore: Semaphore::new(2),
-    });
+    let shared = Arc::new(Shared::new());
     let ready = Arc::new(AtomicUsize::new(0));
     let go = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicUsize::new(0));

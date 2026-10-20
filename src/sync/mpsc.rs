@@ -93,19 +93,16 @@
 //!   an async task, so they never panic for it; on a task they block the
 //!   thread (on `wasm32`, where nothing else can run, a call that would wait
 //!   forever panics instead).
-//! - A reservation is all or nothing: `reserve_many(n)` waits until `n` slots
-//!   are free together and holds none while it waits, where the established
-//!   API holds the free ones as it waits for the rest.
+//! - When the receiver closes, a reservation still waiting gives back the
+//!   slots set aside for it at the close, where the established API keeps
+//!   them with the failed wait until its future is dropped. So a closed
+//!   receiver's drain never waits for a failed reservation to be dropped.
 //! - [`Receiver::try_recv`] does not park the thread for a send that is in
 //!   progress on another thread. Such a value is not in the channel yet, and
 //!   its sender wakes the receiver when it is; the established API parks the
 //!   thread until the send finishes. The one place a receive does wait for a
 //!   sender is inside the queue (see [Progress](#progress)), where it spins
 //!   and yields the thread rather than parking it.
-//! - Reservations are not strictly first come, first served. The semaphore
-//!   wakes waiting reservations oldest first, but a caller that finds slots
-//!   free takes them even while others wait; a waiter that loses
-//!   [`MAX_BYPASS`](crate::sync::MAX_BYPASS) times is owed the next slot.
 //! - There is no cooperative-scheduling budget: a receiver that always finds a
 //!   value never yields.
 //!
@@ -135,8 +132,16 @@
 //! - **Lock-free**: every send, `try_send`, reservation and permit send;
 //!   `closed`; `WeakSender::upgrade` (a compare-and-swap loop on the sender
 //!   count); and `Receiver::close`. A bounded wait that has to queue is
-//!   lock-free for the reason the semaphore's is (see the
-//!   [parent module](super#progress)).
+//!   lock-free for the reason every wait queue is (see the
+//!   [parent module](super#progress)): its poll pushes a node, and may serve
+//!   the queue for one pass plus one for each operation of another thread
+//!   that lands meanwhile.
+//! - **When a waiting bounded send is served** is not a bound on its own
+//!   calls. Its slot is set aside and granted by whichever thread serves the
+//!   queue once the slot is free (the receiver taking a value, a permit
+//!   dropped), so a thread the scheduler stops while it serves the queue
+//!   delays that grant until it runs again, and a `try_send` fails meanwhile
+//!   even if the last waiting send has just left. No call waits for it.
 //! - **Lock-free except for the queue's one wait**: every receive (`recv`,
 //!   `recv_many`, `try_recv`, `poll_recv`, `poll_recv_many`) and the
 //!   receiver's drop, which pops every value left and so takes time
@@ -152,8 +157,18 @@
 //! nothing. `send` is cancel safe in the sense that a dropped future sent
 //! nothing, but it drops the value it held; `reserve` and its relatives hold no
 //! slot when dropped, and a dropped `reserve_owned` also drops its sender.
-//! Waiting reservations are woken oldest first, and dropping one gives up its
-//! place.
+//!
+//! # Fairness
+//!
+//! The bounded channel serves waiting sends and reservations strictly in the
+//! order they began to wait, as the established API does. Slots that come
+//! free are set aside for the oldest waiting request until it has all it
+//! asked for, so a `reserve_many(n)` is not starved by smaller requests and
+//! nothing behind it is served first; a `try_send` or `try_reserve` never
+//! takes a slot while a request waits. Dropping a waiting future gives up its
+//! place and passes on whatever was set aside or granted to it, so no slot
+//! and no wakeup is lost. The unbounded channel never waits, so it has no
+//! order to keep.
 
 mod bounded;
 mod chan;
