@@ -120,6 +120,7 @@ The properties:
 | `Conservation` | every slot is free, set aside, held by a grant, held as a permit, on its way back, or carrying a value in the queue: the counts add up to the channel's size, and the queue never holds more values than there are slots |
 | `FifoFair` | a request that was already waiting when another began is never still waiting once that other one has its slots; a `try_` that took slots counts too, and so does a `reserve_many` |
 | `CloseSemantics` | after the close no slot leaves the free count, and every operation that began after the close fails |
+| `CloseReturnsShare` | once the channel is closed and no pass is running, nothing is set aside any more: the close's pass hands every share back to the free count |
 | `EndMeansDrained` | once a receive returned the end of the channel, no value ever goes in again |
 | `ExactlyOnce` | every value put in is received once, or is still in the queue, or was thrown away by the receiver's drop |
 | `PerSenderOrder` | each sender's values come out in the order it put them in |
@@ -140,9 +141,11 @@ The 42 configurations, listed with their expected result in `tla/mpsc/EXPECTED.t
   property that rule protects: `try_ignores_queue` and `skip_unfit_front` (an attempt, or a
   pass, that serves a later request first) break `FifoFair`; `drop_pass_on` (a leaving
   waiter's share is dropped) breaks `Conservation`; `park_no_look`, `grant_no_wake`,
-  `release_no_pass`, `exit_ignores_release`, `rx_no_recheck` and `close_keeps_set_aside` (a
-  wakeup or a hand-over that never comes) end in a deadlock, and `park_no_look` and
-  `grant_no_wake` also break `Termination`; `try_ignores_close` and `take_after_close` break
+  `release_no_pass`, `exit_ignores_release` and `rx_no_recheck` (a wakeup or a hand-over that
+  never comes) end in a deadlock, and `park_no_look` and `grant_no_wake` also break
+  `Termination`; `close_keeps_set_aside` (the close keeps what was set aside for the front
+  waiter, so the channel can never go idle) breaks `CloseReturnsShare`;
+  `try_ignores_close` and `take_after_close` break
   `CloseSemantics`; `finish_early` breaks `EndMeansDrained`; `queue_lifo` breaks
   `PerSenderOrder`; `double_delivery` breaks `ExactlyOnce`.
 - **12 witnesses that must fail.** Each claims an interesting case never happens, and must be
@@ -174,8 +177,8 @@ semaphore of any size, `lean/Nuclei/FairSemaphore/Theorems.lean` proves:
 
 and computes the worked example above (`example_after_release`, `example_share_held`,
 `example_after_cancel`). `lean/Axioms.lean` prints the axioms each theorem rests on; the check
-accepts only Lean's standard three (`propext`, `Quot.sound`, `Classical.choice`). No proof has a
-`sorry` or an `admit`.
+accepts only Lean's standard axioms (`propext`, `Quot.sound`, `Classical.choice`), and no
+theorem today needs more than the first two. No proof has a `sorry` or an `admit`.
 
 ## What is not checked
 
