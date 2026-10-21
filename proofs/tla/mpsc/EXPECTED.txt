@@ -21,7 +21,7 @@ M_grant_no_wake                MC_BoundedChannel    deadlock
 M_release_no_pass              MC_BoundedChannel    deadlock
 M_exit_ignores_release         MC_BoundedChannel    deadlock
 M_rx_no_recheck                MC_BoundedChannel    deadlock
-M_close_keeps_set_aside        MC_BoundedChannel    deadlock
+M_close_keeps_set_aside        MC_BoundedChannel    violated:CloseReturnsShare
 M_try_ignores_close            MC_BoundedChannel    violated:CloseSemantics
 M_take_after_close             MC_BoundedChannel    violated:CloseSemantics
 M_finish_early                 MC_BoundedChannel    violated:EndMeansDrained

@@ -1,0 +1,49 @@
+TLC run of every configuration in proofs/tla/mpsc, 2026-10-21 01:37 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 8, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+BC_sends                       1176077     425460      9  pass                                  pass                                  yes
+BC_many                       10838225    3866625     43  pass                                  pass                                  yes
+BC_large_small                 6232339    2239245     22  pass                                  pass                                  yes
+BC_cancel_many                15234663    5419661     64  pass                                  pass                                  yes
+BC_cancel_one                 28304141   10102832     95  pass                                  pass                                  yes
+BC_try                          389552     141195      3  pass                                  pass                                  yes
+BC_pair                           1033        562      1  pass                                  pass                                  yes
+BC_close                      13410985    4813370     51  pass                                  pass                                  yes
+BC_close_cancel               28997554   10354143    163  pass                                  pass                                  yes
+BC_drop                        1852652     680757     11  pass                                  pass                                  yes
+BC_live_sends                  1176077     425460     55  pass                                  pass                                  yes
+BC_live_cancel                 2947177    1056270    114  pass                                  pass                                  yes
+BC_live_many                   2446085     871676    128  pass                                  pass                                  yes
+BC_live_close                  5477692    1961074    176  pass                                  pass                                  yes
+M_try_ignores_queue               7955       3410      3  violated:FifoFair                     violated:FifoFair                     yes
+M_skip_unfit_front               24257      10102      2  violated:FifoFair                     violated:FifoFair                     yes
+M_drop_pass_on                  205400      84666      7  violated:Conservation                 violated:Conservation                 yes
+M_park_no_look                  210068      83693      5  deadlock                              deadlock                              yes
+M_grant_no_wake                 299400     117868      8  deadlock                              deadlock                              yes
+M_release_no_pass               124765      49084      4  deadlock                              deadlock                              yes
+M_exit_ignores_release          161654      65257      5  deadlock                              deadlock                              yes
+M_rx_no_recheck                  32182      13539      3  deadlock                              deadlock                              yes
+M_close_keeps_set_aside         316196     132293      7  violated:CloseReturnsShare            violated:CloseReturnsShare            yes
+M_try_ignores_close               3257       1447      2  violated:CloseSemantics               violated:CloseSemantics               yes
+M_take_after_close               47411      19897      3  violated:CloseSemantics               violated:CloseSemantics               yes
+M_finish_early                  112448      47599      4  violated:EndMeansDrained              violated:EndMeansDrained              yes
+M_queue_lifo                       257        168      1  violated:PerSenderOrder               violated:PerSenderOrder               yes
+M_double_delivery                  134         73      2  violated:ExactlyOnce                  violated:ExactlyOnce                  yes
+ML_park_no_look                 561634     212583     65  violated:Termination                  violated:Termination                  yes
+ML_grant_no_wake                562889     214565     66  violated:Termination                  violated:Termination                  yes
+W_share_held                      9919       4192      2  violated:NoShareHeldBetweenPasses     violated:NoShareHeldBetweenPasses     yes
+W_withdraw_at_grant             170304      70289      6  violated:NoWithdrawAtGrant            violated:NoWithdrawAtGrant            yes
+W_grant_then_drop               118502      50278      4  violated:NoGrantThenDrop              violated:NoGrantThenDrop              yes
+W_cancel_with_share              15653       6561      2  violated:NoCancelWithShare            violated:NoCancelWithShare            yes
+W_refusal_for_queue               6274       2723      2  violated:NoRefusalForQueue            violated:NoRefusalForQueue            yes
+W_wake_by_grant                 144795      58639      5  violated:NoWakeByGrant                violated:NoWakeByGrant                yes
+W_pass_again                     11637       5073      2  violated:NoPassAgain                  violated:NoPassAgain                  yes
+W_close_refund                  214336      90195      6  violated:NoCloseRefund                violated:NoCloseRefund                yes
+W_fail_by_close                  30482      12742      2  violated:NoFailByClose                violated:NoFailByClose                yes
+W_value_after_close               1746        812      2  violated:NoValueAfterClose            violated:NoValueAfterClose            yes
+W_end_by_idle                    46070      19324      3  violated:NoEndByIdle                  violated:NoEndByIdle                  yes
+W_grant_before_park              29855      12752      3  violated:NoGrantBeforePark            violated:NoGrantBeforePark            yes
+
+results matching EXPECTED.txt: 42 of 42

@@ -638,6 +638,12 @@ CloseSemantics ==
     /\ ~admittedAfterClose
     /\ \A r \in Reqs : lateStart[r] => status[r] \in {"failed", "refused"}
 
+\* The close's pass hands a set-aside share back to the free count: once the channel is
+\* closed and no pass is running, nothing is set aside any more. A share kept there
+\* would be lost for good: the free count could never reach the capacity again, so the
+\* closed channel would never go idle (the mutation close_keeps_set_aside does this).
+CloseReturnsShare == closedBit /\ ~draining => setAside = 0
+
 \* Once a receive returned the end, no value ever goes in again: the receiver had drained
 \* every value any slot could still carry.
 EndMeansDrained == ~pushAfterEnd
@@ -655,8 +661,8 @@ PerSenderOrder ==
         j < m /\ received[j][1] = received[m][1] => received[j][2] < received[m][2]
 
 \* All the safety properties together.
-Safe == Conservation /\ FifoFair /\ CloseSemantics /\ EndMeansDrained /\ ExactlyOnce
-        /\ PerSenderOrder
+Safe == Conservation /\ FifoFair /\ CloseSemantics /\ CloseReturnsShare
+        /\ EndMeansDrained /\ ExactlyOnce /\ PerSenderOrder
 
 (***************************************************************************)
 (* Witnesses. Each one claims an interesting case never happens; a         *)
