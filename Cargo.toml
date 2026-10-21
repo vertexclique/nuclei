@@ -104,4 +104,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 members = [
   ".",
   "examples",
+  "nuclei-macros",
 ]
