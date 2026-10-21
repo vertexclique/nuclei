@@ -1,6 +1,7 @@
 import Nuclei.FairSemaphore.Model
 import Nuclei.FairSemaphore.Invariant
 import Nuclei.FairSemaphore.Theorems
+import Nuclei.Oneshot
 
 /-!
 # The Lean proofs of nuclei

@@ -32,3 +32,15 @@ open Nuclei.FairSemaphore
 #print axioms example_after_release
 #print axioms example_share_held
 #print axioms example_after_cancel
+
+-- A fresh one-shot channel is good.
+#print axioms Nuclei.Oneshot.fresh_good
+-- One whole operation keeps every fact of the one-shot story.
+#print axioms Nuclei.Oneshot.step_good
+-- So does any sequence of operations, from a fresh channel.
+#print axioms Nuclei.Oneshot.run_good
+-- The worked examples, computed: pending then taken; a close that owns the value; a
+-- refused send that takes its value back.
+#print axioms Nuclei.Oneshot.example_pending_then_taken
+#print axioms Nuclei.Oneshot.example_close_owns_the_value
+#print axioms Nuclei.Oneshot.example_refused_send_takes_it_back

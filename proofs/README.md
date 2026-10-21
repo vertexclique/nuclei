@@ -180,6 +180,30 @@ and computes the worked example above (`example_after_release`, `example_share_h
 accepts only Lean's standard axioms (`propext`, `Quot.sound`, `Classical.choice`), and no
 theorem today needs more than the first two. No proof has a `sorry` or an `admit`.
 
+## The one-shot channel
+
+`oneshot` (`tla/oneshot/Oneshot.tla`, `lean/Nuclei/Oneshot.lean`) gets the same treatment with
+its own story: one value, one sender, one receiver. The sender publishes two bits of the state
+word in one step; if the receiver had closed first the send fails and the value comes back.
+The receiver registers its waker and looks again before sleeping, and so does a sender waiting
+in `closed()`. Whoever owns the cell when the dust settles reads the value exactly once: the
+receiver by receiving, the receiver's drop for a value nobody took, or the sender of a failed
+send.
+
+A worked example: the receiver polls once and stays pending; the sender sends; the next poll
+takes the value (computed by Lean, `Nuclei.Oneshot.example_pending_then_taken`). Two more in
+one line each: sent, closed, receiver dropped, and the close owns the value so the drop
+destroys it; closed empty, then sent, and the failed send takes its value back.
+
+The TLA+ family checks 23 configurations: 9 that must pass (sends, drops, a close, parking
+races, and liveness under weak fairness), 8 mutations that each take one rule away (a wake
+lost or early, a value read twice or dropped, a send past the close, both rechecks) and 6
+witnesses that prove the search reaches the interesting cases. The Lean file proves the
+ownership story for every sequence of operations: the value sits in exactly one of its four
+places, at most one send succeeds, and every answer agrees with what the channel did. What the
+models leave out is said in each file's header: the waker cells are single flags (their
+handshake is loom's), and the value is one unlabelled token.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the

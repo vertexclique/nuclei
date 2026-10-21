@@ -1,0 +1,30 @@
+TLC run of every configuration in proofs/tla/oneshot, 2026-10-21 02:47 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 8, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+BC_send_recv                       232        138      1  pass                                  pass                                  yes
+BC_tx_drop                         223        133      1  pass                                  pass                                  yes
+BC_rx_drop                         164         94      0  pass                                  pass                                  yes
+BC_close                           212        120      1  pass                                  pass                                  yes
+BC_try                             286        167      1  pass                                  pass                                  yes
+BC_park                            308        182      1  pass                                  pass                                  yes
+BC_park_drop                       384        220      1  pass                                  pass                                  yes
+BC_live_send                       232        138      1  pass                                  pass                                  yes
+BC_live_park                       308        182      1  pass                                  pass                                  yes
+M_wake_lost                        134         83      1  deadlock                              deadlock                              yes
+M_wake_early                         4          4      1  violated:WakeMeansVisible             violated:WakeMeansVisible             yes
+M_take_keeps_handle                 93         60      1  violated:ValueReadOnce                violated:ValueReadOnce                yes
+M_drop_loses_value                  51         35      1  violated:ValueConserved               violated:ValueConserved               yes
+M_send_ignores_close                26         19      1  violated:NoSendPastClose              violated:NoSendPastClose              yes
+M_rx_no_recheck                     99         64      1  deadlock                              deadlock                              yes
+M_tx_no_recheck                     77         52      1  deadlock                              deadlock                              yes
+M_error_despite_value               25         18      1  violated:AnswerSound                  violated:AnswerSound                  yes
+W_value_at_recheck                  38         27      1  violated:NoValueAtRecheck             violated:NoValueAtRecheck             yes
+W_wake_racing_drop                  15         12      1  violated:NoWakeRacingDrop             violated:NoWakeRacingDrop             yes
+W_send_refused                      26         19      1  violated:NoSendRefused                violated:NoSendRefused                yes
+W_rx_woken                          52         36      1  violated:NoRxWake                     violated:NoRxWake                     yes
+W_tx_woken                          24         18      1  violated:NoTxWake                     violated:NoTxWake                     yes
+W_value_dropped                     37         26      1  violated:NoValueDroppedByRx           violated:NoValueDroppedByRx           yes
+
+results matching EXPECTED.txt: 23 of 23
