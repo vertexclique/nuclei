@@ -44,7 +44,7 @@ the same program and finds none.
 ### A second example: a waiter that leaves passes its share on
 
 A channel of three slots, in the order things happen (this run is computed by Lean in
-`lean/Nuclei/FairSemaphore.lean`, `example_ops`):
+`lean/Nuclei/FairSemaphore/Theorems.lean`, `example_ops`):
 
 1. Request 0 takes all 3 slots.
 2. Request 1 asks for 2 and waits; request 2 asks for 1 and waits behind it.
@@ -157,10 +157,10 @@ The 42 configurations, listed with their expected result in `tla/mpsc/EXPECTED.t
 
 ## What the Lean proofs check
 
-`lean/Nuclei/FairSemaphore.lean` models the fair semaphore with one thread doing one whole
-operation at a time: acquire (wait if needed), try-acquire (never wait), release, cancel and
-close, each followed by the pass. For every sequence of operations from a fresh semaphore of
-any size, it proves:
+`lean/Nuclei/FairSemaphore/Model.lean` models the fair semaphore with one thread doing one
+whole operation at a time: acquire (wait if needed), try-acquire (never wait), release,
+cancel and close, each followed by the pass. For every sequence of operations from a fresh
+semaphore of any size, `lean/Nuclei/FairSemaphore/Theorems.lean` proves:
 
 | theorem | what it says |
 |---------|--------------|

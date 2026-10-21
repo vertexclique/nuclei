@@ -1,4 +1,6 @@
-import Nuclei.FairSemaphore
+import Nuclei.FairSemaphore.Model
+import Nuclei.FairSemaphore.Invariant
+import Nuclei.FairSemaphore.Theorems
 
 /-!
 # The Lean proofs of nuclei
