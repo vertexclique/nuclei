@@ -11,8 +11,8 @@ async fn write_vectored() {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use futures::io::IoSliceMut;
     use futures::AsyncReadExt;
+    use futures::io::IoSliceMut;
     use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt};
     use std::io::{IoSlice, Read, SeekFrom};
     use std::ops::Deref;

@@ -27,12 +27,12 @@ macro_rules! syscall {
 ///////////////////
 
 use crate::config::NucleiConfig;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use rustix_uring::cqueue::{more, sock_nonempty};
 use rustix_uring::{
-    cqueue::Entry as CQEntry, squeue::Entry as SQEntry, CompletionQueue, IoUring, SubmissionQueue,
-    Submitter,
+    CompletionQueue, IoUring, SubmissionQueue, Submitter, cqueue::Entry as CQEntry,
+    squeue::Entry as SQEntry,
 };
 use socket2::SockAddr;
 use std::mem;

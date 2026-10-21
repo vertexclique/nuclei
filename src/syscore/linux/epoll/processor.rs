@@ -12,9 +12,9 @@ use std::{
     os::unix::io::{AsRawFd, FromRawFd},
 };
 
+use crate::Handle;
 use crate::proactor::Proactor;
 use crate::syscore::shim_to_af_unix;
-use crate::Handle;
 
 pub struct Processor;
 
@@ -174,11 +174,7 @@ impl Processor {
             let in_progress = err.raw_os_error() == Some(libc::EINPROGRESS);
 
             // If connect results with an "in progress" error, that's not an error.
-            if in_progress {
-                Ok(())
-            } else {
-                Err(err)
-            }
+            if in_progress { Ok(()) } else { Err(err) }
         })?;
 
         let stream_raw = sock.into_tcp_stream();

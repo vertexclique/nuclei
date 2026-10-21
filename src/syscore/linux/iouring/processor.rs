@@ -10,15 +10,15 @@ use std::path::Path;
 
 use crate::proactor::Proactor;
 
-use crate::syscore::shim_to_af_unix;
 use crate::Handle;
+use crate::syscore::shim_to_af_unix;
 use libc::sockaddr_un;
 use os_socketaddr::OsSocketAddr;
 
-use rustix::io_uring::{msghdr, IoringRecvFlags, RecvFlags, SendFlags, SocketFlags};
+use rustix::io_uring::{IoringRecvFlags, RecvFlags, SendFlags, SocketFlags, msghdr};
 use rustix::net::{SocketAddrAny, SocketAddrUnix};
 
-use rustix_uring::types::{socklen_t, AtFlags, Mode, OFlags, Statx, StatxFlags};
+use rustix_uring::types::{AtFlags, Mode, OFlags, Statx, StatxFlags, socklen_t};
 use rustix_uring::{opcode as OP, types::Fd};
 use socket2::SockAddr;
 use std::ffi::CString;

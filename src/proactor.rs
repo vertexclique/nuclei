@@ -82,8 +82,10 @@ pub fn drive<T>(future: impl Future<Output = T>) -> T {
     let cx = &mut Context::from_waker(&waker);
     futures::pin_mut!(future);
 
-    let driver = spawn_blocking(move || loop {
-        let _ = p.wait(1, None);
+    let driver = spawn_blocking(move || {
+        loop {
+            let _ = p.wait(1, None);
+        }
     });
 
     futures::pin_mut!(driver);
@@ -104,8 +106,8 @@ pub fn drive<T>(future: impl Future<Output = T>) -> T {
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod proactor_tests {
-    use crate::config::{IoUringConfiguration, NucleiConfig};
     use crate::Proactor;
+    use crate::config::{IoUringConfiguration, NucleiConfig};
 
     #[test]
     #[ignore]

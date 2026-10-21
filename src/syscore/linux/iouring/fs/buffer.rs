@@ -1,6 +1,6 @@
 use futures::ready;
 use rustix_uring::types::Statx;
-use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cmp;
 use std::io;
 use std::mem;

@@ -3,8 +3,8 @@ use std::fs::File;
 
 use std::path::PathBuf;
 
-use futures::io::IoSliceMut;
 use futures::AsyncReadExt;
+use futures::io::IoSliceMut;
 
 const IOVEC_WIDTH: usize = 1 << 10;
 

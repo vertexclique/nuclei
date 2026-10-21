@@ -1,4 +1,4 @@
-use crate::sys::event::{kevent_ts, kqueue, KEvent};
+use crate::sys::event::{KEvent, kevent_ts, kqueue};
 use ahash::{HashMap, HashMapExt};
 use futures::channel::oneshot;
 use lever::prelude::*;
