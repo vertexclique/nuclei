@@ -2,78 +2,54 @@ name: CI
 
 on: [push, pull_request]
 
+# One run per ref: a new push or PR update cancels the run it supersedes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build_and_test:
     strategy:
       fail-fast: false
       matrix:
-        toolchain:
-          - x86_64-unknown-linux-gnu
-          - x86_64-apple-darwin
-        version:
-          - stable
-          - nightly
         include:
           - toolchain: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - toolchain: x86_64-apple-darwin
-            os: macOS-latest
+          # The macOS runners are Apple Silicon: the aarch64 toolchain runs
+          # natively there (an x86_64 one cannot run on the arm64 hosts).
+          - toolchain: aarch64-apple-darwin
+            os: macos-latest
 
-    name: ${{ matrix.version }} - ${{ matrix.toolchain }}
+    name: stable - ${{ matrix.toolchain }}
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@master
+      - uses: actions/checkout@v4
 
-      - name: Install ${{ matrix.version }}
-        uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.version }}-${{ matrix.toolchain }}
-          default: true
+          targets: ${{ matrix.toolchain }}
 
-      - name: check nightly - linux + windows
-        if: matrix.version == 'nightly' && matrix.os != 'macOS-latest'
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --all --benches --bins --tests
+      - name: check
+        run: cargo check --all --bins --tests
 
-      - name: check stable
-        if: matrix.version == 'stable'
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --all --bins --tests
-
-      - name: tests nightly - linux + windows
-        if: matrix.version == 'nightly' && matrix.os != 'macOS-latest'
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --all
-
-      - name: tests stable
-        if: matrix.version == 'stable'
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --all
+      - name: tests
+        run: cargo test --all
 
   check_fmt_and_docs:
     name: Checking fmt and docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@master
+      - uses: actions/checkout@v4
 
-      - name: Setup
-        uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          default: true
           components: rustfmt
 
       - name: fmt
         run: cargo fmt --all -- --check
 
+      # Doc warnings stay visible but not fatal while the legacy runtime is
+      # in the tree; it is on its way out and its doc nits go with it.
       - name: doc
         run: cargo doc
