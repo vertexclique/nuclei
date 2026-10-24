@@ -3,8 +3,9 @@
 //!
 //! A [`Runtime`] runs one shard per worker thread. A shard owns its run
 //! queue, its timers and its poller, and a task stays on the shard it was
-//! placed on: [`spawn`] places it on the less loaded of two shards picked at
-//! random, [`spawn_local`] keeps it on the calling thread. [`block_on`] runs a
+//! placed on: [`spawn`] keeps it near the spawning thread's other tasks
+//! within a margin of load (see [`Builder::local_spawn_margin`]),
+//! [`spawn_local`] keeps it on the calling thread. [`block_on`] runs a
 //! future on the calling thread and nests: called from a task, it keeps the
 //! shard running its other tasks until the future completes.
 //!

@@ -3,10 +3,11 @@
 //! A runtime has one worker shard per thread it was built with, each a thread
 //! running its shard's loop until shutdown, and a blocking pool. `spawn` on a
 //! worker keeps the task there unless the worker holds more than a margin
-//! of live tasks beyond a shard picked at random, which then takes it; from
-//! any other thread it picks two distinct shards at random and takes the one
-//! with fewer live tasks (the power of two choices). A task never moves
-//! after.
+//! of live tasks beyond a shard picked at random, which then takes it. Any
+//! other thread has a home shard, where its spawns went last, kept by the
+//! same rule (its first spawn takes the less loaded of two distinct shards
+//! picked at random, the power of two choices), so tasks spawned together
+//! run together. A task never moves after.
 //! With no worker threads, a task goes to the shard of the thread that
 //! spawns it, and runs while that thread is inside `block_on`.
 //!
@@ -144,12 +145,14 @@ impl Builder {
         self
     }
 
-    /// How many more live tasks than another shard a worker may hold and
-    /// still keep a task it spawns (default 32). A task spawned on a worker
-    /// stays on it (so a task that waits for what it spawned keeps it on
-    /// its own thread) unless the worker holds that many more tasks than a
-    /// shard picked at random; then it goes to the less loaded of the two.
-    /// Zero balances strictly; a larger margin keeps more work local.
+    /// How many more live tasks than another shard a spawning thread's shard
+    /// may hold and still take a task it spawns (default 32). A task spawned
+    /// on a worker stays on it (so a task that waits for what it spawned
+    /// keeps it on its own thread), and a task spawned on any other thread
+    /// goes to that thread's home shard (where its spawns went last), unless
+    /// that shard holds that many more tasks than a shard picked at random;
+    /// then it goes to the other, which becomes the home. Zero balances
+    /// strictly; a larger margin keeps more work together.
     pub fn local_spawn_margin(mut self, margin: usize) -> Self {
         self.local_spawn_margin = Some(margin);
         self
@@ -561,8 +564,9 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// runtime. Spawned on a worker, the task stays on that worker unless it
 /// holds more live tasks than another shard by the runtime's
 /// [`local_spawn_margin`](Builder::local_spawn_margin); spawned anywhere
-/// else, it goes to the less loaded of two shards picked at random. The task
-/// stays on its shard.
+/// else, it goes to the spawning thread's home shard by the same rule (the
+/// first spawn takes the less loaded of two shards picked at random). The
+/// task stays on its shard.
 ///
 /// Dropping the returned [`Task`] cancels it; call [`Task::detach`] to let
 /// it run on its own.

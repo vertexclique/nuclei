@@ -8,6 +8,7 @@
 //! to stop takes no new task from then on, runs the ones it has to their
 //! end, and exits; its slot is not filled again.
 
+use core::cell::Cell;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -16,6 +17,12 @@ use super::context;
 use super::runtime::Inner;
 use super::shard::{Limits, Shard, Shared};
 use crate::sync::internal::{AtomicUsize, Ordering};
+
+thread_local! {
+    /// The runtime and the shard the spawns of this thread (one that is not
+    /// that runtime's worker) went to last.
+    static HOME: Cell<Option<(u64, usize)>> = const { Cell::new(None) };
+}
 
 /// How a worker is started.
 pub(crate) struct Start {
@@ -73,8 +80,12 @@ impl Workers {
     /// Picks the shard a new task goes to, or `None` when no worker takes
     /// tasks. Spawned on one of the runtime's workers: that worker, unless it
     /// holds more than `margin` live tasks beyond a shard picked at random,
-    /// which then takes it. Spawned anywhere else: the less loaded of two
-    /// distinct shards picked at random.
+    /// which then takes it. Spawned on any other thread: that thread's home
+    /// shard (where its spawns went last), by the same rule, the shard that
+    /// takes it becoming the new home; a first spawn takes the less loaded
+    /// of two distinct shards picked at random. Tasks spawned together so
+    /// stay on one shard, and no shard holds more than `margin` live tasks
+    /// beyond another for long.
     pub(crate) fn place(&self, runtime: u64, margin: usize) -> Option<&Arc<Shared>> {
         let n = self.claimed.load(Ordering::Acquire).min(self.slots.len());
         let take = |i: usize| self.slots[i].get().filter(|s| s.takes_tasks());
@@ -84,22 +95,42 @@ impl Workers {
             _ => {}
         }
         let load = |s: &Shared| s.load.load(Ordering::Relaxed);
+        // Stays on `home` unless a shard picked at random is lighter by more
+        // than the margin.
+        let stay_or_move = |home: usize| {
+            let mine = take(home)?;
+            let other = (home + 1 + random_below(n - 1)) % n;
+            Some(match take(other) {
+                Some(o) if load(mine) > load(o).saturating_add(margin) => (other, o),
+                _ => (home, mine),
+            })
+        };
         let local = context::current(|current| current.and_then(|s| s.worker_index(runtime)));
-        if let Some(mine) = local.filter(|&i| i < n).and_then(take) {
-            let other = (local.unwrap_or(0) + 1 + random_below(n - 1)) % n;
-            return Some(match take(other) {
-                Some(other) if load(mine) > load(other).saturating_add(margin) => other,
-                _ => mine,
-            });
+        if let Some((_, shard)) = local.filter(|&i| i < n).and_then(stay_or_move) {
+            return Some(shard);
         }
-        let a = random_below(n);
-        let b = (a + 1 + random_below(n - 1)) % n;
-        match (take(a), take(b)) {
-            (Some(x), Some(y)) => Some(if load(x) <= load(y) { x } else { y }),
-            (Some(x), None) | (None, Some(x)) => Some(x),
-            // Both stopping: any worker that takes tasks.
-            (None, None) => (0..n).find_map(take),
-        }
+        let home = HOME
+            .try_with(Cell::get)
+            .ok()
+            .flatten()
+            .filter(|&(owner, i)| owner == runtime && i < n)
+            .and_then(|(_, i)| stay_or_move(i));
+        let (index, shard) = match home {
+            Some(chosen) => chosen,
+            None => {
+                let a = random_below(n);
+                let b = (a + 1 + random_below(n - 1)) % n;
+                match (take(a), take(b)) {
+                    (Some(x), Some(y)) if load(y) < load(x) => (b, y),
+                    (Some(x), _) => (a, x),
+                    (None, Some(y)) => (b, y),
+                    // Both stopping: any worker that takes tasks.
+                    (None, None) => (0..n).find_map(|i| take(i).map(|s| (i, s)))?,
+                }
+            }
+        };
+        let _ = HOME.try_with(|h| h.set(Some((runtime, index))));
+        Some(shard)
     }
 
     /// Starts up to `count` more workers, in free slots; returns how many
@@ -401,5 +432,71 @@ mod tests {
         .unwrap();
         assert_eq!(&buf[..n], b"two!");
         drop(writer.join().unwrap());
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod placement_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use crate::runtime::{Builder, Runtime};
+
+    fn runtime(workers: usize) -> Runtime {
+        Builder::new()
+            .worker_threads(workers)
+            .pin_workers(false)
+            .build()
+            .unwrap()
+    }
+
+    /// Spawns `count` tasks from this thread, each held until `release`;
+    /// returns how many landed on each worker thread.
+    fn spread(rt: &Runtime, count: usize, release: &Arc<AtomicBool>) -> Vec<usize> {
+        let (tell, landed) = std::sync::mpsc::channel();
+        let tasks: Vec<_> = (0..count)
+            .map(|_| {
+                let (tell, release) = (tell.clone(), Arc::clone(release));
+                rt.spawn(async move {
+                    let _ = tell.send(std::thread::current().id());
+                    while !release.load(Ordering::SeqCst) {
+                        crate::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+            })
+            .collect();
+        let mut per_thread: HashMap<_, usize> = HashMap::new();
+        for _ in 0..count {
+            let id = landed.recv_timeout(Duration::from_secs(10)).unwrap();
+            *per_thread.entry(id).or_default() += 1;
+        }
+        tasks.into_iter().for_each(|t| t.detach());
+        let mut counts: Vec<_> = per_thread.into_values().collect();
+        counts.sort_unstable();
+        counts
+    }
+
+    #[test]
+    fn spawns_from_outside_the_runtime_stay_together() {
+        let rt = runtime(4);
+        let release = Arc::new(AtomicBool::new(true));
+        // Below the margin: every task goes to the home shard.
+        assert_eq!(spread(&rt, 20, &release), [20]);
+    }
+
+    #[test]
+    fn spawns_from_outside_spread_once_a_shard_is_a_margin_ahead() {
+        let rt = runtime(4);
+        let release = Arc::new(AtomicBool::new(false));
+        let counts = spread(&rt, 400, &release);
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(counts.len(), 4, "every worker took tasks: {counts:?}");
+        let (min, max) = (counts[0], counts[counts.len() - 1]);
+        assert!(
+            max - min <= 3 * 32,
+            "the load stays within the margin: {counts:?}"
+        );
     }
 }
