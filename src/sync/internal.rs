@@ -310,15 +310,22 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
 }
 
 /// `future`'s output, waited for on this thread: what every `blocking_*`
-/// method runs, so they all fail the same way.
+/// method runs, so they all behave the same way.
 ///
-/// It parks the calling thread (a system call) until the future's waker
-/// fires, so it must not run on a thread an executor needs for other tasks.
+/// On a thread that runs a nuclei shard (inside one of its tasks) it runs a
+/// nested `block_on` on that shard, which keeps running the shard's other
+/// tasks, timers and IO until the future completes. On any other thread it
+/// parks the thread (a system call) until the future's waker fires, so it
+/// must not run on a thread another executor needs for other tasks.
 ///
 /// # Panics
 ///
 /// On `wasm32`, when the future is not ready at once: see [`wait_here`].
 pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
+    #[cfg(not(any(loom, target_arch = "wasm32", target_os = "windows")))]
+    if crate::rt::context::current(|current| current.is_some()) {
+        return crate::runtime::block_on(future);
+    }
     match wait_here(future) {
         Ok(output) => output,
         Err(stuck) => panic!("{stuck}"),

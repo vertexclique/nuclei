@@ -256,9 +256,10 @@ impl<T: ?Sized> RwLock<T> {
     }
 
     /// [`read`](Self::read) for a thread that may block: it parks the
-    /// calling thread until the lock can be shared. Called from inside an
-    /// async task it blocks that task's executor thread, so do not: the task
-    /// that would release may be the one this thread was running.
+    /// calling thread until the lock can be shared. On a nuclei shard (inside one of its tasks) it does not park the thread: it runs a nested `block_on`, so the shard keeps running its other tasks meanwhile.
+    /// Inside another runtime's task it blocks that task's executor thread,
+    /// so do not: the task that would release may be the one that thread was
+    /// running.
     ///
     /// # Panics
     ///

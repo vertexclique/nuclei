@@ -9,8 +9,10 @@
 //! exception is inside kovan's queues, which recycle waiter nodes and yield
 //! the thread when they meet contention. The other exception is the
 //! `blocking_*` methods, which exist for threads that may block and park
-//! the calling thread until their wait is over; called from inside an async
-//! task they block the thread that task runs on.
+//! the calling thread until their wait is over. Called on a nuclei shard
+//! (inside one of its tasks) they run a nested `block_on` instead, so the
+//! shard keeps running its other tasks; called inside another runtime's task
+//! they block the thread that task runs on.
 //!
 //! # Names and signatures
 //!

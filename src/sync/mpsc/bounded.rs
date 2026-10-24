@@ -307,10 +307,9 @@ impl<T> Sender<T> {
 
     /// Sends a value from a thread that may block.
     ///
-    /// It parks the calling thread until there is room, so it must not run on
-    /// a thread an executor needs for other tasks; called from inside an async
-    /// task it blocks that task's thread. It works whether or not the receiver
-    /// uses [`Receiver::blocking_recv`].
+    /// It parks the calling thread until there is room. On a nuclei shard (inside one of its tasks) it does not park the thread: it runs a nested `block_on`, so the shard keeps running its other tasks meanwhile. Inside another
+    /// runtime's task it blocks that task's thread. It works whether or not
+    /// the receiver uses [`Receiver::blocking_recv`].
     ///
     /// # Panics
     ///

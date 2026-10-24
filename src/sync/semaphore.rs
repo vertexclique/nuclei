@@ -242,8 +242,9 @@ impl Semaphore {
     }
 
     /// [`acquire`](Self::acquire) for a thread that may block: it parks the
-    /// calling thread until the permit is free. Called from inside an async
-    /// task it blocks that task's executor thread, so do not.
+    /// calling thread until the permit is free. On a nuclei shard (inside one of its tasks) it does not park the thread: it runs a nested `block_on`, so the shard keeps running its other tasks meanwhile.
+    /// Inside another runtime's task it blocks that task's executor thread,
+    /// so do not.
     ///
     /// # Panics
     ///

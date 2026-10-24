@@ -157,9 +157,8 @@ impl<T> Receiver<T> {
     /// Receives the next value from a thread that may block.
     ///
     /// Like [`recv`](Self::recv), but it parks the calling thread while the
-    /// channel is empty and open, so it must not run on a thread an executor
-    /// needs for other tasks; called from inside an async task it blocks that
-    /// task's thread. It works whether or not the senders use
+    /// channel is empty and open. On a nuclei shard (inside one of its tasks) it does not park the thread: it runs a nested `block_on`, so the shard keeps running its other tasks meanwhile. Inside another runtime's task it
+    /// blocks that task's thread. It works whether or not the senders use
     /// [`Sender::blocking_send`](super::Sender::blocking_send).
     ///
     /// # Panics

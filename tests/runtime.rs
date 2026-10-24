@@ -474,3 +474,40 @@ fn a_loaded_worker_spreads_what_it_spawns() {
         "64 live tasks with a margin of 4 ran on {n} worker(s)"
     );
 }
+
+/// A blocking call inside a task does not hold the shard up: it nests, so
+/// the task it waits for runs on the same (single) worker.
+#[test]
+fn a_blocking_recv_inside_a_task_lets_the_shard_run_the_sender() {
+    let rt = runtime(1);
+    let got = rt.block_on(rt.spawn(async {
+        let (tx, mut rx) = nuclei::sync::mpsc::channel::<u32>(1);
+        spawn(async move {
+            nuclei::sleep(Duration::from_millis(2)).await;
+            tx.send(9).await.unwrap();
+        })
+        .detach();
+        rx.blocking_recv()
+    }));
+    assert_eq!(got, Some(9));
+}
+
+/// A blocking lock inside a task lets the shard run the task that holds the
+/// lock, which then releases it.
+#[test]
+fn a_blocking_lock_inside_a_task_lets_the_holder_finish() {
+    let rt = runtime(1);
+    let done = rt.block_on(rt.spawn(async {
+        let lock = Arc::new(nuclei::sync::Mutex::new(0u32));
+        let guard = lock.clone().lock_owned().await;
+        spawn(async move {
+            nuclei::sleep(Duration::from_millis(2)).await;
+            drop(guard);
+        })
+        .detach();
+        let mut g = lock.blocking_lock();
+        *g += 1;
+        *g
+    }));
+    assert_eq!(done, 1);
+}

@@ -70,17 +70,19 @@
 //!
 //! Every method that is not `async` can be called from any thread. For
 //! synchronous code on the receiving or sending end, the `blocking_*` methods
-//! park the calling thread until their wait is over; do not call them from a
-//! task an executor needs to run on that thread, because they block it.
+//! park the calling thread until their wait is over. On a nuclei shard they
+//! run a nested `block_on` instead, which keeps the shard running its other
+//! tasks; do not call them from a task of another runtime, whose thread they
+//! block.
 //!
 //! # Differences from the established API
 //!
 //! - [`Sender::send_timeout`] waits on nuclei's own timers: on a thread that
 //!   runs no nuclei shard, the default runtime fires it.
-//! - The `blocking_*` methods cannot tell that they were called from inside
-//!   an async task, so they never panic for it; on a task they block the
-//!   thread (on `wasm32`, where nothing else can run, a call that would wait
-//!   forever panics instead).
+//! - The `blocking_*` methods called from inside a task do not panic: on a
+//!   nuclei shard they run a nested `block_on`, and inside another runtime's
+//!   task they block its thread (on `wasm32`, where nothing else can run, a
+//!   call that would wait forever panics instead).
 //! - When the receiver closes, a reservation still waiting gives back the
 //!   slots set aside for it at the close, where the established API keeps
 //!   them with the failed wait until its future is dropped. So a closed

@@ -576,8 +576,8 @@ impl<T> Receiver<T> {
     /// Receives the value on this thread, parking the thread until it
     /// arrives.
     ///
-    /// For use outside asynchronous code: called from inside an async task it
-    /// blocks that task's executor thread, so do not. It is not wait-free:
+    /// For use outside asynchronous code. On a nuclei shard (inside one of its tasks) it does not park the thread: it runs a nested `block_on`, so the shard keeps running its other tasks meanwhile. Inside another runtime's task
+    /// it blocks that task's executor thread, so do not. It is not wait-free:
     /// waiting for the sender is what it does.
     ///
     /// # Panics
