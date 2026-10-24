@@ -187,7 +187,14 @@ pub(crate) fn kind_of(fd: RawFd) -> io::Result<crate::io::source::Kind> {
         _ => return Ok(Kind::Bytes),
     }
     let ty = socket_option(fd, libc::SOL_SOCKET, libc::SO_TYPE)?;
-    let listening = socket_option(fd, libc::SOL_SOCKET, libc::SO_ACCEPTCONN)? != 0;
+    let listening = match socket_option(fd, libc::SOL_SOCKET, libc::SO_ACCEPTCONN) {
+        Ok(listening) => listening != 0,
+        // Some kernels (macOS for some families) do not answer: a stream
+        // socket with no peer listens (one that neither listens nor is
+        // connected can do no IO either way).
+        Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => has_no_peer(fd),
+        Err(e) => return Err(e),
+    };
     // SAFETY: plain data; all zeroes is a valid value.
     let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
     let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -207,6 +214,22 @@ pub(crate) fn kind_of(fd: RawFd) -> io::Result<crate::io::source::Kind> {
         (_, false, true) => Kind::TcpListener,
         _ => Kind::Stream,
     })
+}
+
+/// Whether a socket has no connected peer.
+fn has_no_peer(fd: RawFd) -> bool {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most `len` bytes of address.
+    let ret = unsafe {
+        libc::getpeername(
+            fd,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    };
+    ret < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOTCONN)
 }
 
 /// Makes a descriptor nuclei just received its own: non-blocking where the
