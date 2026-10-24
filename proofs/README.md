@@ -219,11 +219,10 @@ handshake is loom's), and the value is one unlabelled token.
   programs the configurations set: at most two slots, two senders with at most two operations
   each, and a receiver with at most three operations. Larger cases are not checked by TLA+.
   Lean covers every size, but only one whole operation at a time.
-- **The message queue.** The TLA+ model treats it as an in-order sequence, so
-  `PerSenderOrder` is proved for an in-order queue only. Its lock-free implementation is
-  kovan's, checked there; the queue the channel uses today can hand a sender's later value out
-  before its earlier one under load (see the Ordering section of the `mpsc` module docs), and
-  that is fixed separately.
+- **The message queue.** The TLA+ model treats it as a sequence of cells in claim order, each
+  claimed by a send before it is written, so `PerSenderOrder` is proved for a queue that hands
+  cells out in claim order. Its lock-free implementation is kovan's, checked there (kovan's
+  own TLA+ model of the segment queue checks that order).
 - **The receiver's waker cell.** The TLA+ model treats it as one flag that a wake empties; its
   own handshake is covered by the loom models.
 - **Memory ordering.** A TLA+ step is atomic and seen by every thread at once. Whether the
