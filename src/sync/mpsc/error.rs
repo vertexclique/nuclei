@@ -110,6 +110,48 @@ impl<T> From<SendError<T>> for TrySendError<T> {
     }
 }
 
+/// Error returned by [`Sender::send_timeout`](super::Sender::send_timeout):
+/// the value was not sent, and comes back.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum SendTimeoutError<T> {
+    /// The channel stayed full until the timeout.
+    Timeout(T),
+
+    /// The receive half of the channel was explicitly closed or has been
+    /// dropped.
+    Closed(T),
+}
+
+impl<T> SendTimeoutError<T> {
+    /// Consume the `SendTimeoutError`, returning the unsent value.
+    pub fn into_inner(self) -> T {
+        match self {
+            SendTimeoutError::Timeout(val) => val,
+            SendTimeoutError::Closed(val) => val,
+        }
+    }
+}
+
+impl<T> fmt::Debug for SendTimeoutError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            SendTimeoutError::Timeout(..) => "Timeout(..)".fmt(f),
+            SendTimeoutError::Closed(..) => "Closed(..)".fmt(f),
+        }
+    }
+}
+
+impl<T> fmt::Display for SendTimeoutError<T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.write_str(match self {
+            SendTimeoutError::Timeout(..) => "timed out waiting on send operation",
+            SendTimeoutError::Closed(..) => "channel closed",
+        })
+    }
+}
+
+impl<T> Error for SendTimeoutError<T> {}
+
 /// Error returned by [`Receiver::try_recv`](super::Receiver::try_recv) and
 /// [`UnboundedReceiver::try_recv`](super::UnboundedReceiver::try_recv).
 ///

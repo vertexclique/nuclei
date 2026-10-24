@@ -550,3 +550,65 @@ fn the_unwind_safety_of_the_handles_matches_the_established_api() {
         "the channel is usable after the panic"
     );
 }
+
+#[test]
+fn send_timeout_sends_when_there_is_room() {
+    nuclei::runtime::block_on(async {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send_timeout(5, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await, Some(5));
+    });
+}
+
+#[test]
+fn send_timeout_gives_the_value_back_when_the_channel_stays_full() {
+    use mpsc::error::SendTimeoutError;
+    nuclei::runtime::block_on(async {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let start = std::time::Instant::now();
+        let err = tx
+            .send_timeout(2, std::time::Duration::from_millis(15))
+            .await
+            .unwrap_err();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(15));
+        assert!(matches!(err, SendTimeoutError::Timeout(2)));
+        assert_eq!(err.into_inner(), 2);
+        assert_eq!(
+            SendTimeoutError::Timeout(0).to_string(),
+            "timed out waiting on send operation"
+        );
+    });
+}
+
+#[test]
+fn send_timeout_gives_the_value_back_when_the_receiver_is_gone() {
+    use mpsc::error::SendTimeoutError;
+    nuclei::runtime::block_on(async {
+        let (tx, rx) = mpsc::channel::<u8>(1);
+        drop(rx);
+        let err = tx
+            .send_timeout(3, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendTimeoutError::Closed(3)));
+    });
+}
+
+#[test]
+fn send_timeout_succeeds_once_the_receiver_makes_room_in_time() {
+    nuclei::runtime::block_on(async {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(1).unwrap();
+        let receiver = nuclei::runtime::spawn(async move {
+            nuclei::sleep(std::time::Duration::from_millis(5)).await;
+            (rx.recv().await, rx.recv().await)
+        });
+        tx.send_timeout(2, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(receiver.await, (Some(1), Some(2)));
+    });
+}

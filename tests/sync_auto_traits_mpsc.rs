@@ -180,16 +180,19 @@ async_assert_fn!(mpsc::Sender<NN>::reserve(_): !Send & !Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<NN>::reserve_many(_, usize): !Send & !Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<NN>::reserve_owned(_): !Send & !Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<NN>::send(_, NN): !Send & !Sync & !Unpin);
+async_assert_fn!(mpsc::Sender<NN>::send_timeout(_, NN, std::time::Duration): !Send & !Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YN>::closed(_): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YN>::reserve(_): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YN>::reserve_many(_, usize): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YN>::reserve_owned(_): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YN>::send(_, YN): Send & !Sync & !Unpin);
+async_assert_fn!(mpsc::Sender<YN>::send_timeout(_, YN, std::time::Duration): Send & !Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YY>::closed(_): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YY>::reserve(_): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YY>::reserve_many(_, usize): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YY>::reserve_owned(_): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::Sender<YY>::send(_, YY): Send & Sync & !Unpin);
+async_assert_fn!(mpsc::Sender<YY>::send_timeout(_, YY, std::time::Duration): Send & Sync & !Unpin);
 
 // The futures of the unbounded channel.
 async_assert_fn!(mpsc::UnboundedReceiver<NN>::recv(_): !Send & !Sync & !Unpin);

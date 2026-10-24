@@ -75,8 +75,8 @@
 //!
 //! # Differences from the established API
 //!
-//! - `Sender::send_timeout` and its `SendTimeoutError` are not here: a wait
-//!   with a deadline needs a timer, which nuclei adds with its time module.
+//! - [`Sender::send_timeout`] waits on nuclei's own timers: on a thread that
+//!   runs no nuclei shard, the default runtime fires it.
 //! - The `blocking_*` methods cannot tell that they were called from inside
 //!   an async task, so they never panic for it; on a task they block the
 //!   thread (on `wasm32`, where nothing else can run, a call that would wait

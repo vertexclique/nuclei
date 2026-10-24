@@ -20,7 +20,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use super::chan::{Chan, Limit};
-use super::error::{SendError, TrySendError};
+use super::error::{SendError, SendTimeoutError, TrySendError};
 use super::permit::{OwnedPermit, Permit, PermitIterator};
 use super::receiver::Receiver;
 use crate::sync::fair_semaphore::{FairSemaphore, FairWait};
@@ -209,6 +209,45 @@ impl<T> Sender<T> {
                 Ok(())
             }
             Err(_) => Err(SendError(value)),
+        }
+    }
+
+    /// Sends a value, waiting for room at most `timeout`.
+    ///
+    /// As [`send`](Self::send), with a deadline: the value comes back in
+    /// [`SendTimeoutError::Timeout`] if the channel stayed full until then,
+    /// and in [`SendTimeoutError::Closed`] if the receiver is gone. The wait
+    /// is on nuclei's timers: on a thread that runs no nuclei shard, the
+    /// default runtime fires it.
+    ///
+    /// # Cancel safety
+    ///
+    /// As [`send`](Self::send): a dropped future sent nothing, and drops its
+    /// value.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use nuclei::sync::mpsc::{self, error::SendTimeoutError};
+    ///
+    /// nuclei::runtime::block_on(async {
+    ///     let (tx, _rx) = mpsc::channel(1);
+    ///     tx.send_timeout(1, Duration::from_millis(10)).await.unwrap();
+    ///     let full = tx.send_timeout(2, Duration::from_millis(10)).await;
+    ///     assert!(matches!(full, Err(SendTimeoutError::Timeout(2))));
+    /// });
+    /// ```
+    pub async fn send_timeout(
+        &self,
+        value: T,
+        timeout: std::time::Duration,
+    ) -> Result<(), SendTimeoutError<T>> {
+        match crate::time::timeout(timeout, self.reserve()).await {
+            Ok(Ok(permit)) => {
+                permit.send(value);
+                Ok(())
+            }
+            Ok(Err(_)) => Err(SendTimeoutError::Closed(value)),
+            Err(_) => Err(SendTimeoutError::Timeout(value)),
         }
     }
 
