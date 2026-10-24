@@ -9,7 +9,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use nuclei::runtime::{Runtime, spawn};
-use nuclei::time::{self, MissedTickBehavior, error::Elapsed};
+use nuclei::time::{self, MissedTickBehavior};
 
 fn runtime(workers: usize) -> Runtime {
     Runtime::builder()
