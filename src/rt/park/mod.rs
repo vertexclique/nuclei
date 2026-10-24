@@ -37,10 +37,14 @@ pub(crate) use self::kqueue::{Notifier, Poller, Registrar};
 
 /// What a registered source became ready for. A hang-up or an error counts
 /// as both: the operations waiting on it then see it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Readiness {
     pub(crate) readable: bool,
     pub(crate) writable: bool,
+    /// Urgent (out-of-band) data came: a read stops at its mark.
+    pub(crate) urgent: bool,
+    /// The peer hung up, or the socket failed.
+    pub(crate) hangup: bool,
 }
 
 #[cfg(test)]

@@ -83,6 +83,7 @@ impl Poller {
     /// `timeout` passes (`None` waits, a zero timeout only looks). Calls
     /// `on_event` with the token and readiness of each ready source. Returns
     /// whether a wake came.
+    #[cfg(test)]
     pub(crate) fn wait(
         &mut self,
         timeout: Option<Duration>,
@@ -146,6 +147,8 @@ impl Poller {
                     readable: bits & libc::EPOLLIN != 0 || hup,
                     writable: bits & libc::EPOLLOUT != 0
                         || bits & (libc::EPOLLHUP | libc::EPOLLERR) != 0,
+                    urgent: bits & libc::EPOLLPRI != 0,
+                    hangup: hup,
                 },
             );
         }
@@ -174,7 +177,11 @@ impl Registrar {
     /// reported with `token`.
     pub(crate) fn add(&self, fd: RawFd, token: u64) -> io::Result<()> {
         let mut event = libc::epoll_event {
-            events: (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
+            events: (libc::EPOLLIN
+                | libc::EPOLLPRI
+                | libc::EPOLLOUT
+                | libc::EPOLLRDHUP
+                | libc::EPOLLET) as u32,
             u64: token,
         };
         // SAFETY: a plain syscall; `fd` is the caller's open descriptor.

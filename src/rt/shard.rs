@@ -76,10 +76,11 @@ const SPIN_GAP_MAX: u32 = 64;
 /// How long a shard spins before it parks, adapted to what spins see.
 ///
 /// Work that arrives within a spin costs neither a park nor the waker's
-/// notification. A spin that found work doubles the budget; one that ran out
-/// halves it, so a shard whose work comes only after long gaps (or through
-/// its poller, which a spin cannot see) stops spinning; a park that a
-/// notification cut short sets it going again. The budget counts pause
+/// notification, and IO that becomes ready within it (each look asks the
+/// poller too, without waiting) costs no kernel wake of the thread. A spin
+/// that found work doubles the budget; one that ran out halves it, so a
+/// shard whose work comes only after long gaps stops spinning; a park that
+/// ended soon after it began sets it going again. The budget counts pause
 /// hints, not time, and is a hint: it only sizes the next spin.
 pub(crate) struct Spin {
     budget: Cell<u32>,
@@ -517,16 +518,35 @@ impl Shard {
             (Some(w), Some(t)) => Some(w.min(t)),
             (w, t) => w.or(t),
         };
-        {
-            let sources = self.sources.borrow();
-            self.poller.borrow_mut().wait(timeout, |token, readiness| {
+        self.poll_io(usize::MAX, timeout)?;
+        self.fire_timers();
+        Ok(())
+    }
+
+    /// Waits on the poller up to `timeout` (`None` for no bound) and
+    /// completes the IO of the sources that became ready, taking at most
+    /// `max` events from the kernel. Returns how many it handled.
+    fn poll_io(&self, max: usize, timeout: Option<Duration>) -> io::Result<usize> {
+        let sources = self.sources.borrow();
+        let mut events = 0;
+        self.poller
+            .borrow_mut()
+            .wait_at_most(max, timeout, |token, readiness| {
+                events += 1;
                 if let Some(source) = sources.get(token) {
                     source.on_event(token, readiness);
                 }
             })?;
+        Ok(events)
+    }
+
+    /// Completes the IO that is ready now, without waiting: whether there
+    /// was any.
+    fn io_ready_now(&self) -> bool {
+        match self.poll_io(usize::MAX, Some(Duration::ZERO)) {
+            Ok(events) => events > 0,
+            Err(err) => panic!("the shard's poller failed: {err}"),
         }
-        self.fire_timers();
-        Ok(())
     }
 
     /// How long until the next timer, if any.
@@ -620,10 +640,13 @@ impl Shard {
             }
             self.since_drive.set(0);
             let shared = &self.shared;
-            if self
-                .spin
-                .run(|| shared.has_remote_work() || signal.woken.load(Ordering::Relaxed))
-            {
+            // The spin looks at the poller too: IO that comes within it
+            // costs neither a park nor the kernel's wake of this thread.
+            if self.spin.run(|| {
+                shared.has_remote_work()
+                    || signal.woken.load(Ordering::Relaxed)
+                    || self.io_ready_now()
+            }) {
                 continue;
             }
             if shared
@@ -662,22 +685,11 @@ impl Shard {
             (Some(w), Some(t)) => Some(w.min(t)),
             (w, t) => w.or(t),
         };
-        let mut events = 0;
-        let result = {
-            let sources = self.sources.borrow();
-            self.poller
-                .borrow_mut()
-                .wait_at_most(max, timeout, |token, readiness| {
-                    events += 1;
-                    if let Some(source) = sources.get(token) {
-                        source.on_event(token, readiness);
-                    }
-                })
-        };
+        let result = self.poll_io(max, timeout);
         if sleeps {
             shared.park.end_park();
         }
-        result?;
+        let events = result?;
         self.fire_timers();
         self.run_ready();
         Ok(events)

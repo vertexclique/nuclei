@@ -116,6 +116,7 @@ impl Poller {
     /// `timeout` passes (`None` waits, a zero timeout only looks). Calls
     /// `on_event` with the token and readiness of each ready source. Returns
     /// whether a wake came.
+    #[cfg(test)]
     pub(crate) fn wait(
         &mut self,
         timeout: Option<Duration>,
@@ -175,10 +176,27 @@ impl Poller {
                 Readiness {
                     readable: e.filter == libc::EVFILT_READ as _ || done,
                     writable: e.filter == libc::EVFILT_WRITE as _ || done,
+                    urgent: urgent(e),
+                    hangup: done,
                 },
             );
         }
         Ok(woken)
+    }
+}
+
+/// Whether an event says urgent data came (Apple's `EV_OOBAND`; the other
+/// kqueues do not say, and nuclei never takes a short read as draining
+/// there).
+fn urgent(e: &libc::kevent) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        e.filter == libc::EVFILT_READ as _ && e.flags & libc::EV_OOBAND != 0
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let _ = e;
+        false
     }
 }
 
