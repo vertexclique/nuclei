@@ -62,6 +62,7 @@ pub struct Builder {
     blocking_keep_alive: Option<Duration>,
     pin_workers: Option<bool>,
     local_spawn_margin: Option<usize>,
+    io_buffer_cap: Option<usize>,
 }
 
 impl Default for Builder {
@@ -89,6 +90,7 @@ impl Builder {
             blocking_keep_alive: None,
             pin_workers: None,
             local_spawn_margin: None,
+            io_buffer_cap: None,
         }
     }
 
@@ -152,6 +154,15 @@ impl Builder {
         self
     }
 
+    /// The most bytes each worker's IO buffers hold (default 64 MiB). Reads
+    /// that had to wait land in these buffers, and writes that had to wait
+    /// are copied into them; at the cap, IO waits for buffers to come back,
+    /// so a worker's IO memory never grows past it.
+    pub fn io_buffer_cap(mut self, bytes: usize) -> Self {
+        self.io_buffer_cap = Some(bytes);
+        self
+    }
+
     /// Whether each worker thread is pinned to its own core (Linux; default
     /// true). A pinned shard keeps its cache warm; unpinned, the scheduler may
     /// move it.
@@ -172,6 +183,7 @@ impl Builder {
         let stack = self.thread_stack_size.unwrap_or(DEFAULT_STACK);
         let limits = Limits {
             max_nesting: self.max_nesting.unwrap_or(context::DEFAULT_MAX_NESTING),
+            buffer_cap: self.io_buffer_cap.unwrap_or(crate::buf::DEFAULT_CAP),
         };
         let blocking_name = self
             .thread_name
@@ -277,6 +289,8 @@ impl fmt::Debug for Builder {
             .field("max_blocking_threads", &self.max_blocking_threads)
             .field("thread_keep_alive", &self.blocking_keep_alive)
             .field("pin_workers", &self.pin_workers)
+            .field("local_spawn_margin", &self.local_spawn_margin)
+            .field("io_buffer_cap", &self.io_buffer_cap)
             .finish_non_exhaustive()
     }
 }
@@ -498,10 +512,10 @@ fn random_below(n: usize) -> usize {
     })
 }
 
-/// A shard to fire a timer for a thread that runs none: one of the current
-/// (or default) runtime's workers, the less loaded of two; with no workers,
-/// the calling thread's own shard.
-pub(crate) fn timer_shard() -> Arc<Shared> {
+/// A shard to serve a thread that runs none (its timers, the registrations
+/// of its IO): one of the current (or default) runtime's workers, the less
+/// loaded of two; with no workers, the calling thread's own shard.
+pub(crate) fn service_shard() -> Arc<Shared> {
     let inner = current();
     if inner.shards.is_empty() {
         return match context::own_shard() {

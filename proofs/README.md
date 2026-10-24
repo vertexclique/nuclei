@@ -65,7 +65,7 @@ moment a waiter is dropped while a pass is granting it.
 
 | tool | what it checks here | how far a check goes |
 |------|---------------------|----------------------|
-| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake and the remote timer the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
+| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer and the guard of an IO source's side the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
 | Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, and the timer wheel's arithmetic (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
 The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
@@ -297,6 +297,30 @@ never come within a run, so a cancel that did not remove its entry shows as a le
 be for a far deadline. The waker slot's register-then-look-again handshake guards a waker that
 changed between polls; one task cannot show that, and it is checked by the loom models of the
 sync module's waker cell.
+
+## The guard of an IO source's side
+
+`side` (`tla/side/Side.tla`) checks how a poll and the shard's driver share one side of an IO
+source without losing an edge (`src/io/side.rs`, `src/io/source/read.rs`). The side's word has
+a busy bit (someone holds it for one step) and a ready bit (an edge came while it was held).
+Bytes arrive in the kernel, each with an edge for the driver. The driver takes a free side and
+serves it: the edge clears the readiness cache, and with a reader waiting it reads into the
+read-ahead and wakes the reader, or marks the cache blocked. Finding the side held, the driver
+sets the ready bit and goes on; if the holder let go before the bit landed, it takes the side
+after all. The reader holds the side for one step (it takes the read-ahead, reads the kernel
+itself unless the cache says it would block, or registers its waker) and, as it lets go, looks
+at the ready bit: if set it does the driver's part itself, then its own step again.
+
+The family checks 11 configurations: 3 that must pass (two and three bytes with
+`Conservation`, no byte lost or made up, and `Exclusive`, one holder at a time; and liveness
+under weak fairness), 4 mutations (a driver that drops an edge on a held side, a holder that
+lets go without looking at the ready bit and an edge that leaves the cache blocked each end in
+a deadlock; a hold that refuses a free side carrying a flag breaks `Termination`), and 4
+witnesses (a flag, a reader doing the driver's part, a read the driver completes, a read the
+reader makes itself). Bytes are a count and there is one reader: several tasks waiting on one
+side share its waker list, which the driver wakes whole. The loom models in `src/io/side.rs`
+check the code's word with a calibration that must lose the edge (a driver that skips a held
+side).
 
 ## The timer wheel
 

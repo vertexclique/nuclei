@@ -3,9 +3,11 @@
 //!
 //! [`Shared`] is what any thread may touch: the inbox other threads push
 //! runnables into, the park handshake, the notifier that wakes the poller,
-//! and the count of live tasks placement reads. [`Shard`] is the rest, owned
-//! by the thread that runs it: the local run queue, the LIFO slot, the timer
-//! wheel and the poller. Only that thread touches it, so it is plain cells.
+//! the registrar and mailbox of its IO registrations, and the count of live
+//! tasks placement reads. [`Shard`] is the rest, owned by the thread that
+//! runs it: the local run queue, the LIFO slot, the timer wheel, the poller,
+//! the IO sources it watches and its buffer pool. Only that thread touches
+//! it, so it is plain cells.
 //!
 //! # The run loop
 //!
@@ -14,7 +16,8 @@
 //! ran, at most [`LIFO_MAX`] times in a row), then the local queue, then the
 //! inbox (first every [`INBOX_INTERVAL`] runs, so remote work is not
 //! starved). Every [`DRIVER_INTERVAL`] runs, and whenever the queues are
-//! empty, it fires due timers and polls the poller without waiting. With
+//! empty, it fires due timers and polls the poller without waiting, which
+//! completes the IO of every source that became ready (see `io::source`). With
 //! nothing to run it spins briefly (see [`Spin`]), then parks until the next
 //! timer, a remote push or a wake of the future. Workers run the same loop
 //! on a future that ends at shutdown.
@@ -41,8 +44,11 @@ use std::time::{Duration, Instant};
 use kovan_queue::seg_queue::SegQueue;
 
 use super::handshake::ParkState;
-use super::park::{Notifier, Poller};
+use super::park::{Notifier, Poller, Registrar};
+use super::sources::Sources;
 use super::task::{Runnable, ScheduleInfo};
+use crate::buf::{self, Pool};
+use crate::io::Source;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering};
 use crate::time::TimerOp;
@@ -135,6 +141,19 @@ pub(crate) struct Shared {
     /// Work on the timer wheel from other threads, applied by the shard
     /// before it fires timers.
     timer_ops: SegQueue<TimerOp>,
+    registrar: Registrar,
+    /// Registrations other threads ask of the shard, applied before it
+    /// polls.
+    io_ops: SegQueue<IoOp>,
+}
+
+/// A registration change another thread asks of a shard.
+pub(crate) enum IoOp {
+    /// Watch a source for a thread that runs no shard.
+    Register(Arc<Source>),
+    /// A source went (its kernel registration is already gone): free its
+    /// slot.
+    Release(u64),
 }
 
 impl Shared {
@@ -167,6 +186,28 @@ impl Shared {
         }
     }
 
+    /// Adds and removes the kernel registrations of the shard's poller.
+    pub(crate) fn registrar(&self) -> &Registrar {
+        &self.registrar
+    }
+
+    /// Hands a registration change to the shard and wakes it.
+    pub(crate) fn post_io(&self, op: IoOp) {
+        self.io_ops.push(op);
+        self.unpark();
+    }
+
+    /// Frees the slot of a source whose kernel registration is gone: at once
+    /// on the shard's own thread, else through its mailbox.
+    pub(crate) fn release_source(self: &Arc<Self>, token: u64) {
+        let done = super::context::current(|current| {
+            current.is_some_and(|shard| shard.is(self) && shard.try_release(token))
+        });
+        if !done {
+            self.post_io(IoOp::Release(token));
+        }
+    }
+
     /// Whether the shard stopped.
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
@@ -195,7 +236,10 @@ impl Shared {
     }
 
     fn has_remote_work(&self) -> bool {
-        !self.inbox.is_empty() || !self.local_inbox.is_empty() || !self.timer_ops.is_empty()
+        !self.inbox.is_empty()
+            || !self.local_inbox.is_empty()
+            || !self.timer_ops.is_empty()
+            || !self.io_ops.is_empty()
     }
 }
 
@@ -214,6 +258,8 @@ impl Drop for Shared {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
     pub(crate) max_nesting: usize,
+    /// What the shard's IO buffers may hold, in bytes.
+    pub(crate) buffer_cap: usize,
 }
 
 /// The part of a shard its own thread owns.
@@ -239,6 +285,10 @@ pub(crate) struct Shard {
     epoch: Instant,
     /// Wakers of fired timers, woken once the wheel is let go; reused.
     fired: RefCell<Vec<Waker>>,
+    /// The IO sources the poller watches, by token.
+    sources: RefCell<Sources>,
+    /// Where the shard's reads land and its writes wait.
+    pool: Pool,
 }
 
 impl Shard {
@@ -253,6 +303,8 @@ impl Shard {
             stopped: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
             timer_ops: SegQueue::new(),
+            registrar: poller.registrar(),
+            io_ops: SegQueue::new(),
         });
         Ok(Self {
             shared,
@@ -270,7 +322,56 @@ impl Shard {
             wheel: RefCell::new(Wheel::new()),
             epoch: Instant::now(),
             fired: RefCell::new(Vec::new()),
+            sources: RefCell::new(Sources::default()),
+            pool: Pool::new(limits.buffer_cap),
         })
+    }
+
+    /// Watches `source` from now on, under a new token. The caller moved
+    /// the source's registration to registering.
+    pub(crate) fn register_source(&self, source: &Arc<Source>) -> io::Result<()> {
+        let token = match self.sources.borrow_mut().insert(Arc::clone(source)) {
+            Ok(token) => token,
+            Err(err) => {
+                source.registration_abandoned();
+                return Err(err);
+            }
+        };
+        let attached = source.attach(&self.shared, token);
+        if attached.is_err() {
+            let gone = self.sources.borrow_mut().remove(token);
+            drop(gone);
+        }
+        attached
+    }
+
+    /// Frees a released source's slot, unless the slots are in use (the
+    /// release then goes through the mailbox).
+    fn try_release(&self, token: u64) -> bool {
+        let Ok(mut sources) = self.sources.try_borrow_mut() else {
+            return false;
+        };
+        let gone = sources.remove(token);
+        drop(sources);
+        drop(gone);
+        true
+    }
+
+    /// Applies the registration changes other threads asked for.
+    fn apply_io_ops(&self) {
+        while let Ok(op) = self.shared.io_ops.try_pop() {
+            match op {
+                IoOp::Register(source) => {
+                    if let Err(err) = self.register_source(&source) {
+                        source.registration_failed(&err);
+                    }
+                }
+                IoOp::Release(token) => {
+                    let gone = self.sources.borrow_mut().remove(token);
+                    drop(gone);
+                }
+            }
+        }
     }
 
     /// Whether `shared` is this shard's.
@@ -368,15 +469,26 @@ impl Shard {
         self.in_task.set(outer);
     }
 
-    /// Fires due timers, then looks at the poller (waiting up to `wait`, or
-    /// until the next timer).
+    /// Applies registration changes and fires due timers, then looks at the
+    /// poller (waiting up to `wait`, or until the next timer) and completes
+    /// the IO of the sources that became ready.
     fn drive(&self, wait: Option<Duration>) -> io::Result<()> {
+        if !self.shared.io_ops.is_empty() {
+            self.apply_io_ops();
+        }
         self.fire_timers();
         let timeout = match (wait, self.next_timer()) {
             (Some(w), Some(t)) => Some(w.min(t)),
             (w, t) => w.or(t),
         };
-        self.poller.borrow_mut().wait(timeout)?;
+        {
+            let sources = self.sources.borrow();
+            self.poller.borrow_mut().wait(timeout, |token, readiness| {
+                if let Some(source) = sources.get(token) {
+                    source.on_event(token, readiness);
+                }
+            })?;
+        }
         self.fire_timers();
         Ok(())
     }
@@ -430,6 +542,7 @@ impl Shard {
         }
         self.depth.set(depth + 1);
         let _depth = Depth(&self.depth);
+        let _pool = buf::enter(&self.pool);
 
         let signal = Arc::new(Signal {
             woken: AtomicBool::new(true),
@@ -459,7 +572,12 @@ impl Shard {
                 }
                 continue;
             }
-            // Nothing to run: due timers may have made work.
+            // Nothing to run: due timers may have made work, and work other
+            // threads posted (which the spin and the park count as work) is
+            // applied here, so it never keeps the loop from sleeping.
+            if !self.shared.io_ops.is_empty() {
+                self.apply_io_ops();
+            }
             self.fire_timers();
             if self.has_local_work() || signal.woken.load(Ordering::SeqCst) {
                 continue;
@@ -557,7 +675,11 @@ mod tests {
 
     #[test]
     fn a_timer_fires_from_the_run_loop_and_never_early() {
-        let shard = Shard::new(Limits { max_nesting: 8 }).unwrap();
+        let shard = Shard::new(Limits {
+            max_nesting: 8,
+            buffer_cap: crate::buf::DEFAULT_CAP,
+        })
+        .unwrap();
         let _current = context::enter(&shard);
         for ms in [1u64, 5, 30] {
             let start = Instant::now();
@@ -570,7 +692,11 @@ mod tests {
 
     #[test]
     fn the_loop_parks_until_the_next_timer_rather_than_forever() {
-        let shard = Shard::new(Limits { max_nesting: 8 }).unwrap();
+        let shard = Shard::new(Limits {
+            max_nesting: 8,
+            buffer_cap: crate::buf::DEFAULT_CAP,
+        })
+        .unwrap();
         let _current = context::enter(&shard);
         let start = Instant::now();
         // Nothing but the timer can wake the loop: if it parked without a

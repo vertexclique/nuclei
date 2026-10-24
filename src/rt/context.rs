@@ -64,6 +64,7 @@ pub(crate) fn own_shard() -> io::Result<Rc<Shard>> {
         }
         let shard = Rc::new(Shard::new(Limits {
             max_nesting: DEFAULT_MAX_NESTING,
+            buffer_cap: crate::buf::DEFAULT_CAP,
         })?);
         *own.borrow_mut() = Some(Rc::clone(&shard));
         Ok(shard)

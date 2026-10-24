@@ -1,16 +1,19 @@
-//! The Linux poller: an epoll instance with an eventfd for wakes.
+//! The Linux poller: an epoll instance with an eventfd for wakes, and the
+//! registrations of the shard's IO sources.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
+
+use super::Readiness;
 
 /// The epoll data of the wake eventfd; IO registrations never use it.
 const WAKE: u64 = u64::MAX;
 
 /// A shard's poller.
 pub(crate) struct Poller {
-    epoll: OwnedFd,
+    epoll: Arc<OwnedFd>,
     wake: Arc<OwnedFd>,
     events: Vec<libc::epoll_event>,
 }
@@ -19,6 +22,12 @@ pub(crate) struct Poller {
 #[derive(Clone)]
 pub(crate) struct Notifier {
     wake: Arc<OwnedFd>,
+}
+
+/// Adds and removes registrations of a poller, from any thread.
+#[derive(Clone)]
+pub(crate) struct Registrar {
+    epoll: Arc<OwnedFd>,
 }
 
 fn check(ret: libc::c_int) -> io::Result<libc::c_int> {
@@ -51,9 +60,9 @@ impl Poller {
                 &mut event,
             ))?;
             Ok(Self {
-                epoll,
+                epoll: Arc::new(epoll),
                 wake: Arc::new(wake),
-                events: Vec::with_capacity(64),
+                events: Vec::with_capacity(256),
             })
         }
     }
@@ -64,9 +73,21 @@ impl Poller {
         }
     }
 
-    /// Blocks until a notifier fires or `timeout` passes (`None` waits for a
-    /// wake, a zero timeout only looks). Returns whether a wake came.
-    pub(crate) fn wait(&mut self, timeout: Option<Duration>) -> io::Result<bool> {
+    pub(crate) fn registrar(&self) -> Registrar {
+        Registrar {
+            epoll: Arc::clone(&self.epoll),
+        }
+    }
+
+    /// Blocks until a notifier fires, a registered source is ready, or
+    /// `timeout` passes (`None` waits, a zero timeout only looks). Calls
+    /// `on_event` with the token and readiness of each ready source. Returns
+    /// whether a wake came.
+    pub(crate) fn wait(
+        &mut self,
+        timeout: Option<Duration>,
+        mut on_event: impl FnMut(u64, Readiness),
+    ) -> io::Result<bool> {
         // epoll counts milliseconds: round up, so a wait never ends early.
         let ms = match timeout {
             None => -1,
@@ -101,9 +122,21 @@ impl Poller {
         unsafe { self.events.set_len(n) };
         let mut woken = false;
         for event in &self.events {
-            if event.u64 == WAKE {
+            let token = event.u64;
+            if token == WAKE {
                 woken = true;
+                continue;
             }
+            let bits = event.events as libc::c_int;
+            let hup = bits & (libc::EPOLLHUP | libc::EPOLLERR | libc::EPOLLRDHUP) != 0;
+            on_event(
+                token,
+                Readiness {
+                    readable: bits & libc::EPOLLIN != 0 || hup,
+                    writable: bits & libc::EPOLLOUT != 0
+                        || bits & (libc::EPOLLHUP | libc::EPOLLERR) != 0,
+                },
+            );
         }
         Ok(woken)
     }
@@ -122,5 +155,31 @@ impl Notifier {
                 size_of::<u64>(),
             )
         };
+    }
+}
+
+impl Registrar {
+    /// Registers `fd` for readiness to read and to write, edge-triggered,
+    /// reported with `token`.
+    pub(crate) fn add(&self, fd: RawFd, token: u64) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
+            u64: token,
+        };
+        // SAFETY: a plain syscall; `fd` is the caller's open descriptor.
+        check(unsafe {
+            libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event)
+        })
+        .map(drop)
+    }
+
+    /// Removes the registration of `fd`. Called before `fd` closes.
+    pub(crate) fn delete(&self, fd: RawFd) -> io::Result<()> {
+        let mut event = libc::epoll_event { events: 0, u64: 0 };
+        // SAFETY: a plain syscall; `fd` is still open.
+        check(unsafe {
+            libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, &mut event)
+        })
+        .map(drop)
     }
 }

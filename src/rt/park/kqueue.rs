@@ -1,9 +1,12 @@
-//! The kqueue poller (macOS and the BSDs): an `EVFILT_USER` event for wakes.
+//! The kqueue poller (macOS and the BSDs): an `EVFILT_USER` event for wakes,
+//! and the registrations of the shard's IO sources.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
+
+use super::Readiness;
 
 /// The ident of the wake event; IO registrations use file descriptors.
 const WAKE: libc::uintptr_t = 0;
@@ -25,6 +28,12 @@ pub(crate) struct Notifier {
     queue: Arc<OwnedFd>,
 }
 
+/// Adds and removes registrations of a poller, from any thread.
+#[derive(Clone)]
+pub(crate) struct Registrar {
+    queue: Arc<OwnedFd>,
+}
+
 /// A kevent for the wake event, built from a zeroed struct so the fields that
 /// differ between the BSDs stay zero.
 fn wake_event(flags: u16, fflags: u32) -> libc::kevent {
@@ -37,13 +46,29 @@ fn wake_event(flags: u16, fflags: u32) -> libc::kevent {
     event
 }
 
+/// A kevent for `fd`'s `filter`, built from a zeroed struct so the fields
+/// that differ between the BSDs stay zero.
+fn fd_event(fd: RawFd, filter: i16, flags: u16, token: u64) -> libc::kevent {
+    // SAFETY: kevent is plain data; all zeroes is a valid value.
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    event.ident = fd as _;
+    event.filter = filter as _;
+    event.flags = flags as _;
+    event.udata = token as usize as _;
+    event
+}
+
 fn submit(queue: &OwnedFd, event: &libc::kevent) -> io::Result<()> {
-    // SAFETY: one change, no event out.
+    submit_all(queue, core::slice::from_ref(event))
+}
+
+fn submit_all(queue: &OwnedFd, events: &[libc::kevent]) -> io::Result<()> {
+    // SAFETY: the changes are read from `events`; no event out.
     let ret = unsafe {
         libc::kevent(
             queue.as_raw_fd(),
-            event,
-            1,
+            events.as_ptr(),
+            events.len() as _,
             std::ptr::null_mut(),
             0,
             std::ptr::null(),
@@ -81,9 +106,21 @@ impl Poller {
         }
     }
 
-    /// Blocks until a notifier fires or `timeout` passes (`None` waits for a
-    /// wake, a zero timeout only looks). Returns whether a wake came.
-    pub(crate) fn wait(&mut self, timeout: Option<Duration>) -> io::Result<bool> {
+    pub(crate) fn registrar(&self) -> Registrar {
+        Registrar {
+            queue: Arc::clone(&self.queue),
+        }
+    }
+
+    /// Blocks until a notifier fires, a registered source is ready, or
+    /// `timeout` passes (`None` waits, a zero timeout only looks). Calls
+    /// `on_event` with the token and readiness of each ready source. Returns
+    /// whether a wake came.
+    pub(crate) fn wait(
+        &mut self,
+        timeout: Option<Duration>,
+        mut on_event: impl FnMut(u64, Readiness),
+    ) -> io::Result<bool> {
         let ts = timeout.map(|t| libc::timespec {
             tv_sec: t.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
             tv_nsec: t.subsec_nanos() as _,
@@ -115,10 +152,49 @@ impl Poller {
         };
         // SAFETY: the kernel wrote `n` events.
         unsafe { self.events.set_len(n) };
-        Ok(self
-            .events
-            .iter()
-            .any(|e| e.filter == libc::EVFILT_USER as _ && e.ident == WAKE))
+        let mut woken = false;
+        for e in &self.events {
+            if e.filter == libc::EVFILT_USER as _ {
+                woken |= e.ident == WAKE;
+                continue;
+            }
+            let done = e.flags & (libc::EV_EOF | libc::EV_ERROR) as u16 != 0;
+            on_event(
+                e.udata as usize as u64,
+                Readiness {
+                    readable: e.filter == libc::EVFILT_READ as _ || done,
+                    writable: e.filter == libc::EVFILT_WRITE as _ || done,
+                },
+            );
+        }
+        Ok(woken)
+    }
+}
+
+impl Registrar {
+    /// Registers `fd` for readiness to read and to write, edge-triggered
+    /// (EV_CLEAR), reported with `token`.
+    pub(crate) fn add(&self, fd: RawFd, token: u64) -> io::Result<()> {
+        let flags = (libc::EV_ADD | libc::EV_CLEAR) as u16;
+        submit_all(
+            &self.queue,
+            &[
+                fd_event(fd, libc::EVFILT_READ as i16, flags, token),
+                fd_event(fd, libc::EVFILT_WRITE as i16, flags, token),
+            ],
+        )
+    }
+
+    /// Removes the registration of `fd`. Called before `fd` closes.
+    pub(crate) fn delete(&self, fd: RawFd) -> io::Result<()> {
+        let flags = libc::EV_DELETE as u16;
+        submit_all(
+            &self.queue,
+            &[
+                fd_event(fd, libc::EVFILT_READ as i16, flags, 0),
+                fd_event(fd, libc::EVFILT_WRITE as i16, flags, 0),
+            ],
+        )
     }
 }
 

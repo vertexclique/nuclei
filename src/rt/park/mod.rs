@@ -14,7 +14,7 @@
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) use self::linux::{Notifier, Poller};
+pub(crate) use self::linux::{Notifier, Poller, Registrar};
 
 #[cfg(any(
     target_os = "macos",
@@ -33,7 +33,15 @@ mod kqueue;
     target_os = "openbsd",
     target_os = "dragonfly",
 ))]
-pub(crate) use self::kqueue::{Notifier, Poller};
+pub(crate) use self::kqueue::{Notifier, Poller, Registrar};
+
+/// What a registered source became ready for. A hang-up or an error counts
+/// as both: the operations waiting on it then see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Readiness {
+    pub(crate) readable: bool,
+    pub(crate) writable: bool,
+}
 
 #[cfg(test)]
 mod tests;

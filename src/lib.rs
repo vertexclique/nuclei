@@ -35,11 +35,14 @@
 // legacy runtime out; removed with the legacy runtime by the thread-per-core driver rewrite.
 #[cfg(not(loom))]
 mod async_io;
+mod buf;
 /// Nuclei's configuration options reside here.
 #[cfg(not(loom))]
 pub mod config;
 #[cfg(not(loom))]
 mod handle;
+#[cfg(unix)]
+mod io;
 #[cfg(not(loom))]
 mod proactor;
 mod rt;

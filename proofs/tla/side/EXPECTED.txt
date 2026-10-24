@@ -1,0 +1,12 @@
+# configuration                spec                 expected
+P_two                          MC_Side              pass
+P_three                        MC_Side              pass
+P_live                         MC_Side              pass
+M_skip_held                    MC_Side              deadlock
+M_release_ignores_ready        MC_Side              deadlock
+M_edge_keeps_cache             MC_Side              deadlock
+M_hold_needs_zero              MC_Side              violated:Termination
+W_flag                         MC_Side              violated:NoFlag
+W_delegate                     MC_Side              violated:NoDelegate
+W_driver_read                  MC_Side              violated:NoDriverRead
+W_inline                       MC_Side              violated:NoInline

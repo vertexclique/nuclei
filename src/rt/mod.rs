@@ -9,4 +9,6 @@ pub(crate) mod park;
 pub(crate) mod runtime;
 mod sched;
 pub(crate) mod shard;
+#[cfg(not(target_os = "windows"))]
+mod sources;
 pub(crate) mod task;

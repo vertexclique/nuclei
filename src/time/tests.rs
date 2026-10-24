@@ -8,7 +8,11 @@ use crate::rt::context;
 use crate::rt::shard::{Limits, Shard};
 
 fn shard() -> Shard {
-    Shard::new(Limits { max_nesting: 8 }).unwrap()
+    Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+    })
+    .unwrap()
 }
 
 /// Polls `f` once, from inside the shard's loop.
@@ -40,6 +44,8 @@ fn a_finished_sleep_leaves_nothing_in_the_wheel() {
 }
 
 #[test]
+// The block hands the armed sleep out on purpose, to drop it elsewhere.
+#[allow(clippy::async_yields_async)]
 fn a_sleep_dropped_on_another_thread_is_removed_by_its_shard() {
     let shard = shard();
     let _current = context::enter(&shard);

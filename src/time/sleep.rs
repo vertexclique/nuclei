@@ -171,7 +171,7 @@ impl Sleep {
             key: UnsafeCell::new(None),
         });
         cell.waker.register(cx.waker());
-        let shard = crate::rt::runtime::timer_shard();
+        let shard = crate::rt::runtime::service_shard();
         shard.post_timer(TimerOp::Insert {
             at: self.deadline,
             cell: Arc::clone(&cell),
