@@ -106,6 +106,50 @@ fn tempdir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Where a seccomp filter ends any thread that calls `io_uring_setup`, the
+/// process is not ended: `auto` falls back to epoll, and a TCP exchange runs.
+/// Alone in its process: the filter cannot be taken off again.
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+#[test]
+fn auto_falls_back_to_epoll_where_a_filter_kills_io_uring() {
+    if !alone("net::tests::auto_falls_back_to_epoll_where_a_filter_kills_io_uring") {
+        return;
+    }
+    if std::env::var("NUCLEI_BACKEND").is_ok_and(|b| !b.is_empty() && b != "auto") {
+        return;
+    }
+    use crate::syscore::linux::probe::tests::{answer, install};
+    // Every thread the runtime starts from here on carries the filter.
+    if let Err(e) = install(answer(
+        libc::SYS_io_uring_setup,
+        libc::SECCOMP_RET_KILL_THREAD,
+    )) {
+        eprintln!("skipping: cannot install a seccomp filter here: {e}");
+        return;
+    }
+    assert!(
+        !crate::rt::backend::rings(),
+        "auto took a ring this process cannot have"
+    );
+    let rt = runtime();
+    rt.block_on(async {
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn(async move {
+            let (mut conn, _) = within(listener.accept()).await.unwrap();
+            let mut buf = [0u8; 5];
+            within(read_exact(&mut conn, &mut buf)).await.unwrap();
+            within(write_all(&mut conn, &buf)).await.unwrap();
+        });
+        let mut client = within(Handle::<TcpStream>::connect(addr)).await.unwrap();
+        within(write_all(&mut client, b"hello")).await.unwrap();
+        let mut back = [0u8; 5];
+        within(read_exact(&mut client, &mut back)).await.unwrap();
+        assert_eq!(&back, b"hello");
+        server.await;
+    });
+}
+
 #[test]
 fn a_tcp_echo_carries_a_large_message_both_ways() {
     let rt = runtime();

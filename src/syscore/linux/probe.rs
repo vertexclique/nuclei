@@ -401,7 +401,7 @@ impl Drop for Stack {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{env, fs, thread};
 
     use super::*;
@@ -625,7 +625,7 @@ mod tests {
     }
 
     /// A filter program that answers syscall `nr` with `action` and allows everything else.
-    fn answer(nr: libc::c_long, action: u32) -> Vec<libc::sock_filter> {
+    pub(crate) fn answer(nr: libc::c_long, action: u32) -> Vec<libc::sock_filter> {
         vec![
             insn(LD, 0, 0, 0),
             insn(JEQ, 0, 1, nr as u32),
@@ -648,7 +648,7 @@ mod tests {
     }
 
     /// Installs `program` on the calling thread (and so on its children).
-    fn install(mut program: Vec<libc::sock_filter>) -> io::Result<()> {
+    pub(crate) fn install(mut program: Vec<libc::sock_filter>) -> io::Result<()> {
         let filter = libc::sock_fprog {
             len: program.len() as u16,
             filter: program.as_mut_ptr(),

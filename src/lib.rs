@@ -57,8 +57,9 @@ pub mod runtime;
 pub mod sync;
 #[cfg(target_os = "linux")]
 mod syscore {
-    // The io_uring ring and its probe: the io_uring driver builds on them,
-    // and their own tests run them now.
+    // The io_uring ring and its probe. Parts of the ring layer (provided
+    // buffer rings, multishot entries, flags) are for the driver's next
+    // steps; their own tests run them now.
     #![allow(dead_code)]
     pub(crate) mod linux;
 }

@@ -36,11 +36,11 @@ jobs:
       - name: tests
         run: cargo test --all
 
-      - name: tests on io_uring
+      - name: tests on epoll
         if: runner.os == 'Linux'
         run: cargo test --all
         env:
-          NUCLEI_BACKEND: io_uring
+          NUCLEI_BACKEND: epoll
 
   check_fmt_and_docs:
     name: Checking fmt and docs
