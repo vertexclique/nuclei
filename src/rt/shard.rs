@@ -374,12 +374,12 @@ impl Shard {
                 return Err(err);
             }
         };
-        let attached = source.attach(&self.shared, token);
-        if attached.is_err() {
-            let gone = self.sources.borrow_mut().remove(token);
-            drop(gone);
+        // A failed attach hands the slot back itself; one left to another
+        // thread reports its failure to the tasks waiting on the source.
+        match source.attach(&self.shared, token) {
+            Some(Err(err)) => Err(err),
+            _ => Ok(()),
         }
-        attached
     }
 
     /// Frees a released source's slot, unless the slots are in use (the

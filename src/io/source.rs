@@ -23,18 +23,23 @@
 //!
 //! The driver makes calls on the descriptor itself, so it must never touch
 //! one the handle no longer owns (closed, or swapped behind `get_mut`). The
-//! number lives in the source; a close or a `get_mut` retires the source
-//! first: it takes both guards (waiting at most for one call of the
-//! driver), marks the source stale and deregisters it before the descriptor
-//! can change. The driver skips a stale source, and checks every event's
-//! token (slot index and generation, never a pointer) against the
-//! registration in place, so an event for one that is gone does nothing.
+//! number lives in the source, and it changes, or the handle lets go of its
+//! object, only through a request that needs both sides
+//! ([`requests`](self::requests)): whoever holds both performs it, so it
+//! never overlaps a call of the driver, which holds a side while it makes
+//! one. A dropped handle never waits for that: if a side is held, it hands
+//! its object to the source and the last holder closes it. Retiring marks
+//! the source stale and deregisters it before the descriptor can change;
+//! the driver skips a stale source, and checks every event's token (slot
+//! index and generation, never a pointer) against the registration in
+//! place, so an event for one that is gone does nothing.
 
 mod read;
+pub(crate) mod requests;
 pub(crate) mod write;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
@@ -44,8 +49,9 @@ use std::sync::Arc;
 use std::task::{Poll, Wake};
 
 use self::read::ReadState;
+use self::requests::Ask;
 use self::write::WriteState;
-use super::side::{After, Side};
+use super::side::{After, Hooks, Side};
 use crate::rt::context;
 use crate::rt::park::Readiness;
 use crate::rt::shard::{IoOp, Shared};
@@ -58,6 +64,24 @@ const NO_TOKEN: u64 = u64::MAX;
 const UNREGISTERED: u8 = 0;
 const REGISTERING: u8 = 1;
 const REGISTERED: u8 = 2;
+
+/// Side-local work of the read side (its deferred word).
+mod read_work {
+    /// Urgent data or a hangup was reported.
+    pub(super) const UNSURE: u8 = 1;
+    /// A buffer came back to the pool the side ran out of.
+    pub(super) const UNSTARVE: u8 = 2;
+    /// The future of a lent buffer went away.
+    pub(super) const ABANDON: u8 = 4;
+}
+
+/// Side-local work of the write side (its deferred word).
+mod write_work {
+    /// A buffer came back to the pool the side ran out of.
+    pub(super) const UNSTARVE: u8 = 1;
+    /// The future of a lent buffer went away.
+    pub(super) const ABANDON: u8 = 2;
+}
 
 /// What kind of descriptor a source is: which system calls fit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,8 +146,7 @@ struct Registration {
     /// The token in place, or `NO_TOKEN`: what the driver checks an event
     /// against.
     token: AtomicU64,
-    /// The shard that holds it. Written with both sides held, read with
-    /// either.
+    /// The shard that holds it. Written and read only with both sides held.
     shard: UnsafeCell<Option<Arc<Shared>>>,
 }
 
@@ -133,25 +156,112 @@ pub(crate) struct Source {
     /// The descriptor a retired source had, to tell a revival with another
     /// one.
     retired_fd: AtomicI32,
+    /// Moves on when a revival brings another descriptor: a side whose
+    /// state is of an older one discards it when it is next taken.
+    epoch: AtomicU32,
+    /// The epoch a retire left, which one revival moves on.
+    retired_epoch: AtomicU32,
     kind: Kind,
     read: Side<ReadState>,
     write: Side<WriteState>,
     reg: Registration,
+    /// Work that needs both sides, and what it carries (see `requests`).
+    requests: AtomicU8,
+    ask: Ask,
+    /// Whether the write side holds bytes or a datagram the kernel has not
+    /// taken, as its last holder left it.
+    unsent: AtomicBool,
 }
 
-// SAFETY: the sides guard their contents; `reg.shard` is written only with
-// both sides held and read only with one.
+// SAFETY: the sides guard their contents; `reg.shard` is touched only with
+// both sides held, and `ask` by its own protocol (see `requests`).
 unsafe impl Send for Source {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for Source {}
 
+/// What a holder of one of the source's sides does for the work others
+/// left it: the driver's part with the descriptor in place, side-local
+/// work, the source's requests, and a side's catching up with a revival.
+#[derive(Clone, Copy)]
+struct SourceHooks<'a> {
+    src: &'a Source,
+    /// For the driver's own edge: the registration the event came for.
+    token: Option<u64>,
+}
+
+impl Hooks<ReadState> for SourceHooks<'_> {
+    fn taken(&self, st: &mut ReadState, after: &mut After) {
+        if self.src.catch_up(st.epoch_mut()) {
+            st.discard(after);
+        }
+    }
+
+    fn serve(&self, st: &mut ReadState, after: &mut After) {
+        if let Some(fd) = self.src.serving_fd(self.token) {
+            st.serve(fd, self.src.kind, true, after);
+        }
+    }
+
+    fn deferred(&self, st: &mut ReadState, bits: u8, after: &mut After) {
+        if bits & read_work::UNSURE != 0 {
+            st.short_reads_unsure();
+        }
+        if bits & read_work::UNSTARVE != 0 {
+            st.unstarve(after);
+        }
+        if bits & read_work::ABANDON != 0 {
+            st.abandon_lent(after);
+        }
+    }
+
+    fn requests(&self, st: &mut ReadState, after: &mut After) {
+        self.src.requests_holding_read(st, after);
+    }
+}
+
+impl Hooks<WriteState> for SourceHooks<'_> {
+    fn taken(&self, st: &mut WriteState, after: &mut After) {
+        if self.src.catch_up(st.epoch_mut()) {
+            st.discard(after);
+        }
+    }
+
+    fn serve(&self, st: &mut WriteState, after: &mut After) {
+        if let Some(fd) = self.src.serving_fd(self.token) {
+            st.serve(fd, self.src.kind, true, after);
+        }
+    }
+
+    fn deferred(&self, st: &mut WriteState, bits: u8, after: &mut After) {
+        if bits & write_work::UNSTARVE != 0 {
+            st.unstarve(after);
+        }
+        if bits & write_work::ABANDON != 0 {
+            st.abandon_lent(after);
+        }
+    }
+
+    fn released(&self, saw_requests: bool, after: &mut After) {
+        if saw_requests {
+            self.src.requests_after_write(after);
+        }
+    }
+
+    fn releasing(&self, st: &mut WriteState) {
+        // Release: a drop on another thread reads it.
+        self.src.unsent.store(st.has_unsent(), Ordering::Release);
+    }
+}
+
 impl Source {
     /// A source for `fd`, which the caller set non-blocking and keeps open
-    /// for the source's life (until [`retire`](Self::retire)).
+    /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: RawFd, kind: Kind) -> Arc<Self> {
         Arc::new(Self {
             fd: AtomicI32::new(fd),
             retired_fd: AtomicI32::new(NO_FD),
+            epoch: AtomicU32::new(0),
+            retired_epoch: AtomicU32::new(0),
             kind,
             read: Side::new(ReadState::default()),
             write: Side::new(WriteState::default()),
@@ -160,11 +270,22 @@ impl Source {
                 token: AtomicU64::new(NO_TOKEN),
                 shard: UnsafeCell::new(None),
             },
+            requests: AtomicU8::new(0),
+            ask: Ask::default(),
+            unsent: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// The hooks of a poll's or a request's hold.
+    fn hooks(&self) -> SourceHooks<'_> {
+        SourceHooks {
+            src: self,
+            token: None,
+        }
     }
 
     /// The descriptor, unless the source is retired.
@@ -182,6 +303,29 @@ impl Source {
             )),
             fd => Ok(fd),
         }
+    }
+
+    /// The descriptor the driver's part runs on, with a side held: for the
+    /// driver's own edge, only while `token` is the registration in place.
+    fn serving_fd(&self, token: Option<u64>) -> Option<RawFd> {
+        if token.is_some_and(|t| self.reg.token.load(Ordering::Acquire) != t) {
+            return None;
+        }
+        match self.fd.load(Ordering::Acquire) {
+            NO_FD => None,
+            fd => Some(fd),
+        }
+    }
+
+    /// Whether a side last saw an older epoch than the source's: if so it
+    /// catches up, and its state is of a descriptor that is gone.
+    fn catch_up(&self, seen: &mut u32) -> bool {
+        let now = self.epoch.load(Ordering::Acquire);
+        if *seen == now {
+            return false;
+        }
+        *seen = now;
+        true
     }
 
     /// What every step leaves for once no guard is held: a side that ran out
@@ -211,24 +355,6 @@ impl Source {
             return Poll::Ready(Err(err));
         }
         poll
-    }
-
-    /// The driver's part for a path that is not a poll: the descriptor is
-    /// the handle's while it is not retired.
-    fn serve_read(&self) -> impl FnMut(&mut ReadState, &mut After) + '_ {
-        move |st, after| {
-            if let Ok(fd) = self.fd() {
-                st.serve(fd, self.kind, true, after);
-            }
-        }
-    }
-
-    fn serve_write(&self) -> impl FnMut(&mut WriteState, &mut After) + '_ {
-        move |st, after| {
-            if let Ok(fd) = self.fd() {
-                st.serve(fd, self.kind, true, after);
-            }
-        }
     }
 
     /// Makes sure the driver of some shard watches the source: the current
@@ -262,51 +388,10 @@ impl Source {
         }
     }
 
-    /// Registers the source with `shard`'s poller under `token`. Called on
-    /// that shard's thread by whoever moved the state to `REGISTERING`.
-    pub(crate) fn attach(&self, shard: &Arc<Shared>, token: u64) -> io::Result<()> {
-        let read = self.read.hold();
-        let write = self.write.hold();
-        let result = match self.fd.load(Ordering::Acquire) {
-            NO_FD => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the handle closed before its registration",
-            )),
-            fd => shard.registrar().add(fd, token, self.kind == Kind::Tcp),
-        };
-        if result.is_ok() {
-            // SAFETY: both sides are held.
-            unsafe { *self.reg.shard.get() = Some(Arc::clone(shard)) };
-            self.reg.token.store(token, Ordering::Release);
-            self.reg.state.store(REGISTERED, Ordering::Release);
-        } else {
-            self.reg.state.store(UNREGISTERED, Ordering::Release);
-        }
-        // No registration was in place, so no driver flagged the sides.
-        drop((write, read));
-        result
-    }
-
     /// The shard could not even take the source in: the next wait tries
     /// again.
     pub(crate) fn registration_abandoned(&self) {
         self.reg.state.store(UNREGISTERED, Ordering::Release);
-    }
-
-    /// A registration the shard made for a thread that runs none failed:
-    /// the tasks waiting hear why, and the next wait tries again.
-    pub(crate) fn registration_failed(&self, err: &io::Error) {
-        let failure = Failure::of(err);
-        let mut after = After::default();
-        {
-            let mut read = self.read.hold();
-            read.get().fail(failure, &mut after);
-        }
-        {
-            let mut write = self.write.hold();
-            write.get().fail(failure, &mut after);
-        }
-        after.run();
     }
 
     /// Deregisters the source; both sides are held by the caller.
@@ -330,89 +415,34 @@ impl Source {
         }
     }
 
-    /// The shard the source is registered with is going away: the
-    /// registration goes, and every task waiting on the source is woken, to
-    /// register it where it polls next.
-    pub(crate) fn evict(&self) {
-        let mut read = self.read.hold();
-        let mut write = self.write.hold();
-        if self.reg.state.load(Ordering::Acquire) == REGISTERED {
-            // SAFETY: both sides are held.
-            let shard = unsafe { (*self.reg.shard.get()).take() };
-            self.reg.token.store(NO_TOKEN, Ordering::Release);
-            self.reg.state.store(UNREGISTERED, Ordering::Release);
-            if let (Some(shard), Ok(fd)) = (shard, self.fd()) {
-                let _ = shard.registrar().delete(fd, self.kind == Kind::Tcp);
-            }
-        }
-        let mut after = After::default();
-        read.get().wake_all(&mut after);
-        write.get().wake_all(&mut after);
-        drop((write, read));
-        after.run();
-    }
-
-    /// Stops all IO on the descriptor and deregisters it, before the handle
-    /// closes the descriptor or hands its IO object out mutably. Results
-    /// nobody took yet stay for the next operation, unless a revival brings
-    /// another descriptor.
-    pub(crate) fn retire(&self) {
-        let mut read = self.read.hold();
-        let mut write = self.write.hold();
-        self.detach();
-        let fd = self.fd.swap(NO_FD, Ordering::AcqRel);
-        if fd != NO_FD {
-            self.retired_fd.store(fd, Ordering::Release);
-        }
-        // Only a handle held exclusively retires its source, so no task
-        // borrows it: the wakers left are of operations that are gone.
-        let mut after = After::default();
-        read.get().forget_waiters(&mut after);
-        write.get().forget_waiters(&mut after);
-        // Edges flagged meanwhile are of the registration just removed.
-        drop((write, read));
-        after.run();
-    }
-
     /// A copy of the descriptor (the same open socket under another
     /// number), close-on-exec; `None` if the process has none to spare.
     pub(crate) fn duplicate(&self) -> Option<std::os::fd::OwnedFd> {
         super::sys::duplicate(self.fd().ok()?).ok()
     }
 
-    /// The source goes on with `fd`, a copy of its descriptor the caller
-    /// keeps open, as the handle's own closes: the registration under the
-    /// old number goes first (while that number is still the handle's),
-    /// reads stop, and what the write side holds is delivered through the
-    /// copy.
-    pub(crate) fn move_to(&self, fd: RawFd) {
-        let mut read = self.read.hold();
-        let mut write = self.write.hold();
-        self.detach();
-        self.fd.store(fd, Ordering::Release);
-        let mut after = After::default();
-        read.get().discard(&mut after);
-        read.get().forget_waiters(&mut after);
-        write.get().forget_waiters(&mut after);
-        // Edges flagged meanwhile are of the registration just removed.
-        drop((write, read));
-        after.run();
-    }
-
     /// Gives a retired source its descriptor again (the handle's IO object,
     /// possibly another one): the next wait registers it again. Another
-    /// descriptor than before discards what the old one left.
+    /// descriptor than before moves the epoch on, and each side discards
+    /// what the old one left when it is next taken. Concurrent revivals of
+    /// one object agree: the epoch moves on once, and the number is put in
+    /// place once, after it.
     pub(crate) fn revive(&self, fd: RawFd) {
         if self.fd.load(Ordering::Acquire) != NO_FD {
             return;
         }
-        if self.retired_fd.swap(NO_FD, Ordering::AcqRel) != fd {
-            let mut after = After::default();
-            self.read.hold().get().discard(&mut after);
-            self.write.hold().get().discard(&mut after);
-            after.run();
+        if self.retired_fd.load(Ordering::Acquire) != fd {
+            let retired = self.retired_epoch.load(Ordering::Acquire);
+            let _ = self.epoch.compare_exchange(
+                retired,
+                retired.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
-        self.fd.store(fd, Ordering::Release);
+        let _ = self
+            .fd
+            .compare_exchange(NO_FD, fd, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Whether the source is retired: the handle's next poll revives it.
@@ -420,61 +450,56 @@ impl Source {
         self.fd.load(Ordering::Acquire) == NO_FD
     }
 
+    /// Whether the write side holds bytes or a datagram the kernel has not
+    /// taken yet, as its last holder left it.
+    pub(crate) fn has_unsent(&self) -> bool {
+        self.unsent.load(Ordering::Acquire)
+    }
+
     /// The driver saw readiness for `token`.
     pub(crate) fn on_event(self: &Arc<Self>, token: u64, readiness: Readiness) {
         let mut after = After::default();
-        let kind = self.kind;
+        let hooks = SourceHooks {
+            src: self,
+            token: Some(token),
+        };
         if readiness.readable {
-            self.read.drive(
-                &mut after,
-                |st, edge, after| {
-                    if readiness.urgent || readiness.hangup {
-                        st.short_reads_unsure();
-                    }
-                    if let Some(fd) = self.live_fd(token) {
-                        st.serve(fd, kind, edge, after);
-                    }
-                },
-                true,
-            );
+            let unsure = if readiness.urgent || readiness.hangup {
+                read_work::UNSURE
+            } else {
+                0
+            };
+            self.read.drive(&mut after, &hooks, unsure);
         }
         if readiness.writable {
-            self.write.drive(
-                &mut after,
-                |st, edge, after| {
-                    if let Some(fd) = self.live_fd(token) {
-                        st.serve(fd, kind, edge, after);
-                    }
-                },
-                true,
-            );
+            self.write.drive(&mut after, &hooks, 0);
         }
         // If the driver's own pool ran out, the readers hear when a buffer
         // comes back and read for themselves.
         self.settle(after);
-    }
-
-    /// The descriptor, if `token` is the registration in place and the
-    /// source is not retired. Called with a side held.
-    fn live_fd(&self, token: u64) -> Option<RawFd> {
-        if self.reg.token.load(Ordering::Acquire) != token {
-            return None;
-        }
-        match self.fd.load(Ordering::Acquire) {
-            NO_FD => None,
-            fd => Some(fd),
-        }
     }
 }
 
 #[cfg(test)]
 impl Source {
     fn has_read_ahead(&self) -> bool {
-        self.read.hold().get().has_result()
+        let mut after = After::default();
+        let hooks = self.hooks();
+        self.read.try_hold().is_some_and(|mut held| {
+            let found = held.get().has_result();
+            held.release(&mut after, &hooks);
+            found
+        })
     }
 
     fn has_write_behind(&self) -> bool {
-        self.write.hold().get().has_behind()
+        let mut after = After::default();
+        let hooks = self.hooks();
+        self.write.try_hold().is_some_and(|mut held| {
+            let found = held.get().has_behind();
+            held.release(&mut after, &hooks);
+            found
+        })
     }
 }
 
@@ -498,16 +523,9 @@ impl Wake for Source {
 
     fn wake_by_ref(self: &Arc<Self>) {
         let mut after = After::default();
-        self.read.run(
-            &mut after,
-            |st, after| st.unstarve(after),
-            self.serve_read(),
-        );
-        self.write.run(
-            &mut after,
-            |st, after| st.unstarve(after),
-            self.serve_write(),
-        );
+        let hooks = self.hooks();
+        self.read.defer(read_work::UNSTARVE, &mut after, &hooks);
+        self.write.defer(write_work::UNSTARVE, &mut after, &hooks);
         self.settle(after);
     }
 }

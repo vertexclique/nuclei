@@ -1,34 +1,59 @@
 //! The guard of one direction of a source, shared by the source's polls and
 //! its shard's driver.
 //!
-//! A side's state word has two bits. `BUSY`: someone holds the side, for one
-//! system call or one copy at most, never across an await. `READY`:
-//! readiness came while the side was held. The driver never waits for the
-//! guard: finding the side held, it sets `READY` and goes on, and the
-//! holder, as it lets go, sees `READY` and does the driver's part itself
-//! (if the holder let go before `READY` landed, the driver takes the side
-//! after all). A poll that finds the side held waits for the holder, which
-//! is only ever doing one bounded step. So an edge is never lost and the
+//! # Progress
+//!
+//! No thread ever waits for another. Taking a side is one `fetch_or`; a
+//! thread that finds it held leaves what it came for to the holder and goes
+//! on, and the holder, as it lets go, does that work itself. What can be
+//! left: the driver's part for an edge (`READY`), the wake of a poll that
+//! found the side held (`WAITING`), side-local work such as waking readers a
+//! returned buffer unstarves (`DEFER`), and requests that need both sides of
+//! the source (`REQ`). Letting go is one compare-and-swap from the exact
+//! word the holder took to zero; when others left flags meanwhile it fails,
+//! and the holder takes the flags with one swap (still holding), does the
+//! work, and tries again. So an edge is never lost, no poll spins, and the
 //! driver never stalls behind a poll. `proofs/tla/side/` checks the
 //! protocol and the loom models below check this code.
+//!
+//! A poll that finds the side held stores its waker in the side's contended
+//! set, then raises `WAITING`; if that showed the side free again, it takes
+//! the side itself (one more `fetch_or`), else it returns `Pending` and the
+//! holder wakes it.
 //!
 //! Nothing that may run code of its own happens under the guard: wakers
 //! are woken and buffers dropped (a dropped buffer may wake a source that
 //! waits for one) only after the guard is let go, through [`After`].
 
-use core::task::Waker;
+use core::task::{Poll, Waker};
 
 use crate::buf::PoolBuf;
-use crate::sync::internal::{AtomicU8, Ordering, UnsafeCell};
+use crate::sync::atomic_waker::{AtomicWaker, Registered};
+use crate::sync::internal::{AtomicPtr, AtomicU8, AtomicUsize, Ordering, UnsafeCell};
 
 /// Someone holds the side.
 const BUSY: u8 = 1;
-/// Readiness came while the side was held.
+/// An edge came while the side was held: the holder does the driver's part.
 const READY: u8 = 2;
+/// A poll found the side held and waits in the contended set.
+const WAITING: u8 = 4;
+/// Side-local work waits in the deferred word.
+const DEFER: u8 = 8;
+/// The source has requests that need both of its sides.
+const REQ: u8 = 16;
+
+/// Slots of a side's contended set: polls of more tasks than this at one
+/// moment share the last slot.
+const SIDE_SLOTS: usize = 4;
 
 /// One direction of a source: its state, behind the guard.
 pub(crate) struct Side<S> {
     state: AtomicU8,
+    /// Side-local work left for the holder; its bits are the user's.
+    deferred: AtomicU8,
+    /// Wakers of polls that found the side held, made on the side's first
+    /// contention.
+    contended: AtomicPtr<WakerSet<SIDE_SLOTS>>,
     inner: UnsafeCell<S>,
 }
 
@@ -37,133 +62,143 @@ unsafe impl<S: Send> Send for Side<S> {}
 // SAFETY: as for `Send`: one holder at a time.
 unsafe impl<S: Send> Sync for Side<S> {}
 
-/// A held side. Dropping it lets go without looking at `READY`; the paths
-/// that must look use [`release`](Held::release).
+/// What a side's holder does for the work others left it, and as it takes
+/// and lets go of the side.
+pub(crate) trait Hooks<S> {
+    /// Just after the side is taken.
+    fn taken(&self, _st: &mut S, _after: &mut After) {}
+    /// The driver's part, for an edge that came while the side was held.
+    fn serve(&self, st: &mut S, after: &mut After);
+    /// Side-local work others left: the deferred word's bits.
+    fn deferred(&self, _st: &mut S, _bits: u8, _after: &mut After) {}
+    /// The source's requests may be pending (each holder looks).
+    fn requests(&self, _st: &mut S, _after: &mut After) {}
+    /// The side was let go; `saw_requests`: the holder saw `REQ` meanwhile.
+    fn released(&self, _saw_requests: bool, _after: &mut After) {}
+    /// Just before each attempt to let go.
+    fn releasing(&self, _st: &mut S) {}
+}
+
+/// A held side. Let go through [`release`](Held::release), which does what
+/// others left; a drop (a panic under the guard) only wakes the contended.
 pub(crate) struct Held<'a, S> {
     side: &'a Side<S>,
+    /// The word the holder took: what letting go swaps back to zero.
+    expect: u8,
+    /// The driver took the side with its own `READY`.
+    own_ready: bool,
 }
 
 impl<S> Side<S> {
     pub(crate) fn new(inner: S) -> Self {
         Self {
             state: AtomicU8::new(0),
+            deferred: AtomicU8::new(0),
+            contended: AtomicPtr::new(core::ptr::null_mut()),
             inner: UnsafeCell::new(inner),
         }
     }
 
-    /// Takes the side, unless someone holds it. A `READY` left on a free
-    /// side (the holder let go as the driver flagged it) is taken with it:
-    /// the new holder is about to look at the descriptor anyway.
-    fn try_hold(&self) -> Option<Held<'_, S>> {
-        let mut state = self.state.load(Ordering::Relaxed);
-        loop {
-            if state & BUSY != 0 {
-                return None;
-            }
-            // Acquire: the holder before us published the contents with its
-            // Release.
-            match self.state.compare_exchange_weak(
-                state,
-                BUSY,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(Held { side: self }),
-                Err(actual) => state = actual,
-            }
-        }
+    /// The side, if it was free, taken with one `fetch_or` that also raises
+    /// `extra`; if it was held, `extra` is left for its holder.
+    fn take(&self, extra: u8) -> Option<Held<'_, S>> {
+        // AcqRel: acquires what the last holder published, and publishes
+        // what this thread left (its deferred bits, its contended waker)
+        // to the holder.
+        let prev = self.state.fetch_or(BUSY | extra, Ordering::AcqRel);
+        // Built only on success: a `Held` dropped unused would let go of a
+        // side another thread holds.
+        (prev & BUSY == 0).then(|| Held {
+            side: self,
+            expect: BUSY | (extra & READY),
+            own_ready: extra & READY != 0,
+        })
     }
 
-    /// Takes the side, waiting for the holder's one step.
-    pub(crate) fn hold(&self) -> Held<'_, S> {
-        let mut spins = 0u32;
-        loop {
-            if let Some(held) = self.try_hold() {
-                return held;
-            }
-            #[cfg(loom)]
-            loom::thread::yield_now();
-            if spins < 64 {
-                core::hint::spin_loop();
-                spins += 1;
-            } else {
-                // The holder was preempted mid-step: let it run.
-                std::thread::yield_now();
-            }
-        }
+    /// The side, if it is free: a test's look.
+    #[cfg(test)]
+    pub(crate) fn try_hold(&self) -> Option<Held<'_, S>> {
+        self.take(0)
     }
 
-    /// The driver's way in: the side if it is free; if it is held, `READY`
-    /// is left for the holder, and `None` returned.
-    fn hold_or_flag(&self) -> Option<Held<'_, S>> {
-        loop {
-            if let Some(held) = self.try_hold() {
-                return Some(held);
-            }
-            // AcqRel: the flag is the holder's to act on, after its step.
-            if self.state.fetch_or(READY, Ordering::AcqRel) & BUSY != 0 {
-                return None;
-            }
-            // The holder let go before the flag landed: take the side.
-        }
+    /// For a request that needs this side and another: the side, if it was
+    /// free; if it was held, its holder sees `REQ` and looks at the requests.
+    pub(crate) fn take_for_request(&self) -> Option<Held<'_, S>> {
+        self.take(REQ)
     }
 
-    /// Runs one step of a poll under the guard. When readiness came while
-    /// it ran, the driver's part (`serve`, told it serves an edge) runs here
-    /// in its place, then the step again if it was pending. Wakes and drops
-    /// happen once the guard is let go.
+    /// Runs one step of a poll under the guard. A poll that finds the side
+    /// held registers `waker` and returns `Pending`: the holder wakes it as
+    /// it lets go. When an edge came while the step ran, the driver's part
+    /// runs here, then the step again if it was pending.
     pub(crate) fn poll<R>(
         &self,
         after: &mut After,
-        mut step: impl FnMut(&mut S, &mut After) -> core::task::Poll<R>,
-        mut serve: impl FnMut(&mut S, &mut After),
-    ) -> core::task::Poll<R> {
-        let mut held = self.hold();
+        waker: &Waker,
+        hooks: &impl Hooks<S>,
+        mut step: impl FnMut(&mut S, &mut After) -> Poll<R>,
+    ) -> Poll<R> {
+        let Some(mut held) = self.take(0).or_else(|| self.contend(waker)) else {
+            return Poll::Pending;
+        };
+        hooks.taken(held.get(), after);
         let mut out = step(held.get(), after);
-        while held.release() {
-            held = self.hold();
-            serve(held.get(), after);
+        held.release_with(after, hooks, |st, after| {
             if out.is_pending() {
-                out = step(held.get(), after);
+                out = step(st, after);
             }
-        }
+        });
         out
     }
 
-    /// Runs `f` under the guard; when readiness came while it ran, the
-    /// driver's part (`serve`) runs here before the guard is let go for good.
-    pub(crate) fn run<R>(
-        &self,
-        after: &mut After,
-        f: impl FnOnce(&mut S, &mut After) -> R,
-        mut serve: impl FnMut(&mut S, &mut After),
-    ) -> R {
-        let mut held = self.hold();
-        let out = f(held.get(), after);
-        while held.release() {
-            held = self.hold();
-            serve(held.get(), after);
+    /// For a poll that found the side held: its waker goes to the contended
+    /// set for the holder to wake, or, if the side came free meanwhile, the
+    /// side is taken after all.
+    fn contend(&self, waker: &Waker) -> Option<Held<'_, S>> {
+        if !self.contended().register(waker) {
+            // The holder is taking the contended wakers right now, so it is
+            // about to let go, and `waker` was woken already: this poll ends
+            // and the next one finds the side free, with no flag that would
+            // send the holder round again.
+            return None;
         }
-        out
+        // AcqRel: publishes the registration to the holder that takes the
+        // flag, and acquires the release of a holder that let go first.
+        if self.state.fetch_or(WAITING, Ordering::AcqRel) & BUSY != 0 {
+            return None;
+        }
+        self.take(0)
     }
 
-    /// The driver's part: `serve` runs under the guard, or, if a poll holds
-    /// it, in that poll as it lets go. `edge`: the driver saw readiness;
-    /// `serve` is told so, and so is every round after a flag.
-    pub(crate) fn drive(
-        &self,
-        after: &mut After,
-        mut serve: impl FnMut(&mut S, bool, &mut After),
-        edge: bool,
-    ) {
-        let mut edge = edge;
-        while let Some(mut held) = self.hold_or_flag() {
-            serve(held.get(), edge, after);
-            if !held.release() {
-                return;
-            }
-            edge = true;
+    /// The driver's part for an edge, after side-local work `defer` (say,
+    /// urgent data came): done now if the side is free, else by its holder
+    /// as it lets go.
+    pub(crate) fn drive(&self, after: &mut After, hooks: &impl Hooks<S>, defer: u8) {
+        if defer != 0 {
+            // Release: the holder that takes DEFER reads the bits.
+            self.deferred.fetch_or(defer, Ordering::Release);
         }
+        let extra = if defer != 0 { READY | DEFER } else { READY };
+        let Some(mut held) = self.take(extra) else {
+            return;
+        };
+        hooks.taken(held.get(), after);
+        held.run_deferred(hooks, after);
+        hooks.serve(held.get(), after);
+        held.release(after, hooks);
+    }
+
+    /// Leaves side-local work `bits` for whoever holds the side: done now if
+    /// the side is free, else by its holder as it lets go.
+    pub(crate) fn defer(&self, bits: u8, after: &mut After, hooks: &impl Hooks<S>) {
+        // Release: the holder that takes DEFER reads the bits.
+        self.deferred.fetch_or(bits, Ordering::Release);
+        let Some(mut held) = self.take(DEFER) else {
+            return;
+        };
+        hooks.taken(held.get(), after);
+        held.run_deferred(hooks, after);
+        held.release(after, hooks);
     }
 
     /// The contents, through exclusive access: nobody else can hold it.
@@ -172,6 +207,48 @@ impl<S> Side<S> {
             // SAFETY: `&mut self` excludes every holder.
             unsafe { &mut *p }
         })
+    }
+
+    /// The contended set, made on first use.
+    fn contended(&self) -> &WakerSet<SIDE_SLOTS> {
+        let mut set = self.contended.load(Ordering::Acquire);
+        if set.is_null() {
+            let made = Box::into_raw(Box::new(WakerSet::new()));
+            set = match self.contended.compare_exchange(
+                core::ptr::null_mut(),
+                made,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => made,
+                Err(theirs) => {
+                    // SAFETY: `made` was never published.
+                    drop(unsafe { Box::from_raw(made) });
+                    theirs
+                }
+            };
+        }
+        // SAFETY: once published, the set lives as long as the side.
+        unsafe { &*set }
+    }
+
+    /// Wakes every poll waiting in the contended set.
+    fn wake_contended(&self, after: &mut After) {
+        let set = self.contended.load(Ordering::Acquire);
+        // SAFETY: as in `contended`.
+        if let Some(set) = unsafe { set.as_ref() } {
+            set.take_all(after);
+        }
+    }
+}
+
+impl<S> Drop for Side<S> {
+    fn drop(&mut self) {
+        let set = crate::sync::internal::take_ptr(&mut self.contended);
+        if !set.is_null() {
+            // SAFETY: made by `Box::into_raw` and owned by the side alone.
+            drop(unsafe { Box::from_raw(set) });
+        }
     }
 }
 
@@ -183,19 +260,139 @@ impl<S> Held<'_, S> {
         })
     }
 
-    /// Lets go of the side. Returns whether readiness came while it was
-    /// held, so the caller does the driver's part.
-    pub(crate) fn release(self) -> bool {
-        // Release: publishes the contents to the next holder.
-        let state = self.side.state.swap(0, Ordering::AcqRel);
+    fn run_deferred(&mut self, hooks: &impl Hooks<S>, after: &mut After) {
+        // Acquire: pairs with the Release of whoever left the bits.
+        let bits = self.side.deferred.swap(0, Ordering::Acquire);
+        if bits != 0 {
+            hooks.deferred(self.get(), bits, after);
+        }
+    }
+
+    /// Lets go of the side, first doing what others left for its holder.
+    pub(crate) fn release(self, after: &mut After, hooks: &impl Hooks<S>) {
+        self.release_with(after, hooks, |_, _| {});
+    }
+
+    /// As [`release`](Self::release); `again` runs after each driver's part
+    /// (a poll's step, while it waits).
+    fn release_with(
+        mut self,
+        after: &mut After,
+        hooks: &impl Hooks<S>,
+        mut again: impl FnMut(&mut S, &mut After),
+    ) {
+        let mut saw_requests = false;
+        loop {
+            hooks.releasing(self.get());
+            // Release: publishes the contents to the next holder.
+            if self
+                .side
+                .state
+                .compare_exchange(self.expect, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            // Flags others left meanwhile: taken, the side still held.
+            let mut flags = self.side.state.swap(BUSY, Ordering::AcqRel) & !BUSY;
+            if core::mem::take(&mut self.own_ready) {
+                // Only the driver raises READY, and it is the holder.
+                flags &= !READY;
+            }
+            self.expect = BUSY;
+            if flags & DEFER != 0 {
+                self.run_deferred(hooks, after);
+            }
+            if flags & READY != 0 {
+                hooks.serve(self.get(), after);
+                again(self.get(), after);
+            }
+            if flags & WAITING != 0 {
+                self.side.wake_contended(after);
+            }
+            if flags & REQ != 0 {
+                saw_requests = true;
+                hooks.requests(self.get(), after);
+            }
+        }
         core::mem::forget(self);
-        state & READY != 0
+        hooks.released(saw_requests, after);
     }
 }
 
 impl<S> Drop for Held<'_, S> {
+    /// Only a panic under the guard gets here: the side goes free, and the
+    /// polls waiting on it are woken to look again.
     fn drop(&mut self) {
-        self.side.state.store(0, Ordering::Release);
+        let flags = self.side.state.swap(0, Ordering::AcqRel);
+        if flags & WAITING != 0 {
+            let mut after = After::default();
+            self.side.wake_contended(&mut after);
+            after.run();
+        }
+    }
+}
+
+/// Wakers of tasks waiting for one thing, registered and taken without a
+/// lock, every operation in a bounded number of steps.
+///
+/// A task claims a slot with its tag (its waker's data pointer) in one
+/// compare-and-swap, and registers there again on later polls. When every
+/// slot holds another task, the last slot is shared: a registration there
+/// wakes the waker it displaces, so no task loses its wake, at the cost of
+/// a spurious one.
+pub(crate) struct WakerSet<const N: usize> {
+    tags: [AtomicUsize; N],
+    wakers: [AtomicWaker; N],
+}
+
+impl<const N: usize> WakerSet<N> {
+    pub(crate) fn new() -> Self {
+        Self {
+            tags: core::array::from_fn(|_| AtomicUsize::new(0)),
+            wakers: core::array::from_fn(|_| AtomicWaker::new()),
+        }
+    }
+
+    /// Registers `waker` to be woken by the next [`take_all`](Self::take_all).
+    ///
+    /// The task's own slot first, then a free one; a slot another wake or
+    /// registration is using is passed over, and since a take works on one
+    /// slot at a time another always serves. Only when every slot holds
+    /// another task does the last one take `waker`, waking the one it
+    /// displaces. Returns false when `waker` was woken at once instead of
+    /// kept: a take met the registration (the taker is waking this set's
+    /// tasks now), or the last slot was in use.
+    pub(crate) fn register(&self, waker: &Waker) -> bool {
+        // Never zero, the empty slot's tag.
+        let tag = waker.data() as usize | 1;
+        let own = (0..N).filter(|&i| self.tags[i].load(Ordering::Acquire) == tag);
+        let free = (0..N).filter(|&i| {
+            self.tags[i]
+                .compare_exchange(0, tag, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
+        for i in own.chain(free) {
+            match self.wakers[i].try_register_displacing(waker) {
+                Registered::Kept(_) => return true,
+                // A take of this slot met the registration and woke it.
+                Registered::WokenNow => return false,
+                Registered::InUse => {}
+            }
+        }
+        self.wakers[N - 1].register_displacing(waker)
+    }
+
+    /// Takes every registered waker, for `after` to wake, and frees the
+    /// slots.
+    pub(crate) fn take_all(&self, after: &mut After) {
+        for (tag, waker) in self.tags.iter().zip(&self.wakers) {
+            if let Some(w) = waker.take() {
+                after.wake_one(w);
+            }
+            // Release: a slot claimed after this sees the waker taken.
+            tag.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -336,105 +533,8 @@ impl Wakers {
     }
 }
 
+#[cfg(all(test, not(loom)))]
+mod tests;
+
 #[cfg(all(test, loom))]
-mod loom_tests {
-    use core::task::Poll;
-
-    use loom::sync::Arc;
-    use loom::sync::atomic::{AtomicUsize, Ordering};
-    use loom::thread;
-
-    use super::{After, Side};
-
-    /// What a side holds in the model: the readiness cache (an edge came
-    /// since the last empty read) and what the reader got.
-    #[derive(Default)]
-    struct Model {
-        ready: bool,
-        got: usize,
-    }
-
-    /// One read attempt on the model's descriptor (`kernel`, the bytes the
-    /// kernel holds): takes them all, or clears the cache.
-    fn read(m: &mut Model, kernel: &AtomicUsize) -> bool {
-        match kernel.swap(0, Ordering::SeqCst) {
-            0 => {
-                m.ready = false;
-                false
-            }
-            n => {
-                m.got += n;
-                true
-            }
-        }
-    }
-
-    /// The model: a byte arrives and its edge is reported while a poll
-    /// reads. `flag`: the driver uses the protocol; without it, a held side
-    /// makes it drop the edge.
-    fn model(flag: bool) {
-        let side = Arc::new(Side::new(Model {
-            ready: true,
-            ..Model::default()
-        }));
-        let kernel = Arc::new(AtomicUsize::new(0));
-        let driver = {
-            let (side, kernel) = (side.clone(), kernel.clone());
-            thread::spawn(move || {
-                kernel.fetch_add(1, Ordering::SeqCst);
-                let mut after = After::default();
-                let serve = |m: &mut Model, edge: bool, _: &mut After| {
-                    if edge {
-                        m.ready = true;
-                    }
-                    if m.ready {
-                        read(m, &kernel);
-                    }
-                };
-                if flag {
-                    side.drive(&mut after, serve, true);
-                } else if let Some(mut held) = side.try_hold() {
-                    serve(held.get(), true, &mut after);
-                }
-            })
-        };
-        let mut after = After::default();
-        let _ = side.poll(
-            &mut after,
-            |m, _| {
-                if m.ready && read(m, &kernel) {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            },
-            |m, _| {
-                m.ready = true;
-                read(m, &kernel);
-            },
-        );
-        driver.join().unwrap();
-        assert_eq!(
-            kernel.load(Ordering::SeqCst),
-            0,
-            "the byte was left in the kernel"
-        );
-        assert_eq!(side.hold().get().got, 1);
-    }
-
-    /// A poll reads while the data arrives and the driver reports it: the
-    /// byte is read, by the poll or by the driver's part, never left in the
-    /// kernel with the cache cleared.
-    #[test]
-    fn an_edge_during_a_poll_is_never_lost() {
-        loom::model(|| model(true));
-    }
-
-    /// The calibration: a driver that skips a held side loses the edge in
-    /// some interleaving.
-    #[test]
-    #[should_panic(expected = "the byte was left in the kernel")]
-    fn calibration_a_driver_that_skips_a_held_side_loses_the_edge() {
-        loom::model(|| model(false));
-    }
-}
+mod loom_tests;

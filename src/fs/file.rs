@@ -36,8 +36,10 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::task::Wake;
 
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
 use crate::buf::{PoolBuf, with_pool};
-use crate::io::side::{After, Side, Wakers};
+use crate::io::side::{After, Hooks, Side, WakerSet};
 use crate::io::source::Failure;
 use crate::io::sys;
 use crate::rt::task::Task;
@@ -47,13 +49,64 @@ pub(crate) const READ_MIN: usize = 64 * 1024;
 /// The least a write buffer holds, so a run of small writes takes one job.
 const WRITE_MIN: usize = 64 * 1024;
 
+/// Tasks at once that wait on one file without sharing a slot.
+const FILE_SLOTS: usize = 8;
+
+/// Work on the file state left for its holder (its deferred word).
+mod work {
+    /// Consume `consumed` bytes of the read-ahead.
+    pub(super) const CONSUME: u8 = 1;
+    /// The future of a lent write went away.
+    pub(super) const ABANDON: u8 = 2;
+}
+
 /// The IO state of a file handle, shared with the waker its jobs wake.
 pub(crate) struct FileIo {
     /// The jobs' copy of the descriptor.
     fd: Arc<OwnedFd>,
     state: Side<FileState>,
     /// Tasks waiting for a job: all woken when any job ends.
-    waiters: Side<Wakers>,
+    waiters: WakerSet<FILE_SLOTS>,
+    /// Bytes a buffered read consumed, for the state's holder to apply.
+    consumed: AtomicUsize,
+    /// Whether written bytes have not reached the file yet, and the cursor,
+    /// as the state's last holder left them.
+    unsent: AtomicBool,
+    cursor: AtomicU64,
+}
+
+/// What the file state's holder does for the work others left it.
+struct FileHooks<'a> {
+    io: &'a Arc<FileIo>,
+}
+
+impl Hooks<FileState> for FileHooks<'_> {
+    // The file has no driver: its jobs wake the waiting tasks instead.
+    fn serve(&self, _st: &mut FileState, _after: &mut After) {}
+
+    fn deferred(&self, st: &mut FileState, bits: u8, after: &mut After) {
+        if bits & work::CONSUME != 0 {
+            let amt = self.io.consumed.swap(0, Ordering::Acquire);
+            let n = st.ahead.as_mut().map_or(0, |ahead| {
+                let n = amt.min(ahead.filled().len());
+                ahead.consume(n);
+                n
+            });
+            st.consumed(n, after);
+        }
+        if bits & work::ABANDON != 0 {
+            st.abandon_lent(&Waker::from(Arc::clone(self.io)), after);
+        }
+    }
+
+    fn releasing(&self, st: &mut FileState) {
+        // Release: read without the guard, on any thread.
+        self.io.unsent.store(
+            st.writing.is_some() || st.behind.is_some(),
+            Ordering::Release,
+        );
+        self.io.cursor.store(st.cursor, Ordering::Release);
+    }
 }
 
 struct Job<T> {
@@ -136,7 +189,10 @@ impl FileIo {
                 cursor,
                 ..FileState::default()
             }),
-            waiters: Side::new(Wakers::default()),
+            waiters: WakerSet::new(),
+            consumed: AtomicUsize::new(0),
+            unsent: AtomicBool::new(false),
+            cursor: AtomicU64::new(cursor),
         }))
     }
 
@@ -185,20 +241,22 @@ impl FileIo {
     }
 
     /// Runs `step` on the state for a task polling with `cx`: the task is
-    /// woken when any job ends.
+    /// woken when any job ends, or, if another task holds the state, when
+    /// that one lets go.
     fn with_state<R>(
         self: &Arc<Self>,
         cx: &Context<'_>,
-        step: impl FnOnce(&mut FileState, &FileIo, &Waker, &mut After) -> R,
-    ) -> R {
-        self.waiters.hold().get().register(cx.waker());
+        mut step: impl FnMut(&mut FileState, &FileIo, &Waker, &mut After) -> Poll<R>,
+    ) -> Poll<R> {
+        self.waiters.register(cx.waker());
         let waker = Waker::from(Arc::clone(self));
         let mut after = After::default();
-        let out = self.state.run(
-            &mut after,
-            |st, after| step(st, self, &waker, after),
-            |_, _| {},
-        );
+        let hooks = FileHooks { io: self };
+        let out = self
+            .state
+            .poll(&mut after, cx.waker(), &hooks, |st, after| {
+                step(st, self, &waker, after)
+            });
         if after.starved {
             with_pool(|pool| {
                 if let Some(pool) = pool {
@@ -249,20 +307,12 @@ impl FileIo {
         })
     }
 
-    pub(crate) fn consume(&self, amt: usize) {
+    pub(crate) fn consume(self: &Arc<Self>, amt: usize) {
+        // Release: the holder that runs the work reads the amount.
+        self.consumed.fetch_add(amt, Ordering::Release);
         let mut after = After::default();
-        self.state.run(
-            &mut after,
-            |st, after| {
-                let n = st.ahead.as_mut().map_or(0, |ahead| {
-                    let n = amt.min(ahead.filled().len());
-                    ahead.consume(n);
-                    n
-                });
-                st.consumed(n, after);
-            },
-            |_, _| {},
-        );
+        self.state
+            .defer(work::CONSUME, &mut after, &FileHooks { io: self });
         after.run();
     }
 
@@ -406,25 +456,16 @@ impl FileIo {
         self.with_state(cx, |st, io, waker, after| st.seek(io, pos, waker, after))
     }
 
-    /// Whether written bytes have not reached the file yet.
+    /// Whether written bytes have not reached the file yet, as the state's
+    /// last holder left it.
     pub(crate) fn has_unsent(&self) -> bool {
-        let mut after = After::default();
-        let unsent = self.state.run(
-            &mut after,
-            |st, _| st.writing.is_some() || st.behind.is_some(),
-            |_, _| {},
-        );
-        after.run();
-        unsent
+        self.unsent.load(Ordering::Acquire)
     }
 
     /// The cursor, where the file's own offset goes when the handle hands
-    /// the file out.
+    /// the file out, as the state's last holder left it.
     pub(crate) fn cursor(&self) -> u64 {
-        let mut after = After::default();
-        let cursor = self.state.run(&mut after, |st, _| st.cursor, |_, _| {});
-        after.run();
-        cursor
+        self.cursor.load(Ordering::Acquire)
     }
 }
 
@@ -436,9 +477,8 @@ impl Wake for FileIo {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        let mut wakers = core::mem::take(self.waiters.hold().get());
         let mut after = After::default();
-        after.wake(&mut wakers);
+        self.waiters.take_all(&mut after);
         after.run();
     }
 }
@@ -719,13 +759,10 @@ impl WriteOwned<'_> {
 impl Drop for WriteOwned<'_> {
     fn drop(&mut self) {
         if self.out {
-            let waker = Waker::from(Arc::clone(self.io));
             let mut after = After::default();
-            self.io.state.run(
-                &mut after,
-                |st, after| st.abandon_lent(&waker, after),
-                |_, _| {},
-            );
+            self.io
+                .state
+                .defer(work::ABANDON, &mut after, &FileHooks { io: self.io });
             after.run();
         }
     }

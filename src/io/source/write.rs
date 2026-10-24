@@ -111,6 +111,8 @@ pub(super) struct WriteState {
     connecting: bool,
     connected: Option<io::Result<()>>,
     shut: bool,
+    /// The source's epoch this state is of.
+    epoch: u32,
 }
 
 /// Writes bytes to a stream.
@@ -131,6 +133,10 @@ fn send_datagram(fd: RawFd, bytes: &[u8], dest: Dest<'_>) -> io::Result<usize> {
 }
 
 impl WriteState {
+    pub(super) fn epoch_mut(&mut self) -> &mut u32 {
+        &mut self.epoch
+    }
+
     #[cfg(test)]
     pub(super) fn has_behind(&self) -> bool {
         self.behind.is_some()
@@ -349,7 +355,7 @@ impl WriteState {
     /// The task of the lent buffer went away: a write none of which went
     /// out is withdrawn, one that started is left to the driver to finish,
     /// and the error of one that ended is kept as the write-behind's.
-    fn abandon_lent(&mut self, after: &mut After) {
+    pub(super) fn abandon_lent(&mut self, after: &mut After) {
         let Some(lent) = self.lent.as_mut() else {
             return;
         };
@@ -513,7 +519,7 @@ impl WriteState {
 
     /// Bytes or a datagram accepted and not handed to the kernel yet, that
     /// the driver can still deliver.
-    fn has_unsent(&self) -> bool {
+    pub(super) fn has_unsent(&self) -> bool {
         self.failed.is_none()
             && (self.behind.is_some() || self.lent_waits() || self.queued.is_some())
     }
@@ -649,11 +655,11 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.write.poll(
-            &mut after,
-            |st, after| st.write(fd, kind, bufs, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .write
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.write(fd, kind, bufs, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
     }
 
@@ -682,23 +688,29 @@ impl Source {
             Ok(fd) => {
                 let kind = self.kind;
                 let mut after = After::default();
-                let poll = self.write.poll(
-                    &mut after,
-                    |st, after| st.write_owned(fd, kind, held, cx.waker(), after),
-                    |st, after| st.serve(fd, kind, true, after),
-                );
+                let poll = self
+                    .write
+                    .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                        st.write_owned(fd, kind, held, cx.waker(), after)
+                    });
                 self.finish_poll(after, poll)
             }
             Err(err) => Poll::Ready(Err(err)),
         };
         if poll.is_ready() && held.is_none() {
+            // The poll failed with the buffer lent: it comes back as it is.
+            // If the side is held now, the poll waits and starts over.
             let mut after = After::default();
-            *held = self.write.run(
-                &mut after,
-                |st, after| st.reclaim(after),
-                self.serve_write(),
-            );
+            let back = self
+                .write
+                .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                    Poll::Ready(st.reclaim(after))
+                });
             self.settle(after);
+            match back {
+                Poll::Ready(buf) => *held = buf,
+                Poll::Pending => return Poll::Pending,
+            }
         }
         poll
     }
@@ -711,11 +723,11 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.write.poll(
-            &mut after,
-            |st, after| st.flush(fd, kind, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .write
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.flush(fd, kind, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
     }
 
@@ -727,11 +739,11 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.write.poll(
-            &mut after,
-            |st, after| st.close(fd, kind, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .write
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.close(fd, kind, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
     }
 
@@ -748,18 +760,12 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.write.poll(
-            &mut after,
-            |st, after| st.send(fd, kind, bytes, dest, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .write
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.send(fd, kind, bytes, dest, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
-    }
-
-    /// Whether the write side holds bytes or a datagram the kernel has not
-    /// taken yet.
-    pub(crate) fn has_unsent(&self) -> bool {
-        self.write.hold().get().has_unsent()
     }
 
     /// Completes once the kernel took every byte and datagram accepted (or
@@ -771,11 +777,11 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.write.poll(
-            &mut after,
-            |st, after| st.drain(fd, kind, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .write
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.drain(fd, kind, cx.waker(), after)
+            });
         match self.finish_poll(after, poll.map(Ok)) {
             Poll::Ready(_) => Poll::Ready(()),
             Poll::Pending => Poll::Pending,
@@ -794,13 +800,12 @@ impl Source {
             Ok(fd) => fd,
             Err(err) => return Poll::Ready(Err(err)),
         };
-        let kind = self.kind;
         let mut after = After::default();
-        let poll = self.write.poll(
-            &mut after,
-            |st, after| st.connect(fd, peer, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .write
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.connect(fd, peer, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
     }
 }
@@ -826,11 +831,9 @@ impl Drop for WriteOwned<'_> {
     fn drop(&mut self) {
         if self.lent {
             let mut after = After::default();
-            self.source.write.run(
-                &mut after,
-                |st, after| st.abandon_lent(after),
-                self.source.serve_write(),
-            );
+            self.source
+                .write
+                .defer(super::write_work::ABANDON, &mut after, &self.source.hooks());
             self.source.settle(after);
         }
     }

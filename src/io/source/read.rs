@@ -125,9 +125,15 @@ pub(super) struct ReadState {
     /// Urgent data or a hangup was reported: a short read may leave bytes
     /// behind it from now on (see [`drained`]).
     unsure: bool,
+    /// The source's epoch this state is of.
+    epoch: u32,
 }
 
 impl ReadState {
+    pub(super) fn epoch_mut(&mut self) -> &mut u32 {
+        &mut self.epoch
+    }
+
     pub(super) fn has_result(&self) -> bool {
         self.ahead.is_some()
             || self.eof
@@ -443,7 +449,7 @@ impl ReadState {
     /// The task of the lent buffer went away: what the driver read into it
     /// becomes the read-ahead (its end or its error, the next read's), so
     /// nothing is lost.
-    fn abandon_lent(&mut self, after: &mut After) {
+    pub(super) fn abandon_lent(&mut self, after: &mut After) {
         let Some(lent) = self.lent.take() else {
             return;
         };
@@ -657,11 +663,11 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.read.poll(
-            &mut after,
-            |st, after| st.read(fd, kind, out, peek, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .read
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.read(fd, kind, out, peek, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
     }
 
@@ -691,21 +697,29 @@ impl Source {
             Ok(fd) => {
                 let kind = self.kind;
                 let mut after = After::default();
-                let poll = self.read.poll(
-                    &mut after,
-                    |st, after| st.read_owned(fd, kind, held, cx.waker(), after),
-                    |st, after| st.serve(fd, kind, true, after),
-                );
+                let poll = self
+                    .read
+                    .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                        st.read_owned(fd, kind, held, cx.waker(), after)
+                    });
                 self.finish_poll(after, poll)
             }
             Err(err) => Poll::Ready(Err(err)),
         };
         if poll.is_ready() && held.is_none() {
+            // The poll failed with the buffer lent: it comes back as it is.
+            // If the side is held now, the poll waits and starts over.
             let mut after = After::default();
-            *held = self
+            let back = self
                 .read
-                .run(&mut after, |st, after| st.reclaim(after), self.serve_read());
+                .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                    Poll::Ready(st.reclaim(after))
+                });
             self.settle(after);
+            match back {
+                Poll::Ready(buf) => *held = buf,
+                Poll::Pending => return Poll::Pending,
+            }
         }
         poll
     }
@@ -725,11 +739,11 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.read.poll(
-            &mut after,
-            |st, after| st.read_vectored(fd, kind, bufs, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .read
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.read_vectored(fd, kind, bufs, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
     }
 
@@ -744,11 +758,11 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.read.poll(
-            &mut after,
-            |st, after| st.accept(fd, kind, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .read
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.accept(fd, kind, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
     }
 
@@ -766,11 +780,11 @@ impl Source {
         };
         let kind = self.kind;
         let mut after = After::default();
-        let poll = self.read.poll(
-            &mut after,
-            |st, after| st.receive(fd, kind, out, peek, cx.waker(), after),
-            |st, after| st.serve(fd, kind, true, after),
-        );
+        let poll = self
+            .read
+            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                st.receive(fd, kind, out, peek, cx.waker(), after)
+            });
         self.finish_poll(after, poll)
     }
 }
@@ -795,11 +809,9 @@ impl Drop for ReadOwned<'_> {
     fn drop(&mut self) {
         if self.lent {
             let mut after = After::default();
-            self.source.read.run(
-                &mut after,
-                |st, after| st.abandon_lent(after),
-                self.source.serve_read(),
-            );
+            self.source
+                .read
+                .defer(super::read_work::ABANDON, &mut after, &self.source.hooks());
             self.source.settle(after);
         }
     }

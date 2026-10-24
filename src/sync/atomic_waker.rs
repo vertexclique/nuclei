@@ -71,20 +71,61 @@ impl AtomicWaker {
     /// registration is the caller's, as with any waker slot: a wake that
     /// came before the registration took nothing.
     pub fn register(&self, waker: &Waker) {
+        if let Registered::InUse = self.register_returning(waker) {
+            waker.wake_by_ref();
+        }
+    }
+
+    /// As [`register`](Self::register), but a different waker it replaces is
+    /// woken rather than dropped: for a slot several tasks may share, where
+    /// the task displaced polls again instead of missing its wake. Returns
+    /// true when `waker` is kept; false when it was woken at once (a wake or
+    /// another registration was in progress).
+    pub(crate) fn register_displacing(&self, waker: &Waker) -> bool {
+        match self.register_returning(waker) {
+            Registered::Kept(displaced) => {
+                if let Some(displaced) = displaced {
+                    displaced.wake();
+                }
+                true
+            }
+            Registered::InUse => {
+                waker.wake_by_ref();
+                false
+            }
+            Registered::WokenNow => false,
+        }
+    }
+
+    /// As [`register_displacing`](Self::register_displacing), except that a
+    /// cell another wake or registration is using is left alone: `waker` is
+    /// neither kept nor woken, and the caller may try elsewhere.
+    pub(crate) fn try_register_displacing(&self, waker: &Waker) -> Registered {
+        let registered = self.register_returning(waker);
+        if let Registered::Kept(Some(displaced)) = registered {
+            displaced.wake();
+            return Registered::Kept(None);
+        }
+        registered
+    }
+
+    /// Registers `waker`: kept (with the different waker it replaced), left
+    /// alone because the cell was in use, or woken at once because a wake
+    /// came while it was being stored.
+    fn register_returning(&self, waker: &Waker) -> Registered {
         // Acquire: pairs with the Release that last gave the slot up.
         if self
             .state
             .compare_exchange(WAITING, REGISTERING, Ordering::Acquire, Ordering::Acquire)
             .is_err()
         {
-            waker.wake_by_ref();
-            return;
+            return Registered::InUse;
         }
         // SAFETY: REGISTERING is held, so no wake touches the slot.
-        self.waker.with_mut(|slot| unsafe {
+        let displaced = self.waker.with_mut(|slot| unsafe {
             match &*slot {
-                Some(old) if old.will_wake(waker) => {}
-                _ => *slot = Some(waker.clone()),
+                Some(old) if old.will_wake(waker) => None,
+                _ => (*slot).replace(waker.clone()),
             }
         });
         // Release: publishes the slot to the next wake. It fails only when a
@@ -102,7 +143,10 @@ impl AtomicWaker {
             if let Some(taken) = taken {
                 taken.wake();
             }
+            drop(displaced);
+            return Registered::WokenNow;
         }
+        Registered::Kept(displaced)
     }
 
     /// Takes the registered waker, if a task is registered, leaving the
@@ -127,6 +171,22 @@ impl AtomicWaker {
         if let Some(waker) = self.take() {
             waker.wake();
         }
+    }
+}
+
+/// What a registration did with its waker.
+pub(crate) enum Registered {
+    /// Kept in the cell; with the different waker it replaced.
+    Kept(Option<Waker>),
+    /// Left alone: a wake or another registration was using the cell.
+    InUse,
+    /// Woken at once: a wake came while it was being stored.
+    WokenNow,
+}
+
+impl Default for AtomicWaker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

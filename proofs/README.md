@@ -301,27 +301,54 @@ sync module's waker cell.
 ## The guard of an IO source's side
 
 `side` (`tla/side/Side.tla`) checks how a poll and the shard's driver share one side of an IO
-source without losing an edge (`src/io/side.rs`, `src/io/source/read.rs`). The side's word has
-a busy bit (someone holds it for one step) and a ready bit (an edge came while it was held).
-Bytes arrive in the kernel, each with an edge for the driver. The driver takes a free side and
-serves it: the edge clears the readiness cache, and with a reader waiting it reads into the
-read-ahead and wakes the reader, or marks the cache blocked. Finding the side held, the driver
-sets the ready bit and goes on; if the holder let go before the bit landed, it takes the side
-after all. The reader holds the side for one step (it takes the read-ahead; or, unless the
-cache says the call would block, it runs the driver's read at once, into the read-ahead and
-never into its own buffer, and takes that; or it registers its waker) and, as it lets go, looks
-at the ready bit: if set it does the driver's part itself, then its own step again.
+source without losing an edge or a wake, and without either ever waiting for the other
+(`src/io/side.rs`, `src/io/source/read.rs`). The side's word has a busy bit (someone holds it
+for one step), a ready bit (an edge came while it was held) and a waiting bit (a poll found it
+held and waits to be woken). Bytes arrive in the kernel, each with an edge for the driver,
+which takes the side with one fetch-or of busy and ready: free, it holds the side and serves
+the edge (the cache is cleared, and with a reader waiting it reads into the read-ahead and wakes
+the reader, or marks the cache blocked); held, the ready bit it left is the holder's to serve.
+The reader takes the side with one fetch-or of busy: free, it takes the read-ahead, or (unless
+the cache says the call would block) runs the driver's read at once into the read-ahead and
+takes that, or registers its waker. Held, it stores its waker in the contended set and raises
+the waiting bit; if that showed the side free, it takes the side once more, else it sleeps until
+the holder wakes it. Letting go is one compare-and-swap from the word the holder took to zero;
+when flags came meanwhile it fails, and the holder takes them with one swap, still holding: the
+ready bit, it does the driver's part (and its own step again if it waited); the waiting bit, it
+takes the contended wakers, which it wakes once it has let go.
 
-The family checks 11 configurations: 3 that must pass (two and three bytes with
-`Conservation`, no byte lost or made up, and `Exclusive`, one holder at a time; and liveness
-under weak fairness), 4 mutations (a driver that drops an edge on a held side, a holder that
-lets go without looking at the ready bit and an edge that leaves the cache blocked each end in
-a deadlock; a hold that refuses a free side carrying a flag breaks `Termination`), and 4
-witnesses (a flag, a reader doing the driver's part, a read the driver completes on an edge,
-and a reader's submit that runs the driver's read at once). Bytes are a count and there is one reader: several tasks waiting on one
-side share its waker list, which the driver wakes whole. The loom models in `src/io/side.rs`
-check the code's word with a calibration that must lose the edge (a driver that skips a held
-side).
+16 configurations: 3 that must pass (two and three bytes with `Conservation`, no byte lost or
+made up, and `Exclusive`, one holder at a time; and liveness under weak fairness), 7 mutations
+(a driver that drops an edge on a held side, one that flags in a step of its own after looking,
+a holder that lets go without serving the ready bit, an edge that leaves the cache blocked, a
+holder that wakes nobody for the waiting bit, and a contended reader that sleeps without looking
+whether the side came free each end in a deadlock; a take that refuses a free side carrying a
+flag breaks `Termination`), and 6 witnesses (a flag, a reader doing the driver's part, a read
+the driver completes on an edge, a reader's submit that runs the driver's read at once, a
+contended reader woken by the holder, and a contended reader that finds the side free and takes
+it). Bytes are a count and there is one reader: several tasks waiting on one side share its
+waker list, which the driver wakes whole. The loom models in `src/io/side/loom_tests.rs` check
+the code's word with two calibrations that must strand a thread (a driver's part that forgets
+the reader's wake, and a contended poll that is never woken).
+
+`Requests.tla`, in the same family, checks the work that needs both sides of a source, a
+dropped handle's close in particular (`src/io/source/requests.rs`), against a holder on each
+side that loads the descriptor and uses it. The dropper raises the close in the source's request
+word and takes the read side with one fetch-or that also raises the side's request bit; holding
+it, it tries the write side the same way, and with both it performs the close and drops its
+object. Taking fewer, it lets go and hands its object to the source, never waiting. Sides are
+taken in one order: a holder of the read side that sees the request bit tries the write side; a
+holder of the write side lets go first, then tries the read side once. Whoever performs the
+close marks it done, and whichever of the dropper's hand-over and that mark comes second drops
+the object. 9 configurations: 2 that must pass (`NoUseOfClosed`, no holder uses a descriptor
+closed under it; `PerformedOnce`; `Closed`, once everyone is done the close was performed and
+the object dropped; and liveness), 5 mutations (a holder that ignores the request bit, or takes
+a raised bit for its own, breaks `Closed`; a dropper that performs holding one side, or drops
+its object before the close is done, breaks `NoUseOfClosed`; a holder of the write side that
+tries the read side while still holding its own livelocks, breaking `Termination`), and 2
+witnesses (a holder performs the close; the dropper hands its object over). The Rust tests in
+`src/io/source/tests/requests.rs` hold a side from the test and check the same on real sockets,
+each with a mutation of the code that makes one of them fail.
 
 ## Reads and writes from a task's own buffer
 

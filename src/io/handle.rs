@@ -189,22 +189,9 @@ impl<T> Handle<T> {
 }
 
 impl<T> Drop for Handle<T> {
+    /// Never waits: the source closes the object once no call of the driver
+    /// can use its descriptor (at once, or as the driver lets go of it).
     fn drop(&mut self) {
-        match self
-            .source
-            .has_unsent()
-            .then(|| self.source.duplicate())
-            .flatten()
-        {
-            // The unsent bytes go out through a copy of the descriptor,
-            // which a task keeps and closes once they are out.
-            Some(copy) => {
-                self.source.move_to(copy.as_raw_fd());
-                crate::runtime::spawn(linger(Arc::clone(&self.source), copy)).detach();
-            }
-            // The registration goes before the descriptor closes.
-            None => self.source.retire(),
-        }
         // A file's writes in flight keep their own copy of the descriptor;
         // what waits behind them is handed to a task.
         if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
@@ -215,8 +202,23 @@ impl<T> Drop for Handle<T> {
             })
             .detach();
         }
-        // SAFETY: dropped once, here.
-        unsafe { ManuallyDrop::drop(&mut self.io) };
+        // SAFETY: taken once, here; the field is never used again.
+        let io = unsafe { ManuallyDrop::take(&mut self.io) };
+        match self
+            .source
+            .has_unsent()
+            .then(|| self.source.duplicate())
+            .flatten()
+        {
+            // The unsent bytes go out through a copy of the descriptor,
+            // which a task keeps and closes once they are out.
+            Some(copy) => {
+                self.source.close(io, Some(copy.as_raw_fd()));
+                crate::runtime::spawn(linger(Arc::clone(&self.source), copy)).detach();
+            }
+            // The registration goes before the descriptor closes.
+            None => self.source.close(io, None),
+        }
     }
 }
 
@@ -224,8 +226,7 @@ impl<T> Drop for Handle<T> {
 /// closes it.
 async fn linger(source: Arc<Source>, copy: OwnedFd) {
     let _ = crate::time::timeout(LINGER, core::future::poll_fn(|cx| source.poll_drain(cx))).await;
-    source.retire();
-    drop(copy);
+    source.close(copy, None);
 }
 
 impl<T> Deref for Handle<T> {
