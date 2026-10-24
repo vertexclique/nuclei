@@ -41,11 +41,11 @@ use super::chan::Chan;
 /// assert_eq!(rx.try_recv(), Ok("reserved"));
 /// ```
 #[must_use = "dropping a permit gives its slot back unused"]
-pub struct Permit<'a, T: 'static> {
+pub struct Permit<'a, T> {
     chan: &'a Chan<T, Bounded>,
 }
 
-impl<'a, T: 'static> Permit<'a, T> {
+impl<'a, T> Permit<'a, T> {
     pub(super) fn new(chan: &'a Chan<T, Bounded>) -> Self {
         Self { chan }
     }
@@ -74,13 +74,13 @@ impl<'a, T: 'static> Permit<'a, T> {
     }
 }
 
-impl<T: 'static> Drop for Permit<'_, T> {
+impl<T> Drop for Permit<'_, T> {
     fn drop(&mut self) {
         self.chan.give_back(1);
     }
 }
 
-impl<T: 'static> fmt::Debug for Permit<'_, T> {
+impl<T> fmt::Debug for Permit<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Permit").finish_non_exhaustive()
     }
@@ -112,18 +112,18 @@ impl<T: 'static> fmt::Debug for Permit<'_, T> {
 /// assert_eq!(rx.try_recv(), Ok(1));
 /// ```
 #[must_use = "dropping the iterator gives its slots back unused"]
-pub struct PermitIterator<'a, T: 'static> {
+pub struct PermitIterator<'a, T> {
     chan: &'a Chan<T, Bounded>,
     n: usize,
 }
 
-impl<'a, T: 'static> PermitIterator<'a, T> {
+impl<'a, T> PermitIterator<'a, T> {
     pub(super) fn new(chan: &'a Chan<T, Bounded>, n: usize) -> Self {
         Self { chan, n }
     }
 }
 
-impl<'a, T: 'static> Iterator for PermitIterator<'a, T> {
+impl<'a, T> Iterator for PermitIterator<'a, T> {
     type Item = Permit<'a, T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -139,11 +139,11 @@ impl<'a, T: 'static> Iterator for PermitIterator<'a, T> {
     }
 }
 
-impl<T: 'static> ExactSizeIterator for PermitIterator<'_, T> {}
+impl<T> ExactSizeIterator for PermitIterator<'_, T> {}
 
-impl<T: 'static> FusedIterator for PermitIterator<'_, T> {}
+impl<T> FusedIterator for PermitIterator<'_, T> {}
 
-impl<T: 'static> Drop for PermitIterator<'_, T> {
+impl<T> Drop for PermitIterator<'_, T> {
     fn drop(&mut self) {
         if self.n > 0 {
             self.chan.give_back(self.n);
@@ -151,7 +151,7 @@ impl<T: 'static> Drop for PermitIterator<'_, T> {
     }
 }
 
-impl<T: 'static> fmt::Debug for PermitIterator<'_, T> {
+impl<T> fmt::Debug for PermitIterator<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PermitIterator")
             .field("remaining", &self.n)
@@ -188,11 +188,11 @@ impl<T: 'static> fmt::Debug for PermitIterator<'_, T> {
 /// tx.try_send(456).unwrap();
 /// ```
 #[must_use = "dropping a permit gives its slot back unused"]
-pub struct OwnedPermit<T: 'static> {
+pub struct OwnedPermit<T> {
     sender: Sender<T>,
 }
 
-impl<T: 'static> OwnedPermit<T> {
+impl<T> OwnedPermit<T> {
     pub(super) fn new(sender: Sender<T>) -> Self {
         Self { sender }
     }
@@ -281,14 +281,14 @@ impl<T: 'static> OwnedPermit<T> {
     }
 }
 
-impl<T: 'static> Drop for OwnedPermit<T> {
+impl<T> Drop for OwnedPermit<T> {
     fn drop(&mut self) {
         // The sender field drops after this, which counts the sender out.
         self.sender.chan.give_back(1);
     }
 }
 
-impl<T: 'static> fmt::Debug for OwnedPermit<T> {
+impl<T> fmt::Debug for OwnedPermit<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OwnedPermit").finish_non_exhaustive()
     }

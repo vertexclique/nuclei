@@ -66,9 +66,6 @@ impl Limit for Bounded {
 /// [`SendError`] with the value. When every [`Sender`] is dropped, `recv`
 /// returns `None` once the buffered messages are received.
 ///
-/// The message type must be `'static`: the queue behind the channel reclaims
-/// its segments after the channel is gone, so it cannot hold borrowed data.
-///
 /// # Panics
 ///
 /// Panics if `buffer` is 0, or larger than
@@ -90,7 +87,7 @@ impl Limit for Bounded {
 /// producer.join().unwrap();
 /// ```
 #[track_caller]
-pub fn channel<T: 'static>(buffer: usize) -> (Sender<T>, Receiver<T>) {
+pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
     assert!(buffer > 0, "mpsc bounded channel requires buffer > 0");
     let chan = Arc::new(Chan::new(Bounded {
         sem: FairSemaphore::new(buffer),
@@ -134,7 +131,7 @@ pub fn channel<T: 'static>(buffer: usize) -> (Sender<T>, Receiver<T>) {
 /// if the last waiting reservation has just left. No call waits for it.
 ///
 /// `blocking_send` parks the calling thread until there is room.
-pub struct Sender<T: 'static> {
+pub struct Sender<T> {
     pub(super) chan: Arc<Chan<T, Bounded>>,
 }
 
@@ -160,11 +157,11 @@ pub struct Sender<T: 'static> {
 /// [`weak_count`](Self::weak_count) are wait-free. [`upgrade`](Self::upgrade)
 /// is lock-free, not wait-free: it is a compare-and-swap on the sender count
 /// that retries when a sender was cloned or dropped meanwhile.
-pub struct WeakSender<T: 'static> {
+pub struct WeakSender<T> {
     chan: Arc<Chan<T, Bounded>>,
 }
 
-impl<T: 'static> Sender<T> {
+impl<T> Sender<T> {
     /// Sends a value, waiting until there is capacity.
     ///
     /// A successful send means the other end had not hung up when the value
@@ -394,8 +391,8 @@ impl<T: 'static> Sender<T> {
     /// returned [`OwnedPermit`].
     ///
     /// Unlike [`reserve`](Self::reserve), the permit borrows nothing, so it can
-    /// be held for `'static`. Cloning a sender first keeps a handle to send
-    /// with meanwhile. [`OwnedPermit::send`] and [`OwnedPermit::release`] hand
+    /// be stored or moved into another task. Cloning a sender first keeps a
+    /// handle to send with meanwhile. [`OwnedPermit::send`] and [`OwnedPermit::release`] hand
     /// the sender back.
     ///
     /// # Errors
@@ -582,7 +579,7 @@ impl<T: 'static> Sender<T> {
     }
 }
 
-impl<T: 'static> Clone for Sender<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         self.chan.add_sender();
         Sender {
@@ -591,13 +588,13 @@ impl<T: 'static> Clone for Sender<T> {
     }
 }
 
-impl<T: 'static> Drop for Sender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.chan.drop_sender();
     }
 }
 
-impl<T: 'static> fmt::Debug for Sender<T> {
+impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sender")
             .field("closed", &self.is_closed())
@@ -607,7 +604,7 @@ impl<T: 'static> fmt::Debug for Sender<T> {
     }
 }
 
-impl<T: 'static> WeakSender<T> {
+impl<T> WeakSender<T> {
     /// Tries to turn the weak sender into a [`Sender`].
     ///
     /// Returns `Some` while at least one [`Sender`] (or [`OwnedPermit`]) is
@@ -629,7 +626,7 @@ impl<T: 'static> WeakSender<T> {
     }
 }
 
-impl<T: 'static> Clone for WeakSender<T> {
+impl<T> Clone for WeakSender<T> {
     fn clone(&self) -> Self {
         self.chan.add_weak();
         WeakSender {
@@ -638,13 +635,13 @@ impl<T: 'static> Clone for WeakSender<T> {
     }
 }
 
-impl<T: 'static> Drop for WeakSender<T> {
+impl<T> Drop for WeakSender<T> {
     fn drop(&mut self) {
         self.chan.drop_weak();
     }
 }
 
-impl<T: 'static> fmt::Debug for WeakSender<T> {
+impl<T> fmt::Debug for WeakSender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WeakSender").finish()
     }
@@ -652,10 +649,7 @@ impl<T: 'static> fmt::Debug for WeakSender<T> {
 
 /// Takes `n` slots without waiting: the permits are the caller's to hand to
 /// [`Permit`]s, which return them.
-fn try_reserve_inner<T: 'static>(
-    chan: &Chan<T, Bounded>,
-    n: usize,
-) -> Result<(), TrySendError<()>> {
+fn try_reserve_inner<T>(chan: &Chan<T, Bounded>, n: usize) -> Result<(), TrySendError<()>> {
     match chan.limit.sem.try_acquire(n) {
         Ok(()) => Ok(()),
         Err(seen) if observed_closed(seen) => Err(TrySendError::Closed(())),
@@ -664,7 +658,7 @@ fn try_reserve_inner<T: 'static>(
 }
 
 /// Waits for `n` slots, which the caller then owns as [`Permit`]s.
-async fn reserve_inner<T: 'static>(chan: &Chan<T, Bounded>, n: usize) -> Result<(), SendError<()>> {
+async fn reserve_inner<T>(chan: &Chan<T, Bounded>, n: usize) -> Result<(), SendError<()>> {
     if n > chan.limit.bound {
         return Err(SendError(()));
     }
@@ -684,7 +678,7 @@ async fn reserve_inner<T: 'static>(chan: &Chan<T, Bounded>, n: usize) -> Result<
 /// idle once what it held is back, with no receiver call to notice: so its
 /// drop wakes a receiver that waits for a closed channel to go idle, after
 /// the wait has left the queue.
-struct Reserve<'a, T: 'static> {
+struct Reserve<'a, T> {
     chan: &'a Chan<T, Bounded>,
     n: usize,
     wait: FairWait,
@@ -692,7 +686,7 @@ struct Reserve<'a, T: 'static> {
     taken: bool,
 }
 
-impl<T: 'static> Future for Reserve<'_, T> {
+impl<T> Future for Reserve<'_, T> {
     type Output = Result<(), SendError<()>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -706,7 +700,7 @@ impl<T: 'static> Future for Reserve<'_, T> {
     }
 }
 
-impl<T: 'static> Drop for Reserve<'_, T> {
+impl<T> Drop for Reserve<'_, T> {
     fn drop(&mut self) {
         if !self.taken {
             self.wait.cancel(&self.chan.limit.sem, self.n);

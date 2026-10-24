@@ -75,10 +75,6 @@
 //!
 //! # Differences from the established API
 //!
-//! - The message type must be `'static`. Values live in kovan's segmented
-//!   lock-free queue, whose segments are reclaimed after the channel is
-//!   gone, so it cannot hold borrowed data. The established API has no such
-//!   bound.
 //! - `Sender::send_timeout` and its `SendTimeoutError` are not here: a wait
 //!   with a deadline needs a timer, which nuclei adds with its time module.
 //! - The `blocking_*` methods cannot tell that they were called from inside

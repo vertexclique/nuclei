@@ -83,9 +83,6 @@ impl Limit for Unbounded {
 /// [Ordering](super#ordering)). The sender can be cloned; only one receiver
 /// exists.
 ///
-/// The message type must be `'static`: the queue behind the channel reclaims
-/// its segments after the channel is gone, so it cannot hold borrowed data.
-///
 /// ```
 /// use nuclei::sync::mpsc;
 ///
@@ -101,7 +98,7 @@ impl Limit for Unbounded {
 /// assert_eq!(rx.blocking_recv(), None);
 /// producer.join().unwrap();
 /// ```
-pub fn unbounded_channel<T: 'static>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
+pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
     let chan = Arc::new(Chan::new(Unbounded(AtomicUsize::new(0))));
     let tx = UnboundedSender {
         chan: Arc::clone(&chan),
@@ -129,7 +126,7 @@ pub fn unbounded_channel<T: 'static>() -> (UnboundedSender<T>, UnboundedReceiver
 /// it loses a slot to another sender and allocates a segment when the last one
 /// is full. Some thread's call completes whenever any retries.
 /// [`closed`](Self::closed) is lock-free: a poll may queue a waiter.
-pub struct UnboundedSender<T: 'static> {
+pub struct UnboundedSender<T> {
     chan: Arc<Chan<T, Unbounded>>,
 }
 
@@ -155,7 +152,7 @@ pub struct UnboundedSender<T: 'static> {
 /// [`weak_count`](Self::weak_count) are wait-free. [`upgrade`](Self::upgrade)
 /// is lock-free, not wait-free: it is a compare-and-swap on the sender count
 /// that retries when a sender was cloned or dropped meanwhile.
-pub struct WeakUnboundedSender<T: 'static> {
+pub struct WeakUnboundedSender<T> {
     chan: Arc<Chan<T, Unbounded>>,
 }
 
@@ -183,11 +180,11 @@ pub struct WeakUnboundedSender<T: 'static> {
 ///
 /// `blocking_recv` and `blocking_recv_many` park the calling thread until a
 /// value arrives.
-pub struct UnboundedReceiver<T: 'static> {
+pub struct UnboundedReceiver<T> {
     chan: Arc<Chan<T, Unbounded>>,
 }
 
-impl<T: 'static> UnboundedSender<T> {
+impl<T> UnboundedSender<T> {
     /// Sends a value, without waiting.
     ///
     /// A successful send means the other end had not hung up when the value
@@ -292,7 +289,7 @@ impl<T: 'static> UnboundedSender<T> {
     }
 }
 
-impl<T: 'static> Clone for UnboundedSender<T> {
+impl<T> Clone for UnboundedSender<T> {
     fn clone(&self) -> Self {
         self.chan.add_sender();
         UnboundedSender {
@@ -301,13 +298,13 @@ impl<T: 'static> Clone for UnboundedSender<T> {
     }
 }
 
-impl<T: 'static> Drop for UnboundedSender<T> {
+impl<T> Drop for UnboundedSender<T> {
     fn drop(&mut self) {
         self.chan.drop_sender();
     }
 }
 
-impl<T: 'static> fmt::Debug for UnboundedSender<T> {
+impl<T> fmt::Debug for UnboundedSender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UnboundedSender")
             .field("closed", &self.is_closed())
@@ -315,7 +312,7 @@ impl<T: 'static> fmt::Debug for UnboundedSender<T> {
     }
 }
 
-impl<T: 'static> WeakUnboundedSender<T> {
+impl<T> WeakUnboundedSender<T> {
     /// Tries to turn the weak sender into an [`UnboundedSender`].
     ///
     /// Returns `Some` while at least one [`UnboundedSender`] is alive, and
@@ -337,7 +334,7 @@ impl<T: 'static> WeakUnboundedSender<T> {
     }
 }
 
-impl<T: 'static> Clone for WeakUnboundedSender<T> {
+impl<T> Clone for WeakUnboundedSender<T> {
     fn clone(&self) -> Self {
         self.chan.add_weak();
         WeakUnboundedSender {
@@ -346,19 +343,19 @@ impl<T: 'static> Clone for WeakUnboundedSender<T> {
     }
 }
 
-impl<T: 'static> Drop for WeakUnboundedSender<T> {
+impl<T> Drop for WeakUnboundedSender<T> {
     fn drop(&mut self) {
         self.chan.drop_weak();
     }
 }
 
-impl<T: 'static> fmt::Debug for WeakUnboundedSender<T> {
+impl<T> fmt::Debug for WeakUnboundedSender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WeakUnboundedSender").finish()
     }
 }
 
-impl<T: 'static> UnboundedReceiver<T> {
+impl<T> UnboundedReceiver<T> {
     /// Receives the next value.
     ///
     /// Returns `None` once the channel is closed and no buffered value is
@@ -607,13 +604,13 @@ impl<T: 'static> UnboundedReceiver<T> {
     }
 }
 
-impl<T: 'static> Drop for UnboundedReceiver<T> {
+impl<T> Drop for UnboundedReceiver<T> {
     fn drop(&mut self) {
         self.chan.drop_rx();
     }
 }
 
-impl<T: 'static> fmt::Debug for UnboundedReceiver<T> {
+impl<T> fmt::Debug for UnboundedReceiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UnboundedReceiver")
             .field("closed", &self.is_closed())

@@ -202,9 +202,10 @@ async_assert_fn!(mpsc::UnboundedSender<NN>::closed(_): !Send & !Sync & !Unpin);
 async_assert_fn!(mpsc::UnboundedSender<YN>::closed(_): Send & Sync & !Unpin);
 async_assert_fn!(mpsc::UnboundedSender<YY>::closed(_): Send & Sync & !Unpin);
 
-/// The panic-safety markers hold for every handle whatever the message.
+/// The panic-safety markers hold for every handle whatever the message,
+/// one that borrows included.
 #[allow(dead_code)]
-fn unwind_safety_holds<T: 'static>() {
+fn unwind_safety_holds<'a, T: 'a>() {
     fn both<U: UnwindSafe + RefUnwindSafe>() {}
     both::<mpsc::Sender<T>>();
     both::<mpsc::WeakSender<T>>();
@@ -213,8 +214,23 @@ fn unwind_safety_holds<T: 'static>() {
     both::<mpsc::WeakUnboundedSender<T>>();
     both::<mpsc::UnboundedReceiver<T>>();
     both::<mpsc::OwnedPermit<T>>();
-    both::<mpsc::Permit<'static, T>>();
-    both::<mpsc::PermitIterator<'static, T>>();
+    both::<mpsc::Permit<'a, T>>();
+    both::<mpsc::PermitIterator<'a, T>>();
+}
+
+/// A message that borrows: every handle is `Send + Sync` when the borrowed
+/// data is `Sync`, as for any other `Send` message.
+#[allow(dead_code)]
+fn handles_of_a_borrowing_message_cross_threads<'a>() {
+    fn send_sync<U: Send + Sync>() {}
+    send_sync::<mpsc::Sender<&'a str>>();
+    send_sync::<mpsc::WeakSender<&'a str>>();
+    send_sync::<mpsc::Receiver<&'a str>>();
+    send_sync::<mpsc::UnboundedSender<&'a str>>();
+    send_sync::<mpsc::WeakUnboundedSender<&'a str>>();
+    send_sync::<mpsc::UnboundedReceiver<&'a str>>();
+    send_sync::<mpsc::OwnedPermit<&'a str>>();
+    send_sync::<mpsc::Permit<'a, &'a str>>();
 }
 
 #[test]

@@ -36,11 +36,11 @@ use crate::sync::internal::{self, Arc};
 ///
 /// `blocking_recv` and `blocking_recv_many` park the calling thread until a
 /// value arrives.
-pub struct Receiver<T: 'static> {
+pub struct Receiver<T> {
     chan: Arc<Chan<T, Bounded>>,
 }
 
-impl<T: 'static> Receiver<T> {
+impl<T> Receiver<T> {
     pub(super) fn new(chan: Arc<Chan<T, Bounded>>) -> Self {
         Self { chan }
     }
@@ -339,13 +339,13 @@ impl<T: 'static> Receiver<T> {
     }
 }
 
-impl<T: 'static> Drop for Receiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         self.chan.drop_rx();
     }
 }
 
-impl<T: 'static> fmt::Debug for Receiver<T> {
+impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Receiver")
             .field("closed", &self.is_closed())

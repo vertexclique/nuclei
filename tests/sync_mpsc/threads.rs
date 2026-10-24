@@ -539,3 +539,32 @@ fn a_receiver_that_moves_between_threads_keeps_its_place() {
     }
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 }
+
+/// The message may borrow from the caller: values that point into a vector
+/// on this stack travel to scoped threads and back.
+#[test]
+fn values_that_borrow_from_the_caller_travel_between_scoped_threads() {
+    let words: Vec<String> = (0..64).map(|i| format!("word {i}")).collect();
+    let (tx, mut rx) = mpsc::channel::<&str>(4);
+    let (utx, mut urx) = mpsc::unbounded_channel::<&str>();
+    std::thread::scope(|scope| {
+        let words = &words;
+        scope.spawn(move || {
+            for word in words {
+                tx.blocking_send(word.as_str())
+                    .expect("the receiver is alive");
+                utx.send(word.as_str()).expect("the receiver is alive");
+            }
+        });
+        let mut got = Vec::new();
+        while let Some(word) = rx.blocking_recv() {
+            got.push(word);
+        }
+        let mut ugot = Vec::new();
+        while let Some(word) = urx.blocking_recv() {
+            ugot.push(word);
+        }
+        assert_eq!(got, words.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(ugot, got);
+    });
+}

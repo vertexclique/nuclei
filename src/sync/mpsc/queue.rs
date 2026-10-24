@@ -34,11 +34,11 @@ pub(super) use kovan_queue::seg_queue::TryPopError;
 
 /// The queue of one channel.
 #[cfg(not(loom))]
-pub(super) struct Queue<T: 'static>(crate::sync::SegQueue<T>);
+pub(super) struct Queue<T>(crate::sync::SegQueue<T>);
 
 /// The queue of one channel, modelled for loom.
 #[cfg(loom)]
-pub(super) struct Queue<T: 'static>(loom::sync::Mutex<Cells<T>>);
+pub(super) struct Queue<T>(loom::sync::Mutex<Cells<T>>);
 
 /// The loom model's cells: the claimed ones from the oldest on, `None` while
 /// the push that claimed it has not written it yet.
@@ -50,7 +50,7 @@ pub(super) struct Cells<T> {
 }
 
 #[cfg(not(loom))]
-impl<T: 'static> Queue<T> {
+impl<T> Queue<T> {
     pub(super) fn new() -> Self {
         Self(crate::sync::SegQueue::new())
     }
@@ -75,7 +75,7 @@ impl<T: 'static> Queue<T> {
 }
 
 #[cfg(loom)]
-impl<T: 'static> Queue<T> {
+impl<T> Queue<T> {
     pub(super) fn new() -> Self {
         Self(loom::sync::Mutex::new(Cells {
             taken: 0,

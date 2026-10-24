@@ -79,7 +79,7 @@ enum Pop<T> {
 }
 
 /// The shared state of one channel.
-pub(super) struct Chan<T: 'static, L> {
+pub(super) struct Chan<T, L> {
     queue: Queue<T>,
     /// The receiver's task, woken when a value arrives or the channel ends.
     rx_waker: AtomicWaker,
@@ -95,10 +95,10 @@ pub(super) struct Chan<T: 'static, L> {
 // A channel holds no invariant that a panic in a caller's closure could break
 // half way: every shared word is an atomic and every step is complete before
 // the next, so a panic leaves it usable.
-impl<T: 'static, L> UnwindSafe for Chan<T, L> {}
-impl<T: 'static, L> RefUnwindSafe for Chan<T, L> {}
+impl<T, L> UnwindSafe for Chan<T, L> {}
+impl<T, L> RefUnwindSafe for Chan<T, L> {}
 
-impl<T: 'static, L: Limit> Chan<T, L> {
+impl<T, L: Limit> Chan<T, L> {
     /// A channel with one sender counted.
     pub(super) fn new(limit: L) -> Self {
         Self {
@@ -366,9 +366,9 @@ impl<T: 'static, L: Limit> Chan<T, L> {
     /// task is not kept alive, and drop everything still queued.
     pub(super) fn drop_rx(&self) {
         /// Finishes the drain when a value's destructor panics.
-        struct Drain<'a, T: 'static, L: Limit>(&'a Chan<T, L>);
+        struct Drain<'a, T, L: Limit>(&'a Chan<T, L>);
 
-        impl<T: 'static, L: Limit> Drop for Drain<'_, T, L> {
+        impl<T, L: Limit> Drop for Drain<'_, T, L> {
             fn drop(&mut self) {
                 self.0.drain();
             }
