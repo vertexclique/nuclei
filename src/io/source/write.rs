@@ -331,6 +331,12 @@ impl WriteState {
         }
     }
 
+    /// Every waiting task looks again.
+    pub(super) fn wake_all(&mut self, after: &mut After) {
+        self.starved = false;
+        after.wake(&mut self.waiters);
+    }
+
     pub(super) fn forget_waiters(&mut self, after: &mut After) {
         self.starved = false;
         after.forget(&mut self.waiters);

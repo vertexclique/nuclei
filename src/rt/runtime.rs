@@ -22,7 +22,6 @@ use core::future::Future;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, OnceLock};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use kovan_channel::flavors::RecvDeadline;
@@ -32,13 +31,13 @@ use super::context;
 use super::sched::{Counted, Sched};
 use super::shard::{Limits, Shard, Shared};
 use super::task::{self, Task};
-use crate::sync::internal::Ordering;
+use super::workers::{Start, Workers};
 
 /// What a runtime's threads share.
 pub(crate) struct Inner {
     /// Tells this runtime's workers from another's.
     id: u64,
-    shards: Box<[Arc<Shared>]>,
+    pub(crate) workers: Workers,
     pool: Arc<Pool>,
     /// How many live tasks more than the other choice the spawning shard
     /// may hold and still keep a task it spawns.
@@ -63,6 +62,7 @@ pub struct Builder {
     pin_workers: Option<bool>,
     local_spawn_margin: Option<usize>,
     io_buffer_cap: Option<usize>,
+    max_worker_threads: Option<usize>,
 }
 
 impl Default for Builder {
@@ -91,6 +91,7 @@ impl Builder {
             pin_workers: None,
             local_spawn_margin: None,
             io_buffer_cap: None,
+            max_worker_threads: None,
         }
     }
 
@@ -154,6 +155,15 @@ impl Builder {
         self
     }
 
+    /// The most worker threads the runtime may start over its life, the
+    /// ones it starts with included (default four times
+    /// [`worker_threads`](Self::worker_threads)): what `spawn_more_threads`
+    /// may add up to. A stopped worker's place is not taken again.
+    pub fn max_worker_threads(mut self, n: usize) -> Self {
+        self.max_worker_threads = Some(n);
+        self
+    }
+
     /// The most bytes each worker's IO buffers hold (default 64 MiB). Reads
     /// that had to wait land in these buffers, and writes that had to wait
     /// are copied into them; at the cap, IO waits for buffers to come back,
@@ -201,65 +211,37 @@ impl Builder {
             stack_size: self.thread_stack_size,
             name: blocking_name,
         });
-        let shards = (0..workers)
-            .map(|_| Shard::new(limits))
-            .collect::<io::Result<Vec<_>>>()?;
         static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let inner = Arc::new(Inner {
-            id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            shards: shards.iter().map(|s| Arc::clone(&s.shared)).collect(),
-            pool,
-            local_margin: self.local_spawn_margin.unwrap_or(DEFAULT_LOCAL_MARGIN),
-        });
         let (exit_tx, exits) = kovan_channel::unbounded();
         let cores = if self.pin_workers.unwrap_or(true) {
             allowed_cores()
         } else {
             Vec::new()
         };
-        let mut threads = Vec::with_capacity(workers);
-        for (index, shard) in shards.into_iter().enumerate() {
-            let worker_inner = Arc::clone(&inner);
-            let exit_tx = exit_tx.clone();
-            let core = (!cores.is_empty()).then(|| cores[index % cores.len()]);
-            let spawned = std::thread::Builder::new()
-                .name(worker_name())
-                .stack_size(stack)
-                .spawn(move || {
-                    /// Reports the worker's exit once its shard is dropped,
-                    /// even when the loop ends by a panic.
-                    struct Exit(kovan_channel::unbounded::Sender<()>);
-                    impl Drop for Exit {
-                        fn drop(&mut self) {
-                            self.0.send(());
-                        }
-                    }
-                    let _exit = Exit(exit_tx);
-                    if let Some(core) = core {
-                        pin_to(core);
-                    }
-                    shard.set_owner(worker_inner.id, index);
-                    let _runtime = context::set_runtime(&worker_inner);
-                    let _current = context::enter(&shard);
-                    shard.block_on(shard.shared.stopped());
-                });
-            match spawned {
-                Ok(handle) => threads.push(handle),
-                Err(err) => {
-                    // The workers already started stop again.
-                    inner.shards.iter().for_each(|s| s.stop());
-                    threads.into_iter().for_each(|t: JoinHandle<()>| {
-                        let _ = t.join();
-                    });
-                    return Err(err);
-                }
-            }
-        }
-        Ok(Runtime {
-            inner,
-            threads,
-            exits,
-        })
+        let capacity = self
+            .max_worker_threads
+            .unwrap_or(workers.saturating_mul(4))
+            .max(workers);
+        let inner = Arc::new(Inner {
+            id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            workers: Workers::new(
+                capacity,
+                workers,
+                Start {
+                    limits,
+                    stack,
+                    name: worker_name,
+                    cores,
+                },
+                exit_tx,
+            ),
+            pool,
+            local_margin: self.local_spawn_margin.unwrap_or(DEFAULT_LOCAL_MARGIN),
+        });
+        let runtime = Runtime { inner, exits };
+        // On an error the runtime drops: the workers already started stop.
+        Workers::start(&runtime.inner, workers)?;
+        Ok(runtime)
     }
 
     /// Starts the runtime and makes it the process default, the one the free
@@ -300,7 +282,6 @@ impl fmt::Debug for Builder {
 /// exit.
 pub struct Runtime {
     inner: Arc<Inner>,
-    threads: Vec<JoinHandle<()>>,
     /// One message per worker that exited.
     exits: kovan_channel::unbounded::Receiver<()>,
 }
@@ -364,25 +345,37 @@ impl Runtime {
     }
 
     fn stop_and_join(&mut self, timeout: Option<Duration>) {
-        self.inner.shards.iter().for_each(|s| s.stop());
+        self.inner.workers.stop_all();
+        let threads = self.inner.workers.take_threads();
         if let Some(timeout) = timeout {
             let deadline = std::time::Instant::now() + timeout;
-            for _ in 0..self.threads.len() {
+            // Workers that exited already sent theirs; one message each.
+            for thread in &threads {
+                if thread.is_finished() {
+                    continue;
+                }
                 if !matches!(self.exits.recv_deadline(deadline), RecvDeadline::Msg(())) {
                     break;
                 }
             }
             // A worker that did not exit in time is left to exit on its own.
-            for thread in self.threads.drain(..) {
+            for thread in threads {
                 if thread.is_finished() {
                     let _ = thread.join();
                 }
             }
         } else {
-            for thread in self.threads.drain(..) {
+            for thread in threads {
                 let _ = thread.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Runtime {
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
+        &self.inner
     }
 }
 
@@ -395,7 +388,7 @@ impl Drop for Runtime {
 impl fmt::Debug for Runtime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runtime")
-            .field("worker_threads", &self.inner.shards.len())
+            .field("worker_threads", &self.inner.workers.running())
             .finish_non_exhaustive()
     }
 }
@@ -434,7 +427,7 @@ impl RuntimeHandle {
 impl fmt::Debug for RuntimeHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RuntimeHandle")
-            .field("worker_threads", &self.inner.shards.len())
+            .field("worker_threads", &self.inner.workers.running())
             .finish_non_exhaustive()
     }
 }
@@ -442,74 +435,24 @@ impl fmt::Debug for RuntimeHandle {
 /// The process default runtime, started on first use.
 static DEFAULT: OnceLock<Runtime> = OnceLock::new();
 
+impl Inner {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// The process default runtime, started now if it is not running.
+pub(crate) fn default_runtime() -> &'static Runtime {
+    DEFAULT.get_or_init(|| {
+        Builder::new()
+            .build()
+            .unwrap_or_else(|err| panic!("the default runtime could not start: {err}"))
+    })
+}
+
 /// The runtime this thread is inside, or the default one.
-fn current() -> Arc<Inner> {
-    context::runtime().unwrap_or_else(|| {
-        let runtime = DEFAULT.get_or_init(|| {
-            Builder::new()
-                .build()
-                .unwrap_or_else(|err| panic!("the default runtime could not start: {err}"))
-        });
-        Arc::clone(&runtime.inner)
-    })
-}
-
-/// Picks the shard a new task goes to. Spawned on one of the runtime's
-/// workers: that worker, unless it holds more than `local_margin` live tasks
-/// beyond a shard picked at random, which then takes it. Spawned anywhere
-/// else: the less loaded of two distinct shards picked at random.
-fn place(inner: &Inner) -> &Arc<Shared> {
-    let shards = &inner.shards;
-    let n = shards.len();
-    if n == 1 {
-        return &shards[0];
-    }
-    if let Some(local) = context::current(|current| current.and_then(|s| s.worker_index(inner.id)))
-    {
-        let other = (local + 1 + random_below(n - 1)) % n;
-        let (ll, lo) = (
-            shards[local].load.load(Ordering::Relaxed),
-            shards[other].load.load(Ordering::Relaxed),
-        );
-        return if ll <= lo.saturating_add(inner.local_margin) {
-            &shards[local]
-        } else {
-            &shards[other]
-        };
-    }
-    let a = random_below(n);
-    let b = (a + 1 + random_below(n - 1)) % n;
-    let (la, lb) = (
-        shards[a].load.load(Ordering::Relaxed),
-        shards[b].load.load(Ordering::Relaxed),
-    );
-    if la <= lb { &shards[a] } else { &shards[b] }
-}
-
-/// A random number below `n`, from a per-thread xorshift generator.
-fn random_below(n: usize) -> usize {
-    use core::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new({
-            // Seeded from the thread's own address and the clock: distinct
-            // per thread, and nothing depends on its quality but balance.
-            let local = 0u8;
-            let addr = &local as *const u8 as u64;
-            let time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
-            (addr ^ time.rotate_left(32)) | 1
-        });
-    }
-    STATE.with(|s| {
-        let mut x = s.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        // Multiply-shift: unbiased enough for placement, no division.
-        ((u128::from(x) * n as u128) >> 64) as usize
-    })
+pub(crate) fn current() -> Arc<Inner> {
+    context::runtime().unwrap_or_else(|| Arc::clone(&default_runtime().inner))
 }
 
 /// A shard to serve a thread that runs none (its timers, the registrations
@@ -517,13 +460,13 @@ fn random_below(n: usize) -> usize {
 /// loaded of two; with no workers, the calling thread's own shard.
 pub(crate) fn service_shard() -> Arc<Shared> {
     let inner = current();
-    if inner.shards.is_empty() {
-        return match context::own_shard() {
+    match inner.workers.place(inner.id, inner.local_margin) {
+        Some(shard) => Arc::clone(shard),
+        None => match context::own_shard() {
             Ok(shard) => Arc::clone(&shard.shared),
             Err(err) => panic!("this thread's shard could not start: {err}"),
-        };
+        },
     }
-    Arc::clone(place(&inner))
 }
 
 /// Spawns `future` on `inner`.
@@ -532,11 +475,10 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    if inner.shards.is_empty() {
-        // No workers: the spawning thread's own shard runs it.
+    let Some(shard) = inner.workers.place(inner.id, inner.local_margin) else {
+        // No worker takes tasks: the spawning thread's own shard runs it.
         return spawn_here(future, false);
-    }
-    let shard = place(inner);
+    };
     let (runnable, task) = task::spawn(
         Counted::new(future, shard),
         Sched {
@@ -677,7 +619,7 @@ fn allowed_cores() -> Vec<usize> {
 
 /// Pins the calling thread to `core` (Linux). A failure leaves it unpinned,
 /// which costs locality and nothing else.
-fn pin_to(core: usize) {
+pub(crate) fn pin_to(core: usize) {
     #[cfg(target_os = "linux")]
     // SAFETY: a plain syscall with a set of our own.
     unsafe {

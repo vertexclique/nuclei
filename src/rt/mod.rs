@@ -12,3 +12,4 @@ pub(crate) mod shard;
 #[cfg(not(target_os = "windows"))]
 mod sources;
 pub(crate) mod task;
+pub(crate) mod workers;

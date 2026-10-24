@@ -136,6 +136,8 @@ pub(crate) struct Shared {
     pub(crate) load: AtomicUsize,
     /// The shard stopped: it takes no new task and runs no more.
     stopped: AtomicBool,
+    /// The shard stops once its live tasks are done, and takes no new one.
+    draining: AtomicBool,
     /// The waker of the worker's loop, woken by `stop`.
     stop_waker: AtomicWaker,
     /// Work on the timer wheel from other threads, applied by the shard
@@ -215,19 +217,52 @@ impl Shared {
 
     /// Stops the shard: a worker's loop ends at its next look.
     pub(crate) fn stop(&self) {
+        self.draining.store(true, Ordering::SeqCst);
         self.stopped.store(true, Ordering::SeqCst);
         self.stop_waker.wake();
         self.unpark();
     }
 
-    /// Completes once the shard is stopped: the future a worker's loop runs.
+    /// Whether placement may give the shard a new task.
+    pub(crate) fn takes_tasks(&self) -> bool {
+        !self.draining.load(Ordering::Relaxed)
+    }
+
+    /// The shard takes no new task, and its worker exits once the live ones
+    /// are done.
+    pub(crate) fn drain(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+        // Pairs with the fence of `last_task_done`: either this sees the
+        // count at zero, or the last task sees the flag.
+        crate::sync::internal::fence(Ordering::SeqCst);
+        if self.load.load(Ordering::Relaxed) == 0 {
+            self.stop_waker.wake();
+        }
+        self.unpark();
+    }
+
+    /// The shard's last live task is done: a draining worker may exit.
+    pub(crate) fn last_task_done(&self) {
+        crate::sync::internal::fence(Ordering::SeqCst);
+        if self.draining.load(Ordering::Relaxed) {
+            self.stop_waker.wake();
+        }
+    }
+
+    fn may_exit(&self) -> bool {
+        self.is_stopped()
+            || (self.draining.load(Ordering::Acquire) && self.load.load(Ordering::Acquire) == 0)
+    }
+
+    /// Completes once the shard is stopped, or drained of its tasks: the
+    /// future a worker's loop runs.
     pub(crate) fn stopped(&self) -> impl Future<Output = ()> + '_ {
         core::future::poll_fn(move |cx| {
-            if self.is_stopped() {
+            if self.may_exit() {
                 return Poll::Ready(());
             }
             self.stop_waker.register(cx.waker());
-            if self.is_stopped() {
+            if self.may_exit() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -301,6 +336,7 @@ impl Shard {
             notifier: poller.notifier(),
             load: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
             timer_ops: SegQueue::new(),
             registrar: poller.registrar(),
@@ -615,7 +651,13 @@ impl Drop for Shard {
     fn drop(&mut self) {
         // Every task still queued here is dropped on this thread, the one its
         // future may be dropped on.
+        self.shared.draining.store(true, Ordering::SeqCst);
         self.shared.stopped.store(true, Ordering::SeqCst);
+        // The sources registered here lose their driver: each is told, and
+        // registers where it is polled next.
+        for source in self.sources.get_mut().drain() {
+            source.evict();
+        }
         drop(self.lifo.take());
         let queue = core::mem::take(&mut *self.queue.borrow_mut());
         drop(queue);

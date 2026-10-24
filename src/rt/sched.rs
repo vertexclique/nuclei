@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::context;
 use super::shard::Shared;
 use super::task::{Runnable, Schedule, ScheduleInfo};
-use crate::sync::internal::{AtomicUsize, Ordering};
+use crate::sync::internal::Ordering;
 
 /// The schedule of a task placed on a shard.
 pub(crate) struct Sched {
@@ -44,22 +44,18 @@ unsafe impl Schedule for Sched {
 /// or is dropped.
 pub(crate) struct Counted<F> {
     future: F,
-    load: *const AtomicUsize,
+    shard: *const Shared,
 }
 
-// SAFETY: the pointer is to an atomic in the task's shard, which the task's
-// schedule keeps alive for as long as the future lives; the future decides
-// the rest.
+// SAFETY: the pointer is to the task's shard, which the task's schedule
+// keeps alive for as long as the future lives; the future decides the rest.
 unsafe impl<F: Send> Send for Counted<F> {}
 
 impl<F> Counted<F> {
     /// Counts the task in `shard` from now on.
     pub(crate) fn new(future: F, shard: &Shared) -> Self {
         shard.load.fetch_add(1, Ordering::Relaxed);
-        Self {
-            future,
-            load: &shard.load,
-        }
+        Self { future, shard }
     }
 }
 
@@ -75,6 +71,9 @@ impl<F: Future> Future for Counted<F> {
 impl<F> Drop for Counted<F> {
     fn drop(&mut self) {
         // SAFETY: see `Send` above: the shard outlives the future.
-        unsafe { (*self.load).fetch_sub(1, Ordering::Relaxed) };
+        let shard = unsafe { &*self.shard };
+        if shard.load.fetch_sub(1, Ordering::Release) == 1 {
+            shard.last_task_done();
+        }
     }
 }

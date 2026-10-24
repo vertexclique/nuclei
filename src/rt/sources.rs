@@ -81,6 +81,12 @@ impl Sources {
         Some(source)
     }
 
+    /// Takes every registered source out.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = Arc<Source>> + '_ {
+        self.free.clear();
+        self.slots.drain(..).filter_map(|slot| slot.source)
+    }
+
     /// How many sources are registered.
     pub(crate) fn len(&self) -> usize {
         self.slots.len() - self.free.len()

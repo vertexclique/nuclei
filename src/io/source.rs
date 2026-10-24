@@ -354,6 +354,28 @@ impl Source {
         drop((write, read));
     }
 
+    /// The shard the source is registered with is going away: the
+    /// registration goes, and every task waiting on the source is woken, to
+    /// register it where it polls next.
+    pub(crate) fn evict(&self) {
+        let mut read = self.read.hold();
+        let mut write = self.write.hold();
+        if self.reg.state.load(Ordering::Acquire) == REGISTERED {
+            // SAFETY: both sides are held.
+            let shard = unsafe { (*self.reg.shard.get()).take() };
+            self.reg.token.store(NO_TOKEN, Ordering::Release);
+            self.reg.state.store(UNREGISTERED, Ordering::Release);
+            if let (Some(shard), Ok(fd)) = (shard, self.fd()) {
+                let _ = shard.registrar().delete(fd);
+            }
+        }
+        let mut after = After::default();
+        read.get().wake_all(&mut after);
+        write.get().wake_all(&mut after);
+        drop((write, read));
+        after.run();
+    }
+
     /// Stops all IO on the descriptor and deregisters it, before the handle
     /// closes the descriptor or hands its IO object out mutably. Results
     /// nobody took yet stay for the next operation, unless a revival brings
