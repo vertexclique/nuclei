@@ -65,8 +65,8 @@ moment a waiter is dropped while a pass is granting it.
 
 | tool | what it checks here | how far a check goes |
 |------|---------------------|----------------------|
-| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop | every order of every thread's steps, for the slots, senders and programs each configuration sets |
-| Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
+| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel and the runtime's task the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
+| Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership and the task's references, future and output (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
 The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
 under every interleaving loom reaches (with the weak memory orderings of the atomics), for a
@@ -186,8 +186,9 @@ semaphore of any size, `lean/Nuclei/FairSemaphore/Theorems.lean` proves:
 
 and computes the worked example above (`example_after_release`, `example_share_held`,
 `example_after_cancel`). `lean/Axioms.lean` prints the axioms each theorem rests on; the check
-accepts only Lean's standard axioms (`propext`, `Quot.sound`, `Classical.choice`), and no
-theorem today needs more than the first two. No proof has a `sorry` or an `admit`.
+accepts only Lean's standard axioms (`propext`, `Quot.sound`, `Classical.choice`); the fair
+semaphore and one-shot theorems need only the first two. No proof has a `sorry` or an
+`admit`.
 
 ## The one-shot channel
 
@@ -212,6 +213,53 @@ ownership story for every sequence of operations: the value sits in exactly one 
 places, at most one send succeeds, and every answer agrees with what the channel did. What the
 models leave out is said in each file's header: the waker cells are single flags (their
 handshake is loom's), and the value is one unlabelled token.
+
+## The task
+
+`task` (`tla/task/Task.tla`, `lean/Nuclei/Task.lean`) checks the runtime's task
+(`src/rt/task/`): one allocation holding a future, one state word of flags and a count of
+references, reached through a runnable, any number of wakers and one handle. A runner pops the
+runnable and polls the future once. A wake that lands during the poll only marks the task, and
+the runner puts it back in its queue after the poll, so the future is never polled twice at
+once. The handle awaits the output, cancels the task (an idle one is scheduled once more, so a
+runner drops its future), or lets go of it. Whoever lets go of the last reference frees the
+memory, and never before the future and the output are gone.
+
+A worked example (computed by Lean, `Nuclei.Task.example_detached_last_waker`): spawn; run,
+Pending, the future keeps a waker; detach; wake by reference, which makes a new runnable; run
+again, and the future drops that waker during the poll. The run's reference is now the last
+one and nobody holds the handle, so nothing can wake the task or await it: the run drops the
+future, then frees the memory. The established task crate frees the memory there and leaves
+the future behind, never dropped. The TLA+ model found it (the mutation `pending_leaks_future`
+brings that behaviour back and must fail), and nuclei's task drops the future in its last
+decrement instead.
+
+The TLA+ family checks 26 configurations: 11 that must pass (the handle awaiting, detaching,
+dropped or cancelling, with one or two runners, wakes by value and by reference, a future that
+wakes itself, a waker dropped without a wake, and liveness under weak fairness), 9 mutations
+that each take one rule away (a wake during the poll that schedules a second runnable breaks
+`OnePoll`; a run that drops a wake from its own poll, and a handle that sleeps without looking
+again, end in a deadlock; freeing the memory while the handle lives, and a wake by reference
+that makes a runnable without its own reference, break `NothingAfterFree`; a cancel that drops
+the future itself breaks `FutureOnce`; a detach that skips the last-reference free, and a
+completion that leaves the output behind, break `CleanEnd`; the established crate's leak
+breaks `FreedAfterFuture`), and 6 witnesses: a wake during the poll, a cancel during the poll,
+a cancel found in the queue, a registration of the handle's waker meeting a notification, the
+last waker closing an idle task, and the handle woken from its sleep.
+
+The Lean file proves, for every sequence of operations and any number of wakers: the count of
+references is exactly the runnable plus the wakers; the future is dropped at most once, and a
+runnable always has a live future; the output is used at most once; the memory is freed at
+most once and only after the future and the output are gone; freed memory is never touched
+again (every operation needs a reference or the handle, and none is left); and memory nobody
+refers to is freed. The loom models in `src/rt/task/loom_tests.rs` run the real code under
+weak memory orderings, with a calibration that loses a wake and must fail.
+
+What the models leave out: the Lean model runs one whole operation at a time, so a poll is
+never seen in progress (that is TLA+'s part); the TLA+ model treats the future as one step per
+poll and the run queue as a count; the awaiter's waker cell is modelled by TLA+ only. The task
+theorems also rest on `Classical.choice`, which the arithmetic tactic brings in for its case
+analysis.
 
 ## What is not checked
 

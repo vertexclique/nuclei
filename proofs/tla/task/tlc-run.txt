@@ -1,0 +1,33 @@
+TLC run of every configuration in proofs/tla/task, 2026-10-24 10:01 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+T_await                           3508       1560      2  pass                                  pass                                  yes
+T_await_self                     18969       7578      1  pass                                  pass                                  yes
+T_cancel                         51005      20112      2  pass                                  pass                                  yes
+T_cancel_dropped_waker           14442       5505      1  pass                                  pass                                  yes
+T_detach                          4766       1998      1  pass                                  pass                                  yes
+T_drop                           10553       4176      1  pass                                  pass                                  yes
+T_drop_ref                        6756       2776      1  pass                                  pass                                  yes
+T_last_waker                       459        203      1  pass                                  pass                                  yes
+T_live_await                     16565       6928      3  pass                                  pass                                  yes
+T_live_cancel                    20187       8432      2  pass                                  pass                                  yes
+T_live_detach                      459        203      1  pass                                  pass                                  yes
+M_wake_running_schedules          2703       1171      1  violated:OnePoll                      violated:OnePoll                      yes
+M_run_drops_woken                 1306        569      1  deadlock                              deadlock                              yes
+M_free_ignores_handle              657        301      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
+M_cancel_drops_future              336        173      1  violated:FutureOnce                   violated:FutureOnce                   yes
+M_no_recheck                      1235        541      1  deadlock                              deadlock                              yes
+M_wake_no_ref                      786        360      1  violated:NothingAfterFree             violated:NothingAfterFree             yes
+M_detach_skips_last                831        373      1  violated:CleanEnd                     violated:CleanEnd                     yes
+M_complete_leaks_output            670        305      1  violated:CleanEnd                     violated:CleanEnd                     yes
+M_pending_leaks_future             361        154      1  violated:FreedAfterFuture             violated:FreedAfterFuture             yes
+W_wake_while_running               133         71      1  violated:NoWakeWhileRunning           violated:NoWakeWhileRunning           yes
+W_cancel_while_running              51         30      1  violated:NoCancelWhileRunning         violated:NoCancelWhileRunning         yes
+W_cancel_in_queue                   82         47      1  violated:NoCancelInQueue              violated:NoCancelInQueue              yes
+W_register_meets_notify           2280        998      1  violated:NoRegisterMeetsNotify        violated:NoRegisterMeetsNotify        yes
+W_last_waker_close                 362        155      1  violated:NoLastWakerClose             violated:NoLastWakerClose             yes
+W_park_woken                      1836        822      1  violated:NoParkWoken                  violated:NoParkWoken                  yes
+
+results matching EXPECTED.txt: 26 of 26

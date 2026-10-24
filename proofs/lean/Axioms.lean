@@ -44,3 +44,19 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Oneshot.example_pending_then_taken
 #print axioms Nuclei.Oneshot.example_close_owns_the_value
 #print axioms Nuclei.Oneshot.example_refused_send_takes_it_back
+
+-- A spawned task is good, every operation keeps it good, and so does any sequence.
+#print axioms Nuclei.Task.spawned_good
+#print axioms Nuclei.Task.step_good
+#print axioms Nuclei.Task.run_good
+-- The future is dropped at most once; the output is used at most once.
+#print axioms Nuclei.Task.future_dropped_once
+#print axioms Nuclei.Task.output_used_once
+-- The memory is freed at most once, after the future and the output are gone.
+#print axioms Nuclei.Task.freed_once_and_last
+-- Freed memory is never touched again.
+#print axioms Nuclei.Task.freed_is_inert
+-- A task nobody refers to or holds a handle of is freed.
+#print axioms Nuclei.Task.no_leak
+-- The worked example, computed.
+#print axioms Nuclei.Task.example_detached_last_waker

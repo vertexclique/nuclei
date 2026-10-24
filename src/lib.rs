@@ -42,6 +42,7 @@ pub mod config;
 mod handle;
 #[cfg(not(loom))]
 mod proactor;
+mod rt;
 #[cfg(not(loom))]
 mod submission_handler;
 /// Runtime-independent synchronization primitives: futures and wakers only, usable from any executor.
