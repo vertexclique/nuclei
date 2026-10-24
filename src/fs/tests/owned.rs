@@ -171,10 +171,18 @@ fn lent_writes_land_in_order_among_copied_writes() {
             assert_eq!(n.unwrap(), 200_000);
             assert_eq!(back.len(), 200_000, "the buffer came back whole");
             // A copied write after a lent one that started goes after it.
+            // The blocking pool may finish the lent write within its first
+            // poll; it has started either way.
             let mut lent = Box::pin(file.write_owned(c));
-            pends(&mut lent).await;
+            let first = poll_fn(|cx| core::task::Poll::Ready(Pin::new(&mut lent).poll(cx))).await;
             within(write_all(&mut &file, b"last")).await.unwrap();
-            let (n, _) = within(lent).await;
+            let (n, _) = match first {
+                core::task::Poll::Ready(done) => {
+                    drop(lent);
+                    done
+                }
+                core::task::Poll::Pending => within(lent).await,
+            };
             assert_eq!(n.unwrap(), 100_000);
             within(flush(&mut file)).await.unwrap();
             std::fs::read(&path).unwrap()
