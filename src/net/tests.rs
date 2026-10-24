@@ -736,12 +736,62 @@ fn a_tcp_dup_and_close_never_lets_the_driver_touch_a_reused_number() {
     });
 }
 
+/// Set in a process of this test binary that runs one test alone.
+const ALONE: &str = "NUCLEI_TEST_ALONE";
+
+/// Runs the test `name` again, alone in a new process of this test binary,
+/// and checks that it ran and passed there. Returns true in that process,
+/// where the caller then runs its case: one that needs the next socket to
+/// take the number a drop just freed, which only holds while no other test
+/// opens descriptors.
+fn alone(name: &str) -> bool {
+    if std::env::var_os(ALONE).is_some() {
+        return true;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--test-threads=1"])
+        .env(ALONE, "1")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut backoff = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("{name} did not finish in its own process");
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(100));
+    };
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    assert!(status.success(), "{name} failed in its own process:\n{out}");
+    assert!(
+        out.contains("test result: ok. 1 passed"),
+        "{name} did not run in its own process:\n{out}"
+    );
+    false
+}
+
 /// A handle dropped with bytes still to send hands them to a copy of its
-/// descriptor; its own number is closed and may be taken by another socket
-/// at once. The bytes still go to the old peer, and nothing goes to the
-/// socket that took the number.
+/// descriptor; its own number is closed and taken by the next socket at
+/// once. The bytes still go to the old peer, and nothing goes to the socket
+/// that took the number.
 #[test]
 fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
+    if !alone("net::tests::bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number")
+    {
+        return;
+    }
     let rt = runtime();
     let (mine, peer) = UnixStream::pair().unwrap();
     let (sent, number) = rt.block_on(async {
@@ -751,15 +801,14 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         drop(handle);
         (sent, number)
     });
-    // The number is free: the next socket of this thread is likely to take
-    // it, and dup2 makes that certain without racing other threads.
-    let (taker_peer, taker) = UnixStream::pair().unwrap();
-    // SAFETY: `number` was closed by the drop; nobody else here took it, and
-    // dup2 onto it is atomic.
-    assert_eq!(unsafe { libc::dup2(taker.as_raw_fd(), number) }, number);
-    drop(taker);
-    // SAFETY: `number` is this test's own descriptor now.
-    let reused = unsafe { OwnedFd::from_raw_fd(number) };
+    // Alone in its process, the test's next socket takes the lowest free
+    // number: the one the drop closed.
+    let (taker, taker_peer) = UnixStream::pair().unwrap();
+    assert_eq!(
+        taker.as_raw_fd(),
+        number,
+        "the next socket did not take the freed number"
+    );
     let got = std::thread::spawn(move || read_to_end_blocking(peer))
         .join()
         .unwrap();
@@ -770,7 +819,7 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         sent.len()
     );
     // Nothing reached the socket that took the number.
-    drop(reused);
+    drop(taker);
     taker_peer.set_nonblocking(true).unwrap();
     let mut buf = [0u8; 1];
     assert!(
