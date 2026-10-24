@@ -26,9 +26,10 @@ async fn main() -> io::Result<()> {
 
     let fo = File::open(&path).unwrap();
     let mut file = Handle::<File>::new(fo).unwrap();
-    file.read_vectored(&mut bufs[..]).await.unwrap();
+    let n = file.read_vectored(&mut bufs[..]).await.unwrap();
+    println!("read {n} bytes into the three buffers");
 
-    let bufs = vec![buf1, buf2, buf3];
+    let bufs = [buf1, buf2, buf3];
 
     bufs.iter().enumerate().for_each(|(idx, e)| {
         println!(

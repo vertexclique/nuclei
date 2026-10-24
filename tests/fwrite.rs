@@ -1,15 +1,15 @@
-use nuclei::*;
+mod io_support;
+
 use std::fs::{File, OpenOptions};
+use std::io::SeekFrom;
 
-use std::path::PathBuf;
+use io_support::{TempFile, flush, read_to_end, seek, write_all};
+use nuclei::Handle;
 
-use futures::io::SeekFrom;
-use futures::*;
-
-const DARK_MATTER_TEXT: &'static str = "\
+const DARK_MATTER_TEXT: &str = "\
 Dark matter is a form of matter thought to account for approximately \
 85% of the matter in the universe and about a quarter of its total \
-mass–energy density or about 2.241×10−27 kg/m3. Its presence is implied \
+mass-energy density or about 2.241x10^-27 kg/m3. Its presence is implied \
 in a variety of astrophysical observations, including gravitational effects \
 that cannot be explained by accepted theories of gravity unless more matter \
 is present than can be seen. For this reason, most experts think that dark \
@@ -18,30 +18,28 @@ on its structure and evolution. Dark matter is called dark because it does \
 not appear to interact with the electromagnetic field, which means it doesn't \
 absorb, reflect or emit electromagnetic radiation, and is therefore difficult \
 to detect.[1]\
-\
 ";
 
 #[nuclei::test]
 async fn write_file() {
-    // Approximately ~75,9 MB
+    // About 75 MB.
     let dark_matter = vec![DARK_MATTER_TEXT; 100_000].join("\n");
-
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("testdata");
-    path.push("dark-matter");
-
+    let tmp = TempFile::new("dark-matter");
     let fo = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&path)
+        .create_new(true)
+        .open(&tmp.0)
         .unwrap();
     let mut file = Handle::<File>::new(fo).unwrap();
-    file.write_all(dark_matter.as_bytes()).await.unwrap();
-
-    let mut buf = vec![];
-    assert!(file.seek(SeekFrom::Start(0)).await.is_ok());
-    assert_eq!(file.read_to_end(&mut buf).await.unwrap(), dark_matter.len());
-    assert_eq!(&buf[0..dark_matter.len()], dark_matter.as_bytes());
-
-    assert_eq!(75899999, buf.len());
+    write_all(&mut file, dark_matter.as_bytes()).await.unwrap();
+    assert_eq!(seek(&mut file, SeekFrom::Start(0)).await.unwrap(), 0);
+    let buf = read_to_end(&mut file).await.unwrap();
+    assert_eq!(buf.len(), dark_matter.len());
+    assert!(buf == dark_matter.as_bytes());
+    flush(&mut file).await.unwrap();
+    assert_eq!(
+        std::fs::metadata(&tmp.0).unwrap().len(),
+        dark_matter.len() as u64
+    );
 }

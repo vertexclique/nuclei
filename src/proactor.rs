@@ -1,155 +1,130 @@
-use std::task::{Context, Poll};
+//! The proactor facade of earlier nuclei versions, over the runtime's
+//! shards: every shard drives its own IO, and these calls reach the shard
+//! of the calling thread.
+
+use core::future::Future;
+use std::io;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
-use std::{future::Future, io};
 
 use crate::config::NucleiConfig;
-use once_cell::sync::OnceCell;
+use crate::rt::context;
+use crate::rt::shard::Shared;
 
-use super::syscore::*;
-use super::waker::*;
-use crate::spawn_blocking;
-use crate::sys::IoBackend;
+/// Which kernel interface nuclei's IO runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IoBackend {
+    /// kqueue (macOS and the BSDs).
+    Kqueue,
+    /// epoll (Linux).
+    Epoll,
+    /// io_uring (Linux).
+    IoUring,
+    /// I/O completion ports (Windows).
+    Iocp,
+}
 
-pub use super::handle::*;
+/// The process's proactor: its configuration, and the IO of the calling
+/// thread's shard.
+#[derive(Debug)]
+pub struct Proactor {
+    config: NucleiConfig,
+}
 
-///
-/// Concrete proactor instance
-pub struct Proactor(pub(crate) SysProactor);
-unsafe impl Send for Proactor {}
-unsafe impl Sync for Proactor {}
+static PROACTOR: OnceLock<Proactor> = OnceLock::new();
 
-static mut PROACTOR: OnceCell<Proactor> = OnceCell::new();
+/// The shards of the threads inside [`Proactor::wait`].
+static WAITING: Mutex<Vec<Arc<Shared>>> = Mutex::new(Vec::new());
+
+fn waiting() -> std::sync::MutexGuard<'static, Vec<Arc<Shared>>> {
+    WAITING.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 impl Proactor {
-    /// Returns a reference to the proactor.
+    /// The proactor, with the default configuration unless
+    /// [`with_config`](Self::with_config) set one first.
     pub fn get() -> &'static Proactor {
-        unsafe {
-            PROACTOR.get_or_init(|| {
-                Proactor(
-                    SysProactor::new(NucleiConfig::default())
-                        .expect("cannot initialize IO backend"),
-                )
-            })
-        }
+        PROACTOR.get_or_init(|| Proactor {
+            config: NucleiConfig::default(),
+        })
     }
 
-    /// Builds a proactor instance with given config and returns a reference to it.
+    /// Sets the proactor's configuration, and returns the proactor.
+    ///
+    /// # Panics
+    ///
+    /// When the proactor was configured already, or used (which configures
+    /// it with the defaults): a configuration is set once, before any IO.
     pub fn with_config(config: NucleiConfig) -> &'static Proactor {
-        unsafe {
-            let proactor =
-                Proactor(SysProactor::new(config.clone()).expect("cannot initialize IO backend"));
-            PROACTOR
-                .set(proactor)
-                .map_err(|e| "Proactor instance not being able to set.")
-                .unwrap();
+        let mut config = Some(config);
+        let proactor = PROACTOR.get_or_init(|| Proactor {
+            config: config.take().unwrap_or_default(),
+        });
+        assert!(
+            config.is_none(),
+            "the proactor is configured already: call `with_config` once, before any IO"
+        );
+        proactor
+    }
 
-            PROACTOR.wait()
+    /// The configuration in place.
+    pub fn config(&self) -> &NucleiConfig {
+        &self.config
+    }
+
+    /// Ends every [`wait`](Self::wait) in progress at once.
+    pub fn wake(&self) {
+        for shard in waiting().iter() {
+            shard.unpark();
         }
     }
 
-    /// Wakes the thread waiting on proactor.
-    pub fn wake(&self) {
-        self.0.wake().expect("failed to wake thread");
-    }
-
-    /// Wait for completion of IO object
+    /// Drives the calling thread's shard once: runs its ready tasks, waits
+    /// for IO (up to `duration`; `None` until some comes or [`wake`]),
+    /// handling at most `max_event_size` events, and runs the tasks the IO
+    /// woke. Returns how many IO events it handled.
+    ///
+    /// [`wake`]: Self::wake
+    ///
+    /// # Errors
+    ///
+    /// When the thread's shard cannot start, or its poller fails.
     pub fn wait(&self, max_event_size: usize, duration: Option<Duration>) -> io::Result<usize> {
-        self.0.wait(max_event_size, duration)
+        if let Some(events) =
+            context::current(|current| current.map(|s| s.turn(max_event_size, duration)))
+        {
+            return events;
+        }
+        let shard = context::own_shard()?;
+        let _current = context::enter(&shard);
+        waiting().push(Arc::clone(&shard.shared));
+        let events = shard.turn(max_event_size, duration);
+        waiting().retain(|s| !Arc::ptr_eq(s, &shard.shared));
+        events
     }
 
-    /// Get the IO backend that is used with Nuclei's proactor.
+    /// The backend nuclei's IO runs on in this process.
     pub fn backend() -> IoBackend {
         BACKEND
     }
-
-    /// Get underlying proactor instance.
-    pub(crate) fn inner(&self) -> &SysProactor {
-        &self.0
-    }
-
-    #[cfg(all(feature = "iouring", target_os = "linux"))]
-    /// Get IO_URING backend probes
-    pub fn ring_params(&self) -> &rustix_uring::Parameters {
-        unsafe { IO_URING.as_ref().unwrap().params() }
-    }
 }
 
-///
-/// IO driver that drives underlying event systems
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const BACKEND: IoBackend = IoBackend::Epoll;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+const BACKEND: IoBackend = IoBackend::Kqueue;
+#[cfg(target_os = "windows")]
+const BACKEND: IoBackend = IoBackend::Iocp;
+
+/// Runs `future` to its end on the calling thread, driving its shard's IO
+/// meanwhile: [`block_on`](crate::runtime::block_on).
 pub fn drive<T>(future: impl Future<Output = T>) -> T {
-    let p = Proactor::get();
-    let waker = waker_fn(move || {
-        p.wake();
-    });
-
-    let cx = &mut Context::from_waker(&waker);
-    futures::pin_mut!(future);
-
-    let driver = spawn_blocking(move || loop {
-        let _ = p.wait(1, None);
-    });
-
-    futures::pin_mut!(driver);
-
-    loop {
-        if let Poll::Ready(val) = future.as_mut().poll(cx) {
-            return val;
-        }
-
-        cx.waker().wake_by_ref();
-
-        // TODO: (vcq): we don't need this.
-        // let _duration = Duration::from_millis(1);
-        let _ = driver.as_mut().poll(cx);
-    }
-}
-
-#[cfg(test)]
-#[cfg(target_os = "linux")]
-mod proactor_tests {
-    use crate::config::{IoUringConfiguration, NucleiConfig};
-    use crate::Proactor;
-
-    #[test]
-    #[ignore]
-    fn proactor_with_defaults() {
-        let old = Proactor::get();
-
-        let osq = old.0.sq.lock();
-        let olen = osq.capacity();
-        drop(osq);
-        dbg!(olen);
-
-        assert_eq!(olen, 2048);
-    }
-
-    #[test]
-    fn proactor_with_config_rollup() {
-        let config = NucleiConfig {
-            iouring: IoUringConfiguration {
-                queue_len: 10,
-                sqpoll_wake_interval: Some(11),
-                per_numa_bounded_worker_count: Some(12),
-                per_numa_unbounded_worker_count: Some(13),
-                ..IoUringConfiguration::default()
-            },
-        };
-        let new = Proactor::with_config(config);
-        let old = Proactor::get();
-
-        let nsq = new.0.sq.lock();
-        let nlen = nsq.capacity();
-        drop(nsq);
-
-        let osq = old.0.sq.lock();
-        let olen = osq.capacity();
-        drop(osq);
-
-        dbg!(nlen);
-        dbg!(olen);
-
-        assert_eq!(nlen, olen);
-        assert_eq!(nlen, 16);
-        assert_eq!(olen, 16);
-    }
+    crate::runtime::block_on(future)
 }

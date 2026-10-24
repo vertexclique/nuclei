@@ -12,7 +12,7 @@ pub struct NucleiConfig {
 pub struct IoUringConfiguration {
     /// Allowed entries in both submission and completion queues.
     ///
-    /// **[default]**: By default this value is 2048.
+    /// **Default**: 2048.
     pub queue_len: u32,
     /// SQPOLL kernel thread wake up interval.
     ///
@@ -30,7 +30,7 @@ pub struct IoUringConfiguration {
     /// Increasing it will slow down completion push rate from kernel.
     /// This config is in milliseconds.
     ///
-    /// **[default]**: If [None] then SQPOLL will be disabled.
+    /// **Default**: `None`: no SQPOLL thread.
     pub sqpoll_wake_interval: Option<u32>,
 
     /// Get and/or set the limit for number of io_uring worker threads per NUMA
@@ -39,7 +39,7 @@ pub struct IoUringConfiguration {
     /// that is I/O on regular files or block devices. Passing `0` does not change
     /// the current limit.
     ///
-    /// **[default]**: If [None] then Nuclei default value of will be used `256`.
+    /// **Default**: `Some(256)`.
     ///
     /// If [None] passed, by default, the amount of bounded IO workers is limited to how
     /// many SQ entries the ring was setup with, or 4 times the number of
@@ -50,7 +50,7 @@ pub struct IoUringConfiguration {
     /// which carry out I/O operations that can never complete, for instance I/O
     /// on sockets. Passing `0` does not change the current limit.
     ///
-    /// **[default]**: If [None] then Nuclei default value of will be used `512`.
+    /// **Default**: `Some(512)`.
     ///
     /// If [None] passed unbounded workers will be limited by the process task limit,
     /// as indicated by the rlimit [RLIMIT_NPROC](https://man7.org/linux/man-pages/man2/getrlimit.2.html) limit.
@@ -58,19 +58,18 @@ pub struct IoUringConfiguration {
 
     /// This argument allows aggressively waiting on CQ(completion queue) to have low latency of IO completions.
     /// Basically, this argument polls CQEs(completion queue events) directly on cq at userspace.
-    /// Mind that, using this increase pressure on CPUs from userspace side. By default, nuclei reaps the CQ with
-    /// aggressive wait. This is double polling approach for nuclei where Kernel gets submissions by itself (SQPOLL),
-    /// processes it and puts completions to completion queue and we immediately pick up without latency
-    /// (aggressive_poll).
+    /// Mind that, using this increase pressure on CPUs from userspace side. With SQPOLL as well, this is
+    /// a double polling approach, where the kernel takes submissions by itself, processes them and puts
+    /// completions on the completion queue, which nuclei picks up without latency.
     ///
-    /// **[default]**: `true`.
+    /// **Default**: `false`.
     pub aggressive_poll: bool,
 
     /// Perform busy-waiting for I/O completion events, as opposed to getting notifications via an
     /// asynchronous IRQ (Interrupt Request). This will reduce latency, but increases CPU usage.
     /// This is only usable on file systems that support polling and files opened with `O_DIRECT`.
     ///
-    /// **[default]**: `false`.
+    /// **Default**: `false`.
     pub iopoll_enabled: bool,
     // XXX: `redrive_kthread_wake` = bool, syncs queue changes so kernel threads got awakened. increased cpu usage.
 }
@@ -129,15 +128,14 @@ impl IoUringConfiguration {
     }
 }
 
+/// The interrupt-driven profile, with the io-wq worker limits nuclei sets on
+/// every ring.
 impl Default for IoUringConfiguration {
     fn default() -> Self {
         Self {
-            queue_len: 1 << 11,
-            sqpoll_wake_interval: Some(2),
             per_numa_bounded_worker_count: Some(1 << 8),
             per_numa_unbounded_worker_count: Some(1 << 9),
-            aggressive_poll: true,
-            iopoll_enabled: false,
+            ..Self::interrupt_driven(1 << 11)
         }
     }
 }

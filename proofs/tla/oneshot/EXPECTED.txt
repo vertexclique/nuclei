@@ -1,0 +1,24 @@
+# configuration                spec            expected
+BC_send_recv                   MC_Oneshot      pass
+BC_tx_drop                     MC_Oneshot      pass
+BC_rx_drop                     MC_Oneshot      pass
+BC_close                       MC_Oneshot      pass
+BC_try                         MC_Oneshot      pass
+BC_park                        MC_Oneshot      pass
+BC_park_drop                   MC_Oneshot      pass
+BC_live_send                   MC_Oneshot      pass
+BC_live_park                   MC_Oneshot      pass
+M_wake_lost                    MC_Oneshot      deadlock
+M_wake_early                   MC_Oneshot      violated:WakeMeansVisible
+M_take_keeps_handle            MC_Oneshot      violated:ValueReadOnce
+M_drop_loses_value             MC_Oneshot      violated:ValueConserved
+M_send_ignores_close           MC_Oneshot      violated:NoSendPastClose
+M_rx_no_recheck                MC_Oneshot      deadlock
+M_tx_no_recheck                MC_Oneshot      deadlock
+M_error_despite_value          MC_Oneshot      violated:AnswerSound
+W_value_at_recheck             MC_Oneshot      violated:NoValueAtRecheck
+W_wake_racing_drop             MC_Oneshot      violated:NoWakeRacingDrop
+W_send_refused                 MC_Oneshot      violated:NoSendRefused
+W_rx_woken                     MC_Oneshot      violated:NoRxWake
+W_tx_woken                     MC_Oneshot      violated:NoTxWake
+W_value_dropped                MC_Oneshot      violated:NoValueDroppedByRx

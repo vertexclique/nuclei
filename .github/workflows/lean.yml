@@ -1,0 +1,28 @@
+name: Lean
+
+# Proofs are never listed here by hand: `lean.sh` installs a checksum-verified elan and runs
+# `proofs/lean/check.sh build`, which builds every module the library imports with the Lean
+# release proofs/lean/lean-toolchain pins, failing on any warning. The next steps fail if
+# `sorry` or `admit` appears in any Lean source, and unless every theorem rests only on Lean's
+# standard axioms, so a proof with a hole cannot pass.
+
+on: [push, pull_request]
+
+jobs:
+  lean:
+    name: Lean proofs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the Lean proofs
+        run: .github/workflows/lean.sh
+
+      - name: Fail on an unfinished proof
+        run: bash proofs/lean/check.sh sorry
+
+      - name: Fail on a non-standard axiom
+        run: |
+          export PATH="$HOME/.elan/bin:$PATH"
+          bash proofs/lean/check.sh axioms
