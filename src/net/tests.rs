@@ -729,10 +729,17 @@ fn a_tcp_dup_and_close_never_lets_the_driver_touch_a_reused_number() {
         (&new_peer).write_all(b"mine").unwrap();
         let n = within(reused.recv(&mut buf)).await.unwrap();
         assert_eq!(&buf[..n], b"mine");
-        keep.set_nonblocking(true).unwrap();
-        let mut old = [0u8; 8];
-        assert_eq!((&keep).read(&mut old).unwrap(), 3);
-        assert_eq!(&old[..3], b"old");
+        // The old connection still has its bytes. TCP may hand them over a
+        // little after the write (macOS does on loopback), so the read waits
+        // for them, for a bounded time.
+        keep.set_nonblocking(false).unwrap();
+        keep.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut old = [0u8; 3];
+        (&keep)
+            .read_exact(&mut old)
+            .expect("the old connection's bytes never came");
+        assert_eq!(&old, b"old");
     });
 }
 
