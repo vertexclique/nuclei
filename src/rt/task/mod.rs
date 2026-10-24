@@ -44,7 +44,7 @@ use core::ptr::NonNull;
 use core::task::{RawWaker, Waker};
 
 use self::header::Header;
-use self::join::Task;
+pub use self::join::{FallibleTask, Task};
 use self::raw::RawTask;
 
 /// How a task came to be scheduled.

@@ -1,0 +1,9 @@
+# configuration                spec                 expected
+P_one                          MC_Park              pass
+P_three                        MC_Park              pass
+P_live                         MC_Park              pass
+M_no_recheck                   MC_Park              deadlock
+M_check_first                  MC_Park              deadlock
+W_notify                       MC_Park              violated:NoNotify
+W_recheck                      MC_Park              violated:NoRecheckFind
+W_spurious                     MC_Park              violated:NoSpurious

@@ -43,6 +43,8 @@ mod handle;
 #[cfg(not(loom))]
 mod proactor;
 mod rt;
+/// nuclei's own runtime: shards, tasks, `block_on`, `spawn` and the blocking pool.
+pub mod runtime;
 #[cfg(not(loom))]
 mod submission_handler;
 /// Runtime-independent synchronization primitives: futures and wakers only, usable from any executor.
@@ -104,6 +106,7 @@ mod syscore {
 pub use async_global_executor::*;
 #[cfg(not(loom))]
 pub use proactor::*;
+pub use runtime::{Builder, Runtime, RuntimeHandle};
 
 #[cfg(all(not(loom), feature = "attributes"))]
 pub use nuclei_attributes::*;

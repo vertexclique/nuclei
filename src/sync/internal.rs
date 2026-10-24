@@ -46,12 +46,12 @@ pub(crate) use std::sync::Arc;
 #[cfg(loom)]
 #[allow(unused_imports)]
 pub(crate) use loom::sync::atomic::{
-    AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
 #[cfg(not(loom))]
 #[allow(unused_imports)]
 pub(crate) use std::sync::atomic::{
-    AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
 
 /// Take the pointer out of `atomic`, leaving null, through `&mut`: no other

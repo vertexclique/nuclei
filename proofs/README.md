@@ -65,7 +65,7 @@ moment a waiter is dropped while a pass is granting it.
 
 | tool | what it checks here | how far a check goes |
 |------|---------------------|----------------------|
-| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel and the runtime's task the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
+| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task and the park handshake the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
 | Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, and the timer wheel's arithmetic (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
 The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
@@ -260,6 +260,24 @@ never seen in progress (that is TLA+'s part); the TLA+ model treats the future a
 poll and the run queue as a count; the awaiter's waker cell is modelled by TLA+ only. The task
 theorems also rest on `Classical.choice`, which the arithmetic tactic brings in for its case
 analysis.
+
+## The park handshake
+
+`park` (`tla/park/Park.tla`) checks how a shard goes to sleep without losing a wake
+(`src/rt/handshake.rs`, `src/rt/shard.rs`). A shard with nothing to run publishes that it
+parks, looks at its inbox once more, and only then sleeps until its poller is notified. A
+thread that gives it work pushes the work, then looks whether the shard parks; if it does, it
+swaps the flag back and notifies, so only the first of a burst of wakes notifies. Every access
+of the pair is sequentially consistent, so whichever publication comes second, the look after
+it sees the other: the shard finds the work, or the waker finds the shard parked.
+
+The family checks 8 configurations: 3 that must pass (one waker, three wakers racing, and
+liveness under weak fairness), 2 mutations that must deadlock (the shard sleeping without its
+look after publishing; a waker looking before it pushes), and 3 witnesses (a notification, a
+look that finds the work, a notification that lands while the shard is awake). TLA+ steps are
+sequentially consistent, so the model checks the protocol; the loom models in
+`src/rt/handshake.rs` check the code, with two calibrations that must lose a wake (no look
+after publishing; the pair relaxed with no fence).
 
 ## The timer wheel
 
