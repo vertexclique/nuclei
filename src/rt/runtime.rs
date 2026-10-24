@@ -197,6 +197,7 @@ impl Builder {
         let limits = Limits {
             max_nesting: self.max_nesting.unwrap_or(context::DEFAULT_MAX_NESTING),
             buffer_cap: self.io_buffer_cap.unwrap_or(crate::buf::DEFAULT_CAP),
+            backend: super::backend::chosen()?,
         };
         let blocking_name = self
             .thread_name
@@ -541,7 +542,9 @@ fn block_on_with<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
         Err(err) => panic!("this thread's shard could not start: {err}"),
     };
     let _current = context::enter(&shard);
-    shard.block_on(future)
+    let output = shard.block_on(future);
+    shard.leave();
+    output
 }
 
 /// Runs `future` to its end on the calling thread, running other tasks of

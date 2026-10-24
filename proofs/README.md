@@ -65,8 +65,8 @@ moment a waiter is dropped while a pass is granting it.
 
 | tool | what it checks here | how far a check goes |
 |------|---------------------|----------------------|
-| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer, the guard of an IO source's side and the reads and writes from a task's own buffer the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
-| Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, and the timer wheel's arithmetic (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
+| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer, the guard of an IO source's side, the reads and writes from a task's own buffer and a source's operations on its shard's ring the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
+| Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, the timer wheel's arithmetic and a ring's file slots (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
 The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
 under every interleaving loom reaches (with the weak memory orderings of the atomics), for a
@@ -340,13 +340,18 @@ object. Taking fewer, it lets go and hands its object to the source, never waiti
 taken in one order: a holder of the read side that sees the request bit tries the write side; a
 holder of the write side lets go first, then tries the read side once. Whoever performs the
 close marks it done, and whichever of the dropper's hand-over and that mark comes second drops
-the object. 9 configurations: 2 that must pass (`NoUseOfClosed`, no holder uses a descriptor
-closed under it; `PerformedOnce`; `Closed`, once everyone is done the close was performed and
-the object dropped; and liveness), 5 mutations (a holder that ignores the request bit, or takes
-a raised bit for its own, breaks `Closed`; a dropper that performs holding one side, or drops
-its object before the close is done, breaks `NoUseOfClosed`; a holder of the write side that
-tries the read side while still holding its own livelocks, breaking `Termination`), and 2
-witnesses (a holder performs the close; the dropper hands its object over). The Rust tests in
+the object. The close lingers: once the dropper is done, a task drains what the handle wrote
+through a copy of the descriptor, holding the write side; finding the close not performed yet,
+it waits on the write side, and the performer wakes the write side's waiters rather than
+forget them as it does the handle's others. 11 configurations: 2 that must pass
+(`NoUseOfClosed`, no holder uses a descriptor closed under it; `PerformedOnce`; `Closed`, once
+everything else is done the close was performed and the object dropped; and liveness), 6
+mutations (a holder that ignores the request bit, or takes a raised bit for its own, breaks
+`Closed`; a dropper that performs holding one side, or drops its object before the close is
+done, breaks `NoUseOfClosed`; a holder of the write side that tries the read side while still
+holding its own livelocks, and a close that forgets the lingering drain's wake strands it, both
+breaking `Termination`), and 3 witnesses (a holder performs the close; the dropper hands its
+object over; the lingering drain waits before the close is performed). The Rust tests in
 `src/io/source/tests/requests.rs` hold a side from the test and check the same on real sockets,
 each with a mutation of the code that makes one of them fail.
 
@@ -406,6 +411,53 @@ moves the cursor back.
 
 The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
 rules on real sockets and files, each with a mutation of the code that makes one of them fail.
+
+## A source's operations on its shard's ring
+
+`ring` (`tla/ring/RingOp.tla`) checks how a side of a source works on an io_uring ring
+(`src/io/source/ring.rs`, `src/io/source/write/ring.rs`, `src/rt/shard/ring.rs`) when the
+side is held from another thread than the ring's. A task there writes twice; each write is
+accepted into the side, and the side's operation goes to the ring one at a time. Only the
+ring's own thread submits: a task elsewhere posts a kick once it has let go of the side, and
+the ring's thread submits what the side wants. Submitting raises the side's flag (an operation
+is out) and the source's count of operations in the kernel. When the kernel completes one, the
+ring's thread lowers the count, leaves the completion in the side's one-slot mailbox and
+defers it to the side: applied at once if the side is free, else by its holder as it lets go,
+which then asks for the next operation. A retire deregisters the source, cancels what is out
+and waits until the count is zero: it puts its waker in, raises a flag, and only then looks at
+the count, while the ring's thread lowers the count and then looks at the flag. 11
+configurations: 3 that must pass (`OneOut` and `NoOverwrite`, one operation out and one
+completion in the mailbox at most; `SingleIssuer`, only the ring's thread submits;
+`RetiredIdle`, once the retire returned the kernel holds no operation of the source; the
+retire returns; and with no retire, both writes go out), 6 mutations (a second operation out
+while one is breaks `OneOut`; a task that submits from its own thread breaks `SingleIssuer`;
+a want left unkicked keeps the writes from going out; a completion that wakes nobody, and a
+retire that looks at the count before raising its flag, keep the retire from returning; a
+retire that does not wait breaks `RetiredIdle`), and 2 witnesses (the task's thread applies a
+completion as it lets go; the retire waits for one).
+
+`tla/ring/RingLent.tla` checks `write_owned` through the ring when its task may go away while
+the buffer is out with the kernel: the kernel takes some of the buffer, or, if a cancel came
+before it took any, completes cancelled; the task's going asks for that cancel when nothing
+went out yet; a completion that leaves an abandoned buffer with nothing sent withdraws it, and
+one that leaves part of it sent goes on to the end. 6 configurations: 2 that must pass
+(`WholeOrNothing`, the stream gets the buffer whole or not at all; and the write ends), 2
+mutations (withdrawing a write part of which went out breaks `WholeOrNothing`; leaving the rest
+of an abandoned write unsent keeps it from ending), and 2 witnesses (a withdrawn write; an
+abandoned write finished after part of it went out).
+
+`lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
+every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
+table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its
+submission to its completion. For every sequence of operations from a fresh table it proves
+that a free slot is held by nobody, named by no entry and holds no open copy (`inv_run`); that
+a slot a source takes has no entry naming it, so an entry on its way never reaches the next
+source's file (`taken_slot_is_unnamed`); that a free slot is never freed again
+(`no_double_free`); and that a copy closes only once no source holds it and no entry names it
+(`copy_closes_unnamed`); and it computes the worked example of a slot released with a read out
+and handed out again only once the read completed (`example_reuse_waits`). The Rust tests in
+`src/rt/shard/ring/tests.rs` run sources past a full table, a retire with a read out and a
+shard that goes with one, each with a mutation of the code that makes one of them fail.
 
 ## The timer wheel
 

@@ -621,3 +621,50 @@ fn recvmsg_out_rejects_short_buffers_and_clamps_claims() {
         b"xy"
     );
 }
+
+/// A fixed file keeps the socket it was given: once the descriptor it came from is closed, and
+/// its number taken by another socket, a read on the slot still reads the first socket.
+#[test]
+fn a_fixed_file_outlives_the_descriptor_it_came_from() {
+    let Some(mut ring) = ring_or_skip() else {
+        return;
+    };
+    ring.register_files_sparse(8).unwrap();
+    let (mine, peer) = socketpair();
+    ring.update_file(3, mine.as_raw_fd()).unwrap();
+    // The descriptor closes and its number names another socket, in one atomic step (so no
+    // other thread of the test process can take the number in between).
+    let number = std::os::fd::IntoRawFd::into_raw_fd(mine);
+    let (other, other_peer) = socketpair();
+    // SAFETY: `number` is this test's own descriptor; dup2 replaces it atomically.
+    assert_eq!(unsafe { libc::dup2(other.as_raw_fd(), number) }, number);
+    // SAFETY: `number` is this test's own descriptor.
+    let reused = unsafe { OwnedFd::from_raw_fd(number) };
+    write_fd(peer.as_raw_fd(), b"first");
+    write_fd(other_peer.as_raw_fd(), b"other");
+    let mut buf = [0u8; 16];
+    push(
+        &mut ring,
+        Sqe::recv(3, buf.as_mut_ptr(), buf.len() as u32, 0)
+            .flags(IOSQE_FIXED_FILE)
+            .user_data(7),
+    );
+    let cqe = reap(&mut ring, 1)[0];
+    assert_eq!(cqe.user_data, 7);
+    assert_eq!(cqe.res, 5, "{cqe:?}");
+    assert_eq!(
+        &buf[..5],
+        b"first",
+        "the slot read the socket that took the number"
+    );
+    // Emptied, the slot names nothing.
+    ring.update_file(3, -1).unwrap();
+    push(
+        &mut ring,
+        Sqe::recv(3, buf.as_mut_ptr(), buf.len() as u32, 0)
+            .flags(IOSQE_FIXED_FILE)
+            .user_data(8),
+    );
+    assert_eq!(reap(&mut ring, 1)[0].res, -libc::EBADF);
+    drop((reused, other, other_peer, peer));
+}

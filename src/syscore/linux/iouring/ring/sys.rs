@@ -180,6 +180,31 @@ pub(crate) struct IoUringRsrcUpdate {
     pub data: u64,
 }
 
+/// Argument of `IORING_REGISTER_FILES2`: a table of `nr` files, empty with
+/// `IORING_RSRC_REGISTER_SPARSE`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct IoUringRsrcRegister {
+    pub nr: u32,
+    pub flags: u32,
+    pub resv2: u64,
+    pub data: u64,
+    pub tags: u64,
+}
+
+/// Argument of `IORING_REGISTER_FILES_UPDATE2`: `nr` descriptors from `data`
+/// into the table from slot `offset` (-1 empties a slot).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct IoUringRsrcUpdate2 {
+    pub offset: u32,
+    pub resv: u32,
+    pub data: u64,
+    pub tags: u64,
+    pub nr: u32,
+    pub resv2: u32,
+}
+
 /// The kernel's 64-bit timespec (`__kernel_timespec`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -242,6 +267,10 @@ const _: () = {
     assert!(offset_of!(IoUringRecvmsgOut, payloadlen) == 8);
 
     assert!(size_of::<IoUringRsrcUpdate>() == 16);
+    assert!(size_of::<IoUringRsrcRegister>() == 32);
+    assert!(size_of::<IoUringRsrcUpdate2>() == 32);
+    assert!(offset_of!(IoUringRsrcUpdate2, data) == 8);
+    assert!(offset_of!(IoUringRsrcUpdate2, nr) == 24);
     assert!(offset_of!(IoUringRsrcUpdate, data) == 8);
 
     assert!(size_of::<KernelTimespec>() == 16);
@@ -319,6 +348,11 @@ pub(crate) const IORING_REGISTER_IOWQ_MAX_WORKERS: u32 = 19;
 pub(crate) const IORING_REGISTER_RING_FDS: u32 = 20;
 pub(crate) const IORING_UNREGISTER_RING_FDS: u32 = 21;
 pub(crate) const IORING_REGISTER_PBUF_RING: u32 = 22;
+pub(crate) const IORING_REGISTER_FILES2: u32 = 13;
+pub(crate) const IORING_REGISTER_FILES_UPDATE2: u32 = 14;
+
+/// `io_uring_rsrc_register.flags`: register an empty table.
+pub(crate) const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 pub(crate) const IORING_UNREGISTER_PBUF_RING: u32 = 23;
 
 // mmap offsets of the ring regions.
@@ -335,6 +369,7 @@ pub(crate) const IORING_RECV_MULTISHOT: u16 = 1 << 1;
 pub(crate) const IORING_ASYNC_CANCEL_ALL: u32 = 1 << 0;
 pub(crate) const IORING_ASYNC_CANCEL_FD: u32 = 1 << 1;
 pub(crate) const IORING_ASYNC_CANCEL_ANY: u32 = 1 << 2;
+pub(crate) const IORING_ASYNC_CANCEL_FD_FIXED: u32 = 1 << 3;
 
 // sqe.timeout_flags.
 pub(crate) const IORING_TIMEOUT_ABS: u32 = 1 << 0;

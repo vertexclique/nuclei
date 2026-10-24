@@ -426,6 +426,10 @@ pub(crate) struct After {
     pub(crate) starved: bool,
     /// Work was left to the driver: the source must be registered.
     pub(crate) register: bool,
+    /// A side of a ring source wants an operation the ring's thread, the
+    /// one of this shard, must submit.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(crate) kick: Option<std::sync::Arc<crate::rt::shard::Shared>>,
 }
 
 impl After {

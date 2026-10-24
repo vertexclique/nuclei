@@ -69,3 +69,12 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Wheel.cascade_lowers
 #print axioms Nuclei.Wheel.next_window_wraps
 #print axioms Nuclei.Wheel.example_seventy_thousand
+
+-- A ring's file slots: every operation keeps a free slot unheld, unnamed and with no open copy;
+-- a taken slot has no entry naming it; a free slot is never freed twice; a copy closes only
+-- once unheld and unnamed; and the worked example.
+#print axioms Nuclei.Files.inv_run
+#print axioms Nuclei.Files.taken_slot_is_unnamed
+#print axioms Nuclei.Files.no_double_free
+#print axioms Nuclei.Files.copy_closes_unnamed
+#print axioms Nuclei.Files.example_reuse_waits

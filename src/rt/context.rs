@@ -35,6 +35,24 @@ pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
     f(unsafe { ptr.as_ref() })
 }
 
+/// Runs `f` with the shard whose driver this thread may use now: the one
+/// it runs, or else its own, which no other thread ever runs.
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+pub(crate) fn here<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
+    let ptr = CURRENT.try_with(Cell::get).unwrap_or(core::ptr::null());
+    // SAFETY: as in `current`.
+    if let Some(shard) = unsafe { ptr.as_ref() } {
+        return f(Some(shard));
+    }
+    let own = own_shard_if_made();
+    f(own.as_deref())
+}
+
+/// This thread's own shard, if it made one.
+pub(crate) fn own_shard_if_made() -> Option<Rc<Shard>> {
+    OWN.try_with(|own| own.borrow().clone()).ok().flatten()
+}
+
 /// Marks `shard` as the one this thread runs, until the guard drops.
 pub(crate) fn enter(shard: &Shard) -> Entered<'_> {
     let previous = CURRENT.with(|c| c.replace(shard));
@@ -65,6 +83,7 @@ pub(crate) fn own_shard() -> io::Result<Rc<Shard>> {
         let shard = Rc::new(Shard::new(Limits {
             max_nesting: DEFAULT_MAX_NESTING,
             buffer_cap: crate::buf::DEFAULT_CAP,
+            backend: super::backend::chosen()?,
         })?);
         *own.borrow_mut() = Some(Rc::clone(&shard));
         Ok(shard)

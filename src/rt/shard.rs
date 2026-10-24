@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 use kovan_queue::seg_queue::SegQueue;
 
+use super::backend::Backend;
 use super::handshake::ParkState;
 use super::park::{Notifier, Poller, Registrar};
 use super::sources::Sources;
@@ -53,6 +54,9 @@ use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering};
 use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+pub(crate) mod ring;
 
 /// Runs of the LIFO slot in a row before its task goes to the back.
 pub(crate) const LIFO_MAX: u32 = 3;
@@ -144,7 +148,9 @@ pub(crate) struct Shared {
     /// Work on the timer wheel from other threads, applied by the shard
     /// before it fires timers.
     timer_ops: SegQueue<TimerOp>,
-    registrar: Registrar,
+    /// The registrations of the shard's readiness poller; `None` on a ring
+    /// shard, whose sources' IO is the ring's operations.
+    registrar: Option<Registrar>,
     /// Registrations other threads ask of the shard, applied before it
     /// polls.
     io_ops: SegQueue<IoOp>,
@@ -157,6 +163,21 @@ pub(crate) enum IoOp {
     /// A source went (its kernel registration is already gone): free its
     /// slot.
     Release(u64),
+    /// Put the file of a source into the ring's table: a copy of its
+    /// descriptor, made while the source could not close, which the ring
+    /// closes once the table holds the file.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    RingAttach(u64, std::os::fd::OwnedFd),
+    /// A ring source went: cancel its sides' operations (by user data)
+    /// and let go of its slot.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    RingDetach(u32, [Option<u64>; 2]),
+    /// A ring source's side wants an operation submitted.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    RingKick(Arc<Source>),
+    /// Cancel the ring operation of this user data.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    RingCancel(u64),
 }
 
 impl Shared {
@@ -189,9 +210,16 @@ impl Shared {
         }
     }
 
-    /// Adds and removes the kernel registrations of the shard's poller.
-    pub(crate) fn registrar(&self) -> &Registrar {
-        &self.registrar
+    /// Adds and removes the kernel registrations of the shard's readiness
+    /// poller; `None` on a ring shard.
+    pub(crate) fn registrar(&self) -> Option<&Registrar> {
+        self.registrar.as_ref()
+    }
+
+    /// Whether the shard's IO is the operations of a ring.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(crate) fn is_ring(&self) -> bool {
+        self.registrar.is_none()
     }
 
     /// Hands a registration change to the shard and wakes it.
@@ -296,6 +324,21 @@ pub(crate) struct Limits {
     pub(crate) max_nesting: usize,
     /// What the shard's IO buffers may hold, in bytes.
     pub(crate) buffer_cap: usize,
+    /// What the shard drives its IO with.
+    pub(crate) backend: Backend,
+}
+
+/// What a shard waits on and does its sources' IO with.
+#[cfg_attr(
+    all(any(target_os = "linux", target_os = "android"), feature = "iouring"),
+    expect(clippy::large_enum_variant, reason = "one per shard, built with it")
+)]
+enum Driver {
+    /// A readiness poller (epoll, kqueue): the driver makes the calls.
+    Poll(RefCell<Poller>),
+    /// A ring: the sources' IO is its operations.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    Ring(ring::ShardRing),
 }
 
 /// The part of a shard its own thread owns.
@@ -315,7 +358,7 @@ pub(crate) struct Shard {
     in_task: Cell<bool>,
     depth: Cell<usize>,
     limits: Limits,
-    poller: RefCell<Poller>,
+    driver: Driver,
     wheel: RefCell<Wheel>,
     /// The wheel's zero.
     epoch: Instant,
@@ -329,18 +372,34 @@ pub(crate) struct Shard {
 
 impl Shard {
     pub(crate) fn new(limits: Limits) -> io::Result<Self> {
-        let poller = Poller::new()?;
+        let (driver, notifier, registrar) = match limits.backend {
+            Backend::Poll => {
+                let poller = Poller::new()?;
+                let (notifier, registrar) = (poller.notifier(), poller.registrar());
+                (
+                    Driver::Poll(RefCell::new(poller)),
+                    notifier,
+                    Some(registrar),
+                )
+            }
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            Backend::Ring(cfg) => {
+                let ring = ring::ShardRing::new(&cfg, ring::table_len())?;
+                let notifier = ring.notifier();
+                (Driver::Ring(ring), notifier, None)
+            }
+        };
         let shared = Arc::new(Shared {
             inbox: SegQueue::new(),
             local_inbox: SegQueue::new(),
             park: ParkState::new(),
-            notifier: poller.notifier(),
+            notifier,
             load: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
             timer_ops: SegQueue::new(),
-            registrar: poller.registrar(),
+            registrar,
             io_ops: SegQueue::new(),
         });
         Ok(Self {
@@ -355,7 +414,7 @@ impl Shard {
             in_task: Cell::new(false),
             depth: Cell::new(0),
             limits,
-            poller: RefCell::new(poller),
+            driver,
             wheel: RefCell::new(Wheel::new()),
             epoch: Instant::now(),
             fired: RefCell::new(Vec::new()),
@@ -407,8 +466,37 @@ impl Shard {
                     let gone = self.sources.borrow_mut().remove(token);
                     drop(gone);
                 }
+                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                IoOp::RingAttach(token, copy) => {
+                    let source = self.sources.borrow().get(token).cloned();
+                    if let (Some(ring), Some(source)) = (self.ring(), source) {
+                        source.ring_attached(ring, &self.shared, &copy, token);
+                    }
+                    drop(copy);
+                }
+                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                IoOp::RingDetach(slot, out) => {
+                    if let Some(ring) = self.ring() {
+                        ring.detach(slot, out);
+                    }
+                }
+                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                IoOp::RingKick(source) => source.ring_kick(),
+                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                IoOp::RingCancel(user_data) => {
+                    if let Some(ring) = self.ring() {
+                        ring.cancel(user_data);
+                    }
+                }
             }
         }
+    }
+
+    /// The address of the shard's `Shared`, which a ring source keeps to
+    /// tell its home shard: compared, never followed.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(crate) fn shared_addr(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
     /// Whether `shared` is this shard's.
@@ -527,17 +615,32 @@ impl Shard {
     /// completes the IO of the sources that became ready, taking at most
     /// `max` events from the kernel. Returns how many it handled.
     fn poll_io(&self, max: usize, timeout: Option<Duration>) -> io::Result<usize> {
-        let sources = self.sources.borrow();
-        let mut events = 0;
-        self.poller
-            .borrow_mut()
-            .wait_at_most(max, timeout, |token, readiness| {
-                events += 1;
-                if let Some(source) = sources.get(token) {
-                    source.on_event(token, readiness);
-                }
-            })?;
-        Ok(events)
+        match &self.driver {
+            Driver::Poll(poller) => {
+                let sources = self.sources.borrow();
+                let mut events = 0;
+                poller
+                    .borrow_mut()
+                    .wait_at_most(max, timeout, |token, readiness| {
+                        events += 1;
+                        if let Some(source) = sources.get(token) {
+                            source.on_event(token, readiness);
+                        }
+                    })?;
+                Ok(events)
+            }
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            Driver::Ring(ring) => ring.wait(timeout).map(|(handled, _)| handled),
+        }
+    }
+
+    /// The shard's ring, if its IO runs on one.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(crate) fn ring(&self) -> Option<&ring::ShardRing> {
+        match &self.driver {
+            Driver::Ring(ring) => Some(ring),
+            Driver::Poll(_) => None,
+        }
     }
 
     /// Completes the IO that is ready now, without waiting: whether there
@@ -661,6 +764,23 @@ impl Shard {
         }
     }
 
+    /// The outermost `block_on` of a thread outside the runtime returned,
+    /// and this, its own shard, runs again only at its next one: the
+    /// sources registered here go, each to register where it is polled
+    /// next, and a ring waits for the operations they had out to end.
+    pub(crate) fn leave(&self) {
+        let gone: Vec<Arc<Source>> = self.sources.borrow_mut().drain().collect();
+        for source in gone {
+            source.evict();
+        }
+        // Sources that went before (a dropped handle's) may have left a
+        // cancel queued, or their operations still out.
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        if let Driver::Ring(ring) = &self.driver {
+            ring.settle(|| self.apply_io_ops());
+        }
+    }
+
     /// One turn of the shard, for a caller driving it by hand: runs every
     /// task ready now, waits once on the poller (up to `wait`, at once if
     /// work is ready; at most `max` events) and runs what the IO woke.
@@ -721,6 +841,15 @@ impl Drop for Shard {
         // registers where it is polled next.
         for source in self.sources.get_mut().drain() {
             source.evict();
+        }
+        // The ring's operations still out are cancelled and their
+        // completions waited for, so no memory they point at goes while the
+        // kernel may write it.
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        if let Driver::Ring(ring) = &self.driver {
+            // Cancels a holder of a source on another thread left here.
+            ring.settle(|| self.apply_io_ops());
+            ring.shut_down();
         }
         drop(self.lifo.take());
         let queue = core::mem::take(&mut *self.queue.borrow_mut());
@@ -784,6 +913,7 @@ mod tests {
         let shard = Shard::new(Limits {
             max_nesting: 8,
             buffer_cap: crate::buf::DEFAULT_CAP,
+            backend: crate::rt::backend::chosen().unwrap(),
         })
         .unwrap();
         let _current = context::enter(&shard);
@@ -801,6 +931,7 @@ mod tests {
         let shard = Shard::new(Limits {
             max_nesting: 8,
             buffer_cap: crate::buf::DEFAULT_CAP,
+            backend: crate::rt::backend::chosen().unwrap(),
         })
         .unwrap();
         let _current = context::enter(&shard);

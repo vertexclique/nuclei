@@ -69,7 +69,9 @@ pub(crate) struct Ask {
     doomed: Doomed,
     /// The retire was performed; its requester waits on the waker.
     retired: AtomicBool,
-    retire_waker: AtomicWaker,
+    pub(super) retire_waker: AtomicWaker,
+    /// A retire waits for the sides' ring operations to complete.
+    pub(super) awaits_ops: AtomicBool,
 }
 
 impl Drop for Ask {
@@ -98,7 +100,7 @@ impl Source {
     /// Raises `bits` and performs every pending request if both sides were
     /// free; else leaves them to the sides' holders. Only the read side is
     /// taken here: performing goes through it (see the module docs).
-    fn request(&self, bits: u8, after: &mut After) -> Done {
+    fn request(self: &Arc<Self>, bits: u8, after: &mut After) -> Done {
         // Release: the performer that takes the bits reads what they carry.
         self.requests.fetch_or(bits, Ordering::Release);
         let Some(mut read) = self.read.take_for_request() else {
@@ -115,7 +117,12 @@ impl Source {
     /// For the read side's holder: takes the write side (one `fetch_or`
     /// that raises `REQ` there if it is held) and, getting it, performs the
     /// pending requests.
-    fn try_write_and_perform(&self, read: &mut ReadState, after: &mut After, here: bool) -> Done {
+    fn try_write_and_perform(
+        self: &Arc<Self>,
+        read: &mut ReadState,
+        after: &mut After,
+        here: bool,
+    ) -> Done {
         if self.requests.load(Ordering::Acquire) == 0 {
             return Done {
                 here: false,
@@ -137,7 +144,7 @@ impl Source {
     }
 
     /// For the read side's holder that saw `REQ`.
-    pub(super) fn requests_holding_read(&self, read: &mut ReadState, after: &mut After) {
+    pub(super) fn requests_holding_read(self: &Arc<Self>, read: &mut ReadState, after: &mut After) {
         self.try_write_and_perform(read, after, false);
     }
 
@@ -146,7 +153,7 @@ impl Source {
     /// read side while it holds its own, so two holders never pass the
     /// request back and forth); getting it, it goes on as the read side's
     /// holder.
-    pub(super) fn requests_after_write(&self, after: &mut After) {
+    pub(super) fn requests_after_write(self: &Arc<Self>, after: &mut After) {
         if self.requests.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -161,7 +168,7 @@ impl Source {
     /// when it is the one performing (`here`); else a failed attach fails
     /// the tasks waiting on the source, as a failed registration does.
     fn perform(
-        &self,
+        self: &Arc<Self>,
         read: &mut ReadState,
         write: &mut WriteState,
         after: &mut After,
@@ -170,7 +177,7 @@ impl Source {
         // Acquire: pairs with the Release of each requester.
         let bits = self.requests.swap(0, Ordering::Acquire);
         if bits & (RETIRE | CLOSE | LINGER) != 0 {
-            self.detach();
+            self.detach(read, write);
             if bits & LINGER != 0 {
                 // The registration under the old number went first, while
                 // that number was still the handle's.
@@ -188,9 +195,15 @@ impl Source {
                 }
             }
             // No task borrows a handle that is retired or gone: the wakers
-            // left are of operations that are gone.
+            // left are of operations that are gone, but for the drain of a
+            // lingering close, which may wait already and goes on through
+            // the copy.
             read.forget_waiters(after);
-            write.forget_waiters(after);
+            if bits & LINGER != 0 {
+                write.wake_all(after);
+            } else {
+                write.forget_waiters(after);
+            }
             if bits & RETIRE != 0 {
                 self.ask.retired.store(true, Ordering::Release);
                 if let Some(waker) = self.ask.retire_waker.take() {
@@ -215,6 +228,15 @@ impl Source {
             }
         }
         let attached = (bits & ATTACH != 0).then(|| self.attach_now());
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        if matches!(attached, Some(Ok(())))
+            && self.reg.ring.load(Ordering::Acquire)
+            && self.reg.state.load(Ordering::Acquire) == super::REGISTERED
+        {
+            // The ring took the source over here and now: tasks that waited
+            // look again, and what the sides hold goes to it.
+            self.ring_registered(read, write, after);
+        }
         if !here && let Some(Err(err)) = &attached {
             let failure = Failure::of(err);
             read.fail(failure, after);
@@ -227,7 +249,7 @@ impl Source {
     }
 
     /// Stores `err` for the next performer of `FAIL` and raises it.
-    fn leave_failure(&self, err: &io::Error) {
+    fn leave_failure(self: &Arc<Self>, err: &io::Error) {
         let failure = Box::into_raw(Box::new(Failure::of(err)));
         let old = self.ask.failure.swap(failure, Ordering::AcqRel);
         if !old.is_null() {
@@ -240,7 +262,7 @@ impl Source {
 
     /// Registers the source with the shard and token the attach carries;
     /// both sides are held. A failure hands the slot back to the shard.
-    fn attach_now(&self) -> io::Result<()> {
+    fn attach_now(self: &Arc<Self>) -> io::Result<()> {
         let ask = self
             .ask
             .attach
@@ -259,7 +281,12 @@ impl Source {
                 io::ErrorKind::NotConnected,
                 "the shard stopped before the registration",
             )),
-            fd => shard.registrar().add(fd, token, self.kind == Kind::Tcp),
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            fd if shard.is_ring() => return self.attach_ring(shard, token, fd),
+            fd => match shard.registrar() {
+                Some(registrar) => registrar.add(fd, token, self.kind == Kind::Tcp),
+                None => Err(io::Error::other("the shard has no poller to register with")),
+            },
         };
         match &result {
             Ok(()) => {
@@ -278,14 +305,30 @@ impl Source {
 
     /// The registration goes, and every task waiting on the source is
     /// woken, to register it where it polls next; both sides are held.
-    fn evict_now(&self, read: &mut ReadState, write: &mut WriteState, after: &mut After) {
+    fn evict_now(
+        self: &Arc<Self>,
+        read: &mut ReadState,
+        write: &mut WriteState,
+        after: &mut After,
+    ) {
         if self.reg.state.load(Ordering::Acquire) == REGISTERED {
             // SAFETY: both sides are held.
             let shard = unsafe { (*self.reg.shard.get()).take() };
             self.reg.token.store(NO_TOKEN, Ordering::Release);
             self.reg.state.store(UNREGISTERED, Ordering::Release);
-            if let (Some(shard), Ok(fd)) = (shard, self.fd()) {
-                let _ = shard.registrar().delete(fd, self.kind == Kind::Tcp);
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            if self.reg.ring.swap(false, Ordering::AcqRel) {
+                // What the sides have out is cancelled, and the ring lets go
+                // of the file; the completions still reach the sides.
+                if let Some(shard) = &shard {
+                    let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
+                    self.detach_ring(shard, slot, [read.ring_out(), write.ring_out()]);
+                }
+            }
+            if let (Some(shard), Ok(fd)) = (shard, self.fd())
+                && let Some(registrar) = shard.registrar()
+            {
+                let _ = registrar.delete(fd, self.kind == Kind::Tcp);
             }
         }
         read.wake_all(after);
@@ -297,7 +340,11 @@ impl Source {
     /// its holder does it, and a failure reaches the tasks waiting on the
     /// source. Called on the shard's thread by whoever moved the state to
     /// registering.
-    pub(crate) fn attach(&self, shard: &Arc<Shared>, token: u64) -> Option<io::Result<()>> {
+    pub(crate) fn attach(
+        self: &Arc<Self>,
+        shard: &Arc<Shared>,
+        token: u64,
+    ) -> Option<io::Result<()>> {
         let ask = Box::into_raw(Box::new((Arc::clone(shard), token)));
         let old = self.ask.attach.swap(ask, Ordering::AcqRel);
         if !old.is_null() {
@@ -312,7 +359,7 @@ impl Source {
 
     /// A registration the shard made for a thread that runs none failed:
     /// the tasks waiting hear why, and the next wait tries again.
-    pub(crate) fn registration_failed(&self, err: &io::Error) {
+    pub(crate) fn registration_failed(self: &Arc<Self>, err: &io::Error) {
         self.leave_failure(err);
         let mut after = After::default();
         self.request(0, &mut after);
@@ -322,7 +369,7 @@ impl Source {
     /// The shard the source is registered with is going away: the
     /// registration goes, and every task waiting on the source is woken, to
     /// register it where it polls next.
-    pub(crate) fn evict(&self) {
+    pub(crate) fn evict(self: &Arc<Self>) {
         let mut after = After::default();
         self.request(EVICT, &mut after);
         after.run();
@@ -333,24 +380,31 @@ impl Source {
     /// stay for the next operation, unless a revival brings another
     /// descriptor. If a side is held, its holder performs the retire, and
     /// this waits for it (on a shard, its other tasks run meanwhile): the
-    /// object must not change while a call of the driver may use it.
-    pub(crate) fn retire(&self) {
+    /// object must not change while a call of the driver may use it. On a
+    /// ring it waits, the same way, until the kernel is done with every
+    /// operation of the source, so none takes bytes from the object after.
+    pub(crate) fn retire(self: &Arc<Self>) {
         self.ask.retired.store(false, Ordering::Release);
         let mut after = After::default();
         let done = self.request(RETIRE, &mut after);
         after.run();
-        if done.here {
+        if done.here && self.ring_idle() {
             return;
         }
         let ask = &self.ask;
         crate::sync::internal::blocking(core::future::poll_fn(|cx| {
             ask.retire_waker.register(cx.waker());
-            if ask.retired.load(Ordering::Acquire) {
+            // SeqCst, after the waker is in: a completion that leaves no
+            // operation out either sees the flag (and takes the waker) or
+            // its count is seen here.
+            ask.awaits_ops.store(true, Ordering::SeqCst);
+            if ask.retired.load(Ordering::Acquire) && self.ring_idle() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
             }
         }));
+        ask.awaits_ops.store(false, Ordering::SeqCst);
     }
 
     /// The handle is gone: its registration goes and `io`, its IO object, is
@@ -359,7 +413,7 @@ impl Source {
     /// source goes on with that copy to deliver what the write side holds.
     /// Never waits: if a side is held, the source keeps `io` and its last
     /// holder drops it.
-    pub(crate) fn close<T>(&self, io: T, linger: Option<RawFd>) {
+    pub(crate) fn close<T>(self: &Arc<Self>, io: T, linger: Option<RawFd>) {
         let bit = match linger {
             Some(copy) => {
                 self.ask.linger_fd.store(copy, Ordering::Release);

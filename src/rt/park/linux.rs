@@ -161,6 +161,12 @@ impl Poller {
 }
 
 impl Notifier {
+    /// The notifier of a poller waiting on the eventfd `wake`.
+    #[cfg(feature = "iouring")]
+    pub(crate) fn of(wake: Arc<OwnedFd>) -> Self {
+        Self { wake }
+    }
+
     /// Wakes the poller, or makes its next wait return at once.
     pub(crate) fn notify(&self) {
         let one = 1u64;

@@ -21,6 +21,12 @@
 (* marks it done; the object is dropped by whichever of the dropper's     *)
 (* hand-over and the performer's mark comes second.                        *)
 (*                                                                          *)
+(* The close lingers: once the handle is gone, a task drains what it wrote *)
+(* through a copy of the descriptor, as a holder of the write side. If it  *)
+(* finds the close not performed yet, it waits on the write side for a    *)
+(* wake; the performer wakes the write side's waiters (the handle's other *)
+(* waiters are of operations that are gone, and are forgotten instead).   *)
+(*                                                                          *)
 (* What is abstract: the other flags of a side's word (Side.tla checks    *)
 (* them), and the descriptor (open until its object is dropped).           *)
 (***************************************************************************)
@@ -45,11 +51,15 @@ variables
     loaded = [h \in Holders |-> FALSE],  \* a holder loaded the descriptor and will use it
     usedClosed = FALSE,       \* (record) a holder used a descriptor that was closed
     byHolder = FALSE,         \* (record) a holder performed the close
-    handedOver = FALSE;       \* (record) the dropper handed its object over
+    handedOver = FALSE,       \* (record) the dropper handed its object over
+    lingerWaits = FALSE,      \* the lingering drain waits on the write side for a wake
+    lingerWaited = FALSE;     \* (record) it waited, before the close was performed
 
 define
     \* The close, done with both sides held: deregistration and the descriptor out of the source.
-    AllDone == \A p \in Holders \cup {"drop"} : pc[p] = "Done"
+    \* Nothing is left to happen but the lingering drain's wait for its wake.
+    Settled == /\ \A p \in Holders \cup {"drop"} : pc[p] = "Done"
+               /\ pc["linger"] \in {"L_wait", "Done"}
 end define;
 
 macro Perform() begin
@@ -58,6 +68,9 @@ macro Perform() begin
     \* The performer marks the close done; it drops the object if it was handed over.
     if doomed = "stored" then objectDropped := TRUE; end if;
     doomed := "closed";
+    \* The write side's waiters are woken: a waiting drain goes on.
+    \* MUTATION linger_forgets: they are forgotten, as the handle's others are.
+    if Mutation # "linger_forgets" then lingerWaits := FALSE; end if;
 end macro;
 
 \* Holding the read side: tries the write side (one fetch_or that raises its request bit); getting it,
@@ -176,6 +189,26 @@ D_own:
     objectDropped := TRUE;
 end process;
 
+\* The lingering drain, spawned once the dropper is done: a holder of the write side that waits for a
+\* wake when the close is not performed yet.
+fair process lingerer = "linger"
+begin
+L_start:
+    await pc["drop"] = "Done";
+L_take:
+    await ~busy["write"];
+    busy["write"] := TRUE;
+L_drain:
+    if performed = 0 then
+        lingerWaits := TRUE;
+        lingerWaited := TRUE;
+    end if;
+L_release:
+    call Release("write");
+L_wait:
+    await ~lingerWaits;
+end process;
+
 fair process holder \in Holders
 begin
 H_take:
@@ -207,8 +240,8 @@ NoUseOfClosed == ~usedClosed
 \* The close is performed once at most.
 PerformedOnce == performed <= 1
 
-\* Once everyone is done, the close was performed and the object dropped.
-Closed == AllDone => (performed = 1 /\ objectDropped)
+\* Once everything else is done, the close was performed and the object dropped.
+Closed == Settled => (performed = 1 /\ objectDropped)
 
 \* `Termination` (every process ends) is the one the translator writes for the fair processes.
 
@@ -221,4 +254,6 @@ Closed == AllDone => (performed = 1 /\ objectDropped)
 NoHolderClose == ~byHolder
 \* The dropper hands its object over instead of dropping it.
 NoHandOver == ~handedOver
+\* The lingering drain waits before the close is performed (and so needs the performer's wake).
+NoLingerWait == ~lingerWaited
 =============================================================================

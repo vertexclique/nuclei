@@ -25,10 +25,13 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::sync::Arc;
 use std::task::Context;
 
-use super::{Addr, Failure, Kind, Source};
+use super::{Addr, Failure, Io, Kind, Source};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
 use crate::io::sys;
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+mod ring;
 
 /// The most connections or datagrams the driver takes ahead on one edge.
 const BATCH: usize = 32;
@@ -105,6 +108,11 @@ struct Lent {
     done: Option<io::Result<usize>>,
     /// The task to wake when it is made; `None` while the task polls.
     waker: Option<Waker>,
+    /// The buffer is out with a ring operation (`buf` is empty meanwhile).
+    out: bool,
+    /// Its task went away while the buffer was out: the completion hands
+    /// what came to the read-ahead.
+    orphan: bool,
 }
 
 #[derive(Default)]
@@ -127,11 +135,25 @@ pub(super) struct ReadState {
     unsure: bool,
     /// The source's epoch this state is of.
     epoch: u32,
+    /// The user data of the operation out on the ring; only its
+    /// completion clears this.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    ring_out: Option<u64>,
+    /// The ring gave an operation back because the socket was not ready:
+    /// the next one waits for it to be.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    poll_first: bool,
 }
 
 impl ReadState {
     pub(super) fn epoch_mut(&mut self) -> &mut u32 {
         &mut self.epoch
+    }
+
+    /// The user data of the operation out on the ring, if one is.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(super) fn ring_out(&self) -> Option<u64> {
+        self.ring_out
     }
 
     pub(super) fn has_result(&self) -> bool {
@@ -184,7 +206,7 @@ impl ReadState {
         if self.waiters.is_empty() && !self.lent_waits() {
             return;
         }
-        self.complete(fd, kind, self.want, after);
+        self.complete_fd(fd, kind, self.want, after);
         if self.has_result() {
             self.want = 0;
             after.wake(&mut self.waiters);
@@ -196,7 +218,18 @@ impl ReadState {
     /// listener's connections; a socket's datagrams (`len` each). Nothing
     /// while the last call would have blocked and no edge came since, or
     /// while a result waits to be taken.
-    fn complete(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
+    fn complete(&mut self, io: Io<'_>, kind: Kind, len: usize, after: &mut After) {
+        match io {
+            Io::Fd(fd) => self.complete_fd(fd, kind, len, after),
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            Io::Ring(r) => self.submit_ring(r, kind, len, after),
+            #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+            Io::Ring(_) => {}
+        }
+    }
+
+    /// The driver's call on the descriptor, as [`complete`](Self::complete).
+    fn complete_fd(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
         if self.blocked || self.has_result() || self.lent_done() {
             return;
         }
@@ -343,14 +376,14 @@ impl ReadState {
     /// first if the socket may hold bytes, and the task copies them out.
     fn read(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         out: &mut [u8],
         peek: bool,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
-        self.complete(fd, kind, out.len(), after);
+        self.complete(io, kind, out.len(), after);
         match self.take_stream(peek, after, |ahead| ahead.copy_into(out, peek)) {
             Some(result) => {
                 self.pass_on(after);
@@ -366,14 +399,14 @@ impl ReadState {
     /// A stream read scattered into `bufs`, as [`read`](Self::read).
     fn read_vectored(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         bufs: &mut [io::IoSliceMut<'_>],
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
         let len = bufs.iter().map(|b| b.len()).sum();
-        self.complete(fd, kind, len, after);
+        self.complete(io, kind, len, after);
         match self.take_stream(false, after, |ahead| ahead.copy_vectored(bufs)) {
             Some(result) => {
                 self.pass_on(after);
@@ -393,7 +426,7 @@ impl ReadState {
     /// `held`.
     fn read_owned(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         held: &mut Option<Vec<u8>>,
         waker: &Waker,
@@ -414,11 +447,13 @@ impl ReadState {
                 buf,
                 done: None,
                 waker: None,
+                out: false,
+                orphan: false,
             });
         }
         // The task polls, so the driver's read needs no wake for it.
         let old = self.lent.as_mut().and_then(|l| l.waker.take());
-        self.complete(fd, kind, 0, after);
+        self.complete(io, kind, 0, after);
         let Some(lent) = self.lent.as_mut() else {
             return Poll::Ready(Err(io::Error::other("the read lost its buffer")));
         };
@@ -450,6 +485,15 @@ impl ReadState {
     /// becomes the read-ahead (its end or its error, the next read's), so
     /// nothing is lost.
     pub(super) fn abandon_lent(&mut self, after: &mut After) {
+        if let Some(lent) = self.lent.as_mut().filter(|l| l.out) {
+            // The buffer is out with a ring operation: its completion does
+            // this.
+            lent.orphan = true;
+            if let Some(w) = lent.waker.take() {
+                after.forget_one(w);
+            }
+            return;
+        }
         let Some(lent) = self.lent.take() else {
             return;
         };
@@ -473,6 +517,12 @@ impl ReadState {
 
     /// The lent buffer back, as it is, for a poll that ends in an error.
     fn reclaim(&mut self, after: &mut After) -> Option<Vec<u8>> {
+        if self.lent.as_ref().is_some_and(|l| l.out) {
+            // Out with a ring operation, it cannot come back now: its
+            // completion hands what came to the read-ahead.
+            self.abandon_lent(after);
+            return None;
+        }
         let lent = self.lent.take()?;
         if let Some(w) = lent.waker {
             after.forget_one(w);
@@ -485,12 +535,12 @@ impl ReadState {
     /// connection, and the task takes it.
     fn accept(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<(OwnedFd, Addr)>> {
-        self.complete(fd, kind, 0, after);
+        self.complete(io, kind, 0, after);
         let taken = match self.accepted.pop_front() {
             Some(conn) => Some(Ok(conn)),
             None => self.error.take().map(Err),
@@ -512,14 +562,14 @@ impl ReadState {
     /// (what does not fit `out` is cut, as the kernel cuts it).
     fn receive(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         out: &mut [u8],
         peek: bool,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<(usize, Addr)>> {
-        self.complete(fd, kind, out.len(), after);
+        self.complete(io, kind, out.len(), after);
         let taken = match self.datagrams.front() {
             Some((datagram, addr)) => {
                 let (n, addr) = (datagram.peek_into(out), addr.clone());
@@ -599,6 +649,10 @@ impl ReadState {
         self.eof = false;
         self.error = None;
         self.blocked = false;
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        {
+            self.poll_first = false;
+        }
     }
 }
 
@@ -657,18 +711,33 @@ impl Source {
         if out.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
         let kind = self.kind;
+        self.poll_reading(cx, |st, io, waker, after| {
+            st.read(io, kind, out, peek, waker, after)
+        })
+    }
+
+    /// Polls the read side with `step`, given the way this thread reaches
+    /// the descriptor.
+    fn poll_reading<R>(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        mut step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
+    ) -> Poll<io::Result<R>> {
         let mut after = After::default();
-        let poll = self
-            .read
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.read(fd, kind, out, peek, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        let polled = self.with_io(|io| {
+            self.read
+                .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                    step(st, io, cx.waker(), after)
+                })
+        });
+        match polled {
+            Ok(poll) => self.finish_poll(after, poll),
+            Err(err) => {
+                self.settle(after);
+                Poll::Ready(Err(err))
+            }
+        }
     }
 
     /// Reads into the spare capacity of `buf`, after the bytes it holds,
@@ -693,19 +762,10 @@ impl Source {
         if held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
             return Poll::Ready(Ok(0));
         }
-        let poll = match self.fd() {
-            Ok(fd) => {
-                let kind = self.kind;
-                let mut after = After::default();
-                let poll = self
-                    .read
-                    .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                        st.read_owned(fd, kind, held, cx.waker(), after)
-                    });
-                self.finish_poll(after, poll)
-            }
-            Err(err) => Poll::Ready(Err(err)),
-        };
+        let kind = self.kind;
+        let poll = self.poll_reading(cx, |st, io, waker, after| {
+            st.read_owned(io, kind, held, waker, after)
+        });
         if poll.is_ready() && held.is_none() {
             // The poll failed with the buffer lent: it comes back as it is.
             // If the side is held now, the poll waits and starts over.
@@ -733,18 +793,10 @@ impl Source {
         if bufs.iter().all(|b| b.is_empty()) {
             return Poll::Ready(Ok(0));
         }
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
         let kind = self.kind;
-        let mut after = After::default();
-        let poll = self
-            .read
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.read_vectored(fd, kind, bufs, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        self.poll_reading(cx, |st, io, waker, after| {
+            st.read_vectored(io, kind, bufs, waker, after)
+        })
     }
 
     /// Accepts a connection from a listener.
@@ -752,18 +804,8 @@ impl Source {
         self: &Arc<Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<(OwnedFd, Addr)>> {
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
         let kind = self.kind;
-        let mut after = After::default();
-        let poll = self
-            .read
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.accept(fd, kind, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        self.poll_reading(cx, |st, io, waker, after| st.accept(io, kind, waker, after))
     }
 
     /// Receives a datagram into `out`, with its sender; `peek` leaves it to
@@ -774,18 +816,10 @@ impl Source {
         out: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<(usize, Addr)>> {
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
         let kind = self.kind;
-        let mut after = After::default();
-        let poll = self
-            .read
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.receive(fd, kind, out, peek, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        self.poll_reading(cx, |st, io, waker, after| {
+            st.receive(io, kind, out, peek, waker, after)
+        })
     }
 }
 

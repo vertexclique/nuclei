@@ -101,6 +101,20 @@ async fn read_exact(src: &Arc<Source>, mut buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Fills the kernel's buffers of `io` until it takes no more; returns the
+/// bytes written.
+fn fill(io: &UnixStream) -> Vec<u8> {
+    let chunk = vec![7u8; 64 * 1024];
+    let mut written = Vec::new();
+    loop {
+        match (&*io).write(&chunk) {
+            Ok(n) => written.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return written,
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
 /// A pattern no shift of itself matches, so misordered bytes show.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 + i / 251) as u8).collect()
@@ -502,6 +516,44 @@ fn reads_complete_through_a_pool_of_one_small_buffer() {
         writer.join().unwrap();
         drop(a);
     });
+}
+
+/// A source first used inside `block_on` on a thread outside the runtime
+/// registers with that thread's shard, which runs only while it is inside
+/// `block_on`. Once that returns the source goes from it, and a worker's
+/// task that polls it next is served.
+#[test]
+fn a_source_used_in_block_on_is_served_by_a_worker_after_it_returns() {
+    let rt = runtime(None);
+    let (a, b) = pair();
+    rt.block_on(async {
+        // A read that waits: the source registers with this thread's shard.
+        let mut buf = [0u8; 1];
+        let mut reading = Box::pin(read(&b.src, &mut buf));
+        pends(&mut reading).await;
+        a.io().write_all(b"x").unwrap();
+        assert_eq!(within(reading).await.unwrap(), 1);
+    });
+    let src = Arc::clone(&b.src);
+    let (waiting, waits) = std::sync::mpsc::channel();
+    let (done, got) = std::sync::mpsc::channel();
+    rt.spawn(async move {
+        let mut buf = [0u8; 4];
+        let mut reading = Box::pin(read(&src, &mut buf));
+        pends(&mut reading).await;
+        waiting.send(()).unwrap();
+        let n = reading.await.unwrap();
+        done.send(buf[..n].to_vec()).unwrap();
+    })
+    .detach();
+    waits
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the worker's read never ran");
+    a.io().write_all(b"yz").unwrap();
+    let bytes = got
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the worker's read was never served");
+    assert_eq!(bytes, b"yz");
 }
 
 /// A task of another executor, on a thread that runs no shard: the source

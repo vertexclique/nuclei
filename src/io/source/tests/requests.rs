@@ -132,3 +132,48 @@ fn a_dropped_handle_lingers_through_a_held_side() {
     drop(rt);
     assert!(src.is_retired(), "the copy was never closed");
 }
+
+/// The drain of a lingering close may wait on the write side before the
+/// close runs: the close wakes it, and it goes on through the copy.
+#[test]
+fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
+    let rt = runtime(None);
+    let (mine, peer) = UnixStream::pair().unwrap();
+    sys::set_nonblocking(mine.as_raw_fd()).unwrap();
+    let src = Source::new(mine.as_raw_fd(), Kind::Stream);
+    let woken = Arc::new(Flag(AtomicBool::new(false)));
+    // The kernel takes nothing more: what the source accepts next waits.
+    fill(&mine);
+    rt.block_on(async {
+        let chunk = pattern(64 * 1024);
+        let start = Instant::now();
+        while !src.has_unsent() {
+            within(poll_fn(|cx| src.poll_write(cx, &chunk)))
+                .await
+                .unwrap();
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "nothing went behind"
+            );
+        }
+    });
+    let held = src.read.try_hold().expect("the read side is free");
+    let copy = src.duplicate().expect("a copy of the descriptor");
+    src.close(mine, Some(copy.as_raw_fd()));
+    let waker = Waker::from(Arc::clone(&woken));
+    assert!(
+        src.poll_drain(&mut Context::from_waker(&waker))
+            .is_pending(),
+        "the peer reads nothing, so the drain waits"
+    );
+    let mut after = After::default();
+    held.release(&mut after, &src.hooks());
+    after.run();
+    assert!(
+        woken.0.load(Ordering::SeqCst),
+        "the drain waiting before the close was never woken"
+    );
+    drop(peer);
+    src.close(copy, None);
+    drop(rt);
+}

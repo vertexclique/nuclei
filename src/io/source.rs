@@ -25,7 +25,7 @@
 //! one the handle no longer owns (closed, or swapped behind `get_mut`). The
 //! number lives in the source, and it changes, or the handle lets go of its
 //! object, only through a request that needs both sides
-//! ([`requests`](self::requests)): whoever holds both performs it, so it
+//! ([`requests`]): whoever holds both performs it, so it
 //! never overlaps a call of the driver, which holds a side while it makes
 //! one. A dropped handle never waits for that: if a side is held, it hands
 //! its object to the source and the last holder closes it. Retiring marks
@@ -36,6 +36,8 @@
 
 mod read;
 pub(crate) mod requests;
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+pub(crate) mod ring;
 pub(crate) mod write;
 
 use core::cell::UnsafeCell;
@@ -56,6 +58,25 @@ use crate::rt::context;
 use crate::rt::park::Readiness;
 use crate::rt::shard::{IoOp, Shared};
 
+/// How the driver's part of a source reaches the descriptor.
+#[derive(Clone, Copy)]
+pub(crate) enum Io<'a> {
+    /// Calls on the descriptor, made by the driver itself (epoll, kqueue).
+    Fd(RawFd),
+    /// Operations on the ring of the source's shard.
+    #[cfg_attr(
+        not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")),
+        expect(dead_code, reason = "no ring where io_uring is not built")
+    )]
+    Ring(RingRef<'a>),
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+pub(crate) type RingRef<'a> = ring::RingIo<'a>;
+/// No ring where io_uring is not built: never made.
+#[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+pub(crate) type RingRef<'a> = core::marker::PhantomData<&'a ()>;
+
 /// No descriptor: the source is retired.
 const NO_FD: RawFd = -1;
 /// No registration.
@@ -73,6 +94,15 @@ mod read_work {
     pub(super) const UNSTARVE: u8 = 2;
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 4;
+    /// The side's ring operation completed (its mailbox holds it).
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(super) const DONE: u8 = 8;
+    /// Submit what the side wants, on the ring's thread.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(super) const SUBMIT: u8 = 16;
+    /// The registration with the ring came into place.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(super) const ATTACHED: u8 = 32;
 }
 
 /// Side-local work of the write side (its deferred word).
@@ -81,6 +111,15 @@ mod write_work {
     pub(super) const UNSTARVE: u8 = 1;
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 2;
+    /// The side's ring operation completed (its mailbox holds it).
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(super) const DONE: u8 = 4;
+    /// Submit what the side wants, on the ring's thread.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(super) const SUBMIT: u8 = 8;
+    /// The registration with the ring came into place.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(super) const ATTACHED: u8 = 16;
 }
 
 /// What kind of descriptor a source is: which system calls fit it.
@@ -146,8 +185,18 @@ struct Registration {
     /// The token in place, or `NO_TOKEN`: what the driver checks an event
     /// against.
     token: AtomicU64,
-    /// The shard that holds it. Written and read only with both sides held.
+    /// The shard that holds it. Written only with both sides held, so read
+    /// with either.
     shard: UnsafeCell<Option<Arc<Shared>>>,
+    /// The registration is with a ring: the source's operations are the
+    /// ring's, on fixed slot `slot`, and run on the shard whose `Shared`
+    /// is at `home` (an address, compared, never followed).
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    ring: AtomicBool,
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    slot: AtomicU32,
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    home: core::sync::atomic::AtomicUsize,
 }
 
 /// The part of a handle its shard's driver reaches.
@@ -171,6 +220,15 @@ pub(crate) struct Source {
     /// Whether the write side holds bytes or a datagram the kernel has not
     /// taken, as its last holder left it.
     unsent: AtomicBool,
+    /// Completions of the sides' ring operations, for their holders.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    read_done: ring::Mailbox,
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    write_done: ring::Mailbox,
+    /// The sides' operations in the kernel's hands: a retire waits until
+    /// none is.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    ring_ops: core::sync::atomic::AtomicU8,
 }
 
 // SAFETY: the sides guard their contents; `reg.shard` is touched only with
@@ -184,7 +242,7 @@ unsafe impl Sync for Source {}
 /// work, the source's requests, and a side's catching up with a revival.
 #[derive(Clone, Copy)]
 struct SourceHooks<'a> {
-    src: &'a Source,
+    src: &'a Arc<Source>,
     /// For the driver's own edge: the registration the event came for.
     token: Option<u64>,
 }
@@ -212,6 +270,21 @@ impl Hooks<ReadState> for SourceHooks<'_> {
         if bits & read_work::ABANDON != 0 {
             st.abandon_lent(after);
         }
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        {
+            if bits & read_work::DONE != 0
+                && let Some(done) = self.src.read_done.take()
+            {
+                st.ring_done(done, self.src.kind, after);
+            }
+            // After a completion, a kick or the registration, what the
+            // side still wants goes to the ring: the tasks that wait are
+            // woken by what it brings.
+            if bits & (read_work::DONE | read_work::SUBMIT | read_work::ATTACHED) != 0 {
+                self.src
+                    .with_ring(|io| st.submit_wanted(io, self.src.kind, after));
+            }
+        }
     }
 
     fn requests(&self, st: &mut ReadState, after: &mut After) {
@@ -238,6 +311,22 @@ impl Hooks<WriteState> for SourceHooks<'_> {
         }
         if bits & write_work::ABANDON != 0 {
             st.abandon_lent(after);
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            if let Some(user_data) = st.withdrawal() {
+                self.src.cancel_ring_op(user_data);
+            }
+        }
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        {
+            if bits & write_work::DONE != 0
+                && let Some(done) = self.src.write_done.take()
+            {
+                st.ring_done(done, self.src.serving_fd(None), after);
+            }
+            if bits & (write_work::DONE | write_work::SUBMIT | write_work::ATTACHED) != 0 {
+                self.src
+                    .with_ring(|io| st.submit_wanted(io, self.src.kind, after));
+            }
         }
     }
 
@@ -269,10 +358,22 @@ impl Source {
                 state: AtomicU8::new(UNREGISTERED),
                 token: AtomicU64::new(NO_TOKEN),
                 shard: UnsafeCell::new(None),
+                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                ring: AtomicBool::new(false),
+                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                slot: AtomicU32::new(u32::MAX),
+                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                home: core::sync::atomic::AtomicUsize::new(0),
             },
             requests: AtomicU8::new(0),
             ask: Ask::default(),
             unsent: AtomicBool::new(false),
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            read_done: ring::Mailbox::default(),
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            write_done: ring::Mailbox::default(),
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            ring_ops: core::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -281,7 +382,7 @@ impl Source {
     }
 
     /// The hooks of a poll's or a request's hold.
-    fn hooks(&self) -> SourceHooks<'_> {
+    fn hooks(self: &Arc<Self>) -> SourceHooks<'_> {
         SourceHooks {
             src: self,
             token: None,
@@ -303,6 +404,41 @@ impl Source {
             )),
             fd => Ok(fd),
         }
+    }
+
+    /// Runs `f` with the way this thread reaches the descriptor: calls on
+    /// it (epoll, kqueue, and regular files everywhere), or the operations
+    /// of the ring the source is registered with. A source about to
+    /// register with a ring (this thread's shard runs one, or the
+    /// process's shards do) registers before its first operation, which
+    /// waits until the registration is in place.
+    fn with_io<R>(self: &Arc<Self>, f: impl FnOnce(Io<'_>) -> R) -> io::Result<R> {
+        let fd = self.fd()?;
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        if self.kind != Kind::File {
+            return context::current(|current| {
+                if !self.reg.ring.load(Ordering::Acquire) {
+                    // Registered with a poller, or about to register where
+                    // no ring runs: the driver's calls.
+                    let rings =
+                        current.map_or_else(crate::rt::backend::rings, |s| s.ring().is_some());
+                    if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
+                        return Ok(f(Io::Fd(fd)));
+                    }
+                    self.ensure_registered()?;
+                }
+                Ok(f(Io::Ring(
+                    self.ring_route(current).unwrap_or(ring::RingIo::NotYet),
+                )))
+            });
+        }
+        Ok(f(Io::Fd(fd)))
+    }
+
+    /// No ring operation of the source can be in the kernel's hands.
+    #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+    fn ring_idle(&self) -> bool {
+        true
     }
 
     /// The descriptor the driver's part runs on, with a side held: for the
@@ -332,6 +468,10 @@ impl Source {
     /// of buffers waits for one of this thread's pool, then the wakes and
     /// drops.
     fn settle(self: &Arc<Self>, mut after: After) {
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        if let Some(home) = after.kick.take() {
+            home.post_io(crate::rt::shard::IoOp::RingKick(Arc::clone(self)));
+        }
         if after.starved {
             crate::buf::with_pool(|pool| {
                 if let Some(pool) = pool {
@@ -394,8 +534,13 @@ impl Source {
         self.reg.state.store(UNREGISTERED, Ordering::Release);
     }
 
-    /// Deregisters the source; both sides are held by the caller.
-    fn detach(&self) {
+    /// Deregisters the source; both sides are held by the caller, who
+    /// hands their states in.
+    #[cfg_attr(
+        not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")),
+        expect(unused_variables)
+    )]
+    fn detach(self: &Arc<Self>, read: &ReadState, write: &WriteState) {
         if self.reg.state.load(Ordering::Acquire) != REGISTERED {
             return;
         }
@@ -404,12 +549,23 @@ impl Source {
         let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            if self.reg.ring.swap(false, Ordering::AcqRel) {
+                // The ring holds the file: the descriptor may close at once,
+                // and the ring cancels what the sides have out.
+                let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
+                self.detach_ring(&shard, slot, [read.ring_out(), write.ring_out()]);
+                shard.release_source(token);
+                return;
+            }
             let fd = self.fd.load(Ordering::Acquire);
-            if fd != NO_FD {
+            if fd != NO_FD
+                && let Some(registrar) = shard.registrar()
+            {
                 // Before the descriptor closes or changes hands. A failure
                 // means the descriptor was already gone, and with it the
                 // kernel's registration.
-                let _ = shard.registrar().delete(fd, self.kind == Kind::Tcp);
+                let _ = registrar.delete(fd, self.kind == Kind::Tcp);
             }
             shard.release_source(token);
         }
@@ -482,7 +638,7 @@ impl Source {
 
 #[cfg(test)]
 impl Source {
-    fn has_read_ahead(&self) -> bool {
+    fn has_read_ahead(self: &Arc<Self>) -> bool {
         let mut after = After::default();
         let hooks = self.hooks();
         self.read.try_hold().is_some_and(|mut held| {
@@ -492,7 +648,7 @@ impl Source {
         })
     }
 
-    fn has_write_behind(&self) -> bool {
+    fn has_write_behind(self: &Arc<Self>) -> bool {
         let mut after = After::default();
         let hooks = self.hooks();
         self.write.try_hold().is_some_and(|mut held| {

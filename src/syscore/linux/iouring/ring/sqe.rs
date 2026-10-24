@@ -11,9 +11,9 @@ use std::{ffi::c_char, os::fd::RawFd};
 
 use super::sys::{
     IORING_ACCEPT_MULTISHOT, IORING_ASYNC_CANCEL_ALL, IORING_ASYNC_CANCEL_ANY,
-    IORING_ASYNC_CANCEL_FD, IORING_FSYNC_DATASYNC, IORING_MSG_DATA, IORING_POLL_ADD_MULTI,
-    IORING_RECV_MULTISHOT, IORING_TIMEOUT_ABS, IOSQE_BUFFER_SELECT, IoUringSqe, KernelTimespec,
-    Opcode,
+    IORING_ASYNC_CANCEL_FD, IORING_ASYNC_CANCEL_FD_FIXED, IORING_FSYNC_DATASYNC, IORING_MSG_DATA,
+    IORING_POLL_ADD_MULTI, IORING_RECV_MULTISHOT, IORING_TIMEOUT_ABS, IOSQE_BUFFER_SELECT,
+    IoUringSqe, KernelTimespec, Opcode,
 };
 
 /// Address of `p` as the kernel expects it in an entry field.
@@ -49,6 +49,12 @@ impl Sqe {
     /// Adds `IOSQE_*` flags (links, drain, async, ...) to the entry.
     pub(crate) fn flags(mut self, flags: u8) -> Self {
         self.0.flags |= flags;
+        self
+    }
+
+    /// Points the entry at descriptor (or fixed slot) `fd` instead.
+    pub(crate) fn fd(mut self, fd: RawFd) -> Self {
+        self.0.fd = fd;
         self
     }
 
@@ -322,6 +328,16 @@ impl Sqe {
     pub(crate) fn async_cancel_fd(fd: RawFd, all: bool) -> Self {
         Self::new(Opcode::AsyncCancel, fd).with(|s| {
             s.op_flags = IORING_ASYNC_CANCEL_FD | if all { IORING_ASYNC_CANCEL_ALL } else { 0 };
+        })
+    }
+
+    /// Cancels the pending operations on fixed file `slot` (the first found, or every one with
+    /// `all`).
+    pub(crate) fn async_cancel_fixed(slot: u32, all: bool) -> Self {
+        Self::new(Opcode::AsyncCancel, slot as RawFd).with(|s| {
+            s.op_flags = IORING_ASYNC_CANCEL_FD
+                | IORING_ASYNC_CANCEL_FD_FIXED
+                | if all { IORING_ASYNC_CANCEL_ALL } else { 0 };
         })
     }
 

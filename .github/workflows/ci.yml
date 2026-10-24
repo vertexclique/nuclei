@@ -36,6 +36,12 @@ jobs:
       - name: tests
         run: cargo test --all
 
+      - name: tests on io_uring
+        if: runner.os == 'Linux'
+        run: cargo test --all
+        env:
+          NUCLEI_BACKEND: io_uring
+
   check_fmt_and_docs:
     name: Checking fmt and docs
     runs-on: ubuntu-latest

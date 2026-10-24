@@ -86,7 +86,7 @@ pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+pub(crate) const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
 /// Apple's sockets get `SO_NOSIGPIPE` when nuclei takes them instead.
 #[cfg(not(any(
     target_os = "linux",
@@ -305,7 +305,10 @@ pub(crate) fn accept_unix(fd: RawFd) -> io::Result<(OwnedFd, unix::SocketAddr)> 
 }
 
 /// An internet address from its raw form.
-fn inet_addr(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> io::Result<SocketAddr> {
+pub(crate) fn inet_addr(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> io::Result<SocketAddr> {
     let len = len as usize;
     match libc::c_int::from(storage.ss_family) {
         libc::AF_INET if len >= size_of::<libc::sockaddr_in>() => {
@@ -337,7 +340,7 @@ fn inet_addr(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> io::Resu
 }
 
 /// The raw form of an internet address.
-fn raw_inet(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+pub(crate) fn raw_inet(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     // SAFETY: plain data; all zeroes is a valid value.
     let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
     let len = match addr {
@@ -389,6 +392,12 @@ pub(crate) fn connect_inet(fd: RawFd, addr: &SocketAddr) -> io::Result<bool> {
 /// Starts a connect of a non-blocking Unix socket to `path`, as
 /// [`connect_inet`]. A listener whose backlog is full answers `WouldBlock`.
 pub(crate) fn connect_unix(fd: RawFd, path: &Path) -> io::Result<bool> {
+    let (un, len) = raw_unix(path)?;
+    connect_raw(fd, (&un as *const libc::sockaddr_un).cast(), len)
+}
+
+/// The raw form of the Unix socket address `path`.
+pub(crate) fn raw_unix(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     // SAFETY: plain data; all zeroes is a valid value.
     let mut un: libc::sockaddr_un = unsafe { core::mem::zeroed() };
     let bytes = path.as_os_str().as_bytes();
@@ -403,11 +412,7 @@ pub(crate) fn connect_unix(fd: RawFd, path: &Path) -> io::Result<bool> {
         *dst = src as libc::c_char;
     }
     let len = core::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-    connect_raw(
-        fd,
-        (&un as *const libc::sockaddr_un).cast(),
-        len as libc::socklen_t,
-    )
+    Ok((un, len as libc::socklen_t))
 }
 
 fn connect_raw(fd: RawFd, addr: *const libc::sockaddr, len: libc::socklen_t) -> io::Result<bool> {
@@ -454,7 +459,10 @@ pub(crate) fn send_to_unix(fd: RawFd, buf: &[u8], path: &Path) -> io::Result<usi
 
 /// A Unix socket address from its raw form: a path, an abstract name
 /// (Linux), or unnamed.
-fn unix_addr(storage: &libc::sockaddr_un, len: libc::socklen_t) -> io::Result<unix::SocketAddr> {
+pub(crate) fn unix_addr(
+    storage: &libc::sockaddr_un,
+    len: libc::socklen_t,
+) -> io::Result<unix::SocketAddr> {
     let base = core::mem::offset_of!(libc::sockaddr_un, sun_path);
     let path_len = (len as usize)
         .saturating_sub(base)

@@ -304,8 +304,18 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
 /// On `wasm32`, when the future is not ready at once: see [`wait_here`].
 pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
     #[cfg(not(any(loom, target_arch = "wasm32", target_os = "windows")))]
-    if crate::rt::context::current(|current| current.is_some()) {
-        return crate::runtime::block_on(future);
+    {
+        if crate::rt::context::current(|current| current.is_some()) {
+            return crate::runtime::block_on(future);
+        }
+        // Only this thread runs its own shard: what waits on it (an edge,
+        // a completion, a request posted to it) comes only if it runs.
+        if let Some(shard) = crate::rt::context::own_shard_if_made() {
+            let _entered = crate::rt::context::enter(&shard);
+            let output = shard.block_on(future);
+            shard.leave();
+            return output;
+        }
     }
     match wait_here(future) {
         Ok(output) => output,

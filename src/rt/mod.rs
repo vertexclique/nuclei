@@ -1,6 +1,7 @@
 //! nuclei's runtime: tasks, the shards that run them, and the runtimes that
 //! own the shards.
 
+pub(crate) mod backend;
 mod blocking;
 pub(crate) mod context;
 mod handshake;

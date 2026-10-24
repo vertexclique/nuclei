@@ -1,0 +1,18 @@
+# configuration                spec                 expected
+RO_safe                        MC_RingOp            pass
+RO_live                        MC_RingOp            pass
+RO_flow                        MC_RingOp            pass
+MO_submit_while_out            MC_RingOp            violated:OneOut
+MO_elsewhere_submits           MC_RingOp            violated:SingleIssuer
+MO_no_kick                     MC_RingOp            violated:WritesGo
+MO_no_wake                     MC_RingOp            violated:RetireReturns
+MO_count_first                 MC_RingOp            violated:RetireReturns
+MO_skip_wait                   MC_RingOp            violated:RetiredIdle
+WO_task_applies                MC_RingOp            violated:NoTaskApplies
+WO_retire_waits                MC_RingOp            violated:NoRetireWait
+RL_safe                        MC_RingLent          pass
+RL_live                        MC_RingLent          pass
+ML_withdraw_started            MC_RingLent          violated:WholeOrNothing
+ML_no_resubmit                 MC_RingLent          violated:Settles
+WL_withdraw                    MC_RingLent          violated:NoWithdraw
+WL_orphan_finish               MC_RingLent          violated:NoOrphanFinish

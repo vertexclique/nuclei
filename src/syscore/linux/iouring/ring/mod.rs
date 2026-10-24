@@ -43,7 +43,7 @@ use crate::config::IoUringConfiguration;
 use queue::{Cq, Sq};
 
 /// How a [`Ring`] is created.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RingConfig {
     /// Submission queue entries (the kernel rounds up to a power of two and clamps to its limit).
     pub entries: u32,
@@ -455,6 +455,51 @@ impl Ring {
             }
         }
         Ok(set)
+    }
+
+    /// Registers an empty table of `slots` fixed files: an entry then names a slot
+    /// (`IOSQE_FIXED_FILE`), and the table holds its own reference to the file a slot was given,
+    /// so closing the descriptor it came from changes nothing for the ring.
+    pub(crate) fn register_files_sparse(&self, slots: u32) -> io::Result<()> {
+        let table = IoUringRsrcRegister {
+            nr: slots,
+            flags: IORING_RSRC_REGISTER_SPARSE,
+            ..IoUringRsrcRegister::default()
+        };
+        // SAFETY: the opcode reads one `io_uring_rsrc_register` of the size passed.
+        unsafe {
+            self.register(
+                IORING_REGISTER_FILES2,
+                ptr::from_ref(&table).cast(),
+                size_of::<IoUringRsrcRegister>() as u32,
+            )
+        }?;
+        Ok(())
+    }
+
+    /// Puts the file of `fd` into fixed slot `slot` (`fd` -1 empties the slot). An operation
+    /// already in flight on the slot keeps the file it started with.
+    pub(crate) fn update_file(&self, slot: u32, fd: RawFd) -> io::Result<()> {
+        let fds = [fd];
+        let update = IoUringRsrcUpdate2 {
+            offset: slot,
+            data: fds.as_ptr().expose_provenance() as u64,
+            nr: 1,
+            ..IoUringRsrcUpdate2::default()
+        };
+        // SAFETY: the opcode reads one `io_uring_rsrc_update2` of the size passed, whose `data`
+        // points to `fds`, a local that outlives the call.
+        let n = unsafe {
+            self.register(
+                IORING_REGISTER_FILES_UPDATE2,
+                ptr::from_ref(&update).cast(),
+                size_of::<IoUringRsrcUpdate2>() as u32,
+            )
+        }?;
+        if n != 1 {
+            return Err(io::Error::other("the kernel did not update the fixed file"));
+        }
+        Ok(())
     }
 
     /// Sets the async worker limits `[bounded, unbounded]` (0 leaves one unchanged) and returns the

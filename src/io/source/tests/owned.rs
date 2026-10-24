@@ -53,20 +53,6 @@ async fn read_to_end(src: &Arc<Source>) -> Vec<u8> {
     }
 }
 
-/// Fills the kernel's buffers of `io` until it takes no more; returns the
-/// bytes written.
-fn fill(io: &UnixStream) -> Vec<u8> {
-    let chunk = vec![7u8; 64 * 1024];
-    let mut written = Vec::new();
-    loop {
-        match (&*io).write(&chunk) {
-            Ok(n) => written.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return written,
-            Err(e) => panic!("{e}"),
-        }
-    }
-}
-
 #[test]
 fn a_lent_read_takes_ready_bytes_after_what_the_buffer_holds() {
     let rt = runtime(None);
@@ -339,7 +325,18 @@ fn a_dropped_lent_write_that_sent_nothing_is_withdrawn() {
         let mut owned = Box::pin(a.src.write_owned(vec![9u8; 1000]));
         pends(&mut owned).await;
         drop(owned);
-        assert!(!a.src.has_unsent(), "the withdrawn write is still pending");
+        // Withdrawn at once by a readiness driver; on a ring once the
+        // kernel says the cancelled send took nothing.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut backoff = Duration::from_millis(1);
+        while a.src.has_unsent() {
+            assert!(
+                Instant::now() < deadline,
+                "the withdrawn write is still pending"
+            );
+            crate::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(50));
+        }
     });
     a.io().shutdown(std::net::Shutdown::Write).unwrap();
     let mut got = Vec::new();

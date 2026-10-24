@@ -31,10 +31,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::task::Context;
 
-use super::{Failure, Kind, Source, Target};
+use super::{Failure, Io, Kind, Source, Target};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
 use crate::io::sys;
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+mod ring;
 
 /// The least a write-behind buffer holds, so a run of small writes fills
 /// one buffer rather than waiting on each.
@@ -84,8 +87,10 @@ struct Lent {
     done: Option<io::Result<usize>>,
     /// The task to wake when it is done; `None` while the task polls.
     waker: Option<Waker>,
-    /// The task went away after some of the buffer went out: the driver
-    /// writes the rest, then drops it.
+    /// The buffer is out with a ring operation (`buf` is empty meanwhile).
+    out: bool,
+    /// The task went away after some of the buffer went out, or while it
+    /// was out: the driver writes the rest, then drops it.
     // vertexia: the caller's allocation, kept uncharged by the pool (one per
     // source at most, for at most `LINGER` once its handle is gone); charge
     // it to the pool if kept buffers must count against the cap.
@@ -113,6 +118,21 @@ pub(super) struct WriteState {
     shut: bool,
     /// The source's epoch this state is of.
     epoch: u32,
+    /// The user data of the operation out on the ring; only its
+    /// completion clears this.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    ring_out: Option<u64>,
+    /// The ring gave an operation back because the socket was not ready:
+    /// the next one waits for it to be.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    poll_first: bool,
+    /// What the ring gave back undone (bytes of the write-behind it took
+    /// part of, or none, or a datagram): it goes out first.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    again: Option<super::ring::OpMem>,
+    /// A connect to start on the ring, to its peer.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    dial: Option<Box<super::ring::RawAddr>>,
 }
 
 /// Writes bytes to a stream.
@@ -137,9 +157,17 @@ impl WriteState {
         &mut self.epoch
     }
 
+    /// The user data of the operation out on the ring, if one is.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    pub(super) fn ring_out(&self) -> Option<u64> {
+        self.ring_out
+    }
+
+    /// Bytes written behind that the kernel has not taken: in the
+    /// write-behind, or out with the ring (or given back by it).
     #[cfg(test)]
     pub(super) fn has_behind(&self) -> bool {
-        self.behind.is_some()
+        self.behind.is_some() || self.ring_holds()
     }
 
     /// A lent buffer has bytes left to go out.
@@ -170,16 +198,43 @@ impl WriteState {
         if edge {
             self.blocked = false;
         }
-        if self.push(fd, kind, after) {
+        if self.push_fd(fd, kind, after) {
             after.wake(&mut self.waiters);
         }
+    }
+
+    /// The driver's part for what the side holds: its calls on the
+    /// descriptor, or its next operation on the ring. Returns whether
+    /// anything changed at once.
+    fn push(&mut self, io: Io<'_>, kind: Kind, after: &mut After) -> bool {
+        match io {
+            Io::Fd(fd) => self.push_fd(fd, kind, after),
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            Io::Ring(r) => {
+                self.submit_ring(r, kind, after);
+                false
+            }
+            #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+            Io::Ring(_) => false,
+        }
+    }
+
+    /// Bytes, a datagram or a connect the ring holds or was given back.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    fn ring_holds(&self) -> bool {
+        self.ring_out.is_some() || self.again.is_some() || self.dial.is_some()
+    }
+
+    #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+    fn ring_holds(&self) -> bool {
+        false
     }
 
     /// The driver's calls on the descriptor, while the socket takes them:
     /// ends a connect in progress, writes the write-behind out and then the
     /// lent buffer, sends a queued datagram. Returns whether anything
     /// changed.
-    fn push(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
+    fn push_fd(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
         if self.blocked {
             return false;
         }
@@ -274,6 +329,16 @@ impl WriteState {
         if lent.done.is_none() {
             return progress;
         }
+        self.lent_finished(after);
+        true
+    }
+
+    /// The lent buffer's write ended: its task is woken, and one whose task
+    /// went is dropped.
+    fn lent_finished(&mut self, after: &mut After) {
+        let Some(lent) = self.lent.as_mut() else {
+            return;
+        };
         if let Some(w) = lent.waker.take() {
             after.wake_one(w);
         }
@@ -284,7 +349,6 @@ impl WriteState {
             // Nobody waits for this write: its error is the write-behind's.
             self.failed = Some(Failure::of(&err));
         }
-        true
     }
 
     /// A write of all of a task's own buffer (`held`; `None` while it is
@@ -293,7 +357,7 @@ impl WriteState {
     /// went out (or failed), with the buffer back in `held`.
     fn write_owned(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         held: &mut Option<Vec<u8>>,
         waker: &Waker,
@@ -319,12 +383,13 @@ impl WriteState {
                 sent: 0,
                 done: None,
                 waker: None,
+                out: false,
                 orphan: false,
             });
         }
         // The task polls, so the driver's write needs no wake for it.
         let old = self.lent.as_mut().and_then(|l| l.waker.take());
-        self.push(fd, kind, after);
+        self.push(io, kind, after);
         let Some(lent) = self.lent.as_mut() else {
             return Poll::Ready(Err(io::Error::other("the write lost its buffer")));
         };
@@ -362,7 +427,9 @@ impl WriteState {
         if let Some(w) = lent.waker.take() {
             after.forget_one(w);
         }
-        if lent.done.is_none() && lent.sent > 0 {
+        // Out with a ring operation, some of it may be going out: its
+        // completion withdraws it if none did.
+        if lent.done.is_none() && (lent.sent > 0 || lent.out) {
             lent.orphan = true;
             return;
         }
@@ -378,6 +445,12 @@ impl WriteState {
 
     /// The lent buffer back, as it is, for a poll that ends in an error.
     fn reclaim(&mut self, after: &mut After) -> Option<Vec<u8>> {
+        if self.lent.as_ref().is_some_and(|l| l.out) {
+            // Out with a ring operation, it cannot come back now: the
+            // write goes on as if its task went away.
+            self.abandon_lent(after);
+            return None;
+        }
         let lent = self.lent.take()?;
         if let Some(w) = lent.waker {
             after.forget_one(w);
@@ -391,7 +464,7 @@ impl WriteState {
     /// once if the socket may take it.
     fn write(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         bufs: &[io::IoSlice<'_>],
         waker: &Waker,
@@ -430,7 +503,7 @@ impl WriteState {
             self.waiters.register(waker);
             return Poll::Pending;
         }
-        self.push(fd, kind, after);
+        self.push(io, kind, after);
         if first && let Some(failure) = self.failed.take() {
             // Nothing written before was lost: the error is this write's.
             return Poll::Ready(Err(failure.error()));
@@ -443,30 +516,33 @@ impl WriteState {
 
     fn flush(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<()>> {
-        self.push(fd, kind, after);
+        self.push(io, kind, after);
         if let Some(failure) = self.failed.take() {
             return Poll::Ready(Err(failure.error()));
         }
-        if self.behind.is_some() || self.lent_waits() {
+        if self.behind.is_some() || self.lent_waits() || self.ring_holds() {
             self.waiters.register(waker);
             return Poll::Pending;
         }
         Poll::Ready(Ok(()))
     }
 
+    /// Flushes, then shuts a stream's writing half of `fd` down (with
+    /// nothing out on the ring by then, the driver's call on it at once).
     fn close(
         &mut self,
+        io: Io<'_>,
         fd: RawFd,
         kind: Kind,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<()>> {
-        match self.flush(fd, kind, waker, after) {
+        match self.flush(io, kind, waker, after) {
             Poll::Ready(Ok(())) => {}
             other => return other,
         }
@@ -481,7 +557,7 @@ impl WriteState {
     /// once if the socket may take it.
     fn send(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
         kind: Kind,
         bytes: &[u8],
         dest: Dest<'_>,
@@ -504,7 +580,7 @@ impl WriteState {
         };
         datagram.fill_from(bytes);
         self.queued = Some((datagram, dest.to_owned()));
-        self.push(fd, kind, after);
+        self.push(io, kind, after);
         if self.queued.is_none()
             && let Some(err) = self.error.take()
         {
@@ -521,11 +597,14 @@ impl WriteState {
     /// the driver can still deliver.
     pub(super) fn has_unsent(&self) -> bool {
         self.failed.is_none()
-            && (self.behind.is_some() || self.lent_waits() || self.queued.is_some())
+            && (self.behind.is_some()
+                || self.lent_waits()
+                || self.queued.is_some()
+                || self.ring_holds())
     }
 
-    fn drain(&mut self, fd: RawFd, kind: Kind, waker: &Waker, after: &mut After) -> Poll<()> {
-        self.push(fd, kind, after);
+    fn drain(&mut self, io: Io<'_>, kind: Kind, waker: &Waker, after: &mut After) -> Poll<()> {
+        self.push(io, kind, after);
         if self.has_unsent() {
             self.waiters.register(waker);
             Poll::Pending
@@ -536,9 +615,17 @@ impl WriteState {
 
     /// A connect to `peer`: the driver starts it on the first poll, and sees
     /// it end on the socket's first edge.
+    #[cfg_attr(
+        not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")),
+        expect(
+            unused_variables,
+            reason = "the kind matters to the ring's connect only"
+        )
+    )]
     fn connect(
         &mut self,
-        fd: RawFd,
+        io: Io<'_>,
+        kind: Kind,
         peer: Peer<'_>,
         waker: &Waker,
         after: &mut After,
@@ -548,17 +635,39 @@ impl WriteState {
         }
         if !self.connect_started {
             self.connect_started = true;
-            let started = match peer {
-                Peer::Inet(addr) => sys::connect_inet(fd, &addr),
-                Peer::Unix(path) => sys::connect_unix(fd, path),
-            };
-            match started {
-                Ok(true) => return Poll::Ready(Ok(())),
-                Ok(false) => {
-                    self.connecting = true;
-                    after.register = true;
+            match io {
+                Io::Fd(fd) => {
+                    let started = match peer {
+                        Peer::Inet(addr) => sys::connect_inet(fd, &addr),
+                        Peer::Unix(path) => sys::connect_unix(fd, path),
+                    };
+                    match started {
+                        Ok(true) => return Poll::Ready(Ok(())),
+                        Ok(false) => {
+                            self.connecting = true;
+                            after.register = true;
+                        }
+                        Err(err) => return Poll::Ready(Err(err)),
+                    }
                 }
-                Err(err) => return Poll::Ready(Err(err)),
+                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                Io::Ring(r) => {
+                    let addr = match peer {
+                        Peer::Inet(addr) => super::ring::RawAddr::inet(&addr),
+                        Peer::Unix(path) => match super::ring::RawAddr::unix(path) {
+                            Ok(addr) => addr,
+                            Err(err) => return Poll::Ready(Err(err)),
+                        },
+                    };
+                    self.dial = Some(addr);
+                    self.connecting = true;
+                    self.submit_ring(r, kind, after);
+                }
+                #[cfg(not(all(
+                    any(target_os = "linux", target_os = "android"),
+                    feature = "iouring"
+                )))]
+                Io::Ring(_) => {}
             }
         }
         if self.connecting {
@@ -628,6 +737,17 @@ impl WriteState {
         self.connected = None;
         self.shut = false;
         self.blocked = false;
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        {
+            self.poll_first = false;
+        }
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        {
+            if let Some(mem) = self.again.take() {
+                mem.release(after);
+            }
+            self.dial = None;
+        }
     }
 }
 
@@ -649,18 +769,33 @@ impl Source {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
         let kind = self.kind;
+        self.poll_writing(cx, |st, io, waker, after| {
+            st.write(io, kind, bufs, waker, after)
+        })
+    }
+
+    /// Polls the write side with `step`, given the way this thread reaches
+    /// the descriptor.
+    fn poll_writing<R>(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        mut step: impl FnMut(&mut WriteState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
+    ) -> Poll<io::Result<R>> {
         let mut after = After::default();
-        let poll = self
-            .write
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.write(fd, kind, bufs, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        let polled = self.with_io(|io| {
+            self.write
+                .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                    step(st, io, cx.waker(), after)
+                })
+        });
+        match polled {
+            Ok(poll) => self.finish_poll(after, poll),
+            Err(err) => {
+                self.settle(after);
+                Poll::Ready(Err(err))
+            }
+        }
     }
 
     /// Writes all of `buf` and gives it back with the write's result. The
@@ -684,19 +819,10 @@ impl Source {
         cx: &mut Context<'_>,
         held: &mut Option<Vec<u8>>,
     ) -> Poll<io::Result<usize>> {
-        let poll = match self.fd() {
-            Ok(fd) => {
-                let kind = self.kind;
-                let mut after = After::default();
-                let poll = self
-                    .write
-                    .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                        st.write_owned(fd, kind, held, cx.waker(), after)
-                    });
-                self.finish_poll(after, poll)
-            }
-            Err(err) => Poll::Ready(Err(err)),
-        };
+        let kind = self.kind;
+        let poll = self.poll_writing(cx, |st, io, waker, after| {
+            st.write_owned(io, kind, held, waker, after)
+        });
         if poll.is_ready() && held.is_none() {
             // The poll failed with the buffer lent: it comes back as it is.
             // If the side is held now, the poll waits and starts over.
@@ -717,18 +843,8 @@ impl Source {
 
     /// Completes once the write-behind is out (or reports why it stopped).
     pub(crate) fn poll_flush(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
         let kind = self.kind;
-        let mut after = After::default();
-        let poll = self
-            .write
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.flush(fd, kind, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        self.poll_writing(cx, |st, io, waker, after| st.flush(io, kind, waker, after))
     }
 
     /// Flushes, then shuts a stream socket's writing half down.
@@ -738,13 +854,9 @@ impl Source {
             Err(err) => return Poll::Ready(Err(err)),
         };
         let kind = self.kind;
-        let mut after = After::default();
-        let poll = self
-            .write
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.close(fd, kind, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        self.poll_writing(cx, |st, io, waker, after| {
+            st.close(io, fd, kind, waker, after)
+        })
     }
 
     /// Sends a datagram to `dest`: copied, queued and sent by the driver.
@@ -754,35 +866,19 @@ impl Source {
         bytes: &[u8],
         dest: Dest<'_>,
     ) -> Poll<io::Result<usize>> {
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
         let kind = self.kind;
-        let mut after = After::default();
-        let poll = self
-            .write
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.send(fd, kind, bytes, dest, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        self.poll_writing(cx, |st, io, waker, after| {
+            st.send(io, kind, bytes, dest, waker, after)
+        })
     }
 
     /// Completes once the kernel took every byte and datagram accepted (or
     /// a failure ended them).
     pub(crate) fn poll_drain(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(_) => return Poll::Ready(()),
-        };
         let kind = self.kind;
-        let mut after = After::default();
-        let poll = self
-            .write
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.drain(fd, kind, cx.waker(), after)
-            });
-        match self.finish_poll(after, poll.map(Ok)) {
+        match self.poll_writing(cx, |st, io, waker, after| {
+            st.drain(io, kind, waker, after).map(Ok)
+        }) {
             Poll::Ready(_) => Poll::Ready(()),
             Poll::Pending => Poll::Pending,
         }
@@ -796,17 +892,10 @@ impl Source {
         cx: &mut Context<'_>,
         peer: Peer<'_>,
     ) -> Poll<io::Result<()>> {
-        let fd = match self.fd() {
-            Ok(fd) => fd,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-        let mut after = After::default();
-        let poll = self
-            .write
-            .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
-                st.connect(fd, peer, cx.waker(), after)
-            });
-        self.finish_poll(after, poll)
+        let kind = self.kind;
+        self.poll_writing(cx, |st, io, waker, after| {
+            st.connect(io, kind, peer, waker, after)
+        })
     }
 }
 

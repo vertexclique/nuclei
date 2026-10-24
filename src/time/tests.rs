@@ -11,6 +11,7 @@ fn shard() -> Shard {
     Shard::new(Limits {
         max_nesting: 8,
         buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
     })
     .unwrap()
 }
