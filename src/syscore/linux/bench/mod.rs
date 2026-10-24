@@ -157,7 +157,8 @@ fn involuntary_csw() -> i64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: `ru` is a valid out-pointer.
     unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
-    ru.ru_nivcsw
+    // A `c_long`: 32 bits wide on 32-bit targets.
+    i64::from(ru.ru_nivcsw)
 }
 
 #[derive(Clone, Copy)]

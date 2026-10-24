@@ -600,9 +600,10 @@ fn after(clock: libc::clockid_t, ms: i64) -> KernelTimespec {
     let mut ts: libc::timespec = zeroed();
     // SAFETY: `ts` is a valid timespec to write into.
     assert_eq!(unsafe { libc::clock_gettime(clock, &mut ts) }, 0);
-    let nanos = ts.tv_nsec + ms * 1_000_000;
+    // The libc fields are 32 bits wide on 32-bit targets; the kernel's are 64.
+    let nanos = i64::from(ts.tv_nsec) + ms * 1_000_000;
     KernelTimespec {
-        tv_sec: ts.tv_sec + nanos / 1_000_000_000,
+        tv_sec: i64::from(ts.tv_sec) + nanos / 1_000_000_000,
         tv_nsec: nanos % 1_000_000_000,
     }
 }
