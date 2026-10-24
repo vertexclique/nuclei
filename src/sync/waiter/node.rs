@@ -97,7 +97,7 @@ impl Waiter {
         self.next.store(next, Ordering::Relaxed);
     }
 
-    /// The back link of a node on a [`List`](super::list::List); only the
+    /// The back link of a node on a [`List`](crate::sync::list::List); only the
     /// drain role's holder, which owns the list, uses it.
     pub(in crate::sync) fn prev(&self) -> *mut Waiter {
         self.prev.load(Ordering::Relaxed)
