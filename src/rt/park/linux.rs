@@ -38,8 +38,10 @@ impl Poller {
                 0,
                 libc::EFD_CLOEXEC | libc::EFD_NONBLOCK,
             ))?);
+            // Edge-triggered: every write is one event, and the counter is
+            // never read back, which saves a syscall per wake.
             let mut event = libc::epoll_event {
-                events: libc::EPOLLIN as u32,
+                events: (libc::EPOLLIN | libc::EPOLLET) as u32,
                 u64: WAKE,
             };
             check(libc::epoll_ctl(
@@ -102,20 +104,6 @@ impl Poller {
             if event.u64 == WAKE {
                 woken = true;
             }
-        }
-        if woken {
-            let mut count = 0u64;
-            // Reset the counter. Nonblocking: a wake racing this read leaves it
-            // nonzero, and the next wait returns at once, which is a spurious
-            // wake and harmless.
-            // SAFETY: reads 8 bytes into `count`.
-            unsafe {
-                libc::read(
-                    self.wake.as_raw_fd(),
-                    (&mut count as *mut u64).cast(),
-                    size_of::<u64>(),
-                )
-            };
         }
         Ok(woken)
     }

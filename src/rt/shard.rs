@@ -14,9 +14,10 @@
 //! ran, at most [`LIFO_MAX`] times in a row), then the local queue, then the
 //! inbox (first every [`INBOX_INTERVAL`] runs, so remote work is not
 //! starved). Every [`DRIVER_INTERVAL`] runs, and whenever the queues are
-//! empty, it fires due timers and polls the poller without waiting; with
-//! nothing to run it parks until the next timer, a remote push or a wake of
-//! the future. Workers run the same loop on a future that ends at shutdown.
+//! empty, it fires due timers and polls the poller without waiting. With
+//! nothing to run it spins briefly (see [`Spin`]), then parks until the next
+//! timer, a remote push or a wake of the future. Workers run the same loop
+//! on a future that ends at shutdown.
 //!
 //! # Nesting
 //!
@@ -52,6 +53,67 @@ pub(crate) const LIFO_MAX: u32 = 3;
 pub(crate) const INBOX_INTERVAL: u32 = 31;
 /// Timers and the poller are looked at once every this many runs.
 pub(crate) const DRIVER_INTERVAL: u32 = 61;
+
+/// The most pause hints a shard spins before it parks.
+const SPIN_MAX: u32 = 2048;
+/// The spin a fresh shard starts with.
+const SPIN_START: u32 = 256;
+/// The spin a shard whose park was cut short starts again with.
+const SPIN_RESTART: u32 = 64;
+/// A park that ended this soon would have been caught by a spin.
+const SHORT_PARK: Duration = Duration::from_micros(50);
+/// The longest gap between two looks of a spin, in pauses: each look reads
+/// lines the waker writes, so looking seldom leaves it to run at full speed.
+const SPIN_GAP_MAX: u32 = 64;
+
+/// How long a shard spins before it parks, adapted to what spins see.
+///
+/// Work that arrives within a spin costs neither a park nor the waker's
+/// notification. A spin that found work doubles the budget; one that ran out
+/// halves it, so a shard whose work comes only after long gaps (or through
+/// its poller, which a spin cannot see) stops spinning; a park that a
+/// notification cut short sets it going again. The budget counts pause
+/// hints, not time, and is a hint: it only sizes the next spin.
+pub(crate) struct Spin {
+    budget: Cell<u32>,
+}
+
+impl Spin {
+    fn new() -> Self {
+        Self {
+            budget: Cell::new(SPIN_START),
+        }
+    }
+
+    /// Spins until `found` says work is there (true) or the budget is spent
+    /// (false).
+    fn run(&self, mut found: impl FnMut() -> bool) -> bool {
+        let budget = self.budget.get();
+        let mut spent = 0;
+        let mut gap = 1;
+        while spent < budget {
+            for _ in 0..gap {
+                core::hint::spin_loop();
+            }
+            spent += gap;
+            gap = (gap * 2).min(SPIN_GAP_MAX);
+            if found() {
+                self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
+                return true;
+            }
+        }
+        self.budget.set(budget / 2);
+        false
+    }
+
+    /// The shard slept for `slept`: a short sleep means work came right
+    /// after the spin gave up.
+    fn parked_for(&self, slept: Duration) {
+        if slept < SHORT_PARK {
+            self.budget.set(self.budget.get().max(SPIN_RESTART));
+        }
+    }
+}
 
 /// The part of a shard any thread may touch.
 pub(crate) struct Shared {
@@ -149,6 +211,10 @@ pub(crate) struct Shard {
     tick: Cell<u32>,
     /// Runs since timers and the poller were last looked at.
     since_drive: Cell<u32>,
+    spin: Spin,
+    /// The runtime and the place this shard is a worker of, set when its
+    /// worker thread starts: what `spawn` uses to keep a task local.
+    owner: Cell<Option<(u64, usize)>>,
     /// A task is being polled: a wake it makes goes to the LIFO slot.
     in_task: Cell<bool>,
     depth: Cell<usize>,
@@ -180,6 +246,8 @@ impl Shard {
             lifo_streak: Cell::new(0),
             tick: Cell::new(0),
             since_drive: Cell::new(0),
+            spin: Spin::new(),
+            owner: Cell::new(None),
             in_task: Cell::new(false),
             depth: Cell::new(0),
             limits,
@@ -193,6 +261,19 @@ impl Shard {
     /// Whether `shared` is this shard's.
     pub(crate) fn is(&self, shared: &Arc<Shared>) -> bool {
         Arc::ptr_eq(&self.shared, shared)
+    }
+
+    /// Marks this shard as worker `index` of runtime `runtime`.
+    pub(crate) fn set_owner(&self, runtime: u64, index: usize) {
+        self.owner.set(Some((runtime, index)));
+    }
+
+    /// This shard's place among the workers of runtime `runtime`, if it is
+    /// one of them.
+    pub(crate) fn worker_index(&self, runtime: u64) -> Option<usize> {
+        self.owner
+            .get()
+            .and_then(|(owner, index)| (owner == runtime).then_some(index))
     }
 
     /// Queues a runnable from this shard's own thread. A task woken by the
@@ -355,12 +436,20 @@ impl Shard {
             }
             self.since_drive.set(0);
             let shared = &self.shared;
+            if self
+                .spin
+                .run(|| shared.has_remote_work() || signal.woken.load(Ordering::Relaxed))
+            {
+                continue;
+            }
             if shared
                 .park
                 .begin_park(|| shared.has_remote_work() || signal.woken.load(Ordering::SeqCst))
             {
+                let slept = Instant::now();
                 self.drive_or_report(None);
                 shared.park.end_park();
+                self.spin.parked_for(slept.elapsed());
             }
         }
     }
@@ -458,5 +547,47 @@ mod tests {
         // deadline, this would never return.
         shard.block_on(sleep_on(&shard, start + Duration::from_millis(20)));
         assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod spin_tests {
+    use std::time::Duration;
+
+    use super::{SPIN_MAX, SPIN_RESTART, SPIN_START, Spin};
+
+    #[test]
+    fn a_spin_that_finds_work_doubles_the_budget_and_one_that_runs_out_halves_it() {
+        let spin = Spin::new();
+        assert_eq!(spin.budget.get(), SPIN_START);
+        assert!(spin.run(|| true));
+        assert_eq!(spin.budget.get(), SPIN_START * 2);
+        assert!(!spin.run(|| false));
+        assert_eq!(spin.budget.get(), SPIN_START);
+        for _ in 0..20 {
+            spin.run(|| true);
+        }
+        assert_eq!(spin.budget.get(), SPIN_MAX, "capped");
+        for _ in 0..20 {
+            spin.run(|| false);
+        }
+        assert_eq!(spin.budget.get(), 0, "an idle shard stops spinning");
+        assert!(!spin.run(|| true), "a spent budget does not spin");
+    }
+
+    #[test]
+    fn a_short_park_starts_the_spin_again() {
+        let spin = Spin::new();
+        for _ in 0..20 {
+            spin.run(|| false);
+        }
+        spin.parked_for(Duration::from_millis(5));
+        assert_eq!(
+            spin.budget.get(),
+            0,
+            "a long sleep: spinning would not have helped"
+        );
+        spin.parked_for(Duration::from_micros(3));
+        assert_eq!(spin.budget.get(), SPIN_RESTART);
     }
 }

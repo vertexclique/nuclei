@@ -14,6 +14,11 @@ pub(crate) struct Poller {
     events: Vec<libc::kevent>,
 }
 
+// SAFETY: the event buffer is plain data the kernel fills on each wait; its
+// `udata` pointers are never dereferenced (nuclei stores none), so the
+// poller may move to the thread that runs its shard.
+unsafe impl Send for Poller {}
+
 /// Wakes a poller from any thread.
 #[derive(Clone)]
 pub(crate) struct Notifier {

@@ -411,3 +411,66 @@ fn the_current_handle_inside_a_worker_is_its_runtime() {
     }));
     assert_eq!(inside, 3);
 }
+
+/// A task spawned on a worker stays there while the worker is not loaded
+/// beyond the margin: one that waits for what it spawned keeps it on its
+/// own thread.
+#[test]
+fn a_task_spawned_on_a_worker_stays_on_it() {
+    let rt = runtime(4);
+    let same = rt.block_on(rt.spawn(async {
+        let here = std::thread::current().id();
+        let mut same = 0;
+        for _ in 0..50 {
+            if spawn(async { std::thread::current().id() }).await == here {
+                same += 1;
+            }
+        }
+        same
+    }));
+    assert_eq!(same, 50);
+}
+
+/// A worker holding more live tasks than the margin beyond another shard
+/// sends what it spawns elsewhere.
+#[test]
+fn a_loaded_worker_spreads_what_it_spawns() {
+    let rt = Runtime::builder()
+        .worker_threads(4)
+        .pin_workers(false)
+        .local_spawn_margin(4)
+        .build()
+        .unwrap();
+    let threads = Arc::new(Mutex::new(HashSet::new()));
+    let gates: Vec<Gate> = (0..64).map(|_| Gate::default()).collect();
+    let started = Arc::new(AtomicUsize::new(0));
+    let t = Arc::clone(&threads);
+    let g = gates.clone();
+    let s = Arc::clone(&started);
+    let spawner = rt.spawn(async move {
+        let tasks: Vec<_> = g
+            .into_iter()
+            .map(|gate| {
+                let (t, s) = (Arc::clone(&t), Arc::clone(&s));
+                spawn(async move {
+                    t.lock().unwrap().insert(std::thread::current().id());
+                    s.fetch_add(1, Ordering::SeqCst);
+                    gate.await;
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await;
+        }
+    });
+    eventually("every task to start", || {
+        started.load(Ordering::SeqCst) == 64
+    });
+    gates.iter().for_each(Gate::open);
+    rt.block_on(spawner);
+    let n = threads.lock().unwrap().len();
+    assert!(
+        n >= 3,
+        "64 live tasks with a margin of 4 ran on {n} worker(s)"
+    );
+}

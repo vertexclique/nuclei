@@ -1,9 +1,12 @@
 //! Runtimes: worker shards, the blocking pool, and where `spawn` puts a task.
 //!
 //! A runtime has one worker shard per thread it was built with, each a thread
-//! running its shard's loop until shutdown, and a blocking pool. `spawn`
-//! picks two distinct shards at random and places the task on the one with
-//! fewer live tasks (the power of two choices); a task never moves after.
+//! running its shard's loop until shutdown, and a blocking pool. `spawn` on a
+//! worker keeps the task there unless the worker holds more than a margin
+//! of live tasks beyond a shard picked at random, which then takes it; from
+//! any other thread it picks two distinct shards at random and takes the one
+//! with fewer live tasks (the power of two choices). A task never moves
+//! after.
 //! With no worker threads, a task goes to the shard of the thread that
 //! spawns it, and runs while that thread is inside `block_on`.
 //!
@@ -33,8 +36,13 @@ use crate::sync::internal::Ordering;
 
 /// What a runtime's threads share.
 pub(crate) struct Inner {
+    /// Tells this runtime's workers from another's.
+    id: u64,
     shards: Box<[Arc<Shared>]>,
     pool: Arc<Pool>,
+    /// How many live tasks more than the other choice the spawning shard
+    /// may hold and still keep a task it spawns.
+    local_margin: usize,
 }
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
@@ -53,6 +61,7 @@ pub struct Builder {
     max_blocking_threads: Option<usize>,
     blocking_keep_alive: Option<Duration>,
     pin_workers: Option<bool>,
+    local_spawn_margin: Option<usize>,
 }
 
 impl Default for Builder {
@@ -65,6 +74,8 @@ impl Default for Builder {
 const DEFAULT_STACK: usize = 8 * 1024 * 1024;
 const DEFAULT_BLOCKING_THREADS: usize = 512;
 const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(10);
+/// See [`Builder::local_spawn_margin`].
+const DEFAULT_LOCAL_MARGIN: usize = 32;
 
 impl Builder {
     /// A builder with every setting at its default.
@@ -77,6 +88,7 @@ impl Builder {
             max_blocking_threads: None,
             blocking_keep_alive: None,
             pin_workers: None,
+            local_spawn_margin: None,
         }
     }
 
@@ -129,6 +141,17 @@ impl Builder {
         self
     }
 
+    /// How many more live tasks than another shard a worker may hold and
+    /// still keep a task it spawns (default 32). A task spawned on a worker
+    /// stays on it (so a task that waits for what it spawned keeps it on
+    /// its own thread) unless the worker holds that many more tasks than a
+    /// shard picked at random; then it goes to the less loaded of the two.
+    /// Zero balances strictly; a larger margin keeps more work local.
+    pub fn local_spawn_margin(mut self, margin: usize) -> Self {
+        self.local_spawn_margin = Some(margin);
+        self
+    }
+
     /// Whether each worker thread is pinned to its own core (Linux; default
     /// true). A pinned shard keeps its cache warm; unpinned, the scheduler may
     /// move it.
@@ -169,9 +192,12 @@ impl Builder {
         let shards = (0..workers)
             .map(|_| Shard::new(limits))
             .collect::<io::Result<Vec<_>>>()?;
+        static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let inner = Arc::new(Inner {
+            id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             shards: shards.iter().map(|s| Arc::clone(&s.shared)).collect(),
             pool,
+            local_margin: self.local_spawn_margin.unwrap_or(DEFAULT_LOCAL_MARGIN),
         });
         let (exit_tx, exits) = kovan_channel::unbounded();
         let cores = if self.pin_workers.unwrap_or(true) {
@@ -200,6 +226,7 @@ impl Builder {
                     if let Some(core) = core {
                         pin_to(core);
                     }
+                    shard.set_owner(worker_inner.id, index);
                     let _runtime = context::set_runtime(&worker_inner);
                     let _current = context::enter(&shard);
                     shard.block_on(shard.shared.stopped());
@@ -413,13 +440,28 @@ fn current() -> Arc<Inner> {
     })
 }
 
-/// Picks the shard a new task goes to: the less loaded of two distinct
-/// shards picked at random.
+/// Picks the shard a new task goes to. Spawned on one of the runtime's
+/// workers: that worker, unless it holds more than `local_margin` live tasks
+/// beyond a shard picked at random, which then takes it. Spawned anywhere
+/// else: the less loaded of two distinct shards picked at random.
 fn place(inner: &Inner) -> &Arc<Shared> {
     let shards = &inner.shards;
     let n = shards.len();
     if n == 1 {
         return &shards[0];
+    }
+    if let Some(local) = context::current(|current| current.and_then(|s| s.worker_index(inner.id)))
+    {
+        let other = (local + 1 + random_below(n - 1)) % n;
+        let (ll, lo) = (
+            shards[local].load.load(Ordering::Relaxed),
+            shards[other].load.load(Ordering::Relaxed),
+        );
+        return if ll <= lo.saturating_add(inner.local_margin) {
+            &shards[local]
+        } else {
+            &shards[other]
+        };
     }
     let a = random_below(n);
     let b = (a + 1 + random_below(n - 1)) % n;
@@ -546,8 +588,11 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 /// Spawns a task on the runtime this thread is inside, or on the default
-/// runtime: on one of its shards, the less loaded of two picked at random.
-/// The task stays on that shard.
+/// runtime. Spawned on a worker, the task stays on that worker unless it
+/// holds more live tasks than another shard by the runtime's
+/// [`local_spawn_margin`](Builder::local_spawn_margin); spawned anywhere
+/// else, it goes to the less loaded of two shards picked at random. The task
+/// stays on its shard.
 ///
 /// Dropping the returned [`Task`] cancels it; call [`Task::detach`] to let
 /// it run on its own.

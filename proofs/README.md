@@ -264,8 +264,9 @@ analysis.
 ## The park handshake
 
 `park` (`tla/park/Park.tla`) checks how a shard goes to sleep without losing a wake
-(`src/rt/handshake.rs`, `src/rt/shard.rs`). A shard with nothing to run publishes that it
-parks, looks at its inbox once more, and only then sleeps until its poller is notified. A
+(`src/rt/handshake.rs`, `src/rt/shard.rs`). A shard with nothing to run (after a short spin that
+only looks at its inbox) publishes that it parks, looks at its inbox once more, and only then
+sleeps until its poller is notified. A
 thread that gives it work pushes the work, then looks whether the shard parks; if it does, it
 swaps the flag back and notifies, so only the first of a burst of wakes notifies. Every access
 of the pair is sequentially consistent, so whichever publication comes second, the look after
