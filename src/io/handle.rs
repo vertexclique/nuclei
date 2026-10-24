@@ -16,6 +16,15 @@
 //! by another file, reaches nothing. The next operation registers the
 //! object again, whatever it is by then.
 //!
+//! The driver keeps the descriptor's number, not a borrow of it, so the
+//! number must stay the object's while the handle holds it. That holds
+//! because IO exists only on std's own types (the sockets, `File`), whose
+//! descriptor no method on a shared borrow can close or swap: the only ways
+//! to change it go through `&mut` or ownership, which retire the source
+//! first. A handle over any other `AsFd` type does no IO, so its number is
+//! never used past `new`. A new IO type must keep this: a type whose
+//! descriptor can change behind `&self` must not get IO methods.
+//!
 //! # Bytes written behind
 //!
 //! A write is accepted into the handle's write-behind, as the kernel

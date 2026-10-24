@@ -699,3 +699,82 @@ fn tcp_short_round_trips_never_wait_for_the_next_message() {
         within(server).await;
     });
 }
+
+/// The TCP form of the reuse case: a connection's number taken over by
+/// another socket while a dup keeps the old one open.
+#[test]
+fn a_tcp_dup_and_close_never_lets_the_driver_touch_a_reused_number() {
+    let rt = runtime();
+    rt.block_on(async {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = within(Handle::<TcpStream>::connect(addr)).await.unwrap();
+        let (old_peer, _) = listener.accept().unwrap();
+        let keep = handle.get_ref().try_clone().unwrap();
+        let mut buf = [0u8; 8];
+        {
+            let mut waiting = Box::pin(handle.recv(&mut buf));
+            let polled = poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await;
+            assert!(polled.is_pending());
+        }
+        let number = handle.into_inner().into_raw_fd();
+        let (new_peer, other) = UnixStream::pair().unwrap();
+        // SAFETY: `number` is this test's own descriptor; dup2 replaces it.
+        assert_eq!(unsafe { libc::dup2(other.as_raw_fd(), number) }, number);
+        drop(other);
+        // SAFETY: `number` is this test's own descriptor.
+        let reused =
+            Handle::new(UnixStream::from(unsafe { OwnedFd::from_raw_fd(number) })).unwrap();
+        (&old_peer).write_all(b"old").unwrap();
+        (&new_peer).write_all(b"mine").unwrap();
+        let n = within(reused.recv(&mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"mine");
+        keep.set_nonblocking(true).unwrap();
+        let mut old = [0u8; 8];
+        assert_eq!((&keep).read(&mut old).unwrap(), 3);
+        assert_eq!(&old[..3], b"old");
+    });
+}
+
+/// A handle dropped with bytes still to send hands them to a copy of its
+/// descriptor; its own number is closed and may be taken by another socket
+/// at once. The bytes still go to the old peer, and nothing goes to the
+/// socket that took the number.
+#[test]
+fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
+    let rt = runtime();
+    let (mine, peer) = UnixStream::pair().unwrap();
+    let (sent, number) = rt.block_on(async {
+        let handle = Handle::new(mine).unwrap();
+        let sent = fill_behind(&handle).await;
+        let number = handle.as_raw_fd();
+        drop(handle);
+        (sent, number)
+    });
+    // The number is free: the next socket of this thread is likely to take
+    // it, and dup2 makes that certain without racing other threads.
+    let (taker_peer, taker) = UnixStream::pair().unwrap();
+    // SAFETY: `number` was closed by the drop; nobody else here took it, and
+    // dup2 onto it is atomic.
+    assert_eq!(unsafe { libc::dup2(taker.as_raw_fd(), number) }, number);
+    drop(taker);
+    // SAFETY: `number` is this test's own descriptor now.
+    let reused = unsafe { OwnedFd::from_raw_fd(number) };
+    let got = std::thread::spawn(move || read_to_end_blocking(peer))
+        .join()
+        .unwrap();
+    assert!(
+        got == sent,
+        "{} of {} bytes reached the old peer",
+        got.len(),
+        sent.len()
+    );
+    // Nothing reached the socket that took the number.
+    drop(reused);
+    taker_peer.set_nonblocking(true).unwrap();
+    let mut buf = [0u8; 1];
+    assert!(
+        matches!((&taker_peer).read(&mut buf), Ok(0)),
+        "bytes leaked into the new socket"
+    );
+}
