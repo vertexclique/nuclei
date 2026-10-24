@@ -121,6 +121,15 @@ impl<S> Side<S> {
         self.take(0)
     }
 
+    /// The guard's word and the deferred bits, for a test that failed.
+    #[cfg(test)]
+    pub(crate) fn words(&self) -> (u8, u8) {
+        (
+            self.state.load(Ordering::SeqCst),
+            self.deferred.load(Ordering::SeqCst),
+        )
+    }
+
     /// For a request that needs this side and another: the side, if it was
     /// free; if it was held, its holder sees `REQ` and looks at the requests.
     pub(crate) fn take_for_request(&self) -> Option<Held<'_, S>> {

@@ -17,7 +17,25 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    rt.block_on(async move { within(crate::runtime::spawn(fut)).await })
+    // Longer than the steps' own deadlines, so a step that never ends says
+    // so itself.
+    rt.block_on(async move {
+        crate::time::timeout(Duration::from_secs(30), crate::runtime::spawn(fut))
+            .await
+            .expect("the task never completed")
+    })
+}
+
+/// Waits, letting the shard run, until `done` holds; at its deadline it
+/// fails with `report`.
+async fn until_or(mut done: impl FnMut() -> bool, report: impl Fn() -> String) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pause = Duration::from_micros(50);
+    while !done() {
+        assert!(Instant::now() < deadline, "it never happened: {}", report());
+        crate::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_millis(5));
+    }
 }
 
 /// An empty buffer of exactly `cap` bytes.
@@ -25,17 +43,6 @@ fn exactly(cap: usize) -> Vec<u8> {
     let mut buf = vec![0u8; cap].into_boxed_slice().into_vec();
     buf.clear();
     buf
-}
-
-/// Waits, letting the shard run, until `done` holds.
-async fn until(mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut pause = Duration::from_micros(50);
-    while !done() {
-        assert!(Instant::now() < deadline, "it never happened");
-        crate::time::sleep(pause).await;
-        pause = (pause * 2).min(Duration::from_millis(5));
-    }
 }
 
 /// Reads `src` to its end with lent buffers.
@@ -151,14 +158,35 @@ fn a_dropped_lent_read_hands_its_bytes_to_the_next_read() {
                 .is_pending()
         );
         sys::write(peer, b"abcdefgh").unwrap();
-        until(|| woke.0.load(Ordering::SeqCst)).await;
+        until_or(
+            || woke.0.load(Ordering::SeqCst),
+            || {
+                format!(
+                    "the driver never filled the lent buffer: {}",
+                    src.read_report()
+                )
+            },
+        )
+        .await;
         let mut first = [0u8; 4];
         let mut early = Box::pin(read(&src, &mut first));
         pends(&mut early).await;
+        let before = src.read_report();
         drop(lent);
-        assert_eq!(within(early).await.unwrap(), 4);
+        let after = src.read_report();
+        // The state on both sides of the drop, should the read never end.
+        match crate::time::timeout(Duration::from_secs(5), early).await {
+            Ok(n) => assert_eq!(n.unwrap(), 4),
+            Err(_) => panic!(
+                "the read never ended; before the drop: {before}; after: {after}; now: {}",
+                src.read_report()
+            ),
+        }
         let mut rest = [0u8; 4];
-        read_exact(&src, &mut rest).await.unwrap();
+        match crate::time::timeout(Duration::from_secs(5), read_exact(&src, &mut rest)).await {
+            Ok(done) => done.unwrap(),
+            Err(_) => panic!("the rest never came: {}", src.read_report()),
+        }
         (first, rest)
     });
     assert_eq!((&first, &rest), (b"abcd", b"efgh"));

@@ -592,6 +592,26 @@ impl ReadState {
         }
     }
 
+    /// What the side holds, as a line, for a test that failed.
+    #[cfg(test)]
+    pub(super) fn report(&self) -> String {
+        format!(
+            "lent {:?}, read ahead {:?}, waiters {}, blocked {}, eof {}, error {:?}",
+            self.lent.as_ref().map(|l| (
+                l.buf.len(),
+                l.from,
+                l.done.as_ref().map(|d| d.as_ref().ok()),
+                l.waker.is_some(),
+                l.out
+            )),
+            self.ahead.as_ref().map(|a| a.filled().len()),
+            self.waiters.len(),
+            self.blocked,
+            self.eof,
+            self.error.as_ref().map(io::Error::kind),
+        )
+    }
+
     /// Urgent data or a hangup was reported for the socket.
     pub(super) fn short_reads_unsure(&mut self) {
         self.unsure = true;
