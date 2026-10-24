@@ -1,0 +1,11 @@
+# configuration                spec                 expected
+T_await                        MC_Timer             pass
+T_drop                         MC_Timer             pass
+T_live_await                   MC_Timer             pass
+T_live_drop                    MC_Timer             pass
+M_fire_keeps_entry             MC_Timer             violated:NothingLeft
+M_cancel_keeps_entry           MC_Timer             violated:NothingLeft
+M_drop_keeps_waker             MC_Timer             violated:NoWakeAfterDrop
+W_cancel_armed                 MC_Timer             violated:NoCancelOfArmed
+W_cancel_before_arm            MC_Timer             violated:NoCancelBeforeArm
+W_fire_wake                    MC_Timer             violated:NoFireWake

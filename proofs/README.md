@@ -65,7 +65,7 @@ moment a waiter is dropped while a pass is granting it.
 
 | tool | what it checks here | how far a check goes |
 |------|---------------------|----------------------|
-| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task and the park handshake the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
+| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake and the remote timer the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
 | Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, and the timer wheel's arithmetic (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
 The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
@@ -279,6 +279,24 @@ look that finds the work, a notification that lands while the shard is awake). T
 sequentially consistent, so the model checks the protocol; the loom models in
 `src/rt/handshake.rs` check the code, with two calibrations that must lose a wake (no look
 after publishing; the pair relaxed with no fence).
+
+## A timer for a thread that runs no shard
+
+`timer` (`tla/timer/Timer.tla`) checks how a sleep polled on another runtime's thread is fired
+by a nuclei shard (`src/time/sleep.rs`). The sleep cannot touch the shard's wheel, so it posts
+an arm request into the shard's mailbox and waits on a small shared cell (a fired flag and a
+waker slot). The shard applies its mailbox in order, arms the timer, and when the deadline
+passes sets the flag, wakes the waker and removes the entry. Dropping the sleep marks the cell
+cancelled, takes the waker out and posts a cancel; the shard removes the entry if it has it. The
+family checks 10 configurations: 4 that must pass (awaited and dropped, each with every safety
+property and with liveness), 3 mutations (a fire that leaves its entry in the wheel and a
+cancel that does not remove it break `NothingLeft`; a drop that leaves its waker in the cell
+breaks `NoWakeAfterDrop`), and 3 witnesses (a drop after the timer was armed, a drop before
+the shard applied the arm request, a fire that wakes the task). A dropped sleep's deadline may
+never come within a run, so a cancel that did not remove its entry shows as a leak, as it would
+be for a far deadline. The waker slot's register-then-look-again handshake guards a waker that
+changed between polls; one task cannot show that, and it is checked by the loom models of the
+sync module's waker cell.
 
 ## The timer wheel
 

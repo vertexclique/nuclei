@@ -498,6 +498,20 @@ fn random_below(n: usize) -> usize {
     })
 }
 
+/// A shard to fire a timer for a thread that runs none: one of the current
+/// (or default) runtime's workers, the less loaded of two; with no workers,
+/// the calling thread's own shard.
+pub(crate) fn timer_shard() -> Arc<Shared> {
+    let inner = current();
+    if inner.shards.is_empty() {
+        return match context::own_shard() {
+            Ok(shard) => Arc::clone(&shard.shared),
+            Err(err) => panic!("this thread's shard could not start: {err}"),
+        };
+    }
+    Arc::clone(place(&inner))
+}
+
 /// Spawns `future` on `inner`.
 fn spawn_with<F>(inner: &Arc<Inner>, future: F) -> Task<F::Output>
 where

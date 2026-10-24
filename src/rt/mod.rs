@@ -2,7 +2,7 @@
 //! own the shards.
 
 mod blocking;
-mod context;
+pub(crate) mod context;
 mod handshake;
 #[cfg(not(target_os = "windows"))]
 pub(crate) mod park;

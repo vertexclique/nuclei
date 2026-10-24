@@ -16,12 +16,12 @@
 //!   handle resumes it; a detached task's panic is dropped (the panic hook
 //!   has already reported it).
 //! - Dropping the handle cancels the task: its future is dropped by the next
-//!   run, or right away by the runnable's drop. [`Task::detach`](join::Task::detach) lets it run
-//!   to the end instead, and [`Task::cancel`](join::Task::cancel) cancels and returns the output
+//!   run, or right away by the runnable's drop. [`Task::detach`] lets it run
+//!   to the end instead, and [`Task::cancel`] cancels and returns the output
 //!   if the task had completed.
 //! - Dropping a runnable without running it cancels the task and drops its
 //!   future there; awaiting the handle then panics, and a
-//!   [`FallibleTask`](join::FallibleTask) returns `None`.
+//!   [`FallibleTask`] returns `None`.
 //!
 //! Two fixes the established crate has not released are part of this one:
 //! the poll's waker is the task's canonical waker (`will_wake` holds between

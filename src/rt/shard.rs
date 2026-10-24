@@ -45,6 +45,7 @@ use super::park::{Notifier, Poller};
 use super::task::{Runnable, ScheduleInfo};
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering};
+use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
 
 /// Runs of the LIFO slot in a row before its task goes to the back.
@@ -131,6 +132,9 @@ pub(crate) struct Shared {
     stopped: AtomicBool,
     /// The waker of the worker's loop, woken by `stop`.
     stop_waker: AtomicWaker,
+    /// Work on the timer wheel from other threads, applied by the shard
+    /// before it fires timers.
+    timer_ops: SegQueue<TimerOp>,
 }
 
 impl Shared {
@@ -151,6 +155,16 @@ impl Shared {
     /// visible with a sequentially consistent write).
     pub(crate) fn unpark(&self) {
         self.park.wake(|| self.notifier.notify());
+    }
+
+    /// Hands work on the timer wheel to the shard. An arm request wakes the
+    /// shard, which may sleep past the new deadline otherwise.
+    pub(crate) fn post_timer(&self, op: TimerOp) {
+        let wake = op.needs_wake();
+        self.timer_ops.push(op);
+        if wake {
+            self.unpark();
+        }
     }
 
     /// Whether the shard stopped.
@@ -181,7 +195,7 @@ impl Shared {
     }
 
     fn has_remote_work(&self) -> bool {
-        !self.inbox.is_empty() || !self.local_inbox.is_empty()
+        !self.inbox.is_empty() || !self.local_inbox.is_empty() || !self.timer_ops.is_empty()
     }
 }
 
@@ -238,6 +252,7 @@ impl Shard {
             load: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
+            timer_ops: SegQueue::new(),
         });
         Ok(Self {
             shared,
@@ -294,11 +309,18 @@ impl Shard {
         &self.wheel
     }
 
-    /// The wheel's time for `at`, rounded up: a deadline computed from it is
-    /// never early.
+    /// The wheel's time for the deadline `at`, rounded up to its
+    /// millisecond: a timer never fires before its deadline.
     pub(crate) fn wheel_time(&self, at: Instant) -> u64 {
         let since = at.saturating_duration_since(self.epoch);
         u64::try_from(since.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+    }
+
+    /// The wheel's time now, rounded down: the wheel never runs ahead of the
+    /// clock.
+    fn wheel_now(&self) -> u64 {
+        let since = Instant::now().saturating_duration_since(self.epoch);
+        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
     }
 
     /// The next runnable, in the loop's order.
@@ -362,15 +384,23 @@ impl Shard {
     /// How long until the next timer, if any.
     fn next_timer(&self) -> Option<Duration> {
         let next = self.wheel.borrow().next_deadline()?;
-        let now = self.wheel_time(Instant::now());
-        Some(Duration::from_millis(next.saturating_sub(now)))
+        // From the clock's own nanoseconds, so the wait ends at the
+        // deadline's millisecond and not one early.
+        let at = self.epoch + Duration::from_millis(next);
+        Some(at.saturating_duration_since(Instant::now()))
     }
 
     fn fire_timers(&self) {
+        if !self.shared.timer_ops.is_empty() {
+            let mut wheel = self.wheel.borrow_mut();
+            while let Ok(op) = self.shared.timer_ops.try_pop() {
+                op.apply(self, &mut wheel);
+            }
+        }
         if self.wheel.borrow().armed() == 0 {
             return;
         }
-        let now = self.wheel_time(Instant::now());
+        let now = self.wheel_now();
         // The buffer is taken out, so the wheel and the buffer are let go
         // while the wakers run (a wake may arm a timer again).
         let mut fired = self.fired.take();

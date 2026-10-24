@@ -51,7 +51,8 @@ mod submission_handler;
 pub mod sync;
 #[cfg(not(loom))]
 mod sys;
-mod time;
+/// Time: sleeping, timeouts and intervals on the shard's timer wheel.
+pub mod time;
 #[cfg(not(loom))]
 mod utils;
 #[cfg(not(loom))]
@@ -107,6 +108,7 @@ pub use async_global_executor::*;
 #[cfg(not(loom))]
 pub use proactor::*;
 pub use runtime::{Builder, Runtime, RuntimeHandle};
+pub use time::{sleep, timeout};
 
 #[cfg(all(not(loom), feature = "attributes"))]
 pub use nuclei_attributes::*;
