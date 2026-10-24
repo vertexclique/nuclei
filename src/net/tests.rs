@@ -480,3 +480,87 @@ fn stream_impls_are_on_the_handle_and_its_reference(h: &Handle<TcpStream>, u: &H
     io(h);
     io(u);
 }
+
+/// Writes until a write goes behind (the socket is full); returns every
+/// byte written, in order.
+async fn fill_behind(h: &Handle<UnixStream>) -> Vec<u8> {
+    let mut sent = Vec::new();
+    let mut seq = 0usize;
+    while !h.source.has_unsent() {
+        let chunk: Vec<u8> = (0..16 * 1024)
+            .map(|i| ((seq * 16 * 1024 + i) % 251) as u8)
+            .collect();
+        seq += 1;
+        let n = within(h.send(&chunk)).await.unwrap();
+        sent.extend_from_slice(&chunk[..n]);
+    }
+    sent
+}
+
+fn read_to_end_blocking(mut peer: UnixStream) -> Vec<u8> {
+    peer.set_nonblocking(false).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    peer.read_to_end(&mut got).unwrap();
+    got
+}
+
+#[test]
+fn a_handle_dropped_with_bytes_behind_still_delivers_them_then_closes() {
+    let rt = runtime();
+    let (mine, peer) = UnixStream::pair().unwrap();
+    let sent = rt.block_on(async {
+        let handle = Handle::new(mine).unwrap();
+        let sent = fill_behind(&handle).await;
+        drop(handle);
+        sent
+    });
+    let got = std::thread::spawn(move || read_to_end_blocking(peer))
+        .join()
+        .unwrap();
+    assert_eq!(got.len(), sent.len(), "bytes accepted were lost");
+    assert!(got == sent, "the bytes arrived changed or out of order");
+}
+
+#[test]
+fn into_inner_hands_the_object_back_after_the_bytes_behind() {
+    let rt = runtime();
+    let (mine, peer) = UnixStream::pair().unwrap();
+    let (sent, reader) = rt.block_on(async {
+        let handle = Handle::new(mine).unwrap();
+        let mut sent = fill_behind(&handle).await;
+        // The socket is full: a reader starts draining it.
+        let reader = std::thread::spawn(move || read_to_end_blocking(peer));
+        let mut stream = handle.into_inner();
+        // Written with std after the handle's bytes: it must come after them.
+        stream.set_nonblocking(false).unwrap();
+        stream.write_all(b"after").unwrap();
+        sent.extend_from_slice(b"after");
+        (sent, reader)
+    });
+    let got = reader.join().unwrap();
+    assert!(got == sent, "{} bytes sent, {} got", sent.len(), got.len());
+}
+
+#[test]
+fn get_mut_hands_the_object_out_after_the_bytes_behind() {
+    let rt = runtime();
+    let (mine, peer) = UnixStream::pair().unwrap();
+    let (sent, reader) = rt.block_on(async {
+        let mut handle = Handle::new(mine).unwrap();
+        let mut sent = fill_behind(&handle).await;
+        let reader = std::thread::spawn(move || read_to_end_blocking(peer));
+        // Written with std after the handle's bytes: it must come after them.
+        let direct = handle.get_mut();
+        direct.set_nonblocking(false).unwrap();
+        direct.write_all(b"direct").unwrap();
+        direct.set_nonblocking(true).unwrap();
+        sent.extend_from_slice(b"direct");
+        within(handle.send(b"!")).await.unwrap();
+        sent.extend_from_slice(b"!");
+        (sent, reader)
+    });
+    let got = reader.join().unwrap();
+    assert!(got == sent, "{} bytes sent, {} got", sent.len(), got.len());
+}

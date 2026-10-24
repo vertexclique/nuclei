@@ -15,13 +15,28 @@
 //! its registration goes, so a later event for it, or a reuse of the number
 //! by another file, reaches nothing. The next operation registers the
 //! object again, whatever it is by then.
+//!
+//! # Bytes written behind
+//!
+//! A write the socket could not take at once is accepted into the handle's
+//! write-behind, as the kernel accepts bytes into a socket's buffer. Those
+//! bytes go out whatever happens to the handle, as std's do: `get_mut` and
+//! `into_inner` wait until the kernel took them, and a handle dropped before
+//! that leaves them to a copy of its descriptor, which delivers them (for
+//! at most [`LINGER`]) and then closes.
+
+/// How long a dropped handle's unsent bytes may take to reach the kernel.
+// vertexia: one constant for every handle; a builder setting if a peer that
+// never reads must be given up on sooner or later.
+pub(crate) const LINGER: Duration = Duration::from_secs(60);
 
 use core::fmt;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::source::{Kind, Source};
 use super::sys;
@@ -91,18 +106,21 @@ impl<T> Handle<T> {
         &self.io
     }
 
-    /// The IO object, to change. Its pending IO stops first; the handle's
-    /// next operation takes the object as it is then (another descriptor
+    /// The IO object, to change. Bytes written behind reach the kernel
+    /// first (this waits for them), then the handle's IO stops; its next
+    /// operation takes the object as it is then (another descriptor
     /// discards what the old one left).
     pub fn get_mut(&mut self) -> &mut T {
+        self.deliver_unsent();
         self.source.retire();
         &mut self.io
     }
 
-    /// The IO object, back from the handle. Bytes the handle read ahead and
-    /// had not handed out are dropped with it; written bytes it still held
-    /// are not written.
+    /// The IO object, back from the handle, once the bytes written behind
+    /// reached the kernel (this waits for them). Bytes the handle read ahead
+    /// and had not handed out are dropped with it.
     pub fn into_inner(self) -> T {
+        self.deliver_unsent();
         let mut this = ManuallyDrop::new(self);
         this.source.retire();
         // SAFETY: `this` is never used or dropped again; each field is
@@ -114,13 +132,49 @@ impl<T> Handle<T> {
     }
 }
 
+impl<T> Handle<T> {
+    /// Waits until the kernel took what the write-behind holds (or
+    /// [`LINGER`] passed): on a shard, its other tasks run meanwhile.
+    fn deliver_unsent(&self) {
+        if !self.source.has_unsent() {
+            return;
+        }
+        let source = &self.source;
+        let _ = crate::sync::internal::blocking(crate::time::timeout(
+            LINGER,
+            core::future::poll_fn(|cx| source.poll_drain(cx)),
+        ));
+    }
+}
+
 impl<T> Drop for Handle<T> {
     fn drop(&mut self) {
-        // The registration goes before the descriptor closes.
-        self.source.retire();
+        match self
+            .source
+            .has_unsent()
+            .then(|| self.source.duplicate())
+            .flatten()
+        {
+            // The unsent bytes go out through a copy of the descriptor,
+            // which a task keeps and closes once they are out.
+            Some(copy) => {
+                self.source.move_to(copy.as_raw_fd());
+                crate::runtime::spawn(linger(Arc::clone(&self.source), copy)).detach();
+            }
+            // The registration goes before the descriptor closes.
+            None => self.source.retire(),
+        }
         // SAFETY: dropped once, here.
         unsafe { ManuallyDrop::drop(&mut self.io) };
     }
+}
+
+/// Delivers what a dropped handle's write-behind holds through `copy`, then
+/// closes it.
+async fn linger(source: Arc<Source>, copy: OwnedFd) {
+    let _ = crate::time::timeout(LINGER, core::future::poll_fn(|cx| source.poll_drain(cx))).await;
+    source.retire();
+    drop(copy);
 }
 
 impl<T> Deref for Handle<T> {

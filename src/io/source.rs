@@ -371,6 +371,36 @@ impl Source {
         after.run();
     }
 
+    /// A copy of the descriptor (the same open socket under another
+    /// number), close-on-exec; `None` if the process has none to spare.
+    pub(crate) fn duplicate(&self) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let fd = self.fd().ok()?;
+        // SAFETY: a plain fcntl on the handle's own open descriptor.
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        // SAFETY: a new descriptor nobody else owns.
+        (copy >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) })
+    }
+
+    /// The source goes on with `fd`, a copy of its descriptor the caller
+    /// keeps open, as the handle's own closes: the registration under the
+    /// old number goes first (while that number is still the handle's),
+    /// reads stop, and what the write side holds is delivered through the
+    /// copy.
+    pub(crate) fn move_to(&self, fd: RawFd) {
+        let mut read = self.read.hold();
+        let mut write = self.write.hold();
+        self.detach();
+        self.fd.store(fd, Ordering::Release);
+        let mut after = After::default();
+        read.get().discard(&mut after);
+        read.get().forget_waiters(&mut after);
+        write.get().forget_waiters(&mut after);
+        // Edges flagged meanwhile are of the registration just removed.
+        drop((write, read));
+        after.run();
+    }
+
     /// Gives a retired source its descriptor again (the handle's IO object,
     /// possibly another one): the next wait registers it again. Another
     /// descriptor than before discards what the old one left.

@@ -286,6 +286,21 @@ impl WriteState {
         }
     }
 
+    /// Bytes or a datagram accepted and not handed to the kernel yet, that
+    /// the driver can still deliver.
+    fn has_unsent(&self) -> bool {
+        self.failed.is_none() && (self.behind.is_some() || self.queued.is_some())
+    }
+
+    fn drain(&mut self, waker: &Waker) -> Poll<()> {
+        if self.has_unsent() {
+            self.waiters.register(waker);
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
     fn connect(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
         if let Some(result) = self.connected.take() {
             return Poll::Ready(result);
@@ -412,6 +427,32 @@ impl Source {
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)
+    }
+
+    /// Whether the write side holds bytes or a datagram the kernel has not
+    /// taken yet.
+    pub(crate) fn has_unsent(&self) -> bool {
+        self.write.hold().get().has_unsent()
+    }
+
+    /// Completes once the kernel took every byte and datagram accepted (or
+    /// a failure ended them).
+    pub(crate) fn poll_drain(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let fd = match self.fd() {
+            Ok(fd) => fd,
+            Err(_) => return Poll::Ready(()),
+        };
+        let kind = self.kind;
+        let mut after = After::default();
+        let poll = self.write.poll(
+            &mut after,
+            |st, _| st.drain(cx.waker()),
+            |st, after| st.serve(fd, kind, true, after),
+        );
+        match self.finish_poll(after, poll.map(Ok)) {
+            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     /// A non-blocking connect is in progress: the driver sees it end.
