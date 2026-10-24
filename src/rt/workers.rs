@@ -367,19 +367,23 @@ mod tests {
         let second = workers.shards().nth(1).map(Arc::clone).unwrap();
         let release = Arc::new(AtomicBool::new(false));
         // A task held on the second worker until released: tasks are
-        // spawned until one lands there, and only that one waits.
+        // spawned until one lands there, and only that one waits. Each comes
+        // from a new thread, whose first spawn picks a shard afresh (a
+        // thread's later spawns stay on its home shard).
         let held = (0..1000)
             .find_map(|_| {
                 let (r, s) = (Arc::clone(&release), Arc::clone(&second));
                 let (tell, landed) = std::sync::mpsc::channel();
-                let task = rt.spawn(async move {
+                let probe = async move {
                     let here = crate::rt::context::current(|c| c.is_some_and(|shard| shard.is(&s)));
                     let _ = tell.send(here);
                     while here && !r.load(Ordering::SeqCst) {
                         crate::time::sleep(Duration::from_millis(1)).await;
                     }
                     here
-                });
+                };
+                let task =
+                    std::thread::scope(|scope| scope.spawn(|| rt.spawn(probe)).join().unwrap());
                 let here = landed.recv_timeout(Duration::from_secs(10)).unwrap();
                 here.then_some(task)
             })
