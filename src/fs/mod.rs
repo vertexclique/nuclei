@@ -53,6 +53,20 @@ macro_rules! file_io {
                     Err(err) => Poll::Ready(Err(err)),
                 }
             }
+
+            fn poll_read_vectored(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &mut [io::IoSliceMut<'_>],
+            ) -> Poll<io::Result<usize>> {
+                if !self.is_regular() {
+                    return self.source().poll_read_vectored(cx, bufs);
+                }
+                match self.file() {
+                    Ok(file) => file.poll_read_vectored(cx, bufs),
+                    Err(err) => Poll::Ready(Err(err)),
+                }
+            }
         }
 
         impl AsyncWrite for $ty {
@@ -66,6 +80,20 @@ macro_rules! file_io {
                 }
                 match self.file() {
                     Ok(file) => file.poll_write(cx, buf),
+                    Err(err) => Poll::Ready(Err(err)),
+                }
+            }
+
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                if !self.is_regular() {
+                    return self.source().poll_write_vectored(cx, bufs);
+                }
+                match self.file() {
+                    Ok(file) => file.poll_write_vectored(cx, bufs),
                     Err(err) => Poll::Ready(Err(err)),
                 }
             }

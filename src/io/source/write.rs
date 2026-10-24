@@ -81,6 +81,15 @@ fn write_bytes(fd: RawFd, kind: Kind, bytes: &[u8]) -> io::Result<usize> {
     }
 }
 
+/// Writes the bytes of `bufs`, gathered, to a stream.
+fn write_gathered(fd: RawFd, kind: Kind, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    match (bufs, kind) {
+        ([one], _) => write_bytes(fd, kind, one),
+        (_, Kind::Bytes | Kind::File) => sys::write_vectored(fd, bufs),
+        _ => sys::send_vectored(fd, bufs),
+    }
+}
+
 /// Sends a datagram.
 fn send_datagram(fd: RawFd, bytes: &[u8], dest: Dest<'_>) -> io::Result<usize> {
     match dest {
@@ -183,11 +192,13 @@ impl WriteState {
         }
     }
 
+    /// A write of the bytes of `bufs`, in order (one slice for a plain
+    /// write).
     fn write(
         &mut self,
         fd: RawFd,
         kind: Kind,
-        bytes: &[u8],
+        bufs: &[io::IoSlice<'_>],
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -197,11 +208,12 @@ impl WriteState {
         if let Some(err) = self.error.take() {
             return Poll::Ready(Err(err));
         }
-        if bytes.is_empty() {
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        if len == 0 {
             return Poll::Ready(Ok(0));
         }
         if let Some(behind) = self.behind.as_mut() {
-            let n = behind.append(bytes);
+            let n = behind.append_vectored(bufs);
             if n > 0 {
                 return Poll::Ready(Ok(n));
             }
@@ -209,14 +221,14 @@ impl WriteState {
             return Poll::Pending;
         }
         if !self.blocked {
-            match sys::ready(write_bytes(fd, kind, bytes)) {
+            match sys::ready(write_gathered(fd, kind, bufs)) {
                 Some(result) => return Poll::Ready(result),
                 None => self.blocked = true,
             }
         }
-        match self.buffer(bytes.len().max(BEHIND_MIN), false, after) {
+        match self.buffer(len.max(BEHIND_MIN), false, after) {
             Some(mut behind) => {
-                let n = behind.fill_from(bytes);
+                let n = behind.append_vectored(bufs);
                 self.behind = Some(behind);
                 after.register = true;
                 Poll::Ready(Ok(n))
@@ -367,6 +379,16 @@ impl Source {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        self.poll_write_vectored(cx, &[io::IoSlice::new(bytes)])
+    }
+
+    /// Writes the bytes of `bufs`, gathered in order, as
+    /// [`poll_write`](Self::poll_write) writes one slice.
+    pub(crate) fn poll_write_vectored(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
         let fd = match self.fd() {
             Ok(fd) => fd,
             Err(err) => return Poll::Ready(Err(err)),
@@ -375,7 +397,7 @@ impl Source {
         let mut after = After::default();
         let poll = self.write.poll(
             &mut after,
-            |st, after| st.write(fd, kind, bytes, cx.waker(), after),
+            |st, after| st.write(fd, kind, bufs, cx.waker(), after),
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)

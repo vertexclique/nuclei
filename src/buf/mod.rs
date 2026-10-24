@@ -168,6 +168,7 @@ impl Pool {
     }
 
     /// Bytes the pool holds, in use and free.
+    #[cfg(test)]
     pub(crate) fn charged(&self) -> usize {
         self.charged.get()
     }
@@ -474,6 +475,33 @@ impl PoolBuf {
     pub(crate) fn read_into(&mut self, out: &mut [u8]) -> usize {
         let n = self.peek_into(out);
         self.consume(n);
+        n
+    }
+
+    /// Copies filled bytes into `bufs`, in order, and consumes them;
+    /// returns how many.
+    pub(crate) fn read_into_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> usize {
+        let mut n = 0;
+        for buf in bufs.iter_mut() {
+            if self.is_empty() {
+                break;
+            }
+            n += self.read_into(buf);
+        }
+        n
+    }
+
+    /// Adds the bytes of `bufs` after the filled ones, in order, as many as
+    /// fit; returns how many.
+    pub(crate) fn append_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> usize {
+        let mut n = 0;
+        for buf in bufs {
+            let taken = self.append(buf);
+            n += taken;
+            if taken < buf.len() {
+                break;
+            }
+        }
         n
     }
 

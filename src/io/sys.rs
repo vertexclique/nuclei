@@ -607,3 +607,48 @@ pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: a new descriptor nobody else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(copy) })
 }
+
+/// The most `iovec`s one call takes; the rest wait for the next call, as a
+/// short read or write leaves them.
+const IOV_MAX: usize = 1024;
+
+/// `bufs` as `iovec`s, at most [`IOV_MAX`].
+fn iovecs<'a>(bufs: &'a [io::IoSlice<'_>]) -> &'a [libc::iovec] {
+    // SAFETY: `IoSlice` is documented to be ABI-compatible with `iovec` on
+    // Unix; the slice is a prefix of `bufs`.
+    unsafe { core::slice::from_raw_parts(bufs.as_ptr().cast(), bufs.len().min(IOV_MAX)) }
+}
+
+/// `bufs` as `iovec`s, at most [`IOV_MAX`].
+fn iovecs_mut<'a>(bufs: &'a mut [io::IoSliceMut<'_>]) -> &'a [libc::iovec] {
+    // SAFETY: `IoSliceMut` is documented to be ABI-compatible with `iovec`
+    // on Unix; the slice is a prefix of `bufs`, lent for the call.
+    unsafe { core::slice::from_raw_parts(bufs.as_ptr().cast(), bufs.len().min(IOV_MAX)) }
+}
+
+/// `readv(2)`.
+pub(crate) fn read_vectored(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+    let iov = iovecs_mut(bufs);
+    // SAFETY: the kernel writes at most each iovec's length into its buffer,
+    // which `bufs` lends mutably for the call.
+    retry(|| cvt(unsafe { libc::readv(fd, iov.as_ptr(), iov.len() as libc::c_int) }))
+}
+
+/// `writev(2)`.
+pub(crate) fn write_vectored(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    let iov = iovecs(bufs);
+    // SAFETY: the kernel reads at most each iovec's length from its buffer.
+    retry(|| cvt(unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as libc::c_int) }))
+}
+
+/// `sendmsg(2)` of `bufs` with no address: a stream socket's gathered send,
+/// never raising `SIGPIPE` (as [`send`]).
+pub(crate) fn send_vectored(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    let iov = iovecs(bufs);
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    msg.msg_iov = iov.as_ptr().cast_mut();
+    msg.msg_iovlen = iov.len() as _;
+    // SAFETY: the kernel reads at most each iovec's length from its buffer.
+    retry(|| cvt(unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) }))
+}

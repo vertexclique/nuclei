@@ -196,6 +196,40 @@ impl ReadState {
         Poll::Pending
     }
 
+    /// A stream read scattered into `bufs`.
+    fn read_vectored(
+        &mut self,
+        fd: RawFd,
+        bufs: &mut [io::IoSliceMut<'_>],
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        if let Some(ahead) = self.ahead.as_mut() {
+            let n = ahead.read_into_vectored(bufs);
+            if ahead.is_empty()
+                && let Some(done) = self.ahead.take()
+            {
+                after.drop_buf(done);
+            }
+            return Poll::Ready(Ok(n));
+        }
+        if self.eof {
+            self.eof = false;
+            return Poll::Ready(Ok(0));
+        }
+        if let Some(err) = self.error.take() {
+            return Poll::Ready(Err(err));
+        }
+        if !self.blocked {
+            match sys::ready(sys::read_vectored(fd, bufs)) {
+                Some(result) => return Poll::Ready(result),
+                None => self.blocked = true,
+            }
+        }
+        self.wait(waker, bufs.iter().map(|b| b.len()).sum());
+        Poll::Pending
+    }
+
     fn accept(
         &mut self,
         fd: RawFd,
@@ -326,6 +360,29 @@ impl Source {
         let poll = self.read.poll(
             &mut after,
             |st, after| st.read(fd, out, peek, cx.waker(), after),
+            |st, after| st.serve(fd, kind, true, after),
+        );
+        self.finish_poll(after, poll)
+    }
+
+    /// Reads from a stream, scattered into `bufs` in order.
+    pub(crate) fn poll_read_vectored(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if bufs.iter().all(|b| b.is_empty()) {
+            return Poll::Ready(Ok(0));
+        }
+        let fd = match self.fd() {
+            Ok(fd) => fd,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
+        let kind = self.kind;
+        let mut after = After::default();
+        let poll = self.read.poll(
+            &mut after,
+            |st, after| st.read_vectored(fd, bufs, cx.waker(), after),
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)

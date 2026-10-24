@@ -564,3 +564,44 @@ fn get_mut_hands_the_object_out_after_the_bytes_behind() {
     let got = reader.join().unwrap();
     assert!(got == sent, "{} bytes sent, {} got", sent.len(), got.len());
 }
+
+#[test]
+fn vectored_reads_and_writes_scatter_and_gather_in_order() {
+    use std::io::{IoSlice, IoSliceMut};
+    let rt = runtime();
+    rt.block_on(async {
+        let (a, b) = Handle::<UnixStream>::pair().unwrap();
+        let (mut a, mut b) = (&a, &b);
+        // At once: the socket takes the gathered bytes.
+        let n = within(poll_fn(|cx| {
+            Pin::new(&mut a).poll_write_vectored(cx, &[IoSlice::new(b"one"), IoSlice::new(b"two")])
+        }))
+        .await
+        .unwrap();
+        assert_eq!(n, 6);
+        let (mut x, mut y) = ([0u8; 2], [0u8; 8]);
+        let n = within(poll_fn(|cx| {
+            let mut bufs = [IoSliceMut::new(&mut x), IoSliceMut::new(&mut y)];
+            Pin::new(&mut b).poll_read_vectored(cx, &mut bufs)
+        }))
+        .await
+        .unwrap();
+        assert_eq!(n, 6);
+        assert_eq!((&x, &y[..4]), (b"on", &b"etwo"[..]));
+        // A scattered read that waits, completed by the driver.
+        let writer = async {
+            crate::time::sleep(Duration::from_millis(5)).await;
+            write_all(&mut a, b"late bytes").await.unwrap();
+        };
+        let (mut p, mut q) = ([0u8; 4], [0u8; 16]);
+        let reader = poll_fn(|cx| {
+            let mut bufs = [IoSliceMut::new(&mut p), IoSliceMut::new(&mut q)];
+            Pin::new(&mut b).poll_read_vectored(cx, &mut bufs)
+        });
+        let (n, ()) = within(join(reader, writer)).await;
+        let n = n.unwrap();
+        let mut got = p[..n.min(4)].to_vec();
+        got.extend_from_slice(&q[..n.saturating_sub(4)]);
+        assert_eq!(got, b"late bytes"[..n]);
+    });
+}

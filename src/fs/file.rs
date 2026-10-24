@@ -194,12 +194,45 @@ impl FileIo {
         after.run();
     }
 
+    /// A read scattered into `bufs`, in order.
+    pub(crate) fn poll_read_vectored(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let want: usize = bufs.iter().map(|b| b.len()).sum();
+        if want == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        self.with_state(cx, |st, io, waker, after| {
+            match st.fill(io, want, waker, after) {
+                Poll::Ready(Ok(true)) => {}
+                other => return other.map_ok(|_| 0),
+            }
+            let n = st
+                .ahead
+                .as_mut()
+                .map_or(0, |ahead| ahead.read_into_vectored(bufs));
+            st.consumed(n, after);
+            Poll::Ready(Ok(n))
+        })
+    }
+
     pub(crate) fn poll_write(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.with_state(cx, |st, io, waker, after| st.write(io, bytes, waker, after))
+        self.poll_write_vectored(cx, &[io::IoSlice::new(bytes)])
+    }
+
+    /// A write of the bytes of `bufs`, gathered in order.
+    pub(crate) fn poll_write_vectored(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.with_state(cx, |st, io, waker, after| st.write(io, bufs, waker, after))
     }
 
     pub(crate) fn poll_flush(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -349,7 +382,7 @@ impl FileState {
     fn write(
         &mut self,
         io: &FileIo,
-        bytes: &[u8],
+        bufs: &[io::IoSlice<'_>],
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -357,29 +390,30 @@ impl FileState {
         if let Some(failure) = self.failed {
             return Poll::Ready(Err(failure.error()));
         }
-        if bytes.is_empty() {
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        if len == 0 {
             return Poll::Ready(Ok(0));
         }
         self.invalidate(after);
         let n = if self.writing.is_none() {
             // Nothing in flight: these bytes go now.
-            let Some(mut buf) = buffer(bytes.len().max(WRITE_MIN), after) else {
+            let Some(mut buf) = buffer(len.max(WRITE_MIN), after) else {
                 return Poll::Pending;
             };
-            let n = buf.fill_from(bytes);
+            let n = buf.append_vectored(bufs);
             self.writing = Some(io.submit_write(buf, self.cursor));
             n
         } else if let Some(behind) = self.behind.as_mut() {
-            match behind.append(bytes) {
+            match behind.append_vectored(bufs) {
                 // Both buffers full: the write waits for the one in flight.
                 0 => return Poll::Pending,
                 n => n,
             }
         } else {
-            let Some(mut buf) = buffer(bytes.len().max(WRITE_MIN), after) else {
+            let Some(mut buf) = buffer(len.max(WRITE_MIN), after) else {
                 return Poll::Pending;
             };
-            let n = buf.fill_from(bytes);
+            let n = buf.append_vectored(bufs);
             self.behind = Some(buf);
             self.behind_at = self.cursor;
             n

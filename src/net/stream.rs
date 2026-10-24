@@ -21,6 +21,14 @@ macro_rules! stream_io {
             ) -> Poll<io::Result<usize>> {
                 self.source().poll_read(cx, buf, false)
             }
+
+            fn poll_read_vectored(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &mut [io::IoSliceMut<'_>],
+            ) -> Poll<io::Result<usize>> {
+                self.source().poll_read_vectored(cx, bufs)
+            }
         }
 
         impl AsyncWrite for &Handle<$ty> {
@@ -30,6 +38,14 @@ macro_rules! stream_io {
                 buf: &[u8],
             ) -> Poll<io::Result<usize>> {
                 self.source().poll_write(cx, buf)
+            }
+
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                self.source().poll_write_vectored(cx, bufs)
             }
 
             fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -49,6 +65,14 @@ macro_rules! stream_io {
             ) -> Poll<io::Result<usize>> {
                 self.source().poll_read(cx, buf, false)
             }
+
+            fn poll_read_vectored(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &mut [io::IoSliceMut<'_>],
+            ) -> Poll<io::Result<usize>> {
+                self.source().poll_read_vectored(cx, bufs)
+            }
         }
 
         impl AsyncWrite for Handle<$ty> {
@@ -58,6 +82,14 @@ macro_rules! stream_io {
                 buf: &[u8],
             ) -> Poll<io::Result<usize>> {
                 self.source().poll_write(cx, buf)
+            }
+
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                self.source().poll_write_vectored(cx, bufs)
             }
 
             fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
