@@ -111,7 +111,11 @@ programs the configurations run. One labelled step of the algorithm is one atomi
 code (a compare-and-swap, a fetch-and-add, a load), named after the Rust function it stands
 for, with two exceptions the spec's header explains: the pass's look past withdrawn waiters at
 the head of the line is one step, and so is the receiver's look at the queue and the sender
-count. Every line carries a comment.
+count. The message queue is a sequence of cells in the order sends claimed them: a send claims
+its cell in one step and writes its value in a later one, as in kovan's segment queue, so the
+receiver can find the oldest cell claimed and not written yet. It then takes nothing, does not
+read the sender count, and waits for that send's wake, which comes after the write. Every
+line carries a comment.
 
 The properties:
 
@@ -127,7 +131,7 @@ The properties:
 | `Termination` (under weak fairness of every thread) | every thread finishes: no waiter whose request can be served sleeps forever, so no wakeup is lost; checked with the waiter's park and the grant's wake modelled step by step |
 | deadlock freedom (TLC's own check, on every configuration that must pass) | no state where some thread is stuck while every other one is done |
 
-The 42 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
+The 45 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
 `.cfg` file says in its first lines what it checks):
 
 - **14 that must pass.** Ten check every safety property and deadlock freedom: three sends on
@@ -137,7 +141,7 @@ The 42 configurations, listed with their expected result in `tla/mpsc/EXPECTED.t
   the middle, with and without a dropped request; the receiver dropped while sends wait. Four
   check `Termination` under weak fairness: plain sends, a dropped send, a request for both
   slots, and a close.
-- **16 mutations that must fail.** Each takes one rule out of the algorithm and must break the
+- **18 mutations that must fail.** Each takes one rule out of the algorithm and must break the
   property that rule protects: `try_ignores_queue` and `skip_unfit_front` (an attempt, or a
   pass, that serves a later request first) break `FifoFair`; `drop_pass_on` (a leaving
   waiter's share is dropped) breaks `Conservation`; `park_no_look`, `grant_no_wake`,
@@ -147,16 +151,21 @@ The 42 configurations, listed with their expected result in `tla/mpsc/EXPECTED.t
   waiter, so the channel can never go idle) breaks `CloseReturnsShare`;
   `try_ignores_close` and `take_after_close` break
   `CloseSemantics`; `finish_early` breaks `EndMeansDrained`; `queue_lifo` breaks
-  `PerSenderOrder`; `double_delivery` breaks `ExactlyOnce`.
-- **12 witnesses that must fail.** Each claims an interesting case never happens, and must be
+  `PerSenderOrder`, and so does `skip_busy` (the receiver passes over a cell still being
+  written and takes a written one behind it, as the queue of kovan before 0.2 did: a sender's
+  second value comes out first); `wake_before_write` (a send wakes the receiver before it
+  writes, so a receiver that looked in between sleeps through the value) ends in a deadlock;
+  `double_delivery` breaks `ExactlyOnce`.
+- **13 witnesses that must fail.** Each claims an interesting case never happens, and must be
   proved wrong, which shows the search really reaches it: a share held between passes; a
   waiter that withdraws at the very moment a pass grants it; a grant that its future never
   looks at before the drop; the front waiter dropped while it holds a share; an attempt
   refused only because somebody waits; a sleeping waiter woken by a grant; a drain that passes
   again because something changed while it worked; the close giving a share back; a waiter
   failed by the close; a value sent after the close through a slot reserved before it; the
-  receiver ending a closed channel because it went idle; and a grant that lands between a
-  waiter's arrival and its park.
+  receiver ending a closed channel because it went idle; a grant that lands between a
+  waiter's arrival and its park; and the receiver parking while the oldest cell is still being
+  written.
 
 ## What the Lean proofs check
 

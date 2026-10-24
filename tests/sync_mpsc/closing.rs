@@ -512,10 +512,9 @@ fn clean_shutdown_loses_no_value_a_sender_was_promised() {
         received.push(value);
     }
     let sent = producer.join().unwrap();
-    received.sort_unstable();
     assert_eq!(
         received,
         (0..sent).collect::<Vec<_>>(),
-        "every value that got a slot was received, once"
+        "every value that got a slot was received, once and in order"
     );
 }

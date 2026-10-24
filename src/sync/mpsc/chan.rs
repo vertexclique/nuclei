@@ -27,7 +27,8 @@
 //!   idle limit that is closed) wakes the registered waker after it changed
 //!   the state. The waker cell is a handshake on one state word, so for any
 //!   pair of a registration and a wake one of them sees the other: see the
-//!   `atomic_waker` module.
+//!   `atomic_waker` module. A value still being written (the queue answers
+//!   `Busy`) is one of these: its push wakes the receiver once it returned.
 //! - **Single consumer.** Only the [`Receiver`](super::Receiver) halves call
 //!   the receive-side methods, each through `&mut self`, so there is one
 //!   registrant at a time.
@@ -43,7 +44,7 @@ use core::task::{Context, Poll};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use super::error::TryRecvError;
-use super::queue::Queue;
+use super::queue::{Queue, TryPopError};
 use crate::sync::Event;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicUsize, Ordering};
@@ -72,6 +73,9 @@ enum Pop<T> {
     Closed,
     /// Empty for now.
     Empty,
+    /// The next value is still being written: its sender wakes the receiver
+    /// once its push returned.
+    Busy,
 }
 
 /// The shared state of one channel.
@@ -218,17 +222,20 @@ impl<T: 'static, L: Limit> Chan<T, L> {
 
     /// Looks at the queue once.
     fn pop(&self) -> Pop<T> {
-        if let Some(value) = self.queue.pop() {
-            return Pop::Value(value);
+        match self.queue.try_pop() {
+            Ok(value) => return Pop::Value(value),
+            Err(TryPopError::Busy) => return Pop::Busy,
+            Err(TryPopError::Empty) => {}
         }
         // Count first, then look again: the count reads zero only after every
         // sender's pushes, so an empty queue behind a zero count is final.
         if self.tx_count.load(Ordering::Acquire) != 0 {
             return Pop::Empty;
         }
-        match self.queue.pop() {
-            Some(value) => Pop::Value(value),
-            None => Pop::Closed,
+        match self.queue.try_pop() {
+            Ok(value) => Pop::Value(value),
+            Err(TryPopError::Busy) => Pop::Busy,
+            Err(TryPopError::Empty) => Pop::Closed,
         }
     }
 
@@ -241,7 +248,7 @@ impl<T: 'static, L: Limit> Chan<T, L> {
                 Some(Some(value))
             }
             Pop::Closed => Some(None),
-            Pop::Empty => None,
+            Pop::Empty | Pop::Busy => None,
         }
     }
 
@@ -284,7 +291,7 @@ impl<T: 'static, L: Limit> Chan<T, L> {
                     taken += 1;
                 }
                 Pop::Closed => break true,
-                Pop::Empty => break false,
+                Pop::Empty | Pop::Busy => break false,
             }
         };
         if taken > 0 {
@@ -319,10 +326,9 @@ impl<T: 'static, L: Limit> Chan<T, L> {
 
     /// The receiver's non-waiting look.
     ///
-    /// It does not park for a send that is still in progress on another
+    /// It does not wait for a send that is still in progress on another
     /// thread: that value is not in the channel yet, and its sender wakes the
-    /// receiver when it is. (The queue's own spin, see the `queue` module, is
-    /// the one wait.)
+    /// receiver when it is.
     pub(super) fn try_recv(&self) -> Result<T, TryRecvError> {
         match self.pop() {
             Pop::Value(value) => {
@@ -331,7 +337,7 @@ impl<T: 'static, L: Limit> Chan<T, L> {
             }
             Pop::Closed => Err(TryRecvError::Disconnected),
             Pop::Empty if self.finished() => Err(TryRecvError::Disconnected),
-            Pop::Empty => Err(TryRecvError::Empty),
+            Pop::Empty | Pop::Busy => Err(TryRecvError::Empty),
         }
     }
 
@@ -344,8 +350,13 @@ impl<T: 'static, L: Limit> Chan<T, L> {
     /// Drops every queued value, giving each one's admission back. A value
     /// whose destructor panics is dropped after its admission came back, and
     /// the `Drain` guard of [`drop_rx`](Self::drop_rx) carries on with the rest.
+    ///
+    /// It stops at a value still being written, as a receive would: that
+    /// value, and any behind it, stay queued and are dropped with the channel
+    /// when its last handle goes. Nothing waits for their admissions, as the
+    /// channel admits nothing after the close.
     fn drain(&self) {
-        while let Some(value) = self.queue.pop() {
+        while let Ok(value) = self.queue.try_pop() {
             self.limit.release(1);
             drop(value);
         }

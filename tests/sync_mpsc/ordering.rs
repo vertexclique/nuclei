@@ -1,20 +1,16 @@
 //! The order of one sender's values.
 //!
 //! The guarantee of the established API is that what one sender sends comes out
-//! in the order it was sent. This channel does not keep it under load: the
-//! message queue (kovan's segment queue) lets the receiver take a slot past one
-//! that a sender has claimed but not finished writing, so when the receiver
-//! stalls at that moment, a sender's next value can be taken first. The test
-//! below stands for the correct behaviour. It fails on some runs today (it
-//! failed in one of three runs of three senders and nine million values on the
-//! machine it was written on, and the same queue used directly fails more
-//! often), which is why it is ignored; run it with `--ignored`. It must pass
-//! on every run before the ignore is lifted.
+//! in the order it was sent. The load test below is the case a queue that let
+//! the receiver take a cell past one still being written got wrong: a receiver
+//! polling without pause meets the cells senders have claimed and not written
+//! yet as often as it can, and a sender's next value must still never come out
+//! first. (Before the queue took cells in claim order, it failed on one run in
+//! three at this size.)
 
 use super::*;
 
 #[test]
-#[ignore = "known defect: the message queue can deliver a sender's later value before its earlier one under load (fails on some runs)"]
 fn each_senders_values_arrive_in_the_order_it_sent_them_under_load() {
     let per_sender = scale(3_000_000, 1_000);
     let senders = 3usize;

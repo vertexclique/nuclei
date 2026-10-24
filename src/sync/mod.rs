@@ -202,7 +202,7 @@ pub mod futures {
 pub use kovan::Atom;
 pub use kovan_map::HopscotchMap;
 pub use kovan_queue::array_queue::ArrayQueue;
-pub use kovan_queue::seg_queue::SegQueue;
+pub use kovan_queue::seg_queue::{SegQueue, TryPopError};
 
 #[cfg(all(test, not(loom)))]
 mod tests {

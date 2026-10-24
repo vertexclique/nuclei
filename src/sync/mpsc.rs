@@ -37,19 +37,13 @@
 //!
 //! # Ordering
 //!
-//! The established API promises that what one sender sends comes out in the
-//! order it was sent. **This channel does not yet keep that promise under
-//! load.** Its message queue is kovan's segmented queue, whose receive takes
-//! the oldest *published* slot and so can pass a slot that a sender has claimed
-//! but not finished writing. When the receiver stalls at that moment, the same
-//! sender's next value can be published and taken first. Used directly, the
-//! queue delivered a sender's values out of order about once in 10^5 values
-//! with two senders and a receiver polling it in a loop, and the channel did
-//! so on one run in three at three senders and nine million values. Values are
-//! never lost, repeated or dropped twice because of it, and values that are all
-//! queued before the receiver starts come out in order. The fix is a queue that
-//! takes slots in claim order; the rest of the channel does not depend on how
-//! the queue is built.
+//! What one sender sends comes out in the order it was sent, as the
+//! established API promises. The message queue is kovan's segment queue, a
+//! linearizable FIFO queue: a send claims the next cell, and the receiver
+//! takes cells in the order they were claimed, so a send that returned before
+//! another began comes out first. Values that different senders send at the
+//! same time come out in the order their sends claimed cells.
+//!
 //! # Disconnection
 //!
 //! When every sender is dropped, no value can be sent. That is the end of the
@@ -85,8 +79,6 @@
 //!   lock-free queue, whose segments are reclaimed after the channel is
 //!   gone, so it cannot hold borrowed data. The established API has no such
 //!   bound.
-//! - One sender's values can be delivered out of order under load, which the
-//!   established API does not allow: see [Ordering](#ordering).
 //! - `Sender::send_timeout` and its `SendTimeoutError` are not here: a wait
 //!   with a deadline needs a timer, which nuclei adds with its time module.
 //! - The `blocking_*` methods cannot tell that they were called from inside
@@ -100,28 +92,24 @@
 //! - [`Receiver::try_recv`] does not park the thread for a send that is in
 //!   progress on another thread. Such a value is not in the channel yet, and
 //!   its sender wakes the receiver when it is; the established API parks the
-//!   thread until the send finishes. The one place a receive does wait for a
-//!   sender is inside the queue (see [Progress](#progress)), where it spins
-//!   and yields the thread rather than parking it.
+//!   thread until the send finishes.
 //! - There is no cooperative-scheduling budget: a receiver that always finds a
 //!   value never yields.
 //!
 //! # Progress
 //!
-//! The message queue is kovan's segmented queue. A send claims a slot with a
-//! compare-and-swap, writes its value into the slot and publishes it. A send
-//! that loses a slot to another sender moves on to the next one, and
-//! allocates a segment when the last is full, so a send never waits for
-//! another thread, and some thread's send completes whenever any retries: the
-//! push is lock-free. A receive takes the oldest published slot of the head
-//! segment, and has one wait. If every other slot of the head segment is used
-//! up, one slot is claimed by a sender that has not finished writing it, and
-//! a newer segment exists, the receive spins and then yields the thread until
-//! that sender writes the slot. The window is a handful of instructions, so in
-//! practice the wait lasts nanoseconds, but a sender the scheduler stops
-//! inside it holds the receiver up until the scheduler runs it again. Other
-//! senders are never held up by it. The module [parent](super) notes the same
-//! about kovan's queues.
+//! The message queue is kovan's segment queue. A send claims the next cell
+//! with one fetch-add, writes its value into it and publishes it with a
+//! compare-and-swap. It retries only when another send linked the next
+//! segment first, so a send never waits for another thread, and some send
+//! completes whenever any retries: the push is lock-free. A receive takes the
+//! next cell with a compare-and-swap no other thread contends for, and never
+//! waits for a sender: when the next cell is claimed by a send that has not
+//! written it yet, the receive finds nothing for now, registers its waker and
+//! returns `Pending`, and that send wakes it once its value is in. So a sender
+//! the scheduler stops between its claim and its write holds back the values
+//! behind its own until it runs again, but no call waits for it, and other
+//! senders are never held up by it.
 //!
 //! - **Wait-free** (a bounded number of the caller's own atomic steps, whatever
 //!   other threads do): the accessors (`is_closed`, `len`, `is_empty`,
@@ -142,10 +130,10 @@
 //!   dropped), so a thread the scheduler stops while it serves the queue
 //!   delays that grant until it runs again, and a `try_send` fails meanwhile
 //!   even if the last waiting send has just left. No call waits for it.
-//! - **Lock-free except for the queue's one wait**: every receive (`recv`,
-//!   `recv_many`, `try_recv`, `poll_recv`, `poll_recv_many`) and the
-//!   receiver's drop, which pops every value left and so takes time
-//!   proportional to them.
+//! - **Lock-free**: every receive (`recv`, `recv_many`, `try_recv`,
+//!   `poll_recv`, `poll_recv_many`), none of which waits for a sender inside
+//!   the call, and the receiver's drop, which drops every value left and so
+//!   takes time proportional to them.
 //! - A [`Waker`](core::task::Waker) the channel calls is the executor's, and so
 //!   is what it does; the destructor of a value runs in the call that drops
 //!   it; and the `blocking_*` methods park the thread until their wait is over,

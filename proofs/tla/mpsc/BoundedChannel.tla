@@ -20,14 +20,21 @@
 (* parks, cancellation, permits, the receiver's recv, close and drop, and  *)
 (* the receiver's own register-then-look-again handshake.                  *)
 (*                                                                          *)
-(* What is abstract: the message queue is an in-order FIFO sequence (its   *)
-(* lock-free implementation is kovan's, checked there); the receiver's     *)
-(* waker cell is one flag that a wake empties (its handshake is checked by *)
-(* the loom models); a pass's look at the head of the waiting list, which  *)
-(* skips withdrawn waiters, is one step (a waiter never comes back from    *)
-(* withdrawn, so this is one of the orders the real loads can take); and   *)
-(* the receiver's look at the queue, the sender count and the queue again  *)
-(* (`Chan::pop`) is one step too, as the queue is abstract anyway.         *)
+(* The message queue is a FIFO sequence of cells in the order sends       *)
+(* claimed them. A send claims its cell in one step and writes its value   *)
+(* in a later one, as in kovan's segment queue, so the receiver can find   *)
+(* the oldest cell claimed and not written yet: the queue's `Busy`. Then   *)
+(* it takes nothing and waits for that send's wake.                        *)
+(*                                                                          *)
+(* What is abstract: the queue's lock-free implementation is kovan's,      *)
+(* checked there (its claim order is this sequence's order); the           *)
+(* receiver's waker cell is one flag that a wake empties (its handshake is *)
+(* checked by the loom models); a pass's look at the head of the waiting   *)
+(* list, which skips withdrawn waiters, is one step (a waiter never comes  *)
+(* back from withdrawn, so this is one of the orders the real loads can    *)
+(* take); and the receiver's look at the queue, the sender count and the   *)
+(* queue again (`Chan::pop`) is one step too, as the queue is abstract     *)
+(* anyway.                                                                 *)
 (*                                                                          *)
 (* `Mutation` names one rule taken away, so that a configuration can show *)
 (* the property that rule protects really is checked (see README).         *)
@@ -92,7 +99,8 @@ variables
     \* ---- the channel ----
     held = [s \in Senders |-> 0],       \* slots a sender holds as permits
     inHand = [p \in Procs |-> 0],       \* slots a thread is in the middle of giving back
-    mq = <<>>,                          \* the message queue: values in the order they went in
+    mq = <<>>,                          \* the message queue: values in the order their cells were claimed
+    unready = {},                       \* values whose cell is claimed but not written yet
     txCount = Cardinality(Senders),     \* how many senders are alive
     rxRegistered = FALSE,               \* the receiver's waker cell holds its waker
     rxWoken = FALSE,                    \* the receiver's waker was called
@@ -110,6 +118,14 @@ variables
 define
     \* The receiver may report the end of a closed channel only once no slot is out anywhere.
     Finished == closedBit /\ free = Cap
+    \* The oldest cell of the queue holds its value: the receiver can take it.
+    FrontReady == mq # <<>> /\ Head(mq) \notin unready
+    \* The oldest cell is claimed and not written yet: the queue answers `Busy`.
+    FrontBusy == mq # <<>> /\ Head(mq) \in unready
+    \* For the "skip_busy" mutation: the position of the first written cell after the
+    \* oldest one, or 0 when there is none.
+    FirstWritten == LET ws == {j \in 2..Len(mq) : mq[j] \notin unready}
+                    IN IF ws = {} THEN 0 ELSE Min(ws)
     \* The waiting list after the pass let go of the withdrawn waiters at its head.
     PruneFront(l) == LET live == {j \in 1..Len(l) : nodeState[l[j]] # "cancelled"}
                      IN IF live = {} THEN <<>> ELSE SubSeq(l, Min(live), Len(l))
@@ -478,21 +494,33 @@ S_use:
     \* With its slots in hand, the operation puts `use` values in (a "cancel" puts none).
     left := IF OpOf(req).op = "cancel" THEN 0 ELSE OpOf(req).use;
 S_send:
-    \* `Permit::send`: a slot goes to a value, which goes into the queue.
+    \* `Permit::send`: a slot goes to a value, whose push first claims the queue's next cell.
     if left > 0 then
         sq := sq + 1;                       \* this sender's next value ...
-        mq := Append(mq, <<self, sq>>);     \* ... goes in at the back of the queue
+        mq := Append(mq, <<self, sq>>);     \* ... claims the cell at the back of the queue
+        unready := unready \cup {<<self, sq>>};   \* claimed, not written yet
         pushed := pushed \cup {<<self, sq>>};   \* (record) it was sent
         held[self] := held[self] - 1;       \* the permit is used up: its slot carries the value
         left := left - 1;                   \* one fewer to send
         if rxEnded then pushAfterEnd := TRUE; end if;   \* (record) a value after the end
-        goto S_send_wake;
+        \* MUTATION wake_before_write: the receiver is woken before the value is written.
+        if Mutation = "wake_before_write" then goto S_early_wake; end if;
     else
         goto S_give_back;
     end if;
+S_write:
+    \* The push writes the value into its cell: the receiver can take it now.
+    unready := unready \ {<<self, sq>>};
 S_send_wake:
-    \* Then the receiver's waker.
+    \* Then, once the push returned, the receiver's waker.
     wake_rx();
+    goto S_send;
+S_early_wake:
+    \* (mutation wake_before_write only) The wake comes first ...
+    wake_rx();
+S_late_write:
+    \* ... and the value is written after it.
+    unready := unready \ {<<self, sq>>};
     goto S_send;
 S_give_back:
     \* The permits not used are dropped: their slots go back in one release.
@@ -543,11 +571,26 @@ R_next:
     end if;
 R_look:
     \* `next()`: take the oldest value, or see that every sender is gone.
-    if mq # <<>> then
+    if FrontReady then
         take_value();
         goto R_release;
+    elsif FrontBusy then
+        \* `Busy`: a value is on its way, so the sender count is not read.
+        \* MUTATION skip_busy: the receiver passes over the cell being written and, in a
+        \* later step, takes the first written cell behind it (the queue kovan had before).
+        if Mutation = "skip_busy" then goto R_skip; else goto R_register; end if;
     elsif txCount = 0 then
         goto R_end;                         \* empty, and nobody can send: the end
+    else
+        goto R_register;
+    end if;
+R_skip:
+    \* (mutation skip_busy only) The first written cell after the oldest, if any.
+    if FirstWritten > 0 then
+        received := Append(received, mq[FirstWritten]);   \* (record) taken out of order
+        mq := RemoveAt(mq, FirstWritten);   \* it leaves the queue
+        inHand[Rx] := 1;                    \* its slot, on its way back
+        goto R_release;
     else
         goto R_register;
     end if;
@@ -557,12 +600,13 @@ R_register:
     \* MUTATION rx_no_recheck: the receiver sleeps without looking again.
     if Mutation = "rx_no_recheck" then goto R_sleep; end if;
 R_look_again:
-    \* The look after the registration: whatever came before it is seen here.
-    if mq # <<>> then
+    \* The look after the registration: whatever came before it is seen here. A value
+    \* still being written is not: its send wakes the receiver after the write.
+    if FrontReady then
         take_value();
         goto R_release;
     \* MUTATION finish_early: a closed channel counts as finished before it is idle.
-    elsif txCount = 0 \/ Finished \/ (Mutation = "finish_early" /\ closedBit) then
+    elsif (mq = <<>> /\ txCount = 0) \/ Finished \/ (Mutation = "finish_early" /\ closedBit) then
         goto R_end;                         \* the end: no sender, or closed and idle
     else
         goto R_sleep;
@@ -587,8 +631,10 @@ R_drop_waker:
     \* The receiver's drop lets go of its waker ...
     rxRegistered := FALSE;                  \* the cell is emptied for good
 R_drop_values:
-    \* ... and drops every value left, giving each one's slot back.
-    if mq # <<>> then
+    \* ... and drops every value left, giving each one's slot back. It stops at a cell
+    \* still being written: that value and those behind it stay in the queue, which is
+    \* dropped with the channel.
+    if FrontReady then
         dropped := dropped \cup {Head(mq)};   \* (record) the oldest value is thrown away
         mq := Tail(mq);                     \* it leaves the queue
         inHand[Rx] := 1;                    \* its slot, on its way back
@@ -693,6 +739,8 @@ NoCloseRefund == \A p \in Procs : (pc[p] = "D_return" /\ closedBit) => setAside 
 NoFailByClose == \A r \in Reqs : ~closedG[r]
 \* A value goes in after the close, through a slot reserved before it.
 NoValueAfterClose == \A p \in Senders : pc[p] = "S_send_wake" => ~closedBit
+\* The receiver parks while the oldest cell is claimed and not written yet.
+NoParkOnBusy == pc[Rx] = "R_sleep" => ~FrontBusy
 \* The receiver ends a closed channel by finding it idle while a sender still lives.
 NoEndByIdle == rxEnded => txCount = 0
 \* A grant reaches a node between its push and its park, so the future sees it without

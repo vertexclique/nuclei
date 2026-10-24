@@ -37,10 +37,11 @@
 //! calibration writes the release the old way, raising the dirty bit, and
 //! must fail.
 //!
-//! Last, two entry points for the bounded channel's models in
-//! `tests/sync_loom_mpsc.rs`: the counts of the places the channel's fair
-//! semaphore handed a leaving waiter's share on, and the switch of the
-//! calibration that drops every such share instead.
+//! Last, three entry points for the channel models in
+//! `tests/sync_loom_mpsc.rs`: the counts of the places the bounded channel's
+//! fair semaphore handed a leaving waiter's share on, the switch of the
+//! calibration that drops every such share instead, and how often a
+//! receiver found the next value still being written.
 
 use core::cell::Cell;
 use core::task::Waker;
@@ -619,4 +620,24 @@ pub fn fair_handoff_counts() -> [usize; 3] {
 /// on must fail.
 pub fn fair_drop_pass_on(on: bool) {
     super::fair_semaphore::probe::drop_pass_on(on);
+}
+
+std::thread_local! {
+    /// How often a channel's receiver found the next cell of its queue
+    /// claimed and not written yet. Loom runs a model's threads on the
+    /// test's own thread, so this is per test.
+    static BUSY_LOOKS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts one look of a channel's receiver that found the next value still
+/// being written (the loom queue's `Busy` answer).
+pub(super) fn busy_look() {
+    BUSY_LOOKS.with(|n| n.set(n.get() + 1));
+}
+
+/// How often a channel's receiver found the next value still being written
+/// since the last call. The models in `tests/sync_loom_mpsc.rs` read it to
+/// show their search reached that answer.
+pub fn mpsc_busy_looks() -> usize {
+    BUSY_LOOKS.with(|n| n.replace(0))
 }

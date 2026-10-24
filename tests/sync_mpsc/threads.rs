@@ -1,8 +1,8 @@
 //! Threads racing sends, receives, closes and drops: every value arrives
-//! exactly once, the capacity is never exceeded, no wakeup is lost, and every
-//! value is dropped exactly once whatever the race. (The order of one sender's
-//! values under load is in `ordering.rs`.) The counts shrink under Miri
-//! (`scale`).
+//! exactly once and in its sender's order, the capacity is never exceeded, no
+//! wakeup is lost, and every value is dropped exactly once whatever the race.
+//! (A receiver that polls without pause is in `ordering.rs`.) The counts
+//! shrink under Miri (`scale`).
 
 use super::*;
 
@@ -39,29 +39,33 @@ impl Drop for Token {
 }
 
 /// What a receiver checks of the messages it takes: every sender's values
-/// arrive without a gap or a repeat.
+/// arrive in the order it sent them, without a gap or a repeat.
 struct Ledger {
-    seen: Vec<Vec<bool>>,
+    next: Vec<u64>,
+    per_sender: u64,
 }
 
 impl Ledger {
     fn new(senders: usize, per_sender: u64) -> Self {
         Self {
-            seen: vec![vec![false; per_sender as usize]; senders],
+            next: vec![0; senders],
+            per_sender,
         }
     }
 
     fn take(&mut self, msg: &Msg) {
-        let seen = &mut self.seen[msg.from][msg.seq as usize];
-        assert!(!*seen, "sender {} delivered {} twice", msg.from, msg.seq);
-        *seen = true;
+        let next = &mut self.next[msg.from];
+        assert_eq!(
+            msg.seq, *next,
+            "sender {} delivered {} when {} was due",
+            msg.from, msg.seq, *next
+        );
+        *next += 1;
     }
 
     fn assert_complete(&self) {
-        for (from, seen) in self.seen.iter().enumerate() {
-            if let Some(seq) = seen.iter().position(|got| !got) {
-                panic!("sender {from} lost value {seq}");
-            }
+        for (from, &next) in self.next.iter().enumerate() {
+            assert_eq!(next, self.per_sender, "sender {from} lost value {next}");
         }
     }
 }

@@ -27,6 +27,8 @@ M_take_after_close             MC_BoundedChannel    violated:CloseSemantics
 M_finish_early                 MC_BoundedChannel    violated:EndMeansDrained
 M_queue_lifo                   MC_BoundedChannel    violated:PerSenderOrder
 M_double_delivery              MC_BoundedChannel    violated:ExactlyOnce
+M_skip_busy                    MC_BoundedChannel    violated:PerSenderOrder
+M_wake_before_write            MC_BoundedChannel    deadlock
 ML_park_no_look                MC_BoundedChannel    violated:Termination
 ML_grant_no_wake               MC_BoundedChannel    violated:Termination
 W_share_held                   MC_BoundedChannel    violated:NoShareHeldBetweenPasses
@@ -41,3 +43,4 @@ W_fail_by_close                MC_BoundedChannel    violated:NoFailByClose
 W_value_after_close            MC_BoundedChannel    violated:NoValueAfterClose
 W_end_by_idle                  MC_BoundedChannel    violated:NoEndByIdle
 W_grant_before_park            MC_BoundedChannel    violated:NoGrantBeforePark
+W_park_on_busy                 MC_BoundedChannel    violated:NoParkOnBusy

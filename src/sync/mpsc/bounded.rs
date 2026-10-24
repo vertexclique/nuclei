@@ -58,10 +58,9 @@ impl Limit for Bounded {
 /// send waits until a message is received. The buffer must hold at least one
 /// message.
 ///
-/// Everything sent on a [`Sender`] comes out of the [`Receiver`], and is meant
-/// to come out in the order it was sent; under load that order can break (see
-/// [Ordering](super#ordering)). The [`Sender`] can be cloned to send to the
-/// same channel from many places; only one [`Receiver`] exists.
+/// Everything sent on a [`Sender`] comes out of the [`Receiver`], in the order
+/// it was sent (see [Ordering](super#ordering)). The [`Sender`] can be cloned
+/// to send to the same channel from many places; only one [`Receiver`] exists.
 ///
 /// If the [`Receiver`] is closed or dropped, a send returns a
 /// [`SendError`] with the value. When every [`Sender`] is dropped, `recv`

@@ -25,10 +25,7 @@ fn a_bounded_recv_many_collects_what_a_sender_thread_produces() {
         assert_eq!(buffer.len(), recv_count);
     }
 
-    // Compared sorted: values sent while the receiver runs can be delivered out
-    // of order (see the ordering notes in the module docs).
-    buffer.sort_unstable();
-    assert_eq!(vec![0, 1, 2, 7], buffer);
+    assert_eq!(vec![1, 2, 7, 0], buffer);
     assert_eq!(0, block_on(rx.recv_many(&mut buffer, limit)));
     handle.join().unwrap();
 }
@@ -292,9 +289,8 @@ fn blocking_recv_many_parks_until_a_batch_arrives() {
         tx.blocking_send(i).unwrap();
     }
     drop(tx);
-    let (total, mut buffer) = receiver.join().unwrap();
+    let (total, buffer) = receiver.join().unwrap();
     assert_eq!(total, 20);
-    buffer.sort_unstable();
     assert_eq!(buffer, (0..20).collect::<Vec<_>>());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -307,7 +303,6 @@ fn blocking_recv_many_parks_until_a_batch_arrives() {
         tx.send(i).unwrap();
     }
     drop(tx);
-    let mut buffer = receiver.join().unwrap();
-    buffer.sort_unstable();
+    let buffer = receiver.join().unwrap();
     assert_eq!(buffer, (0..20).collect::<Vec<_>>());
 }

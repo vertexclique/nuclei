@@ -79,9 +79,9 @@ impl Limit for Unbounded {
 /// [`channel`](super::channel) where a producer can outrun the receiver.
 ///
 /// Everything sent on an [`UnboundedSender`] comes out of the
-/// [`UnboundedReceiver`], and is meant to come out in the order it was sent;
-/// under load that order can break (see [Ordering](super#ordering)). The
-/// sender can be cloned; only one receiver exists.
+/// [`UnboundedReceiver`], in the order it was sent (see
+/// [Ordering](super#ordering)). The sender can be cloned; only one receiver
+/// exists.
 ///
 /// The message type must be `'static`: the queue behind the channel reclaims
 /// its segments after the channel is gone, so it cannot hold borrowed data.
@@ -169,16 +169,14 @@ pub struct WeakUnboundedSender<T: 'static> {
 /// [`len`](Self::len), [`sender_strong_count`](Self::sender_strong_count) and
 /// [`sender_weak_count`](Self::sender_weak_count): each is a load.
 ///
-/// Lock-free, except for one wait inside the message queue: [`recv`](Self::recv),
-/// [`recv_many`](Self::recv_many), [`try_recv`](Self::try_recv) and the two
-/// `poll_` forms. Registering the waker is wait-free (the cell runs two
-/// read-modify-writes and no loop). Taking a value off the message queue scans
-/// the head segment for the oldest published slot and takes it with a
-/// compare-and-swap no other thread contends for, but it spins, then yields
-/// the thread, when the only slot left in the head segment is one a sender
-/// has claimed and not finished writing (see the [Progress](super#progress)
-/// notes of the module), so a sender the scheduler stops there holds the
-/// receiver up. [`close`](Self::close) is lock-free: one `fetch_or` on the
+/// Lock-free: [`recv`](Self::recv), [`recv_many`](Self::recv_many),
+/// [`try_recv`](Self::try_recv) and the two `poll_` forms. Registering the
+/// waker is wait-free (the cell runs two read-modify-writes and no loop).
+/// Taking a value off the message queue is a compare-and-swap no other thread
+/// contends for, and never waits for a sender: a value whose send claimed its
+/// place and has not written it yet is not there, and its sender wakes the
+/// receiver once it is (see the [Progress](super#progress) notes of the
+/// module). [`close`](Self::close) is lock-free: one `fetch_or` on the
 /// count, then the set of the event that `closed` waits on, which takes that
 /// event's drain role. The drop is the same as a receive per value left, since
 /// it drops every value still queued, and so takes time proportional to them.
@@ -444,10 +442,9 @@ impl<T: 'static> UnboundedReceiver<T> {
     /// closed.
     ///
     /// A value whose send is still in progress on another thread is not in the
-    /// channel yet, and this call does not park the thread for it (its sender
-    /// wakes the receiver when it is). The one wait is the queue's, described
-    /// under [Progress](super#progress) in the module docs: a spin that yields
-    /// the thread until a sender writes a slot it claimed.
+    /// channel yet, nor are the values sent after it, which come out behind
+    /// it. This call does not wait for them: the sender wakes the receiver
+    /// once its value is in.
     ///
     /// ```
     /// use nuclei::sync::mpsc::{self, error::TryRecvError};

@@ -16,6 +16,12 @@
 //!   `calibration_a_poll_that_skips_the_recheck_loses_a_wakeup` writes the
 //!   receiver's poll without the re-check after the registration and must fail
 //!   that way.
+//! - **A value still being written is waited for.** A send claims its place
+//!   in the queue, then writes its value, then wakes the receiver; a receiver
+//!   that finds the place claimed and empty registers and returns `Pending`,
+//!   and must be woken by that send. The models of a send racing the
+//!   receiver's wait count the looks that found a value still being written
+//!   and fail unless their search reached one.
 //! - **A value has one owner.** Every model counts the drops of the values it
 //!   sends, on a counter loom does not track and the model reads only after
 //!   every thread joined: each value is dropped exactly once, whoever ends up
@@ -38,13 +44,15 @@
 //!   and fails unless its search reached the ones it is about.
 //!
 //! What the models do not cover. The message queue is kovan's segment queue,
-//! which loom cannot instrument; under `--cfg loom` the channel puts a
-//! `Mutex<VecDeque<T>>` of loom's behind the same four-method type (see
+//! which loom cannot instrument; under `--cfg loom` the channel puts a loom
+//! `Mutex` around a deque of cells behind the same type (see
 //! `src/sync/mpsc/queue.rs`; the cancellation token's registry is modelled the
-//! same way). So the models check the protocol around the queue: the waker
-//! handshake, the sender count, the closed bit and the limit's idle test. The
-//! queue's own ordering argument is in its module docs, and its memory
-//! reclamation belongs to kovan's tests.
+//! same way). A push there is two steps, a claim and a write, as in the
+//! segment queue. So the models check the protocol around the queue: the
+//! waker handshake (a value still being written included), the sender count,
+//! the closed bit and the limit's idle test. The queue's own order, progress
+//! and memory reclamation are kovan's, checked by its TLA+ model and its
+//! tests.
 //!
 //! Every calibration expects a failure the protocol does not allow, or an
 //! outcome the model must be able to reach, and must fail: without them a
@@ -64,7 +72,7 @@ use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::thread;
 
 use nuclei::sync::atomic_waker::AtomicWaker;
-use nuclei::sync::loom_model::{fair_drop_pass_on, fair_handoff_counts};
+use nuclei::sync::loom_model::{fair_drop_pass_on, fair_handoff_counts, mpsc_busy_looks};
 use nuclei::sync::mpsc::{
     self,
     error::{SendError, TrySendError},
@@ -95,6 +103,24 @@ fn explore(
     assert!(
         explored >= min_interleavings,
         "{name} explored only {explored} interleavings, below the {min_interleavings} floor"
+    );
+}
+
+/// [`explore`], then fails the model unless its search found the next value
+/// still being written at least once.
+fn explore_busy(
+    name: &str,
+    preemptions: usize,
+    min_interleavings: usize,
+    model: impl Fn() + Sync + Send + 'static,
+) {
+    mpsc_busy_looks();
+    explore(name, preemptions, min_interleavings, model);
+    let busy = mpsc_busy_looks();
+    println!("loom model {name}: {busy} looks found the next value still being written");
+    assert!(
+        busy > 0,
+        "{name}: the search never found a value still being written"
     );
 }
 
@@ -164,7 +190,7 @@ impl Drops {
 
 #[test]
 fn a_bounded_send_racing_the_receivers_wait_is_delivered_once() {
-    explore(
+    explore_busy(
         "a_bounded_send_racing_the_receivers_wait_is_delivered_once",
         3,
         100,
@@ -183,7 +209,7 @@ fn a_bounded_send_racing_the_receivers_wait_is_delivered_once() {
 
 #[test]
 fn an_unbounded_send_racing_the_receivers_wait_is_delivered_once() {
-    explore(
+    explore_busy(
         "an_unbounded_send_racing_the_receivers_wait_is_delivered_once",
         3,
         100,
@@ -204,7 +230,7 @@ fn an_unbounded_send_racing_the_receivers_wait_is_delivered_once() {
 /// and each value arrives once.
 #[test]
 fn two_senders_racing_one_waiting_receiver_both_arrive() {
-    explore(
+    explore_busy(
         "two_senders_racing_one_waiting_receiver_both_arrive",
         2,
         3000,

@@ -21,16 +21,14 @@ use crate::sync::internal::{self, Arc};
 /// [`sender_strong_count`](Self::sender_strong_count) and
 /// [`sender_weak_count`](Self::sender_weak_count): each is a load.
 ///
-/// Lock-free, except for one wait inside the message queue: [`recv`](Self::recv),
-/// [`recv_many`](Self::recv_many), [`try_recv`](Self::try_recv) and the two
-/// `poll_` forms. Registering the waker is wait-free (the cell runs two
-/// read-modify-writes and no loop). Taking a value off the message queue scans
-/// the head segment for the oldest published slot and takes it with a
-/// compare-and-swap no other thread contends for, but it spins, then yields
-/// the thread, when the only slot left in the head segment is one a sender
-/// has claimed and not finished writing (see the [Progress](super#progress)
-/// notes of the module), so a sender the scheduler stops there holds the
-/// receiver up. Giving the slot back to the senders is a semaphore release
+/// Lock-free: [`recv`](Self::recv), [`recv_many`](Self::recv_many),
+/// [`try_recv`](Self::try_recv) and the two `poll_` forms. Registering the
+/// waker is wait-free (the cell runs two read-modify-writes and no loop).
+/// Taking a value off the message queue is a compare-and-swap no other thread
+/// contends for, and never waits for a sender: a value whose send claimed its
+/// place and has not written it yet is not there, and its sender wakes the
+/// receiver once it is (see the [Progress](super#progress) notes of the
+/// module). Giving the slot back to the senders is a semaphore release
 /// that, when senders wait, serves the queue and is lock-free.
 /// [`close`](Self::close) is lock-free; the drop is the same as a receive per
 /// value left, since it drops every value still queued, and so takes time
@@ -135,10 +133,9 @@ impl<T: 'static> Receiver<T> {
     /// every sender is gone, or the channel was closed and no permit is held.
     ///
     /// A value whose send is still in progress on another thread is not in the
-    /// channel yet, and this call does not park the thread for it (its sender
-    /// wakes the receiver when it is). The one wait is the queue's, described
-    /// under [Progress](super#progress) in the module docs: a spin that yields
-    /// the thread until a sender writes a slot it claimed.
+    /// channel yet, nor are the values sent after it, which come out behind
+    /// it. This call does not wait for them: the sender wakes the receiver
+    /// once its value is in.
     ///
     /// ```
     /// use nuclei::sync::mpsc::{self, error::TryRecvError};
