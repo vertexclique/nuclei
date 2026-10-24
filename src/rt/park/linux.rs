@@ -88,6 +88,17 @@ impl Poller {
         timeout: Option<Duration>,
         mut on_event: impl FnMut(u64, Readiness),
     ) -> io::Result<bool> {
+        self.wait_at_most(usize::MAX, timeout, &mut on_event)
+    }
+
+    /// As [`wait`](Self::wait), taking at most `max` events (at least one)
+    /// from the kernel in this call.
+    pub(crate) fn wait_at_most(
+        &mut self,
+        max: usize,
+        timeout: Option<Duration>,
+        mut on_event: impl FnMut(u64, Readiness),
+    ) -> io::Result<bool> {
         // epoll counts milliseconds: round up, so a wait never ends early.
         let ms = match timeout {
             None => -1,
@@ -96,7 +107,7 @@ impl Poller {
                 ms.min(libc::c_int::MAX as u128) as libc::c_int
             }
         };
-        let capacity = self.events.capacity() as libc::c_int;
+        let capacity = self.events.capacity().min(max).max(1) as libc::c_int;
         // SAFETY: the buffer has room for `capacity` events; the kernel says
         // how many it wrote.
         let n = unsafe {

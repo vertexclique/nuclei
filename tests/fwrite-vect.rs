@@ -1,52 +1,37 @@
-/// Unfortunately, underlying implementation of writevec have problems.
-/// Ref issue: https://github.com/rust-lang/rust/issues/68041
-/// This should work fine with iouring.
-#[cfg(feature = "iouring")]
-#[cfg(target_os = "linux")]
+mod io_support;
+
+use std::fs::{File, OpenOptions};
+use std::io::{IoSlice, SeekFrom};
+
+use io_support::{TempFile, read_to_end, seek, write_vectored};
+use nuclei::Handle;
+
+const IOVEC_WIDTH: usize = 1 << 10;
+
 #[nuclei::test]
-async fn write_vectored() {
-    use nuclei::*;
-    use std::fs::{File, OpenOptions};
-    use std::io;
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    use futures::AsyncReadExt;
-    use futures::io::IoSliceMut;
-    use futures::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt};
-    use std::io::{IoSlice, Read, SeekFrom};
-    use std::ops::Deref;
-
-    const IOVEC_WIDTH: usize = 1 << 10;
-
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("testdata");
-    path.push("dark-matter-vect");
-
+async fn write_vectored_gathers_every_buffer_in_order() {
+    let tmp = TempFile::new("dark-matter-vect");
     let buf1 = [0x41; IOVEC_WIDTH];
     let buf2 = [0x42; IOVEC_WIDTH];
     let buf3 = [0x43; IOVEC_WIDTH];
-    let mut bufs = [
+    let bufs = [
         IoSlice::new(&buf1),
         IoSlice::new(&buf2),
         IoSlice::new(&buf3),
     ];
-
     let fo = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&path)
+        .create_new(true)
+        .open(&tmp.0)
         .unwrap();
     let mut file = Handle::<File>::new(fo).unwrap();
-    file.write_vectored(&bufs[..]).await.unwrap();
-
-    let mut bufv = String::new();
-    assert!(file.seek(SeekFrom::Start(0)).await.is_ok());
-    file.read_to_string(&mut bufv).await.unwrap();
-
-    assert_eq!(bufv.matches('A').count(), IOVEC_WIDTH);
-    assert_eq!(bufv.matches('B').count(), IOVEC_WIDTH);
-    assert_eq!(bufv.matches('C').count(), IOVEC_WIDTH);
-
-    println!("SG write was: {}", bufv);
+    assert_eq!(
+        write_vectored(&mut file, &bufs).await.unwrap(),
+        3 * IOVEC_WIDTH
+    );
+    assert_eq!(seek(&mut file, SeekFrom::Start(0)).await.unwrap(), 0);
+    let got = read_to_end(&mut file).await.unwrap();
+    let expected: Vec<u8> = [buf1, buf2, buf3].concat();
+    assert_eq!(got, expected);
 }

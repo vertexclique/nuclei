@@ -9,29 +9,28 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use pin_project_lite::pin_project;
-
 use super::CancellationToken;
 use crate::sync::event::{Event, EventWait};
 
-pin_project! {
-    /// `fut`, or `None` if the token is cancelled first; `fut` wins a tie.
-    pub(super) struct RunUntilCancelled<'a, F: Future> {
-        #[pin]
-        pub(super) cancellation: WaitForCancellationFuture<'a>,
-        #[pin]
-        pub(super) future: F,
-    }
+/// `fut`, or `None` if the token is cancelled first; `fut` wins a tie.
+pub(super) struct RunUntilCancelled<'a, F: Future> {
+    pub(super) cancellation: WaitForCancellationFuture<'a>,
+    pub(super) future: F,
 }
 
 impl<F: Future> Future for RunUntilCancelled<'_, F> {
     type Output = Option<F::Output>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        if let Poll::Ready(output) = this.future.poll(cx) {
+        // SAFETY: `future` is pinned structurally: it is never moved out of
+        // the struct, the struct has no `Drop`, and it is `Unpin` only when
+        // `F` is. `cancellation` is `Unpin`.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: as above.
+        let future = unsafe { Pin::new_unchecked(&mut this.future) };
+        if let Poll::Ready(output) = future.poll(cx) {
             Poll::Ready(Some(output))
-        } else if this.cancellation.poll(cx).is_ready() {
+        } else if Pin::new(&mut this.cancellation).poll(cx).is_ready() {
             Poll::Ready(None)
         } else {
             Poll::Pending
@@ -97,7 +96,7 @@ pub struct WaitForCancellationFutureOwned {
     // lifetime erased to `'static`. It is declared first so it drops first:
     // it must never be used or dropped after `token` is gone.
     wait: MaybeDangling<EventWait<'static>>,
-    token: CancellationToken,
+    _token: CancellationToken,
 }
 
 impl WaitForCancellationFutureOwned {
@@ -109,7 +108,7 @@ impl WaitForCancellationFutureOwned {
         let wait = unsafe { (*event).wait() };
         Self {
             wait: MaybeDangling::new(wait),
-            token,
+            _token: token,
         }
     }
 }

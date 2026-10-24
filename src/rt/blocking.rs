@@ -79,6 +79,7 @@ impl Pool {
     }
 
     /// Threads alive now.
+    #[cfg(test)]
     pub(crate) fn threads(&self) -> usize {
         self.threads.load(Ordering::SeqCst)
     }

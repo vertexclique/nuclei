@@ -26,7 +26,7 @@
 //! permits, which is `usize::MAX >> 7`. What this module adds is the
 //! [`Event`](crate::sync::Event), the [`Latch`](crate::sync::Latch), the [`Lazy`](crate::sync::Lazy) value, the upgradable read of the
 //! [`RwLock`](crate::sync::RwLock), the reentrant locks and `OnceCell::get_or_init_racy`.
-//! The [`mpsc`] channels follow the same rule for the established channel API,
+//! The [`mpsc`](crate::sync::mpsc) channels follow the same rule for the established channel API,
 //! with their own progress notes.
 //!
 //! # What every primitive guarantees
@@ -141,6 +141,8 @@ mod mutex;
 mod notify;
 mod once_cell;
 pub mod oneshot;
+// See the note on its re-export below.
+#[allow(dead_code)]
 mod owned_lock;
 mod owner;
 mod queue;
@@ -173,12 +175,10 @@ pub use mutex::{
 pub use notify::{Notified, Notify, OwnedNotified};
 pub use once_cell::{OnceCell, SetError};
 // vertexia: the owner-named lock has no consumer in this crate yet; its
-// tests run in `owned_lock`. Trim the re-exports if it stays unused.
+// tests run in `owned_lock`. Trim it if it stays unused.
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use owned_lock::between_take_and_grant;
-#[allow(unused_imports)]
-pub(crate) use owned_lock::{OwnedLock, OwnedWait, OwnerId, TryLock};
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};
 pub use reentrant_rwlock::{

@@ -638,6 +638,58 @@ impl Shard {
         }
     }
 
+    /// One turn of the shard, for a caller driving it by hand: runs every
+    /// task ready now, waits once on the poller (up to `wait`, at once if
+    /// work is ready; at most `max` events) and runs what the IO woke.
+    /// Returns how many IO events it handled.
+    pub(crate) fn turn(&self, max: usize, wait: Option<Duration>) -> io::Result<usize> {
+        let _pool = buf::enter(&self.pool);
+        self.run_ready();
+        if !self.shared.io_ops.is_empty() {
+            self.apply_io_ops();
+        }
+        self.fire_timers();
+        let shared = &self.shared;
+        let sleeps = wait != Some(Duration::ZERO)
+            && !self.has_local_work()
+            && shared.park.begin_park(|| shared.has_remote_work());
+        let wait = if sleeps || wait == Some(Duration::ZERO) {
+            wait
+        } else {
+            Some(Duration::ZERO)
+        };
+        let timeout = match (wait, self.next_timer()) {
+            (Some(w), Some(t)) => Some(w.min(t)),
+            (w, t) => w.or(t),
+        };
+        let mut events = 0;
+        let result = {
+            let sources = self.sources.borrow();
+            self.poller
+                .borrow_mut()
+                .wait_at_most(max, timeout, |token, readiness| {
+                    events += 1;
+                    if let Some(source) = sources.get(token) {
+                        source.on_event(token, readiness);
+                    }
+                })
+        };
+        if sleeps {
+            shared.park.end_park();
+        }
+        result?;
+        self.fire_timers();
+        self.run_ready();
+        Ok(events)
+    }
+
+    /// Runs every task that is ready now, and the ones they wake.
+    fn run_ready(&self) {
+        while let Some(runnable) = self.next() {
+            self.run(runnable);
+        }
+    }
+
     /// Drives the poller; a failure of the poller itself cannot be handed to
     /// any task, so it ends the shard loudly.
     fn drive_or_report(&self, wait: Option<Duration>) {

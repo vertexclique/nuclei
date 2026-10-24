@@ -312,7 +312,7 @@ fn a_sleep_wakes_whichever_task_polled_it_last() {
         let mut s = Box::pin(time::sleep(Duration::from_millis(10)));
         let first = std::future::poll_fn(|cx| Poll::Ready(s.as_mut().poll(cx))).await;
         assert!(first.is_pending());
-        spawn(async move { s.await }).await;
+        spawn(s).await;
     });
 }
 
@@ -322,6 +322,4 @@ fn sleep_is_send_sync_unpin(s: time::Sleep) -> impl Send + Sync + Unpin {
 }
 
 #[allow(dead_code)]
-fn pin_projection_compiles(t: Pin<&mut time::Timeout<std::future::Pending<()>>>) {
-    let _ = t;
-}
+fn pin_projection_compiles(_t: Pin<&mut time::Timeout<std::future::Pending<()>>>) {}

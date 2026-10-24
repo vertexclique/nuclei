@@ -224,7 +224,7 @@ fn unwind_safety_holds<'a, T: 'a>() {
 /// A message that borrows: every handle is `Send + Sync` when the borrowed
 /// data is `Sync`, as for any other `Send` message.
 #[allow(dead_code)]
-fn handles_of_a_borrowing_message_cross_threads<'a>() {
+fn handles_of_a_borrowing_message_cross_threads<'a>(_borrowed: &'a str) {
     fn send_sync<U: Send + Sync>() {}
     send_sync::<mpsc::Sender<&'a str>>();
     send_sync::<mpsc::WeakSender<&'a str>>();

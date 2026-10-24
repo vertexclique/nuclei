@@ -15,6 +15,8 @@ mod tcp;
 mod udp;
 mod unix;
 
+pub use self::tcp::TcpStreamGenerator;
+
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 

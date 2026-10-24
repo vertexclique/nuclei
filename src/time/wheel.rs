@@ -144,6 +144,7 @@ impl Wheel {
     }
 
     /// The wheel's time: every deadline up to it has been processed.
+    #[cfg(test)]
     pub(crate) fn elapsed(&self) -> u64 {
         self.elapsed
     }
@@ -195,6 +196,7 @@ impl Wheel {
 
     /// Moves the timer of `key` to a new deadline, armed again if it had
     /// fired. A stale key does nothing.
+    #[cfg(test)]
     pub(crate) fn reset(&mut self, key: TimerKey, when: u64, waker: &Waker) {
         let Some(index) = self.live(key) else { return };
         if let Place::Armed { .. } = self.entries[index].place {

@@ -1,69 +1,69 @@
-//!
 //! # Nuclei
 //!
-//! Nuclei is a proactive IO system which is runtime agnostic and can work with any runtime.
-//! Proactive system's design principles matching to [Boost Asio](https://www.boost.org/doc/libs/1_47_0/doc/html/boost_asio/overview/core/async.html).
-//! Nuclei is not using conventional reactor approach. It is completely asynchronous, and it's wrapping poll based IO proactive fashion.
+//! A proactive IO runtime: thread-per-core shards that run tasks and drive
+//! their own IO, timers and buffers. Every operation is completed for the
+//! task that asked for it; no task waits for readiness and then makes the
+//! call itself.
 //!
-//! Nuclei uses [epoll](https://en.wikipedia.org/wiki/Epoll) on Linux as primary evented IO backend, secondarily (if your system supports) you can use
-//! [io_uring](https://kernel.dk/io_uring.pdf). On MacOS, Nuclei is using [kqueue](https://en.wikipedia.org/wiki/Kqueue).
-//! On Windows, [IOCP](https://en.wikipedia.org/wiki/Input/output_completion_port) backend is used.
+//! IO runs on epoll on Linux and on kqueue on macOS and the BSDs. A
+//! [`Handle`] wraps std's own socket or file types and gives them async
+//! operations (`accept`, `connect`, `send`, `recv`, ...) and the
+//! `futures-io` traits. [`spawn`], [`block_on`] and the rest place work on
+//! the process default [`Runtime`], which starts on first use with no
+//! configuration; a [`Builder`] sets every setting for a runtime of one's
+//! own.
 //!
-//! Current io_uring implementation needs Linux kernel 5.6+.
+//! ```no_run
+//! use std::net::TcpListener;
+//! use nuclei::Handle;
 //!
-//! ## Features
-//!
-//! * Async TCP, UDP, Unix domain sockets and files...
-//! * Proactor system don't block.
-//! * Scatter/Gather operations
-//! * Minimal allocation as much as possible.
-//! * More expressive than any other runtime.
-//! * Completely asynchronous I/O system with lock free programming.
-//!
-//! ## Examples
-//! For more information about how to use Nuclei with std IO types please head to [examples](https://github.com/vertexclique/nuclei/tree/master/examples).
-//!
-//! ### Executor
-//! Executor is using `async-global-executor`. Available features are:
-//! * `async-exec`: Uses `async-io` feature of `async-global-executor`.
+//! #[nuclei::main]
+//! async fn main() -> std::io::Result<()> {
+//!     let listener = Handle::<TcpListener>::bind("127.0.0.1:7000")?;
+//!     loop {
+//!         let (stream, _) = listener.accept().await?;
+//!         nuclei::spawn(async move {
+//!             let mut buf = [0u8; 1024];
+//!             while let Ok(n @ 1..) = stream.recv(&mut buf).await {
+//!                 if stream.send(&buf[..n]).await.is_err() {
+//!                     break;
+//!                 }
+//!             }
+//!         })
+//!         .detach();
+//!     }
+//! }
+//! ```
 
-// These need to go through time.
-#![allow(dead_code, unused_variables)]
+// A model-checking build (`--cfg loom`) compiles the loom models and leaves
+// the ordinary tests out, so the helpers only those tests use go unused.
+#![cfg_attr(loom, allow(dead_code, unused_imports))]
 
-// vertexia: the legacy runtime's executor stack (event-listener, concurrent-queue) has its own
-// `cfg(loom)` paths and cannot build under `--cfg loom`, so a model-checking build leaves the
-// legacy runtime out; removed with the legacy runtime by the thread-per-core driver rewrite.
-#[cfg(not(loom))]
-mod async_io;
 mod buf;
+mod compat;
 /// Nuclei's configuration options reside here.
-#[cfg(not(loom))]
 pub mod config;
 #[cfg(unix)]
 mod fs;
-#[cfg(not(loom))]
-mod handle;
 #[cfg(unix)]
 mod io;
 #[cfg(unix)]
 mod net;
-#[cfg(not(loom))]
 mod proactor;
 mod rt;
 /// nuclei's own runtime: shards, tasks, `block_on`, `spawn` and the blocking pool.
 pub mod runtime;
-#[cfg(not(loom))]
-mod submission_handler;
 /// Runtime-independent synchronization primitives: futures and wakers only, usable from any executor.
 pub mod sync;
-#[cfg(not(loom))]
-mod sys;
+#[cfg(target_os = "linux")]
+mod syscore {
+    // The io_uring ring and its probe: the io_uring driver builds on them,
+    // and their own tests run them now.
+    #![allow(dead_code)]
+    pub(crate) mod linux;
+}
 /// Time: sleeping, timeouts and intervals on the shard's timer wheel.
 pub mod time;
-#[cfg(not(loom))]
-mod utils;
-#[cfg(not(loom))]
-mod waker;
 
 #[cfg(not(any(
     target_os = "linux",     // epoll, iouring
@@ -75,47 +75,25 @@ mod waker;
     target_os = "netbsd",    // kqueue
     target_os = "openbsd",   // kqueue
     target_os = "dragonfly", // kqueue
-    target_os = "windows",   // iocp
 )))]
 compile_error!("Target OS is not supported");
 
-#[cfg(all(
-    not(loom),
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-    )
-))]
-mod syscore {
-    mod bsd;
-    pub(crate) use bsd::*;
-}
+#[cfg(target_os = "windows")]
+compile_error!("nuclei's Windows backend (I/O completion ports) is not in this version");
 
-#[cfg(all(
-    not(loom),
-    any(target_os = "linux", target_os = "android", target_os = "illumos")
-))]
-mod syscore {
-    mod linux;
-    pub(crate) use linux::*;
-}
-
-#[cfg(all(not(loom), target_os = "windows"))]
-mod syscore {
-    mod windows;
-    pub(crate) use windows::*;
-}
-
-#[cfg(not(loom))]
-pub use async_global_executor::*;
-#[cfg(not(loom))]
-pub use proactor::*;
-pub use runtime::{Builder, Runtime, RuntimeHandle};
+pub use compat::{
+    GlobalExecutorConfig, init, init_with_config, spawn_more_threads, stop_current_thread,
+    stop_thread,
+};
+#[cfg(unix)]
+pub use io::Handle;
+#[cfg(unix)]
+pub use net::TcpStreamGenerator;
+#[cfg(feature = "attributes")]
+pub use nuclei_macros::{bench, main, test};
+pub use proactor::{IoBackend, Proactor, drive};
+pub use runtime::{
+    Builder, FallibleTask, Runtime, RuntimeHandle, Task, block_on, spawn, spawn_blocking,
+    spawn_local,
+};
 pub use time::{sleep, timeout};
-
-#[cfg(all(not(loom), feature = "attributes"))]
-pub use nuclei_attributes::*;

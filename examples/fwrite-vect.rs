@@ -1,7 +1,6 @@
 use nuclei::*;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
 
 use futures::AsyncReadExt;
 use futures::{AsyncSeekExt, AsyncWriteExt};
@@ -11,9 +10,8 @@ const IOVEC_WIDTH: usize = 1 << 10;
 
 #[nuclei::main]
 async fn main() -> io::Result<()> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("data");
-    path.push("dark-matter-vect");
+    // A scratch file of the example's own, so the tree stays as it is.
+    let path = std::env::temp_dir().join("nuclei-example-dark-matter-vect");
 
     let buf1 = [0x41; IOVEC_WIDTH];
     let buf2 = [0x42; IOVEC_WIDTH];
@@ -27,10 +25,13 @@ async fn main() -> io::Result<()> {
     let fo = OpenOptions::new()
         .read(true)
         .write(true)
+        .create(true)
+        .truncate(true)
         .open(&path)
         .unwrap();
     let mut file = Handle::<File>::new(fo).unwrap();
-    file.write_vectored(&bufs[..]).await.unwrap();
+    let n = file.write_vectored(&bufs[..]).await.unwrap();
+    println!("wrote {n} bytes from the three buffers");
 
     let mut bufv = String::new();
     assert!(file.seek(SeekFrom::Start(0)).await.is_ok());

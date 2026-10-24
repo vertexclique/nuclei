@@ -1,6 +1,6 @@
 [package]
 name = "nuclei"
-version = "0.4.3"
+version = "0.5.0"
 authors = ["Mahmut Bulut <vertexclique@gmail.com>"]
 edition = "2024"
 rust-version = "1.90"
@@ -33,15 +33,14 @@ autoexamples = false
 
 
 [features]
-default = ["async-exec", "iouring", "attributes"]
-# Devs should enable these features to use iouring on linux.
-#default = ["asyncstd", "iouring"]
+default = ["iouring", "epoll", "attributes"]
+# The kernel interfaces nuclei may use on Linux; both on by default, and the
+# runtime picks the one the machine offers.
 epoll = []
-iouring = ["rustix-uring", "rustix"]
+iouring = []
 
-async-exec = ["async-global-executor"]
-
-attributes = ["nuclei-attributes"]
+# `#[nuclei::main]`, `#[nuclei::test]` and `#[nuclei::bench]`.
+attributes = ["nuclei-macros"]
 
 # Node memory from kovan's per-thread magazine cache over a slab layer, instead of the global
 # allocator. Off by default and meant for applications: cargo turns a feature on for every user
@@ -49,32 +48,13 @@ attributes = ["nuclei-attributes"]
 recycle = ["kovan/recycle", "kovan-channel/recycle", "kovan-map/recycle", "kovan-queue/recycle"]
 
 [dependencies]
-nuclei-attributes = { version = "0.1", optional = true }
-lever = "0.1"
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+nuclei-macros = { version = "0.5.0", path = "nuclei-macros", optional = true }
 futures-io = "0.3"
 futures-core = { version = "0.3", default-features = false }
-socket2 = { version = "0.3.19", features = ["pair", "unix"] }
-pin-utils = "0.1.0"
-pin-project-lite = "0.2"
-crossbeam-channel = "0.5"
-once_cell = "1.19.0"
-os_socketaddr = "0.2.5"
-ahash = "0.8.7"
 kovan = "0.2"
 kovan-channel = "0.2"
 kovan-map = "0.2"
 kovan-queue = "0.2"
-
-# vertexia: the executor stack has its own `cfg(loom)` paths and cannot build under `--cfg loom`;
-# see src/lib.rs.
-[target.'cfg(not(loom))'.dependencies]
-async-global-executor = { version = "2.4", optional = true, features = ["async-io"] }
-
-# Other backends
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "0.38", optional = true }
-rustix-uring = { version = "0.2.0", optional = true }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 libc = { version = "0.2" }

@@ -126,6 +126,7 @@ impl<T> RwLock<T> {
         /// spin: they queue at once. For a lock its holders keep across long
         /// waits of their own (I/O, say), where a spin could only burn the
         /// caller's time.
+        #[cfg(test)]
         pub(crate) fn new_without_spin(value: T) -> Self {
             Self { raw: RawRwLock::without_spin(), value: core::cell::UnsafeCell::new(value) }
         }

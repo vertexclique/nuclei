@@ -471,7 +471,7 @@ fn send_and_sync_follow_the_object() {
     send_sync::<Handle<UdpSocket>>();
     send_sync::<Handle<UnixStream>>();
     fn send<T: Send>() {}
-    send::<super::tcp::TcpStreamGenerator>();
+    send::<super::TcpStreamGenerator>();
 }
 
 #[allow(dead_code)]

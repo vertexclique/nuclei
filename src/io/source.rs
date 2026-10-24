@@ -73,12 +73,6 @@ pub(crate) enum Kind {
     UnixDatagram,
 }
 
-impl Kind {
-    fn is_datagram(self) -> bool {
-        matches!(self, Kind::Udp | Kind::UnixDatagram)
-    }
-}
-
 /// A peer's address.
 #[derive(Clone, Debug)]
 pub(crate) enum Addr {

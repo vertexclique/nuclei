@@ -1,12 +1,11 @@
 use nuclei::*;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
 
 use futures::io::SeekFrom;
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-const DARK_MATTER_TEXT: &'static str = "\
+const DARK_MATTER_TEXT: &str = "\
 Dark matter is a form of matter thought to account for approximately \
 85% of the matter in the universe and about a quarter of its total \
 mass–energy density or about 2.241×10−27 kg/m3. Its presence is implied \
@@ -26,13 +25,14 @@ async fn main() -> io::Result<()> {
     // Approximately ~75,9 MB
     let dark_matter = vec![DARK_MATTER_TEXT; 100_000].join("\n");
 
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("data");
-    path.push("dark-matter");
+    // A scratch file of the example's own, so the tree stays as it is.
+    let path = std::env::temp_dir().join("nuclei-example-dark-matter");
 
     let fo = OpenOptions::new()
         .read(true)
         .write(true)
+        .create(true)
+        .truncate(true)
         .open(&path)
         .unwrap();
     let mut file = Handle::<File>::new(fo).unwrap();

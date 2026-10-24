@@ -121,6 +121,17 @@ impl Poller {
         timeout: Option<Duration>,
         mut on_event: impl FnMut(u64, Readiness),
     ) -> io::Result<bool> {
+        self.wait_at_most(usize::MAX, timeout, &mut on_event)
+    }
+
+    /// As [`wait`](Self::wait), taking at most `max` events (at least one)
+    /// from the kernel in this call.
+    pub(crate) fn wait_at_most(
+        &mut self,
+        max: usize,
+        timeout: Option<Duration>,
+        mut on_event: impl FnMut(u64, Readiness),
+    ) -> io::Result<bool> {
         let ts = timeout.map(|t| libc::timespec {
             tv_sec: t.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
             tv_nsec: t.subsec_nanos() as _,
@@ -136,7 +147,7 @@ impl Poller {
                 std::ptr::null(),
                 0,
                 self.events.as_mut_ptr(),
-                self.events.capacity() as _,
+                self.events.capacity().min(max).max(1) as _,
                 ts_ptr,
             );
             if n < 0 {

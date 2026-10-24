@@ -88,6 +88,7 @@ impl Sources {
     }
 
     /// How many sources are registered.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.slots.len() - self.free.len()
     }

@@ -91,6 +91,7 @@ impl<T> Mutex<T> {
         /// spin: they queue at once. For a mutex its holders keep across
         /// long waits of their own (I/O, say), where a spin could only burn
         /// the caller's time.
+        #[cfg(test)]
         pub(crate) fn new_without_spin(value: T) -> Self {
             Self { sem: RawSemaphore::without_spin(1), value: UnsafeCell::new(value) }
         }

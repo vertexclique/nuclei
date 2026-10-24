@@ -157,7 +157,9 @@ fn involuntary_csw() -> i64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: `ru` is a valid out-pointer.
     unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
-    // A `c_long`: 32 bits wide on 32-bit targets.
+    // A `c_long`: 32 bits wide on 32-bit targets, where the conversion is
+    // not the identity it is here.
+    #[allow(clippy::useless_conversion)]
     i64::from(ru.ru_nivcsw)
 }
 

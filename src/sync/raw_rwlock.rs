@@ -116,6 +116,7 @@ impl RawRwLock {
     loom_const_fn! {
         /// A lock whose contended acquires never spin (see
         /// `spin::Budget::never`).
+        #[cfg(test)]
         pub(super) fn without_spin() -> Self {
             Self {
                 queue: WaitQueue::without_spin(0),

@@ -160,9 +160,12 @@ fn config_maps_from_the_public_configuration() {
     assert_eq!((r.entries, r.sqpoll_idle_ms, r.iopoll), (128, None, false));
     assert_eq!(r.iowq_max_workers, None);
 
+    // The default is the interrupt-driven profile (no SQPOLL thread), with
+    // the io-wq limits set.
     let r = RingConfig::from(&IoUringConfiguration::default());
     assert_eq!(r.entries, 1 << 11);
-    assert_eq!(r.sqpoll_idle_ms, Some(2));
+    assert_eq!(r.sqpoll_idle_ms, None);
+    assert!(!r.iopoll);
     assert_eq!(r.iowq_max_workers, Some([256, 512]));
 
     let c = IoUringConfiguration {

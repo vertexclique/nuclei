@@ -601,7 +601,10 @@ fn after(clock: libc::clockid_t, ms: i64) -> KernelTimespec {
     // SAFETY: `ts` is a valid timespec to write into.
     assert_eq!(unsafe { libc::clock_gettime(clock, &mut ts) }, 0);
     // The libc fields are 32 bits wide on 32-bit targets; the kernel's are 64.
+    // There the conversions widen; here they are the identity.
+    #[allow(clippy::useless_conversion)]
     let nanos = i64::from(ts.tv_nsec) + ms * 1_000_000;
+    #[allow(clippy::useless_conversion)]
     KernelTimespec {
         tv_sec: i64::from(ts.tv_sec) + nanos / 1_000_000_000,
         tv_nsec: nanos % 1_000_000_000,

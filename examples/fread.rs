@@ -1,7 +1,6 @@
 use nuclei::*;
 use std::fs::File;
 use std::io;
-use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 
 use futures::AsyncReadExt;
