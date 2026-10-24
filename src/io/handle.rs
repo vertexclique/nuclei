@@ -35,11 +35,12 @@ use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use super::source::{Kind, Source};
 use super::sys;
+use crate::fs::file::FileIo;
 
 /// An IO object (a socket, a pipe, a file) whose operations run on nuclei's
 /// shards.
@@ -56,6 +57,8 @@ use super::sys;
 pub struct Handle<T> {
     io: ManuallyDrop<T>,
     pub(crate) source: Arc<Source>,
+    /// A regular file's IO state, made on its first operation.
+    pub(crate) file: OnceLock<Arc<FileIo>>,
 }
 
 impl<T: AsFd> Handle<T> {
@@ -87,7 +90,17 @@ impl<T: AsFd> Handle<T> {
         Handle {
             io: ManuallyDrop::new(io),
             source,
+            file: OnceLock::new(),
         }
+    }
+
+    /// A regular file's IO state, made now on its first use.
+    pub(crate) fn file(&self) -> io::Result<&Arc<FileIo>> {
+        if let Some(file) = self.file.get() {
+            return Ok(file);
+        }
+        let file = FileIo::new(self.io.as_fd().as_raw_fd())?;
+        Ok(self.file.get_or_init(|| file))
     }
 
     /// The source, with the object's descriptor in place: after a
@@ -112,6 +125,7 @@ impl<T> Handle<T> {
     /// discards what the old one left).
     pub fn get_mut(&mut self) -> &mut T {
         self.deliver_unsent();
+        self.hand_file_back();
         self.source.retire();
         &mut self.io
     }
@@ -119,15 +133,28 @@ impl<T> Handle<T> {
     /// The IO object, back from the handle, once the bytes written behind
     /// reached the kernel (this waits for them). Bytes the handle read ahead
     /// and had not handed out are dropped with it.
-    pub fn into_inner(self) -> T {
+    pub fn into_inner(mut self) -> T {
         self.deliver_unsent();
+        self.hand_file_back();
         let mut this = ManuallyDrop::new(self);
         this.source.retire();
         // SAFETY: `this` is never used or dropped again; each field is
         // moved out once.
         unsafe {
             drop(core::ptr::read(&this.source));
+            drop(core::ptr::read(&this.file));
             ManuallyDrop::take(&mut this.io)
+        }
+    }
+
+    /// A regular file goes back to std where the handle's cursor is: its own
+    /// offset moves there, and the handle's next operation starts from the
+    /// offset std leaves.
+    fn hand_file_back(&mut self) {
+        if let Some(file) = self.file.take()
+            && let Ok(fd) = self.source.raw_fd()
+        {
+            let _ = sys::seek(fd, Some(file.cursor()));
         }
     }
 }
@@ -136,14 +163,19 @@ impl<T> Handle<T> {
     /// Waits until the kernel took what the write-behind holds (or
     /// [`LINGER`] passed): on a shard, its other tasks run meanwhile.
     fn deliver_unsent(&self) {
-        if !self.source.has_unsent() {
-            return;
+        if self.source.has_unsent() {
+            let source = &self.source;
+            let _ = crate::sync::internal::blocking(crate::time::timeout(
+                LINGER,
+                core::future::poll_fn(|cx| source.poll_drain(cx)),
+            ));
         }
-        let source = &self.source;
-        let _ = crate::sync::internal::blocking(crate::time::timeout(
-            LINGER,
-            core::future::poll_fn(|cx| source.poll_drain(cx)),
-        ));
+        if let Some(file) = self.file.get().filter(|f| f.has_unsent()) {
+            let _ = crate::sync::internal::blocking(crate::time::timeout(
+                LINGER,
+                core::future::poll_fn(|cx| file.poll_flush(cx)),
+            ));
+        }
     }
 }
 
@@ -163,6 +195,16 @@ impl<T> Drop for Handle<T> {
             }
             // The registration goes before the descriptor closes.
             None => self.source.retire(),
+        }
+        // A file's writes in flight keep their own copy of the descriptor;
+        // what waits behind them is handed to a task.
+        if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
+            crate::runtime::spawn(async move {
+                let _ =
+                    crate::time::timeout(LINGER, core::future::poll_fn(|cx| file.poll_flush(cx)))
+                        .await;
+            })
+            .detach();
         }
         // SAFETY: dropped once, here.
         unsafe { ManuallyDrop::drop(&mut self.io) };

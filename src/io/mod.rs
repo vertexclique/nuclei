@@ -7,7 +7,7 @@
 //! completes it on readiness and wakes the task (see [`source`]).
 
 mod handle;
-mod side;
+pub(crate) mod side;
 pub(crate) mod source;
 pub(crate) mod sys;
 

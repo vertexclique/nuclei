@@ -39,6 +39,8 @@ mod buf;
 /// Nuclei's configuration options reside here.
 #[cfg(not(loom))]
 pub mod config;
+#[cfg(unix)]
+mod fs;
 #[cfg(not(loom))]
 mod handle;
 #[cfg(unix)]

@@ -533,3 +533,77 @@ fn unnamed() -> io::Result<unix::SocketAddr> {
     let addr = UnixDatagram::unbound()?.local_addr()?;
     Ok(UNNAMED.get_or_init(|| addr).clone())
 }
+
+/// `pread(2)`: reads at `offset` without moving the file's own offset.
+pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    let offset = libc::off_t::try_from(offset).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the offset is past what the file can hold",
+        )
+    })?;
+    // SAFETY: writes at most `buf.len()` bytes into `buf`.
+    retry(|| cvt(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) }))
+}
+
+/// `pwrite(2)` until every byte is written at `offset`, without moving the
+/// file's own offset.
+pub(crate) fn pwrite_all(fd: RawFd, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let at = libc::off_t::try_from(offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the offset is past what the file can hold",
+            )
+        })?;
+        // SAFETY: reads at most `buf.len()` bytes from `buf`.
+        let n = retry(|| cvt(unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), at) }))?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// Moves the file's own offset to `offset` (`SEEK_SET`); with `None`, only
+/// reads it.
+pub(crate) fn seek(fd: RawFd, offset: Option<u64>) -> io::Result<u64> {
+    let (to, whence) = match offset {
+        Some(offset) => (
+            libc::off_t::try_from(offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the offset is past what the file can hold",
+                )
+            })?,
+            libc::SEEK_SET,
+        ),
+        None => (0, libc::SEEK_CUR),
+    };
+    // SAFETY: a plain syscall on the caller's descriptor.
+    let at = unsafe { libc::lseek(fd, to, whence) };
+    if at < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(at as u64)
+    }
+}
+
+/// The file's size.
+pub(crate) fn file_size(fd: RawFd) -> io::Result<u64> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    // SAFETY: the kernel fills our own `stat`.
+    cvt_int(unsafe { libc::fstat(fd, &mut st) })?;
+    Ok(st.st_size as u64)
+}
+
+/// A copy of `fd` (the same open file under another number), close-on-exec.
+pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: a plain fcntl on the caller's open descriptor.
+    let copy = cvt_int(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })?;
+    // SAFETY: a new descriptor nobody else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+}

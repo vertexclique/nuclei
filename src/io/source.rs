@@ -97,20 +97,20 @@ pub(crate) enum Target {
 
 /// An error kept to be reported again: the kernel's code, or its kind.
 #[derive(Clone, Copy, Debug)]
-struct Failure {
+pub(crate) struct Failure {
     code: Option<i32>,
     kind: io::ErrorKind,
 }
 
 impl Failure {
-    fn of(err: &io::Error) -> Self {
+    pub(crate) fn of(err: &io::Error) -> Self {
         Self {
             code: err.raw_os_error(),
             kind: err.kind(),
         }
     }
 
-    fn error(self) -> io::Error {
+    pub(crate) fn error(self) -> io::Error {
         match self.code {
             Some(code) => io::Error::from_raw_os_error(code),
             None => self.kind.into(),
@@ -167,6 +167,11 @@ impl Source {
 
     pub(crate) fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// The descriptor, unless the source is retired.
+    pub(crate) fn raw_fd(&self) -> io::Result<RawFd> {
+        self.fd()
     }
 
     /// The descriptor for a poll: the handle revived the source before it
@@ -374,12 +379,7 @@ impl Source {
     /// A copy of the descriptor (the same open socket under another
     /// number), close-on-exec; `None` if the process has none to spare.
     pub(crate) fn duplicate(&self) -> Option<std::os::fd::OwnedFd> {
-        use std::os::fd::FromRawFd;
-        let fd = self.fd().ok()?;
-        // SAFETY: a plain fcntl on the handle's own open descriptor.
-        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-        // SAFETY: a new descriptor nobody else owns.
-        (copy >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) })
+        super::sys::duplicate(self.fd().ok()?).ok()
     }
 
     /// The source goes on with `fd`, a copy of its descriptor the caller
