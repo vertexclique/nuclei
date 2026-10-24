@@ -8,7 +8,7 @@ use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 const DARK_MATTER_TEXT: &str = "\
 Dark matter is a form of matter thought to account for approximately \
 85% of the matter in the universe and about a quarter of its total \
-mass–energy density or about 2.241×10−27 kg/m3. Its presence is implied \
+mass-energy density or about 2.241×10−27 kg/m3. Its presence is implied \
 in a variety of astrophysical observations, including gravitational effects \
 that cannot be explained by accepted theories of gravity unless more matter \
 is present than can be seen. For this reason, most experts think that dark \
