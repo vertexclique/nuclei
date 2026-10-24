@@ -66,7 +66,7 @@ moment a waiter is dropped while a pass is granting it.
 | tool | what it checks here | how far a check goes |
 |------|---------------------|----------------------|
 | TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel and the runtime's task the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
-| Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership and the task's references, future and output (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
+| Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, and the timer wheel's arithmetic (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
 The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
 under every interleaving loom reaches (with the weak memory orderings of the atomics), for a
@@ -260,6 +260,29 @@ never seen in progress (that is TLA+'s part); the TLA+ model treats the future a
 poll and the run queue as a count; the awaiter's waker cell is modelled by TLA+ only. The task
 theorems also rest on `Classical.choice`, which the arithmetic tactic brings in for its case
 analysis.
+
+## The timer wheel
+
+`lean/Nuclei/Wheel.lean` checks the arithmetic of each shard's timing wheel
+(`src/time/wheel.rs`): six levels of 64 slots, one millisecond wide on level 0 and 64 times
+wider on each level up. A timer goes to the lowest level whose window holds both the wheel's
+time and the timer's deadline, in the slot the deadline falls in; when the wheel's time reaches
+that slot, a level-0 timer fires and a higher one is placed again. For every wheel time and
+every deadline the file proves: the slot is after the wheel's own on its level (the wheel has
+not passed it); the deadline lies inside the slot, so the slot comes no later than the
+deadline; on level 0 the slot is the deadline itself, so a timer fires exactly on time; placing
+a timer again from its slot's start puts it on a lower level, so it always reaches level 0; and
+a deadline in the next top window goes to a slot the code reads as the next window's, which
+starts no later than the deadline. It computes a worked example: the wheel at 1000 and a timer
+due at 70000 go through level 2, slot 17 (from 69632), level 1, slot 5 (from 69952), and fire
+at 70000. Every theorem rests on `propext` and `Quot.sound` only.
+
+The code finds a timer's level with one exclusive-or and a count of leading zeros; the Lean
+file states the level by its definition, and a property test checks the two agree. The slot
+lists, the bitmaps and the slab of entries are checked by unit tests and by a property test
+that runs random arms, cancels, resets and advances against a model keeping every deadline: a
+timer fires in the advance that first reaches its deadline, never earlier, never later, once.
+The wheel has no unsafe code and runs on one thread, so it has no TLA+ model and no loom model.
 
 ## What is not checked
 

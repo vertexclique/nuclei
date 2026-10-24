@@ -49,6 +49,7 @@ mod submission_handler;
 pub mod sync;
 #[cfg(not(loom))]
 mod sys;
+mod time;
 #[cfg(not(loom))]
 mod utils;
 #[cfg(not(loom))]

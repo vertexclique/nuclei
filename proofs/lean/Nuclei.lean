@@ -3,6 +3,7 @@ import Nuclei.FairSemaphore.Invariant
 import Nuclei.FairSemaphore.Theorems
 import Nuclei.Oneshot
 import Nuclei.Task
+import Nuclei.Wheel
 
 /-!
 # The Lean proofs of nuclei

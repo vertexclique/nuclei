@@ -60,3 +60,12 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Task.no_leak
 -- The worked example, computed.
 #print axioms Nuclei.Task.example_detached_last_waker
+
+-- The wheel: placement after the wheel's slot, inside the slot, exact on level 0, a cascade
+-- that lowers the level, the next top window's wrap, and the worked example.
+#print axioms Nuclei.Wheel.placed_after
+#print axioms Nuclei.Wheel.inside_slot
+#print axioms Nuclei.Wheel.level_zero_exact
+#print axioms Nuclei.Wheel.cascade_lowers
+#print axioms Nuclei.Wheel.next_window_wraps
+#print axioms Nuclei.Wheel.example_seventy_thousand
