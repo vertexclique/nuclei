@@ -18,6 +18,28 @@ async fn pends<F: Future + Unpin>(fut: &mut F) {
     assert!(polled.is_pending(), "it did not wait");
 }
 
+/// A runtime whose blocking pool has one thread.
+fn one_blocking_thread() -> Runtime {
+    Builder::new()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .pin_workers(false)
+        .build()
+        .unwrap()
+}
+
+/// Holds the one thread of the pool of [`one_blocking_thread`] until the
+/// sender sends: a file job submitted meanwhile waits in the pool's queue,
+/// so it is out (and its future pending) for certain, not by timing. The
+/// task ends once the thread is let go.
+fn hold_the_pool() -> (std::sync::mpsc::Sender<()>, crate::runtime::Task<()>) {
+    let (hold, held) = std::sync::mpsc::channel::<()>();
+    let busy = crate::runtime::spawn_blocking(move || {
+        let _ = held.recv();
+    });
+    (hold, busy)
+}
+
 /// Both futures, polled together until both are done.
 async fn both<A: Future + Unpin, B: Future + Unpin>(mut a: A, mut b: B) -> (A::Output, B::Output) {
     let (mut x, mut y) = (None, None);
@@ -114,15 +136,19 @@ fn a_lent_read_sees_the_writes_before_it() {
 
 #[test]
 fn a_dropped_lent_read_moves_the_cursor_nowhere() {
-    let rt = runtime();
+    let rt = one_blocking_thread();
     let tmp = Temp::new("lent-drop");
     let path = tmp.file("data");
     std::fs::write(&path, b"from the start").unwrap();
     rt.block_on(async {
         let mut file = Handle::new(File::open(&path).unwrap()).unwrap();
+        let (release, busy) = hold_the_pool();
         let mut lent = Box::pin(file.read_owned(Vec::with_capacity(4)));
         pends(&mut lent).await;
         drop(lent);
+        // The read's job runs only now, after its future went away.
+        release.send(()).unwrap();
+        within(busy).await;
         let got = within(read_to_end(&mut file)).await.unwrap();
         assert_eq!(got, b"from the start");
     });
@@ -219,22 +245,14 @@ fn a_lent_write_takes_no_pool_buffer() {
 /// still queued when the lent one comes.
 #[test]
 fn a_lent_write_waits_for_a_write_still_queued() {
-    let rt = Builder::new()
-        .worker_threads(1)
-        .max_blocking_threads(1)
-        .pin_workers(false)
-        .build()
-        .unwrap();
+    let rt = one_blocking_thread();
     let tmp = Temp::new("lent-queued");
     let path = tmp.file("data");
     let (a, b) = (pattern(100_000), vec![b'b'; 1000]);
     let mut expected = a.clone();
     expected.extend_from_slice(&b);
-    let (hold, held) = std::sync::mpsc::channel::<()>();
     rt.block_on(async {
-        let busy = crate::runtime::spawn_blocking(move || {
-            let _ = held.recv();
-        });
+        let (hold, busy) = hold_the_pool();
         let mut file = Handle::new(read_write(&path)).unwrap();
         within(write_all(&mut file, &a)).await.unwrap();
         let mut lent = Box::pin(file.write_owned(b));
@@ -255,16 +273,20 @@ fn a_lent_write_waits_for_a_write_still_queued() {
 /// a flush waits for it.
 #[test]
 fn a_dropped_lent_write_that_started_still_lands() {
-    let rt = runtime();
+    let rt = one_blocking_thread();
     let tmp = Temp::new("lent-orphan");
     let path = tmp.file("data");
     let data = pattern(4 << 20);
     let expected = data.clone();
     rt.block_on(async {
         let mut file = Handle::new(read_write(&path)).unwrap();
+        let (release, busy) = hold_the_pool();
         let mut lent = Box::pin(file.write_owned(data));
         pends(&mut lent).await;
         drop(lent);
+        // The write's job runs only now, after its future went away.
+        release.send(()).unwrap();
+        within(busy).await;
         within(write_all(&mut file, b"after")).await.unwrap();
         within(flush(&mut file)).await.unwrap();
     });
@@ -281,7 +303,7 @@ fn a_dropped_lent_write_that_started_still_lands() {
 /// the write lands all the same.
 #[test]
 fn a_dropped_handle_still_lands_a_started_lent_write() {
-    let rt = runtime();
+    let rt = one_blocking_thread();
     let tmp = Temp::new("lent-handle");
     let path = tmp.file("data");
     let data = pattern(4 << 20);
@@ -289,10 +311,14 @@ fn a_dropped_handle_still_lands_a_started_lent_write() {
     let open = path.clone();
     rt.block_on(async move {
         let file = Handle::new(read_write(&open)).unwrap();
+        let (release, busy) = hold_the_pool();
         let mut lent = Box::pin(file.write_owned(data));
         pends(&mut lent).await;
         drop(lent);
         drop(file);
+        // The write's job runs only now, after its future and its handle went.
+        release.send(()).unwrap();
+        within(busy).await;
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut pause = Duration::from_micros(50);
