@@ -5,11 +5,12 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 use futures_core::Stream;
 
 use super::{addresses, none_worked};
+use crate::io::source::write::Peer;
 use crate::io::source::{Addr, Kind};
 use crate::io::{Handle, sys};
 
@@ -71,7 +72,7 @@ impl Handle<TcpListener> {
 
 /// An accepted connection, non-blocking already.
 fn stream(fd: OwnedFd) -> Handle<TcpStream> {
-    Handle::from_nonblocking(TcpStream::from(fd), Kind::Stream)
+    Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp)
 }
 
 fn inet(addr: Addr) -> io::Result<SocketAddr> {
@@ -151,8 +152,8 @@ impl Handle<TcpStream> {
         Err(none_worked(last))
     }
 
-    /// Sends bytes; returns how many were taken (see [`AsyncWrite`] for
-    /// bytes taken while the socket was full).
+    /// Sends bytes; returns how many were taken (into the write-behind, as
+    /// for [`AsyncWrite`]).
     ///
     /// [`AsyncWrite`]: futures_io::AsyncWrite
     ///
@@ -192,11 +193,8 @@ async fn connect(addr: SocketAddr) -> io::Result<Handle<TcpStream>> {
     };
     let stream = Handle::from_nonblocking(
         TcpStream::from(sys::socket(domain, libc::SOCK_STREAM)?),
-        Kind::Stream,
+        Kind::Tcp,
     );
-    if !sys::connect_inet(stream.as_raw_fd(), &addr)? {
-        stream.source().begin_connect();
-        poll_fn(|cx| stream.source().poll_connect(cx)).await?;
-    }
+    poll_fn(|cx| stream.source().poll_connect(cx, Peer::Inet(addr))).await?;
     Ok(stream)
 }

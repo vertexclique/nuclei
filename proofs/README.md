@@ -307,8 +307,9 @@ Bytes arrive in the kernel, each with an edge for the driver. The driver takes a
 serves it: the edge clears the readiness cache, and with a reader waiting it reads into the
 read-ahead and wakes the reader, or marks the cache blocked. Finding the side held, the driver
 sets the ready bit and goes on; if the holder let go before the bit landed, it takes the side
-after all. The reader holds the side for one step (it takes the read-ahead, reads the kernel
-itself unless the cache says it would block, or registers its waker) and, as it lets go, looks
+after all. The reader holds the side for one step (it takes the read-ahead; or, unless the
+cache says the call would block, it runs the driver's read at once, into the read-ahead and
+never into its own buffer, and takes that; or it registers its waker) and, as it lets go, looks
 at the ready bit: if set it does the driver's part itself, then its own step again.
 
 The family checks 11 configurations: 3 that must pass (two and three bytes with
@@ -316,8 +317,8 @@ The family checks 11 configurations: 3 that must pass (two and three bytes with
 under weak fairness), 4 mutations (a driver that drops an edge on a held side, a holder that
 lets go without looking at the ready bit and an edge that leaves the cache blocked each end in
 a deadlock; a hold that refuses a free side carrying a flag breaks `Termination`), and 4
-witnesses (a flag, a reader doing the driver's part, a read the driver completes, a read the
-reader makes itself). Bytes are a count and there is one reader: several tasks waiting on one
+witnesses (a flag, a reader doing the driver's part, a read the driver completes on an edge,
+and a reader's submit that runs the driver's read at once). Bytes are a count and there is one reader: several tasks waiting on one
 side share its waker list, which the driver wakes whole. The loom models in `src/io/side.rs`
 check the code's word with a calibration that must lose the edge (a driver that skips a held
 side).

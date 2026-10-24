@@ -143,7 +143,11 @@ fn a_request_takes_the_largest_class_the_cap_allows_but_a_whole_one_does_not_shr
         pool.get_whole(20_000).is_none(),
         "a whole datagram is never cut"
     );
-    assert!(Pool::new(100).get(1).is_none(), "no class fits");
+    assert_eq!(
+        Pool::new(100).get(1).unwrap().capacity(),
+        512,
+        "a pool holds one smallest buffer at least"
+    );
 }
 
 #[test]

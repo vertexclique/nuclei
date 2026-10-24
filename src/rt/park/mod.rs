@@ -1,7 +1,7 @@
 //! Where a shard sleeps when it has nothing to run, and how another thread
 //! wakes it.
 //!
-//! A [`Poller`] belongs to one shard thread: [`Poller::wait`] blocks until a
+//! A [`Poller`] belongs to one shard thread: [`Poller::wait_at_most`] blocks until a
 //! [`Notifier`] fires or the timeout passes. A notifier is cheap to clone and
 //! may fire from any thread, any number of times: wakes that land while the
 //! shard runs collapse into one return of the next wait. The IO drivers wait

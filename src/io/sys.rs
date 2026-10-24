@@ -12,7 +12,7 @@
 use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{self as unix, UnixDatagram};
 use std::path::Path;
@@ -32,7 +32,10 @@ unsafe fn borrow<S: FromRawFd>(fd: RawFd) -> ManuallyDrop<S> {
 /// (`EAGAIN`, `EWOULDBLOCK`), or the call's result.
 pub(crate) fn ready<T>(result: io::Result<T>) -> Option<io::Result<T>> {
     match result {
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
+        // The code itself, not std's kind (which is decoded from it).
+        Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK) => {
+            None
+        }
         other => Some(other),
     }
 }
@@ -73,12 +76,6 @@ pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     // SAFETY: reads at most `buf.len()` bytes from `buf`.
     retry(|| cvt(unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) }))
-}
-
-/// `recv(2)` with `flags` (`MSG_PEEK` to look without taking).
-pub(crate) fn recv(fd: RawFd, buf: &mut [u8], flags: libc::c_int) -> io::Result<usize> {
-    // SAFETY: writes at most `buf.len()` bytes into `buf`.
-    retry(|| cvt(unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), flags) }))
 }
 
 #[cfg(any(
@@ -212,7 +209,8 @@ pub(crate) fn kind_of(fd: RawFd) -> io::Result<crate::io::source::Kind> {
         (libc::SOCK_DGRAM, false, _) => Kind::Udp,
         (_, true, true) => Kind::UnixListener,
         (_, false, true) => Kind::TcpListener,
-        _ => Kind::Stream,
+        (_, true, false) => Kind::Stream,
+        _ => Kind::Tcp,
     })
 }
 
@@ -236,6 +234,7 @@ fn has_no_peer(fd: RawFd) -> bool {
 /// call could not say so, close-on-exec, no `SIGPIPE`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn adopt(fd: OwnedFd) -> io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
     set_nonblocking(fd.as_raw_fd())?;
     // SAFETY: a plain fcntl on our own descriptor.
     cvt_int(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
@@ -425,39 +424,18 @@ fn connect_raw(fd: RawFd, addr: *const libc::sockaddr, len: libc::socklen_t) -> 
     }
 }
 
-/// A datagram from a UDP socket, with its sender; `peek` leaves it queued.
-pub(crate) fn recv_from_udp(
-    fd: RawFd,
-    buf: &mut [u8],
-    peek: bool,
-) -> io::Result<(usize, SocketAddr)> {
+/// A datagram from a UDP socket, with its sender.
+pub(crate) fn recv_from_udp(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
     // SAFETY: see `borrow`; the fd is a UDP socket.
     let socket = unsafe { borrow::<UdpSocket>(fd) };
-    retry(|| {
-        if peek {
-            socket.peek_from(buf)
-        } else {
-            socket.recv_from(buf)
-        }
-    })
+    retry(|| socket.recv_from(buf))
 }
 
-/// A datagram from a Unix datagram socket, with its sender; `peek` leaves it
-/// queued.
-pub(crate) fn recv_from_unix(
-    fd: RawFd,
-    buf: &mut [u8],
-    peek: bool,
-) -> io::Result<(usize, unix::SocketAddr)> {
+/// A datagram from a Unix datagram socket, with its sender.
+pub(crate) fn recv_from_unix(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, unix::SocketAddr)> {
     // SAFETY: see `borrow`; the fd is a Unix datagram socket.
     let socket = unsafe { borrow::<UnixDatagram>(fd) };
-    retry(|| {
-        if peek {
-            unix_peek_from(&socket, buf)
-        } else {
-            socket.recv_from(buf)
-        }
-    })
+    retry(|| socket.recv_from(buf))
 }
 
 /// A datagram to `addr` on a UDP socket.
@@ -472,27 +450,6 @@ pub(crate) fn send_to_unix(fd: RawFd, buf: &[u8], path: &Path) -> io::Result<usi
     // SAFETY: see `borrow`; the fd is a Unix datagram socket.
     let socket = unsafe { borrow::<UnixDatagram>(fd) };
     retry(|| socket.send_to(buf, path))
-}
-
-/// Peeks at the next datagram of a Unix socket with its sender: one
-/// `recvfrom(2)` with `MSG_PEEK` (std's `peek_from` for Unix datagrams is not
-/// stable).
-fn unix_peek_from(socket: &UnixDatagram, buf: &mut [u8]) -> io::Result<(usize, unix::SocketAddr)> {
-    // SAFETY: writes at most `buf.len()` bytes into `buf` and the address
-    // into a sockaddr_un of our own.
-    unsafe {
-        let mut storage: libc::sockaddr_un = core::mem::zeroed();
-        let mut len = size_of::<libc::sockaddr_un>() as libc::socklen_t;
-        let n = cvt(libc::recvfrom(
-            socket.as_raw_fd(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            libc::MSG_PEEK,
-            (&mut storage as *mut libc::sockaddr_un).cast(),
-            &mut len,
-        ))?;
-        Ok((n, unix_addr(&storage, len)?))
-    }
 }
 
 /// A Unix socket address from its raw form: a path, an abstract name
@@ -606,49 +563,4 @@ pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     let copy = cvt_int(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })?;
     // SAFETY: a new descriptor nobody else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(copy) })
-}
-
-/// The most `iovec`s one call takes; the rest wait for the next call, as a
-/// short read or write leaves them.
-const IOV_MAX: usize = 1024;
-
-/// `bufs` as `iovec`s, at most [`IOV_MAX`].
-fn iovecs<'a>(bufs: &'a [io::IoSlice<'_>]) -> &'a [libc::iovec] {
-    // SAFETY: `IoSlice` is documented to be ABI-compatible with `iovec` on
-    // Unix; the slice is a prefix of `bufs`.
-    unsafe { core::slice::from_raw_parts(bufs.as_ptr().cast(), bufs.len().min(IOV_MAX)) }
-}
-
-/// `bufs` as `iovec`s, at most [`IOV_MAX`].
-fn iovecs_mut<'a>(bufs: &'a mut [io::IoSliceMut<'_>]) -> &'a [libc::iovec] {
-    // SAFETY: `IoSliceMut` is documented to be ABI-compatible with `iovec`
-    // on Unix; the slice is a prefix of `bufs`, lent for the call.
-    unsafe { core::slice::from_raw_parts(bufs.as_ptr().cast(), bufs.len().min(IOV_MAX)) }
-}
-
-/// `readv(2)`.
-pub(crate) fn read_vectored(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
-    let iov = iovecs_mut(bufs);
-    // SAFETY: the kernel writes at most each iovec's length into its buffer,
-    // which `bufs` lends mutably for the call.
-    retry(|| cvt(unsafe { libc::readv(fd, iov.as_ptr(), iov.len() as libc::c_int) }))
-}
-
-/// `writev(2)`.
-pub(crate) fn write_vectored(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-    let iov = iovecs(bufs);
-    // SAFETY: the kernel reads at most each iovec's length from its buffer.
-    retry(|| cvt(unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as libc::c_int) }))
-}
-
-/// `sendmsg(2)` of `bufs` with no address: a stream socket's gathered send,
-/// never raising `SIGPIPE` (as [`send`]).
-pub(crate) fn send_vectored(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-    let iov = iovecs(bufs);
-    // SAFETY: plain data; all zeroes is a valid value.
-    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
-    msg.msg_iov = iov.as_ptr().cast_mut();
-    msg.msg_iovlen = iov.len() as _;
-    // SAFETY: the kernel reads at most each iovec's length from its buffer.
-    retry(|| cvt(unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) }))
 }

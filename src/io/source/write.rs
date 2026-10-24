@@ -1,14 +1,18 @@
 //! The write side of a source: writes, flushes, shutdown, datagram sends
 //! and connects.
 //!
-//! A write that would block is accepted at once: its bytes are copied into
-//! a buffer of the pool (the write-behind, one per source), and the driver
-//! writes them out as the socket takes more. Later writes add to that
-//! buffer while it has room and wait while it is full, so bytes go out in
-//! the order they were written. A write-behind that fails keeps its error:
-//! every write fails with it until a flush reports it. A datagram that
-//! would block is queued the same way, one at a time, and an error sending
-//! it is reported by the next send.
+//! Every call on the descriptor is the driver's ([`WriteState::push`]): on
+//! an edge, or at once after a task handed it work while the socket may
+//! take it. A task never makes the call itself. A write copies its bytes
+//! into a buffer of the pool (the write-behind, one per source) and is
+//! accepted; the driver writes them out as the socket takes them. Later
+//! writes add to that buffer while it has room and wait while it is full,
+//! so bytes go out in the order they were written. A write-behind that fails
+//! keeps its error: every write fails with it until a flush reports it,
+//! except that a write whose own bytes were the first to fail gets the error
+//! itself. A datagram is copied and queued the same way, one at a time, and
+//! an error sending it goes to its own send or else the next one. A connect
+//! and a shutdown are the driver's calls too.
 
 use core::task::{Poll, Waker};
 use std::io;
@@ -55,6 +59,13 @@ impl Target {
     }
 }
 
+/// The peer a connect goes to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Peer<'a> {
+    Inet(SocketAddr),
+    Unix(&'a Path),
+}
+
 #[derive(Default)]
 pub(super) struct WriteState {
     /// The last call would have blocked, and no edge came since.
@@ -68,6 +79,8 @@ pub(super) struct WriteState {
     failed: Option<Failure>,
     /// An error the next call reports once.
     error: Option<io::Error>,
+    /// The connect was started.
+    connect_started: bool,
     connecting: bool,
     connected: Option<io::Result<()>>,
     shut: bool,
@@ -78,15 +91,6 @@ fn write_bytes(fd: RawFd, kind: Kind, bytes: &[u8]) -> io::Result<usize> {
     match kind {
         Kind::Bytes | Kind::File => sys::write(fd, bytes),
         _ => sys::send(fd, bytes),
-    }
-}
-
-/// Writes the bytes of `bufs`, gathered, to a stream.
-fn write_gathered(fd: RawFd, kind: Kind, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-    match (bufs, kind) {
-        ([one], _) => write_bytes(fd, kind, one),
-        (_, Kind::Bytes | Kind::File) => sys::write_vectored(fd, bufs),
-        _ => sys::send_vectored(fd, bufs),
     }
 }
 
@@ -105,7 +109,14 @@ impl WriteState {
         self.behind.is_some()
     }
 
+    /// A buffer from this thread's pool, or the side starves until one
+    /// comes back. A whole datagram no buffer of the pool could hold fails
+    /// the operation instead.
     fn buffer(&mut self, len: usize, whole: bool, after: &mut After) -> Option<PoolBuf> {
+        if whole && let Some(err) = crate::io::side::whole_too_large(len) {
+            self.error = Some(err);
+            return None;
+        }
         let buf =
             with_pool(|pool| pool.and_then(|p| if whole { p.get_whole(len) } else { p.get(len) }));
         if buf.is_none() && !self.starved {
@@ -115,15 +126,23 @@ impl WriteState {
         buf
     }
 
-    /// The driver's part: on readiness, finishes a connect, writes the
-    /// write-behind out and sends a queued datagram; wakes the tasks that
-    /// wait on any of it.
+    /// The driver's part: on readiness, does what the side holds and wakes
+    /// the tasks that wait on any of it.
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         if edge {
             self.blocked = false;
         }
+        if self.push(fd, kind, after) {
+            after.wake(&mut self.waiters);
+        }
+    }
+
+    /// The driver's calls on the descriptor, while the socket takes them:
+    /// ends a connect in progress, writes the write-behind out, sends a
+    /// queued datagram. Returns whether anything changed.
+    fn push(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
         if self.blocked {
-            return;
+            return false;
         }
         let mut progress = false;
         if self.connecting {
@@ -181,19 +200,12 @@ impl WriteState {
                 }
             }
         }
-        if self.starved && !self.blocked {
-            // The socket takes bytes again: a write that found no buffer
-            // goes straight to it.
-            self.starved = false;
-            progress = true;
-        }
-        if progress {
-            after.wake(&mut self.waiters);
-        }
+        progress
     }
 
     /// A write of the bytes of `bufs`, in order (one slice for a plain
-    /// write).
+    /// write): copied into the write-behind, which the driver writes out at
+    /// once if the socket may take it.
     fn write(
         &mut self,
         fd: RawFd,
@@ -212,35 +224,43 @@ impl WriteState {
         if len == 0 {
             return Poll::Ready(Ok(0));
         }
-        if let Some(behind) = self.behind.as_mut() {
-            let n = behind.append_vectored(bufs);
-            if n > 0 {
-                return Poll::Ready(Ok(n));
-            }
+        let first = self.behind.is_none();
+        let n = match self.behind.as_mut() {
+            Some(behind) => behind.append_vectored(bufs),
+            None => match self.buffer(len.max(BEHIND_MIN), false, after) {
+                Some(mut behind) => {
+                    let n = behind.append_vectored(bufs);
+                    self.behind = Some(behind);
+                    n
+                }
+                None => 0,
+            },
+        };
+        if n == 0 {
+            // No room (the write-behind is full, or the pool has nothing):
+            // the write waits for the driver to make some.
             self.waiters.register(waker);
             return Poll::Pending;
         }
-        if !self.blocked {
-            match sys::ready(write_gathered(fd, kind, bufs)) {
-                Some(result) => return Poll::Ready(result),
-                None => self.blocked = true,
-            }
+        self.push(fd, kind, after);
+        if first && let Some(failure) = self.failed.take() {
+            // Nothing written before was lost: the error is this write's.
+            return Poll::Ready(Err(failure.error()));
         }
-        match self.buffer(len.max(BEHIND_MIN), false, after) {
-            Some(mut behind) => {
-                let n = behind.append_vectored(bufs);
-                self.behind = Some(behind);
-                after.register = true;
-                Poll::Ready(Ok(n))
-            }
-            None => {
-                self.waiters.register(waker);
-                Poll::Pending
-            }
+        if self.behind.is_some() {
+            after.register = true;
         }
+        Poll::Ready(Ok(n))
     }
 
-    fn flush(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
+    fn flush(
+        &mut self,
+        fd: RawFd,
+        kind: Kind,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<()>> {
+        self.push(fd, kind, after);
         if let Some(failure) = self.failed.take() {
             return Poll::Ready(Err(failure.error()));
         }
@@ -251,21 +271,30 @@ impl WriteState {
         Poll::Ready(Ok(()))
     }
 
-    fn close(&mut self, fd: RawFd, kind: Kind, waker: &Waker) -> Poll<io::Result<()>> {
-        match self.flush(waker) {
+    fn close(
+        &mut self,
+        fd: RawFd,
+        kind: Kind,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<()>> {
+        match self.flush(fd, kind, waker, after) {
             Poll::Ready(Ok(())) => {}
             other => return other,
         }
-        if kind == Kind::Stream && !self.shut {
+        if matches!(kind, Kind::Stream | Kind::Tcp) && !self.shut {
             self.shut = true;
             return Poll::Ready(sys::shutdown_write(fd));
         }
         Poll::Ready(Ok(()))
     }
 
+    /// A datagram to `dest`: copied and queued, and sent by the driver at
+    /// once if the socket may take it.
     fn send(
         &mut self,
         fd: RawFd,
+        kind: Kind,
         bytes: &[u8],
         dest: Dest<'_>,
         waker: &Waker,
@@ -278,24 +307,26 @@ impl WriteState {
             self.waiters.register(waker);
             return Poll::Pending;
         }
-        if !self.blocked {
-            match sys::ready(send_datagram(fd, bytes, dest)) {
-                Some(result) => return Poll::Ready(result),
-                None => self.blocked = true,
+        let Some(mut datagram) = self.buffer(bytes.len(), true, after) else {
+            if let Some(err) = self.error.take() {
+                return Poll::Ready(Err(err));
             }
+            self.waiters.register(waker);
+            return Poll::Pending;
+        };
+        datagram.fill_from(bytes);
+        self.queued = Some((datagram, dest.to_owned()));
+        self.push(fd, kind, after);
+        if self.queued.is_none()
+            && let Some(err) = self.error.take()
+        {
+            // This datagram's own send failed.
+            return Poll::Ready(Err(err));
         }
-        match self.buffer(bytes.len(), true, after) {
-            Some(mut datagram) => {
-                datagram.fill_from(bytes);
-                self.queued = Some((datagram, dest.to_owned()));
-                after.register = true;
-                Poll::Ready(Ok(bytes.len()))
-            }
-            None => {
-                self.waiters.register(waker);
-                Poll::Pending
-            }
+        if self.queued.is_some() {
+            after.register = true;
         }
+        Poll::Ready(Ok(bytes.len()))
     }
 
     /// Bytes or a datagram accepted and not handed to the kernel yet, that
@@ -304,7 +335,8 @@ impl WriteState {
         self.failed.is_none() && (self.behind.is_some() || self.queued.is_some())
     }
 
-    fn drain(&mut self, waker: &Waker) -> Poll<()> {
+    fn drain(&mut self, fd: RawFd, kind: Kind, waker: &Waker, after: &mut After) -> Poll<()> {
+        self.push(fd, kind, after);
         if self.has_unsent() {
             self.waiters.register(waker);
             Poll::Pending
@@ -313,9 +345,32 @@ impl WriteState {
         }
     }
 
-    fn connect(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
+    /// A connect to `peer`: the driver starts it on the first poll, and sees
+    /// it end on the socket's first edge.
+    fn connect(
+        &mut self,
+        fd: RawFd,
+        peer: Peer<'_>,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<()>> {
         if let Some(result) = self.connected.take() {
             return Poll::Ready(result);
+        }
+        if !self.connect_started {
+            self.connect_started = true;
+            let started = match peer {
+                Peer::Inet(addr) => sys::connect_inet(fd, &addr),
+                Peer::Unix(path) => sys::connect_unix(fd, path),
+            };
+            match started {
+                Ok(true) => return Poll::Ready(Ok(())),
+                Ok(false) => {
+                    self.connecting = true;
+                    after.register = true;
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
         }
         if self.connecting {
             self.waiters.register(waker);
@@ -364,6 +419,7 @@ impl WriteState {
         }
         self.failed = None;
         self.error = None;
+        self.connect_started = false;
         self.connecting = false;
         self.connected = None;
         self.shut = false;
@@ -372,8 +428,8 @@ impl WriteState {
 }
 
 impl Source {
-    /// Writes `bytes` to a stream: at once if the socket takes them, else
-    /// into the write-behind.
+    /// Writes `bytes` to a stream: copied into the write-behind and written
+    /// out by the driver.
     pub(crate) fn poll_write(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -413,7 +469,7 @@ impl Source {
         let mut after = After::default();
         let poll = self.write.poll(
             &mut after,
-            |st, _| st.flush(cx.waker()),
+            |st, after| st.flush(fd, kind, cx.waker(), after),
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)
@@ -429,14 +485,13 @@ impl Source {
         let mut after = After::default();
         let poll = self.write.poll(
             &mut after,
-            |st, _| st.close(fd, kind, cx.waker()),
+            |st, after| st.close(fd, kind, cx.waker(), after),
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)
     }
 
-    /// Sends a datagram to `dest`: at once if the socket takes it, else
-    /// queued for the driver.
+    /// Sends a datagram to `dest`: copied, queued and sent by the driver.
     pub(crate) fn poll_send(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -451,7 +506,7 @@ impl Source {
         let mut after = After::default();
         let poll = self.write.poll(
             &mut after,
-            |st, after| st.send(fd, bytes, dest, cx.waker(), after),
+            |st, after| st.send(fd, kind, bytes, dest, cx.waker(), after),
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)
@@ -474,7 +529,7 @@ impl Source {
         let mut after = After::default();
         let poll = self.write.poll(
             &mut after,
-            |st, _| st.drain(cx.waker()),
+            |st, after| st.drain(fd, kind, cx.waker(), after),
             |st, after| st.serve(fd, kind, true, after),
         );
         match self.finish_poll(after, poll.map(Ok)) {
@@ -483,23 +538,14 @@ impl Source {
         }
     }
 
-    /// A non-blocking connect is in progress: the driver sees it end.
-    pub(crate) fn begin_connect(self: &Arc<Self>) {
-        let mut after = After::default();
-        self.write.run(
-            &mut after,
-            |st, _| {
-                st.connecting = true;
-                st.connected = None;
-            },
-            self.serve_write(),
-        );
-        self.settle(after);
-    }
-
-    /// Completes when the connect begun with
-    /// [`begin_connect`](Self::begin_connect) ended, with its outcome.
-    pub(crate) fn poll_connect(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    /// Connects the socket to `peer`: the driver starts the connect on the
+    /// first poll and sees it end. Polled again after it completes, it
+    /// completes at once.
+    pub(crate) fn poll_connect(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        peer: Peer<'_>,
+    ) -> Poll<io::Result<()>> {
         let fd = match self.fd() {
             Ok(fd) => fd,
             Err(err) => return Poll::Ready(Err(err)),
@@ -508,7 +554,7 @@ impl Source {
         let mut after = After::default();
         let poll = self.write.poll(
             &mut after,
-            |st, _| st.connect(cx.waker()),
+            |st, after| st.connect(fd, peer, cx.waker(), after),
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)

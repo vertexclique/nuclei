@@ -9,13 +9,15 @@
 //!
 //! # How an operation runs
 //!
-//! An operation first tries its system call at once, into the caller's own
-//! buffer: most find the descriptor ready and finish there. One that would
-//! block records that its task waits, and the driver, on the descriptor's
-//! next readiness, makes the call itself on the shard thread into a buffer
-//! of the shard's pool (a read) or from the bytes it was handed (a write),
-//! and wakes the task, which takes the result. No task waits for readiness
-//! and then makes the call: the driver completes the operation.
+//! Every operation is completed by the driver, and every call on the
+//! descriptor is the driver's, into runtime memory: a read lands in a
+//! buffer of the pool and the task copies it out; a write's bytes are
+//! copied into a buffer of the pool and the driver writes them out. A task
+//! that asks hands the work to the driver, which makes the call at once if
+//! the socket may be ready (on the task's thread, under the side's guard)
+//! and otherwise on the socket's next edge; the task takes the result when
+//! it is there and waits for a wake when it is not. No task waits for
+//! readiness and then makes the call itself.
 //!
 //! # The descriptor
 //!
@@ -60,8 +62,10 @@ const REGISTERED: u8 = 2;
 /// What kind of descriptor a source is: which system calls fit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
-    /// A connected stream socket (TCP or Unix).
+    /// A connected Unix stream socket.
     Stream,
+    /// A connected TCP stream socket.
+    Tcp,
     /// Any other byte stream (a pipe, a terminal).
     Bytes,
     /// A regular file or a block device: always ready to the kernel, so
@@ -230,14 +234,11 @@ impl Source {
     /// Makes sure the driver of some shard watches the source: the current
     /// shard's, or (on a thread that runs none) one of the runtime's.
     fn ensure_registered(self: &Arc<Self>) -> io::Result<()> {
-        match self.reg.state.load(Ordering::Acquire) {
-            REGISTERED if !self.registered_on_stopped_shard() => return Ok(()),
-            // The shard stopped with its runtime: one that runs takes over.
-            REGISTERED => self.detach_held(),
-            // Another poll is registering it; readiness is reported once the
-            // registration is in place.
-            REGISTERING => return Ok(()),
-            _ => {}
+        // Registered, or being registered by another poll (readiness is
+        // reported once the registration is in place). A shard that goes
+        // evicts its sources first, so a registration in place has a driver.
+        if self.reg.state.load(Ordering::Acquire) != UNREGISTERED {
+            return Ok(());
         }
         if self
             .reg
@@ -259,18 +260,6 @@ impl Source {
                 Ok(())
             }
         }
-    }
-
-    fn registered_on_stopped_shard(self: &Arc<Self>) -> bool {
-        let mut after = After::default();
-        let stopped = self.read.run(
-            &mut after,
-            // SAFETY: a side is held, so nobody writes the registration.
-            |_, _| unsafe { (*self.reg.shard.get()).as_ref() }.is_some_and(|s| s.is_stopped()),
-            self.serve_read(),
-        );
-        self.settle(after);
-        stopped
     }
 
     /// Registers the source with `shard`'s poller under `token`. Called on
@@ -339,13 +328,6 @@ impl Source {
             }
             shard.release_source(token);
         }
-    }
-
-    fn detach_held(&self) {
-        let read = self.read.hold();
-        let write = self.write.hold();
-        self.detach();
-        drop((write, read));
     }
 
     /// The shard the source is registered with is going away: the
@@ -446,6 +428,9 @@ impl Source {
             self.read.drive(
                 &mut after,
                 |st, edge, after| {
+                    if readiness.urgent || readiness.hangup {
+                        st.short_reads_unsure();
+                    }
                     if let Some(fd) = self.live_fd(token) {
                         st.serve(fd, kind, edge, after);
                     }

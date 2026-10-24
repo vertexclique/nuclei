@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use super::write::Dest;
 use super::{Addr, Kind, Source};
 use crate::io::sys;
@@ -471,10 +472,10 @@ fn a_revival_with_the_same_descriptor_keeps_the_read_ahead() {
     });
 }
 
-/// A pool too small for any buffer: reads still complete, each one by the
-/// task once the driver had no buffer to read into.
+/// A pool asked to hold nothing holds one small buffer: reads still
+/// complete, all through it, as it comes back for each.
 #[test]
-fn reads_complete_when_the_pool_has_no_room() {
+fn reads_complete_through_a_pool_of_one_small_buffer() {
     let rt = runtime(Some(0));
     let (a, b) = pair();
     let data = pattern(256 * 1024);
@@ -528,6 +529,38 @@ fn a_thread_that_runs_no_shard_is_served_by_the_runtime() {
     }
 }
 
+/// A datagram larger than any buffer the pool may hold cannot be received
+/// or sent through it: the operation fails at once, saying what to raise.
+#[test]
+fn a_datagram_larger_than_the_pool_allows_fails_loudly() {
+    let rt = runtime(Some(64 * 1024));
+    let (a, b) = UnixDatagram::pair().unwrap();
+    let a = Owned::new(a, Kind::UnixDatagram);
+    let b = Owned::new(b, Kind::UnixDatagram);
+    rt.block_on(async {
+        let big = vec![1u8; 100 * 1024];
+        // Polled on a worker, whose pool has the cap.
+        let (src, bytes) = (Arc::clone(&a.src), big.clone());
+        let sent = within(crate::runtime::spawn(async move {
+            poll_fn(|cx| src.poll_send(cx, &bytes, super::write::Dest::Connected)).await
+        }))
+        .await;
+        let err = sent.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(err.to_string().contains("io_buffer_cap"), "{err}");
+        let src = Arc::clone(&b.src);
+        let got = within(crate::runtime::spawn(async move {
+            let mut buf = vec![0u8; 100 * 1024];
+            poll_fn(|cx| src.poll_receive(cx, &mut buf, false))
+                .await
+                .map(|(n, _)| n)
+        }))
+        .await;
+        assert_eq!(got.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+    });
+}
+
+#[cfg(target_os = "linux")]
 fn set_buffers(fd: std::os::fd::RawFd, bytes: libc::c_int) {
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
         // SAFETY: a plain setsockopt with a pointer to our own int.

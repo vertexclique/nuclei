@@ -199,6 +199,22 @@ impl<S> Drop for Held<'_, S> {
     }
 }
 
+/// The error of a whole datagram larger than any buffer the thread's pool
+/// may hold, or `None` when it could get one.
+pub(crate) fn whole_too_large(len: usize) -> Option<std::io::Error> {
+    crate::buf::with_pool(|pool| {
+        pool.filter(|p| !p.could_hold_whole(len)).map(|p| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!(
+                    "a datagram of {len} bytes needs more IO buffer memory than the runtime allows ({} bytes); raise `Builder::io_buffer_cap`",
+                    p.cap()
+                ),
+            )
+        })
+    })
+}
+
 /// What a step leaves for once no guard is held: wakers to wake, wakers and
 /// buffers to drop (either may run code that reaches a source), and what
 /// the source must do next.
@@ -206,7 +222,9 @@ impl<S> Drop for Held<'_, S> {
 pub(crate) struct After {
     wake: Wakers,
     forget: Wakers,
-    drop: Vec<PoolBuf>,
+    /// Buffers to drop: almost every step drops one at most.
+    drop_one: Option<PoolBuf>,
+    drop_more: Vec<PoolBuf>,
     /// A side found the pool empty and must hear when a buffer comes back.
     pub(crate) starved: bool,
     /// Work was left to the driver: the source must be registered.
@@ -224,13 +242,21 @@ impl After {
     }
 
     pub(crate) fn drop_buf(&mut self, buf: PoolBuf) {
-        self.drop.push(buf);
+        match self.drop_one {
+            None => self.drop_one = Some(buf),
+            Some(_) => self.drop_more.push(buf),
+        }
     }
 
     /// Wakes and drops; call with no guard held.
     pub(crate) fn run(&mut self) {
-        self.drop.clear();
-        self.forget = Wakers::default();
+        drop(self.drop_one.take());
+        if !self.drop_more.is_empty() {
+            self.drop_more.clear();
+        }
+        if !self.forget.is_empty() {
+            self.forget = Wakers::default();
+        }
         self.wake.wake_all();
     }
 }
@@ -291,8 +317,10 @@ impl Wakers {
         if let Some(w) = self.first.take() {
             w.wake();
         }
-        for w in self.rest.drain(..) {
-            w.wake();
+        if !self.rest.is_empty() {
+            for w in self.rest.drain(..) {
+                w.wake();
+            }
         }
     }
 }

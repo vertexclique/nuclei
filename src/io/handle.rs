@@ -18,8 +18,8 @@
 //!
 //! # Bytes written behind
 //!
-//! A write the socket could not take at once is accepted into the handle's
-//! write-behind, as the kernel accepts bytes into a socket's buffer. Those
+//! A write is accepted into the handle's write-behind, as the kernel
+//! accepts bytes into a socket's buffer, and the driver writes it out. Those
 //! bytes go out whatever happens to the handle, as std's do: `get_mut` and
 //! `into_inner` wait until the kernel took them, and a handle dropped before
 //! that leaves them to a copy of its descriptor, which delivers them (for

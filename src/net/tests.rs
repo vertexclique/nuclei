@@ -605,3 +605,97 @@ fn vectored_reads_and_writes_scatter_and_gather_in_order() {
         assert_eq!(got, b"late bytes"[..n]);
     });
 }
+
+/// Bytes and the peer's FIN come in one event: after a short read the end
+/// of the stream is still seen.
+#[test]
+fn tcp_bytes_then_the_peers_close_read_whole_then_end() {
+    let rt = runtime();
+    rt.block_on(async {
+        for size in [1usize, 100, 70_000] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = within(Handle::<TcpStream>::connect(addr)).await.unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            let data = pattern(size);
+            // Written and closed at once: the bytes and the FIN arrive together.
+            peer.write_all(&data).unwrap();
+            drop(peer);
+            crate::time::sleep(Duration::from_millis(5)).await;
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match within(read_some(&mut client, &mut buf)).await.unwrap() {
+                    0 => break,
+                    n => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            assert!(got == data, "{size} bytes: got {}", got.len());
+        }
+    });
+}
+
+/// Urgent data stops a read at its mark with bytes still queued behind it:
+/// those bytes are still read, without new ones having to come.
+#[test]
+fn tcp_bytes_behind_urgent_data_are_still_read() {
+    let rt = runtime();
+    rt.block_on(async {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = within(Handle::<TcpStream>::connect(addr)).await.unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        peer.set_nodelay(true).unwrap();
+        // One normal read first, so the socket reads short and drained.
+        (&peer).write_all(b"first").unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(within(read_some(&mut client, &mut buf)).await.unwrap(), 5);
+        // Bytes, one urgent byte, more bytes: the read stops at the mark.
+        (&peer).write_all(b"before").unwrap();
+        // SAFETY: a plain send of one byte from our own buffer.
+        let sent = unsafe { libc::send(peer.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
+        assert_eq!(sent, 1);
+        (&peer).write_all(b"after").unwrap();
+        crate::time::sleep(Duration::from_millis(5)).await;
+        let mut got = Vec::new();
+        while got.len() < b"beforeafter".len() {
+            let n = within(read_some(&mut client, &mut buf)).await.unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+        // The urgent byte is not in the stream (no SO_OOBINLINE).
+        assert_eq!(got, b"beforeafter");
+        drop(peer);
+    });
+}
+
+/// Many short round trips: every reply is read, none waits for a later one.
+#[test]
+fn tcp_short_round_trips_never_wait_for_the_next_message() {
+    let rt = runtime();
+    rt.block_on(async {
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16];
+            loop {
+                match read_some(&mut s, &mut buf).await.unwrap() {
+                    0 => break,
+                    n => write_all(&mut s, &buf[..n]).await.unwrap(),
+                }
+            }
+        });
+        let mut c = within(Handle::<TcpStream>::connect(addr)).await.unwrap();
+        c.set_nodelay(true).unwrap();
+        for i in 0..2000u32 {
+            let msg = i.to_le_bytes();
+            within(write_all(&mut c, &msg)).await.unwrap();
+            let mut back = [0u8; 4];
+            within(read_exact(&mut c, &mut back)).await.unwrap();
+            assert_eq!(back, msg);
+        }
+        drop(c);
+        within(server).await;
+    });
+}

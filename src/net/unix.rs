@@ -4,13 +4,13 @@ use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
 use std::path::Path;
 
 use futures_core::Stream;
 
-use crate::io::source::write::Dest;
+use crate::io::source::write::{Dest, Peer};
 use crate::io::source::{Addr, Kind};
 use crate::io::{Handle, sys};
 
@@ -91,13 +91,9 @@ impl Handle<UnixStream> {
             UnixStream::from(sys::socket(libc::AF_UNIX, libc::SOCK_STREAM)?),
             Kind::Stream,
         );
-        match sys::connect_unix(stream.as_raw_fd(), path.as_ref()) {
-            Ok(true) => Ok(stream),
-            Ok(false) => {
-                stream.source().begin_connect();
-                poll_fn(|cx| stream.source().poll_connect(cx)).await?;
-                Ok(stream)
-            }
+        let peer = Peer::Unix(path.as_ref());
+        match poll_fn(|cx| stream.source().poll_connect(cx, peer)).await {
+            Ok(()) => Ok(stream),
             // The listener's backlog is full: nothing tells a socket when it
             // has room, so a thread of the blocking pool waits in a blocking
             // connect instead.

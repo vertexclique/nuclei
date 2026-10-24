@@ -2,9 +2,10 @@
 //! system calls they make.
 //!
 //! A handle's IO object stays its own (std's sockets and files); its source
-//! is what the shard's driver reaches. Operations try their system call at
-//! once and leave it to the driver when it would block; the driver
-//! completes it on readiness and wakes the task (see [`source`]).
+//! is what the shard's driver reaches. The driver completes every
+//! operation, into and out of the pool's buffers, at once when it can and
+//! on readiness otherwise, and wakes the task, which takes the result (see
+//! [`source`]).
 
 mod handle;
 pub(crate) mod side;

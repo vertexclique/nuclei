@@ -153,7 +153,11 @@ pub(crate) struct Pool {
 unsafe impl Send for Pool {}
 
 impl Pool {
+    /// A pool holding at most `cap` bytes, and at least one buffer of the
+    /// smallest class whatever `cap` says: IO through a pool that could hold
+    /// none would never move.
     pub(crate) fn new(cap: usize) -> Self {
+        let cap = cap.max(CLASSES[0]);
         Self {
             home: Arc::new(Home {
                 returned: SegQueue::new(),
@@ -191,6 +195,22 @@ impl Pool {
             .or_else(|| self.take_returned(class))
             .or_else(|| self.allocate(class))?;
         Some(self.buf(ptr, class as u8, CLASSES[class]))
+    }
+
+    /// Whether a buffer holding all of `len` bytes could ever come from the
+    /// pool, every other buffer back.
+    pub(crate) fn could_hold_whole(&self, len: usize) -> bool {
+        let size = if len <= LARGEST {
+            CLASSES[class_for(len)]
+        } else {
+            len.next_multiple_of(4096)
+        };
+        size <= self.cap
+    }
+
+    /// The bytes the pool may hold.
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
     }
 
     /// A buffer that holds all of `len` bytes, whatever their number: a class

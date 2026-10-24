@@ -92,8 +92,11 @@ impl Poller {
         self.wait_at_most(usize::MAX, timeout, &mut on_event)
     }
 
-    /// As [`wait`](Self::wait), taking at most `max` events (at least one)
-    /// from the kernel in this call.
+    /// Blocks until a notifier fires, a registered source is ready, or
+    /// `timeout` passes (`None` waits, a zero timeout only looks), taking at
+    /// most `max` events (at least one) from the kernel. Calls `on_event`
+    /// with the token and readiness of each ready source. Returns whether a
+    /// wake came.
     pub(crate) fn wait_at_most(
         &mut self,
         max: usize,

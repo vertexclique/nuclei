@@ -12,8 +12,10 @@
 (* ahead and wakes the reader, or marks the cache blocked. Finding the     *)
 (* side held, it sets READY instead and goes on; if the holder let go      *)
 (* before the flag landed, it takes the side after all. The reader holds   *)
-(* the side for one step: it takes the read-ahead, or reads the kernel     *)
-(* itself unless the cache says it would block, or registers its waker.    *)
+(* the side for one step: it takes the read-ahead; or, unless the cache    *)
+(* says the call would block, it runs the driver's read at once (into the  *)
+(* read-ahead, never into its own buffer) and takes that; or it registers  *)
+(* its waker.                                                              *)
 (* As it lets go it looks at READY: if set, it takes the side again and    *)
 (* does the driver's part, then its own step again if it was waiting.      *)
 (*                                                                          *)
@@ -45,7 +47,7 @@ variables
     flagged = FALSE,    \* (record) the driver flagged a held side
     delegated = FALSE,  \* (record) the reader did the driver's part
     driverRead = FALSE, \* (record) the driver read for the reader
-    inline = FALSE;     \* (record) the reader read the kernel itself
+    submitRead = FALSE; \* (record) a reader's submit ran the driver's read
 
 define
     Busy(s) == s % 2 = 1
@@ -139,15 +141,19 @@ R_step:
             goto R_release;
         end if;
 R_read:
-        \* The read system call, into the reader's own buffer.
+        \* The driver's read, run by the reader's submit: into the read-ahead.
         if kernel > 0 then
-            got := got + kernel; kernel := 0;
-            inline := TRUE; out := "ready";
-            goto R_release;
+            ahead := ahead + kernel; kernel := 0;
+            submitRead := TRUE;
+            goto R_take;
         end if;
 R_mark:
         \* It would have blocked: the cache, and the waker.
         blocked := TRUE; waiting := TRUE; out := "pending";
+        goto R_release;
+R_take:
+        \* The reader copies out what the driver read.
+        got := got + ahead; ahead := 0; out := "ready";
 R_release:
         \* MUTATION release_ignores_ready: the reader lets go without looking.
         if Flag(state) /\ Mutation # "release_ignores_ready" then
@@ -201,7 +207,7 @@ Conservation == got + ahead + kernel = arrived
 
 \* One holder at a time, and the word says so.
 DriverHolds == pc["driver"] \in {"D_edge", "D_serve", "D_release"}
-ReaderHolds == pc["reader"] \in {"R_step", "R_read", "R_mark", "R_release", "R_edge", "R_serve", "R_again"}
+ReaderHolds == pc["reader"] \in {"R_step", "R_read", "R_mark", "R_take", "R_release", "R_edge", "R_serve", "R_again"}
 Exclusive == ~(DriverHolds /\ ReaderHolds) /\ ((DriverHolds \/ ReaderHolds) => Busy(state))
 
 \* `Termination` (every thread finishes, so every byte reached the reader) is the one the
@@ -218,6 +224,6 @@ NoFlag == ~flagged
 NoDelegate == ~delegated
 \* The driver completes a read for a waiting reader.
 NoDriverRead == ~driverRead
-\* The reader reads the kernel itself.
-NoInline == ~inline
+\* A reader's submit runs the driver's read and takes its bytes.
+NoSubmitRead == ~submitRead
 =============================================================================

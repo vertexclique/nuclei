@@ -9,4 +9,4 @@ M_hold_needs_zero              MC_Side              violated:Termination
 W_flag                         MC_Side              violated:NoFlag
 W_delegate                     MC_Side              violated:NoDelegate
 W_driver_read                  MC_Side              violated:NoDriverRead
-W_inline                       MC_Side              violated:NoInline
+W_submit_read                  MC_Side              violated:NoSubmitRead
