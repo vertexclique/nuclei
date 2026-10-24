@@ -9,7 +9,15 @@
 //! accepted connections, a datagram socket's datagrams (as many as tasks
 //! wait, at most [`BATCH`]). A task whose future went away leaves it for the
 //! next operation, so nothing the kernel handed over is lost.
+//!
+//! A stream read may also lend the side a buffer of its own
+//! ([`Source::read_owned`]): the driver reads into that buffer, with no copy,
+//! and the task takes it back with the bytes. One buffer is lent at a time;
+//! while it waits for its bytes the driver reads into nothing else, and a
+//! lent buffer whose task went away hands what the driver read into it to
+//! the read-ahead, ahead of anything read after it.
 
+use core::future::poll_fn;
 use core::task::{Poll, Waker};
 use std::collections::VecDeque;
 use std::io;
@@ -25,6 +33,82 @@ use crate::io::sys;
 /// The most connections or datagrams the driver takes ahead on one edge.
 const BATCH: usize = 32;
 
+/// Bytes read ahead that no task took yet.
+enum Ahead {
+    /// Read by the driver into a buffer of the pool.
+    Pool(PoolBuf),
+    /// Read into a lent buffer, from `start`, whose task went away.
+    // vertexia: the caller's allocation, kept uncharged by the pool (one per
+    // source at most, freed by the next reads); copy it into pool buffers if
+    // kept buffers must count against the cap.
+    Left { buf: Vec<u8>, start: usize },
+}
+
+impl Ahead {
+    fn filled(&self) -> &[u8] {
+        match self {
+            Ahead::Pool(buf) => buf.filled(),
+            Ahead::Left { buf, start } => buf.get(*start..).unwrap_or_default(),
+        }
+    }
+
+    fn consume(&mut self, n: usize) {
+        match self {
+            Ahead::Pool(buf) => buf.consume(n),
+            Ahead::Left { buf, start } => *start = (*start + n).min(buf.len()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.filled().is_empty()
+    }
+
+    /// Copies bytes into `out`, consumed unless `peek`; returns how many.
+    fn copy_into(&mut self, out: &mut [u8], peek: bool) -> usize {
+        let src = self.filled();
+        let n = src.len().min(out.len());
+        out[..n].copy_from_slice(&src[..n]);
+        if !peek {
+            self.consume(n);
+        }
+        n
+    }
+
+    /// Copies bytes into `bufs`, in order, and consumes them.
+    fn copy_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> usize {
+        let n = crate::buf::copy_vectored(self.filled(), bufs);
+        self.consume(n);
+        n
+    }
+
+    /// Moves bytes onto the end of `buf`, as many as its spare capacity
+    /// holds.
+    fn append_to(&mut self, buf: &mut Vec<u8>) -> usize {
+        let src = self.filled();
+        let n = src.len().min(buf.capacity() - buf.len());
+        buf.extend_from_slice(&src[..n]);
+        self.consume(n);
+        n
+    }
+
+    fn release(self, after: &mut After) {
+        if let Ahead::Pool(buf) = self {
+            after.drop_buf(buf);
+        }
+    }
+}
+
+/// A task's own buffer, lent to the side for the driver to read into.
+struct Lent {
+    buf: Vec<u8>,
+    /// What the buffer held before: the read's bytes start here.
+    from: usize,
+    /// The read's result, once the driver made it.
+    done: Option<io::Result<usize>>,
+    /// The task to wake when it is made; `None` while the task polls.
+    waker: Option<Waker>,
+}
+
 #[derive(Default)]
 pub(super) struct ReadState {
     /// The last call would have blocked, and no edge came since.
@@ -34,7 +118,8 @@ pub(super) struct ReadState {
     starved: bool,
     /// The largest read a waiting task asked for: what the driver reads.
     want: usize,
-    ahead: Option<PoolBuf>,
+    ahead: Option<Ahead>,
+    lent: Option<Lent>,
     eof: bool,
     error: Option<io::Error>,
     accepted: VecDeque<(OwnedFd, Addr)>,
@@ -51,6 +136,17 @@ impl ReadState {
             || self.error.is_some()
             || !self.accepted.is_empty()
             || !self.datagrams.is_empty()
+    }
+
+    /// A lent buffer the driver has read into: nothing more is read until
+    /// its task takes it back or goes away, so bytes stay in order.
+    fn lent_done(&self) -> bool {
+        self.lent.as_ref().is_some_and(|l| l.done.is_some())
+    }
+
+    /// A lent buffer waits for the driver.
+    fn lent_waits(&self) -> bool {
+        self.lent.as_ref().is_some_and(|l| l.done.is_none())
     }
 
     fn wait(&mut self, waker: &Waker, len: usize) {
@@ -81,7 +177,7 @@ impl ReadState {
         if edge {
             self.blocked = false;
         }
-        if self.waiters.is_empty() {
+        if self.waiters.is_empty() && !self.lent_waits() {
             return;
         }
         self.complete(fd, kind, self.want, after);
@@ -91,17 +187,22 @@ impl ReadState {
         }
     }
 
-    /// The driver's call on the descriptor, into the pool's buffers: a
-    /// stream's bytes (`len` asked), a listener's connections, a socket's
-    /// datagrams (`len` each). Nothing while the last call would have
-    /// blocked and no edge came since, or while a result waits to be taken.
+    /// The driver's call on the descriptor: a stream's bytes, into the lent
+    /// buffer if there is one, else into the pool's (`len` asked); a
+    /// listener's connections; a socket's datagrams (`len` each). Nothing
+    /// while the last call would have blocked and no edge came since, or
+    /// while a result waits to be taken.
     fn complete(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
-        if self.blocked || self.has_result() {
+        if self.blocked || self.has_result() || self.lent_done() {
             return;
         }
         match kind {
             Kind::Stream | Kind::Tcp | Kind::Bytes | Kind::File => {
-                self.read_ahead(fd, kind, len, after)
+                if self.lent.is_some() {
+                    self.read_lent(fd, kind, after);
+                } else {
+                    self.read_ahead(fd, kind, len, after);
+                }
             }
             Kind::TcpListener | Kind::UnixListener => self.accept_ahead(fd, kind),
             Kind::Udp | Kind::UnixDatagram => self.receive_ahead(fd, kind, len, after),
@@ -122,14 +223,14 @@ impl ReadState {
         &mut self,
         peek: bool,
         after: &mut After,
-        copy: impl FnOnce(&mut PoolBuf) -> usize,
+        copy: impl FnOnce(&mut Ahead) -> usize,
     ) -> Option<io::Result<usize>> {
         if let Some(ahead) = self.ahead.as_mut() {
             let n = copy(ahead);
             if ahead.is_empty()
                 && let Some(done) = self.ahead.take()
             {
-                after.drop_buf(done);
+                done.release(after);
             }
             return Some(Ok(n));
         }
@@ -157,12 +258,38 @@ impl ReadState {
             Some(Ok(n)) => {
                 self.blocked = drained(kind, self.unsure, n, buf.capacity());
                 buf.set_filled(n);
-                self.ahead = Some(buf);
+                self.ahead = Some(Ahead::Pool(buf));
             }
             Some(Err(err)) => {
                 self.error = Some(err);
                 after.drop_buf(buf);
             }
+        }
+    }
+
+    /// Reads into the spare capacity of the lent buffer, and wakes its task.
+    fn read_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) {
+        let Some(lent) = self.lent.as_mut() else {
+            return;
+        };
+        let spare = lent.buf.spare_capacity_mut();
+        let asked = spare.len();
+        let result = match sys::ready(sys::read_uninit(fd, spare)) {
+            None => {
+                self.blocked = true;
+                return;
+            }
+            Some(result) => result,
+        };
+        if let Ok(n) = result {
+            // SAFETY: the kernel wrote the first `n` bytes of the spare
+            // capacity.
+            unsafe { lent.buf.set_len(lent.buf.len() + n) };
+            self.blocked = drained(kind, self.unsure, n, asked);
+        }
+        lent.done = Some(result);
+        if let Some(waker) = lent.waker.take() {
+            after.wake_one(waker);
         }
     }
 
@@ -220,14 +347,7 @@ impl ReadState {
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
         self.complete(fd, kind, out.len(), after);
-        let copy = |ahead: &mut PoolBuf| {
-            if peek {
-                ahead.peek_into(out)
-            } else {
-                ahead.read_into(out)
-            }
-        };
-        match self.take_stream(peek, after, copy) {
+        match self.take_stream(peek, after, |ahead| ahead.copy_into(out, peek)) {
             Some(result) => {
                 self.pass_on(after);
                 Poll::Ready(result)
@@ -250,7 +370,7 @@ impl ReadState {
     ) -> Poll<io::Result<usize>> {
         let len = bufs.iter().map(|b| b.len()).sum();
         self.complete(fd, kind, len, after);
-        match self.take_stream(false, after, |ahead| ahead.read_into_vectored(bufs)) {
+        match self.take_stream(false, after, |ahead| ahead.copy_vectored(bufs)) {
             Some(result) => {
                 self.pass_on(after);
                 Poll::Ready(result)
@@ -260,6 +380,101 @@ impl ReadState {
                 Poll::Pending
             }
         }
+    }
+
+    /// A stream read into a task's own buffer (`held`; `None` while it is
+    /// lent): bytes another read left are moved into it; otherwise it is
+    /// lent and the driver reads into it, at once if the socket may hold
+    /// bytes and on the next edge if not. Ready with the buffer back in
+    /// `held`.
+    fn read_owned(
+        &mut self,
+        fd: RawFd,
+        kind: Kind,
+        held: &mut Option<Vec<u8>>,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        if let Some(buf) = held.as_mut() {
+            if let Some(result) = self.take_stream(false, after, |ahead| ahead.append_to(buf)) {
+                self.pass_on(after);
+                return Poll::Ready(result);
+            }
+            if self.lent.is_some() {
+                // Another task's buffer is lent: this one waits its turn.
+                self.wait(waker, 0);
+                return Poll::Pending;
+            }
+            self.lent = held.take().map(|buf| Lent {
+                from: buf.len(),
+                buf,
+                done: None,
+                waker: None,
+            });
+        }
+        // The task polls, so the driver's read needs no wake for it.
+        let old = self.lent.as_mut().and_then(|l| l.waker.take());
+        self.complete(fd, kind, 0, after);
+        let Some(lent) = self.lent.as_mut() else {
+            return Poll::Ready(Err(io::Error::other("the read lost its buffer")));
+        };
+        if lent.done.is_none() {
+            lent.waker = Some(match old {
+                Some(w) if w.will_wake(waker) => w,
+                other => {
+                    if let Some(w) = other {
+                        after.forget_one(w);
+                    }
+                    waker.clone()
+                }
+            });
+            return Poll::Pending;
+        }
+        if let Some(w) = old {
+            after.forget_one(w);
+        }
+        let Some(Lent { buf, done, .. }) = self.lent.take() else {
+            return Poll::Ready(Err(io::Error::other("the read lost its buffer")));
+        };
+        *held = Some(buf);
+        // Reads that waited for the lent buffer go on.
+        after.wake(&mut self.waiters);
+        Poll::Ready(done.unwrap_or(Ok(0)))
+    }
+
+    /// The task of the lent buffer went away: what the driver read into it
+    /// becomes the read-ahead (its end or its error, the next read's), so
+    /// nothing is lost.
+    fn abandon_lent(&mut self, after: &mut After) {
+        let Some(lent) = self.lent.take() else {
+            return;
+        };
+        if let Some(w) = lent.waker {
+            after.forget_one(w);
+        }
+        match lent.done {
+            None => {}
+            Some(Ok(0)) => self.eof = true,
+            Some(Ok(_)) => {
+                debug_assert!(self.ahead.is_none(), "bytes were read past the lent buffer");
+                self.ahead = Some(Ahead::Left {
+                    buf: lent.buf,
+                    start: lent.from,
+                });
+            }
+            Some(Err(err)) => self.error = Some(err),
+        }
+        after.wake(&mut self.waiters);
+    }
+
+    /// The lent buffer back, as it is, for a poll that ends in an error.
+    fn reclaim(&mut self, after: &mut After) -> Option<Vec<u8>> {
+        let lent = self.lent.take()?;
+        if let Some(w) = lent.waker {
+            after.forget_one(w);
+        }
+        after.wake(&mut self.waiters);
+        Some(lent.buf)
     }
 
     /// An accept: the driver accepts first if the listener may hold a
@@ -331,6 +546,12 @@ impl ReadState {
     /// Registration failed: the waiting tasks get the error.
     pub(super) fn fail(&mut self, failure: Failure, after: &mut After) {
         self.error = Some(failure.error());
+        if let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none()) {
+            lent.done = Some(Err(failure.error()));
+            if let Some(w) = lent.waker.take() {
+                after.wake_one(w);
+            }
+        }
         after.wake(&mut self.waiters);
     }
 
@@ -345,18 +566,27 @@ impl ReadState {
     /// Every waiting task looks again.
     pub(super) fn wake_all(&mut self, after: &mut After) {
         self.starved = false;
+        if let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take()) {
+            after.wake_one(w);
+        }
         after.wake(&mut self.waiters);
     }
 
     pub(super) fn forget_waiters(&mut self, after: &mut After) {
         self.starved = false;
+        if let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take()) {
+            after.forget_one(w);
+        }
         after.forget(&mut self.waiters);
     }
 
     /// Drops what the side holds: the descriptor it came from is gone.
     pub(super) fn discard(&mut self, after: &mut After) {
-        if let Some(buf) = self.ahead.take() {
-            after.drop_buf(buf);
+        if let Some(ahead) = self.ahead.take() {
+            ahead.release(after);
+        }
+        if let Some(w) = self.lent.take().and_then(|l| l.waker) {
+            after.forget_one(w);
         }
         for (buf, _) in self.datagrams.drain(..) {
             after.drop_buf(buf);
@@ -437,6 +667,51 @@ impl Source {
         self.finish_poll(after, poll)
     }
 
+    /// Reads into the spare capacity of `buf`, after the bytes it holds,
+    /// and gives it back with the read's result. The buffer is lent to the
+    /// side until the driver read into it, so the bytes land in it with no
+    /// copy (bytes another read left behind are copied in instead).
+    pub(crate) async fn read_owned(self: &Arc<Self>, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        let mut op = ReadOwned {
+            source: self,
+            buf: Some(buf),
+            lent: false,
+        };
+        let result = poll_fn(|cx| op.poll(cx)).await;
+        (result, op.buf.take().unwrap_or_default())
+    }
+
+    fn poll_read_owned(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        held: &mut Option<Vec<u8>>,
+    ) -> Poll<io::Result<usize>> {
+        if held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
+            return Poll::Ready(Ok(0));
+        }
+        let poll = match self.fd() {
+            Ok(fd) => {
+                let kind = self.kind;
+                let mut after = After::default();
+                let poll = self.read.poll(
+                    &mut after,
+                    |st, after| st.read_owned(fd, kind, held, cx.waker(), after),
+                    |st, after| st.serve(fd, kind, true, after),
+                );
+                self.finish_poll(after, poll)
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        };
+        if poll.is_ready() && held.is_none() {
+            let mut after = After::default();
+            *held = self
+                .read
+                .run(&mut after, |st, after| st.reclaim(after), self.serve_read());
+            self.settle(after);
+        }
+        poll
+    }
+
     /// Reads from a stream, scattered into `bufs` in order.
     pub(crate) fn poll_read_vectored(
         self: &Arc<Self>,
@@ -499,5 +774,35 @@ impl Source {
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)
+    }
+}
+
+/// A read whose buffer may be lent to the side. Dropped while it is, the
+/// side keeps what the driver read into it for the next read.
+struct ReadOwned<'a> {
+    source: &'a Arc<Source>,
+    buf: Option<Vec<u8>>,
+    lent: bool,
+}
+
+impl ReadOwned<'_> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let poll = self.source.poll_read_owned(cx, &mut self.buf);
+        self.lent = self.buf.is_none();
+        poll
+    }
+}
+
+impl Drop for ReadOwned<'_> {
+    fn drop(&mut self) {
+        if self.lent {
+            let mut after = After::default();
+            self.source.read.run(
+                &mut after,
+                |st, after| st.abandon_lent(after),
+                self.source.serve_read(),
+            );
+            self.source.settle(after);
+        }
     }
 }

@@ -4,7 +4,9 @@
 //! operations (`accept`, `connect`, `send`, `recv`, `peek`, `send_to`,
 //! `recv_from`, `peek_from`) and, for the streams, `AsyncRead` and
 //! `AsyncWrite` on the handle and on a shared reference to it, so two tasks
-//! can read and write one stream at once.
+//! can read and write one stream at once. A stream's `read_owned` and
+//! `write_owned` take the caller's buffer and give it back, so the driver
+//! reads into it and writes from it with no copy.
 //!
 //! Addresses given by name (`"localhost:80"`) are looked up on the calling
 //! thread, as std does: the lookup blocks that thread while it lasts.

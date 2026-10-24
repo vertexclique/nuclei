@@ -13,7 +13,16 @@
 //! itself. A datagram is copied and queued the same way, one at a time, and
 //! an error sending it goes to its own send or else the next one. A connect
 //! and a shutdown are the driver's calls too.
+//!
+//! A stream write may instead lend the side a buffer of its own
+//! ([`Source::write_owned`]): the driver writes all of it from there, with
+//! no copy, after the write-behind, and the task takes it back once the
+//! kernel took the last byte. Writes after it wait until it is out. A lent
+//! buffer whose task went away is withdrawn if none of it went out, and
+//! written to its end by the driver if some did, so the stream gets it whole
+//! or not at all.
 
+use core::future::poll_fn;
 use core::task::{Poll, Waker};
 use std::io;
 use std::net::SocketAddr;
@@ -66,6 +75,23 @@ pub(crate) enum Peer<'a> {
     Unix(&'a Path),
 }
 
+/// A task's own buffer, lent to the side for the driver to write out.
+struct Lent {
+    buf: Vec<u8>,
+    /// Bytes the kernel took.
+    sent: usize,
+    /// The write's result, once all of it went out or it failed.
+    done: Option<io::Result<usize>>,
+    /// The task to wake when it is done; `None` while the task polls.
+    waker: Option<Waker>,
+    /// The task went away after some of the buffer went out: the driver
+    /// writes the rest, then drops it.
+    // vertexia: the caller's allocation, kept uncharged by the pool (one per
+    // source at most, for at most `LINGER` once its handle is gone); charge
+    // it to the pool if kept buffers must count against the cap.
+    orphan: bool,
+}
+
 #[derive(Default)]
 pub(super) struct WriteState {
     /// The last call would have blocked, and no edge came since.
@@ -74,6 +100,7 @@ pub(super) struct WriteState {
     /// A write found the pool empty; the source waits for a buffer.
     starved: bool,
     behind: Option<PoolBuf>,
+    lent: Option<Lent>,
     queued: Option<(PoolBuf, Target)>,
     /// Why the write-behind stopped.
     failed: Option<Failure>,
@@ -109,6 +136,11 @@ impl WriteState {
         self.behind.is_some()
     }
 
+    /// A lent buffer has bytes left to go out.
+    fn lent_waits(&self) -> bool {
+        self.lent.as_ref().is_some_and(|l| l.done.is_none())
+    }
+
     /// A buffer from this thread's pool, or the side starves until one
     /// comes back. A whole datagram no buffer of the pool could hold fails
     /// the operation instead.
@@ -138,8 +170,9 @@ impl WriteState {
     }
 
     /// The driver's calls on the descriptor, while the socket takes them:
-    /// ends a connect in progress, writes the write-behind out, sends a
-    /// queued datagram. Returns whether anything changed.
+    /// ends a connect in progress, writes the write-behind out and then the
+    /// lent buffer, sends a queued datagram. Returns whether anything
+    /// changed.
     fn push(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
         if self.blocked {
             return false;
@@ -184,6 +217,9 @@ impl WriteState {
                 }
             }
         }
+        if self.behind.is_none() && self.lent_waits() {
+            progress |= self.push_lent(fd, kind, after);
+        }
         if !self.blocked
             && let Some((datagram, target)) = self.queued.as_ref()
         {
@@ -201,6 +237,147 @@ impl WriteState {
             }
         }
         progress
+    }
+
+    /// Writes the lent buffer out, after the write-behind. Returns whether
+    /// anything changed.
+    fn push_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
+        let Some(lent) = self.lent.as_mut() else {
+            return false;
+        };
+        let mut progress = false;
+        if let Some(failure) = self.failed {
+            // The write-behind before it failed: none of it went out.
+            lent.done = Some(Err(failure.error()));
+        }
+        while lent.done.is_none() && !self.blocked {
+            let rest = lent.buf.get(lent.sent..).unwrap_or_default();
+            match sys::ready(write_bytes(fd, kind, rest)) {
+                None => self.blocked = true,
+                Some(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
+                Some(Ok(n)) => {
+                    lent.sent += n;
+                    progress = true;
+                    if lent.sent >= lent.buf.len() {
+                        lent.done = Some(Ok(lent.buf.len()));
+                    }
+                }
+                Some(Err(err)) => lent.done = Some(Err(err)),
+            }
+        }
+        if lent.done.is_none() {
+            return progress;
+        }
+        if let Some(w) = lent.waker.take() {
+            after.wake_one(w);
+        }
+        if lent.orphan
+            && let Some(Lent { done, .. }) = self.lent.take()
+            && let Some(Err(err)) = done
+        {
+            // Nobody waits for this write: its error is the write-behind's.
+            self.failed = Some(Failure::of(&err));
+        }
+        true
+    }
+
+    /// A write of all of a task's own buffer (`held`; `None` while it is
+    /// lent): lent to the side, and written out by the driver at once if
+    /// the socket may take it and on its edges if not. Ready once all of it
+    /// went out (or failed), with the buffer back in `held`.
+    fn write_owned(
+        &mut self,
+        fd: RawFd,
+        kind: Kind,
+        held: &mut Option<Vec<u8>>,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        if let Some(buf) = held.as_ref() {
+            if let Some(failure) = self.failed {
+                return Poll::Ready(Err(failure.error()));
+            }
+            if let Some(err) = self.error.take() {
+                return Poll::Ready(Err(err));
+            }
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            if self.lent.is_some() {
+                // Another buffer is lent: this one goes after it.
+                self.waiters.register(waker);
+                return Poll::Pending;
+            }
+            self.lent = held.take().map(|buf| Lent {
+                buf,
+                sent: 0,
+                done: None,
+                waker: None,
+                orphan: false,
+            });
+        }
+        // The task polls, so the driver's write needs no wake for it.
+        let old = self.lent.as_mut().and_then(|l| l.waker.take());
+        self.push(fd, kind, after);
+        let Some(lent) = self.lent.as_mut() else {
+            return Poll::Ready(Err(io::Error::other("the write lost its buffer")));
+        };
+        if lent.done.is_none() {
+            lent.waker = Some(match old {
+                Some(w) if w.will_wake(waker) => w,
+                other => {
+                    if let Some(w) = other {
+                        after.forget_one(w);
+                    }
+                    waker.clone()
+                }
+            });
+            return Poll::Pending;
+        }
+        if let Some(w) = old {
+            after.forget_one(w);
+        }
+        let Some(Lent { buf, done, .. }) = self.lent.take() else {
+            return Poll::Ready(Err(io::Error::other("the write lost its buffer")));
+        };
+        *held = Some(buf);
+        // Writes that waited for the lent buffer go on.
+        after.wake(&mut self.waiters);
+        Poll::Ready(done.unwrap_or(Ok(0)))
+    }
+
+    /// The task of the lent buffer went away: a write none of which went
+    /// out is withdrawn, one that started is left to the driver to finish,
+    /// and the error of one that ended is kept as the write-behind's.
+    fn abandon_lent(&mut self, after: &mut After) {
+        let Some(lent) = self.lent.as_mut() else {
+            return;
+        };
+        if let Some(w) = lent.waker.take() {
+            after.forget_one(w);
+        }
+        if lent.done.is_none() && lent.sent > 0 {
+            lent.orphan = true;
+            return;
+        }
+        if let Some(Lent {
+            done: Some(Err(err)),
+            ..
+        }) = self.lent.take()
+        {
+            self.failed = Some(Failure::of(&err));
+        }
+        after.wake(&mut self.waiters);
+    }
+
+    /// The lent buffer back, as it is, for a poll that ends in an error.
+    fn reclaim(&mut self, after: &mut After) -> Option<Vec<u8>> {
+        let lent = self.lent.take()?;
+        if let Some(w) = lent.waker {
+            after.forget_one(w);
+        }
+        after.wake(&mut self.waiters);
+        Some(lent.buf)
     }
 
     /// A write of the bytes of `bufs`, in order (one slice for a plain
@@ -223,6 +400,11 @@ impl WriteState {
         let len: usize = bufs.iter().map(|b| b.len()).sum();
         if len == 0 {
             return Poll::Ready(Ok(0));
+        }
+        if self.lent_waits() {
+            // A lent buffer goes out first.
+            self.waiters.register(waker);
+            return Poll::Pending;
         }
         let first = self.behind.is_none();
         let n = match self.behind.as_mut() {
@@ -264,7 +446,7 @@ impl WriteState {
         if let Some(failure) = self.failed.take() {
             return Poll::Ready(Err(failure.error()));
         }
-        if self.behind.is_some() {
+        if self.behind.is_some() || self.lent_waits() {
             self.waiters.register(waker);
             return Poll::Pending;
         }
@@ -332,7 +514,8 @@ impl WriteState {
     /// Bytes or a datagram accepted and not handed to the kernel yet, that
     /// the driver can still deliver.
     fn has_unsent(&self) -> bool {
-        self.failed.is_none() && (self.behind.is_some() || self.queued.is_some())
+        self.failed.is_none()
+            && (self.behind.is_some() || self.lent_waits() || self.queued.is_some())
     }
 
     fn drain(&mut self, fd: RawFd, kind: Kind, waker: &Waker, after: &mut After) -> Poll<()> {
@@ -387,6 +570,12 @@ impl WriteState {
         } else {
             self.error = Some(failure.error());
         }
+        if let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none()) {
+            lent.done = Some(Err(failure.error()));
+            if let Some(w) = lent.waker.take() {
+                after.wake_one(w);
+            }
+        }
         after.wake(&mut self.waiters);
     }
 
@@ -401,11 +590,17 @@ impl WriteState {
     /// Every waiting task looks again.
     pub(super) fn wake_all(&mut self, after: &mut After) {
         self.starved = false;
+        if let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take()) {
+            after.wake_one(w);
+        }
         after.wake(&mut self.waiters);
     }
 
     pub(super) fn forget_waiters(&mut self, after: &mut After) {
         self.starved = false;
+        if let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take()) {
+            after.forget_one(w);
+        }
         after.forget(&mut self.waiters);
     }
 
@@ -416,6 +611,9 @@ impl WriteState {
         }
         if let Some((buf, _)) = self.queued.take() {
             after.drop_buf(buf);
+        }
+        if let Some(w) = self.lent.take().and_then(|l| l.waker) {
+            after.forget_one(w);
         }
         self.failed = None;
         self.error = None;
@@ -457,6 +655,52 @@ impl Source {
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)
+    }
+
+    /// Writes all of `buf` and gives it back with the write's result. The
+    /// buffer is lent to the side until the kernel took the last byte, so
+    /// the bytes go out from it with no copy.
+    pub(crate) async fn write_owned(
+        self: &Arc<Self>,
+        buf: Vec<u8>,
+    ) -> (io::Result<usize>, Vec<u8>) {
+        let mut op = WriteOwned {
+            source: self,
+            buf: Some(buf),
+            lent: false,
+        };
+        let result = poll_fn(|cx| op.poll(cx)).await;
+        (result, op.buf.take().unwrap_or_default())
+    }
+
+    fn poll_write_owned(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        held: &mut Option<Vec<u8>>,
+    ) -> Poll<io::Result<usize>> {
+        let poll = match self.fd() {
+            Ok(fd) => {
+                let kind = self.kind;
+                let mut after = After::default();
+                let poll = self.write.poll(
+                    &mut after,
+                    |st, after| st.write_owned(fd, kind, held, cx.waker(), after),
+                    |st, after| st.serve(fd, kind, true, after),
+                );
+                self.finish_poll(after, poll)
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        };
+        if poll.is_ready() && held.is_none() {
+            let mut after = After::default();
+            *held = self.write.run(
+                &mut after,
+                |st, after| st.reclaim(after),
+                self.serve_write(),
+            );
+            self.settle(after);
+        }
+        poll
     }
 
     /// Completes once the write-behind is out (or reports why it stopped).
@@ -558,5 +802,36 @@ impl Source {
             |st, after| st.serve(fd, kind, true, after),
         );
         self.finish_poll(after, poll)
+    }
+}
+
+/// A write whose buffer may be lent to the side. Dropped while it is, the
+/// side withdraws the write if none of it went out and finishes it if some
+/// did.
+struct WriteOwned<'a> {
+    source: &'a Arc<Source>,
+    buf: Option<Vec<u8>>,
+    lent: bool,
+}
+
+impl WriteOwned<'_> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let poll = self.source.poll_write_owned(cx, &mut self.buf);
+        self.lent = self.buf.is_none();
+        poll
+    }
+}
+
+impl Drop for WriteOwned<'_> {
+    fn drop(&mut self) {
+        if self.lent {
+            let mut after = After::default();
+            self.source.write.run(
+                &mut after,
+                |st, after| st.abandon_lent(after),
+                self.source.serve_write(),
+            );
+            self.source.settle(after);
+        }
     }
 }

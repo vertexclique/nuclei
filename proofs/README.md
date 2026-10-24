@@ -65,7 +65,7 @@ moment a waiter is dropped while a pass is granting it.
 
 | tool | what it checks here | how far a check goes |
 |------|---------------------|----------------------|
-| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer and the guard of an IO source's side the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
+| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer, the guard of an IO source's side and the reads and writes that lend the side a task's buffer the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
 | Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, and the timer wheel's arithmetic (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
 The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
@@ -322,6 +322,45 @@ and a reader's submit that runs the driver's read at once). Bytes are a count an
 side share its waker list, which the driver wakes whole. The loom models in `src/io/side.rs`
 check the code's word with a calibration that must lose the edge (a driver that skips a held
 side).
+
+## Reads and writes that lend the side a task's buffer
+
+`lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`) checks a stream's `read_owned` and
+`write_owned` (`src/io/source/read.rs`, `src/io/source/write.rs`), where the task hands the
+side its own buffer and the driver reads into it or writes from it, with no copy. The side's
+guard is abstract here (a step under it runs whole; `side` checks the guard itself).
+
+The read: bytes arrive in order, each with an edge, and then the stream ends. The lending task
+takes what another read left first (bytes, or the end); otherwise it lends its buffer, which
+the driver fills at once if the socket may hold bytes or on a later edge, and wakes it; the
+task takes the buffer back. It may go away while the buffer is lent: what the driver read into
+it then becomes the read-ahead. A second task reads as usual until it reads the end. While a
+filled buffer waits to be taken back, the driver reads nothing more, so a task that went away
+hands its bytes on ahead of anything read after them. 12 configurations: 5 that must pass
+(buffers of one and two bytes, a lender that may go away and one that stays, with
+`Conservation`, no byte lost or made up; `Order`, each task gets its bytes in order;
+`NoScribble`, the driver reads only into a buffer the side has; `AllTaken`, every byte is
+taken; and liveness), 4 mutations (a lender that goes away and takes its bytes with it breaks
+`Conservation`; reads that go on while a filled buffer waits break `Order`; a buffer taken back
+while the side still counts it lent breaks `NoScribble`; a fill that wakes nobody ends in a
+deadlock), and 3 witnesses (the driver fills the buffer on an edge, the lender's own poll fills
+it at once, a lender that went away leaves its bytes to the read-ahead).
+
+The write: the socket is full and a byte waits in the write-behind. The lending task lends a
+buffer of three bytes, which the driver writes after the write-behind as the peer makes room,
+and a later copied write waits until it is out. A lender that goes away has its write withdrawn
+if none of it went out, and finished by the driver if some did, so the wire carries 1 2 3 4 5
+or 1 5 and never part of the buffer. 12 configurations: 5 that must pass (sockets that hold one
+and two bytes, a lender that may go away and one that stays, with `WireOrder`, the bytes in
+order and the buffer whole or not at all; `Delivered`, everything written reaches the peer;
+`NoScribble`; and liveness), 4 mutations (withdrawing a write that started and a copied write
+that passes the lent buffer break `WireOrder`; a task that takes its buffer back once some of
+it went out breaks `NoScribble`; an end that wakes nobody deadlocks), and 3 witnesses (a buffer
+that goes out over several calls, the driver finishing the write of a task that went away, a
+withdrawn write).
+
+The Rust tests in `src/io/source/tests/owned.rs` check the same rules on real sockets, each
+with a mutation of the code that makes one of them fail.
 
 ## The timer wheel
 

@@ -241,6 +241,16 @@ impl After {
         self.forget.append(wakers);
     }
 
+    /// Wakes the one task of `waker`.
+    pub(crate) fn wake_one(&mut self, waker: Waker) {
+        self.wake.push(waker);
+    }
+
+    /// Drops `waker` without waking it.
+    pub(crate) fn forget_one(&mut self, waker: Waker) {
+        self.forget.push(waker);
+    }
+
     pub(crate) fn drop_buf(&mut self, buf: PoolBuf) {
         match self.drop_one {
             None => self.drop_one = Some(buf),
@@ -285,10 +295,15 @@ impl Wakers {
         if known {
             return;
         }
+        self.push(waker.clone());
+    }
+
+    /// Adds `waker`, known or not.
+    fn push(&mut self, waker: Waker) {
         if self.first.is_none() {
-            self.first = Some(waker.clone());
+            self.first = Some(waker);
         } else {
-            self.rest.push(waker.clone());
+            self.rest.push(waker);
         }
     }
 
@@ -304,11 +319,7 @@ impl Wakers {
     /// Moves every waker of `other` here.
     fn append(&mut self, other: &mut Wakers) {
         if let Some(w) = other.first.take() {
-            if self.first.is_none() {
-                self.first = Some(w);
-            } else {
-                self.rest.push(w);
-            }
+            self.push(w);
         }
         self.rest.append(&mut other.rest);
     }

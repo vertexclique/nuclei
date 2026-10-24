@@ -1,0 +1,25 @@
+# configuration                spec                 expected
+PR_three                       MC_LentRead          pass
+PR_one                         MC_LentRead          pass
+PR_stays                       MC_LentRead          pass
+PR_live                        MC_LentRead          pass
+PR_live_stays                  MC_LentRead          pass
+MR_abandon_drops               MC_LentRead          violated:Conservation
+MR_read_past_lent              MC_LentRead          violated:Order
+MR_take_keeps_slot             MC_LentRead          violated:NoScribble
+MR_no_wake                     MC_LentRead          deadlock
+WR_driver_fill                 MC_LentRead          violated:NoDriverFill
+WR_submit_fill                 MC_LentRead          violated:NoSubmitFill
+WR_left_bytes                  MC_LentRead          violated:NoLeftBytes
+PW_two                         MC_LentWrite         pass
+PW_one                         MC_LentWrite         pass
+PW_stays                       MC_LentWrite         pass
+PW_live                        MC_LentWrite         pass
+PW_live_stays                  MC_LentWrite         pass
+MW_withdraw_started            MC_LentWrite         violated:WireOrder
+MW_copy_passes_lent            MC_LentWrite         violated:WireOrder
+MW_take_early                  MC_LentWrite         violated:NoScribble
+MW_no_wake                     MC_LentWrite         deadlock
+WW_partial                     MC_LentWrite         violated:NoPartial
+WW_orphan_done                 MC_LentWrite         violated:NoOrphanDone
+WW_withdraw                    MC_LentWrite         violated:NoWithdraw

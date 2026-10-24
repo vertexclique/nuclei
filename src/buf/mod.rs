@@ -397,6 +397,21 @@ pub(crate) fn with_pool<R>(f: impl FnOnce(Option<&Pool>) -> R) -> R {
     f(unsafe { pool.as_ref() })
 }
 
+/// Copies the front of `src` into `bufs`, in order; returns how many bytes.
+pub(crate) fn copy_vectored(src: &[u8], bufs: &mut [std::io::IoSliceMut<'_>]) -> usize {
+    let mut n = 0;
+    for buf in bufs.iter_mut() {
+        let rest = &src[n..];
+        if rest.is_empty() {
+            break;
+        }
+        let k = rest.len().min(buf.len());
+        buf[..k].copy_from_slice(&rest[..k]);
+        n += k;
+    }
+    n
+}
+
 /// A buffer of a shard's pool, with the bytes `start..end` filled and not
 /// read yet.
 pub(crate) struct PoolBuf {
@@ -501,13 +516,8 @@ impl PoolBuf {
     /// Copies filled bytes into `bufs`, in order, and consumes them;
     /// returns how many.
     pub(crate) fn read_into_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> usize {
-        let mut n = 0;
-        for buf in bufs.iter_mut() {
-            if self.is_empty() {
-                break;
-            }
-            n += self.read_into(buf);
-        }
+        let n = copy_vectored(self.filled(), bufs);
+        self.consume(n);
         n
     }
 

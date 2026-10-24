@@ -564,3 +564,11 @@ pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: a new descriptor nobody else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(copy) })
 }
+
+/// `read(2)` into memory not written yet: the kernel writes the bytes it
+/// returns, and the caller takes that many as initialized.
+pub(crate) fn read_uninit(fd: RawFd, buf: &mut [core::mem::MaybeUninit<u8>]) -> io::Result<usize> {
+    // SAFETY: writes at most `buf.len()` bytes into `buf`; nothing is read
+    // from it.
+    retry(|| cvt(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }))
+}
