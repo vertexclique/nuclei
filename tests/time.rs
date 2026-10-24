@@ -114,7 +114,8 @@ fn a_timeout_elapses_on_a_future_that_never_finishes() {
         Duration::from_millis(20),
         std::future::pending::<()>(),
     ));
-    assert_eq!(out, Err(Elapsed::clone(&out.unwrap_err())));
+    // `Elapsed` is `Copy` and compares equal to itself.
+    assert_eq!(out, Err(out.unwrap_err()));
     assert!(start.elapsed() >= Duration::from_millis(20));
     let err: std::io::Error = out.unwrap_err().into();
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
@@ -243,6 +244,8 @@ fn a_dropped_foreign_sleep_never_wakes_its_task() {
 }
 
 #[test]
+// The task hands the armed sleep out on purpose, to finish it elsewhere.
+#[allow(clippy::async_yields_async)]
 fn a_sleep_armed_on_one_runtime_finishes_on_another() {
     let a = runtime(1);
     let b = runtime(1);
