@@ -491,14 +491,19 @@ fn unnamed() -> io::Result<unix::SocketAddr> {
     Ok(UNNAMED.get_or_init(|| addr).clone())
 }
 
-/// `pread(2)`: reads at `offset` without moving the file's own offset.
-pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    let offset = libc::off_t::try_from(offset).map_err(|_| {
+/// `offset` as the system's file offset.
+fn file_offset(offset: u64) -> io::Result<libc::off_t> {
+    libc::off_t::try_from(offset).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "the offset is past what the file can hold",
         )
-    })?;
+    })
+}
+
+/// `pread(2)`: reads at `offset` without moving the file's own offset.
+pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    let offset = file_offset(offset)?;
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
     retry(|| cvt(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) }))
 }
@@ -507,12 +512,7 @@ pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize>
 /// file's own offset.
 pub(crate) fn pwrite_all(fd: RawFd, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
-        let at = libc::off_t::try_from(offset).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the offset is past what the file can hold",
-            )
-        })?;
+        let at = file_offset(offset)?;
         // SAFETY: reads at most `buf.len()` bytes from `buf`.
         let n = retry(|| cvt(unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), at) }))?;
         if n == 0 {
@@ -528,15 +528,7 @@ pub(crate) fn pwrite_all(fd: RawFd, mut buf: &[u8], mut offset: u64) -> io::Resu
 /// reads it.
 pub(crate) fn seek(fd: RawFd, offset: Option<u64>) -> io::Result<u64> {
     let (to, whence) = match offset {
-        Some(offset) => (
-            libc::off_t::try_from(offset).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "the offset is past what the file can hold",
-                )
-            })?,
-            libc::SEEK_SET,
-        ),
+        Some(offset) => (file_offset(offset)?, libc::SEEK_SET),
         None => (0, libc::SEEK_CUR),
     };
     // SAFETY: a plain syscall on the caller's descriptor.
@@ -571,4 +563,15 @@ pub(crate) fn read_uninit(fd: RawFd, buf: &mut [core::mem::MaybeUninit<u8>]) -> 
     // SAFETY: writes at most `buf.len()` bytes into `buf`; nothing is read
     // from it.
     retry(|| cvt(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }))
+}
+
+/// `pread(2)` into memory not written yet, as [`read_uninit`] at `offset`.
+pub(crate) fn pread_uninit(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+    offset: u64,
+) -> io::Result<usize> {
+    let offset = file_offset(offset)?;
+    // SAFETY: writes at most `buf.len()` bytes into `buf`.
+    retry(|| cvt(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) }))
 }

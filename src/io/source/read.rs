@@ -84,9 +84,7 @@ impl Ahead {
     /// Moves bytes onto the end of `buf`, as many as its spare capacity
     /// holds.
     fn append_to(&mut self, buf: &mut Vec<u8>) -> usize {
-        let src = self.filled();
-        let n = src.len().min(buf.capacity() - buf.len());
-        buf.extend_from_slice(&src[..n]);
+        let n = crate::buf::append_spare(self.filled(), buf);
         self.consume(n);
         n
     }

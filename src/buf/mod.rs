@@ -412,6 +412,14 @@ pub(crate) fn copy_vectored(src: &[u8], bufs: &mut [std::io::IoSliceMut<'_>]) ->
     n
 }
 
+/// Copies the front of `src` onto the end of `buf`, as much as its spare
+/// capacity holds; returns how many bytes.
+pub(crate) fn append_spare(src: &[u8], buf: &mut Vec<u8>) -> usize {
+    let n = src.len().min(buf.capacity() - buf.len());
+    buf.extend_from_slice(&src[..n]);
+    n
+}
+
 /// A buffer of a shard's pool, with the bytes `start..end` filled and not
 /// read yet.
 pub(crate) struct PoolBuf {

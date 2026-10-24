@@ -65,7 +65,7 @@ moment a waiter is dropped while a pass is granting it.
 
 | tool | what it checks here | how far a check goes |
 |------|---------------------|----------------------|
-| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer, the guard of an IO source's side and the reads and writes that lend the side a task's buffer the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
+| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer, the guard of an IO source's side and the reads and writes from a task's own buffer the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
 | Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, and the timer wheel's arithmetic (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
 The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
@@ -323,12 +323,13 @@ side share its waker list, which the driver wakes whole. The loom models in `src
 check the code's word with a calibration that must lose the edge (a driver that skips a held
 side).
 
-## Reads and writes that lend the side a task's buffer
+## Reads and writes from a task's own buffer
 
-`lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`) checks a stream's `read_owned` and
-`write_owned` (`src/io/source/read.rs`, `src/io/source/write.rs`), where the task hands the
-side its own buffer and the driver reads into it or writes from it, with no copy. The side's
-guard is abstract here (a step under it runs whole; `side` checks the guard itself).
+`lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`, `tla/lent/LentFile.tla`) checks
+`read_owned` and `write_owned` on streams (`src/io/source/read.rs`, `src/io/source/write.rs`),
+where the task hands the side its own buffer and the driver reads into it or writes from it
+with no copy, and on files (`src/fs/file.rs`), where the buffer goes to a job of the blocking
+pool. The guards are abstract here (a step under one runs whole; `side` checks the side's).
 
 The read: bytes arrive in order, each with an edge, and then the stream ends. The lending task
 takes what another read left first (bytes, or the end); otherwise it lends its buffer, which
@@ -359,8 +360,25 @@ it went out breaks `NoScribble`; an end that wakes nobody deadlocks), and 3 witn
 that goes out over several calls, the driver finishing the write of a task that went away, a
 withdrawn write).
 
-The Rust tests in `src/io/source/tests/owned.rs` check the same rules on real sockets, each
-with a mutation of the code that makes one of them fail.
+The file (`LentFile.tla`): the file has a cursor and an epoch, which every write and seek
+moves on, and its jobs run on the blocking pool in any order. Two tasks each read one cell at
+the cursor into their own buffers: a read waits for the write in flight, its job reads at the
+cursor, and its result counts only if the cursor and the epoch are still those it read at, else
+it reads again. A third task writes a cell from the pool, then one from its own buffer (which
+waits for the write in flight and then is that write), then seeks back to the start. Any task
+may go away while its job is out: a read job is cancelled or its result dropped, and a lent
+write still lands. 9 configurations: 3 that must pass (tasks that may go away and tasks that
+stay, with `NoStaleRead`, a read counts only a value its cell still holds; `AllLanded`, every
+accepted write is in the file at the end; and liveness), 3 mutations (a result that counts on
+the cursor alone breaks `NoStaleRead`, through the seek back; a lent write that goes in flight
+over the one there and a lent write cancelled when its task goes away break `AllLanded`), and 3
+witnesses (a read that reads again, the write of a task that went away landing, a read after
+the seek that counts the lent write's value). In Rust a seek needs the handle exclusively, so
+it cannot overlap a read; the model lets it, so the epoch rule is checked for any path that
+moves the cursor back.
+
+The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
+rules on real sockets and files, each with a mutation of the code that makes one of them fail.
 
 ## The timer wheel
 

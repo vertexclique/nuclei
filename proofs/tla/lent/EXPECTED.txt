@@ -23,3 +23,12 @@ MW_no_wake                     MC_LentWrite         deadlock
 WW_partial                     MC_LentWrite         violated:NoPartial
 WW_orphan_done                 MC_LentWrite         violated:NoOrphanDone
 WW_withdraw                    MC_LentWrite         violated:NoWithdraw
+PF_leave                       MC_LentFile          pass
+PF_stay                        MC_LentFile          pass
+PF_live                        MC_LentFile          pass
+MF_no_epoch_check              MC_LentFile          violated:NoStaleRead
+MF_lent_skips_wait             MC_LentFile          violated:AllLanded
+MF_orphan_cancelled            MC_LentFile          violated:AllLanded
+WF_redo                        MC_LentFile          violated:NoRedo
+WF_orphan_landed               MC_LentFile          violated:NoOrphanLanded
+WF_read_of_lent                MC_LentFile          violated:NoReadOfLent

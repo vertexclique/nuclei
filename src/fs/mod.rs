@@ -5,7 +5,9 @@
 //! FIFO, a terminal) is watched by the shard's poller like a socket. Reads
 //! and writes are `AsyncRead` and `AsyncWrite` on the handle and on a shared
 //! reference to it (both share the cursor, as `&File` shares its offset);
-//! `AsyncBufRead` and `AsyncSeek` are on the handle.
+//! `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned` and
+//! `write_owned` take the caller's buffer and give it back, so the bytes are
+//! read into it and written from it with no copy.
 
 pub(crate) mod file;
 
@@ -34,6 +36,41 @@ impl Handle<File> {
 
     fn is_regular(&self) -> bool {
         self.source.kind() == Kind::File
+    }
+
+    /// Reads at the cursor into the spare capacity of `buf`, after the bytes
+    /// it holds, and gives `buf` back with how many bytes came: zero at the
+    /// end of the file, or when `buf` has no spare capacity. The bytes are
+    /// read into `buf` itself, never copied, once the writes before the read
+    /// landed.
+    ///
+    /// If the future is dropped before it completes, the cursor stays where
+    /// it was.
+    pub async fn read_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        if !self.is_regular() {
+            return self.source().read_owned(buf).await;
+        }
+        match self.file() {
+            Ok(file) => file.read_owned(buf).await,
+            Err(err) => (Err(err), buf),
+        }
+    }
+
+    /// Writes all of `buf` at the cursor, after the writes before it, and
+    /// gives it back with its length once the bytes reached the file. They
+    /// are written from `buf` itself, never copied.
+    ///
+    /// If the future is dropped before it completes, the write is withdrawn
+    /// while it still waits for the writes before it, and lands whole, in
+    /// its place, once it started.
+    pub async fn write_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        if !self.is_regular() {
+            return self.source().write_owned(buf).await;
+        }
+        match self.file() {
+            Ok(file) => file.write_owned(buf).await,
+            Err(err) => (Err(err), buf),
+        }
     }
 }
 

@@ -332,3 +332,5 @@ fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
         writer.join().unwrap();
     });
 }
+
+mod owned;
