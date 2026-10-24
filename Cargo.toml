@@ -43,6 +43,11 @@ async-exec = ["async-global-executor"]
 
 attributes = ["nuclei-attributes"]
 
+# Node memory from kovan's per-thread magazine cache over a slab layer, instead of the global
+# allocator. Off by default and meant for applications: cargo turns a feature on for every user
+# of a crate in the build, so a library that enabled it would enable it for all of them.
+recycle = ["kovan/recycle", "kovan-map/recycle", "kovan-queue/recycle"]
+
 [dependencies]
 nuclei-attributes = { version = "0.1", optional = true }
 lever = "0.1"
@@ -54,9 +59,9 @@ crossbeam-channel = "0.5"
 once_cell = "1.19.0"
 os_socketaddr = "0.2.5"
 ahash = "0.8.7"
-kovan = "0.1.22"
-kovan-map = "0.1.22"
-kovan-queue = "0.1.22"
+kovan = "0.2"
+kovan-map = "0.2"
+kovan-queue = "0.2"
 
 # vertexia: the executor stack has its own `cfg(loom)` paths and cannot build under `--cfg loom`;
 # see src/lib.rs.
