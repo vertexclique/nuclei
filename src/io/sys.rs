@@ -155,6 +155,60 @@ pub(crate) fn set_nosigpipe(fd: RawFd) {
     let _ = fd;
 }
 
+/// One integer socket option.
+fn socket_option(fd: RawFd, level: libc::c_int, name: libc::c_int) -> io::Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most `len` bytes into our own int.
+    cvt_int(unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    })?;
+    Ok(value)
+}
+
+/// What kind of descriptor `fd` is, from the kernel: a socket by its type,
+/// family and whether it listens; a regular file or block device; or any
+/// other byte stream.
+pub(crate) fn kind_of(fd: RawFd) -> io::Result<crate::io::source::Kind> {
+    use crate::io::source::Kind;
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    // SAFETY: the kernel fills our own `stat`.
+    cvt_int(unsafe { libc::fstat(fd, &mut st) })?;
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFSOCK => {}
+        libc::S_IFREG | libc::S_IFBLK => return Ok(Kind::File),
+        _ => return Ok(Kind::Bytes),
+    }
+    let ty = socket_option(fd, libc::SOL_SOCKET, libc::SO_TYPE)?;
+    let listening = socket_option(fd, libc::SOL_SOCKET, libc::SO_ACCEPTCONN)? != 0;
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most `len` bytes of address.
+    cvt_int(unsafe {
+        libc::getsockname(
+            fd,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    })?;
+    let unix = libc::c_int::from(storage.ss_family) == libc::AF_UNIX;
+    Ok(match (ty, unix, listening) {
+        (libc::SOCK_DGRAM, true, _) => Kind::UnixDatagram,
+        (libc::SOCK_DGRAM, false, _) => Kind::Udp,
+        (_, true, true) => Kind::UnixListener,
+        (_, false, true) => Kind::TcpListener,
+        _ => Kind::Stream,
+    })
+}
+
 /// Makes a descriptor nuclei just received its own: non-blocking where the
 /// call could not say so, close-on-exec, no `SIGPIPE`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]

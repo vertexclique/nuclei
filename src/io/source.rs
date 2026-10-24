@@ -29,7 +29,7 @@
 //! registration in place, so an event for one that is gone does nothing.
 
 mod read;
-mod write;
+pub(crate) mod write;
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
@@ -64,6 +64,9 @@ pub(crate) enum Kind {
     Stream,
     /// Any other byte stream (a pipe, a terminal).
     Bytes,
+    /// A regular file or a block device: always ready to the kernel, so
+    /// its IO goes to the blocking pool rather than to the poller.
+    File,
     TcpListener,
     UnixListener,
     Udp,

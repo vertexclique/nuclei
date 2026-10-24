@@ -76,7 +76,7 @@ pub(super) struct WriteState {
 /// Writes bytes to a stream.
 fn write_bytes(fd: RawFd, kind: Kind, bytes: &[u8]) -> io::Result<usize> {
     match kind {
-        Kind::Bytes => sys::write(fd, bytes),
+        Kind::Bytes | Kind::File => sys::write(fd, bytes),
         _ => sys::send(fd, bytes),
     }
 }

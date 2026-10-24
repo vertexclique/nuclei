@@ -52,6 +52,8 @@ recycle = ["kovan/recycle", "kovan-channel/recycle", "kovan-map/recycle", "kovan
 nuclei-attributes = { version = "0.1", optional = true }
 lever = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+futures-io = "0.3"
+futures-core = { version = "0.3", default-features = false }
 socket2 = { version = "0.3.19", features = ["pair", "unix"] }
 pin-utils = "0.1.0"
 pin-project-lite = "0.2"

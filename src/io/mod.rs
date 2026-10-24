@@ -6,8 +6,10 @@
 //! once and leave it to the driver when it would block; the driver
 //! completes it on readiness and wakes the task (see [`source`]).
 
+mod handle;
 mod side;
 pub(crate) mod source;
-mod sys;
+pub(crate) mod sys;
 
+pub use self::handle::Handle;
 pub(crate) use self::source::Source;

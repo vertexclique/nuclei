@@ -43,6 +43,8 @@ pub mod config;
 mod handle;
 #[cfg(unix)]
 mod io;
+#[cfg(unix)]
+mod net;
 #[cfg(not(loom))]
 mod proactor;
 mod rt;

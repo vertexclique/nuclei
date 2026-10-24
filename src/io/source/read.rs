@@ -74,7 +74,7 @@ impl ReadState {
         }
         if !self.has_result() {
             match kind {
-                Kind::Stream | Kind::Bytes => self.read_ahead(fd, after),
+                Kind::Stream | Kind::Bytes | Kind::File => self.read_ahead(fd, after),
                 Kind::TcpListener | Kind::UnixListener => self.accept_ahead(fd, kind),
                 Kind::Udp | Kind::UnixDatagram => self.receive_ahead(fd, kind, after),
             }
