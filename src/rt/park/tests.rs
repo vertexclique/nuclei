@@ -66,7 +66,7 @@ fn a_registered_socket_reports_its_readiness_with_its_token() {
     let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
     b.set_nonblocking(true).unwrap();
     use std::os::fd::AsRawFd;
-    poller.registrar().add(b.as_raw_fd(), 42).unwrap();
+    poller.registrar().add(b.as_raw_fd(), 42, false).unwrap();
     // Writable at once (an empty send buffer), edge-triggered.
     let mut seen = Vec::new();
     poller
@@ -79,11 +79,44 @@ fn a_registered_socket_reports_its_readiness_with_its_token() {
         .wait(Some(Duration::from_secs(5)), |t, r| seen.push((t, r)))
         .unwrap();
     assert!(seen.iter().any(|&(t, r)| t == 42 && r.readable), "{seen:?}");
-    poller.registrar().delete(b.as_raw_fd()).unwrap();
+    poller.registrar().delete(b.as_raw_fd(), false).unwrap();
     a.write_all(b"y").unwrap();
     seen.clear();
     poller
         .wait(Some(Duration::from_millis(20)), |t, r| seen.push((t, r)))
         .unwrap();
     assert!(seen.is_empty(), "no event after the registration is gone");
+}
+
+/// A TCP socket registered for urgent data hears of an out-of-band byte as
+/// urgent and readable, on the pollers that report it.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+#[test]
+fn urgent_data_on_a_tcp_socket_is_reported() {
+    use std::os::fd::AsRawFd;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mine, _) = listener.accept().unwrap();
+    mine.set_nonblocking(true).unwrap();
+    let mut poller = Poller::new().unwrap();
+    poller.registrar().add(mine.as_raw_fd(), 7, true).unwrap();
+    // SAFETY: a plain send of one byte from our own buffer.
+    let sent = unsafe { libc::send(peer.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
+    assert_eq!(sent, 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut urgent = false;
+    while !urgent {
+        assert!(Instant::now() < deadline, "no urgent readiness came");
+        poller
+            .wait(Some(Duration::from_millis(100)), |t, r| {
+                urgent |= t == 7 && r.urgent && r.readable;
+            })
+            .unwrap();
+    }
+    poller.registrar().delete(mine.as_raw_fd(), true).unwrap();
 }

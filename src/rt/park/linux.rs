@@ -144,13 +144,14 @@ impl Poller {
             }
             let bits = event.events as libc::c_int;
             let hup = bits & (libc::EPOLLHUP | libc::EPOLLERR | libc::EPOLLRDHUP) != 0;
+            let urgent = bits & libc::EPOLLPRI != 0;
             on_event(
                 token,
                 Readiness {
-                    readable: bits & libc::EPOLLIN != 0 || hup,
+                    readable: bits & libc::EPOLLIN != 0 || hup || urgent,
                     writable: bits & libc::EPOLLOUT != 0
                         || bits & (libc::EPOLLHUP | libc::EPOLLERR) != 0,
-                    urgent: bits & libc::EPOLLPRI != 0,
+                    urgent,
                     hangup: hup,
                 },
             );
@@ -177,14 +178,12 @@ impl Notifier {
 
 impl Registrar {
     /// Registers `fd` for readiness to read and to write, edge-triggered,
-    /// reported with `token`.
-    pub(crate) fn add(&self, fd: RawFd, token: u64) -> io::Result<()> {
+    /// reported with `token`; `urgent`: and for urgent data (a TCP socket).
+    pub(crate) fn add(&self, fd: RawFd, token: u64, urgent: bool) -> io::Result<()> {
+        let pri = if urgent { libc::EPOLLPRI } else { 0 };
         let mut event = libc::epoll_event {
-            events: (libc::EPOLLIN
-                | libc::EPOLLPRI
-                | libc::EPOLLOUT
-                | libc::EPOLLRDHUP
-                | libc::EPOLLET) as u32,
+            events: (libc::EPOLLIN | pri | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET)
+                as u32,
             u64: token,
         };
         // SAFETY: a plain syscall; `fd` is the caller's open descriptor.
@@ -194,8 +193,9 @@ impl Registrar {
         .map(drop)
     }
 
-    /// Removes the registration of `fd`. Called before `fd` closes.
-    pub(crate) fn delete(&self, fd: RawFd) -> io::Result<()> {
+    /// Removes the registration of `fd`, made with `urgent` (one removal
+    /// takes every event here). Called before `fd` closes.
+    pub(crate) fn delete(&self, fd: RawFd, _urgent: bool) -> io::Result<()> {
         let mut event = libc::epoll_event { events: 0, u64: 0 };
         // SAFETY: a plain syscall; `fd` is still open.
         check(unsafe {

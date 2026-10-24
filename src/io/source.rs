@@ -272,7 +272,7 @@ impl Source {
                 io::ErrorKind::NotConnected,
                 "the handle closed before its registration",
             )),
-            fd => shard.registrar().add(fd, token),
+            fd => shard.registrar().add(fd, token, self.kind == Kind::Tcp),
         };
         if result.is_ok() {
             // SAFETY: both sides are held.
@@ -324,7 +324,7 @@ impl Source {
                 // Before the descriptor closes or changes hands. A failure
                 // means the descriptor was already gone, and with it the
                 // kernel's registration.
-                let _ = shard.registrar().delete(fd);
+                let _ = shard.registrar().delete(fd, self.kind == Kind::Tcp);
             }
             shard.release_source(token);
         }
@@ -342,7 +342,7 @@ impl Source {
             self.reg.token.store(NO_TOKEN, Ordering::Release);
             self.reg.state.store(UNREGISTERED, Ordering::Release);
             if let (Some(shard), Ok(fd)) = (shard, self.fd()) {
-                let _ = shard.registrar().delete(fd);
+                let _ = shard.registrar().delete(fd, self.kind == Kind::Tcp);
             }
         }
         let mut after = After::default();

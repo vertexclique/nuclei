@@ -1,6 +1,10 @@
 //! The kqueue poller (macOS and the BSDs): an `EVFILT_USER` event for wakes,
 //! and the registrations of the shard's IO sources.
 
+// The kevent fields and flag constants have different types on different
+// BSDs; the casts that make one source fit them all are no-ops on some.
+#![allow(clippy::unnecessary_cast)]
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
@@ -55,6 +59,15 @@ fn fd_event(fd: RawFd, filter: i16, flags: u16, token: u64) -> libc::kevent {
     event.filter = filter as _;
     event.flags = flags as _;
     event.udata = token as usize as _;
+    event
+}
+
+/// The change that watches `fd` for urgent data: Apple's `EVFILT_EXCEPT`
+/// with `NOTE_OOB` (its read filter does not report it).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn urgent_event(fd: RawFd, flags: u16, token: u64) -> libc::kevent {
+    let mut event = fd_event(fd, libc::EVFILT_EXCEPT, flags, token);
+    event.fflags = libc::NOTE_OOB;
     event
 }
 
@@ -174,12 +187,13 @@ impl Poller {
                 continue;
             }
             let done = e.flags & (libc::EV_EOF | libc::EV_ERROR) as u16 != 0;
+            let urgent = urgent(e);
             on_event(
                 e.udata as usize as u64,
                 Readiness {
-                    readable: e.filter == libc::EVFILT_READ as _ || done,
+                    readable: e.filter == libc::EVFILT_READ as _ || done || urgent,
                     writable: e.filter == libc::EVFILT_WRITE as _ || done,
-                    urgent: urgent(e),
+                    urgent,
                     hangup: done,
                 },
             );
@@ -188,13 +202,13 @@ impl Poller {
     }
 }
 
-/// Whether an event says urgent data came (Apple's `EV_OOBAND`; the other
-/// kqueues do not say, and nuclei never takes a short read as draining
-/// there).
+/// Whether an event says urgent data came (Apple's `EVFILT_EXCEPT` with
+/// `NOTE_OOB`; the other kqueues do not say, and nuclei never takes a short
+/// read as draining there).
 fn urgent(e: &libc::kevent) -> bool {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        e.filter == libc::EVFILT_READ as _ && e.flags & libc::EV_OOBAND != 0
+        e.filter == libc::EVFILT_EXCEPT as _ && e.fflags & libc::NOTE_OOB != 0
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
@@ -205,28 +219,36 @@ fn urgent(e: &libc::kevent) -> bool {
 
 impl Registrar {
     /// Registers `fd` for readiness to read and to write, edge-triggered
-    /// (EV_CLEAR), reported with `token`.
-    pub(crate) fn add(&self, fd: RawFd, token: u64) -> io::Result<()> {
+    /// (EV_CLEAR), reported with `token`; `urgent`: and for urgent data (a
+    /// TCP socket), where the kqueue reports it.
+    pub(crate) fn add(&self, fd: RawFd, token: u64, urgent: bool) -> io::Result<()> {
         let flags = (libc::EV_ADD | libc::EV_CLEAR) as u16;
-        submit_all(
-            &self.queue,
-            &[
-                fd_event(fd, libc::EVFILT_READ as i16, flags, token),
-                fd_event(fd, libc::EVFILT_WRITE as i16, flags, token),
-            ],
-        )
+        let rw = [
+            fd_event(fd, libc::EVFILT_READ as i16, flags, token),
+            fd_event(fd, libc::EVFILT_WRITE as i16, flags, token),
+        ];
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if urgent {
+            return submit_all(&self.queue, &[rw[0], rw[1], urgent_event(fd, flags, token)]);
+        }
+        let _ = urgent;
+        submit_all(&self.queue, &rw)
     }
 
-    /// Removes the registration of `fd`. Called before `fd` closes.
-    pub(crate) fn delete(&self, fd: RawFd) -> io::Result<()> {
+    /// Removes the registration of `fd`, made with `urgent`. Called before
+    /// `fd` closes.
+    pub(crate) fn delete(&self, fd: RawFd, urgent: bool) -> io::Result<()> {
         let flags = libc::EV_DELETE as u16;
-        submit_all(
-            &self.queue,
-            &[
-                fd_event(fd, libc::EVFILT_READ as i16, flags, 0),
-                fd_event(fd, libc::EVFILT_WRITE as i16, flags, 0),
-            ],
-        )
+        let rw = [
+            fd_event(fd, libc::EVFILT_READ as i16, flags, 0),
+            fd_event(fd, libc::EVFILT_WRITE as i16, flags, 0),
+        ];
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if urgent {
+            return submit_all(&self.queue, &[rw[0], rw[1], urgent_event(fd, flags, 0)]);
+        }
+        let _ = urgent;
+        submit_all(&self.queue, &rw)
     }
 }
 
