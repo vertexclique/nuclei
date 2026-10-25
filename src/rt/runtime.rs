@@ -637,6 +637,31 @@ where
     current().pool.spawn(f)
 }
 
+/// Runs `future` as a task of the runtime's own, left out of its shard's
+/// count of live tasks so it keeps no worker from draining: on the shard the
+/// calling thread runs, else on a shard that serves threads that run none.
+#[cfg(unix)]
+pub(crate) fn spawn_service<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let shared = context::current(|current| current.map(|s| Arc::clone(&s.shared)))
+        .unwrap_or_else(service_shard);
+    // SAFETY: as in `spawn_here`: the schedule sends a woken task back to
+    // its shard; the future is `Send` and 'static.
+    let (runnable, task) = unsafe {
+        task::spawn_unchecked(
+            future,
+            Sched {
+                shard: shared,
+                bound: false,
+            },
+        )
+    };
+    runnable.schedule();
+    task.detach();
+}
+
 /// Runs `f` on the blocking pool of the runtime this thread is inside, if
 /// it is inside one (it never starts the default runtime, which a thread on
 /// its way out could not): whether `f` went.

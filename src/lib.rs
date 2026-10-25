@@ -51,6 +51,8 @@ mod proactor;
 mod rt;
 /// nuclei's own runtime: shards, tasks, `block_on`, `spawn` and the blocking pool.
 pub mod runtime;
+/// Signals (unix) and console control events (Windows), as streams.
+pub mod signal;
 /// Runtime-independent synchronization primitives: futures and wakers only, usable from any executor.
 pub mod sync;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]

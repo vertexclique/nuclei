@@ -1,0 +1,8 @@
+# configuration                spec                 expected
+SG_safe                        MC_Signal            pass
+SG_live                        MC_Signal            pass
+MG_write_first                 MC_Signal            violated:SeesAll
+MG_dispatch_first              MC_Signal            violated:SeesAll
+MG_no_recheck                  MC_Signal            violated:SeesAll
+WG_coalesce                    MC_Signal            violated:NoCoalesce
+WG_pump_wake                   MC_Signal            violated:NoPumpWake

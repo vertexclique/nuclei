@@ -261,6 +261,10 @@ pub(crate) type PTIMERAPCROUTINE = *const c_void;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    pub(crate) fn SetConsoleCtrlHandler(
+        HandlerRoutine: Option<unsafe extern "system" fn(u32) -> BOOL>,
+        Add: BOOL,
+    ) -> BOOL;
     pub(crate) fn CreateIoCompletionPort(
         FileHandle: HANDLE,
         ExistingCompletionPort: HANDLE,
