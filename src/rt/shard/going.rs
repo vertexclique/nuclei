@@ -16,10 +16,8 @@ impl Shard {
     /// The outermost `block_on` of a thread outside the runtime returned,
     /// and this, its own shard, runs again only at its next one.
     pub(crate) fn leave(&self) {
-        let gone: Vec<Arc<Source>> = self.sources.borrow_mut().drain().collect();
-        for source in gone {
-            source.evict();
-        }
+        let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
+        evict_all(gone);
         self.let_go_of_children();
         // Sources that went before (a dropped handle's) may have left a
         // cancel queued, or their operations still out.
@@ -35,6 +33,23 @@ impl Shard {
     }
 }
 
+/// Evicts each source of `gone` (registered under its token here), and
+/// waits until each one's registration here has gone. A source a side of
+/// which another thread holds is evicted by that holder as it lets go,
+/// which comes a driver call later; until then the holder may still hand
+/// this shard's driver an operation, so the operations out here are only
+/// known once every eviction happened.
+fn evict_all(gone: Vec<(u64, Arc<Source>)>) {
+    for (_, source) in &gone {
+        source.evict();
+    }
+    for (token, source) in &gone {
+        while source.registered_under(*token) {
+            std::thread::yield_now();
+        }
+    }
+}
+
 impl Drop for Shard {
     fn drop(&mut self) {
         // Every task still queued here is dropped on this thread, the one its
@@ -46,9 +61,8 @@ impl Drop for Shard {
         drop(self.shared.stop_waker.take());
         // The sources registered here lose their driver: each is told, and
         // registers where it is polled next.
-        for source in self.sources.get_mut().drain() {
-            source.evict();
-        }
+        let gone: Vec<(u64, Arc<Source>)> = self.sources.get_mut().drain_tokens().collect();
+        evict_all(gone);
         self.let_go_of_children();
         // The ring's operations still out are cancelled and their
         // completions waited for, so no memory they point at goes while the

@@ -235,3 +235,68 @@ fn a_close_before_the_ring_installs_an_attach_leaves_it_no_file() {
         "the peer never saw the end: the ring kept the file"
     );
 }
+
+/// A shard that stops running while another thread holds a side of a
+/// source registered to it: the holder evicts the source as it lets go, a
+/// driver call later, and may hand the shard's driver an operation until
+/// then; the shard waits for that eviction before it looks at what its
+/// driver has out, so it never stops with the source still registered to it.
+#[test]
+fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
+    let (mine, _peer) = stream_pair();
+    let handle = Handle::new(mine).unwrap();
+    let src = Arc::clone(handle.source());
+    let (token_tx, token_rx) = std::sync::mpsc::channel::<u64>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let left = Arc::new(AtomicBool::new(false));
+    let shard = {
+        let (src, left) = (Arc::clone(&src), Arc::clone(&left));
+        std::thread::spawn(move || {
+            let holder = crate::block_on(async {
+                // One read polled here registers the source with this
+                // thread's own shard.
+                let mut buf = [0u8; 1];
+                {
+                    let mut read = Box::pin(handle.recv(&mut buf));
+                    let polled = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+                    assert!(polled.is_pending());
+                }
+                token_tx.send(src.reg.token.load(Ordering::SeqCst)).unwrap();
+                let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+                let holder = {
+                    let src = Arc::clone(&src);
+                    std::thread::spawn(move || {
+                        let held = src.read.try_hold().expect("the side is free");
+                        held_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        let mut after = After::default();
+                        held.release(&mut after, &src.hooks());
+                        after.run();
+                    })
+                };
+                held_rx.recv().unwrap();
+                holder
+            });
+            left.store(true, Ordering::SeqCst);
+            (holder, handle)
+        })
+    };
+    let token = token_rx.recv().unwrap();
+    // Past the ring's wait for its operations as a shard goes (one second),
+    // which a shard that did not wait for the eviction would end by.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !left.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    if left.load(Ordering::SeqCst) {
+        assert!(
+            !src.registered_under(token),
+            "the shard stopped with the source still registered to it"
+        );
+    }
+    release_tx.send(()).unwrap();
+    let (holder, handle) = shard.join().unwrap();
+    holder.join().unwrap();
+    assert!(!src.registered_under(token), "the eviction never ran");
+    drop(handle);
+}

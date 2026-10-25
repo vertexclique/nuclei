@@ -112,8 +112,19 @@ impl<T, const TAG: u64> Tokens<T, TAG> {
 
     /// Takes every registered entry out.
     pub(crate) fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        self.drain_tokens().map(|(_, entry)| entry)
+    }
+
+    /// Takes every registered entry out, each with its token.
+    pub(crate) fn drain_tokens(&mut self) -> impl Iterator<Item = (u64, T)> + '_ {
         self.free.clear();
-        self.slots.drain(..).filter_map(|slot| slot.entry)
+        self.slots
+            .drain(..)
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let token = Self::token(index as u32, slot.generation);
+                slot.entry.map(|entry| (token, entry))
+            })
     }
 
     /// How many entries are registered.

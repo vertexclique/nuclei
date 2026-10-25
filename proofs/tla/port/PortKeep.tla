@@ -6,6 +6,10 @@
 (* src/io/source/port.rs: `attach_port`; src/io/source/ops.rs: `op_done`, *)
 (* `waits_for_ops`), at the grain of each atomic access.                  *)
 (*                                                                          *)
+(* A source whose side another thread holds is evicted by that holder as *)
+(* it lets go, and may get one more operation out on the port before: the *)
+(* shard waits for the eviction before it looks at what is out.           *)
+(*                                                                          *)
 (* In plain words: a source has operations out on its shard's port (a TCP *)
 (* send, never cancelled, and a receive). The shard stops running: it     *)
 (* delivers what the port has ready, and hands the rest to a keeper, a    *)
@@ -48,7 +52,8 @@ variables
     failed = FALSE,       \* the registration failed
     waited = FALSE,       \* (record) a registration waited
     stopped = FALSE,      \* (record) a keeper that kept was stopped
-    kept = FALSE;         \* (record) the keeper delivered a packet
+    kept = FALSE,         \* (record) the keeper delivered a packet
+    evicted = FALSE;      \* the holder of a side performed the source's eviction
 
 define
     \* The source's operations not delivered: the port's count, and the source's.
@@ -71,10 +76,25 @@ end macro;
 fair process kernel = "kernel"
 begin
 K_loop:
-    while inKernel > 0 do
+    while TRUE do
+        await inKernel > 0;
         inKernel := inKernel - 1;
         queued := queued + 1;
     end while;
+end process;
+
+\* A side's holder on another thread: it may hand the port one more
+\* operation, then performs the source's eviction as it lets go.
+fair process holder = "holder"
+begin
+H_op:
+    either
+        skip;
+    or
+        inKernel := inKernel + 1;
+    end either;
+H_evict:
+    evicted := TRUE;
 end process;
 
 fair process shard = "shard"
@@ -84,6 +104,10 @@ S_ready:
     while queued > 0 do
         Deliver("shard");
     end while;
+S_evicted:
+    \* MUTATION no_evict_wait: the shard looks at what is out before the
+    \* eviction a holder performs.
+    await evicted \/ Mutation = "no_evict_wait";
 S_handoff:
     \* MUTATION no_keeper: the operations still out are left on the port.
     if Out > 0 /\ Mutation # "no_keeper" then
@@ -158,7 +182,7 @@ end process;
 fair process task = "task"
 begin
 T_bind:
-    await handedOff;
+    await handedOff /\ evicted;
     \* The bind fails while the kernel holds an operation of the handle.
     if inKernel = 0 then
         registered := TRUE;
@@ -214,8 +238,9 @@ OneDrainer == ~(running /\ kstate \in {"keeping", "stopping"})
 \* A registration never fails for operations that were still out.
 NoFailure == ~failed
 
-\* Every operation's packet is delivered, whether the shard runs again or not.
-AllDelivered == <>(Out = 0)
+\* Every operation's packet is delivered, whether the shard runs again or
+\* not: from some point on none is left out.
+AllDelivered == <>[](Out = 0)
 
 \* The source ends registered with the other port.
 Registers == <>registered

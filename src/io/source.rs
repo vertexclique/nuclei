@@ -743,6 +743,13 @@ impl Source {
         self.fd.load(Ordering::Acquire) == NO_FD
     }
 
+    /// Whether the source is still registered under `token`: its
+    /// deregistration (an evict another thread's holder performs, say) has
+    /// not happened yet.
+    pub(crate) fn registered_under(&self, token: u64) -> bool {
+        self.reg.token.load(Ordering::Acquire) == token
+    }
+
     /// Whether the write side holds bytes or a datagram the kernel has not
     /// taken yet, as its last holder left it.
     pub(crate) fn has_unsent(&self) -> bool {
