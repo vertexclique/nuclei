@@ -452,25 +452,54 @@ fn a_registration_the_kernel_refuses_is_counted() {
 }
 
 /// An accept with no descriptor left fails, and is counted as one for want
-/// of descriptors. Alone in its process: it lowers the descriptor limit.
+/// of descriptors. Alone in its process: it lowers the descriptor limit. On
+/// a ring, with the listener in the fixed-file table and on a copy (as on
+/// kernels before 6.13): the registration, which may make a copy, happens
+/// while descriptors are left, so what fails is the accept.
 #[cfg(unix)]
 #[test]
 fn an_accept_with_no_descriptor_left_is_counted() {
     if !crate::alone::alone("rt::counters::tests::an_accept_with_no_descriptor_left_is_counted") {
         return;
     }
+    for table in [None, Some(0)] {
+        #[cfg(ring)]
+        crate::rt::shard::ring::TABLE_FOR_TEST.with(|t| t.set(table));
+        #[cfg(not(ring))]
+        let _ = table;
+        accept_with_no_descriptor_left();
+    }
+}
+
+#[cfg(unix)]
+fn accept_with_no_descriptor_left() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
     run(async {
         let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
         let addr = listener.get_ref().local_addr().unwrap();
-        let _client = TcpStream::connect(addr).unwrap();
-        // Arms the shard's driver for the listener, with descriptors left.
-        crate::time::sleep(Duration::from_millis(1)).await;
+        // The client's socket is made while one can be.
+        // SAFETY: a plain call; the descriptor is owned at once.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        // SAFETY: just made, and ours.
+        let client = unsafe { OwnedFd::from_raw_fd(fd) };
+        // The accept waits, its listener registered. On a ring its entry
+        // is only queued: the kernel takes the descriptor limit as it takes
+        // the entry in, at the shard's next wait, after the limit is
+        // lowered below (no await comes between).
+        let mut accept = core::pin::pin!(listener.accept());
+        poll_fn(|cx| {
+            assert!(accept.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
         // SAFETY: plain data, all zeroes valid; the kernel fills it.
         let mut limit: libc::rlimit = unsafe { core::mem::zeroed() };
         // SAFETY: plain calls on this process's own limit and descriptors.
         unsafe {
             assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
-            let lowest_free = libc::dup(std::os::fd::AsRawFd::as_raw_fd(listener.get_ref()));
+            let lowest_free = libc::dup(client.as_raw_fd());
             assert!(lowest_free >= 0);
             libc::close(lowest_free);
             let tight = libc::rlimit {
@@ -479,18 +508,48 @@ fn an_accept_with_no_descriptor_left_is_counted() {
             };
             assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &tight), 0);
         }
-        let accepted = crate::time::timeout(Duration::from_secs(10), listener.accept()).await;
+        let connected = connect_inet(&client, addr);
+        let accepted = crate::time::timeout(Duration::from_secs(10), accept).await;
         // SAFETY: as above.
         unsafe { assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0) };
+        connected.unwrap();
         let err = accepted.expect("the accept ended").unwrap_err();
         assert!(
             matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)),
             "{err}"
         );
         let errors = here().errors;
-        assert_eq!(errors.accepts_out_of_descriptors, 1);
+        assert_eq!(errors.refused_registrations, 0, "{errors:?}");
+        assert_eq!(errors.accepts_out_of_descriptors, 1, "{errors:?}");
         assert!(errors.get(ErrorKind::Other) >= 1, "{errors:?}");
     });
+}
+
+/// A blocking connect of `sock` to `addr` (an IPv4 one).
+#[cfg(unix)]
+fn connect_inet(sock: &std::os::fd::OwnedFd, addr: std::net::SocketAddr) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let std::net::SocketAddr::V4(v4) = addr else {
+        panic!("an IPv4 address");
+    };
+    // SAFETY: plain data, all zeroes valid.
+    let mut raw: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+    raw.sin_family = libc::AF_INET as libc::sa_family_t;
+    raw.sin_port = v4.port().to_be();
+    raw.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+    // SAFETY: the address is a whole `sockaddr_in`, the length its own.
+    let r = unsafe {
+        libc::connect(
+            sock.as_raw_fd(),
+            core::ptr::from_ref(&raw).cast(),
+            core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Whether the registry has an entry for the shard of `Shared` at `key`.
