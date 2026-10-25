@@ -12,7 +12,8 @@
 //! `futures-io` traits. [`spawn`], [`block_on`] and the rest place work on
 //! the process default [`Runtime`], which starts on first use with no
 //! configuration; a [`Builder`] sets every setting for a runtime of one's
-//! own.
+//! own. [`stats()`] takes a snapshot of what every shard is doing: its
+//! tasks, polls, IO in flight, buffers, timers and errors.
 //!
 //! ```no_run
 //! use std::net::TcpListener;
