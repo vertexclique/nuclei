@@ -141,9 +141,11 @@ mod unix {
         assert_eq!(rt.block_on(task).unwrap().code(), Some(9));
     }
 
-    /// A thousand children live at once: each one's exit comes, half of
-    /// them killed, half exiting on their own. Alone in its process: the
-    /// thousand pidfds and pids would crowd tests that count descriptors.
+    /// A thousand children live at once, each one's exit reported: half
+    /// killed, half exiting on their own once their stdin ends. Each waits
+    /// for what ends it, so all of them run until then, however long the
+    /// spawns take. Alone in its process: the thousand pidfds, pipes and
+    /// pids would crowd tests that count descriptors.
     #[test]
     fn a_thousand_live_children_each_report_their_exit() {
         if !crate::alone::alone(
@@ -153,17 +155,34 @@ mod unix {
         }
         crate::block_on(async {
             let mut children: Vec<_> = (0..1000)
-                .map(|_| Command::new("sleep").arg("2").spawn().unwrap())
+                .map(|i| {
+                    if i % 2 == 0 {
+                        Command::new("sleep").arg("60").spawn().unwrap()
+                    } else {
+                        sh("read line; exit 3")
+                            .stdin(Stdio::piped())
+                            .spawn()
+                            .unwrap()
+                    }
+                })
                 .collect();
-            for child in children.iter_mut().step_by(2) {
-                child.kill().unwrap();
+            for (i, child) in children.iter_mut().enumerate() {
+                if i % 2 == 0 {
+                    child.kill().unwrap();
+                } else {
+                    drop(child.stdin.take());
+                }
             }
             for (i, child) in children.iter_mut().enumerate() {
                 let status = within(child.wait()).await.unwrap();
                 if i % 2 == 0 {
-                    assert_eq!(status.signal(), Some(libc::SIGKILL), "child {i}");
+                    assert_eq!(
+                        status.signal(),
+                        Some(libc::SIGKILL),
+                        "child {i}: {status:?}"
+                    );
                 } else {
-                    assert!(status.success(), "child {i}: {status:?}");
+                    assert_eq!(status.code(), Some(3), "child {i}: {status:?}");
                 }
             }
         });
