@@ -53,6 +53,11 @@ pub(crate) enum Want {
     RecvLent(Vec<u8>),
     /// Receive a datagram into a buffer of the pool, with its sender.
     RecvFrom(PoolBuf),
+    /// Receive datagrams as they come, each into a buffer of the shard's
+    /// receive group with its sender, until the receive is stopped (its end
+    /// as [`Outcome::RecvMultiEnd`]).
+    #[cfg(ring)]
+    RecvFromMulti,
     /// Connect to a peer.
     Connect(Dial),
     /// Send a stream the bytes a buffer of the pool holds.
@@ -71,7 +76,7 @@ impl Want {
             Want::Ready { read } => *read,
             Want::Accept | Want::Recv(_) | Want::RecvLent(_) | Want::RecvFrom(_) => true,
             #[cfg(ring)]
-            Want::RecvMulti | Want::AcceptMulti => true,
+            Want::RecvMulti | Want::AcceptMulti | Want::RecvFromMulti => true,
             Want::Connect(_) | Want::Send(_) | Want::SendLent(..) | Want::SendTo(..) => false,
         }
     }

@@ -53,6 +53,15 @@ pub(crate) enum RingMem {
         held: usize,
         stopping: bool,
     },
+    /// A multishot receive of datagrams, as `RecvMulti`; its arrivals hold a
+    /// header and the sender's address before the payload, the room for
+    /// which the message header the kernel reads gives.
+    RecvFromMulti {
+        held: usize,
+        stopping: bool,
+        #[expect(dead_code, reason = "the kernel reads it until the last completion")]
+        msg: RecvHdr,
+    },
     RecvLent(Vec<u8>),
     RecvFrom(Box<Msg>, PoolBuf),
     Connect(
@@ -112,7 +121,7 @@ impl RingMem {
                     Answer::Undone { not_ready } => Answer::Undone { not_ready },
                 },
             }),
-            RingMem::RecvMulti { .. } => Outcome::RecvMultiEnd {
+            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => Outcome::RecvMultiEnd {
                 // A group with no buffer left gives the receive back undone.
                 answer: match res {
                     r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
@@ -364,6 +373,17 @@ impl RingIssuer<'_> {
     pub(crate) fn multishot(&self, kind: Kind) -> bool {
         matches!(kind, Kind::Tcp | Kind::Stream) && self.ring.recv_group().is_some()
     }
+
+    /// Whether a datagram receive of a source of `kind` goes out as a
+    /// multishot one: a UDP socket's, on a ring whose group's buffers hold
+    /// any datagram whole (a Unix datagram may be larger than any buffer).
+    pub(crate) fn multishot_datagrams(&self, kind: Kind) -> bool {
+        kind == Kind::Udp
+            && self
+                .ring
+                .recv_buf_size()
+                .is_some_and(|s| s >= DATAGRAM_ROOM)
+    }
 }
 
 /// What a multishot receive or accept hands the side as it comes.
@@ -373,6 +393,69 @@ pub(crate) enum Arrival {
     /// An accepted connection, whose peer is asked of the kernel when a task
     /// wants it.
     Conn(OwnedFd),
+    /// A datagram's payload in a receive's buffer, with its sender.
+    Datagram(crate::rt::shard::recv::RingChunk, Addr),
+}
+
+/// The room a multishot datagram receive's buffer needs: the kernel's
+/// header, the sender's address and the largest datagram, which then always
+/// comes whole.
+pub(crate) const DATAGRAM_ROOM: u32 = (size_of::<
+    crate::syscore::linux::iouring::ring::IoUringRecvmsgOut,
+>() + size_of::<libc::sockaddr_storage>()
+    + u16::MAX as usize) as u32;
+
+/// The message header of a multishot datagram receive, kept until its last
+/// completion: room for the sender, none for control data.
+pub(crate) struct RecvHdr(Box<libc::msghdr>);
+
+// SAFETY: the header's pointers are null: the kernel reads only its name and
+// control lengths, and nothing writes it while it is out.
+unsafe impl Send for RecvHdr {}
+
+impl RecvHdr {
+    fn new() -> Self {
+        // SAFETY: plain data; all zeroes is a valid value.
+        let mut msg: Box<libc::msghdr> = Box::new(unsafe { core::mem::zeroed() });
+        msg.msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        Self(msg)
+    }
+
+    fn as_ptr(&self) -> *const libc::msghdr {
+        &*self.0
+    }
+}
+
+/// The payload and the sender of a multishot datagram receive's arrival,
+/// from the header the kernel wrote into `chunk`: the chunk narrowed to the
+/// payload. `None` for a buffer the kernel did not lay out as it says.
+pub(crate) fn datagram_of(
+    mut chunk: crate::rt::shard::recv::RingChunk,
+    kind: Kind,
+) -> Option<(crate::rt::shard::recv::RingChunk, Addr)> {
+    use crate::syscore::linux::iouring::ring::IoUringRecvmsgOut;
+    let namelen = size_of::<libc::sockaddr_storage>() as u32;
+    let (start, len, name) = {
+        let parts = IoUringRecvmsgOut::parse(chunk.bytes(), namelen, 0)?;
+        // The payload comes after the header and the room for the sender.
+        let start = size_of::<IoUringRecvmsgOut>() + namelen as usize;
+        let mut name = RawAddr::empty();
+        let raw = parts.name;
+        // SAFETY: the storage is large enough for any address the kernel
+        // writes, and `raw` is at most `namelen` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                raw.as_ptr(),
+                (&mut name.storage as *mut libc::sockaddr_storage).cast::<u8>(),
+                raw.len(),
+            );
+        }
+        name.len = parts.header.namelen as libc::socklen_t;
+        (start, parts.payload.len(), name)
+    };
+    let from = name.to_addr(kind).ok()?;
+    chunk.narrow(start, start + len);
+    Some((chunk, from))
 }
 
 /// The peer of `conn`, a connection a listener of `kind` accepted: a
@@ -433,6 +516,26 @@ fn entry(
                 libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             ),
         ),
+        Want::RecvFromMulti => match group {
+            Some(group) => {
+                let msg = RecvHdr::new();
+                let sqe = Sqe::recvmsg_multishot(slot, msg.as_ptr(), group, 0);
+                (
+                    RingMem::RecvFromMulti {
+                        held: 0,
+                        stopping: false,
+                        msg,
+                    },
+                    sqe,
+                )
+            }
+            None => {
+                return Err(Box::new(Outcome::RecvMultiEnd {
+                    answer: Answer::Undone { not_ready: false },
+                    dry: true,
+                }));
+            }
+        },
         Want::RecvMulti => match group {
             Some(group) => (
                 RingMem::RecvMulti {

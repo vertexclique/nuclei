@@ -68,3 +68,7 @@ path = "tcp-client.rs"
 [[example]]
 name = "unix-signal"
 path = "unix-signal.rs"
+
+[[example]]
+name = "udp-server"
+path = "udp-server.rs"

@@ -46,6 +46,39 @@ use ahead::{Ahead, Piece};
 #[cfg(readiness)]
 const BATCH: usize = 32;
 
+/// A datagram received ahead: in a buffer of the pool, or on a ring in a
+/// buffer of the receive group a multishot receive filled.
+enum Datagram {
+    Pool(PoolBuf),
+    #[cfg(ring)]
+    Ring(crate::rt::shard::recv::RingChunk),
+}
+
+impl Datagram {
+    /// Copies the datagram into `out`, cut to it as the kernel cuts it.
+    fn peek_into(&self, out: &mut [u8]) -> usize {
+        match self {
+            Datagram::Pool(buf) => buf.peek_into(out),
+            #[cfg(ring)]
+            Datagram::Ring(chunk) => {
+                let src = chunk.bytes();
+                let n = src.len().min(out.len());
+                out[..n].copy_from_slice(&src[..n]);
+                n
+            }
+        }
+    }
+
+    fn release(self, after: &mut After) {
+        match self {
+            Datagram::Pool(buf) => after.drop_buf(buf),
+            // Goes back to its group as it drops.
+            #[cfg(ring)]
+            Datagram::Ring(_) => {}
+        }
+    }
+}
+
 /// The peer of a connection accepted ahead: its address, or, for one a
 /// multishot accept brought, to be asked of the kernel if a task wants it.
 enum Peer {
@@ -84,7 +117,7 @@ pub(super) struct ReadState {
     eof: bool,
     error: Option<io::Error>,
     accepted: VecDeque<(Owned, Peer)>,
-    datagrams: VecDeque<(PoolBuf, Addr)>,
+    datagrams: VecDeque<(Datagram, Addr)>,
     /// Urgent data or a hangup was reported: a short read may leave bytes
     /// behind it from now on (see [`drained`]).
     unsure: bool,
@@ -331,7 +364,7 @@ impl ReadState {
                 }
                 Some(Ok((n, addr))) => {
                     buf.set_filled(n);
-                    self.datagrams.push_back((buf, addr));
+                    self.datagrams.push_back((Datagram::Pool(buf), addr));
                 }
                 Some(Err(err)) => {
                     self.error = Some(err);
@@ -594,7 +627,7 @@ impl ReadState {
             Some((datagram, addr)) => {
                 let (n, addr) = (datagram.peek_into(out), addr.clone());
                 if !peek && let Some((done, _)) = self.datagrams.pop_front() {
-                    after.drop_buf(done);
+                    done.release(after);
                 }
                 Some(Ok((n, addr)))
             }
@@ -690,6 +723,9 @@ impl ReadState {
         match arrival {
             super::ring::Arrival::Chunk(chunk) => self.ahead.push(Piece::Ring(chunk), after),
             super::ring::Arrival::Conn(conn) => self.accepted.push_back((conn, Peer::Ask)),
+            super::ring::Arrival::Datagram(payload, from) => {
+                self.datagrams.push_back((Datagram::Ring(payload), from));
+            }
         }
         self.want = 0;
         if let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take()) {
@@ -704,8 +740,8 @@ impl ReadState {
         if let Some(w) = self.lent.take().and_then(|l| l.waker) {
             after.forget_one(w);
         }
-        for (buf, _) in self.datagrams.drain(..) {
-            after.drop_buf(buf);
+        for (datagram, _) in self.datagrams.drain(..) {
+            datagram.release(after);
         }
         self.accepted.clear();
         self.eof = false;

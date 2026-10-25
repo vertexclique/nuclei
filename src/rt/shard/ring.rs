@@ -113,6 +113,11 @@ impl ShardRing {
         self.recv.borrow().as_ref().map(RecvGroup::bgid)
     }
 
+    /// The size of the group's buffers, if the ring has a group.
+    pub(crate) fn recv_buf_size(&self) -> Option<u32> {
+        self.recv.borrow().as_ref().map(RecvGroup::buf_size)
+    }
+
     pub(crate) fn notifier(&self) -> Notifier {
         self.poller.borrow().notifier()
     }
@@ -131,7 +136,7 @@ impl ShardRing {
         #[cfg(test)]
         if matches!(
             op.mem,
-            RingMem::RecvMulti { .. } | RingMem::AcceptMulti { .. }
+            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } | RingMem::AcceptMulti { .. }
         ) {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed + 1, arrived, dry));
@@ -276,11 +281,14 @@ impl ShardRing {
             };
             let mut ops = self.ops.borrow_mut();
             let held = ops.get_mut(user_data).and_then(|op| match &mut op.mem {
-                RingMem::RecvMulti { held, stopping } => Some((op.epoch, held, stopping)),
+                RingMem::RecvMulti { held, stopping } => Some((op.epoch, held, stopping, false)),
+                RingMem::RecvFromMulti { held, stopping, .. } => {
+                    Some((op.epoch, held, stopping, true))
+                }
                 _ => None,
             });
             match (u32::try_from(res), held) {
-                (Ok(len @ 1..), Some((epoch, held, stopping))) => {
+                (Ok(len @ 1..), Some((epoch, held, stopping, datagram))) => {
                     match group.hand_out(user_data, bid, len) {
                         Some(chunk) => {
                             *held += len as usize;
@@ -288,8 +296,9 @@ impl ShardRing {
                                 *stopping = true;
                                 stop = true;
                             }
-                            ops.get_mut(user_data)
-                                .map(|op| (std::sync::Arc::clone(&op.source), chunk, epoch))
+                            ops.get_mut(user_data).map(|op| {
+                                (std::sync::Arc::clone(&op.source), chunk, epoch, datagram)
+                            })
                         }
                         None => None,
                     }
@@ -306,13 +315,22 @@ impl ShardRing {
             self.cancel(user_data);
         }
         // Handed over with nothing borrowed: the source may submit at once.
-        if let Some((source, chunk, epoch)) = delivery {
+        if let Some((source, chunk, epoch, datagram)) = delivery {
             #[cfg(test)]
             {
                 let (armed, arrived, dry) = self.counts.get();
                 self.counts.set((armed, arrived + 1, dry));
             }
-            source.ring_arrival(Arrival::Chunk(chunk), epoch);
+            let arrival = if datagram {
+                // A buffer not laid out as the kernel says is only given back.
+                match crate::io::source::ring::datagram_of(chunk, source.kind()) {
+                    Some((payload, from)) => Arrival::Datagram(payload, from),
+                    None => return,
+                }
+            } else {
+                Arrival::Chunk(chunk)
+            };
+            source.ring_arrival(arrival, epoch);
         }
     }
 
@@ -356,7 +374,7 @@ impl ShardRing {
         };
         let mut ops = self.ops.borrow_mut();
         group.take_back(|user_data, len| {
-            if let Some(RingMem::RecvMulti { held, .. }) =
+            if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
                 ops.get_mut(user_data).map(|op| &mut op.mem)
             {
                 *held = held.saturating_sub(len as usize);
@@ -487,7 +505,9 @@ impl ShardRing {
             .filter(|op| {
                 matches!(
                     op.mem,
-                    RingMem::RecvMulti { .. } | RingMem::AcceptMulti { .. }
+                    RingMem::RecvMulti { .. }
+                        | RingMem::RecvFromMulti { .. }
+                        | RingMem::AcceptMulti { .. }
                 )
             })
             .count()

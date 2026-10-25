@@ -105,6 +105,11 @@ impl RecvGroup {
         self.cap
     }
 
+    /// The size of each buffer.
+    pub(crate) fn buf_size(&self) -> u32 {
+        self.ring.buf_size()
+    }
+
     /// The chunk of buffer `bid` that a completion of receive `user_data`
     /// filled with `len` bytes; `None` for an id or a length outside the
     /// group (the buffer then goes back at once).
@@ -175,6 +180,17 @@ impl RingChunk {
         // SAFETY: the buffer was handed out and goes back only when this
         // chunk drops, so the kernel does not write it while it lives.
         unsafe { self.back.mem.bytes(self.bid, self.start, self.end) }.unwrap_or_default()
+    }
+
+    /// Keeps only bytes `start..end` of the buffer: the payload of a
+    /// message whose header and sender come first.
+    pub(crate) fn narrow(&mut self, start: usize, end: usize) {
+        let (start, end) = (
+            u32::try_from(start).unwrap_or(u32::MAX),
+            u32::try_from(end).unwrap_or(u32::MAX),
+        );
+        self.end = end.min(self.end);
+        self.start = start.min(self.end);
     }
 
     /// Takes `n` bytes off the front.

@@ -9,7 +9,7 @@
 //! again. Only the operation's own completion clears it, so a side never
 //! has two operations out, and its mailbox never more than one completion.
 
-use super::{Kind, Peer, Piece, ReadState};
+use super::{Datagram, Kind, Peer, Piece, ReadState};
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::Io;
@@ -76,10 +76,14 @@ impl ReadState {
             #[cfg(not(ring))]
             Want::Accept
         } else if kind.datagrams() {
-            let Some(buf) = self.buffer(len, true, after) else {
+            #[cfg(ring)]
+            let multi = !self.dry && issuer.multishot_datagrams(kind);
+            #[cfg(not(ring))]
+            let multi = false;
+            let Some(want) = self.datagram_want(multi, len, after) else {
                 return;
             };
-            Want::RecvFrom(buf)
+            want
         } else {
             match self.lent.as_mut().filter(|l| !l.out) {
                 Some(lent) => {
@@ -100,6 +104,20 @@ impl ReadState {
             }
         };
         self.out = Some(issuer.issue(want, kind, self.epoch, after));
+    }
+
+    /// The datagram receive to go out: a multishot one into the receive
+    /// group (`multi`), or one into a buffer of the pool that holds `len`
+    /// whole; `None` while the pool has none.
+    fn datagram_want(&mut self, multi: bool, len: usize, after: &mut After) -> Option<Want> {
+        #[cfg(ring)]
+        if multi {
+            self.multi = true;
+            return Some(Want::RecvFromMulti);
+        }
+        #[cfg(not(ring))]
+        let _ = multi;
+        self.buffer(len, true, after).map(Want::RecvFrom)
     }
 
     /// A receive into a buffer of the pool completed.
@@ -224,17 +242,26 @@ impl ReadState {
             }
             Outcome::Accept(Answer::Done(Err(err))) => self.error = Some(err),
             Outcome::RecvFrom(buf, _) if stale => after.drop_buf(buf),
-            Outcome::RecvFrom(buf, answer) => match answer {
-                Answer::Undone { not_ready } => {
-                    self.not_ready(not_ready);
-                    after.drop_buf(buf);
+            Outcome::RecvFrom(buf, answer) => {
+                // The group may have buffers again: the next receive tries.
+                #[cfg(ring)]
+                {
+                    self.dry = false;
                 }
-                Answer::Done(Ok((_, from))) => self.datagrams.push_back((buf, from)),
-                Answer::Done(Err(err)) => {
-                    self.error = Some(err);
-                    after.drop_buf(buf);
+                match answer {
+                    Answer::Undone { not_ready } => {
+                        self.not_ready(not_ready);
+                        after.drop_buf(buf);
+                    }
+                    Answer::Done(Ok((_, from))) => {
+                        self.datagrams.push_back((Datagram::Pool(buf), from));
+                    }
+                    Answer::Done(Err(err)) => {
+                        self.error = Some(err);
+                        after.drop_buf(buf);
+                    }
                 }
-            },
+            }
             // The write side's.
             other => other.release(after),
         }

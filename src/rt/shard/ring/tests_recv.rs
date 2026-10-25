@@ -479,3 +479,118 @@ fn past_its_cap_a_multishot_accept_is_stopped_and_loses_no_connection() {
     assert!(armed >= 2, "the accept was not armed again after its stop");
     src.retire();
 }
+
+/// A bound UDP socket with its source.
+fn udp_source() -> (std::net::UdpSocket, Arc<Source>, std::net::SocketAddr) {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    sys::set_nonblocking(socket.as_raw_fd()).unwrap();
+    // Room for every datagram the tests send at once.
+    set_buffers(socket.as_raw_fd(), 4 << 20);
+    let src = Source::new(socket.as_raw_fd(), Kind::Udp);
+    (socket, src, addr)
+}
+
+async fn receive(src: &Arc<Source>, out: &mut [u8]) -> (usize, crate::io::source::Addr) {
+    poll_fn(|cx| src.poll_receive(cx, out, false))
+        .await
+        .unwrap()
+}
+
+/// A group whose buffers hold any datagram.
+const DATAGRAM_BUFFERS: u32 = 66 * 1024;
+
+/// Datagrams from two senders, up to 60000 bytes, all come whole and with
+/// their senders through the one multishot receive the first armed.
+#[test]
+fn datagrams_come_whole_with_their_senders_through_one_multishot_receive() {
+    let Some(shard) = recv_shard(16, DATAGRAM_BUFFERS) else {
+        return;
+    };
+    let _current = context::enter(&shard);
+    let (_socket, src, addr) = udp_source();
+    let senders = [
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+    ];
+    let sizes = [1usize, 100, 1500, 9000, 60_000, 33];
+    let mut expected = Vec::new();
+    shard.block_on(async {
+        // Armed by the first receive.
+        senders[0].send_to(b"first", addr).unwrap();
+        let mut buf = vec![0u8; 65536];
+        let (n, _) = receive(&src, &mut buf).await;
+        assert_eq!(&buf[..n], b"first");
+        for (i, size) in sizes.iter().enumerate() {
+            for sender in &senders {
+                let datagram: Vec<u8> = (0..*size).map(|j| (i * 31 + j) as u8).collect();
+                sender.send_to(&datagram, addr).unwrap();
+                expected.push((sender.local_addr().unwrap(), datagram));
+            }
+        }
+        for (from, datagram) in &expected {
+            let (n, got_from) = receive(&src, &mut buf).await;
+            assert_eq!(n, datagram.len(), "a datagram was cut");
+            assert!(
+                buf[..n] == datagram[..],
+                "a datagram changed or came out of order"
+            );
+            match got_from {
+                crate::io::source::Addr::Inet(got) => assert_eq!(got, *from),
+                other => panic!("a UDP sender came as {other:?}"),
+            }
+        }
+    });
+    let (armed, arrived, _) = shard.ring().unwrap().multishot_counts();
+    assert_eq!(armed, 1, "the receive was armed again {} times", armed - 1);
+    assert!(arrived >= expected.len(), "only {arrived} arrivals");
+    src.retire();
+}
+
+/// A datagram longer than the reader's buffer is cut to it, as the kernel
+/// cuts it, and the next one comes whole.
+#[test]
+fn a_multishot_datagram_is_cut_to_the_readers_buffer() {
+    let Some(shard) = recv_shard(16, DATAGRAM_BUFFERS) else {
+        return;
+    };
+    let _current = context::enter(&shard);
+    let (_socket, src, addr) = udp_source();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    shard.block_on(async {
+        sender.send_to(&[7u8; 1000], addr).unwrap();
+        sender.send_to(b"next", addr).unwrap();
+        let mut small = [0u8; 100];
+        let (n, _) = receive(&src, &mut small).await;
+        assert_eq!((n, small), (100, [7u8; 100]));
+        let mut buf = [0u8; 16];
+        let (n, _) = receive(&src, &mut buf).await;
+        assert_eq!(&buf[..n], b"next");
+    });
+    src.retire();
+}
+
+/// A group whose buffers cannot hold every datagram: UDP receives stay
+/// single, so no datagram is ever cut at a buffer's end.
+#[test]
+fn datagrams_wider_than_the_groups_buffers_never_go_multishot() {
+    let Some(shard) = recv_shard(16, 16 * 1024) else {
+        return;
+    };
+    let _current = context::enter(&shard);
+    let (_socket, src, addr) = udp_source();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    shard.block_on(async {
+        let big = vec![3u8; 60_000];
+        sender.send_to(&big, addr).unwrap();
+        let mut buf = vec![0u8; 65536];
+        let (n, _) = receive(&src, &mut buf).await;
+        assert_eq!(n, big.len(), "the datagram was cut");
+    });
+    let (armed, _, _) = shard.ring().unwrap().multishot_counts();
+    assert_eq!(
+        armed, 0,
+        "a datagram receive went multishot into buffers too small"
+    );
+    src.retire();
+}
