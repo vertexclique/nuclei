@@ -664,7 +664,9 @@ fn start_job(
 fn run_job(slot: &Slot, handle: &OwnedHandle, read: bool, port: &Port) {
     // SAFETY: the job has the slot from its spawn to its packet.
     let inner = unsafe { &mut *slot.inner.get() };
-    let me = THIS_THREAD.with(|t| t.as_ref().map_or(0, |t| t.0 as usize));
+    let me = THIS_THREAD
+        .try_with(|t| t.as_ref().map_or(0, |t| t.0 as usize))
+        .unwrap_or(0);
     let (code, bytes) = if me == 0 {
         // No handle a canceller could use: the call is not made.
         slot.job.0.store(IDLE, Ordering::Release);
