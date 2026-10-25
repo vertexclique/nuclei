@@ -53,6 +53,26 @@ fn a_handle_value_taken_by_the_next_socket_never_sees_the_old_registration() {
     });
 }
 
+/// Writes until the socket takes nothing more for a while (Windows' TCP
+/// grows its buffers, so a first write that goes behind is not enough):
+/// what is left behind then cannot go out until the peer reads. Returns
+/// every byte the handle took, in order.
+async fn fill_until_stuck(h: &Handle<TcpStream>) -> Vec<u8> {
+    let mut sent = Vec::new();
+    let mut seq = 0usize;
+    loop {
+        let chunk: Vec<u8> = (0..64 * 1024)
+            .map(|i| ((seq * 64 * 1024 + i) % 251) as u8)
+            .collect();
+        seq += 1;
+        match crate::time::timeout(Duration::from_millis(100), h.send(&chunk)).await {
+            Ok(n) => sent.extend_from_slice(&chunk[..n.unwrap()]),
+            // A send that waits took none of its bytes.
+            Err(_) => return sent,
+        }
+    }
+}
+
 /// A handle dropped with bytes still to send keeps its socket open until
 /// they are out: the next socket gets another value, the bytes reach the
 /// old peer whole, and none reaches the new socket.
@@ -65,7 +85,8 @@ fn a_dropped_handle_keeps_its_value_until_its_bytes_are_out() {
     let (mine, peer) = stream_pair();
     let (sent, value) = rt.block_on(async {
         let handle = Handle::new(mine).unwrap();
-        let sent = fill_behind(&handle).await;
+        let sent = fill_until_stuck(&handle).await;
+        assert!(handle.source().has_unsent(), "nothing was left to send");
         let value = handle.as_raw_socket();
         drop(handle);
         (sent, value)

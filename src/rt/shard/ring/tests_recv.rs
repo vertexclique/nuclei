@@ -375,9 +375,13 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
     let mut seen = Vec::new();
     shard.block_on(async {
         for _ in 0..16 {
-            let conn = accept_stream(&src).await;
+            let conn = std::net::TcpStream::from(accept_stream(&src).await);
+            // An accepted connection is non-blocking; its byte may still be
+            // on its way.
+            conn.set_nonblocking(false).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut b = [0u8; 1];
-            let n = std::io::Read::read(&mut std::net::TcpStream::from(conn), &mut b).unwrap();
+            let n = std::io::Read::read(&mut &conn, &mut b).unwrap();
             assert_eq!(n, 1);
             seen.push(b[0]);
         }
