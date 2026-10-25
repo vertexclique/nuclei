@@ -511,3 +511,82 @@ fn a_blocking_lock_inside_a_task_lets_the_holder_finish() {
     }));
     assert_eq!(done, 1);
 }
+
+/// A task woken once its worker stopped is dropped then: it is never run
+/// again, and it does not keep itself (and its shard) for good.
+#[test]
+fn a_task_woken_after_its_worker_stopped_is_dropped() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicBool::new(false));
+    let gate = Gate::default();
+    let rt = runtime(1);
+    {
+        let (dropped, started, gate) = (dropped.clone(), started.clone(), gate.clone());
+        rt.spawn(async move {
+            let _counted = Counted(dropped);
+            started.store(true, Ordering::SeqCst);
+            gate.await;
+        })
+        .detach();
+    }
+    eventually("the task to wait on its gate", || {
+        started.load(Ordering::SeqCst)
+    });
+    drop(rt);
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        0,
+        "the waiting task went with its worker"
+    );
+    gate.open();
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "the task woken after its worker stopped was kept"
+    );
+}
+
+/// A thread's local tasks still waiting as it exits are dropped there: one
+/// asleep on a timer, which holds a channel's sender, and one waiting on
+/// that channel, which the first one's going wakes.
+#[test]
+fn a_thread_drops_its_waiting_local_tasks_as_it_exits() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let counter = dropped.clone();
+    std::thread::spawn(move || {
+        nuclei::block_on(async move {
+            let started = Rc::new(Cell::new(0));
+            let (tx, rx) = oneshot::channel::<()>();
+            let (count, up) = (counter.clone(), started.clone());
+            spawn_local(async move {
+                let _counted = Counted(count);
+                let _tx = tx;
+                up.set(up.get() + 1);
+                loop {
+                    nuclei::time::sleep(Duration::from_secs(3600)).await;
+                }
+            })
+            .detach();
+            let up = started.clone();
+            spawn_local(async move {
+                let _counted = Counted(counter);
+                up.set(up.get() + 1);
+                let _ = rx.await;
+                core::future::pending::<()>().await;
+            })
+            .detach();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while started.get() < 2 {
+                assert!(Instant::now() < deadline, "the local tasks never started");
+                nuclei::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        2,
+        "a local task waiting as its thread exited was kept"
+    );
+}

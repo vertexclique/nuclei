@@ -154,6 +154,15 @@ impl Wheel {
         self.armed
     }
 
+    /// Takes the waker of every timer, for a wheel whose shard goes: none
+    /// fires any more. The timers stay, for their keys to remove.
+    pub(crate) fn take_wakers(&mut self) -> Vec<Waker> {
+        self.entries
+            .iter_mut()
+            .filter_map(|entry| entry.waker.take())
+            .collect()
+    }
+
     /// Arms a timer for `when`, waking `waker` once the wheel passes it. A
     /// deadline the wheel has passed already is fired at once, without a
     /// wake: the caller sees it fired when it looks.

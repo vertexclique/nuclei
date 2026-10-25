@@ -13,3 +13,10 @@ M_drive_waits                  MC_Park              deadlock
 W_drive_fire                   MC_Park              violated:NoDriveFire
 P_proactor                     MC_Park              pass
 M_handshake_wake               MC_Park              deadlock
+PS_safe                        MC_ShardStop         pass
+PS_live                        MC_ShardStop         pass
+MS_check_first                 MC_ShardStop         violated:NothingLeft
+MS_no_pusher_drop              MC_ShardStop         violated:NothingLeft
+MS_one_pass                    MC_ShardStop         violated:NothingLeft
+WS_pusher_drain                MC_ShardStop         violated:NoPusherDrain
+WS_second_pass                 MC_ShardStop         violated:NoSecondPass

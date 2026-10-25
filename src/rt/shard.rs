@@ -201,6 +201,18 @@ impl Shared {
             self.local_inbox.push(runnable);
         } else {
             self.inbox.push(runnable);
+            // A shard that stopped runs nothing more, and its last drain of
+            // the inbox may be over: what is pushed then is dropped here (its
+            // future may be dropped on any thread), or it would keep itself
+            // and, through its schedule, the shard for good. The push and the
+            // flag's store are both sequentially consistent: either the
+            // drain finds it, or this sees the flag.
+            if self.stopped.load(Ordering::SeqCst) {
+                while let Ok(runnable) = self.inbox.try_pop() {
+                    drop(runnable);
+                }
+                return;
+            }
         }
         // The queue's push is sequentially consistent: the shard either finds
         // the runnable after it parks, or is parked now.
@@ -971,11 +983,24 @@ impl Drop for Shard {
         if !self.port_kept() && !self.hand_off_port() {
             self.settle_port();
         }
-        drop(self.lifo.take());
-        let queue = core::mem::take(&mut *self.queue.borrow_mut());
-        drop(queue);
-        while let Some(runnable) = self.pop_inbox() {
-            drop(runnable);
+        // What goes with a task may wake another of the shard's (a timer's
+        // waker, a channel its future held): that one comes back through the
+        // inbox, and is dropped here too, until none is left.
+        loop {
+            let lifo = self.lifo.take();
+            let queue = core::mem::take(&mut *self.queue.borrow_mut());
+            let timers = self.wheel.borrow_mut().take_wakers();
+            let fired = core::mem::take(&mut *self.fired.borrow_mut());
+            let mut quiet =
+                lifo.is_none() && queue.is_empty() && timers.is_empty() && fired.is_empty();
+            drop((lifo, queue, timers, fired));
+            while let Some(runnable) = self.pop_inbox() {
+                drop(runnable);
+                quiet = false;
+            }
+            if quiet {
+                break;
+            }
         }
     }
 }
