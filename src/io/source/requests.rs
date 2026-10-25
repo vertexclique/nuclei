@@ -348,9 +348,11 @@ impl Source {
             // SAFETY: made by `Box::into_raw` and pushed once; the swap took it.
             let install = *unsafe { Box::from_raw(next) };
             next = install.next;
+            // The attach under way, to this install's shard: one to another
+            // shard may carry a token of the same number.
             let wanted = self.reg.state.load(Ordering::Acquire) == super::REGISTERING
                 && self.reg.ops.load(Ordering::Acquire)
-                && self.reg.token.load(Ordering::Acquire) == install.token
+                && self.registered_with(Arc::as_ptr(&install.shard) as usize, install.token)
                 && self.fd.load(Ordering::Acquire) != NO_FD;
             match (wanted, install.slot) {
                 (true, Ok(slot)) => {
@@ -379,6 +381,7 @@ impl Source {
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
         let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
+        self.reg.home.store(0, Ordering::Release);
         self.reg.ops.store(false, Ordering::Release);
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
@@ -441,6 +444,9 @@ impl Source {
         };
         match &result {
             Ok(()) => {
+                self.reg
+                    .home
+                    .store(Arc::as_ptr(&shard) as usize, Ordering::Release);
                 // SAFETY: both sides are held.
                 unsafe { *self.reg.shard.get() = Some(shard) };
                 self.reg.token.store(token, Ordering::Release);
@@ -470,6 +476,7 @@ impl Source {
             // SAFETY: both sides are held.
             let shard = unsafe { (*self.reg.shard.get()).take() };
             self.reg.token.store(NO_TOKEN, Ordering::Release);
+            self.reg.home.store(0, Ordering::Release);
             self.reg.state.store(UNREGISTERED, Ordering::Release);
             #[cfg(ring)]
             if self.reg.ops.swap(false, Ordering::AcqRel) {

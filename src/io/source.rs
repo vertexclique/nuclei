@@ -254,13 +254,15 @@ struct Registration {
     shard: UnsafeCell<Option<Arc<Shared>>>,
     /// The registration is with a completion driver: the source's IO is
     /// its operations. On a ring they name fixed slot `slot` and run on the
-    /// shard whose `Shared` is at `home` (an address, compared, never
-    /// followed).
+    /// shard at `home`.
     #[cfg(completion)]
     ops: AtomicBool,
     #[cfg(ring)]
     slot: AtomicU32,
-    #[cfg(ring)]
+    /// The address of the `Shared` of the shard the registration in place
+    /// (or a ring attach under way) is with, else 0: compared, never
+    /// followed. With the token it names the registration, since every
+    /// shard numbers its own tokens.
     home: core::sync::atomic::AtomicUsize,
     /// A registration found operations of the source out, which keep its
     /// handle on the port they were issued to: it waits for the last to
@@ -464,7 +466,6 @@ impl Source {
                 ops: AtomicBool::new(false),
                 #[cfg(ring)]
                 slot: AtomicU32::new(u32::MAX),
-                #[cfg(ring)]
                 home: core::sync::atomic::AtomicUsize::new(0),
                 #[cfg(port)]
                 awaits_idle: AtomicBool::new(false),
@@ -673,6 +674,7 @@ impl Source {
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
         let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
+        self.reg.home.store(0, Ordering::Release);
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
             #[cfg(ring)]
@@ -743,11 +745,17 @@ impl Source {
         self.fd.load(Ordering::Acquire) == NO_FD
     }
 
-    /// Whether the source is still registered under `token`: its
-    /// deregistration (an evict another thread's holder performs, say) has
-    /// not happened yet.
-    pub(crate) fn registered_under(&self, token: u64) -> bool {
+    /// Whether the source is still registered under `token` with the
+    /// shard whose `Shared` is at `home`: that deregistration (an evict
+    /// another thread's holder performs, say) has not happened yet. A
+    /// registration with another shard since is not it, whatever its token.
+    pub(crate) fn registered_with(&self, home: usize, token: u64) -> bool {
+        // The token first. Every end of a registration clears `home` before
+        // the state, and a registration elsewhere stores its token after it
+        // took the state: a token seen from it comes with `home` cleared or
+        // moved on. A failed attach leaves its token, never its `home`.
         self.reg.token.load(Ordering::Acquire) == token
+            && self.reg.home.load(Ordering::Acquire) == home
     }
 
     /// Whether the write side holds bytes or a datagram the kernel has not
@@ -783,6 +791,14 @@ impl Source {
 
 #[cfg(test)]
 impl Source {
+    /// The registration in place: its shard's address and its token.
+    pub(crate) fn registration(&self) -> (usize, u64) {
+        (
+            self.reg.home.load(Ordering::SeqCst),
+            self.reg.token.load(Ordering::SeqCst),
+        )
+    }
+
     /// The read side as a line, for a test that failed: its guard's words,
     /// and what it holds unless it is held.
     pub(crate) fn read_report(self: &Arc<Self>) -> String {

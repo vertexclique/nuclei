@@ -498,9 +498,32 @@ ring's thread, racing a close or an evict (`src/io/source/requests.rs`,
 `src/io/source/ring.rs`). The performing thread marks the registration under way and posts the
 ring a copy of the descriptor; the ring's thread puts the file into its table and hands the
 slot back as a request, which whoever performs it (both sides held) keeps if the attach is
-still wanted, or lets go. 9 configurations: 4 that must pass (a close, an evict, both, and
-liveness), 2 mutations that leak the file into the table of a closed source (`NoLeak`), and 3
-witnesses.
+still wanted, or lets go. After the evict the source may attach to another shard under a token
+of the same number (every shard numbers its own), so the ring's look and the install's taking
+check the registration's shard with its token. 12 configurations: 5 that must pass (a close, an
+evict, both, liveness, and an evict followed by an attach to another shard), 3 mutations (2
+that leak the file into the table of a closed source, `NoLeak`; a look and a taking by the
+token alone, which hand the source registered with the other shard a slot of this ring's table,
+`NoForeignSlot`), and 4 witnesses.
+
+## A shard that goes
+
+`going` (`tla/going/Going.tla`) checks how a shard that goes waits for the evictions of its
+sources (`src/rt/shard/going.rs`, `src/io/source.rs`, `src/io/source/requests.rs`) before it
+looks at what its ring has out. The shard evicts a source with a receive out on its ring, at
+once or, while another thread holds a side, by that holder as it lets go, and waits until the
+source is no longer registered with it; then its mailbox, where the eviction left the cancel,
+ends the receive. A task on another shard registers the source as soon as the eviction is done,
+under a token of the same number, and its receive goes out once the old one has ended. The
+wait checks the registration's shard with its token, and every end of a registration (a failed
+ring attach too) clears the shard. 9 configurations: 4 that must pass (the shard's own
+eviction, a holder's, a registration that was a failed attach, and that with a holder and the
+other shard), with nothing left out on the ring once the shard has gone and everything ending;
+3 mutations (a wait by the token alone, which waits for the other shard's registration while
+that one's receive waits for this shard's cancel, `AllEnd`; a failed attach that keeps its
+shard, `AllEnd`; no wait, which lands the holder's cancel after the shard has gone,
+`NoStrandedOp`); and 2 witnesses (the other shard's registration under the same number while
+the shard waits; a holder's eviction).
 
 ## A blocking job of a Windows handle
 

@@ -571,9 +571,8 @@ impl Shard {
         }
     }
 
-    /// The address of the shard's `Shared`, which a ring source keeps to
-    /// tell its home shard: compared, never followed.
-    #[cfg(ring)]
+    /// The address of the shard's `Shared`, which a source keeps to tell
+    /// the shard it is registered with: compared, never followed.
     pub(crate) fn shared_addr(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
     }

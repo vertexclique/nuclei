@@ -3,8 +3,11 @@ A_close                        MC_Attach            pass
 A_evict                        MC_Attach            pass
 A_both                         MC_Attach            pass
 A_live                         MC_Attach            pass
+A_again                        MC_Attach            pass
 M_direct                       MC_Attach            violated:NoLeak
 M_no_abandon                   MC_Attach            violated:NoLeak
+M_token_only                   MC_Attach            violated:NoForeignSlot
 W_registered                   MC_Attach            violated:NoRegistered
 W_stale_drop                   MC_Attach            violated:NoStaleDrop
 W_rejected                     MC_Attach            violated:NoRejected
+W_again                        MC_Attach            violated:NoRegisteredWithB

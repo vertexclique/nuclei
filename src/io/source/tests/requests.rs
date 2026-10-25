@@ -236,6 +236,85 @@ fn a_close_before_the_ring_installs_an_attach_leaves_it_no_file() {
     );
 }
 
+/// An attach to a ring off the ring's thread is undone (its shard evicted
+/// the source) before the ring gets to it, and the source attaches to
+/// another ring meanwhile, under a token of the same number (every shard
+/// numbers its own). The first ring must not take that attach for its own:
+/// it would put the file into its table and hand the source a slot of it,
+/// which the source would then name on the other ring. Both rings' threads
+/// are held in a task meanwhile, so the order is certain.
+#[cfg(ring)]
+#[test]
+fn a_stale_attach_is_not_taken_for_one_to_another_ring_under_the_same_token() {
+    use std::sync::mpsc::channel;
+    let (a, b) = (runtime(None), runtime(None));
+    let on_ring = a.block_on(
+        a.spawn(async { crate::proactor::Proactor::backend() == crate::IoBackend::IoUring }),
+    );
+    if !on_ring {
+        eprintln!("skipping: the runtime's shard runs no ring here");
+        return;
+    }
+    let (mine, peer) = stream_pair();
+    let handle = Handle::new(mine).unwrap();
+    let src = Arc::clone(handle.source());
+    // A read polled on `rt`'s worker registers the source there, the attach
+    // left to this thread (it holds the write side), which then performs it
+    // and posts the copy to the ring; the worker's thread waits for `go`.
+    let attach_held = |rt: &Runtime| {
+        let held = src.write.try_hold().expect("the write side is free");
+        let (polled, has_polled) = channel();
+        let (go, gone) = channel::<()>();
+        let reader = Arc::clone(&src);
+        let task = rt.spawn(async move {
+            let mut buf = [0u8; 8];
+            let mut read = Box::pin(poll_fn(|cx| reader.poll_read(cx, &mut buf, false)));
+            pends(&mut read).await;
+            drop(read);
+            polled.send(()).unwrap();
+            gone.recv().unwrap();
+        });
+        has_polled
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the worker's read never ran");
+        let mut after = After::default();
+        held.release(&mut after, &src.hooks());
+        after.run();
+        (go, task)
+    };
+    let (go_a, task_a) = attach_held(&a);
+    let (home_a, token) = src.registration();
+    // The first shard evicts the source: its attach under way is undone.
+    src.evict();
+    let (go_b, task_b) = attach_held(&b);
+    let (home_b, token_b) = src.registration();
+    assert_ne!(home_a, home_b);
+    assert_eq!(token, token_b, "the two shards' first tokens differ");
+    // The first ring gets to its stale attach: its worker applies what was
+    // posted to it before it sleeps.
+    go_a.send(()).unwrap();
+    a.block_on(task_a);
+    let in_a = a.block_on(a.spawn(async {
+        crate::time::sleep(Duration::from_millis(10)).await;
+        crate::rt::context::current(|s| s.and_then(|s| s.ring().map(|r| r.files_in_use().0)))
+    }));
+    assert_eq!(in_a, Some(0), "the first ring put the file into its table");
+    // The second ring installs its own, and a read through it gets the
+    // peer's bytes.
+    go_b.send(()).unwrap();
+    b.block_on(task_b);
+    (&peer).write_all(b"x").unwrap();
+    let reader = Arc::clone(&src);
+    let got = b.block_on(b.spawn(async move {
+        let mut buf = [0u8; 8];
+        within(poll_fn(|cx| reader.poll_read(cx, &mut buf, false)))
+            .await
+            .map(|n| buf[..n].to_vec())
+    }));
+    assert_eq!(got.unwrap(), b"x");
+    drop(handle);
+}
+
 /// A shard that stops running while another thread holds a side of a
 /// source registered to it: the holder evicts the source as it lets go, a
 /// driver call later, and may hand the shard's driver an operation until
@@ -246,7 +325,7 @@ fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
     let (mine, _peer) = stream_pair();
     let handle = Handle::new(mine).unwrap();
     let src = Arc::clone(handle.source());
-    let (token_tx, token_rx) = std::sync::mpsc::channel::<u64>();
+    let (token_tx, token_rx) = std::sync::mpsc::channel::<(usize, u64)>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let left = Arc::new(AtomicBool::new(false));
     let shard = {
@@ -261,7 +340,7 @@ fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
                     let polled = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
                     assert!(polled.is_pending());
                 }
-                token_tx.send(src.reg.token.load(Ordering::SeqCst)).unwrap();
+                token_tx.send(src.registration()).unwrap();
                 let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
                 let holder = {
                     let src = Arc::clone(&src);
@@ -281,7 +360,7 @@ fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
             (holder, handle)
         })
     };
-    let token = token_rx.recv().unwrap();
+    let (home, token) = token_rx.recv().unwrap();
     // Past the ring's wait for its operations as a shard goes (one second),
     // which a shard that did not wait for the eviction would end by.
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -290,13 +369,13 @@ fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
     }
     if left.load(Ordering::SeqCst) {
         assert!(
-            !src.registered_under(token),
+            !src.registered_with(home, token),
             "the shard stopped with the source still registered to it"
         );
     }
     release_tx.send(()).unwrap();
     let (holder, handle) = shard.join().unwrap();
     holder.join().unwrap();
-    assert!(!src.registered_under(token), "the eviction never ran");
+    assert!(!src.registered_with(home, token), "the eviction never ran");
     drop(handle);
 }

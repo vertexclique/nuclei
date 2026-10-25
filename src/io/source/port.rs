@@ -954,6 +954,9 @@ impl Source {
         // SAFETY: both sides are held.
         unsafe { *self.port.sync.get() = sync };
         self.reg.ops.store(true, Ordering::Release);
+        self.reg
+            .home
+            .store(Arc::as_ptr(&shard) as usize, Ordering::Release);
         self.reg.token.store(token, Ordering::Release);
         // SAFETY: both sides are held.
         unsafe { *self.reg.shard.get() = Some(shard) };

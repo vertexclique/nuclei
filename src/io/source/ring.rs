@@ -756,6 +756,7 @@ impl Source {
     ) -> io::Result<()> {
         shard.counters.refused_registration();
         self.reg.ops.store(false, Ordering::Release);
+        self.reg.home.store(0, Ordering::Release);
         self.reg.state.store(super::UNREGISTERED, Ordering::Release);
         shard.release_source(token);
         Err(err)
@@ -774,9 +775,10 @@ impl Source {
     ) {
         use std::os::fd::AsRawFd;
         // A source that closed or moved on meanwhile: its registration was
-        // undone, and the copy only goes.
+        // undone, and the copy only goes. One under way with another shard
+        // may carry a token of the same number.
         if self.reg.state.load(Ordering::Acquire) != super::REGISTERING
-            || self.reg.token.load(Ordering::Acquire) != token
+            || !self.registered_with(Arc::as_ptr(shard) as usize, token)
         {
             return;
         }
