@@ -1,11 +1,13 @@
-//! The IO sources a shard's poller watches, by token.
+//! What a shard's poller watches, by token: its IO sources, and the
+//! children whose exits it waits for.
 //!
 //! A token is a slot index and the slot's generation, and is what the
 //! kernel hands back with each event (epoll data, kevent udata): never a
 //! pointer. A slot's generation moves on when its registration goes, so an
 //! event still in flight for a registration that is gone, or for a slot
 //! reused since, finds nothing. Tokens fit a pointer-sized word, since that
-//! is all kqueue carries.
+//! is all kqueue carries. The word's top bit says which table a token is
+//! of: a source's has it clear, a child's set.
 
 use std::io;
 use std::sync::Arc;
@@ -15,32 +17,57 @@ use crate::io::Source;
 /// Bits of a token that index the slot; the rest carry the generation.
 const INDEX_BITS: u32 = if usize::BITS >= 64 { 32 } else { 20 };
 const INDEX_MASK: u64 = (1 << INDEX_BITS) - 1;
-/// Generations wrap within what a token holds above the index.
-const GEN_MASK: u64 = (usize::MAX as u64) >> INDEX_BITS;
+/// The top bit of a pointer-sized word: set in every token of the children.
+pub(crate) const CHILD: u64 = 1 << (usize::BITS - 1);
+/// Generations wrap within what a token holds between the index and the
+/// top bit.
+const GEN_MASK: u64 = ((usize::MAX as u64) >> 1) >> INDEX_BITS;
 
-struct Slot {
+struct Slot<T> {
     generation: u64,
-    source: Option<Arc<Source>>,
+    entry: Option<T>,
 }
 
-/// The shard's registrations.
-#[derive(Default)]
-pub(crate) struct Sources {
-    slots: Vec<Slot>,
+/// Registrations by token, every token carrying `TAG` (0 or [`CHILD`]).
+pub(crate) struct Tokens<T, const TAG: u64> {
+    slots: Vec<Slot<T>>,
     free: Vec<u32>,
 }
 
-fn token(index: u32, generation: u64) -> u64 {
-    (generation << INDEX_BITS) | u64::from(index)
+/// The shard's IO sources.
+pub(crate) type Sources = Tokens<Arc<Source>, 0>;
+
+impl<T, const TAG: u64> Default for Tokens<T, TAG> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+        }
+    }
 }
 
-impl Sources {
-    /// Stores `source` and returns its token.
-    pub(crate) fn insert(&mut self, source: Arc<Source>) -> io::Result<u64> {
+impl<T, const TAG: u64> Tokens<T, TAG> {
+    fn token(index: u32, generation: u64) -> u64 {
+        TAG | (generation << INDEX_BITS) | u64::from(index)
+    }
+
+    /// The index of the slot `token` names, if it is of this table and of
+    /// the slot's generation.
+    fn index_of(&self, token: u64) -> Option<usize> {
+        if token & CHILD != TAG {
+            return None;
+        }
+        let index = (token & INDEX_MASK) as usize;
+        let slot = self.slots.get(index)?;
+        (slot.generation == (token & !CHILD) >> INDEX_BITS).then_some(index)
+    }
+
+    /// Stores `entry` and returns its token.
+    pub(crate) fn insert(&mut self, entry: T) -> io::Result<u64> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
-            slot.source = Some(source);
-            return Ok(token(index, slot.generation));
+            slot.entry = Some(entry);
+            return Ok(Self::token(index, slot.generation));
         }
         let index = self.slots.len();
         // The last index is never handed out, so no token is all ones (the
@@ -53,42 +80,43 @@ impl Sources {
         }
         self.slots.push(Slot {
             generation: 0,
-            source: Some(source),
+            entry: Some(entry),
         });
-        Ok(token(index as u32, 0))
+        Ok(Self::token(index as u32, 0))
     }
 
-    /// The source registered under `token`, if that registration is still
+    /// The entry registered under `token`, if that registration is still
     /// in place.
     #[cfg(any(readiness, test))]
-    pub(crate) fn get(&self, token: u64) -> Option<&Arc<Source>> {
-        let slot = self.slots.get((token & INDEX_MASK) as usize)?;
-        if slot.generation != token >> INDEX_BITS {
-            return None;
-        }
-        slot.source.as_ref()
+    pub(crate) fn get(&self, token: u64) -> Option<&T> {
+        self.slots[self.index_of(token)?].entry.as_ref()
     }
 
-    /// Ends the registration under `token`; a stale token does nothing.
-    pub(crate) fn remove(&mut self, token: u64) -> Option<Arc<Source>> {
-        let index = (token & INDEX_MASK) as usize;
-        let slot = self.slots.get_mut(index)?;
-        if slot.generation != token >> INDEX_BITS {
-            return None;
-        }
-        let source = slot.source.take()?;
+    /// The entry registered under `token`, to change.
+    #[cfg(port)]
+    pub(crate) fn get_mut(&mut self, token: u64) -> Option<&mut T> {
+        let index = self.index_of(token)?;
+        self.slots[index].entry.as_mut()
+    }
+
+    /// Ends the registration under `token`; a stale token, or one of the
+    /// other table, does nothing.
+    pub(crate) fn remove(&mut self, token: u64) -> Option<T> {
+        let index = self.index_of(token)?;
+        let slot = &mut self.slots[index];
+        let entry = slot.entry.take()?;
         slot.generation = (slot.generation + 1) & GEN_MASK;
         self.free.push(index as u32);
-        Some(source)
+        Some(entry)
     }
 
-    /// Takes every registered source out.
-    pub(crate) fn drain(&mut self) -> impl Iterator<Item = Arc<Source>> + '_ {
+    /// Takes every registered entry out.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
         self.free.clear();
-        self.slots.drain(..).filter_map(|slot| slot.source)
+        self.slots.drain(..).filter_map(|slot| slot.entry)
     }
 
-    /// How many sources are registered.
+    /// How many entries are registered.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.slots.len() - self.free.len()
@@ -97,7 +125,7 @@ impl Sources {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use super::{INDEX_BITS, Sources};
+    use super::{CHILD, INDEX_BITS, Sources, Tokens};
     use crate::io::Source;
     use crate::io::source::Kind;
 
@@ -125,11 +153,31 @@ mod tests {
     #[test]
     fn tokens_fit_a_pointer_and_are_never_all_ones() {
         let mut s = Sources::default();
+        let mut c = Tokens::<u8, CHILD>::default();
         for _ in 0..1000 {
             let t = s.insert(source()).unwrap();
-            assert!(t <= usize::MAX as u64);
-            assert_ne!(t, u64::MAX);
+            let u = c.insert(0).unwrap();
+            for token in [t, u] {
+                assert!(token <= usize::MAX as u64);
+                assert_ne!(token, u64::MAX);
+            }
             s.remove(t);
+            c.remove(u);
         }
+    }
+
+    /// A token of one table finds nothing in the other, even where index
+    /// and generation agree.
+    #[test]
+    fn a_token_of_one_table_finds_nothing_in_the_other() {
+        let mut s = Sources::default();
+        let mut c = Tokens::<u8, CHILD>::default();
+        let t = s.insert(source()).unwrap();
+        let u = c.insert(7).unwrap();
+        assert_eq!(t & !CHILD, u & !CHILD, "the same index and generation");
+        assert!(s.get(u).is_none());
+        assert!(c.get(t).is_none());
+        assert!(s.remove(u).is_none() && c.remove(t).is_none());
+        assert_eq!((s.len(), c.len()), (1, 1));
     }
 }

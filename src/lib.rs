@@ -48,6 +48,8 @@ mod fs;
 mod io;
 mod net;
 mod proactor;
+/// Child processes: spawn one, wait for its exit and talk to it through async pipes.
+pub mod process;
 mod rt;
 /// nuclei's own runtime: shards, tasks, `block_on`, `spawn` and the blocking pool.
 pub mod runtime;

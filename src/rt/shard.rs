@@ -59,8 +59,11 @@ use crate::syscore::linux::iouring::ring::RingConfig;
 use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
 
+mod children;
+mod going;
 #[cfg(port)]
 mod port;
+pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 #[cfg(ring)]
 pub(crate) mod recv;
 #[cfg(ring)]
@@ -191,6 +194,8 @@ pub(crate) enum IoOp {
     /// Cancel the ring operation of this user data.
     #[cfg(ring)]
     RingCancel(u64),
+    /// Watch a child's exit for a thread that runs no shard.
+    Watch(Arc<crate::process::exit::Exit>),
 }
 
 impl Shared {
@@ -421,6 +426,8 @@ pub(crate) struct Shard {
     fired: RefCell<Vec<Waker>>,
     /// The IO sources the poller watches, by token.
     sources: RefCell<Sources>,
+    /// The children whose exits the poller or the port watches, by token.
+    children: RefCell<children::Children>,
     /// Where the shard's reads land and its writes wait.
     pool: Pool,
     /// The keeper of the shard's port while the shard does not run.
@@ -508,6 +515,7 @@ impl Shard {
             epoch: Instant::now(),
             fired: RefCell::new(Vec::new()),
             sources: RefCell::new(Sources::default()),
+            children: RefCell::new(children::Children::default()),
             pool: Pool::new(limits.buffer_cap),
             #[cfg(port)]
             keeper: RefCell::new(None),
@@ -557,6 +565,7 @@ impl Shard {
                     let gone = self.sources.borrow_mut().remove(token);
                     drop(gone);
                 }
+                IoOp::Watch(exit) => self.watch(exit),
                 #[cfg(ring)]
                 IoOp::RingAttach(token, copy) => {
                     let source = self.sources.borrow().get(token).cloned();
@@ -723,7 +732,9 @@ impl Shard {
                     .borrow_mut()
                     .wait_at_most(max, timeout, |token, readiness| {
                         events += 1;
-                        if let Some(source) = sources.get(token) {
+                        if token & crate::rt::sources::CHILD != 0 {
+                            self.exit_came(token);
+                        } else if let Some(source) = sources.get(token) {
                             source.on_event(token, readiness);
                         }
                     })?;
@@ -734,6 +745,11 @@ impl Shard {
                 let mut events = 0;
                 poller.borrow_mut().wait_at_most(max, timeout, |entry| {
                     events += 1;
+                    if entry.lpCompletionKey == crate::rt::park::iocp::EXIT {
+                        // A child's exit: its packet carries the child's token.
+                        self.exit_came(entry.lpOverlapped as usize as u64);
+                        return;
+                    }
                     // SAFETY: a packet of a source's key is one of its
                     // operations, its OVERLAPPED the first field of a
                     // slot the operation's strong reference keeps.
@@ -885,29 +901,6 @@ impl Shard {
         }
     }
 
-    /// The outermost `block_on` of a thread outside the runtime returned,
-    /// and this, its own shard, runs again only at its next one: the
-    /// sources registered here go, each to register where it is polled
-    /// next; a ring waits for the operations they had out to end, and a
-    /// port hands them to a keeper.
-    pub(crate) fn leave(&self) {
-        let gone: Vec<Arc<Source>> = self.sources.borrow_mut().drain().collect();
-        for source in gone {
-            source.evict();
-        }
-        // Sources that went before (a dropped handle's) may have left a
-        // cancel queued, or their operations still out.
-        #[cfg(ring)]
-        if let Driver::Ring(ring) = &self.driver {
-            ring.settle(|| self.apply_io_ops());
-        }
-        // The port's go to its keeper.
-        #[cfg(port)]
-        if !self.hand_off_port() {
-            self.settle_port();
-        }
-    }
-
     /// One turn of the shard, for a caller driving it by hand: runs every
     /// task ready now, waits once on the poller (up to `wait`, at once if
     /// work is ready; at most `max` events) and runs what the IO woke.
@@ -954,56 +947,6 @@ impl Shard {
     fn drive_or_report(&self, wait: Option<Duration>) {
         if let Err(err) = self.drive(wait) {
             panic!("the shard's poller failed: {err}");
-        }
-    }
-}
-
-impl Drop for Shard {
-    fn drop(&mut self) {
-        // Every task still queued here is dropped on this thread, the one its
-        // future may be dropped on.
-        self.shared.draining.store(true, Ordering::SeqCst);
-        self.shared.stopped.store(true, Ordering::SeqCst);
-        // The waker a worker's loop leaves when its look after registering
-        // finds it may exit: it holds the shard's `Shared`, which holds it.
-        drop(self.shared.stop_waker.take());
-        // The sources registered here lose their driver: each is told, and
-        // registers where it is polled next.
-        for source in self.sources.get_mut().drain() {
-            source.evict();
-        }
-        // The ring's operations still out are cancelled and their
-        // completions waited for, so no memory they point at goes while the
-        // kernel may write it.
-        #[cfg(ring)]
-        if let Driver::Ring(ring) = &self.driver {
-            // Cancels a holder of a source on another thread left here.
-            ring.settle(|| self.apply_io_ops());
-            ring.shut_down();
-        }
-        // The port's operations to a keeper, unless one has them already.
-        #[cfg(port)]
-        if !self.port_kept() && !self.hand_off_port() {
-            self.settle_port();
-        }
-        // What goes with a task may wake another of the shard's (a timer's
-        // waker, a channel its future held): that one comes back through the
-        // inbox, and is dropped here too, until none is left.
-        loop {
-            let lifo = self.lifo.take();
-            let queue = core::mem::take(&mut *self.queue.borrow_mut());
-            let timers = self.wheel.borrow_mut().take_wakers();
-            let fired = core::mem::take(&mut *self.fired.borrow_mut());
-            let mut quiet =
-                lifo.is_none() && queue.is_empty() && timers.is_empty() && fired.is_empty();
-            drop((lifo, queue, timers, fired));
-            while let Some(runnable) = self.pop_inbox() {
-                drop(runnable);
-                quiet = false;
-            }
-            if quiet {
-                break;
-            }
         }
     }
 }

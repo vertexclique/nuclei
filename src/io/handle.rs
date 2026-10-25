@@ -103,15 +103,26 @@ windows_sockets!(
     std::net::UdpSocket
 );
 
-#[cfg(windows)]
-impl sealed::Sealed for std::fs::File {}
+macro_rules! windows_handles {
+    ($($ty:ty),*) => {$(
+        #[cfg(windows)]
+        impl sealed::Sealed for $ty {}
 
-#[cfg(windows)]
-impl IoObject for std::fs::File {
-    fn raw_io(&self) -> Raw {
-        self.as_raw_handle() as usize as Raw
-    }
+        #[cfg(windows)]
+        impl IoObject for $ty {
+            fn raw_io(&self) -> Raw {
+                self.as_raw_handle() as usize as Raw
+            }
+        }
+    )*};
 }
+
+windows_handles!(
+    std::fs::File,
+    std::process::ChildStdin,
+    std::process::ChildStdout,
+    std::process::ChildStderr
+);
 
 /// An IO object (a socket, a pipe, a file) whose operations run on nuclei's
 /// shards.

@@ -93,6 +93,15 @@ impl<T> Ops<T> {
         self.slots.len() - self.free.len()
     }
 
+    /// The user data of every operation in flight.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = u64> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.op.is_some())
+            .map(|(index, slot)| user_data(index as u32, slot.generation))
+    }
+
     /// The operations in flight, for a test.
     #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {

@@ -225,6 +225,8 @@ pub(crate) const ERROR_IO_PENDING: i32 = 997;
 pub(crate) const ERROR_HANDLE_EOF: i32 = 38;
 pub(crate) const ERROR_BROKEN_PIPE: i32 = 109;
 pub(crate) const WAIT_TIMEOUT: i32 = 258;
+/// `WaitForSingleObject`: the object is signalled (a process: it ended).
+pub(crate) const WAIT_OBJECT_0: DWORD = 0;
 pub(crate) const WSAEINVAL: i32 = 10022;
 pub(crate) const WSAEADDRINUSE: i32 = 10048;
 pub(crate) const WSAENETUNREACH: i32 = 10051;
@@ -265,6 +267,9 @@ unsafe extern "system" {
         HandlerRoutine: Option<unsafe extern "system" fn(u32) -> BOOL>,
         Add: BOOL,
     ) -> BOOL;
+    pub(crate) fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
+    pub(crate) fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
+    pub(crate) fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> BOOL;
     pub(crate) fn CreateIoCompletionPort(
         FileHandle: HANDLE,
         ExistingCompletionPort: HANDLE,

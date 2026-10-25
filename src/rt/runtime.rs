@@ -479,6 +479,17 @@ pub(crate) fn current() -> Arc<Inner> {
     context::runtime().unwrap_or_else(|| Arc::clone(&default_runtime().inner))
 }
 
+/// A shard to serve a thread that runs none, of the runtime this thread is
+/// inside or of the default one, if one runs: it never starts one (a thread
+/// on its way out may ask).
+pub(crate) fn running_service_shard() -> Option<Arc<Shared>> {
+    let inner = context::runtime().or_else(|| DEFAULT.get().map(|rt| Arc::clone(&rt.inner)))?;
+    inner
+        .workers
+        .place(inner.id, inner.local_margin)
+        .map(Arc::clone)
+}
+
 /// Whether the shard [`service_shard`] hands out runs a ring: the current
 /// (or default) runtime's workers do, or with no workers, this thread's own
 /// shard.

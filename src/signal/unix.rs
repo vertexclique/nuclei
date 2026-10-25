@@ -389,9 +389,16 @@ thread_local! {
 /// A pump on a runtime worker serves listeners polled where no shard runs.
 static SERVICE_PUMP: AtomicBool = AtomicBool::new(false);
 
+/// Installs the handler of `signum` with no listener: for the process
+/// module's `SIGCHLD` reaper, which the dispatch calls.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn listen_raw(signum: c_int) -> io::Result<()> {
+    install(signum)
+}
+
 /// Makes sure a pump serves listeners polled here: one on the shard this
 /// thread runs, or the one on a runtime worker.
-fn ensure_pump() {
+pub(crate) fn ensure_pump() {
     let on_shard = crate::rt::context::current(|shard| shard.is_some());
     let started = if on_shard {
         PUMPING.try_with(|p| p.replace(true)).unwrap_or(true)

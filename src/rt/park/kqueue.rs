@@ -62,6 +62,18 @@ fn fd_event(fd: RawFd, filter: i16, flags: u16, token: u64) -> libc::kevent {
     event
 }
 
+/// The change for the exit of child `pid`.
+fn exit_event(pid: u32, flags: impl Into<u32>, token: u64) -> libc::kevent {
+    // SAFETY: kevent is plain data; all zeroes is a valid value.
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    event.ident = pid as _;
+    event.filter = libc::EVFILT_PROC as _;
+    event.flags = flags.into() as _;
+    event.fflags = libc::NOTE_EXIT as _;
+    event.udata = token as usize as _;
+    event
+}
+
 /// The change that watches `fd` for urgent data: Apple's `EVFILT_EXCEPT`
 /// with `NOTE_OOB` (its read filter does not report it).
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -234,6 +246,25 @@ impl Registrar {
         }
         let _ = urgent;
         submit_all(&self.queue, &rw)
+    }
+
+    /// Watches the exit of child `pid`, reported once with `token`; false
+    /// when the child exited already (no live process has the pid).
+    pub(crate) fn add_exit(&self, pid: u32, token: u64) -> io::Result<bool> {
+        match submit(
+            &self.queue,
+            &exit_event(pid, libc::EV_ADD | libc::EV_ONESHOT, token),
+        ) {
+            Ok(()) => Ok(true),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Ends the exit watch of child `pid`, if it did not fire.
+    pub(crate) fn delete_exit(&self, pid: u32) {
+        // A watch that fired is gone already: nothing to remove.
+        let _ = submit(&self.queue, &exit_event(pid, libc::EV_DELETE, 0));
     }
 
     /// Removes the registration of `fd`, made with `urgent`. Called before

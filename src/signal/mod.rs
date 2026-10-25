@@ -82,6 +82,10 @@ fn dispatch() {
     if moved == 0 {
         return;
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if moved & (1 << libc::SIGCHLD) != 0 {
+        crate::process::reap_fallback();
+    }
     for (_, waiter) in waiters().iter() {
         if moved & (1 << waiter.signum) != 0 {
             waiter.waker.wake();

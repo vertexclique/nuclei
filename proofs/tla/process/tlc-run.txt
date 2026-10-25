@@ -1,0 +1,19 @@
+TLC run of every configuration in proofs/tla/process, 2026-10-25 09:50 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+PW_safe                            423        238      1  pass                                  pass                                  yes
+PW_live                            423        238      2  pass                                  pass                                  yes
+MW_early_let_go                     43         29      1  violated:OneWatch                     violated:OneWatch                     yes
+MW_no_recheck                      410        223      1  violated:Settles                      violated:Settles                      yes
+MW_unwatched_orphan                428        244      1  violated:Settles                      violated:Settles                      yes
+WW_rewatch                         189        105      1  violated:NoRewatch                    violated:NoRewatch                    yes
+WW_seen_on_b                       222        125      1  violated:NoSeenOnB                    violated:NoSeenOnB                    yes
+PK_safe                             31         20      1  pass                                  pass                                  yes
+PK_live                             31         20      1  pass                                  pass                                  yes
+MK_no_busy                          37         23      1  violated:NoKillAfterReap              violated:NoKillAfterReap              yes
+WK_kill                              8          7      1  violated:NoKill                       violated:NoKill                       yes
+WK_skip                             16         12      1  violated:NoSkip                       violated:NoSkip                       yes
+
+results matching EXPECTED.txt: 12 of 12

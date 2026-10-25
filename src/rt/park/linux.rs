@@ -199,6 +199,24 @@ impl Registrar {
         .map(drop)
     }
 
+    /// Registers a child's `pidfd` for its exit, reported once with `token`.
+    pub(crate) fn add_exit(&self, pidfd: RawFd, token: u64) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLONESHOT) as u32,
+            u64: token,
+        };
+        // SAFETY: a plain syscall; `pidfd` is the child's open pidfd.
+        check(unsafe {
+            libc::epoll_ctl(
+                self.epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                pidfd,
+                &mut event,
+            )
+        })
+        .map(drop)
+    }
+
     /// Removes the registration of `fd`, made with `urgent` (one removal
     /// takes every event here). Called before `fd` closes.
     pub(crate) fn delete(&self, fd: RawFd, _urgent: bool) -> io::Result<()> {

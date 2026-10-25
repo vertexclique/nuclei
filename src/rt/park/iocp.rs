@@ -43,6 +43,9 @@ pub(crate) const SOURCE: usize = 0;
 /// The completion key of a blocking job's packet: an operation on a handle
 /// opened for synchronous IO, whose call a thread of the pool made.
 pub(crate) const JOB: usize = usize::MAX - 2;
+/// The completion key of a child's exit, whose packet carries the child's
+/// token where an operation's carries its `OVERLAPPED`.
+pub(crate) const EXIT: usize = usize::MAX - 3;
 
 /// A shard's port, shared with the threads that issue operations to it and
 /// wake it.
@@ -115,11 +118,64 @@ impl Port {
                 return;
             }
             for entry in &entries[..removed as usize] {
-                if !matches!(entry.lpCompletionKey, WAKE | TIMER) && !entry.lpOverlapped.is_null() {
+                // A child's exit packet is the shard's, which let its
+                // children go before it stopped running.
+                if !matches!(entry.lpCompletionKey, WAKE | TIMER | EXIT)
+                    && !entry.lpOverlapped.is_null()
+                {
                     deliver(entry);
                 }
             }
         }
+    }
+
+    /// Has a packet keyed [`EXIT`] and carrying `token` come to this port
+    /// once `process` ends, through a wait packet of its own, which the
+    /// caller lets go with [`close_packet`](Self::close_packet) once it
+    /// came, or [`unwatch_exit`](Self::unwatch_exit) before.
+    pub(crate) fn watch_exit(&self, process: HANDLE, token: u64) -> io::Result<HANDLE> {
+        let mut packet: HANDLE = core::ptr::null_mut();
+        // SAFETY: plain arguments; the packet handle is owned at once, and
+        // `process` is open for the call (the wait holds its own reference).
+        unsafe {
+            let made =
+                NtCreateWaitCompletionPacket(&mut packet, GENERIC_ALL, core::ptr::null_mut());
+            if made != STATUS_SUCCESS {
+                return Err(nt_error(made));
+            }
+            let mut already: BOOLEAN = 0;
+            let status = NtAssociateWaitCompletionPacket(
+                packet,
+                self.handle,
+                process,
+                EXIT as *mut c_void,
+                token as usize as *mut c_void,
+                STATUS_SUCCESS,
+                0,
+                &mut already,
+            );
+            if status != STATUS_SUCCESS {
+                CloseHandle(packet);
+                return Err(nt_error(status));
+            }
+        }
+        Ok(packet)
+    }
+
+    /// Ends a watch whose packet has not come, taking back a packet queued
+    /// already, and lets its wait packet go.
+    pub(crate) fn unwatch_exit(packet: HANDLE) {
+        // SAFETY: the watch's own wait packet, closed once, here.
+        unsafe {
+            NtCancelWaitCompletionPacket(packet, 1);
+            CloseHandle(packet);
+        }
+    }
+
+    /// Lets the wait packet of a watch whose packet came go.
+    pub(crate) fn close_packet(packet: HANDLE) {
+        // SAFETY: as above.
+        unsafe { CloseHandle(packet) };
     }
 
     /// Moves the completions of `handle` to this port: at once if it is not
@@ -159,6 +215,11 @@ impl Port {
         unsafe { SetFileCompletionNotificationModes(handle, FILE_SKIP_SET_EVENT_ON_HANDLE) };
         Ok(())
     }
+}
+
+/// An NTSTATUS as an error.
+fn nt_error(status: i32) -> io::Error {
+    io::Error::from_raw_os_error(crate::syscore::windows::status_error(status).unwrap_or(0))
 }
 
 /// A high-resolution waitable timer and the wait packet that brings its
