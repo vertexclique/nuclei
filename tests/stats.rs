@@ -1,6 +1,8 @@
 //! `nuclei::stats()`: the shards it lists and when, the blocking pools'
 //! threads, and how its error counts read. Each test holds `ONE`, so the
-//! shards one makes never show in another's counts.
+//! shards one makes never show in another's counts, and runs `block_on`
+//! only on threads it joins: the shard of the test's own thread would go
+//! only as that thread exits, after the lock is let go.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::HashMap;
@@ -97,7 +99,9 @@ fn blocking_threads_count_the_pools_threads() {
     running.recv().unwrap();
     assert!(nuclei::stats().blocking_threads >= 1);
     release.send(()).unwrap();
-    rt.block_on(job);
+    // On a thread of its own, joined: its shard is gone before the next
+    // test counts shards (a test's own thread outlives the test).
+    std::thread::spawn(move || rt.block_on(job)).join().unwrap();
 }
 
 #[test]
