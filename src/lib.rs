@@ -55,7 +55,7 @@ mod rt;
 pub mod runtime;
 /// Runtime-independent synchronization primitives: futures and wakers only, usable from any executor.
 pub mod sync;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod syscore {
     // The io_uring ring and its probe. Parts of the ring layer (provided
     // buffer rings, multishot entries, flags) are for the driver's next

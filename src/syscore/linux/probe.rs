@@ -352,7 +352,11 @@ extern "C" fn child_main(arg: *mut c_void) -> libc::c_int {
     };
     if r < 0 {
         // SAFETY: the libc errno slot of this (shared) thread is valid to read.
+        #[cfg(not(target_os = "android"))]
         let errno = unsafe { *libc::__errno_location() };
+        // SAFETY: as above; Bionic names the slot `__errno`.
+        #[cfg(target_os = "android")]
+        let errno = unsafe { *libc::__errno() };
         // SAFETY: `_exit` runs no handlers and returns nothing; the ring fd, if any, closes with
         // the child's own copy of the descriptor table.
         unsafe { libc::_exit(errno.clamp(1, 255)) }
@@ -400,7 +404,8 @@ impl Drop for Stack {
     }
 }
 
-#[cfg(test)]
+// The tests install seccomp filters with Linux's classic BPF constants.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) mod tests {
     use std::{env, fs, thread};
 

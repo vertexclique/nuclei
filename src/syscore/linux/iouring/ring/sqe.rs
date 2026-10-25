@@ -389,7 +389,9 @@ impl Sqe {
         options: u32,
     ) -> Self {
         Self::new(Opcode::Waitid, id as RawFd).with(|s| {
-            s.len = idtype;
+            // `idtype_t` is unsigned on glibc and musl, signed on Bionic; the
+            // kernel reads the same bits.
+            s.len = u32::from_ne_bytes(idtype.to_ne_bytes());
             s.off = addr(info);
             s.file_index = options;
         })
