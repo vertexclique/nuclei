@@ -58,11 +58,13 @@ use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering};
 use crate::syscore::linux::iouring::ring::RingConfig;
 use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
+use spin::Spin;
 
 mod children;
 mod going;
 #[cfg(port)]
 mod port;
+mod spin;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 #[cfg(ring)]
 pub(crate) mod recv;
@@ -75,68 +77,6 @@ pub(crate) const LIFO_MAX: u32 = 3;
 pub(crate) const INBOX_INTERVAL: u32 = 31;
 /// Timers and the poller are looked at once every this many runs.
 pub(crate) const DRIVER_INTERVAL: u32 = 61;
-
-/// The most pause hints a shard spins before it parks.
-const SPIN_MAX: u32 = 2048;
-/// The spin a fresh shard starts with.
-const SPIN_START: u32 = 256;
-/// The spin a shard whose park was cut short starts again with.
-const SPIN_RESTART: u32 = 64;
-/// A park that ended this soon would have been caught by a spin.
-const SHORT_PARK: Duration = Duration::from_micros(50);
-/// The longest gap between two looks of a spin, in pauses: each look reads
-/// lines the waker writes, so looking seldom leaves it to run at full speed.
-const SPIN_GAP_MAX: u32 = 64;
-
-/// How long a shard spins before it parks, adapted to what spins see.
-///
-/// Work that arrives within a spin costs neither a park nor the waker's
-/// notification, and IO that becomes ready within it (each look asks the
-/// poller too, without waiting) costs no kernel wake of the thread. A spin
-/// that found work doubles the budget; one that ran out halves it, so a
-/// shard whose work comes only after long gaps stops spinning; a park that
-/// ended soon after it began sets it going again. The budget counts pause
-/// hints, not time, and is a hint: it only sizes the next spin.
-pub(crate) struct Spin {
-    budget: Cell<u32>,
-}
-
-impl Spin {
-    fn new() -> Self {
-        Self {
-            budget: Cell::new(SPIN_START),
-        }
-    }
-
-    /// Spins until `found` says work is there (true) or the budget is spent
-    /// (false).
-    fn run(&self, mut found: impl FnMut() -> bool) -> bool {
-        let budget = self.budget.get();
-        let mut spent = 0;
-        let mut gap = 1;
-        while spent < budget {
-            for _ in 0..gap {
-                core::hint::spin_loop();
-            }
-            spent += gap;
-            gap = (gap * 2).min(SPIN_GAP_MAX);
-            if found() {
-                self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
-                return true;
-            }
-        }
-        self.budget.set(budget / 2);
-        false
-    }
-
-    /// The shard slept for `slept`: a short sleep means work came right
-    /// after the spin gave up.
-    fn parked_for(&self, slept: Duration) {
-        if slept < SHORT_PARK {
-            self.budget.set(self.budget.get().max(SPIN_RESTART));
-        }
-    }
-}
 
 /// The part of a shard any thread may touch.
 pub(crate) struct Shared {
@@ -970,6 +910,3 @@ impl Wake for Signal {
 
 #[cfg(all(test, not(loom)))]
 mod tests;
-
-#[cfg(all(test, not(loom)))]
-mod spin_tests;
