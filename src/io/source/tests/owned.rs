@@ -343,7 +343,11 @@ fn a_lent_write_keeps_its_place_among_copied_writes() {
 }
 
 /// The socket takes nothing, and the lent write's future is dropped: none
-/// of the buffer ever goes out.
+/// of the buffer ever goes out. A Unix socket's buffers are fixed, so a
+/// full one takes nothing; Windows' TCP grows its send buffer and takes a
+/// send even then, so there the withdrawal is checked on pipes (see
+/// `fs::tests::windows`).
+#[cfg(unix)]
 #[test]
 fn a_dropped_lent_write_that_sent_nothing_is_withdrawn() {
     let rt = runtime(None);

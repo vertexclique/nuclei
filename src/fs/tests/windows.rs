@@ -191,6 +191,63 @@ fn a_dropped_read_on_a_synchronous_pipe_loses_nothing() {
     });
 }
 
+/// Writes through `writer` until a write does not complete (the pipe's
+/// buffer is full, and nothing reads it), drops that write, and checks
+/// that none of it ever comes out of `reader`: the write was withdrawn.
+fn withdraws_a_write_the_pipe_never_took(reader: File, writer: File) {
+    let rt = runtime();
+    let (taken, reader) = rt.block_on(async {
+        let writer = Handle::new(writer).unwrap();
+        let mut taken = 0;
+        loop {
+            let mut write = Box::pin(writer.write_owned(vec![7u8; 4096]));
+            match crate::time::timeout(Duration::from_millis(200), &mut write).await {
+                Ok((n, _)) => {
+                    taken += n.unwrap();
+                    assert!(taken < 64 << 20, "the pipe never filled");
+                }
+                Err(_) => {
+                    drop(write);
+                    break;
+                }
+            }
+        }
+        // The withdrawal is done once the cancelled write came back.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while writer.source().has_unsent() {
+            assert!(
+                Instant::now() < deadline,
+                "the withdrawn write is still out"
+            );
+            crate::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(writer);
+        let mut reader = Handle::new(reader).unwrap();
+        let mut got = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match within(read_some(&mut reader, &mut buf)).await.unwrap() {
+                0 => break,
+                n => got += n,
+            }
+        }
+        (taken, got)
+    });
+    assert_eq!(reader, taken, "bytes of the withdrawn write came out");
+}
+
+#[test]
+fn a_dropped_write_a_synchronous_pipe_never_took_is_withdrawn() {
+    let (r, w) = synchronous_pipe();
+    withdraws_a_write_the_pipe_never_took(r, w);
+}
+
+#[test]
+fn a_dropped_write_an_overlapped_pipe_never_took_is_withdrawn() {
+    let (server, client) = overlapped_pipe();
+    withdraws_a_write_the_pipe_never_took(server, client);
+}
+
 async fn read_some_ref(r: &Handle<File>, buf: &mut [u8]) -> io::Result<usize> {
     let mut r = r;
     poll_fn(|cx| Pin::new(&mut r).poll_read(cx, buf)).await
