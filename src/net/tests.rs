@@ -591,19 +591,53 @@ fn read_to_end_blocking(mut peer: Pair) -> Vec<u8> {
     got
 }
 
+/// Reads `peer` to its end, up to a deadline: what came, and whether the
+/// end did.
+fn read_to_end_within(mut peer: Pair, within: Duration) -> (Vec<u8>, bool) {
+    peer.set_nonblocking(false).unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let deadline = std::time::Instant::now() + within;
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    while std::time::Instant::now() < deadline {
+        match peer.read(&mut buf) {
+            Ok(0) => return (got, true),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+    (got, false)
+}
+
 #[test]
 fn a_handle_dropped_with_bytes_behind_still_delivers_them_then_closes() {
     let rt = runtime();
     let (mine, peer) = stream_pair();
-    let sent = rt.block_on(async {
+    let (sent, source) = rt.block_on(async {
         let handle = Handle::new(mine).unwrap();
         let sent = fill_behind(&handle).await;
+        let source = std::sync::Arc::clone(handle.source());
         drop(handle);
-        sent
+        (sent, source)
     });
-    let got = std::thread::spawn(move || read_to_end_blocking(peer))
-        .join()
-        .unwrap();
+    let (got, ended) =
+        std::thread::spawn(move || read_to_end_within(peer, Duration::from_secs(10)))
+            .join()
+            .unwrap();
+    // The source's state, should the bytes or the end never come.
+    assert!(
+        ended,
+        "{} of {} bytes came, then nothing: {}",
+        got.len(),
+        sent.len(),
+        source.write_report()
+    );
     assert_eq!(got.len(), sent.len(), "bytes accepted were lost");
     assert!(got == sent, "the bytes arrived changed or out of order");
 }

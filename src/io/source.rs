@@ -113,9 +113,6 @@ mod read_work {
     /// Submit what the side wants, on the ring's thread.
     #[cfg(completion)]
     pub(super) const SUBMIT: u8 = 16;
-    /// The registration with the ring came into place.
-    #[cfg(completion)]
-    pub(super) const ATTACHED: u8 = 32;
 }
 
 /// Side-local work of the write side (its deferred word).
@@ -130,9 +127,6 @@ mod write_work {
     /// Submit what the side wants, on the ring's thread.
     #[cfg(completion)]
     pub(super) const SUBMIT: u8 = 8;
-    /// The registration with the ring came into place.
-    #[cfg(completion)]
-    pub(super) const ATTACHED: u8 = 16;
 }
 
 /// What kind of descriptor a source is: which system calls fit it.
@@ -349,7 +343,7 @@ impl Hooks<ReadState> for SourceHooks<'_> {
             // After a completion, a kick or the registration, what the
             // side still wants goes to the ring: the tasks that wait are
             // woken by what it brings.
-            if bits & (read_work::DONE | read_work::SUBMIT | read_work::ATTACHED) != 0 {
+            if bits & (read_work::DONE | read_work::SUBMIT) != 0 {
                 self.src
                     .with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
@@ -396,7 +390,7 @@ impl Hooks<WriteState> for SourceHooks<'_> {
             {
                 st.op_done(done, self.src.serving_fd(None), after);
             }
-            if bits & (write_work::DONE | write_work::SUBMIT | write_work::ATTACHED) != 0 {
+            if bits & (write_work::DONE | write_work::SUBMIT) != 0 {
                 self.src
                     .with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
@@ -627,6 +621,13 @@ impl Source {
     /// hands their states in.
     #[cfg_attr(not(ring), expect(unused_variables))]
     fn detach(self: &Arc<Self>, read: &ReadState, write: &WriteState) {
+        // An attach still under way on a ring's thread is undone: the ring's
+        // install of the file then finds it unwanted and lets it go.
+        #[cfg(ring)]
+        if self.ring_attach_under_way() {
+            self.abandon_ring_attach();
+            return;
+        }
         if self.reg.state.load(Ordering::Acquire) != REGISTERED {
             return;
         }
@@ -751,6 +752,36 @@ impl Source {
             None => "held".into(),
         };
         format!("guard {word:#x}, deferred {deferred:#x}: {held}")
+    }
+
+    /// The write side and the registration as a line, for a test that
+    /// failed: its guard's words, what it holds unless it is held, the
+    /// registration's state and the operations out.
+    pub(crate) fn write_report(self: &Arc<Self>) -> String {
+        let (word, deferred) = self.write.words();
+        let held = match self.write.try_hold() {
+            Some(mut held) => {
+                let line = held.get().report();
+                let mut after = After::default();
+                held.release(&mut after, &self.hooks());
+                after.run();
+                line
+            }
+            None => "held".into(),
+        };
+        #[cfg(completion)]
+        let ops = format!(
+            ", ops registered {}, ops out {}",
+            self.reg.ops.load(Ordering::SeqCst),
+            self.ops_out.load(Ordering::SeqCst)
+        );
+        #[cfg(not(completion))]
+        let ops = String::new();
+        format!(
+            "guard {word:#x}, deferred {deferred:#x}: {held}; registration {}, retired {}{ops}",
+            self.reg.state.load(Ordering::SeqCst),
+            self.is_retired(),
+        )
     }
 
     fn has_read_ahead(self: &Arc<Self>) -> bool {

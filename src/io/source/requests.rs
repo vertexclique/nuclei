@@ -55,6 +55,11 @@ const CLOSE: u8 = 16;
 /// The handle is gone with bytes still to send: deregister, go on with the
 /// copy in `Ask::linger_fd`, and drop its object.
 const LINGER: u8 = 32;
+/// A ring put the file into its table for an attach performed on another
+/// thread (`Ask::installs`): the registration takes it if it still wants
+/// it, else the ring lets it go.
+#[cfg(ring)]
+const INSTALLED: u8 = 64;
 
 /// What pending requests carry. Each field is written by its requester
 /// before the request's bit is raised (Release) and read by the performer
@@ -74,6 +79,21 @@ pub(crate) struct Ask {
     pub(super) retire_waker: AtomicWaker,
     /// A retire waits for the sides' ring operations to complete.
     pub(super) awaits_ops: AtomicBool,
+    /// The files rings put into their tables for this source's attaches,
+    /// a stack the ring threads push onto and the performer of
+    /// `INSTALLED` empties.
+    #[cfg(ring)]
+    installs: AtomicPtr<Install>,
+}
+
+/// A file a ring put into its table (or could not) for the attach of
+/// `token` that another thread performed.
+#[cfg(ring)]
+struct Install {
+    token: u64,
+    shard: Arc<Shared>,
+    slot: io::Result<u32>,
+    next: *mut Install,
 }
 
 impl Drop for Ask {
@@ -87,6 +107,21 @@ impl Drop for Ask {
         if !failure.is_null() {
             // SAFETY: as above.
             drop(unsafe { Box::from_raw(failure) });
+        }
+        // A file no performer took: its ring lets it go.
+        #[cfg(ring)]
+        {
+            let mut next = core::mem::replace(self.installs.get_mut(), core::ptr::null_mut());
+            while !next.is_null() {
+                // SAFETY: made by `Box::into_raw` and pushed once.
+                let install = *unsafe { Box::from_raw(next) };
+                next = install.next;
+                if let Ok(slot) = install.slot {
+                    install
+                        .shard
+                        .post_io(crate::rt::shard::IoOp::RingDetach(slot, [None, None]));
+                }
+            }
         }
     }
 }
@@ -229,6 +264,10 @@ impl Source {
                 write.fail(failure, after);
             }
         }
+        #[cfg(ring)]
+        if bits & INSTALLED != 0 {
+            self.take_installs(read, write, after);
+        }
         let attached = (bits & ATTACH != 0).then(|| self.attach_now());
         #[cfg(completion)]
         if matches!(attached, Some(Ok(())))
@@ -248,6 +287,108 @@ impl Source {
             self.evict_now(read, write, after);
         }
         attached
+    }
+
+    /// On a ring's thread: the ring put the file of the attach of `token`
+    /// into its table under `slot` (or could not). Whether the registration
+    /// still wants it is decided with both sides held, so a close, a retire
+    /// or an evict meanwhile never leaves the file in the table.
+    #[cfg(ring)]
+    pub(crate) fn ring_installed(
+        self: &Arc<Self>,
+        shard: &Arc<Shared>,
+        token: u64,
+        slot: io::Result<u32>,
+    ) {
+        let install = Box::into_raw(Box::new(Install {
+            token,
+            shard: Arc::clone(shard),
+            slot,
+            next: core::ptr::null_mut(),
+        }));
+        let mut head = self.ask.installs.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: the node is ours until the swap below publishes it.
+            unsafe { (*install).next = head };
+            // Release: the performer reads the node after it takes it.
+            match self.ask.installs.compare_exchange_weak(
+                head,
+                install,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => head = now,
+            }
+        }
+        let mut after = After::default();
+        self.request(INSTALLED, &mut after);
+        self.settle(after);
+    }
+
+    /// Takes the files the rings installed; both sides are held. The one of
+    /// the attach still under way completes the registration; any other
+    /// (the attach was undone, or the handle closed) goes back to its ring.
+    #[cfg(ring)]
+    fn take_installs(
+        self: &Arc<Self>,
+        read: &mut ReadState,
+        write: &mut WriteState,
+        after: &mut After,
+    ) {
+        // Acquire: pairs with the Release of each push.
+        let mut next = self
+            .ask
+            .installs
+            .swap(core::ptr::null_mut(), Ordering::Acquire);
+        while !next.is_null() {
+            // SAFETY: made by `Box::into_raw` and pushed once; the swap took it.
+            let install = *unsafe { Box::from_raw(next) };
+            next = install.next;
+            let wanted = self.reg.state.load(Ordering::Acquire) == super::REGISTERING
+                && self.reg.ops.load(Ordering::Acquire)
+                && self.reg.token.load(Ordering::Acquire) == install.token
+                && self.fd.load(Ordering::Acquire) != NO_FD;
+            match (wanted, install.slot) {
+                (true, Ok(slot)) => {
+                    self.reg.slot.store(slot, Ordering::Release);
+                    self.reg.state.store(REGISTERED, Ordering::Release);
+                    // Tasks that waited look again, and what the sides hold
+                    // goes to the ring.
+                    self.ops_registered(read, write, after);
+                }
+                (true, Err(err)) => {
+                    self.abandon_ring_attach();
+                    let failure = Failure::of(&err);
+                    read.fail(failure, after);
+                    write.fail(failure, after);
+                }
+                (false, Ok(slot)) => self.detach_ring(&install.shard, slot, [None, None]),
+                (false, Err(_)) => {}
+            }
+        }
+    }
+
+    /// Undoes an attach to a ring still under way on the ring's thread; both
+    /// sides are held. The ring's install of it then finds it unwanted.
+    #[cfg(ring)]
+    pub(super) fn abandon_ring_attach(&self) {
+        // SAFETY: both sides are held.
+        let shard = unsafe { (*self.reg.shard.get()).take() };
+        let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
+        self.reg.ops.store(false, Ordering::Release);
+        self.reg.state.store(UNREGISTERED, Ordering::Release);
+        if let Some(shard) = shard {
+            shard.release_source(token);
+        }
+    }
+
+    /// Whether an attach to a ring is under way on the ring's thread: its
+    /// file not taken yet.
+    #[cfg(ring)]
+    pub(super) fn ring_attach_under_way(&self) -> bool {
+        self.reg.state.load(Ordering::Acquire) == super::REGISTERING
+            && self.reg.ops.load(Ordering::Acquire)
     }
 
     /// Stores `err` for the next performer of `FAIL` and raises it.
@@ -316,6 +457,10 @@ impl Source {
         write: &mut WriteState,
         after: &mut After,
     ) {
+        #[cfg(ring)]
+        if self.ring_attach_under_way() {
+            self.abandon_ring_attach();
+        }
         if self.reg.state.load(Ordering::Acquire) == REGISTERED {
             // SAFETY: both sides are held.
             let shard = unsafe { (*self.reg.shard.get()).take() };

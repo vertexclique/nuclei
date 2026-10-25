@@ -180,3 +180,58 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
     src.close(copy, None);
     drop(rt);
 }
+
+/// An attach performed off the ring's thread hands the ring a copy of the
+/// descriptor to put into its table. The handle closes before the ring
+/// gets to it: the ring must not keep the file, or the peer never sees the
+/// end. The ring's thread is held in a task meanwhile, so the order is
+/// certain.
+#[cfg(ring)]
+#[test]
+fn a_close_before_the_ring_installs_an_attach_leaves_it_no_file() {
+    use std::sync::mpsc::channel;
+    let rt = runtime(None);
+    let on_ring = rt.block_on(
+        rt.spawn(async { crate::proactor::Proactor::backend() == crate::IoBackend::IoUring }),
+    );
+    if !on_ring {
+        eprintln!("skipping: the runtime's shard runs no ring here");
+        return;
+    }
+    let (mine, peer) = stream_pair();
+    let handle = Handle::new(mine).unwrap();
+    let src = Arc::clone(handle.source());
+    // The write side held here: the read the worker polls registers the
+    // source, and the attach is left to this thread.
+    let held = src.write.try_hold().expect("the write side is free");
+    let (polled, has_polled) = channel();
+    let (go, gone) = channel::<()>();
+    let reader = Arc::clone(&src);
+    let task = rt.spawn(async move {
+        let mut buf = [0u8; 8];
+        let mut read = Box::pin(poll_fn(|cx| reader.poll_read(cx, &mut buf, false)));
+        pends(&mut read).await;
+        drop(read);
+        polled.send(()).unwrap();
+        // The ring's thread waits here, its posted work not applied yet.
+        gone.recv().unwrap();
+    });
+    has_polled
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the worker's read never ran");
+    // Letting go performs the attach here, which posts the copy to the ring.
+    let mut after = After::default();
+    held.release(&mut after, &src.hooks());
+    after.run();
+    drop(handle);
+    go.send(()).unwrap();
+    rt.block_on(task);
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        (&peer).read(&mut buf).unwrap(),
+        0,
+        "the peer never saw the end: the ring kept the file"
+    );
+}

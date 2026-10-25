@@ -521,7 +521,8 @@ impl Source {
 
     /// On the ring's thread: puts the file of `copy` (a copy of the
     /// source's descriptor made while the source could not close) into the
-    /// table, and has what the sides hold go to the ring.
+    /// table, and hands the slot to the source, whose registration takes it
+    /// with both sides held (see `ring_installed`).
     pub(crate) fn ring_attached(
         self: &Arc<Self>,
         ring: &ShardRing,
@@ -537,26 +538,7 @@ impl Source {
         {
             return;
         }
-        match ring.attach(copy.as_raw_fd()) {
-            Ok(slot) => {
-                self.reg.slot.store(slot, Ordering::Release);
-                self.reg.state.store(super::REGISTERED, Ordering::Release);
-            }
-            Err(err) => {
-                self.reg.ops.store(false, Ordering::Release);
-                self.reg.state.store(super::UNREGISTERED, Ordering::Release);
-                shard.release_source(token);
-                self.registration_failed(&err);
-                return;
-            }
-        }
-        let mut after = After::default();
-        let hooks = self.hooks();
-        self.read
-            .defer(super::read_work::ATTACHED, &mut after, &hooks);
-        self.write
-            .defer(super::write_work::ATTACHED, &mut after, &hooks);
-        self.settle(after);
+        self.ring_installed(shard, token, ring.attach(copy.as_raw_fd()));
     }
 
     /// The source's registration with ring shard `shard` goes: its ring

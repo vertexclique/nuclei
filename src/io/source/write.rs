@@ -625,6 +625,33 @@ impl WriteState {
                 || self.ring_holds())
     }
 
+    /// What the side holds, as a line, for a test that failed.
+    #[cfg(test)]
+    pub(super) fn report(&self) -> String {
+        #[cfg(completion)]
+        let ops = format!(
+            ", out {:?}, again {}, dial {}",
+            self.out,
+            self.again.is_some(),
+            self.dial.is_some()
+        );
+        #[cfg(not(completion))]
+        let ops = String::new();
+        #[cfg(ring)]
+        let ops = format!("{ops}, poll first {}", self.poll_first);
+        format!(
+            "behind {:?}, lent {}, queued {}, waiters {}, blocked {}, starved {}, failed {}, epoch {}{ops}",
+            self.behind.as_ref().map(|b| b.filled().len()),
+            self.lent.is_some(),
+            self.queued.is_some(),
+            self.waiters.len(),
+            self.blocked,
+            self.starved,
+            self.failed.is_some(),
+            self.epoch,
+        )
+    }
+
     fn drain(&mut self, io: Io<'_>, kind: Kind, waker: &Waker, after: &mut After) -> Poll<()> {
         self.push(io, kind, after);
         if self.has_unsent() {
