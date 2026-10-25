@@ -23,7 +23,8 @@ use std::io;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
-use crate::io::source::ring::{Done, RingOp};
+use crate::io::source::ops::Done;
+use crate::io::source::ring::RingOp;
 use crate::io::sys;
 use crate::rt::park::Notifier;
 use crate::rt::park::ring::RingPoller;
@@ -78,7 +79,7 @@ impl ShardRing {
             Some(copy) => sqe.fd(copy),
             None => sqe.flags(IOSQE_FIXED_FILE),
         };
-        op.source.ring_op_out();
+        op.source.op_out();
         let inserted = self.ops.borrow_mut().insert(op);
         let user_data = match inserted {
             Ok(user_data) => user_data,
@@ -201,10 +202,11 @@ impl ShardRing {
     fn end(&self, op: RingOp, res: i32) {
         let freed = self.files.borrow_mut().done(op.file);
         self.freed(op.file, freed);
-        op.source.ring_done(Done {
-            mem: op.mem,
-            res,
+        let kind = op.source.kind();
+        op.source.op_done(Done {
+            outcome: op.mem.complete(res, kind),
             epoch: op.epoch,
+            read: op.read,
         });
     }
 

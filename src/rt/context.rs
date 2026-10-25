@@ -37,7 +37,7 @@ pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
 
 /// Runs `f` with the shard whose driver this thread may use now: the one
 /// it runs, or else its own, which no other thread ever runs.
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+#[cfg(ring)]
 pub(crate) fn here<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
     let ptr = CURRENT.try_with(Cell::get).unwrap_or(core::ptr::null());
     // SAFETY: as in `current`.

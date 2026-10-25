@@ -13,7 +13,7 @@
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+#[cfg(ring)]
 pub(crate) mod ring;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use self::linux::{Notifier, Poller, Registrar};

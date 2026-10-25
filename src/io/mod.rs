@@ -8,6 +8,7 @@
 //! [`source`]).
 
 mod handle;
+pub(crate) mod raw;
 pub(crate) mod side;
 pub(crate) mod source;
 pub(crate) mod sys;

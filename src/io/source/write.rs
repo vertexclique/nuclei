@@ -36,8 +36,8 @@ use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
 use crate::io::sys;
 
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-mod ring;
+#[cfg(completion)]
+mod ops;
 
 /// The least a write-behind buffer holds, so a run of small writes fills
 /// one buffer rather than waiting on each.
@@ -118,21 +118,21 @@ pub(super) struct WriteState {
     shut: bool,
     /// The source's epoch this state is of.
     epoch: u32,
-    /// The user data of the operation out on the ring; only its
+    /// The id of the operation out with the completion driver; only its
     /// completion clears this.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    ring_out: Option<u64>,
+    #[cfg(completion)]
+    out: Option<u64>,
     /// The ring gave an operation back because the socket was not ready:
     /// the next one waits for it to be.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     poll_first: bool,
-    /// What the ring gave back undone (bytes of the write-behind it took
+    /// What the driver gave back undone (bytes of the write-behind it took
     /// part of, or none, or a datagram): it goes out first.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    again: Option<super::ring::OpMem>,
-    /// A connect to start on the ring, to its peer.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    dial: Option<Box<super::ring::RawAddr>>,
+    #[cfg(completion)]
+    again: Option<super::ops::Want>,
+    /// A connect to start on the completion driver, to its peer.
+    #[cfg(completion)]
+    dial: Option<super::ops::Dial>,
 }
 
 /// Writes bytes to a stream.
@@ -157,10 +157,10 @@ impl WriteState {
         &mut self.epoch
     }
 
-    /// The user data of the operation out on the ring, if one is.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    pub(super) fn ring_out(&self) -> Option<u64> {
-        self.ring_out
+    /// The id of the operation out with the completion driver, if one is.
+    #[cfg(completion)]
+    pub(super) fn out(&self) -> Option<u64> {
+        self.out
     }
 
     /// Bytes written behind that the kernel has not taken: in the
@@ -208,24 +208,26 @@ impl WriteState {
     /// anything changed at once.
     fn push(&mut self, io: Io<'_>, kind: Kind, after: &mut After) -> bool {
         match io {
+            #[cfg(readiness)]
             Io::Fd(fd) => self.push_fd(fd, kind, after),
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-            Io::Ring(r) => {
-                self.submit_ring(r, kind, after);
+            #[cfg(completion)]
+            Io::Ops(route) => {
+                self.submit_ops(route, kind, after);
                 false
             }
-            #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
-            Io::Ring(_) => false,
+            #[cfg(not(completion))]
+            Io::None(never, _) => match never {},
         }
     }
 
-    /// Bytes, a datagram or a connect the ring holds or was given back.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    /// Bytes, a datagram or a connect the completion driver holds or gave
+    /// back.
+    #[cfg(completion)]
     fn ring_holds(&self) -> bool {
-        self.ring_out.is_some() || self.again.is_some() || self.dial.is_some()
+        self.out.is_some() || self.again.is_some() || self.dial.is_some()
     }
 
-    #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+    #[cfg(not(completion))]
     fn ring_holds(&self) -> bool {
         false
     }
@@ -616,7 +618,7 @@ impl WriteState {
     /// A connect to `peer`: the driver starts it on the first poll, and sees
     /// it end on the socket's first edge.
     #[cfg_attr(
-        not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")),
+        not(ring),
         expect(
             unused_variables,
             reason = "the kind matters to the ring's connect only"
@@ -650,24 +652,16 @@ impl WriteState {
                         Err(err) => return Poll::Ready(Err(err)),
                     }
                 }
-                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-                Io::Ring(r) => {
-                    let addr = match peer {
-                        Peer::Inet(addr) => super::ring::RawAddr::inet(&addr),
-                        Peer::Unix(path) => match super::ring::RawAddr::unix(path) {
-                            Ok(addr) => addr,
-                            Err(err) => return Poll::Ready(Err(err)),
-                        },
-                    };
-                    self.dial = Some(addr);
+                #[cfg(completion)]
+                Io::Ops(route) => {
+                    self.dial = Some(match peer {
+                        Peer::Inet(addr) => super::ops::Dial::Inet(addr),
+                        #[cfg(unix)]
+                        Peer::Unix(path) => super::ops::Dial::Unix(path.to_path_buf()),
+                    });
                     self.connecting = true;
-                    self.submit_ring(r, kind, after);
+                    self.submit_ops(route, kind, after);
                 }
-                #[cfg(not(all(
-                    any(target_os = "linux", target_os = "android"),
-                    feature = "iouring"
-                )))]
-                Io::Ring(_) => {}
             }
         }
         if self.connecting {
@@ -737,14 +731,14 @@ impl WriteState {
         self.connected = None;
         self.shut = false;
         self.blocked = false;
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         {
             self.poll_first = false;
         }
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(completion)]
         {
-            if let Some(mem) = self.again.take() {
-                mem.release(after);
+            if let Some(want) = self.again.take() {
+                want.release(after);
             }
             self.dial = None;
         }

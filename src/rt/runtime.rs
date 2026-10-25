@@ -44,7 +44,7 @@ pub(crate) struct Inner {
     /// may hold and still keep a task it spawns.
     local_margin: usize,
     /// The workers' IO runs on rings.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     rings: bool,
 }
 
@@ -215,7 +215,7 @@ impl Builder {
             buffer_cap: self.io_buffer_cap.unwrap_or(crate::buf::DEFAULT_CAP),
             backend: super::backend::for_runtime(self.backend)?,
         };
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         let rings = limits.backend.rings();
         let blocking_name = self
             .thread_name
@@ -259,7 +259,7 @@ impl Builder {
             ),
             pool,
             local_margin: self.local_spawn_margin.unwrap_or(DEFAULT_LOCAL_MARGIN),
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            #[cfg(ring)]
             rings,
         });
         let runtime = Runtime { inner, exits };
@@ -482,7 +482,7 @@ pub(crate) fn current() -> Arc<Inner> {
 /// Whether the shard [`service_shard`] hands out runs a ring: the current
 /// (or default) runtime's workers do, or with no workers, this thread's own
 /// shard.
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+#[cfg(ring)]
 pub(crate) fn service_rings() -> bool {
     let inner = current();
     if inner.workers.running() > 0 {

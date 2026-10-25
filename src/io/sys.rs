@@ -583,3 +583,16 @@ pub(crate) fn pread_uninit(
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
     retry(|| cvt(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) }))
 }
+
+/// Gives a connection a listener accepted the context it needs: nothing on
+/// unix, where the kernel's accept makes the socket whole.
+#[cfg(ring)]
+pub(crate) fn adopt_accepted(_listener: RawFd, _conn: &OwnedFd) -> io::Result<()> {
+    Ok(())
+}
+
+/// Gives a socket a connect ended the context it needs: nothing on unix.
+#[cfg(ring)]
+pub(crate) fn adopt_connected(_fd: RawFd) -> io::Result<()> {
+    Ok(())
+}

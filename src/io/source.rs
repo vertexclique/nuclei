@@ -34,17 +34,19 @@
 //! index and generation, never a pointer) against the registration in
 //! place, so an event for one that is gone does nothing.
 
+#[cfg(completion)]
+pub(crate) mod ops;
 mod read;
 pub(crate) mod requests;
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+#[cfg(ring)]
 pub(crate) mod ring;
 pub(crate) mod write;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+#[cfg(unix)]
 use std::os::unix::net as unix;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,6 +55,7 @@ use std::task::{Poll, Wake};
 use self::read::ReadState;
 use self::requests::Ask;
 use self::write::WriteState;
+use super::raw::{AtomicRaw, Raw};
 use super::side::{After, Hooks, Side};
 use crate::rt::context;
 use crate::rt::park::Readiness;
@@ -62,23 +65,27 @@ use crate::rt::shard::{IoOp, Shared};
 #[derive(Clone, Copy)]
 pub(crate) enum Io<'a> {
     /// Calls on the descriptor, made by the driver itself (epoll, kqueue).
-    Fd(RawFd),
-    /// Operations on the ring of the source's shard.
-    #[cfg_attr(
-        not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")),
-        expect(dead_code, reason = "no ring where io_uring is not built")
-    )]
-    Ring(RingRef<'a>),
+    #[cfg(readiness)]
+    Fd(Raw),
+    /// Operations of the completion driver the source is registered with.
+    #[cfg(completion)]
+    Ops(route::Route<'a>),
+    /// Carries the lifetime where no completion driver is built; it cannot
+    /// be made.
+    #[cfg(not(completion))]
+    #[expect(dead_code, reason = "uninhabited: it only carries the lifetime")]
+    None(core::convert::Infallible, core::marker::PhantomData<&'a ()>),
 }
 
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-pub(crate) type RingRef<'a> = ring::RingIo<'a>;
-/// No ring where io_uring is not built: never made.
-#[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
-pub(crate) type RingRef<'a> = core::marker::PhantomData<&'a ()>;
+/// The way a completion driver's operations are issued from this thread.
+#[cfg(completion)]
+pub(crate) mod route {
+    #[cfg(ring)]
+    pub(crate) use super::ring::RingIo as Route;
+}
 
 /// No descriptor: the source is retired.
-const NO_FD: RawFd = -1;
+const NO_FD: Raw = super::raw::NONE;
 /// No registration.
 const NO_TOKEN: u64 = u64::MAX;
 
@@ -95,13 +102,13 @@ mod read_work {
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 4;
     /// The side's ring operation completed (its mailbox holds it).
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     pub(super) const DONE: u8 = 8;
     /// Submit what the side wants, on the ring's thread.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     pub(super) const SUBMIT: u8 = 16;
     /// The registration with the ring came into place.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     pub(super) const ATTACHED: u8 = 32;
 }
 
@@ -112,13 +119,13 @@ mod write_work {
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 2;
     /// The side's ring operation completed (its mailbox holds it).
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     pub(super) const DONE: u8 = 4;
     /// Submit what the side wants, on the ring's thread.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     pub(super) const SUBMIT: u8 = 8;
     /// The registration with the ring came into place.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     pub(super) const ATTACHED: u8 = 16;
 }
 
@@ -126,24 +133,59 @@ mod write_work {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// A connected Unix stream socket.
+    #[cfg(unix)]
     Stream,
     /// A connected TCP stream socket.
     Tcp,
     /// Any other byte stream (a pipe, a terminal).
+    #[cfg(unix)]
     Bytes,
     /// A regular file or a block device: always ready to the kernel, so
     /// its IO goes to the blocking pool rather than to the poller.
     File,
     TcpListener,
+    #[cfg(unix)]
     UnixListener,
     Udp,
+    #[cfg(unix)]
     UnixDatagram,
+}
+
+impl Kind {
+    /// A listener: its reads are accepts.
+    #[cfg_attr(
+        not(completion),
+        expect(dead_code, reason = "the completion drivers' only")
+    )]
+    pub(crate) fn listens(self) -> bool {
+        match self {
+            Kind::TcpListener => true,
+            #[cfg(unix)]
+            Kind::UnixListener => true,
+            _ => false,
+        }
+    }
+
+    /// A datagram socket: its reads and writes are whole datagrams.
+    #[cfg_attr(
+        not(completion),
+        expect(dead_code, reason = "the completion drivers' only")
+    )]
+    pub(crate) fn datagrams(self) -> bool {
+        match self {
+            Kind::Udp => true,
+            #[cfg(unix)]
+            Kind::UnixDatagram => true,
+            _ => false,
+        }
+    }
 }
 
 /// A peer's address.
 #[derive(Clone, Debug)]
 pub(crate) enum Addr {
     Inet(SocketAddr),
+    #[cfg(unix)]
     Unix(unix::SocketAddr),
 }
 
@@ -191,20 +233,20 @@ struct Registration {
     /// The registration is with a ring: the source's operations are the
     /// ring's, on fixed slot `slot`, and run on the shard whose `Shared`
     /// is at `home` (an address, compared, never followed).
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     ring: AtomicBool,
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     slot: AtomicU32,
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     home: core::sync::atomic::AtomicUsize,
 }
 
 /// The part of a handle its shard's driver reaches.
 pub(crate) struct Source {
-    fd: AtomicI32,
+    fd: AtomicRaw,
     /// The descriptor a retired source had, to tell a revival with another
     /// one.
-    retired_fd: AtomicI32,
+    retired_fd: AtomicRaw,
     /// Moves on when a revival brings another descriptor: a side whose
     /// state is of an older one discards it when it is next taken.
     epoch: AtomicU32,
@@ -221,14 +263,14 @@ pub(crate) struct Source {
     /// taken, as its last holder left it.
     unsent: AtomicBool,
     /// Completions of the sides' ring operations, for their holders.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    read_done: ring::Mailbox,
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    write_done: ring::Mailbox,
+    #[cfg(ring)]
+    read_done: ops::Mailbox,
+    #[cfg(ring)]
+    write_done: ops::Mailbox,
     /// The sides' operations in the kernel's hands: a retire waits until
     /// none is.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    ring_ops: core::sync::atomic::AtomicU8,
+    #[cfg(ring)]
+    ops_out: core::sync::atomic::AtomicU8,
 }
 
 // SAFETY: the sides guard their contents; `reg.shard` is touched only with
@@ -270,19 +312,19 @@ impl Hooks<ReadState> for SourceHooks<'_> {
         if bits & read_work::ABANDON != 0 {
             st.abandon_lent(after);
         }
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         {
             if bits & read_work::DONE != 0
                 && let Some(done) = self.src.read_done.take()
             {
-                st.ring_done(done, self.src.kind, after);
+                st.op_done(done, self.src.serving_fd(None), after);
             }
             // After a completion, a kick or the registration, what the
             // side still wants goes to the ring: the tasks that wait are
             // woken by what it brings.
             if bits & (read_work::DONE | read_work::SUBMIT | read_work::ATTACHED) != 0 {
                 self.src
-                    .with_ring(|io| st.submit_wanted(io, self.src.kind, after));
+                    .with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
         }
     }
@@ -311,21 +353,21 @@ impl Hooks<WriteState> for SourceHooks<'_> {
         }
         if bits & write_work::ABANDON != 0 {
             st.abandon_lent(after);
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            #[cfg(ring)]
             if let Some(user_data) = st.withdrawal() {
-                self.src.cancel_ring_op(user_data);
+                self.src.cancel_op(user_data);
             }
         }
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         {
             if bits & write_work::DONE != 0
                 && let Some(done) = self.src.write_done.take()
             {
-                st.ring_done(done, self.src.serving_fd(None), after);
+                st.op_done(done, self.src.serving_fd(None), after);
             }
             if bits & (write_work::DONE | write_work::SUBMIT | write_work::ATTACHED) != 0 {
                 self.src
-                    .with_ring(|io| st.submit_wanted(io, self.src.kind, after));
+                    .with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
         }
     }
@@ -345,10 +387,10 @@ impl Hooks<WriteState> for SourceHooks<'_> {
 impl Source {
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
-    pub(crate) fn new(fd: RawFd, kind: Kind) -> Arc<Self> {
+    pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
         Arc::new(Self {
-            fd: AtomicI32::new(fd),
-            retired_fd: AtomicI32::new(NO_FD),
+            fd: AtomicRaw::new(fd),
+            retired_fd: AtomicRaw::new(NO_FD),
             epoch: AtomicU32::new(0),
             retired_epoch: AtomicU32::new(0),
             kind,
@@ -358,22 +400,22 @@ impl Source {
                 state: AtomicU8::new(UNREGISTERED),
                 token: AtomicU64::new(NO_TOKEN),
                 shard: UnsafeCell::new(None),
-                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                #[cfg(ring)]
                 ring: AtomicBool::new(false),
-                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                #[cfg(ring)]
                 slot: AtomicU32::new(u32::MAX),
-                #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+                #[cfg(ring)]
                 home: core::sync::atomic::AtomicUsize::new(0),
             },
             requests: AtomicU8::new(0),
             ask: Ask::default(),
             unsent: AtomicBool::new(false),
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-            read_done: ring::Mailbox::default(),
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-            write_done: ring::Mailbox::default(),
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-            ring_ops: core::sync::atomic::AtomicU8::new(0),
+            #[cfg(ring)]
+            read_done: ops::Mailbox::default(),
+            #[cfg(ring)]
+            write_done: ops::Mailbox::default(),
+            #[cfg(ring)]
+            ops_out: core::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -390,13 +432,13 @@ impl Source {
     }
 
     /// The descriptor, unless the source is retired.
-    pub(crate) fn raw_fd(&self) -> io::Result<RawFd> {
+    pub(crate) fn raw_fd(&self) -> io::Result<Raw> {
         self.fd()
     }
 
     /// The descriptor for a poll: the handle revived the source before it
     /// polled, so it is never stale here.
-    fn fd(&self) -> io::Result<RawFd> {
+    fn fd(&self) -> io::Result<Raw> {
         match self.fd.load(Ordering::Acquire) {
             NO_FD => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -414,7 +456,7 @@ impl Source {
     /// waits until the registration is in place.
     fn with_io<R>(self: &Arc<Self>, f: impl FnOnce(Io<'_>) -> R) -> io::Result<R> {
         let fd = self.fd()?;
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         if self.kind != Kind::File {
             return context::current(|current| {
                 if !self.reg.ring.load(Ordering::Acquire) {
@@ -427,8 +469,8 @@ impl Source {
                     }
                     self.ensure_registered()?;
                 }
-                Ok(f(Io::Ring(
-                    self.ring_route(current).unwrap_or(ring::RingIo::NotYet),
+                Ok(f(Io::Ops(
+                    self.route(current).unwrap_or(route::Route::NotYet),
                 )))
             });
         }
@@ -436,14 +478,14 @@ impl Source {
     }
 
     /// No ring operation of the source can be in the kernel's hands.
-    #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
-    fn ring_idle(&self) -> bool {
+    #[cfg(not(ring))]
+    fn ops_idle(&self) -> bool {
         true
     }
 
     /// The descriptor the driver's part runs on, with a side held: for the
     /// driver's own edge, only while `token` is the registration in place.
-    fn serving_fd(&self, token: Option<u64>) -> Option<RawFd> {
+    fn serving_fd(&self, token: Option<u64>) -> Option<Raw> {
         if token.is_some_and(|t| self.reg.token.load(Ordering::Acquire) != t) {
             return None;
         }
@@ -468,7 +510,7 @@ impl Source {
     /// of buffers waits for one of this thread's pool, then the wakes and
     /// drops.
     fn settle(self: &Arc<Self>, mut after: After) {
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         if let Some(home) = after.kick.take() {
             home.post_io(crate::rt::shard::IoOp::RingKick(Arc::clone(self)));
         }
@@ -536,10 +578,7 @@ impl Source {
 
     /// Deregisters the source; both sides are held by the caller, who
     /// hands their states in.
-    #[cfg_attr(
-        not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")),
-        expect(unused_variables)
-    )]
+    #[cfg_attr(not(ring), expect(unused_variables))]
     fn detach(self: &Arc<Self>, read: &ReadState, write: &WriteState) {
         if self.reg.state.load(Ordering::Acquire) != REGISTERED {
             return;
@@ -549,12 +588,12 @@ impl Source {
         let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            #[cfg(ring)]
             if self.reg.ring.swap(false, Ordering::AcqRel) {
                 // The ring holds the file: the descriptor may close at once,
                 // and the ring cancels what the sides have out.
                 let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
-                self.detach_ring(&shard, slot, [read.ring_out(), write.ring_out()]);
+                self.detach_ring(&shard, slot, [read.out(), write.out()]);
                 shard.release_source(token);
                 return;
             }
@@ -583,7 +622,7 @@ impl Source {
     /// what the old one left when it is next taken. Concurrent revivals of
     /// one object agree: the epoch moves on once, and the number is put in
     /// place once, after it.
-    pub(crate) fn revive(&self, fd: RawFd) {
+    pub(crate) fn revive(&self, fd: Raw) {
         if self.fd.load(Ordering::Acquire) != NO_FD {
             return;
         }

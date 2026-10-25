@@ -30,8 +30,8 @@ use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
 use crate::io::sys;
 
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-mod ring;
+#[cfg(completion)]
+mod ops;
 
 /// The most connections or datagrams the driver takes ahead on one edge.
 const BATCH: usize = 32;
@@ -135,13 +135,13 @@ pub(super) struct ReadState {
     unsure: bool,
     /// The source's epoch this state is of.
     epoch: u32,
-    /// The user data of the operation out on the ring; only its
+    /// The id of the operation out with the completion driver; only its
     /// completion clears this.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    ring_out: Option<u64>,
+    #[cfg(completion)]
+    out: Option<u64>,
     /// The ring gave an operation back because the socket was not ready:
     /// the next one waits for it to be.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     poll_first: bool,
 }
 
@@ -150,10 +150,10 @@ impl ReadState {
         &mut self.epoch
     }
 
-    /// The user data of the operation out on the ring, if one is.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-    pub(super) fn ring_out(&self) -> Option<u64> {
-        self.ring_out
+    /// The id of the operation out with the completion driver, if one is.
+    #[cfg(completion)]
+    pub(super) fn out(&self) -> Option<u64> {
+        self.out
     }
 
     pub(super) fn has_result(&self) -> bool {
@@ -220,11 +220,12 @@ impl ReadState {
     /// while a result waits to be taken.
     fn complete(&mut self, io: Io<'_>, kind: Kind, len: usize, after: &mut After) {
         match io {
+            #[cfg(readiness)]
             Io::Fd(fd) => self.complete_fd(fd, kind, len, after),
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-            Io::Ring(r) => self.submit_ring(r, kind, len, after),
-            #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
-            Io::Ring(_) => {}
+            #[cfg(completion)]
+            Io::Ops(route) => self.submit_ops(route, kind, len, after),
+            #[cfg(not(completion))]
+            Io::None(never, _) => match never {},
         }
     }
 
@@ -669,7 +670,7 @@ impl ReadState {
         self.eof = false;
         self.error = None;
         self.blocked = false;
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         {
             self.poll_first = false;
         }

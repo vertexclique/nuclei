@@ -25,12 +25,12 @@
 //! drops it, after the deregistration, so its descriptor closes only once
 //! no call of the driver can use it.
 
+use crate::io::raw::{AtomicRaw, Raw};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 use core::task::Poll;
 use std::io;
-use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use super::read::ReadState;
@@ -64,7 +64,7 @@ pub(crate) struct Ask {
     /// The failure of a registration.
     failure: AtomicPtr<Failure>,
     /// The copy of the descriptor a linger goes on with.
-    linger_fd: AtomicI32,
+    linger_fd: AtomicRaw,
     /// A dropped handle's IO object, for the close to drop.
     doomed: Doomed,
     /// The retire was performed; its requester waits on the waker.
@@ -228,14 +228,14 @@ impl Source {
             }
         }
         let attached = (bits & ATTACH != 0).then(|| self.attach_now());
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         if matches!(attached, Some(Ok(())))
             && self.reg.ring.load(Ordering::Acquire)
             && self.reg.state.load(Ordering::Acquire) == super::REGISTERED
         {
             // The ring took the source over here and now: tasks that waited
             // look again, and what the sides hold goes to it.
-            self.ring_registered(read, write, after);
+            self.ops_registered(read, write, after);
         }
         if !here && let Some(Err(err)) = &attached {
             let failure = Failure::of(err);
@@ -281,7 +281,7 @@ impl Source {
                 io::ErrorKind::NotConnected,
                 "the shard stopped before the registration",
             )),
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            #[cfg(ring)]
             fd if shard.is_ring() => return self.attach_ring(shard, token, fd),
             fd => match shard.registrar() {
                 Some(registrar) => registrar.add(fd, token, self.kind == Kind::Tcp),
@@ -316,13 +316,13 @@ impl Source {
             let shard = unsafe { (*self.reg.shard.get()).take() };
             self.reg.token.store(NO_TOKEN, Ordering::Release);
             self.reg.state.store(UNREGISTERED, Ordering::Release);
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            #[cfg(ring)]
             if self.reg.ring.swap(false, Ordering::AcqRel) {
                 // What the sides have out is cancelled, and the ring lets go
                 // of the file; the completions still reach the sides.
                 if let Some(shard) = &shard {
                     let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
-                    self.detach_ring(shard, slot, [read.ring_out(), write.ring_out()]);
+                    self.detach_ring(shard, slot, [read.out(), write.out()]);
                 }
             }
             if let (Some(shard), Ok(fd)) = (shard, self.fd())
@@ -388,7 +388,7 @@ impl Source {
         let mut after = After::default();
         let done = self.request(RETIRE, &mut after);
         after.run();
-        if done.here && self.ring_idle() {
+        if done.here && self.ops_idle() {
             return;
         }
         let ask = &self.ask;
@@ -398,7 +398,7 @@ impl Source {
             // operation out either sees the flag (and takes the waker) or
             // its count is seen here.
             ask.awaits_ops.store(true, Ordering::SeqCst);
-            if ask.retired.load(Ordering::Acquire) && self.ring_idle() {
+            if ask.retired.load(Ordering::Acquire) && self.ops_idle() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -413,7 +413,7 @@ impl Source {
     /// source goes on with that copy to deliver what the write side holds.
     /// Never waits: if a side is held, the source keeps `io` and its last
     /// holder drops it.
-    pub(crate) fn close<T>(self: &Arc<Self>, io: T, linger: Option<RawFd>) {
+    pub(crate) fn close<T>(self: &Arc<Self>, io: T, linger: Option<Raw>) {
         let bit = match linger {
             Some(copy) => {
                 self.ask.linger_fd.store(copy, Ordering::Release);

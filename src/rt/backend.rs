@@ -24,20 +24,20 @@ pub(crate) enum Backend {
     Poll,
     /// An io_uring ring, made as configured: the sources' IO is its
     /// operations. A shard that cannot make it fails.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     Ring(crate::syscore::linux::iouring::ring::RingConfig),
     /// A ring as `Ring`, chosen by `auto`: a shard whose ring finds no
     /// memory even with fewer entries runs the poller instead.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     RingOrPoll(crate::syscore::linux::iouring::ring::RingConfig),
 }
 
 impl Backend {
     /// Whether shards on this backend run rings.
     pub(crate) fn rings(self) -> bool {
-        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        #[cfg(ring)]
         return matches!(self, Backend::Ring(_) | Backend::RingOrPoll(_));
-        #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+        #[cfg(not(ring))]
         {
             let _ = self;
             false
@@ -79,7 +79,7 @@ fn env_override() -> Option<String> {
 }
 
 /// Whether this process can use io_uring (the probe runs once), or why not.
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+#[cfg(ring)]
 fn usable() -> Result<(), String> {
     use crate::syscore::linux::probe::{Probe, probe};
     static PROBED: OnceLock<Result<(), String>> = OnceLock::new();
@@ -91,7 +91,7 @@ fn usable() -> Result<(), String> {
         .clone()
 }
 
-#[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+#[cfg(not(ring))]
 fn usable() -> Result<(), String> {
     Err("this build has no io_uring".into())
 }
@@ -166,7 +166,7 @@ fn ask_for(backend: IoBackend) -> Result<Ask, String> {
 /// The ring the shards make, as the process's configuration says; `auto`:
 /// whether `auto` chose it.
 fn ring(auto: bool) -> Backend {
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     {
         let cfg = (&crate::proactor::Proactor::get().config().iouring).into();
         if auto {
@@ -175,7 +175,7 @@ fn ring(auto: bool) -> Backend {
             Backend::Ring(cfg)
         }
     }
-    #[cfg(not(all(any(target_os = "linux", target_os = "android"), feature = "iouring")))]
+    #[cfg(not(ring))]
     {
         let _ = auto;
         Backend::Poll
@@ -186,10 +186,7 @@ fn ring(auto: bool) -> Backend {
 /// finds no memory, down to `least`: a ring under a tight memory limit gets
 /// what fits rather than nothing.
 #[cfg_attr(
-    all(
-        not(test),
-        not(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))
-    ),
+    all(not(test), not(ring)),
     expect(dead_code, reason = "only rings are made smaller")
 )]
 pub(crate) fn with_room<T>(
@@ -212,10 +209,7 @@ pub(crate) fn with_room<T>(
 mod tests {
     use super::{Backend, IoBackend, decide, with_room};
 
-    const RINGS_BUILT: bool = cfg!(all(
-        any(target_os = "linux", target_os = "android"),
-        feature = "iouring"
-    ));
+    const RINGS_BUILT: bool = cfg!(ring);
 
     fn usable() -> Result<(), String> {
         Ok(())
@@ -244,7 +238,7 @@ mod tests {
 
     /// Only a ring `auto` chose may fall back for one shard; an explicit one
     /// may not.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    #[cfg(ring)]
     #[test]
     fn only_autos_ring_may_fall_back() {
         assert!(matches!(
