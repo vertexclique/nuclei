@@ -126,3 +126,11 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Semaphore.an_unfit_front_is_not_skipped
 #print axioms Nuclei.Semaphore.a_release_wakes_the_front
 #print axioms Nuclei.Semaphore.stops_at_the_first_unfit
+
+-- Notify: every owed wake is served or left over for the permit, no more waiters are served than
+-- wait, something is left over only once every waiter was served, and a generation is never one of
+-- the grant markers.
+#print axioms Nuclei.Notify.served_and_left
+#print axioms Nuclei.Notify.served_le_waiting
+#print axioms Nuclei.Notify.left_only_when_all_served
+#print axioms Nuclei.Notify.a_generation_is_never_a_marker

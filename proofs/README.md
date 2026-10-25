@@ -664,6 +664,31 @@ front's request after a release), an unfit front stops the walk, a release wakes
 the walk stops at the first waiter that does not fit what those before it left, so a smaller
 request behind a large front is never served first by a nudge.
 
+## Notify
+
+`notify` (`tla/notify/Notify.tla`) checks `Notify` (`src/sync/notify.rs`, on the drain role of
+`src/sync/queue.rs`) at the grain of its atomic steps: the stored permit, `QUEUED` and the drain
+role's bits; the generation and the owed counts of `notify_one` and `notify_last`; the arrival
+stack and the waiting list; each node's phase and payload; and each transition, pass and grant,
+with a waiter's first look (a moved generation, or the permit with nobody queued), its enqueue
+and its drop. The node's waker handshake and the list's sweep are abstract, as in the semaphore
+model. 12 configurations: 6 that must pass (two waiters and a `notify_waiters`, and a
+`notify_one` then a `notify_waiters`, in any order, where every waiter made before the last
+`notify_waiters` ends; two queued waiters and two `notify_one` calls, and a `notify_last` then a
+`notify_one`, where both end; the same calls in any order, safety only, since two calls before
+anybody waits store one permit; a waiter dropped beside one that awaits, which ends), with no
+waiter done without a notification made since its `Notified` was (`NoSpuriousWake`), no
+`notify_one` serving more than one waiter, and no waiter left on the arrival stack once the role
+is free; 4 mutations (a `notify_waiters` that asks for no pass leaves its waiters,
+`AwaitersMadeBeforeAWaitersCallEnd`; a pass that reads the generation before it takes the
+arrivals wakes a newer arrival, `NoSpuriousWake`; a dropped waiter keeping a `notify_one`'s grant
+leaves the other waiting, `EveryAwaiterEnds`; a drain giving up its role over a change made
+during its pass strands an arrival, `NoStrandedArrival`); and 2 witnesses (a permit stored; a
+grant passed on). `lean/Nuclei/Notify.lean` proves the pass's accounting of owed wakes for every
+line and count (each served or left over for the permit, no more served than wait, something
+left over only once every waiter was served) and that a masked generation is never one of the two
+grant markers.
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver

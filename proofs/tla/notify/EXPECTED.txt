@@ -1,0 +1,13 @@
+# configuration                spec                 expected
+L_broadcast                    MC_Notify            pass
+L_mixed                        MC_Notify            pass
+L_ones                         MC_Notify            pass
+L_ones_any                     MC_Notify            pass
+L_last                         MC_Notify            pass
+L_drop                         MC_Notify            pass
+M_waiters_no_pass              MC_Notify            violated:AwaitersMadeBeforeAWaitersCallEnd
+M_generation_first             MC_Notify            violated:NoSpuriousWake
+M_drop_keeps_grant             MC_Notify            violated:EveryAwaiterEnds
+M_exit_ignores_dirty           MC_Notify            violated:NoStrandedArrival
+W_permit_stored                MC_Notify            violated:NoPermitStored
+W_pass_on                      MC_Notify            violated:NoPassOn
