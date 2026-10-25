@@ -1,3 +1,4 @@
+import Nuclei.Barrier
 import Nuclei.Broadcast
 import Nuclei.Cancel
 import Nuclei.FairSemaphore.Model

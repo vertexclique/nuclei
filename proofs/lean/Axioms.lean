@@ -134,3 +134,12 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Notify.served_le_waiting
 #print axioms Nuclei.Notify.left_only_when_all_served
 #print axioms Nuclei.Notify.a_generation_is_never_a_marker
+
+-- The barrier's generations: a generation is exactly n arrivals, its last leads it and only it,
+-- the leader's arrival completes it, and a waiter released for a generation behind the count goes
+-- only once that generation had every arrival.
+#print axioms Nuclei.Barrier.gen_of_range
+#print axioms Nuclei.Barrier.the_last_leads
+#print axioms Nuclei.Barrier.one_leader
+#print axioms Nuclei.Barrier.the_leader_completes
+#print axioms Nuclei.Barrier.released_only_when_complete

@@ -1,0 +1,8 @@
+# configuration                spec                 expected
+L_event                        MC_Event             pass
+L_event_drop                   MC_Event             pass
+L_latch                        MC_Event             pass
+L_latch_extra                  MC_Event             pass
+M_set_no_pass                  MC_Event             violated:AllWokenAfterSet
+M_opens_early                  MC_Event             violated:LatchOpensAtZero
+M_exit_ignores_dirty           MC_Event             violated:NoStrandedArrival

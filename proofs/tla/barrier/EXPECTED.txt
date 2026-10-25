@@ -1,0 +1,9 @@
+# configuration                spec                 expected
+L_two_gens                     MC_Barrier           pass
+L_three                        MC_Barrier           pass
+L_drop                         MC_Barrier           pass
+M_leader_no_pass               MC_Barrier           violated:ReleasedTogether
+M_count_first                  MC_Barrier           violated:NoEarlyRelease
+M_grant_current                MC_Barrier           violated:NoEarlyRelease
+M_exit_ignores_dirty           MC_Barrier           violated:NoStrandedArrival
+W_second_generation            MC_Barrier           violated:NoSecondGeneration

@@ -689,6 +689,41 @@ line and count (each served or left over for the permit, no more served than wai
 left over only once every waiter was served) and that a masked generation is never one of the two
 grant markers.
 
+## The barrier
+
+`barrier` (`tla/barrier/Barrier.tla`) checks the reusable barrier (`src/sync/barrier.rs`, on the
+drain role of `src/sync/queue.rs`) at the grain of its atomic steps: the arrival count's
+`fetch_add` (an arrival's generation, and whether it leads), the leader's transition, each
+waiter's enqueue and drop, and each pass, which reads the current generation from the count after
+it took the arrivals. The node's waker handshake and the list's sweep are abstract, as in the other
+models of the drain role. 8 configurations: 3 that must pass (two tasks waiting twice at a barrier
+of two, two generations; three tasks at a barrier of two, the third waiting for a second
+generation by design; a wait dropped, its arrival still counted), with no wait completing before
+its generation had every arrival (`NoEarlyRelease`), one leader per generation, no waiter left on
+the arrival stack, and every wait of a finished generation that was not dropped completing; 4
+mutations (a leader that asks for no pass leaves its generation waiting, `ReleasedTogether`; a
+pass that reads the count before it takes the arrivals, and one that grants arrivals of the
+current generation, release a wait early, `NoEarlyRelease`; a drain giving up its role over a
+change strands an arrival, `NoStrandedArrival`); and 1 witness (a wait of the second generation
+completes: the barrier is reused). `lean/Nuclei/Barrier.lean` proves the generation arithmetic for
+every size: a generation is exactly `n` arrivals, its last leads it and only it, the leader's
+arrival completes it, and a generation behind the count had every arrival.
+
+## The event and the latch
+
+`event` (`tla/event/Event.tla`) checks the one-shot `Event` and the `Latch` built on it
+(`src/sync/event.rs`, `src/sync/latch.rs`): the `SET` bit and its transition (nothing when set,
+a draining one when somebody is queued), each wait's first look, enqueue and drop, each pass,
+and the latch's count with each compare-and-swap of `count_down`, the one that takes it to zero
+setting the event. 7 configurations: 4 that must pass (two waiters and an event set twice; a
+waiter dropped beside one that awaits; a latch of two counted down by two threads; and by three,
+the third finding it open), with no waiter done before the set (`NoEarlyWake`), the latch never
+open before its count reached zero, no waiter left on the arrival stack, every waiter not dropped
+ending once the event is set, and the latch opening once counted; 3 mutations (a set with
+waiters queued that asks for no pass leaves them, `AllWokenAfterSet`; a latch that sets the event
+one count early, `LatchOpensAtZero`; a drain giving up its role over a change,
+`NoStrandedArrival`).
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver
