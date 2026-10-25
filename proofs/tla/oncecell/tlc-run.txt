@@ -1,0 +1,17 @@
+TLC run of every configuration in proofs/tla/oncecell, 2026-10-25 21:17 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_inits                             49         34      1  pass                                  pass                                  yes
+L_fail                              44         31      1  pass                                  pass                                  yes
+L_drop                              44         31      1  pass                                  pass                                  yes
+L_race                             456        219      1  pass                                  pass                                  yes
+L_crowd                          11517       3675      2  pass                                  pass                                  yes
+M_no_close                          45         32      1  violated:EveryCallEnds                violated:EveryCallEnds                yes
+M_skip_relook                       38         27      1  violated:NoInitAfterPublish           violated:NoInitAfterPublish           yes
+M_fail_keeps_turn                   39         27      1  violated:EveryCallEnds                violated:EveryCallEnds                yes
+M_set_without_turn                  58         42      0  violated:OneWriter                    violated:OneWriter                    yes
+W_lost_to_racer                     69         44      1  violated:NoLostPublish                violated:NoLostPublish                yes
+
+results matching EXPECTED.txt: 10 of 10

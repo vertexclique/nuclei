@@ -724,6 +724,30 @@ waiters queued that asks for no pass leaves them, `AllWokenAfterSet`; a latch th
 one count early, `LatchOpensAtZero`; a drain giving up its role over a change,
 `NoStrandedArrival`).
 
+## The once-cell
+
+`oncecell` (`tla/oncecell/OnceCell.tla`) checks `OnceCell` (`src/sync/once_cell.rs`) at the grain
+of its atomic steps: the value pointer (null, the slot's marker, or a racing builder's box) and
+each compare-and-swap on it; the slot's write and its take-back after a lost publication; the turn
+to write the slot (its permit, the close that ends every wait for it, and each wait); and each
+asynchronous initializer's look, wait, second look, run (which may fail or be dropped) and
+publication, each racing builder's, and each `set`. The turn's semaphore is abstract here (one
+permit and a closed bit); its own protocol is the semaphore family's. `SetOnce` is a once-cell with
+an `Event` beside it (the event family), and `Lazy` fills its cell as a racing builder does, so
+both are covered by these two models. 10 configurations: 5 that must pass (two initializers; one
+that fails, then one that succeeds; one dropped mid-run, then one that succeeds; an initializer, a
+racing builder and a `set`; three initializers, one failing and one dropped, with a builder and a
+`set`), with every call answering the one published value (`OneValue`), one writer of the slot at
+a time, no initializer run over a value that was there as it took the turn, every call ending, and
+the cell filled; 4 mutations (a publication that does not close the turn's semaphore leaves a
+waiter for good, `EveryCallEnds`; an initializer that does not look again after taking the turn
+runs over a builder's value, `NoInitAfterPublish`; a failed initializer that keeps the turn,
+`EveryCallEnds`; a `set` that writes without the turn, `OneWriter`); and 1 witness (an initializer
+that loses its publication to a builder and answers the builder's value).
+`lean/Nuclei/OnceCell.lean` proves the pointer's state machine for every sequence of attempts: a
+published value stays, every answer after it is that value, and from an empty cell the first
+attempt wins.
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver

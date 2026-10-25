@@ -143,3 +143,9 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Barrier.one_leader
 #print axioms Nuclei.Barrier.the_leader_completes
 #print axioms Nuclei.Barrier.released_only_when_complete
+
+-- The once-cell's pointer: a published value stays, every answer after it is that value, and from
+-- an empty cell the first attempt wins.
+#print axioms Nuclei.OnceCell.published_stays
+#print axioms Nuclei.OnceCell.every_answer_is_the_published
+#print axioms Nuclei.OnceCell.the_first_wins
