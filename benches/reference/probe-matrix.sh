@@ -13,6 +13,9 @@ cd "$root"
 target=x86_64-unknown-linux-musl
 test_name=syscore::linux::probe::tests::probe_report
 image=${PROBE_IMAGE:-alpine:3}
+# How the systemd cases start their unit: a user unit by default; where no user session runs
+# (a CI runner), `PROBE_SYSTEMD_RUN="sudo systemd-run"` makes it a system unit.
+read -r -a systemd_run <<<"${PROBE_SYSTEMD_RUN:-systemd-run --user}"
 # Named syscalls: systemd 262 has no `@io-uring` group (these sit in `@aio`), and it ignores an
 # unknown group in a deny list without applying any filter, which the cases below would flag.
 deny='~io_uring_setup io_uring_enter io_uring_register'
@@ -68,11 +71,11 @@ run_case "plain host" \
 
 run_case "systemd, SystemCallFilter=~io_uring (kill)" \
     "probe seccomp=2 outcome=Unavailable(KilledBySeccomp) path=child" \
-    systemd-run --user --wait --pipe -q -p "SystemCallFilter=$deny" "$stage/probe-test" "${args[@]}"
+    "${systemd_run[@]}" --wait --pipe -q -p "SystemCallFilter=$deny" "$stage/probe-test" "${args[@]}"
 
 run_case "systemd, same + SystemCallErrorNumber=EPERM" \
     "probe seccomp=2 outcome=Unavailable(Denied(EPERM)) path=child" \
-    systemd-run --user --wait --pipe -q -p "SystemCallFilter=$deny" \
+    "${systemd_run[@]}" --wait --pipe -q -p "SystemCallFilter=$deny" \
     -p SystemCallErrorNumber=EPERM "$stage/probe-test" "${args[@]}"
 
 run_case "docker default seccomp profile" \
@@ -82,6 +85,22 @@ run_case "docker default seccomp profile" \
 run_case "docker seccomp=unconfined" \
     "probe seccomp=0 outcome=Available path=in-process" \
     docker run --rm --security-opt seccomp=unconfined -v "$stage":/t:ro "$image" /t/probe-test "${args[@]}"
+
+# The io_uring_disabled sysctl (Linux 6.6 and later), with PROBE_SYSCTL=1: setting it takes
+# root (through sudo), and it is set back to what it was, however the script ends.
+if [[ ${PROBE_SYSCTL:-0} == 1 ]]; then
+    was=$(cat /proc/sys/kernel/io_uring_disabled)
+    trap 'sudo sysctl -q kernel.io_uring_disabled="$was"' EXIT
+    sudo sysctl -q kernel.io_uring_disabled=2
+    run_case "io_uring_disabled=2" \
+        "probe seccomp=0 outcome=Unavailable(Denied(EPERM)) path=in-process" \
+        "$stage/probe-test" "${args[@]}"
+    sudo sysctl -q kernel.io_uring_disabled=1
+    run_case "io_uring_disabled=1, a user outside io_uring_group" \
+        "probe seccomp=0 outcome=Unavailable(Denied(EPERM)) path=in-process" \
+        "$stage/probe-test" "${args[@]}"
+    sudo sysctl -q kernel.io_uring_disabled="$was"
+fi
 
 {
     echo "environment|expected|actual|verdict"

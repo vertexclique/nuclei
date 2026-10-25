@@ -86,6 +86,25 @@ jobs:
         env:
           NUCLEI_BACKEND: epoll
 
+  # The io_uring probe in each sandbox it meets (benches/reference/probe-matrix.sh): the plain
+  # host, systemd units that kill or deny the io_uring calls, Docker's default seccomp profile
+  # and unconfined, and the io_uring_disabled sysctl; each must report what that sandbox gives.
+  probe_matrix:
+    name: The io_uring probe in each sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: probe matrix
+        run: bash benches/reference/probe-matrix.sh
+        env:
+          PROBE_SYSTEMD_RUN: sudo systemd-run
+          PROBE_SYSCTL: "1"
+
   check_fmt_and_docs:
     name: Checking fmt and docs
     runs-on: ubuntu-latest

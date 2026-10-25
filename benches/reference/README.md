@@ -37,7 +37,10 @@ file runs on the host, under systemd and in a container) and runs the ignored te
 a user systemd unit that kills io_uring syscalls, the same with `SystemCallErrorNumber=EPERM`,
 Docker's default seccomp profile, and Docker with `seccomp=unconfined`. Needs `jq`, `column`,
 `systemd-run --user` and a running Docker daemon with the `alpine:3` image (override with
-`PROBE_IMAGE`).
+`PROBE_IMAGE`). Where no user session runs, `PROBE_SYSTEMD_RUN="sudo systemd-run"` starts system
+units instead. `PROBE_SYSCTL=1` adds two cases that set the `kernel.io_uring_disabled` sysctl
+(Linux 6.6 and later) through `sudo`, to 2 and to 1 for a user outside `io_uring_group`, and sets
+it back after; CI runs the script this way.
 
 ```sh
 bash benches/reference/probe-matrix.sh
