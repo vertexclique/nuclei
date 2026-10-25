@@ -27,11 +27,12 @@ pub(crate) fn expand_test(item: &FnItem, opts: &Options) -> Vec<Tok> {
     )
 }
 
-/// Expands `#[nuclei::bench]`: the body runs on the runtime's `block_on`
-/// inside a benchmark function that takes the benchmark harness.
+/// Expands `#[nuclei::bench]`: the harness times runs of the body, each on
+/// the runtime's `block_on` (a runtime of its own is built once, before the
+/// first). The last run's value is the benchmark's.
 pub(crate) fn expand_bench(item: &FnItem, opts: &Options) -> Vec<Tok> {
     let params = vec![
-        id("_bencher"),
+        id(BENCHER),
         punct(':'),
         joint('&'),
         id("mut"),
@@ -40,8 +41,45 @@ pub(crate) fn expand_bench(item: &FnItem, opts: &Options) -> Vec<Tok> {
         joint(':'),
         id("Bencher"),
     ];
-    wrapper(item, harness_attr("bench"), params, enter(&item.body, opts))
+    let mut body = Vec::new();
+    let run = match opts.threads {
+        Some(threads) => {
+            // let __nuclei_runtime = <builder>;
+            body.extend([id("let"), id(RUNTIME), punct('=')]);
+            body.extend(builder(threads));
+            body.push(punct(';'));
+            let mut run = vec![id(RUNTIME), punct('.'), id("block_on")];
+            run.push(async_arg(&item.body));
+            run
+        }
+        None => block_on(&item.body),
+    };
+    // let mut __nuclei_last = None;
+    body.extend([id("let"), id("mut"), id(LAST), punct('=')]);
+    body.extend(path(&["core", "option", "Option", "None"]));
+    body.push(punct(';'));
+    // __nuclei_bencher.iter(|| __nuclei_last = Some(run));
+    let mut store = vec![id(LAST), punct('=')];
+    store.extend(path(&["core", "option", "Option", "Some"]));
+    store.push(group(Delimiter::Parenthesis, run));
+    let mut closure = vec![joint('|'), punct('|')];
+    closure.extend(store);
+    body.extend([id(BENCHER), punct('.'), id("iter")]);
+    body.push(group(Delimiter::Parenthesis, closure));
+    body.push(punct(';'));
+    // __nuclei_last.expect("...")
+    body.extend([id(LAST), punct('.'), id("expect")]);
+    body.push(group(Delimiter::Parenthesis, vec![str_lit(NEVER_RAN)]));
+    wrapper(item, harness_attr("bench"), params, body)
 }
+
+/// The names the bench expansion binds, out of the way of the body's.
+const BENCHER: &str = "__nuclei_bencher";
+const RUNTIME: &str = "__nuclei_runtime";
+const LAST: &str = "__nuclei_last";
+
+/// The message of a benchmark whose harness never ran its body.
+const NEVER_RAN: &str = "the benchmark harness never ran the body";
 
 /// Builds the wrapper function: harness attribute, the user's attributes and
 /// visibility, the name, the parameter list, the return type and the body
@@ -73,6 +111,15 @@ fn enter(body: &[Tok], opts: &Options) -> Vec<Tok> {
     let Some(threads) = opts.threads else {
         return block_on(body);
     };
+    let mut out = builder(threads);
+    out.push(punct('.'));
+    out.push(id("block_on"));
+    out.push(async_arg(body));
+    out
+}
+
+/// `::nuclei::Runtime::builder().worker_threads(N).build().expect("...")`.
+fn builder(threads: u32) -> Vec<Tok> {
     let mut out = path(&["nuclei", "Runtime", "builder"]);
     out.push(group(Delimiter::Parenthesis, Vec::new()));
     out.push(punct('.'));
@@ -90,23 +137,22 @@ fn enter(body: &[Tok], opts: &Options) -> Vec<Tok> {
         Delimiter::Parenthesis,
         vec![str_lit(FAILED_TO_START)],
     ));
-    out.push(punct('.'));
-    out.push(id("block_on"));
-    out.push(group(
-        Delimiter::Parenthesis,
-        vec![id("async"), group(Delimiter::Brace, body.to_vec())],
-    ));
     out
 }
 
 /// `::nuclei::block_on(async { body })`.
 fn block_on(body: &[Tok]) -> Vec<Tok> {
     let mut out = path(&["nuclei", "block_on"]);
-    out.push(group(
+    out.push(async_arg(body));
+    out
+}
+
+/// `(async { body })`: the argument of a `block_on`.
+fn async_arg(body: &[Tok]) -> Tok {
+    group(
         Delimiter::Parenthesis,
         vec![id("async"), group(Delimiter::Brace, body.to_vec())],
-    ));
-    out
+    )
 }
 
 /// An absolute path, written with a leading `::`.

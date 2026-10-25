@@ -16,5 +16,6 @@ autotests = false
 [lib]
 proc-macro = true
 
-[[test]]
-name = "expansion_shape"
+# The doc examples use the macros through the runtime that re-exports them.
+[dev-dependencies]
+nuclei = { path = ".." }

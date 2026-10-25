@@ -14,20 +14,31 @@
 //!
 //! # `#[nuclei::main]`
 //!
-//! ```ignore
+//! ```no_run
+//! use std::net::TcpListener;
+//! use nuclei::Handle;
+//!
 //! #[nuclei::main]
 //! async fn main() -> std::io::Result<()> {
-//!     let listener = nuclei::Handle::<std::net::TcpListener>::bind("0.0.0.0:7000")?;
+//!     let listener = Handle::<TcpListener>::bind("0.0.0.0:7000")?;
 //!     loop {
 //!         let (stream, _) = listener.accept().await?;
-//!         nuclei::spawn(echo(stream)).detach();
+//!         nuclei::spawn(async move {
+//!             let mut buf = [0u8; 1024];
+//!             while let Ok(n @ 1..) = stream.recv(&mut buf).await {
+//!                 if stream.send(&buf[..n]).await.is_err() {
+//!                     break;
+//!                 }
+//!             }
+//!         })
+//!         .detach();
 //!     }
 //! }
 //! ```
 //!
 //! With an explicit worker thread count:
 //!
-//! ```ignore
+//! ```
 //! #[nuclei::main(threads = 2)]
 //! async fn main() {
 //!     println!("two worker threads");
@@ -36,7 +47,7 @@
 //!
 //! # `#[nuclei::test]`
 //!
-//! ```ignore
+//! ```
 //! #[nuclei::test]
 //! async fn echoes() -> std::io::Result<()> {
 //!     assert_eq!(2 * 2, 4);
@@ -47,7 +58,11 @@
 //! # `#[nuclei::bench]`
 //!
 //! Benchmarks need the nightly test harness, so the crate using them writes
-//! `#![feature(test)]` and `extern crate test;` at its root.
+//! `#![feature(test)]` and `extern crate test;` at its root (which is why
+//! this example is not compiled here; the nightly CI job builds and runs
+//! the macro in `tests/macros_bench.rs`). The harness times runs of the
+//! body, each on `block_on`; with `threads = N` the runtime is built once,
+//! before the first.
 //!
 //! ```ignore
 //! #![feature(test)]
@@ -78,7 +93,7 @@ use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenSt
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// #[nuclei::main]
 /// async fn main() -> std::io::Result<()> {
 ///     Ok(())
@@ -97,7 +112,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// #[nuclei::test]
 /// async fn adds_up() -> std::io::Result<()> {
 ///     assert_eq!(2 + 2, 4);
@@ -111,10 +126,12 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Enables an async benchmark function.
 ///
-/// The body of the async function runs on the runtime's `block_on`; the
-/// benchmark function itself takes the benchmark harness, so the annotated
-/// function takes no parameters. Benchmarks need the nightly test harness:
-/// write `#![feature(test)]` and `extern crate test;` at the crate root.
+/// The harness times runs of the body of the async function, each on the
+/// runtime's `block_on` (with `threads = N` the runtime is built once,
+/// before the first); the benchmark function itself takes the harness, so
+/// the annotated function takes no parameters. Benchmarks need the nightly
+/// test harness: write `#![feature(test)]` and `extern crate test;` at the
+/// crate root (so the example is not compiled here).
 ///
 /// # Examples
 ///
