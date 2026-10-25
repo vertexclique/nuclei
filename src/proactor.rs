@@ -4,7 +4,7 @@
 
 use core::future::Future;
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::config::NucleiConfig;
@@ -33,11 +33,40 @@ pub struct Proactor {
 
 static PROACTOR: OnceLock<Proactor> = OnceLock::new();
 
-/// The shards of the threads inside [`Proactor::wait`].
-static WAITING: Mutex<Vec<Arc<Shared>>> = Mutex::new(Vec::new());
+/// The shards of threads inside [`Proactor::wait`], by address.
+type Waiting = kovan_map::HashMap<usize, Arc<Shared>>;
 
-fn waiting() -> std::sync::MutexGuard<'static, Vec<Arc<Shared>>> {
-    WAITING.lock().unwrap_or_else(PoisonError::into_inner)
+static WAITING: OnceLock<Waiting> = OnceLock::new();
+
+fn waiting() -> &'static Waiting {
+    // 64 is the smallest table the map accepts.
+    WAITING.get_or_init(|| Waiting::with_capacity(64))
+}
+
+/// Ends the waits of every shard in `waiting`: a wake is left on each
+/// one's poller, so a wait that has not begun yet (its thread is inside
+/// `Proactor::wait`, before the poller) ends as soon as it does.
+fn wake_all(waiting: &Waiting) {
+    for (_, shard) in waiting.iter() {
+        shard.notify();
+    }
+}
+
+/// A thread's shard in [`WAITING`] while its `Proactor::wait` lasts.
+struct InWait(usize);
+
+impl InWait {
+    fn new(shard: &Arc<Shared>) -> Self {
+        let key = Arc::as_ptr(shard) as usize;
+        waiting().insert(key, Arc::clone(shard));
+        Self(key)
+    }
+}
+
+impl Drop for InWait {
+    fn drop(&mut self) {
+        waiting().remove(&self.0);
+    }
 }
 
 impl Proactor {
@@ -74,9 +103,7 @@ impl Proactor {
 
     /// Ends every [`wait`](Self::wait) in progress at once.
     pub fn wake(&self) {
-        for shard in waiting().iter() {
-            shard.unpark();
-        }
+        wake_all(waiting());
     }
 
     /// Drives the calling thread's shard once: runs its ready tasks, waits
@@ -99,10 +126,8 @@ impl Proactor {
         let _current = context::enter(&shard);
         #[cfg(port)]
         shard.take_port_back();
-        waiting().push(Arc::clone(&shard.shared));
-        let events = shard.turn(max_event_size, duration);
-        waiting().retain(|s| !Arc::ptr_eq(s, &shard.shared));
-        events
+        let _waiting = InWait::new(&shard.shared);
+        shard.turn(max_event_size, duration)
     }
 
     /// The backend the calling thread's shard runs its IO on; on a thread
@@ -142,4 +167,31 @@ pub(crate) const POLLER: IoBackend = IoBackend::Iocp;
 /// meanwhile: [`block_on`](crate::runtime::block_on).
 pub fn drive<T>(future: impl Future<Output = T>) -> T {
     crate::runtime::block_on(future)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{Waiting, wake_all};
+    use crate::rt::context;
+
+    /// A wake that comes after the thread went into the wait, but before
+    /// its shard waits on the poller, still ends that wait.
+    #[test]
+    fn a_wake_before_the_poller_wait_ends_it() {
+        let shard = context::own_shard().unwrap();
+        let _current = context::enter(&shard);
+        let waiting = Waiting::with_capacity(64);
+        waiting.insert(0, Arc::clone(&shard.shared));
+        wake_all(&waiting);
+        let start = Instant::now();
+        shard.turn(64, Some(Duration::from_secs(10))).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the wake was lost: the wait ran {:?}",
+            start.elapsed()
+        );
+    }
 }

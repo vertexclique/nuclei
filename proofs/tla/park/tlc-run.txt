@@ -1,19 +1,21 @@
-TLC run of every configuration in proofs/tla/park, 2026-10-25 06:50 UTC.
+TLC run of every configuration in proofs/tla/park, 2026-10-25 08:36 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-P_one                              483        260      1  pass                                  pass                                  yes
-P_three                          66123      20428      1  pass                                  pass                                  yes
-P_live                            6246       2498      2  pass                                  pass                                  yes
-M_no_recheck                       217        115      0  deadlock                              deadlock                              yes
-M_check_first                      214        119      1  deadlock                              deadlock                              yes
-W_notify                           116         66      1  violated:NoNotify                     violated:NoNotify                     yes
-W_recheck                           81         47      1  violated:NoRecheckFind                violated:NoRecheckFind                yes
-W_spurious                         406        188      1  violated:NoSpurious                   violated:NoSpurious                   yes
-P_timer                            928        575      1  pass                                  pass                                  yes
-P_timer_live                     12990       5696      2  pass                                  pass                                  yes
-M_drive_waits                      426        251      1  deadlock                              deadlock                              yes
-W_drive_fire                        80         50      0  violated:NoDriveFire                  violated:NoDriveFire                  yes
+P_one                             1219        520      1  pass                                  pass                                  yes
+P_three                         152659      40856      1  pass                                  pass                                  yes
+P_live                           14979       4996      2  pass                                  pass                                  yes
+M_no_recheck                       565        240      1  deadlock                              deadlock                              yes
+M_check_first                      571        254      1  deadlock                              deadlock                              yes
+W_notify                           246        114      0  violated:NoNotify                     violated:NoNotify                     yes
+W_recheck                          165         80      1  violated:NoRecheckFind                violated:NoRecheckFind                yes
+W_spurious                         779        312      1  violated:NoSpurious                   violated:NoSpurious                   yes
+P_timer                           2418       1150      1  pass                                  pass                                  yes
+P_timer_live                     31655      11392      2  pass                                  pass                                  yes
+M_drive_waits                     1144        530      1  deadlock                              deadlock                              yes
+W_drive_fire                       158         82      1  violated:NoDriveFire                  violated:NoDriveFire                  yes
+P_proactor                          57         30      1  pass                                  pass                                  yes
+M_handshake_wake                    66         38      1  deadlock                              deadlock                              yes
 
-results matching EXPECTED.txt: 12 of 12
+results matching EXPECTED.txt: 14 of 14

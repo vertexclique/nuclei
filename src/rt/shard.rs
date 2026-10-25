@@ -207,6 +207,12 @@ impl Shared {
         self.park.wake(|| self.notifier.notify());
     }
 
+    /// Leaves a wake on the shard's poller: a wait of it in progress ends,
+    /// and one that has not begun yet ends as soon as it does.
+    pub(crate) fn notify(&self) {
+        self.notifier.notify();
+    }
+
     /// Wakes the shard if it sleeps (after the caller made its reason
     /// visible with a sequentially consistent write).
     pub(crate) fn unpark(&self) {

@@ -11,3 +11,5 @@ P_timer                        MC_Park              pass
 P_timer_live                   MC_Park              pass
 M_drive_waits                  MC_Park              deadlock
 W_drive_fire                   MC_Park              violated:NoDriveFire
+P_proactor                     MC_Park              pass
+M_handshake_wake               MC_Park              deadlock

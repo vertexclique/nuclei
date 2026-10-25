@@ -17,6 +17,11 @@
 (* sequentially consistent, as the code's accesses are; that the weaker    *)
 (* orderings would lose a wake is the loom calibration's part.             *)
 (*                                                                          *)
+(* A `Proactor::wake` (src/proactor.rs) pushes no work: it ends the wait  *)
+(* of a thread inside `Proactor::wait` by leaving a notification on its   *)
+(* shard's poller whether the shard parks yet or not, so a wait that has  *)
+(* not begun ends as soon as it does.                                      *)
+(*                                                                          *)
 (* What is abstract: the inbox is a count (the order of work does not     *)
 (* matter here); the poller is one flag that a notification raises and a   *)
 (* wait lowers (an eventfd's counter, collapsed).                          *)
@@ -26,12 +31,16 @@ EXTENDS Integers, FiniteSets, TLC
 CONSTANTS
     Wakers,    \* the waker threads, numbered 1, 2, ...
     TimerTask, \* TRUE: a task of the shard's own sleeps on a timer of its wheel
+    ProactorWake, \* TRUE: the shard's thread is inside `Proactor::wait`, whose one
+               \* wait only a `Proactor::wake` ends, and one comes
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The shard's thread number: no waker uses it.
 ShardT == 0
 \* The clock's: it makes the timer due.
 ClockT == -1
+\* The thread that calls `Proactor::wake`.
+ProactorT == -2
 \* Every item of work: one per waker.
 Total == Cardinality(Wakers)
 
@@ -104,11 +113,16 @@ S_check:
 S_sleep:
     \* The poller's wait: until a notification, the deadline of a timer still in the wheel,
     \* or (the model's end) until every waker is done and all the work ran.
-    await pending \/ (timerArmed /\ timerDue) \/ (WakersDone /\ AllRan);
+    await pending \/ (timerArmed /\ timerDue) \/ (WakersDone /\ AllRan /\ ~ProactorWake);
     if pending then
         pending := FALSE;
         parked := FALSE;                    \* `end_park`
-        goto S_run;
+        \* The one wait of `Proactor::wait` ended: the call returns.
+        if ProactorWake then
+            goto Done;
+        else
+            goto S_run;
+        end if;
     elsif timerArmed /\ timerDue then
         parked := FALSE;
         goto S_run;
@@ -121,6 +135,22 @@ begin
 C_tick:
     if timerArmed then
         timerDue := TRUE;
+    end if;
+end process;
+
+\* `Proactor::wake`, once, at any point of the thread's `Proactor::wait`.
+fair process proactor = ProactorT
+begin
+P_wake:
+    if ProactorWake then
+        \* MUTATION handshake_wake: the wake goes through the handshake, so it
+        \* notifies only a shard that parks already.
+        if Mutation # "handshake_wake" then
+            pending := TRUE;
+        elsif parked then
+            parked := FALSE;
+            pending := TRUE;
+        end if;
     end if;
 end process;
 
