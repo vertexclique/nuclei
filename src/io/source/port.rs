@@ -895,14 +895,17 @@ impl Source {
 
     /// Registers the source with port shard `shard` under `token`, with
     /// both sides held: its socket's completions go to the shard's port
-    /// from now on (moved from a port it had, whose shard went).
+    /// from now on (moved from a port it had, whose shard went). A handle
+    /// with operations still out cannot move: the registration then waits
+    /// for them to end, and is made again by the tasks they wake (see
+    /// [`waits_for_ops`](Self::waits_for_ops)).
     pub(super) fn attach_port(
         &self,
         shard: Arc<crate::rt::shard::Shared>,
         token: u64,
         fd: Raw,
     ) -> io::Result<()> {
-        let bound = match self.kind {
+        let bind = || match self.kind {
             // A handle opened for synchronous IO completes on no port: its
             // calls are the pool's, on a copy of it.
             Kind::Bytes => sys::synchronous(fd).and_then(|sync| match sync {
@@ -915,6 +918,16 @@ impl Source {
                 .and_then(|()| sys::udp_connreset_off(fd))
                 .map(|()| None),
             _ => shard.port().bind(fd as usize as HANDLE).map(|()| None),
+        };
+        let bound = match bind() {
+            Err(_) if self.waits_for_ops() => {
+                self.reg.state.store(super::UNREGISTERED, Ordering::Release);
+                shard.release_source(token);
+                return Ok(());
+            }
+            // None is out (any more): once more, and that answer stands.
+            Err(_) => bind(),
+            bound => bound,
         };
         let sync = match bound {
             Ok(sync) => sync,

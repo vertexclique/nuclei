@@ -575,6 +575,8 @@ fn block_on_with<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
         Err(err) => panic!("this thread's shard could not start: {err}"),
     };
     let _current = context::enter(&shard);
+    #[cfg(port)]
+    shard.take_port_back();
     let output = shard.block_on(future);
     shard.leave();
     output
@@ -633,6 +635,20 @@ where
     T: Send + 'static,
 {
     current().pool.spawn(f)
+}
+
+/// Runs `f` on the blocking pool of the runtime this thread is inside, if
+/// it is inside one (it never starts the default runtime, which a thread on
+/// its way out could not): whether `f` went.
+#[cfg(port)]
+pub(crate) fn spawn_blocking_inside(f: impl FnOnce() + Send + 'static) -> bool {
+    match context::runtime() {
+        Some(inner) => {
+            inner.pool.spawn(f).detach();
+            true
+        }
+        None => false,
+    }
 }
 
 /// The cores this process may run on, in order (Linux; Windows, in the

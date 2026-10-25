@@ -117,6 +117,10 @@ mod read_work {
     /// queue.
     #[cfg(ring)]
     pub(super) const ARRIVALS: u8 = 32;
+    /// The source's operations ended, which a registration waited for: the
+    /// tasks waiting look again, and register it where they run.
+    #[cfg(port)]
+    pub(super) const LOOK: u8 = 64;
 }
 
 /// Side-local work of the write side (its deferred word).
@@ -131,6 +135,9 @@ mod write_work {
     /// Submit what the side wants, on the ring's thread.
     #[cfg(completion)]
     pub(super) const SUBMIT: u8 = 8;
+    /// As the read side's.
+    #[cfg(port)]
+    pub(super) const LOOK: u8 = 16;
 }
 
 /// What kind of descriptor a source is: which system calls fit it.
@@ -255,6 +262,11 @@ struct Registration {
     slot: AtomicU32,
     #[cfg(ring)]
     home: core::sync::atomic::AtomicUsize,
+    /// A registration found operations of the source out, which keep its
+    /// handle on the port they were issued to: it waits for the last to
+    /// end (see `ops::Source::waits_for_ops`).
+    #[cfg(port)]
+    awaits_idle: AtomicBool,
 }
 
 /// The part of a handle its shard's driver reaches.
@@ -363,6 +375,10 @@ impl Hooks<ReadState> for SourceHooks<'_> {
                     .with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
         }
+        #[cfg(port)]
+        if bits & read_work::LOOK != 0 {
+            st.wake_all(after);
+        }
     }
 
     fn requests(&self, st: &mut ReadState, after: &mut After) {
@@ -410,6 +426,10 @@ impl Hooks<WriteState> for SourceHooks<'_> {
                     .with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
         }
+        #[cfg(port)]
+        if bits & write_work::LOOK != 0 {
+            st.wake_all(after);
+        }
     }
 
     fn released(&self, saw_requests: bool, after: &mut After) {
@@ -446,6 +466,8 @@ impl Source {
                 slot: AtomicU32::new(u32::MAX),
                 #[cfg(ring)]
                 home: core::sync::atomic::AtomicUsize::new(0),
+                #[cfg(port)]
+                awaits_idle: AtomicBool::new(false),
             },
             requests: AtomicU8::new(0),
             ask: Ask::default(),

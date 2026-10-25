@@ -1,0 +1,13 @@
+# configuration                spec                 expected
+PK_safe                        MC_PortKeep          pass
+PK_live                        MC_PortKeep          pass
+PK_away                        MC_PortKeep          pass
+MK_no_keeper                   MC_PortKeep          violated:AllDelivered
+MK_no_wait                     MC_PortKeep          violated:OneDrainer
+MK_ignore_called_off           MC_PortKeep          violated:OneDrainer
+MK_no_recheck                  MC_PortKeep          violated:Registers
+MK_fail_on_ops                 MC_PortKeep          violated:NoFailure
+WK_waited                      MC_PortKeep          violated:NoWaited
+WK_called_off                  MC_PortKeep          violated:NoCalledOff
+WK_stopped                     MC_PortKeep          violated:NoStopped
+WK_kept                        MC_PortKeep          violated:NoKept

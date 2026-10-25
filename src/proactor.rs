@@ -97,6 +97,8 @@ impl Proactor {
         }
         let shard = context::own_shard()?;
         let _current = context::enter(&shard);
+        #[cfg(port)]
+        shard.take_port_back();
         waiting().push(Arc::clone(&shard.shared));
         let events = shard.turn(max_event_size, duration);
         waiting().retain(|s| !Arc::ptr_eq(s, &shard.shared));

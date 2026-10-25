@@ -9,9 +9,12 @@
 //! own timeout, rounded up so it never ends early.
 //!
 //! The port counts the operations issued to it that the kernel has not
-//! completed: a shard that goes waits for that count to reach zero before
-//! it closes the port, so no packet of an operation whose memory the kernel
-//! holds is lost.
+//! completed: a shard that stops running hands a port with operations still
+//! out to a keeper on the blocking pool ([`Port::keep`]), which delivers
+//! their packets until none is out or the shard runs again; so no packet of
+//! an operation whose memory the kernel holds is lost, and none waits for a
+//! shard that is not running (a TCP send is never cancelled, so it may stay
+//! out for as long as its peer reads nothing).
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -81,6 +84,42 @@ impl Port {
     /// Operations issued to this port and not completed.
     pub(crate) fn out(&self) -> usize {
         self.out.load(Ordering::Acquire)
+    }
+
+    /// Delivers the packets of the port's operations with `deliver` until
+    /// none is out or `stopped` says so, for a port whose shard does not
+    /// run; a wake (which is what ends the wait for a stop) is nobody's then.
+    pub(crate) fn keep(
+        &self,
+        stopped: impl Fn() -> bool,
+        mut deliver: impl FnMut(&OVERLAPPED_ENTRY),
+    ) {
+        let mut entries = [OVERLAPPED_ENTRY::zeroed(); 64];
+        while self.out() > 0 && !stopped() {
+            let mut removed: ULONG = 0;
+            // SAFETY: the entries buffer has room for its length in packets;
+            // the kernel says how many it wrote.
+            let ok = unsafe {
+                GetQueuedCompletionStatusEx(
+                    self.handle,
+                    entries.as_mut_ptr(),
+                    entries.len() as ULONG,
+                    &mut removed,
+                    INFINITE,
+                    0,
+                )
+            };
+            // A wait with no timeout on a port this borrow keeps open fails
+            // for no reason it could go on from.
+            if ok == 0 {
+                return;
+            }
+            for entry in &entries[..removed as usize] {
+                if !matches!(entry.lpCompletionKey, WAKE | TIMER) && !entry.lpOverlapped.is_null() {
+                    deliver(entry);
+                }
+            }
+        }
     }
 
     /// Moves the completions of `handle` to this port: at once if it is not
@@ -161,13 +200,17 @@ pub(crate) struct Notifier {
 impl Poller {
     pub(crate) fn new() -> io::Result<Self> {
         crate::syscore::windows::winsock::start()?;
-        // SAFETY: a new port with one thread draining it.
+        // SAFETY: a new port. Its shard drains it, or a keeper while the
+        // shard does not run; no limit on the threads its packets release,
+        // since a thread that drained a port counts against the limit while
+        // it runs (the shard after it handed the port on, a pool thread after
+        // it kept one) and would hold the next drainer's packets back.
         let handle = unsafe {
             CreateIoCompletionPort(
                 crate::syscore::windows::INVALID_HANDLE_VALUE,
                 core::ptr::null_mut(),
                 0,
-                1,
+                ULONG::MAX,
             )
         };
         if handle.is_null() {

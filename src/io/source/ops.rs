@@ -231,9 +231,11 @@ impl Source {
     /// The kernel completed one of the source's operations: its side takes
     /// the completion at once if free, else its holder does as it lets go.
     pub(crate) fn op_done(self: &Arc<Self>, done: Done) {
-        // SeqCst, with the flag after it: against a retire that raises the
-        // flag and then looks at the count (see `retire`).
-        if self.ops_out.fetch_sub(1, Ordering::SeqCst) == 1
+        // SeqCst, with the flags after it: against a retire, or a
+        // registration, that raises its flag and then looks at the count
+        // (see `retire`, `waits_for_ops`).
+        let idle = self.ops_out.fetch_sub(1, Ordering::SeqCst) == 1;
+        if idle
             && self.ask.awaits_ops.load(Ordering::SeqCst)
             && let Some(waker) = self.ask.retire_waker.take()
         {
@@ -249,7 +251,31 @@ impl Source {
             self.write
                 .defer(super::write_work::DONE, &mut after, &hooks);
         }
+        #[cfg(port)]
+        if idle && self.reg.awaits_idle.swap(false, Ordering::SeqCst) {
+            self.read.defer(super::read_work::LOOK, &mut after, &hooks);
+            self.write
+                .defer(super::write_work::LOOK, &mut after, &hooks);
+        }
         self.settle(after);
+    }
+
+    /// A registration with a port could not bind the source's handle:
+    /// whether that is because operations of the source are out (a handle
+    /// with operations out stays on its port), and the registration waits
+    /// for the last to end, whose `op_done` has the tasks look again. The
+    /// flag goes up before the count is looked at, and `op_done` lowers the
+    /// count before it looks at the flag, all sequentially consistent: so
+    /// either this sees the count at zero, or that end sees the flag. With
+    /// none out (the flag taken back, if it went up), the caller binds once
+    /// more: the operations may have ended since its bind failed.
+    #[cfg(port)]
+    pub(super) fn waits_for_ops(&self) -> bool {
+        if self.ops_idle() {
+            return false;
+        }
+        self.reg.awaits_idle.store(true, Ordering::SeqCst);
+        !self.ops_idle() || !self.reg.awaits_idle.swap(false, Ordering::SeqCst)
     }
 
     /// The registration with a completion driver took, with both sides

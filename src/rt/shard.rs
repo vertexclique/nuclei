@@ -59,6 +59,8 @@ use crate::syscore::linux::iouring::ring::RingConfig;
 use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
 
+#[cfg(port)]
+mod port;
 #[cfg(ring)]
 pub(crate) mod recv;
 #[cfg(ring)]
@@ -403,6 +405,9 @@ pub(crate) struct Shard {
     sources: RefCell<Sources>,
     /// Where the shard's reads land and its writes wait.
     pool: Pool,
+    /// The keeper of the shard's port while the shard does not run.
+    #[cfg(port)]
+    keeper: RefCell<Option<Arc<port::Keeper>>>,
 }
 
 /// The fewest submission entries a ring short of memory is made with.
@@ -486,6 +491,8 @@ impl Shard {
             fired: RefCell::new(Vec::new()),
             sources: RefCell::new(Sources::default()),
             pool: Pool::new(limits.buffer_cap),
+            #[cfg(port)]
+            keeper: RefCell::new(None),
         })
     }
 
@@ -863,7 +870,8 @@ impl Shard {
     /// The outermost `block_on` of a thread outside the runtime returned,
     /// and this, its own shard, runs again only at its next one: the
     /// sources registered here go, each to register where it is polled
-    /// next, and a ring waits for the operations they had out to end.
+    /// next; a ring waits for the operations they had out to end, and a
+    /// port hands them to a keeper.
     pub(crate) fn leave(&self) {
         let gone: Vec<Arc<Source>> = self.sources.borrow_mut().drain().collect();
         for source in gone {
@@ -875,26 +883,10 @@ impl Shard {
         if let Driver::Ring(ring) = &self.driver {
             ring.settle(|| self.apply_io_ops());
         }
+        // The port's go to its keeper.
         #[cfg(port)]
-        self.settle_port();
-    }
-
-    /// Waits, up to a bound, for the packets of the operations issued to the
-    /// shard's port, cancelled as their sources went: each brings its side
-    /// what it held. One that never comes keeps its source and its memory
-    /// for good, so the kernel never writes memory that is gone.
-    #[cfg(port)]
-    fn settle_port(&self) {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while self.shared.port.out() > 0 {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero()
-                || self
-                    .poll_io(usize::MAX, Some(left.min(Duration::from_millis(10))))
-                    .is_err()
-            {
-                return;
-            }
+        if !self.hand_off_port() {
+            self.settle_port();
         }
     }
 
@@ -968,9 +960,11 @@ impl Drop for Shard {
             ring.settle(|| self.apply_io_ops());
             ring.shut_down();
         }
-        // The port's operations likewise, before the port is let go.
+        // The port's operations to a keeper, unless one has them already.
         #[cfg(port)]
-        self.settle_port();
+        if !self.port_kept() && !self.hand_off_port() {
+            self.settle_port();
+        }
         drop(self.lifo.take());
         let queue = core::mem::take(&mut *self.queue.borrow_mut());
         drop(queue);

@@ -179,8 +179,13 @@ impl Workers {
                 }
                 shard.set_owner(worker_inner.id(), index);
                 let _runtime = context::set_runtime(&worker_inner);
-                let _current = context::enter(&shard);
-                shard.block_on(shard.shared.stopped());
+                {
+                    let _current = context::enter(&shard);
+                    shard.block_on(shard.shared.stopped());
+                }
+                // While the worker's runtime is still this thread's: what the
+                // shard hands on as it goes (a port's keeper) goes there.
+                drop(shard);
             });
         match spawned {
             Ok(thread) => {

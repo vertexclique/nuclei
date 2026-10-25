@@ -116,3 +116,40 @@ fn a_dropped_handle_keeps_its_value_until_its_bytes_are_out() {
         "bytes leaked into the new socket"
     );
 }
+
+/// A stream whose thread's `block_on` returned (and then the thread) while
+/// its send was still out, stuck until the peer reads, goes on from
+/// another thread: the port it was on is kept while the send ends, the
+/// stream registers again once it did, and the peer gets every byte once,
+/// in order.
+#[test]
+fn a_stream_left_with_a_send_out_goes_on_from_another_thread() {
+    let (mine, peer) = stream_pair();
+    let (handle, mut sent) = std::thread::spawn(move || {
+        crate::block_on(async {
+            let handle = Handle::new(mine).unwrap();
+            let sent = fill_until_stuck(&handle).await;
+            assert!(handle.source().has_unsent(), "nothing was left to send");
+            (handle, sent)
+        })
+    })
+    .join()
+    .unwrap();
+    let reader = std::thread::spawn(move || read_to_end_blocking(peer));
+    let tail = b"the rest, from another thread";
+    runtime().block_on(async {
+        let mut at = 0;
+        while at < tail.len() {
+            at += within(handle.send(&tail[at..])).await.unwrap();
+        }
+    });
+    drop(handle);
+    sent.extend_from_slice(tail);
+    let got = reader.join().unwrap();
+    assert!(
+        got == sent,
+        "{} of {} bytes reached the peer, or not in order",
+        got.len(),
+        sent.len()
+    );
+}
