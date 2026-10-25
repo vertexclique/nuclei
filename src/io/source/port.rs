@@ -311,14 +311,19 @@ fn socket_of(raw: Raw) -> SOCKET {
 }
 
 /// The answer of an operation that ended with Winsock or Win32 error
-/// `code` (`None`: it ran) after `bytes`. One cancelled after it took some
-/// bytes counts them, so none goes out twice.
+/// `code` (`None`: it ran) after `bytes`, an error counted for `stats`.
+/// One cancelled after it took some bytes counts them, so none goes out
+/// twice.
 fn answer(code: Option<i32>, bytes: usize) -> Answer<usize> {
     match code {
         None => Answer::Done(Ok(bytes)),
         Some(WSA_OPERATION_ABORTED) if bytes == 0 => Answer::Undone { not_ready: false },
         Some(WSA_OPERATION_ABORTED) => Answer::Done(Ok(bytes)),
-        Some(code) => Answer::Done(Err(io::Error::from_raw_os_error(code))),
+        Some(code) => {
+            let err = io::Error::from_raw_os_error(code);
+            crate::rt::counters::io_error(&err);
+            Answer::Done(Err(err))
+        }
     }
 }
 
@@ -762,17 +767,19 @@ unsafe fn finish(slot: &Slot, code: Option<i32>, bytes: usize) {
 /// The outcome of an operation on `mem`, from what the kernel left in the
 /// slot.
 fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> Outcome {
-    let answer = answer(code, bytes);
+    // Made once: an error is counted as it is made.
+    let answer = match mem {
+        PortMem::Recv(_) | PortMem::RecvLent(_) => read_answer(code, bytes),
+        _ => answer(code, bytes),
+    };
     match mem {
         PortMem::Recv(mut buf) => {
-            let answer = read_answer(code, bytes);
             if let Answer::Done(Ok(n)) = answer {
                 buf.set_filled(n);
             }
             Outcome::Recv(buf, answer)
         }
         PortMem::RecvLent(mut buf) => {
-            let answer = read_answer(code, bytes);
             if let Answer::Done(Ok(n)) = answer {
                 // SAFETY: the kernel wrote the first `n` bytes of the spare
                 // capacity.
@@ -801,12 +808,18 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         }
         PortMem::NoAccept => Outcome::Accept(match answer {
             Answer::Done(Ok(_)) => Answer::Done(Err(io::ErrorKind::Other.into())),
-            Answer::Done(Err(err)) => Answer::Done(Err(err)),
+            Answer::Done(Err(err)) => {
+                crate::rt::counters::accept_error(&err);
+                Answer::Done(Err(err))
+            }
             Answer::Undone { not_ready } => Answer::Undone { not_ready },
         }),
         PortMem::Accept(conn) => Outcome::Accept(match answer {
             Answer::Done(Ok(_)) => Answer::Done(accepted_peer(inner).map(|peer| (conn, peer))),
-            Answer::Done(Err(err)) => Answer::Done(Err(err)),
+            Answer::Done(Err(err)) => {
+                crate::rt::counters::accept_error(&err);
+                Answer::Done(Err(err))
+            }
             Answer::Undone { not_ready } => Answer::Undone { not_ready },
         }),
         PortMem::Connect(dial) => Outcome::Connect(
@@ -932,6 +945,7 @@ impl Source {
         let sync = match bound {
             Ok(sync) => sync,
             Err(err) => {
+                shard.counters.refused_registration();
                 self.reg.state.store(super::UNREGISTERED, Ordering::Release);
                 shard.release_source(token);
                 return Err(err);

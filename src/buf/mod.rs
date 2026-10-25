@@ -144,6 +144,8 @@ pub(crate) struct Pool {
     top: Option<usize>,
     /// Bytes it holds.
     charged: Cell<usize>,
+    /// Times a buffer was wanted with every byte under the cap in use.
+    exhausted: Cell<u64>,
 }
 
 // SAFETY: the free buffers are memory the pool owns outright and the rest
@@ -168,13 +170,18 @@ impl Pool {
             cap,
             top: CLASSES.iter().rposition(|&size| size <= cap),
             charged: Cell::new(0),
+            exhausted: Cell::new(0),
         }
     }
 
     /// Bytes the pool holds, in use and free.
-    #[cfg(test)]
     pub(crate) fn charged(&self) -> usize {
         self.charged.get()
+    }
+
+    /// Times a buffer was wanted while every byte under the cap was in use.
+    pub(crate) fn exhausted(&self) -> u64 {
+        self.exhausted.get()
     }
 
     /// Whether `home` is this pool's.
@@ -293,6 +300,7 @@ impl Pool {
                 }
             }
         }
+        self.exhausted.set(self.exhausted.get() + 1);
         false
     }
 

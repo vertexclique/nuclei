@@ -55,6 +55,7 @@ mod rt;
 pub mod runtime;
 /// Signals (unix) and console control events (Windows), as streams.
 pub mod signal;
+pub mod stats;
 /// Runtime-independent synchronization primitives: futures and wakers only, usable from any executor.
 pub mod sync;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
@@ -101,4 +102,5 @@ pub use runtime::{
     Builder, FallibleTask, Runtime, RuntimeHandle, Task, block_on, spawn, spawn_blocking,
     spawn_local,
 };
+pub use stats::stats;
 pub use time::{sleep, timeout};

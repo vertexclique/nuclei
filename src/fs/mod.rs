@@ -34,7 +34,9 @@ impl Handle<File> {
     /// As [`File::open`].
     pub async fn open(p: impl AsRef<Path>) -> io::Result<Handle<File>> {
         let path = p.as_ref().to_path_buf();
-        let file = crate::runtime::spawn_blocking(move || File::open(path)).await?;
+        let file = crate::runtime::spawn_blocking(move || File::open(path))
+            .await
+            .inspect_err(crate::rt::counters::io_error)?;
         Handle::new(file)
     }
 

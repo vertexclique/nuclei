@@ -100,8 +100,9 @@ impl Handle<UnixStream> {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 drop(stream);
                 let path = path.as_ref().to_path_buf();
-                let connected =
-                    crate::runtime::spawn_blocking(move || UnixStream::connect(path)).await?;
+                let connected = crate::runtime::spawn_blocking(move || UnixStream::connect(path))
+                    .await
+                    .inspect_err(crate::rt::counters::io_error)?;
                 Handle::adopt(connected, Kind::Stream)
             }
             Err(err) => Err(err),

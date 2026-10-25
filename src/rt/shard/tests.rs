@@ -136,3 +136,31 @@ fn a_shard_lets_go_of_the_waker_its_loop_left() {
         "the shard's Shared was kept by its own loop's waker"
     );
 }
+
+/// A park publishes the shard's counts for `stats`, even one that does not
+/// wait after all (a task queued already); a look between tasks publishes
+/// every `PUBLISH_INTERVAL`th time.
+#[test]
+fn a_park_publishes_and_a_look_between_tasks_every_few() {
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let _current = context::enter(&shard);
+    let published = || shard.shared.stats().polls;
+    shard.polls.set(1);
+    for look in 1..super::PUBLISH_INTERVAL {
+        shard.drive(Some(Duration::ZERO)).unwrap();
+        assert_eq!(published(), 0, "look {look}");
+    }
+    shard.drive(Some(Duration::ZERO)).unwrap();
+    assert_eq!(published(), 1);
+    shard.polls.set(2);
+    let queued = crate::runtime::spawn_local(async {});
+    assert!(shard.has_local_work());
+    shard.drive(None).unwrap();
+    assert_eq!(published(), 2, "a park that found a task queued");
+    drop(queued);
+}

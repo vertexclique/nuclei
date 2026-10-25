@@ -575,6 +575,19 @@ ring later, so the receiver's new position is past its old one; the ring's last 
 in different slots; and a take or a lag keeps taken plus lost equal to the positions passed,
 so at the close a receiver accounts for every value sent after it subscribed.
 
+## A ring's overflow count
+
+`lean/Nuclei/Overflow.lean` checks how a ring's poller counts completion-queue overflows for
+`stats` (`src/rt/park/ring.rs`): it looks at the kernel's overflow flag before each wait's
+enter and after it took the completions, and counts a look that finds the flag set after one
+that found it clear. Over every sequence of looks it proves that an overflow counts once however
+many waits it lasts (`stutter`), that the count never passes the looks that saw the flag set
+(`at_most_seen`), that a set look after a clear one counts (`counted_after_clear`), and that two
+stretches of looks add up when the first ends clear (`split_at_clear`). Its witness shows why
+the look after the completions is there: with it two floods count two, and without it they count
+one; its mutation, counting every set look, breaks `stutter`. An overflow that begins and ends
+between two looks is seen by neither the code nor the model.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the

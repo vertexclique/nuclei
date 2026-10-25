@@ -30,6 +30,10 @@ pub(crate) struct RingPoller {
     waiting: VecDeque<Sqe>,
     /// The shard's thread made itself the issuer.
     enabled: bool,
+    /// The kernel held completions the queue had no room for, at the last
+    /// look; how many times that began.
+    overflowed: bool,
+    overflows: u64,
 }
 
 // SAFETY: the ring is used by one thread only. A shard is built on one
@@ -64,6 +68,8 @@ impl RingPoller {
             wake_armed: false,
             waiting: VecDeque::new(),
             enabled: false,
+            overflowed: false,
+            overflows: 0,
         })
     }
 
@@ -133,6 +139,9 @@ impl RingPoller {
         self.enable()?;
         self.arm_wake();
         self.flush_waiting();
+        // The enter below flushes what the kernel holds into the queue as
+        // room frees up.
+        self.look_for_overflow();
         let min = u32::from(timeout != Some(Duration::ZERO));
         match self.ring.submit_and_wait(min, timeout) {
             Ok(_) => {}
@@ -152,14 +161,30 @@ impl RingPoller {
                 out.push(cqe);
             }
         }
+        self.look_for_overflow();
         // Completions freed room: entries that waited for it go in now.
         self.flush_waiting();
         Ok(woken)
     }
 
+    /// Counts an overflow the first time a look finds the kernel holding
+    /// completions: before each enter, and after the completions are taken
+    /// (one may begin while the wait sleeps, or after it ended).
+    fn look_for_overflow(&mut self) {
+        let overflowed = self.ring.cq_overflow_pending();
+        self.overflows += u64::from(overflowed && !self.overflowed);
+        self.overflowed = overflowed;
+    }
+
     /// Puts the file of `fd` into fixed slot `slot` (-1 empties it).
     pub(crate) fn update_file(&self, slot: u32, fd: std::os::fd::RawFd) -> io::Result<()> {
         self.ring.update_file(slot, fd)
+    }
+
+    /// Times the kernel began holding completions the queue had no room
+    /// for, as the waits saw.
+    pub(crate) fn overflows(&self) -> u64 {
+        self.overflows
     }
 
     /// The ring's completion queue size: the bound of operations in flight.
@@ -220,6 +245,50 @@ mod tests {
         let start = Instant::now();
         assert!(!p.wait(Some(Duration::from_millis(20)), &mut out).unwrap());
         assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+
+    /// Floods `p` with `n` NOPs from `first`, submitted with no wait to take
+    /// their completions: past the queue's room the kernel holds them.
+    fn flood(p: &mut RingPoller, first: u64, n: u64) {
+        let mut next = first;
+        while next < first + n {
+            while next < first + n && p.ring.push(&Sqe::nop().user_data(next)).is_ok() {
+                next += 1;
+            }
+            match p.ring.submit() {
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                Err(e) => panic!("submit failed: {e}"),
+            }
+        }
+        assert!(
+            p.ring.cq_overflow_pending(),
+            "the flood overflowed the queue"
+        );
+    }
+
+    /// Completions past the queue's room wait in the kernel: the waits
+    /// count that once however many of them it takes to take them all, and
+    /// every completion comes.
+    #[test]
+    fn an_overflow_is_counted_once_and_loses_nothing() {
+        let Some(mut p) = poller() else { return };
+        const N: u64 = 64;
+        let mut out = Vec::new();
+        for round in 0..2 {
+            flood(&mut p, round * N, N);
+            assert_eq!(p.overflows(), round);
+            out.clear();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while out.len() < N as usize {
+                p.wait(Some(Duration::from_millis(100)), &mut out).unwrap();
+                assert!(Instant::now() < deadline, "{} of {N} completed", out.len());
+            }
+            let mut got: Vec<u64> = out.iter().map(|c| c.user_data).collect();
+            got.sort_unstable();
+            assert_eq!(got, (round * N..round * N + N).collect::<Vec<_>>());
+            assert_eq!(p.overflows(), round + 1);
+        }
     }
 
     /// More entries than the submission queue holds: they wait in order

@@ -342,6 +342,7 @@ impl ReadState {
                 }
                 Some(Ok((conn, peer))) => self.accepted.push_back((conn, Peer::Known(peer))),
                 Some(Err(err)) => {
+                    crate::rt::counters::accept_error(&err);
                     self.error = Some(err);
                     break;
                 }

@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use kovan_queue::seg_queue::SegQueue;
 
 use super::backend::Backend;
+use super::counters::{self, Counters};
 use super::handshake::ParkState;
 #[cfg(readiness)]
 use super::park::Registrar;
@@ -65,6 +66,7 @@ mod going;
 #[cfg(port)]
 mod port;
 mod spin;
+mod stats;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 #[cfg(ring)]
 pub(crate) mod recv;
@@ -77,6 +79,9 @@ pub(crate) const LIFO_MAX: u32 = 3;
 pub(crate) const INBOX_INTERVAL: u32 = 31;
 /// Timers and the poller are looked at once every this many runs.
 pub(crate) const DRIVER_INTERVAL: u32 = 61;
+/// A shard that looks at its driver between tasks publishes its counts
+/// once every this many looks; one that parks publishes every time.
+pub(crate) const PUBLISH_INTERVAL: u32 = 8;
 
 /// The part of a shard any thread may touch.
 pub(crate) struct Shared {
@@ -110,6 +115,8 @@ pub(crate) struct Shared {
     /// Registrations other threads ask of the shard, applied before it
     /// polls.
     io_ops: SegQueue<IoOp>,
+    /// What the shard counts, for `stats`.
+    pub(crate) counters: Counters,
 }
 
 /// A registration change another thread asks of a shard.
@@ -298,6 +305,11 @@ impl Shared {
         })
     }
 
+    /// The shard's counters as they are now.
+    pub(crate) fn stats(&self) -> crate::stats::ShardStats {
+        self.counters.read(self.load.load(Ordering::Relaxed))
+    }
+
     fn has_remote_work(&self) -> bool {
         !self.inbox.is_empty()
             || !self.local_inbox.is_empty()
@@ -350,6 +362,13 @@ pub(crate) struct Shard {
     tick: Cell<u32>,
     /// Runs since timers and the poller were last looked at.
     since_drive: Cell<u32>,
+    /// Task polls run (the run loop's are added from `since_drive` as it
+    /// starts again), and runnables taken from other threads: published for
+    /// `stats` with the rest of the shard's cells.
+    polls: Cell<u64>,
+    remote_wakes: Cell<u64>,
+    /// Looks at the driver from the run loop.
+    looks: Cell<u32>,
     spin: Spin,
     /// The runtime and the place this shard is a worker of, set when its
     /// worker thread starts: what `spawn` uses to keep a task local.
@@ -381,6 +400,17 @@ const MIN_RING_ENTRIES: u32 = 64;
 
 impl Shard {
     pub(crate) fn new(limits: Limits) -> io::Result<Self> {
+        Self::made(limits, None)
+    }
+
+    /// The shard of worker `index` of runtime `runtime`.
+    pub(crate) fn worker(limits: Limits, runtime: u64, index: usize) -> io::Result<Self> {
+        Self::made(limits, Some((runtime, index)))
+    }
+
+    /// A shard, worker `owner` (a runtime and a place) if it is one. Its
+    /// counters know the place before `stats` can list it.
+    fn made(limits: Limits, owner: Option<(u64, usize)>) -> io::Result<Self> {
         #[cfg(readiness)]
         let poller = || -> io::Result<_> {
             let poller = Poller::new()?;
@@ -422,6 +452,7 @@ impl Shard {
                 }
             }
         };
+        let pool = Pool::new(limits.buffer_cap);
         let shared = Arc::new(Shared {
             inbox: SegQueue::new(),
             local_inbox: SegQueue::new(),
@@ -437,7 +468,9 @@ impl Shard {
             #[cfg(port)]
             port: kernel,
             io_ops: SegQueue::new(),
+            counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
         });
+        counters::register(&shared);
         Ok(Self {
             shared,
             queue: RefCell::new(VecDeque::new()),
@@ -445,8 +478,11 @@ impl Shard {
             lifo_streak: Cell::new(0),
             tick: Cell::new(0),
             since_drive: Cell::new(0),
+            polls: Cell::new(0),
+            remote_wakes: Cell::new(0),
+            looks: Cell::new(0),
             spin: Spin::new(),
-            owner: Cell::new(None),
+            owner: Cell::new(owner),
             in_task: Cell::new(false),
             depth: Cell::new(0),
             limits,
@@ -456,7 +492,7 @@ impl Shard {
             fired: RefCell::new(Vec::new()),
             sources: RefCell::new(Sources::default()),
             children: RefCell::new(children::Children::default()),
-            pool: Pool::new(limits.buffer_cap),
+            pool,
             #[cfg(port)]
             keeper: RefCell::new(None),
         })
@@ -468,6 +504,7 @@ impl Shard {
         let token = match self.sources.borrow_mut().insert(Arc::clone(source)) {
             Ok(token) => token,
             Err(err) => {
+                self.shared.counters.refused_registration();
                 source.registration_abandoned();
                 return Err(err);
             }
@@ -544,11 +581,6 @@ impl Shard {
         Arc::ptr_eq(&self.shared, shared)
     }
 
-    /// Marks this shard as worker `index` of runtime `runtime`.
-    pub(crate) fn set_owner(&self, runtime: u64, index: usize) {
-        self.owner.set(Some((runtime, index)));
-    }
-
     /// This shard's place among the workers of runtime `runtime`, if it is
     /// one of them.
     pub(crate) fn worker_index(&self, runtime: u64) -> Option<usize> {
@@ -612,11 +644,14 @@ impl Shard {
     }
 
     fn pop_inbox(&self) -> Option<Runnable> {
-        self.shared
+        let runnable = self
+            .shared
             .inbox
             .try_pop()
             .or_else(|_| self.shared.local_inbox.try_pop())
-            .ok()
+            .ok()?;
+        self.remote_wakes.set(self.remote_wakes.get() + 1);
+        Some(runnable)
     }
 
     fn has_local_work(&self) -> bool {
@@ -638,6 +673,12 @@ impl Shard {
     /// poller (waiting up to `wait`, or until the next timer) and completes
     /// the IO of the sources that became ready.
     fn drive(&self, wait: Option<Duration>) -> io::Result<()> {
+        // The run loop's look between tasks, or its park (which may not wait
+        // after all, its timer due): a park publishes the counts always, the
+        // shard about to go quiet, and a look once every few.
+        let looks = self.looks.get().wrapping_add(1);
+        self.looks.set(looks);
+        let publish = wait != Some(Duration::ZERO) || looks.is_multiple_of(PUBLISH_INTERVAL);
         if !self.shared.io_ops.is_empty() {
             self.apply_io_ops();
         }
@@ -654,6 +695,9 @@ impl Shard {
             (Some(w), Some(t)) => Some(w.min(t)),
             (w, t) => w.or(t),
         };
+        if publish {
+            self.publish();
+        }
         self.poll_io(usize::MAX, timeout)?;
         self.fire_timers();
         Ok(())
@@ -704,11 +748,7 @@ impl Shard {
 
     /// The kernel interface this shard runs its IO on.
     pub(crate) fn io_backend(&self) -> crate::IoBackend {
-        match &self.driver {
-            Driver::Poll(_) => crate::proactor::POLLER,
-            #[cfg(ring)]
-            Driver::Ring(_) => crate::IoBackend::IoUring,
-        }
+        self.driver.backend()
     }
 
     /// The shard's ring, if its IO runs on one.
@@ -801,7 +841,7 @@ impl Shard {
                 let since = self.since_drive.get() + 1;
                 if since >= DRIVER_INTERVAL {
                     // Timers and the poller get a look, without a wait.
-                    self.since_drive.set(0);
+                    self.count_again(since);
                     self.drive_or_report(Some(Duration::ZERO));
                 } else {
                     self.since_drive.set(since);
@@ -818,7 +858,7 @@ impl Shard {
             if self.has_local_work() || signal.woken.load(Ordering::SeqCst) {
                 continue;
             }
-            self.since_drive.set(0);
+            self.count_again(self.since_drive.get());
             let shared = &self.shared;
             // The spin looks at the poller too: IO that comes within it
             // costs neither a park nor the kernel's wake of this thread.
@@ -865,6 +905,7 @@ impl Shard {
             (Some(w), Some(t)) => Some(w.min(t)),
             (w, t) => w.or(t),
         };
+        self.publish();
         let result = self.poll_io(max, timeout);
         if sleeps {
             shared.park.end_park();
@@ -879,7 +920,16 @@ impl Shard {
     fn run_ready(&self) {
         while let Some(runnable) = self.next() {
             self.run(runnable);
+            self.polls.set(self.polls.get() + 1);
         }
+    }
+
+    /// Starts the count of runs before the next look at the driver again,
+    /// adding the `runs` it held to the polls: the run loop counts its
+    /// polls there, never one by one.
+    pub(super) fn count_again(&self, runs: u32) {
+        self.polls.set(self.polls.get() + u64::from(runs));
+        self.since_drive.set(0);
     }
 
     /// Drives the poller; a failure of the poller itself cannot be handed to

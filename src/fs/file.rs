@@ -121,13 +121,37 @@ enum Work<T> {
     Ring(super::ring::RingJob<T>),
 }
 
-impl<T> Work<T> {
+impl<T: Ended> Work<T> {
+    /// The call's end once it came, its error counted for `stats`.
     fn poll(&mut self, waker: &Waker) -> Poll<T> {
-        match self {
+        let end = match self {
             Work::Pool(task) => poll_task(task, waker),
             #[cfg(ring)]
             Work::Ring(job) => job.poll(waker),
+        };
+        if let Poll::Ready(end) = &end
+            && let Some(err) = end.error()
+        {
+            crate::rt::counters::io_error(err);
         }
+        end
+    }
+}
+
+/// The end of a file's call: its result, alone or with the task's buffer.
+trait Ended {
+    fn error(&self) -> Option<&io::Error>;
+}
+
+impl<T> Ended for io::Result<T> {
+    fn error(&self) -> Option<&io::Error> {
+        self.as_ref().err()
+    }
+}
+
+impl<T> Ended for (io::Result<T>, Vec<u8>) {
+    fn error(&self) -> Option<&io::Error> {
+        self.0.as_ref().err()
     }
 }
 
@@ -810,7 +834,10 @@ impl FileState {
                 self.sizing = None;
                 match size {
                     Ok(size) => size.checked_add_signed(d),
-                    Err(err) => return Poll::Ready(Err(err)),
+                    Err(err) => {
+                        crate::rt::counters::io_error(&err);
+                        return Poll::Ready(Err(err));
+                    }
                 }
             }
         };

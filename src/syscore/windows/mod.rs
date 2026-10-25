@@ -228,6 +228,7 @@ pub(crate) const WAIT_TIMEOUT: i32 = 258;
 /// `WaitForSingleObject`: the object is signalled (a process: it ended).
 pub(crate) const WAIT_OBJECT_0: DWORD = 0;
 pub(crate) const WSAEINVAL: i32 = 10022;
+pub(crate) const WSAEMFILE: i32 = 10024;
 pub(crate) const WSAEADDRINUSE: i32 = 10048;
 pub(crate) const WSAENETUNREACH: i32 = 10051;
 pub(crate) const WSAECONNABORTED: i32 = 10053;

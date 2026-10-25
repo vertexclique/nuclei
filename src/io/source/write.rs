@@ -264,7 +264,10 @@ impl WriteState {
             self.connecting = false;
             self.connected = Some(match sys::take_error(fd) {
                 Ok(None) => Ok(()),
-                Ok(Some(err)) | Err(err) => Err(err),
+                Ok(Some(err)) | Err(err) => {
+                    crate::rt::counters::io_error(&err);
+                    Err(err)
+                }
             });
             progress = true;
         }
@@ -570,7 +573,7 @@ impl WriteState {
         }
         if kind.streams() && !self.shut {
             self.shut = true;
-            return Poll::Ready(sys::shutdown_write(fd));
+            return Poll::Ready(sys::shutdown_write(fd).inspect_err(crate::rt::counters::io_error));
         }
         Poll::Ready(Ok(()))
     }
@@ -697,7 +700,10 @@ impl WriteState {
                             self.connecting = true;
                             after.register = true;
                         }
-                        Err(err) => return Poll::Ready(Err(err)),
+                        Err(err) => {
+                            crate::rt::counters::io_error(&err);
+                            return Poll::Ready(Err(err));
+                        }
                     }
                 }
                 #[cfg(completion)]

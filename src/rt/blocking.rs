@@ -129,6 +129,7 @@ impl Pool {
 
     /// A pool thread's life.
     fn work(self: Arc<Self>) {
+        let _alive = Alive::new();
         loop {
             self.idle.fetch_add(1, Ordering::SeqCst);
             let got = self
@@ -155,6 +156,30 @@ impl Pool {
             }
             return;
         }
+    }
+}
+
+/// Threads of every blocking pool alive now.
+static ALIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Threads of the blocking pools alive now, for `stats`.
+pub(crate) fn threads_alive() -> usize {
+    ALIVE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A pool thread, counted in [`ALIVE`] for its life, however it ends.
+struct Alive;
+
+impl Alive {
+    fn new() -> Self {
+        ALIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        ALIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

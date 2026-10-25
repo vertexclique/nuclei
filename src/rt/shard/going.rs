@@ -52,6 +52,7 @@ fn evict_all(gone: Vec<(u64, Arc<Source>)>) {
 
 impl Drop for Shard {
     fn drop(&mut self) {
+        self.shared.counters.went();
         // Every task still queued here is dropped on this thread, the one its
         // future may be dropped on.
         self.shared.draining.store(true, Ordering::SeqCst);

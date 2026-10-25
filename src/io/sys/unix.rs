@@ -29,14 +29,19 @@ unsafe fn borrow<S: FromRawFd>(fd: RawFd) -> ManuallyDrop<S> {
 }
 
 /// The answer of a call that may have to wait: `None` for "not now"
-/// (`EAGAIN`, `EWOULDBLOCK`), or the call's result.
+/// (`EAGAIN`, `EWOULDBLOCK`), or the call's result (an error counted for
+/// `stats`).
 pub(crate) fn ready<T>(result: io::Result<T>) -> Option<io::Result<T>> {
     match result {
         // The code itself, not std's kind (which is decoded from it).
         Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK) => {
             None
         }
-        other => Some(other),
+        Err(e) => {
+            crate::rt::counters::io_error(&e);
+            Some(Err(e))
+        }
+        ok => Some(ok),
     }
 }
 

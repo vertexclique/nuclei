@@ -519,8 +519,14 @@ impl ShardRing {
 
 impl ShardRing {
     /// Operations in flight: the sources', the files' and the children's.
-    fn in_flight(&self) -> usize {
+    pub(crate) fn in_flight(&self) -> usize {
         self.ops.borrow().len() + self.file_ops.borrow().len() + self.exit_ops.borrow().len()
+    }
+
+    /// Times the kernel began holding completions the ring's queue had no
+    /// room for.
+    pub(crate) fn overflows(&self) -> u64 {
+        self.poller.borrow().overflows()
     }
 
     /// Submits what is queued and waits until no operation is out, for at

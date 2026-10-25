@@ -300,6 +300,9 @@ impl Source {
         token: u64,
         slot: io::Result<u32>,
     ) {
+        if slot.is_err() {
+            shard.counters.refused_registration();
+        }
         let install = Box::into_raw(Box::new(Install {
             token,
             shard: Arc::clone(shard),
@@ -430,7 +433,9 @@ impl Source {
             fd => return self.attach_port(shard, token, fd),
             #[cfg(readiness)]
             fd => match shard.registrar() {
-                Some(registrar) => registrar.add(fd, token, self.kind == Kind::Tcp),
+                Some(registrar) => registrar
+                    .add(fd, token, self.kind == Kind::Tcp)
+                    .inspect_err(|_| shard.counters.refused_registration()),
                 None => Err(io::Error::other("the shard has no poller to register with")),
             },
         };

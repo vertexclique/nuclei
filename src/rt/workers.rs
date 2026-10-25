@@ -153,7 +153,7 @@ impl Workers {
         }
         // A shard that cannot be made leaves its slot empty; placement
         // skips it.
-        let shard = Shard::new(workers.start.limits)?;
+        let shard = Shard::worker(workers.start.limits, inner.id(), index)?;
         let shared = Arc::clone(&shard.shared);
         let _ = workers.slots[index].set(Arc::clone(&shared));
         workers.running.fetch_add(1, Ordering::AcqRel);
@@ -177,7 +177,6 @@ impl Workers {
                 if let Some(core) = core {
                     super::runtime::pin_to(core);
                 }
-                shard.set_owner(worker_inner.id(), index);
                 let _runtime = context::set_runtime(&worker_inner);
                 {
                     let _current = context::enter(&shard);

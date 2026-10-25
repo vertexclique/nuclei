@@ -4,6 +4,7 @@
 pub(crate) mod backend;
 mod blocking;
 pub(crate) mod context;
+pub(crate) mod counters;
 mod handshake;
 pub(crate) mod park;
 pub(crate) mod runtime;

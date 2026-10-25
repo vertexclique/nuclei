@@ -83,9 +83,16 @@ fn answer(res: i32) -> Answer<usize> {
     match res {
         r if r == -libc::ECANCELED => Answer::Undone { not_ready: false },
         r if r == -libc::EAGAIN => Answer::Undone { not_ready: true },
-        r if r < 0 => Answer::Done(Err(io::Error::from_raw_os_error(-r))),
+        r if r < 0 => Answer::Done(Err(failed(-r))),
         r => Answer::Done(Ok(r as usize)),
     }
+}
+
+/// The error of an operation that failed with errno `code`, counted.
+fn failed(code: i32) -> io::Error {
+    let err = io::Error::from_raw_os_error(code);
+    crate::rt::counters::io_error(&err);
+    err
 }
 
 impl RingMem {
@@ -103,7 +110,10 @@ impl RingMem {
                     let conn = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
                     Answer::Done(addr.to_addr(kind).map(|peer| (conn, peer)))
                 }
-                Answer::Done(Err(err)) => Answer::Done(Err(err)),
+                Answer::Done(Err(err)) => {
+                    crate::rt::counters::accept_error(&err);
+                    Answer::Done(Err(err))
+                }
                 Answer::Undone { not_ready } => Answer::Undone { not_ready },
             }),
             RingMem::Recv(mut buf) => {
@@ -117,7 +127,11 @@ impl RingMem {
                 // Its last connection came as an arrival.
                 r if r >= 0 => Answer::Done(Ok(())),
                 r => match answer(r) {
-                    Answer::Done(result) => Answer::Done(result.map(drop)),
+                    Answer::Done(result) => Answer::Done(
+                        result
+                            .map(drop)
+                            .inspect_err(crate::rt::counters::accept_error),
+                    ),
                     Answer::Undone { not_ready } => Answer::Undone { not_ready },
                 },
             }),
@@ -156,7 +170,7 @@ impl RingMem {
                     r if r == -libc::EALREADY => Answer::Undone { not_ready: true },
                     r if r == -libc::EISCONN => Answer::Done(Ok(())),
                     r if r == -libc::ECANCELED => Answer::Undone { not_ready: false },
-                    r if r < 0 => Answer::Done(Err(io::Error::from_raw_os_error(-r))),
+                    r if r < 0 => Answer::Done(Err(failed(-r))),
                     _ => Answer::Done(Ok(())),
                 },
             ),
@@ -567,7 +581,10 @@ fn entry(
                 let sqe = Sqe::connect(slot, addr.as_ptr(), addr.len);
                 (RingMem::Connect(dial, addr), sqe)
             }
-            Err(err) => return Err(Box::new(Outcome::Connect(dial, Answer::Done(Err(err))))),
+            Err(err) => {
+                crate::rt::counters::io_error(&err);
+                return Err(Box::new(Outcome::Connect(dial, Answer::Done(Err(err)))));
+            }
         },
         Want::Send(buf) => {
             let sqe = stream_write(kind, slot, buf.filled());
@@ -584,6 +601,7 @@ fn entry(
                 Target::Unix(path) => match RawAddr::unix(path) {
                     Ok(addr) => Some(addr),
                     Err(err) => {
+                        crate::rt::counters::io_error(&err);
                         return Err(Box::new(Outcome::SendTo(
                             buf,
                             target,
@@ -736,6 +754,7 @@ impl Source {
         token: u64,
         err: io::Error,
     ) -> io::Result<()> {
+        shard.counters.refused_registration();
         self.reg.ops.store(false, Ordering::Release);
         self.reg.state.store(super::UNREGISTERED, Ordering::Release);
         shard.release_source(token);

@@ -61,8 +61,9 @@ open Nuclei.FairSemaphore
 -- The worked example, computed.
 #print axioms Nuclei.Task.example_detached_last_waker
 
--- The wheel: placement after the wheel's slot, inside the slot, exact on level 0, a cascade
--- that lowers the level, the next top window's wrap, and the worked example.
+-- The broadcast channel: a position's slot is in the ring, a later position in the same slot is
+-- a whole ring later, a lag goes forward, the last ring of positions sit in different slots,
+-- and a receiver's taken plus lost values are everything sent since it subscribed.
 #print axioms Nuclei.Broadcast.slot_in_ring
 #print axioms Nuclei.Broadcast.later_in_same_slot_is_a_ring_later
 #print axioms Nuclei.Broadcast.lag_goes_forward
@@ -70,6 +71,8 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Broadcast.take_counts
 #print axioms Nuclei.Broadcast.lag_counts
 #print axioms Nuclei.Broadcast.closed_receiver_accounts_for_every_value
+-- The wheel: placement after the wheel's slot, inside the slot, exact on level 0, a cascade
+-- that lowers the level, the next top window's wrap, and the worked example.
 #print axioms Nuclei.Wheel.placed_after
 #print axioms Nuclei.Wheel.inside_slot
 #print axioms Nuclei.Wheel.level_zero_exact
@@ -85,3 +88,11 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Files.no_double_free
 #print axioms Nuclei.Files.copy_closes_unnamed
 #print axioms Nuclei.Files.example_reuse_waits
+
+-- A ring's overflow count: an overflow counts once however many waits it lasts, never more than
+-- the looks that saw it, a set look after a clear one counts, and stretches split at a clear
+-- look add up.
+#print axioms Nuclei.Overflow.stutter
+#print axioms Nuclei.Overflow.at_most_seen
+#print axioms Nuclei.Overflow.counted_after_clear
+#print axioms Nuclei.Overflow.split_at_clear
