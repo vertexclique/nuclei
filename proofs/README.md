@@ -272,10 +272,19 @@ swaps the flag back and notifies, so only the first of a burst of wakes notifies
 of the pair is sequentially consistent, so whichever publication comes second, the look after
 it sees the other: the shard finds the work, or the waker finds the shard parked.
 
-The family checks 8 configurations: 3 that must pass (one waker, three wakers racing, and
-liveness under weak fairness), 2 mutations that must deadlock (the shard sleeping without its
-look after publishing; a waker looking before it pushes), and 3 witnesses (a notification, a
-look that finds the work, a notification that lands while the shard is awake). TLA+ steps are
+The family checks 21 configurations. `Park.tla`: 6 that must pass (one waker, three wakers
+racing, liveness under weak fairness, a timer of the shard's own, its liveness, and a
+`Proactor::wake` that ends a `Proactor::wait` wherever it lands), 4 mutations that must
+deadlock (the shard sleeping without its look after publishing; a waker looking before it
+pushes; the drive waiting on the poller after a timer it fired; a `Proactor::wake` that
+notifies only a shard that parks already), and 4 witnesses (a notification, a look that finds
+the work, a notification that lands while the shard is awake, a timer fired on the way to
+park). `ShardStop.tla` checks a shard that stops while other threads push to it: a pusher
+that sees the shard stopped drops what its inbox holds, and the stopping shard drains pass
+after pass until nothing more comes (a timer's waker, a channel its tasks held), so no
+runnable is left to keep itself and the shard for good: 2 that must pass, 3 mutations that
+break `NothingLeft` (a pusher looking before it pushes, one that leaves its runnable, a single
+drain pass), and 2 witnesses. TLA+ steps are
 sequentially consistent, so the model checks the protocol; the loom models in
 `src/rt/handshake.rs` check the code, with two calibrations that must lose a wake (no look
 after publishing; the pair relaxed with no fence).
@@ -482,6 +491,90 @@ that runs random arms, cancels, resets and advances against a model keeping ever
 timer fires in the advance that first reaches its deadline, never earlier, never later, once.
 The wheel has no unsafe code and runs on one thread, so it has no TLA+ model and no loom model.
 
+## A ring source's attach from another thread
+
+`attach` (`tla/attach/Attach.tla`) checks the attach of a source to a ring performed off the
+ring's thread, racing a close or an evict (`src/io/source/requests.rs`,
+`src/io/source/ring.rs`). The performing thread marks the registration under way and posts the
+ring a copy of the descriptor; the ring's thread puts the file into its table and hands the
+slot back as a request, which whoever performs it (both sides held) keeps if the attach is
+still wanted, or lets go. 9 configurations: 4 that must pass (a close, an evict, both, and
+liveness), 2 mutations that leak the file into the table of a closed source (`NoLeak`), and 3
+witnesses.
+
+## A blocking job of a Windows handle
+
+`job` (`tla/job/Job.tla`) checks the cancel of a pool thread's call on a Windows handle opened
+for synchronous IO (`src/io/source/port.rs`, `Job`): `CancelSynchronousIo` ends whatever call
+the thread is in, so a cancel must never land after the job's call, in a later call of the
+same thread, and must never be lost. 8 configurations: 2 that must pass, 3 mutations (no
+CANCELLING flag lets a cancel stray into a later call; no retry deadlocks; no OUT flag breaks
+termination), and 3 witnesses.
+
+## A stopped shard's completion port
+
+`port` (`tla/port/PortKeep.tla`) checks how a Windows shard that stops running hands its
+completion port to a keeper, and how a source moves off that port while operations are still
+out (`src/rt/shard/port.rs`, `src/rt/park/iocp.rs`, `src/io/source/port.rs`). The shard
+waits for every eviction a side's holder performs, delivers what the port has ready, and
+hands the rest to a keeper job, which drains the port until nothing is out or the shard runs
+again; the shard calls off a keeper that has not started, and stops and waits for one that
+keeps, so one thread at most drains the port. A source's registration on another port waits
+while its handle has operations out (Windows cannot move it then) and is made again as the
+last one ends: the registration raises a flag and looks at the count again, the last
+completion lowers the count and looks at the flag. 13 configurations: 3 that must pass (one
+drainer and no failed registration, every packet delivered and the source registered,
+whether the shard runs again or not), 6 mutations (no keeper and no wait for the evictions
+strand packets, `AllDelivered`; no wait for the keeper and a keeper that ignores being called
+off break `OneDrainer`; no look at the count after the flag breaks `Registers`; a bind failure
+that fails the registration breaks `NoFailure`), and 4 witnesses.
+
+## Signals
+
+`signal` (`tla/signal/Signal.tla`) checks how a unix signal's deliveries reach a listener
+(`src/signal/unix.rs`, `src/signal/mod.rs`). The handler raises the signal's count, then
+writes to the process's wake descriptor; each shard's pump drains the descriptor, then
+dispatches: it loads the count, swaps it into the count the last dispatch woke for, and wakes
+the listeners if it moved. A listener takes an item when the count moved since it last looked,
+else registers its waker and looks again before it sleeps. 7 configurations: 2 that must pass
+(never an item more than the deliveries; every delivery seen), 3 mutations that lose a
+delivery (`SeesAll`: the handler writing before it counts, a pump looking before it drains, a
+listener sleeping without its second look), and 2 witnesses (deliveries coalesced into one
+item, a pump's wake).
+
+## Child processes
+
+`process` (`tla/process/ExitWatch.tla`, `tla/process/KillReap.tla`) checks how a child's exit
+is watched and reaped (`src/process/exit.rs`, `src/rt/shard/children.rs`,
+`src/rt/shard/ring/exits.rs`). `ExitWatch`: one shard at a time watches a child; a ring's
+watch is a `WAITID` that reaps the child itself, so a second watch would find ECHILD. A shard
+that stops running cancels its watch and lets the child go only at that watch's completion; a
+waiter registers its waker, has its shard watch the child unless one does (a `try_wait` before
+may have, with no waker), and looks again before it sleeps; a dropped `Child`'s child is
+watched elsewhere. `KillReap`: a kill by pid and a reap by pid exclude each other through the
+child's state, so no signal goes by pid after the reap. 12 configurations: 4 that must pass, 4
+mutations (letting go at the cancel breaks `OneWatch`; no second look and an unwatched orphan
+break `Settles`; a killer that only looks breaks `NoKillAfterReap`), and 4 witnesses.
+
+## The broadcast channel
+
+`broadcast` (`tla/broadcast/Broadcast.tla`) checks the broadcast channel's senders and a
+receiver (`src/sync/broadcast.rs`). A sender takes the next position from the tail and
+publishes it into the position's slot unless the slot holds a later position (a send a ring
+later got there first: its value goes, every receiver is past it); the last sender to go
+closes the channel. The receiver looks at its next position's slot: its own position is a value
+taken, a later one is a lag (it goes on from the tail, read then, less the ring's size, counting
+what it skipped), anything else is nothing yet, unless the channel is closed and its next
+position is the tail. 7 configurations: 2 that must pass (what was taken plus what was
+reported lost is every value sent; the receiver reaches the close), 3 mutations (a send
+publishing over a later position leaves the receiver waiting for good, `Finishes`; stopping at
+the close with values in the ring and an uncounted lag break `Counted`), and 2 witnesses (a
+lag; a send that finds a later position in its slot). `lean/Nuclei/Broadcast.lean` proves the
+arithmetic, for every size: a later position found in a receiver's slot is at least a whole
+ring later, so the receiver's new position is past its old one; the ring's last positions sit
+in different slots; and a take or a lag keeps taken plus lost equal to the positions passed,
+so at the close a receiver accounts for every value sent after it subscribed.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the
@@ -500,6 +593,12 @@ The wheel has no unsafe code and runs on one thread, so it has no TLA+ model and
 - **The rest of the channel.** The unbounded channel, weak senders and their upgrade,
   `Sender::closed`, `recv_many`, the waiter nodes' recycling, the waiting list's sweep of
   withdrawn nodes, and the destructors of values are not in these models.
+- **The newer families' abstractions.** The signal model leaves out the handler's
+  async-signal-safety and its errno (code review and the signal tests' part); the process
+  models abstract the kernel's reap to one step; the port model abstracts Windows'
+  refusal to rebind a handle with operations out to a bind that fails while any are; the
+  broadcast model leaves the wake to `Notify` (checked with the sync primitives) and the
+  reclamation of nodes to kovan.
 - **How soon.** `Termination` says every waiter is eventually served under weak fairness; it
   says nothing about how long that takes, and nothing about a thread the scheduler stops for
   good.
