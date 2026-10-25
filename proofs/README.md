@@ -600,6 +600,32 @@ after any number of sends short of a whole turn of the word (2^63) the version d
 one before them, so a receiver that slept through them hears of a change; and `mark_changed`
 always makes a change.
 
+## The cancellation token's tree
+
+`cancel` (`tla/cancel/Cancel.tla`) checks the tree behind `CancellationToken`
+(`src/sync/cancellation.rs`, `node.rs`) at the grain of its atomic steps: the making of a child
+node, its insert into its parent's registry and its read of the parent's flag; a cancel's flag
+set and its walk, reading each registry with an upgrade of each weak handle, marking what it
+found and going into all of it; and each strong handle let go, with the free, the removal from the
+registry and the walk up the chain. The tree is a root, its child and a grandchild made while one
+cancel runs on the root and, in some configurations, another on the child. The SeqCst fences are
+abstract (a TLA+ step is seen by every thread at once; the module docs and the loom models cover
+the fences), and so is the registry's walk, taken as one read. 10 configurations: 3 that must
+pass (one cancel; two at once; both, with every token dropped at the end), with a cancel that
+returned leaving every descendant that existed as it began cancelled or freed
+(`CancelReturnsWithSubtree`), a child made during a cancel cancelled once both returned, no walk
+touching a freed node, a freed node in no registry, and with every token gone the whole tree freed;
+5 mutations (a child reading its parent's flag before its insert stays uncancelled,
+`RacingChildCancelled`; a walk that does not go into a child another cancel marked returns before
+that subtree is cancelled, `CancelReturnsWithSubtree`; a walk using the weak handles without
+upgrading them reaches a freed node, `NoTouchFreed`; a freed node left in its parent's registry,
+`RegistryHoldsTheLive`; a freed node that does not let go of its parent leaks the chain, `NoLeak`);
+and 2 witnesses (a new child cancelling itself; a walk going into a child another cancel had
+marked). `lean/Nuclei/Cancel.lean` proves the free's walk up a chain of any length: letting go of
+one handle frees exactly the nodes at the start of the chain that held their last handle, the next
+one loses one handle and stays, no node with another handle is freed, and a chain of last handles
+goes whole, whatever its length.
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver

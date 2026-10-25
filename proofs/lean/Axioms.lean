@@ -107,3 +107,12 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Watch.publishN_version
 #print axioms Nuclei.Watch.sends_are_seen
 #print axioms Nuclei.Watch.mark_changed_makes_a_change
+
+-- A cancellation token's chain going: freed plus left is the chain, exactly the last holders at
+-- its start are freed, a node with another handle stops the walk and is never freed, and a chain
+-- of last handles of any length goes whole.
+#print axioms Nuclei.Cancel.freed_and_left
+#print axioms Nuclei.Cancel.frees_the_last_holders
+#print axioms Nuclei.Cancel.stops_at_a_node_with_another_handle
+#print axioms Nuclei.Cancel.never_frees_a_held_node
+#print axioms Nuclei.Cancel.a_chain_of_last_handles_goes_whole

@@ -1,0 +1,11 @@
+# configuration                spec                 expected
+L_cancel                       MC_Cancel            pass
+L_two_cancels                  MC_Cancel            pass
+L_drop_all                     MC_Cancel            pass
+M_flag_before_insert           MC_Cancel            violated:RacingChildCancelled
+M_skip_marked                  MC_Cancel            violated:CancelReturnsWithSubtree
+M_visit_without_upgrade        MC_Cancel            violated:NoTouchFreed
+M_no_detach                    MC_Cancel            violated:RegistryHoldsTheLive
+M_no_walk_up                   MC_Cancel            violated:NoLeak
+W_self_cancel                  MC_Cancel            violated:NoSelfCancel
+W_found_marked                 MC_Cancel            violated:NoFoundMarked

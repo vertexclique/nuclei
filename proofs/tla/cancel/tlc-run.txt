@@ -1,0 +1,17 @@
+TLC run of every configuration in proofs/tla/cancel, 2026-10-25 18:23 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_cancel                         12845       5390      1  pass                                  pass                                  yes
+L_two_cancels                   534568     163068      3  pass                                  pass                                  yes
+L_drop_all                     4485274    1239772     11  pass                                  pass                                  yes
+M_flag_before_insert              1218        592      1  violated:RacingChildCancelled         violated:RacingChildCancelled         yes
+M_skip_marked                    67132      23891      2  violated:CancelReturnsWithSubtree     violated:CancelReturnsWithSubtree     yes
+M_visit_without_upgrade          22809       8351      2  violated:NoTouchFreed                 violated:NoTouchFreed                 yes
+M_no_detach                      54974      20839      1  violated:RegistryHoldsTheLive         violated:RegistryHoldsTheLive         yes
+M_no_walk_up                     59051      22096      1  violated:NoLeak                       violated:NoLeak                       yes
+W_self_cancel                      110         62      1  violated:NoSelfCancel                 violated:NoSelfCancel                 yes
+W_found_marked                     330        176      1  violated:NoFoundMarked                violated:NoFoundMarked                yes
+
+results matching EXPECTED.txt: 10 of 10
