@@ -45,6 +45,12 @@ impl ParkState {
         }
     }
 
+    /// Whether the shard says it parks, for a test that failed.
+    #[cfg(test)]
+    pub(crate) fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
     /// The shard woke. A waker may have cleared `parked` already.
     pub(crate) fn end_park(&self) {
         self.parked.store(false, Ordering::SeqCst);

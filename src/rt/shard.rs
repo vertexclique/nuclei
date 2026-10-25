@@ -240,6 +240,22 @@ impl Shared {
         self.registrar.is_none()
     }
 
+    /// The shard as other threads see it, as a line, for a test that failed.
+    #[cfg(test)]
+    pub(crate) fn state_line(&self) -> String {
+        format!(
+            "parked {}, inbox {}, local inbox {}, timer ops {}, io ops {}, load {}, stopped {}, draining {}",
+            self.park.is_parked(),
+            self.inbox.len(),
+            self.local_inbox.len(),
+            self.timer_ops.len(),
+            self.io_ops.len(),
+            self.load.load(Ordering::SeqCst),
+            self.stopped.load(Ordering::SeqCst),
+            self.draining.load(Ordering::SeqCst),
+        )
+    }
+
     /// Hands a registration change to the shard and wakes it.
     pub(crate) fn post_io(&self, op: IoOp) {
         self.io_ops.push(op);

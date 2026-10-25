@@ -17,6 +17,16 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    on_worker_reporting(rt, fut, String::new)
+}
+
+/// As [`on_worker`], with `report` saying more of the state should the
+/// task never be seen to complete.
+fn on_worker_reporting<F>(rt: &Runtime, fut: F, report: impl Fn() -> String) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     use std::sync::atomic::AtomicU8;
     // How far the task got, should it never be seen to complete: it never
     // ran (its spawn's wake was lost), it runs (its worker is stuck), or it
@@ -37,12 +47,19 @@ where
         match crate::time::timeout(Duration::from_secs(30), crate::runtime::spawn(task)).await {
             Ok(out) => out,
             Err(_) => panic!(
-                "the task never completed: {}",
+                "the task never completed: {}; the workers: [{}]; {}",
                 match progress.load(Ordering::SeqCst) {
                     0 => "it never ran",
                     STARTED => "it still runs, past its own deadlines",
                     _ => "it ended, and this thread was never woken for it",
-                }
+                },
+                rt.inner()
+                    .workers
+                    .shards()
+                    .map(|s| s.state_line())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                report(),
             ),
         }
     })
@@ -170,47 +187,70 @@ fn a_dropped_lent_read_hands_its_bytes_to_the_next_read() {
     let rt = runtime(None);
     let (a, b) = pair();
     let (src, peer) = (Arc::clone(&b.src), a.io().try_clone().unwrap());
-    let (first, rest) = on_worker(&rt, async move {
-        let woke = Arc::new(Flag(AtomicBool::new(false)));
-        let waker = Waker::from(Arc::clone(&woke));
-        let mut lent = Box::pin(src.read_owned(exactly(4)));
-        assert!(
-            lent.as_mut()
-                .poll(&mut Context::from_waker(&waker))
-                .is_pending()
-        );
-        send(&peer, b"abcdefgh");
-        until_or(
-            || woke.0.load(Ordering::SeqCst),
-            || {
-                format!(
-                    "the driver never filled the lent buffer: {}",
-                    src.read_report()
-                )
-            },
+    // The step the task reached, for a report should it never complete.
+    let step = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let at = Arc::clone(&step);
+    let watched = Arc::clone(&b.src);
+    let report = move || {
+        format!(
+            "the task was at step {}; the read side: {}",
+            step.load(Ordering::SeqCst),
+            watched.read_report()
         )
-        .await;
-        let mut first = [0u8; 4];
-        let mut early = Box::pin(read(&src, &mut first));
-        pends(&mut early).await;
-        let before = src.read_report();
-        drop(lent);
-        let after = src.read_report();
-        // The state on both sides of the drop, should the read never end.
-        match crate::time::timeout(Duration::from_secs(5), early).await {
-            Ok(n) => assert_eq!(n.unwrap(), 4),
-            Err(_) => panic!(
-                "the read never ended; before the drop: {before}; after: {after}; now: {}",
-                src.read_report()
-            ),
-        }
-        let mut rest = [0u8; 4];
-        match crate::time::timeout(Duration::from_secs(5), read_exact(&src, &mut rest)).await {
-            Ok(done) => done.unwrap(),
-            Err(_) => panic!("the rest never came: {}", src.read_report()),
-        }
-        (first, rest)
-    });
+    };
+    let (first, rest) = on_worker_reporting(
+        &rt,
+        async move {
+            let at = |n: u8| at.store(n, Ordering::SeqCst);
+            at(1);
+            let woke = Arc::new(Flag(AtomicBool::new(false)));
+            let waker = Waker::from(Arc::clone(&woke));
+            let mut lent = Box::pin(src.read_owned(exactly(4)));
+            assert!(
+                lent.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            send(&peer, b"abcdefgh");
+            at(2);
+            until_or(
+                || woke.0.load(Ordering::SeqCst),
+                || {
+                    format!(
+                        "the driver never filled the lent buffer: {}",
+                        src.read_report()
+                    )
+                },
+            )
+            .await;
+            at(3);
+            let mut first = [0u8; 4];
+            let mut early = Box::pin(read(&src, &mut first));
+            pends(&mut early).await;
+            at(4);
+            let before = src.read_report();
+            drop(lent);
+            let after = src.read_report();
+            at(5);
+            // The state on both sides of the drop, should the read never end.
+            match crate::time::timeout(Duration::from_secs(5), early).await {
+                Ok(n) => assert_eq!(n.unwrap(), 4),
+                Err(_) => panic!(
+                    "the read never ended; before the drop: {before}; after: {after}; now: {}",
+                    src.read_report()
+                ),
+            }
+            at(6);
+            let mut rest = [0u8; 4];
+            match crate::time::timeout(Duration::from_secs(5), read_exact(&src, &mut rest)).await {
+                Ok(done) => done.unwrap(),
+                Err(_) => panic!("the rest never came: {}", src.read_report()),
+            }
+            at(7);
+            (first, rest)
+        },
+        report,
+    );
     assert_eq!((&first, &rest), (b"abcd", b"efgh"));
     drop(a);
 }
