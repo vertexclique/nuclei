@@ -5,8 +5,9 @@
 //! task that asked for it; no task waits for readiness and then makes the
 //! call itself.
 //!
-//! IO runs on epoll on Linux and on kqueue on macOS and the BSDs. A
-//! [`Handle`] wraps std's own socket or file types and gives them async
+//! IO runs on io_uring on Linux where the kernel allows it, else on epoll;
+//! on kqueue on macOS and the BSDs; and on I/O completion ports on Windows.
+//! A [`Handle`] wraps std's own socket or file types and gives them async
 //! operations (`accept`, `connect`, `send`, `recv`, ...) and the
 //! `futures-io` traits. [`spawn`], [`block_on`] and the rest place work on
 //! the process default [`Runtime`], which starts on first use with no
@@ -43,11 +44,8 @@ mod buf;
 mod compat;
 /// Nuclei's configuration options reside here.
 pub mod config;
-#[cfg(unix)]
 mod fs;
-#[cfg(unix)]
 mod io;
-#[cfg(unix)]
 mod net;
 mod proactor;
 mod rt;
@@ -55,13 +53,17 @@ mod rt;
 pub mod runtime;
 /// Runtime-independent synchronization primitives: futures and wakers only, usable from any executor.
 pub mod sync;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
 mod syscore {
     // The io_uring ring and its probe. Parts of the ring layer (provided
     // buffer rings, multishot entries, flags) are for the driver's next
     // steps; their own tests run them now.
-    #![allow(dead_code)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[allow(dead_code)]
     pub(crate) mod linux;
+    // The kernel32, ws2_32 and ntdll interface of the IOCP driver.
+    #[cfg(windows)]
+    pub(crate) mod windows;
 }
 #[cfg(test)]
 mod alone;
@@ -78,19 +80,15 @@ pub mod time;
     target_os = "netbsd",    // kqueue
     target_os = "openbsd",   // kqueue
     target_os = "dragonfly", // kqueue
+    windows,                 // I/O completion ports
 )))]
 compile_error!("Target OS is not supported");
-
-#[cfg(target_os = "windows")]
-compile_error!("nuclei's Windows backend (I/O completion ports) is not in this version");
 
 pub use compat::{
     GlobalExecutorConfig, init, init_with_config, spawn_more_threads, stop_current_thread,
     stop_thread,
 };
-#[cfg(unix)]
-pub use io::Handle;
-#[cfg(unix)]
+pub use io::{Handle, IoObject};
 pub use net::TcpStreamGenerator;
 #[cfg(feature = "attributes")]
 pub use nuclei_macros::{bench, main, test};

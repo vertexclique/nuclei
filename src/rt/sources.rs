@@ -60,6 +60,7 @@ impl Sources {
 
     /// The source registered under `token`, if that registration is still
     /// in place.
+    #[cfg(any(readiness, test))]
     pub(crate) fn get(&self, token: u64) -> Option<&Arc<Source>> {
         let slot = self.slots.get((token & INDEX_MASK) as usize)?;
         if slot.generation != token >> INDEX_BITS {
@@ -101,7 +102,7 @@ mod tests {
     use crate::io::source::Kind;
 
     fn source() -> std::sync::Arc<Source> {
-        Source::new(-1, Kind::Bytes)
+        Source::new(crate::io::raw::NONE, Kind::Bytes)
     }
 
     #[test]

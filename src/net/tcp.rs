@@ -5,7 +5,6 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::os::fd::OwnedFd;
 
 use futures_core::Stream;
 
@@ -70,14 +69,15 @@ impl Handle<TcpListener> {
     }
 }
 
-/// An accepted connection, non-blocking already.
-fn stream(fd: OwnedFd) -> Handle<TcpStream> {
+/// An accepted connection, set up already.
+fn stream(fd: crate::io::raw::Owned) -> Handle<TcpStream> {
     Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp)
 }
 
 fn inet(addr: Addr) -> io::Result<SocketAddr> {
     match addr {
         Addr::Inet(addr) => Ok(addr),
+        #[cfg(unix)]
         Addr::Unix(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "a TCP listener's peer has no internet address",
@@ -186,15 +186,22 @@ impl Handle<TcpStream> {
 /// One connect: a non-blocking socket, its connect, and the driver seeing
 /// it end.
 async fn connect(addr: SocketAddr) -> io::Result<Handle<TcpStream>> {
-    let domain = if addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
+    #[cfg(unix)]
+    let socket = {
+        let domain = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        sys::socket(domain, libc::SOCK_STREAM)?
     };
-    let stream = Handle::from_nonblocking(
-        TcpStream::from(sys::socket(domain, libc::SOCK_STREAM)?),
-        Kind::Tcp,
-    );
+    #[cfg(windows)]
+    let socket = sys::tcp_socket(if addr.is_ipv4() {
+        crate::syscore::windows::AF_INET
+    } else {
+        crate::syscore::windows::AF_INET6
+    })?;
+    let stream = Handle::from_nonblocking(TcpStream::from(socket), Kind::Tcp);
     poll_fn(|cx| stream.source().poll_connect(cx, Peer::Inet(addr))).await?;
     Ok(stream)
 }

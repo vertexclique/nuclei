@@ -3,7 +3,9 @@
 
 use std::future::{Future, poll_fn};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,21 +16,109 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use super::write::Dest;
 use super::{Addr, Kind, Source};
+use crate::io::raw::Raw;
+#[cfg(unix)]
 use crate::io::sys;
 use crate::runtime::{Builder, Runtime};
 
+/// The connected stream sockets the tests pair: Unix ones where the system
+/// has them, else TCP over loopback.
+#[cfg(unix)]
+type Stream = UnixStream;
+#[cfg(windows)]
+type Stream = std::net::TcpStream;
+#[cfg(unix)]
+const STREAM: Kind = Kind::Stream;
+#[cfg(windows)]
+const STREAM: Kind = Kind::Tcp;
+
+/// The connected datagram sockets the tests pair, likewise.
+#[cfg(unix)]
+type Datagram = UnixDatagram;
+#[cfg(windows)]
+type Datagram = std::net::UdpSocket;
+#[cfg(unix)]
+const DATAGRAM: Kind = Kind::UnixDatagram;
+#[cfg(windows)]
+const DATAGRAM: Kind = Kind::Udp;
+
+fn stream_pair() -> (Stream, Stream) {
+    #[cfg(unix)]
+    return UnixStream::pair().unwrap();
+    #[cfg(windows)]
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = Stream::connect(listener.local_addr().unwrap()).unwrap();
+        let (b, _) = listener.accept().unwrap();
+        (a, b)
+    }
+}
+
+fn datagram_pair() -> (Datagram, Datagram) {
+    #[cfg(unix)]
+    return UnixDatagram::pair().unwrap();
+    #[cfg(windows)]
+    {
+        let a = Datagram::bind("127.0.0.1:0").unwrap();
+        let b = Datagram::bind("127.0.0.1:0").unwrap();
+        a.connect(b.local_addr().unwrap()).unwrap();
+        b.connect(a.local_addr().unwrap()).unwrap();
+        (a, b)
+    }
+}
+
+/// A test's socket, as a source names it.
+trait TestIo {
+    fn raw(&self) -> Raw;
+}
+
+#[cfg(unix)]
+impl<T: AsRawFd> TestIo for T {
+    fn raw(&self) -> Raw {
+        self.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsRawSocket> TestIo for T {
+    fn raw(&self) -> Raw {
+        self.as_raw_socket() as Raw
+    }
+}
+
+/// Readies a socket for a source of its own: non-blocking where the driver
+/// makes the calls (a port's operations do not care).
+fn adopt(io: &impl TestIo) {
+    #[cfg(unix)]
+    sys::set_nonblocking(io.raw()).unwrap();
+    #[cfg(windows)]
+    let _ = io;
+}
+
+/// Writes all of `bytes` to the peer from the test, waiting out a full
+/// socket buffer.
+fn send(mut io: &Stream, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        match io.write(bytes) {
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
 /// A socket with its source, retired before the socket closes: the order a
 /// handle keeps.
-struct Owned<T: AsRawFd> {
+struct Owned<T: TestIo> {
     src: Arc<Source>,
     io: Option<T>,
 }
 
-impl<T: AsRawFd> Owned<T> {
+impl<T: TestIo> Owned<T> {
     fn new(io: T, kind: Kind) -> Self {
-        sys::set_nonblocking(io.as_raw_fd()).unwrap();
+        adopt(&io);
         Self {
-            src: Source::new(io.as_raw_fd(), kind),
+            src: Source::new(io.raw(), kind),
             io: Some(io),
         }
     }
@@ -38,7 +128,7 @@ impl<T: AsRawFd> Owned<T> {
     }
 }
 
-impl<T: AsRawFd> Drop for Owned<T> {
+impl<T: TestIo> Drop for Owned<T> {
     fn drop(&mut self) {
         self.src.retire();
         drop(self.io.take());
@@ -53,9 +143,9 @@ fn runtime(cap: Option<usize>) -> Runtime {
     b.build().unwrap()
 }
 
-fn pair() -> (Owned<UnixStream>, Owned<UnixStream>) {
-    let (a, b) = UnixStream::pair().unwrap();
-    (Owned::new(a, Kind::Stream), Owned::new(b, Kind::Stream))
+fn pair() -> (Owned<Stream>, Owned<Stream>) {
+    let (a, b) = stream_pair();
+    (Owned::new(a, STREAM), Owned::new(b, STREAM))
 }
 
 async fn read(src: &Arc<Source>, buf: &mut [u8]) -> io::Result<usize> {
@@ -103,7 +193,8 @@ async fn read_exact(src: &Arc<Source>, mut buf: &mut [u8]) -> io::Result<()> {
 
 /// Fills the kernel's buffers of `io` until it takes no more; returns the
 /// bytes written.
-fn fill(io: &UnixStream) -> Vec<u8> {
+fn fill(io: &Stream) -> Vec<u8> {
+    io.set_nonblocking(true).unwrap();
     let chunk = vec![7u8; 64 * 1024];
     let mut written = Vec::new();
     loop {
@@ -146,11 +237,10 @@ fn a_read_that_waits_is_completed_by_the_driver() {
     let rt = runtime(None);
     let (a, b) = pair();
     let writer = {
-        let fd = a.io().as_raw_fd();
+        let peer = a.io().try_clone().unwrap();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            // SAFETY: `a` outlives the thread, which is joined below.
-            sys::write(fd, b"late").unwrap();
+            send(&peer, b"late");
         })
     };
     rt.block_on(async {
@@ -261,7 +351,7 @@ fn a_failed_write_behind_fails_every_write_until_a_flush_reports_it() {
             matches!(
                 failed.kind(),
                 io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-            ),
+            ) || cfg!(windows) && failed.kind() == io::ErrorKind::ConnectionAborted,
             "{failed:?}"
         );
         assert!(
@@ -272,31 +362,37 @@ fn a_failed_write_behind_fails_every_write_until_a_flush_reports_it() {
     });
 }
 
-#[test]
-fn connections_are_accepted_now_and_by_the_driver_and_none_are_lost() {
+/// Accepts on `listener` while `connect` makes clients: an accept dropped
+/// while it waits loses no connection, and a burst is taken whole, part at
+/// once and part by the driver. `S` is the accepted sockets' type, of
+/// `kind`; `is_peer` checks the address an accept reports.
+fn accepts_every_connection<S, C>(
+    listener: Owned<impl TestIo>,
+    connect: impl Fn() -> C,
+    kind: Kind,
+    is_peer: fn(&Addr) -> bool,
+) where
+    S: From<crate::io::raw::Owned> + TestIo,
+    C: Read,
+{
     let rt = runtime(None);
-    let dir = tempdir();
-    let path = dir.join("accept.sock");
-    let listener = Owned::new(UnixListener::bind(&path).unwrap(), Kind::UnixListener);
     rt.block_on(async {
         // An accept that waits, then is dropped: the driver still takes the
         // connection that comes, for the next accept.
         let mut dropped = Box::pin(poll_fn(|cx| listener.src.poll_accept(cx)));
         pends(&mut dropped).await;
         drop(dropped);
-        let first = UnixStream::connect(&path).unwrap();
+        let first = connect();
         crate::time::sleep(Duration::from_millis(10)).await;
         let (conn, addr) = within(poll_fn(|cx| listener.src.poll_accept(cx)))
             .await
             .unwrap();
-        assert!(matches!(addr, Addr::Unix(_)));
+        assert!(is_peer(&addr), "{addr:?}");
         drop((conn, first));
         // Then a burst: some accepted at once, the rest by the driver.
         let mut waiting = Box::pin(poll_fn(|cx| listener.src.poll_accept(cx)));
         pends(&mut waiting).await;
-        let clients: Vec<_> = (0..8)
-            .map(|_| UnixStream::connect(&path).unwrap())
-            .collect();
+        let clients: Vec<_> = (0..8).map(|_| connect()).collect();
         let mut accepted = vec![within(waiting).await.unwrap()];
         while accepted.len() < clients.len() {
             accepted.push(
@@ -306,26 +402,56 @@ fn connections_are_accepted_now_and_by_the_driver_and_none_are_lost() {
             );
         }
         // Each accepted connection is a working peer of one client.
-        for (client, (conn, _)) in clients.iter().zip(&accepted) {
-            let _ = (client, conn);
-        }
-        let mut seen = 0;
         for (conn, _) in &accepted {
-            let conn = Owned::new(UnixStream::from(conn.try_clone().unwrap()), Kind::Stream);
+            let conn = Owned::new(S::from(conn.try_clone().unwrap()), kind);
             within(write_all(&conn.src, b"!")).await.unwrap();
-            seen += 1;
         }
-        assert_eq!(seen, clients.len());
         for mut client in clients {
             let mut b = [0u8; 1];
-            client
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
             client.read_exact(&mut b).unwrap();
             assert_eq!(&b, b"!");
         }
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_connections_are_accepted_now_and_by_the_driver_and_none_are_lost() {
+    let dir = tempdir();
+    let path = dir.join("accept.sock");
+    let listener = Owned::new(UnixListener::bind(&path).unwrap(), Kind::UnixListener);
+    accepts_every_connection::<UnixStream, _>(
+        listener,
+        || {
+            let client = UnixStream::connect(&path).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client
+        },
+        Kind::Stream,
+        |addr| matches!(addr, Addr::Unix(_)),
+    );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn tcp_connections_are_accepted_now_and_by_the_driver_and_none_are_lost() {
+    let bound = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = bound.local_addr().unwrap();
+    let listener = Owned::new(bound, Kind::TcpListener);
+    accepts_every_connection::<std::net::TcpStream, _>(
+        listener,
+        || {
+            let client = std::net::TcpStream::connect(at).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client
+        },
+        Kind::Tcp,
+        |addr| matches!(addr, Addr::Inet(peer) if peer.ip().is_loopback()),
+    );
 }
 
 /// Linux lets a Unix datagram be as large as the socket buffer; other
@@ -364,9 +490,9 @@ fn datagrams_wait_peek_and_arrive_whole_even_past_the_largest_class() {
 #[test]
 fn a_datagram_is_cut_to_the_buffer_as_the_kernel_cuts_it() {
     let rt = runtime(None);
-    let (a, b) = UnixDatagram::pair().unwrap();
-    let a = Owned::new(a, Kind::UnixDatagram);
-    let b = Owned::new(b, Kind::UnixDatagram);
+    let (a, b) = datagram_pair();
+    let a = Owned::new(a, DATAGRAM);
+    let b = Owned::new(b, DATAGRAM);
     rt.block_on(async {
         let mut small = [0u8; 4];
         let mut recv = Box::pin(poll_fn(|cx| b.src.poll_receive(cx, &mut small, false)));
@@ -389,6 +515,7 @@ fn a_datagram_is_cut_to_the_buffer_as_the_kernel_cuts_it() {
 /// (a dup elsewhere keeps the kernel's registration of it alive unless it
 /// was deleted): neither the old file's events nor a stale token may make
 /// the driver read the new socket's bytes.
+#[cfg(unix)]
 #[test]
 fn a_reused_descriptor_number_is_never_read_for_the_old_registration() {
     let rt = runtime(None);
@@ -431,11 +558,11 @@ fn a_reused_descriptor_number_is_never_read_for_the_old_registration() {
 #[test]
 fn a_revival_with_another_descriptor_discards_the_old_ones_results() {
     let rt = runtime(None);
-    let (a1, b1) = UnixStream::pair().unwrap();
-    let (a2, b2) = UnixStream::pair().unwrap();
-    sys::set_nonblocking(b1.as_raw_fd()).unwrap();
-    sys::set_nonblocking(b2.as_raw_fd()).unwrap();
-    let src = Source::new(b1.as_raw_fd(), Kind::Stream);
+    let (a1, b1) = stream_pair();
+    let (a2, b2) = stream_pair();
+    adopt(&b1);
+    adopt(&b2);
+    let src = Source::new(b1.raw(), STREAM);
     rt.block_on(async {
         let mut buf = [0u8; 8];
         let mut waiting = Box::pin(read(&src, &mut buf));
@@ -451,7 +578,7 @@ fn a_revival_with_another_descriptor_discards_the_old_ones_results() {
     // Swap: retire, then revive with the other socket.
     src.retire();
     drop(b1);
-    src.revive(b2.as_raw_fd());
+    src.revive(b2.raw());
     (&a2).write_all(b"new").unwrap();
     rt.block_on(async {
         let mut buf = [0u8; 8];
@@ -478,7 +605,7 @@ fn a_revival_with_the_same_descriptor_keeps_the_read_ahead() {
         assert!(b.src.has_read_ahead());
     });
     b.src.retire();
-    b.src.revive(b.io().as_raw_fd());
+    b.src.revive(b.io().raw());
     rt.block_on(async {
         let mut buf = [0u8; 8];
         let n = within(read(&b.src, &mut buf)).await.unwrap();
@@ -501,17 +628,8 @@ fn reads_complete_through_a_pool_of_one_small_buffer() {
             read_exact(&reader_src, &mut got).await.unwrap();
             got == expected
         });
-        let writer_fd = a.io().as_raw_fd();
-        let writer = std::thread::spawn(move || {
-            let mut rest = &data[..];
-            while !rest.is_empty() {
-                match sys::write(writer_fd, rest) {
-                    Ok(n) => rest = &rest[n..],
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
-                    Err(e) => panic!("{e}"),
-                }
-            }
-        });
+        let peer = a.io().try_clone().unwrap();
+        let writer = std::thread::spawn(move || send(&peer, &data));
         assert!(within(reader).await);
         writer.join().unwrap();
         drop(a);
@@ -586,9 +704,9 @@ fn a_thread_that_runs_no_shard_is_served_by_the_runtime() {
 #[test]
 fn a_datagram_larger_than_the_pool_allows_fails_loudly() {
     let rt = runtime(Some(64 * 1024));
-    let (a, b) = UnixDatagram::pair().unwrap();
-    let a = Owned::new(a, Kind::UnixDatagram);
-    let b = Owned::new(b, Kind::UnixDatagram);
+    let (a, b) = datagram_pair();
+    let a = Owned::new(a, DATAGRAM);
+    let b = Owned::new(b, DATAGRAM);
     rt.block_on(async {
         let big = vec![1u8; 100 * 1024];
         // Polled on a worker, whose pool has the cap.
@@ -628,6 +746,7 @@ fn set_buffers(fd: std::os::fd::RawFd, bytes: libc::c_int) {
     }
 }
 
+#[cfg(unix)]
 fn tempdir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "nuclei-source-{}-{}",

@@ -447,7 +447,7 @@ impl Source {
         self: &'a Arc<Self>,
         current: Option<&'a crate::rt::shard::Shard>,
     ) -> Option<RingIo<'a>> {
-        if !self.reg.ring.load(Ordering::Acquire) {
+        if !self.reg.ops.load(Ordering::Acquire) {
             return None;
         }
         if self.reg.state.load(Ordering::Acquire) != super::REGISTERED {
@@ -481,7 +481,7 @@ impl Source {
             here.filter(|s| s.is(&shard))
                 .and_then(|s| s.ring().map(|ring| ring.attach(fd)))
         });
-        self.reg.ring.store(true, Ordering::Release);
+        self.reg.ops.store(true, Ordering::Release);
         self.reg
             .home
             .store(Arc::as_ptr(&shard) as usize, Ordering::Release);
@@ -513,7 +513,7 @@ impl Source {
         token: u64,
         err: io::Error,
     ) -> io::Result<()> {
-        self.reg.ring.store(false, Ordering::Release);
+        self.reg.ops.store(false, Ordering::Release);
         self.reg.state.store(super::UNREGISTERED, Ordering::Release);
         shard.release_source(token);
         Err(err)
@@ -543,7 +543,7 @@ impl Source {
                 self.reg.state.store(super::REGISTERED, Ordering::Release);
             }
             Err(err) => {
-                self.reg.ring.store(false, Ordering::Release);
+                self.reg.ops.store(false, Ordering::Release);
                 self.reg.state.store(super::UNREGISTERED, Ordering::Release);
                 shard.release_source(token);
                 self.registration_failed(&err);

@@ -37,6 +37,10 @@ impl WriteState {
 
     /// Issues what the side holds, if this thread reaches a completion
     /// driver.
+    #[cfg_attr(
+        not(readiness),
+        expect(irrefutable_let_patterns, reason = "a port is the only driver there")
+    )]
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
         if let Io::Ops(route) = io {
             self.submit_ops(route, kind, after);

@@ -26,7 +26,9 @@ use core::future::poll_fn;
 use core::task::{Poll, Waker};
 use std::io;
 use std::net::SocketAddr;
+#[cfg(readiness)]
 use std::os::fd::RawFd;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
 use std::task::Context;
@@ -43,12 +45,20 @@ mod ops;
 /// one buffer rather than waiting on each.
 const BEHIND_MIN: usize = 16 * 1024;
 
+/// A Unix socket's path, borrowed; on Windows, which has none, nothing can
+/// be one.
+#[cfg(unix)]
+pub(crate) type UnixPath<'a> = &'a Path;
+#[cfg(windows)]
+pub(crate) type UnixPath<'a> = (core::convert::Infallible, core::marker::PhantomData<&'a ()>);
+
 /// Where a datagram goes, borrowed for one send.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Dest<'a> {
     Connected,
     Inet(SocketAddr),
-    Unix(&'a Path),
+    #[cfg_attr(windows, expect(dead_code, reason = "Windows has no Unix sockets"))]
+    Unix(UnixPath<'a>),
 }
 
 impl Dest<'_> {
@@ -56,11 +66,15 @@ impl Dest<'_> {
         match self {
             Dest::Connected => Target::Connected,
             Dest::Inet(addr) => Target::Inet(addr),
+            #[cfg(unix)]
             Dest::Unix(path) => Target::Unix(path.to_path_buf()),
+            #[cfg(windows)]
+            Dest::Unix((never, _)) => match never {},
         }
     }
 }
 
+#[cfg(readiness)]
 impl Target {
     fn as_dest(&self) -> Dest<'_> {
         match self {
@@ -75,7 +89,8 @@ impl Target {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Peer<'a> {
     Inet(SocketAddr),
-    Unix(&'a Path),
+    #[cfg_attr(windows, expect(dead_code, reason = "Windows has no Unix sockets"))]
+    Unix(UnixPath<'a>),
 }
 
 /// A task's own buffer, lent to the side for the driver to write out.
@@ -135,6 +150,7 @@ pub(super) struct WriteState {
     dial: Option<super::ops::Dial>,
 }
 
+#[cfg(readiness)]
 /// Writes bytes to a stream.
 fn write_bytes(fd: RawFd, kind: Kind, bytes: &[u8]) -> io::Result<usize> {
     match kind {
@@ -143,6 +159,7 @@ fn write_bytes(fd: RawFd, kind: Kind, bytes: &[u8]) -> io::Result<usize> {
     }
 }
 
+#[cfg(readiness)]
 /// Sends a datagram.
 fn send_datagram(fd: RawFd, bytes: &[u8], dest: Dest<'_>) -> io::Result<usize> {
     match dest {
@@ -157,8 +174,8 @@ impl WriteState {
         &mut self.epoch
     }
 
-    /// The id of the operation out with the completion driver, if one is.
-    #[cfg(completion)]
+    /// The id of the operation out with the ring, if one is.
+    #[cfg(ring)]
     pub(super) fn out(&self) -> Option<u64> {
         self.out
     }
@@ -192,6 +209,7 @@ impl WriteState {
         buf
     }
 
+    #[cfg(readiness)]
     /// The driver's part: on readiness, does what the side holds and wakes
     /// the tasks that wait on any of it.
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
@@ -232,6 +250,7 @@ impl WriteState {
         false
     }
 
+    #[cfg(readiness)]
     /// The driver's calls on the descriptor, while the socket takes them:
     /// ends a connect in progress, writes the write-behind out and then the
     /// lent buffer, sends a queued datagram. Returns whether anything
@@ -302,6 +321,7 @@ impl WriteState {
         progress
     }
 
+    #[cfg(readiness)]
     /// Writes the lent buffer out, after the write-behind. Returns whether
     /// anything changed.
     fn push_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
@@ -539,7 +559,7 @@ impl WriteState {
     fn close(
         &mut self,
         io: Io<'_>,
-        fd: RawFd,
+        fd: crate::io::raw::Raw,
         kind: Kind,
         waker: &Waker,
         after: &mut After,
@@ -548,7 +568,7 @@ impl WriteState {
             Poll::Ready(Ok(())) => {}
             other => return other,
         }
-        if matches!(kind, Kind::Stream | Kind::Tcp) && !self.shut {
+        if kind.streams() && !self.shut {
             self.shut = true;
             return Poll::Ready(sys::shutdown_write(fd));
         }
@@ -618,10 +638,10 @@ impl WriteState {
     /// A connect to `peer`: the driver starts it on the first poll, and sees
     /// it end on the socket's first edge.
     #[cfg_attr(
-        not(ring),
+        not(completion),
         expect(
             unused_variables,
-            reason = "the kind matters to the ring's connect only"
+            reason = "the kind matters to a completion driver's connect only"
         )
     )]
     fn connect(
@@ -638,6 +658,7 @@ impl WriteState {
         if !self.connect_started {
             self.connect_started = true;
             match io {
+                #[cfg(readiness)]
                 Io::Fd(fd) => {
                     let started = match peer {
                         Peer::Inet(addr) => sys::connect_inet(fd, &addr),
@@ -658,6 +679,8 @@ impl WriteState {
                         Peer::Inet(addr) => super::ops::Dial::Inet(addr),
                         #[cfg(unix)]
                         Peer::Unix(path) => super::ops::Dial::Unix(path.to_path_buf()),
+                        #[cfg(windows)]
+                        Peer::Unix((never, _)) => match never {},
                     });
                     self.connecting = true;
                     self.submit_ops(route, kind, after);

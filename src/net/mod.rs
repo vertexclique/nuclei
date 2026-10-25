@@ -15,6 +15,7 @@
 mod stream;
 mod tcp;
 mod udp;
+#[cfg(unix)]
 mod unix;
 
 pub use self::tcp::TcpStreamGenerator;

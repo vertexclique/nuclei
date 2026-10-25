@@ -43,13 +43,75 @@ use core::fmt;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, AsRawSocket, AsSocket, BorrowedHandle, BorrowedSocket, IntoRawHandle,
+    IntoRawSocket, RawHandle, RawSocket,
+};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use super::raw::Raw;
 use super::source::{Kind, Source};
 use super::sys;
 use crate::fs::file::FileIo;
+
+mod sealed {
+    /// Only nuclei says what an [`IoObject`](super::IoObject) is.
+    pub trait Sealed {}
+}
+
+/// An IO object a [`Handle`] takes over: on unix anything with a file
+/// descriptor; on Windows std's `TcpStream`, `TcpListener`, `UdpSocket` and
+/// `File`.
+pub trait IoObject: sealed::Sealed {
+    /// The descriptor (unix), the socket or the file handle (Windows) the
+    /// handle's IO runs on.
+    #[doc(hidden)]
+    fn raw_io(&self) -> Raw;
+}
+
+#[cfg(unix)]
+impl<T: AsFd> sealed::Sealed for T {}
+
+#[cfg(unix)]
+impl<T: AsFd> IoObject for T {
+    fn raw_io(&self) -> Raw {
+        self.as_fd().as_raw_fd()
+    }
+}
+
+macro_rules! windows_sockets {
+    ($($ty:ty),*) => {$(
+        #[cfg(windows)]
+        impl sealed::Sealed for $ty {}
+
+        #[cfg(windows)]
+        impl IoObject for $ty {
+            fn raw_io(&self) -> Raw {
+                self.as_raw_socket()
+            }
+        }
+    )*};
+}
+
+windows_sockets!(
+    std::net::TcpStream,
+    std::net::TcpListener,
+    std::net::UdpSocket
+);
+
+#[cfg(windows)]
+impl sealed::Sealed for std::fs::File {}
+
+#[cfg(windows)]
+impl IoObject for std::fs::File {
+    fn raw_io(&self) -> Raw {
+        self.as_raw_handle() as usize as Raw
+    }
+}
 
 /// An IO object (a socket, a pipe, a file) whose operations run on nuclei's
 /// shards.
@@ -70,32 +132,35 @@ pub struct Handle<T> {
     pub(crate) file: OnceLock<Arc<FileIo>>,
 }
 
-impl<T: AsFd> Handle<T> {
-    /// Takes `io` over: it is made non-blocking, and what kind of
-    /// descriptor it is (a socket, a file, a pipe) decides how its IO runs.
+impl<T: IoObject> Handle<T> {
+    /// Takes `io` over: what kind of object it is (a socket, a file, a
+    /// pipe) decides how its IO runs. On unix it is made non-blocking.
     ///
     /// # Errors
     ///
-    /// When the descriptor cannot be inspected or set non-blocking.
+    /// When the object cannot be inspected or set up.
     pub fn new(io: T) -> io::Result<Handle<T>> {
-        let kind = sys::kind_of(io.as_fd().as_raw_fd())?;
+        let kind = sys::kind_of(io.raw_io())?;
         Self::adopt(io, kind)
     }
 
-    /// Takes over `io`, a descriptor of `kind` in blocking mode or not.
+    /// Takes over `io`, an object of `kind` in blocking mode or not.
     pub(crate) fn adopt(io: T, kind: Kind) -> io::Result<Handle<T>> {
-        let fd = io.as_fd().as_raw_fd();
-        sys::set_nonblocking(fd)?;
-        if !matches!(kind, Kind::Bytes | Kind::File) {
-            sys::set_nosigpipe(fd);
+        #[cfg(unix)]
+        {
+            let fd = io.raw_io();
+            sys::set_nonblocking(fd)?;
+            if !matches!(kind, Kind::Bytes | Kind::File) {
+                sys::set_nosigpipe(fd);
+            }
         }
         Ok(Self::from_nonblocking(io, kind))
     }
 
-    /// Takes over `io`, a non-blocking descriptor of `kind` set up already
-    /// (an accepted connection, a socket nuclei made).
+    /// Takes over `io`, an object of `kind` set up already (an accepted
+    /// connection, a socket nuclei made).
     pub(crate) fn from_nonblocking(io: T, kind: Kind) -> Handle<T> {
-        let source = Source::new(io.as_fd().as_raw_fd(), kind);
+        let source = Source::new(io.raw_io(), kind);
         Handle {
             io: ManuallyDrop::new(io),
             source,
@@ -108,7 +173,7 @@ impl<T: AsFd> Handle<T> {
         if let Some(file) = self.file.get() {
             return Ok(file);
         }
-        let file = FileIo::new(self.io.as_fd().as_raw_fd())?;
+        let file = FileIo::new(self.io.raw_io())?;
         Ok(self.file.get_or_init(|| file))
     }
 
@@ -116,7 +181,7 @@ impl<T: AsFd> Handle<T> {
     /// `get_mut` it may be another one.
     pub(crate) fn source(&self) -> &Arc<Source> {
         if self.source.is_retired() {
-            self.source.revive(self.io.as_fd().as_raw_fd());
+            self.source.revive(self.io.raw_io());
         }
         &self.source
     }
@@ -204,6 +269,7 @@ impl<T> Drop for Handle<T> {
         }
         // SAFETY: taken once, here; the field is never used again.
         let io = unsafe { ManuallyDrop::take(&mut self.io) };
+        #[cfg(unix)]
         match self
             .source
             .has_unsent()
@@ -219,14 +285,69 @@ impl<T> Drop for Handle<T> {
             // The registration goes before the descriptor closes.
             None => self.source.close(io, None),
         }
+        // Closing a socket cancels its sends, so the object itself stays
+        // with a task until the unsent bytes are out, and closes then.
+        #[cfg(windows)]
+        match self
+            .source
+            .raw_fd()
+            .ok()
+            .filter(|_| self.source.has_unsent())
+        {
+            Some(socket) => {
+                self.source.close((), Some(socket));
+                let kept = Kept::new(io);
+                crate::runtime::spawn(linger(Arc::clone(&self.source), kept)).detach();
+            }
+            None => self.source.close(io, None),
+        }
     }
 }
 
-/// Delivers what a dropped handle's write-behind holds through `copy`, then
-/// closes it.
-async fn linger(source: Arc<Source>, copy: OwnedFd) {
+/// Delivers what a dropped handle's write-behind holds through `copy` (on
+/// Windows the object itself), then closes it.
+async fn linger<C: Send + 'static>(source: Arc<Source>, copy: C) {
     let _ = crate::time::timeout(LINGER, core::future::poll_fn(|cx| source.poll_drain(cx))).await;
     source.close(copy, None);
+}
+
+/// A dropped handle's object, kept while its unsent bytes go out.
+#[cfg(windows)]
+struct Kept {
+    ptr: core::ptr::NonNull<()>,
+    drop: unsafe fn(core::ptr::NonNull<()>),
+}
+
+// SAFETY: a handle wraps only std's sockets and files (see `IoObject`), all
+// of them `Send`; the type is erased because `Drop` cannot say so.
+#[cfg(windows)]
+unsafe impl Send for Kept {}
+
+#[cfg(windows)]
+impl Kept {
+    fn new<T>(io: T) -> Self {
+        /// Drops the `T` boxed at `ptr`.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` came from `Box::<T>::leak`, and is dropped once.
+        unsafe fn drop_boxed<T>(ptr: core::ptr::NonNull<()>) {
+            // SAFETY: the caller's.
+            drop(unsafe { Box::from_raw(ptr.cast::<T>().as_ptr()) });
+        }
+        Self {
+            ptr: core::ptr::NonNull::from(Box::leak(Box::new(io))).cast(),
+            drop: drop_boxed::<T>,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Kept {
+    fn drop(&mut self) {
+        // SAFETY: made by `new`, dropped once, here.
+        unsafe { (self.drop)(self.ptr) };
+    }
 }
 
 impl<T> Deref for Handle<T> {
@@ -250,20 +371,65 @@ impl<T: fmt::Debug> fmt::Debug for Handle<T> {
     }
 }
 
+#[cfg(unix)]
 impl<T: AsFd> AsFd for Handle<T> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.io.as_fd()
     }
 }
 
+#[cfg(unix)]
 impl<T: AsRawFd> AsRawFd for Handle<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.io.as_raw_fd()
     }
 }
 
+#[cfg(unix)]
 impl<T: IntoRawFd> IntoRawFd for Handle<T> {
     fn into_raw_fd(self) -> RawFd {
         self.into_inner().into_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl<T: AsSocket> AsSocket for Handle<T> {
+    fn as_socket(&self) -> BorrowedSocket<'_> {
+        self.io.as_socket()
+    }
+}
+
+#[cfg(windows)]
+impl<T: AsRawSocket> AsRawSocket for Handle<T> {
+    fn as_raw_socket(&self) -> RawSocket {
+        self.io.as_raw_socket()
+    }
+}
+
+#[cfg(windows)]
+impl<T: IntoRawSocket> IntoRawSocket for Handle<T> {
+    fn into_raw_socket(self) -> RawSocket {
+        self.into_inner().into_raw_socket()
+    }
+}
+
+#[cfg(windows)]
+impl<T: AsHandle> AsHandle for Handle<T> {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.io.as_handle()
+    }
+}
+
+#[cfg(windows)]
+impl<T: AsRawHandle> AsRawHandle for Handle<T> {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.io.as_raw_handle()
+    }
+}
+
+#[cfg(windows)]
+impl<T: IntoRawHandle> IntoRawHandle for Handle<T> {
+    fn into_raw_handle(self) -> RawHandle {
+        self.into_inner().into_raw_handle()
     }
 }

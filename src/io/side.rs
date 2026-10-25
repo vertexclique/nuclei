@@ -182,6 +182,7 @@ impl<S> Side<S> {
     /// The driver's part for an edge, after side-local work `defer` (say,
     /// urgent data came): done now if the side is free, else by its holder
     /// as it lets go.
+    #[cfg(readiness)]
     pub(crate) fn drive(&self, after: &mut After, hooks: &impl Hooks<S>, defer: u8) {
         if defer != 0 {
             // Release: the holder that takes DEFER reads the bits.
@@ -522,6 +523,7 @@ impl Wakers {
     }
 
     /// How many tasks wait.
+    #[cfg(any(readiness, test))]
     pub(crate) fn len(&self) -> usize {
         usize::from(self.first.is_some()) + self.rest.len()
     }

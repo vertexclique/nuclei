@@ -36,6 +36,8 @@
 
 #[cfg(completion)]
 pub(crate) mod ops;
+#[cfg(port)]
+pub(crate) mod port;
 mod read;
 pub(crate) mod requests;
 #[cfg(ring)]
@@ -48,6 +50,7 @@ use std::io;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::net as unix;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::{Poll, Wake};
@@ -58,6 +61,7 @@ use self::write::WriteState;
 use super::raw::{AtomicRaw, Raw};
 use super::side::{After, Hooks, Side};
 use crate::rt::context;
+#[cfg(readiness)]
 use crate::rt::park::Readiness;
 use crate::rt::shard::{IoOp, Shared};
 
@@ -80,6 +84,8 @@ pub(crate) enum Io<'a> {
 /// The way a completion driver's operations are issued from this thread.
 #[cfg(completion)]
 pub(crate) mod route {
+    #[cfg(port)]
+    pub(crate) use super::port::PortIo as Route;
     #[cfg(ring)]
     pub(crate) use super::ring::RingIo as Route;
 }
@@ -102,13 +108,13 @@ mod read_work {
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 4;
     /// The side's ring operation completed (its mailbox holds it).
-    #[cfg(ring)]
+    #[cfg(completion)]
     pub(super) const DONE: u8 = 8;
     /// Submit what the side wants, on the ring's thread.
-    #[cfg(ring)]
+    #[cfg(completion)]
     pub(super) const SUBMIT: u8 = 16;
     /// The registration with the ring came into place.
-    #[cfg(ring)]
+    #[cfg(completion)]
     pub(super) const ATTACHED: u8 = 32;
 }
 
@@ -119,13 +125,13 @@ mod write_work {
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 2;
     /// The side's ring operation completed (its mailbox holds it).
-    #[cfg(ring)]
+    #[cfg(completion)]
     pub(super) const DONE: u8 = 4;
     /// Submit what the side wants, on the ring's thread.
-    #[cfg(ring)]
+    #[cfg(completion)]
     pub(super) const SUBMIT: u8 = 8;
     /// The registration with the ring came into place.
-    #[cfg(ring)]
+    #[cfg(completion)]
     pub(super) const ATTACHED: u8 = 16;
 }
 
@@ -137,8 +143,8 @@ pub(crate) enum Kind {
     Stream,
     /// A connected TCP stream socket.
     Tcp,
-    /// Any other byte stream (a pipe, a terminal).
-    #[cfg(unix)]
+    /// Any other byte stream (a pipe, a terminal; on Windows, any handle
+    /// that is neither a socket nor a disk file).
     Bytes,
     /// A regular file or a block device: always ready to the kernel, so
     /// its IO goes to the blocking pool rather than to the poller.
@@ -162,6 +168,16 @@ impl Kind {
             Kind::TcpListener => true,
             #[cfg(unix)]
             Kind::UnixListener => true,
+            _ => false,
+        }
+    }
+
+    /// A connected stream socket, whose writing half shuts down.
+    pub(crate) fn streams(self) -> bool {
+        match self {
+            Kind::Tcp => true,
+            #[cfg(unix)]
+            Kind::Stream => true,
             _ => false,
         }
     }
@@ -195,6 +211,7 @@ pub(crate) enum Target {
     /// The socket's connected peer.
     Connected,
     Inet(SocketAddr),
+    #[cfg(unix)]
     Unix(PathBuf),
 }
 
@@ -230,11 +247,12 @@ struct Registration {
     /// The shard that holds it. Written only with both sides held, so read
     /// with either.
     shard: UnsafeCell<Option<Arc<Shared>>>,
-    /// The registration is with a ring: the source's operations are the
-    /// ring's, on fixed slot `slot`, and run on the shard whose `Shared`
-    /// is at `home` (an address, compared, never followed).
-    #[cfg(ring)]
-    ring: AtomicBool,
+    /// The registration is with a completion driver: the source's IO is
+    /// its operations. On a ring they name fixed slot `slot` and run on the
+    /// shard whose `Shared` is at `home` (an address, compared, never
+    /// followed).
+    #[cfg(completion)]
+    ops: AtomicBool,
     #[cfg(ring)]
     slot: AtomicU32,
     #[cfg(ring)]
@@ -263,14 +281,18 @@ pub(crate) struct Source {
     /// taken, as its last holder left it.
     unsent: AtomicBool,
     /// Completions of the sides' ring operations, for their holders.
-    #[cfg(ring)]
+    #[cfg(completion)]
     read_done: ops::Mailbox,
-    #[cfg(ring)]
+    #[cfg(completion)]
     write_done: ops::Mailbox,
     /// The sides' operations in the kernel's hands: a retire waits until
     /// none is.
-    #[cfg(ring)]
+    #[cfg(completion)]
     ops_out: core::sync::atomic::AtomicU8,
+    /// The sides' operation slots on a port, and what a handle opened for
+    /// synchronous IO needs.
+    #[cfg(port)]
+    port: port::PortState,
 }
 
 // SAFETY: the sides guard their contents; `reg.shard` is touched only with
@@ -286,6 +308,7 @@ unsafe impl Sync for Source {}
 struct SourceHooks<'a> {
     src: &'a Arc<Source>,
     /// For the driver's own edge: the registration the event came for.
+    #[cfg(readiness)]
     token: Option<u64>,
 }
 
@@ -297,9 +320,13 @@ impl Hooks<ReadState> for SourceHooks<'_> {
     }
 
     fn serve(&self, st: &mut ReadState, after: &mut After) {
+        // Only a readiness driver serves edges.
+        #[cfg(readiness)]
         if let Some(fd) = self.src.serving_fd(self.token) {
             st.serve(fd, self.src.kind, true, after);
         }
+        #[cfg(not(readiness))]
+        let _ = (st, after);
     }
 
     fn deferred(&self, st: &mut ReadState, bits: u8, after: &mut After) {
@@ -312,7 +339,7 @@ impl Hooks<ReadState> for SourceHooks<'_> {
         if bits & read_work::ABANDON != 0 {
             st.abandon_lent(after);
         }
-        #[cfg(ring)]
+        #[cfg(completion)]
         {
             if bits & read_work::DONE != 0
                 && let Some(done) = self.src.read_done.take()
@@ -342,9 +369,13 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     }
 
     fn serve(&self, st: &mut WriteState, after: &mut After) {
+        // Only a readiness driver serves edges.
+        #[cfg(readiness)]
         if let Some(fd) = self.src.serving_fd(self.token) {
             st.serve(fd, self.src.kind, true, after);
         }
+        #[cfg(not(readiness))]
+        let _ = (st, after);
     }
 
     fn deferred(&self, st: &mut WriteState, bits: u8, after: &mut After) {
@@ -353,12 +384,12 @@ impl Hooks<WriteState> for SourceHooks<'_> {
         }
         if bits & write_work::ABANDON != 0 {
             st.abandon_lent(after);
-            #[cfg(ring)]
+            #[cfg(completion)]
             if let Some(user_data) = st.withdrawal() {
                 self.src.cancel_op(user_data);
             }
         }
-        #[cfg(ring)]
+        #[cfg(completion)]
         {
             if bits & write_work::DONE != 0
                 && let Some(done) = self.src.write_done.take()
@@ -400,8 +431,8 @@ impl Source {
                 state: AtomicU8::new(UNREGISTERED),
                 token: AtomicU64::new(NO_TOKEN),
                 shard: UnsafeCell::new(None),
-                #[cfg(ring)]
-                ring: AtomicBool::new(false),
+                #[cfg(completion)]
+                ops: AtomicBool::new(false),
                 #[cfg(ring)]
                 slot: AtomicU32::new(u32::MAX),
                 #[cfg(ring)]
@@ -410,12 +441,14 @@ impl Source {
             requests: AtomicU8::new(0),
             ask: Ask::default(),
             unsent: AtomicBool::new(false),
-            #[cfg(ring)]
+            #[cfg(completion)]
             read_done: ops::Mailbox::default(),
-            #[cfg(ring)]
+            #[cfg(completion)]
             write_done: ops::Mailbox::default(),
-            #[cfg(ring)]
+            #[cfg(completion)]
             ops_out: core::sync::atomic::AtomicU8::new(0),
+            #[cfg(port)]
+            port: Default::default(),
         })
     }
 
@@ -427,6 +460,7 @@ impl Source {
     fn hooks(self: &Arc<Self>) -> SourceHooks<'_> {
         SourceHooks {
             src: self,
+            #[cfg(readiness)]
             token: None,
         }
     }
@@ -456,16 +490,19 @@ impl Source {
     /// waits until the registration is in place.
     fn with_io<R>(self: &Arc<Self>, f: impl FnOnce(Io<'_>) -> R) -> io::Result<R> {
         let fd = self.fd()?;
-        #[cfg(ring)]
+        #[cfg(completion)]
         if self.kind != Kind::File {
             return context::current(|current| {
-                if !self.reg.ring.load(Ordering::Acquire) {
+                if !self.reg.ops.load(Ordering::Acquire) {
                     // Registered with a poller, or about to register where
                     // no ring runs: the driver's calls.
-                    let rings = current
-                        .map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
-                    if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
-                        return Ok(f(Io::Fd(fd)));
+                    #[cfg(readiness)]
+                    {
+                        let rings = current
+                            .map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
+                        if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
+                            return Ok(f(Io::Fd(fd)));
+                        }
                     }
                     self.ensure_registered()?;
                 }
@@ -474,11 +511,21 @@ impl Source {
                 )))
             });
         }
-        Ok(f(Io::Fd(fd)))
+        #[cfg(readiness)]
+        return Ok(f(Io::Fd(fd)));
+        // A regular file's IO goes through the file's jobs, never here.
+        #[cfg(not(readiness))]
+        {
+            let _ = (fd, f);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a regular file is read and written through its handle",
+            ))
+        }
     }
 
     /// No ring operation of the source can be in the kernel's hands.
-    #[cfg(not(ring))]
+    #[cfg(not(completion))]
     fn ops_idle(&self) -> bool {
         true
     }
@@ -589,7 +636,7 @@ impl Source {
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
             #[cfg(ring)]
-            if self.reg.ring.swap(false, Ordering::AcqRel) {
+            if self.reg.ops.swap(false, Ordering::AcqRel) {
                 // The ring holds the file: the descriptor may close at once,
                 // and the ring cancels what the sides have out.
                 let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
@@ -597,7 +644,17 @@ impl Source {
                 shard.release_source(token);
                 return;
             }
+            #[cfg(port)]
+            if self.reg.ops.swap(false, Ordering::AcqRel) {
+                // What the sides have out is cancelled; its packets still
+                // come, to whichever port the socket goes to next.
+                self.detach_port();
+                shard.release_source(token);
+                return;
+            }
+            #[cfg(readiness)]
             let fd = self.fd.load(Ordering::Acquire);
+            #[cfg(readiness)]
             if fd != NO_FD
                 && let Some(registrar) = shard.registrar()
             {
@@ -612,6 +669,7 @@ impl Source {
 
     /// A copy of the descriptor (the same open socket under another
     /// number), close-on-exec; `None` if the process has none to spare.
+    #[cfg(unix)]
     pub(crate) fn duplicate(&self) -> Option<std::os::fd::OwnedFd> {
         super::sys::duplicate(self.fd().ok()?).ok()
     }
@@ -652,6 +710,7 @@ impl Source {
     }
 
     /// The driver saw readiness for `token`.
+    #[cfg(readiness)]
     pub(crate) fn on_event(self: &Arc<Self>, token: u64, readiness: Readiness) {
         let mut after = After::default();
         let hooks = SourceHooks {

@@ -2,14 +2,13 @@
 //! it, and `drive`.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use nuclei::{Handle, IoBackend, Proactor, drive};
 
 /// The backend reported is the one the shards run: io_uring or epoll on
-/// Linux (as `NUCLEI_BACKEND` and the kernel decide), kqueue on macOS; and a
-/// thread's own shard reports what it runs.
+/// Linux (as `NUCLEI_BACKEND` and the kernel decide), IOCP on Windows,
+/// kqueue elsewhere; and a thread's own shard reports what it runs.
 #[test]
 fn the_backend_is_the_live_one() {
     let reported = Proactor::backend();
@@ -23,17 +22,43 @@ fn the_backend_is_the_live_one() {
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    assert_eq!(reported, IoBackend::Kqueue);
+    assert_eq!(reported, poller());
     assert_eq!(nuclei::block_on(async { Proactor::backend() }), reported);
+}
+
+/// The platform's own poller.
+fn poller() -> IoBackend {
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        IoBackend::Epoll
+    } else if cfg!(windows) {
+        IoBackend::Iocp
+    } else {
+        IoBackend::Kqueue
+    }
+}
+
+/// A connected pair of stream sockets: Unix ones where the system has them,
+/// else TCP over loopback.
+#[cfg(unix)]
+fn stream_pair() -> (
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+) {
+    std::os::unix::net::UnixStream::pair().unwrap()
+}
+
+#[cfg(windows)]
+fn stream_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (b, _) = listener.accept().unwrap();
+    (a, b)
 }
 
 /// A runtime built for the platform's poller runs it, whatever the default.
 #[test]
 fn a_runtime_built_for_the_poller_runs_it() {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let poller = IoBackend::Epoll;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let poller = IoBackend::Kqueue;
+    let poller = poller();
     if std::env::var("NUCLEI_BACKEND").is_ok_and(|b| !b.is_empty()) {
         return;
     }
@@ -53,14 +78,22 @@ fn a_runtime_built_for_a_foreign_backend_fails() {
     if std::env::var("NUCLEI_BACKEND").is_ok_and(|b| !b.is_empty()) {
         return;
     }
+    let foreign = if cfg!(windows) {
+        IoBackend::Kqueue
+    } else {
+        IoBackend::Iocp
+    };
     let Err(err) = nuclei::Builder::new()
         .worker_threads(1)
-        .backend(IoBackend::Iocp)
+        .backend(foreign)
         .build()
     else {
-        panic!("a runtime on IOCP started on this platform");
+        panic!("a runtime on {foreign:?} started on this platform");
     };
-    assert!(err.to_string().contains("no Iocp backend"), "{err}");
+    assert!(
+        err.to_string().contains(&format!("no {foreign:?} backend")),
+        "{err}"
+    );
 }
 
 #[test]
@@ -73,7 +106,7 @@ fn a_wait_with_nothing_to_do_lasts_its_duration() {
 
 #[test]
 fn a_wait_handles_the_io_of_this_threads_shard() {
-    let (mut peer, mine) = UnixStream::pair().unwrap();
+    let (mut peer, mine) = stream_pair();
     let handle = Handle::new(mine).unwrap();
     // A task of this thread's own shard: the waits below run it, and its
     // receive registers the socket with this shard.

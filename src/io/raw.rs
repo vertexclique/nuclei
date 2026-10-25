@@ -6,12 +6,15 @@
 mod imp {
     use core::sync::atomic::AtomicI32;
 
-    #[cfg_attr(
-        not(completion),
-        expect(unused_imports, reason = "the completion drivers' only")
-    )]
     pub(crate) use std::os::fd::OwnedFd as Owned;
+    pub(crate) use std::os::fd::OwnedFd as OwnedFile;
     pub(crate) use std::os::fd::RawFd as Raw;
+
+    /// The descriptor of an owned file.
+    pub(crate) fn file_raw(file: &OwnedFile) -> Raw {
+        use std::os::fd::AsRawFd;
+        file.as_raw_fd()
+    }
 
     pub(crate) type AtomicRaw = AtomicI32;
 
@@ -23,7 +26,14 @@ mod imp {
 mod imp {
     use core::sync::atomic::AtomicU64;
 
+    pub(crate) use std::os::windows::io::OwnedHandle as OwnedFile;
     pub(crate) use std::os::windows::io::OwnedSocket as Owned;
+
+    /// The handle of an owned file, as an integer.
+    pub(crate) fn file_raw(file: &OwnedFile) -> Raw {
+        use std::os::windows::io::AsRawHandle;
+        file.as_raw_handle() as usize as Raw
+    }
 
     /// A `SOCKET`, or a file `HANDLE` cast to the same width.
     pub(crate) type Raw = u64;

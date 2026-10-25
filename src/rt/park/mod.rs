@@ -37,8 +37,14 @@ mod kqueue;
 ))]
 pub(crate) use self::kqueue::{Notifier, Poller, Registrar};
 
+#[cfg(windows)]
+pub(crate) mod iocp;
+#[cfg(windows)]
+pub(crate) use self::iocp::{Notifier, Poller};
+
 /// What a registered source became ready for. A hang-up or an error counts
 /// as both: the operations waiting on it then see it.
+#[cfg(readiness)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Readiness {
     pub(crate) readable: bool,
@@ -49,5 +55,5 @@ pub(crate) struct Readiness {
     pub(crate) hangup: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, readiness))]
 mod tests;

@@ -635,8 +635,9 @@ where
     current().pool.spawn(f)
 }
 
-/// The cores this process may run on, in order (Linux); empty where that is
-/// not known, so nothing is pinned.
+/// The cores this process may run on, in order (Linux; Windows, in the
+/// process's processor group); empty where that is not known, so nothing
+/// is pinned.
 fn allowed_cores() -> Vec<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -651,14 +652,26 @@ fn allowed_cores() -> Vec<usize> {
         }
         Vec::new()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use crate::syscore::windows::{GetCurrentProcess, GetProcessAffinityMask};
+        let (mut process, mut system) = (0usize, 0usize);
+        // SAFETY: plain out-parameters of our own.
+        if unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) } != 0 {
+            return (0..usize::BITS as usize)
+                .filter(|&cpu| process & (1 << cpu) != 0)
+                .collect();
+        }
+        Vec::new()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         Vec::new()
     }
 }
 
-/// Pins the calling thread to `core` (Linux). A failure leaves it unpinned,
-/// which costs locality and nothing else.
+/// Pins the calling thread to `core` (Linux, Windows). A failure leaves it
+/// unpinned, which costs locality and nothing else.
 pub(crate) fn pin_to(core: usize) {
     #[cfg(target_os = "linux")]
     // SAFETY: a plain syscall with a set of our own.
@@ -667,6 +680,12 @@ pub(crate) fn pin_to(core: usize) {
         libc::CPU_SET(core, &mut set);
         let _ = libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    if core < usize::BITS as usize {
+        use crate::syscore::windows::{GetCurrentThread, SetThreadAffinityMask};
+        // SAFETY: the pseudo-handle of the calling thread, and a mask.
+        unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << core) };
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     let _ = core;
 }

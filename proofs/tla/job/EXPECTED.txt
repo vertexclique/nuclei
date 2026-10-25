@@ -1,0 +1,9 @@
+# configuration                spec                 expected
+J_safe                         MC_Job               pass
+J_live                         MC_Job               pass
+M_no_cancelling                MC_Job               violated:NoStray
+M_no_retry                     MC_Job               deadlock
+M_no_out                       MC_Job               violated:Termination
+W_abort                        MC_Job               violated:NoAbort
+W_cancel_ends                  MC_Job               violated:NoCancelEnd
+W_retry                        MC_Job               violated:NoRetry

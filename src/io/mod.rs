@@ -13,5 +13,5 @@ pub(crate) mod side;
 pub(crate) mod source;
 pub(crate) mod sys;
 
-pub use self::handle::Handle;
+pub use self::handle::{Handle, IoObject};
 pub(crate) use self::source::Source;

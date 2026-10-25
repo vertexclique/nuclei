@@ -3,11 +3,12 @@
 //! A program names it with [`Builder::backend`](crate::Builder::backend)
 //! for one runtime, or with the `backend` field of
 //! [`NucleiConfig`](crate::config::NucleiConfig) for every runtime that
-//! names none; `NUCLEI_BACKEND` (`auto`, `io_uring`, `epoll`, `kqueue`),
-//! when set, overrides both. Named by nobody, it is `auto`: io_uring when
-//! the kernel lets this process make the ring its shards use (see
-//! `syscore::linux::probe`, which checks without risking the process
-//! under a seccomp filter), and the platform's readiness poller otherwise.
+//! names none; `NUCLEI_BACKEND` (`auto`, `io_uring`, `epoll`, `kqueue`,
+//! `iocp`), when set, overrides both. Named by nobody, it is `auto`:
+//! io_uring when the kernel lets this process make the ring its shards use
+//! (see `syscore::linux::probe`, which checks without risking the process
+//! under a seccomp filter), and the platform's own poller otherwise (its
+//! I/O completion port on Windows).
 //! A backend named explicitly that this process cannot have fails with the
 //! reason when the first shard starts, and never falls back.
 
@@ -132,10 +133,17 @@ fn decide(
     }
 }
 
-/// The platform's readiness poller, by name.
+/// The platform's own poller (on Windows, its completion port), by name.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "illumos"))]
 const POLLER: (&str, IoBackend) = ("epoll", IoBackend::Epoll);
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "illumos")))]
+#[cfg(windows)]
+const POLLER: (&str, IoBackend) = ("iocp", IoBackend::Iocp);
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "illumos",
+    windows
+)))]
 const POLLER: (&str, IoBackend) = ("kqueue", IoBackend::Kqueue);
 
 fn ask_by_name(name: &str) -> Result<Ask, String> {
@@ -185,10 +193,7 @@ fn ring(auto: bool) -> Backend {
 /// Makes something of `entries` entries with `make`, halving them while it
 /// finds no memory, down to `least`: a ring under a tight memory limit gets
 /// what fits rather than nothing.
-#[cfg_attr(
-    all(not(test), not(ring)),
-    expect(dead_code, reason = "only rings are made smaller")
-)]
+#[cfg(ring)]
 pub(crate) fn with_room<T>(
     entries: u32,
     least: u32,
@@ -207,7 +212,9 @@ pub(crate) fn with_room<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, IoBackend, decide, with_room};
+    #[cfg(ring)]
+    use super::with_room;
+    use super::{Backend, IoBackend, decide};
 
     const RINGS_BUILT: bool = cfg!(ring);
 
@@ -294,16 +301,15 @@ mod tests {
         ));
         let err = decide(Some("kqueue-ish"), None, usable).unwrap_err();
         assert!(err.contains("NUCLEI_BACKEND=kqueue-ish"), "{err}");
-        let foreign = if poller.1 == IoBackend::Epoll {
-            IoBackend::Kqueue
-        } else {
-            IoBackend::Epoll
-        };
-        let err = decide(None, Some(foreign), usable).unwrap_err();
-        assert!(err.contains("this platform has no"), "{err}");
-        assert!(decide(None, Some(IoBackend::Iocp), usable).is_err());
+        for foreign in [IoBackend::Epoll, IoBackend::Kqueue, IoBackend::Iocp] {
+            if foreign != poller.1 {
+                let err = decide(None, Some(foreign), usable).unwrap_err();
+                assert!(err.contains("this platform has no"), "{err}");
+            }
+        }
     }
 
+    #[cfg(ring)]
     #[test]
     fn a_ring_short_of_memory_is_made_smaller_down_to_the_least() {
         let mut tried = Vec::new();

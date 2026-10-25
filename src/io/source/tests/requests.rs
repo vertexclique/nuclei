@@ -8,7 +8,7 @@ use crate::io::side::After;
 
 /// The peer of a socket, polled once: still open (nothing to read), or at
 /// its end.
-fn peer_sees_end(peer: &UnixStream) -> bool {
+fn peer_sees_end(peer: &Stream) -> bool {
     let mut buf = [0u8; 1];
     match (&*peer).read(&mut buf) {
         Ok(0) => true,
@@ -19,7 +19,7 @@ fn peer_sees_end(peer: &UnixStream) -> bool {
 
 #[test]
 fn a_handle_dropped_while_a_side_is_held_closes_once_the_holder_lets_go() {
-    let (mine, peer) = UnixStream::pair().unwrap();
+    let (mine, peer) = stream_pair();
     peer.set_nonblocking(true).unwrap();
     let handle = Handle::new(mine).unwrap();
     let src = Arc::clone(handle.source());
@@ -41,7 +41,7 @@ fn a_handle_dropped_while_a_side_is_held_closes_once_the_holder_lets_go() {
 /// waits for the second, which performs it.
 #[test]
 fn a_close_with_both_sides_held_is_done_by_the_last_to_let_go() {
-    let (mine, peer) = UnixStream::pair().unwrap();
+    let (mine, peer) = stream_pair();
     peer.set_nonblocking(true).unwrap();
     let handle = Handle::new(mine).unwrap();
     let src = Arc::clone(handle.source());
@@ -64,7 +64,7 @@ fn a_close_with_both_sides_held_is_done_by_the_last_to_let_go() {
 /// performed the retire.
 #[test]
 fn a_retire_waits_for_the_holder_that_performs_it() {
-    let (mine, _peer) = UnixStream::pair().unwrap();
+    let (mine, _peer) = stream_pair();
     let handle = Handle::new(mine).unwrap();
     let src = Arc::clone(handle.source());
     let held = src.write.try_hold().expect("the side is free");
@@ -96,7 +96,7 @@ fn a_retire_waits_for_the_holder_that_performs_it() {
 #[test]
 fn a_dropped_handle_lingers_through_a_held_side() {
     let rt = runtime(None);
-    let (mine, peer) = UnixStream::pair().unwrap();
+    let (mine, peer) = stream_pair();
     let (sent, src) = rt.block_on(async {
         let handle = Handle::new(mine).unwrap();
         let mut sent = Vec::new();
@@ -134,13 +134,16 @@ fn a_dropped_handle_lingers_through_a_held_side() {
 }
 
 /// The drain of a lingering close may wait on the write side before the
-/// close runs: the close wakes it, and it goes on through the copy.
+/// close runs: the close wakes it, and it goes on through the copy (a
+/// descriptor's; on Windows the handle keeps its object instead, see
+/// `a_dropped_handle_lingers_through_a_held_side`).
+#[cfg(unix)]
 #[test]
 fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
     let rt = runtime(None);
-    let (mine, peer) = UnixStream::pair().unwrap();
-    sys::set_nonblocking(mine.as_raw_fd()).unwrap();
-    let src = Source::new(mine.as_raw_fd(), Kind::Stream);
+    let (mine, peer) = stream_pair();
+    adopt(&mine);
+    let src = Source::new(mine.raw(), STREAM);
     let woken = Arc::new(Flag(AtomicBool::new(false)));
     // The kernel takes nothing more: what the source accepts next waits.
     fill(&mine);

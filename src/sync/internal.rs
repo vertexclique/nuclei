@@ -303,7 +303,7 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
 ///
 /// On `wasm32`, when the future is not ready at once: see [`wait_here`].
 pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
-    #[cfg(not(any(loom, target_arch = "wasm32", target_os = "windows")))]
+    #[cfg(not(any(loom, target_arch = "wasm32")))]
     {
         if crate::rt::context::current(|current| current.is_some()) {
             return crate::runtime::block_on(future);

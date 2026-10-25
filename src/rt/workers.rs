@@ -400,9 +400,15 @@ mod tests {
     #[test]
     fn a_source_on_a_worker_that_exits_registers_again_where_it_is_polled() {
         use std::io::Write;
-        use std::os::unix::net::UnixStream;
         let rt = runtime(2, 2);
-        let (mut peer, mine) = UnixStream::pair().unwrap();
+        #[cfg(unix)]
+        let (mut peer, mine) = std::os::unix::net::UnixStream::pair().unwrap();
+        #[cfg(windows)]
+        let (mut peer, mine) = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            (peer, listener.accept().unwrap().0)
+        };
         let handle = Arc::new(crate::io::Handle::new(mine).unwrap());
         // A receive on a worker registers the source with that worker.
         let h = Arc::clone(&handle);

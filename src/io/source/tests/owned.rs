@@ -81,11 +81,11 @@ fn a_lent_read_takes_ready_bytes_after_what_the_buffer_holds() {
 fn a_lent_read_that_waits_is_filled_by_the_driver() {
     let rt = runtime(None);
     let (a, b) = pair();
-    let (src, peer) = (Arc::clone(&b.src), a.io().as_raw_fd());
+    let (src, peer) = (Arc::clone(&b.src), a.io().try_clone().unwrap());
     let (n, buf, charged) = on_worker(&rt, async move {
         let mut read = Box::pin(src.read_owned(Vec::with_capacity(64)));
         pends(&mut read).await;
-        sys::write(peer, b"late").unwrap();
+        send(&peer, b"late");
         let (n, buf) = read.await;
         (n.unwrap(), buf, pool_charged())
     });
@@ -147,7 +147,7 @@ fn bytes_read_ahead_go_into_a_lent_buffer_first() {
 fn a_dropped_lent_read_hands_its_bytes_to_the_next_read() {
     let rt = runtime(None);
     let (a, b) = pair();
-    let (src, peer) = (Arc::clone(&b.src), a.io().as_raw_fd());
+    let (src, peer) = (Arc::clone(&b.src), a.io().try_clone().unwrap());
     let (first, rest) = on_worker(&rt, async move {
         let woke = Arc::new(Flag(AtomicBool::new(false)));
         let waker = Waker::from(Arc::clone(&woke));
@@ -157,7 +157,7 @@ fn a_dropped_lent_read_hands_its_bytes_to_the_next_read() {
                 .poll(&mut Context::from_waker(&waker))
                 .is_pending()
         );
-        sys::write(peer, b"abcdefgh").unwrap();
+        send(&peer, b"abcdefgh");
         until_or(
             || woke.0.load(Ordering::SeqCst),
             || {
@@ -214,13 +214,13 @@ fn a_lent_read_dropped_before_any_byte_loses_nothing() {
 fn two_lent_reads_take_their_turns_in_order() {
     let rt = runtime(None);
     let (a, b) = pair();
-    let (src, peer) = (Arc::clone(&b.src), a.io().as_raw_fd());
+    let (src, peer) = (Arc::clone(&b.src), a.io().try_clone().unwrap());
     let (first, second) = on_worker(&rt, async move {
         let mut one = Box::pin(src.read_owned(exactly(4)));
         let mut two = Box::pin(src.read_owned(exactly(4)));
         pends(&mut one).await;
         pends(&mut two).await;
-        sys::write(peer, b"abcdefgh").unwrap();
+        send(&peer, b"abcdefgh");
         let (n1, b1) = one.await;
         let (n2, b2) = two.await;
         assert_eq!((n1.unwrap(), n2.unwrap()), (4, 4));
@@ -235,7 +235,7 @@ fn two_lent_reads_take_their_turns_in_order() {
 fn a_plain_read_waits_behind_a_lent_buffer() {
     let rt = runtime(None);
     let (a, b) = pair();
-    let (src, peer) = (Arc::clone(&b.src), a.io().as_raw_fd());
+    let (src, peer) = (Arc::clone(&b.src), a.io().try_clone().unwrap());
     let (lent, plain) = on_worker(&rt, async move {
         let mut lent = Box::pin(src.read_owned(exactly(4)));
         pends(&mut lent).await;
@@ -245,7 +245,7 @@ fn a_plain_read_waits_behind_a_lent_buffer() {
             read_exact(&reader, &mut buf).await.unwrap();
             buf
         });
-        sys::write(peer, b"abcdefgh").unwrap();
+        send(&peer, b"abcdefgh");
         let (n, buf) = lent.await;
         assert_eq!(n.unwrap(), 4);
         (buf, plain.await)
@@ -412,13 +412,23 @@ fn a_lent_write_to_a_gone_peer_fails_and_gives_the_buffer_back() {
     let (a, b) = pair();
     drop(b);
     rt.block_on(async {
-        let (n, back) = within(a.src.write_owned(vec![1u8; 100])).await;
-        let err = n.unwrap_err();
+        // A Unix socket fails the first write; TCP takes it, and fails the
+        // ones after the peer's reset.
+        let (err, back) = within(async {
+            loop {
+                let (n, back) = a.src.write_owned(vec![1u8; 100]).await;
+                match n {
+                    Err(err) => break (err, back),
+                    Ok(_) => crate::time::sleep(Duration::from_millis(1)).await,
+                }
+            }
+        })
+        .await;
         assert!(
             matches!(
                 err.kind(),
                 io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-            ),
+            ) || cfg!(windows) && err.kind() == io::ErrorKind::ConnectionAborted,
             "{err:?}"
         );
         assert_eq!(back, vec![1u8; 100]);
@@ -430,7 +440,7 @@ fn a_lent_write_to_a_gone_peer_fails_and_gives_the_buffer_back() {
 #[test]
 fn a_dropped_handle_delivers_the_rest_of_a_started_lent_write() {
     let rt = runtime(None);
-    let (a, b) = UnixStream::pair().unwrap();
+    let (a, b) = stream_pair();
     let data = pattern(4 << 20);
     let expected = data.clone();
     let got = on_worker(&rt, async move {

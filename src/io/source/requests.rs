@@ -33,9 +33,11 @@ use core::task::Poll;
 use std::io;
 use std::sync::Arc;
 
+#[cfg(readiness)]
+use super::Kind;
 use super::read::ReadState;
 use super::write::WriteState;
-use super::{Failure, Kind, NO_FD, NO_TOKEN, REGISTERED, Source, UNREGISTERED};
+use super::{Failure, NO_FD, NO_TOKEN, REGISTERED, Source, UNREGISTERED};
 use crate::io::side::After;
 use crate::rt::shard::Shared;
 use crate::sync::atomic_waker::AtomicWaker;
@@ -228,13 +230,13 @@ impl Source {
             }
         }
         let attached = (bits & ATTACH != 0).then(|| self.attach_now());
-        #[cfg(ring)]
+        #[cfg(completion)]
         if matches!(attached, Some(Ok(())))
-            && self.reg.ring.load(Ordering::Acquire)
+            && self.reg.ops.load(Ordering::Acquire)
             && self.reg.state.load(Ordering::Acquire) == super::REGISTERED
         {
-            // The ring took the source over here and now: tasks that waited
-            // look again, and what the sides hold goes to it.
+            // The driver took the source over here and now: tasks that
+            // waited look again, and what the sides hold goes to it.
             self.ops_registered(read, write, after);
         }
         if !here && let Some(Err(err)) = &attached {
@@ -283,6 +285,9 @@ impl Source {
             )),
             #[cfg(ring)]
             fd if shard.is_ring() => return self.attach_ring(shard, token, fd),
+            #[cfg(port)]
+            fd => return self.attach_port(shard, token, fd),
+            #[cfg(readiness)]
             fd => match shard.registrar() {
                 Some(registrar) => registrar.add(fd, token, self.kind == Kind::Tcp),
                 None => Err(io::Error::other("the shard has no poller to register with")),
@@ -317,7 +322,7 @@ impl Source {
             self.reg.token.store(NO_TOKEN, Ordering::Release);
             self.reg.state.store(UNREGISTERED, Ordering::Release);
             #[cfg(ring)]
-            if self.reg.ring.swap(false, Ordering::AcqRel) {
+            if self.reg.ops.swap(false, Ordering::AcqRel) {
                 // What the sides have out is cancelled, and the ring lets go
                 // of the file; the completions still reach the sides.
                 if let Some(shard) = &shard {
@@ -325,11 +330,20 @@ impl Source {
                     self.detach_ring(shard, slot, [read.out(), write.out()]);
                 }
             }
+            #[cfg(port)]
+            if self.reg.ops.swap(false, Ordering::AcqRel) {
+                // What the sides have out is cancelled; its packets still
+                // reach the sides, wherever the socket's completions go.
+                self.detach_port();
+            }
+            #[cfg(readiness)]
             if let (Some(shard), Ok(fd)) = (shard, self.fd())
                 && let Some(registrar) = shard.registrar()
             {
                 let _ = registrar.delete(fd, self.kind == Kind::Tcp);
             }
+            #[cfg(not(readiness))]
+            drop(shard);
         }
         read.wake_all(after);
         write.wake_all(after);

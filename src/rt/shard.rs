@@ -45,7 +45,9 @@ use kovan_queue::seg_queue::SegQueue;
 
 use super::backend::Backend;
 use super::handshake::ParkState;
-use super::park::{Notifier, Poller, Registrar};
+#[cfg(readiness)]
+use super::park::Registrar;
+use super::park::{Notifier, Poller};
 use super::sources::Sources;
 use super::task::{Runnable, ScheduleInfo};
 use crate::buf::{self, Pool};
@@ -152,7 +154,12 @@ pub(crate) struct Shared {
     timer_ops: SegQueue<TimerOp>,
     /// The registrations of the shard's readiness poller; `None` on a ring
     /// shard, whose sources' IO is the ring's operations.
+    #[cfg(readiness)]
     registrar: Option<Registrar>,
+    /// The shard's completion port, which its sources' handles are bound
+    /// to and their operations complete on.
+    #[cfg(port)]
+    port: Arc<super::park::iocp::Port>,
     /// Registrations other threads ask of the shard, applied before it
     /// polls.
     io_ops: SegQueue<IoOp>,
@@ -214,8 +221,15 @@ impl Shared {
 
     /// Adds and removes the kernel registrations of the shard's readiness
     /// poller; `None` on a ring shard.
+    #[cfg(readiness)]
     pub(crate) fn registrar(&self) -> Option<&Registrar> {
         self.registrar.as_ref()
+    }
+
+    /// The shard's completion port.
+    #[cfg(port)]
+    pub(crate) fn port(&self) -> &Arc<super::park::iocp::Port> {
+        &self.port
     }
 
     /// Whether the shard's IO is the operations of a ring.
@@ -336,7 +350,8 @@ pub(crate) struct Limits {
     expect(clippy::large_enum_variant, reason = "one per shard, built with it")
 )]
 enum Driver {
-    /// A readiness poller (epoll, kqueue): the driver makes the calls.
+    /// A readiness poller (epoll, kqueue): the driver makes the calls. On
+    /// Windows, the completion port the sources' operations complete on.
     Poll(RefCell<Poller>),
     /// A ring: the sources' IO is its operations.
     #[cfg(ring)]
@@ -378,6 +393,7 @@ const MIN_RING_ENTRIES: u32 = 64;
 
 impl Shard {
     pub(crate) fn new(limits: Limits) -> io::Result<Self> {
+        #[cfg(readiness)]
         let poller = || -> io::Result<_> {
             let poller = Poller::new()?;
             let (notifier, registrar) = (poller.notifier(), poller.registrar());
@@ -387,7 +403,14 @@ impl Shard {
                 Some(registrar),
             ))
         };
-        let (driver, notifier, registrar) = match limits.backend {
+        #[cfg(port)]
+        let poller = || -> io::Result<_> {
+            let poller = Poller::new()?;
+            let (notifier, port) = (poller.notifier(), Arc::clone(poller.port()));
+            Ok((Driver::Poll(RefCell::new(poller)), notifier, port))
+        };
+        // The poller's registrar, or the port its handles bind to.
+        let (driver, notifier, kernel) = match limits.backend {
             Backend::Poll => poller()?,
             #[cfg(ring)]
             Backend::Ring(cfg) | Backend::RingOrPoll(cfg) => {
@@ -421,7 +444,10 @@ impl Shard {
             draining: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
             timer_ops: SegQueue::new(),
-            registrar,
+            #[cfg(readiness)]
+            registrar: kernel,
+            #[cfg(port)]
+            port: kernel,
             io_ops: SegQueue::new(),
         });
         Ok(Self {
@@ -638,6 +664,7 @@ impl Shard {
     /// `max` events from the kernel. Returns how many it handled.
     fn poll_io(&self, max: usize, timeout: Option<Duration>) -> io::Result<usize> {
         match &self.driver {
+            #[cfg(readiness)]
             Driver::Poll(poller) => {
                 let sources = self.sources.borrow();
                 let mut events = 0;
@@ -649,6 +676,18 @@ impl Shard {
                             source.on_event(token, readiness);
                         }
                     })?;
+                Ok(events)
+            }
+            #[cfg(port)]
+            Driver::Poll(poller) => {
+                let mut events = 0;
+                poller.borrow_mut().wait_at_most(max, timeout, |entry| {
+                    events += 1;
+                    // SAFETY: a packet of a source's key is one of its
+                    // operations, its OVERLAPPED the first field of a
+                    // slot the operation's strong reference keeps.
+                    unsafe { crate::io::source::port::complete(entry) };
+                })?;
                 Ok(events)
             }
             #[cfg(ring)]
@@ -810,6 +849,27 @@ impl Shard {
         if let Driver::Ring(ring) = &self.driver {
             ring.settle(|| self.apply_io_ops());
         }
+        #[cfg(port)]
+        self.settle_port();
+    }
+
+    /// Waits, up to a bound, for the packets of the operations issued to the
+    /// shard's port, cancelled as their sources went: each brings its side
+    /// what it held. One that never comes keeps its source and its memory
+    /// for good, so the kernel never writes memory that is gone.
+    #[cfg(port)]
+    fn settle_port(&self) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while self.shared.port.out() > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero()
+                || self
+                    .poll_io(usize::MAX, Some(left.min(Duration::from_millis(10))))
+                    .is_err()
+            {
+                return;
+            }
+        }
     }
 
     /// One turn of the shard, for a caller driving it by hand: runs every
@@ -882,6 +942,9 @@ impl Drop for Shard {
             ring.settle(|| self.apply_io_ops());
             ring.shut_down();
         }
+        // The port's operations likewise, before the port is let go.
+        #[cfg(port)]
+        self.settle_port();
         drop(self.lifo.take());
         let queue = core::mem::take(&mut *self.queue.borrow_mut());
         drop(queue);
@@ -909,109 +972,7 @@ impl Wake for Signal {
 }
 
 #[cfg(all(test, not(loom)))]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use super::{Limits, Shard};
-    use crate::rt::context;
-
-    /// A timer armed in the shard's wheel, done once it fired.
-    fn sleep_on(shard: &Shard, at: Instant) -> impl core::future::Future<Output = ()> + '_ {
-        let mut key = None;
-        core::future::poll_fn(move |cx| {
-            let mut wheel = shard.wheel().borrow_mut();
-            match key {
-                None => {
-                    key = Some(wheel.insert(shard.wheel_time(at), cx.waker()));
-                }
-                Some(k) if wheel.is_fired(k) => {
-                    wheel.remove(k);
-                    return core::task::Poll::Ready(());
-                }
-                Some(k) => wheel.set_waker(k, cx.waker()),
-            }
-            let fired = key.is_some_and(|k| wheel.is_fired(k));
-            if fired {
-                core::task::Poll::Ready(())
-            } else {
-                core::task::Poll::Pending
-            }
-        })
-    }
-
-    #[test]
-    fn a_timer_fires_from_the_run_loop_and_never_early() {
-        let shard = Shard::new(Limits {
-            max_nesting: 8,
-            buffer_cap: crate::buf::DEFAULT_CAP,
-            backend: crate::rt::backend::chosen().unwrap(),
-        })
-        .unwrap();
-        let _current = context::enter(&shard);
-        for ms in [1u64, 5, 30] {
-            let start = Instant::now();
-            let at = start + Duration::from_millis(ms);
-            shard.block_on(sleep_on(&shard, at));
-            assert!(Instant::now() >= at, "a {ms} ms timer fired early");
-            assert!(start.elapsed() < Duration::from_secs(5));
-        }
-    }
-
-    #[test]
-    fn the_loop_parks_until_the_next_timer_rather_than_forever() {
-        let shard = Shard::new(Limits {
-            max_nesting: 8,
-            buffer_cap: crate::buf::DEFAULT_CAP,
-            backend: crate::rt::backend::chosen().unwrap(),
-        })
-        .unwrap();
-        let _current = context::enter(&shard);
-        let start = Instant::now();
-        // Nothing but the timer can wake the loop: if it parked without a
-        // deadline, this would never return.
-        shard.block_on(sleep_on(&shard, start + Duration::from_millis(20)));
-        assert!(start.elapsed() >= Duration::from_millis(20));
-    }
-}
+mod tests;
 
 #[cfg(all(test, not(loom)))]
-mod spin_tests {
-    use std::time::Duration;
-
-    use super::{SPIN_MAX, SPIN_RESTART, SPIN_START, Spin};
-
-    #[test]
-    fn a_spin_that_finds_work_doubles_the_budget_and_one_that_runs_out_halves_it() {
-        let spin = Spin::new();
-        assert_eq!(spin.budget.get(), SPIN_START);
-        assert!(spin.run(|| true));
-        assert_eq!(spin.budget.get(), SPIN_START * 2);
-        assert!(!spin.run(|| false));
-        assert_eq!(spin.budget.get(), SPIN_START);
-        for _ in 0..20 {
-            spin.run(|| true);
-        }
-        assert_eq!(spin.budget.get(), SPIN_MAX, "capped");
-        for _ in 0..20 {
-            spin.run(|| false);
-        }
-        assert_eq!(spin.budget.get(), 0, "an idle shard stops spinning");
-        assert!(!spin.run(|| true), "a spent budget does not spin");
-    }
-
-    #[test]
-    fn a_short_park_starts_the_spin_again() {
-        let spin = Spin::new();
-        for _ in 0..20 {
-            spin.run(|| false);
-        }
-        spin.parked_for(Duration::from_millis(5));
-        assert_eq!(
-            spin.budget.get(),
-            0,
-            "a long sleep: spinning would not have helped"
-        );
-        spin.parked_for(Duration::from_micros(3));
-        assert_eq!(spin.budget.get(), SPIN_RESTART);
-    }
-}
+mod spin_tests;

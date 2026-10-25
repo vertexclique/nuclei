@@ -21,19 +21,24 @@ use core::future::poll_fn;
 use core::task::{Poll, Waker};
 use std::collections::VecDeque;
 use std::io;
-use std::os::fd::{OwnedFd, RawFd};
+#[cfg(readiness)]
+use std::os::fd::RawFd;
+
+use crate::io::raw::Owned;
 use std::sync::Arc;
 use std::task::Context;
 
 use super::{Addr, Failure, Io, Kind, Source};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
+#[cfg(readiness)]
 use crate::io::sys;
 
 #[cfg(completion)]
 mod ops;
 
 /// The most connections or datagrams the driver takes ahead on one edge.
+#[cfg(readiness)]
 const BATCH: usize = 32;
 
 /// Bytes read ahead that no task took yet.
@@ -128,7 +133,7 @@ pub(super) struct ReadState {
     lent: Option<Lent>,
     eof: bool,
     error: Option<io::Error>,
-    accepted: VecDeque<(OwnedFd, Addr)>,
+    accepted: VecDeque<(Owned, Addr)>,
     datagrams: VecDeque<(PoolBuf, Addr)>,
     /// Urgent data or a hangup was reported: a short read may leave bytes
     /// behind it from now on (see [`drained`]).
@@ -150,8 +155,8 @@ impl ReadState {
         &mut self.epoch
     }
 
-    /// The id of the operation out with the completion driver, if one is.
-    #[cfg(completion)]
+    /// The id of the operation out with the ring, if one is.
+    #[cfg(ring)]
     pub(super) fn out(&self) -> Option<u64> {
         self.out
     }
@@ -197,6 +202,7 @@ impl ReadState {
         buf
     }
 
+    #[cfg(readiness)]
     /// The driver's part: on readiness, completes what the waiting tasks
     /// asked for, into the pool's buffers, and wakes them.
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
@@ -229,6 +235,7 @@ impl ReadState {
         }
     }
 
+    #[cfg(readiness)]
     /// The driver's call on the descriptor, as [`complete`](Self::complete).
     fn complete_fd(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
         if self.blocked || self.has_result() || self.lent_done() {
@@ -280,6 +287,7 @@ impl ReadState {
         self.error.take().map(Err)
     }
 
+    #[cfg(readiness)]
     fn read_ahead(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
         let Some(mut buf) = self.buffer(len, false, after) else {
             return;
@@ -305,6 +313,7 @@ impl ReadState {
         }
     }
 
+    #[cfg(readiness)]
     /// Reads into the spare capacity of the lent buffer, and wakes its task.
     fn read_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) {
         let Some(lent) = self.lent.as_mut() else {
@@ -331,6 +340,7 @@ impl ReadState {
         }
     }
 
+    #[cfg(readiness)]
     fn accept_ahead(&mut self, fd: RawFd, kind: Kind) {
         let limit = self.waiters.len().clamp(1, BATCH);
         while self.accepted.len() < limit {
@@ -348,6 +358,7 @@ impl ReadState {
         }
     }
 
+    #[cfg(readiness)]
     fn receive_ahead(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
         let limit = self.waiters.len().clamp(1, BATCH);
         while self.datagrams.len() < limit {
@@ -540,7 +551,7 @@ impl ReadState {
         kind: Kind,
         waker: &Waker,
         after: &mut After,
-    ) -> Poll<io::Result<(OwnedFd, Addr)>> {
+    ) -> Poll<io::Result<(Owned, Addr)>> {
         self.complete(io, kind, 0, after);
         let taken = match self.accepted.pop_front() {
             Some(conn) => Some(Ok(conn)),
@@ -677,6 +688,7 @@ impl ReadState {
     }
 }
 
+#[cfg(readiness)]
 /// Whether a TCP read of `n` bytes, when `asked` were asked for, emptied the
 /// socket, so the next read can wait for the next edge instead of making a
 /// call that would find nothing.
@@ -696,6 +708,7 @@ fn drained(kind: Kind, unsure: bool, n: usize, asked: usize) -> bool {
     REPORTS_URGENT && kind == Kind::Tcp && !unsure && n > 0 && n < asked
 }
 
+#[cfg(readiness)]
 /// The pollers that report urgent data.
 const REPORTS_URGENT: bool = cfg!(any(
     target_os = "linux",
@@ -704,14 +717,16 @@ const REPORTS_URGENT: bool = cfg!(any(
     target_os = "ios"
 ));
 
+#[cfg(readiness)]
 /// Accepts a connection, non-blocking, with its peer's address.
-fn accept(fd: RawFd, kind: Kind) -> io::Result<(OwnedFd, Addr)> {
+fn accept(fd: RawFd, kind: Kind) -> io::Result<(Owned, Addr)> {
     match kind {
         Kind::UnixListener => sys::accept_unix(fd).map(|(s, a)| (s, Addr::Unix(a))),
         _ => sys::accept_inet(fd).map(|(s, a)| (s, Addr::Inet(a))),
     }
 }
 
+#[cfg(readiness)]
 /// Receives a datagram with its sender's address.
 fn receive(fd: RawFd, kind: Kind, out: &mut [u8]) -> io::Result<(usize, Addr)> {
     match kind {
@@ -824,7 +839,7 @@ impl Source {
     pub(crate) fn poll_accept(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<(OwnedFd, Addr)>> {
+    ) -> Poll<io::Result<(Owned, Addr)>> {
         let kind = self.kind;
         self.poll_reading(cx, |st, io, waker, after| st.accept(io, kind, waker, after))
     }

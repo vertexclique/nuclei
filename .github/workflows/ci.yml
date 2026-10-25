@@ -19,6 +19,9 @@ jobs:
           # natively there (an x86_64 one cannot run on the arm64 hosts).
           - toolchain: aarch64-apple-darwin
             os: macos-latest
+          # The completion port backend.
+          - toolchain: x86_64-pc-windows-msvc
+            os: windows-latest
 
     name: stable - ${{ matrix.toolchain }}
     runs-on: ${{ matrix.os }}

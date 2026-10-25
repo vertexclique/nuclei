@@ -66,6 +66,8 @@ $ cargo test # io_uring where available, otherwise the platform's evented backen
 $ NUCLEI_BACKEND=epoll cargo test # epoll on Linux
 ```
 
+`NUCLEI_BACKEND` takes `auto`, `io_uring` or `epoll` on Linux, `kqueue` on macOS and the BSDs, and `iocp` on Windows.
+
 ## Configurations
 
 ### Evented IO backend

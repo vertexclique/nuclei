@@ -4,7 +4,7 @@
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -305,8 +305,10 @@ fn a_failed_write_fails_the_next_writes_until_a_flush_reports_it() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
+    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let rt = runtime();
     let tmp = Temp::new("fifo");
@@ -334,3 +336,5 @@ fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
 }
 
 mod owned;
+#[cfg(windows)]
+mod windows;

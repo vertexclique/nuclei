@@ -558,6 +558,11 @@ pub(crate) fn file_size(fd: RawFd) -> io::Result<u64> {
 }
 
 /// A copy of `fd` (the same open file under another number), close-on-exec.
+/// A copy of a file's descriptor, as [`duplicate`] makes it.
+pub(crate) fn duplicate_file(fd: RawFd) -> io::Result<OwnedFd> {
+    duplicate(fd)
+}
+
 pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: a plain fcntl on the caller's open descriptor.
     let copy = cvt_int(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })?;

@@ -107,6 +107,7 @@ impl Handle<UdpSocket> {
         let (n, addr) = poll_fn(|cx| self.source().poll_receive(cx, buf, peek)).await?;
         match addr {
             Addr::Inet(addr) => Ok((n, addr)),
+            #[cfg(unix)]
             Addr::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "a UDP datagram came with no internet address",

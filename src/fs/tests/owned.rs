@@ -2,7 +2,10 @@
 //! and write from it at the cursor, in order with every other operation,
 //! and a dropped future moves the cursor nowhere or lands its write whole.
 
-use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::fd::OwnedFd as OwnedFile;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFile;
 use std::sync::Arc;
 
 use super::*;
@@ -357,8 +360,8 @@ fn a_pipe_opened_as_a_file_reads_and_writes_lent_buffers() {
     let rt = runtime();
     let (r, w) = std::io::pipe().unwrap();
     rt.block_on(async {
-        let reader = Handle::new(File::from(OwnedFd::from(r))).unwrap();
-        let writer = Arc::new(Handle::new(File::from(OwnedFd::from(w))).unwrap());
+        let reader = Handle::new(File::from(OwnedFile::from(r))).unwrap();
+        let writer = Arc::new(Handle::new(File::from(OwnedFile::from(w))).unwrap());
         let sender = Arc::clone(&writer);
         let sent = spawn(async move { sender.write_owned(b"through the pipe".to_vec()).await });
         let (n, got) = within(reader.read_owned(Vec::with_capacity(64))).await;

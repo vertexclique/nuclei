@@ -2,7 +2,9 @@
 //!
 //! A regular file's reads and writes run on the blocking pool at the
 //! handle's own cursor (see `file`); a `File` that is not a regular file (a
-//! FIFO, a terminal) is watched by the shard's poller like a socket. Reads
+//! FIFO, a terminal, a pipe) is a byte stream the shard's driver serves
+//! like a socket (on Windows, through the completion port, or through jobs
+//! of the blocking pool for a handle opened for synchronous IO). Reads
 //! and writes are `AsyncRead` and `AsyncWrite` on the handle and on a shared
 //! reference to it (both share the cursor, as `&File` shares its offset);
 //! `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned` and

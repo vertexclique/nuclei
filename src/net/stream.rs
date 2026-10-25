@@ -6,6 +6,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 use futures_io::{AsyncRead, AsyncWrite};
@@ -132,4 +133,6 @@ macro_rules! stream_io {
     )*};
 }
 
-stream_io!(TcpStream, UnixStream);
+stream_io!(TcpStream);
+#[cfg(unix)]
+stream_io!(UnixStream);

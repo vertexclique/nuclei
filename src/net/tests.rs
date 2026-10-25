@@ -7,7 +7,9 @@ use core::pin::Pin;
 use core::task::Poll;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::time::Duration;
 
@@ -94,6 +96,31 @@ fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 13 + i / 241) as u8).collect()
 }
 
+/// The connected stream sockets the tests pair: Unix ones where the system
+/// has them, else TCP over loopback.
+#[cfg(unix)]
+type Pair = UnixStream;
+#[cfg(windows)]
+type Pair = TcpStream;
+
+fn stream_pair() -> (Pair, Pair) {
+    #[cfg(unix)]
+    return UnixStream::pair().unwrap();
+    #[cfg(windows)]
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (b, _) = listener.accept().unwrap();
+        (a, b)
+    }
+}
+
+fn handle_pair() -> (Handle<Pair>, Handle<Pair>) {
+    let (a, b) = stream_pair();
+    (Handle::new(a).unwrap(), Handle::new(b).unwrap())
+}
+
+#[cfg(unix)]
 fn tempdir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "nuclei-net-{tag}-{}-{}",
@@ -317,6 +344,7 @@ fn udp_sends_receives_peeks_and_connects() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn unix_streams_connect_accept_and_pair() {
     let rt = runtime();
@@ -352,6 +380,7 @@ fn unix_streams_connect_accept_and_pair() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn unix_datagrams_send_to_paths_and_pairs() {
     let rt = runtime();
@@ -394,7 +423,17 @@ fn a_handle_made_by_new_finds_out_what_it_wraps() {
         within(client.send(b"new")).await.unwrap();
         let mut buf = [0u8; 3];
         assert_eq!(within(conn.recv(&mut buf)).await.unwrap(), 3);
+        #[cfg(unix)]
         let (a, b) = UnixDatagram::pair().unwrap();
+        #[cfg(windows)]
+        let (a, b) = {
+            let (a, b) = (
+                UdpSocket::bind("127.0.0.1:0").unwrap(),
+                UdpSocket::bind("127.0.0.1:0").unwrap(),
+            );
+            a.connect(b.local_addr().unwrap()).unwrap();
+            (a, b)
+        };
         let (a, b) = (Handle::new(a).unwrap(), Handle::new(b).unwrap());
         within(a.send(b"dg")).await.unwrap();
         assert_eq!(within(b.recv(&mut buf)).await.unwrap(), 2);
@@ -407,8 +446,8 @@ fn a_handle_made_by_new_finds_out_what_it_wraps() {
 fn a_get_mut_swap_is_seen_by_the_next_operation() {
     let rt = runtime();
     rt.block_on(async {
-        let (old_peer, mine) = UnixStream::pair().unwrap();
-        let (new_peer, other) = UnixStream::pair().unwrap();
+        let (old_peer, mine) = stream_pair();
+        let (new_peer, other) = stream_pair();
         let mut handle = Handle::new(mine).unwrap();
         let mut buf = [0u8; 8];
         // A receive that waits, then is dropped, and the old peer's bytes
@@ -432,6 +471,7 @@ fn a_get_mut_swap_is_seen_by_the_next_operation() {
 /// The handle's number changes hands while the old file lives on through a
 /// dup: the old file's bytes never show up on the new socket, and the new
 /// socket's bytes are all its own.
+#[cfg(unix)]
 #[test]
 fn a_dup_and_close_never_lets_the_driver_read_a_reused_number() {
     let rt = runtime();
@@ -471,7 +511,7 @@ fn a_dup_and_close_never_lets_the_driver_read_a_reused_number() {
 fn a_handle_dropped_with_an_operation_waiting_closes_cleanly() {
     let rt = runtime();
     rt.block_on(async {
-        let (a, b) = Handle::<UnixStream>::pair().unwrap();
+        let (a, b) = handle_pair();
         let mut buf = [0u8; 8];
         {
             let mut waiting = Box::pin(a.recv(&mut buf));
@@ -488,7 +528,7 @@ fn a_handle_dropped_with_an_operation_waiting_closes_cleanly() {
 fn a_handle_used_from_another_executor_works() {
     // Polled by a minimal executor on a plain thread: a runtime shard
     // serves the source.
-    let (a, b) = Handle::<UnixStream>::pair().unwrap();
+    let (a, b) = handle_pair();
     let echo = std::thread::spawn(move || {
         let mut buf = [0u8; 5];
         plain_block_on(async {
@@ -514,13 +554,13 @@ fn send_and_sync_follow_the_object() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Handle<TcpStream>>();
     send_sync::<Handle<UdpSocket>>();
-    send_sync::<Handle<UnixStream>>();
+    send_sync::<Handle<Pair>>();
     fn send<T: Send>() {}
     send::<super::TcpStreamGenerator>();
 }
 
 #[allow(dead_code)]
-fn stream_impls_are_on_the_handle_and_its_reference(h: &Handle<TcpStream>, u: &Handle<UnixStream>) {
+fn stream_impls_are_on_the_handle_and_its_reference(h: &Handle<TcpStream>, u: &Handle<Pair>) {
     fn io<T: AsyncRead + AsyncWrite>(_: T) {}
     io(h);
     io(u);
@@ -528,7 +568,7 @@ fn stream_impls_are_on_the_handle_and_its_reference(h: &Handle<TcpStream>, u: &H
 
 /// Writes until a write goes behind (the socket is full); returns every
 /// byte written, in order.
-async fn fill_behind(h: &Handle<UnixStream>) -> Vec<u8> {
+async fn fill_behind(h: &Handle<Pair>) -> Vec<u8> {
     let mut sent = Vec::new();
     let mut seq = 0usize;
     while !h.source.has_unsent() {
@@ -542,7 +582,7 @@ async fn fill_behind(h: &Handle<UnixStream>) -> Vec<u8> {
     sent
 }
 
-fn read_to_end_blocking(mut peer: UnixStream) -> Vec<u8> {
+fn read_to_end_blocking(mut peer: Pair) -> Vec<u8> {
     peer.set_nonblocking(false).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -554,7 +594,7 @@ fn read_to_end_blocking(mut peer: UnixStream) -> Vec<u8> {
 #[test]
 fn a_handle_dropped_with_bytes_behind_still_delivers_them_then_closes() {
     let rt = runtime();
-    let (mine, peer) = UnixStream::pair().unwrap();
+    let (mine, peer) = stream_pair();
     let sent = rt.block_on(async {
         let handle = Handle::new(mine).unwrap();
         let sent = fill_behind(&handle).await;
@@ -571,7 +611,7 @@ fn a_handle_dropped_with_bytes_behind_still_delivers_them_then_closes() {
 #[test]
 fn into_inner_hands_the_object_back_after_the_bytes_behind() {
     let rt = runtime();
-    let (mine, peer) = UnixStream::pair().unwrap();
+    let (mine, peer) = stream_pair();
     let (sent, reader) = rt.block_on(async {
         let handle = Handle::new(mine).unwrap();
         let mut sent = fill_behind(&handle).await;
@@ -591,7 +631,7 @@ fn into_inner_hands_the_object_back_after_the_bytes_behind() {
 #[test]
 fn get_mut_hands_the_object_out_after_the_bytes_behind() {
     let rt = runtime();
-    let (mine, peer) = UnixStream::pair().unwrap();
+    let (mine, peer) = stream_pair();
     let (sent, reader) = rt.block_on(async {
         let mut handle = Handle::new(mine).unwrap();
         let mut sent = fill_behind(&handle).await;
@@ -615,7 +655,7 @@ fn vectored_reads_and_writes_scatter_and_gather_in_order() {
     use std::io::{IoSlice, IoSliceMut};
     let rt = runtime();
     rt.block_on(async {
-        let (a, b) = Handle::<UnixStream>::pair().unwrap();
+        let (a, b) = handle_pair();
         let (mut a, mut b) = (&a, &b);
         // At once: the socket takes the gathered bytes.
         let n = within(poll_fn(|cx| {
@@ -697,8 +737,20 @@ fn tcp_bytes_behind_urgent_data_are_still_read() {
         assert_eq!(within(read_some(&mut client, &mut buf)).await.unwrap(), 5);
         // Bytes, one urgent byte, more bytes: the read stops at the mark.
         (&peer).write_all(b"before").unwrap();
+        #[cfg(unix)]
         // SAFETY: a plain send of one byte from our own buffer.
         let sent = unsafe { libc::send(peer.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
+        #[cfg(windows)]
+        // SAFETY: as above.
+        let sent = unsafe {
+            use std::os::windows::io::AsRawSocket;
+            crate::syscore::windows::send(
+                peer.as_raw_socket() as _,
+                b"!".as_ptr(),
+                1,
+                crate::syscore::windows::MSG_OOB,
+            )
+        };
         assert_eq!(sent, 1);
         (&peer).write_all(b"after").unwrap();
         crate::time::sleep(Duration::from_millis(5)).await;
@@ -747,6 +799,7 @@ fn tcp_short_round_trips_never_wait_for_the_next_message() {
 
 /// The TCP form of the reuse case: a connection's number taken over by
 /// another socket while a dup keeps the old one open.
+#[cfg(unix)]
 #[test]
 fn a_tcp_dup_and_close_never_lets_the_driver_touch_a_reused_number() {
     let rt = runtime();
@@ -792,6 +845,7 @@ fn a_tcp_dup_and_close_never_lets_the_driver_touch_a_reused_number() {
 /// descriptor; its own number is closed and taken by the next socket at
 /// once. The bytes still go to the old peer, and nothing goes to the socket
 /// that took the number.
+#[cfg(unix)]
 #[test]
 fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
     if !alone("net::tests::bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number")
@@ -833,3 +887,6 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         "bytes leaked into the new socket"
     );
 }
+
+#[cfg(windows)]
+mod windows;
