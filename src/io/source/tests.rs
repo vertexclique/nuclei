@@ -191,19 +191,29 @@ async fn read_exact(src: &Arc<Source>, mut buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Fills the kernel's buffers of `io` until it takes no more; returns the
-/// bytes written.
+/// Fills the kernel's buffers of `io` until it takes no more, even after a
+/// pause (a TCP peer's receive window may still grow, as on Windows'
+/// loopback, and free room after the first refusal); returns the bytes
+/// written.
 fn fill(io: &Stream) -> Vec<u8> {
     io.set_nonblocking(true).unwrap();
     let chunk = vec![7u8; 64 * 1024];
     let mut written = Vec::new();
-    loop {
-        match (&*io).write(&chunk) {
-            Ok(n) => written.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return written,
-            Err(e) => panic!("{e}"),
+    for round in 0.. {
+        let before = written.len();
+        loop {
+            match (&*io).write(&chunk) {
+                Ok(n) => written.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
         }
+        if round > 0 && written.len() == before {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
+    written
 }
 
 /// A pattern no shift of itself matches, so misordered bytes show.
