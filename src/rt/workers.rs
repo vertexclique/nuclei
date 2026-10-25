@@ -442,7 +442,14 @@ mod tests {
         let n = crate::runtime::block_on(async {
             crate::time::timeout(Duration::from_secs(10), h.recv(&mut buf)).await
         })
-        .expect("the receive never completed")
+        .unwrap_or_else(|_| {
+            let source = handle.source();
+            panic!(
+                "the receive never completed: read side {}; write side {}",
+                source.read_report(),
+                source.write_report()
+            )
+        })
         .unwrap();
         assert_eq!(&buf[..n], b"two!");
         drop(writer.join().unwrap());

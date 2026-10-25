@@ -649,8 +649,17 @@ impl ReadState {
     /// What the side holds, as a line, for a test that failed.
     #[cfg(test)]
     pub(super) fn report(&self) -> String {
+        #[cfg(ring)]
+        let ops = format!(
+            ", out {:?}, multishot {}, stopping {}, poll first {}, dry {}, epoch {}",
+            self.out, self.multi, self.multi_stopping, self.poll_first, self.dry, self.epoch
+        );
+        #[cfg(all(completion, not(ring)))]
+        let ops = format!(", out {:?}, epoch {}", self.out, self.epoch);
+        #[cfg(not(completion))]
+        let ops = String::new();
         format!(
-            "lent {:?}, read ahead {}, waiters {}, blocked {}, eof {}, error {:?}",
+            "lent {:?}, read ahead {}, waiters {}, blocked {}, eof {}, error {:?}{ops}",
             self.lent.as_ref().map(|l| (
                 l.buf.len(),
                 l.from,

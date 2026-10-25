@@ -785,7 +785,7 @@ impl Source {
 impl Source {
     /// The read side as a line, for a test that failed: its guard's words,
     /// and what it holds unless it is held.
-    fn read_report(self: &Arc<Self>) -> String {
+    pub(crate) fn read_report(self: &Arc<Self>) -> String {
         let (word, deferred) = self.read.words();
         let held = match self.read.try_hold() {
             Some(mut held) => {
