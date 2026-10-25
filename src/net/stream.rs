@@ -37,7 +37,9 @@ macro_rules! stream_io {
             /// If the future is dropped before it completes, the stream
             /// gets `buf` whole or not at all: a write none of which went
             /// out is withdrawn, and one that started is finished by the
-            /// driver.
+            /// driver. On Windows a TCP write is always finished: there a
+            /// cancelled send may have handed bytes to the stack while it
+            /// says it took none.
             pub async fn write_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
                 self.source().write_owned(buf).await
             }

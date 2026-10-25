@@ -16,6 +16,10 @@ ML_withdraw_started            MC_RingLent          violated:WholeOrNothing
 ML_no_resubmit                 MC_RingLent          violated:Settles
 WL_withdraw                    MC_RingLent          violated:NoWithdraw
 WL_orphan_finish               MC_RingLent          violated:NoOrphanFinish
+RL_port_safe                   MC_RingLent          pass
+RL_port_live                   MC_RingLent          pass
+ML_cancel_tcp                  MC_RingLent          violated:WholeOrNothing
+WL_resend                      MC_RingLent          violated:NoResend
 MU_safe                        MC_RingMulti         pass
 MU_lent                        MC_RingMulti         pass
 MU_live                        MC_RingMulti         pass

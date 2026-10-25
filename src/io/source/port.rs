@@ -872,6 +872,9 @@ impl Source {
             slot.job.cancel();
             return;
         }
+        if !self.may_cancel(id) {
+            return;
+        }
         let fd = self.fd.load(Ordering::Acquire);
         if fd == super::NO_FD {
             return;
@@ -879,6 +882,15 @@ impl Source {
         // SAFETY: a cancel names the side's own OVERLAPPED on its own handle;
         // one that finds the operation done does nothing.
         unsafe { CancelIoEx(fd as usize as HANDLE, slot.ov.get()) };
+    }
+
+    /// Whether the side's operation `id` may be cancelled. A TCP send may
+    /// not: a send the stack has taken bytes of can come back cancelled
+    /// with none counted, and sending them again would send them twice. It
+    /// is left to end on its own (as the bytes behind a handle are delivered
+    /// whatever happens to it).
+    fn may_cancel(&self, id: u64) -> bool {
+        !(id == WRITE && self.kind == Kind::Tcp)
     }
 
     /// Registers the source with port shard `shard` under `token`, with
@@ -923,8 +935,9 @@ impl Source {
     }
 
     /// The source's registration with a port goes: every operation it has
-    /// out is cancelled (its packet still comes, wherever the socket's
-    /// completions go then). Both sides are held.
+    /// out that may be cancelled is (its packet still comes, wherever the
+    /// socket's completions go then); a TCP send goes on (see
+    /// [`may_cancel`](Self::may_cancel)). Both sides are held.
     pub(super) fn detach_port(&self) {
         // SAFETY: both sides are held; the jobs keep their own copies.
         if unsafe { (*self.port.sync.get()).take() }.is_some() {
@@ -934,10 +947,15 @@ impl Source {
             return;
         }
         let fd = self.fd.load(Ordering::Acquire);
-        if fd != super::NO_FD {
-            // SAFETY: cancels the operations on the source's own handle;
-            // none out is nothing to do.
-            unsafe { CancelIoEx(fd as usize as HANDLE, core::ptr::null_mut()) };
+        if fd == super::NO_FD {
+            return;
+        }
+        for id in [READ, WRITE] {
+            if self.may_cancel(id) {
+                // SAFETY: cancels the side's own operation on the source's
+                // own handle; one done or none out is nothing to do.
+                unsafe { CancelIoEx(fd as usize as HANDLE, self.port.slots[id as usize].ov.get()) };
+            }
         }
     }
 }
