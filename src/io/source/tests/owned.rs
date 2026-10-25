@@ -17,12 +17,34 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    use std::sync::atomic::AtomicU8;
+    // How far the task got, should it never be seen to complete: it never
+    // ran (its spawn's wake was lost), it runs (its worker is stuck), or it
+    // ended (the wake of this thread was lost).
+    const STARTED: u8 = 1;
+    const ENDED: u8 = 2;
+    let progress = Arc::new(AtomicU8::new(0));
+    let seen = Arc::clone(&progress);
+    let task = async move {
+        seen.store(STARTED, Ordering::SeqCst);
+        let out = fut.await;
+        seen.store(ENDED, Ordering::SeqCst);
+        out
+    };
     // Longer than the steps' own deadlines, so a step that never ends says
     // so itself.
     rt.block_on(async move {
-        crate::time::timeout(Duration::from_secs(30), crate::runtime::spawn(fut))
-            .await
-            .expect("the task never completed")
+        match crate::time::timeout(Duration::from_secs(30), crate::runtime::spawn(task)).await {
+            Ok(out) => out,
+            Err(_) => panic!(
+                "the task never completed: {}",
+                match progress.load(Ordering::SeqCst) {
+                    0 => "it never ran",
+                    STARTED => "it still runs, past its own deadlines",
+                    _ => "it ended, and this thread was never woken for it",
+                }
+            ),
+        }
     })
 }
 
