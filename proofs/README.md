@@ -626,6 +626,44 @@ one handle frees exactly the nodes at the start of the chain that held their las
 one loses one handle and stays, no node with another handle is freed, and a chain of last handles
 goes whole, whatever its length.
 
+## The barging semaphore
+
+`semaphore` (`tla/semaphore/Semaphore.tla`) checks the semaphore that `Semaphore`, `Mutex` (one
+permit) and `ReentrantMutex` build on (`src/sync/raw_semaphore.rs`, with the acquire of
+`src/sync/contend.rs` and the drain role of `src/sync/queue.rs`), at the grain of its atomic
+steps: the state word (free permits, the closed bit, `QUEUED`, `NUDGE_OUT`, `HANDOFF`,
+`WAKE_FRONT`, and the drain role's `DRAINING` and `DIRTY`), the owed count, the arrival stack and
+the waiting list, and every waiter node (its phase, its nudge and owed marks, what a grant gave
+it); each compare-and-swap of an attempt, an enqueue, a release, the owe-or-take and its
+settling, a withdrawal and the close; and the drain's passes, each grant and each nudge. The
+spin before queueing is abstract (more attempts of the kind other callers' barging already
+makes), so is the node's waker handshake (the waiter machinery's part), and so is the list's
+sweep of withdrawn waiters (one step). 15 configurations: 6 that must
+pass (a mutex locked three times past one wait; two tasks locking twice each; a wait given up
+between two locks, with a handoff owed from the first loss; the same with two tasks, where every
+task's ending is checked too; two permits with a request for both behind requests for one; a close
+while two tasks lock), with the permits always adding up (`Conservation`) and all back at the end,
+one holder at a time for a mutex, no waiter passed over more than `MAX_BYPASS` times while it
+waits (`BypassBounded`), nobody barging while the handoff bit is up, nothing admitted after the
+close, no waiter left on the arrival stack once the drain role is free (`NoStrandedArrival`), and
+every task ending; 6 mutations (a release that never asks for a pass leaves a waiter for good,
+`AllTasksEnd`; a drain that gives up its role over a change made during its pass strands a
+waiter that queued meanwhile, `NoStrandedArrival`; the last allowed loss raising no handoff lets
+the waiter be passed over again, `BypassBounded`; an attempt that ignores the handoff bit barges
+past the owed waiter, `NoBargePastOwed`; a waiter that leaves keeping what a grant gave it leaks
+the permits, `PermitsBackAtEnd`; an attempt that ignores the closed bit is admitted after the
+close, `NoAdmitAfterClose`); and 3 witnesses (the handoff raised; a grant given back by a waiter
+that took on its own or left; a nudge finding its waiter still carrying the last one, which keeps
+the marker up). Two of the model's first properties were stronger than the code's promises and
+were corrected to them: a caller may take between a waiter's owe mark and its compare-and-swap,
+which then raises the bit (`NoBargePastOwed` is about the bit), and a waiter granted while it
+retried loses only to the permits taken for itself, which passes it over for nobody (the code
+counts it, capped at `MAX_BYPASS`). `lean/Nuclei/Semaphore.lean` proves the pass's choice of whom
+to nudge, for every line and budget: never more than the line, within the free permits (plus the
+front's request after a release), an unfit front stops the walk, a release wakes the front, and
+the walk stops at the first waiter that does not fit what those before it left, so a smaller
+request behind a large front is never served first by a nudge.
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver

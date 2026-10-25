@@ -1,0 +1,16 @@
+# configuration                spec                 expected
+L_barge                        MC_Semaphore         pass
+L_pair                         MC_Semaphore         pass
+L_cancel                       MC_Semaphore         pass
+L_cancel_live                  MC_Semaphore         pass
+L_weighted                     MC_Semaphore         pass
+L_close                        MC_Semaphore         pass
+M_release_no_pass              MC_Semaphore         violated:AllTasksEnd
+M_exit_ignores_dirty           MC_Semaphore         violated:NoStrandedArrival
+M_owe_without_handoff          MC_Semaphore         violated:BypassBounded
+M_try_ignores_handoff          MC_Semaphore         violated:NoBargePastOwed
+M_keep_grant                   MC_Semaphore         violated:PermitsBackAtEnd
+M_close_admits                 MC_Semaphore         violated:NoAdmitAfterClose
+W_handoff                      MC_Semaphore         violated:NoHandoff
+W_grant_given_back             MC_Semaphore         violated:NoGrantGivenBack
+W_nudge_pending                MC_Semaphore         violated:NoNudgePending

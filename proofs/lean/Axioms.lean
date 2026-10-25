@@ -116,3 +116,13 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Cancel.stops_at_a_node_with_another_handle
 #print axioms Nuclei.Cancel.never_frees_a_held_node
 #print axioms Nuclei.Cancel.a_chain_of_last_handles_goes_whole
+
+-- The barging semaphore's nudges: never more than the line, within the budget (plus the front's
+-- request after a release), an unfit front stops the walk, a release wakes the front, and the walk
+-- stops at the first waiter that does not fit what those before it left.
+#print axioms Nuclei.Semaphore.nudged_le_length
+#print axioms Nuclei.Semaphore.nudged_fit_the_budget
+#print axioms Nuclei.Semaphore.nudged_fit_with_the_front
+#print axioms Nuclei.Semaphore.an_unfit_front_is_not_skipped
+#print axioms Nuclei.Semaphore.a_release_wakes_the_front
+#print axioms Nuclei.Semaphore.stops_at_the_first_unfit
