@@ -575,6 +575,18 @@ ring later, so the receiver's new position is past its old one; the ring's last 
 in different slots; and a take or a lag keeps taken plus lost equal to the positions passed,
 so at the close a receiver accounts for every value sent after it subscribed.
 
+## The run loop's looks at its driver
+
+`loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver
+(`src/rt/shard.rs`, `Shard::block_on`). Each turn, in any order, either a task runs, or no
+task runs and the future woke itself again, or nothing is ready and the loop spins and parks
+(both look). Every `N` task runs bring a look without waiting, and so do every `N` turns of
+the future's own. 4 configurations: 1 that must pass (the driver gets a look at least once
+every `2N - 1` turns, `BoundedGap`), 1 mutation (not counting the future's own turns lets a
+future that keeps waking itself starve the driver, breaking `BoundedGap`: the bug a test
+caught, where IO such a future waited on never completed), and 2 witnesses (a look that came
+from the future's turns; `2N - 2` turns without a look, so the bound is the tightest).
+
 ## A ring's overflow count
 
 `lean/Nuclei/Overflow.lean` checks how a ring's poller counts completion-queue overflows for

@@ -15,12 +15,14 @@
 //! shard's tasks: the LIFO slot first (a task woken by the task that just
 //! ran, at most [`LIFO_MAX`] times in a row), then the local queue, then the
 //! inbox (first every [`INBOX_INTERVAL`] runs, so remote work is not
-//! starved). Every [`DRIVER_INTERVAL`] runs, and whenever the queues are
-//! empty, it fires due timers and polls the poller without waiting, which
-//! completes the IO of every source that became ready (see `io::source`). With
-//! nothing to run it spins briefly (see [`Spin`]), then parks until the next
-//! timer, a remote push or a wake of the future. Workers run the same loop
-//! on a future that ends at shutdown.
+//! starved). Every [`DRIVER_INTERVAL`] runs, and every [`DRIVER_INTERVAL`]
+//! turns in which only the future ran (it keeps waking itself), it fires
+//! due timers and polls the poller without waiting, which completes the IO
+//! of every source that became ready (see `io::source`); with the queues
+//! empty it fires due timers each turn. With nothing to run and the future
+//! not woken it spins briefly (see [`Spin`]), looking at the poller as it
+//! does, then parks until the next timer, a remote push or a wake of the
+//! future. Workers run the same loop on a future that ends at shutdown.
 //!
 //! # Nesting
 //!
@@ -827,6 +829,8 @@ impl Shard {
         let waker = Waker::from(Arc::clone(&signal));
         let mut cx = Context::from_waker(&waker);
         let mut future = pin!(future);
+        // Turns in which the future woke itself and no task ran.
+        let mut self_woken = 0u32;
         loop {
             if signal.woken.load(Ordering::Relaxed) && signal.woken.swap(false, Ordering::SeqCst) {
                 let outer = self.in_task.replace(true);
@@ -856,6 +860,16 @@ impl Shard {
             }
             self.fire_timers();
             if self.has_local_work() || signal.woken.load(Ordering::SeqCst) {
+                // The future woke itself again, or a task is ready: the
+                // driver gets a look every `DRIVER_INTERVAL` such turns too,
+                // or IO the future waits on (on a ring, an operation not even
+                // submitted yet) would never complete.
+                self_woken += 1;
+                if self_woken >= DRIVER_INTERVAL {
+                    self_woken = 0;
+                    self.count_again(self.since_drive.get());
+                    self.drive_or_report(Some(Duration::ZERO));
+                }
                 continue;
             }
             self.count_again(self.since_drive.get());

@@ -164,3 +164,52 @@ fn a_park_publishes_and_a_look_between_tasks_every_few() {
     assert_eq!(published(), 2, "a park that found a task queued");
     drop(queued);
 }
+
+/// A `block_on` future that keeps waking itself, with no task to run, still
+/// has the shard's IO driven: a read it waits for completes.
+#[test]
+fn a_future_that_keeps_waking_itself_still_has_its_io_driven() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let server = crate::Handle::new(listener.accept().unwrap().0).unwrap();
+    // The bytes come once the read waits: it needs the driver either way.
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        client.write_all(b"x").unwrap();
+        client
+    });
+    let got = crate::block_on(async {
+        let mut buf = [0u8; 1];
+        let mut read = core::pin::pin!(server.recv(&mut buf));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let polled = core::future::poll_fn(|cx| {
+                let polled = read.as_mut().poll(cx);
+                // Woken again at once: the loop has no reason to wait.
+                cx.waker().wake_by_ref();
+                core::task::Poll::Ready(polled)
+            })
+            .await;
+            if let core::task::Poll::Ready(n) = polled {
+                break n;
+            }
+            assert!(Instant::now() < deadline, "the read was never driven");
+            // Lets the loop come back to this future.
+            let mut yielded = false;
+            core::future::poll_fn(|cx| {
+                if yielded {
+                    core::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    core::task::Poll::Pending
+                }
+            })
+            .await;
+        }
+    });
+    assert_eq!(got.unwrap(), 1);
+    drop(writer.join().unwrap());
+}
