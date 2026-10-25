@@ -1,0 +1,13 @@
+# configuration                spec                 expected
+L_sends                        MC_Watch             pass
+L_modifies                     MC_Watch             pass
+L_mixed                        MC_Watch             pass
+L_closed                       MC_Watch             pass
+M_store_not_cas                MC_Watch             violated:NoLostModify
+M_read_before_notified         MC_Watch             violated:ReceiverEnds
+M_closed_first                 MC_Watch             violated:ErrOnlyWhenSeen
+M_value_first                  MC_Watch             violated:PairedNoOlder
+M_count_before_notified        MC_Watch             violated:ProducerEnds
+W_change_seen                  MC_Watch             violated:NoChangeSeen
+W_cas_retry                    MC_Watch             violated:NoRetry
+W_borrow_ahead                 MC_Watch             violated:NeverAhead

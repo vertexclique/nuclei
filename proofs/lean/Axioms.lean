@@ -96,3 +96,14 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Overflow.at_most_seen
 #print axioms Nuclei.Overflow.counted_after_clear
 #print axioms Nuclei.Overflow.split_at_clear
+
+-- The watch channel's state word: a send keeps the closed bit and moves the version one step, a
+-- close keeps the version, sends short of a whole turn are always seen, and `mark_changed` always
+-- makes a change.
+#print axioms Nuclei.Watch.publish_keeps_closed
+#print axioms Nuclei.Watch.publish_moves_version
+#print axioms Nuclei.Watch.close_closes
+#print axioms Nuclei.Watch.close_keeps_version
+#print axioms Nuclei.Watch.publishN_version
+#print axioms Nuclei.Watch.sends_are_seen
+#print axioms Nuclei.Watch.mark_changed_makes_a_change

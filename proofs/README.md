@@ -575,6 +575,31 @@ ring later, so the receiver's new position is past its old one; the ring's last 
 in different slots; and a take or a lag keeps taken plus lost equal to the positions passed,
 so at the close a receiver accounts for every value sent after it subscribed.
 
+## The watch channel
+
+`watch` (`tla/watch/Watch.tla`) checks the watch channel (`src/sync/watch.rs`) at the grain of
+its atomic steps: a send's store of the value, its version bump and its wake; a modifying send's
+load, its compare-and-swap and its retry; the last sender's close and wake; `changed` making its
+`Notified`, reading the state word and deciding; a borrow's read of the version and of the value;
+the receivers' count and its wake; and a sender's `closed` waiting for the receivers to go. A
+`Notified` is abstracted to what `Notify` promises: it hears every wake made after it was made. 12
+configurations: 4 that must pass (sends; modifying sends, where no change is lost; the two mixed;
+a sender waiting for the receivers to go, which ends), with `changed` never answering closed
+while a version it has not seen is there (`ErrOnlyWhenSeen`), a borrow never pairing a version
+with an older value (`PairedNoOlder`), the version counting every publication, the receiver
+seeing the last version and ending; 5 mutations (a modifying send that stores without comparing
+loses a change, `NoLostModify`; `changed` reading the state before making its `Notified` misses a
+wake and never ends, `ReceiverEnds`; answering the closed bit first misses the last change,
+`ErrOnlyWhenSeen`; a borrow that loads the value before the version pairs it with a newer
+version, `PairedNoOlder`; a `closed` that counts the receivers before making its `Notified` never
+ends, `ProducerEnds`); and 3 witnesses (a change seen; a compare-and-swap that lost and started
+over; a borrow whose value is one send ahead of its version, the harmless extra change the docs of
+`borrow` warn of). `lean/Nuclei/Watch.lean` proves the state word's arithmetic for every word: a
+send keeps the closed bit and moves the version one step, wrapping; a close keeps the version;
+after any number of sends short of a whole turn of the word (2^63) the version differs from the
+one before them, so a receiver that slept through them hears of a change; and `mark_changed`
+always makes a change.
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver

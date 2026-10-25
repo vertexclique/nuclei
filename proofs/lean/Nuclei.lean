@@ -6,6 +6,7 @@ import Nuclei.Files
 import Nuclei.Oneshot
 import Nuclei.Overflow
 import Nuclei.Task
+import Nuclei.Watch
 import Nuclei.Wheel
 
 /-!
