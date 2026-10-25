@@ -1,13 +1,16 @@
-//! The one-shot channel, the watch channel and the cancellation token of
-//! `nuclei::sync`, uncontended: one thread, no waiting, so each row is the cost
-//! of the operation's own atomic steps. These are the numbers behind the
-//! progress claims in the type docs.
+//! The one-shot channel, the broadcast channel, the watch channel and the
+//! cancellation token of `nuclei::sync`, uncontended: one thread, no waiting,
+//! so each row is the cost of the operation's own atomic steps. These are the
+//! numbers behind the progress claims in the type docs.
 //!
 //! Run with `cargo bench --bench sync_new`.
 //!
 //! - **oneshot**: a whole channel (create, send, receive), the same through
 //!   `poll`, a poll that registers a waker followed by the send that wakes it,
 //!   and a failed send into a dropped receiver.
+//! - **broadcast**: a send and the receive that takes it, a receive that finds
+//!   nothing, a send to nine receivers each taking it, a waiting receive woken
+//!   by a send, and a subscription dropped.
 //! - **watch**: a borrow, a borrow that marks seen, a send (the swap and the
 //!   version bump, plus the wake of nobody), a send with a receiver waiting,
 //!   a send and the `changed` that completes at once, `send_modify` and
@@ -29,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Wake, Waker};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use nuclei::sync::{CancellationToken, oneshot, watch};
+use nuclei::sync::{CancellationToken, broadcast, oneshot, watch};
 
 struct Counter(AtomicUsize);
 
@@ -168,6 +171,46 @@ fn watch_rows(c: &mut Criterion) {
     group.finish();
 }
 
+fn broadcast_rows(c: &mut Criterion) {
+    let mut group = c.benchmark_group("broadcast");
+    let waker = Waker::noop();
+    let (tx, mut rx) = broadcast::channel::<u64>(64);
+    group.bench_function("send_then_try_recv", |b| {
+        b.iter(|| {
+            tx.send(black_box(1)).expect("a receiver");
+            black_box(rx.try_recv().expect("sent"))
+        })
+    });
+    group.bench_function("try_recv_empty", |b| b.iter(|| black_box(rx.try_recv())));
+    let mut more: Vec<_> = (0..8).map(|_| tx.subscribe()).collect();
+    group.bench_function("send_to_nine_then_each_takes_it", |b| {
+        b.iter(|| {
+            tx.send(black_box(1)).expect("a receiver");
+            black_box(rx.try_recv().expect("sent"));
+            for other in &mut more {
+                black_box(other.try_recv().expect("sent"));
+            }
+        })
+    });
+    drop(more);
+    group.bench_function("recv_pending_then_send_wakes_it", |b| {
+        b.iter(|| {
+            let mut recv = pin!(rx.recv());
+            assert!(
+                recv.as_mut()
+                    .poll(&mut Context::from_waker(waker))
+                    .is_pending()
+            );
+            tx.send(black_box(1)).expect("a receiver");
+            black_box(recv.as_mut().poll(&mut Context::from_waker(waker)))
+        })
+    });
+    group.bench_function("subscribe_drop", |b| {
+        b.iter(|| drop(black_box(tx.subscribe())))
+    });
+    group.finish();
+}
+
 fn token_rows(c: &mut Criterion) {
     let mut group = c.benchmark_group("token");
     let mut cx = Context::from_waker(Waker::noop());
@@ -237,5 +280,11 @@ fn token_rows(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, oneshot_rows, watch_rows, token_rows);
+criterion_group!(
+    benches,
+    oneshot_rows,
+    broadcast_rows,
+    watch_rows,
+    token_rows
+);
 criterion_main!(benches);

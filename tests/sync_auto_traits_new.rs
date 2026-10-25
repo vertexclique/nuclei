@@ -1,10 +1,11 @@
-//! Auto traits of the one-shot channel, the watch channel and the cancellation
-//! token, asserted at compile time.
+//! Auto traits of the one-shot channel, the broadcast channel, the watch
+//! channel and the cancellation token, asserted at compile time.
 //!
 //! They match the channels and the token they follow:
 //!
 //! - A one-shot half is `Send + Sync` when the value is `Send`, and always
 //!   `Unpin`.
+//! - A broadcast half is `Send + Sync` when the value is.
 //! - A watch half is `Send + Sync` when the value is; a watch `Ref` is not
 //!   `Send` (its reclamation guard belongs to the thread that took it) but
 //!   is `Sync`.
@@ -20,6 +21,7 @@ use std::future::Future;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::rc::Rc;
 
+use nuclei::sync::broadcast;
 use nuclei::sync::oneshot::{self, error as oneshot_error};
 use nuclei::sync::watch::{self, error as watch_error};
 use nuclei::sync::{
@@ -110,6 +112,19 @@ fn the_watch_halves_need_a_value_that_is_send_and_sync() {
 }
 
 #[test]
+fn the_broadcast_halves_need_a_value_that_is_send_and_sync() {
+    assert_send_sync::<broadcast::Sender<u8>>();
+    assert_send_sync::<broadcast::Receiver<u8>>();
+    assert_send_sync::<broadcast::Sender<String>>();
+    assert_unpin::<broadcast::Sender<u8>>();
+    assert_unpin::<broadcast::Receiver<u8>>();
+    assert_send_sync::<broadcast::RecvError>();
+    assert_send_sync::<broadcast::TryRecvError>();
+    assert_send_sync::<broadcast::SendError<u8>>();
+    assert_neither_send_nor_sync!(broadcast::SendError<Rc<u8>>);
+}
+
+#[test]
 fn a_watch_ref_stays_on_its_thread_and_can_be_shared() {
     assert_not_send!(watch::Ref<'static, u8>);
     assert_sync::<watch::Ref<'static, u8>>();
@@ -145,6 +160,12 @@ fn the_async_fn_futures_are_send_sync_and_not_unpin() {
     send_sync_future(&orx);
     assert_unpin::<oneshot::Receiver<u8>>();
     let _ = orx.try_recv();
+
+    let (btx, mut brx) = broadcast::channel::<u8>(1);
+    send_sync_future(&btx.closed());
+    assert_not_unpin_value!(btx.closed());
+    send_sync_future(&brx.recv());
+    assert_not_unpin_value!(brx.recv());
 
     let (wtx, mut wrx) = watch::channel(0u8);
     send_sync_future(&wtx.closed());

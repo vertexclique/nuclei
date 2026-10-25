@@ -63,6 +63,13 @@ open Nuclei.FairSemaphore
 
 -- The wheel: placement after the wheel's slot, inside the slot, exact on level 0, a cascade
 -- that lowers the level, the next top window's wrap, and the worked example.
+#print axioms Nuclei.Broadcast.slot_in_ring
+#print axioms Nuclei.Broadcast.later_in_same_slot_is_a_ring_later
+#print axioms Nuclei.Broadcast.lag_goes_forward
+#print axioms Nuclei.Broadcast.window_slots_differ
+#print axioms Nuclei.Broadcast.take_counts
+#print axioms Nuclei.Broadcast.lag_counts
+#print axioms Nuclei.Broadcast.closed_receiver_accounts_for_every_value
 #print axioms Nuclei.Wheel.placed_after
 #print axioms Nuclei.Wheel.inside_slot
 #print axioms Nuclei.Wheel.level_zero_exact

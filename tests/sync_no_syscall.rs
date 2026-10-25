@@ -7,11 +7,13 @@
 //! contention) and `exit_group` (to end the child) and kills the process
 //! on anything else. The hot loops then run: every primitive uncontended,
 //! every primitive contended between futures on one thread, and the locks,
-//! the semaphore and both `mpsc` channels contended across threads. The
-//! channels run every non-blocking path: `send`, `recv`, `recv_many` and the
-//! reservations polled as futures, their `try_` forms, permits, a waiting
-//! send served by a receive, a waiting `reserve_many` that is dropped and
-//! passes its share on, `closed`, `close`, and weak senders. The parent
+//! the semaphore and both `mpsc` channels contended across threads (the
+//! broadcast channel on one thread). The channels run every non-blocking
+//! path: `send`, `recv`, `recv_many` and the reservations polled as
+//! futures, their `try_` forms, permits, a waiting send served by a
+//! receive, a waiting `reserve_many` that is dropped and passes its share
+//! on, `closed`, `close`, weak senders, and a broadcast receiver's lag. The
+//! parent
 //! passes only if the child exits cleanly; a forbidden call shows up as
 //! death by SIGSYS.
 //!
@@ -39,6 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
+use nuclei::sync::broadcast;
 use nuclei::sync::mpsc::{self, error::TrySendError};
 use nuclei::sync::{
     Barrier, Event, Latch, Lazy, MappedMutexGuard, Mutex, MutexGuard, Notify, OnceCell, Owner,
@@ -304,8 +307,29 @@ fn channel_loops(rounds: usize, waker: &Waker, flag: &Flag) {
     let (one_tx, mut one_rx) = mpsc::channel::<u64>(1);
     let (two_tx, mut two_rx) = mpsc::channel::<u64>(2);
     let (utx, mut urx) = mpsc::unbounded_channel::<u64>();
+    let (btx, mut brx) = broadcast::channel::<u64>(4);
     let mut batch = Vec::with_capacity(4);
     for i in 0..rounds as u64 {
+        {
+            btx.send(i).expect("a receiver");
+            assert_eq!(brx.try_recv(), Ok(i));
+            {
+                let mut waiting = pin!(brx.recv());
+                assert!(poll_once(&mut waiting, waker).is_pending());
+                btx.send(i).expect("a receiver");
+                assert!(matches!(poll_once(&mut waiting, waker), Poll::Ready(Ok(_))));
+            }
+            for value in 0..5 {
+                btx.send(value).expect("a receiver");
+            }
+            assert!(matches!(
+                brx.try_recv(),
+                Err(broadcast::TryRecvError::Lagged(1))
+            ));
+            while brx.try_recv().is_ok() {}
+            drop(btx.subscribe());
+            assert!(btx.is_empty());
+        }
         {
             tx.try_send(i).expect("room");
             assert_eq!(rx.try_recv(), Ok(i));

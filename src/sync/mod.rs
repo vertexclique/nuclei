@@ -125,6 +125,7 @@ pub(crate) mod atomic_waker;
 #[doc(hidden)]
 pub mod atomic_waker;
 mod barrier;
+pub mod broadcast;
 mod cancellation;
 mod contend;
 mod event;
