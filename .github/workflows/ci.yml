@@ -45,6 +45,21 @@ jobs:
         env:
           NUCLEI_BACKEND: epoll
 
+  # `#[nuclei::bench]` expands to a benchmark, which only nightly's test
+  # harness takes: built and run here, each benchmark's body once.
+  bench_macro_on_nightly:
+    name: The bench macro on nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: bench macro
+        run: cargo test --test macros_bench
+        env:
+          RUSTFLAGS: --cfg nuclei_nightly
+
   check_fmt_and_docs:
     name: Checking fmt and docs
     runs-on: ubuntu-latest

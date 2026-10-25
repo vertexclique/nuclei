@@ -70,6 +70,11 @@ loom = "0.7"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 
+# `#[nuclei::main]` run as a program of its own.
+[[test]]
+name = "macros_main"
+harness = false
+
 [[bench]]
 name = "sync"
 harness = false
@@ -85,7 +90,7 @@ harness = false
 # Declaring `loom` keeps `unexpected_cfgs` quiet in the ordinary build
 # without turning the lint off.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(nuclei_nightly)'] }
 
 
 [workspace]
