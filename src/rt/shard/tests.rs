@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 
 use super::{Limits, Shard};
@@ -99,4 +101,38 @@ fn a_timer_fired_on_the_way_to_park_runs_its_task_rather_than_parking() {
         .expect("the drive waited on the poller with the task it woke still to run");
     assert!(armed_unfired, "the timer fired before it was due");
     assert!(woke, "the task the timer woke never ran");
+}
+
+/// A waker that holds a shard's `Shared`, as the one of a worker's loop
+/// does.
+struct Holds(#[allow(dead_code)] Arc<super::Shared>);
+
+#[expect(
+    clippy::manual_noop_waker,
+    reason = "the waker holds the Shared, which the no-op waker cannot"
+)]
+impl Wake for Holds {
+    fn wake(self: Arc<Self>) {}
+}
+
+/// The waker a worker's loop leaves in its shard's `Shared` (when its look
+/// after registering finds it may exit) goes with the shard, so the two do
+/// not keep each other.
+#[test]
+fn a_shard_lets_go_of_the_waker_its_loop_left() {
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let shared = Arc::downgrade(&shard.shared);
+    let waker = Waker::from(Arc::new(Holds(Arc::clone(&shard.shared))));
+    shard.shared.stop_waker.register(&waker);
+    drop(waker);
+    drop(shard);
+    assert!(
+        shared.upgrade().is_none(),
+        "the shard's Shared was kept by its own loop's waker"
+    );
 }

@@ -964,6 +964,9 @@ impl Drop for Shard {
         // future may be dropped on.
         self.shared.draining.store(true, Ordering::SeqCst);
         self.shared.stopped.store(true, Ordering::SeqCst);
+        // The waker a worker's loop leaves when its look after registering
+        // finds it may exit: it holds the shard's `Shared`, which holds it.
+        drop(self.shared.stop_waker.take());
         // The sources registered here lose their driver: each is told, and
         // registers where it is polled next.
         for source in self.sources.get_mut().drain() {
