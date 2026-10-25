@@ -39,6 +39,12 @@ pub(crate) struct RingOp {
 pub(crate) enum RingMem {
     Ready,
     Accept(Box<RawAddr>),
+    /// A multishot accept: `handed` connections so far; `stopping`: past
+    /// the cap, a cancel of it is on its way.
+    AcceptMulti {
+        handed: usize,
+        stopping: bool,
+    },
     Recv(PoolBuf),
     /// A multishot receive: its arrivals land in the receive group's
     /// buffers. `held`: the bytes of its arrivals not given back yet;
@@ -98,6 +104,14 @@ impl RingMem {
                 }
                 Outcome::Recv(buf, answer)
             }
+            RingMem::AcceptMulti { .. } => Outcome::AcceptMultiEnd(match res {
+                // Its last connection came as an arrival.
+                r if r >= 0 => Answer::Done(Ok(())),
+                r => match answer(r) {
+                    Answer::Done(result) => Answer::Done(result.map(drop)),
+                    Answer::Undone { not_ready } => Answer::Undone { not_ready },
+                },
+            }),
             RingMem::RecvMulti { .. } => Outcome::RecvMultiEnd {
                 // A group with no buffer left gives the receive back undone.
                 answer: match res {
@@ -352,6 +366,32 @@ impl RingIssuer<'_> {
     }
 }
 
+/// What a multishot receive or accept hands the side as it comes.
+pub(crate) enum Arrival {
+    /// A receive's buffer of bytes.
+    Chunk(crate::rt::shard::recv::RingChunk),
+    /// An accepted connection, whose peer is asked of the kernel when a task
+    /// wants it.
+    Conn(OwnedFd),
+}
+
+/// The peer of `conn`, a connection a listener of `kind` accepted: a
+/// multishot accept brings no address, so it is asked of the kernel.
+pub(crate) fn peer_of(conn: &OwnedFd, kind: Kind) -> io::Result<Addr> {
+    use std::os::fd::AsRawFd;
+    let mut addr = RawAddr::empty();
+    // SAFETY: the kernel writes at most `len` bytes into the storage.
+    if unsafe { libc::getpeername(conn.as_raw_fd(), addr.as_mut_ptr(), &mut addr.len) } < 0 {
+        let err = io::Error::last_os_error();
+        // The peer went before the connection was taken.
+        return Err(match err.raw_os_error() {
+            Some(libc::ENOTCONN) => io::ErrorKind::ConnectionAborted.into(),
+            _ => err,
+        });
+    }
+    addr.to_addr(kind)
+}
+
 /// The entry for `want` on slot `slot`, with the memory it points at (a
 /// multishot receive draws from group `group`); or, for an address no
 /// socket can have or a ring with no group, the outcome that says so.
@@ -381,6 +421,18 @@ fn entry(
             let sqe = stream_read(kind, slot, spare.as_mut_ptr(), spare.len());
             (RingMem::Recv(buf), sqe)
         }
+        Want::AcceptMulti => (
+            RingMem::AcceptMulti {
+                handed: 0,
+                stopping: false,
+            },
+            Sqe::accept_multishot(
+                slot,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            ),
+        ),
         Want::RecvMulti => match group {
             Some(group) => (
                 RingMem::RecvMulti {
@@ -467,18 +519,14 @@ fn stream_write(kind: Kind, slot: RawFd, bytes: &[u8]) -> Sqe {
 
 impl Source {
     /// On the ring's thread: an arrival of the read side's multishot
-    /// receive, submitted in `epoch`. The side takes it at once if free,
-    /// else its holder does as it lets go.
-    pub(crate) fn ring_chunk(
-        self: &Arc<Self>,
-        chunk: crate::rt::shard::recv::RingChunk,
-        epoch: u32,
-    ) {
-        self.read_chunks.push((chunk, epoch));
+    /// receive or accept, submitted in `epoch`. The side takes it at once if
+    /// free, else its holder does as it lets go.
+    pub(crate) fn ring_arrival(self: &Arc<Self>, arrival: Arrival, epoch: u32) {
+        self.read_arrivals.push((arrival, epoch));
         let mut after = After::default();
         let hooks = self.hooks();
         self.read
-            .defer(super::read_work::CHUNKS, &mut after, &hooks);
+            .defer(super::read_work::ARRIVALS, &mut after, &hooks);
         self.settle(after);
     }
 

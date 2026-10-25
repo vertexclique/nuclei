@@ -1,11 +1,11 @@
-TLC run of every configuration in proofs/tla/ring, 2026-10-25 05:58 UTC.
+TLC run of every configuration in proofs/tla/ring, 2026-10-25 06:25 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-RO_safe                          13974       6109      1  pass                                  pass                                  yes
-RO_live                          13974       6109      2  pass                                  pass                                  yes
-RO_flow                           1698        814      1  pass                                  pass                                  yes
+RO_safe                          13974       6109      2  pass                                  pass                                  yes
+RO_live                          13974       6109      1  pass                                  pass                                  yes
+RO_flow                           1698        814      2  pass                                  pass                                  yes
 MO_submit_while_out               3234       1504      1  violated:OneOut                       violated:OneOut                       yes
 MO_elsewhere_submits                14         11      1  violated:SingleIssuer                 violated:SingleIssuer                 yes
 MO_no_kick                          53         36      1  violated:WritesGo                     violated:WritesGo                     yes
@@ -13,13 +13,13 @@ MO_no_wake                       10718       4729      2  violated:RetireReturns
 MO_count_first                   16194       7075      2  violated:RetireReturns                violated:RetireReturns                yes
 MO_skip_wait                      1128        583      1  violated:RetiredIdle                  violated:RetiredIdle                  yes
 WO_task_applies                   2424       1166      1  violated:NoTaskApplies                violated:NoTaskApplies                yes
-WO_retire_waits                   3061       1439      1  violated:NoRetireWait                 violated:NoRetireWait                 yes
+WO_retire_waits                   3061       1439      2  violated:NoRetireWait                 violated:NoRetireWait                 yes
 RL_safe                             81         43      1  pass                                  pass                                  yes
 RL_live                             81         43      1  pass                                  pass                                  yes
-ML_withdraw_started                 21         16      1  violated:WholeOrNothing               violated:WholeOrNothing               yes
+ML_withdraw_started                 21         16      0  violated:WholeOrNothing               violated:WholeOrNothing               yes
 ML_no_resubmit                      82         45      1  violated:Settles                      violated:Settles                      yes
-WL_withdraw                         28         20      0  violated:NoWithdraw                   violated:NoWithdraw                   yes
-WL_orphan_finish                    27         19      0  violated:NoOrphanFinish               violated:NoOrphanFinish               yes
+WL_withdraw                         28         20      1  violated:NoWithdraw                   violated:NoWithdraw                   yes
+WL_orphan_finish                    27         19      1  violated:NoOrphanFinish               violated:NoOrphanFinish               yes
 MU_safe                          20292       7050      2  pass                                  pass                                  yes
 MU_lent                          26697       9651      1  pass                                  pass                                  yes
 MU_live                          20292       7050      2  pass                                  pass                                  yes

@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use super::recv::RecvGroup;
 use crate::io::source::ops::Done;
-use crate::io::source::ring::{RingMem, RingOp};
+use crate::io::source::ring::{Arrival, RingMem, RingOp};
 use crate::io::sys;
 use crate::rt::park::Notifier;
 use crate::rt::park::ring::RingPoller;
@@ -59,8 +59,8 @@ pub(crate) struct ShardRing {
     /// The buffers multishot receives draw from; `None` when the
     /// configuration asks for none or the kernel could not make them.
     recv: RefCell<Option<RecvGroup>>,
-    /// Multishot receives submitted, their arrivals, and the receives that
-    /// ended as the group ran dry, for a test.
+    /// Multishot receives and accepts submitted, the receives' arrivals,
+    /// and the receives that ended as the group ran dry, for a test.
     #[cfg(test)]
     counts: Cell<(usize, usize, usize)>,
 }
@@ -129,7 +129,10 @@ impl ShardRing {
         };
         op.source.op_out();
         #[cfg(test)]
-        if matches!(op.mem, RingMem::RecvMulti { .. }) {
+        if matches!(
+            op.mem,
+            RingMem::RecvMulti { .. } | RingMem::AcceptMulti { .. }
+        ) {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed + 1, arrived, dry));
         }
@@ -245,6 +248,8 @@ impl ShardRing {
     fn complete(&self, cqe: IoUringCqe) {
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
             self.arrived(cqe.user_data, bid, cqe.res);
+        } else if cqe.res >= 0 {
+            self.accepted(cqe.user_data, cqe.res);
         }
         // More of a multishot receive's arrivals come: it stays in flight.
         if cqe.flags & IORING_CQE_F_MORE != 0 {
@@ -307,8 +312,39 @@ impl ShardRing {
                 let (armed, arrived, dry) = self.counts.get();
                 self.counts.set((armed, arrived + 1, dry));
             }
-            source.ring_chunk(chunk, epoch);
+            source.ring_arrival(Arrival::Chunk(chunk), epoch);
         }
+    }
+
+    /// A completion `res` of the operation of `user_data` that carries no
+    /// buffer: for a multishot accept, a connection (its descriptor), handed
+    /// to the source as it comes. Past the cap of connections one accept
+    /// hands over, the accept is stopped; its source asks for another once
+    /// its tasks took them.
+    fn accepted(&self, user_data: u64, res: i32) {
+        let delivery = {
+            let mut ops = self.ops.borrow_mut();
+            let Some(op) = ops.get_mut(user_data) else {
+                return;
+            };
+            let RingMem::AcceptMulti { handed, stopping } = &mut op.mem else {
+                return;
+            };
+            *handed += 1;
+            let stop = *handed > ACCEPT_CAP && !*stopping;
+            if stop {
+                *stopping = true;
+            }
+            // SAFETY: the kernel made this descriptor for us.
+            let conn =
+                unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(res) };
+            (std::sync::Arc::clone(&op.source), conn, op.epoch, stop)
+        };
+        let (source, conn, epoch, stop) = delivery;
+        if stop {
+            self.cancel(user_data);
+        }
+        source.ring_arrival(Arrival::Conn(conn), epoch);
     }
 
     /// Takes in the buffers chunks gave back and gives them to the kernel
@@ -401,6 +437,10 @@ impl ShardRing {
     }
 }
 
+/// The connections one multishot accept hands over before the ring stops
+/// it: its source asks for another once its tasks took them.
+const ACCEPT_CAP: usize = 256;
+
 /// The user data of the ring's own cancels, whose completions say nothing
 /// to anyone: no operation of the slab has it (its index is the one the
 /// slab never hands out), and it is not the wake's.
@@ -439,12 +479,17 @@ impl ShardRing {
         self.recv.borrow().as_ref().map_or(0, RecvGroup::out)
     }
 
-    /// Multishot receives in flight.
+    /// Multishot receives and accepts in flight.
     pub(crate) fn receives_in_flight(&self) -> usize {
         self.ops
             .borrow()
             .iter()
-            .filter(|op| matches!(op.mem, RingMem::RecvMulti { .. }))
+            .filter(|op| {
+                matches!(
+                    op.mem,
+                    RingMem::RecvMulti { .. } | RingMem::AcceptMulti { .. }
+                )
+            })
             .count()
     }
 

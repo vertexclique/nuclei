@@ -36,6 +36,11 @@ pub(crate) enum Want {
     Ready { read: bool },
     /// Accept a connection.
     Accept,
+    /// Accept connections as they come, until the accept is stopped: each
+    /// is handed to the side as it comes, with no address (see
+    /// [`Outcome::AcceptMultiEnd`]).
+    #[cfg(ring)]
+    AcceptMulti,
     /// Read a stream's bytes into the spare room of a buffer of the pool.
     Recv(PoolBuf),
     /// Receive a stream's bytes as they come, into buffers of the shard's
@@ -66,7 +71,7 @@ impl Want {
             Want::Ready { read } => *read,
             Want::Accept | Want::Recv(_) | Want::RecvLent(_) | Want::RecvFrom(_) => true,
             #[cfg(ring)]
-            Want::RecvMulti => true,
+            Want::RecvMulti | Want::AcceptMulti => true,
             Want::Connect(_) | Want::Send(_) | Want::SendLent(..) | Want::SendTo(..) => false,
         }
     }
@@ -107,6 +112,10 @@ pub(crate) enum Outcome {
     #[cfg(ring)]
     Ready(Answer<()>),
     Accept(Answer<(Owned, Addr)>),
+    /// A multishot accept ended: after its last connection (`Done(Ok(()))`,
+    /// handed over already), an error, or a stop.
+    #[cfg(ring)]
+    AcceptMultiEnd(Answer<()>),
     Recv(PoolBuf, Answer<usize>),
     /// A multishot receive ended: on the stream's end (`Done(Ok(0))`), an
     /// error, a cancel, or after its last arrival (`Done(Ok(n))`, its bytes

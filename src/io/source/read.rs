@@ -46,6 +46,14 @@ use ahead::{Ahead, Piece};
 #[cfg(readiness)]
 const BATCH: usize = 32;
 
+/// The peer of a connection accepted ahead: its address, or, for one a
+/// multishot accept brought, to be asked of the kernel if a task wants it.
+enum Peer {
+    Known(Addr),
+    #[cfg(ring)]
+    Ask,
+}
+
 /// A task's own buffer, lent to the side for the driver to read into.
 struct Lent {
     buf: Vec<u8>,
@@ -75,7 +83,7 @@ pub(super) struct ReadState {
     lent: Option<Lent>,
     eof: bool,
     error: Option<io::Error>,
-    accepted: VecDeque<(Owned, Addr)>,
+    accepted: VecDeque<(Owned, Peer)>,
     datagrams: VecDeque<(PoolBuf, Addr)>,
     /// Urgent data or a hangup was reported: a short read may leave bytes
     /// behind it from now on (see [`drained`]).
@@ -96,6 +104,10 @@ pub(super) struct ReadState {
     multi: bool,
     #[cfg(ring)]
     multi_stopping: bool,
+    /// The tasks that wait for connections take no address: an accept may
+    /// go out as a multishot one.
+    #[cfg(ring)]
+    streams: bool,
     /// The receive group had no buffer left: the next receive takes one of
     /// the pool.
     #[cfg(ring)]
@@ -295,7 +307,7 @@ impl ReadState {
                     self.blocked = true;
                     break;
                 }
-                Some(Ok(conn)) => self.accepted.push_back(conn),
+                Some(Ok((conn, peer))) => self.accepted.push_back((conn, Peer::Known(peer))),
                 Some(Err(err)) => {
                     self.error = Some(err);
                     break;
@@ -510,9 +522,47 @@ impl ReadState {
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<(Owned, Addr)>> {
+        #[cfg(ring)]
+        {
+            self.streams = false;
+        }
         self.complete(io, kind, 0, after);
         let taken = match self.accepted.pop_front() {
-            Some(conn) => Some(Ok(conn)),
+            Some((conn, Peer::Known(peer))) => Some(Ok((conn, peer))),
+            #[cfg(ring)]
+            Some((conn, Peer::Ask)) => {
+                Some(super::ring::peer_of(&conn, kind).map(|peer| (conn, peer)))
+            }
+            None => self.error.take().map(Err),
+        };
+        match taken {
+            Some(result) => {
+                self.pass_on(after);
+                Poll::Ready(result)
+            }
+            None => {
+                self.wait(waker, 0);
+                Poll::Pending
+            }
+        }
+    }
+
+    /// An accept that takes no address, for a stream of connections: on a
+    /// ring it may go out as a multishot accept.
+    fn accept_stream(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<Owned>> {
+        #[cfg(ring)]
+        {
+            self.streams = true;
+        }
+        self.complete(io, kind, 0, after);
+        let taken = match self.accepted.pop_front() {
+            Some((conn, _)) => Some(Ok(conn)),
             None => self.error.take().map(Err),
         };
         match taken {
@@ -624,19 +674,23 @@ impl ReadState {
         after.forget(&mut self.waiters);
     }
 
-    /// An arrival of the multishot receive, submitted in `epoch`: the
-    /// tasks waiting take it. One of an older descriptor only goes back.
+    /// An arrival of the multishot receive or accept, submitted in
+    /// `epoch`: the tasks waiting take it. One of an older descriptor only
+    /// goes.
     #[cfg(ring)]
-    pub(super) fn take_chunk(
+    pub(super) fn take_arrival(
         &mut self,
-        chunk: crate::rt::shard::recv::RingChunk,
+        arrival: super::ring::Arrival,
         epoch: u32,
         after: &mut After,
     ) {
         if epoch != self.epoch {
             return;
         }
-        self.ahead.push(Piece::Ring(chunk), after);
+        match arrival {
+            super::ring::Arrival::Chunk(chunk) => self.ahead.push(Piece::Ring(chunk), after),
+            super::ring::Arrival::Conn(conn) => self.accepted.push_back((conn, Peer::Ask)),
+        }
         self.want = 0;
         if let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take()) {
             after.wake_one(w);
@@ -818,6 +872,17 @@ impl Source {
     ) -> Poll<io::Result<(Owned, Addr)>> {
         let kind = self.kind;
         self.poll_reading(cx, |st, io, waker, after| st.accept(io, kind, waker, after))
+    }
+
+    /// Accepts a connection, without its peer's address.
+    pub(crate) fn poll_accept_stream(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Owned>> {
+        let kind = self.kind;
+        self.poll_reading(cx, |st, io, waker, after| {
+            st.accept_stream(io, kind, waker, after)
+        })
     }
 
     /// Receives a datagram into `out`, with its sender; `peek` leaves it to

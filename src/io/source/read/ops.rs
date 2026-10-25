@@ -9,7 +9,7 @@
 //! again. Only the operation's own completion clears it, so a side never
 //! has two operations out, and its mailbox never more than one completion.
 
-use super::{Kind, Piece, ReadState};
+use super::{Kind, Peer, Piece, ReadState};
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::Io;
@@ -66,6 +66,14 @@ impl ReadState {
             return;
         }
         let want = if kind.listens() {
+            #[cfg(ring)]
+            if self.streams {
+                self.multi = true;
+                Want::AcceptMulti
+            } else {
+                Want::Accept
+            }
+            #[cfg(not(ring))]
             Want::Accept
         } else if kind.datagrams() {
             let Some(buf) = self.buffer(len, true, after) else {
@@ -193,11 +201,24 @@ impl ReadState {
                     }
                 }
             }
+            #[cfg(ring)]
+            Outcome::AcceptMultiEnd(answer) => {
+                self.multi = false;
+                self.multi_stopping = false;
+                if !stale {
+                    match answer {
+                        // Its connections came as arrivals.
+                        Answer::Done(Ok(())) => {}
+                        Answer::Done(Err(err)) => self.error = Some(err),
+                        Answer::Undone { not_ready } => self.not_ready(not_ready),
+                    }
+                }
+            }
             Outcome::Accept(_) if stale => {}
             Outcome::Accept(Answer::Undone { not_ready }) => self.not_ready(not_ready),
             Outcome::Accept(Answer::Done(Ok((conn, peer)))) => {
                 match fd.map_or(Ok(()), |listener| sys::adopt_accepted(listener, &conn)) {
-                    Ok(()) => self.accepted.push_back((conn, peer)),
+                    Ok(()) => self.accepted.push_back((conn, Peer::Known(peer))),
                     Err(err) => self.error = Some(err),
                 }
             }

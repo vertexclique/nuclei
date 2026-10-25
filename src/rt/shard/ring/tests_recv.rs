@@ -21,13 +21,20 @@ use crate::syscore::linux::iouring::ring::RingConfig;
 /// A shard on a ring with a receive group of `buffers` of `size` bytes, or
 /// `None` where the kernel gives no ring.
 fn recv_shard(buffers: u16, size: u32) -> Option<Shard> {
+    ring_shard_of(64, buffers, size)
+}
+
+/// As [`recv_shard`], on a ring of `entries` submission entries (twice as
+/// many completions): a ring whose completion queue overflows ends its
+/// multishot operations itself.
+fn ring_shard_of(entries: u32, buffers: u16, size: u32) -> Option<Shard> {
     let shard = Shard::new(Limits {
         max_nesting: 8,
         buffer_cap: crate::buf::DEFAULT_CAP,
         backend: Backend::Ring(RingConfig {
             recv_buffers: buffers,
             recv_buffer_size: size,
-            ..RingConfig::new(64)
+            ..RingConfig::new(entries)
         }),
     });
     match shard {
@@ -331,4 +338,144 @@ impl std::task::Wake for Flag {
     fn wake(self: Arc<Self>) {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// A TCP listener with its source, and its address.
+fn listener_source() -> (std::net::TcpListener, Arc<Source>, std::net::SocketAddr) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    sys::set_nonblocking(listener.as_raw_fd()).unwrap();
+    let src = Source::new(listener.as_raw_fd(), Kind::TcpListener);
+    (listener, src, addr)
+}
+
+async fn accept_stream(src: &Arc<Source>) -> crate::io::raw::Owned {
+    poll_fn(|cx| src.poll_accept_stream(cx)).await.unwrap()
+}
+
+/// Connections taken without their addresses are all served by the one
+/// multishot accept the first armed.
+#[test]
+fn one_multishot_accept_serves_a_stream_of_connections() {
+    let Some(shard) = recv_shard(16, 4096) else {
+        return;
+    };
+    let _current = context::enter(&shard);
+    let (_listener, src, addr) = listener_source();
+    let clients = std::thread::spawn(move || {
+        (0..16)
+            .map(|i| {
+                let mut c = std::net::TcpStream::connect(addr).unwrap();
+                c.write_all(&[i]).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+                c
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut seen = Vec::new();
+    shard.block_on(async {
+        for _ in 0..16 {
+            let conn = accept_stream(&src).await;
+            let mut b = [0u8; 1];
+            let n = std::io::Read::read(&mut std::net::TcpStream::from(conn), &mut b).unwrap();
+            assert_eq!(n, 1);
+            seen.push(b[0]);
+        }
+    });
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (0..16).collect::<Vec<u8>>(),
+        "a connection was lost or taken twice"
+    );
+    let (armed, _, _) = shard.ring().unwrap().multishot_counts();
+    assert_eq!(armed, 1, "the accept was armed again {} times", armed - 1);
+    drop(clients.join().unwrap());
+    src.retire();
+}
+
+/// An accept that wants the peer's address, taking a connection the
+/// multishot accept brought, gets it from the kernel.
+#[test]
+fn an_accept_after_a_multishot_one_gets_its_peer_from_the_kernel() {
+    let Some(shard) = recv_shard(16, 4096) else {
+        return;
+    };
+    let _current = context::enter(&shard);
+    let (_listener, src, addr) = listener_source();
+    shard.block_on(async {
+        // A stream accept arms the multishot accept.
+        let first = std::net::TcpStream::connect(addr).unwrap();
+        drop(accept_stream(&src).await);
+        let second = std::net::TcpStream::connect(addr).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (conn, peer) = loop {
+            let mut accepted = Box::pin(poll_fn(|cx| src.poll_accept(cx)));
+            match crate::time::timeout(Duration::from_millis(50), &mut accepted).await {
+                Ok(done) => break done.unwrap(),
+                Err(_) => assert!(Instant::now() < deadline, "the connection never came"),
+            }
+        };
+        match peer {
+            crate::io::source::Addr::Inet(peer) => assert_eq!(
+                peer,
+                second.local_addr().unwrap(),
+                "the peer's address is not the client's"
+            ),
+            other => panic!("a TCP peer came as {other:?}"),
+        }
+        drop((conn, first, second));
+    });
+    src.retire();
+}
+
+/// Connections that come while no task takes them: past its cap the accept
+/// is stopped, none is lost, and once they are taken the accept is armed
+/// again.
+#[test]
+fn past_its_cap_a_multishot_accept_is_stopped_and_loses_no_connection() {
+    // A completion queue with room for every connection: only the cap stops
+    // the accept.
+    let Some(shard) = ring_shard_of(1024, 16, 4096) else {
+        return;
+    };
+    let _current = context::enter(&shard);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Room in the backlog for every client.
+    // SAFETY: a plain listen on our own socket.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1024) }, 0);
+    sys::set_nonblocking(listener.as_raw_fd()).unwrap();
+    let src = Source::new(listener.as_raw_fd(), Kind::TcpListener);
+    let ring = shard.ring().unwrap();
+    const CLIENTS: usize = 300;
+    shard.block_on(async {
+        let first = std::net::TcpStream::connect(addr).unwrap();
+        drop(accept_stream(&src).await);
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|_| std::net::TcpStream::connect(addr).unwrap())
+            .collect();
+        // Nobody takes them: the accept is stopped once past its cap.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ring.receives_in_flight() > 0 {
+            assert!(Instant::now() < deadline, "the accept was never stopped");
+            pause(Duration::from_millis(5)).await;
+        }
+        for _ in 0..CLIENTS {
+            drop(accept_stream(&src).await);
+        }
+        // One more, which only a new accept takes.
+        let late = std::net::TcpStream::connect(addr).unwrap();
+        let mut taken = Box::pin(accept_stream(&src));
+        assert!(
+            crate::time::timeout(Duration::from_secs(5), &mut taken)
+                .await
+                .is_ok(),
+            "no accept was armed again after the stop"
+        );
+        drop((first, clients, late));
+    });
+    let (armed, _, _) = ring.multishot_counts();
+    assert!(armed >= 2, "the accept was not armed again after its stop");
+    src.retire();
 }

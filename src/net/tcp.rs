@@ -43,6 +43,15 @@ impl Handle<TcpListener> {
         })
     }
 
+    /// A connection, without its address: on io_uring the listener's
+    /// accept stays armed for every connection that comes, taking them
+    /// ahead for this handle.
+    fn poll_accept_stream(&self, cx: &mut Context<'_>) -> Poll<io::Result<Handle<TcpStream>>> {
+        self.source()
+            .poll_accept_stream(cx)
+            .map(|accepted| accepted.map(stream))
+    }
+
     /// The connections as they come, without their addresses; the stream
     /// never ends, and an error is one of its items.
     pub fn incoming(
@@ -55,6 +64,11 @@ impl Handle<TcpListener> {
     /// the listener, so it may outlive this handle. A connection reset before
     /// it was taken is skipped; any other error ends the stream, and
     /// [`TcpStreamGenerator::take_error`] says what it was.
+    ///
+    /// On io_uring the stream keeps one accept armed for every connection
+    /// that comes, so it takes connections ahead of its polls; those it took
+    /// and never yielded close when it drops, as a listener's own backlog
+    /// does when the last copy of the listener closes.
     ///
     /// # Errors
     ///
@@ -120,9 +134,9 @@ impl Stream for TcpStreamGenerator {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         while !this.done {
-            match this.listener.poll_accept(cx) {
+            match this.listener.poll_accept_stream(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok((stream, _))) => return Poll::Ready(Some(stream)),
+                Poll::Ready(Ok(stream)) => return Poll::Ready(Some(stream)),
                 Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::ConnectionAborted => {}
                 Poll::Ready(Err(err)) => {
                     this.error = Some(err);
