@@ -149,3 +149,15 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.OnceCell.published_stays
 #print axioms Nuclei.OnceCell.every_answer_is_the_published
 #print axioms Nuclei.OnceCell.the_first_wins
+
+-- The reader-writer lock's state word: every admitted entry, every release, a downgrade and an
+-- upgrade's finish keep a writer alone with upgrading tied to the upgradable read; an upgrade
+-- holds reads back, and a write needs the lock empty.
+#print axioms Nuclei.RwLock.enter_keeps_good
+#print axioms Nuclei.RwLock.read_release_keeps_good
+#print axioms Nuclei.RwLock.write_release_keeps_good
+#print axioms Nuclei.RwLock.upgradable_release_keeps_good
+#print axioms Nuclei.RwLock.downgrade_keeps_good
+#print axioms Nuclei.RwLock.upgrade_finish_keeps_good
+#print axioms Nuclei.RwLock.upgrading_holds_reads_back
+#print axioms Nuclei.RwLock.a_write_needs_the_lock_empty

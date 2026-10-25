@@ -748,6 +748,33 @@ that loses its publication to a builder and answers the builder's value).
 published value stays, every answer after it is that value, and from an empty cell the first
 attempt wins.
 
+## The reader-writer lock
+
+`rwlock` (`tla/rwlock/RwLock.tla`) checks the lock that `RwLock` and `ReentrantRwLock` build on
+(`src/sync/raw_rwlock.rs`, with the acquire of `src/sync/contend.rs` and the drain role of
+`src/sync/queue.rs`) at the grain of its atomic steps: the state word (the readers, the writer,
+upgradable and upgrading bits, and the queue's bits), the owed count, the arrival stack, the
+waiting list and the upgrade's own slot, every node, each compare-and-swap of an attempt, an
+enqueue, each kind's release, a downgrade, an upgrade (the upgrading bit, the write at once with
+no reader inside, or the wait in its slot and the finish) and the owe-or-take, and each pass with
+its upgrade grant, its handoffs in order (stopping after a writer) and its nudges (the front, and
+the readers behind a sharing front). The spin, the node's waker handshake and the list's sweep
+are abstract, as in the semaphore model. 14 configurations: 8 that must pass (reads beside a write;
+writers; an upgrade beside a read; a downgrade beside a read; two upgradable reads; reads barging
+past a waiting writer, which is owed a handoff in the end; a write dropped beside readers, with
+three tasks for safety and with two for the ending too), with the state word matching exactly
+who holds what (`StateMatches`), a writer alone and one upgradable read at most (`Exclusion`), no
+read entering while an upgrade is under way, no upgrade finishing over a reader, the bypass bound,
+no barging while a handoff is owed, no waiter left on the arrival stack, the lock free at the end,
+and every task ending; 4 mutations (a read that ignores the upgrading bit,
+`NoReaderWhileUpgrading`; a pass that grants the upgrade with a reader inside,
+`NoUpgradeOverReaders`; a release that never asks for a pass, `AllTasksEnd`; a drain giving up
+its role over a change, `NoStrandedArrival`); and 2 witnesses (an upgrade that waits in its slot;
+a downgrade). `lean/Nuclei/RwLock.lean` proves the state word's rules for every state: each
+admitted entry, each release, a downgrade and an upgrade's finish keep a writer alone with
+upgrading tied to the upgradable read; an upgrade holds reads back; and a write needs the lock
+empty.
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver
