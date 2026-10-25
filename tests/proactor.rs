@@ -7,12 +7,60 @@ use std::time::{Duration, Instant};
 
 use nuclei::{Handle, IoBackend, Proactor, drive};
 
+/// The backend reported is the one the shards run: io_uring or epoll on
+/// Linux (as `NUCLEI_BACKEND` and the kernel decide), kqueue on macOS; and a
+/// thread's own shard reports what it runs.
 #[test]
-fn the_backend_is_the_platforms() {
-    #[cfg(target_os = "linux")]
-    assert_eq!(Proactor::backend(), IoBackend::Epoll);
-    #[cfg(target_os = "macos")]
-    assert_eq!(Proactor::backend(), IoBackend::Kqueue);
+fn the_backend_is_the_live_one() {
+    let reported = Proactor::backend();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let named = std::env::var("NUCLEI_BACKEND").unwrap_or_default();
+        match named.as_str() {
+            "epoll" => assert_eq!(reported, IoBackend::Epoll),
+            "io_uring" => assert_eq!(reported, IoBackend::IoUring),
+            _ => assert!(matches!(reported, IoBackend::IoUring | IoBackend::Epoll)),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    assert_eq!(reported, IoBackend::Kqueue);
+    assert_eq!(nuclei::block_on(async { Proactor::backend() }), reported);
+}
+
+/// A runtime built for the platform's poller runs it, whatever the default.
+#[test]
+fn a_runtime_built_for_the_poller_runs_it() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let poller = IoBackend::Epoll;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let poller = IoBackend::Kqueue;
+    if std::env::var("NUCLEI_BACKEND").is_ok_and(|b| !b.is_empty()) {
+        return;
+    }
+    let rt = nuclei::Builder::new()
+        .worker_threads(1)
+        .backend(poller)
+        .build()
+        .unwrap();
+    let on_worker = rt.block_on(async { nuclei::spawn(async { Proactor::backend() }).await });
+    assert_eq!(on_worker, poller);
+}
+
+/// A backend the platform has not got fails the build of a runtime, with
+/// the reason.
+#[test]
+fn a_runtime_built_for_a_foreign_backend_fails() {
+    if std::env::var("NUCLEI_BACKEND").is_ok_and(|b| !b.is_empty()) {
+        return;
+    }
+    let Err(err) = nuclei::Builder::new()
+        .worker_threads(1)
+        .backend(IoBackend::Iocp)
+        .build()
+    else {
+        panic!("a runtime on IOCP started on this platform");
+    };
+    assert!(err.to_string().contains("no Iocp backend"), "{err}");
 }
 
 #[test]

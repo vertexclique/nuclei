@@ -420,8 +420,8 @@ impl Source {
                 if !self.reg.ring.load(Ordering::Acquire) {
                     // Registered with a poller, or about to register where
                     // no ring runs: the driver's calls.
-                    let rings =
-                        current.map_or_else(crate::rt::backend::rings, |s| s.ring().is_some());
+                    let rings = current
+                        .map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
                     if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
                         return Ok(f(Io::Fd(fd)));
                     }

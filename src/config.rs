@@ -4,6 +4,13 @@
 pub struct NucleiConfig {
     /// **IO_URING Configuration** allows you to configure [io_uring](https://unixism.net/loti/what_is_io_uring.html) backend.
     pub iouring: IoUringConfiguration,
+    /// The kernel interface every runtime that names none runs its IO on
+    /// ([`Builder::backend`](crate::Builder::backend) names one for one
+    /// runtime). `None` (the default) picks io_uring where the kernel lets
+    /// this process have it and the platform's poller otherwise; a backend
+    /// named here that this process cannot have makes the first shard fail
+    /// with the reason. A non-empty `NUCLEI_BACKEND` overrides it.
+    pub backend: Option<crate::IoBackend>,
 }
 
 /// **IO_URING Configuration**

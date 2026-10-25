@@ -103,14 +103,27 @@ impl Proactor {
         events
     }
 
-    /// The backend nuclei's IO runs on in this process.
+    /// The backend the calling thread's shard runs its IO on; on a thread
+    /// that runs none, the one of every runtime that names none (the
+    /// platform's poller when the backend named cannot be had: the shards
+    /// then fail with the reason).
     pub fn backend() -> IoBackend {
-        BACKEND
+        match context::current(|shard| shard.map(|s| s.io_backend())) {
+            Some(running) => running,
+            None => crate::rt::backend::chosen().map_or(POLLER, |b| {
+                if b.rings() {
+                    IoBackend::IoUring
+                } else {
+                    POLLER
+                }
+            }),
+        }
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const BACKEND: IoBackend = IoBackend::Epoll;
+/// The platform's readiness poller.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "illumos"))]
+pub(crate) const POLLER: IoBackend = IoBackend::Epoll;
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -119,9 +132,9 @@ const BACKEND: IoBackend = IoBackend::Epoll;
     target_os = "openbsd",
     target_os = "dragonfly",
 ))]
-const BACKEND: IoBackend = IoBackend::Kqueue;
+pub(crate) const POLLER: IoBackend = IoBackend::Kqueue;
 #[cfg(target_os = "windows")]
-const BACKEND: IoBackend = IoBackend::Iocp;
+pub(crate) const POLLER: IoBackend = IoBackend::Iocp;
 
 /// Runs `future` to its end on the calling thread, driving its shard's IO
 /// meanwhile: [`block_on`](crate::runtime::block_on).

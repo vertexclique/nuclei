@@ -52,6 +52,8 @@ use crate::buf::{self, Pool};
 use crate::io::Source;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+use crate::syscore::linux::iouring::ring::RingConfig;
 use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
 
@@ -370,23 +372,43 @@ pub(crate) struct Shard {
     pool: Pool,
 }
 
+/// The fewest submission entries a ring short of memory is made with.
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+const MIN_RING_ENTRIES: u32 = 64;
+
 impl Shard {
     pub(crate) fn new(limits: Limits) -> io::Result<Self> {
+        let poller = || -> io::Result<_> {
+            let poller = Poller::new()?;
+            let (notifier, registrar) = (poller.notifier(), poller.registrar());
+            Ok((
+                Driver::Poll(RefCell::new(poller)),
+                notifier,
+                Some(registrar),
+            ))
+        };
         let (driver, notifier, registrar) = match limits.backend {
-            Backend::Poll => {
-                let poller = Poller::new()?;
-                let (notifier, registrar) = (poller.notifier(), poller.registrar());
-                (
-                    Driver::Poll(RefCell::new(poller)),
-                    notifier,
-                    Some(registrar),
-                )
-            }
+            Backend::Poll => poller()?,
             #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
-            Backend::Ring(cfg) => {
-                let ring = ring::ShardRing::new(&cfg, ring::table_len())?;
-                let notifier = ring.notifier();
-                (Driver::Ring(ring), notifier, None)
+            Backend::Ring(cfg) | Backend::RingOrPoll(cfg) => {
+                // Under a tight memory limit the ring gets fewer entries; one
+                // `auto` chose runs the poller if even the least finds none.
+                let made = super::backend::with_room(cfg.entries, MIN_RING_ENTRIES, |entries| {
+                    ring::ShardRing::new(&RingConfig { entries, ..cfg }, ring::table_len())
+                });
+                match made {
+                    Ok(ring) => {
+                        let notifier = ring.notifier();
+                        (Driver::Ring(ring), notifier, None)
+                    }
+                    Err(err)
+                        if matches!(limits.backend, Backend::RingOrPoll(_))
+                            && err.raw_os_error() == Some(libc::ENOMEM) =>
+                    {
+                        poller()?
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         };
         let shared = Arc::new(Shared {
@@ -631,6 +653,15 @@ impl Shard {
             }
             #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
             Driver::Ring(ring) => ring.wait(timeout).map(|(handled, _)| handled),
+        }
+    }
+
+    /// The kernel interface this shard runs its IO on.
+    pub(crate) fn io_backend(&self) -> crate::IoBackend {
+        match &self.driver {
+            Driver::Poll(_) => crate::proactor::POLLER,
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            Driver::Ring(_) => crate::IoBackend::IoUring,
         }
     }
 

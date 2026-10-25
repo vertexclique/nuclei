@@ -63,6 +63,8 @@ mod syscore {
     #![allow(dead_code)]
     pub(crate) mod linux;
 }
+#[cfg(test)]
+mod alone;
 /// Time: sleeping, timeouts and intervals on the shard's timer wheel.
 pub mod time;
 

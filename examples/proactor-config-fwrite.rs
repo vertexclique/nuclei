@@ -29,6 +29,8 @@ fn main() -> io::Result<()> {
         // * kernel_poll_only
         // * io_poll
         iouring: IoUringConfiguration::interrupt_driven(1 << 11),
+        // None: io_uring where the kernel allows it, else the platform's poller.
+        backend: None,
     };
     let _ = Proactor::with_config(nuclei_config);
 

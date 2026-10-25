@@ -7,6 +7,7 @@ use nuclei::config::{IoUringConfiguration, NucleiConfig};
 fn a_configuration_is_set_once() {
     let config = NucleiConfig {
         iouring: IoUringConfiguration::low_latency_driven(256),
+        backend: None,
     };
     let p = Proactor::with_config(config);
     assert_eq!(p.config().iouring.queue_len, 256);

@@ -149,3 +149,68 @@ fn a_shard_that_goes_waits_for_its_cancelled_operations() {
     // Evicted, the source registers again where it is polled next.
     src.retire();
 }
+
+/// Under a memory limit no ring fits in, a runtime that `auto` gave rings
+/// runs its worker on the poller, and its IO works; one that asks for
+/// io_uring by name fails with the reason. Alone in its process: the limit
+/// cannot be raised again.
+#[test]
+fn a_shard_short_of_memory_for_a_ring_runs_the_poller_under_auto() {
+    if !crate::alone::alone(
+        "rt::shard::ring::tests::a_shard_short_of_memory_for_a_ring_runs_the_poller_under_auto",
+    ) {
+        return;
+    }
+    if std::env::var("NUCLEI_BACKEND").is_ok_and(|b| !b.is_empty()) {
+        return;
+    }
+    // `auto` decided while memory was there.
+    if !crate::rt::backend::chosen().is_ok_and(|b| b.rings()) {
+        eprintln!("skipping: io_uring is not usable here");
+        return;
+    }
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain data in, nothing kept.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &none) }, 0);
+    if super::ShardRing::new(&RingConfig::new(64), 64).is_ok() {
+        eprintln!("skipping: this kernel makes rings past a zero memory-lock limit");
+        return;
+    }
+    let rt = crate::runtime::Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .build()
+        .expect("a runtime that may fall back to the poller starts");
+    let (mine, src, peer) = source_pair();
+    let (backend, got) = rt.block_on(async move {
+        crate::runtime::spawn(async move {
+            let mut rest = &b"hi"[..];
+            while !rest.is_empty() {
+                let n = poll_fn(|cx| src.poll_write(cx, rest)).await.unwrap();
+                rest = &rest[n..];
+            }
+            poll_fn(|cx| src.poll_flush(cx)).await.unwrap();
+            let mut got = [0u8; 2];
+            let mut peer = &peer;
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            peer.read_exact(&mut got).unwrap();
+            src.retire();
+            (crate::Proactor::backend(), got)
+        })
+        .await
+    });
+    drop(mine);
+    assert_eq!(backend, crate::IoBackend::Epoll);
+    assert_eq!(&got, b"hi");
+    let Err(err) = crate::runtime::Builder::new()
+        .worker_threads(1)
+        .backend(crate::IoBackend::IoUring)
+        .build()
+    else {
+        panic!("a runtime that asked for io_uring by name started without memory for a ring");
+    };
+    assert_eq!(err.raw_os_error(), Some(libc::ENOMEM), "{err}");
+}

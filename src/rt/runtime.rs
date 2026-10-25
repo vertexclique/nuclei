@@ -43,6 +43,9 @@ pub(crate) struct Inner {
     /// How many live tasks more than the other choice the spawning shard
     /// may hold and still keep a task it spawns.
     local_margin: usize,
+    /// The workers' IO runs on rings.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+    rings: bool,
 }
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
@@ -64,6 +67,7 @@ pub struct Builder {
     local_spawn_margin: Option<usize>,
     io_buffer_cap: Option<usize>,
     max_worker_threads: Option<usize>,
+    backend: Option<crate::IoBackend>,
 }
 
 impl Default for Builder {
@@ -93,6 +97,7 @@ impl Builder {
             local_spawn_margin: None,
             io_buffer_cap: None,
             max_worker_threads: None,
+            backend: None,
         }
     }
 
@@ -176,6 +181,17 @@ impl Builder {
         self
     }
 
+    /// The kernel interface the workers run their IO on. Unset, it is the
+    /// process's: the `backend` of
+    /// [`NucleiConfig`](crate::config::NucleiConfig), or io_uring where the
+    /// kernel lets this process have it and the platform's poller otherwise.
+    /// A backend this process cannot have makes [`build`](Self::build) fail
+    /// with the reason. A non-empty `NUCLEI_BACKEND` overrides it.
+    pub fn backend(mut self, backend: crate::IoBackend) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
     /// Whether each worker thread is pinned to its own core (Linux; default
     /// true). A pinned shard keeps its cache warm; unpinned, the scheduler may
     /// move it.
@@ -197,8 +213,10 @@ impl Builder {
         let limits = Limits {
             max_nesting: self.max_nesting.unwrap_or(context::DEFAULT_MAX_NESTING),
             buffer_cap: self.io_buffer_cap.unwrap_or(crate::buf::DEFAULT_CAP),
-            backend: super::backend::chosen()?,
+            backend: super::backend::for_runtime(self.backend)?,
         };
+        #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+        let rings = limits.backend.rings();
         let blocking_name = self
             .thread_name
             .clone()
@@ -241,6 +259,8 @@ impl Builder {
             ),
             pool,
             local_margin: self.local_spawn_margin.unwrap_or(DEFAULT_LOCAL_MARGIN),
+            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+            rings,
         });
         let runtime = Runtime { inner, exits };
         // On an error the runtime drops: the workers already started stop.
@@ -457,6 +477,19 @@ pub(crate) fn default_runtime() -> &'static Runtime {
 /// The runtime this thread is inside, or the default one.
 pub(crate) fn current() -> Arc<Inner> {
     context::runtime().unwrap_or_else(|| Arc::clone(&default_runtime().inner))
+}
+
+/// Whether the shard [`service_shard`] hands out runs a ring: the current
+/// (or default) runtime's workers do, or with no workers, this thread's own
+/// shard.
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "iouring"))]
+pub(crate) fn service_rings() -> bool {
+    let inner = current();
+    if inner.workers.running() > 0 {
+        inner.rings
+    } else {
+        super::backend::chosen().is_ok_and(|b| b.rings())
+    }
 }
 
 /// A shard to serve a thread that runs none (its timers, the registrations
