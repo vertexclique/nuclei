@@ -887,9 +887,10 @@ fn a_tcp_dup_and_close_never_lets_the_driver_touch_a_reused_number() {
 }
 
 /// A handle dropped with bytes still to send hands them to a copy of its
-/// descriptor; its own number is closed and taken by the next socket at
-/// once. The bytes still go to the old peer, and nothing goes to the socket
-/// that took the number.
+/// descriptor; its own number is closed (at once, or by the source's last
+/// holder as it lets go) and taken by a socket of the test while the bytes
+/// are still out. The bytes still go to the old peer, and nothing goes to
+/// the socket that took the number.
 #[cfg(unix)]
 #[test]
 fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
@@ -906,14 +907,25 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         drop(handle);
         (sent, number)
     });
-    // Alone in its process, the test's next socket takes the lowest free
-    // number: the one the drop closed.
-    let (taker, taker_peer) = UnixStream::pair().unwrap();
-    assert_eq!(
-        taker.as_raw_fd(),
-        number,
-        "the next socket did not take the freed number"
-    );
+    // A new socket takes the lowest free number. Until the drop's number is
+    // free (its close may come from another thread, and the runtime's own
+    // descriptors may come and go meanwhile), the sockets made are kept, so
+    // every number below it stays taken and the first made after it closes
+    // takes it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut kept = Vec::new();
+    let (taker, taker_peer) = loop {
+        let (a, b) = UnixStream::pair().unwrap();
+        if a.as_raw_fd() == number {
+            break (a, b);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped handle's number {number} never came free"
+        );
+        kept.push((a, b));
+        std::thread::sleep(Duration::from_millis(1));
+    };
     let got = std::thread::spawn(move || read_to_end_blocking(peer))
         .join()
         .unwrap();
@@ -923,6 +935,7 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         got.len(),
         sent.len()
     );
+    drop(kept);
     // Nothing reached the socket that took the number.
     drop(taker);
     taker_peer.set_nonblocking(true).unwrap();
