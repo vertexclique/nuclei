@@ -24,6 +24,8 @@ mod tests;
 mod tests_net;
 #[cfg(test)]
 mod tests_setup;
+#[cfg(test)]
+mod tests_wake;
 
 use std::{
     ffi::c_void,
