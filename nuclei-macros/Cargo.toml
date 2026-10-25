@@ -7,7 +7,6 @@ rust-version = "1.90"
 description = "Attribute macros for the nuclei runtime"
 keywords = ["io", "async", "uring", "iouring", "proactor"]
 categories = ["concurrency", "asynchronous"]
-homepage = "https://github.com/vertexclique/nuclei"
 repository = "https://github.com/vertexclique/nuclei"
 documentation = "https://docs.rs/nuclei"
 license = "Apache-2.0/MIT"
