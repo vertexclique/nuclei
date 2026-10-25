@@ -106,23 +106,27 @@ fn one_multishot_receive_serves_every_arrival() {
     };
     let _current = context::enter(&shard);
     let (_mine, src, mut peer) = source_pair();
+    // Each message goes once the one before was read: each is an arrival
+    // of its own, however slow the reader.
+    let (read_one, wait_read) = std::sync::mpsc::channel::<()>();
     let writer = std::thread::spawn(move || {
         for i in 0..32u8 {
             peer.write_all(&[i; 100]).unwrap();
-            std::thread::sleep(Duration::from_millis(2));
+            wait_read.recv().unwrap();
         }
         peer
     });
     shard.block_on(async {
-        let mut got = vec![0u8; 3200];
-        read_exact(&src, &mut got).await;
-        for (i, message) in got.chunks(100).enumerate() {
-            assert!(message.iter().all(|&b| b == i as u8), "message {i} changed");
+        for i in 0..32u8 {
+            let mut message = [0u8; 100];
+            read_exact(&src, &mut message).await;
+            assert!(message.iter().all(|&b| b == i), "message {i} changed");
+            read_one.send(()).unwrap();
         }
     });
     let (armed, arrived, _) = shard.ring().unwrap().multishot_counts();
     assert_eq!(armed, 1, "the receive was armed again {} times", armed - 1);
-    assert!(arrived >= 16, "only {arrived} arrivals for 32 messages");
+    assert!(arrived >= 32, "only {arrived} arrivals for 32 messages");
     drop(writer.join().unwrap());
     src.retire();
 }
@@ -157,10 +161,12 @@ fn a_long_stream_arrives_whole_and_in_order_across_the_buffers() {
     src.retire();
 }
 
-/// A reader that stops reading while bytes keep coming in small batches:
-/// its receive is stopped once it holds past its cap, so it takes nothing
-/// more from the group however long the bytes keep coming, and once it
-/// reads again every byte comes, in order.
+/// A reader that stops reading while bytes keep coming: its receive is
+/// stopped once it holds past its cap, so it takes nothing more from the
+/// group however many bytes come after, and once it reads again every byte
+/// comes, in order. The writer sends half, waits for the reader to see the
+/// receive stopped, then sends the rest: what the stop bounds is what comes
+/// after it, whatever the batches the kernel made of the first half.
 #[test]
 fn a_reader_that_falls_behind_is_stopped_at_its_cap_and_loses_nothing() {
     let Some(shard) = recv_shard(256, 4096) else {
@@ -174,29 +180,58 @@ fn a_reader_that_falls_behind_is_stopped_at_its_cap_and_loses_nothing() {
     const PIECES: usize = 80;
     let data = pattern(PIECE * PIECES);
     let expected = data.clone();
-    // Small batches: each arrives on its own, well under the group.
+    let (half_sent, wait_half) = std::sync::mpsc::channel::<()>();
+    let (go_on, wait_go_on) = std::sync::mpsc::channel::<()>();
+    let (all_sent, wait_all) = std::sync::mpsc::channel::<()>();
     let writer = std::thread::spawn(move || {
-        for piece in data.chunks(PIECE) {
+        let (first, second) = data.split_at(data.len() / 2);
+        for piece in first.chunks(PIECE) {
             peer.write_all(piece).unwrap();
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(1));
         }
+        half_sent.send(()).unwrap();
+        wait_go_on.recv().unwrap();
+        peer.write_all(second).unwrap();
+        all_sent.send(()).unwrap();
         peer
     });
     let ring = shard.ring().unwrap();
     let cap = ring.recv_cap().unwrap();
+    assert!(cap < PIECE * PIECES / 2, "the first half passes the cap");
     shard.block_on(async {
-        // One read arms the receive, then the reader falls behind while
-        // the writer goes on.
+        // One read arms the receive, then the reader falls behind.
         let mut first = vec![0u8; 1];
         read_exact(&src, &mut first).await;
-        pause(Duration::from_millis(PIECES as u64 * 5 + 100)).await;
-        // Past the cap the receive stops: at most the batch in which it
-        // passed it comes on top.
-        let held = ring.held();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while wait_half.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "the first half was never sent");
+            pause(Duration::from_millis(5)).await;
+        }
+        // Until what the receive holds stops growing: it stopped.
+        let mut held = ring.held();
+        loop {
+            pause(Duration::from_millis(20)).await;
+            let now = ring.held();
+            if now == held {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the receive never stopped: {now} bytes"
+            );
+            held = now;
+        }
         assert!(
-            held <= cap + 2 * PIECE,
-            "a reader that took nothing holds {held} bytes, past its cap of {cap}"
+            held > cap,
+            "it stopped at {held} bytes, under its cap of {cap}"
         );
+        go_on.send(()).unwrap();
+        while wait_all.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "the rest was never sent");
+            pause(Duration::from_millis(5)).await;
+        }
+        pause(Duration::from_millis(50)).await;
+        assert_eq!(ring.held(), held, "the stopped receive took more");
         let mut rest = vec![0u8; expected.len() - 1];
         read_exact(&src, &mut rest).await;
         assert_eq!(first[0], expected[0]);
