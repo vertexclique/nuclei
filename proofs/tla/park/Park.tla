@@ -25,10 +25,13 @@ EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS
     Wakers,    \* the waker threads, numbered 1, 2, ...
+    TimerTask, \* TRUE: a task of the shard's own sleeps on a timer of its wheel
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The shard's thread number: no waker uses it.
 ShardT == 0
+\* The clock's: it makes the timer due.
+ClockT == -1
 \* Every item of work: one per waker.
 Total == Cardinality(Wakers)
 
@@ -40,20 +43,36 @@ variables
     consumed = 0,      \* (record) work the shard ran
     notifies = 0,      \* (record) notifications sent
     rechecked = FALSE, \* (record) the look after publishing found work
-    spurious = FALSE;  \* (record) a notification came while the shard was awake
+    spurious = FALSE,  \* (record) a notification came while the shard was awake
+    timerArmed = TimerTask, \* the task's timer is in the wheel, not fired
+    timerDue = FALSE,  \* its deadline passed
+    local = 0,         \* the shard's own runnable tasks (the timer's, once it fired)
+    driveFired = FALSE;\* (record) the timer fired in the drive on the way to park
 
 define
     \* Every waker is done.
     WakersDone == \A w \in Wakers : pc[w] = "Done"
+    \* All the work ran: the wakers' and the timer's task.
+    AllRan == consumed = Total /\ local = 0 /\ ~timerArmed
 end define;
 
 fair process shard = ShardT
 begin
 S_run:
-    \* Run what is in the inbox.
+    \* Run what is in the inbox, and the shard's own tasks.
     if inbox > 0 then
         inbox := inbox - 1;
         consumed := consumed + 1;
+        goto S_run;
+    elsif local > 0 then
+        local := local - 1;
+        goto S_run;
+    end if;
+S_fire:
+    \* The loop fires the timers that are due.
+    if timerArmed /\ timerDue then
+        timerArmed := FALSE;
+        local := local + 1;
         goto S_run;
     end if;
 S_publish:
@@ -67,14 +86,41 @@ S_look:
         parked := FALSE;
         goto S_run;
     end if;
+S_drive:
+    \* `drive`: it fires the timers that came due meanwhile ...
+    if timerArmed /\ timerDue then
+        timerArmed := FALSE;
+        local := local + 1;
+        driveFired := TRUE;                 \* (record)
+    end if;
+S_check:
+    \* ... and only looks at the poller if that woke a task of the shard's own, which
+    \* nothing else would wake it for.
+    \* MUTATION drive_waits: the drive waits on the poller all the same.
+    if local > 0 /\ Mutation # "drive_waits" then
+        parked := FALSE;
+        goto S_run;
+    end if;
 S_sleep:
-    \* The poller's wait: until a notification, or (the model's end) until every waker is
-    \* done and all their work ran.
-    await pending \/ (WakersDone /\ consumed = Total);
+    \* The poller's wait: until a notification, the deadline of a timer still in the wheel,
+    \* or (the model's end) until every waker is done and all the work ran.
+    await pending \/ (timerArmed /\ timerDue) \/ (WakersDone /\ AllRan);
     if pending then
         pending := FALSE;
         parked := FALSE;                    \* `end_park`
         goto S_run;
+    elsif timerArmed /\ timerDue then
+        parked := FALSE;
+        goto S_run;
+    end if;
+end process;
+
+\* The clock: the timer's deadline passes at some point.
+fair process clock = ClockT
+begin
+C_tick:
+    if timerArmed then
+        timerDue := TRUE;
     end if;
 end process;
 
@@ -134,4 +180,6 @@ NoNotify == notifies = 0
 NoRecheckFind == ~rechecked
 \* A notification lands while the shard is awake (harmless: its next wait returns at once).
 NoSpurious == ~spurious
+\* The timer comes due on the shard's way to park, and the drive fires it.
+NoDriveFire == ~driveFired
 =============================================================================

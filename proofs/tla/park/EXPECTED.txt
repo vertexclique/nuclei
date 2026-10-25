@@ -7,3 +7,7 @@ M_check_first                  MC_Park              deadlock
 W_notify                       MC_Park              violated:NoNotify
 W_recheck                      MC_Park              violated:NoRecheckFind
 W_spurious                     MC_Park              violated:NoSpurious
+P_timer                        MC_Park              pass
+P_timer_live                   MC_Park              pass
+M_drive_waits                  MC_Park              deadlock
+W_drive_fire                   MC_Park              violated:NoDriveFire

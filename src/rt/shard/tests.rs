@@ -60,3 +60,43 @@ fn the_loop_parks_until_the_next_timer_rather_than_forever() {
     shard.block_on(sleep_on(&shard, start + Duration::from_millis(20)));
     assert!(start.elapsed() >= Duration::from_millis(20));
 }
+
+/// A task's timer comes due while the shard is on its way to park: the
+/// drive that fires it finds the task it woke, and only looks at the
+/// poller instead of waiting there, where nothing would wake the shard.
+/// The shard runs on a thread of its own, so a drive that waited fails the
+/// test rather than hanging it.
+#[test]
+fn a_timer_fired_on_the_way_to_park_runs_its_task_rather_than_parking() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let shard = Shard::new(Limits {
+            max_nesting: 8,
+            buffer_cap: crate::buf::DEFAULT_CAP,
+            backend: crate::rt::backend::chosen().unwrap(),
+        })
+        .unwrap();
+        let _current = context::enter(&shard);
+        let woke = std::rc::Rc::new(core::cell::Cell::new(false));
+        let flag = std::rc::Rc::clone(&woke);
+        crate::runtime::spawn_local(async move {
+            crate::time::sleep(Duration::from_millis(1)).await;
+            flag.set(true);
+        })
+        .detach();
+        // The task arms its timer, which then comes due without firing.
+        shard.run_ready();
+        let armed_unfired = !woke.get();
+        std::thread::sleep(Duration::from_millis(5));
+        // Nothing but the timer has work for the shard: a drive that waited
+        // on the poller after firing it would never return.
+        shard.drive(None).unwrap();
+        shard.run_ready();
+        let _ = done.send((armed_unfired, woke.get()));
+    });
+    let (armed_unfired, woke) = finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the drive waited on the poller with the task it woke still to run");
+    assert!(armed_unfired, "the timer fired before it was due");
+    assert!(woke, "the task the timer woke never ran");
+}

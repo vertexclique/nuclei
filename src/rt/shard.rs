@@ -668,6 +668,14 @@ impl Shard {
             self.apply_io_ops();
         }
         self.fire_timers();
+        // A timer that fired just now (or a change applied above) may have
+        // woken a task of this shard, which nothing else will wake it for:
+        // the poller is only looked at, and the task runs at once.
+        let wait = if self.has_local_work() {
+            Some(Duration::ZERO)
+        } else {
+            wait
+        };
         let timeout = match (wait, self.next_timer()) {
             (Some(w), Some(t)) => Some(w.min(t)),
             (w, t) => w.or(t),
