@@ -775,6 +775,36 @@ admitted entry, each release, a downgrade and an upgrade's finish keep a writer 
 upgrading tied to the upgradable read; an upgrade holds reads back; and a write needs the lock
 empty.
 
+## The reentrant locks
+
+`reentrant` checks the two locks an owner may lock again, at the grain of their atomic steps.
+`tla/reentrant/ReentrantMutex.tla` checks `ReentrantMutex` (`src/sync/reentrant_mutex.rs`, keyed
+by `src/sync/owner.rs`): the holder id's loads and stores, the depth, and the permit's take, wait
+and release, with the semaphore under it abstract (its protocol is the semaphore family's).
+`tla/reentrant/ReentrantRwLock.tla` checks `ReentrantRwLock` (`src/sync/reentrant_rwlock.rs`): the
+writer id, the write depth, each record's owner and reads, each lookup, a claim's look and its
+compare-and-swap (which a racing claim can beat, and whose walk may miss a record freed behind
+it), the push, and the plain lock's shares, with the plain lock abstract (its protocol is the
+rwlock family's). 24 configurations: 5 that must pass (two owners that lock two deep, let one go
+and lock again; one three deep beside one that locks twice; a writer that reads inside and lets
+the write go first, a downgrade, beside a reader two deep; a writer that lets its read go first
+beside a reader refused the write; two readers whose claims race for a freed record), with one
+holder at a time and its depth its guards, a lock again only ever the holder's, a writer alone,
+the plain lock's shares exactly the owners', every guard covered by a share, one record per
+reading owner holding its read guards, the lock free at the end, and every owner ending; 13
+mutations (the permit given back before the id is cleared, and every unlock clearing it,
+`AllOwnersEnd`; the id never cleared, `Exclusion`, `FreeAtEnd` and `NoFalseReenter`; a lock again
+that leaves the depth, `DepthMatches`; the last write given back though its owner reads,
+`GuardsCovered`; the last read giving a share back under its owner's write, `SharesMatch`; a
+reading owner's write not refused, `AllOwnersEnd`; a read taking no share beside any writer,
+`Exclusion`; a claim without its compare-and-swap, `ReadsMatch`; a read that does not look for
+its own record, `OneRecordEach`; the writer id kept, `FreeAtEnd`); and 6 witnesses (two deep; a
+wait behind the holder; a refusal; a downgrade; a record claimed again; a claim beaten by a
+racing one). `lean/Nuclei/Reentrant.lean` proves, for one owner at every depth (the TLA+ model
+checks a few levels), that the mutex's owner holds the permit exactly while its depth is above
+zero, and that the reader-writer lock's owner holds exactly the share its read and write depths
+call for after any steps, a write being refused exactly when the owner reads without writing.
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver

@@ -161,3 +161,14 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.RwLock.upgrade_finish_keeps_good
 #print axioms Nuclei.RwLock.upgrading_holds_reads_back
 #print axioms Nuclei.RwLock.a_write_needs_the_lock_empty
+
+-- The reentrant locks: the mutex's owner holds the permit exactly while its depth is above zero,
+-- and the reader-writer lock's owner holds exactly the share its read and write depths call for,
+-- after any steps; a write is refused exactly when the owner reads without writing.
+#print axioms Nuclei.Reentrant.stepM_keeps_good
+#print axioms Nuclei.Reentrant.the_permit_follows_the_depth
+#print axioms Nuclei.Reentrant.lock_adds_one
+#print axioms Nuclei.Reentrant.unlock_takes_one
+#print axioms Nuclei.Reentrant.step_keeps_good
+#print axioms Nuclei.Reentrant.the_share_follows_the_depths
+#print axioms Nuclei.Reentrant.refused_iff

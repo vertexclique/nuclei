@@ -1,0 +1,25 @@
+# configuration                spec                 expected
+L_two                          MC_ReentrantMutex    pass
+L_deep_shallow                 MC_ReentrantMutex    pass
+M_release_before_clear         MC_ReentrantMutex    violated:AllOwnersEnd
+M_clear_each_unlock            MC_ReentrantMutex    violated:AllOwnersEnd
+M_never_clear                  MC_ReentrantMutex    violated:Exclusion
+M_never_clear_end              MC_ReentrantMutex    violated:FreeAtEnd
+M_never_clear_reenter          MC_ReentrantMutex    violated:NoFalseReenter
+M_reenter_skips_depth          MC_ReentrantMutex    violated:DepthMatches
+MW_reenter                     MC_ReentrantMutex    violated:OneLevel
+MW_contend                     MC_ReentrantMutex    violated:NoWaitBehind
+RW_downgrade                   MC_ReentrantRwLock   pass
+RW_refused                     MC_ReentrantRwLock   pass
+RW_claims                      MC_ReentrantRwLock   pass
+RWM_forgets_reads              MC_ReentrantRwLock   violated:GuardsCovered
+RWM_read_unlock_while_writing  MC_ReentrantRwLock   violated:SharesMatch
+RWM_write_waits_for_own_read   MC_ReentrantRwLock   violated:AllOwnersEnd
+RWM_read_beside_any_writer     MC_ReentrantRwLock   violated:Exclusion
+RWM_claim_without_cas          MC_ReentrantRwLock   violated:ReadsMatch
+RWM_read_ignores_own_record    MC_ReentrantRwLock   violated:OneRecordEach
+RWM_keeps_writer_id            MC_ReentrantRwLock   violated:FreeAtEnd
+RWW_refusal                    MC_ReentrantRwLock   violated:NoRefusal
+RWW_downgrade                  MC_ReentrantRwLock   violated:NoDowngrade
+RWW_reuse                      MC_ReentrantRwLock   violated:NoReuse
+RWW_lost_claim                 MC_ReentrantRwLock   violated:NoLostClaim
