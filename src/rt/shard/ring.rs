@@ -630,11 +630,16 @@ thread_local! {
 
 /// The fixed-file table of a ring: the process's descriptor limit (no more
 /// sources can be open while it holds), at most [`MAX_TABLE`], whose slots
-/// cost kernel memory per ring. Sources past it run on copies.
+/// cost kernel memory per ring. Sources past it run on copies; every source
+/// does where the kernel lets go of a file out of the table only late (see
+/// `files::release_at_once`).
 pub(crate) fn table_len() -> u32 {
     #[cfg(test)]
     if let Some(len) = TABLE_FOR_TEST.with(Cell::get) {
         return len;
+    }
+    if !crate::syscore::linux::iouring::files::release_at_once() {
+        return 0;
     }
     // SAFETY: plain data; the call fills it.
     let mut limit: libc::rlimit = unsafe { core::mem::zeroed() };

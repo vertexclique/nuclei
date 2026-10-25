@@ -46,7 +46,9 @@ impl RingPoller {
         let mut cfg = *cfg;
         cfg.start_disabled = true;
         let ring = Ring::new(&cfg)?;
-        ring.register_files_sparse(files)?;
+        if files > 0 {
+            ring.register_files_sparse(files)?;
+        }
         // SAFETY: a plain syscall; the descriptor it returns is owned at once.
         let wake = unsafe {
             let fd = libc::eventfd(0, libc::EFD_CLOEXEC);

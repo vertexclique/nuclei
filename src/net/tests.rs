@@ -524,6 +524,17 @@ fn a_handle_dropped_with_an_operation_waiting_closes_cleanly() {
     });
 }
 
+/// The same where the ring keeps no fixed-file table, as on a kernel that
+/// lets go of a file out of the table only late: the dropped handle's file
+/// goes once its own operation ended, whatever else the ring has out.
+#[cfg(ring)]
+#[test]
+fn a_handle_dropped_with_an_operation_waiting_closes_cleanly_on_copies() {
+    crate::rt::shard::ring::TABLE_FOR_TEST.with(|t| t.set(Some(0)));
+    a_handle_dropped_with_an_operation_waiting_closes_cleanly();
+    crate::rt::shard::ring::TABLE_FOR_TEST.with(|t| t.set(None));
+}
+
 #[test]
 fn a_handle_used_from_another_executor_works() {
     // Polled by a minimal executor on a plain thread: a runtime shard
