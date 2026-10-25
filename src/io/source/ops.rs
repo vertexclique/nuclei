@@ -38,6 +38,12 @@ pub(crate) enum Want {
     Accept,
     /// Read a stream's bytes into the spare room of a buffer of the pool.
     Recv(PoolBuf),
+    /// Receive a stream's bytes as they come, into buffers of the shard's
+    /// receive group, until the receive is stopped: each arrival is handed
+    /// to the side as it comes, apart from the end (see
+    /// [`Outcome::RecvMultiEnd`]).
+    #[cfg(ring)]
+    RecvMulti,
     /// Read a stream's bytes into the spare capacity of a task's buffer.
     RecvLent(Vec<u8>),
     /// Receive a datagram into a buffer of the pool, with its sender.
@@ -59,6 +65,8 @@ impl Want {
             #[cfg(ring)]
             Want::Ready { read } => *read,
             Want::Accept | Want::Recv(_) | Want::RecvLent(_) | Want::RecvFrom(_) => true,
+            #[cfg(ring)]
+            Want::RecvMulti => true,
             Want::Connect(_) | Want::Send(_) | Want::SendLent(..) | Want::SendTo(..) => false,
         }
     }
@@ -100,6 +108,15 @@ pub(crate) enum Outcome {
     Ready(Answer<()>),
     Accept(Answer<(Owned, Addr)>),
     Recv(PoolBuf, Answer<usize>),
+    /// A multishot receive ended: on the stream's end (`Done(Ok(0))`), an
+    /// error, a cancel, or after its last arrival (`Done(Ok(n))`, its bytes
+    /// handed over already). `dry`: the receive group had no buffer left,
+    /// so the next receive takes one of the pool.
+    #[cfg(ring)]
+    RecvMultiEnd {
+        answer: Answer<usize>,
+        dry: bool,
+    },
     RecvLent(Vec<u8>, Answer<usize>),
     RecvFrom(PoolBuf, Answer<(usize, Addr)>),
     Connect(Dial, Answer<()>),

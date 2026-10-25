@@ -16,6 +16,13 @@
 //! One that is cancelled or whose source goes while it waits ends here,
 //! never submitted. A side has one operation out at a time, so the
 //! operations here are bounded by the sources.
+//!
+//! A multishot receive stays in flight across its arrivals: each completion
+//! that says more come (`IORING_CQE_F_MORE`) hands its buffer of the
+//! receive group (see `recv`) to the source as a chunk, and only the last
+//! ends the operation. Its arrivals are bounded by the group's buffers, so
+//! the operations let into the kernel leave the completion queue room for
+//! them.
 
 use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -23,14 +30,17 @@ use std::io;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
+use super::recv::RecvGroup;
 use crate::io::source::ops::Done;
-use crate::io::source::ring::RingOp;
+use crate::io::source::ring::{RingMem, RingOp};
 use crate::io::sys;
 use crate::rt::park::Notifier;
 use crate::rt::park::ring::RingPoller;
 use crate::syscore::linux::iouring::files::Files;
 use crate::syscore::linux::iouring::ops::Ops;
-use crate::syscore::linux::iouring::ring::sys::IOSQE_FIXED_FILE;
+use crate::syscore::linux::iouring::ring::sys::{
+    IORING_CQE_F_MORE, IOSQE_FIXED_FILE, cqe_buffer_id,
+};
 use crate::syscore::linux::iouring::ring::{IoUringCqe, RingConfig, Sqe};
 
 /// A shard's ring.
@@ -46,6 +56,13 @@ pub(crate) struct ShardRing {
     cap: usize,
     /// Completions of the last wait, reused.
     cqes: RefCell<Vec<IoUringCqe>>,
+    /// The buffers multishot receives draw from; `None` when the
+    /// configuration asks for none or the kernel could not make them.
+    recv: RefCell<Option<RecvGroup>>,
+    /// Multishot receives submitted, their arrivals, and the receives that
+    /// ended as the group ran dry, for a test.
+    #[cfg(test)]
+    counts: Cell<(usize, usize, usize)>,
 }
 
 impl ShardRing {
@@ -53,7 +70,30 @@ impl ShardRing {
     /// disabled until its first wait or submission.
     pub(crate) fn new(cfg: &RingConfig, files: u32) -> io::Result<Self> {
         let poller = RingPoller::new(cfg, files)?;
-        let cap = poller.cq_entries() as usize;
+        let recv = match cfg.recv_buffers {
+            0 => None,
+            entries => match RecvGroup::new(poller.ring(), entries, cfg.recv_buffer_size) {
+                Ok(group) => Some(group),
+                // A count or a size no group can have is the configuration's
+                // mistake, said at once.
+                Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("io_uring recv_buffers and recv_buffer_size: {err}"),
+                    ));
+                }
+                // Short of memory: each read takes a buffer of the pool.
+                Err(_) => None,
+            },
+        };
+        // Room in the completion queue for every arrival the group's buffers
+        // can hold.
+        let arrivals = recv
+            .as_ref()
+            .map_or(0, |g: &RecvGroup| usize::from(g.entries()));
+        let cap = (poller.cq_entries() as usize)
+            .saturating_sub(arrivals)
+            .max(1);
         Ok(Self {
             poller: RefCell::new(poller),
             ops: RefCell::new(Ops::new(u32::MAX)),
@@ -62,7 +102,15 @@ impl ShardRing {
             in_kernel: Cell::new(0),
             cap,
             cqes: RefCell::new(Vec::with_capacity(256)),
+            recv: RefCell::new(recv),
+            #[cfg(test)]
+            counts: Cell::new((0, 0, 0)),
         })
+    }
+
+    /// The group id multishot receives draw from, if the ring has a group.
+    pub(crate) fn recv_group(&self) -> Option<u16> {
+        self.recv.borrow().as_ref().map(RecvGroup::bgid)
     }
 
     pub(crate) fn notifier(&self) -> Notifier {
@@ -80,6 +128,11 @@ impl ShardRing {
             None => sqe.flags(IOSQE_FIXED_FILE),
         };
         op.source.op_out();
+        #[cfg(test)]
+        if matches!(op.mem, RingMem::RecvMulti { .. }) {
+            let (armed, arrived, dry) = self.counts.get();
+            self.counts.set((armed + 1, arrived, dry));
+        }
         let inserted = self.ops.borrow_mut().insert(op);
         let user_data = match inserted {
             Ok(user_data) => user_data,
@@ -178,6 +231,7 @@ impl ShardRing {
     /// which are handed to their sources. Returns how many it handled and
     /// whether a wake came.
     pub(crate) fn wait(&self, timeout: Option<Duration>) -> io::Result<(usize, bool)> {
+        self.take_back();
         let mut cqes = core::mem::take(&mut *self.cqes.borrow_mut());
         let woken = self.poller.borrow_mut().wait(timeout, &mut cqes);
         let handled = cqes.len();
@@ -189,6 +243,13 @@ impl ShardRing {
     }
 
     fn complete(&self, cqe: IoUringCqe) {
+        if let Some(bid) = cqe_buffer_id(cqe.flags) {
+            self.arrived(cqe.user_data, bid, cqe.res);
+        }
+        // More of a multishot receive's arrivals come: it stays in flight.
+        if cqe.flags & IORING_CQE_F_MORE != 0 {
+            return;
+        }
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
             return;
         };
@@ -197,9 +258,84 @@ impl ShardRing {
         self.end(op, cqe.res);
     }
 
+    /// Buffer `bid` of the receive group came with `res` bytes for the
+    /// multishot receive of `user_data`: its source gets them as a chunk.
+    /// Past the cap of bytes it holds, the receive is stopped; its source
+    /// asks for another once its reader took them.
+    fn arrived(&self, user_data: u64, bid: u16, res: i32) {
+        let mut stop = false;
+        let delivery = {
+            let mut recv = self.recv.borrow_mut();
+            let Some(group) = recv.as_mut() else {
+                return;
+            };
+            let mut ops = self.ops.borrow_mut();
+            let held = ops.get_mut(user_data).and_then(|op| match &mut op.mem {
+                RingMem::RecvMulti { held, stopping } => Some((op.epoch, held, stopping)),
+                _ => None,
+            });
+            match (u32::try_from(res), held) {
+                (Ok(len @ 1..), Some((epoch, held, stopping))) => {
+                    match group.hand_out(user_data, bid, len) {
+                        Some(chunk) => {
+                            *held += len as usize;
+                            if *held > group.cap() && !*stopping {
+                                *stopping = true;
+                                stop = true;
+                            }
+                            ops.get_mut(user_data)
+                                .map(|op| (std::sync::Arc::clone(&op.source), chunk, epoch))
+                        }
+                        None => None,
+                    }
+                }
+                // No bytes, or no receive to give them to: the buffer goes
+                // back at once.
+                _ => {
+                    group.give_back(bid);
+                    None
+                }
+            }
+        };
+        if stop {
+            self.cancel(user_data);
+        }
+        // Handed over with nothing borrowed: the source may submit at once.
+        if let Some((source, chunk, epoch)) = delivery {
+            #[cfg(test)]
+            {
+                let (armed, arrived, dry) = self.counts.get();
+                self.counts.set((armed, arrived + 1, dry));
+            }
+            source.ring_chunk(chunk, epoch);
+        }
+    }
+
+    /// Takes in the buffers chunks gave back and gives them to the kernel
+    /// again, counting each off the receive it went to.
+    fn take_back(&self) {
+        let mut recv = self.recv.borrow_mut();
+        let Some(group) = recv.as_mut() else {
+            return;
+        };
+        let mut ops = self.ops.borrow_mut();
+        group.take_back(|user_data, len| {
+            if let Some(RingMem::RecvMulti { held, .. }) =
+                ops.get_mut(user_data).map(|op| &mut op.mem)
+            {
+                *held = held.saturating_sub(len as usize);
+            }
+        });
+    }
+
     /// `op` ended with `res`: its slot is named once less, and its source
     /// gets the completion.
     fn end(&self, op: RingOp, res: i32) {
+        #[cfg(test)]
+        if res == -libc::ENOBUFS && matches!(op.mem, RingMem::RecvMulti { .. }) {
+            let (armed, arrived, dry) = self.counts.get();
+            self.counts.set((armed, arrived, dry + 1));
+        }
         let freed = self.files.borrow_mut().done(op.file);
         self.freed(op.file, freed);
         let kind = op.source.kind();
@@ -232,6 +368,11 @@ impl ShardRing {
         self.settle(|| {});
         let stuck: Vec<RingOp> = self.ops.borrow_mut().drain().collect();
         LEAKED.fetch_add(stuck.len(), core::sync::atomic::Ordering::Relaxed);
+        if !stuck.is_empty() {
+            // A receive still in the kernel may write the group's buffers:
+            // they stay registered and mapped for good.
+            core::mem::forget(self.recv.borrow_mut().take());
+        }
         core::mem::forget(stuck);
     }
 }
@@ -284,6 +425,33 @@ impl ShardRing {
         let files = self.files.borrow();
         (files.in_use(), files.copies_in_use())
     }
+
+    /// Multishot receives submitted so far, the arrivals they handed out,
+    /// and those that ended as the group ran dry.
+    pub(crate) fn multishot_counts(&self) -> (usize, usize, usize) {
+        self.counts.get()
+    }
+
+    /// Bytes of the group's buffers handed out and not given back, whether
+    /// or not the receive they went to is still in flight.
+    pub(crate) fn held(&self) -> usize {
+        self.take_back();
+        self.recv.borrow().as_ref().map_or(0, RecvGroup::out)
+    }
+
+    /// Multishot receives in flight.
+    pub(crate) fn receives_in_flight(&self) -> usize {
+        self.ops
+            .borrow()
+            .iter()
+            .filter(|op| matches!(op.mem, RingMem::RecvMulti { .. }))
+            .count()
+    }
+
+    /// The bytes one receive may hold before the ring stops it.
+    pub(crate) fn recv_cap(&self) -> Option<usize> {
+        self.recv.borrow().as_ref().map(RecvGroup::cap)
+    }
 }
 
 #[cfg(test)]
@@ -318,3 +486,5 @@ const MAX_TABLE: u32 = 1 << 14;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_recv;

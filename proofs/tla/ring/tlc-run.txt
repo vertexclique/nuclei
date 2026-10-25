@@ -1,14 +1,14 @@
-TLC run of every configuration in proofs/tla/ring, 2026-10-24 22:00 UTC.
+TLC run of every configuration in proofs/tla/ring, 2026-10-25 05:58 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
 RO_safe                          13974       6109      1  pass                                  pass                                  yes
-RO_live                          13974       6109      1  pass                                  pass                                  yes
-RO_flow                           1698        814      2  pass                                  pass                                  yes
+RO_live                          13974       6109      2  pass                                  pass                                  yes
+RO_flow                           1698        814      1  pass                                  pass                                  yes
 MO_submit_while_out               3234       1504      1  violated:OneOut                       violated:OneOut                       yes
 MO_elsewhere_submits                14         11      1  violated:SingleIssuer                 violated:SingleIssuer                 yes
-MO_no_kick                          53         36      0  violated:WritesGo                     violated:WritesGo                     yes
+MO_no_kick                          53         36      1  violated:WritesGo                     violated:WritesGo                     yes
 MO_no_wake                       10718       4729      2  violated:RetireReturns                violated:RetireReturns                yes
 MO_count_first                   16194       7075      2  violated:RetireReturns                violated:RetireReturns                yes
 MO_skip_wait                      1128        583      1  violated:RetiredIdle                  violated:RetiredIdle                  yes
@@ -19,6 +19,15 @@ RL_live                             81         43      1  pass                  
 ML_withdraw_started                 21         16      1  violated:WholeOrNothing               violated:WholeOrNothing               yes
 ML_no_resubmit                      82         45      1  violated:Settles                      violated:Settles                      yes
 WL_withdraw                         28         20      0  violated:NoWithdraw                   violated:NoWithdraw                   yes
-WL_orphan_finish                    27         19      1  violated:NoOrphanFinish               violated:NoOrphanFinish               yes
+WL_orphan_finish                    27         19      0  violated:NoOrphanFinish               violated:NoOrphanFinish               yes
+MU_safe                          20292       7050      2  pass                                  pass                                  yes
+MU_lent                          26697       9651      1  pass                                  pass                                  yes
+MU_live                          20292       7050      2  pass                                  pass                                  yes
+MU_live_lent                     26697       9651      2  pass                                  pass                                  yes
+MMU_no_cap                         863        319      1  violated:CapHeld                      violated:CapHeld                      yes
+MMU_arm_twice                       48         29      1  violated:OneOut                       violated:OneOut                       yes
+WMU_dry                            131         67      1  violated:NoDry                        violated:NoDry                        yes
+WMU_stop                           140         68      1  violated:NoStop                       violated:NoStop                       yes
+WMU_lent                          5903       2208      1  violated:NoLentGot                    violated:NoLentGot                    yes
 
-results matching EXPECTED.txt: 17 of 17
+results matching EXPECTED.txt: 26 of 26

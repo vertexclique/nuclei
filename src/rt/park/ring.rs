@@ -164,6 +164,12 @@ impl RingPoller {
     pub(crate) fn cq_entries(&self) -> u32 {
         self.ring.cq_entries()
     }
+
+    /// The ring itself, to register a buffer group on it before its first
+    /// submission.
+    pub(crate) fn ring(&self) -> &Ring {
+        &self.ring
+    }
 }
 
 #[cfg(test)]

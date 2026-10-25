@@ -93,6 +93,12 @@ impl<T> Ops<T> {
         self.slots.len() - self.free.len()
     }
 
+    /// The operations in flight, for a test.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().filter_map(|slot| slot.op.as_ref())
+    }
+
     /// Takes every operation out: what a ring that could not drain leaves.
     pub(crate) fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
         self.free.clear();

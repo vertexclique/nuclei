@@ -57,6 +57,9 @@ pub(crate) struct RingConfig {
     pub start_disabled: bool,
     /// Worker thread limits for `[bounded, unbounded]` async work; 0 leaves a limit unchanged.
     pub iowq_max_workers: Option<[u32; 2]>,
+    /// Buffers of the group multishot receives draw from (0: no group), and their size.
+    pub recv_buffers: u16,
+    pub recv_buffer_size: u32,
 }
 
 impl RingConfig {
@@ -69,6 +72,8 @@ impl RingConfig {
             iopoll: false,
             start_disabled: false,
             iowq_max_workers: None,
+            recv_buffers: 0,
+            recv_buffer_size: 0,
         }
     }
 }
@@ -89,6 +94,8 @@ impl From<&IoUringConfiguration> for RingConfig {
                     c.per_numa_unbounded_worker_count.unwrap_or(0),
                 ]
             }),
+            recv_buffers: c.recv_buffers,
+            recv_buffer_size: c.recv_buffer_size,
         }
     }
 }

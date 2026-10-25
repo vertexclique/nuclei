@@ -78,8 +78,32 @@ pub struct IoUringConfiguration {
     ///
     /// **Default**: `false`.
     pub iopoll_enabled: bool,
+
+    /// Buffers in each shard's pool for multishot receives: the kernel fills
+    /// one as bytes arrive, so a stream's receive stays armed for every
+    /// arrival and a receive that waits holds no buffer of its own. A power
+    /// of two up to 32768; 0 turns multishot receives off, and each read then
+    /// takes a buffer of the shard's own pool for its receive.
+    ///
+    /// **Default**: 256.
+    pub recv_buffers: u16,
+
+    /// The size in bytes of each of those buffers. A receive is stopped once
+    /// the bytes it handed out and its reader has not taken pass an eighth of
+    /// the pool (at least one buffer), and asked for again when its reader
+    /// catches up. What the kernel took for it before the stop stays with
+    /// it, so a reader with a long backlog may hold more until it reads;
+    /// other receives take buffers of the shard's own pool meanwhile.
+    ///
+    /// **Default**: 16384.
+    pub recv_buffer_size: u32,
     // XXX: `redrive_kthread_wake` = bool, syncs queue changes so kernel threads got awakened. increased cpu usage.
 }
+
+/// The default of [`IoUringConfiguration::recv_buffers`].
+const DEFAULT_RECV_BUFFERS: u16 = 256;
+/// The default of [`IoUringConfiguration::recv_buffer_size`].
+const DEFAULT_RECV_BUFFER_SIZE: u32 = 16 * 1024;
 
 impl IoUringConfiguration {
     ///
@@ -97,6 +121,8 @@ impl IoUringConfiguration {
             per_numa_unbounded_worker_count: None,
             aggressive_poll: false,
             iopoll_enabled: false,
+            recv_buffers: DEFAULT_RECV_BUFFERS,
+            recv_buffer_size: DEFAULT_RECV_BUFFER_SIZE,
         }
     }
 

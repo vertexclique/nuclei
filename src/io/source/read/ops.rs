@@ -9,7 +9,7 @@
 //! again. Only the operation's own completion clears it, so a side never
 //! has two operations out, and its mailbox never more than one completion.
 
-use super::{Ahead, Kind, ReadState};
+use super::{Kind, Piece, ReadState};
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::Io;
@@ -37,6 +37,21 @@ impl ReadState {
         len: usize,
         after: &mut After,
     ) {
+        // A lent buffer that waits with nothing read ahead takes the next
+        // bytes itself: a multishot receive out is stopped for it.
+        #[cfg(ring)]
+        if let Some(id) = self.out
+            && self.multi
+            && !self.multi_stopping
+            && self.ahead.is_empty()
+            && self
+                .lent
+                .as_ref()
+                .is_some_and(|l| !l.out && l.done.is_none())
+        {
+            self.multi_stopping = true;
+            route.cancel(id);
+        }
         if self.out.is_some() || self.has_result() || self.lent_done() {
             return;
         }
@@ -63,6 +78,11 @@ impl ReadState {
                     lent.out = true;
                     Want::RecvLent(core::mem::take(&mut lent.buf))
                 }
+                #[cfg(ring)]
+                None if !self.dry && issuer.multishot(kind) => {
+                    self.multi = true;
+                    Want::RecvMulti
+                }
                 None => {
                     let Some(buf) = self.buffer(len, false, after) else {
                         return;
@@ -72,6 +92,25 @@ impl ReadState {
             }
         };
         self.out = Some(issuer.issue(want, kind, self.epoch, after));
+    }
+
+    /// A receive into a buffer of the pool completed.
+    fn recv_done(&mut self, buf: crate::buf::PoolBuf, answer: Answer<usize>, after: &mut After) {
+        match answer {
+            Answer::Undone { not_ready } => {
+                self.not_ready(not_ready);
+                after.drop_buf(buf);
+            }
+            Answer::Done(Ok(0)) => {
+                self.eof = true;
+                after.drop_buf(buf);
+            }
+            Answer::Done(Ok(_)) => self.ahead.push(Piece::Pool(buf), after),
+            Answer::Done(Err(err)) => {
+                self.error = Some(err);
+                after.drop_buf(buf);
+            }
+        }
     }
 
     /// The kernel gave an operation back because the socket was not ready.
@@ -103,22 +142,33 @@ impl ReadState {
                     }
                 }
             }
+            #[cfg(ring)]
+            Outcome::RecvMultiEnd { answer, dry } => {
+                self.multi = false;
+                self.multi_stopping = false;
+                if !stale {
+                    // The next receive takes a buffer of the pool if the
+                    // group ran dry.
+                    self.dry = dry;
+                    match answer {
+                        Answer::Done(Ok(0)) => self.eof = true,
+                        // Its bytes came as arrivals already.
+                        Answer::Done(Ok(_)) => {}
+                        Answer::Done(Err(err)) => self.error = Some(err),
+                        // Stopped, or the group ran dry: asked again.
+                        Answer::Undone { not_ready } => self.not_ready(not_ready),
+                    }
+                }
+            }
             Outcome::Recv(buf, _) if stale => after.drop_buf(buf),
-            Outcome::Recv(buf, answer) => match answer {
-                Answer::Undone { not_ready } => {
-                    self.not_ready(not_ready);
-                    after.drop_buf(buf);
+            Outcome::Recv(buf, answer) => {
+                // The group may have buffers again: the next receive tries.
+                #[cfg(ring)]
+                {
+                    self.dry = false;
                 }
-                Answer::Done(Ok(0)) => {
-                    self.eof = true;
-                    after.drop_buf(buf);
-                }
-                Answer::Done(Ok(_)) => self.ahead = Some(Ahead::Pool(buf)),
-                Answer::Done(Err(err)) => {
-                    self.error = Some(err);
-                    after.drop_buf(buf);
-                }
-            },
+                self.recv_done(buf, answer, after);
+            }
             Outcome::RecvLent(buf, answer) => {
                 if let Some(lent) = self.lent.as_mut().filter(|l| l.out && !stale) {
                     lent.buf = buf;

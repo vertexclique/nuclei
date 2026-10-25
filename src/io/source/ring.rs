@@ -40,6 +40,13 @@ pub(crate) enum RingMem {
     Ready,
     Accept(Box<RawAddr>),
     Recv(PoolBuf),
+    /// A multishot receive: its arrivals land in the receive group's
+    /// buffers. `held`: the bytes of its arrivals not given back yet;
+    /// `stopping`: past the cap, a cancel of it is on its way.
+    RecvMulti {
+        held: usize,
+        stopping: bool,
+    },
     RecvLent(Vec<u8>),
     RecvFrom(Box<Msg>, PoolBuf),
     Connect(
@@ -91,6 +98,14 @@ impl RingMem {
                 }
                 Outcome::Recv(buf, answer)
             }
+            RingMem::RecvMulti { .. } => Outcome::RecvMultiEnd {
+                // A group with no buffer left gives the receive back undone.
+                answer: match res {
+                    r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
+                    r => answer(r),
+                },
+                dry: res == -libc::ENOBUFS,
+            },
             RingMem::RecvLent(mut buf) => {
                 let answer = answer(res);
                 if let Answer::Done(Ok(n)) = answer {
@@ -271,6 +286,18 @@ pub(crate) struct RingIssuer<'a> {
     file: u32,
 }
 
+impl RingIo<'_> {
+    /// Cancels the side's operation `user_data`; the caller holds that side.
+    pub(crate) fn cancel(self, user_data: u64) {
+        match self {
+            RingIo::Here { source, .. } | RingIo::Elsewhere { source } => {
+                source.cancel_op(user_data);
+            }
+            RingIo::NotYet => {}
+        }
+    }
+}
+
 impl<'a> RingIo<'a> {
     /// What submits operations from this thread; elsewhere the ring's own
     /// thread is kicked to submit what the side wants, and before the
@@ -293,7 +320,7 @@ impl RingIssuer<'_> {
     /// address no socket can have) completes at once with the reason.
     pub(crate) fn issue(&self, want: Want, kind: Kind, epoch: u32, _after: &mut After) -> u64 {
         let read = want.of_read();
-        match entry(want, kind, self.file as RawFd) {
+        match entry(want, kind, self.file as RawFd, self.ring.recv_group()) {
             Ok((mem, sqe)) => self.ring.submit(
                 RingOp {
                     source: Arc::clone(self.source),
@@ -317,9 +344,23 @@ impl RingIssuer<'_> {
     }
 }
 
-/// The entry for `want` on slot `slot`, with the memory it points at; or,
-/// for an address no socket can have, the outcome that says so.
-fn entry(want: Want, kind: Kind, slot: RawFd) -> Result<(RingMem, Sqe), Box<Outcome>> {
+impl RingIssuer<'_> {
+    /// Whether a stream read of a source of `kind` goes out as a multishot
+    /// receive: a socket's, on a ring with a receive group.
+    pub(crate) fn multishot(&self, kind: Kind) -> bool {
+        matches!(kind, Kind::Tcp | Kind::Stream) && self.ring.recv_group().is_some()
+    }
+}
+
+/// The entry for `want` on slot `slot`, with the memory it points at (a
+/// multishot receive draws from group `group`); or, for an address no
+/// socket can have or a ring with no group, the outcome that says so.
+fn entry(
+    want: Want,
+    kind: Kind,
+    slot: RawFd,
+    group: Option<u16>,
+) -> Result<(RingMem, Sqe), Box<Outcome>> {
     Ok(match want {
         Want::Ready { read } => {
             let events = if read { libc::POLLIN } else { libc::POLLOUT };
@@ -340,6 +381,21 @@ fn entry(want: Want, kind: Kind, slot: RawFd) -> Result<(RingMem, Sqe), Box<Outc
             let sqe = stream_read(kind, slot, spare.as_mut_ptr(), spare.len());
             (RingMem::Recv(buf), sqe)
         }
+        Want::RecvMulti => match group {
+            Some(group) => (
+                RingMem::RecvMulti {
+                    held: 0,
+                    stopping: false,
+                },
+                Sqe::recv_multishot(slot, group, 0),
+            ),
+            None => {
+                return Err(Box::new(Outcome::RecvMultiEnd {
+                    answer: Answer::Undone { not_ready: false },
+                    dry: true,
+                }));
+            }
+        },
         Want::RecvLent(mut buf) => {
             let spare = buf.spare_capacity_mut();
             let sqe = stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len());
@@ -410,6 +466,22 @@ fn stream_write(kind: Kind, slot: RawFd, bytes: &[u8]) -> Sqe {
 }
 
 impl Source {
+    /// On the ring's thread: an arrival of the read side's multishot
+    /// receive, submitted in `epoch`. The side takes it at once if free,
+    /// else its holder does as it lets go.
+    pub(crate) fn ring_chunk(
+        self: &Arc<Self>,
+        chunk: crate::rt::shard::recv::RingChunk,
+        epoch: u32,
+    ) {
+        self.read_chunks.push((chunk, epoch));
+        let mut after = After::default();
+        let hooks = self.hooks();
+        self.read
+            .defer(super::read_work::CHUNKS, &mut after, &hooks);
+        self.settle(after);
+    }
+
     /// Cancels the side's operation of `user_data`, on its ring's thread;
     /// the caller holds a side. A ring the source moved from cancelled it
     /// already, and a cancel that finds another operation by the same user

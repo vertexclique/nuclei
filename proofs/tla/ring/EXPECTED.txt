@@ -16,3 +16,12 @@ ML_withdraw_started            MC_RingLent          violated:WholeOrNothing
 ML_no_resubmit                 MC_RingLent          violated:Settles
 WL_withdraw                    MC_RingLent          violated:NoWithdraw
 WL_orphan_finish               MC_RingLent          violated:NoOrphanFinish
+MU_safe                        MC_RingMulti         pass
+MU_lent                        MC_RingMulti         pass
+MU_live                        MC_RingMulti         pass
+MU_live_lent                   MC_RingMulti         pass
+MMU_no_cap                     MC_RingMulti         violated:CapHeld
+MMU_arm_twice                  MC_RingMulti         violated:OneOut
+WMU_dry                        MC_RingMulti         violated:NoDry
+WMU_stop                       MC_RingMulti         violated:NoStop
+WMU_lent                       MC_RingMulti         violated:NoLentGot

@@ -113,6 +113,9 @@ mod read_work {
     /// Submit what the side wants, on the ring's thread.
     #[cfg(completion)]
     pub(super) const SUBMIT: u8 = 16;
+    /// A multishot receive's arrivals wait in the source's chunk queue.
+    #[cfg(ring)]
+    pub(super) const CHUNKS: u8 = 32;
 }
 
 /// Side-local work of the write side (its deferred word).
@@ -279,6 +282,10 @@ pub(crate) struct Source {
     read_done: ops::Mailbox,
     #[cfg(completion)]
     write_done: ops::Mailbox,
+    /// A multishot receive's arrivals, from its ring's thread to the read
+    /// side's holder, in order, each with the epoch it came in.
+    #[cfg(ring)]
+    read_chunks: kovan_queue::seg_queue::SegQueue<(crate::rt::shard::recv::RingChunk, u32)>,
     /// The sides' operations in the kernel's hands: a retire waits until
     /// none is.
     #[cfg(completion)]
@@ -335,6 +342,13 @@ impl Hooks<ReadState> for SourceHooks<'_> {
         }
         #[cfg(completion)]
         {
+            // A receive's arrivals go first: its end comes after them.
+            #[cfg(ring)]
+            if bits & (read_work::CHUNKS | read_work::DONE) != 0 {
+                while let Ok((chunk, epoch)) = self.src.read_chunks.try_pop() {
+                    st.take_chunk(chunk, epoch, after);
+                }
+            }
             if bits & read_work::DONE != 0
                 && let Some(done) = self.src.read_done.take()
             {
@@ -439,6 +453,8 @@ impl Source {
             read_done: ops::Mailbox::default(),
             #[cfg(completion)]
             write_done: ops::Mailbox::default(),
+            #[cfg(ring)]
+            read_chunks: kovan_queue::seg_queue::SegQueue::new(),
             #[cfg(completion)]
             ops_out: core::sync::atomic::AtomicU8::new(0),
             #[cfg(port)]

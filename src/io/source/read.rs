@@ -5,7 +5,9 @@
 //! once when a task asks and the socket may hold something. A task never
 //! makes the call itself: it takes what the driver completed, copying it
 //! into its own buffer. What no task took yet waits here: a stream's
-//! read-ahead (one buffer at most), its end or its error, a listener's
+//! read-ahead (in the order it came: a buffer of the pool, a lent buffer's
+//! leftover, or on a ring the buffers of the shard's receive group that a
+//! multishot receive handed out), its end or its error, a listener's
 //! accepted connections, a datagram socket's datagrams (as many as tasks
 //! wait, at most [`BATCH`]). A task whose future went away leaves it for the
 //! next operation, so nothing the kernel handed over is lost.
@@ -41,8 +43,8 @@ mod ops;
 #[cfg(readiness)]
 const BATCH: usize = 32;
 
-/// Bytes read ahead that no task took yet.
-enum Ahead {
+/// One run of bytes read ahead.
+enum Piece {
     /// Read by the driver into a buffer of the pool.
     Pool(PoolBuf),
     /// Read into a lent buffer, from `start`, whose task went away.
@@ -50,58 +52,159 @@ enum Ahead {
     // source at most, freed by the next reads); copy it into pool buffers if
     // kept buffers must count against the cap.
     Left { buf: Vec<u8>, start: usize },
+    /// A buffer of the shard's receive group a multishot receive filled;
+    /// it goes back to the group once taken.
+    #[cfg(ring)]
+    Ring(crate::rt::shard::recv::RingChunk),
 }
 
-impl Ahead {
+impl Piece {
     fn filled(&self) -> &[u8] {
         match self {
-            Ahead::Pool(buf) => buf.filled(),
-            Ahead::Left { buf, start } => buf.get(*start..).unwrap_or_default(),
+            Piece::Pool(buf) => buf.filled(),
+            Piece::Left { buf, start } => buf.get(*start..).unwrap_or_default(),
+            #[cfg(ring)]
+            Piece::Ring(chunk) => chunk.bytes(),
         }
     }
 
     fn consume(&mut self, n: usize) {
         match self {
-            Ahead::Pool(buf) => buf.consume(n),
-            Ahead::Left { buf, start } => *start = (*start + n).min(buf.len()),
+            Piece::Pool(buf) => buf.consume(n),
+            Piece::Left { buf, start } => *start = (*start + n).min(buf.len()),
+            #[cfg(ring)]
+            Piece::Ring(chunk) => chunk.consume(n),
         }
     }
 
+    fn release(self, after: &mut After) {
+        if let Piece::Pool(buf) = self {
+            after.drop_buf(buf);
+        }
+    }
+}
+
+/// Bytes read ahead that no task took yet, in the order they came: what
+/// the driver read into the pool, what a lent buffer whose task went away
+/// holds, what multishot receives handed out.
+#[derive(Default)]
+struct Ahead {
+    pieces: VecDeque<Piece>,
+}
+
+impl Ahead {
     fn is_empty(&self) -> bool {
-        self.filled().is_empty()
+        self.pieces.is_empty()
     }
 
-    /// Copies bytes into `out`, consumed unless `peek`; returns how many.
-    fn copy_into(&mut self, out: &mut [u8], peek: bool) -> usize {
-        let src = self.filled();
-        let n = src.len().min(out.len());
-        out[..n].copy_from_slice(&src[..n]);
+    /// The bytes held.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pieces.iter().map(|p| p.filled().len()).sum()
+    }
+
+    /// Adds bytes that came after those held.
+    fn push(&mut self, piece: Piece, after: &mut After) {
+        if piece.filled().is_empty() {
+            piece.release(after);
+        } else {
+            self.pieces.push_back(piece);
+        }
+    }
+
+    /// Takes `n` bytes off the front, letting go of the pieces emptied.
+    fn consume(&mut self, mut n: usize, after: &mut After) {
+        while n > 0 {
+            let Some(front) = self.pieces.front_mut() else {
+                return;
+            };
+            let here = front.filled().len().min(n);
+            front.consume(here);
+            n -= here;
+            if front.filled().is_empty()
+                && let Some(done) = self.pieces.pop_front()
+            {
+                done.release(after);
+            }
+        }
+    }
+
+    /// Copies bytes into `out`, in order, consumed unless `peek`; returns
+    /// how many.
+    fn copy_into(&mut self, out: &mut [u8], peek: bool, after: &mut After) -> usize {
+        let mut n = 0;
+        for piece in &self.pieces {
+            let src = piece.filled();
+            let take = src.len().min(out.len() - n);
+            out[n..n + take].copy_from_slice(&src[..take]);
+            n += take;
+            if n == out.len() {
+                break;
+            }
+        }
         if !peek {
-            self.consume(n);
+            self.consume(n, after);
         }
         n
     }
 
     /// Copies bytes into `bufs`, in order, and consumes them.
-    fn copy_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> usize {
-        let n = crate::buf::copy_vectored(self.filled(), bufs);
-        self.consume(n);
+    fn copy_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>], after: &mut After) -> usize {
+        let mut n = 0;
+        for piece in &self.pieces {
+            let copied = copy_vectored_from(piece.filled(), bufs, n);
+            n += copied;
+            if copied < piece.filled().len() {
+                break;
+            }
+        }
+        self.consume(n, after);
         n
     }
 
     /// Moves bytes onto the end of `buf`, as many as its spare capacity
     /// holds.
-    fn append_to(&mut self, buf: &mut Vec<u8>) -> usize {
-        let n = crate::buf::append_spare(self.filled(), buf);
-        self.consume(n);
+    fn append_to(&mut self, buf: &mut Vec<u8>, after: &mut After) -> usize {
+        let mut n = 0;
+        for piece in &self.pieces {
+            let src = piece.filled();
+            let copied = crate::buf::append_spare(src, buf);
+            n += copied;
+            if copied < src.len() {
+                break;
+            }
+        }
+        self.consume(n, after);
         n
     }
 
-    fn release(self, after: &mut After) {
-        if let Ahead::Pool(buf) = self {
-            after.drop_buf(buf);
+    /// Lets go of every byte held.
+    fn release(&mut self, after: &mut After) {
+        for piece in self.pieces.drain(..) {
+            piece.release(after);
         }
     }
+}
+
+/// Copies `src` into `bufs` after the first `skip` bytes they hold;
+/// returns how many bytes it copied.
+fn copy_vectored_from(src: &[u8], bufs: &mut [io::IoSliceMut<'_>], mut skip: usize) -> usize {
+    let mut n = 0;
+    for buf in bufs.iter_mut() {
+        if skip >= buf.len() {
+            skip -= buf.len();
+            continue;
+        }
+        let room = &mut buf[skip..];
+        skip = 0;
+        let take = room.len().min(src.len() - n);
+        room[..take].copy_from_slice(&src[n..n + take]);
+        n += take;
+        if n == src.len() {
+            break;
+        }
+    }
+    n
 }
 
 /// A task's own buffer, lent to the side for the driver to read into.
@@ -129,7 +232,7 @@ pub(super) struct ReadState {
     starved: bool,
     /// The largest read a waiting task asked for: what the driver reads.
     want: usize,
-    ahead: Option<Ahead>,
+    ahead: Ahead,
     lent: Option<Lent>,
     eof: bool,
     error: Option<io::Error>,
@@ -148,6 +251,16 @@ pub(super) struct ReadState {
     /// the next one waits for it to be.
     #[cfg(ring)]
     poll_first: bool,
+    /// The operation out is a multishot receive, and whether it is being
+    /// stopped (for a lent buffer, which takes the next bytes itself).
+    #[cfg(ring)]
+    multi: bool,
+    #[cfg(ring)]
+    multi_stopping: bool,
+    /// The receive group had no buffer left: the next receive takes one of
+    /// the pool.
+    #[cfg(ring)]
+    dry: bool,
 }
 
 impl ReadState {
@@ -162,7 +275,7 @@ impl ReadState {
     }
 
     pub(super) fn has_result(&self) -> bool {
-        self.ahead.is_some()
+        !self.ahead.is_empty()
             || self.eof
             || self.error.is_some()
             || !self.accepted.is_empty()
@@ -268,16 +381,10 @@ impl ReadState {
         &mut self,
         peek: bool,
         after: &mut After,
-        copy: impl FnOnce(&mut Ahead) -> usize,
+        copy: impl FnOnce(&mut Ahead, &mut After) -> usize,
     ) -> Option<io::Result<usize>> {
-        if let Some(ahead) = self.ahead.as_mut() {
-            let n = copy(ahead);
-            if ahead.is_empty()
-                && let Some(done) = self.ahead.take()
-            {
-                done.release(after);
-            }
-            return Some(Ok(n));
+        if !self.ahead.is_empty() {
+            return Some(Ok(copy(&mut self.ahead, after)));
         }
         if self.eof {
             // A read takes the end; a peek leaves it for the read.
@@ -304,7 +411,7 @@ impl ReadState {
             Some(Ok(n)) => {
                 self.blocked = drained(kind, self.unsure, n, buf.capacity());
                 buf.set_filled(n);
-                self.ahead = Some(Ahead::Pool(buf));
+                self.ahead.push(Piece::Pool(buf), after);
             }
             Some(Err(err)) => {
                 self.error = Some(err);
@@ -396,7 +503,9 @@ impl ReadState {
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
         self.complete(io, kind, out.len(), after);
-        match self.take_stream(peek, after, |ahead| ahead.copy_into(out, peek)) {
+        match self.take_stream(peek, after, |ahead, after| {
+            ahead.copy_into(out, peek, after)
+        }) {
             Some(result) => {
                 self.pass_on(after);
                 Poll::Ready(result)
@@ -419,7 +528,9 @@ impl ReadState {
     ) -> Poll<io::Result<usize>> {
         let len = bufs.iter().map(|b| b.len()).sum();
         self.complete(io, kind, len, after);
-        match self.take_stream(false, after, |ahead| ahead.copy_vectored(bufs)) {
+        match self.take_stream(false, after, |ahead, after| {
+            ahead.copy_vectored(bufs, after)
+        }) {
             Some(result) => {
                 self.pass_on(after);
                 Poll::Ready(result)
@@ -445,7 +556,9 @@ impl ReadState {
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
         if let Some(buf) = held.as_mut() {
-            if let Some(result) = self.take_stream(false, after, |ahead| ahead.append_to(buf)) {
+            if let Some(result) =
+                self.take_stream(false, after, |ahead, after| ahead.append_to(buf, after))
+            {
                 self.pass_on(after);
                 return Poll::Ready(result);
             }
@@ -516,11 +629,17 @@ impl ReadState {
             None => {}
             Some(Ok(0)) => self.eof = true,
             Some(Ok(_)) => {
-                debug_assert!(self.ahead.is_none(), "bytes were read past the lent buffer");
-                self.ahead = Some(Ahead::Left {
-                    buf: lent.buf,
-                    start: lent.from,
-                });
+                debug_assert!(
+                    self.ahead.is_empty(),
+                    "bytes were read past the lent buffer"
+                );
+                self.ahead.push(
+                    Piece::Left {
+                        buf: lent.buf,
+                        start: lent.from,
+                    },
+                    after,
+                );
             }
             Some(Err(err)) => self.error = Some(err),
         }
@@ -608,7 +727,7 @@ impl ReadState {
     #[cfg(test)]
     pub(super) fn report(&self) -> String {
         format!(
-            "lent {:?}, read ahead {:?}, waiters {}, blocked {}, eof {}, error {:?}",
+            "lent {:?}, read ahead {}, waiters {}, blocked {}, eof {}, error {:?}",
             self.lent.as_ref().map(|l| (
                 l.buf.len(),
                 l.from,
@@ -616,7 +735,7 @@ impl ReadState {
                 l.waker.is_some(),
                 l.out
             )),
-            self.ahead.as_ref().map(|a| a.filled().len()),
+            self.ahead.len(),
             self.waiters.len(),
             self.blocked,
             self.eof,
@@ -666,11 +785,29 @@ impl ReadState {
         after.forget(&mut self.waiters);
     }
 
+    /// An arrival of the multishot receive, submitted in `epoch`: the
+    /// tasks waiting take it. One of an older descriptor only goes back.
+    #[cfg(ring)]
+    pub(super) fn take_chunk(
+        &mut self,
+        chunk: crate::rt::shard::recv::RingChunk,
+        epoch: u32,
+        after: &mut After,
+    ) {
+        if epoch != self.epoch {
+            return;
+        }
+        self.ahead.push(Piece::Ring(chunk), after);
+        self.want = 0;
+        if let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take()) {
+            after.wake_one(w);
+        }
+        after.wake(&mut self.waiters);
+    }
+
     /// Drops what the side holds: the descriptor it came from is gone.
     pub(super) fn discard(&mut self, after: &mut After) {
-        if let Some(ahead) = self.ahead.take() {
-            ahead.release(after);
-        }
+        self.ahead.release(after);
         if let Some(w) = self.lent.take().and_then(|l| l.waker) {
             after.forget_one(w);
         }

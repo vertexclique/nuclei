@@ -60,6 +60,8 @@ use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
 
 #[cfg(ring)]
+pub(crate) mod recv;
+#[cfg(ring)]
 pub(crate) mod ring;
 
 /// Runs of the LIFO slot in a row before its task goes to the back.

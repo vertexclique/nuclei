@@ -9,6 +9,10 @@
 //!
 //! The ring tail is not a field of its own: it overlays the `resv` field of descriptor 0, so
 //! descriptor writes touch `addr`, `len` and `bid` only and never `resv`.
+//!
+//! The buffers are a [`BufMem`] the ring shares: a buffer handed out by a completion can be read
+//! on any thread for as long as its holder keeps the `BufMem`, which stays mapped until the last
+//! holder lets go, after the ring itself unregistered.
 
 use std::{
     ffi::c_void,
@@ -17,6 +21,7 @@ use std::{
     os::fd::{AsRawFd, OwnedFd},
     ptr::{self, addr_of_mut},
     slice,
+    sync::Arc,
     sync::atomic::{AtomicU16, Ordering},
 };
 
@@ -33,6 +38,38 @@ const MAX_ENTRIES: u16 = 1 << 15;
 /// Byte offset of the tail inside descriptor 0 (the `resv` field).
 const TAIL_OFFSET: usize = 14;
 
+/// The buffers of a provided-buffer ring: buffer id `n` is the `n`-th `buf_size` chunk.
+#[derive(Debug)]
+pub(crate) struct BufMem {
+    map: Mapping,
+    entries: u16,
+    buf_size: u32,
+}
+
+// SAFETY: the mapping is plain memory; the kernel writes a buffer only while it is queued in the
+// ring, and a holder reads one only between its completion and its re-add.
+unsafe impl Send for BufMem {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for BufMem {}
+
+impl BufMem {
+    /// Bytes `start..end` of buffer `bid`, or `None` when they are out of range.
+    ///
+    /// # Safety
+    ///
+    /// The buffer is not queued in its ring (a completion handed it out and it was not re-added
+    /// yet), so the kernel does not write it while the slice lives.
+    pub(crate) unsafe fn bytes(&self, bid: u16, start: u32, end: u32) -> Option<&[u8]> {
+        if bid >= self.entries || start > end || end > self.buf_size {
+            return None;
+        }
+        let at = usize::from(bid) * self.buf_size as usize + start as usize;
+        // SAFETY: the range lies inside the mapping (checked above), which lives as long as
+        // `self`; the caller's: the kernel does not write it now.
+        Some(unsafe { slice::from_raw_parts(self.map.as_ptr().add(at), (end - start) as usize) })
+    }
+}
+
 /// A registered provided-buffer ring and the buffers behind it; one buffer per descriptor slot,
 /// buffer id `n` being the `n`-th `buf_size` chunk of the buffer mapping.
 #[derive(Debug)]
@@ -47,7 +84,7 @@ pub(crate) struct BufRing {
     /// Descriptors written since the last commit.
     pending: u16,
     /// The descriptor ring, then the buffers. Left mapped (leaked) if unregistering fails.
-    maps: ManuallyDrop<(Mapping, Mapping)>,
+    maps: ManuallyDrop<(Mapping, Arc<BufMem>)>,
 }
 
 impl BufRing {
@@ -98,8 +135,20 @@ impl BufRing {
             buf_size,
             tail: 0,
             pending: 0,
-            maps: ManuallyDrop::new((ring_map, buf_map)),
+            maps: ManuallyDrop::new((
+                ring_map,
+                Arc::new(BufMem {
+                    map: buf_map,
+                    entries,
+                    buf_size,
+                }),
+            )),
         })
+    }
+
+    /// The buffers, for a holder of one that a completion handed out.
+    pub(crate) fn memory(&self) -> &Arc<BufMem> {
+        &self.maps.1
     }
 
     /// The buffer group id receives name to draw from this ring.
@@ -148,6 +197,7 @@ impl BufRing {
         let buf = self
             .maps
             .1
+            .map
             .as_ptr()
             .wrapping_add(usize::from(bid) * self.buf_size as usize);
         // SAFETY: `slot` is below `entries`, so the descriptor lies inside the ring mapping. Only
@@ -190,7 +240,7 @@ impl BufRing {
         let start = usize::from(bid) * self.buf_size as usize;
         // SAFETY: `start + len` lies inside the buffer mapping (checked above), which lives as
         // long as `self`; a completion for this id means the kernel finished writing it.
-        Some(unsafe { slice::from_raw_parts(self.maps.1.as_ptr().add(start), len as usize) })
+        Some(unsafe { slice::from_raw_parts(self.maps.1.map.as_ptr().add(start), len as usize) })
     }
 }
 
@@ -240,7 +290,7 @@ impl Drop for BufRing {
         // quiesce before drop once the op slab can name the groups still in use.
         if unregistered.is_ok() {
             // SAFETY: the group is gone, so the kernel no longer touches either mapping, and
-            // `maps` is not used again.
+            // `maps` is not used again. The buffers stay mapped while a holder keeps them.
             unsafe { ManuallyDrop::drop(&mut self.maps) };
         }
     }
