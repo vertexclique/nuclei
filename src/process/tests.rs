@@ -153,6 +153,15 @@ mod unix {
         ) {
             return;
         }
+        // A pidfd per child and a pipe per other one: past the 1024
+        // descriptors a process starts with on some systems.
+        // SAFETY: plain data and calls on this process's own limit.
+        unsafe {
+            let mut limit: libc::rlimit = core::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            limit.rlim_cur = limit.rlim_max;
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+        }
         crate::block_on(async {
             let mut children: Vec<_> = (0..1000)
                 .map(|i| {
