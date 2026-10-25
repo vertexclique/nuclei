@@ -31,6 +31,7 @@ use std::os::fd::RawFd;
 use std::time::Duration;
 
 use super::recv::RecvGroup;
+use crate::fs::ring::FileOp;
 use crate::io::source::ops::Done;
 use crate::io::source::ring::{Arrival, RingMem, RingOp};
 use crate::io::sys;
@@ -47,6 +48,9 @@ use crate::syscore::linux::iouring::ring::{IoUringCqe, RingConfig, Sqe};
 pub(crate) struct ShardRing {
     poller: RefCell<RingPoller>,
     ops: RefCell<Ops<RingOp>>,
+    /// Files' reads and writes in flight, their user data marked with
+    /// [`FILE_TAG`].
+    file_ops: RefCell<Ops<FileOp>>,
     files: RefCell<Files>,
     /// Operations submitted but not in the kernel yet, by user data, with
     /// their entries, in order.
@@ -63,6 +67,9 @@ pub(crate) struct ShardRing {
     /// and the receives that ended as the group ran dry, for a test.
     #[cfg(test)]
     counts: Cell<(usize, usize, usize)>,
+    /// Files' calls submitted, for a test.
+    #[cfg(test)]
+    file_calls: Cell<usize>,
 }
 
 impl ShardRing {
@@ -96,7 +103,9 @@ impl ShardRing {
             .max(1);
         Ok(Self {
             poller: RefCell::new(poller),
-            ops: RefCell::new(Ops::new(u32::MAX)),
+            // Below the file tag's bit, so a source's user data never has it.
+            ops: RefCell::new(Ops::new((1 << 31) - 1)),
+            file_ops: RefCell::new(Ops::new(1 << 30)),
             files: RefCell::new(Files::new(files)),
             room: RefCell::new(VecDeque::new()),
             in_kernel: Cell::new(0),
@@ -105,6 +114,8 @@ impl ShardRing {
             recv: RefCell::new(recv),
             #[cfg(test)]
             counts: Cell::new((0, 0, 0)),
+            #[cfg(test)]
+            file_calls: Cell::new(0),
         })
     }
 
@@ -158,6 +169,44 @@ impl ShardRing {
             self.room.borrow_mut().push_back((user_data, sqe));
         }
         user_data
+    }
+
+    /// Submits a file's read or write, on its own file (no slot of the
+    /// table): the operation holds a copy of the descriptor until it ends.
+    /// With the kernel full it waits for room.
+    pub(crate) fn submit_file(&self, mut op: FileOp) {
+        #[cfg(test)]
+        self.file_calls.set(self.file_calls.get() + 1);
+        let sqe = op.entry();
+        let inserted = self.file_ops.borrow_mut().insert(op);
+        let user_data = match inserted {
+            Ok(user_data) => user_data | FILE_TAG,
+            // Past 2^30 file calls at once: the call goes to the pool.
+            Err(op) => {
+                drop(op.complete(-libc::ECANCELED));
+                return;
+            }
+        };
+        let sqe = sqe.user_data(user_data);
+        if self.room.borrow().is_empty() && self.in_kernel.get() < self.cap {
+            self.in_kernel.set(self.in_kernel.get() + 1);
+            self.poller.borrow_mut().push(sqe);
+        } else {
+            self.room.borrow_mut().push_back((user_data, sqe));
+        }
+    }
+
+    /// A file's call completed: the rest of a write goes on, else its end
+    /// is left for its task.
+    fn complete_file(&self, user_data: u64, res: i32) {
+        let Some(op) = self.file_ops.borrow_mut().remove(user_data & !FILE_TAG) else {
+            return;
+        };
+        self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
+        self.admit_waiting();
+        if let Some(rest) = op.complete(res) {
+            self.submit_file(rest);
+        }
     }
 
     /// Moves waiting operations into the kernel while it has room.
@@ -251,6 +300,10 @@ impl ShardRing {
     }
 
     fn complete(&self, cqe: IoUringCqe) {
+        if cqe.user_data & FILE_TAG != 0 {
+            self.complete_file(cqe.user_data, cqe.res);
+            return;
+        }
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
             self.arrived(cqe.user_data, bid, cqe.res);
         } else if cqe.res >= 0 {
@@ -405,23 +458,37 @@ impl ShardRing {
     /// [`SHUTDOWN_WAIT`]. One that never completes keeps its memory for
     /// good (the kernel may still write it), and is counted (`leaked`).
     pub(crate) fn shut_down(&self) {
-        let waiting: Vec<RingOp> = {
-            let mut room = self.room.borrow_mut();
-            let mut ops = self.ops.borrow_mut();
-            room.drain(..).filter_map(|(u, _)| ops.remove(u)).collect()
-        };
-        for op in waiting {
-            // Never submitted: nothing points at its memory.
-            self.end(op, -libc::ECANCELED);
+        let waiting: Vec<u64> = self.room.borrow_mut().drain(..).map(|(u, _)| u).collect();
+        for user_data in waiting {
+            // Never submitted: nothing points at its memory. A file's call
+            // goes to the pool.
+            if user_data & FILE_TAG != 0 {
+                let op = self.file_ops.borrow_mut().remove(user_data & !FILE_TAG);
+                if let Some(op) = op {
+                    drop(op.complete(-libc::ECANCELED));
+                }
+            } else {
+                let op = self.ops.borrow_mut().remove(user_data);
+                if let Some(op) = op {
+                    self.end(op, -libc::ECANCELED);
+                }
+            }
         }
-        if self.ops.borrow().len() > 0 {
+        if self.ops.borrow().len() + self.file_ops.borrow().len() > 0 {
             self.poller
                 .borrow_mut()
                 .push(Sqe::async_cancel_any(true).user_data(IGNORED));
         }
         self.settle(|| {});
         let stuck: Vec<RingOp> = self.ops.borrow_mut().drain().collect();
-        LEAKED.fetch_add(stuck.len(), core::sync::atomic::Ordering::Relaxed);
+        let stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
+        LEAKED.fetch_add(
+            stuck.len() + stuck_files.len(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        // A file's call still in the kernel keeps its buffer and its
+        // descriptor for good.
+        core::mem::forget(stuck_files);
         if !stuck.is_empty() {
             // A receive still in the kernel may write the group's buffers:
             // they stay registered and mapped for good.
@@ -440,7 +507,7 @@ impl ShardRing {
         let deadline = std::time::Instant::now() + SHUTDOWN_WAIT;
         loop {
             between();
-            if self.ops.borrow().len() == 0 {
+            if self.ops.borrow().len() + self.file_ops.borrow().len() == 0 {
                 return;
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -454,6 +521,10 @@ impl ShardRing {
         }
     }
 }
+
+/// The bit of the user data of a file's call (in the slot index, which the
+/// sources' operations never reach).
+const FILE_TAG: u64 = 1 << 31;
 
 /// The connections one multishot accept hands over before the ring stops
 /// it: its source asks for another once its tasks took them.
@@ -495,6 +566,11 @@ impl ShardRing {
     pub(crate) fn held(&self) -> usize {
         self.take_back();
         self.recv.borrow().as_ref().map_or(0, RecvGroup::out)
+    }
+
+    /// Files' calls submitted so far.
+    pub(crate) fn file_calls(&self) -> usize {
+        self.file_calls.get()
     }
 
     /// Multishot receives and accepts in flight.

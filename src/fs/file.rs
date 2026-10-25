@@ -73,6 +73,10 @@ pub(crate) struct FileIo {
     /// as the state's last holder left them.
     unsent: AtomicBool,
     cursor: AtomicU64,
+    /// The calls go to the blocking pool even on a ring, for a test that
+    /// holds the pool to keep a call in flight.
+    #[cfg(test)]
+    on_pool: AtomicBool,
 }
 
 /// What the file state's holder does for the work others left it.
@@ -109,8 +113,26 @@ impl Hooks<FileState> for FileHooks<'_> {
     }
 }
 
+/// A file's call in flight: a job of the blocking pool, or an operation on
+/// the ring of the shard whose thread issued it.
+enum Work<T> {
+    Pool(Task<T>),
+    #[cfg(ring)]
+    Ring(super::ring::RingJob<T>),
+}
+
+impl<T> Work<T> {
+    fn poll(&mut self, waker: &Waker) -> Poll<T> {
+        match self {
+            Work::Pool(task) => poll_task(task, waker),
+            #[cfg(ring)]
+            Work::Ring(job) => job.poll(waker),
+        }
+    }
+}
+
 struct Job<T> {
-    task: Task<io::Result<T>>,
+    task: Work<io::Result<T>>,
     /// Where it reads, and the epoch it read in.
     at: u64,
     epoch: u64,
@@ -118,7 +140,7 @@ struct Job<T> {
 
 /// A read job into a task's own buffer, which comes back with the result.
 struct LentRead {
-    task: Task<(io::Result<usize>, Vec<u8>)>,
+    task: Work<(io::Result<usize>, Vec<u8>)>,
     at: u64,
     epoch: u64,
     /// What the buffer held before: the read's bytes come after.
@@ -128,9 +150,9 @@ struct LentRead {
 /// The write in flight.
 enum Writing {
     /// From a buffer of the pool.
-    Pool(Task<io::Result<()>>),
+    Pool(Work<io::Result<()>>),
     /// From a task's own buffer, which comes back with the result.
-    Lent(Task<(io::Result<()>, Vec<u8>)>),
+    Lent(Work<(io::Result<()>, Vec<u8>)>),
 }
 
 /// A write from a task's own buffer, from its submission until its task
@@ -193,29 +215,90 @@ impl FileIo {
             consumed: AtomicUsize::new(0),
             unsent: AtomicBool::new(false),
             cursor: AtomicU64::new(cursor),
+            #[cfg(test)]
+            on_pool: AtomicBool::new(false),
         }))
     }
 
-    fn submit_read(&self, mut buf: PoolBuf, at: u64, epoch: u64) -> Job<PoolBuf> {
+    /// Sends this file's calls to the blocking pool even on a ring.
+    #[cfg(test)]
+    pub(crate) fn keep_on_pool(&self) {
+        self.on_pool.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this thread's calls go to its shard's ring.
+    #[cfg(ring)]
+    fn on_ring(&self) -> bool {
+        #[cfg(test)]
+        if self.on_pool.load(Ordering::Relaxed) {
+            return false;
+        }
+        true
+    }
+
+    fn submit_read(&self, buf: PoolBuf, at: u64, epoch: u64) -> Job<PoolBuf> {
+        #[cfg(ring)]
+        let buf = match self.on_ring() {
+            true => match super::ring::read(&self.fd, at, buf) {
+                Ok(job) => {
+                    return Job {
+                        task: Work::Ring(job),
+                        at,
+                        epoch,
+                    };
+                }
+                Err(buf) => buf,
+            },
+            false => buf,
+        };
         let fd = Arc::clone(&self.fd);
+        let mut buf = buf;
         let task = crate::runtime::spawn_blocking(move || {
             let n = sys::pread(file_raw(&fd), buf.spare(), at)?;
             buf.set_filled(n);
             Ok(buf)
         });
-        Job { task, at, epoch }
+        Job {
+            task: Work::Pool(task),
+            at,
+            epoch,
+        }
     }
 
     fn submit_write(&self, buf: PoolBuf, at: u64) -> Writing {
+        #[cfg(ring)]
+        let buf = match self.on_ring() {
+            true => match super::ring::write(&self.fd, at, buf) {
+                Ok(job) => return Writing::Pool(Work::Ring(job)),
+                Err(buf) => buf,
+            },
+            false => buf,
+        };
         let fd = Arc::clone(&self.fd);
-        Writing::Pool(crate::runtime::spawn_blocking(move || {
+        Writing::Pool(Work::Pool(crate::runtime::spawn_blocking(move || {
             sys::pwrite_all(file_raw(&fd), buf.filled(), at)
-        }))
+        })))
     }
 
-    fn submit_read_owned(&self, mut buf: Vec<u8>, at: u64, epoch: u64) -> LentRead {
-        let fd = Arc::clone(&self.fd);
+    fn submit_read_owned(&self, buf: Vec<u8>, at: u64, epoch: u64) -> LentRead {
         let from = buf.len();
+        #[cfg(ring)]
+        let buf = match self.on_ring() {
+            true => match super::ring::read_lent(&self.fd, at, buf) {
+                Ok(job) => {
+                    return LentRead {
+                        task: Work::Ring(job),
+                        at,
+                        epoch,
+                        from,
+                    };
+                }
+                Err(buf) => buf,
+            },
+            false => buf,
+        };
+        let fd = Arc::clone(&self.fd);
+        let mut buf = buf;
         let task = crate::runtime::spawn_blocking(move || {
             let result = sys::pread_uninit(file_raw(&fd), buf.spare_capacity_mut(), at);
             if let Ok(n) = result {
@@ -226,7 +309,7 @@ impl FileIo {
             (result, buf)
         });
         LentRead {
-            task,
+            task: Work::Pool(task),
             at,
             epoch,
             from,
@@ -234,10 +317,18 @@ impl FileIo {
     }
 
     fn submit_write_owned(&self, buf: Vec<u8>, at: u64) -> Writing {
+        #[cfg(ring)]
+        let buf = match self.on_ring() {
+            true => match super::ring::write_lent(&self.fd, at, buf) {
+                Ok(job) => return Writing::Lent(Work::Ring(job)),
+                Err(buf) => buf,
+            },
+            false => buf,
+        };
         let fd = Arc::clone(&self.fd);
-        Writing::Lent(crate::runtime::spawn_blocking(move || {
+        Writing::Lent(Work::Pool(crate::runtime::spawn_blocking(move || {
             (sys::pwrite_all(file_raw(&fd), &buf, at), buf)
-        }))
+        })))
     }
 
     /// Runs `step` on the state for a task polling with `cx`: the task is
@@ -364,7 +455,7 @@ impl FileIo {
         self.with_state(cx, |st, io, waker, after| {
             loop {
                 if let Some(lent) = job.as_mut() {
-                    let (result, mut buf) = match poll_task(&mut lent.task, waker) {
+                    let (result, mut buf) = match lent.task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(out) => out,
                     };
@@ -507,11 +598,11 @@ impl FileState {
         loop {
             if let Some(writing) = self.writing.as_mut() {
                 let failure = match writing {
-                    Writing::Pool(task) => match poll_task(task, waker) {
+                    Writing::Pool(task) => match task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(result) => result.as_ref().err().map(Failure::of),
                     },
-                    Writing::Lent(task) => match poll_task(task, waker) {
+                    Writing::Lent(task) => match task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready((result, buf)) => {
                             let failure = result.as_ref().err().map(Failure::of);
@@ -559,7 +650,7 @@ impl FileState {
                 return Poll::Ready(Ok(true));
             }
             if let Some(job) = self.reading.as_mut() {
-                let result = match poll_task(&mut job.task, waker) {
+                let result = match job.task.poll(waker) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => result,
                 };

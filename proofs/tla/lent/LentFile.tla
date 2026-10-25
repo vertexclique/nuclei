@@ -1,10 +1,15 @@
 ----------------------------- MODULE LentFile -----------------------------
 (***************************************************************************)
 (* File reads and writes from a task's own buffer (src/fs/file.rs:         *)
-(* `read_owned`, `write_owned`, `poll_writes`), on the file's jobs.         *)
+(* `read_owned`, `write_owned`, `poll_writes`), on the file's jobs, made   *)
+(* on the blocking pool or on the ring of the task's shard (src/fs/ring.rs) *)
 (*                                                                          *)
 (* In plain words: the file has a cursor and an epoch, which every write   *)
-(* and seek moves on. Jobs run on the blocking pool, in any order. Two     *)
+(* and seek moves on. Jobs run on the blocking pool or the ring, in any   *)
+(* order. A write on the ring may land in two parts, the kernel taking    *)
+(* only some of its bytes first: the rest goes out next, and the write is *)
+(* done only once all of it landed. The shard may go while its ring has   *)
+(* calls out: each is made on the pool instead, from where it stopped. Two *)
 (* tasks each read one cell at the cursor into their own buffers: a read   *)
 (* waits for the write in flight, then its job reads at the cursor, and   *)
 (* its result counts only if the cursor and the epoch are still those it  *)
@@ -35,17 +40,24 @@ variables
     file = [i \in Cells |-> 0],     \* what the file holds: 0 before any write
     cursor = 0,
     epoch = 0,
-    writing = NoJob,                \* the write in flight: [at, val, lent, ran]
+    writing = NoJob,                \* the write in flight: [at, val, lent, ran, on, part]
     lent = "none",                  \* the lent write: "none", "out", "done" or "orphan"
-    jobs = [r \in Readers |-> NoJob], \* each reader's job: [at, epoch, ran, val]
+    jobs = [r \in Readers |-> NoJob], \* each reader's job: [at, epoch, ran, val, on]
+    shut = FALSE,                   \* the shard went: its ring makes no more calls
     written = {},                   \* the writes accepted: <<cell, value>>
     taken = {},                     \* the reads that counted: <<reader, cell, value>>
     stale = FALSE,                  \* (record) a read counted a value the cell no longer holds
     redone = FALSE,                 \* (record) a read found the cursor or epoch moved and read again
-    orphanLanded = FALSE;           \* (record) the write of a task that went away landed
+    orphanLanded = FALSE,           \* (record) the write of a task that went away landed
+    short = FALSE,                  \* (record) a write on the ring landed in two parts
+    movedMid = FALSE;               \* (record) a write cut short on the ring was finished on the pool
 
 define
     InFlight == writing # NoJob /\ ~writing.ran
+    \* Where a new job goes: the ring of the task's shard while it runs one, or the pool.
+    Wheres == IF shut THEN {"pool"} ELSE {"ring", "pool"}
+    \* A job its runner may make now: the pool's always, the ring's while the shard runs.
+    Runs(j) == j.on = "pool" \/ ~shut
     AllDone == \A p \in Readers \cup {"writer"} : pc[p] = "Done"
 end define;
 
@@ -61,18 +73,49 @@ macro PollWrites() begin
     end if;
 end macro;
 
+\* The blocking pool and the shard's ring, which make the jobs' calls; and the shard's going.
 fair process pool = "pool"
 begin
 P_loop:
     while ~(AllDone /\ ~InFlight /\ \A r \in Readers : jobs[r] = NoJob \/ jobs[r].ran) do
         either
-            await InFlight;
-            file[writing.at] := writing.val;
-            writing.ran := TRUE;
+            await InFlight /\ Runs(writing);
+            either
+                \* All of the write, or the rest of one cut short.
+                file[writing.at] := writing.val;
+                writing.ran := TRUE;
+            or
+                \* The ring's call takes only part of it: half the cell holds the value.
+                await writing.on = "ring" /\ writing.part = 0;
+                file[writing.at] := -writing.val;
+                short := TRUE;
+                \* MUTATION no_continuation: a write cut short counts as done.
+                if Mutation = "no_continuation" then
+                    writing.ran := TRUE;
+                else
+                    writing.part := 1;
+                end if;
+            end either;
         or
-            with r \in {q \in Readers : jobs[q] # NoJob /\ ~jobs[q].ran} do
+            with r \in {q \in Readers : jobs[q] # NoJob /\ ~jobs[q].ran /\ Runs(jobs[q])} do
                 jobs[r].val := file[jobs[r].at] || jobs[r].ran := TRUE;
             end with;
+        or
+            \* The shard goes: every call its ring has out is made on the pool.
+            await ~shut;
+            shut := TRUE;
+            jobs := [r \in Readers |->
+                        IF jobs[r] # NoJob /\ ~jobs[r].ran THEN [jobs[r] EXCEPT !.on = "pool"]
+                        ELSE jobs[r]];
+            if InFlight /\ writing.on = "ring" then
+                \* MUTATION cancel_ends: a write cancelled as its shard went ends there.
+                if Mutation = "cancel_ends" then
+                    writing.ran := TRUE;
+                else
+                    if writing.part = 1 then movedMid := TRUE; end if;
+                    writing.on := "pool";
+                end if;
+            end if;
         end either;
     end while;
 end process;
@@ -91,7 +134,9 @@ R_wait_writes:
         await ~InFlight;
         goto R_hold;
     else
-        jobs[self] := [at |-> cursor, epoch |-> epoch, ran |-> FALSE, val |-> 0];
+        with where \in Wheres do
+            jobs[self] := [at |-> cursor, epoch |-> epoch, ran |-> FALSE, val |-> 0, on |-> where];
+        end with;
         holder := "none";
     end if;
 R_wait:
@@ -128,7 +173,9 @@ begin
 W_copy:
     \* A copied write: nothing is in flight, so it goes at once.
     await holder = "none";
-    writing := [at |-> cursor, val |-> 1, lent |-> FALSE, ran |-> FALSE];
+    with where \in Wheres do
+        writing := [at |-> cursor, val |-> 1, lent |-> FALSE, ran |-> FALSE, on |-> where, part |-> 0];
+    end with;
     written := written \cup {<<cursor, 1>>};
     cursor := cursor + 1;
     epoch := epoch + 1;
@@ -145,7 +192,9 @@ W_wait_writes:
         await ~InFlight;
         goto W_hold;
     else
-        writing := [at |-> cursor, val |-> 2, lent |-> TRUE, ran |-> FALSE];
+        with where \in Wheres do
+            writing := [at |-> cursor, val |-> 2, lent |-> TRUE, ran |-> FALSE, on |-> where, part |-> 0];
+        end with;
         written := written \cup {<<cursor, 2>>};
         cursor := cursor + 1;
         epoch := epoch + 1;
@@ -212,6 +261,9 @@ end algorithm; *)
 \* A read counts only a value its cell still holds when the read is taken.
 NoStaleRead == ~stale
 
+\* No read counts a cell a write had landed only part of.
+NoTornRead == \A t \in taken : t[3] >= 0
+
 \* Once every task is done and no write is in flight, every write accepted is in the file.
 AllLanded == (AllDone /\ ~InFlight) => \A w \in written : file[w[1]] = w[2]
 
@@ -228,4 +280,8 @@ NoRedo == ~redone
 NoOrphanLanded == ~orphanLanded
 \* A read after the seek counts the value the lent write put there.
 NoReadOfLent == \A t \in taken : t[3] # 2
+\* A write on the ring lands in two parts.
+NoShortWrite == ~short
+\* A write cut short on the ring, whose shard then went, is finished on the pool.
+NoMovedMid == ~movedMid
 =============================================================================

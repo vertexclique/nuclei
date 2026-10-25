@@ -12,6 +12,8 @@
 //! read into it and written from it with no copy.
 
 pub(crate) mod file;
+#[cfg(ring)]
+pub(crate) mod ring;
 
 use core::pin::Pin;
 use core::task::{Context, Poll};

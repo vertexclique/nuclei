@@ -29,6 +29,10 @@ PF_live                        MC_LentFile          pass
 MF_no_epoch_check              MC_LentFile          violated:NoStaleRead
 MF_lent_skips_wait             MC_LentFile          violated:AllLanded
 MF_orphan_cancelled            MC_LentFile          violated:AllLanded
+MF_no_continuation             MC_LentFile          violated:AllLanded
+MF_cancel_ends                 MC_LentFile          violated:AllLanded
 WF_redo                        MC_LentFile          violated:NoRedo
 WF_orphan_landed               MC_LentFile          violated:NoOrphanLanded
 WF_read_of_lent                MC_LentFile          violated:NoReadOfLent
+WF_short_write                 MC_LentFile          violated:NoShortWrite
+WF_moved_mid                   MC_LentFile          violated:NoMovedMid

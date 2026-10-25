@@ -145,6 +145,8 @@ fn a_dropped_lent_read_moves_the_cursor_nowhere() {
     std::fs::write(&path, b"from the start").unwrap();
     rt.block_on(async {
         let mut file = Handle::new(File::open(&path).unwrap()).unwrap();
+        // The test holds the pool: the file's calls go there.
+        file.file().unwrap().keep_on_pool();
         let (release, busy) = hold_the_pool();
         let mut lent = Box::pin(file.read_owned(Vec::with_capacity(4)));
         pends(&mut lent).await;
@@ -257,6 +259,8 @@ fn a_lent_write_waits_for_a_write_still_queued() {
     rt.block_on(async {
         let (hold, busy) = hold_the_pool();
         let mut file = Handle::new(read_write(&path)).unwrap();
+        // The test holds the pool: the file's calls go there.
+        file.file().unwrap().keep_on_pool();
         within(write_all(&mut file, &a)).await.unwrap();
         let mut lent = Box::pin(file.write_owned(b));
         pends(&mut lent).await;
@@ -283,6 +287,8 @@ fn a_dropped_lent_write_that_started_still_lands() {
     let expected = data.clone();
     rt.block_on(async {
         let mut file = Handle::new(read_write(&path)).unwrap();
+        // The test holds the pool: the file's calls go there.
+        file.file().unwrap().keep_on_pool();
         let (release, busy) = hold_the_pool();
         let mut lent = Box::pin(file.write_owned(data));
         pends(&mut lent).await;
@@ -314,6 +320,8 @@ fn a_dropped_handle_still_lands_a_started_lent_write() {
     let open = path.clone();
     rt.block_on(async move {
         let file = Handle::new(read_write(&open)).unwrap();
+        // The test holds the pool: the file's calls go there.
+        file.file().unwrap().keep_on_pool();
         let (release, busy) = hold_the_pool();
         let mut lent = Box::pin(file.write_owned(data));
         pends(&mut lent).await;
