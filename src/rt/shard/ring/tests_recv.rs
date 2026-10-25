@@ -164,9 +164,12 @@ fn a_long_stream_arrives_whole_and_in_order_across_the_buffers() {
 /// A reader that stops reading while bytes keep coming: its receive is
 /// stopped once it holds past its cap, so it takes nothing more from the
 /// group however many bytes come after, and once it reads again every byte
-/// comes, in order. The writer sends half, waits for the reader to see the
-/// receive stopped, then sends the rest: what the stop bounds is what comes
-/// after it, whatever the batches the kernel made of the first half.
+/// comes, in order. The writer sends a little past the cap, waits for the
+/// reader to see the receive stopped, then sends a few pieces more: what
+/// the stop bounds is what comes after it, whatever the batches the kernel
+/// made before. The parts are sized to the cap, not to the socket's
+/// buffers, which a system may keep small: the receive takes the first
+/// part up to its stop, and the rest waits in the socket.
 #[test]
 fn a_reader_that_falls_behind_is_stopped_at_its_cap_and_loses_nothing() {
     let Some(shard) = recv_shard(256, 4096) else {
@@ -176,35 +179,35 @@ fn a_reader_that_falls_behind_is_stopped_at_its_cap_and_loses_nothing() {
     let (mine, src, mut peer) = source_pair();
     set_buffers(mine.as_raw_fd(), 8 << 20);
     set_buffers(peer.as_raw_fd(), 8 << 20);
+    let ring = shard.ring().unwrap();
+    let cap = ring.recv_cap().unwrap();
     const PIECE: usize = 16 * 1024;
-    const PIECES: usize = 80;
-    let data = pattern(PIECE * PIECES);
+    // Past the cap by four pieces, then four more after the stop.
+    let first_pieces = cap / PIECE + 4;
+    let data = pattern(PIECE * (first_pieces + 4));
     let expected = data.clone();
-    let (half_sent, wait_half) = std::sync::mpsc::channel::<()>();
+    let (first_sent, wait_first) = std::sync::mpsc::channel::<()>();
     let (go_on, wait_go_on) = std::sync::mpsc::channel::<()>();
     let (all_sent, wait_all) = std::sync::mpsc::channel::<()>();
     let writer = std::thread::spawn(move || {
-        let (first, second) = data.split_at(data.len() / 2);
+        let (first, rest) = data.split_at(PIECE * first_pieces);
         for piece in first.chunks(PIECE) {
             peer.write_all(piece).unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }
-        half_sent.send(()).unwrap();
+        first_sent.send(()).unwrap();
         wait_go_on.recv().unwrap();
-        peer.write_all(second).unwrap();
+        peer.write_all(rest).unwrap();
         all_sent.send(()).unwrap();
         peer
     });
-    let ring = shard.ring().unwrap();
-    let cap = ring.recv_cap().unwrap();
-    assert!(cap < PIECE * PIECES / 2, "the first half passes the cap");
     shard.block_on(async {
         // One read arms the receive, then the reader falls behind.
         let mut first = vec![0u8; 1];
         read_exact(&src, &mut first).await;
         let deadline = Instant::now() + Duration::from_secs(20);
-        while wait_half.try_recv().is_err() {
-            assert!(Instant::now() < deadline, "the first half was never sent");
+        while wait_first.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "the first part was never sent");
             pause(Duration::from_millis(5)).await;
         }
         // Until what the receive holds stops growing: it stopped.
