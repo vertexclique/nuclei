@@ -106,7 +106,7 @@ impl Poller {
         // SAFETY: sets close-on-exec on our own descriptor.
         unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
         // Registered once; EV_CLEAR resets it each time it is delivered.
-        submit(&queue, &wake_event(libc::EV_ADD | libc::EV_CLEAR, 0))?;
+        submit(&queue, &wake_event((libc::EV_ADD | libc::EV_CLEAR) as _, 0))?;
         Ok(Self {
             queue: Arc::new(queue),
             events: Vec::with_capacity(64),
@@ -186,7 +186,8 @@ impl Poller {
                 woken |= e.ident == WAKE;
                 continue;
             }
-            let done = e.flags & (libc::EV_EOF | libc::EV_ERROR) as u16 != 0;
+            // The flags are 16 bits wide on most BSDs and 32 on NetBSD.
+            let done = u64::from(e.flags) & u64::from(libc::EV_EOF | libc::EV_ERROR) != 0;
             let urgent = urgent(e);
             on_event(
                 e.udata as usize as u64,
