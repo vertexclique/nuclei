@@ -17,7 +17,7 @@ impl Shard {
     /// and this, its own shard, runs again only at its next one.
     pub(crate) fn leave(&self) {
         let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
-        evict_all(&gone, self.shared_addr());
+        evict_all(gone, self.shared_addr());
         self.let_go_of_children();
         // Sources that went before (a dropped handle's) may have left a
         // cancel queued, or their operations still out.
@@ -39,11 +39,11 @@ impl Shard {
 /// holder as it lets go, which comes a driver call later; until then the
 /// holder may still hand this shard's driver an operation, so the
 /// operations out here are only known once every eviction happened.
-fn evict_all(gone: &[(u64, Arc<Source>)], home: usize) {
-    for (_, source) in gone {
+fn evict_all(gone: Vec<(u64, Arc<Source>)>, home: usize) {
+    for (_, source) in &gone {
         source.evict();
     }
-    wait_for_evictions(gone, home);
+    wait_for_evictions(&gone, home);
 }
 
 /// Waits until no source of `gone` is registered under its token with the
@@ -130,7 +130,7 @@ impl Drop for Shard {
         // The sources registered here lose their driver: each is told, and
         // registers where it is polled next.
         let gone: Vec<(u64, Arc<Source>)> = self.sources.get_mut().drain_tokens().collect();
-        evict_all(&gone, self.shared_addr());
+        evict_all(gone, self.shared_addr());
         self.let_go_of_children();
         // The ring's operations still out are cancelled and their
         // completions waited for, so no memory they point at goes while the
