@@ -387,6 +387,29 @@ pub(crate) fn raw_inet(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::sock
     (storage, len as libc::socklen_t)
 }
 
+/// Binds the socket `fd` to `addr`.
+pub(crate) fn bind_inet(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
+    let (storage, len) = raw_inet(addr);
+    // SAFETY: the address is `len` bytes of our own storage.
+    cvt_int(unsafe { libc::bind(fd, (&storage as *const libc::sockaddr_storage).cast(), len) })
+        .map(drop)
+}
+
+/// Binds the socket `fd` to the Unix socket path `path`.
+pub(crate) fn bind_unix(fd: RawFd, path: &Path) -> io::Result<()> {
+    let (addr, len) = raw_unix(path)?;
+    // SAFETY: the address is `len` bytes of our own `sockaddr_un`.
+    cvt_int(unsafe { libc::bind(fd, (&addr as *const libc::sockaddr_un).cast(), len) }).map(drop)
+}
+
+/// Makes the socket `fd` listen, with room for `backlog` connections not
+/// accepted yet.
+pub(crate) fn listen(fd: RawFd, backlog: u32) -> io::Result<()> {
+    let backlog = libc::c_int::try_from(backlog).unwrap_or(libc::c_int::MAX);
+    // SAFETY: a plain syscall on a socket the caller holds.
+    cvt_int(unsafe { libc::listen(fd, backlog) }).map(drop)
+}
+
 /// Starts a connect on a non-blocking socket. `Ok(true)`: connected now;
 /// `Ok(false)`: in progress, the socket turns writable when it ends.
 pub(crate) fn connect_inet(fd: RawFd, addr: &SocketAddr) -> io::Result<bool> {

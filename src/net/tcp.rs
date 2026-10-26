@@ -10,6 +10,10 @@ use futures_core::Stream;
 
 use super::addr::{ToSocketAddrs, resolve};
 use super::none_worked;
+use std::time::Duration;
+
+use crate::io::IoObject;
+use crate::io::raw::Owned;
 use crate::io::source::write::Peer;
 use crate::io::source::{Addr, Kind};
 use crate::io::{Handle, sys};
@@ -204,27 +208,59 @@ impl Handle<TcpStream> {
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         poll_fn(|cx| self.source().poll_read(cx, buf, true)).await
     }
+
+    /// `SO_LINGER`: how long a close waits for unsent data, `None` if it
+    /// does not wait.
+    pub fn linger(&self) -> io::Result<Option<Duration>> {
+        super::opt::linger_time(self.raw_io())
+    }
+
+    /// Sets `SO_LINGER`: with `Some(time)` a close waits up to `time` (whole
+    /// seconds) for unsent data; with `None` it returns at once and the
+    /// system sends what is left.
+    pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
+        super::opt::set_linger_time(self.raw_io(), linger)
+    }
+
+    /// Sets `SO_LINGER` to zero: the close drops unsent data and resets the
+    /// connection.
+    pub fn set_zero_linger(&self) -> io::Result<()> {
+        super::opt::set_linger_time(self.raw_io(), Some(Duration::ZERO))
+    }
+}
+
+/// A new non-blocking TCP socket, IPv6 or IPv4.
+pub(super) fn new_socket(v6: bool) -> io::Result<Owned> {
+    #[cfg(unix)]
+    return sys::socket(
+        if v6 { libc::AF_INET6 } else { libc::AF_INET },
+        libc::SOCK_STREAM,
+    );
+    #[cfg(windows)]
+    return sys::tcp_socket(if v6 {
+        crate::syscore::windows::AF_INET6
+    } else {
+        crate::syscore::windows::AF_INET
+    });
 }
 
 /// One connect: a non-blocking socket, its connect, and the driver seeing
 /// it end.
 async fn connect(addr: SocketAddr) -> io::Result<Handle<TcpStream>> {
-    #[cfg(unix)]
-    let socket = {
-        let domain = if addr.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        };
-        sys::socket(domain, libc::SOCK_STREAM)?
-    };
-    #[cfg(windows)]
-    let socket = sys::tcp_socket(if addr.is_ipv4() {
-        crate::syscore::windows::AF_INET
+    connect_socket(new_socket(addr.is_ipv6())?, true, addr).await
+}
+
+/// The connect of `socket`, non-blocking already or not, to `addr`.
+pub(super) async fn connect_socket(
+    socket: Owned,
+    nonblocking: bool,
+    addr: SocketAddr,
+) -> io::Result<Handle<TcpStream>> {
+    let stream = if nonblocking {
+        Handle::from_nonblocking(TcpStream::from(socket), Kind::Tcp)
     } else {
-        crate::syscore::windows::AF_INET6
-    })?;
-    let stream = Handle::from_nonblocking(TcpStream::from(socket), Kind::Tcp);
+        Handle::adopt(TcpStream::from(socket), Kind::Tcp)?
+    };
     poll_fn(|cx| stream.source().poll_connect(cx, Peer::Inet(addr))).await?;
     Ok(stream)
 }

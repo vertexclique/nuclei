@@ -191,6 +191,21 @@ pub(crate) const SO_TYPE: i32 = 0x1008;
 pub(crate) const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
 pub(crate) const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 pub(crate) const SO_ACCEPTCONN: i32 = 0x0002;
+pub(crate) const SO_REUSEADDR: i32 = 0x0004;
+pub(crate) const SO_KEEPALIVE: i32 = 0x0008;
+pub(crate) const SO_LINGER: i32 = 0x0080;
+pub(crate) const SO_SNDBUF: i32 = 0x1001;
+pub(crate) const SO_RCVBUF: i32 = 0x1002;
+pub(crate) const IPPROTO_IP: i32 = 0;
+pub(crate) const IP_TOS: i32 = 3;
+
+/// `LINGER`: whether a close waits for unsent data, and how long.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct LINGER {
+    pub(crate) l_onoff: u16,
+    pub(crate) l_linger: u16,
+}
 pub(crate) const SD_SEND: i32 = 1;
 pub(crate) const WSA_FLAG_OVERLAPPED: DWORD = 0x01;
 pub(crate) const WSA_FLAG_NO_HANDLE_INHERIT: DWORD = 0x80;
@@ -453,6 +468,7 @@ unsafe extern "system" {
     ) -> i32;
     pub(crate) fn getsockname(s: SOCKET, name: *mut SOCKADDR, namelen: *mut i32) -> i32;
     pub(crate) fn bind(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
+    pub(crate) fn listen(s: SOCKET, backlog: i32) -> i32;
     pub(crate) fn closesocket(s: SOCKET) -> i32;
     pub(crate) fn shutdown(s: SOCKET, how: i32) -> i32;
     #[cfg(test)]

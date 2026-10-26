@@ -28,14 +28,23 @@
 //! ```
 
 mod addr;
+mod opt;
+mod socket;
 mod stream;
 mod tcp;
 mod udp;
 #[cfg(unix)]
 mod unix;
+#[cfg(unix)]
+mod unix_socket;
 
 pub use self::addr::{ToSocketAddrs, lookup_host};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use self::socket::DeviceName;
+pub use self::socket::TcpSocket;
 pub use self::tcp::TcpStreamGenerator;
+#[cfg(unix)]
+pub use self::unix_socket::UnixSocket;
 
 use std::io;
 

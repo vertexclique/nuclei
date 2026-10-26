@@ -235,6 +235,21 @@ pub(crate) fn udp_connreset_off(raw: Raw) -> io::Result<()> {
     })
 }
 
+/// Binds the socket `raw` to `addr`.
+pub(crate) fn bind_inet(raw: Raw, addr: &SocketAddr) -> io::Result<()> {
+    let (storage, len) = raw_addr(addr);
+    // SAFETY: the address is `len` bytes of our own storage.
+    check(unsafe { bind(socket_of(raw), core::ptr::from_ref(&storage).cast(), len) })
+}
+
+/// Makes the socket `raw` listen, with room for `backlog` connections not
+/// accepted yet.
+pub(crate) fn listen(raw: Raw, backlog: u32) -> io::Result<()> {
+    let backlog = i32::try_from(backlog).unwrap_or(i32::MAX);
+    // SAFETY: a plain call on a socket the caller holds.
+    check(unsafe { crate::syscore::windows::listen(socket_of(raw), backlog) })
+}
+
 /// A socket address in its raw form, and its length.
 pub(crate) fn raw_addr(addr: &SocketAddr) -> (SOCKADDR_STORAGE, i32) {
     let mut storage = SOCKADDR_STORAGE::zeroed();
