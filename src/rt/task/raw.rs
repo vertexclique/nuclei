@@ -290,6 +290,7 @@ where
         // SAFETY: nothing refers to the task any more; its future and output
         // are gone, and the union has no drop glue of its own.
         unsafe {
+            super::names::forget(Self::cell(ptr).header.id);
             abort_on_panic(|| drop(Box::from_raw(ptr.cast_mut().cast::<Cell<F, S>>())));
         }
     }
