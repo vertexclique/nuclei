@@ -144,3 +144,77 @@ fn a_tcp_round_trip_allocates_nothing() {
     });
     assert_eq!(made, 0, "{made} allocations in {RUNS} round trips");
 }
+
+/// File reads and writes through a handle: measured, not yet held to zero
+/// (N-ZERO-4: a ring operation's slot, a pool job's task).
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn file_reads_and_writes_measured() {
+    use nuclei::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    let path = std::env::temp_dir().join(format!("nuclei-zero-alloc-{}", std::process::id()));
+    let rt = nuclei::Runtime::builder()
+        .worker_threads(0)
+        .build()
+        .unwrap();
+    let file = rt.block_on(async {
+        nuclei::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .unwrap()
+    });
+    drop(rt);
+    let mut file = file;
+    let mut buf = [0u8; 4096];
+    let made = steady(async || {
+        file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+        file.write_all(&[7u8; 4096]).await.unwrap();
+        file.flush().await.unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+        file.read_exact(&mut buf).await.unwrap();
+    });
+    eprintln!("FILE: {made} allocations in {RUNS} write, flush, seek and read rounds");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A task's memory comes from the thread's cache of task blocks.
+#[test]
+fn a_local_spawn_allocates_nothing() {
+    let made = steady(async || {
+        nuclei::spawn_local(async { 1u8 }).await;
+    });
+    assert_eq!(made, 0, "{made} allocations in {RUNS} spawns and awaits");
+}
+
+/// Spawns through queues to other threads: measured, not yet held to zero
+/// (N-ZERO-7: the blocking pool's channel takes a node per job, a shard's
+/// inbox a segment per 32 tasks from other threads).
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn spawns_to_other_threads_measured() {
+    let blocking = steady(async || {
+        nuclei::spawn_blocking(|| 1u8).await;
+    });
+    eprintln!("SPAWN_BLOCKING: {blocking} allocations in {RUNS} spawn_blocking and await");
+    // Onto a worker, from this thread: counted on this thread only.
+    let rt = nuclei::Runtime::builder()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let remote = rt.block_on(async {
+        for _ in 0..WARM {
+            nuclei::spawn(async { 1u8 }).await;
+        }
+        let before = allocations();
+        for _ in 0..RUNS {
+            nuclei::spawn(async { 1u8 }).await;
+        }
+        allocations() - before
+    });
+    eprintln!(
+        "SPAWN_REMOTE: {remote} allocations on the spawning thread in {RUNS} spawn and await"
+    );
+}

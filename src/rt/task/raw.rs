@@ -100,17 +100,22 @@ where
         ),
     };
 
-    /// Allocates a task, scheduled, with its handle and its `Runnable`.
+    /// Allocates a task, scheduled, with its handle and its `Runnable`; its
+    /// memory comes from the thread's cache of task blocks (see `memory`).
     pub(super) fn allocate(future: F, schedule: S) -> NonNull<()> {
-        let cell = Box::new(Cell {
-            header: Header::new(&Self::VTABLE),
-            schedule,
-            core: UnsafeCell::new(Core {
-                future: ManuallyDrop::new(future),
-            }),
-        });
-        // SAFETY: a box is never null.
-        unsafe { NonNull::new_unchecked(Box::into_raw(cell).cast()) }
+        let ptr =
+            super::memory::alloc(core::alloc::Layout::new::<Cell<F, S>>()).cast::<Cell<F, S>>();
+        // SAFETY: fresh memory of the cell's layout, written once here.
+        unsafe {
+            ptr.as_ptr().write(Cell {
+                header: Header::new(&Self::VTABLE),
+                schedule,
+                core: UnsafeCell::new(Core {
+                    future: ManuallyDrop::new(future),
+                }),
+            });
+        }
+        ptr.cast()
     }
 
     /// # Safety
@@ -292,7 +297,14 @@ where
         // are gone, and the union has no drop glue of its own.
         unsafe {
             super::names::forget(Self::cell(ptr).header.id);
-            abort_on_panic(|| drop(Box::from_raw(ptr.cast_mut().cast::<Cell<F, S>>())));
+            let cell = ptr.cast_mut().cast::<Cell<F, S>>();
+            abort_on_panic(|| core::ptr::drop_in_place(cell));
+            // SAFETY: the memory came from `memory::alloc` with the cell's
+            // layout, and nothing uses it now.
+            super::memory::free(
+                NonNull::new_unchecked(cell.cast()),
+                core::alloc::Layout::new::<Cell<F, S>>(),
+            );
         }
     }
 

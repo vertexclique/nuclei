@@ -33,6 +33,7 @@ mod header;
 mod join;
 #[cfg(all(test, loom))]
 mod loom_tests;
+mod memory;
 pub(crate) mod names;
 mod raw;
 mod state;
