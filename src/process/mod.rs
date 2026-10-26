@@ -43,6 +43,7 @@ pub struct Command {
     std: std::process::Command,
     /// What `output` gives the child's stdin unless this says otherwise.
     stdin_set: bool,
+    kill_on_drop: bool,
 }
 
 impl Command {
@@ -52,6 +53,7 @@ impl Command {
         Self {
             std: std::process::Command::new(program),
             stdin_set: false,
+            kill_on_drop: false,
         }
     }
 
@@ -125,6 +127,29 @@ impl Command {
         self
     }
 
+    /// Whether the child is ended, as [`Child::start_kill`] ends it, when
+    /// its [`Child`] is dropped before it exits (default false: it runs on,
+    /// and is still reaped once it exits).
+    ///
+    /// ```no_run
+    /// # nuclei::block_on(async {
+    /// use nuclei::process::Command;
+    ///
+    /// let child = Command::new("sleep").arg("60").kill_on_drop(true).spawn()?;
+    /// drop(child); // the child is ended here
+    /// # std::io::Result::Ok(())
+    /// # }).unwrap();
+    /// ```
+    pub fn kill_on_drop(&mut self, kill: bool) -> &mut Self {
+        self.kill_on_drop = kill;
+        self
+    }
+
+    /// Whether [`kill_on_drop`](Self::kill_on_drop) is set.
+    pub fn get_kill_on_drop(&self) -> bool {
+        self.kill_on_drop
+    }
+
     /// The std command underneath, for what this one does not mirror.
     pub fn as_std(&self) -> &std::process::Command {
         &self.std
@@ -135,21 +160,69 @@ impl Command {
         &mut self.std
     }
 
+    /// The std command underneath, taken.
+    pub fn into_std(self) -> std::process::Command {
+        self.std
+    }
+
     /// Spawns the child. Its piped streams are async.
     ///
     /// # Errors
     ///
     /// When the child cannot start, or its pipes cannot be taken over.
     pub fn spawn(&mut self) -> io::Result<Child> {
-        let mut std = self.std.spawn()?;
-        let exit = Exit::new(&std)?;
-        Ok(Child {
-            stdin: std.stdin.take().map(ChildStdin::new).transpose()?,
-            stdout: std.stdout.take().map(ChildStdout::new).transpose()?,
-            stderr: std.stderr.take().map(ChildStderr::new).transpose()?,
+        self.spawn_with(std::process::Command::spawn)
+    }
+
+    /// Spawns the child through `with`, which starts it from the std
+    /// command underneath: for a way to start a child this type does not
+    /// mirror, such as a platform's own spawn call with extra attributes.
+    /// The child `with` returns is then this one's, its piped streams async.
+    ///
+    /// ```no_run
+    /// # nuclei::block_on(async {
+    /// use nuclei::process::Command;
+    ///
+    /// let mut child = Command::new("true").spawn_with(|std| std.spawn())?;
+    /// assert!(child.wait().await?.success());
+    /// # std::io::Result::Ok(())
+    /// # }).unwrap();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// What `with` returns, and when the child's pipes cannot be taken
+    /// over.
+    pub fn spawn_with(
+        &mut self,
+        with: impl FnOnce(&mut std::process::Command) -> io::Result<std::process::Child>,
+    ) -> io::Result<Child> {
+        let mut std = with(&mut self.std)?;
+        let exit = match Exit::new(&std) {
+            Ok(exit) => exit,
+            Err(e) => {
+                if self.kill_on_drop {
+                    // The error that matters is the one returned.
+                    let _ = std.kill();
+                }
+                return Err(e);
+            }
+        };
+        let (stdin, stdout, stderr) = (std.stdin.take(), std.stdout.take(), std.stderr.take());
+        // Made before the pipes are taken over: should one fail, its drop
+        // still reaps the child (and ends it, if asked).
+        let mut child = Child {
+            stdin: None,
+            stdout: None,
+            stderr: None,
             exit,
+            kill_on_drop: self.kill_on_drop,
             _std: std,
-        })
+        };
+        child.stdin = stdin.map(ChildStdin::new).transpose()?;
+        child.stdout = stdout.map(ChildStdout::new).transpose()?;
+        child.stderr = stderr.map(ChildStderr::new).transpose()?;
+        Ok(child)
     }
 
     /// Spawns the child and waits for its exit; its streams are inherited
@@ -182,6 +255,7 @@ impl From<std::process::Command> for Command {
         Self {
             std,
             stdin_set: false,
+            kill_on_drop: false,
         }
     }
 }
@@ -196,6 +270,7 @@ pub struct Child {
     /// The child's stderr, if piped.
     pub stderr: Option<ChildStderr>,
     exit: Arc<Exit>,
+    kill_on_drop: bool,
     /// The std child, kept for what it owns (its process handle).
     _std: std::process::Child,
 }
@@ -236,14 +311,37 @@ impl Child {
         self.exit.try_wait()
     }
 
-    /// Ends the child: `SIGKILL` on unix, `TerminateProcess` on Windows. A
-    /// child that exited already is left alone.
+    /// Starts ending the child, without waiting for it to go: `SIGKILL` on
+    /// unix, `TerminateProcess` on Windows. A child that exited already is
+    /// left alone.
     ///
     /// # Errors
     ///
     /// When the signal or the call fails.
-    pub fn kill(&mut self) -> io::Result<()> {
+    pub fn start_kill(&mut self) -> io::Result<()> {
         self.exit.kill()
+    }
+
+    /// Ends the child, as [`start_kill`](Self::start_kill) does, and waits
+    /// for its exit.
+    ///
+    /// ```no_run
+    /// # nuclei::block_on(async {
+    /// use nuclei::process::Command;
+    ///
+    /// let mut child = Command::new("sleep").arg("60").spawn()?;
+    /// child.kill().await?;
+    /// assert!(child.try_wait()?.is_some());
+    /// # std::io::Result::Ok(())
+    /// # }).unwrap();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As for [`start_kill`](Self::start_kill) and [`wait`](Self::wait).
+    pub async fn kill(&mut self) -> io::Result<()> {
+        self.start_kill()?;
+        self.wait().await.map(drop)
     }
 
     /// Waits for the child's exit, collecting its stdout and stderr (those
@@ -277,6 +375,11 @@ impl Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
+        if self.kill_on_drop {
+            // A drop cannot report a failure, and the kill of a child of
+            // ours fails only once it is gone.
+            let _ = self.exit.kill();
+        }
         // A child that runs on is still reaped once it exits.
         #[cfg(unix)]
         self.exit.watch_orphan();

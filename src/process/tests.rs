@@ -22,6 +22,16 @@ async fn write_all(w: &mut (impl AsyncWrite + Unpin), mut buf: &[u8]) {
     }
 }
 
+#[test]
+fn into_std_hands_the_command_over() {
+    let mut command = Command::new("prog");
+    command.arg("a").current_dir("/");
+    let std = command.into_std();
+    assert_eq!(std.get_program(), "prog");
+    assert_eq!(std.get_args().collect::<Vec<_>>(), ["a"]);
+    assert_eq!(std.get_current_dir(), Some(std::path::Path::new("/")));
+}
+
 #[cfg(unix)]
 mod unix {
     use std::os::unix::process::ExitStatusExt;
@@ -90,13 +100,13 @@ mod unix {
         crate::block_on(async {
             let mut child = Command::new("sleep").arg("30").spawn().unwrap();
             assert!(child.try_wait().unwrap().is_none(), "it runs");
-            child.kill().unwrap();
+            child.start_kill().unwrap();
             let status = within(child.wait()).await.unwrap();
             assert_eq!(status.signal(), Some(libc::SIGKILL));
             // A second wait gives it again; a kill of the exited child is
             // nothing to do.
             assert_eq!(within(child.wait()).await.unwrap(), status);
-            child.kill().unwrap();
+            child.start_kill().unwrap();
         });
     }
 
@@ -177,7 +187,7 @@ mod unix {
                 .collect();
             for (i, child) in children.iter_mut().enumerate() {
                 if i % 2 == 0 {
-                    child.kill().unwrap();
+                    child.start_kill().unwrap();
                 } else {
                     drop(child.stdin.take());
                 }
@@ -194,6 +204,70 @@ mod unix {
                     assert_eq!(status.code(), Some(3), "child {i}: {status:?}");
                 }
             }
+        });
+    }
+
+    #[test]
+    fn kill_ends_the_child_and_waits_for_its_exit() {
+        crate::block_on(async {
+            let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+            within(child.kill()).await.unwrap();
+            assert!(reaped(child.id()));
+            let status = child.try_wait().unwrap().expect("it exited");
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            // The child is gone: nothing to do.
+            within(child.kill()).await.unwrap();
+        });
+    }
+
+    /// With `kill_on_drop` a child whose `Child` goes is ended, then reaped;
+    /// without it, the child runs on.
+    #[test]
+    fn kill_on_drop_ends_the_child_its_child_left() {
+        crate::block_on(async {
+            let mut command = Command::new("sleep");
+            command.arg("60");
+            assert!(!command.get_kill_on_drop());
+            let runs_on = command.spawn().unwrap();
+            let runs_on_pid = runs_on.id();
+            drop(runs_on);
+            let killed = command.kill_on_drop(true).spawn().unwrap();
+            assert!(command.get_kill_on_drop());
+            let pid = killed.id();
+            drop(killed);
+            // Well short of the sleep: only the kill can end it in time.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !reaped(pid) {
+                assert!(Instant::now() < deadline, "the child was not ended");
+                crate::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                !exited(runs_on_pid),
+                "the child without kill_on_drop runs on"
+            );
+            // SAFETY: a plain syscall; the child is alive, so the pid is its.
+            assert_eq!(
+                unsafe { libc::kill(runs_on_pid as libc::pid_t, libc::SIGKILL) },
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn spawn_with_starts_the_child_its_own_way() {
+        crate::block_on(async {
+            let mut command = Command::new("sh");
+            let child = command
+                .stdout(Stdio::piped())
+                .spawn_with(|std| std.args(["-c", "echo hi; exit 3"]).spawn())
+                .unwrap();
+            let output = within(child.wait_with_output()).await.unwrap();
+            assert_eq!(output.status.code(), Some(3));
+            assert_eq!(output.stdout, b"hi\n");
+            let refused = command
+                .spawn_with(|_| Err(std::io::Error::other("refused")))
+                .unwrap_err();
+            assert_eq!(refused.to_string(), "refused");
         });
     }
 
@@ -236,7 +310,7 @@ mod unix {
         crate::block_on(async {
             assert_eq!(within(sh("exit 5").status()).await.unwrap().code(), Some(5));
             let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-            child.kill().unwrap();
+            child.start_kill().unwrap();
             assert_eq!(
                 within(child.wait()).await.unwrap().signal(),
                 Some(libc::SIGKILL)
@@ -287,10 +361,48 @@ mod windows {
                 .spawn()
                 .unwrap();
             assert!(child.try_wait().unwrap().is_none(), "it runs");
-            child.kill().unwrap();
+            child.start_kill().unwrap();
             let status = within(child.wait()).await.unwrap();
             assert_eq!(status.code(), Some(1));
-            child.kill().unwrap();
+            child.start_kill().unwrap();
+        });
+    }
+
+    #[test]
+    fn kill_ends_the_child_and_waits_for_its_exit() {
+        crate::block_on(async {
+            let mut child = Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            within(child.kill()).await.unwrap();
+            let status = child.try_wait().unwrap().expect("it exited");
+            assert_eq!(status.code(), Some(1));
+            within(child.kill()).await.unwrap();
+        });
+    }
+
+    /// With `kill_on_drop` a child whose `Child` goes is ended: its stdout
+    /// ends long before the child would.
+    #[test]
+    fn kill_on_drop_ends_the_child_its_child_left() {
+        use crate::io::AsyncReadExt;
+
+        crate::block_on(async {
+            let mut child = Command::new("ping")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            drop(child);
+            let mut out = Vec::new();
+            crate::time::timeout(Duration::from_secs(10), stdout.read_to_end(&mut out))
+                .await
+                .expect("the child was not ended")
+                .unwrap();
         });
     }
 
