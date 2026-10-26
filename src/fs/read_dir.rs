@@ -19,8 +19,12 @@ use crate::task::Join;
 /// Entries read from the directory in one call of the blocking pool.
 const PAGE: usize = 32;
 
-/// One page and what reads the next.
-type Page = (Option<std::fs::ReadDir>, VecDeque<io::Result<DirEntry>>);
+/// One page and what reads the next. The std reader is boxed: it is large
+/// on Windows, and goes to the pool and back with each page.
+type Page = (
+    Option<Box<std::fs::ReadDir>>,
+    VecDeque<io::Result<DirEntry>>,
+);
 
 /// The entries of the directory at `path`, through
 /// [`ReadDir::next_entry`] or as a [`Stream`].
@@ -28,7 +32,7 @@ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDir> {
     let path = path.as_ref().to_path_buf();
     let dir = blocking(move || std::fs::read_dir(path)).await?;
     Ok(ReadDir {
-        state: State::Idle(Some(dir), VecDeque::new()),
+        state: State::Idle(Some(Box::new(dir)), VecDeque::new()),
     })
 }
 
@@ -41,7 +45,10 @@ pub struct ReadDir {
 #[derive(Debug)]
 enum State {
     /// The entries read and not handed out; `None` once the directory ended.
-    Idle(Option<std::fs::ReadDir>, VecDeque<io::Result<DirEntry>>),
+    Idle(
+        Option<Box<std::fs::ReadDir>>,
+        VecDeque<io::Result<DirEntry>>,
+    ),
     /// The next page on the pool.
     Busy(Join<Page>),
 }
