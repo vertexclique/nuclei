@@ -24,4 +24,11 @@ pub use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
 
 pub use self::handle::{Handle, IoObject};
 pub(crate) use self::source::Source;
-pub use self::util::*;
+pub use self::util::{
+    AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufStream, BufWriter,
+    Chain, DuplexStream, Empty, FillBuf, Flush, Lines, Read, ReadBuf, ReadBufFuture, ReadExact,
+    ReadHalf, ReadLine, ReadNumber, ReadToEnd, ReadToString, ReadUntil, Repeat, Seek, Shutdown,
+    SimplexReader, SimplexWriter, Sink, Split, Take, Write, WriteAll, WriteHalf, WriteNumber,
+    WriteVectored, copy, copy_bidirectional, copy_bidirectional_with_sizes, copy_buf, duplex,
+    empty, repeat, simplex, sink, split,
+};
