@@ -34,6 +34,9 @@ use super::shard::{Limits, Shard, Shared};
 use super::task::{self, Task};
 use super::workers::{Start, Workers};
 
+mod enter;
+pub use self::enter::{EnterGuard, RuntimeId, TryCurrentError, worker_index};
+
 /// What a runtime's threads share.
 pub(crate) struct Inner {
     /// Tells this runtime's workers from another's.
@@ -75,6 +78,7 @@ pub struct Builder {
     max_worker_threads: Option<usize>,
     backend: Option<crate::IoBackend>,
     start_paused: bool,
+    tuning: super::tuning::Tuning,
 }
 
 impl Default for Builder {
@@ -106,6 +110,7 @@ impl Builder {
             max_worker_threads: None,
             backend: None,
             start_paused: false,
+            tuning: super::tuning::Tuning::default(),
         }
     }
 
@@ -209,6 +214,69 @@ impl Builder {
         self
     }
 
+    /// Called on each thread the runtime starts (workers and blocking-pool
+    /// threads), on that thread, before it does anything else.
+    pub fn on_thread_start(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.tuning.hooks.start = Some(Arc::new(f));
+        self
+    }
+
+    /// Called on each thread the runtime starts, on that thread, as it ends
+    /// (after a panic too).
+    pub fn on_thread_stop(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.tuning.hooks.stop = Some(Arc::new(f));
+        self
+    }
+
+    /// Called on a worker thread just before it sleeps with nothing to run.
+    pub fn on_thread_park(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.tuning.hooks.park = Some(Arc::new(f));
+        self
+    }
+
+    /// Called on a worker thread just after it wakes from a sleep.
+    pub fn on_thread_unpark(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.tuning.hooks.unpark = Some(Arc::new(f));
+        self
+    }
+
+    /// Task runs between a worker's looks at its timers and IO when it is
+    /// busy (default 61): lower answers IO sooner, higher runs tasks with
+    /// fewer interruptions.
+    ///
+    /// # Panics
+    ///
+    /// When `runs` is zero.
+    pub fn event_interval(mut self, runs: u32) -> Self {
+        assert!(runs > 0, "event_interval must be at least 1");
+        self.tuning.driver_interval = runs;
+        self
+    }
+
+    /// Task runs between the times a worker takes from its inbox (tasks
+    /// woken by other threads) before its own queue (default 31).
+    ///
+    /// # Panics
+    ///
+    /// When `runs` is zero.
+    pub fn global_queue_interval(mut self, runs: u32) -> Self {
+        assert!(runs > 0, "global_queue_interval must be at least 1");
+        self.tuning.inbox_interval = runs;
+        self
+    }
+
+    /// The most IO events a worker takes from its driver in one look
+    /// (default: all that are ready).
+    ///
+    /// # Panics
+    ///
+    /// When `events` is zero.
+    pub fn max_io_events_per_tick(mut self, events: usize) -> Self {
+        assert!(events > 0, "max_io_events_per_tick must be at least 1");
+        self.tuning.max_io_events = events;
+        self
+    }
+
     /// Whether each worker thread is pinned to its own core (Linux; default
     /// true). A pinned shard keeps its cache warm; unpinned, the scheduler may
     /// move it.
@@ -242,6 +310,7 @@ impl Builder {
             .thread_name
             .unwrap_or_else(|| Arc::new(|| "nuclei-worker".to_string()));
         let pool = Pool::new(PoolConfig {
+            hooks: self.tuning.hooks.clone(),
             max_threads: self
                 .max_blocking_threads
                 .unwrap_or(DEFAULT_BLOCKING_THREADS)
@@ -268,6 +337,7 @@ impl Builder {
                 workers,
                 Start {
                     limits,
+                    tuning: self.tuning.clone(),
                     stack,
                     name: worker_name,
                     cores,

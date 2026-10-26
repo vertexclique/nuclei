@@ -400,6 +400,7 @@ pub(crate) struct Shard {
     in_task: Cell<bool>,
     depth: Cell<usize>,
     limits: Limits,
+    tuning: super::tuning::Tuning,
     driver: Driver,
     wheel: RefCell<Wheel>,
     /// The wheel's zero: the clock's origin, the same for every shard, so a
@@ -428,9 +429,17 @@ impl Shard {
         Self::made(limits, None)
     }
 
-    /// The shard of worker `index` of runtime `runtime`.
-    pub(crate) fn worker(limits: Limits, runtime: u64, index: usize) -> io::Result<Self> {
-        Self::made(limits, Some((runtime, index)))
+    /// The shard of worker `index` of runtime `runtime`, run as `tuning`
+    /// says.
+    pub(crate) fn worker(
+        limits: Limits,
+        tuning: super::tuning::Tuning,
+        runtime: u64,
+        index: usize,
+    ) -> io::Result<Self> {
+        let mut shard = Self::made(limits, Some((runtime, index)))?;
+        shard.tuning = tuning;
+        Ok(shard)
     }
 
     /// A shard, worker `owner` (a runtime and a place) if it is one. Its
@@ -513,6 +522,7 @@ impl Shard {
             in_task: Cell::new(false),
             depth: Cell::new(0),
             limits,
+            tuning: super::tuning::Tuning::default(),
             driver,
             wheel: RefCell::new(Wheel::new()),
             epoch: crate::time::clock::origin(),
@@ -632,7 +642,7 @@ impl Shard {
     fn next(&self) -> Option<Runnable> {
         let tick = self.tick.get().wrapping_add(1);
         self.tick.set(tick);
-        if tick.is_multiple_of(INBOX_INTERVAL)
+        if tick.is_multiple_of(self.tuning.inbox_interval)
             && let Some(r) = self.pop_inbox()
         {
             return Some(r);
@@ -713,7 +723,7 @@ impl Shard {
         if publish {
             self.publish();
         }
-        self.poll_io(usize::MAX, timeout)?;
+        self.poll_io(self.tuning.max_io_events, timeout)?;
         self.fire_timers();
         Ok(())
     }
@@ -839,7 +849,7 @@ impl Shard {
                 owed = owed.saturating_sub(1);
                 self.run(runnable);
                 let since = self.since_drive.get() + 1;
-                if since >= DRIVER_INTERVAL {
+                if since >= self.tuning.driver_interval {
                     // Timers and the poller get a look, without a wait.
                     self.count_again(since);
                     self.drive_or_report(Some(Duration::ZERO));
@@ -863,7 +873,7 @@ impl Shard {
                 // or IO the future waits on (on a ring, an operation not even
                 // submitted yet) would never complete.
                 self_woken += 1;
-                if self_woken >= DRIVER_INTERVAL {
+                if self_woken >= self.tuning.driver_interval {
                     self_woken = 0;
                     self.count_again(self.since_drive.get());
                     self.drive_or_report(Some(Duration::ZERO));
@@ -887,8 +897,14 @@ impl Shard {
                 .begin_park(|| shared.has_remote_work() || signal.woken.load(Ordering::SeqCst))
             {
                 let slept = Instant::now();
+                if let Some(park) = &self.tuning.hooks.park {
+                    park();
+                }
                 self.drive_or_report(None);
                 shared.park.end_park();
+                if let Some(unpark) = &self.tuning.hooks.unpark {
+                    unpark();
+                }
                 self.spin.parked_for(slept.elapsed());
             }
             self.after_park();

@@ -27,6 +27,7 @@ thread_local! {
 /// How a worker is started.
 pub(crate) struct Start {
     pub(crate) limits: Limits,
+    pub(crate) tuning: super::tuning::Tuning,
     pub(crate) stack: usize,
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
     /// The cores workers are pinned to, in turn; empty for none.
@@ -153,7 +154,13 @@ impl Workers {
         }
         // A shard that cannot be made leaves its slot empty; placement
         // skips it.
-        let shard = Shard::worker(workers.start.limits, inner.id(), index)?;
+        let shard = Shard::worker(
+            workers.start.limits,
+            workers.start.tuning.clone(),
+            inner.id(),
+            index,
+        )?;
+        let hooks = workers.start.tuning.hooks.clone();
         let shared = Arc::clone(&shard.shared);
         let _ = workers.slots[index].set(Arc::clone(&shared));
         workers.running.fetch_add(1, Ordering::AcqRel);
@@ -174,6 +181,7 @@ impl Workers {
                     }
                 }
                 let _exit = Exit(exits);
+                let _stopping = hooks.started();
                 if let Some(core) = core {
                     super::runtime::pin_to(core);
                 }

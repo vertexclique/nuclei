@@ -29,6 +29,7 @@
 //! ```
 
 pub use crate::rt::runtime::{
-    Builder, Runtime, RuntimeHandle, block_on, spawn, spawn_blocking, spawn_local,
+    Builder, EnterGuard, Runtime, RuntimeHandle, RuntimeId, TryCurrentError, block_on, spawn,
+    spawn_blocking, spawn_local, worker_index,
 };
 pub use crate::rt::task::{FallibleTask, Task};

@@ -30,6 +30,8 @@ use crate::sync::internal::{AtomicUsize, Ordering};
 #[derive(Clone)]
 pub(crate) struct PoolConfig {
     pub(crate) max_threads: usize,
+    /// The runtime's thread hooks; a pool thread calls start and stop.
+    pub(crate) hooks: super::tuning::ThreadHooks,
     pub(crate) keep_alive: Duration,
     pub(crate) stack_size: Option<usize>,
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
@@ -160,6 +162,7 @@ impl Pool {
     /// A pool thread's life.
     fn work(self: Arc<Self>) {
         let _alive = Alive::new();
+        let _stopping = self.config.hooks.started();
         loop {
             self.idle.fetch_add(1, Ordering::SeqCst);
             let got = self
@@ -223,6 +226,7 @@ mod tests {
     fn pool(max: usize, keep_alive: Duration) -> Arc<Pool> {
         Pool::new(PoolConfig {
             max_threads: max,
+            hooks: crate::rt::tuning::ThreadHooks::default(),
             keep_alive,
             stack_size: None,
             name: Arc::new(|| "test-blocking".to_string()),

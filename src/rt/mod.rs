@@ -13,4 +13,5 @@ mod sched;
 pub(crate) mod shard;
 mod sources;
 pub(crate) mod task;
+pub(crate) mod tuning;
 pub(crate) mod workers;
