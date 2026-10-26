@@ -1,4 +1,5 @@
-//! Reproductions of reported issues, so each stays fixed.
+//! A thread's own shard: a runtime that runs everything on one thread, and a
+//! nested `block_on` inside one of the thread's tasks.
 
 use std::cell::Cell;
 use std::io::{Read, Write};
@@ -9,9 +10,9 @@ use std::time::{Duration, Instant};
 use nuclei::Handle;
 use nuclei::sync::mpsc;
 
-/// Issue 43: a runtime that runs everything on one thread, and a sleep.
+/// A runtime that runs everything on one thread, and a sleep.
 #[test]
-fn issue_43_a_runtime_on_one_thread_runs_its_tasks_there_and_sleeps() {
+fn a_runtime_on_one_thread_runs_its_tasks_there_and_sleeps() {
     let rt = nuclei::Builder::new().worker_threads(0).build().unwrap();
     let me = std::thread::current().id();
     let (slept, ran_on) = rt.block_on(async {
@@ -27,12 +28,12 @@ fn issue_43_a_runtime_on_one_thread_runs_its_tasks_there_and_sleeps() {
     assert!(slept >= Duration::from_millis(20), "the sleep ended early");
 }
 
-/// Issue 45: a task of the thread's own shard that serves each connection
+/// A task of the thread's own shard that serves each connection
 /// inside a nested `block_on` holds up none of the thread's other tasks: a
 /// ticker and its receiver keep going while the connection waits for its
 /// client.
 #[test]
-fn issue_45_a_nested_block_on_in_a_local_task_holds_up_no_other_local_task() {
+fn a_nested_block_on_in_a_local_task_holds_up_no_other_local_task() {
     let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     // A client that keeps the connection quiet for a while, then talks.

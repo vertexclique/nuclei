@@ -163,8 +163,8 @@ fn spawn_local_runs_a_future_that_is_not_send() {
     assert_eq!(out, 10);
 }
 
-/// The reproduction of issue 45: with one worker, a task blocks on another
-/// task's output. The nested loop must run that other task on the same shard.
+/// With one worker, a task blocks on another task's output. The nested loop
+/// must run that other task on the same shard.
 #[test]
 fn a_nested_block_on_runs_the_other_tasks_of_its_shard() {
     let rt = runtime(1);
