@@ -42,17 +42,16 @@ pub(crate) fn expand_bench(item: &FnItem, opts: &Options) -> Vec<Tok> {
         id("Bencher"),
     ];
     let mut body = Vec::new();
-    let run = match opts.threads {
-        Some(threads) => {
-            // let __nuclei_runtime = <builder>;
-            body.extend([id("let"), id(RUNTIME), punct('=')]);
-            body.extend(builder(threads));
-            body.push(punct(';'));
-            let mut run = vec![id(RUNTIME), punct('.'), id("block_on")];
-            run.push(async_arg(&item.body));
-            run
-        }
-        None => block_on(&item.body),
+    let run = if opts.own_runtime() {
+        // let __nuclei_runtime = <builder>;
+        body.extend([id("let"), id(RUNTIME), punct('=')]);
+        body.extend(builder(opts));
+        body.push(punct(';'));
+        let mut run = vec![id(RUNTIME), punct('.'), id("block_on")];
+        run.push(async_arg(&item.body));
+        run
+    } else {
+        block_on(opts, &item.body)
     };
     // let mut __nuclei_last = None;
     body.extend([id("let"), id("mut"), id(LAST), punct('=')]);
@@ -106,28 +105,36 @@ fn harness_attr(name: &str) -> Vec<Tok> {
 }
 
 /// What runs the async body: the process default runtime's `block_on`, or a
-/// runtime built with the given worker thread count when `threads` is set.
+/// runtime of its own when `threads` or `start_paused` is set.
 fn enter(body: &[Tok], opts: &Options) -> Vec<Tok> {
-    let Some(threads) = opts.threads else {
-        return block_on(body);
-    };
-    let mut out = builder(threads);
+    if !opts.own_runtime() {
+        return block_on(opts, body);
+    }
+    let mut out = builder(opts);
     out.push(punct('.'));
     out.push(id("block_on"));
     out.push(async_arg(body));
     out
 }
 
-/// `::nuclei::Runtime::builder().worker_threads(N).build().expect("...")`.
-fn builder(threads: u32) -> Vec<Tok> {
-    let mut out = path(&["nuclei", "Runtime", "builder"]);
+/// `::nuclei::Runtime::builder().worker_threads(N).build().expect("...")`,
+/// with `.start_paused(true)` before `build` when asked. A paused runtime
+/// with no `threads` given has no workers: every task runs on the thread
+/// that runs the body.
+fn builder(opts: &Options) -> Vec<Tok> {
+    let mut out = nuclei_path(opts, &["Runtime", "builder"]);
     out.push(group(Delimiter::Parenthesis, Vec::new()));
     out.push(punct('.'));
     out.push(id("worker_threads"));
     out.push(group(
         Delimiter::Parenthesis,
-        vec![num(&threads.to_string())],
+        vec![num(&opts.threads.unwrap_or(0).to_string())],
     ));
+    if opts.start_paused {
+        out.push(punct('.'));
+        out.push(id("start_paused"));
+        out.push(group(Delimiter::Parenthesis, vec![id("true")]));
+    }
     out.push(punct('.'));
     out.push(id("build"));
     out.push(group(Delimiter::Parenthesis, Vec::new()));
@@ -141,8 +148,8 @@ fn builder(threads: u32) -> Vec<Tok> {
 }
 
 /// `::nuclei::block_on(async { body })`.
-fn block_on(body: &[Tok]) -> Vec<Tok> {
-    let mut out = path(&["nuclei", "block_on"]);
+fn block_on(opts: &Options, body: &[Tok]) -> Vec<Tok> {
+    let mut out = nuclei_path(opts, &["block_on"]);
     out.push(async_arg(body));
     out
 }
@@ -153,6 +160,20 @@ fn async_arg(body: &[Tok]) -> Tok {
         Delimiter::Parenthesis,
         vec![id("async"), group(Delimiter::Brace, body.to_vec())],
     )
+}
+
+/// A path below nuclei: `::nuclei::<rest>`, or below the path `crate` names
+/// (written as given when it starts at `crate`, `self` or `super`).
+fn nuclei_path(opts: &Options, rest: &[&str]) -> Vec<Tok> {
+    let root: Vec<&str> = match &opts.krate {
+        Some(segments) => segments.iter().map(String::as_str).collect(),
+        None => vec!["nuclei"],
+    };
+    let mut out = path(&[root.as_slice(), rest].concat());
+    if matches!(root.first(), Some(&("crate" | "self" | "super"))) {
+        out.drain(..2);
+    }
+    out
 }
 
 /// An absolute path, written with a leading `::`.

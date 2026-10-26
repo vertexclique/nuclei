@@ -65,7 +65,8 @@ fn threads_eq(toks: &[Tok], expected: u32) {
     assert_eq!(
         opts(toks).unwrap(),
         Options {
-            threads: Some(expected)
+            threads: Some(expected),
+            ..Options::default()
         }
     );
 }
@@ -75,14 +76,14 @@ const NUMBER_MESSAGE: &str =
 
 #[test]
 fn options_empty_stream() {
-    assert_eq!(opts(&[]).unwrap(), Options { threads: None });
+    assert_eq!(opts(&[]).unwrap(), Options::default());
 }
 
 #[test]
 fn options_empty_parenthesis_group() {
     assert_eq!(
         opts(&[group(Parenthesis, Vec::new())]).unwrap(),
-        Options { threads: None }
+        Options::default()
     );
 }
 
@@ -115,7 +116,7 @@ fn options_threads_max_u32() {
 fn options_error_unknown_option() {
     assert_eq!(
         options_error(&[id("flavor"), punct('='), num("4")]),
-        "unknown option `flavor`; #[nuclei::main] accepts only `threads`"
+        "unknown option `flavor`; #[nuclei::main] accepts `threads = <number>`, `start_paused = true` or `crate = \"<path>\"`"
     );
 }
 
@@ -125,7 +126,7 @@ fn options_error_unknown_option_names_the_macro() {
         crate::parse::parse_options(&[id("size"), punct('='), num("4")], Macro::Bench).unwrap_err();
     assert_eq!(
         err.message,
-        "unknown option `size`; #[nuclei::bench] accepts only `threads`"
+        "unknown option `size`; #[nuclei::bench] accepts `threads = <number>`, `start_paused = true` or `crate = \"<path>\"`"
     );
 }
 
@@ -223,7 +224,7 @@ fn options_error_duplicate() {
 fn options_error_leading_comma() {
     assert_eq!(
         options_error(&[punct(','), id("threads"), punct('='), num("4")]),
-        "write the option as `threads = <number>`"
+        "write an option as `threads = <number>`, `start_paused = true` or `crate = \"<path>\"`"
     );
 }
 
@@ -442,7 +443,13 @@ fn expansion_main_default() {
 fn expansion_main_threads() {
     let it = parsed(&item_ret("main", ret_io_result(), ok_unit()));
     assert_eq!(
-        render(&expand_main(&it, &Options { threads: Some(4) })),
+        render(&expand_main(
+            &it,
+            &Options {
+                threads: Some(4),
+                ..Options::default()
+            }
+        )),
         include_str!("../tests/fixtures/main_threads.rs").trim()
     );
 }
@@ -478,7 +485,13 @@ fn expansion_test_default() {
 fn expansion_test_threads() {
     let it = crate::parse::parse_fn_item(&item("spins", vec![num("1")]), Macro::Test).unwrap();
     assert_eq!(
-        render(&expand_test(&it, &Options { threads: Some(0) })),
+        render(&expand_test(
+            &it,
+            &Options {
+                threads: Some(0),
+                ..Options::default()
+            }
+        )),
         include_str!("../tests/fixtures/test_threads.rs").trim()
     );
 }
@@ -498,7 +511,128 @@ fn expansion_bench_default() {
 fn expansion_bench_threads() {
     let it = crate::parse::parse_fn_item(&item("bench_spawn", Vec::new()), Macro::Bench).unwrap();
     assert_eq!(
-        render(&expand_bench(&it, &Options { threads: Some(2) })),
+        render(&expand_bench(
+            &it,
+            &Options {
+                threads: Some(2),
+                ..Options::default()
+            }
+        )),
         include_str!("../tests/fixtures/bench_threads.rs").trim()
     );
+}
+
+#[test]
+fn options_start_paused_and_threads() {
+    let parsed = opts(&[
+        id("start_paused"),
+        punct('='),
+        id("true"),
+        punct(','),
+        id("threads"),
+        punct('='),
+        num("2"),
+    ])
+    .unwrap();
+    assert!(parsed.start_paused);
+    assert_eq!(parsed.threads, Some(2));
+    assert!(parsed.own_runtime());
+    let off = opts(&[id("start_paused"), punct('='), id("false")]).unwrap();
+    assert!(!off.start_paused);
+    assert!(
+        !off.own_runtime(),
+        "start_paused = false keeps the default runtime"
+    );
+}
+
+#[test]
+fn options_error_start_paused_needs_a_bool() {
+    assert_eq!(
+        options_error(&[id("start_paused"), punct('='), num("1")]),
+        "give start_paused `true` or `false`"
+    );
+    assert_eq!(
+        options_error(&[id("start_paused"), id("true")]),
+        "write the option as `start_paused = true`"
+    );
+}
+
+#[test]
+fn options_error_an_option_twice() {
+    assert_eq!(
+        options_error(&[
+            id("start_paused"),
+            punct('='),
+            id("true"),
+            punct(','),
+            id("start_paused"),
+            punct('='),
+            id("false"),
+        ]),
+        "start_paused is set more than once; write it a single time"
+    );
+}
+
+#[test]
+fn options_crate_path() {
+    let parsed = opts(&[id("crate"), punct('='), str_lit("my_crate::nuclei")]).unwrap();
+    assert_eq!(
+        parsed.krate,
+        Some(vec!["my_crate".to_string(), "nuclei".to_string()])
+    );
+    let rooted = opts(&[id("crate"), punct('='), str_lit("::rt")]).unwrap();
+    assert_eq!(rooted.krate, Some(vec!["rt".to_string()]));
+}
+
+#[test]
+fn options_error_crate_path() {
+    for bad in ["", "a::", "1x", "a b", "a::::b"] {
+        let message = options_error(&[id("crate"), punct('='), str_lit(bad)]);
+        assert!(
+            message.starts_with("give crate the path"),
+            "{bad:?}: {message}"
+        );
+    }
+    let message = options_error(&[id("crate"), punct('='), id("nuclei")]);
+    assert!(message.starts_with("give crate the path"), "{message}");
+}
+
+#[test]
+fn expand_test_start_paused_builds_a_paused_runtime_of_its_own() {
+    let it = parsed(&item("main", Vec::new()));
+    let opts = Options {
+        start_paused: true,
+        ..Options::default()
+    };
+    let out = render(&expand_test(&it, &opts));
+    assert!(
+        out.contains("::nuclei::Runtime::builder().worker_threads(0).start_paused(true).build()"),
+        "{out}"
+    );
+}
+
+#[test]
+fn expand_main_uses_the_crate_path() {
+    let it = parsed(&item("main", Vec::new()));
+    let opts = Options {
+        krate: Some(vec!["my_crate".to_string(), "nuclei".to_string()]),
+        ..Options::default()
+    };
+    let out = render(&expand_main(&it, &opts));
+    assert!(out.contains("::my_crate::nuclei::block_on(async"), "{out}");
+    assert!(
+        !out.contains("{ ::nuclei::"),
+        "the default path is gone: {out}"
+    );
+}
+
+#[test]
+fn expand_main_keeps_a_relative_crate_path() {
+    let it = parsed(&item("main", Vec::new()));
+    let opts = Options {
+        krate: Some(vec!["crate".to_string(), "rt".to_string()]),
+        ..Options::default()
+    };
+    let out = render(&expand_main(&it, &opts));
+    assert!(out.contains("{ crate::rt::block_on(async"), "{out}");
 }

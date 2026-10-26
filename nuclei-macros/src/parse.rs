@@ -108,13 +108,29 @@ impl Macro {
 }
 
 /// The options a macro invocation carries.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Options {
     /// The `threads` value: the worker thread count, where 0 runs everything
     /// on the `block_on` thread. `None` leaves the runtime at its zero
-    /// configuration default.
+    /// configuration default (or at 0 with `start_paused`).
     pub(crate) threads: Option<u32>,
+    /// `start_paused = true`: the runtime's clock starts paused.
+    pub(crate) start_paused: bool,
+    /// `crate = "path"`: the path the expansion names nuclei by, its
+    /// segments; `None` is `::nuclei`.
+    pub(crate) krate: Option<Vec<String>>,
 }
+
+impl Options {
+    /// Whether the expansion builds a runtime of its own rather than use the
+    /// process default.
+    pub(crate) fn own_runtime(&self) -> bool {
+        self.threads.is_some() || self.start_paused
+    }
+}
+
+/// What the options accept, for the messages that name them.
+const ACCEPTED: &str = "`threads = <number>`, `start_paused = true` or `crate = \"<path>\"`";
 
 /// The parsed shape of the function a macro is applied to.
 #[derive(Clone, Debug)]
@@ -134,8 +150,9 @@ pub(crate) struct FnItem {
     pub(crate) body: Vec<Tok>,
 }
 
-/// Parses the attribute arguments: empty, or `threads = <number>`, with an
-/// optional trailing comma.
+/// Parses the attribute arguments: empty, or a comma-separated list of
+/// `threads = <number>`, `start_paused = <bool>` and `crate = "<path>"`, each
+/// at most once, with an optional trailing comma.
 pub(crate) fn parse_options(toks: &[Tok], mac: Macro) -> Result<Options, Error> {
     let mut toks = toks;
     // Tolerate the arguments arriving wrapped in one empty parenthesis group.
@@ -145,64 +162,117 @@ pub(crate) fn parse_options(toks: &[Tok], mac: Macro) -> Result<Options, Error> 
         toks = &[];
     }
 
-    let mut threads = None;
+    let mut opts = Options::default();
+    let mut seen: Vec<&str> = Vec::new();
     while !toks.is_empty() {
         let (name_span, name) = match &toks[0] {
             Tok::Ident(name, span) => (*span, name.as_str()),
             t => {
                 return Err(Error::at(
-                    "write the option as `threads = <number>`",
+                    format!("write an option as {ACCEPTED}"),
                     t.span(),
                 ));
             }
         };
-        if name != "threads" {
-            return Err(Error::at(
-                format!(
-                    "unknown option `{name}`; #[nuclei::{}] accepts only `threads`",
-                    mac.name()
-                ),
-                name_span,
-            ));
-        }
+        let key = match name {
+            "threads" => "threads",
+            "start_paused" => "start_paused",
+            "crate" => "crate",
+            _ => {
+                return Err(Error::at(
+                    format!(
+                        "unknown option `{name}`; #[nuclei::{}] accepts {ACCEPTED}",
+                        mac.name()
+                    ),
+                    name_span,
+                ));
+            }
+        };
         match toks.get(1) {
             Some(Tok::Punct('=', _, _)) => {}
             _ => {
                 return Err(Error::at(
-                    "write the option as `threads = <number>`",
+                    format!("write the option as `{key} = {}`", placeholder(key)),
                     name_span,
                 ));
             }
         }
-        let (value_span, value) = match toks.get(2) {
-            Some(Tok::Literal(text, span)) => (*span, text.as_str()),
-            Some(t) => return Err(Error::at(thread_number_message(), t.span())),
-            None => return Err(Error::at(thread_number_message(), toks[1].span())),
-        };
-        let Some(digits) = plain_decimal(value) else {
-            return Err(Error::at(thread_number_message(), value_span));
-        };
-        let Ok(count) = digits.parse::<u32>() else {
+        if seen.contains(&key) {
             return Err(Error::at(
-                "threads is too large; write a smaller number",
-                value_span,
-            ));
-        };
-        if threads.is_some() {
-            return Err(Error::at(
-                "threads is set more than once; write it a single time",
+                format!("{key} is set more than once; write it a single time"),
                 name_span,
             ));
         }
-        threads = Some(count);
-        toks = &toks[3..];
+        seen.push(key);
+        let value = toks.get(2);
+        let value_span = value.map_or_else(|| toks[1].span(), Tok::span);
+        match key {
+            "threads" => opts.threads = Some(thread_count(value, value_span)?),
+            "start_paused" => {
+                opts.start_paused = match value {
+                    Some(Tok::Ident(b, _)) if b == "true" => true,
+                    Some(Tok::Ident(b, _)) if b == "false" => false,
+                    _ => return Err(Error::at("give start_paused `true` or `false`", value_span)),
+                }
+            }
+            _ => opts.krate = Some(crate_path(value, value_span)?),
+        }
+        toks = &toks[3.min(toks.len())..];
         match toks.split_first() {
             None => break,
             Some((Tok::Punct(',', _, _), rest)) => toks = rest,
             Some((t, _)) => return Err(Error::at("separate options with a comma", t.span())),
         }
     }
-    Ok(Options { threads })
+    Ok(opts)
+}
+
+/// What each option's value looks like, for the message of a missing `=`.
+fn placeholder(key: &str) -> &'static str {
+    match key {
+        "threads" => "<number>",
+        "start_paused" => "true",
+        _ => "\"<path>\"",
+    }
+}
+
+/// The value of `threads`: a plain decimal `u32`.
+fn thread_count(value: Option<&Tok>, span: Option<Span>) -> Result<u32, Error> {
+    let Some(Tok::Literal(text, _)) = value else {
+        return Err(Error::at(thread_number_message(), span));
+    };
+    let Some(digits) = plain_decimal(text) else {
+        return Err(Error::at(thread_number_message(), span));
+    };
+    digits
+        .parse::<u32>()
+        .map_err(|_| Error::at("threads is too large; write a smaller number", span))
+}
+
+/// The value of `crate`: a string literal holding a path of identifiers
+/// (`"my_crate::nuclei"`), its segments.
+fn crate_path(value: Option<&Tok>, span: Option<Span>) -> Result<Vec<String>, Error> {
+    const MESSAGE: &str =
+        "give crate the path nuclei is reached by, as a string: `crate = \"my_crate::nuclei\"`";
+    let Some(Tok::Literal(text, _)) = value else {
+        return Err(Error::at(MESSAGE, span));
+    };
+    let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
+        return Err(Error::at(MESSAGE, span));
+    };
+    let inner = inner.strip_prefix("::").unwrap_or(inner);
+    let segments: Vec<String> = inner.split("::").map(str::to_string).collect();
+    let valid = segments.iter().all(|s| {
+        let mut chars = s.chars();
+        chars
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    });
+    if !valid {
+        return Err(Error::at(MESSAGE, span));
+    }
+    Ok(segments)
 }
 
 fn thread_number_message() -> &'static str {

@@ -3,14 +3,22 @@
 //! Use them through the re-exports in the nuclei crate. `#[nuclei::main]`
 //! wraps the body of an async `main` function in the runtime's `block_on`,
 //! and `#[nuclei::test]` and `#[nuclei::bench]` do the same for test and
-//! benchmark functions. Every macro accepts one option, `threads = N`, where
-//! N is a plain decimal number of worker threads and 0 runs everything on
-//! the `block_on` thread; without it the process default runtime starts with
-//! zero configuration.
+//! benchmark functions. Every macro accepts these options, comma separated,
+//! each at most once:
 //!
-//! The expansions call the runtime entry points of the nuclei crate:
-//! `block_on` on the default runtime, or, when `threads` is set,
-//! `Runtime::builder().worker_threads(N).build()` finished with `block_on`.
+//! - `threads = N`: a runtime of its own with N worker threads (a plain
+//!   decimal number); 0 runs everything on the `block_on` thread.
+//! - `start_paused = true`: a runtime of its own whose clock starts paused
+//!   (see `nuclei::time::pause`), with no workers unless `threads` says
+//!   otherwise, so every task runs on the thread that runs the body.
+//! - `crate = "path"`: the path nuclei is reached by, for code that
+//!   re-exports it (`crate = "my_crate::nuclei"`); `::nuclei` otherwise.
+//!
+//! Without `threads` or `start_paused` the process default runtime starts
+//! with zero configuration. The expansions call the runtime entry points of
+//! the nuclei crate: `block_on` on the default runtime, or
+//! `Runtime::builder().worker_threads(N)` (and `.start_paused(true)`)
+//! `.build()` finished with `block_on`.
 //!
 //! # `#[nuclei::main]`
 //!
@@ -52,6 +60,19 @@
 //! async fn echoes() -> std::io::Result<()> {
 //!     assert_eq!(2 * 2, 4);
 //!     Ok(())
+//! }
+//! ```
+//!
+//! On a paused clock, code that sleeps runs at once:
+//!
+//! ```
+//! use std::time::Duration;
+//!
+//! #[nuclei::test(start_paused = true)]
+//! async fn waits_a_day() {
+//!     let start = nuclei::time::Instant::now();
+//!     nuclei::time::sleep(Duration::from_secs(86_400)).await;
+//!     assert_eq!(start.elapsed(), Duration::from_secs(86_400));
 //! }
 //! ```
 //!
