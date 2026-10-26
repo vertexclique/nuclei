@@ -186,3 +186,9 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Waiter.arm_arms
 #print axioms Nuclei.Waiter.claiming_again_keeps_the_take
 #print axioms Nuclei.Waiter.a_take_ends_cleanly
+
+-- The remote wake handshake's order: one load of the pair comes after the other side's store, and
+-- of a burst of swaps of the flag only the first reads it up.
+#print axioms Nuclei.Handshake.one_side_sees
+#print axioms Nuclei.Handshake.later_swaps_read_down
+#print axioms Nuclei.Handshake.a_burst_notifies_once

@@ -1,0 +1,14 @@
+TLC run of every configuration in proofs/tla/handshake, 2026-10-26 00:09 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 2, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+H_seqcst                           317        166      1  pass                                  pass                                  yes
+H_fenced                           517        249      1  pass                                  pass                                  yes
+M_relaxed                          134         67      1  violated:AllEnd                       violated:AllEnd                       yes
+M_shard_fence_only                  85         50      1  violated:AllEnd                       violated:AllEnd                       yes
+M_waker_fence_only                  85         50      1  violated:AllEnd                       violated:AllEnd                       yes
+W_both_see                          34         26      1  violated:NotBothSee                   violated:NotBothSee                   yes
+W_notify                            41         28      1  violated:NoNotify                     violated:NoNotify                     yes
+
+results matching EXPECTED.txt: 7 of 7

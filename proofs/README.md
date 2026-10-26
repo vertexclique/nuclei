@@ -289,6 +289,22 @@ sequentially consistent, so the model checks the protocol; the loom models in
 `src/rt/handshake.rs` check the code, with two calibrations that must lose a wake (no look
 after publishing; the pair relaxed with no fence).
 
+## The remote wake handshake on a store buffer
+
+`handshake` (`tla/handshake/Handshake.tla`) checks the Dekker pair of the park handshake
+(`src/rt/handshake.rs`, measured in `src/syscore/linux/bench/wake_handshake.rs`) on a machine
+whose stores wait in a store buffer, as x86's do: each thread's buffer in order, the flush of
+its oldest store at any time, and each store, load, fence and swap of the pair. A store passed by
+a later load of another word is the one reordering of the pair a weaker ordering lets through.
+7 configurations: 2 that must pass (every access sequentially consistent, a store that waits for
+its buffer and a push that is a locked read-modify-write; relaxed accesses with a sequentially
+consistent fence on both sides), each with two wakers notifying once (`OneNotify`) and no wake
+lost (`AllEnd`); 3 mutations that lose a wake (relaxed with no fence, as the measurement's
+control lost wakes on hardware; a fence on the shard's side only; on the waker's side only);
+and 2 witnesses (both sides see each other; a notification). `lean/Nuclei/Handshake.lean` proves
+the two facts the pair takes from the total order: one load comes after the other side's store,
+and of a burst of swaps of the raised flag exactly the first reads it up.
+
 ## A timer for a thread that runs no shard
 
 `timer` (`tla/timer/Timer.tla`) checks how a sleep polled on another runtime's thread is fired

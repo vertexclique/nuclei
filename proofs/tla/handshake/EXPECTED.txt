@@ -1,0 +1,8 @@
+# configuration       spec        expected
+H_seqcst              Handshake   pass
+H_fenced              Handshake   pass
+M_relaxed             Handshake   violated:AllEnd
+M_shard_fence_only    Handshake   violated:AllEnd
+M_waker_fence_only    Handshake   violated:AllEnd
+W_both_see            Handshake   violated:NotBothSee
+W_notify              Handshake   violated:NoNotify
