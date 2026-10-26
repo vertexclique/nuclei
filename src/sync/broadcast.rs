@@ -193,18 +193,20 @@ impl<T: Send + Sync + 'static> Shared<T> {
     }
 
     /// A new receiver, which takes the values sent from now on.
-    fn subscribe(self: &Arc<Self>) -> Receiver<T> {
-        static IDS: AtomicU64 = AtomicU64::new(0);
-        let id = IDS.fetch_add(1, Ordering::Relaxed);
+    fn subscribe(shared: &Arc<Self>) -> Receiver<T> {
+        // The ids only tell receivers apart, so the counter is std's even
+        // under loom, which has no const constructor for a static.
+        static IDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let id = IDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // SeqCst: against a send's claim of its position (also SeqCst), so
         // the value of a position at or past this one reaches the receiver.
         let cursor = Arc::new(Cursor {
-            next: AtomicU64::new(self.tail.load(Ordering::SeqCst)),
+            next: AtomicU64::new(shared.tail.load(Ordering::SeqCst)),
         });
-        self.receivers.fetch_add(1, Ordering::SeqCst);
-        self.cursors.insert(id, Arc::clone(&cursor));
+        shared.receivers.fetch_add(1, Ordering::SeqCst);
+        shared.cursors.insert(id, Arc::clone(&cursor));
         Receiver {
-            shared: Arc::clone(self),
+            shared: Arc::clone(shared),
             id,
             cursor,
         }
@@ -261,7 +263,7 @@ pub fn channel<T: Clone + Send + Sync + 'static>(capacity: usize) -> (Sender<T>,
         notify_rx: Notify::new(),
         notify_tx: Notify::new(),
     });
-    let rx = shared.subscribe();
+    let rx = Shared::subscribe(&shared);
     (Sender { shared }, rx)
 }
 
@@ -355,7 +357,7 @@ impl<T: Send + Sync + 'static> Sender<T> {
     /// assert_eq!(late.try_recv(), Ok(2));
     /// ```
     pub fn subscribe(&self) -> Receiver<T> {
-        self.shared.subscribe()
+        Shared::subscribe(&self.shared)
     }
 
     /// How many receivers there are.
@@ -480,7 +482,7 @@ impl<T: Send + Sync + 'static> Receiver<T> {
 
     /// A new receiver, which takes the values sent from now on.
     pub fn resubscribe(&self) -> Self {
-        self.shared.subscribe()
+        Shared::subscribe(&self.shared)
     }
 }
 
