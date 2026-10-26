@@ -3,83 +3,107 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>nuclei: a thread-per-core proactive IO runtime for Rust</title>
-  <meta name="description" content="Thread-per-core shards that each run their own tasks and drive their own IO, timers and buffers, on io_uring, epoll, kqueue and I/O completion ports.">
+  <title>nuclei: a thread-per-core async runtime for Rust</title>
+  <meta name="description" content="An async runtime for Rust: one shard per core, each owning its tasks, timers, buffers and kernel driver, on io_uring, epoll, kqueue and I/O completion ports.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/">
   <meta property="og:title" content="nuclei">
-  <meta property="og:description" content="A thread-per-core proactive IO runtime for Rust: io_uring or epoll on Linux, kqueue on macOS and the BSDs, completion ports on Windows.">
+  <meta property="og:description" content="An async runtime for Rust. One shard per core, each driving its own IO: io_uring or epoll on Linux, kqueue on macOS and the BSDs, completion ports on Windows.">
   <meta property="og:type" content="website">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@800;900&family=Geist:wght@400;600&family=Geist+Mono:wght@400;600&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
   <link rel="stylesheet" href="tokens.css">
   <link rel="stylesheet" href="site.css">
 </head>
 <body id="top">
-  <header class="slab">
-    <a class="slab__mark" href="#top">nuclei</a>
-    <nav class="slab__nav" aria-label="Primary">
-      <ul>
-        <li class="slab__local"><a href="#map">Map</a></li>
-        <li class="slab__local"><a href="#backends">Backends</a></li>
-        <li class="slab__local"><a href="#checked">Checked</a></li>
-        <li class="slab__source"><a href="https://github.com/vertexclique/nuclei/tree/modernize-2026">Source</a></li>
-      </ul>
+  <header class="nav">
+    <a class="nav__mark" href="#top">nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="https://github.com/vertexclique/nuclei/tree/modernize-2026">Source</a>
+      <a class="nav__cta" href="#install">Install</a>
     </nav>
-    <a class="slab__cta" href="#add">Add it</a>
   </header>
 
   <main>
-    <section class="map-section" id="map" aria-labelledby="map-title">
-      <div class="map-head">
-        <h1 id="map-title">One shard per core.</h1>
-        <p class="lede">nuclei is a proactive IO runtime for Rust. Each shard runs its own tasks and drives its own IO, timers and buffers, and a task stays on the shard it was placed on. Every operation is completed for the task that asked for it: no task waits for readiness and then makes the call itself.</p>
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero__copy">
+        <h1 class="hero__title" id="hero-title">Each core <span class="hero__verb">drives</span>&nbsp;its own&nbsp;IO.</h1>
+        <p class="hero__lede">nuclei is an async runtime for Rust. It runs one shard per core, and each shard owns its tasks, its timers, its buffers and its kernel driver. Every operation is completed for the task that asked for it.</p>
+        <div class="hero__actions">
+          <a class="btn btn--primary" href="#install">Add the dependency</a>
+          <a class="btn btn--ghost" href="https://github.com/vertexclique/nuclei/tree/modernize-2026">Read the source</a>
+        </div>
+        <p class="hero__meta"><span>Rust 1.99 or later</span><span>Apache-2.0 or MIT</span><span>0.5.0, unreleased</span></p>
       </div>
 
-      <figure class="map" aria-labelledby="map-caption">
-        <ol class="map__layers">
-          <li class="layer layer--code">
-            <span class="layer__name">Your code</span>
-            <p class="layer__body"><code>spawn</code> <code>spawn_local</code> <code>block_on</code> <code>Handle&lt;T&gt;</code></p>
-          </li>
-          <li class="layer layer--shards">
-            <span class="layer__name">Shards</span>
-            <ul class="shards">
-              <li class="shard"><b>Shard 0</b><span>tasks</span><span>timer wheel</span><span>buffer pool</span><span>driver</span></li>
-              <li class="shard"><b>Shard 1</b><span>tasks</span><span>timer wheel</span><span>buffer pool</span><span>driver</span></li>
-              <li class="shard shard--wide-only"><b>Shard 2</b><span>tasks</span><span>timer wheel</span><span>buffer pool</span><span>driver</span></li>
-              <li class="shard shard--more" aria-label="and one shard more for every core"><b>&hellip;</b><span>one per core</span></li>
-            </ul>
-            <p class="layer__aside"><code>spawn_blocking</code> &rarr; the blocking pool</p>
-          </li>
-          <li class="layer layer--drivers">
-            <span class="layer__name">Drivers</span>
-            <ul class="drivers">
-              <li><b>io_uring</b><span>Linux 6.1 and later, else epoll</span></li>
-              <li><b>kqueue</b><span>macOS and the BSDs</span></li>
-              <li><b>completion ports</b><span>Windows</span></li>
-            </ul>
-          </li>
-          <li class="layer layer--kernel">
-            <span class="layer__name">Kernel</span>
-          </li>
-        </ol>
-        <figcaption id="map-caption">The layers of a nuclei process. Your code hands work to the shards; each shard&rsquo;s driver submits that work to the kernel and completes it for the task that asked.</figcaption>
+      <figure class="apparatus" aria-label="Four cores, each running a shard with its own driver">
+        <div class="bank" aria-hidden="true">
+          <div class="chamber" style="--i: 0; --fill: 64%"><span class="chamber__tick" style="--y: 25%"></span><span class="chamber__tick" style="--y: 50%"></span><span class="chamber__tick" style="--y: 75%"></span><span class="chamber__liquid"></span><span class="chamber__label">Core 0</span></div>
+          <div class="chamber" style="--i: 1; --fill: 80%"><span class="chamber__tick" style="--y: 25%"></span><span class="chamber__tick" style="--y: 50%"></span><span class="chamber__tick" style="--y: 75%"></span><span class="chamber__liquid"></span><span class="chamber__label">Core 1</span></div>
+          <div class="chamber" style="--i: 2; --fill: 56%"><span class="chamber__tick" style="--y: 25%"></span><span class="chamber__tick" style="--y: 50%"></span><span class="chamber__tick" style="--y: 75%"></span><span class="chamber__liquid"></span><span class="chamber__label">Core 2</span></div>
+          <div class="chamber" style="--i: 3; --fill: 72%"><span class="chamber__tick" style="--y: 25%"></span><span class="chamber__tick" style="--y: 50%"></span><span class="chamber__tick" style="--y: 75%"></span><span class="chamber__liquid"></span><span class="chamber__label">Core 3</span></div>
+        </div>
+        <dl class="facts">
+          <div class="fact"><dt>One shard per core</dt><dd>It runs its own tasks, timers and buffers.</dd></div>
+          <div class="fact"><dt>A driver per shard</dt><dd>Only the driver touches a descriptor.</dd></div>
+          <div class="fact"><dt>A timer wheel per shard</dt><dd>A timer fires on the shard that polls it.</dd></div>
+          <div class="fact"><dt>No work stealing</dt><dd>A task stays on the shard it was placed on.</dd></div>
+        </dl>
       </figure>
     </section>
 
-    <section class="add" id="add" aria-labelledby="add-title">
-      <h2 id="add-title">Add it</h2>
-      <p class="note">0.5.0 is not on crates.io yet: crates.io and docs.rs carry 0.4.3, the API before this rewrite. Until 0.5.0 is published, depend on its branch.</p>
-      <div class="code-block">
-        <pre id="dependency"><code>[dependencies.nuclei]
+    <section class="band" aria-labelledby="band-title">
+      <h2 class="visually-hidden" id="band-title">Kernel interfaces</h2>
+      <ul class="band__list">
+        <li class="band__item"><p class="band__name">io_uring</p><p class="band__where">Linux 6.1 and later</p></li>
+        <li class="band__item"><p class="band__name">epoll</p><p class="band__where">Linux, where io_uring is refused</p></li>
+        <li class="band__item"><p class="band__name">kqueue</p><p class="band__where">macOS and the BSDs</p></li>
+        <li class="band__item"><p class="band__name">IOCP</p><p class="band__where">I/O completion ports on Windows</p></li>
+      </ul>
+    </section>
+
+    <section class="install" id="install" aria-labelledby="install-title">
+      <div class="section-head">
+        <h2 id="install-title">Add it to your project</h2>
+        <p class="section-head__dek">0.5.0 is not on crates.io yet: crates.io and docs.rs carry 0.4.3, the API before this rewrite. Until 0.5.0 is published, depend on its branch.</p>
+      </div>
+      <div class="install__steps">
+        <div class="install__step">
+          <div class="install__head">
+            <h3 class="install__label">With cargo</h3>
+            <button class="copy" type="button" data-copy="cargo-add" hidden><span class="copy__label">Copy</span></button>
+            <span class="visually-hidden" role="status" aria-live="polite"></span>
+          </div>
+          <div class="code">
+            <pre id="cargo-add"><code>cargo add nuclei --git https://github.com/vertexclique/nuclei --branch modernize-2026</code></pre>
+          </div>
+        </div>
+        <div class="install__step">
+          <div class="install__head">
+            <h3 class="install__label">Or in Cargo.toml</h3>
+            <button class="copy" type="button" data-copy="dependency" hidden><span class="copy__label">Copy</span></button>
+            <span class="visually-hidden" role="status" aria-live="polite"></span>
+          </div>
+          <div class="code">
+            <pre id="dependency"><code>[dependencies.nuclei]
 git = "https://github.com/vertexclique/nuclei"
 branch = "modernize-2026"</code></pre>
-        <button class="copy" type="button" data-copy="dependency" hidden><span class="copy__label">Copy</span></button>
-        <span class="copy__status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
       </div>
-      <p class="note">Then a first program: an echo server, one task per connection.</p>
-      <div class="code-block">
-        <pre><code>use std::net::TcpListener;
+    </section>
+
+    <section class="program" aria-labelledby="program-title">
+      <div class="section-head">
+        <h2 id="program-title">An echo server, one task per connection</h2>
+        <p class="section-head__dek">No setup and no configuration: the first <code>spawn</code> or <code>block_on</code> starts a runtime with one shard per core.</p>
+      </div>
+      <div class="program__body">
+        <div class="code code--corner">
+          <pre id="echo"><code>use std::net::TcpListener;
 use nuclei::Handle;
 
 #[nuclei::main]
@@ -98,56 +122,76 @@ async fn main() -&gt; std::io::Result&lt;()&gt; {
         .detach();
     }
 }</code></pre>
+          <button class="copy" type="button" data-copy="echo" hidden><span class="copy__label">Copy</span></button>
+          <span class="visually-hidden" role="status" aria-live="polite"></span>
+        </div>
+        <dl class="notes">
+          <div><dt><code>#[nuclei::main]</code></dt><dd>Runs the async <code>main</code> in the runtime&rsquo;s <code>block_on</code>. A <code>Builder</code> sets every setting for a runtime of your own.</dd></div>
+          <div><dt><code>Handle&lt;TcpListener&gt;</code></dt><dd>Takes std&rsquo;s own listener and gives it async operations.</dd></div>
+          <div><dt><code>nuclei::spawn</code></dt><dd>Places the task on a shard, and there it stays.</dd></div>
+          <div><dt><code>recv</code> and <code>send</code></dt><dd>Complete for this task. On io_uring and completion ports the kernel completes them; on epoll and kqueue the shard&rsquo;s driver makes the call.</dd></div>
+        </dl>
       </div>
-      <p class="note">It needs no configuration: the first <code>spawn</code> or <code>block_on</code> starts a runtime with one shard per core. A <code>Builder</code> sets every setting for a runtime of your own.</p>
     </section>
 
-    <section class="backends" id="backends" aria-labelledby="backends-title">
-      <h2 id="backends-title">Backends</h2>
-      <table>
-        <thead>
-          <tr><th scope="col">Platform</th><th scope="col">Backend</th></tr>
-        </thead>
-        <tbody>
-          <tr><th scope="row">Linux</th><td>io_uring where the kernel and the sandbox allow it, else epoll</td></tr>
-          <tr><th scope="row">macOS, FreeBSD, NetBSD, OpenBSD, DragonFly</th><td>kqueue</td></tr>
-          <tr><th scope="row">Windows</th><td>I/O completion ports</td></tr>
-        </tbody>
-      </table>
-      <p class="note">The runtime tries io_uring first and probes it safely, even under a seccomp filter that kills a process for calling <code>io_uring_setup</code>. CI runs the suite on io_uring and on epoll on Linux 6.1, 6.6 and 6.12, on kqueue on macOS, and on completion ports on Windows. <code>NUCLEI_BACKEND</code> picks one by hand.</p>
-    </section>
-
-    <section class="has" id="has" aria-labelledby="has-title">
-      <h2 id="has-title">What it has</h2>
-      <dl class="spec">
-        <div><dt>Tasks</dt><dd><code>spawn</code>, <code>spawn_local</code> for tasks that are not <code>Send</code>, <code>spawn_blocking</code> for blocking work, and <code>block_on</code> anywhere, nested in a task too, with the shard&rsquo;s other tasks and IO still going.</dd></div>
-        <div><dt>IO</dt><dd><code>Handle&lt;T&gt;</code> over std&rsquo;s sockets, files and pipes, with the <code>futures-io</code> traits. Streams lend the driver your own buffer with <code>read_owned</code> and <code>write_owned</code>.</dd></div>
-        <div><dt>Time</dt><dd><code>sleep</code>, <code>timeout</code> and intervals, on a timer wheel per shard.</dd></div>
-        <div><dt>Sync</dt><dd>Mutexes, reader-writer locks with upgradable reads, reentrant locks, semaphores, <code>Notify</code>, barriers, events, latches, once-cells, cancellation tokens, and mpsc, oneshot, broadcast and watch channels. They need only futures and wakers, so they work under any executor.</dd></div>
-        <div><dt>Processes</dt><dd>Children, their exits and their pipes; Unix signals and Windows console events as streams.</dd></div>
-        <div><dt>Stats</dt><dd><code>nuclei::stats()</code>: every shard&rsquo;s tasks, polls, IO in flight, buffers, timers and errors by kind.</dd></div>
-        <div><dt>Depends on</dt><dd><code>libc</code> on Unix, the <code>kovan</code> crates, <code>futures-io</code> and <code>futures-core</code>. Nothing else.</dd></div>
-      </dl>
-    </section>
-
-    <section class="checked" id="checked" aria-labelledby="checked-title">
-      <h2 id="checked-title">Checked</h2>
-      <ul class="checks">
-        <li><b>TLA+</b> <span class="checks__text">27 families of models of the concurrent protocols: the task&rsquo;s state machine, the park and wake handshake, an IO source&rsquo;s sides and registrations, the ring&rsquo;s operations, the sync primitives&rsquo; queues. Configurations that must pass sit beside mutations that must break them.</span></li>
-        <li><b>Lean</b> <span class="checks__text">Proofs of the arithmetic those protocols rest on: state words, counts, generations.</span></li>
-        <li><b>loom</b> <span class="checks__text">Models of the sync primitives and the runtime&rsquo;s handshakes, run in CI.</span></li>
-        <li><b>ASan</b> <span class="checks__text">The suite under AddressSanitizer on both Linux backends, in CI.</span></li>
+    <section class="decisions" aria-labelledby="decisions-title">
+      <div class="section-head">
+        <h2 id="decisions-title">The decisions underneath</h2>
+      </div>
+      <ul class="cards">
+        <li class="card card--wide"><h3>Proactor</h3><p>No task waits for readiness and then makes the call itself. The shard&rsquo;s driver makes the call, or the kernel completes it, and the result goes to the task that asked.</p></li>
+        <li class="card"><h3>Thread per core</h3><p>A shard per worker thread runs its tasks and owns its driver. A task stays on the shard it was placed on; nothing steals it.</p></li>
+        <li class="card"><h3>io_uring first</h3><p>On Linux the runtime tries io_uring and falls back to epoll where the kernel, before 6.1, or a sandbox refuses it. The probe is safe even under a seccomp filter that kills a process for calling <code>io_uring_setup</code>. <code>NUCLEI_BACKEND</code> picks one by hand.</p></li>
+        <li class="card card--wide"><h3>Nested <code>block_on</code></h3><p><code>block_on</code> works anywhere, inside a task too, and keeps its shard&rsquo;s other tasks and IO going while it waits.</p></li>
+        <li class="card card--half"><h3>Descriptors you can trust</h3><p>A handle owns its descriptor. A registration ends before the descriptor closes, and kernel tokens carry a generation, so a reused descriptor number never receives another source&rsquo;s events.</p></li>
+        <li class="card card--half"><h3>Buffers per shard</h3><p>A read lands in a buffer of the shard&rsquo;s pool and the task copies it out. <code>read_owned</code> and <code>write_owned</code> lend the driver your own buffer instead.</p></li>
       </ul>
-      <p class="note"><a href="https://github.com/vertexclique/nuclei/blob/modernize-2026/proofs/README.md">proofs/README.md</a> says what each model checks and what it leaves out.</p>
+    </section>
+
+    <section class="kit" aria-labelledby="kit-title">
+      <div class="section-head">
+        <h2 id="kit-title">What comes with it</h2>
+        <p class="section-head__dek">The pieces a server needs, in the one crate.</p>
+      </div>
+      <ul class="kit__grid">
+        <li class="kit__item"><h3>Sockets, files and pipes</h3><p class="kit__api"><code>Handle&lt;T&gt;</code></p><p>Takes std&rsquo;s own types and gives them async operations and the <code>futures-io</code> traits.</p></li>
+        <li class="kit__item"><h3>Timers</h3><p class="kit__api"><code>nuclei::time</code></p><p>Sleeps, timeouts and intervals. Arming or cancelling a timer allocates nothing once the shard&rsquo;s wheel has grown to fit.</p></li>
+        <li class="kit__item"><h3>Sync for any executor</h3><p class="kit__api"><code>nuclei::sync</code></p><p>Mutexes, reader-writer locks, semaphores, <code>Notify</code>, barriers, and mpsc, oneshot, broadcast and watch channels, on futures and wakers alone.</p></li>
+        <li class="kit__item"><h3>Child processes</h3><p class="kit__api"><code>nuclei::process</code></p><p>Spawn a child, wait for its exit and talk to it through async pipes.</p></li>
+        <li class="kit__item"><h3>Signals</h3><p class="kit__api"><code>nuclei::signal</code></p><p>Unix signals and Windows console events, as streams.</p></li>
+        <li class="kit__item"><h3>Runtime stats</h3><p class="kit__api"><code>nuclei::stats()</code></p><p>A snapshot of every shard: its tasks, polls, IO in flight, buffers, timers and errors by kind.</p></li>
+        <li class="kit__item"><h3>Local and blocking work</h3><p class="kit__api"><code>spawn_local</code>, <code>spawn_blocking</code></p><p>Tasks that are not <code>Send</code> run on the current shard; blocking work runs on a pool.</p></li>
+        <li class="kit__item"><h3>Attributes</h3><p class="kit__api"><code>#[nuclei::main]</code>, <code>#[nuclei::test]</code></p><p>An async <code>main</code> or an async test, run in the runtime&rsquo;s <code>block_on</code>.</p></li>
+        <li class="kit__item"><h3>A short dependency list</h3><p class="kit__api"><code>libc</code>, <code>kovan-*</code>, <code>futures-*</code></p><p><code>libc</code> on Unix, the <code>kovan</code> crates, <code>futures-io</code> and <code>futures-core</code>. The attribute macros need none of their own.</p></li>
+      </ul>
+    </section>
+
+    <section class="checked" aria-labelledby="checked-title">
+      <div class="section-head">
+        <h2 id="checked-title">Checked, not assumed</h2>
+        <p class="section-head__dek">The concurrent protocols are model-checked, the arithmetic under them is proved, and the suite runs on every backend.</p>
+      </div>
+      <ul class="checks">
+        <li class="check"><h3>TLA+ models</h3><p>The concurrent protocols: the task&rsquo;s state machine, the park and wake handshake, an IO source&rsquo;s sides and registrations, the ring&rsquo;s operations, the sync primitives&rsquo; queues. Configurations that must pass sit beside mutations that must break them.</p></li>
+        <li class="check"><h3>Lean proofs</h3><p>The arithmetic those protocols rest on: state words, counts and generations, for every size and every sequence of operations.</p></li>
+        <li class="check"><h3>AddressSanitizer</h3><p>The suite under AddressSanitizer and LeakSanitizer, on io_uring and on epoll, in CI.</p></li>
+        <li class="check"><h3>Every backend in CI</h3><p>io_uring and epoll on Linux 6.1, 6.6 and 6.12, kqueue on macOS, and completion ports on Windows.</p></li>
+      </ul>
+      <p class="section-note"><a href="https://github.com/vertexclique/nuclei/blob/modernize-2026/proofs/README.md"><code>proofs/README.md</code></a> says what each model checks and what it leaves out.</p>
     </section>
   </main>
 
-  <footer class="colophon">
-    <p>nuclei 0.5.0, unreleased. Licensed under Apache-2.0 or MIT. <a href="https://github.com/vertexclique/nuclei/tree/modernize-2026">Source</a>, <a href="https://github.com/vertexclique/nuclei/blob/modernize-2026/CHANGELOG.md">changes</a> and <a href="https://github.com/vertexclique/nuclei/blob/modernize-2026/proofs/README.md">proofs</a> on GitHub. This page is plain HTML and CSS from <code>site/</code> in that repository, set in Big Shoulders Display, Geist and Geist Mono.</p>
+  <footer class="foot">
+    <p class="foot__line">A task stays where you put it.</p>
+    <div class="foot__meta">
+      <span class="foot__mark">nuclei</span>
+      <span>0.5.0, unreleased &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="https://github.com/vertexclique/nuclei/tree/modernize-2026">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/modernize-2026/CHANGELOG.md">Changes</a> <a href="https://github.com/vertexclique/nuclei/blob/modernize-2026/proofs/README.md">Proofs</a></span>
+    </div>
   </footer>
 
   <script>
-    // The copy button exists only where it works: without script the line is plain text.
+    // The copy buttons exist only where they work: without script the lines are plain text.
     for (const button of document.querySelectorAll("[data-copy]")) {
       const status = button.nextElementSibling;
       button.hidden = false;

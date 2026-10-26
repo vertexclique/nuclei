@@ -1,37 +1,61 @@
-/* Hallmark · genre: editorial · macrostructure: Map / Diagram · theme: Brutal · enrichment: Tier A CSS diagram · nav: N7 · footer: Ft4
- * tone: brutalist · audience: Rust developers choosing a runtime · use: add it to Cargo.toml
- * anchor hue: 50 (warm concrete) · accent: signal red-orange, hue 35
+/* Hallmark · genre: atmospheric · macrostructure: Marquee Hero · theme: custom (Abyss) · enrichment: Tier A CSS apparatus (liquid core bank) · nav: N9 · footer: Ft5
+ * vibe: "turquoise light poured into blue glass, in the dark" · paper oklch(12% 0.016 245) · accent oklch(82% 0.13 188) turquoise, oklch(70% 0.15 248) blue
+ * display: Geist 600 (operator's pick) · body: Geist 400 · labels and code: JetBrains Mono
+ * axes: dark paper · grotesk-sans display · cool accent (turquoise 188 to blue 258)
+ * tone: atmospheric, serious, square, wet surfaces · audience: Rust developers choosing a runtime · use: add it to Cargo.toml
+ * Square everywhere: no radius token exists on purpose.
  */
 
 :root {
-  /* Paper, ink and the steps between, all tinted toward the warm anchor. */
-  --color-paper:     oklch(93% 0.012 75);
-  --color-paper-2:   oklch(89% 0.014 75);
-  --color-ink:       oklch(18% 0.012 50);
-  --color-ink-2:     oklch(26% 0.012 50);
-  --color-muted:     oklch(38% 0.010 50);
-  --color-on-ink:    oklch(93% 0.010 75);
-  --color-on-ink-2:  oklch(78% 0.010 75);
-  --color-rule:      oklch(18% 0.012 50);
-  /* The one accent: marks, the focus ring, link underlines. */
-  --color-accent:    oklch(56% 0.200 35);
-  --color-accent-on-ink: oklch(70% 0.170 38);
-  --color-focus:     oklch(56% 0.200 35);
+  /* Abyss: a blue-black canvas; the only light is the turquoise-to-blue liquid. */
+  --color-paper:       oklch(12% 0.016 245);
+  --color-paper-2:     oklch(16% 0.020 245);
+  --color-paper-3:     oklch(20% 0.024 245);
+  --color-ink:         oklch(96% 0.008 230);
+  --color-ink-2:       oklch(84% 0.014 232);
+  --color-muted:       oklch(68% 0.018 236);
+  --color-rule:        oklch(27% 0.022 245);
+  --color-rule-2:      oklch(37% 0.024 245);
+  --color-accent:      oklch(82% 0.130 188);
+  --color-accent-deep: oklch(52% 0.170 258);
+  --color-liquid-top:  oklch(94% 0.070 185);
+  --color-accent-2:    oklch(70% 0.150 248);
+  --color-focus:       oklch(82% 0.130 188);
+  --color-filament-tip: oklch(97% 0.030 190);
+  --color-glow:        oklch(80% 0.130 195 / 0.40);
+  --color-glow-2:      oklch(70% 0.150 240 / 0.16);
+  --color-card-emit:   oklch(82% 0.130 188 / 0.05);
+  --color-shadow:      oklch(4% 0.012 245 / 0.60);
+  --color-shade:       oklch(4% 0.012 245 / 0.45);
+  /* The wet look: sheens and a lit top edge on every raised surface. */
+  --color-gloss:        oklch(98% 0.010 220 / 0.05);
+  --color-gloss-edge:   oklch(98% 0.010 220 / 0.10);
+  --color-gloss-strong: oklch(98% 0.010 220 / 0.30);
+  --color-bloom:        oklch(80% 0.130 192 / 0.10);
+  --color-bloom-2:      oklch(62% 0.170 255 / 0.12);
 
-  --font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+  /* The liquid: turquoise poured into blue, brightest at its surface. One fill for every
+   * place that holds it (the mark, the buttons, the tanks, the backend squares). */
+  --fill-liquid: linear-gradient(180deg, var(--color-liquid-top) 0%, var(--color-accent) 40%, var(--color-accent-deep) 100%);
+  --fill-accent-rule: linear-gradient(90deg, var(--color-accent) 0%, var(--color-accent-2) 60%, var(--color-accent-deep) 100%);
+
+  --font-display: "Geist", ui-sans-serif, sans-serif;
   --font-body:    "Geist", ui-sans-serif, sans-serif;
-  --font-mono:    "Geist Mono", ui-monospace, monospace;
+  --font-mono:    "JetBrains Mono", ui-monospace, monospace;
 
-  /* Major third from a 16 px body. */
-  --text-xs:   0.8rem;
-  --text-sm:   0.875rem;
-  --text-base: 1rem;
-  --text-md:   1.25rem;
-  --text-lg:   1.5625rem;
-  --text-xl:   1.9531rem;
-  --text-2xl:  2.4414rem;
-  --text-3xl:  3.0518rem;
-  --text-display: clamp(3rem, 8vw + 0.5rem, 6rem);
+  --text-micro: 0.6875rem;
+  --text-xs:    0.8rem;
+  --text-sm:    0.875rem;
+  --text-base:  1rem;
+  --text-md:    1.125rem;
+  --text-lg:    1.375rem;
+  --text-xl:    1.75rem;
+  --text-2xl:   2.25rem;
+  --text-3xl:   clamp(2.25rem, 3vw + 1rem, 3.25rem);
+  --text-display: clamp(2.75rem, 5vw + 1rem, 5.25rem);
+
+  --tracking-display: -0.045em;
+  --tracking-head:    -0.035em;
 
   --space-3xs: 0.125rem;
   --space-2xs: 0.25rem;
@@ -45,19 +69,19 @@
   --space-4xl: 9rem;
 
   --page-gutter: clamp(1rem, 4vw, 3rem);
-  --measure: 62ch;
+  --page-max:    80rem;
+  --measure:     62ch;
 
-  --rule-thin:  2px;
-  --rule:       3px;
-  --rule-heavy: 8px;
-  --radius:     0;
+  --rule-hair:      1px;
 
   --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in:     cubic-bezier(0.7, 0, 0.84, 0);
   --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
   --dur-micro: 120ms;
   --dur-short: 220ms;
+  --dur-tide:  7s;
+  --dur-flow:  900ms;
 
   --z-base:   1;
-  --z-sticky: 200;
+  --z-raised: 10;
 }
