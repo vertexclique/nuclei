@@ -8,7 +8,9 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::sync::Arc;
 use std::task::Wake;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use super::Instant;
 
 use super::wheel::{TimerKey, Wheel};
 use crate::rt::context;
@@ -30,9 +32,9 @@ pub fn sleep(duration: Duration) -> Sleep {
 }
 
 /// Waits until `deadline`.
-pub fn sleep_until(deadline: Instant) -> Sleep {
+pub fn sleep_until(deadline: impl Into<Instant>) -> Sleep {
     Sleep {
-        deadline,
+        deadline: deadline.into(),
         state: State::Idle,
     }
 }
@@ -81,7 +83,8 @@ impl Sleep {
     }
 
     /// Moves the deadline; the sleep is pending again until it.
-    pub fn reset(self: Pin<&mut Self>, deadline: Instant) {
+    pub fn reset(self: Pin<&mut Self>, deadline: impl Into<Instant>) {
+        let deadline = deadline.into();
         let this = self.get_mut();
         this.release();
         this.deadline = deadline;
@@ -138,7 +141,7 @@ impl Sleep {
             self.state = State::Done;
             return Poll::Ready(());
         }
-        let at = shard.wheel_time(self.deadline);
+        let at = shard.wheel_time(self.deadline.into_std());
         let mut wheel = shard.wheel().borrow_mut();
         let key = wheel.insert(at, cx.waker());
         if wheel.is_fired(key) {
@@ -291,7 +294,7 @@ impl TimerOp {
                     return;
                 }
                 let waker = Waker::from(Arc::clone(&cell));
-                let key = wheel.insert(shard.wheel_time(at), &waker);
+                let key = wheel.insert(shard.wheel_time(at.into_std()), &waker);
                 if wheel.is_fired(key) {
                     wheel.remove(key);
                     cell.fired.store(true, Ordering::Release);

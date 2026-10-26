@@ -323,6 +323,29 @@ be for a far deadline. The waker slot's register-then-look-again handshake guard
 changed between polls; one task cannot show that, and it is checked by the loom models of the
 sync module's waker cell.
 
+## A paused clock that moves by itself
+
+`clock` (`tla/clock/Clock.tla`) checks how a runtime's paused clock jumps to the earliest
+armed timer when the runtime has nothing else to do (`src/rt/paused.rs`, the park path of
+`src/rt/shard.rs`, the job count of `src/rt/blocking.rs`). Each shard publishes its deadline
+and counts a park before it says it parks; parked, it claims the advance, looks at every shard
+(parked with nothing pushed, noting its park count and deadline), looks again (the same,
+unchanged), moves the clock to the earliest deadline and wakes the shards whose timers came
+due. A shard that wakes, or that finds work as it is about to sleep, waits for an advance in
+progress before it reads the clock. A blocking job wakes its task before it counts itself out
+of the jobs in flight, then tries the advance too. The family checks configurations that must
+pass (two shards with a pusher and a blocking job; two shards with a timer each, the scenario the
+races below need; three shards; timers armed again by the tasks they wake), each with
+`ClockNeverPassesArmed` (no jump leaves an armed timer behind),
+`NoBadJump` (every jump comes over a moment, between its two looks, at which every shard was
+idle, with no job in flight) and the liveness property `TimersFire` (every armed timer fires:
+no runtime hangs with its shards asleep and a timer armed); one mutation per rule (a deadline
+published after the park, a busy path that does not wait for the advance, one look instead of
+two, a woken shard that does not wait, no look at the jobs, no attempt at the park); and a
+witness that the clock jumps at all. Writing the model found the first two of those races in the
+first version of the code (a deadline published after the park, a busy path that did not wait);
+the code was fixed before it was committed.
+
 ## The guard of an IO source's side
 
 `side` (`tla/side/Side.tla`) checks how a poll and the shard's driver share one side of an IO

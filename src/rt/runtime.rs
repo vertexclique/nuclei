@@ -39,13 +39,19 @@ pub(crate) struct Inner {
     /// Tells this runtime's workers from another's.
     id: u64,
     pub(crate) workers: Workers,
-    pool: Arc<Pool>,
+    pub(crate) pool: Arc<Pool>,
     /// How many live tasks more than the other choice the spawning shard
     /// may hold and still keep a task it spawns.
     local_margin: usize,
     /// The workers' IO runs on rings.
     #[cfg(ring)]
     rings: bool,
+    /// The time its tasks and timers read.
+    pub(crate) clock: crate::time::clock::Clock,
+    /// The shards of threads inside this runtime's `block_on` while its clock
+    /// is paused, by address: with the workers, the shards a paused clock
+    /// waits for before it moves by itself.
+    pub(crate) guests: kovan_map::HashMap<usize, Arc<Shared>>,
 }
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
@@ -68,6 +74,7 @@ pub struct Builder {
     io_buffer_cap: Option<usize>,
     max_worker_threads: Option<usize>,
     backend: Option<crate::IoBackend>,
+    start_paused: bool,
 }
 
 impl Default for Builder {
@@ -98,6 +105,7 @@ impl Builder {
             io_buffer_cap: None,
             max_worker_threads: None,
             backend: None,
+            start_paused: false,
         }
     }
 
@@ -192,6 +200,15 @@ impl Builder {
         self
     }
 
+    /// Whether the runtime's clock starts paused (default false): see
+    /// [`time::pause`](crate::time::pause). Its tasks then see time move only
+    /// as they [`advance`](crate::time::advance) it, or as it jumps to the
+    /// next timer whenever every shard of the runtime is idle.
+    pub fn start_paused(mut self, paused: bool) -> Self {
+        self.start_paused = paused;
+        self
+    }
+
     /// Whether each worker thread is pinned to its own core (Linux; default
     /// true). A pinned shard keeps its cache warm; unpinned, the scheduler may
     /// move it.
@@ -261,7 +278,10 @@ impl Builder {
             local_margin: self.local_spawn_margin.unwrap_or(DEFAULT_LOCAL_MARGIN),
             #[cfg(ring)]
             rings,
+            clock: crate::time::clock::Clock::new(self.start_paused),
+            guests: kovan_map::HashMap::new(),
         });
+        inner.pool.set_owner(Arc::downgrade(&inner));
         let runtime = Runtime { inner, exits };
         // On an error the runtime drops: the workers already started stop.
         Workers::start(&runtime.inner, workers)?;
@@ -297,6 +317,7 @@ impl fmt::Debug for Builder {
             .field("pin_workers", &self.pin_workers)
             .field("local_spawn_margin", &self.local_spawn_margin)
             .field("io_buffer_cap", &self.io_buffer_cap)
+            .field("start_paused", &self.start_paused)
             .finish_non_exhaustive()
     }
 }
@@ -479,6 +500,15 @@ pub(crate) fn current() -> Arc<Inner> {
     context::runtime().unwrap_or_else(|| Arc::clone(&default_runtime().inner))
 }
 
+/// Runs `f` on the clock of the runtime this thread is inside, or of the
+/// default runtime if it runs; `None` when there is neither.
+pub(crate) fn with_clock<R>(f: impl FnOnce(Option<&crate::time::clock::Clock>) -> R) -> R {
+    match context::runtime() {
+        Some(inner) => f(Some(&inner.clock)),
+        None => f(DEFAULT.get().map(|rt| &rt.inner.clock)),
+    }
+}
+
 /// A shard to serve a thread that runs none, of the runtime this thread is
 /// inside or of the default one, if one runs: it never starts one (a thread
 /// on its way out may ask).
@@ -586,6 +616,7 @@ fn block_on_with<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
         Err(err) => panic!("this thread's shard could not start: {err}"),
     };
     let _current = context::enter(&shard);
+    let _guest = super::paused::Guest::enter(inner, &shard.shared);
     #[cfg(port)]
     shard.take_port_back();
     let output = shard.block_on(future);

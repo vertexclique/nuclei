@@ -45,8 +45,8 @@ impl ParkState {
         }
     }
 
-    /// Whether the shard says it parks, for a test that failed.
-    #[cfg(test)]
+    /// Whether the shard says it parks: for a paused clock deciding whether
+    /// every shard is idle, and for a test that failed.
     pub(crate) fn is_parked(&self) -> bool {
         self.parked.load(Ordering::SeqCst)
     }

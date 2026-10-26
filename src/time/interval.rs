@@ -3,7 +3,9 @@
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use super::Instant;
 
 use super::sleep::{Sleep, sleep_until};
 
@@ -35,7 +37,8 @@ pub fn interval(period: Duration) -> Interval {
 /// # Panics
 ///
 /// If `period` is zero.
-pub fn interval_at(start: Instant, period: Duration) -> Interval {
+pub fn interval_at(start: impl Into<Instant>, period: Duration) -> Interval {
+    let start = start.into();
     assert!(
         period > Duration::ZERO,
         "an interval needs a period above zero"

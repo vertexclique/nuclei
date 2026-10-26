@@ -6,7 +6,9 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use nuclei::time::Instant;
 
 use nuclei::runtime::{Runtime, spawn};
 use nuclei::time::{self, MissedTickBehavior};

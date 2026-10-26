@@ -7,6 +7,7 @@ pub(crate) mod context;
 pub(crate) mod counters;
 mod handshake;
 pub(crate) mod park;
+pub(crate) mod paused;
 pub(crate) mod runtime;
 mod sched;
 pub(crate) mod shard;

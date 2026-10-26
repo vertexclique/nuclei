@@ -4,7 +4,9 @@ use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use super::Instant;
 
 use super::error::Elapsed;
 use super::sleep::{Sleep, far_future, sleep_until};
@@ -22,7 +24,7 @@ pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
 }
 
 /// Runs `future` until `deadline` at most; see [`timeout`].
-pub fn timeout_at<F: Future>(deadline: Instant, future: F) -> Timeout<F> {
+pub fn timeout_at<F: Future>(deadline: impl Into<Instant>, future: F) -> Timeout<F> {
     Timeout {
         future,
         sleep: sleep_until(deadline),

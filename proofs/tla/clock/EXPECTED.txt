@@ -1,0 +1,12 @@
+# configuration                spec                 expected
+C_safe                         MC_Clock             pass
+C_three                        MC_Clock             pass
+C_pair                         MC_Clock             pass
+M_publish_late                 MC_Clock             violated:ClockNeverPassesArmed
+M_busy_no_wait                 MC_Clock             violated:ClockNeverPassesArmed
+M_no_recheck                   MC_Clock             violated:NoBadJump
+M_no_wait_advance              MC_Clock             violated:ClockNeverPassesArmed
+M_no_job_check                 MC_Clock             violated:NoBadJump
+M_no_attempt                   MC_Clock             violated:TimersFire
+W_jump                         MC_Clock             violated:NoJumpW
+C_rearm                        MC_Clock             pass

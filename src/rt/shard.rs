@@ -56,7 +56,7 @@ use super::task::{Runnable, ScheduleInfo};
 use crate::buf::{self, Pool};
 use crate::io::Source;
 use crate::sync::atomic_waker::AtomicWaker;
-use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::internal::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(ring)]
 use crate::syscore::linux::iouring::ring::RingConfig;
 use crate::time::TimerOp;
@@ -119,6 +119,13 @@ pub(crate) struct Shared {
     io_ops: SegQueue<IoOp>,
     /// What the shard counts, for `stats`.
     pub(crate) counters: Counters,
+    /// While its runtime's clock is paused: the deadline of the shard's
+    /// earliest timer when it last parked (nanoseconds after the clock's
+    /// origin, `u64::MAX` for none).
+    timer_at: AtomicU64,
+    /// Parks the shard began: a paused clock tells a shard that slept
+    /// throughout from one that woke and parked again.
+    parks: AtomicU64,
 }
 
 /// A registration change another thread asks of a shard.
@@ -312,6 +319,19 @@ impl Shared {
         self.counters.read(self.load.load(Ordering::Relaxed))
     }
 
+    /// Parked with nothing pushed to it: idle, for a paused clock.
+    pub(crate) fn idle(&self) -> bool {
+        self.park.is_parked() && !self.has_remote_work()
+    }
+
+    pub(crate) fn timer_at(&self) -> u64 {
+        self.timer_at.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn parks(&self) -> u64 {
+        self.parks.load(Ordering::SeqCst)
+    }
+
     fn has_remote_work(&self) -> bool {
         !self.inbox.is_empty()
             || !self.local_inbox.is_empty()
@@ -381,7 +401,9 @@ pub(crate) struct Shard {
     limits: Limits,
     driver: Driver,
     wheel: RefCell<Wheel>,
-    /// The wheel's zero.
+    /// The wheel's zero: the clock's origin, the same for every shard, so a
+    /// paused clock on the wheels' millisecond grid fires timers at their
+    /// deadlines exactly.
     epoch: Instant,
     /// Wakers of fired timers, woken once the wheel is let go; reused.
     fired: RefCell<Vec<Waker>>,
@@ -471,6 +493,8 @@ impl Shard {
             port: kernel,
             io_ops: SegQueue::new(),
             counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
+            timer_at: AtomicU64::new(u64::MAX),
+            parks: AtomicU64::new(0),
         });
         counters::register(&shared);
         Ok(Self {
@@ -490,7 +514,7 @@ impl Shard {
             limits,
             driver,
             wheel: RefCell::new(Wheel::new()),
-            epoch: Instant::now(),
+            epoch: crate::time::clock::origin(),
             fired: RefCell::new(Vec::new()),
             sources: RefCell::new(Sources::default()),
             children: RefCell::new(children::Children::default()),
@@ -615,10 +639,10 @@ impl Shard {
         u64::try_from(since.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
     }
 
-    /// The wheel's time now, rounded down: the wheel never runs ahead of the
-    /// clock.
+    /// The wheel's time now on the runtime's clock, rounded down: the wheel
+    /// never runs ahead of the clock.
     fn wheel_now(&self) -> u64 {
-        let since = Instant::now().saturating_duration_since(self.epoch);
+        let since = crate::time::clock::now().saturating_duration_since(self.epoch);
         u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
     }
 
@@ -700,7 +724,7 @@ impl Shard {
         } else {
             wait
         };
-        let timeout = match (wait, self.next_timer()) {
+        let timeout = match (wait, self.timer_wait(wait.is_none())) {
             (Some(w), Some(t)) => Some(w.min(t)),
             (w, t) => w.or(t),
         };
@@ -778,13 +802,78 @@ impl Shard {
         }
     }
 
-    /// How long until the next timer, if any.
-    fn next_timer(&self) -> Option<Duration> {
-        let next = self.wheel.borrow().next_deadline()?;
+    /// How long the shard's wait may last for its next timer, if it has one.
+    ///
+    /// On a paused clock the timer's wait is not real time: a due timer
+    /// fires at once, and otherwise the wait is unbounded, for a waker or for
+    /// the clock to move. A shard about to park (`parking`, its deadline
+    /// published by `before_park`) tries to move the clock to the runtime's
+    /// earliest deadline (`paused::try_advance`); if that makes its own timer
+    /// due, it does not wait.
+    fn timer_wait(&self, parking: bool) -> Option<Duration> {
         // From the clock's own nanoseconds, so the wait ends at the
         // deadline's millisecond and not one early.
-        let at = self.epoch + Duration::from_millis(next);
-        Some(at.saturating_duration_since(Instant::now()))
+        let next = self
+            .wheel
+            .borrow()
+            .next_deadline()
+            .map(|ms| self.epoch + Duration::from_millis(ms));
+        if !crate::time::clock::any_altered() {
+            return next.map(|at| at.saturating_duration_since(Instant::now()));
+        }
+        let Some(inner) = super::context::runtime() else {
+            return next.map(|at| at.saturating_duration_since(crate::time::clock::now()));
+        };
+        let now = inner.clock.now();
+        if !inner.clock.is_paused() {
+            return next.map(|at| at.saturating_duration_since(now));
+        }
+        if next.is_some_and(|at| at <= now) {
+            return Some(Duration::ZERO);
+        }
+        if !parking {
+            return None;
+        }
+        if super::paused::try_advance(&inner, Some(&self.shared)) {
+            Some(Duration::ZERO)
+        } else {
+            None
+        }
+    }
+
+    /// Before a park, for a paused clock: publishes the shard's earliest
+    /// deadline and counts the park, both before the shard says it parks, so
+    /// a shard deciding a jump that sees this one parked sees its deadline
+    /// (`proofs/tla/clock/`, publish_late). Nothing to do while no clock is
+    /// paused.
+    fn before_park(&self) {
+        if crate::time::clock::any_altered() {
+            let at = self.wheel.borrow().next_deadline().map_or(u64::MAX, |ms| {
+                crate::time::clock::to_nanos(self.epoch + Duration::from_millis(ms))
+            });
+            self.shared.timer_at.store(at, Ordering::SeqCst);
+            self.shared.parks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// After a park, slept or given up for work that came: a jump of a paused
+    /// clock in progress ends before this shard runs and reads the clock
+    /// (`proofs/tla/clock/`, busy_no_wait and no_wait_advance).
+    fn after_park(&self) {
+        if crate::time::clock::any_altered()
+            && let Some(inner) = super::context::runtime()
+        {
+            inner.clock.wait_advance();
+        }
+    }
+
+    /// Fires the due timers from inside a task's poll (`time::advance`): the
+    /// tasks they wake go to the queue in deadline order, ahead of a task
+    /// that yields next, and not to the LIFO slot.
+    pub(crate) fn fire_timers_now(&self) {
+        let outer = self.in_task.replace(false);
+        self.fire_timers();
+        self.in_task.set(outer);
     }
 
     fn fire_timers(&self) {
@@ -905,6 +994,7 @@ impl Shard {
             }) {
                 continue;
             }
+            self.before_park();
             if shared
                 .park
                 .begin_park(|| shared.has_remote_work() || signal.woken.load(Ordering::SeqCst))
@@ -914,6 +1004,7 @@ impl Shard {
                 shared.park.end_park();
                 self.spin.parked_for(slept.elapsed());
             }
+            self.after_park();
         }
     }
 
@@ -929,15 +1020,17 @@ impl Shard {
         }
         self.fire_timers();
         let shared = &self.shared;
-        let sleeps = wait != Some(Duration::ZERO)
-            && !self.has_local_work()
-            && shared.park.begin_park(|| shared.has_remote_work());
+        let quiet = wait != Some(Duration::ZERO) && !self.has_local_work();
+        if quiet {
+            self.before_park();
+        }
+        let sleeps = quiet && shared.park.begin_park(|| shared.has_remote_work());
         let wait = if sleeps || wait == Some(Duration::ZERO) {
             wait
         } else {
             Some(Duration::ZERO)
         };
-        let timeout = match (wait, self.next_timer()) {
+        let timeout = match (wait, self.timer_wait(sleeps)) {
             (Some(w), Some(t)) => Some(w.min(t)),
             (w, t) => w.or(t),
         };
@@ -945,6 +1038,9 @@ impl Shard {
         let result = self.poll_io(max, timeout);
         if sleeps {
             shared.park.end_park();
+        }
+        if quiet {
+            self.after_park();
         }
         let events = result?;
         self.fire_timers();

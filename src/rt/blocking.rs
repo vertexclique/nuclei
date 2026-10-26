@@ -41,6 +41,11 @@ pub(crate) struct Pool {
     rx: kovan_channel::unbounded::Receiver<Runnable>,
     threads: AtomicUsize,
     idle: AtomicUsize,
+    /// Jobs submitted and not yet run to their end: a paused clock does not
+    /// move by itself while one is in flight.
+    jobs: AtomicUsize,
+    /// The runtime the pool belongs to, told when its last job ends.
+    owner: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
     config: PoolConfig,
 }
 
@@ -63,6 +68,8 @@ impl Pool {
             rx,
             threads: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),
+            jobs: AtomicUsize::new(0),
+            owner: std::sync::OnceLock::new(),
             config,
         })
     }
@@ -84,7 +91,30 @@ impl Pool {
         self.threads.load(Ordering::SeqCst)
     }
 
+    /// Makes `owner` the runtime told when the pool's last job ends.
+    pub(crate) fn set_owner(&self, owner: std::sync::Weak<super::runtime::Inner>) {
+        let _ = self.owner.set(owner);
+    }
+
+    /// Jobs submitted and not yet run to their end.
+    pub(crate) fn jobs(&self) -> usize {
+        self.jobs.load(Ordering::SeqCst)
+    }
+
+    /// Runs a job, then counts it out. Its awaiter was woken during the run,
+    /// before the count drops, so a paused clock that sees no job in flight
+    /// sees the woken shard's work.
+    fn run(&self, runnable: Runnable) {
+        runnable.run();
+        if self.jobs.fetch_sub(1, Ordering::SeqCst) == 1
+            && let Some(owner) = self.owner.get().and_then(std::sync::Weak::upgrade)
+        {
+            super::paused::try_advance(&owner, None);
+        }
+    }
+
     fn submit(self: &Arc<Self>, runnable: Runnable) {
+        self.jobs.fetch_add(1, Ordering::SeqCst);
         self.tx.send(runnable);
         if self.idle.load(Ordering::SeqCst) == 0 {
             self.start_thread();
@@ -122,7 +152,7 @@ impl Pool {
     fn cannot_start(&self, _err: io::Error) {
         if self.threads.load(Ordering::SeqCst) == 0 {
             while let Some(runnable) = self.rx.try_recv() {
-                runnable.run();
+                self.run(runnable);
             }
         }
     }
@@ -137,13 +167,13 @@ impl Pool {
                 .recv_deadline(Instant::now() + self.config.keep_alive);
             self.idle.fetch_sub(1, Ordering::SeqCst);
             if let RecvDeadline::Msg(runnable) = got {
-                runnable.run();
+                self.run(runnable);
                 continue;
             }
             // Idle for the keep-alive (or the pool is gone). A job sent while
             // this thread still counted as idle is its to run.
             if let Some(runnable) = self.rx.try_recv() {
-                runnable.run();
+                self.run(runnable);
                 continue;
             }
             self.threads.fetch_sub(1, Ordering::SeqCst);
@@ -151,7 +181,7 @@ impl Pool {
             // found no room for a new thread: it is this one's.
             if let Some(runnable) = self.rx.try_recv() {
                 self.threads.fetch_add(1, Ordering::SeqCst);
-                runnable.run();
+                self.run(runnable);
                 continue;
             }
             return;
