@@ -75,6 +75,8 @@ mod syscore {
 mod alone;
 mod coop;
 mod join_set;
+#[doc(hidden)]
+pub mod macros;
 /// Tasks: spawning, their handles and ids, cancellation from anywhere, and yielding.
 pub mod task;
 mod task_local;
