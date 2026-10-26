@@ -458,13 +458,25 @@ a:active {
   color: var(--color-accent);
 }
 
+/* A background clipped to the text paints only inside the word's box, and the headings' negative
+ * tracking pulls that box in past the last glyph: room on the right (--ink-room), given back by
+ * an equal negative margin so nothing moves, keeps the whole last letter lit. */
 @supports ((background-clip: text) or (-webkit-background-clip: text)) {
+  :is(span, strong, em).ink {
+    --ink-room: 0.12em;
+
+    margin-inline-end: calc(-1 * var(--ink-room));
+    padding-inline-end: var(--ink-room);
+  }
+
   .ink {
     background: var(--fill-text);
     background-size: 100% 100%;
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
   }
 }
 
@@ -488,7 +500,7 @@ a:active {
 .hero__verb::after {
   content: "";
   position: absolute;
-  inset-inline: 0.04em;
+  inset-inline: 0.04em calc(0.04em + var(--ink-room, 0em));
   inset-block-end: 0.02em;
   block-size: 0.07em;
   background: var(--fill-accent-rule);
