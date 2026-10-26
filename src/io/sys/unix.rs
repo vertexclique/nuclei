@@ -537,6 +537,28 @@ pub(crate) fn pwrite_all(fd: RawFd, mut buf: &[u8], mut offset: u64) -> io::Resu
     Ok(())
 }
 
+/// `write(2)` until every byte is written, on a file opened to append: each
+/// call lands at the file's end. Returns the file's own offset after, the
+/// end of the bytes written.
+pub(crate) fn append_all(fd: RawFd, mut buf: &[u8]) -> io::Result<u64> {
+    while !buf.is_empty() {
+        // SAFETY: reads at most `buf.len()` bytes from `buf`.
+        let n = retry(|| cvt(unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) }))?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        buf = &buf[n..];
+    }
+    seek(fd, None)
+}
+
+/// Whether the file `fd` was opened to append (`O_APPEND`).
+pub(crate) fn appends(fd: RawFd) -> io::Result<bool> {
+    // SAFETY: a plain fcntl on the caller's open descriptor.
+    let flags = cvt_int(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
+    Ok(flags & libc::O_APPEND != 0)
+}
+
 /// Moves the file's own offset to `offset` (`SEEK_SET`); with `None`, only
 /// reads it.
 pub(crate) fn seek(fd: RawFd, offset: Option<u64>) -> io::Result<u64> {

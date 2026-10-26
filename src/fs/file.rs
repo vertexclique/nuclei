@@ -17,6 +17,12 @@
 //! write that fails keeps its error: every later write fails with it until a
 //! flush reports it.
 //!
+//! A file opened to append writes at its end whatever its cursor says: its
+//! write jobs call `write(2)` (on Windows, a write at the end), since
+//! `pwrite(2)` writes at the offset given on most systems but Linux, and
+//! each ends with where the file's offset is then, which the cursor takes,
+//! as std's does.
+//!
 //! A read or a write may instead hand the job the task's own buffer
 //! ([`FileIo::read_owned`], [`FileIo::write_owned`]), which comes back with
 //! the result, so no byte is copied. A read into a task's buffer is the
@@ -73,6 +79,8 @@ pub(crate) struct FileIo {
     /// as the state's last holder left them.
     unsent: AtomicBool,
     cursor: AtomicU64,
+    /// The file was opened to append.
+    append: bool,
     /// The calls go to the blocking pool even on a ring, for a test that
     /// holds the pool to keep a call in flight.
     #[cfg(test)]
@@ -177,6 +185,11 @@ enum Writing {
     Pool(Work<io::Result<()>>),
     /// From a task's own buffer, which comes back with the result.
     Lent(Work<(io::Result<()>, Vec<u8>)>),
+    /// At the end of a file opened to append, ending with the file's offset
+    /// after it.
+    Append(Work<io::Result<u64>>),
+    /// As `Append`, from a task's own buffer.
+    AppendLent(Work<(io::Result<u64>, Vec<u8>)>),
 }
 
 /// A write from a task's own buffer, from its submission until its task
@@ -229,6 +242,7 @@ impl FileIo {
     /// opened by std and read some way already goes on from there).
     pub(crate) fn new(fd: Raw) -> io::Result<Arc<Self>> {
         let cursor = sys::seek(fd, None)?;
+        let append = sys::appends(fd)?;
         Ok(Arc::new(Self {
             fd: Arc::new(sys::duplicate_file(fd)?),
             state: Side::new(FileState {
@@ -239,6 +253,7 @@ impl FileIo {
             consumed: AtomicUsize::new(0),
             unsent: AtomicBool::new(false),
             cursor: AtomicU64::new(cursor),
+            append,
             #[cfg(test)]
             on_pool: AtomicBool::new(false),
         }))
@@ -290,6 +305,12 @@ impl FileIo {
     }
 
     fn submit_write(&self, buf: PoolBuf, at: u64) -> Writing {
+        if self.append {
+            let fd = Arc::clone(&self.fd);
+            return Writing::Append(Work::Pool(crate::runtime::spawn_blocking(move || {
+                sys::append_all(file_raw(&fd), buf.filled())
+            })));
+        }
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match super::ring::write(&self.fd, at, buf) {
@@ -341,6 +362,12 @@ impl FileIo {
     }
 
     fn submit_write_owned(&self, buf: Vec<u8>, at: u64) -> Writing {
+        if self.append {
+            let fd = Arc::clone(&self.fd);
+            return Writing::AppendLent(Work::Pool(crate::runtime::spawn_blocking(move || {
+                (sys::append_all(file_raw(&fd), &buf), buf)
+            })));
+        }
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match super::ring::write_lent(&self.fd, at, buf) {
@@ -634,27 +661,34 @@ impl FileState {
     fn poll_writes(&mut self, io: &FileIo, waker: &Waker, after: &mut After) -> Poll<()> {
         loop {
             if let Some(writing) = self.writing.as_mut() {
-                let failure = match writing {
+                // Where an append left the file's offset: the cursor.
+                let (failure, end) = match writing {
                     Writing::Pool(task) => match task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
-                        Poll::Ready(result) => result.as_ref().err().map(Failure::of),
+                        Poll::Ready(result) => (result.as_ref().err().map(Failure::of), None),
+                    },
+                    Writing::Append(task) => match task.poll(waker) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => {
+                            (result.as_ref().err().map(Failure::of), result.ok())
+                        }
                     },
                     Writing::Lent(task) => match task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
+                        Poll::Ready((result, buf)) => (self.lent_back(result, buf), None),
+                    },
+                    Writing::AppendLent(task) => match task.poll(waker) {
+                        Poll::Pending => return Poll::Pending,
                         Poll::Ready((result, buf)) => {
-                            let failure = result.as_ref().err().map(Failure::of);
-                            // The buffer goes back to its task, or with the
-                            // job if the task is gone.
-                            if matches!(self.lent, Lent::Out) {
-                                self.lent = Lent::Done(result, buf);
-                            } else {
-                                self.lent = Lent::None;
-                            }
-                            failure
+                            let end = result.as_ref().ok().copied();
+                            (self.lent_back(result.map(drop), buf), end)
                         }
                     },
                 };
                 self.writing = None;
+                if let Some(end) = end {
+                    self.cursor = end;
+                }
                 if let Some(failure) = failure {
                     self.failed = Some(failure);
                     if let Some(behind) = self.behind.take() {
@@ -667,6 +701,18 @@ impl FileState {
                 None => return Poll::Ready(()),
             }
         }
+    }
+
+    /// The end of a write from a task's buffer: the buffer goes back to its
+    /// task, or with the job if the task is gone.
+    fn lent_back(&mut self, result: io::Result<()>, buf: Vec<u8>) -> Option<Failure> {
+        let failure = result.as_ref().err().map(Failure::of);
+        if matches!(self.lent, Lent::Out) {
+            self.lent = Lent::Done(result, buf);
+        } else {
+            self.lent = Lent::None;
+        }
+        failure
     }
 
     /// Makes sure bytes at the cursor are read ahead: `true`, or `false` at

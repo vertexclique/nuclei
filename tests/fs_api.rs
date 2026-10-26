@@ -322,3 +322,48 @@ fn the_calls_work_from_the_workers() {
         let _ = Path::new(&base);
     });
 }
+
+/// A file opened to append writes at its end wherever its cursor is, and
+/// after a write its cursor is the end of what it wrote, as std's is; a
+/// write from the task's own buffer as well.
+#[test]
+fn an_appending_file_writes_at_its_end_and_its_cursor_follows() {
+    nuclei::block_on(async {
+        let t = Temp::new();
+        let p = t.path("log");
+        fs::write(&p, b"one\n").await.unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&p)
+            .await
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+        file.write_all(b"two\n").await.unwrap();
+        file.flush().await.unwrap();
+        assert_eq!(file.stream_position().await.unwrap(), 8);
+        let mut rest = Vec::new();
+        assert_eq!(file.read_to_end(&mut rest).await.unwrap(), 0, "at the end");
+
+        file.seek(std::io::SeekFrom::Start(2)).await.unwrap();
+        let (written, _) = file.write_owned(b"three\n".to_vec()).await;
+        assert_eq!(written.unwrap(), 6);
+        assert_eq!(file.stream_position().await.unwrap(), 14);
+
+        file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+        file.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"one\ntwo\nthree\n");
+
+        // What std does with the same calls.
+        use std::io::{Seek, Write};
+        let mut std_file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&p)
+            .unwrap();
+        std_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        std_file.write_all(b"four\n").unwrap();
+        assert_eq!(std_file.stream_position().unwrap(), 19);
+        assert_eq!(fs::read(&p).await.unwrap(), b"one\ntwo\nthree\nfour\n");
+    });
+}

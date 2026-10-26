@@ -36,3 +36,8 @@ WF_orphan_landed               MC_LentFile          violated:NoOrphanLanded
 WF_read_of_lent                MC_LentFile          violated:NoReadOfLent
 WF_short_write                 MC_LentFile          violated:NoShortWrite
 WF_moved_mid                   MC_LentFile          violated:NoMovedMid
+PF_append                      MC_LentFile          pass
+PF_append_live                 MC_LentFile          pass
+MF_append_at_cursor            MC_LentFile          violated:NoOverwrite
+MF_cursor_stays                MC_LentFile          violated:CursorAtEnd
+WF_append_past_cursor          MC_LentFile          violated:NoAppendPastCursor

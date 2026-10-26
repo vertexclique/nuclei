@@ -85,9 +85,10 @@ impl Handle<StdFile> {
         }
     }
 
-    /// Writes all of `buf` at the cursor, after the writes before it, and
-    /// gives it back with its length once the bytes reached the file. They
-    /// are written from `buf` itself, never copied.
+    /// Writes all of `buf` at the cursor (at the end, for a file opened to
+    /// append), after the writes before it, and gives it back with its
+    /// length once the bytes reached the file. They are written from `buf`
+    /// itself, never copied.
     ///
     /// If the future is dropped before it completes, the write is withdrawn
     /// while it still waits for the writes before it, and lands whole, in

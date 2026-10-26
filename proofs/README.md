@@ -441,21 +441,31 @@ that goes out over several calls, the driver finishing the write of a task that 
 withdrawn write).
 
 The file (`LentFile.tla`): the file has a cursor and an epoch, which every write and seek
-moves on, and its jobs run on the blocking pool in any order. Two tasks each read one cell at
-the cursor into their own buffers: a read waits for the write in flight, its job reads at the
-cursor, and its result counts only if the cursor and the epoch are still those it read at, else
-it reads again. A third task writes a cell from the pool, then one from its own buffer (which
-waits for the write in flight and then is that write), then seeks back to the start. Any task
-may go away while its job is out: a read job is cancelled or its result dropped, and a lent
-write still lands. 9 configurations: 3 that must pass (tasks that may go away and tasks that
-stay, with `NoStaleRead`, a read counts only a value its cell still holds; `AllLanded`, every
-accepted write is in the file at the end; and liveness), 3 mutations (a result that counts on
-the cursor alone breaks `NoStaleRead`, through the seek back; a lent write that goes in flight
-over the one there and a lent write cancelled when its task goes away break `AllLanded`), and 3
-witnesses (a read that reads again, the write of a task that went away landing, a read after
-the seek that counts the lent write's value). In Rust a seek needs the handle exclusively, so
-it cannot overlap a read; the model lets it, so the epoch rule is checked for any path that
-moves the cursor back.
+moves on, and its jobs run on the blocking pool or the ring of the task's shard, in any order;
+a write on the ring may land in two parts, and a shard that goes has its ring's calls made on
+the pool, from where they stopped. Two tasks each read one cell at the cursor into their own
+buffers: a read waits for the write in flight, its job reads at the cursor, and its result
+counts only if the cursor and the epoch are still those it read at, else it reads again. A
+third task writes a cell from the pool, then one from its own buffer (which waits for the write
+in flight and then is that write), then seeks back to the start. Any task may go away while its
+job is out: a read job is cancelled or its result dropped, and a lent write still lands. A file
+opened to append makes its writes on the pool at its end, wherever the cursor was; once one
+landed the cursor is the end of it; and its writer appends once more after the seek. 18
+configurations: 5 that must pass (tasks that may go away and tasks that stay, and a file opened
+to append, with `NoStaleRead`, a read counts only a value its cell still holds; `NoTornRead`,
+no read counts a cell a write landed only part of; `AllLanded`, every accepted write is in the
+file at the end; for the append, `NoOverwrite`, no append writes over what the file holds, and
+`CursorAtEnd`, the cursor is the file's end once an append landed; and liveness, twice), 7
+mutations (a result that counts on the cursor alone breaks `NoStaleRead`, through the seek back;
+a lent write that goes in flight over the one there, a lent write cancelled when its task goes
+away, a write cut short on the ring that counts as done, and a write on the ring cancelled with
+its shard that ends there break `AllLanded`; an append that lands where the cursor was breaks
+`NoOverwrite`; a cursor that stays where an append was made breaks `CursorAtEnd`), and 6
+witnesses (a read that reads again, the write of a task that went away landing, a read after the
+seek that counts the lent write's value, a write on the ring landing in two parts, one cut short
+whose shard went finished on the pool, an append after the seek landing at the end). In Rust a
+seek needs the handle exclusively, so it cannot overlap a read; the model lets it, so the epoch
+rule is checked for any path that moves the cursor back.
 
 The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
 rules on real sockets and files, each with a mutation of the code that makes one of them fail.

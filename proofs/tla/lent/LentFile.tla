@@ -18,7 +18,10 @@
 (* the write in flight and is then the write in flight itself, then seeks *)
 (* back to the start (a seek waits for the write in flight). Any task may *)
 (* go away while its job is out: a read job is cancelled or its result    *)
-(* dropped, and a lent write still lands.                                  *)
+(* dropped, and a lent write still lands. A file opened to append makes   *)
+(* its writes on the pool at its end, wherever the cursor was; once one   *)
+(* landed the cursor is the end of it, and the writer appends once more    *)
+(* after its seek to the start.                                            *)
 (*                                                                          *)
 (* What is abstract: the file state's guard (a step under it runs whole), *)
 (* the write-behind (the copied write is the first, so it goes in flight  *)
@@ -28,16 +31,18 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 
 CONSTANTS
     MayLeave,  \* whether a task may go away while its job is out
+    Appending, \* whether the file was opened to append
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Readers == {"r1", "r2"}
-Cells == 0..3
+Cells == 0..5
 NoJob == [at |-> -1]
 
 (* --algorithm LentFile
 variables
     holder = "none",
     file = [i \in Cells |-> 0],     \* what the file holds: 0 before any write
+    size = 0,                       \* the file's end: one past the last cell written
     cursor = 0,
     epoch = 0,
     writing = NoJob,                \* the write in flight: [at, val, lent, ran, on, part]
@@ -50,12 +55,17 @@ variables
     redone = FALSE,                 \* (record) a read found the cursor or epoch moved and read again
     orphanLanded = FALSE,           \* (record) the write of a task that went away landed
     short = FALSE,                  \* (record) a write on the ring landed in two parts
-    movedMid = FALSE;               \* (record) a write cut short on the ring was finished on the pool
+    movedMid = FALSE,               \* (record) a write cut short on the ring was finished on the pool
+    overwrote = FALSE,              \* (record) an append landed on a cell already written
+    offEnd = FALSE,                 \* (record) an append landed and the cursor is not the end
+    pastCursor = FALSE;             \* (record) an append landed elsewhere than the cursor it was made at
 
 define
     InFlight == writing # NoJob /\ ~writing.ran
     \* Where a new job goes: the ring of the task's shard while it runs one, or the pool.
     Wheres == IF shut THEN {"pool"} ELSE {"ring", "pool"}
+    \* Where a write goes: an append always on the pool.
+    WriteWheres == IF Appending THEN {"pool"} ELSE Wheres
     \* A job its runner may make now: the pool's always, the ring's while the shard runs.
     Runs(j) == j.on = "pool" \/ ~shut
     AllDone == \A p \in Readers \cup {"writer"} : pc[p] = "Done"
@@ -63,12 +73,24 @@ end define;
 
 \* `poll_writes`, under the guard: a write that ran is taken out of flight, and the lent one's
 \* buffer goes back to its task (or with the job, if the task went away).
-macro PollWrites() begin
+\* `seekTo` is where a seek in the same step puts the cursor after, or -1.
+macro PollWrites(seekTo) begin
     if writing # NoJob /\ writing.ran then
         if writing.lent then
             if lent = "orphan" then orphanLanded := TRUE; end if;
             lent := IF lent = "out" THEN "done" ELSE "none";
         end if;
+    end if;
+    \* An append leaves the cursor at the end of what it wrote.
+    \* MUTATION cursor_stays: the cursor stays where the append was made.
+    cursor := IF seekTo >= 0 THEN seekTo
+              ELSE IF writing # NoJob /\ writing.ran /\ Appending /\ Mutation # "cursor_stays"
+                   THEN writing.at + 1
+                   ELSE cursor;
+    if seekTo < 0 /\ writing # NoJob /\ writing.ran /\ Appending /\ cursor # size then
+        offEnd := TRUE;
+    end if;
+    if writing # NoJob /\ writing.ran then
         writing := NoJob;
     end if;
 end macro;
@@ -81,9 +103,15 @@ P_loop:
         either
             await InFlight /\ Runs(writing);
             either
-                \* All of the write, or the rest of one cut short.
-                file[writing.at] := writing.val;
-                writing.ran := TRUE;
+                \* All of the write, or the rest of one cut short; an append at the end.
+                \* MUTATION append_at_cursor: an append lands where the cursor was.
+                with cell = IF Appending /\ Mutation # "append_at_cursor" THEN size ELSE writing.at do
+                    if Appending /\ file[cell] # 0 then overwrote := TRUE; end if;
+                    if Appending /\ cell # writing.at then pastCursor := TRUE; end if;
+                    file[cell] := writing.val;
+                    writing := [writing EXCEPT !.at = cell, !.ran = TRUE];
+                    size := IF cell + 1 > size THEN cell + 1 ELSE size;
+                end with;
             or
                 \* The ring's call takes only part of it: half the cell holds the value.
                 await writing.on = "ring" /\ writing.part = 0;
@@ -126,7 +154,7 @@ R_hold:
     await holder = "none";
     holder := self;
 R_submit:
-    PollWrites();
+    PollWrites(-1);
     \* A read sees the writes before it: it waits for the one in flight.
     if InFlight then
         holder := "none";
@@ -173,17 +201,17 @@ begin
 W_copy:
     \* A copied write: nothing is in flight, so it goes at once.
     await holder = "none";
-    with where \in Wheres do
+    with where \in WriteWheres do
         writing := [at |-> cursor, val |-> 1, lent |-> FALSE, ran |-> FALSE, on |-> where, part |-> 0];
     end with;
-    written := written \cup {<<cursor, 1>>};
+    written := written \cup {<<IF Appending THEN -1 ELSE cursor, 1>>};
     cursor := cursor + 1;
     epoch := epoch + 1;
 W_hold:
     await holder = "none";
     holder := "writer";
 W_poll:
-    PollWrites();
+    PollWrites(-1);
 W_lend:
     \* MUTATION lent_skips_wait: the lent write goes in flight over the one there.
     if InFlight /\ Mutation # "lent_skips_wait" then
@@ -192,10 +220,10 @@ W_wait_writes:
         await ~InFlight;
         goto W_hold;
     else
-        with where \in Wheres do
+        with where \in WriteWheres do
             writing := [at |-> cursor, val |-> 2, lent |-> TRUE, ran |-> FALSE, on |-> where, part |-> 0];
         end with;
-        written := written \cup {<<cursor, 2>>};
+        written := written \cup {<<IF Appending THEN -1 ELSE cursor, 2>>};
         cursor := cursor + 1;
         epoch := epoch + 1;
         lent := "out";
@@ -223,7 +251,7 @@ W_take:
     await holder = "none";
     holder := "writer";
 W_poll_again:
-    PollWrites();
+    PollWrites(-1);
 W_taken:
     if lent = "done" then
         lent := "none";
@@ -237,15 +265,30 @@ W_seek:
     await holder = "none";
     holder := "writer";
 W_seeked:
-    PollWrites();
+    \* A write in flight stays in flight: the seek waits; else it goes to the start.
+    PollWrites(IF InFlight THEN -1 ELSE 0);
     if InFlight then
         holder := "none";
         goto W_seek;
     else
-        cursor := 0;
         epoch := epoch + 1;
         holder := "none";
     end if;
+W_more:
+    if ~Appending then
+        goto Done;
+    end if;
+W_append:
+    \* Appending after the seek: nothing is in flight (the seek waited), so it goes at once.
+    await holder = "none";
+    writing := [at |-> cursor, val |-> 3, lent |-> FALSE, ran |-> FALSE, on |-> "pool", part |-> 0];
+    written := written \cup {<<-1, 3>>};
+    cursor := cursor + 1;
+    epoch := epoch + 1;
+W_append_wait:
+    \* A seek after it would wait for it, then take where it left the cursor.
+    await holder = "none" /\ ~InFlight;
+    PollWrites(-1);
 end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
@@ -264,8 +307,16 @@ NoStaleRead == ~stale
 \* No read counts a cell a write had landed only part of.
 NoTornRead == \A t \in taken : t[3] >= 0
 
-\* Once every task is done and no write is in flight, every write accepted is in the file.
-AllLanded == (AllDone /\ ~InFlight) => \A w \in written : file[w[1]] = w[2]
+\* Once every task is done and no write is in flight, every write accepted is in the file:
+\* at its cell, or anywhere for an append (-1).
+AllLanded == (AllDone /\ ~InFlight) =>
+    \A w \in written : IF w[1] >= 0 THEN file[w[1]] = w[2] ELSE \E c \in Cells : file[c] = w[2]
+
+\* An append never writes over what the file holds.
+NoOverwrite == ~overwrote
+
+\* Once an append landed and was taken, the cursor is the file's end.
+CursorAtEnd == ~offEnd
 
 \* `Termination` (every process ends) is the one the translator writes for the fair processes.
 
@@ -284,4 +335,6 @@ NoReadOfLent == \A t \in taken : t[3] # 2
 NoShortWrite == ~short
 \* A write cut short on the ring, whose shard then went, is finished on the pool.
 NoMovedMid == ~movedMid
+\* An append lands elsewhere than the cursor it was made at (after the seek to the start).
+NoAppendPastCursor == ~pastCursor
 =============================================================================

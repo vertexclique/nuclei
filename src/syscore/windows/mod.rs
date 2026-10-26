@@ -211,6 +211,10 @@ pub(crate) const TIMER_ALL_ACCESS: DWORD = 0x1F_0003;
 /// that moves a handle's completions to another port.
 pub(crate) const FILE_REPLACE_COMPLETION_INFORMATION: u32 = 61;
 pub(crate) const FILE_MODE_INFORMATION: u32 = 16;
+/// `FileAccessInformation`: the access a handle was granted.
+pub(crate) const FILE_ACCESS_INFORMATION: u32 = 8;
+pub(crate) const FILE_WRITE_DATA: ULONG = 0x2;
+pub(crate) const FILE_APPEND_DATA: ULONG = 0x4;
 pub(crate) const FILE_SYNCHRONOUS_IO_ALERT: ULONG = 0x10;
 pub(crate) const FILE_SYNCHRONOUS_IO_NONALERT: ULONG = 0x20;
 pub(crate) const FILE_TYPE_DISK: DWORD = 1;

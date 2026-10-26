@@ -15,11 +15,12 @@ use std::os::windows::io::{BorrowedHandle, FromRawSocket, OwnedHandle, OwnedSock
 use crate::io::raw::Raw;
 use crate::io::source::Kind;
 use crate::syscore::windows::{
-    AF_INET, AF_INET6, DWORD, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, FILE_BEGIN, FILE_CURRENT,
-    FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK,
-    GetFileSizeEx, GetFileType, HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP,
-    NtQueryInformationFile, OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN,
-    SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
+    AF_INET, AF_INET6, DWORD, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION,
+    FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT,
+    FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType,
+    HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, NtQueryInformationFile,
+    OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_TYPE,
+    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
     SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
     SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
     WSA_FLAG_OVERLAPPED, WSAIoctl, WSASocketW, WriteFile, bind, getsockname, getsockopt,
@@ -87,19 +88,32 @@ pub(crate) fn kind_of(raw: Raw) -> io::Result<Kind> {
 /// Whether the handle `raw` was opened for synchronous IO: its calls block
 /// the thread that makes them, and no completion of them reaches a port.
 pub(crate) fn synchronous(raw: Raw) -> io::Result<bool> {
+    let mode = file_information(raw, FILE_MODE_INFORMATION)?;
+    Ok(mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) != 0)
+}
+
+/// Whether the file handle `raw` appends: it may add to the file's end and
+/// not write over it (std's `append`).
+pub(crate) fn appends(raw: Raw) -> io::Result<bool> {
+    let access = file_information(raw, FILE_ACCESS_INFORMATION)?;
+    Ok(access & FILE_APPEND_DATA != 0 && access & FILE_WRITE_DATA == 0)
+}
+
+/// What the handle `raw` tells of itself in `class`, one ULONG.
+fn file_information(raw: Raw, class: u32) -> io::Result<ULONG> {
     let mut status = IO_STATUS_BLOCK {
         Status: 0,
         Information: 0,
     };
-    let mut mode: ULONG = 0;
+    let mut value: ULONG = 0;
     // SAFETY: the class answers with one ULONG, written into our own.
     let got = unsafe {
         NtQueryInformationFile(
             handle_of(raw),
             &mut status,
-            core::ptr::from_mut(&mut mode).cast(),
+            core::ptr::from_mut(&mut value).cast(),
             size_of::<ULONG>() as ULONG,
-            FILE_MODE_INFORMATION,
+            class,
         )
     };
     if got != STATUS_SUCCESS {
@@ -107,7 +121,7 @@ pub(crate) fn synchronous(raw: Raw) -> io::Result<bool> {
             crate::syscore::windows::status_error(got).unwrap_or(0),
         ));
     }
-    Ok(mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) != 0)
+    Ok(value)
 }
 
 /// Shuts the writing half of a stream socket down.
@@ -333,9 +347,23 @@ pub(crate) fn pread_uninit(
 }
 
 /// Writes all of `buf` at `offset` of the file.
-pub(crate) fn pwrite_all(raw: Raw, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+pub(crate) fn pwrite_all(raw: Raw, buf: &[u8], offset: u64) -> io::Result<()> {
+    write_all_at(raw, buf, Some(offset))
+}
+
+/// Writes all of `buf` at the end of a file that appends, returning the
+/// file's size after: the end of the bytes written, as no other writer
+/// appended meanwhile.
+pub(crate) fn append_all(raw: Raw, buf: &[u8]) -> io::Result<u64> {
+    write_all_at(raw, buf, None)?;
+    file_size(raw)
+}
+
+/// Writes all of `buf` at `offset`, or with `None` at the file's end.
+fn write_all_at(raw: Raw, mut buf: &[u8], mut offset: Option<u64>) -> io::Result<()> {
     while !buf.is_empty() {
-        let mut ov = at(offset);
+        // Both halves of the offset all ones: the file's end.
+        let mut ov = at(offset.unwrap_or(u64::MAX));
         let mut written: DWORD = 0;
         let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         // SAFETY: reads at most `len` bytes from `buf`.
@@ -355,7 +383,7 @@ pub(crate) fn pwrite_all(raw: Raw, mut buf: &[u8], mut offset: u64) -> io::Resul
             return Err(io::ErrorKind::WriteZero.into());
         }
         buf = &buf[written as usize..];
-        offset += u64::from(written);
+        offset = offset.map(|at| at + u64::from(written));
     }
     Ok(())
 }
