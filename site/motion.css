@@ -18,17 +18,50 @@
   animation: fade-in 600ms var(--ease-out) backwards;
 }
 
-/* The logo pours in from its bottom edge, as the liquid fills a tank; pointing at it or
- * focusing it pours it again and brightens its glow. The load pour runs on the frame and the
- * replay on the image, so leaving the link never replays the first. */
-.nav__logo {
-  transform-origin: bottom;
-  animation: pour-y 900ms var(--ease-out) 250ms backwards;
+/* The logo breathes: its eight arrows, and the brackets with them, ease out from the core
+ * along their own axes (45 degrees for the diagonals) and come back, while the diamonds hold
+ * still. Each shaft stretches from the core so its arrow stays joined to it. --nm-reach is how
+ * far they go, in the drawing's units (the mark is 672 of them across); pointing at the logo
+ * or focusing it reaches further and brightens the glow, and the reach eases between the two.
+ * The shafts' lengths, 163 and 273.65, and their roots, (512, 395) and (453.5, 453.5), are
+ * the drawing's own (art/build.py). Only transforms move. */
+@property --nm-reach {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
 }
 
-.nav__mark:focus-visible .nav__logo img {
-  animation: pour-y 700ms var(--ease-out);
+.nav__logo {
+  --nm-reach: 22;
+
+  transition: --nm-reach 900ms var(--ease-in-out);
+}
+
+.nm-ax-out,
+.nm-ax-shaft,
+.nm-dg-out,
+.nm-dg-shaft {
+  transform-box: view-box;
+  transform-origin: 0 0;
+  animation: 3.6s var(--ease-in-out) infinite;
+}
+
+.nm-ax-out { animation-name: nm-ax-out; }
+.nm-ax-shaft { animation-name: nm-ax-shaft; }
+.nm-dg-out { animation-name: nm-dg-out; }
+.nm-dg-shaft { animation-name: nm-dg-shaft; }
+
+.nav__mark:focus-visible .nav__logo {
+  --nm-reach: 38;
+}
+
+.nav__mark:focus-visible .nav__mark-svg {
   filter: drop-shadow(0 0 7px var(--color-glow));
+}
+
+/* Off screen, the logo waits (site.js marks the bar .is-idle). */
+.nav.is-idle .nav__logo * {
+  animation-play-state: paused;
 }
 
 .hero__line {
@@ -206,8 +239,11 @@
     transform: scaleX(1);
   }
 
-  .nav__mark:hover .nav__logo img {
-    animation: pour-y 700ms var(--ease-out);
+  .nav__mark:hover .nav__logo {
+    --nm-reach: 38;
+  }
+
+  .nav__mark:hover .nav__mark-svg {
     filter: drop-shadow(0 0 7px var(--color-glow));
   }
 }
@@ -369,6 +405,26 @@
   16% { transform: translateX(260%) skewX(-12deg); opacity: 1; }
   18%,
   100% { transform: translateX(260%) skewX(-12deg); opacity: 0; }
+}
+
+@keyframes nm-ax-out {
+  50% { transform: translateY(calc(var(--nm-reach) * -1px)); }
+}
+
+@keyframes nm-ax-shaft {
+  0%,
+  100% { transform: translate(512px, 395px) scaleY(1) translate(-512px, -395px); }
+  50% { transform: translate(512px, 395px) scaleY(calc(1 + var(--nm-reach) / 163)) translate(-512px, -395px); }
+}
+
+@keyframes nm-dg-out {
+  50% { transform: translate(calc(var(--nm-reach) * -0.7071px), calc(var(--nm-reach) * -0.7071px)); }
+}
+
+@keyframes nm-dg-shaft {
+  0%,
+  100% { transform: translate(453.5px, 453.5px) rotate(45deg) scaleX(1) rotate(-45deg) translate(-453.5px, -453.5px); }
+  50% { transform: translate(453.5px, 453.5px) rotate(45deg) scaleX(calc(1 + var(--nm-reach) / 273.65)) rotate(-45deg) translate(-453.5px, -453.5px); }
 }
 
 @keyframes ink-drift {

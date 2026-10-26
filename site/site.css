@@ -199,8 +199,9 @@ a:active {
   white-space: nowrap;
 }
 
-/* The logo, drawn in lines heavy enough for its size (site/logo.svg, from art/build.py), with
- * the liquid's glow around them. It is sized by the bar, never by the text, so it stays crisp. */
+/* The logo, inline (art/build.py writes it into every page) in lines heavy enough for its size,
+ * with the liquid's glow around them. It is sized by the bar, never by the text, so it stays
+ * crisp; motion.css makes its arrows breathe. */
 .nav__logo {
   display: block;
   flex: none;
@@ -208,12 +209,12 @@ a:active {
   block-size: var(--mark-size);
 }
 
-.nav__logo img {
+.nav__mark-svg {
   display: block;
   inline-size: 100%;
   block-size: 100%;
+  overflow: visible;
   filter: drop-shadow(0 0 4px var(--color-glow-2));
-  transform-origin: bottom;
   transition: filter var(--dur-short) var(--ease-out);
 }
 

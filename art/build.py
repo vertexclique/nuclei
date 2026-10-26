@@ -22,13 +22,17 @@ profile). Files written:
     art/nuclei-logo-1024.png         nuclei-logo.svg at 1024 by 1024
     art/nuclei-logo-square.png       nuclei-logo-dark.svg at 1024 by 1024
     art/nuclei-logo-square-512.png   nuclei-logo-dark.svg at 512 by 512
-    site/logo.svg                    the site's header mark: lines drawn heavier for small sizes
     site/favicon.svg                 the favicon: the mark, heavier still, on a navy square
     site/favicon-32.png              site/favicon.svg at 32 by 32, for browsers without SVG icons
     site/apple-touch-icon.png        site/favicon.svg at 180 by 180
     site/media/social.png            the link preview: the mark on navy, 1200 by 630
+
+and it writes the header mark inline into every page with the bar (site/index.html and
+site/learn/*.html), in heavier lines for its size, its arrows grouped for the animation in
+site/motion.css.
 """
 
+import re
 import shutil
 import struct
 import subprocess
@@ -95,37 +99,71 @@ def num(value):
     return f"{value:g}"
 
 
-def drawing(stroke, transform=None):
-    """The defs and the mark, as lines of SVG."""
+def drawing(stroke, transform=None, prefix="", moving=False):
+    """The defs and the mark, as lines of SVG.
+
+    `prefix` starts every id, so the mark can sit inline in a page beside other ids. `moving`
+    gives the header mark the classes its animation moves: each arrow's outer part (the head
+    with its chevron or its bracket) as one group, and each shaft on its own, which stretches.
+    """
+    ids = {name: f"{prefix}{name}" for name, _, _ in GRADIENTS}
     out = ["  <defs>"]
     for name, (x1, y1, x2, y2), stops in GRADIENTS:
         out.append(
-            f'    <linearGradient id="{name}" gradientUnits="userSpaceOnUse" '
+            f'    <linearGradient id="{ids[name]}" gradientUnits="userSpaceOnUse" '
             f'x1="{num(x1)}" y1="{num(y1)}" x2="{num(x2)}" y2="{num(y2)}">'
         )
         out += [f'      <stop offset="{num(o)}" stop-color="{c}"/>' for o, c in stops]
         out.append("    </linearGradient>")
-    out.append('    <clipPath id="gap">')
+    out.append(f'    <clipPath id="{prefix}gap">')
     out.append('      <path clip-rule="evenodd" d="M0 0H1024V1024H0ZM512 363L661 512L512 661L363 512Z"/>')
     out.append("    </clipPath>")
     for name, d, clipped in PATHS:
-        clip = ' clip-path="url(#gap)"' if clipped else ""
-        out.append(f'    <path id="p-{name}"{clip} d="{d}"/>')
+        clip = f' clip-path="url(#{prefix}gap)"' if clipped else ""
+        out.append(f'    <path id="{prefix}p-{name}"{clip} d="{d}"/>')
     out.append("  </defs>")
     group = f'  <g fill="none" stroke-width="{num(stroke)}" stroke-linejoin="miter" stroke-miterlimit="4"'
     out.append(group + (f' transform="{transform}">' if transform else ">"))
-    out += [f'    <path stroke="url(#core)" d="{d}"/>' for d in DIAMONDS]
+    out += [f'    <path stroke="url(#{ids["core"]})" d="{d}"/>' for d in DIAMONDS]
+
+    def use(part, paint, cls=""):
+        cls = f' class="{prefix}{cls}"' if moving and cls else ""
+        return f'<use{cls} href="#{prefix}p-{part}" stroke="url(#{ids[paint]})"/>'
+
     for angle, chevron, kind in ROTATIONS:
         out.append(f'    <g transform="rotate({angle} 512 512)">' if angle else "    <g>")
-        out.append('      <use href="#p-ax-shaft" stroke="url(#ax-shaft)"/>')
-        out.append('      <use href="#p-ax-head" stroke="url(#ax-head)"/>')
-        out.append(f'      <use href="#p-ax-chev" stroke="url(#{chevron})"/>')
-        out.append(f'      <use href="#p-dg-shaft" stroke="url(#dg-shaft-{kind})"/>')
-        out.append(f'      <use href="#p-dg-head" stroke="url(#dg-head-{kind})"/>')
-        out.append('      <use href="#p-dg-bracket" stroke="url(#bracket)"/>')
+        out.append("      " + use("ax-shaft", "ax-shaft", "ax-shaft"))
+        outer = [use("ax-head", "ax-head"), use("ax-chev", chevron)]
+        out += [f'      <g class="{prefix}ax-out">' + "".join(outer) + "</g>"] if moving else ["      " + u for u in outer]
+        out.append("      " + use("dg-shaft", f"dg-shaft-{kind}", "dg-shaft"))
+        outer = [use("dg-head", f"dg-head-{kind}"), use("dg-bracket", "bracket")]
+        out += [f'      <g class="{prefix}dg-out">' + "".join(outer) + "</g>"] if moving else ["      " + u for u in outer]
         out.append("    </g>")
     out.append("  </g>")
     return out
+
+
+def header_mark():
+    """The header mark, inline in every page so its arrows can move: heavier lines for its few
+    dozen pixels, ids that start with nm-, and hidden from assistive technology (the link's
+    text names it)."""
+    lines = drawing(16, prefix="nm-", moving=True)
+    x, y, w, h = TIGHT
+    return (f'<svg class="nav__mark-svg" viewBox="{x} {y} {w} {h}" width="44" height="44" '
+            f'aria-hidden="true" focusable="false">' + "".join(line.strip() for line in lines) + "</svg>")
+
+
+def put_header_mark(mark):
+    """Writes the header mark into every page that has the bar: the home page and Learn."""
+    pages = [ROOT / "site/index.html", *sorted((ROOT / "site/learn").glob("*.html"))]
+    pattern = re.compile(r'(<span class="nav__logo">).*?(</span>)', re.S)
+    for page in pages:
+        text = page.read_text()
+        new, count = pattern.subn(lambda m: m.group(1) + mark + m.group(2), text)
+        if count != 1:
+            sys.exit(f"{page.relative_to(ROOT)}: expected one header mark, found {count}")
+        page.write_text(new)
+    return pages
 
 
 def svg(view_box, width, height, stroke, navy=None, transform=None):
@@ -187,8 +225,6 @@ def main():
     svgs = {
         "art/nuclei-logo.svg": svg(TIGHT, 672, 672, STROKE),
         "art/nuclei-logo-dark.svg": svg((0, 0, 1024, 1024), 1024, 1024, STROKE, navy=(0, 0, 1024, 1024)),
-        # Heavier lines where the mark is shown a few dozen pixels wide.
-        "site/logo.svg": svg(TIGHT, 672, 672, 16),
         "site/favicon.svg": svg((136, 136, 752, 752), 752, 752, 20, navy=(136, 136, 752, 752)),
     }
     for name, text in svgs.items():
@@ -218,8 +254,10 @@ def main():
     ]
     for source, target, width, height in renders:
         render(ROOT / source, ROOT / target, width, height)
+    pages = put_header_mark(header_mark())
     for name in [*svgs, "site/media/social.png", *(target for _, target, _, _ in renders)]:
         print(name)
+    print(f"the header mark, inline in {len(pages)} pages")
 
 
 if __name__ == "__main__":

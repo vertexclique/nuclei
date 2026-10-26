@@ -599,9 +599,9 @@ if (!still.matches && "IntersectionObserver" in window) {
     }
   });
 
-  // Loops run only on screen: the hero's footage, dots and tanks (.is-idle when away), and
-  // the proactor diagram, which plays a pass (.is-playing), fades it (.is-clearing) and
-  // plays again while it is in view.
+  // Loops run only on screen: the hero's footage, dots and tanks (.is-idle when away), the
+  // bar's logo, and the proactor diagram, which plays a pass (.is-playing), fades it
+  // (.is-clearing) and plays again while it is in view.
   const hero = document.querySelector(".hero");
   const video = hero?.querySelector("video");
   const saveData = navigator.connection?.saveData === true;
@@ -645,6 +645,11 @@ if (!still.matches && "IntersectionObserver" in window) {
   });
   if (hero) sight.observe(hero);
   for (const flow of document.querySelectorAll(".flow")) sight.observe(flow);
+  // The bar's breathing logo waits while the bar is scrolled away.
+  const bar = document.querySelector(".nav");
+  if (bar) {
+    new IntersectionObserver(([entry]) => bar.classList.toggle("is-idle", !entry.isIntersecting)).observe(bar);
+  }
   still.addEventListener("change", () => {
     playback();
     if (still.matches) for (const flow of [...passes.keys()]) rest(flow);
