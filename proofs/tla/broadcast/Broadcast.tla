@@ -1,21 +1,23 @@
 ------------------------------ MODULE Broadcast ------------------------------
 (***************************************************************************)
 (* The broadcast channel's senders and a receiver (src/sync/broadcast.rs:  *)
-(* `Sender::send`, `Receiver::try_recv`, the last sender's drop), at the   *)
-(* grain of each atomic access.                                             *)
+(* `Sender::send`, `Receiver::try_recv`, the last sender's drop,           *)
+(* `WeakSender::upgrade`), at the grain of each atomic access.             *)
 (*                                                                          *)
 (* In plain words: the channel is a ring of `Cap` slots, each holding the  *)
-(* position of the latest value sent to it. A sender takes the next       *)
+(* position of the latest value sent to it. A sender takes the next        *)
 (* position from the tail, then publishes it into the position's slot,     *)
-(* unless the slot holds a later position already (a send a ring later    *)
-(* got there first: the value goes, every receiver is past it). The last  *)
-(* sender to go closes the channel. The receiver looks at the slot of its *)
-(* next position: its own position there is a value taken; a later one is *)
-(* a lag, and it goes on from the oldest position the ring can hold (the  *)
-(* tail, read then, less `Cap`), counting what it skipped; anything else  *)
-(* is nothing yet, unless the channel is closed and its next position is  *)
-(* the tail: then it is done. What it took plus what it heard it lost     *)
-(* must be every value sent.                                               *)
+(* unless the slot holds a later position already (a send a ring later got *)
+(* there first: the value goes, every receiver is past it). The last       *)
+(* sender to go closes the channel. A weak sender's upgrade counts one     *)
+(* more sender only while one is left (a compare-and-swap on the count);   *)
+(* the sender it makes sends and goes as any does. The receiver looks at   *)
+(* the slot of its next position: its own position there is a value taken; *)
+(* a later one is a lag, and it goes on from the oldest position the ring  *)
+(* can hold (the tail, read then, less `Cap`), counting what it skipped;   *)
+(* anything else is nothing yet, unless the channel is closed and its next *)
+(* position is the tail: then it is done. What it took plus what it heard  *)
+(* it lost must be every value sent.                                       *)
 (*                                                                          *)
 (* What is abstract: a value is its position; a wait for a send is the     *)
 (* receiver looking again (the wake is `Notify`'s, checked with the sync   *)
@@ -26,10 +28,10 @@ EXTENDS Integers, FiniteSets, TLC
 CONSTANTS
     Cap,        \* slots in the ring
     Senders,    \* the senders, numbered 1, 2, ...
+    Weak,       \* the weak senders, each trying one upgrade, numbered after them
     PerSender,  \* values each sender sends
     Mutation    \* "none", or the name of the one rule this run takes away
 
-Total == Cardinality(Senders) * PerSender
 ReceiverT == 0
 
 (* --algorithm Broadcast
@@ -42,14 +44,28 @@ variables
     taken = 0,
     lost = 0,
     done = FALSE,                      \* the receiver saw the close
+    upgraded = 0,                      \* weak senders whose upgrade made a sender
     lagged = FALSE,                    \* (record) the receiver heard of a lag
-    superseded = FALSE;                \* (record) a send found a later position in its slot
+    superseded = FALSE,                \* (record) a send found a later position in its slot
+    refused = FALSE;                   \* (record) an upgrade found no sender left
 
-fair process sender \in Senders
-variables pos = 0, sent = 0;
+fair process sender \in Senders \union Weak
+variables pos = 0, sent = 0, holds = self \in Senders;
 begin
+S_upgrade:
+    \* A weak sender's upgrade, one compare-and-swap on the sender count.
+    \* MUTATION upgrade_closed: the upgrade counts a sender with none left.
+    if ~holds then
+        if live > 0 \/ Mutation = "upgrade_closed" then
+            live := live + 1;
+            upgraded := upgraded + 1;
+            holds := TRUE;
+        else
+            refused := TRUE;
+        end if;
+    end if;
 S_loop:
-    while sent < PerSender do
+    while holds /\ sent < PerSender do
         pos := tail;
         tail := tail + 1;
 S_publish:
@@ -62,9 +78,11 @@ S_publish:
         sent := sent + 1;
     end while;
 S_gone:
-    live := live - 1;
-    if live = 0 then
-        closed := TRUE;
+    if holds then
+        live := live - 1;
+        if live = 0 then
+            closed := TRUE;
+        end if;
     end if;
 end process;
 
@@ -104,6 +122,9 @@ end algorithm; *)
 (* The properties.                                                         *)
 (***************************************************************************)
 
+\* Every value the senders send: the senders', and those of each upgrade.
+Total == (Cardinality(Senders) + upgraded) * PerSender
+
 \* Once done, what the receiver took plus what it heard it lost is every value sent.
 Counted == done => taken + lost = Total
 
@@ -122,4 +143,8 @@ Finishes == <>done
 NoLag == ~lagged
 \* A send finds a later position in its slot, and its value goes.
 NoSuperseded == ~superseded
+\* A weak sender's upgrade makes a sender.
+NoUpgrade == upgraded = 0
+\* A weak sender's upgrade finds no sender left.
+NoRefused == ~refused
 =============================================================================

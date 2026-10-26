@@ -51,16 +51,18 @@
 //! - Wait-free: [`Receiver::try_recv`], [`Receiver::len`],
 //!   [`Receiver::is_empty`], [`Sender::receiver_count`],
 //!   [`Sender::same_channel`], [`Sender::subscribe`],
-//!   [`Receiver::resubscribe`], and the clones and drops but the last
-//!   sender's and the last receiver's.
+//!   [`Receiver::resubscribe`], [`Sender::downgrade`], the sender counts,
+//!   and the clones and drops but the last sender's and the last
+//!   receiver's.
 //! - Lock-free: [`Sender::send`] (its compare-and-swap is retried only if a
 //!   send a whole ring later published into the same slot meanwhile, and it
 //!   ends by waking the waiting receivers through
 //!   [`Notify::notify_waiters`](super::Notify), which is lock-free);
 //!   [`Sender::len`] and [`Sender::is_empty`] (they look at every
 //!   receiver); polling [`Receiver::recv`] and [`Sender::closed`] (a poll
-//!   may queue a waiter); and the last sender's or receiver's drop, for its
-//!   wake.
+//!   may queue a waiter); [`WeakSender::upgrade`] (a compare-and-swap on
+//!   the sender count, retried when a sender was cloned or dropped
+//!   meanwhile); and the last sender's or receiver's drop, for its wake.
 
 #![allow(unsafe_code)]
 
@@ -170,8 +172,11 @@ struct Shared<T: Send + Sync + 'static> {
     tail: CachePadded<AtomicU64>,
     /// Every sender is gone.
     closed: AtomicBool,
-    /// How many [`Sender`]s exist.
+    /// How many [`Sender`]s exist. Once zero it stays zero: a sender is
+    /// made only from another, or by an upgrade that finds one.
     senders: AtomicUsize,
+    /// How many [`WeakSender`]s exist.
+    weak_senders: AtomicUsize,
     /// The receivers' cursors, by id; their count is the receiver count.
     cursors: kovan_map::HashMap<u64, Arc<Cursor>>,
     receivers: AtomicUsize,
@@ -242,29 +247,9 @@ impl<T: Send + Sync + 'static> Drop for Shared<T> {
 /// assert_eq!(rx.try_recv(), Ok(1));
 /// ```
 pub fn channel<T: Clone + Send + Sync + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    assert!(
-        capacity > 0,
-        "a broadcast channel's capacity cannot be zero"
-    );
-    assert!(
-        capacity <= usize::MAX >> 1,
-        "a broadcast channel's capacity cannot exceed usize::MAX / 2"
-    );
-    let capacity = capacity.next_power_of_two();
-    let shared = Arc::new(Shared {
-        slots: (0..capacity).map(|_| Atomic::null()).collect(),
-        mask: capacity as u64 - 1,
-        tail: CachePadded::new(AtomicU64::new(0)),
-        closed: AtomicBool::new(false),
-        senders: AtomicUsize::new(1),
-        // 64 is the smallest table the map accepts.
-        cursors: kovan_map::HashMap::with_capacity(64),
-        receivers: AtomicUsize::new(0),
-        notify_rx: Notify::new(),
-        notify_tx: Notify::new(),
-    });
-    let rx = Shared::subscribe(&shared);
-    (Sender { shared }, rx)
+    let tx = Sender::new(capacity);
+    let rx = tx.subscribe();
+    (tx, rx)
 }
 
 /// Sends values to every [`Receiver`] of the channel.
@@ -285,7 +270,71 @@ pub struct Receiver<T: Send + Sync + 'static> {
     cursor: Arc<Cursor>,
 }
 
+/// A sender that does not keep the channel open.
+///
+/// Made by [`Sender::downgrade`]. Once every [`Sender`] is gone the channel
+/// is closed, whatever `WeakSender`s are left. A `WeakSender` sends nothing
+/// itself: [`upgrade`](Self::upgrade) makes a [`Sender`] of it while one
+/// exists.
+///
+/// ```
+/// use nuclei::sync::broadcast;
+///
+/// let (tx, _rx) = broadcast::channel::<u8>(4);
+/// let weak = tx.downgrade();
+/// assert!(weak.upgrade().is_some());
+/// drop(tx);
+/// assert!(weak.upgrade().is_none());
+/// ```
+pub struct WeakSender<T: Send + Sync + 'static> {
+    shared: Arc<Shared<T>>,
+}
+
 impl<T: Send + Sync + 'static> Sender<T> {
+    /// A sender of a new channel holding the last `capacity` values (rounded
+    /// up to a power of two), with no receiver yet: each comes from
+    /// [`subscribe`](Self::subscribe).
+    ///
+    /// # Panics
+    ///
+    /// When `capacity` is zero, or above `usize::MAX / 2`.
+    ///
+    /// ```
+    /// use nuclei::sync::broadcast::Sender;
+    ///
+    /// let tx = Sender::new(4);
+    /// assert!(tx.send(1).is_err(), "no receiver yet");
+    /// let mut rx = tx.subscribe();
+    /// tx.send(2).unwrap();
+    /// assert_eq!(rx.try_recv(), Ok(2));
+    /// ```
+    pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "a broadcast channel's capacity cannot be zero"
+        );
+        assert!(
+            capacity <= usize::MAX >> 1,
+            "a broadcast channel's capacity cannot exceed usize::MAX / 2"
+        );
+        let capacity = capacity.next_power_of_two();
+        Self {
+            shared: Arc::new(Shared {
+                slots: (0..capacity).map(|_| Atomic::null()).collect(),
+                mask: capacity as u64 - 1,
+                tail: CachePadded::new(AtomicU64::new(0)),
+                closed: AtomicBool::new(false),
+                senders: AtomicUsize::new(1),
+                weak_senders: AtomicUsize::new(0),
+                // 64 is the smallest table the map accepts.
+                cursors: kovan_map::HashMap::with_capacity(64),
+                receivers: AtomicUsize::new(0),
+                notify_rx: Notify::new(),
+                notify_tx: Notify::new(),
+            }),
+        }
+    }
+
     /// Sends `value` to every receiver there is now, returning how many.
     ///
     /// A send never waits: the channel holds the last `capacity` values, and
@@ -363,6 +412,27 @@ impl<T: Send + Sync + 'static> Sender<T> {
     /// How many receivers there are.
     pub fn receiver_count(&self) -> usize {
         self.shared.receivers.load(Ordering::SeqCst)
+    }
+
+    /// A [`WeakSender`] of the channel, which does not keep it open. The
+    /// sender itself stays.
+    #[must_use = "a WeakSender that is not kept does nothing"]
+    pub fn downgrade(&self) -> WeakSender<T> {
+        // Relaxed: a plain counter.
+        self.shared.weak_senders.fetch_add(1, Ordering::Relaxed);
+        WeakSender {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// How many [`Sender`]s exist.
+    pub fn strong_count(&self) -> usize {
+        self.shared.senders.load(Ordering::Acquire)
+    }
+
+    /// How many [`WeakSender`]s exist.
+    pub fn weak_count(&self) -> usize {
+        self.shared.weak_senders.load(Ordering::Relaxed)
     }
 
     /// How many values the slowest receiver has yet to take, at most the
@@ -454,6 +524,64 @@ impl<T: Send + Sync + 'static> fmt::Debug for Sender<T> {
         f.debug_struct("Sender")
             .field("receivers", &self.receiver_count())
             .finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + Sync + 'static> WeakSender<T> {
+    /// A [`Sender`] of the channel, while one exists; `None` once the last
+    /// is gone (the channel is closed then, for good).
+    pub fn upgrade(&self) -> Option<Sender<T>> {
+        let senders = &self.shared.senders;
+        // Acquire on a success, as a clone's: the new sender's sends come
+        // after the close only if no sender was left, which this rules out.
+        let mut count = senders.load(Ordering::Acquire);
+        while count > 0 {
+            match senders.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Sender {
+                        shared: Arc::clone(&self.shared),
+                    });
+                }
+                Err(now) => count = now,
+            }
+        }
+        None
+    }
+
+    /// How many [`Sender`]s exist.
+    pub fn strong_count(&self) -> usize {
+        self.shared.senders.load(Ordering::Acquire)
+    }
+
+    /// How many [`WeakSender`]s exist.
+    pub fn weak_count(&self) -> usize {
+        self.shared.weak_senders.load(Ordering::Relaxed)
+    }
+}
+
+impl<T: Send + Sync + 'static> Clone for WeakSender<T> {
+    fn clone(&self) -> Self {
+        self.shared.weak_senders.fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<T: Send + Sync + 'static> Drop for WeakSender<T> {
+    fn drop(&mut self) {
+        self.shared.weak_senders.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl<T: Send + Sync + 'static> fmt::Debug for WeakSender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WeakSender").finish_non_exhaustive()
     }
 }
 
@@ -574,6 +702,39 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
                 Err(TryRecvError::Empty) => notified.await,
             }
         }
+    }
+
+    /// Receives the next value from a thread that may block.
+    ///
+    /// Like [`recv`](Self::recv), but it parks the calling thread while no
+    /// value came and the channel is open. On a nuclei shard (inside one of
+    /// its tasks) it does not park the thread: it runs a nested `block_on`,
+    /// so the shard keeps running its other tasks meanwhile. Inside another
+    /// runtime's task it blocks that task's thread.
+    ///
+    /// # Errors
+    ///
+    /// As for [`recv`](Self::recv).
+    ///
+    /// # Panics
+    ///
+    /// On `wasm32`, where no other thread can send, when no value came and
+    /// the channel is open: the call could never end.
+    ///
+    /// ```
+    /// use nuclei::sync::broadcast::{self, RecvError};
+    ///
+    /// let (tx, mut rx) = broadcast::channel::<u8>(4);
+    /// let receiver = std::thread::spawn(move || {
+    ///     assert_eq!(rx.blocking_recv(), Ok(10));
+    ///     assert_eq!(rx.blocking_recv(), Err(RecvError::Closed));
+    /// });
+    /// tx.send(10).unwrap();
+    /// drop(tx);
+    /// receiver.join().unwrap();
+    /// ```
+    pub fn blocking_recv(&mut self) -> Result<T, RecvError> {
+        super::internal::blocking(self.recv())
     }
 }
 

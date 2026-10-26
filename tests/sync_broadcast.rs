@@ -263,3 +263,86 @@ fn threads_lose_nothing_but_what_the_lags_report() {
         }
     }
 }
+
+/// A weak sender does not keep the channel open; its upgrade makes a sender
+/// while one exists, and that sender keeps the channel open as any does.
+#[test]
+fn a_weak_sender_upgrades_only_while_a_sender_exists() {
+    let (tx, mut rx) = broadcast::channel(4);
+    let weak = tx.downgrade();
+    let other = weak.clone();
+    assert_eq!((tx.strong_count(), tx.weak_count()), (1, 2));
+    let upgraded = weak.upgrade().expect("a sender exists");
+    assert_eq!((weak.strong_count(), weak.weak_count()), (2, 2));
+    drop(tx);
+    upgraded.send(1).unwrap();
+    assert_eq!(rx.try_recv(), Ok(1));
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    drop(upgraded);
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+    assert!(weak.upgrade().is_none(), "the last sender is gone");
+    assert_eq!(weak.strong_count(), 0);
+    drop(other);
+    assert_eq!(weak.weak_count(), 1);
+}
+
+/// Once the last sender went the channel is closed for good: no upgrade
+/// opens it again after a receiver saw the close.
+#[test]
+fn a_channel_with_only_weak_senders_is_closed_for_good() {
+    let (tx, mut rx) = broadcast::channel::<u8>(4);
+    let weak = tx.downgrade();
+    drop(tx);
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+    assert!(weak.upgrade().is_none());
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+}
+
+/// An upgrade racing the last sender's drop either gets a sender, whose
+/// value reaches the receiver before the close, or gets none.
+#[test]
+fn an_upgrade_racing_the_last_drop_loses_no_value() {
+    for _ in 0..2_000 {
+        let (tx, mut rx) = broadcast::channel(4);
+        let weak = tx.downgrade();
+        let upgrader =
+            std::thread::spawn(move || weak.upgrade().map(|tx| tx.send(1).unwrap()).is_some());
+        drop(tx);
+        let upgraded = upgrader.join().unwrap();
+        let mut got = 0;
+        loop {
+            match rx.try_recv() {
+                Ok(1) => got += 1,
+                Err(TryRecvError::Closed) => break,
+                other => panic!("{other:?} after every sender went"),
+            }
+        }
+        assert_eq!(got, usize::from(upgraded));
+    }
+}
+
+#[test]
+fn a_new_sender_has_no_receiver_until_one_subscribes() {
+    let tx = broadcast::Sender::new(2);
+    assert_eq!(tx.receiver_count(), 0);
+    assert_eq!(tx.send(1), Err(SendError(1)));
+    let mut rx = tx.subscribe();
+    assert_eq!(tx.send(2), Ok(1));
+    assert_eq!(rx.try_recv(), Ok(2));
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+/// `blocking_recv` on a thread waits for a send, then for the close.
+#[test]
+fn blocking_recv_waits_for_a_send_and_for_the_close() {
+    let (tx, mut rx) = broadcast::channel(4);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let receiver = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        (rx.blocking_recv(), rx.blocking_recv())
+    });
+    ready_rx.recv().unwrap();
+    tx.send(7).unwrap();
+    drop(tx);
+    assert_eq!(receiver.join().unwrap(), (Ok(7), Err(RecvError::Closed)));
+}

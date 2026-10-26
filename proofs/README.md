@@ -634,14 +634,18 @@ break `Settles`; a killer that only looks breaks `NoKillAfterReap`), and 4 witne
 receiver (`src/sync/broadcast.rs`). A sender takes the next position from the tail and
 publishes it into the position's slot unless the slot holds a later position (a send a ring
 later got there first: its value goes, every receiver is past it); the last sender to go
-closes the channel. The receiver looks at its next position's slot: its own position is a value
-taken, a later one is a lag (it goes on from the tail, read then, less the ring's size, counting
-what it skipped), anything else is nothing yet, unless the channel is closed and its next
-position is the tail. 7 configurations: 2 that must pass (what was taken plus what was
-reported lost is every value sent; the receiver reaches the close), 3 mutations (a send
-publishing over a later position leaves the receiver waiting for good, `Finishes`; stopping at
-the close with values in the ring and an uncounted lag break `Counted`), and 2 witnesses (a
-lag; a send that finds a later position in its slot). `lean/Nuclei/Broadcast.lean` proves the
+closes the channel. A weak sender's upgrade counts one more sender only while one is left (a
+compare-and-swap on the count), and the sender it makes sends and goes as any does. The
+receiver looks at its next position's slot: its own position is a value taken, a later one is
+a lag (it goes on from the tail, read then, less the ring's size, counting what it skipped),
+anything else is nothing yet, unless the channel is closed and its next position is the tail.
+10 configurations: 2 that must pass, with a weak sender upgrading at any point (what was taken
+plus what was reported lost is every value sent; the receiver reaches the close), 4 mutations
+(a send publishing over a later position leaves the receiver waiting for good, `Finishes`;
+stopping at the close with values in the ring, an uncounted lag, and an upgrade that makes a
+sender after the last one went, whose values come after the receiver saw the close, break
+`Counted`), and 4 witnesses (a lag; a send that finds a later position in its slot; an upgrade
+that makes a sender; one that finds none left). `lean/Nuclei/Broadcast.lean` proves the
 arithmetic, for every size: a later position found in a receiver's slot is at least a whole
 ring later, so the receiver's new position is past its old one; the ring's last positions sit
 in different slots; and a take or a lag keeps taken plus lost equal to the positions passed,

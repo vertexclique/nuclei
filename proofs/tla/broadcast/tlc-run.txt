@@ -1,14 +1,17 @@
-TLC run of every configuration in proofs/tla/broadcast, 2026-10-25 14:53 UTC.
+TLC run of every configuration in proofs/tla/broadcast, 2026-10-26 19:37 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-PB_safe                          70941      27770      2  pass                                  pass                                  yes
-PB_live                          70941      27770      3  pass                                  pass                                  yes
-MB_over_later                    75661      29588      3  violated:Finishes                     violated:Finishes                     yes
-MB_closed_only                   32602      14373      2  violated:Counted                      violated:Counted                      yes
-MB_lag_uncounted                 65802      26115      2  violated:Counted                      violated:Counted                      yes
-WB_lag                             341        205      2  violated:NoLag                        violated:NoLag                        yes
-WB_superseded                      204        123      1  violated:NoSuperseded                 violated:NoSuperseded                 yes
+PB_safe                       22657519    6655174     12  pass                                  pass                                  yes
+PB_live                       22657519    6655174     97  pass                                  pass                                  yes
+MB_over_later                    76235      29794      2  violated:Finishes                     violated:Finishes                     yes
+MB_closed_only                   33176      14579      1  violated:Counted                      violated:Counted                      yes
+MB_lag_uncounted                 66376      26321      1  violated:Counted                      violated:Counted                      yes
+WB_lag                             494        269      1  violated:NoLag                        violated:NoLag                        yes
+WB_superseded                      333        180      1  violated:NoSuperseded                 violated:NoSuperseded                 yes
+MB_upgrade_closed                 3070       1481      1  violated:Counted                      violated:Counted                      yes
+WB_upgraded                          4          4      1  violated:NoUpgrade                    violated:NoUpgrade                    yes
+WB_refused                         312        165      1  violated:NoRefused                    violated:NoRefused                    yes
 
-results matching EXPECTED.txt: 7 of 7
+results matching EXPECTED.txt: 10 of 10
