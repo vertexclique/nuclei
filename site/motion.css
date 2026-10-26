@@ -18,9 +18,17 @@
   animation: fade-in 600ms var(--ease-out) backwards;
 }
 
-.nav__mark::before {
+/* The logo pours in from its bottom edge, as the liquid fills a tank; pointing at it or
+ * focusing it pours it again and brightens its glow. The load pour runs on the frame and the
+ * replay on the image, so leaving the link never replays the first. */
+.nav__logo {
   transform-origin: bottom;
   animation: pour-y 900ms var(--ease-out) 250ms backwards;
+}
+
+.nav__mark:focus-visible .nav__logo img {
+  animation: pour-y 700ms var(--ease-out);
+  filter: drop-shadow(0 0 7px var(--color-glow));
 }
 
 .hero__line {
@@ -196,6 +204,11 @@
   .nav__link:hover::after,
   .foot__links a:hover::after {
     transform: scaleX(1);
+  }
+
+  .nav__mark:hover .nav__logo img {
+    animation: pour-y 700ms var(--ease-out);
+    filter: drop-shadow(0 0 7px var(--color-glow));
   }
 }
 

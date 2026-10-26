@@ -140,7 +140,6 @@ a:active {
 }
 
 /* Everything that holds the liquid. */
-.nav__mark::before,
 .btn--primary,
 .chamber__liquid {
   background: var(--fill-liquid);
@@ -185,9 +184,11 @@ a:active {
 }
 
 .nav__mark {
+  --mark-size: clamp(2.125rem, 1.75rem + 1.25vw, 2.75rem);
+
   display: inline-flex;
   align-items: center;
-  gap: var(--space-xs);
+  gap: 0.625rem;
   font-family: var(--font-display);
   font-size: var(--text-lg);
   font-weight: 600;
@@ -198,12 +199,22 @@ a:active {
   white-space: nowrap;
 }
 
-/* A square of the liquid. */
-.nav__mark::before {
-  content: "";
-  inline-size: 0.55em;
-  block-size: 0.55em;
-  box-shadow: 0 0 12px 1px var(--color-glow);
+/* The logo, drawn in lines heavy enough for its size (site/logo.svg, from art/build.py), with
+ * the liquid's glow around them. It is sized by the bar, never by the text, so it stays crisp. */
+.nav__logo {
+  display: block;
+  flex: none;
+  inline-size: var(--mark-size);
+  block-size: var(--mark-size);
+}
+
+.nav__logo img {
+  display: block;
+  inline-size: 100%;
+  block-size: 100%;
+  filter: drop-shadow(0 0 4px var(--color-glow-2));
+  transform-origin: bottom;
+  transition: filter var(--dur-short) var(--ease-out);
 }
 
 .nav__links {
@@ -257,20 +268,35 @@ a:active {
   white-space: nowrap;
 }
 
-/* On the narrowest phones Source leaves the bar (it is in the footer), so no link wraps. */
-@media (max-width: 25.99rem) {
+/* Narrow screens close the bar up so nothing wraps or runs off: Source leaves it below 30rem
+ * and API below 22.5rem (both are in the footer, and search reaches the API too). */
+@media (max-width: 29.99rem) {
+  .nav__links {
+    gap: var(--space-sm);
+  }
+
   .nav__link--wide {
     display: none;
   }
 }
 
 @media (max-width: 23.99rem) {
+  .nav__mark {
+    gap: var(--space-xs);
+  }
+
   .nav__links {
-    gap: var(--space-sm);
+    gap: var(--space-xs);
   }
 
   .nav__cta {
     padding: 0 var(--space-sm);
+  }
+}
+
+@media (max-width: 22.49rem) {
+  .nav__link--mid {
+    display: none;
   }
 }
 

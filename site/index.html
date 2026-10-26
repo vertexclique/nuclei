@@ -10,10 +10,16 @@
   <meta property="og:description" content="Hand over the IO, get back the result. One shard per core, each driving its own IO: io_uring or epoll on Linux, kqueue on macOS and the BSDs, completion ports on Windows.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://vertexclique.com/nuclei/">
-  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/social.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="The Nuclei logo: a diamond inside a diamond, with eight arrows pointing out">
+  <meta name="twitter:card" content="summary_large_image">
   <meta name="theme-color" content="#05090f">
   <meta name="color-scheme" content="dark">
+  <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
@@ -22,15 +28,17 @@
   <link rel="stylesheet" href="code.css">
   <link rel="stylesheet" href="cards.css">
   <link rel="stylesheet" href="flow.css">
+  <link rel="stylesheet" href="search.css">
   <link rel="stylesheet" href="motion.css">
 </head>
 <body id="top">
   <header class="nav">
-    <a class="nav__mark" href="#top">Nuclei</a>
+    <a class="nav__mark" href="#top"><span class="nav__logo"><img src="logo.svg" alt="" width="44" height="44"></span>Nuclei</a>
     <nav class="nav__links" aria-label="Primary">
       <a class="nav__link" href="learn/">Learn</a>
-      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--mid" href="https://docs.rs/nuclei">API</a>
       <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <button class="nav__search" type="button" data-search aria-haspopup="dialog" hidden><svg class="nav__search-icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2" width="8.5" height="8.5"/><path d="M10.5 10.5 14 14"/></svg><span class="nav__search-label">Search</span><kbd class="nav__kbd" data-search-key aria-hidden="true">Ctrl K</kbd></button>
       <a class="nav__cta" href="#install">Install</a>
     </nav>
   </header>
@@ -72,7 +80,7 @@
       </figure>
     </section>
 
-    <section class="band" aria-labelledby="band-title">
+    <section class="band" id="interfaces" aria-labelledby="band-title">
       <h2 class="visually-hidden" id="band-title">Kernel interfaces</h2>
       <ul class="band__list">
         <li class="band__item tile" data-reveal>
@@ -173,7 +181,7 @@
       <p class="section-note" data-reveal><a href="learn/">Learn</a> goes from this line to a server in production, and the API reference is on <a href="https://docs.rs/nuclei">docs.rs</a>.</p>
     </section>
 
-    <section class="program" aria-labelledby="program-title">
+    <section class="program" id="example" aria-labelledby="program-title">
       <div class="section-head" data-reveal>
         <h2 id="program-title">An echo server, one task per connection</h2>
         <p class="section-head__dek">No setup and no configuration: the first <code>spawn</code> or <code>block_on</code> starts a runtime with one shard per core.</p>
@@ -211,7 +219,7 @@
       </div>
     </section>
 
-    <section class="decisions" aria-labelledby="decisions-title">
+    <section class="decisions" id="decisions" aria-labelledby="decisions-title">
       <div class="section-head" data-reveal>
         <h2 id="decisions-title">The decisions <span class="ink">underneath</span></h2>
       </div>
@@ -269,7 +277,7 @@
       </ul>
     </section>
 
-    <section class="kit" aria-labelledby="kit-title">
+    <section class="kit" id="modules" aria-labelledby="kit-title">
       <div class="section-head" data-reveal>
         <h2 id="kit-title"><span class="ink">Modules</span></h2>
         <p class="section-head__dek">The pieces a server needs, in the one crate.</p>
@@ -323,7 +331,7 @@
       </ul>
     </section>
 
-    <section class="checked" aria-labelledby="checked-title">
+    <section class="checked" id="checked" aria-labelledby="checked-title">
       <div class="section-head" data-reveal>
         <h2 id="checked-title"><span class="ink">Checked</span>, not assumed</h2>
         <p class="section-head__dek">The concurrent protocols are model-checked, the arithmetic under them is proved, and the suite runs on every backend.</p>
