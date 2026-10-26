@@ -172,3 +172,17 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Reentrant.step_keeps_good
 #print axioms Nuclei.Reentrant.the_share_follows_the_depths
 #print axioms Nuclei.Reentrant.refused_iff
+
+-- The waiter node's state word: a claim takes the current slot and keeps the rest, one claim at a
+-- time; the register swap disarms, avoids the taken slot and keeps the marks; the arming swap
+-- arms; a take claims again keeping its bits, and ends clearing only its own.
+#print axioms Nuclei.Waiter.of_every
+#print axioms Nuclei.Waiter.claim_takes_the_current_slot
+#print axioms Nuclei.Waiter.claim_keeps_the_rest
+#print axioms Nuclei.Waiter.one_claim_at_a_time
+#print axioms Nuclei.Waiter.register_disarms
+#print axioms Nuclei.Waiter.register_avoids_the_taken_slot
+#print axioms Nuclei.Waiter.register_keeps_the_marks
+#print axioms Nuclei.Waiter.arm_arms
+#print axioms Nuclei.Waiter.claiming_again_keeps_the_take
+#print axioms Nuclei.Waiter.a_take_ends_cleanly

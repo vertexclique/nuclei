@@ -828,6 +828,36 @@ checks a few levels), that the mutex's owner holds the permit exactly while its 
 zero, and that the reader-writer lock's owner holds exactly the share its read and write depths
 call for after any steps, a write being refused exactly when the owner reads without writing.
 
+## The waiter node
+
+`waiter` (`tla/waiter/Waiter.tla`) checks the node every contended future of the sync primitives
+parks in their queues (`src/sync/waiter/`), at the grain of its state word's compare-and-swaps and
+of each access to its two waker slots: a future arms the node and queues it, registers a new
+waker in the slot a take under way is not reading and reads the marks in the swap that arms it,
+spins with its waker disarmed, is polled without a wake (a combinator, say), marks itself owed,
+and leaves by withdrawing; drain passes in turn nudge and grant it, claiming the armed waker for
+the pass's wake list; each wake list takes the waker, claims again one armed meanwhile on a
+granted or nudged node, and calls them beside the later passes; and the node goes back to the
+pool with its last reference, for the next future to take. 16 configurations: 4 that must pass (a
+spin and a spurious poll; a leave and an owed mark; two nudges; two futures through the pool),
+with no slot touched by two parties at once, no party acting after it let go of its reference,
+nothing referenced in the pool, the waker never armed while the future registers, the owed count
+settling to zero, no waker claimed while the future spins, and everything ending with the
+future's latest waker the one called; 7 mutations (a claim while the future registers and a
+registration in the slot a take reads, `SlotExclusive`; a take that does not claim again and an
+arming swap that does not read the marks, `AllEnd`; a spin that keeps its waker armed,
+`NoClaimWhileSpinning`; a queue release that frees the node whoever holds it, `NoStaleAccess`; a
+queue release that forgets the owed mark, `OwedSettled`); and 5 witnesses (a claim again, a mark
+during a spin, a reuse through the pool, an owed mark settled by the queue, a leave that takes
+back its armed waker). The registering test of `claimable` is implied by its armed test, since
+every swap that sets the registering bit clears the armed one (`ArmedApart`): the mutation takes
+both away. `lean/Nuclei/Waiter.lean` checks the word's own constants and expressions over all
+4096 values: a claim takes the current slot, sets the taking bit and the wake reference and keeps
+the phase, the marks and the other references, and a node just claimed is not claimable; the
+register swap disarms, picks the slot a take under way is not reading and keeps the marks; the
+arming swap arms and takes the nudge; a take that claims again keeps its bits, and one that ends
+clears only its own.
+
 ## The run loop's looks at its driver
 
 `loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver

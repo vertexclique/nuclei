@@ -14,6 +14,7 @@ import Nuclei.RwLock
 import Nuclei.Semaphore
 import Nuclei.Task
 import Nuclei.Watch
+import Nuclei.Waiter
 import Nuclei.Wheel
 
 /-!
