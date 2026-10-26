@@ -46,7 +46,13 @@ impl Handle<TcpListener> {
         poll_fn(|cx| self.poll_accept(cx)).await
     }
 
-    fn poll_accept(
+    /// Polls for the next connection, with its peer's address: `Pending`
+    /// with `cx`'s waker kept until one comes.
+    ///
+    /// # Errors
+    ///
+    /// As [`accept`](Self::accept).
+    pub fn poll_accept(
         &self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<(Handle<TcpStream>, SocketAddr)>> {
@@ -207,6 +213,22 @@ impl Handle<TcpStream> {
     /// As `recv(2)` with `MSG_PEEK`.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         poll_fn(|cx| self.source().poll_read(cx, buf, true)).await
+    }
+
+    /// Polls for the bytes the next receive returns, into the unfilled part
+    /// of `buf`, without taking them; `buf` advances by what came.
+    ///
+    /// # Errors
+    ///
+    /// As `recv(2)` with `MSG_PEEK`.
+    pub fn poll_peek(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut crate::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<usize>> {
+        let n = core::task::ready!(self.source().poll_read(cx, buf.initialize_unfilled(), true))?;
+        buf.advance(n);
+        Poll::Ready(Ok(n))
     }
 
     /// `SO_LINGER`: how long a close waits for unsent data, `None` if it

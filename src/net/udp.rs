@@ -1,14 +1,15 @@
 //! UDP sockets.
 
 use core::future::poll_fn;
+use core::task::{Context, Poll};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
 use super::addr::{ToSocketAddrs, resolve};
 use super::none_worked;
-use crate::io::Handle;
 use crate::io::source::write::Dest;
 use crate::io::source::{Addr, Kind};
+use crate::io::{Handle, ReadBuf};
 
 impl Handle<UdpSocket> {
     /// A socket bound to the first of the addresses `addr` names that it
@@ -115,15 +116,70 @@ impl Handle<UdpSocket> {
         self.receive(buf, true).await
     }
 
+    /// The sender of the next datagram, which stays to be received.
+    ///
+    /// # Errors
+    ///
+    /// As `recvfrom(2)` with `MSG_PEEK`.
+    pub async fn peek_sender(&self) -> io::Result<SocketAddr> {
+        poll_fn(|cx| self.poll_peek_sender(cx)).await
+    }
+
+    /// Polls for the sender of the next datagram, which stays to be
+    /// received. No byte of it is copied.
+    ///
+    /// # Errors
+    ///
+    /// As `recvfrom(2)` with `MSG_PEEK`.
+    pub fn poll_peek_sender(&self, cx: &mut Context<'_>) -> Poll<io::Result<SocketAddr>> {
+        self.poll_receive(cx, &mut [], true)
+            .map(|r| r.map(|(_, addr)| addr))
+    }
+
+    /// Receives a datagram from the connected peer into the unfilled part of
+    /// `buf`, which advances by its length; what does not fit is cut.
+    ///
+    /// # Errors
+    ///
+    /// As `recv(2)`.
+    pub async fn recv_buf(&self, buf: &mut ReadBuf<'_>) -> io::Result<usize> {
+        self.recv_buf_from(buf).await.map(|(n, _)| n)
+    }
+
+    /// Receives a datagram and its sender's address into the unfilled part
+    /// of `buf`, which advances by its length; what does not fit is cut.
+    ///
+    /// # Errors
+    ///
+    /// As `recvfrom(2)`.
+    pub async fn recv_buf_from(&self, buf: &mut ReadBuf<'_>) -> io::Result<(usize, SocketAddr)> {
+        // vertexia: the unfilled part is zeroed the first time a buffer offers
+        // it (a `ReadBuf` remembers what it initialized); the receive path
+        // takes initialized bytes. Uninitialized memory through the receive
+        // paths if a profile shows the zeroing.
+        let (n, addr) = self.receive(buf.initialize_unfilled(), false).await?;
+        buf.advance(n);
+        Ok((n, addr))
+    }
+
     async fn receive(&self, buf: &mut [u8], peek: bool) -> io::Result<(usize, SocketAddr)> {
-        let (n, addr) = poll_fn(|cx| self.source().poll_receive(cx, buf, peek)).await?;
-        match addr {
+        poll_fn(|cx| self.poll_receive(cx, buf, peek)).await
+    }
+
+    fn poll_receive(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+        peek: bool,
+    ) -> Poll<io::Result<(usize, SocketAddr)>> {
+        let (n, addr) = core::task::ready!(self.source().poll_receive(cx, buf, peek))?;
+        Poll::Ready(match addr {
             Addr::Inet(addr) => Ok((n, addr)),
             #[cfg(unix)]
             Addr::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "a UDP datagram came with no internet address",
             )),
-        }
+        })
     }
 }
