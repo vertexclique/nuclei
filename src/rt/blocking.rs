@@ -195,6 +195,19 @@ impl Pool {
 /// Threads of every blocking pool alive now.
 static ALIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Runs `call` on the blocking pool and answers its result; a call whose task
+/// was lost (its runtime shut down) is an error, not a panic.
+pub(crate) async fn call<T, F>(call: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    match crate::runtime::spawn_blocking(call).join().await {
+        Ok(result) => result.inspect_err(crate::rt::counters::io_error),
+        Err(lost) => Err(lost.into()),
+    }
+}
+
 /// Threads of the blocking pools alive now, for `stats`.
 pub(crate) fn threads_alive() -> usize {
     ALIVE.load(core::sync::atomic::Ordering::Relaxed)

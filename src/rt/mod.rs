@@ -2,7 +2,7 @@
 //! own the shards.
 
 pub(crate) mod backend;
-mod blocking;
+pub(crate) mod blocking;
 pub(crate) mod context;
 pub(crate) mod counters;
 mod handshake;

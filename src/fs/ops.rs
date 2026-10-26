@@ -8,19 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::io::Handle;
-
-/// Runs `call` on the blocking pool and answers its result; a call whose task
-/// was lost (its runtime shut down) is an error, not a panic.
-pub(crate) async fn blocking<T, F>(call: F) -> io::Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> io::Result<T> + Send + 'static,
-{
-    match crate::runtime::spawn_blocking(call).join().await {
-        Ok(result) => result.inspect_err(crate::rt::counters::io_error),
-        Err(lost) => Err(lost.into()),
-    }
-}
+pub(crate) use crate::rt::blocking::call as blocking;
 
 /// The whole file at `path`.
 pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
