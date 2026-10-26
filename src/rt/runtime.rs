@@ -751,9 +751,7 @@ fn block_on_with<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
     let _guest = super::paused::Guest::enter(inner, &shard.shared);
     #[cfg(port)]
     shard.take_port_back();
-    let output = shard.block_on(future);
-    shard.leave();
-    output
+    shard.block_on_then_leave(future)
 }
 
 /// Runs `future` to its end on the calling thread, running other tasks of

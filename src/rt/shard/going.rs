@@ -13,6 +13,20 @@ use super::Shard;
 use crate::io::Source;
 
 impl Shard {
+    /// Runs `future` to its end on this shard, a thread's own, entered for
+    /// the outermost `block_on` of the thread; then leaves, whether the
+    /// call returned or unwound, so what waits on this shard is handed on.
+    pub(crate) fn block_on_then_leave<F: core::future::Future>(&self, future: F) -> F::Output {
+        struct Leaving<'a>(&'a Shard);
+        impl Drop for Leaving<'_> {
+            fn drop(&mut self) {
+                self.0.leave();
+            }
+        }
+        let _leaving = Leaving(self);
+        self.block_on(future)
+    }
+
     /// The outermost `block_on` of a thread outside the runtime returned,
     /// and this, its own shard, runs again only at its next one.
     pub(crate) fn leave(&self) {

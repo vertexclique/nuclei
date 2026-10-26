@@ -312,9 +312,7 @@ pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
         // a completion, a request posted to it) comes only if it runs.
         if let Some(shard) = crate::rt::context::own_shard_if_made() {
             let _entered = crate::rt::context::enter(&shard);
-            let output = shard.block_on(future);
-            shard.leave();
-            return output;
+            return shard.block_on_then_leave(future);
         }
     }
     match wait_here(future) {
