@@ -1,0 +1,63 @@
+/* Hallmark · genre: editorial · macrostructure: Map / Diagram · theme: Brutal · enrichment: Tier A CSS diagram · nav: N7 · footer: Ft4
+ * tone: brutalist · audience: Rust developers choosing a runtime · use: add it to Cargo.toml
+ * anchor hue: 50 (warm concrete) · accent: signal red-orange, hue 35
+ */
+
+:root {
+  /* Paper, ink and the steps between, all tinted toward the warm anchor. */
+  --color-paper:     oklch(93% 0.012 75);
+  --color-paper-2:   oklch(89% 0.014 75);
+  --color-ink:       oklch(18% 0.012 50);
+  --color-ink-2:     oklch(26% 0.012 50);
+  --color-muted:     oklch(38% 0.010 50);
+  --color-on-ink:    oklch(93% 0.010 75);
+  --color-on-ink-2:  oklch(78% 0.010 75);
+  --color-rule:      oklch(18% 0.012 50);
+  /* The one accent: marks, the focus ring, link underlines. */
+  --color-accent:    oklch(56% 0.200 35);
+  --color-accent-on-ink: oklch(70% 0.170 38);
+  --color-focus:     oklch(56% 0.200 35);
+
+  --font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+  --font-body:    "Geist", ui-sans-serif, sans-serif;
+  --font-mono:    "Geist Mono", ui-monospace, monospace;
+
+  /* Major third from a 16 px body. */
+  --text-xs:   0.8rem;
+  --text-sm:   0.875rem;
+  --text-base: 1rem;
+  --text-md:   1.25rem;
+  --text-lg:   1.5625rem;
+  --text-xl:   1.9531rem;
+  --text-2xl:  2.4414rem;
+  --text-3xl:  3.0518rem;
+  --text-display: clamp(3rem, 8vw + 0.5rem, 6rem);
+
+  --space-3xs: 0.125rem;
+  --space-2xs: 0.25rem;
+  --space-xs:  0.5rem;
+  --space-sm:  0.75rem;
+  --space-md:  1rem;
+  --space-lg:  1.5rem;
+  --space-xl:  2.5rem;
+  --space-2xl: 4rem;
+  --space-3xl: 6rem;
+  --space-4xl: 9rem;
+
+  --page-gutter: clamp(1rem, 4vw, 3rem);
+  --measure: 62ch;
+
+  --rule-thin:  2px;
+  --rule:       3px;
+  --rule-heavy: 8px;
+  --radius:     0;
+
+  --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in:     cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+
+  --z-base:   1;
+  --z-sticky: 200;
+}
