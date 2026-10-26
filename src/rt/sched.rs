@@ -58,6 +58,18 @@ unsafe impl Schedule for Sched {
             super::tuning::call(hooks.terminate.as_ref(), id);
         }
     }
+
+    fn panicked(&self, _id: super::task::Id) {
+        let runtime = self
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.shutdown.as_ref());
+        if let Some(runtime) = runtime.and_then(std::sync::Weak::upgrade) {
+            // In the middle of the task's change of state: nothing here may
+            // unwind.
+            super::task::abort_on_panic(|| runtime.shut_down_on_panic());
+        }
+    }
 }
 
 /// A task's future, counted in its shard's live tasks until it completes

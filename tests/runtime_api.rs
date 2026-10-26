@@ -1,13 +1,14 @@
 //! The runtime's API around its handle: entering a runtime without
 //! `block_on`, the current handle without the default's fallback, runtime
-//! ids, worker indices, a shutdown that does not wait, thread hooks and the
-//! scheduler knobs.
+//! ids, worker indices, a shutdown that does not wait, thread hooks, the
+//! scheduler knobs (the LIFO slot and the seed among them) and a runtime
+//! that shuts down when a task panics.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use nuclei::runtime::{Runtime, RuntimeHandle, worker_index};
+use nuclei::runtime::{RngSeed, Runtime, RuntimeHandle, UnhandledPanic, worker_index};
 
 fn runtime(workers: usize, name: &'static str) -> Runtime {
     Runtime::builder()
@@ -263,4 +264,168 @@ fn a_runtime_without_task_hooks_calls_none() {
         0,
         "another runtime's hook ran"
     );
+}
+
+/// Without the LIFO slot, tasks a task spawns run in the order it spawned
+/// them; with it, the last one runs first.
+#[test]
+fn without_the_lifo_slot_tasks_run_in_the_order_they_came() {
+    fn order(lifo: bool) -> Vec<u8> {
+        let mut builder = Runtime::builder().worker_threads(1).pin_workers(false);
+        if !lifo {
+            builder = builder.disable_lifo_slot();
+        }
+        let rt = builder.build().unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (a, b) = (Arc::clone(&log), Arc::clone(&log));
+        rt.block_on(rt.spawn(async move {
+            let first = nuclei::spawn(async move { a.lock().unwrap().push(1) });
+            let second = nuclei::spawn(async move { b.lock().unwrap().push(2) });
+            first.await;
+            second.await;
+        }));
+        log.lock().unwrap().clone()
+    }
+    assert_eq!(order(true), [2, 1], "the task woken last runs next");
+    assert_eq!(order(false), [1, 2]);
+}
+
+/// Which branch of 64 fair `select!`s runs, in `block_on` and on a worker.
+fn picks(seed: Option<RngSeed>) -> Vec<u8> {
+    async fn sixty_four() -> Vec<u8> {
+        let mut picks = Vec::new();
+        for _ in 0..64 {
+            picks.push(nuclei::select! {
+                n = core::future::ready(0u8) => n,
+                n = core::future::ready(1u8) => n,
+                n = core::future::ready(2u8) => n,
+                n = core::future::ready(3u8) => n,
+            });
+        }
+        picks
+    }
+    let mut builder = Runtime::builder().worker_threads(1).pin_workers(false);
+    if let Some(seed) = seed {
+        builder = builder.rng_seed(seed);
+    }
+    let rt = builder.build().unwrap();
+    let mut picks = rt.block_on(sixty_four());
+    picks.extend(rt.block_on(rt.spawn(sixty_four())));
+    picks
+}
+
+#[test]
+fn a_seeded_runtime_repeats_its_random_choices() {
+    let seed = RngSeed::from_bytes(b"repeat");
+    assert_eq!(picks(Some(seed)), picks(Some(seed)));
+    assert_ne!(
+        picks(Some(seed)),
+        picks(Some(RngSeed::from_bytes(b"other")))
+    );
+    // Unseeded, the choices differ run to run (all 128 alike: 4^-127).
+    assert_ne!(picks(None), picks(None));
+}
+
+/// A future's outcome on this thread, outside any runtime, within thirty
+/// seconds.
+fn wait_here<F: core::future::Future>(future: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing came within thirty seconds"
+        );
+        std::thread::park_timeout(Duration::from_millis(100));
+    }
+}
+
+fn message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
+}
+
+/// Built to shut down when a task panics, the runtime does: the `block_on`
+/// running panics, and every later one; the task's handle still reports
+/// its panic; the workers stop and drop the tasks they hold; a task in a
+/// nested `block_on` on a worker panics out of it too.
+#[test]
+fn a_task_panic_shuts_down_a_runtime_built_to_stop_on_one() {
+    struct Dropped(Arc<AtomicUsize>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let rt = Runtime::builder()
+        .worker_threads(2)
+        .pin_workers(false)
+        .unhandled_panic(UnhandledPanic::ShutdownRuntime)
+        .build()
+        .unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guard = Dropped(Arc::clone(&dropped));
+    rt.spawn(async move {
+        let _guard = guard;
+        core::future::pending::<()>().await
+    })
+    .detach();
+    // Sleeps, not waits for good: an implementation that does not shut down
+    // fails here in bounded time rather than hanging the test.
+    let nested = rt.spawn(async { nuclei::block_on(nuclei::time::sleep(Duration::from_secs(20))) });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            tx.send(nuclei::spawn(async { panic!("a task fails") }))
+                .unwrap();
+            nuclei::time::sleep(Duration::from_secs(20)).await
+        })
+    }));
+    let said = message(&*ran.expect_err("the block_on panics"));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the block_on heard of the panic only when its own future woke it"
+    );
+    assert!(
+        said.contains("shut down because one of its tasks panicked"),
+        "{said}"
+    );
+    let failed = wait_here(rx.recv().unwrap().join()).expect_err("the task panicked");
+    assert_eq!(message(&*failed.into_panic()), "a task fails");
+    let nested = wait_here(nested.join()).expect_err("the nested block_on panicked");
+    assert!(message(&*nested.into_panic()).contains("shut down because"));
+    let later = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(async { 1 })));
+    assert!(later.is_err(), "every later block_on panics");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while dropped.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the waiting task was not dropped"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// By default a task's panic is its outcome alone: the runtime runs on.
+#[test]
+fn a_task_panic_leaves_a_runtime_running_by_default() {
+    let rt = runtime(1, "panic-ignored");
+    let failed = rt.block_on(rt.spawn(async { panic!("a task fails") }).join());
+    assert!(failed.unwrap_err().is_panic());
+    assert_eq!(rt.block_on(rt.spawn(async { 7 })), 7);
 }

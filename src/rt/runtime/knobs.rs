@@ -1,9 +1,10 @@
 //! The builder's hooks and scheduler knobs: what the runtime calls on its
-//! threads and around its tasks, and how its workers run their loops.
+//! threads and around its tasks, how its workers run their loops, what it
+//! does when a task panics, and the seed of its random choices.
 
 use std::sync::Arc;
 
-use super::{Builder, TaskMeta};
+use super::{Builder, RngSeed, TaskMeta, UnhandledPanic};
 
 impl Builder {
     /// Called on each thread the runtime starts (workers and blocking-pool
@@ -97,6 +98,45 @@ impl Builder {
     pub fn max_io_events_per_tick(mut self, events: usize) -> Self {
         assert!(events > 0, "max_io_events_per_tick must be at least 1");
         self.tuning.max_io_events = events;
+        self
+    }
+
+    /// Turns off each worker's LIFO slot, where a task woken by the task
+    /// running on the worker goes to run next. Without it the woken task
+    /// goes to the back of the worker's queue: fairer when the queue is
+    /// long, slower for a task that hands work to another and waits for it.
+    pub fn disable_lifo_slot(mut self) -> Self {
+        self.tuning.lifo = false;
+        self
+    }
+
+    /// Seeds the runtime's random choices, so that they repeat run after
+    /// run; see [`RngSeed`].
+    pub fn rng_seed(mut self, seed: RngSeed) -> Self {
+        self.rng_seed = Some(seed);
+        self
+    }
+
+    /// What the runtime does when one of its tasks panics (default
+    /// [`UnhandledPanic::Ignore`]: the panic goes to the task's handle).
+    ///
+    /// ```
+    /// use nuclei::runtime::{Runtime, UnhandledPanic};
+    ///
+    /// let rt = Runtime::builder()
+    ///     .unhandled_panic(UnhandledPanic::ShutdownRuntime)
+    ///     .build()
+    ///     .unwrap();
+    /// let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    ///     rt.block_on(async {
+    ///         let _task = nuclei::spawn(async { panic!("a task fails") });
+    ///         core::future::pending::<()>().await
+    ///     })
+    /// }));
+    /// assert!(ran.is_err(), "the block_on panics once the task did");
+    /// ```
+    pub fn unhandled_panic(mut self, policy: UnhandledPanic) -> Self {
+        self.unhandled_panic = policy;
         self
     }
 }

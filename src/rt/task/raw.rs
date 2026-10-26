@@ -351,7 +351,7 @@ where
             // Read once: while no runtime of the process has task hooks, the
             // poll costs one predictable branch more, not two calls.
             let hooked =
-                crate::rt::tuning::ANY_TASK_HOOKS.load(core::sync::atomic::Ordering::Relaxed);
+                crate::rt::tuning::ANY_POLL_HOOKS.load(core::sync::atomic::Ordering::Relaxed);
             if hooked {
                 cell.schedule.before_poll(header.id);
             }
@@ -376,6 +376,7 @@ where
             };
             match output {
                 Some(output) => {
+                    let panicked = output.is_err();
                     Self::drop_future(ptr);
                     cell.core
                         .with_mut(|core| (*core).output = ManuallyDrop::new(output));
@@ -401,6 +402,9 @@ where
                                             ManuallyDrop::drop(&mut (*core).output)
                                         })
                                     });
+                                }
+                                if panicked {
+                                    cell.schedule.panicked(header.id);
                                 }
                                 Self::finish(ptr, state);
                                 return false;

@@ -32,7 +32,7 @@ pub mod support {
     /// The branch a fair `select!` polls first.
     #[inline]
     pub fn start(branches: u32) -> u32 {
-        crate::rt::workers::random_below(branches as usize) as u32
+        crate::rt::rng::random_below(branches as usize) as u32
     }
 
     /// Whether the task may go on polling; when its cooperative budget is

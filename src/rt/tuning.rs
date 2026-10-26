@@ -15,6 +15,8 @@ pub(crate) struct Tuning {
     pub(crate) inbox_interval: u32,
     /// The most IO events one look at the driver takes.
     pub(crate) max_io_events: usize,
+    /// A task woken by the running task runs next.
+    pub(crate) lifo: bool,
     pub(crate) hooks: ThreadHooks,
 }
 
@@ -24,6 +26,7 @@ impl Default for Tuning {
             driver_interval: super::shard::DRIVER_INTERVAL,
             inbox_interval: super::shard::INBOX_INTERVAL,
             max_io_events: usize::MAX,
+            lifo: true,
             hooks: ThreadHooks::default(),
         }
     }
@@ -98,13 +101,16 @@ impl TaskMeta<'_> {
 /// A task hook.
 pub(crate) type TaskHook = Arc<dyn Fn(&TaskMeta<'_>) + Send + Sync>;
 
-/// A runtime's task hooks; a task of a runtime with none carries none.
+/// A runtime's task hooks, and the runtime to shut down when a task panics
+/// if it does that; a task of a runtime with none carries none.
 #[derive(Clone, Default)]
 pub(crate) struct TaskHooks {
     pub(crate) spawn: Option<TaskHook>,
     pub(crate) before_poll: Option<TaskHook>,
     pub(crate) after_poll: Option<TaskHook>,
     pub(crate) terminate: Option<TaskHook>,
+    /// Weak: the runtime holds its tasks' hooks.
+    pub(crate) shutdown: Option<std::sync::Weak<super::runtime::Inner>>,
 }
 
 impl TaskHooks {
@@ -113,6 +119,7 @@ impl TaskHooks {
             || self.before_poll.is_some()
             || self.after_poll.is_some()
             || self.terminate.is_some()
+            || self.shutdown.is_some()
     }
 }
 
@@ -120,6 +127,26 @@ impl TaskHooks {
 /// spawn that does not know its runtime looks for none.
 pub(crate) static ANY_TASK_HOOKS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Whether any runtime of the process has a hook around each poll: while
+/// none does, a poll calls none.
+pub(crate) static ANY_POLL_HOOKS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// What a runtime does when one of its tasks panics
+/// ([`Builder::unhandled_panic`](crate::runtime::Builder::unhandled_panic)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnhandledPanic {
+    /// The panic is the task's outcome, for whoever awaits it; the runtime
+    /// runs on.
+    #[default]
+    Ignore,
+    /// The runtime shuts down at once: its workers stop and drop their
+    /// tasks, and every `block_on` of it panics, those running and every
+    /// later one. The panicked task's handle still reports the panic.
+    ShutdownRuntime,
+}
 
 /// Calls `hook`, if set, for the task `id`. A hook that panics aborts the
 /// process: it runs in the middle of a task's change of state.

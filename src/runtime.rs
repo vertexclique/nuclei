@@ -29,7 +29,7 @@
 //! ```
 
 pub use crate::rt::runtime::{
-    Builder, EnterGuard, Runtime, RuntimeHandle, RuntimeId, TaskMeta, TryCurrentError, block_on,
-    spawn, spawn_blocking, spawn_local, worker_index,
+    Builder, EnterGuard, RngSeed, Runtime, RuntimeHandle, RuntimeId, TaskMeta, TryCurrentError,
+    UnhandledPanic, block_on, spawn, spawn_blocking, spawn_local, worker_index,
 };
 pub use crate::rt::task::{FallibleTask, Task};

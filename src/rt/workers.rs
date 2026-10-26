@@ -8,6 +8,7 @@
 //! to stop takes no new task from then on, runs the ones it has to their
 //! end, and exits; its slot is not filled again.
 
+use super::rng::random_below;
 use core::cell::Cell;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,6 +29,8 @@ thread_local! {
 pub(crate) struct Start {
     pub(crate) limits: Limits,
     pub(crate) tuning: super::tuning::Tuning,
+    /// Seeds each worker's generator.
+    pub(crate) seed: Option<super::rng::RngSeed>,
     pub(crate) stack: usize,
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
     /// The cores workers are pinned to, in turn; empty for none.
@@ -167,6 +170,7 @@ impl Workers {
         let cores = &workers.start.cores;
         let core = (!cores.is_empty()).then(|| cores[index % cores.len()]);
         let exits = workers.exits.clone();
+        let seed = workers.start.seed;
         let worker_inner = Arc::clone(inner);
         let spawned = std::thread::Builder::new()
             .name((workers.start.name)())
@@ -182,6 +186,7 @@ impl Workers {
                 }
                 let _exit = Exit(exits);
                 let _stopping = hooks.started();
+                let _seeded = seed.map(|seed| super::rng::Reseeded::new(seed, index as u64 + 1));
                 if let Some(core) = core {
                     super::runtime::pin_to(core);
                 }
@@ -271,32 +276,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// A random number below `n`, from a per-thread xorshift generator.
-pub(crate) fn random_below(n: usize) -> usize {
-    use core::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new({
-            // Seeded from the thread's own address and the clock: distinct
-            // per thread, and nothing depends on its quality but balance.
-            let local = 0u8;
-            let addr = &local as *const u8 as u64;
-            let time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
-            (addr ^ time.rotate_left(32)) | 1
-        });
-    }
-    STATE.with(|s| {
-        let mut x = s.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        // Multiply-shift: unbiased enough for placement, no division.
-        ((u128::from(x) * n as u128) >> 64) as usize
-    })
 }
 
 #[cfg(all(test, not(loom)))]

@@ -116,6 +116,9 @@ pub(crate) unsafe trait Schedule {
 
     /// The task's future was dropped: it completed or was cancelled.
     fn terminated(&self, _id: Id) {}
+
+    /// A poll of the task's future panicked, its outcome now.
+    fn panicked(&self, _id: Id) {}
 }
 
 /// A scheduled task: running it polls the task's future once.

@@ -36,8 +36,10 @@ use super::workers::{Start, Workers};
 
 mod enter;
 mod knobs;
+mod panic;
 pub use self::enter::{EnterGuard, RuntimeId, TryCurrentError, worker_index};
-pub use super::tuning::TaskMeta;
+pub use super::rng::RngSeed;
+pub use super::tuning::{TaskMeta, UnhandledPanic};
 
 /// What a runtime's threads share.
 pub(crate) struct Inner {
@@ -59,6 +61,13 @@ pub(crate) struct Inner {
     pub(crate) guests: kovan_map::HashMap<usize, Arc<Shared>>,
     /// The task hooks every task of this runtime carries, if any is set.
     task_hooks: Option<Arc<super::tuning::TaskHooks>>,
+    /// The runtime shuts down when a task panics; and once one did.
+    shutdown_on_panic: bool,
+    panicked: std::sync::atomic::AtomicBool,
+    /// Wakes the runtime's `block_on` calls when a task panicked.
+    on_panic: crate::sync::Notify,
+    /// Seeds the generator of a thread in this runtime's `block_on`.
+    rng_seed: Option<RngSeed>,
 }
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
@@ -84,6 +93,8 @@ pub struct Builder {
     start_paused: bool,
     tuning: super::tuning::Tuning,
     task_hooks: super::tuning::TaskHooks,
+    unhandled_panic: UnhandledPanic,
+    rng_seed: Option<RngSeed>,
 }
 
 impl Default for Builder {
@@ -117,6 +128,8 @@ impl Builder {
             start_paused: false,
             tuning: super::tuning::Tuning::default(),
             task_hooks: super::tuning::TaskHooks::default(),
+            unhandled_panic: UnhandledPanic::Ignore,
+            rng_seed: None,
         }
     }
 
@@ -273,30 +286,45 @@ impl Builder {
             .max_worker_threads
             .unwrap_or(workers.saturating_mul(4))
             .max(workers);
-        let inner = Arc::new(Inner {
-            id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            workers: Workers::new(
-                capacity,
-                workers,
-                Start {
-                    limits,
-                    tuning: self.tuning.clone(),
-                    stack,
-                    name: worker_name,
-                    cores,
-                },
-                exit_tx,
-            ),
-            pool,
-            local_margin: self.local_spawn_margin.unwrap_or(DEFAULT_LOCAL_MARGIN),
-            #[cfg(ring)]
-            rings,
-            clock: crate::time::clock::Clock::new(self.start_paused),
-            task_hooks: self.task_hooks.any().then(|| {
-                super::tuning::ANY_TASK_HOOKS.store(true, std::sync::atomic::Ordering::Release);
-                Arc::new(self.task_hooks.clone())
-            }),
-            guests: kovan_map::HashMap::new(),
+        let shutdown_on_panic = self.unhandled_panic == UnhandledPanic::ShutdownRuntime;
+        let mut task_hooks = self.task_hooks;
+        if task_hooks.before_poll.is_some() || task_hooks.after_poll.is_some() {
+            super::tuning::ANY_POLL_HOOKS.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let inner = Arc::new_cyclic(|this| {
+            if shutdown_on_panic {
+                task_hooks.shutdown = Some(this.clone());
+            }
+            Inner {
+                id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                workers: Workers::new(
+                    capacity,
+                    workers,
+                    Start {
+                        limits,
+                        tuning: self.tuning.clone(),
+                        seed: self.rng_seed,
+                        stack,
+                        name: worker_name,
+                        cores,
+                    },
+                    exit_tx,
+                ),
+                pool,
+                local_margin: self.local_spawn_margin.unwrap_or(DEFAULT_LOCAL_MARGIN),
+                #[cfg(ring)]
+                rings,
+                clock: crate::time::clock::Clock::new(self.start_paused),
+                task_hooks: task_hooks.any().then(|| {
+                    super::tuning::ANY_TASK_HOOKS.store(true, std::sync::atomic::Ordering::Release);
+                    Arc::new(task_hooks)
+                }),
+                shutdown_on_panic,
+                panicked: std::sync::atomic::AtomicBool::new(false),
+                on_panic: crate::sync::Notify::new(),
+                rng_seed: self.rng_seed,
+                guests: kovan_map::HashMap::new(),
+            }
         });
         inner.pool.set_owner(Arc::downgrade(&inner));
         let runtime = Runtime { inner, exits };
@@ -641,6 +669,13 @@ where
 /// Runs `future` on the calling thread with `inner` as the runtime `spawn`
 /// uses meanwhile.
 fn block_on_with<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
+    if inner.shutdown_on_panic {
+        return block_on_here(inner, panic::watched(inner, future));
+    }
+    block_on_here(inner, future)
+}
+
+fn block_on_here<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
     let _runtime = context::set_runtime(inner);
     let running: *const Shard =
         context::current(|current| current.map_or(core::ptr::null(), |s| s as *const Shard));
@@ -656,6 +691,10 @@ fn block_on_with<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
     };
     let _current = context::enter(&shard);
     let _guest = super::paused::Guest::enter(inner, &shard.shared);
+    // A seeded runtime's choices made here repeat, call after call.
+    let _seeded = inner
+        .rng_seed
+        .map(|seed| super::rng::Reseeded::new(seed, 0));
     #[cfg(port)]
     shard.take_port_back();
     shard.block_on_then_leave(future)
