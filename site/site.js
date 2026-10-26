@@ -245,13 +245,13 @@ for (const button of document.querySelectorAll("[data-copy]")) {
       const points = score(record, terms, query);
       if (points) found[record.kind].push([points, record]);
     }
+    // The groups keep one order, Learn, then the API, then the home page; hits rank within each.
     const order = Object.keys(found)
       .filter((kind) => found[kind].length)
       .map((kind) => {
         found[kind].sort((a, b) => b[0] - a[0] || a[1].title.length - b[1].title.length || a[1].title.localeCompare(b[1].title));
         return kind;
-      })
-      .sort((a, b) => found[b][0][0] - found[a][0][0]);
+      });
     const total = order.reduce((n, kind) => n + found[kind].length, 0);
     const views = [];
     for (const kind of order) {
