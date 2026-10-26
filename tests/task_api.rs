@@ -197,3 +197,24 @@ fn yield_now_lets_the_shards_other_tasks_run() {
         "the tasks did not alternate: {order:?}"
     );
 }
+
+#[test]
+fn a_yield_in_block_on_lets_every_queued_task_run_first() {
+    let rt = runtime(0);
+    rt.block_on(async {
+        let ran = Arc::new(AtomicUsize::new(0));
+        for _ in 0..5 {
+            let ran = Arc::clone(&ran);
+            task::spawn_local(async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+            })
+            .detach();
+        }
+        task::yield_now().await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            5,
+            "one pass of the queue runs before the yielding future goes on"
+        );
+    });
+}

@@ -655,6 +655,14 @@ impl Shard {
         Some(runnable)
     }
 
+    /// Runnables queued on this thread now, the LIFO slot's included.
+    fn queued(&self) -> usize {
+        let lifo = self.lifo.take();
+        let n = self.queue.borrow().len() + usize::from(lifo.is_some());
+        self.lifo.set(lifo);
+        n
+    }
+
     fn has_local_work(&self) -> bool {
         // The LIFO slot is looked at by taking it and putting it back.
         let lifo = self.lifo.take();
@@ -830,8 +838,15 @@ impl Shard {
         let mut future = pin!(future);
         // Turns in which the future woke itself and no task ran.
         let mut self_woken = 0u32;
+        // Tasks to run before the future's next poll: a future that woke
+        // itself (a yield) lets the tasks queued at that moment run first,
+        // one pass of the queue.
+        let mut owed = 0usize;
         loop {
-            if signal.woken.load(Ordering::Relaxed) && signal.woken.swap(false, Ordering::SeqCst) {
+            if owed == 0
+                && signal.woken.load(Ordering::Relaxed)
+                && signal.woken.swap(false, Ordering::SeqCst)
+            {
                 let outer = self.in_task.replace(true);
                 let budget = crate::coop::enter();
                 let poll = future.as_mut().poll(&mut cx);
@@ -840,8 +855,12 @@ impl Shard {
                 if let Poll::Ready(output) = poll {
                     return output;
                 }
+                if signal.woken.load(Ordering::Relaxed) {
+                    owed = self.queued();
+                }
             }
             if let Some(runnable) = self.next() {
+                owed = owed.saturating_sub(1);
                 self.run(runnable);
                 let since = self.since_drive.get() + 1;
                 if since >= DRIVER_INTERVAL {
@@ -853,6 +872,8 @@ impl Shard {
                 }
                 continue;
             }
+            // The queue ran dry: nothing is owed any more.
+            owed = 0;
             // Nothing to run: due timers may have made work, and work other
             // threads posted (which the spin and the park count as work) is
             // applied here, so it never keeps the loop from sleeping.
