@@ -75,6 +75,7 @@ mod syscore {
 mod alone;
 /// Tasks: spawning, their handles and ids, cancellation from anywhere, and yielding.
 pub mod task;
+mod task_local;
 /// Time: sleeping, timeouts and intervals on the shard's timer wheel.
 pub mod time;
 

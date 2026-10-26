@@ -7,6 +7,7 @@ use core::task::{Context, Poll};
 
 pub use crate::rt::task::{AbortHandle, FallibleTask, Id, Join, JoinError, Task};
 pub use crate::runtime::{spawn, spawn_blocking, spawn_local};
+pub use crate::task_local::{AccessError, LocalKey, TaskLocalFuture};
 
 /// The id of the task this code runs in.
 ///
