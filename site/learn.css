@@ -505,25 +505,39 @@
     clip-path: inset(50%);
   }
 
+  /* Blocks, not a table: the column the widest cell sets would run off the screen. */
+  .table,
+  .table tbody {
+    display: block;
+  }
+
   .table tr {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--space-2xs);
     padding-block: var(--space-sm);
     border-block-end: var(--rule-hair) solid var(--color-rule);
   }
 
+  /* A cell is a block, so its text and inline code flow as one paragraph under its label. */
   .table td {
-    display: grid;
-    gap: var(--space-3xs);
+    display: block;
+    min-width: 0;
     padding: 0;
     border: 0;
   }
 
   .table td::before {
     content: attr(data-label);
+    display: block;
+    margin-block-end: var(--space-3xs);
     font-family: var(--font-mono);
     font-size: var(--text-micro);
     color: var(--color-muted);
+  }
+
+  .table td:first-child code {
+    white-space: normal;
   }
 }
 
