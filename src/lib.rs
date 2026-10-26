@@ -45,7 +45,7 @@ mod buf;
 mod compat;
 /// Nuclei's configuration options reside here.
 pub mod config;
-mod fs;
+pub mod fs;
 pub mod io;
 mod net;
 mod proactor;

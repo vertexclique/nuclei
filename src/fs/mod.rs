@@ -1,4 +1,9 @@
-//! Files, as [`Handle<File>`](crate::io::Handle).
+//! The file system: files as [`File`] (std's file in a
+//! [`Handle`]), [`OpenOptions`], the calls by path
+//! ([`read`], [`write`](fn@write), [`metadata`], [`rename`], [`copy`], ...),
+//! directories ([`create_dir_all`], [`DirBuilder`], [`read_dir`] streamed a
+//! page at a time) and links. Calls by path, and a regular file's calls
+//! beside its reads and writes, run on the blocking pool.
 //!
 //! A regular file's reads and writes run on the blocking pool at the
 //! handle's own cursor (see `file`); a `File` that is not a regular file (a
@@ -12,12 +17,32 @@
 //! read into it and written from it with no copy.
 
 pub(crate) mod file;
+mod file_ops;
+mod ops;
+mod read_dir;
 #[cfg(ring)]
 pub(crate) mod ring;
 
+pub use std::fs::{FileTimes, FileType, Metadata, Permissions};
+
+#[cfg(unix)]
+pub use self::ops::symlink;
+pub use self::ops::{
+    DirBuilder, OpenOptions, canonicalize, copy, create_dir, create_dir_all, hard_link, metadata,
+    read, read_link, read_to_string, remove_dir, remove_dir_all, remove_file, rename,
+    set_permissions, symlink_metadata, try_exists, write,
+};
+#[cfg(windows)]
+pub use self::ops::{symlink_dir, symlink_file};
+pub use self::read_dir::{DirEntry, ReadDir, read_dir};
+
+/// A file: std's `File` in a [`Handle`], with async reads, writes, seeks and
+/// calls.
+pub type File = Handle<std::fs::File>;
+
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::fs::File;
+use std::fs::File as StdFile;
 use std::io::{self, SeekFrom};
 use std::path::Path;
 
@@ -26,17 +51,15 @@ use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
 use crate::io::Handle;
 use crate::io::source::Kind;
 
-impl Handle<File> {
+impl Handle<StdFile> {
     /// Opens the file at `p` for reading, on the blocking pool.
     ///
     /// # Errors
     ///
     /// As [`File::open`].
-    pub async fn open(p: impl AsRef<Path>) -> io::Result<Handle<File>> {
+    pub async fn open(p: impl AsRef<Path>) -> io::Result<Handle<StdFile>> {
         let path = p.as_ref().to_path_buf();
-        let file = crate::runtime::spawn_blocking(move || File::open(path))
-            .await
-            .inspect_err(crate::rt::counters::io_error)?;
+        let file = ops::blocking(move || StdFile::open(path)).await?;
         Handle::new(file)
     }
 
@@ -159,9 +182,9 @@ macro_rules! file_io {
     )*};
 }
 
-file_io!(Handle<File>, &Handle<File>);
+file_io!(Handle<StdFile>, &Handle<StdFile>);
 
-impl AsyncSeek for Handle<File> {
+impl AsyncSeek for Handle<StdFile> {
     fn poll_seek(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -180,7 +203,7 @@ impl AsyncSeek for Handle<File> {
     }
 }
 
-impl AsyncBufRead for Handle<File> {
+impl AsyncBufRead for Handle<StdFile> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = Pin::into_inner(self);
         if !this.is_regular() {
