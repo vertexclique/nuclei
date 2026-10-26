@@ -133,7 +133,7 @@ windows_handles!(
 /// use std::net::TcpListener;
 /// use nuclei::Handle;
 ///
-/// let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+/// let listener = Handle::new(TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
 /// assert!(listener.local_addr().unwrap().port() > 0);
 /// ```
 pub struct Handle<T> {

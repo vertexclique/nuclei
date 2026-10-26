@@ -2,21 +2,30 @@
 
 use core::future::poll_fn;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
-use super::{addresses, none_worked};
+use super::addr::{ToSocketAddrs, resolve};
+use super::none_worked;
 use crate::io::Handle;
 use crate::io::source::write::Dest;
 use crate::io::source::{Addr, Kind};
 
 impl Handle<UdpSocket> {
-    /// A socket bound to `addr`.
+    /// A socket bound to the first of the addresses `addr` names that it
+    /// can bind.
     ///
     /// # Errors
     ///
-    /// As [`UdpSocket::bind`].
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<UdpSocket>> {
-        Handle::adopt(UdpSocket::bind(addr)?, Kind::Udp)
+    /// The last address's error when none could be bound, or the lookup's.
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<UdpSocket>> {
+        let mut last = None;
+        for addr in resolve(&addr).await? {
+            match UdpSocket::bind(addr) {
+                Ok(socket) => return Handle::adopt(socket, Kind::Udp),
+                Err(err) => last = Some(err),
+            }
+        }
+        Err(none_worked(last))
     }
 
     /// A socket on an ephemeral local port, connected to the first of
@@ -28,7 +37,7 @@ impl Handle<UdpSocket> {
     /// The last address's error when none worked, or the lookup's.
     pub async fn connect<A: ToSocketAddrs>(sock_addrs: A) -> io::Result<Handle<UdpSocket>> {
         let mut last = None;
-        for addr in addresses(sock_addrs)? {
+        for addr in resolve(&sock_addrs).await? {
             let local: IpAddr = if addr.is_ipv4() {
                 Ipv4Addr::UNSPECIFIED.into()
             } else {
@@ -81,7 +90,10 @@ impl Handle<UdpSocket> {
     ///
     /// As `sendto(2)`, the lookup's, or an earlier datagram's.
     pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
-        let addr = addresses(addr)?.next().ok_or_else(|| none_worked(None))?;
+        let addr = resolve(&addr)
+            .await?
+            .next()
+            .ok_or_else(|| none_worked(None))?;
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Inet(addr))).await
     }
 

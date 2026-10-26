@@ -41,12 +41,11 @@ It needs no configuration: the first `spawn` or `block_on` starts a runtime with
 core. A `Builder` sets every setting for a runtime of one's own.
 
 ```rust
-use std::net::TcpListener;
-use nuclei::Handle;
+use nuclei::net::TcpListener;
 
 #[nuclei::main]
 async fn main() -> std::io::Result<()> {
-    let listener = Handle::<TcpListener>::bind("127.0.0.1:7000")?;
+    let listener = TcpListener::bind("127.0.0.1:7000").await?;
     loop {
         let (stream, _) = listener.accept().await?;
         nuclei::spawn(async move {

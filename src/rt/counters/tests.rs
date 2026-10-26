@@ -476,7 +476,7 @@ fn accept_with_no_descriptor_left() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     run(async {
-        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.get_ref().local_addr().unwrap();
         // The client's socket is made while one can be.
         // SAFETY: a plain call; the descriptor is owned at once.

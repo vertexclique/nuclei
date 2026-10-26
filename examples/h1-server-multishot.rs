@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     }
 
-    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
+    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000").await?);
 
     http.await?;
     Ok(())

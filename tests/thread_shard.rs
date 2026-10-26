@@ -34,7 +34,7 @@ fn a_runtime_on_one_thread_runs_its_tasks_there_and_sleeps() {
 /// client.
 #[test]
 fn a_nested_block_on_in_a_local_task_holds_up_no_other_local_task() {
-    let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+    let listener = nuclei::block_on(Handle::<TcpListener>::bind("127.0.0.1:0")).unwrap();
     let addr = listener.local_addr().unwrap();
     // A client that keeps the connection quiet for a while, then talks.
     let client = std::thread::spawn(move || {

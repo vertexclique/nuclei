@@ -16,12 +16,11 @@
 //! tasks, polls, IO in flight, buffers, timers and errors.
 //!
 //! ```no_run
-//! use std::net::TcpListener;
-//! use nuclei::Handle;
+//! use nuclei::net::TcpListener;
 //!
 //! #[nuclei::main]
 //! async fn main() -> std::io::Result<()> {
-//!     let listener = Handle::<TcpListener>::bind("127.0.0.1:7000")?;
+//!     let listener = TcpListener::bind("127.0.0.1:7000").await?;
 //!     loop {
 //!         let (stream, _) = listener.accept().await?;
 //!         nuclei::spawn(async move {
@@ -47,7 +46,7 @@ mod compat;
 pub mod config;
 pub mod fs;
 pub mod io;
-mod net;
+pub mod net;
 mod proactor;
 /// Child processes: spawn one, wait for its exit and talk to it through async pipes.
 pub mod process;

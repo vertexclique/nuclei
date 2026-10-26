@@ -23,12 +23,11 @@
 //! # `#[nuclei::main]`
 //!
 //! ```no_run
-//! use std::net::TcpListener;
-//! use nuclei::Handle;
+//! use nuclei::net::TcpListener;
 //!
 //! #[nuclei::main]
 //! async fn main() -> std::io::Result<()> {
-//!     let listener = Handle::<TcpListener>::bind("0.0.0.0:7000")?;
+//!     let listener = TcpListener::bind("0.0.0.0:7000").await?;
 //!     loop {
 //!         let (stream, _) = listener.accept().await?;
 //!         nuclei::spawn(async move {

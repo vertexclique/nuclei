@@ -161,7 +161,7 @@ fn auto_falls_back_to_epoll_where_a_filter_kills_io_uring() {
     );
     let rt = runtime();
     rt.block_on(async {
-        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = spawn(async move {
             let (mut conn, _) = within(listener.accept()).await.unwrap();
@@ -182,7 +182,7 @@ fn auto_falls_back_to_epoll_where_a_filter_kills_io_uring() {
 fn a_tcp_echo_carries_a_large_message_both_ways() {
     let rt = runtime();
     rt.block_on(async {
-        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = spawn(async move {
             let (mut conn, peer) = within(listener.accept()).await.unwrap();
@@ -249,7 +249,7 @@ async fn join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 fn send_recv_and_peek_on_tcp() {
     let rt = runtime();
     rt.block_on(async {
-        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let client = spawn(async move { Handle::<TcpStream>::connect(addr).await.unwrap() });
         let (conn, _) = within(listener.accept()).await.unwrap();
@@ -275,7 +275,7 @@ fn connect_tries_each_address_and_reports_the_last_error() {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
-        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let open = listener.local_addr().unwrap();
         let both: &[SocketAddr] = &[closed, open];
         let stream = within(Handle::<TcpStream>::connect(both)).await.unwrap();
@@ -292,7 +292,7 @@ fn connect_tries_each_address_and_reports_the_last_error() {
 fn incoming_and_accept_multi_yield_every_connection() {
     let rt = runtime();
     rt.block_on(async {
-        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let clients: Vec<_> = (0..6).map(|_| TcpStream::connect(addr).unwrap()).collect();
         let mut incoming = listener.incoming();
@@ -316,8 +316,8 @@ fn incoming_and_accept_multi_yield_every_connection() {
 fn udp_sends_receives_peeks_and_connects() {
     let rt = runtime();
     rt.block_on(async {
-        let a = Handle::<UdpSocket>::bind("127.0.0.1:0").unwrap();
-        let b = Handle::<UdpSocket>::bind("127.0.0.1:0").unwrap();
+        let a = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let b = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
         let (a_addr, b_addr) = (a.local_addr().unwrap(), b.local_addr().unwrap());
         let mut buf = [0u8; 64];
         // A receive that waits, completed by the driver.
@@ -816,7 +816,7 @@ fn tcp_bytes_behind_urgent_data_are_still_read() {
 fn tcp_short_round_trips_never_wait_for_the_next_message() {
     let rt = runtime();
     rt.block_on(async {
-        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").unwrap();
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();

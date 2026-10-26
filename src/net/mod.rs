@@ -1,4 +1,4 @@
-//! Sockets: TCP, UDP and Unix domain, as [`Handle`](crate::io::Handle)s.
+//! Sockets: TCP, UDP and Unix domain, as [`Handle`]s.
 //!
 //! Each type keeps std's own socket inside; the handle adds the async
 //! operations (`accept`, `connect`, `send`, `recv`, `peek`, `send_to`,
@@ -8,29 +8,54 @@
 //! `write_owned` take the caller's buffer and give it back, so the driver
 //! reads into it and writes from it with no copy.
 //!
-//! Addresses given by name (`"localhost:80"`) are looked up on the calling
-//! thread, as std does: the lookup blocks that thread while it lasts.
-//! Addresses given as numbers, or as `SocketAddr`, need no lookup.
+//! An address is anything [`ToSocketAddrs`] takes: numbers are used at
+//! once; a name (`"localhost:80"`) is looked up on the blocking pool, so no
+//! shard waits on the resolver. [`lookup_host`] looks one up alone.
+//!
+//! ```
+//! use nuclei::net::{TcpListener, TcpStream};
+//!
+//! # nuclei::block_on(async {
+//! let listener = TcpListener::bind("127.0.0.1:0").await?;
+//! let addr = listener.get_ref().local_addr()?;
+//! let client = TcpStream::connect(addr).await?;
+//! let (server, _) = listener.accept().await?;
+//! client.send(b"hi").await?;
+//! let mut buf = [0u8; 2];
+//! assert_eq!(server.recv(&mut buf).await?, 2);
+//! # std::io::Result::Ok(())
+//! # }).unwrap();
+//! ```
 
+mod addr;
 mod stream;
 mod tcp;
 mod udp;
 #[cfg(unix)]
 mod unix;
 
+pub use self::addr::{ToSocketAddrs, lookup_host};
 pub use self::tcp::TcpStreamGenerator;
 
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
 
-/// Every address `addr` names, or the error of a name that names none.
-// vertexia: a name is looked up on the calling thread (std's resolver, as the
-// signatures take std's `ToSocketAddrs`, which is neither `Send` nor
-// `'static`); an async resolver on the blocking pool if lookups by name
-// prove common on shards.
-fn addresses<A: ToSocketAddrs>(addr: A) -> io::Result<impl Iterator<Item = SocketAddr>> {
-    addr.to_socket_addrs()
-}
+use crate::io::Handle;
+
+/// A TCP listener: std's, with an async `accept`.
+pub type TcpListener = Handle<std::net::TcpListener>;
+/// A TCP stream: std's, with async reads and writes.
+pub type TcpStream = Handle<std::net::TcpStream>;
+/// A UDP socket: std's, with async sends and receives.
+pub type UdpSocket = Handle<std::net::UdpSocket>;
+/// A Unix stream listener: std's, with an async `accept`.
+#[cfg(unix)]
+pub type UnixListener = Handle<std::os::unix::net::UnixListener>;
+/// A Unix stream: std's, with async reads and writes.
+#[cfg(unix)]
+pub type UnixStream = Handle<std::os::unix::net::UnixStream>;
+/// A Unix datagram socket: std's, with async sends and receives.
+#[cfg(unix)]
+pub type UnixDatagram = Handle<std::os::unix::net::UnixDatagram>;
 
 /// The error when every address failed (the last one's), or none was given.
 fn none_worked(last: Option<io::Error>) -> io::Error {

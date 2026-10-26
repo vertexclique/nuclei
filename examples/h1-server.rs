@@ -41,7 +41,7 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
 
 #[nuclei::main]
 async fn main() -> Result<()> {
-    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
+    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000").await?);
 
     http.await?;
     Ok(())

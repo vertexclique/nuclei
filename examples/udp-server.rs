@@ -30,7 +30,7 @@ fn main() -> io::Result<()> {
     println!("IO runs on {:?}", Proactor::backend());
 
     nuclei::block_on(async {
-        let socket = Handle::<UdpSocket>::bind("127.0.0.1:7001")?;
+        let socket = Handle::<UdpSocket>::bind("127.0.0.1:7001").await?;
         println!("Echoing datagrams on {}", socket.local_addr()?);
         let mut buf = vec![0u8; 64 * 1024];
         loop {

@@ -4,23 +4,32 @@ use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 
 use futures_core::Stream;
 
-use super::{addresses, none_worked};
+use super::addr::{ToSocketAddrs, resolve};
+use super::none_worked;
 use crate::io::source::write::Peer;
 use crate::io::source::{Addr, Kind};
 use crate::io::{Handle, sys};
 
 impl Handle<TcpListener> {
-    /// A listener bound to `addr`.
+    /// A listener bound to the first of the addresses `addr` names that
+    /// it can bind.
     ///
     /// # Errors
     ///
-    /// As [`TcpListener::bind`].
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<TcpListener>> {
-        Handle::adopt(TcpListener::bind(addr)?, Kind::TcpListener)
+    /// The last address's error when none could be bound, or the lookup's.
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Handle<TcpListener>> {
+        let mut last = None;
+        for addr in resolve(&addr).await? {
+            match TcpListener::bind(addr) {
+                Ok(listener) => return Handle::adopt(listener, Kind::TcpListener),
+                Err(err) => last = Some(err),
+            }
+        }
+        Err(none_worked(last))
     }
 
     /// The next connection, with its peer's address.
@@ -157,7 +166,7 @@ impl Handle<TcpStream> {
     /// The last address's error when none took it, or the lookup's.
     pub async fn connect<A: ToSocketAddrs>(sock_addrs: A) -> io::Result<Handle<TcpStream>> {
         let mut last = None;
-        for addr in addresses(sock_addrs)? {
+        for addr in resolve(&sock_addrs).await? {
             match connect(addr).await {
                 Ok(stream) => return Ok(stream),
                 Err(err) => last = Some(err),

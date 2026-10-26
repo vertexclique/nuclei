@@ -51,7 +51,7 @@ fn server() -> Result<()> {
 
     block_on(async {
         // XXX: Change this to below line if you want to test epoll:
-        let http = listen_multishot(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
+        let http = listen_multishot(Handle::<TcpListener>::bind("0.0.0.0:8000").await?);
 
         http.await?;
         Ok(())

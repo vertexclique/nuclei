@@ -528,7 +528,9 @@ fn a_dropped_handle_delivers_the_rest_of_a_started_lent_write() {
 fn tcp_streams_read_and_write_lent_buffers() {
     let rt = runtime(None);
     let got = on_worker(&rt, async {
-        let listener = Handle::<std::net::TcpListener>::bind("127.0.0.1:0").unwrap();
+        let listener = Handle::<std::net::TcpListener>::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let client = crate::runtime::spawn(async move {
             let stream = Handle::<std::net::TcpStream>::connect(addr).await.unwrap();
