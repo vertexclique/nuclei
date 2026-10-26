@@ -159,6 +159,41 @@ async fn within<F: Future>(fut: F) -> F::Output {
         .expect("the operation never completed")
 }
 
+/// A test's watchdog: unless dropped within `limit`, it writes `what` and
+/// `report()` to the process's standard error (past the harness's capture,
+/// which an abort throws away) and aborts, so a hang fails at once and says
+/// where it was rather than holding the suite until the job's own limit.
+/// Its one user is a unix test.
+#[cfg(unix)]
+struct Watchdog(Option<std::sync::mpsc::Sender<()>>);
+
+#[cfg(unix)]
+impl Watchdog {
+    fn new(
+        what: &'static str,
+        limit: Duration,
+        report: impl Fn() -> String + Send + 'static,
+    ) -> Self {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(limit) {
+                let _ = writeln!(io::stderr(), "{what} hung: {}", report());
+                std::process::abort();
+            }
+        });
+        Self(Some(done))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
 /// Polls `fut` once: it must wait.
 async fn pends<F: Future + Unpin>(fut: &mut F) {
     let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut *fut).poll(cx))).await;

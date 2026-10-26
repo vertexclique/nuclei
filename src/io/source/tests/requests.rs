@@ -145,6 +145,33 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
     adopt(&mine);
     let src = Source::new(mine.raw(), STREAM);
     let woken = Arc::new(Flag(AtomicBool::new(false)));
+    // How far the test got, for the watchdog's report.
+    let phase = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let _dog = {
+        // Weak: the watchdog must not change when the source goes.
+        let (phase, src) = (Arc::clone(&phase), Arc::downgrade(&src));
+        Watchdog::new(
+            "a_drain_waiting_before_a_lingering_close_is_woken_by_it",
+            Duration::from_secs(30),
+            move || {
+                let sides = src.upgrade().map_or_else(
+                    || "the source is gone".to_string(),
+                    |src| {
+                        format!(
+                            "read side {}; write side {}",
+                            src.read_report(),
+                            src.write_report()
+                        )
+                    },
+                );
+                format!(
+                    "phase {}; {sides}; {:?}",
+                    phase.load(Ordering::SeqCst),
+                    crate::stats()
+                )
+            },
+        )
+    };
     // The kernel takes nothing more: what the source accepts next waits.
     fill(&mine);
     rt.block_on(async {
@@ -160,6 +187,7 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
             );
         }
     });
+    phase.store(1, Ordering::SeqCst);
     let held = src.read.try_hold().expect("the read side is free");
     let copy = src.duplicate().expect("a copy of the descriptor");
     src.close(mine, Some(copy.as_raw_fd()));
@@ -169,6 +197,7 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
             .is_pending(),
         "the peer reads nothing, so the drain waits"
     );
+    phase.store(2, Ordering::SeqCst);
     let mut after = After::default();
     held.release(&mut after, &src.hooks());
     after.run();
@@ -176,8 +205,10 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
         woken.0.load(Ordering::SeqCst),
         "the drain waiting before the close was never woken"
     );
+    phase.store(3, Ordering::SeqCst);
     drop(peer);
     src.close(copy, None);
+    phase.store(4, Ordering::SeqCst);
     drop(rt);
 }
 
