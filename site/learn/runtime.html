@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entry points and runtimes: Learn Nuclei</title>
+  <meta name="description" content="The entry points: the attribute, block_on, runtimes of your own and their handles.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/runtime.html">
+  <meta property="og:title" content="Entry points and runtimes: Learn Nuclei">
+  <meta property="og:description" content="The entry points: the attribute, block_on, runtimes of your own and their handles.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/runtime.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html" aria-current="page">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 2 of 12</p>
+        <h1>Entry points and runtimes</h1>
+        <p class="chapter-head__lede">Where async code starts: the attribute, a plain block_on, a runtime you build yourself, and handles that reach it from anywhere.</p>
+      </header>
+      <article class="prose">
+<h2 id="attribute">The attribute</h2>
+<p><code>#[nuclei::main]</code> turns an async <code>main</code> into a program: its body runs in <code>block_on</code> on the default runtime. It may return anything <code>main</code> may, such as <code>std::io::Result&lt;()&gt;</code>. With <code>threads = N</code> the program builds a runtime of its own with N worker threads instead; <code>threads = 0</code> runs every task on the thread inside <code>block_on</code>, with no worker at all.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="at">#[nuclei::main(threads = 2)]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="kw">let</span> workers <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">stats</span><span class="pu">().</span>shards<span class="pu">.</span><span class="fn">iter</span><span class="pu">().</span><span class="fn">filter</span><span class="pu">(|</span>s<span class="pu">|</span> s<span class="pu">.</span>worker<span class="pu">.</span><span class="fn">is_some</span><span class="pu">()).</span><span class="fn">count</span><span class="pu">();</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>workers<span class="pu">,</span> <span class="nu">2</span><span class="pu">);</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"{workers} worker shards"</span><span class="pu">);</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="block-on">block_on, without the attribute</h2>
+<p><code>nuclei::block_on</code> runs a future to its end on the calling thread, running other tasks of that thread&rsquo;s shard meanwhile. The first call (or the first <code>spawn</code>) starts the default runtime, so a plain <code>fn main</code> needs nothing else.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-2"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="cm">// The first call starts the default runtime: one worker shard per core.</span>
+    <span class="kw">let</span> sum <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">block_on</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="md">nuclei</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">10</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+        <span class="pu">(</span><span class="nu">1</span><span class="pu">..=</span><span class="nu">10</span><span class="pu">).</span><span class="md">sum</span><span class="pu">::&lt;</span>u32<span class="pu">&gt;()</span>
+    <span class="pu">});</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>sum<span class="pu">,</span> <span class="nu">55</span><span class="pu">);</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-2" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p><code>nuclei::drive</code> does the same as <code>block_on</code>; it keeps the name earlier versions used.</p>
+
+<h2 id="nesting">block_on nests</h2>
+<p><code>block_on</code> works anywhere, inside a task too. On a worker the call nests: the worker&rsquo;s shard keeps running its other tasks, timers and IO until the future completes. That lets synchronous code deep in a call stack wait on a future without holding the shard up.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-3"><code><span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="kw">let</span> task <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="cm">// A synchronous helper deep in a call stack can still wait on a future:</span>
+        <span class="cm">// block_on nests, and the shard keeps running its other tasks meanwhile.</span>
+        <span class="kw">let</span> inner <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="nu">21</span> <span class="pu">});</span>
+        <span class="md">nuclei</span><span class="pu">::</span><span class="fn">block_on</span><span class="pu">(</span>inner<span class="pu">)</span> <span class="pu">*</span> <span class="nu">2</span>
+    <span class="pu">});</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>task<span class="pu">.</span><span class="kw">await</span><span class="pu">,</span> <span class="nu">42</span><span class="pu">);</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-3" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p>Two rules come with it. The task that called <code>block_on</code> is not polled again until the call returns, so a future that waits for that very task never completes. And each level runs on the thread&rsquo;s stack, so the depth is bounded: 256 levels by default, set with <code>Builder::max_nesting</code>; one more panics with a message that says so.</p>
+
+<h2 id="runtime">A runtime of your own</h2>
+<p><code>Runtime::new()</code> starts one with every setting at its default; <code>Runtime::builder()</code> (the same as <code>Builder::new()</code>) sets them. A runtime spawns, runs <code>block_on</code> and runs blocking work, like the free functions do on the default runtime.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-4"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> runtime <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Runtime</span><span class="pu">::</span><span class="fn">builder</span><span class="pu">()</span>
+        <span class="pu">.</span><span class="fn">worker_threads</span><span class="pu">(</span><span class="nu">4</span><span class="pu">)</span>
+        <span class="pu">.</span><span class="fn">thread_name</span><span class="pu">(</span><span class="st">"api-worker"</span><span class="pu">)</span>
+        <span class="pu">.</span><span class="fn">max_blocking_threads</span><span class="pu">(</span><span class="nu">64</span><span class="pu">)</span>
+        <span class="pu">.</span><span class="fn">build</span><span class="pu">()?;</span>
+
+    <span class="kw">let</span> task <span class="pu">=</span> runtime<span class="pu">.</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="st">"served"</span> <span class="pu">});</span>
+    <span class="kw">let</span> out <span class="pu">=</span> runtime<span class="pu">.</span><span class="fn">block_on</span><span class="pu">(</span>task<span class="pu">);</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"{out}"</span><span class="pu">);</span>
+
+    <span class="cm">// Stop the workers, waiting for them at most one second.</span>
+    runtime<span class="pu">.</span><span class="fn">shutdown_timeout</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_secs</span><span class="pu">(</span><span class="nu">1</span><span class="pu">));</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-4" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p>Dropping a <code>Runtime</code> stops its workers, drops the tasks they still hold and waits for the threads to exit. <code>shutdown_timeout</code> bounds that wait: workers still running a task when it passes are left to exit on their own. <a href="production.html#builder">Production</a> lists every setting.</p>
+
+<h2 id="handle">Handles</h2>
+<p><code>runtime.handle()</code> gives a <code>RuntimeHandle</code>: cheap to clone, and usable from any thread to spawn on that runtime or to <code>block_on</code>. A handle does not keep its runtime running.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-5"><code><span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> runtime <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Runtime</span><span class="pu">::</span><span class="fn">new</span><span class="pu">()?;</span>
+    <span class="kw">let</span> handle <span class="pu">=</span> runtime<span class="pu">.</span><span class="fn">handle</span><span class="pu">();</span>
+
+    <span class="cm">// A plain thread hands work to the runtime through its handle.</span>
+    <span class="kw">let</span> worker <span class="pu">=</span> <span class="md">std</span><span class="pu">::</span><span class="md">thread</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">move</span> <span class="pu">||</span> handle<span class="pu">.</span><span class="fn">block_on</span><span class="pu">(</span>handle<span class="pu">.</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="nu">2</span> <span class="pu">+</span> <span class="nu">2</span> <span class="pu">})));</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>worker<span class="pu">.</span><span class="fn">join</span><span class="pu">().</span><span class="fn">unwrap</span><span class="pu">(),</span> <span class="nu">4</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-5" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="default">Configuring the default runtime</h2>
+<p>The free functions (<code>spawn</code>, <code>block_on</code>, <code>spawn_blocking</code>, <code>spawn_local</code>) use the runtime the calling thread is inside, or else the default runtime. To configure the default one, build it with <code>Builder::build_global</code> before anything starts it. <code>RuntimeHandle::current()</code> gives a handle to whichever runtime the thread is inside, or the default one, started on the spot if it is not running.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-6"><code><span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="cm">// Configure the default runtime before anything starts it.</span>
+    <span class="kw">let</span> handle <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Builder</span><span class="pu">::</span><span class="fn">new</span><span class="pu">().</span><span class="fn">worker_threads</span><span class="pu">(</span><span class="nu">2</span><span class="pu">).</span><span class="fn">build_global</span><span class="pu">()?;</span>
+
+    <span class="cm">// From here on the free functions use it.</span>
+    <span class="kw">let</span> task <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="st">"on the default runtime"</span> <span class="pu">});</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"{}"</span><span class="pu">,</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">block_on</span><span class="pu">(</span>task<span class="pu">));</span>
+
+    <span class="cm">// A handle to whatever runtime this thread is inside, or the default one.</span>
+    <span class="kw">let</span> _same <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">RuntimeHandle</span><span class="pu">::</span><span class="fn">current</span><span class="pu">();</span>
+    <span class="fn">drop</span><span class="pu">(</span>handle<span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-6" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p><code>build_global</code> fails with <code>the default runtime is already running</code> once a free function, the attribute or an earlier <code>build_global</code> has started it. Call it first thing in <code>main</code>.</p>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="setup.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Setup</span></a><a href="tasks.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Tasks</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-/* Hallmark · genre: atmospheric · macrostructure: Marquee Hero · theme: custom (Abyss) · enrichment: Tier A CSS apparatus (liquid core bank) · nav: N9 · footer: Ft5
+/* Hallmark · genre: atmospheric · macrostructure: Marquee Hero · theme: custom (Abyss) · enrichment: footage behind a dot screen, Tier A CSS apparatus (liquid core bank) · nav: N9 · footer: Ft5
  * vibe: "turquoise light poured into blue glass, in the dark" · paper oklch(12% 0.016 245) · accent oklch(82% 0.13 188) turquoise, oklch(70% 0.15 248) blue
  * display: Geist 600 (operator's pick) · body: Geist 400 · labels and code: JetBrains Mono
  * axes: dark paper · grotesk-sans display · cool accent (turquoise 188 to blue 258)
@@ -20,24 +20,52 @@
   --color-accent-deep: oklch(52% 0.170 258);
   --color-liquid-top:  oklch(94% 0.070 185);
   --color-accent-2:    oklch(70% 0.150 248);
+  --color-accent-3:    oklch(76% 0.130 285);
   --color-focus:       oklch(82% 0.130 188);
   --color-filament-tip: oklch(97% 0.030 190);
   --color-glow:        oklch(80% 0.130 195 / 0.40);
   --color-glow-2:      oklch(70% 0.150 240 / 0.16);
   --color-card-emit:   oklch(82% 0.130 188 / 0.05);
+  --color-card-lit:    oklch(82% 0.130 188 / 0.10);
   --color-shadow:      oklch(4% 0.012 245 / 0.60);
   --color-shade:       oklch(4% 0.012 245 / 0.45);
   /* The wet look: sheens and a lit top edge on every raised surface. */
   --color-gloss:        oklch(98% 0.010 220 / 0.05);
   --color-gloss-edge:   oklch(98% 0.010 220 / 0.10);
   --color-gloss-strong: oklch(98% 0.010 220 / 0.30);
-  --color-bloom:        oklch(80% 0.130 192 / 0.10);
-  --color-bloom-2:      oklch(62% 0.170 255 / 0.12);
+  --color-sheen:        oklch(98% 0.010 220 / 0.14);
+  --color-pool:         oklch(80% 0.130 192 / 0.10);
+  --color-pool-2:       oklch(62% 0.170 255 / 0.12);
+  /* The hero footage sits under a scrim of the paper itself, so text over it keeps its contrast. */
+  --color-scrim:        oklch(12% 0.016 245 / 0.86);
+  --color-scrim-soft:   oklch(12% 0.016 245 / 0.55);
+  --color-scrim-thin:   oklch(12% 0.016 245 / 0.20);
+  --color-dot:          oklch(82% 0.130 188 / 0.34);
+  --color-dot-2:        oklch(70% 0.150 248 / 0.30);
+  /* The reactor lane of the comparison: present, but not lit. */
+  --color-dim-node:     oklch(64% 0.040 245);
+
+  /* Syntax: the code in the page's own light. Every colour passes AA on the code panel's
+   * lightest point (paper-3): comment 5.4:1, punctuation 5.8:1, everything else 7.8:1 and up. */
+  --color-syn-keyword:   oklch(74% 0.135 252);
+  --color-syn-type:      oklch(84% 0.120 186);
+  --color-syn-function:  oklch(91% 0.055 200);
+  --color-syn-string:    oklch(84% 0.105 168);
+  --color-syn-number:    oklch(80% 0.095 280);
+  --color-syn-attribute: oklch(80% 0.115 218);
+  --color-syn-macro:     oklch(86% 0.090 205);
+  --color-syn-module:    oklch(78% 0.030 232);
+  --color-syn-punct:     oklch(66% 0.030 240);
+  --color-syn-comment:   oklch(64% 0.025 236);
 
   /* The liquid: turquoise poured into blue, brightest at its surface. One fill for every
-   * place that holds it (the mark, the buttons, the tanks, the backend squares). */
+   * place that holds it (the mark, the buttons, the tanks, the glyphs). */
   --fill-liquid: linear-gradient(180deg, var(--color-liquid-top) 0%, var(--color-accent) 40%, var(--color-accent-deep) 100%);
   --fill-accent-rule: linear-gradient(90deg, var(--color-accent) 0%, var(--color-accent-2) 60%, var(--color-accent-deep) 100%);
+  --fill-sheen: linear-gradient(100deg, transparent 20%, var(--color-sheen) 50%, transparent 80%);
+  /* Text in colour: turquoise through pale liquid to blue and violet. Every stop is 6.8:1 or
+   * more on the paper, so a word set in it reads as well as the ink around it. */
+  --fill-text: linear-gradient(90deg, var(--color-accent) 0%, var(--color-liquid-top) 38%, var(--color-accent-2) 72%, var(--color-accent-3) 100%);
 
   --font-display: "Geist", ui-sans-serif, sans-serif;
   --font-body:    "Geist", ui-sans-serif, sans-serif;
@@ -72,15 +100,31 @@
   --page-max:    80rem;
   --measure:     62ch;
 
-  --rule-hair:      1px;
+  --rule-hair:  1px;
+  --glyph:      2rem;
+  --dot-cell:   1.5rem;
 
   --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in:     cubic-bezier(0.7, 0, 0.84, 0);
   --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
   --dur-micro: 120ms;
   --dur-short: 220ms;
-  --dur-tide:  7s;
+  --dur-long:  420ms;
+  --dur-rise:  680ms;
   --dur-flow:  900ms;
+  --dur-pour:  1100ms;
+  --dur-glyph: 1000ms;
+  --dur-tide:  7s;
+  --dur-lane:  5.2s;
+  --dur-dots:  9s;
+  --dur-drift: 26s;
+  --stagger:   80ms;
+
+  /* Distances of motion. Reduced motion sets every one to zero (motion.css). */
+  --rise: 1.25rem;
+  --lift: -3px;
+  --nudge: -2px;
+  --press: 1px;
 
   --z-base:   1;
   --z-raised: 10;

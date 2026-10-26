@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Processes and signals: Learn Nuclei</title>
+  <meta name="description" content="Child processes with async pipes, and signals as streams.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/processes.html">
+  <meta property="og:title" content="Processes and signals: Learn Nuclei">
+  <meta property="og:description" content="Child processes with async pipes, and signals as streams.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/processes.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html" aria-current="page">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 8 of 12</p>
+        <h1>Processes and signals</h1>
+        <p class="chapter-head__lede">Child processes whose exits and pipes are async, and signals as streams.</p>
+      </header>
+      <article class="prose">
+<h2 id="commands">Running a program</h2>
+<p><code>nuclei::process::Command</code> describes a process as <code>std::process::Command</code> does (<code>arg</code>, <code>args</code>, <code>env</code>, <code>envs</code>, <code>env_remove</code>, <code>env_clear</code>, <code>current_dir</code>, <code>stdin</code>, <code>stdout</code>, <code>stderr</code>), and <code>as_std_mut</code> reaches the std command for anything it does not mirror. Three ways to run it:</p>
+<ul>
+<li><code>output().await</code>: pipes stdout and stderr (and gives the child an empty stdin unless you set one), collects both, and waits for the exit.</li>
+<li><code>status().await</code>: waits for the exit; the streams are inherited unless set.</li>
+<li><code>spawn()</code>: starts the child and returns a <code>Child</code> at once.</li>
+</ul>
+<p>This example and the next run Unix programs (<code>echo</code>, <code>true</code>, <code>sort</code>).</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">process</span><span class="pu">::</span><span class="ty">Command</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="cm">// Runs the program, collects its stdout and stderr, and waits for its exit.</span>
+    <span class="kw">let</span> out <span class="pu">=</span> <span class="ty">Command</span><span class="pu">::</span><span class="fn">new</span><span class="pu">(</span><span class="st">"echo"</span><span class="pu">).</span><span class="fn">arg</span><span class="pu">(</span><span class="st">"hello from a child"</span><span class="pu">).</span><span class="fn">output</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert!</span><span class="pu">(</span>out<span class="pu">.</span>status<span class="pu">.</span><span class="fn">success</span><span class="pu">());</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span><span class="ty">String</span><span class="pu">::</span><span class="fn">from_utf8_lossy</span><span class="pu">(&amp;</span>out<span class="pu">.</span>stdout<span class="pu">).</span><span class="fn">trim</span><span class="pu">(),</span> <span class="st">"hello from a child"</span><span class="pu">);</span>
+
+    <span class="cm">// Only the exit status, with the streams inherited.</span>
+    <span class="kw">let</span> status <span class="pu">=</span> <span class="ty">Command</span><span class="pu">::</span><span class="fn">new</span><span class="pu">(</span><span class="st">"true"</span><span class="pu">).</span><span class="fn">status</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>status<span class="pu">.</span><span class="fn">code</span><span class="pu">(),</span> <span class="ty">Some</span><span class="pu">(</span><span class="nu">0</span><span class="pu">));</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="pipes">Talking to a child</h2>
+<p>A spawned child&rsquo;s piped streams are async: <code>ChildStdin</code> implements <code>AsyncWrite</code>, and <code>ChildStdout</code> and <code>ChildStderr</code> implement <code>AsyncRead</code>. Take them out of the <code>Child</code> with <code>take()</code>. Drop stdin (or close it) to end the child&rsquo;s input.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-2"><code><span class="kw">use</span> <span class="md">futures</span><span class="pu">::{</span><span class="ty">AsyncReadExt</span><span class="pu">,</span> <span class="ty">AsyncWriteExt</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">process</span><span class="pu">::{</span><span class="ty">Command</span><span class="pu">,</span> <span class="ty">Stdio</span><span class="pu">};</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> <span class="kw">mut</span> child <span class="pu">=</span> <span class="ty">Command</span><span class="pu">::</span><span class="fn">new</span><span class="pu">(</span><span class="st">"sort"</span><span class="pu">)</span>
+        <span class="pu">.</span><span class="fn">stdin</span><span class="pu">(</span><span class="ty">Stdio</span><span class="pu">::</span><span class="fn">piped</span><span class="pu">())</span>
+        <span class="pu">.</span><span class="fn">stdout</span><span class="pu">(</span><span class="ty">Stdio</span><span class="pu">::</span><span class="fn">piped</span><span class="pu">())</span>
+        <span class="pu">.</span><span class="fn">spawn</span><span class="pu">()?;</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"sort runs as process {}"</span><span class="pu">,</span> child<span class="pu">.</span><span class="fn">id</span><span class="pu">());</span>
+
+    <span class="kw">let</span> <span class="kw">mut</span> stdin <span class="pu">=</span> child<span class="pu">.</span>stdin<span class="pu">.</span><span class="fn">take</span><span class="pu">().</span><span class="fn">expect</span><span class="pu">(</span><span class="st">"stdin is piped"</span><span class="pu">);</span>
+    stdin<span class="pu">.</span><span class="fn">write_all</span><span class="pu">(</span><span class="st">b"pear\napple\nfig\n"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="fn">drop</span><span class="pu">(</span>stdin<span class="pu">);</span> <span class="cm">// closing stdin lets sort see the end of its input</span>
+
+    <span class="kw">let</span> <span class="kw">mut</span> sorted <span class="pu">=</span> <span class="ty">String</span><span class="pu">::</span><span class="fn">new</span><span class="pu">();</span>
+    child<span class="pu">.</span>stdout<span class="pu">.</span><span class="fn">take</span><span class="pu">().</span><span class="fn">expect</span><span class="pu">(</span><span class="st">"stdout is piped"</span><span class="pu">).</span><span class="fn">read_to_string</span><span class="pu">(&amp;</span><span class="kw">mut</span> sorted<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> status <span class="pu">=</span> child<span class="pu">.</span><span class="fn">wait</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+
+    <span class="ma">assert!</span><span class="pu">(</span>status<span class="pu">.</span><span class="fn">success</span><span class="pu">());</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>sorted<span class="pu">,</span> <span class="st">"apple\nfig\npear\n"</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-2" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<ul>
+<li><code>wait().await</code> waits for the exit without holding a thread; a piped stdin is closed first, so a child that reads it to the end can exit.</li>
+<li><code>wait_with_output().await</code> also collects the piped stdout and stderr.</li>
+<li><code>try_wait()</code> gives the status if the child has exited, without waiting.</li>
+<li><code>kill()</code> ends the child: <code>SIGKILL</code> on Unix, <code>TerminateProcess</code> on Windows.</li>
+</ul>
+<p>A shard&rsquo;s driver reports the exit and reaps the child: through a pidfd on epoll, <code>EVFILT_PROC</code> on kqueue, a wait on the process handle on Windows, and ring operations on io_uring. A wait fails with <code>ECHILD</code> if something else reaped the child first, for example when the program ignores <code>SIGCHLD</code> or calls <code>waitpid</code> itself.</p>
+
+<h2 id="ctrl-c">Ctrl-C</h2>
+<p><code>nuclei::signal::ctrl_c().await</code> completes when the process gets a Ctrl-C: <code>SIGINT</code> on Unix, the console&rsquo;s <code>CTRL_C_EVENT</code> on Windows. Listening starts with the first poll, and from then on the default action of <code>SIGINT</code> (ending the process) is replaced for good.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-3"><code><span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"running; press Ctrl-C to stop"</span><span class="pu">);</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="md">signal</span><span class="pu">::</span><span class="fn">ctrl_c</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"stopping cleanly"</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-3" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="unix-signals">Unix signals</h2>
+<p><code>nuclei::signal::unix::signal(kind)</code> listens to one signal and returns a <code>Signal</code>, a stream whose every item stands for one delivery or more since the item before; <code>recv().await</code> takes the next. <code>SignalKind</code> names the usual ones (<code>hangup</code>, <code>interrupt</code>, <code>terminate</code>, <code>quit</code>, <code>user_defined1</code>, <code>user_defined2</code>, <code>child</code>, <code>alarm</code>, <code>pipe</code>, <code>window_change</code>) and <code>SignalKind::from_raw</code> takes any number.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-4"><code><span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">signal</span><span class="pu">::</span><span class="md">unix</span><span class="pu">::{</span>signal<span class="pu">,</span> <span class="ty">SignalKind</span><span class="pu">};</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> <span class="kw">mut</span> hangups <span class="pu">=</span> <span class="fn">signal</span><span class="pu">(</span><span class="ty">SignalKind</span><span class="pu">::</span><span class="fn">hangup</span><span class="pu">())?;</span>
+    <span class="kw">let</span> <span class="kw">mut</span> terms <span class="pu">=</span> <span class="fn">signal</span><span class="pu">(</span><span class="ty">SignalKind</span><span class="pu">::</span><span class="fn">terminate</span><span class="pu">())?;</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"process {}: SIGHUP reloads, SIGTERM stops"</span><span class="pu">,</span> <span class="md">std</span><span class="pu">::</span><span class="md">process</span><span class="pu">::</span><span class="fn">id</span><span class="pu">());</span>
+
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="cm">// Each item stands for one delivery or more since the last one.</span>
+        <span class="kw">while</span> hangups<span class="pu">.</span><span class="fn">recv</span><span class="pu">().</span><span class="kw">await</span><span class="pu">.</span><span class="fn">is_some</span><span class="pu">()</span> <span class="pu">{</span>
+            <span class="ma">println!</span><span class="pu">(</span><span class="st">"reloading"</span><span class="pu">);</span>
+        <span class="pu">}</span>
+    <span class="pu">})</span>
+    <span class="pu">.</span><span class="fn">detach</span><span class="pu">();</span>
+
+    terms<span class="pu">.</span><span class="fn">recv</span><span class="pu">().</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"stopping"</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-4" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p><code>signal</code> fails for a number that is no signal, for <code>SIGKILL</code> and <code>SIGSTOP</code> (no handler can take them), and for <code>SIGILL</code>, <code>SIGFPE</code> and <code>SIGSEGV</code> (a handler for them cannot return).</p>
+
+<h2 id="windows-events">Windows console events</h2>
+<p>On Windows, <code>nuclei::signal::windows</code> has <code>ctrl_c</code>, <code>ctrl_break</code>, <code>ctrl_close</code>, <code>ctrl_logoff</code> and <code>ctrl_shutdown</code>, each returning a <code>CtrlEvent</code> stream with <code>recv</code>. An event with a listener alive is taken; for close, logoff and shutdown the system ends the process once the handlers return, whatever they say.</p>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="sync.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Sync</span></a><a href="production.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Production</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

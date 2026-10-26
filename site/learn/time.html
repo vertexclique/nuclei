@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Time: Learn Nuclei</title>
+  <meta name="description" content="Sleeps, timeouts, deadlines and intervals on each shard&#x27;s timer wheel.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/time.html">
+  <meta property="og:title" content="Time: Learn Nuclei">
+  <meta property="og:description" content="Sleeps, timeouts, deadlines and intervals on each shard&#x27;s timer wheel.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/time.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html" aria-current="page">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 6 of 12</p>
+        <h1>Time</h1>
+        <p class="chapter-head__lede">Sleeping, timeouts, deadlines and intervals, each on the timer wheel of the shard that polls it.</p>
+      </header>
+      <article class="prose">
+<h2 id="clock">The clock and the wheel</h2>
+<p><code>nuclei::time</code> measures with <code>std::time::Instant</code>, re-exported as <code>nuclei::time::Instant</code>. Every shard has a timer wheel with millisecond slots: a timer waits at least its duration, rounded up to the next millisecond, and a shard busy with a task fires it once that task yields. Arming and cancelling a timer allocates nothing once the shard&rsquo;s wheel has grown to the most timers alive at once. Dropping a timer&rsquo;s future cancels it.</p>
+<p>The timers work outside Nuclei&rsquo;s tasks too: a timer polled on another runtime&rsquo;s thread is fired for it by a shard of the current runtime, or of the default one.</p>
+
+<h2 id="sleep">Sleeps and timeouts</h2>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">time</span><span class="pu">::{</span><span class="kw">self</span><span class="pu">,</span> <span class="ty">Instant</span><span class="pu">};</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="kw">let</span> start <span class="pu">=</span> <span class="ty">Instant</span><span class="pu">::</span><span class="fn">now</span><span class="pu">();</span>
+    <span class="md">time</span><span class="pu">::</span><span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">20</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="ma">assert!</span><span class="pu">(</span>start<span class="pu">.</span><span class="fn">elapsed</span><span class="pu">()</span> <span class="pu">&gt;=</span> <span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">20</span><span class="pu">));</span>
+
+    <span class="md">time</span><span class="pu">::</span><span class="fn">sleep_until</span><span class="pu">(</span><span class="ty">Instant</span><span class="pu">::</span><span class="fn">now</span><span class="pu">()</span> <span class="pu">+</span> <span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">5</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+
+    <span class="cm">// A future that takes too long gives Elapsed.</span>
+    <span class="kw">let</span> slow <span class="pu">=</span> <span class="md">time</span><span class="pu">::</span><span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_secs</span><span class="pu">(</span><span class="nu">5</span><span class="pu">));</span>
+    <span class="ma">assert!</span><span class="pu">(</span><span class="md">time</span><span class="pu">::</span><span class="fn">timeout</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">10</span><span class="pu">),</span> slow<span class="pu">).</span><span class="kw">await</span><span class="pu">.</span><span class="fn">is_err</span><span class="pu">());</span>
+
+    <span class="cm">// One that is ready in time gives its output.</span>
+    <span class="kw">let</span> quick <span class="pu">=</span> <span class="kw">async</span> <span class="pu">{</span> <span class="st">"in time"</span> <span class="pu">};</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span><span class="md">time</span><span class="pu">::</span><span class="fn">timeout</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_secs</span><span class="pu">(</span><span class="nu">1</span><span class="pu">),</span> quick<span class="pu">).</span><span class="kw">await</span><span class="pu">,</span> <span class="ty">Ok</span><span class="pu">(</span><span class="st">"in time"</span><span class="pu">));</span>
+
+    <span class="cm">// The same against a deadline.</span>
+    <span class="kw">let</span> deadline <span class="pu">=</span> <span class="ty">Instant</span><span class="pu">::</span><span class="fn">now</span><span class="pu">()</span> <span class="pu">+</span> <span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">10</span><span class="pu">);</span>
+    <span class="ma">assert!</span><span class="pu">(</span><span class="md">time</span><span class="pu">::</span><span class="fn">timeout_at</span><span class="pu">(</span>deadline<span class="pu">,</span> <span class="md">std</span><span class="pu">::</span><span class="md">future</span><span class="pu">::</span><span class="md">pending</span><span class="pu">::&lt;()&gt;()).</span><span class="kw">await</span><span class="pu">.</span><span class="fn">is_err</span><span class="pu">());</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<ul>
+<li><code>sleep(duration)</code> and <code>sleep_until(instant)</code> return a <code>Sleep</code>. <code>Sleep::reset</code> moves its deadline; <code>deadline</code> and <code>is_elapsed</code> read it.</li>
+<li><code>timeout(duration, future)</code> and <code>timeout_at(deadline, future)</code> give <code>Ok(output)</code>, or <code>Err(Elapsed)</code> if the time ran out first. The future is polled before the clock is looked at, so one that is ready at once always wins.</li>
+</ul>
+
+<h2 id="interval">Intervals</h2>
+<p><code>interval(period)</code> ticks every period, the first tick at once; <code>interval_at(start, period)</code> starts at <code>start</code>. <code>tick().await</code> gives the instant the tick was due. A period of zero panics.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-2"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">time</span><span class="pu">::{</span><span class="kw">self</span><span class="pu">,</span> <span class="ty">MissedTickBehavior</span><span class="pu">};</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="kw">let</span> <span class="kw">mut</span> every <span class="pu">=</span> <span class="md">time</span><span class="pu">::</span><span class="fn">interval</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">10</span><span class="pu">));</span>
+    <span class="cm">// Late ticks are skipped instead of fired in a burst (the default).</span>
+    every<span class="pu">.</span><span class="fn">set_missed_tick_behavior</span><span class="pu">(</span><span class="ty">MissedTickBehavior</span><span class="pu">::</span><span class="ty">Skip</span><span class="pu">);</span>
+
+    <span class="kw">let</span> first <span class="pu">=</span> every<span class="pu">.</span><span class="fn">tick</span><span class="pu">().</span><span class="kw">await</span><span class="pu">;</span> <span class="cm">// the first tick is at once</span>
+    <span class="kw">for</span> <span class="pu">_</span> <span class="kw">in</span> <span class="nu">0</span><span class="pu">..</span><span class="nu">3</span> <span class="pu">{</span>
+        every<span class="pu">.</span><span class="fn">tick</span><span class="pu">().</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="pu">}</span>
+    <span class="ma">assert!</span><span class="pu">(</span>first<span class="pu">.</span><span class="fn">elapsed</span><span class="pu">()</span> <span class="pu">&gt;=</span> <span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">30</span><span class="pu">));</span>
+
+    <span class="cm">// reset: the next tick is one period from now.</span>
+    every<span class="pu">.</span><span class="fn">reset</span><span class="pu">();</span>
+    every<span class="pu">.</span><span class="fn">tick</span><span class="pu">().</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>every<span class="pu">.</span><span class="fn">period</span><span class="pu">(),</span> <span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">10</span><span class="pu">));</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-2" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<table class="table">
+<thead><tr><th>MissedTickBehavior</th><th>When the interval was polled late</th></tr></thead>
+<tbody>
+<tr><td data-label="MissedTickBehavior"><code>Burst</code> (the default)</td><td data-label="When the interval was polled late">Every missed tick fires without waiting, one after another, until the interval is back on its schedule.</td></tr>
+<tr><td data-label="MissedTickBehavior"><code>Delay</code></td><td data-label="When the interval was polled late">The next tick comes one period after the late one: the schedule moves.</td></tr>
+<tr><td data-label="MissedTickBehavior"><code>Skip</code></td><td data-label="When the interval was polled late">Missed ticks are skipped: the next tick is the next one on the original schedule after now.</td></tr>
+</tbody>
+</table>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="handles.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Handles</span></a><a href="sync.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Sync</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

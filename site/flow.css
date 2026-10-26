@@ -1,0 +1,332 @@
+/* Proactive, not reactive: two lanes, the same read in each.
+ *
+ * A lane is three nodes on two rails: the upper rail carries what goes toward the kernel, the
+ * lower rail what comes back. A packet is a square that starts at the task's centre; the
+ * track is a size container, so --span (the rail's length, in container units) carries it to
+ * the kernel's centre. Standing still (no script, reduced motion, or the section off screen) every packet
+ * sits on its rail between two nodes with a chevron for its direction, which already reads
+ * as the whole exchange; when the section is in view (.is-live, set by the page's script) the
+ * packets run their legs in turn. Both lanes take the same time on purpose: the picture is
+ * about the shape of an exchange, not its speed. */
+
+.flow {
+  display: grid;
+  gap: var(--space-md);
+}
+
+@media (min-width: 64rem) {
+  .flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.lane {
+  --lane-ink: var(--color-accent);
+  --lane-node: var(--color-ink);
+
+  display: grid;
+  gap: var(--space-lg);
+  align-content: start;
+  padding: var(--space-lg);
+}
+
+.lane--re {
+  --lane-ink: var(--color-accent-2);
+  --lane-node: var(--color-dim-node);
+
+  background:
+    linear-gradient(180deg, var(--color-gloss) 0%, transparent 42%),
+    var(--color-paper);
+}
+
+.lane__head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-2xs) var(--space-md);
+}
+
+.lane__name {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--color-ink);
+}
+
+.lane__tag {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--lane-ink);
+  white-space: nowrap;
+}
+
+.lane__track {
+  --node: clamp(4.25rem, 18vw, 6rem);
+  --span: calc(100cqi - var(--node));
+  --dot: 0.625rem;
+
+  container-type: inline-size;
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  block-size: 6.5rem;
+}
+
+.lane__node {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  inline-size: var(--node);
+  block-size: 3.25rem;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  background:
+    linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
+    var(--color-paper-3);
+  color: var(--lane-node);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+/* A node lights as a packet reaches it. */
+.lane__node::after {
+  content: "";
+  position: absolute;
+  inset: calc(-1 * var(--rule-hair));
+  border: var(--rule-hair) solid var(--lane-ink);
+  box-shadow: 0 0 18px -4px var(--lane-ink);
+  opacity: 0;
+}
+
+.lane__rail {
+  position: absolute;
+  inset-inline: calc(var(--node) / 2);
+  z-index: 1;
+  block-size: var(--rule-hair);
+  background: var(--color-rule-2);
+}
+
+.lane__rail--out {
+  inset-block-start: 1.1rem;
+}
+
+.lane__rail--back {
+  inset-block-end: 1.1rem;
+}
+
+/* The rails' chevrons sit in the gaps between nodes: right on the way out, left on the way back. */
+.lane__rail::before,
+.lane__rail::after {
+  content: "";
+  position: absolute;
+  inset-block-start: -3px;
+  inline-size: 7px;
+  block-size: 7px;
+  border-block-start: var(--rule-hair) solid var(--color-rule-2);
+  border-inline-end: var(--rule-hair) solid var(--color-rule-2);
+}
+
+.lane__rail--out::before,
+.lane__rail--out::after {
+  rotate: 45deg;
+}
+
+.lane__rail--back::before,
+.lane__rail--back::after {
+  rotate: -135deg;
+}
+
+.lane__rail::before {
+  inset-inline-start: calc(25% - 4px);
+}
+
+.lane__rail::after {
+  inset-inline-start: calc(75% - 4px);
+}
+
+.lane__packet {
+  position: absolute;
+  z-index: 1;
+  inset-inline-start: calc(var(--node) / 2 - var(--dot) / 2);
+  inline-size: var(--dot);
+  block-size: var(--dot);
+  box-shadow: 0 0 10px -2px var(--lane-ink);
+  transform: translateX(calc(var(--span) * var(--at)));
+}
+
+.lane__packet--out {
+  inset-block-start: calc(1.1rem - var(--dot) / 2);
+}
+
+.lane__packet--back {
+  inset-block-end: calc(1.1rem - var(--dot) / 2);
+}
+
+/* A request is an empty square; what comes back with bytes is a full one; a readiness event
+ * is a small one, with no bytes in it. */
+.lane__packet--ask {
+  border: 1.5px solid var(--lane-ink);
+  background: var(--color-paper);
+}
+
+.lane__packet--bytes {
+  background: var(--lane-ink);
+}
+
+.lane__packet--ready {
+  --dot: 0.25rem;
+
+  background: var(--lane-ink);
+}
+
+/* Where each packet stands in the still picture: in a gap, heading its way. */
+/* The reactor's readiness event and its bytes share the lower rail: the event waits by the
+ * kernel, the bytes travel nearer the task. */
+.lane__packet { --at: 0.25; }
+.lane--re .lane__packet--ready { --at: 0.75; }
+
+.lane__steps {
+  display: grid;
+  gap: var(--space-sm);
+  counter-reset: step;
+}
+
+.lane__steps li {
+  display: grid;
+  grid-template-columns: 1.75rem minmax(0, 1fr);
+  align-items: baseline;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  counter-increment: step;
+}
+
+.lane__steps li::before {
+  content: counter(step);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--lane-ink);
+}
+
+/* The three points under the diagram, each under a rule that draws in from the left. */
+.points {
+  display: grid;
+  gap: var(--space-lg) var(--space-xl);
+}
+
+@media (min-width: 56rem) {
+  .points {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.point {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: var(--space-xs);
+  padding-block-start: var(--space-md);
+}
+
+.point::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+  block-size: 2px;
+  background: var(--fill-accent-rule);
+  transform-origin: left;
+}
+
+.point dt {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--color-ink);
+}
+
+.point dd {
+  max-inline-size: 48ch;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+
+.points > :nth-child(2) { --n: 1; }
+.points > :nth-child(3) { --n: 2; }
+
+/* The legs, as fractions of one cycle. The proactor: the request out (0 to 35%), the kernel
+ * lights, the completed bytes back (47 to 82%), the task lights. The reactor: the readiness
+ * event back (0 to 24%), the task lights, its own call out (29 to 53%), the kernel lights,
+ * the bytes back (58 to 82%), the task lights. */
+.flow.is-live .lane__packet,
+.flow.is-live .lane__node::after {
+  animation: var(--leg) var(--dur-lane) var(--ease-in-out) infinite;
+}
+
+.lane--pro .lane__packet--ask { --leg: leg-pro-ask; }
+.lane--pro .lane__packet--bytes { --leg: leg-pro-bytes; }
+.lane--pro .lane__node--task::after { --leg: lit-pro-task; }
+.lane--pro .lane__node--kernel::after { --leg: lit-pro-kernel; }
+.lane--re .lane__packet--ready { --leg: leg-re-ready; }
+.lane--re .lane__packet--ask { --leg: leg-re-ask; }
+.lane--re .lane__packet--bytes { --leg: leg-re-bytes; }
+.lane--re .lane__node--task::after { --leg: lit-re-task; }
+.lane--re .lane__node--kernel::after { --leg: lit-re-kernel; }
+.flow.is-live .lane__node--mid::after { animation: none; }
+
+@keyframes leg-pro-ask {
+  0% { transform: translateX(0); opacity: 1; }
+  35% { transform: translateX(var(--span)); opacity: 1; }
+  36%, 100% { transform: translateX(var(--span)); opacity: 0; }
+}
+
+@keyframes leg-pro-bytes {
+  0%, 46% { transform: translateX(var(--span)); opacity: 0; }
+  47% { transform: translateX(var(--span)); opacity: 1; }
+  82% { transform: translateX(0); opacity: 1; }
+  83%, 100% { transform: translateX(0); opacity: 0; }
+}
+
+@keyframes lit-pro-kernel {
+  0%, 33%, 52%, 100% { opacity: 0; }
+  38%, 44% { opacity: 1; }
+}
+
+@keyframes lit-pro-task {
+  0%, 80%, 98%, 100% { opacity: 0; }
+  85%, 90% { opacity: 1; }
+}
+
+@keyframes leg-re-ready {
+  0% { transform: translateX(var(--span)); opacity: 1; }
+  24% { transform: translateX(0); opacity: 1; }
+  25%, 100% { transform: translateX(0); opacity: 0; }
+}
+
+@keyframes leg-re-ask {
+  0%, 28% { transform: translateX(0); opacity: 0; }
+  29% { transform: translateX(0); opacity: 1; }
+  53% { transform: translateX(var(--span)); opacity: 1; }
+  54%, 100% { transform: translateX(var(--span)); opacity: 0; }
+}
+
+@keyframes leg-re-bytes {
+  0%, 57% { transform: translateX(var(--span)); opacity: 0; }
+  58% { transform: translateX(var(--span)); opacity: 1; }
+  82% { transform: translateX(0); opacity: 1; }
+  83%, 100% { transform: translateX(0); opacity: 0; }
+}
+
+@keyframes lit-re-kernel {
+  0%, 51%, 64%, 100% { opacity: 0; }
+  55%, 59% { opacity: 1; }
+}
+
+@keyframes lit-re-task {
+  0%, 22%, 33%, 80%, 98%, 100% { opacity: 0; }
+  25%, 28%, 85%, 90% { opacity: 1; }
+}

@@ -1,0 +1,442 @@
+/* The Learn pages: a chapter list, one chapter of prose and runnable code, and a pager.
+ *
+ * Long-form reading, so the motion stays out of the way: no reveals on prose, only the
+ * copy confirmation, the link underlines and the hover light of the chapter cards (all in
+ * motion.css and cards.css). The chapter list is a sticky column on wide screens and a set
+ * of wrapping chips above the chapter on narrow ones, so nothing scrolls sideways. */
+
+.learn-wrap {
+  display: grid;
+  gap: var(--space-xl);
+  max-inline-size: var(--page-max);
+  margin-inline: auto;
+  padding: var(--space-lg) var(--page-gutter) var(--space-3xl);
+}
+
+@media (min-width: 64rem) {
+  .learn-wrap {
+    grid-template-columns: 13rem minmax(0, 1fr);
+    gap: var(--space-2xl);
+  }
+}
+
+/* The chapter list. */
+
+.chapters {
+  display: grid;
+  align-content: start;
+  gap: var(--space-sm);
+}
+
+.chapters__title {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+}
+
+.chapters__title a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.chapters ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  counter-reset: chapter;
+}
+
+.chapters li {
+  counter-increment: chapter;
+}
+
+.chapters li a {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+  padding: var(--space-2xs) var(--space-sm);
+  border: var(--rule-hair) solid var(--color-rule-2);
+  color: var(--color-ink-2);
+  font-size: var(--text-sm);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.chapters li a::before {
+  content: counter(chapter, decimal-leading-zero);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  color: var(--color-muted);
+}
+
+.chapters li a[aria-current="page"] {
+  border-color: var(--color-accent);
+  background: var(--color-card-lit);
+  color: var(--color-ink);
+}
+
+.chapters li a[aria-current="page"]::before {
+  color: var(--color-accent);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .chapters li a:hover {
+    border-color: var(--color-accent);
+    color: var(--color-ink);
+  }
+}
+
+@media (min-width: 64rem) {
+  .chapters {
+    position: sticky;
+    inset-block-start: var(--space-lg);
+    align-self: start;
+    max-block-size: calc(100dvh - 2 * var(--space-lg));
+    overflow-y: auto;
+  }
+
+  .chapters ol {
+    display: grid;
+    gap: 0;
+  }
+
+  .chapters li a {
+    display: flex;
+    padding: var(--space-xs) var(--space-sm);
+    border: 0;
+    border-inline-start: 2px solid var(--color-rule);
+  }
+
+  .chapters li a[aria-current="page"] {
+    border-image: var(--fill-liquid) 1;
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .chapters li a:hover {
+      border-inline-start-color: var(--color-accent);
+    }
+  }
+}
+
+/* A chapter. */
+
+.learn-main {
+  min-width: 0;
+  max-inline-size: 52rem;
+}
+
+.chapter-head {
+  display: grid;
+  gap: var(--space-md);
+  padding-block-end: var(--space-xl);
+  border-block-end: var(--rule-hair) solid var(--color-rule);
+}
+
+.chapter-head__step {
+  justify-self: start;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.chapter-head h1 {
+  font-size: clamp(2.5rem, 3.5vw + 1rem, 4rem);
+  line-height: 1.02;
+  letter-spacing: var(--tracking-display);
+  text-wrap: balance;
+}
+
+.chapter-head__lede {
+  max-inline-size: 60ch;
+  font-size: var(--text-md);
+  color: var(--color-ink-2);
+}
+
+.prose {
+  display: grid;
+  gap: var(--space-md);
+  padding-block-start: var(--space-lg);
+}
+
+.prose > * {
+  min-width: 0;
+}
+
+.prose h2 {
+  margin-block-start: var(--space-2xl);
+  font-size: var(--text-2xl);
+  line-height: 1.12;
+  letter-spacing: var(--tracking-head);
+  scroll-margin-block-start: var(--space-lg);
+}
+
+.prose > h2:first-child {
+  margin-block-start: var(--space-md);
+}
+
+.prose h3 {
+  margin-block-start: var(--space-lg);
+  font-size: var(--text-lg);
+  scroll-margin-block-start: var(--space-lg);
+}
+
+.prose p,
+.prose li {
+  max-inline-size: 68ch;
+}
+
+.prose strong {
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.prose :not(pre) > code {
+  padding: 0.05em 0.3em;
+  border: var(--rule-hair) solid var(--color-rule);
+  background: var(--color-paper-2);
+  overflow-wrap: anywhere;
+}
+
+.prose ul,
+.prose ol {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.prose ul li,
+.prose ol li {
+  position: relative;
+  padding-inline-start: var(--space-lg);
+}
+
+.prose ul li::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 0.62em;
+  inset-inline-start: 0.2rem;
+  inline-size: 0.35rem;
+  block-size: 0.35rem;
+  background: var(--fill-liquid);
+}
+
+.prose ol {
+  counter-reset: item;
+}
+
+.prose ol li {
+  counter-increment: item;
+}
+
+.prose ol li::before {
+  content: counter(item);
+  position: absolute;
+  inset-inline-start: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.9;
+  color: var(--color-accent);
+}
+
+/* A code sample with what it is above it: a file name, or what to type. */
+.snippet {
+  display: grid;
+  gap: var(--space-xs);
+  margin-block: var(--space-xs);
+}
+
+.snippet__label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+}
+
+.snippet .code pre {
+  font-size: var(--text-xs);
+}
+
+@media (min-width: 40rem) {
+  .snippet .code pre {
+    font-size: var(--text-sm);
+  }
+}
+
+/* Output a program prints: plain, set back from the code. */
+.snippet--output .code {
+  background: var(--color-paper);
+  box-shadow: none;
+}
+
+.snippet--output .code pre {
+  color: var(--color-muted);
+}
+
+/* A note: a fact worth stopping for, behind a bar of the liquid. */
+.note {
+  position: relative;
+  display: grid;
+  gap: var(--space-2xs);
+  padding: var(--space-md) var(--space-lg);
+  background: linear-gradient(90deg, var(--color-card-emit) 0%, transparent 80%);
+}
+
+.note::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  inline-size: 2px;
+  background: var(--fill-liquid);
+}
+
+.note__title {
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+/* Tables: rows of facts. On a phone each row becomes a block, its cells labelled. */
+.table {
+  inline-size: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.table th {
+  padding: var(--space-xs) var(--space-sm);
+  border-block-end: var(--rule-hair) solid var(--color-rule-2);
+  color: var(--color-muted);
+  font-weight: 500;
+  text-align: start;
+}
+
+.table td {
+  padding: var(--space-sm);
+  border-block-end: var(--rule-hair) solid var(--color-rule);
+  vertical-align: top;
+}
+
+.table th:first-child,
+.table td:first-child {
+  padding-inline-start: 0;
+}
+
+@media (max-width: 39.99rem) {
+  .table thead {
+    position: absolute;
+    inline-size: 1px;
+    block-size: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .table tr {
+    display: grid;
+    gap: var(--space-2xs);
+    padding-block: var(--space-sm);
+    border-block-end: var(--rule-hair) solid var(--color-rule);
+  }
+
+  .table td {
+    display: grid;
+    gap: var(--space-3xs);
+    padding: 0;
+    border: 0;
+  }
+
+  .table td::before {
+    content: attr(data-label);
+    font-family: var(--font-mono);
+    font-size: var(--text-micro);
+    color: var(--color-muted);
+  }
+}
+
+/* Previous and next. */
+.pager {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-sm);
+  margin-block-start: var(--space-3xl);
+}
+
+/* Each link one line: a drawn chevron and the chapter's name. */
+.pager a {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+  padding: var(--space-md);
+  border: var(--rule-hair) solid var(--color-rule-2);
+  background: var(--color-paper-2);
+  text-decoration: none;
+}
+
+.pager a[rel="next"] {
+  grid-column: 2;
+  justify-content: flex-end;
+}
+
+.pager a[rel="prev"]::before,
+.pager a[rel="next"]::after {
+  content: "";
+  flex: none;
+  inline-size: 0.5rem;
+  block-size: 0.5rem;
+  border-block-start: 1.5px solid var(--color-accent);
+  border-inline-end: 1.5px solid var(--color-accent);
+}
+
+.pager a[rel="prev"]::before {
+  rotate: -135deg;
+}
+
+.pager a[rel="next"]::after {
+  rotate: 45deg;
+}
+
+.pager__title {
+  overflow: hidden;
+  color: var(--color-ink);
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .pager a:hover {
+    border-color: var(--color-accent);
+  }
+}
+
+/* The Learn index: a card per chapter, each a link. */
+.learn-cards {
+  display: grid;
+  gap: var(--space-md);
+  padding-block-start: var(--space-xl);
+}
+
+@media (min-width: 40rem) {
+  .learn-cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 72rem) {
+  .learn-cards {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+a.card {
+  grid-column: auto;
+  color: var(--color-ink-2);
+  text-decoration: none;
+}
+
+.card__step {
+  justify-self: start;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.card p:last-child {
+  font-size: var(--text-sm);
+}

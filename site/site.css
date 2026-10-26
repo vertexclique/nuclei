@@ -1,10 +1,12 @@
-/* Hallmark · genre: atmospheric · macrostructure: Marquee Hero · theme: custom (Abyss) · enrichment: Tier A CSS apparatus (liquid core bank) · nav: N9 · footer: Ft5
+/* Hallmark · genre: atmospheric · macrostructure: Marquee Hero · theme: custom (Abyss) · enrichment: footage behind a dot screen, Tier A CSS apparatus (liquid core bank) · nav: N9 · footer: Ft5
  * tone: atmospheric, serious, square · anchor hue: 245 (blue-black) · accent: turquoise 188 poured into blue 258
- * pre-emit critique: P4 H4 E4 S5 R4 V4 · contrast: pass (40-41) · slop: pass (42-45)
+ * pre-emit critique: P5 H4 E5 S5 R4 V4 · contrast: pass (40-41) · slop: pass (42-45)
  */
 
-/* Two registers: headings and prose in Geist, written as sentences; code and small machine
- * labels in JetBrains Mono, in their own case. Nothing on the page is rounded. */
+/* The page's still form: type, surfaces and layout. code.css holds the code panels,
+ * cards.css the cards and their glyphs, flow.css the proactor diagram, motion.css every
+ * animation. Two registers: headings and prose in Geist, written as sentences; code and small
+ * machine labels in JetBrains Mono, in their own case. Nothing on the page is rounded. */
 
 *,
 *::before,
@@ -72,13 +74,15 @@ h3 {
 
 p,
 ul,
+ol,
 dl,
 dd,
 figure {
   margin: 0;
 }
 
-ul {
+ul,
+ol {
   padding: 0;
   list-style: none;
 }
@@ -106,6 +110,11 @@ a:active {
   outline-offset: 3px;
 }
 
+/* The hidden attribute wins over any display a class sets (the copy buttons rely on it). */
+[hidden] {
+  display: none !important;
+}
+
 .visually-hidden {
   position: absolute;
   inline-size: 1px;
@@ -118,7 +127,8 @@ a:active {
 /* The wet surface: a sheen falling from a lit top edge, light pooled in one corner, and a
  * soft shadow beneath. Every raised panel on the page is this one surface. */
 .code,
-.card {
+.card,
+.lane {
   border: var(--rule-hair) solid var(--color-rule);
   background:
     linear-gradient(180deg, var(--color-gloss) 0%, transparent 42%),
@@ -132,12 +142,35 @@ a:active {
 /* Everything that holds the liquid. */
 .nav__mark::before,
 .btn--primary,
-.band__name::before,
 .chamber__liquid {
   background: var(--fill-liquid);
 }
 
-/* N9 · edge-aligned: the wordmark at one edge, the source and the call to action at the other. */
+/* A light edge laid over a surface, shown on hover and focus (motion.css fades it). */
+.btn--ghost::before,
+.nav__cta::before {
+  content: "";
+  position: absolute;
+  inset: calc(-1 * var(--rule-hair));
+  border: var(--rule-hair) solid var(--color-accent);
+  box-shadow: 0 0 22px -6px var(--color-glow);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* A band of light that crosses a button once on hover. */
+.btn::after,
+.nav__cta::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--fill-sheen);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-110%);
+}
+
+/* N9 · edge-aligned: the wordmark at one edge, the links and the call to action at the other. */
 
 .nav {
   position: relative;
@@ -179,19 +212,39 @@ a:active {
   gap: var(--space-lg);
 }
 
+/* A drawn underline, scaled in from the left on hover and focus. */
+.nav__link,
+.foot__links a {
+  position: relative;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.nav__link::after,
+.foot__links a::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: -0.2em;
+  block-size: var(--rule-hair);
+  background: var(--fill-accent-rule);
+  transform: scaleX(0);
+  transform-origin: left;
+}
+
 .nav__link {
   font-size: var(--text-sm);
   font-weight: 500;
   color: var(--color-ink-2);
-  text-decoration-color: transparent;
-  white-space: nowrap;
 }
 
 .nav__cta {
+  position: relative;
   display: inline-flex;
   align-items: center;
   min-block-size: 2.25rem;
   padding: 0 var(--space-md);
+  overflow: clip;
   border: var(--rule-hair) solid var(--color-rule-2);
   background:
     linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
@@ -202,41 +255,41 @@ a:active {
   font-weight: 500;
   text-decoration: none;
   white-space: nowrap;
-  transition: border-color var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out);
 }
 
-@media (hover: hover) and (pointer: fine) {
-  .nav__cta:hover {
-    border-color: var(--color-accent);
+/* On the narrowest phones Source leaves the bar (it is in the footer), so no link wraps. */
+@media (max-width: 25.99rem) {
+  .nav__link--wide {
+    display: none;
   }
 }
 
-.nav__cta:active {
-  transform: translateY(1px);
+@media (max-width: 23.99rem) {
+  .nav__links {
+    gap: var(--space-sm);
+  }
+
+  .nav__cta {
+    padding: 0 var(--space-sm);
+  }
 }
 
 /* Buttons: square, one line, the primary one filled with the liquid. */
 
 .btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-block-size: 2.875rem;
   padding: 0 var(--space-lg);
+  overflow: clip;
   font-size: var(--text-base);
   font-weight: 600;
   line-height: 1;
   letter-spacing: -0.01em;
   text-decoration: none;
   white-space: nowrap;
-  transition:
-    box-shadow var(--dur-short) var(--ease-out),
-    border-color var(--dur-micro) var(--ease-out),
-    transform var(--dur-micro) var(--ease-out);
-}
-
-.btn:active {
-  transform: translateY(1px);
 }
 
 .btn--primary {
@@ -246,19 +299,8 @@ a:active {
     0 10px 28px -12px var(--color-glow);
 }
 
-@media (hover: hover) and (pointer: fine) {
-  .btn--primary:hover {
-    box-shadow:
-      inset 0 1px 0 var(--color-gloss-strong),
-      0 12px 36px -8px var(--color-glow);
-  }
-
-  .btn--ghost:hover {
-    border-color: var(--color-accent);
-  }
-}
-
 .btn--ghost {
+  overflow: visible;
   border: var(--rule-hair) solid var(--color-rule-2);
   background:
     linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
@@ -267,27 +309,102 @@ a:active {
   color: var(--color-ink);
 }
 
-/* Hero: the headline left, the apparatus right, light pooled on the dark beneath both.
- * It runs the full width so its light is never cut at the column's edge; the padding keeps
- * its content in the page column. */
+/* Hero: the headline left, the apparatus right, over the footage. It runs the full width so
+ * its backdrop is never cut at the column's edge; the padding keeps its content in the page
+ * column. */
 .hero {
   --hero-inline: max(var(--page-gutter), calc((100% - var(--page-max)) / 2 + var(--page-gutter)));
 
+  position: relative;
+  isolation: isolate;
   display: grid;
   gap: var(--space-2xl);
   align-items: center;
   padding: var(--space-xl) var(--hero-inline) var(--space-3xl);
   overflow: clip;
-  background:
-    radial-gradient(42% 52% at 78% 46%, var(--color-bloom) 0%, transparent 72%),
-    radial-gradient(38% 46% at 8% 92%, var(--color-bloom-2) 0%, transparent 72%),
-    var(--color-paper);
+  background: var(--color-paper);
 }
 
 @media (min-width: 60rem) {
   .hero {
     grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
   }
+}
+
+/* The backdrop: the footage, seen through a screen of square holes, a drifting field of dots
+ * over it, and a scrim of the paper that keeps the text side dark and fades every edge. */
+.hero__backdrop {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  isolation: isolate;
+  pointer-events: none;
+}
+
+.hero__video {
+  position: absolute;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: cover;
+  object-position: 62% 50%;
+  opacity: 0.9;
+}
+
+/* The screen: one-pixel bars of the paper on a four-pixel pitch, so the footage shows only
+ * through square holes. */
+.hero__backdrop::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  background:
+    linear-gradient(90deg, var(--color-paper) 1px, transparent 1px) 0 0 / 4px 4px,
+    linear-gradient(180deg, var(--color-paper) 1px, transparent 1px) 0 0 / 4px 4px;
+}
+
+.hero__dots {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  overflow: clip;
+  mask-image: radial-gradient(70% 80% at 72% 48%, #000 0%, transparent 100%);
+}
+
+/* One cell larger than its frame on every side, so a drift of one cell never shows an edge. */
+.hero__dots-field {
+  position: absolute;
+  inset: calc(-1 * var(--dot-cell));
+  background:
+    conic-gradient(at 2px 2px, transparent 75%, var(--color-dot) 0) 0 0 / var(--dot-cell) var(--dot-cell),
+    conic-gradient(at 2px 2px, transparent 75%, var(--color-dot-2) 0) calc(var(--dot-cell) / 2) calc(var(--dot-cell) / 2) / var(--dot-cell) var(--dot-cell);
+}
+
+.hero__backdrop::after {
+  content: "";
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  background:
+    radial-gradient(42% 52% at 78% 46%, var(--color-pool) 0%, transparent 72%),
+    linear-gradient(180deg, var(--color-paper) 0%, transparent 12%, transparent 70%, var(--color-paper) 100%),
+    linear-gradient(180deg, var(--color-scrim) 0%, var(--color-scrim) 62%, var(--color-scrim-soft) 100%);
+}
+
+@media (min-width: 60rem) {
+  .hero__backdrop::after {
+    background:
+      radial-gradient(42% 52% at 78% 46%, var(--color-pool) 0%, transparent 72%),
+      radial-gradient(38% 46% at 8% 92%, var(--color-pool-2) 0%, transparent 72%),
+      linear-gradient(180deg, var(--color-paper) 0%, transparent 14%, transparent 46%, var(--color-scrim-soft) 60%, var(--color-scrim) 76%, var(--color-paper) 100%),
+      linear-gradient(90deg, var(--color-scrim) 0%, var(--color-scrim) 38%, var(--color-scrim-soft) 62%, var(--color-scrim-thin) 100%);
+  }
+}
+
+.hero__copy,
+.apparatus {
+  position: relative;
+  z-index: var(--z-base);
 }
 
 .hero__copy {
@@ -303,10 +420,37 @@ a:active {
   letter-spacing: var(--tracking-display);
 }
 
+/* Each line is its own box, so the lines can rise one after another. */
+.hero__line {
+  display: inline-block;
+}
+
+/* Words in colour: the text gradient, clipped to the glyphs. Where clipping to text is not
+ * supported the word keeps the plain accent, and forced colours get the system's own. */
+.ink {
+  color: var(--color-accent);
+}
+
+@supports ((background-clip: text) or (-webkit-background-clip: text)) {
+  .ink {
+    background: var(--fill-text);
+    background-size: 100% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+}
+
+@media (forced-colors: active) {
+  .ink {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+  }
+}
+
 /* The verb landmark: colour and a drawn bar, never a slanted glyph. */
 .hero__verb {
   position: relative;
-  color: var(--color-accent);
   white-space: nowrap;
 }
 
@@ -314,27 +458,21 @@ a:active {
   content: "";
   position: absolute;
   inset-inline: 0.04em;
-  inset-block-end: 0.12em;
+  inset-block-end: 0.02em;
   block-size: 0.07em;
   background: var(--fill-accent-rule);
   transform-origin: left;
-  animation: verb-pour var(--dur-flow) var(--ease-out) 700ms backwards;
-}
-
-@keyframes verb-pour {
-  from {
-    transform: scaleX(0);
-  }
-
-  to {
-    transform: scaleX(1);
-  }
 }
 
 .hero__lede {
   max-inline-size: 46ch;
   font-size: var(--text-md);
   line-height: 1.6;
+}
+
+.hero__lede strong {
+  font-weight: 600;
+  color: var(--color-ink);
 }
 
 .hero__actions {
@@ -356,18 +494,36 @@ a:active {
   color: var(--color-muted);
 }
 
-.hero__meta span {
+.hero__meta > * {
   display: inline-flex;
   align-items: center;
   gap: var(--space-md);
   white-space: nowrap;
 }
 
-.hero__meta span + span::before {
+.hero__meta > * + *::before {
   content: "";
   inline-size: 0.3rem;
   block-size: 0.3rem;
   background: var(--color-rule-2);
+}
+
+.hero__meta a {
+  color: var(--color-ink-2);
+  text-decoration: none;
+}
+
+.hero__meta a span {
+  text-decoration-line: underline;
+  text-decoration-thickness: var(--rule-hair);
+  text-decoration-color: var(--color-rule-2);
+  text-underline-offset: 0.22em;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .hero__meta a:hover span {
+    text-decoration-color: var(--color-accent);
+  }
 }
 
 /* On a phone the three facts stack without separators, and the buttons fill the width. */
@@ -377,7 +533,7 @@ a:active {
     align-items: start;
   }
 
-  .hero__meta span + span::before {
+  .hero__meta > * + *::before {
     display: none;
   }
 
@@ -423,6 +579,28 @@ a:active {
   block-size: 0.375rem;
   background: linear-gradient(180deg, var(--color-rule-2) 0%, var(--color-paper-3) 100%);
   box-shadow: inset 0 1px 0 var(--color-gloss-edge);
+  transform-origin: center;
+}
+
+/* A slow glint that crosses the glass of the whole bank. */
+.bank__glint {
+  position: absolute;
+  z-index: 3;
+  inset-block: var(--space-lg) var(--space-xl);
+  inset-inline: 0;
+  overflow: clip;
+  pointer-events: none;
+}
+
+.bank__glint::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  inline-size: 40%;
+  background: var(--fill-sheen);
+  opacity: 0;
+  transform: translateX(-100%) skewX(-12deg);
 }
 
 .chamber {
@@ -458,7 +636,7 @@ a:active {
   background: var(--color-rule-2);
 }
 
-/* Poured to its own level, a lit line at its surface; the level breathes like a tide. */
+/* Poured to its own level, with a lit line at its surface. */
 .chamber__liquid {
   position: absolute;
   inset-inline: 4px;
@@ -470,19 +648,37 @@ a:active {
     0 0 14px 1px var(--color-glow),
     0 0 40px 8px var(--color-glow-2);
   transform-origin: bottom;
-  animation: tide var(--dur-tide) var(--ease-in-out) infinite;
-  animation-delay: calc(var(--i) * -1.75s);
 }
 
-@keyframes tide {
-  0%,
-  100% {
-    transform: scaleY(1);
-  }
+/* The surface flares softly when an operation completes there (motion.css times it). */
+.chamber__liquid::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+  block-size: 30%;
+  background: linear-gradient(180deg, var(--color-filament-tip) 0%, transparent 100%);
+  opacity: 0;
+}
 
-  50% {
-    transform: scaleY(0.95);
-  }
+/* An operation rising through the liquid: the frame spans the liquid's height, so moving it
+ * up by its own height carries the square from the floor to the surface. */
+.chamber__bubble {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: var(--x);
+  inline-size: 4px;
+  opacity: 0;
+}
+
+.chamber__bubble::before {
+  content: "";
+  position: absolute;
+  inset-block-end: 0;
+  inline-size: 4px;
+  block-size: 4px;
+  background: var(--color-filament-tip);
+  box-shadow: 0 0 6px var(--color-glow);
 }
 
 .chamber__label {
@@ -492,11 +688,11 @@ a:active {
   transform: translateX(-50%);
   font-family: var(--font-mono);
   font-size: var(--text-micro);
-  color: var(--color-muted);
+  color: var(--color-ink-2);
   white-space: nowrap;
 }
 
-/* Four facts under the bank, each a proper heading and one line. */
+/* Four facts under the bank, each a proper heading and one line, behind a bar of the liquid. */
 .facts {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -507,12 +703,21 @@ a:active {
 }
 
 .fact {
+  position: relative;
   display: grid;
   align-content: start;
   gap: var(--space-2xs);
   padding-inline-start: var(--space-md);
-  border-inline-start: 2px solid;
-  border-image: linear-gradient(180deg, var(--color-accent) 0%, var(--color-accent-deep) 100%) 1;
+}
+
+.fact::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  inline-size: 2px;
+  background: linear-gradient(180deg, var(--color-accent) 0%, var(--color-accent-deep) 100%);
+  transform-origin: top;
 }
 
 .fact dt {
@@ -533,92 +738,6 @@ a:active {
 @media (max-width: 26rem) {
   .facts {
     grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-/* The backend band: the four kernel interfaces, each marked with a square of the liquid. */
-
-.band {
-  border-block: var(--rule-hair) solid var(--color-rule);
-  background:
-    linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
-    var(--color-paper);
-  box-shadow: inset 0 1px 0 var(--color-gloss-edge);
-}
-
-.band__list {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  max-inline-size: var(--page-max);
-  margin-inline: auto;
-  padding-inline: var(--page-gutter);
-}
-
-.band__item {
-  display: grid;
-  align-content: start;
-  gap: var(--space-2xs);
-  padding: var(--space-lg) var(--space-md);
-}
-
-.band__item:nth-child(odd) {
-  padding-inline-start: 0;
-}
-
-.band__item:nth-child(even) {
-  border-inline-start: var(--rule-hair) solid var(--color-rule);
-}
-
-.band__item:nth-child(n + 3) {
-  border-block-start: var(--rule-hair) solid var(--color-rule);
-}
-
-.band__name {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-xs);
-  font-family: var(--font-display);
-  font-size: var(--text-lg);
-  font-weight: 600;
-  line-height: 1.1;
-  letter-spacing: -0.03em;
-  color: var(--color-ink);
-}
-
-.band__name::before {
-  content: "";
-  flex: none;
-  inline-size: 0.4em;
-  block-size: 0.4em;
-  box-shadow: 0 0 10px 0 var(--color-glow);
-}
-
-.band__where {
-  font-size: var(--text-sm);
-  line-height: 1.45;
-  color: var(--color-muted);
-}
-
-@media (min-width: 60rem) {
-  .band__list {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-
-  .band__item,
-  .band__item:nth-child(odd) {
-    padding: var(--space-lg);
-  }
-
-  .band__item:first-child {
-    padding-inline-start: 0;
-  }
-
-  .band__item:nth-child(n + 3) {
-    border-block-start: 0;
-  }
-
-  .band__item + .band__item {
-    border-inline-start: var(--rule-hair) solid var(--color-rule);
   }
 }
 
@@ -644,55 +763,20 @@ main > section:not(.hero, .band) {
   color: var(--color-muted);
 }
 
+.section-head__dek strong {
+  font-weight: 600;
+  color: var(--color-ink-2);
+}
+
 .section-note {
   max-inline-size: var(--measure);
   color: var(--color-muted);
 }
 
-/* Code */
-
-.code {
-  position: relative;
-  min-width: 0;
-}
-
-.code pre {
-  margin: 0;
-  padding: var(--space-lg);
-  overflow-x: auto;
-  color: var(--color-ink-2);
-  font-size: var(--text-sm);
-  line-height: 1.7;
-  tab-size: 4;
-}
-
-.code pre code {
-  font-size: inherit;
-  color: inherit;
-}
-
-/* A copy button in the code's top corner, over the short first line; on a narrow screen the
- * code starts below it. */
-.code--corner .copy {
-  position: absolute;
-  inset-block-start: var(--space-sm);
-  inset-inline-end: var(--space-sm);
-}
-
-.code--corner pre {
-  padding-block-start: calc(var(--space-lg) + var(--space-xl));
-}
-
-@media (min-width: 40rem) {
-  .code--corner pre {
-    padding-block-start: var(--space-lg);
-  }
-}
-
-/* Install */
+/* Install: the two forms side by side once there is room, each with its copy button above it. */
 
 .install {
-  max-inline-size: 56rem;
+  max-inline-size: 64rem;
 }
 
 .install__steps {
@@ -700,8 +784,15 @@ main > section:not(.hero, .band) {
   gap: var(--space-lg);
 }
 
+@media (min-width: 48rem) {
+  .install__steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .install__step {
   display: grid;
+  grid-template-rows: auto 1fr;
   gap: var(--space-sm);
   min-width: 0;
 }
@@ -721,64 +812,9 @@ main > section:not(.hero, .band) {
   color: var(--color-ink-2);
 }
 
-.install .code pre {
-  color: var(--color-ink);
-}
-
-/* The copy button: default, hover, focus, active, disabled, loading (none: the copy is
- * instant), error and success. */
-.copy {
-  flex: none;
-  min-inline-size: 4.5rem;
-  padding: var(--space-2xs) var(--space-sm);
-  border: var(--rule-hair) solid var(--color-rule-2);
-  background: linear-gradient(180deg, var(--color-paper-3) 0%, var(--color-paper-2) 100%);
-  box-shadow: inset 0 1px 0 var(--color-gloss-edge);
-  color: var(--color-ink-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  cursor: pointer;
-  white-space: nowrap;
-  transition: border-color var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out);
-}
-
-@media (hover: hover) and (pointer: fine) {
-  .copy:hover {
-    border-color: var(--color-accent);
-    color: var(--color-ink);
-  }
-}
-
-.copy:active {
-  transform: translateY(1px);
-}
-
-.copy:disabled {
-  border-color: var(--color-rule);
-  color: var(--color-muted);
-  cursor: not-allowed;
-}
-
-.copy[data-state="copied"] {
-  border-color: var(--color-accent);
-  color: var(--color-accent);
-}
-
-.copy[data-state="error"] {
-  border-color: var(--color-accent-2);
-  color: var(--color-accent-2);
-}
-
-.copy[data-state] .copy__label {
-  display: none;
-}
-
-.copy[data-state="copied"]::after {
-  content: "Copied";
-}
-
-.copy[data-state="error"]::after {
-  content: "Select it";
+.install .code {
+  display: grid;
+  align-content: center;
 }
 
 /* First program */
@@ -802,10 +838,20 @@ main > section:not(.hero, .band) {
 }
 
 .notes > div {
+  position: relative;
   display: grid;
   gap: var(--space-2xs);
   padding-block-start: var(--space-md);
-  border-block-start: var(--rule-hair) solid var(--color-rule);
+}
+
+.notes > div::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+  block-size: var(--rule-hair);
+  background: var(--color-rule);
+  transform-origin: left;
 }
 
 .notes dt {
@@ -817,142 +863,25 @@ main > section:not(.hero, .band) {
   max-inline-size: 48ch;
 }
 
-/* The decisions: wet panels on an uneven twelve-column grid. */
-
-.cards {
-  display: grid;
-  gap: var(--space-md);
-}
-
-@media (min-width: 48rem) {
-  .cards {
-    grid-template-columns: repeat(12, minmax(0, 1fr));
-  }
-
-  .card {
-    grid-column: span 5;
-  }
-
-  .card--wide {
-    grid-column: span 7;
-  }
-
-  .card--half {
-    grid-column: span 6;
-  }
-}
-
-.card {
-  display: grid;
-  gap: var(--space-sm);
-  align-content: start;
-  padding: var(--space-lg);
-}
-
-.card p {
-  max-inline-size: 52ch;
-}
-
-/* What comes with it: a ruled grid, one cell per piece, its API under its name. */
-
-.kit__grid {
-  display: grid;
-  border-block-start: var(--rule-hair) solid var(--color-rule);
-}
-
-.kit__item {
-  display: grid;
-  align-content: start;
-  gap: var(--space-xs);
-  padding-block: var(--space-lg);
-  border-block-end: var(--rule-hair) solid var(--color-rule);
-}
-
-.kit__item h3 {
-  font-size: var(--text-md);
-  letter-spacing: -0.015em;
-}
-
-.kit__api {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--color-accent);
-}
-
-.kit__api code {
-  font-size: inherit;
-  color: inherit;
-}
-
-.kit__item p:last-child {
-  max-inline-size: 44ch;
-  font-size: var(--text-sm);
-  line-height: 1.55;
-}
-
-@media (min-width: 40rem) and (max-width: 63.99rem) {
-  .kit__grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    column-gap: var(--space-xl);
-  }
-
-  .kit__item:last-child:nth-child(odd) {
-    grid-column: 1 / -1;
-  }
-}
-
-@media (min-width: 64rem) {
-  .kit__grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .kit__item {
-    padding-inline: var(--space-lg);
-  }
-
-  .kit__item:nth-child(3n + 1) {
-    padding-inline-start: 0;
-  }
-
-  .kit__item:not(:nth-child(3n + 1)) {
-    border-inline-start: var(--rule-hair) solid var(--color-rule);
-  }
-}
-
-/* Checked: four panels, each topped with a rule of the liquid. */
-
-.checks {
-  display: grid;
-  gap: var(--space-xl) var(--space-2xl);
-}
-
-@media (min-width: 48rem) {
-  .checks {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-.check {
-  display: grid;
-  align-content: start;
-  gap: var(--space-sm);
-  padding-block-start: var(--space-lg);
-  border-block-start: 2px solid;
-  border-image: var(--fill-accent-rule) 1;
-}
-
-.check p {
-  max-inline-size: var(--measure);
-}
-
 /* Ft5 · statement */
 
 .foot {
+  position: relative;
+  isolation: isolate;
   display: grid;
   gap: var(--space-xl);
   max-inline-size: var(--page-max);
   margin-inline: auto;
   padding: var(--space-3xl) var(--page-gutter) var(--space-xl);
+}
+
+/* Light pooled under the closing line, the page's last glow. */
+.foot::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: radial-gradient(40% 60% at 12% 40%, var(--color-pool-2) 0%, transparent 70%);
 }
 
 .foot__line {
@@ -966,14 +895,24 @@ main > section:not(.hero, .band) {
 }
 
 .foot__meta {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-sm) var(--space-lg);
   align-items: baseline;
   padding-block-start: var(--space-md);
-  border-block-start: var(--rule-hair) solid var(--color-rule);
   font-size: var(--text-sm);
   color: var(--color-muted);
+}
+
+.foot__meta::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+  block-size: var(--rule-hair);
+  background: var(--color-rule);
+  transform-origin: left;
 }
 
 .foot__mark {
@@ -986,27 +925,16 @@ main > section:not(.hero, .band) {
 
 .foot__links {
   display: flex;
-  gap: var(--space-md);
+  flex-wrap: wrap;
+  gap: var(--space-2xs) var(--space-md);
   margin-inline-start: auto;
 }
 
 .foot__links a {
-  white-space: nowrap;
+  color: var(--color-ink);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
-  }
-
-  .chamber__liquid,
-  .hero__verb::after {
-    animation: none;
-  }
-
-  *,
-  *::before,
-  *::after {
-    transition-duration: 1ms !important;
-  }
+.foot__credit {
+  flex-basis: 100%;
+  font-size: var(--text-xs);
 }

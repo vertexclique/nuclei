@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tasks: Learn Nuclei</title>
+  <meta name="description" content="Spawning, awaiting, detaching and cancelling; local tasks and blocking work.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/tasks.html">
+  <meta property="og:title" content="Tasks: Learn Nuclei">
+  <meta property="og:description" content="Spawning, awaiting, detaching and cancelling; local tasks and blocking work.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/tasks.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html" aria-current="page">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 3 of 12</p>
+        <h1>Tasks</h1>
+        <p class="chapter-head__lede">Spawning work, waiting for its result, letting it run on its own or stopping it; tasks that are not Send, and work that blocks.</p>
+      </header>
+      <article class="prose">
+<h2 id="spawn">Spawn and await</h2>
+<p><code>nuclei::spawn</code> takes a future that is <code>Send + 'static</code> and returns a <code>Task&lt;T&gt;</code>. A task is a future itself: awaiting it gives the task&rsquo;s output. If the task&rsquo;s future panics, awaiting the task resumes the panic.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="cm">// Each task is placed on a shard and stays there.</span>
+    <span class="kw">let</span> tasks<span class="pu">:</span> <span class="ty">Vec</span><span class="pu">&lt;_&gt;</span> <span class="pu">=</span> <span class="pu">(</span><span class="nu">0</span><span class="pu">..</span><span class="nu">8u64</span><span class="pu">)</span>
+        <span class="pu">.</span><span class="fn">map</span><span class="pu">(|</span>n<span class="pu">|</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span> n <span class="pu">*</span> n <span class="pu">}))</span>
+        <span class="pu">.</span><span class="fn">collect</span><span class="pu">();</span>
+
+    <span class="kw">let</span> <span class="kw">mut</span> total <span class="pu">=</span> <span class="nu">0</span><span class="pu">;</span>
+    <span class="kw">for</span> task <span class="kw">in</span> tasks <span class="pu">{</span>
+        total <span class="pu">+=</span> task<span class="pu">.</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="pu">}</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>total<span class="pu">,</span> <span class="nu">140</span><span class="pu">);</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="placement">Where a task runs</h2>
+<p>A task stays on the shard it was placed on: nothing steals it. Spawned on a worker, it stays on that worker unless the worker holds more live tasks than another shard by the runtime&rsquo;s <code>local_spawn_margin</code> (32 by default). Spawned from any other thread, it goes to that thread&rsquo;s home shard by the same rule; the first spawn takes the less loaded of two shards picked at random. So a task that waits for what it spawned keeps it on its own thread.</p>
+
+<h2 id="lifetime">Dropping, detaching, cancelling</h2>
+<p>A <code>Task</code> owns its task. <strong>Dropping it cancels the task</strong>: its future is dropped without being polled again. To let a task run to its end with nobody waiting for it, call <code>detach</code>.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-2"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span>sleep<span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="cm">// Dropping a Task cancels it: this one never prints.</span>
+    <span class="kw">let</span> cancelled <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">50</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+        <span class="ma">println!</span><span class="pu">(</span><span class="st">"never printed"</span><span class="pu">);</span>
+    <span class="pu">});</span>
+    <span class="fn">drop</span><span class="pu">(</span>cancelled<span class="pu">);</span>
+
+    <span class="cm">// detach lets a task run to its end without a handle.</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="ma">println!</span><span class="pu">(</span><span class="st">"detached, and it still runs"</span><span class="pu">);</span>
+    <span class="pu">})</span>
+    <span class="pu">.</span><span class="fn">detach</span><span class="pu">();</span>
+
+    <span class="cm">// cancel stops a task and gives back its output if it had finished.</span>
+    <span class="kw">let</span> slow <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_secs</span><span class="pu">(</span><span class="nu">10</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+        <span class="nu">1</span>
+    <span class="pu">});</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>slow<span class="pu">.</span><span class="fn">cancel</span><span class="pu">().</span><span class="kw">await</span><span class="pu">,</span> <span class="ty">None</span><span class="pu">);</span>
+
+    <span class="cm">// fallible gives None instead of a panic when the task ended without an output.</span>
+    <span class="kw">let</span> done <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="nu">7</span> <span class="pu">}).</span><span class="fn">fallible</span><span class="pu">();</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>done<span class="pu">.</span><span class="kw">await</span><span class="pu">,</span> <span class="ty">Some</span><span class="pu">(</span><span class="nu">7</span><span class="pu">));</span>
+
+    <span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">100</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-2" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<ul>
+<li><code>detach()</code>: the task runs to its end; its output is dropped.</li>
+<li><code>cancel().await</code>: cancels the task and waits for its future to be dropped; gives back the output if the task had already completed.</li>
+<li><code>fallible()</code>: a handle whose await gives <code>Option&lt;T&gt;</code>, <code>None</code> where awaiting the <code>Task</code> would panic (the task was cancelled, or its runtime shut down before it completed).</li>
+<li><code>is_finished()</code>: whether the task completed or was cancelled; awaiting a finished task returns at once.</li>
+</ul>
+<div class="note"><p class="note__title">The most common surprise</p><p>A server loop that spawns a task per connection and drops the handle cancels each connection at once. Write <code>nuclei::spawn(handler).detach()</code>, as every server on these pages does.</p></div>
+
+<h2 id="local">Tasks that are not Send</h2>
+<p><code>nuclei::spawn_local</code> takes a future that need not be <code>Send</code> and keeps it on the calling thread: the worker&rsquo;s shard inside a task, or the thread&rsquo;s own shard, where it runs while the thread is inside <code>block_on</code>.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-3"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">cell</span><span class="pu">::</span><span class="ty">RefCell</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">rc</span><span class="pu">::</span><span class="ty">Rc</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="cm">// Rc is not Send, so this future can only run on the thread that made it.</span>
+    <span class="kw">let</span> log <span class="pu">=</span> <span class="ty">Rc</span><span class="pu">::</span><span class="fn">new</span><span class="pu">(</span><span class="ty">RefCell</span><span class="pu">::</span><span class="fn">new</span><span class="pu">(</span><span class="ty">Vec</span><span class="pu">::</span><span class="fn">new</span><span class="pu">()));</span>
+    <span class="kw">let</span> tasks<span class="pu">:</span> <span class="ty">Vec</span><span class="pu">&lt;_&gt;</span> <span class="pu">=</span> <span class="pu">(</span><span class="nu">0</span><span class="pu">..</span><span class="nu">3</span><span class="pu">)</span>
+        <span class="pu">.</span><span class="fn">map</span><span class="pu">(|</span>n<span class="pu">|</span> <span class="pu">{</span>
+            <span class="kw">let</span> log <span class="pu">=</span> <span class="ty">Rc</span><span class="pu">::</span><span class="fn">clone</span><span class="pu">(&amp;</span>log<span class="pu">);</span>
+            <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn_local</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span> log<span class="pu">.</span><span class="fn">borrow_mut</span><span class="pu">().</span><span class="fn">push</span><span class="pu">(</span>n<span class="pu">)</span> <span class="pu">})</span>
+        <span class="pu">})</span>
+        <span class="pu">.</span><span class="fn">collect</span><span class="pu">();</span>
+    <span class="kw">for</span> task <span class="kw">in</span> tasks <span class="pu">{</span>
+        task<span class="pu">.</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="pu">}</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>log<span class="pu">.</span><span class="fn">borrow</span><span class="pu">().</span><span class="fn">len</span><span class="pu">(),</span> <span class="nu">3</span><span class="pu">);</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-3" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="blocking">Work that blocks</h2>
+<p>A blocking call (a synchronous file system walk, a CPU-heavy computation, a C library that waits) would hold its shard and every task on it. <code>nuclei::spawn_blocking</code> runs a closure on the runtime&rsquo;s blocking pool instead and returns a <code>Task</code> for its result. The pool runs at most 512 threads at once by default, and an idle thread exits after 10 seconds; <code>Builder::max_blocking_threads</code> and <code>Builder::thread_keep_alive</code> change both.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-4"><code><span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="cm">// Blocking calls go to the blocking pool, so no shard is held up.</span>
+    <span class="kw">let</span> listing <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn_blocking</span><span class="pu">(||</span> <span class="md">std</span><span class="pu">::</span><span class="md">fs</span><span class="pu">::</span><span class="fn">read_dir</span><span class="pu">(</span><span class="st">"."</span><span class="pu">).</span><span class="fn">map</span><span class="pu">(|</span>dir<span class="pu">|</span> dir<span class="pu">.</span><span class="fn">count</span><span class="pu">())).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"{listing} entries here"</span><span class="pu">);</span>
+
+    <span class="kw">let</span> digest <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn_blocking</span><span class="pu">(||</span> <span class="pu">(</span><span class="nu">0</span><span class="pu">..</span><span class="nu">1_000_000u64</span><span class="pu">).</span><span class="fn">fold</span><span class="pu">(</span><span class="nu">0u64</span><span class="pu">,</span> <span class="pu">|</span>h<span class="pu">,</span> n<span class="pu">|</span> h<span class="pu">.</span><span class="fn">rotate_left</span><span class="pu">(</span><span class="nu">5</span><span class="pu">)</span> <span class="pu">^</span> n<span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"digest {digest:x}"</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-4" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="workers">More workers, or fewer</h2>
+<p>A runtime starts its workers when it is built and may start more later, up to <code>Builder::max_worker_threads</code> (four times the workers it started with by default). <code>nuclei::spawn_more_threads(n).await</code> starts up to <code>n</code> more and returns how many started. <code>nuclei::stop_thread()</code> stops one worker, unless only the minimum runs: it takes no new task from then on and exits once its tasks are done; <code>stop_current_thread()</code> stops the worker the calling task runs on. Both return a <code>Task&lt;bool&gt;</code> that says whether a worker was stopped. A stopped worker&rsquo;s place is not taken again. <a href="production.html#compat">Production</a> shows them running.</p>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="runtime.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Runtime</span></a><a href="proactive.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Proactive IO</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

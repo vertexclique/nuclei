@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Setup: Learn Nuclei</title>
+  <meta name="description" content="Add Nuclei, pick its features, run a first program, see which backend it chose.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/setup.html">
+  <meta property="og:title" content="Setup: Learn Nuclei">
+  <meta property="og:description" content="Add Nuclei, pick its features, run a first program, see which backend it chose.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/setup.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html" aria-current="page">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 1 of 12</p>
+        <h1>Setup</h1>
+        <p class="chapter-head__lede">Add Nuclei to a project, choose its features, run a first program and see which kernel interface it picked.</p>
+      </header>
+      <article class="prose">
+<h2 id="requirements">What you need</h2>
+<p>Rust 1.99 or later. Nuclei itself is written in the 2024 edition; your crate may use any edition.</p>
+<p>It builds for these systems, each on its own kernel interface:</p>
+<table class="table">
+<thead><tr><th>System</th><th>Backend</th></tr></thead>
+<tbody>
+<tr><td data-label="System">Linux, Android</td><td data-label="Backend">io_uring where the kernel (6.1 or later) and the sandbox allow it, else epoll</td></tr>
+<tr><td data-label="System">illumos</td><td data-label="Backend">epoll</td></tr>
+<tr><td data-label="System">macOS, iOS, FreeBSD, NetBSD, OpenBSD, DragonFly</td><td data-label="Backend">kqueue</td></tr>
+<tr><td data-label="System">Windows</td><td data-label="Backend">I/O completion ports</td></tr>
+</tbody>
+</table>
+<p>Any other target stops the build with <code>Target OS is not supported</code>.</p>
+
+<h2 id="add">Add it</h2>
+<figure class="snippet"><div class="code code--corner code--shell"><pre id="code-3"><code><span class="fn">cargo</span> <span class="kw">add</span> nuclei</code></pre><button class="copy" type="button" data-copy="code-3" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p>or in <code>Cargo.toml</code>:</p>
+<figure class="snippet"><figcaption class="snippet__label">Cargo.toml</figcaption><div class="code code--corner"><pre id="code-4"><code><span class="pu">[</span><span class="kw">dependencies</span><span class="pu">]</span>
+<span class="fn">nuclei</span> <span class="pu">=</span> <span class="st">"0.5"</span></code></pre><button class="copy" type="button" data-copy="code-4" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p>Nuclei implements the <code>futures-io</code> traits (<code>AsyncRead</code>, <code>AsyncWrite</code>, <code>AsyncBufRead</code>, <code>AsyncSeek</code>) and the <code>Stream</code> trait of <code>futures-core</code>. The methods you call through them, such as <code>read_to_end</code>, <code>write_all</code> or a stream&rsquo;s <code>next</code>, come from extension traits. The examples here take those from the <code>futures</code> crate:</p>
+<figure class="snippet"><div class="code code--corner code--shell"><pre id="code-5"><code><span class="fn">cargo</span> <span class="kw">add</span> futures</code></pre><button class="copy" type="button" data-copy="code-5" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="first">A first program</h2>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="kw">let</span> answer <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="nu">6</span> <span class="pu">*</span> <span class="nu">7</span> <span class="pu">}).</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"the answer is {answer}"</span><span class="pu">);</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<figure class="snippet"><div class="code code--corner code--shell"><pre id="code-6"><code><span class="fn">cargo</span> <span class="kw">run</span></code></pre><button class="copy" type="button" data-copy="code-6" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<figure class="snippet snippet--output"><figcaption class="snippet__label">output</figcaption><div class="code"><pre><code>the answer is 42</code></pre></div></figure>
+<p><code>#[nuclei::main]</code> runs the async <code>main</code> on the runtime, and <code>nuclei::spawn</code> places a task on one of its shards; awaiting the task gives its output. There is nothing to set up: the first <code>spawn</code> or <code>block_on</code> starts the default runtime, with one worker shard per core the process may run on.</p>
+
+<h2 id="features">Features</h2>
+<table class="table">
+<thead><tr><th>Feature</th><th>Default</th><th>What it gives</th></tr></thead>
+<tbody>
+<tr><td data-label="Feature"><code>iouring</code></td><td data-label="Default">on</td><td data-label="What it gives">The io_uring driver, on Linux and Android. Without it those systems run on epoll.</td></tr>
+<tr><td data-label="Feature"><code>epoll</code></td><td data-label="Default">on</td><td data-label="What it gives">Names epoll beside <code>iouring</code>. Epoll is built on Linux either way.</td></tr>
+<tr><td data-label="Feature"><code>attributes</code></td><td data-label="Default">on</td><td data-label="What it gives"><code>#[nuclei::main]</code>, <code>#[nuclei::test]</code> and <code>#[nuclei::bench]</code>, from the <code>nuclei-macros</code> crate.</td></tr>
+<tr><td data-label="Feature"><code>recycle</code></td><td data-label="Default">off</td><td data-label="What it gives">Node memory for the lock-free queues, maps and channels the runtime is built on, from a per-thread cache over a slab layer instead of the global allocator.</td></tr>
+</tbody>
+</table>
+<p><code>recycle</code> is for applications. Cargo turns a feature on for every user of a crate in the build, so a library that enabled it would enable it for all of them.</p>
+<figure class="snippet"><figcaption class="snippet__label">Cargo.toml</figcaption><div class="code code--corner"><pre id="code-7"><code><span class="pu">[</span><span class="kw">dependencies</span><span class="pu">]</span>
+<span class="cm"># Without the io_uring driver (Linux runs on epoll), keeping the attribute macros:</span>
+<span class="fn">nuclei</span> <span class="pu">=</span> <span class="pu">{</span> <span class="fn">version</span> <span class="pu">=</span> <span class="st">"0.5"</span><span class="pu">,</span> <span class="fn">default-features</span> <span class="pu">=</span> <span class="nu">false</span><span class="pu">,</span> <span class="fn">features</span> <span class="pu">=</span> <span class="pu">[</span><span class="st">"attributes"</span><span class="pu">]</span> <span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-7" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<figure class="snippet"><figcaption class="snippet__label">Cargo.toml</figcaption><div class="code code--corner"><pre id="code-8"><code><span class="pu">[</span><span class="kw">dependencies</span><span class="pu">]</span>
+<span class="cm"># In an application: node memory from a per-thread cache.</span>
+<span class="fn">nuclei</span> <span class="pu">=</span> <span class="pu">{</span> <span class="fn">version</span> <span class="pu">=</span> <span class="st">"0.5"</span><span class="pu">,</span> <span class="fn">features</span> <span class="pu">=</span> <span class="pu">[</span><span class="st">"recycle"</span><span class="pu">]</span> <span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-8" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="backend">Which backend it runs on</h2>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-2"><code><span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">block_on</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="ma">println!</span><span class="pu">(</span><span class="st">"IO runs on {:?}"</span><span class="pu">,</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Proactor</span><span class="pu">::</span><span class="fn">backend</span><span class="pu">());</span>
+    <span class="pu">});</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-2" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<figure class="snippet snippet--output"><figcaption class="snippet__label">output</figcaption><div class="code"><pre><code>IO runs on IoUring</code></pre></div></figure>
+<p>With nothing set, Nuclei takes io_uring where the kernel lets this process make the ring its shards use, and the platform&rsquo;s poller otherwise. It probes io_uring safely, even under a seccomp filter that kills a process for calling <code>io_uring_setup</code>. The <code>NUCLEI_BACKEND</code> environment variable picks one by hand: <code>auto</code>, <code>io_uring</code> or <code>epoll</code> on Linux, <code>kqueue</code> on macOS and the BSDs, <code>iocp</code> on Windows.</p>
+<figure class="snippet"><div class="code code--corner code--shell"><pre id="code-9"><code><span class="at">NUCLEI_BACKEND=epoll</span> <span class="fn">cargo</span> <span class="kw">run</span></code></pre><button class="copy" type="button" data-copy="code-9" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p>A backend named by hand that the process cannot have is an error with the reason, never a silent fallback. <a href="backends.html">Backends</a> has the details, and <a href="errors.html">Errors</a> the messages.</p>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="runtime.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Runtime</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

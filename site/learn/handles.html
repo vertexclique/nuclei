@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Handles: Learn Nuclei</title>
+  <meta name="description" content="TCP, UDP, Unix sockets and files through Handle&lt;T&gt;, and the futures-io traits.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/handles.html">
+  <meta property="og:title" content="Handles: Learn Nuclei">
+  <meta property="og:description" content="TCP, UDP, Unix sockets and files through Handle&lt;T&gt;, and the futures-io traits.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/handles.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html" aria-current="page">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 5 of 12</p>
+        <h1>Handles</h1>
+        <p class="chapter-head__lede">Handle&lt;T&gt; takes one of std&rsquo;s own IO types and gives it async operations. TCP, UDP, Unix sockets and files, one section each.</p>
+      </header>
+      <article class="prose">
+<h2 id="handle">What a handle is</h2>
+<p>A <code>Handle&lt;T&gt;</code> owns a std IO object (a <code>TcpListener</code>, a <code>UdpSocket</code>, a <code>File</code>) and the source its shard&rsquo;s driver reaches. The object stays std&rsquo;s own type: <code>Deref</code> and <code>get_ref</code> hand it out for its own methods (addresses, socket options), and the handle&rsquo;s async methods and trait impls do the IO. <code>Handle::new(object)</code> takes an object you made yourself; the constructors below make one for you.</p>
+<table class="table">
+<thead><tr><th>Handle</th><th>Async methods</th><th>Traits</th></tr></thead>
+<tbody>
+<tr><td data-label="Handle"><code>Handle&lt;TcpListener&gt;</code></td><td data-label="Async methods"><code>bind</code>, <code>accept</code>, <code>incoming</code>, <code>accept_multi</code></td><td data-label="Traits"></td></tr>
+<tr><td data-label="Handle"><code>Handle&lt;TcpStream&gt;</code></td><td data-label="Async methods"><code>connect</code>, <code>send</code>, <code>recv</code>, <code>peek</code>, <code>read_owned</code>, <code>write_owned</code></td><td data-label="Traits"><code>AsyncRead</code>, <code>AsyncWrite</code>, also on <code>&amp;Handle</code></td></tr>
+<tr><td data-label="Handle"><code>Handle&lt;UdpSocket&gt;</code></td><td data-label="Async methods"><code>bind</code>, <code>connect</code>, <code>send</code>, <code>recv</code>, <code>peek</code>, <code>send_to</code>, <code>recv_from</code>, <code>peek_from</code></td><td data-label="Traits"></td></tr>
+<tr><td data-label="Handle"><code>Handle&lt;UnixListener&gt;</code></td><td data-label="Async methods"><code>bind</code>, <code>accept</code>, <code>incoming</code></td><td data-label="Traits"></td></tr>
+<tr><td data-label="Handle"><code>Handle&lt;UnixStream&gt;</code></td><td data-label="Async methods"><code>connect</code>, <code>pair</code>, <code>send</code>, <code>recv</code>, <code>peek</code>, <code>read_owned</code>, <code>write_owned</code></td><td data-label="Traits"><code>AsyncRead</code>, <code>AsyncWrite</code>, also on <code>&amp;Handle</code></td></tr>
+<tr><td data-label="Handle"><code>Handle&lt;UnixDatagram&gt;</code></td><td data-label="Async methods"><code>bind</code>, <code>pair</code>, <code>send</code>, <code>recv</code>, <code>peek</code>, <code>send_to</code>, <code>recv_from</code>, <code>peek_from</code></td><td data-label="Traits"></td></tr>
+<tr><td data-label="Handle"><code>Handle&lt;File&gt;</code></td><td data-label="Async methods"><code>open</code>, <code>read_owned</code>, <code>write_owned</code></td><td data-label="Traits"><code>AsyncRead</code>, <code>AsyncWrite</code> (also on <code>&amp;Handle</code>), <code>AsyncBufRead</code>, <code>AsyncSeek</code></td></tr>
+</tbody>
+</table>
+<p><code>bind</code>, <code>pair</code> and <code>new</code> are plain functions; everything that waits for the network is <code>async</code>. The Unix types are on Unix only. On Windows a handle takes std&rsquo;s <code>TcpStream</code>, <code>TcpListener</code>, <code>UdpSocket</code> and <code>File</code>, and a child process&rsquo;s pipes.</p>
+
+<h2 id="tcp">TCP</h2>
+<p><code>bind</code> makes a listener; port 0 asks the system for a free one. <code>accept</code> gives a connected <code>Handle&lt;TcpStream&gt;</code> and the peer&rsquo;s address; <code>connect</code> dials out. <code>send</code> and <code>recv</code> move bytes; <code>recv</code> returning <code>Ok(0)</code> means the peer closed its side.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::{</span><span class="ty">TcpListener</span><span class="pu">,</span> <span class="ty">TcpStream</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="cm">// Port 0 asks the system for a free port; local_addr says which.</span>
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> addr <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?;</span>
+
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="kw">loop</span> <span class="pu">{</span>
+            <span class="kw">let</span> <span class="ty">Ok</span><span class="pu">((</span>stream<span class="pu">,</span> peer<span class="pu">))</span> <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">accept</span><span class="pu">().</span><span class="kw">await</span> <span class="kw">else</span> <span class="pu">{</span> <span class="kw">break</span> <span class="pu">};</span>
+            <span class="ma">println!</span><span class="pu">(</span><span class="st">"accepted {peer}"</span><span class="pu">);</span>
+            <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+                <span class="kw">let</span> <span class="kw">mut</span> buf <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">1024</span><span class="pu">];</span>
+                <span class="kw">while</span> <span class="kw">let</span> <span class="ty">Ok</span><span class="pu">(</span>n <span class="pu">@</span> <span class="nu">1</span><span class="pu">..)</span> <span class="pu">=</span> stream<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span> <span class="pu">{</span>
+                    <span class="kw">if</span> stream<span class="pu">.</span><span class="fn">send</span><span class="pu">(&amp;</span>buf<span class="pu">[..</span>n<span class="pu">]).</span><span class="kw">await</span><span class="pu">.</span><span class="fn">is_err</span><span class="pu">()</span> <span class="pu">{</span>
+                        <span class="kw">break</span><span class="pu">;</span>
+                    <span class="pu">}</span>
+                <span class="pu">}</span>
+            <span class="pu">})</span>
+            <span class="pu">.</span><span class="fn">detach</span><span class="pu">();</span>
+        <span class="pu">}</span>
+    <span class="pu">})</span>
+    <span class="pu">.</span><span class="fn">detach</span><span class="pu">();</span>
+
+    <span class="kw">let</span> client <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpStream</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(</span>addr<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    client<span class="pu">.</span><span class="fn">send</span><span class="pu">(</span><span class="st">b"ping"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> <span class="kw">mut</span> reply <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">4</span><span class="pu">];</span>
+    <span class="kw">let</span> n <span class="pu">=</span> client<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> reply<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(&amp;</span>reply<span class="pu">[..</span>n<span class="pu">],</span> <span class="st">b"ping"</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h3 id="traits">The futures-io traits</h3>
+<p>Streams implement <code>AsyncRead</code> and <code>AsyncWrite</code>, on the handle and on a shared reference to it, so one task can read and write the same stream, and any code written against those traits works with it: buffered readers, line splitting, <code>copy</code>. <code>incoming()</code> is a <code>Stream</code> of accepted connections.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-2"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::{</span><span class="ty">TcpListener</span><span class="pu">,</span> <span class="ty">TcpStream</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">futures</span><span class="pu">::</span><span class="md">io</span><span class="pu">::{</span><span class="kw">self</span><span class="pu">,</span> <span class="ty">AsyncBufReadExt</span><span class="pu">,</span> <span class="ty">AsyncWriteExt</span><span class="pu">,</span> <span class="ty">BufReader</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">futures</span><span class="pu">::</span><span class="ty">StreamExt</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> addr <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?;</span>
+
+    <span class="cm">// An echo server in one line: both halves of the copy are the same stream,</span>
+    <span class="cm">// since AsyncRead and AsyncWrite are implemented on &amp;Handle&lt;TcpStream&gt; too.</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="kw">let</span> <span class="kw">mut</span> incoming <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">incoming</span><span class="pu">();</span>
+        <span class="kw">while</span> <span class="kw">let</span> <span class="ty">Some</span><span class="pu">(</span><span class="ty">Ok</span><span class="pu">(</span>stream<span class="pu">))</span> <span class="pu">=</span> incoming<span class="pu">.</span><span class="fn">next</span><span class="pu">().</span><span class="kw">await</span> <span class="pu">{</span>
+            <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span> <span class="md">io</span><span class="pu">::</span><span class="fn">copy</span><span class="pu">(&amp;</span>stream<span class="pu">,</span> <span class="pu">&amp;</span><span class="kw">mut</span> <span class="pu">&amp;</span>stream<span class="pu">).</span><span class="kw">await</span> <span class="pu">}).</span><span class="fn">detach</span><span class="pu">();</span>
+        <span class="pu">}</span>
+    <span class="pu">})</span>
+    <span class="pu">.</span><span class="fn">detach</span><span class="pu">();</span>
+
+    <span class="kw">let</span> <span class="kw">mut</span> stream <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpStream</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(</span>addr<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    stream<span class="pu">.</span><span class="fn">write_all</span><span class="pu">(</span><span class="st">b"first line\nsecond line\n"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    stream<span class="pu">.</span><span class="fn">flush</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+
+    <span class="kw">let</span> <span class="kw">mut</span> lines <span class="pu">=</span> <span class="ty">BufReader</span><span class="pu">::</span><span class="fn">new</span><span class="pu">(&amp;</span>stream<span class="pu">).</span><span class="fn">lines</span><span class="pu">();</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>lines<span class="pu">.</span><span class="fn">next</span><span class="pu">().</span><span class="kw">await</span><span class="pu">.</span><span class="fn">transpose</span><span class="pu">()?.</span><span class="fn">as_deref</span><span class="pu">(),</span> <span class="ty">Some</span><span class="pu">(</span><span class="st">"first line"</span><span class="pu">));</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>lines<span class="pu">.</span><span class="fn">next</span><span class="pu">().</span><span class="kw">await</span><span class="pu">.</span><span class="fn">transpose</span><span class="pu">()?.</span><span class="fn">as_deref</span><span class="pu">(),</span> <span class="ty">Some</span><span class="pu">(</span><span class="st">"second line"</span><span class="pu">));</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-2" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h3 id="accept-multi">accept_multi</h3>
+<p><code>accept_multi</code> returns a stream of connections that owns its own copy of the listener, so it may outlive the handle. A connection reset before it was taken is skipped; any other error ends the stream, and <code>take_error</code> says what it was. On io_uring it keeps one accept armed for every connection that comes.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-3"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::{</span><span class="ty">TcpListener</span><span class="pu">,</span> <span class="ty">TcpStream</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">futures</span><span class="pu">::</span><span class="ty">StreamExt</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> addr <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?;</span>
+
+    <span class="cm">// A stream of connections with its own copy of the listener. On io_uring</span>
+    <span class="cm">// it keeps one accept armed for every connection that comes.</span>
+    <span class="kw">let</span> <span class="kw">mut</span> connections <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">accept_multi</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> server <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="kw">let</span> <span class="kw">mut</span> served <span class="pu">=</span> <span class="nu">0</span><span class="pu">;</span>
+        <span class="kw">while</span> <span class="kw">let</span> <span class="ty">Some</span><span class="pu">(</span>stream<span class="pu">)</span> <span class="pu">=</span> connections<span class="pu">.</span><span class="fn">next</span><span class="pu">().</span><span class="kw">await</span> <span class="pu">{</span>
+            stream<span class="pu">.</span><span class="fn">send</span><span class="pu">(</span><span class="st">b"hi"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">.</span><span class="fn">ok</span><span class="pu">();</span>
+            served <span class="pu">+=</span> <span class="nu">1</span><span class="pu">;</span>
+            <span class="kw">if</span> served <span class="pu">==</span> <span class="nu">3</span> <span class="pu">{</span>
+                <span class="kw">break</span><span class="pu">;</span>
+            <span class="pu">}</span>
+        <span class="pu">}</span>
+        <span class="cm">// Why the stream ended, if it ended on an error.</span>
+        <span class="ma">assert!</span><span class="pu">(</span>connections<span class="pu">.</span><span class="fn">take_error</span><span class="pu">().</span><span class="fn">is_none</span><span class="pu">());</span>
+        served
+    <span class="pu">});</span>
+
+    <span class="kw">for</span> <span class="pu">_</span> <span class="kw">in</span> <span class="nu">0</span><span class="pu">..</span><span class="nu">3</span> <span class="pu">{</span>
+        <span class="kw">let</span> client <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpStream</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(</span>addr<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+        <span class="kw">let</span> <span class="kw">mut</span> buf <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">2</span><span class="pu">];</span>
+        client<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="pu">}</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>server<span class="pu">.</span><span class="kw">await</span><span class="pu">,</span> <span class="nu">3</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-3" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="udp">UDP</h2>
+<p>An unconnected socket sends with <code>send_to</code> and receives with <code>recv_from</code>, which also gives the sender&rsquo;s address. <code>connect</code> fixes a peer; then <code>send</code> and <code>recv</code> talk to it alone. The <code>peek</code> forms read without taking the datagram.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-4"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::</span><span class="ty">UdpSocket</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> a <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">UdpSocket</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> b <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">UdpSocket</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+
+    <span class="cm">// Datagrams to an address, and from whoever sent them.</span>
+    a<span class="pu">.</span><span class="fn">send_to</span><span class="pu">(</span><span class="st">b"hello"</span><span class="pu">,</span> b<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> <span class="kw">mut</span> buf <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">64</span><span class="pu">];</span>
+    <span class="kw">let</span> <span class="pu">(</span>n<span class="pu">,</span> from<span class="pu">)</span> <span class="pu">=</span> b<span class="pu">.</span><span class="fn">recv_from</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">((&amp;</span>buf<span class="pu">[..</span>n<span class="pu">],</span> from<span class="pu">),</span> <span class="pu">(&amp;</span><span class="st">b"hello"</span><span class="pu">[..],</span> a<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?));</span>
+
+    <span class="cm">// A connected socket sends to and receives from its one peer.</span>
+    <span class="kw">let</span> c <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">UdpSocket</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(</span>a<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?).</span><span class="kw">await</span><span class="pu">?;</span>
+    c<span class="pu">.</span><span class="fn">send</span><span class="pu">(</span><span class="st">b"connected"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> <span class="pu">(</span>n<span class="pu">,</span> <span class="pu">_)</span> <span class="pu">=</span> a<span class="pu">.</span><span class="fn">peek_from</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(&amp;</span>buf<span class="pu">[..</span>n<span class="pu">],</span> <span class="st">b"connected"</span><span class="pu">);</span>
+    <span class="kw">let</span> n <span class="pu">=</span> a<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(&amp;</span>buf<span class="pu">[..</span>n<span class="pu">],</span> <span class="st">b"connected"</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-4" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="unix">Unix sockets</h2>
+<p>Unix only. A listener binds a path and accepts streams; <code>pair</code> makes two connected ends with no path at all. A <code>UnixDatagram</code> keeps message boundaries, like UDP.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-5"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">os</span><span class="pu">::</span><span class="md">unix</span><span class="pu">::</span><span class="md">net</span><span class="pu">::{</span><span class="ty">UnixDatagram</span><span class="pu">,</span> <span class="ty">UnixListener</span><span class="pu">,</span> <span class="ty">UnixStream</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">futures</span><span class="pu">::{</span><span class="ty">AsyncReadExt</span><span class="pu">,</span> <span class="ty">AsyncWriteExt</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> path <span class="pu">=</span> <span class="md">std</span><span class="pu">::</span><span class="md">env</span><span class="pu">::</span><span class="fn">temp_dir</span><span class="pu">().</span><span class="fn">join</span><span class="pu">(</span><span class="ma">format!</span><span class="pu">(</span><span class="st">"learn-nuclei-{}.sock"</span><span class="pu">,</span> <span class="md">std</span><span class="pu">::</span><span class="md">process</span><span class="pu">::</span><span class="fn">id</span><span class="pu">()));</span>
+    <span class="kw">let</span> <span class="pu">_</span> <span class="pu">=</span> <span class="md">std</span><span class="pu">::</span><span class="md">fs</span><span class="pu">::</span><span class="fn">remove_file</span><span class="pu">(&amp;</span>path<span class="pu">);</span>
+
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">UnixListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(&amp;</span>path<span class="pu">)?;</span>
+    <span class="kw">let</span> server <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="kw">let</span> <span class="pu">(</span><span class="kw">mut</span> stream<span class="pu">,</span> _addr<span class="pu">)</span> <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">accept</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+        <span class="kw">let</span> <span class="kw">mut</span> word <span class="pu">=</span> <span class="ty">String</span><span class="pu">::</span><span class="fn">new</span><span class="pu">();</span>
+        stream<span class="pu">.</span><span class="fn">read_to_string</span><span class="pu">(&amp;</span><span class="kw">mut</span> word<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+        <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">::</span><span class="ty">Ok</span><span class="pu">(</span>word<span class="pu">)</span>
+    <span class="pu">});</span>
+
+    <span class="kw">let</span> <span class="kw">mut</span> client <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">UnixStream</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(&amp;</span>path<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    client<span class="pu">.</span><span class="fn">write_all</span><span class="pu">(</span><span class="st">b"over a path"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    client<span class="pu">.</span><span class="fn">close</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>server<span class="pu">.</span><span class="kw">await</span><span class="pu">?,</span> <span class="st">"over a path"</span><span class="pu">);</span>
+    <span class="md">std</span><span class="pu">::</span><span class="md">fs</span><span class="pu">::</span><span class="fn">remove_file</span><span class="pu">(&amp;</span>path<span class="pu">)?;</span>
+
+    <span class="cm">// A connected pair, no path needed.</span>
+    <span class="kw">let</span> <span class="pu">(</span>left<span class="pu">,</span> right<span class="pu">)</span> <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">UnixStream</span><span class="pu">&gt;::</span><span class="fn">pair</span><span class="pu">()?;</span>
+    left<span class="pu">.</span><span class="fn">send</span><span class="pu">(</span><span class="st">b"pair"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> <span class="kw">mut</span> buf <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">4</span><span class="pu">];</span>
+    right<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(&amp;</span>buf<span class="pu">,</span> <span class="st">b"pair"</span><span class="pu">);</span>
+
+    <span class="cm">// Datagrams keep their boundaries.</span>
+    <span class="kw">let</span> <span class="pu">(</span>d1<span class="pu">,</span> d2<span class="pu">)</span> <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">UnixDatagram</span><span class="pu">&gt;::</span><span class="fn">pair</span><span class="pu">()?;</span>
+    d1<span class="pu">.</span><span class="fn">send</span><span class="pu">(</span><span class="st">b"one"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    d1<span class="pu">.</span><span class="fn">send</span><span class="pu">(</span><span class="st">b"two"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> <span class="kw">mut</span> buf <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">8</span><span class="pu">];</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>d2<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?,</span> <span class="nu">3</span><span class="pu">);</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>d2<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?,</span> <span class="nu">3</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-5" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="files">Files</h2>
+<p><code>Handle::&lt;File&gt;::open(path).await</code> opens a file for reading, as <code>File::open</code> does. For any other mode, open it with std&rsquo;s <code>OpenOptions</code> and pass the file to <code>Handle::new</code>. Reads and writes share the handle&rsquo;s cursor; <code>seek</code> moves it.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-6"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">fs</span><span class="pu">::{</span><span class="ty">File</span><span class="pu">,</span> <span class="ty">OpenOptions</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">SeekFrom</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">futures</span><span class="pu">::{</span><span class="ty">AsyncReadExt</span><span class="pu">,</span> <span class="ty">AsyncSeekExt</span><span class="pu">,</span> <span class="ty">AsyncWriteExt</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> path <span class="pu">=</span> <span class="md">std</span><span class="pu">::</span><span class="md">env</span><span class="pu">::</span><span class="fn">temp_dir</span><span class="pu">().</span><span class="fn">join</span><span class="pu">(</span><span class="ma">format!</span><span class="pu">(</span><span class="st">"learn-nuclei-{}.txt"</span><span class="pu">,</span> <span class="md">std</span><span class="pu">::</span><span class="md">process</span><span class="pu">::</span><span class="fn">id</span><span class="pu">()));</span>
+
+    <span class="cm">// Open with std's options, then hand the file over.</span>
+    <span class="kw">let</span> std_file <span class="pu">=</span> <span class="ty">OpenOptions</span><span class="pu">::</span><span class="fn">new</span><span class="pu">().</span><span class="fn">read</span><span class="pu">(</span><span class="kw">true</span><span class="pu">).</span><span class="fn">write</span><span class="pu">(</span><span class="kw">true</span><span class="pu">).</span><span class="fn">create</span><span class="pu">(</span><span class="kw">true</span><span class="pu">).</span><span class="fn">truncate</span><span class="pu">(</span><span class="kw">true</span><span class="pu">).</span><span class="fn">open</span><span class="pu">(&amp;</span>path<span class="pu">)?;</span>
+    <span class="kw">let</span> <span class="kw">mut</span> file <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">File</span><span class="pu">&gt;::</span><span class="fn">new</span><span class="pu">(</span>std_file<span class="pu">)?;</span>
+    file<span class="pu">.</span><span class="fn">write_all</span><span class="pu">(</span><span class="st">b"one\ntwo\nthree\n"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    file<span class="pu">.</span><span class="fn">flush</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+
+    file<span class="pu">.</span><span class="fn">seek</span><span class="pu">(</span><span class="ty">SeekFrom</span><span class="pu">::</span><span class="ty">Start</span><span class="pu">(</span><span class="nu">4</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> <span class="kw">mut</span> rest <span class="pu">=</span> <span class="ty">String</span><span class="pu">::</span><span class="fn">new</span><span class="pu">();</span>
+    file<span class="pu">.</span><span class="fn">read_to_string</span><span class="pu">(&amp;</span><span class="kw">mut</span> rest<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>rest<span class="pu">,</span> <span class="st">"two\nthree\n"</span><span class="pu">);</span>
+
+    <span class="cm">// Handle::&lt;File&gt;::open opens for reading.</span>
+    <span class="kw">let</span> reader <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">File</span><span class="pu">&gt;::</span><span class="fn">open</span><span class="pu">(&amp;</span>path<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="cm">// read_owned lends the buffer: the bytes land in it with no copy.</span>
+    <span class="kw">let</span> <span class="pu">(</span>n<span class="pu">,</span> buf<span class="pu">)</span> <span class="pu">=</span> reader<span class="pu">.</span><span class="fn">read_owned</span><span class="pu">(</span><span class="ty">Vec</span><span class="pu">::</span><span class="fn">with_capacity</span><span class="pu">(</span><span class="nu">4</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(&amp;</span>buf<span class="pu">[..</span>n<span class="pu">?],</span> <span class="st">b"one\n"</span><span class="pu">);</span>
+
+    <span class="md">std</span><span class="pu">::</span><span class="md">fs</span><span class="pu">::</span><span class="fn">remove_file</span><span class="pu">(&amp;</span>path<span class="pu">)?;</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-6" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p>A regular file is always ready as far as a poller can tell, so on io_uring its reads and writes are ring operations at the cursor, and on the other backends they run as <code>pread</code> and <code>pwrite</code> jobs on the blocking pool; either way no shard waits. A <code>File</code> that is not a regular file (a FIFO, a terminal, a pipe) is a byte stream the driver serves like a socket.</p>
+
+<h2 id="std">Back to std</h2>
+<p>Through <code>Deref</code> every method of the std type works on the handle: <code>local_addr</code>, <code>set_nodelay</code>, <code>set_ttl</code> and the rest. <code>get_mut</code>, <code>DerefMut</code> and <code>into_inner</code> give mutable access or the object itself; before the object can change, the handle delivers the bytes it wrote behind, stops its other pending work and ends its registration, so the driver never touches a descriptor the handle no longer owns; the next operation registers the object again.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-7"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::{</span><span class="ty">TcpListener</span><span class="pu">,</span> <span class="ty">TcpStream</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> addr <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?;</span> <span class="cm">// std's own method, through Deref</span>
+
+    <span class="kw">let</span> stream <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpStream</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(</span>addr<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    stream<span class="pu">.</span><span class="fn">set_nodelay</span><span class="pu">(</span><span class="kw">true</span><span class="pu">)?;</span> <span class="cm">// a socket option, on std's type</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"{} -&gt; {}"</span><span class="pu">,</span> stream<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?,</span> stream<span class="pu">.</span><span class="fn">get_ref</span><span class="pu">().</span><span class="fn">peer_addr</span><span class="pu">()?);</span>
+
+    <span class="cm">// Take the std object back out; the handle lets go of it first.</span>
+    <span class="kw">let</span> std_stream<span class="pu">:</span> <span class="ty">TcpStream</span> <span class="pu">=</span> stream<span class="pu">.</span><span class="fn">into_inner</span><span class="pu">();</span>
+    std_stream<span class="pu">.</span><span class="fn">set_nonblocking</span><span class="pu">(</span><span class="kw">false</span><span class="pu">)?;</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-7" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="proactive.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Proactive IO</span></a><a href="time.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Time</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

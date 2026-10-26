@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Learn Nuclei</title>
+  <meta name="description" content="A step-by-step tutorial for Nuclei 0.5, the proactive async runtime for Rust: from the first line in Cargo.toml to a server in production, with a runnable example for every idea.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/">
+  <meta property="og:title" content="Learn Nuclei">
+  <meta property="og:description" content="A step-by-step tutorial for Nuclei 0.5, the proactive async runtime for Rust: from the first line in Cargo.toml to a server in production, with a runnable example for every idea.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./" aria-current="page">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <h1>Learn <span class="ink">Nuclei</span></h1>
+        <p class="chapter-head__lede">From the first line in Cargo.toml to a server in production. Each chapter takes one idea, explains it, and shows it in a program you can run.</p>
+      </header>
+      <article class="prose">
+<p>Nuclei is a proactive async runtime for Rust. A task hands its IO to the driver and gets the result back completed, and every core runs a shard of its own: its tasks, its timers, its buffers and its driver. These chapters teach it from the ground up and cover every way of using it that the crate offers.</p>
+<div class="note"><p class="note__title">Every example runs</p><p>Each program on these pages was compiled and run against Nuclei 0.5 on Linux, on io_uring and on epoll. The ones that need Unix (Unix sockets, Unix signals, Unix programs such as <code>sort</code>) say so.</p></div>
+<h2 id="start">Where to start</h2>
+<ul>
+<li><strong>New to async runtimes:</strong> read the chapters in order. Setup, Runtime and Tasks are the core; Proactive IO explains what makes Nuclei different.</li>
+<li><strong>Moving from a readiness-based runtime:</strong> start with <a href="migrate.html">Migrate</a>, then read <a href="tasks.html">Tasks</a> and <a href="proactive.html">Proactive IO</a>. The two behaviours that differ most are what dropping a task handle does and when a write is done.</li>
+<li><strong>Looking for one function:</strong> the API reference is on <a href="https://docs.rs/nuclei">docs.rs</a>.</li>
+</ul>
+<h2 id="chapters">Chapters</h2>
+      </article>
+      <div class="learn-cards"><a class="card tile" href="setup.html" data-reveal style="--n: 0"><span class="card__step ink">01</span><h3>Setup</h3><p>Add Nuclei, pick its features, run a first program, see which backend it chose.</p></a><a class="card tile" href="runtime.html" data-reveal style="--n: 1"><span class="card__step ink">02</span><h3>Runtime</h3><p>The entry points: the attribute, block_on, runtimes of your own and their handles.</p></a><a class="card tile" href="tasks.html" data-reveal style="--n: 2"><span class="card__step ink">03</span><h3>Tasks</h3><p>Spawning, awaiting, detaching and cancelling; local tasks and blocking work.</p></a><a class="card tile" href="proactive.html" data-reveal style="--n: 0"><span class="card__step ink">04</span><h3>Proactive IO</h3><p>What completion-based IO means for your code: buffers, lending, flushing.</p></a><a class="card tile" href="handles.html" data-reveal style="--n: 1"><span class="card__step ink">05</span><h3>Handles</h3><p>TCP, UDP, Unix sockets and files through Handle&lt;T&gt;, and the futures-io traits.</p></a><a class="card tile" href="time.html" data-reveal style="--n: 2"><span class="card__step ink">06</span><h3>Time</h3><p>Sleeps, timeouts, deadlines and intervals on each shard&#x27;s timer wheel.</p></a><a class="card tile" href="sync.html" data-reveal style="--n: 0"><span class="card__step ink">07</span><h3>Sync</h3><p>Locks, semaphores, events, once-cells, cancellation tokens and channels.</p></a><a class="card tile" href="processes.html" data-reveal style="--n: 1"><span class="card__step ink">08</span><h3>Processes</h3><p>Child processes with async pipes, and signals as streams.</p></a><a class="card tile" href="production.html" data-reveal style="--n: 2"><span class="card__step ink">09</span><h3>Production</h3><p>Every runtime setting, io_uring configuration, stats, shutdown and tests.</p></a><a class="card tile" href="backends.html" data-reveal style="--n: 0"><span class="card__step ink">10</span><h3>Backends</h3><p>io_uring, epoll, kqueue and IOCP: how one is picked and what differs.</p></a><a class="card tile" href="errors.html" data-reveal style="--n: 1"><span class="card__step ink">11</span><h3>Errors</h3><p>The messages you may meet, what each means, and the fix.</p></a><a class="card tile" href="migrate.html" data-reveal style="--n: 2"><span class="card__step ink">12</span><h3>Migrate</h3><p>Moving from a readiness-based runtime: the map and the pitfalls.</p></a></div>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

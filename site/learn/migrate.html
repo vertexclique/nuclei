@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Moving from a readiness-based runtime: Learn Nuclei</title>
+  <meta name="description" content="Moving from a readiness-based runtime: the map and the pitfalls.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/migrate.html">
+  <meta property="og:title" content="Moving from a readiness-based runtime: Learn Nuclei">
+  <meta property="og:description" content="Moving from a readiness-based runtime: the map and the pitfalls.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/migrate.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html" aria-current="page">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 12 of 12</p>
+        <h1>Moving from a readiness-based runtime</h1>
+        <p class="chapter-head__lede">Most of what you write today has a direct counterpart. The table maps the usual patterns; the pitfalls below are the places where the same-looking code behaves differently.</p>
+      </header>
+      <article class="prose">
+<h2 id="map">The map</h2>
+<table class="table">
+<thead><tr><th>What you do today</th><th>In Nuclei</th><th>Mind</th></tr></thead>
+<tbody>
+<tr><td data-label="What you do today">An attribute on an async <code>main</code></td><td data-label="In Nuclei"><code>#[nuclei::main]</code>, or <code>#[nuclei::main(threads = N)]</code></td><td data-label="Mind">The default runtime starts one worker per core.</td></tr>
+<tr><td data-label="What you do today">An attribute on an async test</td><td data-label="In Nuclei"><code>#[nuclei::test]</code></td><td data-label="Mind"><code>threads = N</code> gives the test its own runtime.</td></tr>
+<tr><td data-label="What you do today">Run a future from synchronous code</td><td data-label="In Nuclei"><code>nuclei::block_on(future)</code></td><td data-label="Mind">Allowed inside a task too: it nests and keeps the shard running.</td></tr>
+<tr><td data-label="What you do today">Spawn a task and keep its join handle</td><td data-label="In Nuclei"><code>nuclei::spawn(future)</code> returns a <code>Task&lt;T&gt;</code></td><td data-label="Mind">Awaiting gives <code>T</code> itself, not a <code>Result</code>; a panic in the task resumes in the awaiter. <code>fallible()</code> gives <code>Option&lt;T&gt;</code>.</td></tr>
+<tr><td data-label="What you do today">Drop the handle to let the task run on</td><td data-label="In Nuclei"><code>.detach()</code></td><td data-label="Mind"><strong>Dropping a <code>Task</code> cancels it.</strong></td></tr>
+<tr><td data-label="What you do today">Abort a task</td><td data-label="In Nuclei">Drop the <code>Task</code>, or <code>task.cancel().await</code></td><td data-label="Mind"><code>cancel</code> gives back the output if it was already done.</td></tr>
+<tr><td data-label="What you do today">Blocking work on a thread pool</td><td data-label="In Nuclei"><code>nuclei::spawn_blocking(closure)</code></td><td data-label="Mind">Returns a <code>Task</code> like any other.</td></tr>
+<tr><td data-label="What you do today">Tasks that are not <code>Send</code></td><td data-label="In Nuclei"><code>nuclei::spawn_local(future)</code></td><td data-label="Mind">No separate local set to create: it runs on the calling thread&rsquo;s shard.</td></tr>
+<tr><td data-label="What you do today">A runtime builder</td><td data-label="In Nuclei"><code>nuclei::Builder</code>, or <code>Runtime::builder()</code></td><td data-label="Mind"><code>worker_threads</code>, <code>max_blocking_threads</code>, <code>thread_name</code>, <code>thread_stack_size</code>, <code>thread_keep_alive</code> and more; see <a href="production.html#builder">Production</a>.</td></tr>
+<tr><td data-label="What you do today">A runtime handle</td><td data-label="In Nuclei"><code>runtime.handle()</code>, <code>RuntimeHandle::current()</code></td><td data-label="Mind">A handle does not keep the runtime running.</td></tr>
+<tr><td data-label="What you do today">The runtime&rsquo;s own TCP, UDP and Unix socket types</td><td data-label="In Nuclei"><code>Handle&lt;std::net::TcpStream&gt;</code> and friends</td><td data-label="Mind">std&rsquo;s own types inside; their methods work through <code>Deref</code>.</td></tr>
+<tr><td data-label="What you do today">Split a stream into read and write halves</td><td data-label="In Nuclei">Use <code>&amp;Handle</code> for both</td><td data-label="Mind"><code>AsyncRead</code> and <code>AsyncWrite</code> are implemented on <code>&amp;Handle&lt;TcpStream&gt;</code>.</td></tr>
+<tr><td data-label="What you do today">The runtime&rsquo;s read and write extension traits</td><td data-label="In Nuclei">The <code>futures-io</code> traits, with <code>AsyncReadExt</code> and <code>AsyncWriteExt</code> from <code>futures</code></td><td data-label="Mind">Any code written against <code>futures-io</code> works unchanged.</td></tr>
+<tr><td data-label="What you do today">Wait until readable, then try a read</td><td data-label="In Nuclei"><code>recv().await</code>, or <code>read().await</code></td><td data-label="Mind">There is no readiness step to write: the operation completes for you.</td></tr>
+<tr><td data-label="What you do today">The runtime&rsquo;s file type</td><td data-label="In Nuclei"><code>Handle&lt;std::fs::File&gt;</code></td><td data-label="Mind"><code>open</code>, or <code>Handle::new</code> on a file from <code>OpenOptions</code>.</td></tr>
+<tr><td data-label="What you do today">Sleep, timeout, interval</td><td data-label="In Nuclei"><code>nuclei::time::{sleep, timeout, interval}</code></td><td data-label="Mind">Millisecond wheel; missed ticks burst by default.</td></tr>
+<tr><td data-label="What you do today">Locks, semaphores and channels</td><td data-label="In Nuclei"><code>nuclei::sync</code></td><td data-label="Mind">Same names and signatures as the established async API: change the import path.</td></tr>
+<tr><td data-label="What you do today">A cancellation token from a utility crate</td><td data-label="In Nuclei"><code>nuclei::sync::CancellationToken</code></td><td data-label="Mind">Built in, with child tokens and <code>run_until_cancelled</code>.</td></tr>
+<tr><td data-label="What you do today">Ctrl-C and Unix signals</td><td data-label="In Nuclei"><code>nuclei::signal::ctrl_c</code>, <code>nuclei::signal::unix::signal</code></td><td data-label="Mind">A signal is a stream: <code>recv().await</code>.</td></tr>
+<tr><td data-label="What you do today">Child processes</td><td data-label="In Nuclei"><code>nuclei::process::Command</code></td><td data-label="Mind">Shaped like std&rsquo;s; the pipes are async.</td></tr>
+<tr><td data-label="What you do today"><code>select!</code> and <code>join!</code></td><td data-label="In Nuclei">The <code>futures</code> crate&rsquo;s macros, or spawned tasks</td><td data-label="Mind">Nuclei ships no macros of its own for these.</td></tr>
+</tbody>
+</table>
+
+<h2 id="pitfalls">Pitfalls</h2>
+<h3 id="drop-cancels">Dropping a task cancels it</h3>
+<p>The single most common bug after a move. A spawned task whose <code>Task</code> is dropped stops at its next await, and never runs if it had not started. Every fire-and-forget spawn needs <code>.detach()</code>.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span>sleep<span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="cm">// Dropping a Task cancels it: this one never prints.</span>
+    <span class="kw">let</span> cancelled <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">50</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+        <span class="ma">println!</span><span class="pu">(</span><span class="st">"never printed"</span><span class="pu">);</span>
+    <span class="pu">});</span>
+    <span class="fn">drop</span><span class="pu">(</span>cancelled<span class="pu">);</span>
+
+    <span class="cm">// detach lets a task run to its end without a handle.</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="ma">println!</span><span class="pu">(</span><span class="st">"detached, and it still runs"</span><span class="pu">);</span>
+    <span class="pu">})</span>
+    <span class="pu">.</span><span class="fn">detach</span><span class="pu">();</span>
+
+    <span class="cm">// cancel stops a task and gives back its output if it had finished.</span>
+    <span class="kw">let</span> slow <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_secs</span><span class="pu">(</span><span class="nu">10</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+        <span class="nu">1</span>
+    <span class="pu">});</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>slow<span class="pu">.</span><span class="fn">cancel</span><span class="pu">().</span><span class="kw">await</span><span class="pu">,</span> <span class="ty">None</span><span class="pu">);</span>
+
+    <span class="cm">// fallible gives None instead of a panic when the task ended without an output.</span>
+    <span class="kw">let</span> done <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="nu">7</span> <span class="pu">}).</span><span class="fn">fallible</span><span class="pu">();</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>done<span class="pu">.</span><span class="kw">await</span><span class="pu">,</span> <span class="ty">Some</span><span class="pu">(</span><span class="nu">7</span><span class="pu">));</span>
+
+    <span class="fn">sleep</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">100</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h3 id="write-done">A write is accepted, not delivered</h3>
+<p>A write returns once its bytes are copied into the stream&rsquo;s write-behind. Code that wrote and then exited, or wrote and then dropped the stream while expecting an error right away, should <code>flush().await</code> (or <code>close().await</code>). Bytes written behind are still delivered after a drop, for up to 60 seconds.</p>
+
+<h3 id="no-stealing">No work stealing</h3>
+<p>A task stays on its shard. A task that computes for a long time without an await holds every other task of that shard, and no idle core takes them over. Move such work to <code>spawn_blocking</code>, or break it up with awaits.</p>
+
+<h3 id="buffers">Buffers are copied, unless you lend them</h3>
+<p><code>recv</code> and <code>read</code> copy from the shard&rsquo;s buffer into your slice; writes copy into the write-behind. Where the copy matters, <code>read_owned</code> and <code>write_owned</code> hand the driver your <code>Vec&lt;u8&gt;</code> and give it back. See <a href="proactive.html#lending">Proactive IO</a>.</p>
+
+<h3 id="config-once">Configure io_uring before any IO</h3>
+<p><code>Proactor::with_config</code> runs once, before the first IO, spawn or <code>block_on</code>; it panics otherwise. Configure from a plain <code>fn main</code>, then enter the runtime with <code>block_on</code>.</p>
+
+<h3 id="blocking-forms">blocking_ methods inside a task</h3>
+<p>The <code>blocking_</code> forms of the sync types run a nested <code>block_on</code> when called on a Nuclei shard, so the shard keeps running its other tasks. That is safe, but an <code>.await</code> is still the better call inside async code.</p>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="errors.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Errors</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

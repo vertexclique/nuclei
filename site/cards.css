@@ -1,0 +1,581 @@
+/* The cards: the backend band, the decisions, the kit and the checks, each with a glyph of its
+ * own that acts out what the card says.
+ *
+ * Every card that carries a glyph is a .tile. A glyph part that moves has the class g and
+ * names its keyframes in --g (with --gt its length and --go its offset); one rule below starts
+ * them all, when the card scrolls in (motion.css adds reveal-in) and on hover or focus. Every
+ * keyframe ends where the part rests, so a glyph is complete when nothing runs: without
+ * script, and with reduced motion. */
+
+.tile {
+  position: relative;
+}
+
+.glyph {
+  flex: none;
+  inline-size: var(--glyph);
+  block-size: var(--glyph);
+  overflow: visible;
+  fill: none;
+  stroke: var(--color-accent);
+  stroke-width: 1.5;
+  stroke-linecap: square;
+  stroke-linejoin: miter;
+}
+
+.glyph * {
+  vector-effect: non-scaling-stroke;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.glyph .f { fill: var(--color-accent); stroke: none; }
+.glyph .fb { fill: var(--color-accent-2); stroke: none; }
+.glyph .d { stroke: var(--color-rule-2); }
+.glyph .b { stroke: var(--color-accent-2); }
+
+.glyph .g {
+  animation: none var(--gt, var(--dur-glyph)) var(--ge, var(--ease-in-out)) calc(var(--gd, 0ms) + var(--go, 0ms)) backwards;
+}
+
+.reveal-in .g,
+.reveal-now .g,
+.tile:is(:hover, :focus-within) .g {
+  animation-name: var(--g);
+}
+
+/* The backend band: the four kernel interfaces. */
+
+.band {
+  border-block: var(--rule-hair) solid var(--color-rule);
+  background:
+    linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
+    var(--color-paper);
+  box-shadow: inset 0 1px 0 var(--color-gloss-edge);
+}
+
+.band__list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-inline-size: var(--page-max);
+  margin-inline: auto;
+  padding-inline: var(--page-gutter);
+}
+
+.band__item {
+  display: grid;
+  align-content: start;
+  gap: var(--space-xs);
+  padding: var(--space-lg) var(--space-md);
+}
+
+.band__item:nth-child(odd) {
+  padding-inline-start: 0;
+}
+
+.band__item:nth-child(even) {
+  border-inline-start: var(--rule-hair) solid var(--color-rule);
+}
+
+.band__item:nth-child(n + 3) {
+  border-block-start: var(--rule-hair) solid var(--color-rule);
+}
+
+/* Light pooled under a backend as the pointer rests on it. */
+.band__item::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: radial-gradient(80% 90% at 30% 0%, var(--color-card-lit) 0%, transparent 70%);
+  opacity: 0;
+}
+
+.band__name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  color: var(--color-ink);
+}
+
+.band__name .glyph {
+  --glyph: 1.5rem;
+}
+
+.band__where {
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  color: var(--color-muted);
+}
+
+@media (min-width: 60rem) {
+  .band__list {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .band__item,
+  .band__item:nth-child(odd) {
+    padding: var(--space-lg);
+  }
+
+  .band__item:first-child {
+    padding-inline-start: 0;
+  }
+
+  .band__item:nth-child(n + 3) {
+    border-block-start: 0;
+  }
+
+  .band__item + .band__item {
+    border-inline-start: var(--rule-hair) solid var(--color-rule);
+  }
+}
+
+/* The decisions: wet panels on an uneven twelve-column grid. A panel lifts toward the pointer
+ * and its edge lights. */
+
+.cards {
+  display: grid;
+  gap: var(--space-md);
+}
+
+@media (min-width: 48rem) {
+  .cards {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+  }
+
+  .card {
+    grid-column: span 5;
+  }
+
+  .card--wide {
+    grid-column: span 7;
+  }
+
+  .card--half {
+    grid-column: span 6;
+  }
+}
+
+.card {
+  display: grid;
+  gap: var(--space-sm);
+  align-content: start;
+  padding: var(--space-lg);
+}
+
+.card .glyph {
+  margin-block-end: var(--space-xs);
+}
+
+.card p {
+  max-inline-size: 52ch;
+}
+
+.card::before {
+  content: "";
+  position: absolute;
+  inset: calc(-1 * var(--rule-hair));
+  border: var(--rule-hair) solid var(--color-accent);
+  background: radial-gradient(90% 70% at 0% 0%, var(--color-card-lit) 0%, transparent 65%);
+  box-shadow: 0 18px 40px -24px var(--color-glow);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* What comes with it: a ruled grid, one cell per piece, its API under its name. */
+
+.kit__grid {
+  display: grid;
+  border-block-start: var(--rule-hair) solid var(--color-rule);
+}
+
+.kit__item {
+  display: grid;
+  align-content: start;
+  gap: var(--space-xs);
+  padding-block: var(--space-lg);
+  border-block-end: var(--rule-hair) solid var(--color-rule);
+}
+
+/* The cell fills with a faint light from its top corner as the pointer rests on it. */
+.kit__item::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: radial-gradient(70% 80% at 0% 0%, var(--color-card-lit) 0%, transparent 70%);
+  opacity: 0;
+}
+
+.kit__top {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.kit__top .glyph {
+  --glyph: 1.75rem;
+}
+
+.kit__item h3 {
+  font-size: var(--text-md);
+  letter-spacing: -0.015em;
+}
+
+.kit__api {
+  justify-self: start;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.kit__api code {
+  font-size: inherit;
+  color: inherit;
+  white-space: nowrap;
+}
+
+.kit__item p:last-child {
+  max-inline-size: 44ch;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+}
+
+.kit {
+  isolation: isolate;
+}
+
+@media (min-width: 40rem) and (max-width: 63.99rem) {
+  .kit__grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: var(--space-xl);
+  }
+
+  .kit__item:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (min-width: 64rem) {
+  .kit__grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .kit__item {
+    padding-inline: var(--space-lg);
+  }
+
+  .kit__item:nth-child(3n + 1) {
+    padding-inline-start: 0;
+  }
+
+  .kit__item:not(:nth-child(3n + 1)) {
+    border-inline-start: var(--rule-hair) solid var(--color-rule);
+  }
+}
+
+/* Checked: four panels, each under a rule of the liquid that a glint runs along on hover. */
+
+.checks {
+  display: grid;
+  gap: var(--space-xl) var(--space-2xl);
+}
+
+@media (min-width: 48rem) {
+  .checks {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.check {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: start;
+  gap: var(--space-sm) var(--space-md);
+  padding-block-start: var(--space-lg);
+  overflow: clip;
+}
+
+.check::before,
+.check::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+  block-size: 2px;
+}
+
+.check::before {
+  background: var(--fill-accent-rule);
+  transform-origin: left;
+}
+
+.check::after {
+  background: linear-gradient(90deg, transparent 0%, var(--color-filament-tip) 50%, transparent 100%);
+  opacity: 0;
+  transform: translateX(-100%);
+}
+
+.check h3 {
+  align-self: center;
+}
+
+.check p {
+  grid-column: 1 / -1;
+  max-inline-size: var(--measure);
+}
+
+/* Each card's place in its row, for the stagger as cards scroll in together. */
+.band__item:nth-child(2),
+.cards > :nth-child(2n),
+.kit__item:nth-child(3n + 2),
+.checks > :nth-child(2n) { --n: 1; }
+.band__item:nth-child(3),
+.kit__item:nth-child(3n) { --n: 2; }
+.band__item:nth-child(4) { --n: 3; }
+
+/* The glyphs, one per card. */
+
+/* io_uring first: an entry runs once around the ring. */
+.g-orbit { --g: g-orbit; --gt: 1.6s; }
+
+@keyframes g-orbit {
+  25% { transform: translate(22px, 0); }
+  50% { transform: translate(22px, 22px); }
+  75% { transform: translate(0, 22px); }
+}
+
+/* Thread per core: each task rises in its own column, on its own beat. */
+.g-lane { --g: g-lane; --gt: 900ms; }
+.g-lane:nth-of-type(2) { --go: 140ms; }
+.g-lane:nth-of-type(3) { --go: 60ms; }
+.g-lane:nth-of-type(4) { --go: 220ms; }
+
+@keyframes g-lane {
+  50% { transform: translateY(-15px); }
+}
+
+/* Multishot receives: arrivals fall into the one armed buffer, one after another. */
+.g-drop { --g: g-drop; --gt: 700ms; --ge: var(--ease-out); }
+.g-drop:nth-of-type(2) { --go: 180ms; }
+.g-drop:nth-of-type(3) { --go: 360ms; }
+
+@keyframes g-drop {
+  from { opacity: 0; transform: translateY(-18px); }
+}
+
+/* Nested block_on: one level in, and back out. */
+.g-nest { --g: g-nest; --gt: 1.2s; }
+.g-nest-in { --g: g-nest; --gt: 1.2s; --go: 120ms; }
+
+@keyframes g-nest {
+  45% { transform: scale(0.55); }
+}
+
+/* Descriptors you can trust: the generation ticks over. */
+.g-gen { --g: g-gen; --gt: 800ms; --ge: var(--ease-out); }
+
+@keyframes g-gen {
+  from { transform: translateY(14px); }
+}
+
+/* IO memory with a ceiling: the level drops and refills to the cap, never past it. */
+.g-level { --g: g-level; --gt: 1.4s; --ge: var(--ease-out); transform-origin: bottom; }
+.g-cap { --g: g-cap; --gt: 1.4s; }
+
+@keyframes g-level {
+  30% { transform: scaleY(0.25); }
+}
+
+@keyframes g-cap {
+  0%, 80%, 100% { opacity: 1; }
+  90% { opacity: 0.3; }
+}
+
+/* Sockets, files and pipes: the handle closes around std's object. */
+.g-clasp-l { --g: g-clasp-l; --gt: 900ms; }
+.g-clasp-r { --g: g-clasp-r; --gt: 900ms; }
+
+@keyframes g-clasp-l {
+  from { transform: translateX(-6px); opacity: 0.4; }
+}
+
+@keyframes g-clasp-r {
+  from { transform: translateX(6px); opacity: 0.4; }
+}
+
+/* Timers: the hand sweeps once round the wheel. */
+.g-hand { --g: g-hand; --gt: 1.4s; transform-origin: 50% 100%; }
+
+@keyframes g-hand {
+  from { transform: rotate(-360deg); }
+}
+
+/* Sync: the gate lifts, a task passes, the gate drops. */
+.g-gate { --g: g-gate; --gt: 1.4s; }
+.g-pass { --g: g-pass; --gt: 1.4s; }
+
+@keyframes g-gate {
+  20%, 70% { transform: translateY(-8px); }
+}
+
+@keyframes g-pass {
+  0%, 25% { transform: translateX(0); opacity: 1; }
+  65% { transform: translateX(23px); opacity: 1; }
+  66% { transform: translateX(23px); opacity: 0; }
+  67% { transform: translateX(0); opacity: 0; }
+}
+
+/* Child processes: the child steps out of the parent, and a pipe joins them. */
+.g-child { --g: g-child; --gt: 900ms; --ge: var(--ease-out); }
+.g-pipe { --g: g-pipe; --gt: 900ms; }
+
+@keyframes g-child {
+  from { transform: translate(-12px, -9px); opacity: 0; }
+}
+
+@keyframes g-pipe {
+  0%, 50% { opacity: 0; }
+}
+
+/* Signals: square ripples spread from the source. */
+.g-wave { --g: g-wave; --gt: 1.1s; --ge: var(--ease-out); }
+.g-wave + .g-wave { --go: 200ms; }
+
+@keyframes g-wave {
+  from { transform: scale(0.3); opacity: 0; }
+  40% { opacity: 1; }
+}
+
+/* Runtime stats: a fresh snapshot redraws every bar. */
+.g-bar { --g: g-bar; --gt: 1s; transform-origin: bottom; }
+.g-bar:nth-of-type(2) { --go: 80ms; }
+.g-bar:nth-of-type(3) { --go: 160ms; }
+.g-bar:nth-of-type(4) { --go: 240ms; }
+
+@keyframes g-bar {
+  45% { transform: scaleY(0.2); }
+}
+
+/* Local and blocking work: the blocking task goes down to the pool and comes back done. */
+.g-pool { --g: g-pool; --gt: 1.3s; }
+
+@keyframes g-pool {
+  35%, 65% { transform: translateY(14px); }
+}
+
+/* Attributes: the attribute seats on the function, and it runs. */
+.g-tag { --g: g-tag; --gt: 1s; --ge: var(--ease-out); }
+.g-run { --g: g-run; --gt: 1s; --go: 200ms; --ge: var(--ease-out); transform-origin: left; }
+
+@keyframes g-tag {
+  from { transform: translateY(-6px); opacity: 0; }
+}
+
+@keyframes g-run {
+  from { transform: scaleX(0); }
+}
+
+/* A short dependency list: three lines, drawn in turn. */
+.g-line { --g: g-line; --gt: 600ms; --ge: var(--ease-out); transform-origin: left; }
+.g-line:nth-of-type(2) { --go: 140ms; }
+.g-line:nth-of-type(3) { --go: 280ms; }
+
+@keyframes g-line {
+  from { transform: scaleX(0); }
+}
+
+/* TLA+ models: a token walks the state machine. */
+.g-state { --g: g-state; --gt: 1.8s; }
+
+@keyframes g-state {
+  33% { transform: translate(18px, 0); }
+  66% { transform: translate(9px, 16px); }
+}
+
+/* Lean proofs: the lines of the proof, then the square that ends it. */
+.g-proof { --g: g-line; --gt: 500ms; --ge: var(--ease-out); transform-origin: left; }
+.g-proof:nth-of-type(2) { --go: 120ms; }
+.g-proof:nth-of-type(3) { --go: 240ms; }
+.g-qed { --g: g-qed; --gt: 500ms; --go: 520ms; --ge: var(--ease-out); }
+
+@keyframes g-qed {
+  from { transform: scale(0); }
+}
+
+/* AddressSanitizer: a scan passes over the memory. */
+.g-scan { --g: g-scan; --gt: 1.3s; }
+
+@keyframes g-scan {
+  50% { transform: translateY(20px); }
+}
+
+/* Every backend in CI: the matrix lights cell by cell. */
+.g-cell { --g: g-cell; --gt: 500ms; --ge: var(--ease-out); }
+.g-cell:nth-of-type(2) { --go: 140ms; }
+.g-cell:nth-of-type(3) { --go: 280ms; }
+.g-cell:nth-of-type(4) { --go: 420ms; }
+
+@keyframes g-cell {
+  from { opacity: 0; transform: scale(0.4); }
+}
+
+/* io_uring: an entry goes in on the submission ring and comes back on the completion ring. */
+.g-sqe { --g: g-sqe; --gt: 1.5s; }
+
+@keyframes g-sqe {
+  30% { transform: translate(15px, 0); }
+  50% { transform: translate(15px, 14px); }
+  80% { transform: translate(0, 14px); opacity: 1; }
+  81% { transform: translate(0, 14px); opacity: 0; }
+  82% { transform: translate(0, 0); opacity: 0; }
+}
+
+/* epoll: the ready flag moves along the interest list. */
+.g-ready { --g: g-ready; --gt: 1.2s; }
+
+@keyframes g-ready {
+  0%, 24% { transform: translateX(-9px); }
+  25%, 49% { transform: none; }
+  50%, 74% { transform: translateX(9px); }
+  75% { transform: none; }
+}
+
+/* kqueue: the queue moves up by one; the head leaves, a new event joins at the tail. */
+.glyph .gone { opacity: 0; }
+.g-queue { --g: g-queue; --gt: 900ms; --ge: var(--ease-out); }
+.g-tail { --g: g-tail; --gt: 900ms; --ge: var(--ease-out); }
+.g-leave { --g: g-leave; --gt: 900ms; --ge: var(--ease-out); }
+
+@keyframes g-queue {
+  from { transform: translateX(7px); }
+}
+
+@keyframes g-tail {
+  from { transform: translateX(7px); opacity: 0; }
+}
+
+@keyframes g-leave {
+  from { transform: translateX(7px); opacity: 1; }
+}
+
+/* IOCP: an operation enters the port and its completion packet leaves it. */
+.g-op-in { --g: g-op-in; --gt: 1.4s; }
+.g-op-out { --g: g-op-out; --gt: 1.4s; }
+
+@keyframes g-op-in {
+  40% { transform: translateX(9px); opacity: 1; }
+  46%, 85% { transform: translateX(9px); opacity: 0; }
+  86% { transform: none; opacity: 0; }
+}
+
+@keyframes g-op-out {
+  6% { transform: none; opacity: 0; }
+  7%, 48% { transform: translateX(-10px); opacity: 0; }
+  58% { opacity: 1; }
+}

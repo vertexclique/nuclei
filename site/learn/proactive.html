@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The proactive model: Learn Nuclei</title>
+  <meta name="description" content="What completion-based IO means for your code: buffers, lending, flushing.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/proactive.html">
+  <meta property="og:title" content="The proactive model: Learn Nuclei">
+  <meta property="og:description" content="What completion-based IO means for your code: buffers, lending, flushing.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/proactive.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html" aria-current="page">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 4 of 12</p>
+        <h1>The proactive model</h1>
+        <p class="chapter-head__lede">Nuclei completes IO for the task that asked. What that means, backend by backend, and what it changes in the code you write.</p>
+      </header>
+      <article class="prose">
+<h2 id="two-models">Readiness and completion</h2>
+<p>A <strong>reactor</strong> tells a task when a socket is ready, and the task then makes the read or write call itself. If another reader got there first, or the readiness was spurious, the call would block, and the task waits again.</p>
+<p>Nuclei is a <strong>proactor</strong>. A task hands its operation to its shard&rsquo;s driver, and the operation completes for that task. No task waits for readiness and then makes the call itself. Every call on a descriptor is the driver&rsquo;s, made into memory the runtime owns.</p>
+<table class="table">
+<thead><tr><th>Backend</th><th>How an operation completes</th></tr></thead>
+<tbody>
+<tr><td data-label="Backend">io_uring</td><td data-label="How an operation completes">The driver submits it to the shard&rsquo;s ring and the kernel performs it.</td></tr>
+<tr><td data-label="Backend">I/O completion ports</td><td data-label="How an operation completes">It is issued as an overlapped call; the kernel completes it and the shard takes the completion from its port.</td></tr>
+<tr><td data-label="Backend">epoll, kqueue</td><td data-label="How an operation completes">The driver makes the call: at once when the socket may be ready, otherwise on its next edge.</td></tr>
+</tbody>
+</table>
+<p>The task&rsquo;s side is the same on all four: it asks, and later takes the result.</p>
+
+<h2 id="buffers">Where the bytes go</h2>
+<p>The kernel may hold an operation&rsquo;s memory long after the task that asked has moved on, so Nuclei never lends the kernel memory a future borrows. Instead:</p>
+<ul>
+<li><strong>A read</strong> lands in a buffer of the shard&rsquo;s pool, and <code>recv</code> (or <code>read</code>) copies it into the slice you passed.</li>
+<li><strong>A write</strong> is copied into the stream&rsquo;s write-behind buffer and accepted at once; the driver writes it out as the socket takes it, in the order it was written.</li>
+<li><strong>Owned buffers</strong>: <code>read_owned</code> and <code>write_owned</code> take a <code>Vec&lt;u8&gt;</code> and give it back with the result, so the kernel reads into it or writes from it with no copy.</li>
+</ul>
+<p>Each worker&rsquo;s pool is bounded by <code>Builder::io_buffer_cap</code> (64 MiB by default). At the cap, IO waits for buffers to come back, so a worker&rsquo;s IO memory never grows past it.</p>
+
+<h2 id="lending">Lending a buffer</h2>
+<p><code>read_owned</code> reads into the spare capacity of the vector, after the bytes it holds, and gives it back with how many bytes came (zero at the end of the stream, or when the vector has no spare capacity). <code>write_owned</code> writes all of the vector and ends once the kernel took the last byte. Both exist on <code>Handle&lt;TcpStream&gt;</code>, <code>Handle&lt;UnixStream&gt;</code> and <code>Handle&lt;File&gt;</code>.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::{</span><span class="ty">TcpListener</span><span class="pu">,</span> <span class="ty">TcpStream</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> addr <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?;</span>
+
+    <span class="kw">let</span> server <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="kw">let</span> <span class="pu">(</span>stream<span class="pu">,</span> <span class="pu">_)</span> <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">accept</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+        <span class="cm">// Lend the driver this buffer: the kernel reads straight into it,</span>
+        <span class="cm">// and the buffer comes back with the result.</span>
+        <span class="kw">let</span> buf <span class="pu">=</span> <span class="ty">Vec</span><span class="pu">::</span><span class="fn">with_capacity</span><span class="pu">(</span><span class="nu">64</span><span class="pu">);</span>
+        <span class="kw">let</span> <span class="pu">(</span>n<span class="pu">,</span> buf<span class="pu">)</span> <span class="pu">=</span> stream<span class="pu">.</span><span class="fn">read_owned</span><span class="pu">(</span>buf<span class="pu">).</span><span class="kw">await</span><span class="pu">;</span>
+        <span class="kw">let</span> n <span class="pu">=</span> n<span class="pu">?;</span>
+        <span class="cm">// Lend it again for the reply; it comes back once the kernel took every byte.</span>
+        <span class="kw">let</span> <span class="pu">(</span>sent<span class="pu">,</span> _buf<span class="pu">)</span> <span class="pu">=</span> stream<span class="pu">.</span><span class="fn">write_owned</span><span class="pu">(</span>buf<span class="pu">[..</span>n<span class="pu">].</span><span class="fn">to_vec</span><span class="pu">()).</span><span class="kw">await</span><span class="pu">;</span>
+        sent
+    <span class="pu">});</span>
+
+    <span class="kw">let</span> client <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpStream</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(</span>addr<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> <span class="pu">(</span>sent<span class="pu">,</span> <span class="pu">_)</span> <span class="pu">=</span> client<span class="pu">.</span><span class="fn">write_owned</span><span class="pu">(</span><span class="st">b"lent, not copied"</span><span class="pu">.</span><span class="fn">to_vec</span><span class="pu">()).</span><span class="kw">await</span><span class="pu">;</span>
+    sent<span class="pu">?;</span>
+    <span class="kw">let</span> <span class="pu">(</span>n<span class="pu">,</span> reply<span class="pu">)</span> <span class="pu">=</span> client<span class="pu">.</span><span class="fn">read_owned</span><span class="pu">(</span><span class="ty">Vec</span><span class="pu">::</span><span class="fn">with_capacity</span><span class="pu">(</span><span class="nu">64</span><span class="pu">)).</span><span class="kw">await</span><span class="pu">;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(&amp;</span>reply<span class="pu">[..</span>n<span class="pu">?],</span> <span class="st">b"lent, not copied"</span><span class="pu">);</span>
+    server<span class="pu">.</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="write-behind">When a write is done</h2>
+<p>Because a write is accepted into the write-behind, a successful <code>write</code> means the bytes are Nuclei&rsquo;s to deliver, not that the kernel has them. <code>flush</code> waits until the kernel took every byte and reports a write that failed; <code>close</code> flushes and then shuts the write side, so the peer sees the end of the stream.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-2"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::{</span><span class="ty">TcpListener</span><span class="pu">,</span> <span class="ty">TcpStream</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">futures</span><span class="pu">::{</span><span class="ty">AsyncReadExt</span><span class="pu">,</span> <span class="ty">AsyncWriteExt</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> addr <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?;</span>
+    <span class="kw">let</span> reader <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="kw">let</span> <span class="pu">(</span><span class="kw">mut</span> stream<span class="pu">,</span> <span class="pu">_)</span> <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">accept</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+        <span class="kw">let</span> <span class="kw">mut</span> all <span class="pu">=</span> <span class="ty">Vec</span><span class="pu">::</span><span class="fn">new</span><span class="pu">();</span>
+        stream<span class="pu">.</span><span class="fn">read_to_end</span><span class="pu">(&amp;</span><span class="kw">mut</span> all<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+        <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">::</span><span class="ty">Ok</span><span class="pu">(</span>all<span class="pu">.</span><span class="fn">len</span><span class="pu">())</span>
+    <span class="pu">});</span>
+
+    <span class="kw">let</span> <span class="kw">mut</span> stream <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpStream</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(</span>addr<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="cm">// Each write is copied into the stream's write-behind and accepted at once;</span>
+    <span class="cm">// the driver writes it out as the socket takes it.</span>
+    <span class="kw">for</span> <span class="pu">_</span> <span class="kw">in</span> <span class="nu">0</span><span class="pu">..</span><span class="nu">1000</span> <span class="pu">{</span>
+        stream<span class="pu">.</span><span class="fn">write_all</span><span class="pu">(&amp;[</span>b<span class="pu">'</span>x<span class="pu">';</span> <span class="nu">1024</span><span class="pu">]).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="pu">}</span>
+    <span class="cm">// flush waits until the kernel took every byte, and reports a failed write.</span>
+    stream<span class="pu">.</span><span class="fn">flush</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="cm">// close flushes, then shuts the stream's write side, so the reader sees the end.</span>
+    stream<span class="pu">.</span><span class="fn">close</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+
+    <span class="ma">assert_eq!</span><span class="pu">(</span>reader<span class="pu">.</span><span class="kw">await</span><span class="pu">?,</span> <span class="nu">1000</span> <span class="pu">*</span> <span class="nu">1024</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-2" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p>A write that fails keeps its error: every later write fails with it until a flush reports it. Bytes written behind are delivered whatever happens to the handle, as std&rsquo;s are: <code>get_mut</code> and <code>into_inner</code> wait until the kernel took them, and a handle dropped before that leaves them to a copy of its descriptor, which delivers them for at most 60 seconds and then closes.</p>
+
+<h2 id="cancel">Dropping a future halfway</h2>
+<p>Async code drops futures all the time: a timeout fires, a cancellation token trips, a select takes another future first. Nuclei keeps the bytes safe when that happens:</p>
+<ul>
+<li>A read whose future is dropped leaves what the driver already read for the next read, so nothing the kernel handed over is lost.</li>
+<li>A lent read (<code>read_owned</code>) whose future is dropped hands the bytes read into its buffer to the next read, ahead of anything read after them.</li>
+<li>A lent write (<code>write_owned</code>) whose future is dropped reaches the stream whole or not at all: withdrawn if none of it went out, finished by the driver if some did. On Windows a TCP write is always finished.</li>
+</ul>
+
+<h2 id="multishot">One receive for every arrival</h2>
+<p>On io_uring a stream keeps one multishot receive armed for every arrival: the kernel fills a buffer of the shard&rsquo;s receive group as bytes come in, so a receive that waits holds no buffer of its own. A listener&rsquo;s <code>accept_multi</code> works the same way for connections. The receive group&rsquo;s size is set with <code>recv_buffers</code> and <code>recv_buffer_size</code> in the io_uring configuration (<a href="production.html#iouring">Production</a>); a receive that runs past its share is paused until its reader catches up.</p>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="tasks.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Tasks</span></a><a href="handles.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Handles</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

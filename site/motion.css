@@ -1,0 +1,420 @@
+/* Motion: one vocabulary for the whole site. Things rise into place (translate and opacity),
+ * liquid pours (a scale from one edge), and light passes over a surface once (a sheen). Only
+ * transform, translate, scale, opacity and filter move.
+ *
+ * Content never depends on any of it. Load motion is CSS alone and ends where the still page
+ * is; scroll reveals hide only what the page's script hid itself (below the fold, once the
+ * script ran), and print and reduced motion show everything at rest. Loops run only while
+ * their section is on screen (the script sets .is-idle and .is-live). */
+
+/* The hero, on load: the backdrop fades up, the headline rises line by line out of a blur,
+ * the verb's bar pours, the tanks come up and fill, and the facts follow. */
+
+.hero__backdrop {
+  animation: fade-in 1600ms var(--ease-out) backwards;
+}
+
+.nav {
+  animation: fade-in 600ms var(--ease-out) backwards;
+}
+
+.nav__mark::before {
+  transform-origin: bottom;
+  animation: pour-y 900ms var(--ease-out) 250ms backwards;
+}
+
+.hero__line {
+  animation: line-in 900ms var(--ease-out) backwards;
+}
+
+.hero__line:nth-child(1) { animation-delay: 80ms; }
+.hero__line:nth-child(2) { animation-delay: 170ms; }
+.hero__line:nth-child(3) { animation-delay: 260ms; }
+
+.hero__verb::after {
+  animation: pour-x var(--dur-flow) var(--ease-out) 640ms backwards;
+}
+
+.hero__lede,
+.hero__actions,
+.hero__meta {
+  animation: rise-in var(--dur-rise) var(--ease-out) backwards;
+}
+
+.hero__lede { animation-delay: 340ms; }
+.hero__actions { animation-delay: 420ms; }
+.hero__meta { animation-delay: 500ms; }
+
+.bank::after {
+  animation: pour-x 900ms var(--ease-out) 150ms backwards;
+}
+
+.chamber {
+  animation: rise-in 700ms var(--ease-out) calc(200ms + var(--i) * 90ms) backwards;
+}
+
+/* Each tank pours to its level, then breathes like a tide. */
+.chamber__liquid {
+  animation:
+    pour-up var(--dur-pour) var(--ease-out) calc(450ms + var(--i) * 110ms) backwards,
+    tide var(--dur-tide) var(--ease-in-out) calc(var(--i) * -1.75s) infinite;
+}
+
+/* Operations rise through each tank on that core's own beat (no two tanks share a rhythm:
+ * nothing is shared between shards), and the surface lights as each one completes there.
+ * Two bubbles per tank, half a cycle apart; the flare runs at half the cycle, offset to land
+ * at 72% of each half, the moment a bubble reaches the surface. */
+.chamber {
+  --start: calc(1600ms + var(--i) * 450ms);
+}
+
+.chamber__bubble {
+  animation: bubble var(--rate) var(--ease-in-out) var(--start) infinite;
+}
+
+.chamber__bubble + .chamber__bubble,
+.chamber__liquid::before {
+  animation-delay: calc(var(--start) + var(--rate) / 2);
+}
+
+.chamber__liquid::before {
+  animation-name: flare;
+  animation-duration: calc(var(--rate) / 2);
+  animation-timing-function: var(--ease-in-out);
+  animation-iteration-count: infinite;
+}
+
+.chamber__label {
+  animation: fade-in 600ms var(--ease-out) calc(1000ms + var(--i) * 80ms) backwards;
+}
+
+.bank__glint::before {
+  animation: glint 9s var(--ease-in-out) 3s infinite;
+}
+
+.facts .fact {
+  animation: rise-in var(--dur-rise) var(--ease-out) calc(900ms + var(--n, 0) * 90ms) backwards;
+}
+
+.facts .fact::before {
+  animation: pour-y 800ms var(--ease-out) calc(1050ms + var(--n, 0) * 90ms) backwards;
+}
+
+.facts .fact:nth-child(2) { --n: 1; }
+.facts .fact:nth-child(3) { --n: 2; }
+.facts .fact:nth-child(4) { --n: 3; }
+
+/* The coloured verb drifts slowly through the palette (a hue turn of the text gradient). */
+.hero__verb {
+  animation: ink-drift 9s var(--ease-in-out) 1.6s infinite alternate;
+}
+
+/* The dots drift one cell on the diagonal and start again, which is seamless. */
+.hero__dots-field {
+  animation: dots-drift var(--dur-dots) linear infinite;
+}
+
+/* Off screen, the hero's loops wait. */
+.hero.is-idle .hero__verb,
+.hero.is-idle .hero__dots-field,
+.hero.is-idle .chamber__liquid,
+.hero.is-idle .chamber__liquid::before,
+.hero.is-idle .chamber__bubble,
+.hero.is-idle .bank__glint::before {
+  animation-play-state: paused;
+}
+
+/* Buttons and links: a small lift toward the pointer or the keyboard, an edge that lights, a
+ * sheen that crosses once, an underline that draws. The focus ring itself never animates. */
+
+.btn,
+.nav__cta,
+.copy {
+  transition: transform var(--dur-short) var(--ease-out);
+}
+
+.btn--ghost::before,
+.nav__cta::before,
+.btn--primary::before,
+.card::before,
+.kit__item::before,
+.band__item::before {
+  transition: opacity var(--dur-short) var(--ease-out);
+}
+
+.nav__link::after,
+.foot__links a::after {
+  transition: transform var(--dur-short) var(--ease-out);
+}
+
+/* The primary button's glow, deepened on hover. */
+.btn--primary::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  box-shadow: 0 14px 40px -8px var(--color-glow);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.btn:focus-visible,
+.nav__cta:focus-visible {
+  transform: translateY(var(--nudge));
+}
+
+.btn:focus-visible::before,
+.nav__cta:focus-visible::before {
+  opacity: 1;
+}
+
+.btn:focus-visible::after,
+.nav__cta:focus-visible::after {
+  animation: sheen 900ms var(--ease-out);
+}
+
+.nav__link:focus-visible::after,
+.foot__links a:focus-visible::after {
+  transform: scaleX(1);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .btn:hover,
+  .nav__cta:hover {
+    transform: translateY(var(--nudge));
+  }
+
+  .btn:hover::before,
+  .nav__cta:hover::before {
+    opacity: 1;
+  }
+
+  .btn:hover::after,
+  .nav__cta:hover::after {
+    animation: sheen 900ms var(--ease-out);
+  }
+
+  .nav__link:hover::after,
+  .foot__links a:hover::after {
+    transform: scaleX(1);
+  }
+}
+
+.btn:active,
+.nav__cta:active,
+.copy:active {
+  transform: translateY(var(--press));
+  transition-duration: var(--dur-micro);
+}
+
+/* The copy confirmation: the label slides up and away, the new one rises in with a square
+ * of the liquid, light pours across the button, and a band of light passes over the code
+ * that was copied. */
+.copy__face {
+  transition:
+    transform var(--dur-short) var(--ease-out),
+    opacity var(--dur-short) var(--ease-out);
+}
+
+.copy[data-state="copied"]::after {
+  animation: copy-pour 1100ms var(--ease-out);
+}
+
+.copy[data-state="copied"] .copy__face--done::before {
+  animation: pop 420ms var(--ease-out) 120ms backwards;
+}
+
+.code[data-copied]::after {
+  animation: panel-sheen 900ms var(--ease-out);
+}
+
+/* Cards: the decisions lift and light their edge, the kit's cells and the backends fill with
+ * light, a glint runs along a check's rule. Each card's glyph acts out its card (cards.css). */
+
+.card {
+  transition: transform var(--dur-short) var(--ease-out);
+}
+
+.tile:focus-within::before {
+  opacity: 1;
+}
+
+.card:focus-within {
+  transform: translateY(var(--lift));
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .card:hover {
+    transform: translateY(var(--lift));
+  }
+
+  .card:hover::before,
+  .kit__item:hover::before,
+  .band__item:hover::before {
+    opacity: 1;
+  }
+
+  .check:hover::after {
+    animation: rule-glint 900ms var(--ease-out);
+  }
+}
+
+/* Scroll reveals. The script marks what starts below the fold reveal-wait, and swaps it for
+ * reveal-in as it comes into view; what was in view at load gets reveal-now, which plays only
+ * its decorations. Groups stagger by --n, each card's place in its row. */
+
+@media screen and (prefers-reduced-motion: no-preference) {
+  .reveal-wait {
+    opacity: 0;
+    translate: 0 var(--rise);
+  }
+}
+
+.reveal-in {
+  animation: rise-in var(--dur-rise) var(--ease-out) calc(var(--n, 0) * var(--stagger)) backwards;
+}
+
+.reveal-in,
+.reveal-now {
+  --gd: calc(var(--n, 0) * var(--stagger) + 360ms);
+}
+
+.reveal-in .glyph,
+.reveal-now .glyph {
+  animation: glyph-in 700ms var(--ease-out) calc(var(--n, 0) * var(--stagger) + 160ms) backwards;
+}
+
+.reveal-in.check::before,
+.reveal-now.check::before,
+.reveal-in.point::before,
+.reveal-now.point::before,
+.reveal-in.foot__meta::before,
+.reveal-now.foot__meta::before,
+.notes > .reveal-in::before,
+.notes > .reveal-now::before {
+  animation: pour-x 900ms var(--ease-out) calc(var(--n, 0) * var(--stagger) + 140ms) backwards;
+}
+
+.notes > div:nth-child(2) { --n: 1; }
+.notes > div:nth-child(3) { --n: 2; }
+.notes > div:nth-child(4) { --n: 3; }
+.install__step:nth-child(2) { --n: 1; }
+
+/* The keyframes. */
+
+@keyframes fade-in {
+  from { opacity: 0; }
+}
+
+@keyframes rise-in {
+  from { opacity: 0; translate: 0 var(--rise); }
+}
+
+@keyframes line-in {
+  from { opacity: 0; transform: translateY(0.45em); filter: blur(10px); }
+}
+
+@keyframes glyph-in {
+  from { opacity: 0; transform: scale(0.6); }
+}
+
+@keyframes pour-x {
+  from { transform: scaleX(0); }
+}
+
+@keyframes pour-y {
+  from { transform: scaleY(0); }
+}
+
+@keyframes pour-up {
+  from { scale: 1 0; }
+}
+
+@keyframes tide {
+  0%,
+  100% { transform: scaleY(1); }
+  50% { transform: scaleY(0.95); }
+}
+
+@keyframes bubble {
+  0% { transform: translateY(0); opacity: 0; }
+  10% { opacity: 0.9; }
+  80% { opacity: 0.9; }
+  86% { transform: translateY(-100%); opacity: 0; }
+  100% { transform: translateY(-100%); opacity: 0; }
+}
+
+@keyframes flare {
+  0%,
+  62% { opacity: 0; }
+  72% { opacity: 0.55; }
+  100% { opacity: 0; }
+}
+
+@keyframes glint {
+  0% { transform: translateX(-100%) skewX(-12deg); opacity: 0; }
+  3% { opacity: 1; }
+  16% { transform: translateX(260%) skewX(-12deg); opacity: 1; }
+  18%,
+  100% { transform: translateX(260%) skewX(-12deg); opacity: 0; }
+}
+
+@keyframes ink-drift {
+  to { filter: hue-rotate(18deg); }
+}
+
+@keyframes dots-drift {
+  to { transform: translate(var(--dot-cell), var(--dot-cell)); }
+}
+
+@keyframes sheen {
+  from { transform: translateX(-110%); opacity: 1; }
+  to { transform: translateX(110%); opacity: 1; }
+}
+
+@keyframes copy-pour {
+  0% { transform: scaleX(0); opacity: 0.35; }
+  50% { transform: scaleX(1); opacity: 0.35; }
+  100% { transform: scaleX(1); opacity: 0; }
+}
+
+@keyframes pop {
+  from { transform: scale(0); }
+}
+
+@keyframes panel-sheen {
+  from { transform: translateX(-100%); opacity: 1; }
+  to { transform: translateX(100%); opacity: 1; }
+}
+
+@keyframes rule-glint {
+  from { transform: translateX(-100%); opacity: 1; }
+  to { transform: translateX(100%); opacity: 1; }
+}
+
+/* Reduced motion: nothing moves. Every distance is zero, no animation or transition runs, and
+ * anything a reveal was holding back is shown at rest. The footage stays on its still frame
+ * (the script never starts it). */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --rise: 0px;
+    --lift: 0px;
+    --nudge: 0px;
+    --press: 0px;
+  }
+
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .reveal-wait {
+    opacity: 1;
+    translate: none;
+  }
+}

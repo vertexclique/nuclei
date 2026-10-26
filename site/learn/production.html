@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Production: Learn Nuclei</title>
+  <meta name="description" content="Every runtime setting, io_uring configuration, stats, shutdown and tests.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/production.html">
+  <meta property="og:title" content="Production: Learn Nuclei">
+  <meta property="og:description" content="Every runtime setting, io_uring configuration, stats, shutdown and tests.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/production.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html" aria-current="page">Production</a></li><li><a href="backends.html">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 9 of 12</p>
+        <h1>Production</h1>
+        <p class="chapter-head__lede">Every setting of a runtime, the io_uring configuration, the counters to watch, a clean shutdown, and tests.</p>
+      </header>
+      <article class="prose">
+<h2 id="builder">Every runtime setting</h2>
+<p>Every setting is optional; an unset one takes a default that needs no configuration to work well.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::{</span><span class="ty">Builder</span><span class="pu">,</span> <span class="ty">IoBackend</span><span class="pu">};</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> backend <span class="pu">=</span> <span class="kw">if</span> <span class="ma">cfg!</span><span class="pu">(</span>target_os <span class="pu">=</span> <span class="st">"linux"</span><span class="pu">)</span> <span class="pu">{</span> <span class="ty">IoBackend</span><span class="pu">::</span><span class="ty">Epoll</span> <span class="pu">}</span> <span class="kw">else</span> <span class="pu">{</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Proactor</span><span class="pu">::</span><span class="fn">backend</span><span class="pu">()</span> <span class="pu">};</span>
+    <span class="kw">let</span> runtime <span class="pu">=</span> <span class="ty">Builder</span><span class="pu">::</span><span class="fn">new</span><span class="pu">()</span>
+        <span class="pu">.</span><span class="fn">worker_threads</span><span class="pu">(</span><span class="nu">4</span><span class="pu">)</span>                         <span class="cm">// default: one per core</span>
+        <span class="pu">.</span><span class="fn">max_worker_threads</span><span class="pu">(</span><span class="nu">8</span><span class="pu">)</span>                     <span class="cm">// default: four times worker_threads</span>
+        <span class="pu">.</span><span class="fn">pin_workers</span><span class="pu">(</span><span class="kw">true</span><span class="pu">)</span>                         <span class="cm">// Linux; default true</span>
+        <span class="pu">.</span><span class="fn">thread_name_fn</span><span class="pu">(||</span> <span class="st">"edge"</span><span class="pu">.</span><span class="fn">to_string</span><span class="pu">())</span>     <span class="cm">// or .thread_name("edge")</span>
+        <span class="pu">.</span><span class="fn">thread_stack_size</span><span class="pu">(</span><span class="nu">2</span> <span class="pu">*</span> <span class="nu">1024</span> <span class="pu">*</span> <span class="nu">1024</span><span class="pu">)</span>        <span class="cm">// default 8 MiB</span>
+        <span class="pu">.</span><span class="fn">max_nesting</span><span class="pu">(</span><span class="nu">64</span><span class="pu">)</span>                           <span class="cm">// default 256</span>
+        <span class="pu">.</span><span class="fn">max_blocking_threads</span><span class="pu">(</span><span class="nu">128</span><span class="pu">)</span>                 <span class="cm">// default 512</span>
+        <span class="pu">.</span><span class="fn">thread_keep_alive</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_secs</span><span class="pu">(</span><span class="nu">5</span><span class="pu">))</span> <span class="cm">// default 10 seconds</span>
+        <span class="pu">.</span><span class="fn">local_spawn_margin</span><span class="pu">(</span><span class="nu">16</span><span class="pu">)</span>                    <span class="cm">// default 32</span>
+        <span class="pu">.</span><span class="fn">io_buffer_cap</span><span class="pu">(</span><span class="nu">32</span> <span class="pu">*</span> <span class="nu">1024</span> <span class="pu">*</span> <span class="nu">1024</span><span class="pu">)</span>           <span class="cm">// default 64 MiB per worker</span>
+        <span class="pu">.</span><span class="fn">backend</span><span class="pu">(</span>backend<span class="pu">)</span>                          <span class="cm">// default: the process's choice</span>
+        <span class="pu">.</span><span class="fn">build</span><span class="pu">()?;</span>
+
+    <span class="kw">let</span> backend_used <span class="pu">=</span> runtime<span class="pu">.</span><span class="fn">block_on</span><span class="pu">(</span>runtime<span class="pu">.</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Proactor</span><span class="pu">::</span><span class="fn">backend</span><span class="pu">()</span> <span class="pu">}));</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"workers run {backend_used:?}"</span><span class="pu">);</span>
+    runtime<span class="pu">.</span><span class="fn">shutdown_timeout</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_secs</span><span class="pu">(</span><span class="nu">1</span><span class="pu">));</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<table class="table">
+<thead><tr><th>Builder method</th><th>Default</th><th>What it sets</th></tr></thead>
+<tbody>
+<tr><td data-label="Builder method"><code>worker_threads(n)</code></td><td data-label="Default">one per core</td><td data-label="What it sets">Worker threads, each running one shard. Zero runs every task on the thread that spawns it, while that thread is inside <code>block_on</code>.</td></tr>
+<tr><td data-label="Builder method"><code>max_worker_threads(n)</code></td><td data-label="Default">four times <code>worker_threads</code></td><td data-label="What it sets">The most workers the runtime may start over its life; what <code>spawn_more_threads</code> may add up to.</td></tr>
+<tr><td data-label="Builder method"><code>pin_workers(bool)</code></td><td data-label="Default"><code>true</code></td><td data-label="What it sets">Whether each worker is pinned to its own core (Linux). A pinned shard keeps its cache warm.</td></tr>
+<tr><td data-label="Builder method"><code>thread_name(name)</code>, <code>thread_name_fn(f)</code></td><td data-label="Default"><code>nuclei-worker</code>, <code>nuclei-blocking</code></td><td data-label="What it sets">The name of every thread the runtime starts.</td></tr>
+<tr><td data-label="Builder method"><code>thread_stack_size(bytes)</code></td><td data-label="Default">8 MiB</td><td data-label="What it sets">The stack of every thread the runtime starts.</td></tr>
+<tr><td data-label="Builder method"><code>max_nesting(depth)</code></td><td data-label="Default">256</td><td data-label="What it sets">How deep <code>block_on</code> may nest on one thread.</td></tr>
+<tr><td data-label="Builder method"><code>max_blocking_threads(n)</code></td><td data-label="Default">512</td><td data-label="What it sets">The most threads the blocking pool runs at once.</td></tr>
+<tr><td data-label="Builder method"><code>thread_keep_alive(duration)</code></td><td data-label="Default">10 seconds</td><td data-label="What it sets">How long an idle blocking thread waits for work before it exits.</td></tr>
+<tr><td data-label="Builder method"><code>local_spawn_margin(n)</code></td><td data-label="Default">32</td><td data-label="What it sets">How many more live tasks than another shard a spawning thread&rsquo;s shard may hold and still take a task it spawns. Zero balances strictly.</td></tr>
+<tr><td data-label="Builder method"><code>io_buffer_cap(bytes)</code></td><td data-label="Default">64 MiB</td><td data-label="What it sets">The most bytes each worker&rsquo;s IO buffers hold; at the cap, IO waits for buffers to come back.</td></tr>
+<tr><td data-label="Builder method"><code>backend(IoBackend)</code></td><td data-label="Default">the process&rsquo;s choice</td><td data-label="What it sets">The kernel interface this runtime&rsquo;s workers use. One the process cannot have makes <code>build</code> fail with the reason. A non-empty <code>NUCLEI_BACKEND</code> overrides it.</td></tr>
+</tbody>
+</table>
+<p><code>build()</code> starts the runtime; <code>build_global()</code> starts it as the process default (see <a href="runtime.html#default">Runtime</a>).</p>
+
+<h2 id="iouring">The io_uring configuration</h2>
+<p>The io_uring ring of every shard is configured once per process, before any IO, with <code>Proactor::with_config</code>. A second call, or a call after IO has started (which configures the defaults), panics.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-2"><code><span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">config</span><span class="pu">::{</span><span class="ty">IoUringConfiguration</span><span class="pu">,</span> <span class="ty">NucleiConfig</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Proactor</span><span class="pu">;</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="cm">// Once, before any IO: the io_uring ring's settings for every shard.</span>
+    <span class="ty">Proactor</span><span class="pu">::</span><span class="fn">with_config</span><span class="pu">(</span><span class="ty">NucleiConfig</span> <span class="pu">{</span>
+        iouring<span class="pu">:</span> <span class="ty">IoUringConfiguration</span> <span class="pu">{</span>
+            queue_len<span class="pu">:</span> <span class="nu">4096</span><span class="pu">,</span>
+            recv_buffers<span class="pu">:</span> <span class="nu">512</span><span class="pu">,</span>
+            recv_buffer_size<span class="pu">:</span> <span class="nu">16</span> <span class="pu">*</span> <span class="nu">1024</span><span class="pu">,</span>
+            <span class="pu">..</span><span class="ty">IoUringConfiguration</span><span class="pu">::</span><span class="fn">default</span><span class="pu">()</span>
+        <span class="pu">},</span>
+        backend<span class="pu">:</span> <span class="ty">None</span><span class="pu">,</span> <span class="cm">// io_uring where this process may have it, else the poller</span>
+    <span class="pu">});</span>
+
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">block_on</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="ma">println!</span><span class="pu">(</span><span class="st">"IO runs on {:?}"</span><span class="pu">,</span> <span class="ty">Proactor</span><span class="pu">::</span><span class="fn">backend</span><span class="pu">());</span>
+    <span class="pu">});</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-2" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<table class="table">
+<thead><tr><th><code>IoUringConfiguration</code> field</th><th>Default</th><th>What it sets</th></tr></thead>
+<tbody>
+<tr><td data-label="Field"><code>queue_len</code></td><td data-label="Default">2048</td><td data-label="What it sets">Entries in the submission and completion queues.</td></tr>
+<tr><td data-label="Field"><code>recv_buffers</code></td><td data-label="Default">256</td><td data-label="What it sets">Buffers in each shard&rsquo;s group for multishot receives: a power of two up to 32768. Zero turns multishot receives off; each read then takes a buffer of the shard&rsquo;s own pool.</td></tr>
+<tr><td data-label="Field"><code>recv_buffer_size</code></td><td data-label="Default">16384</td><td data-label="What it sets">The size of each of those buffers, in bytes. For UDP, make it hold the largest datagram you expect.</td></tr>
+<tr><td data-label="Field"><code>sqpoll_wake_interval</code></td><td data-label="Default"><code>None</code></td><td data-label="What it sets">With <code>Some(ms)</code>, a kernel thread polls the submission queue and sleeps after that many idle milliseconds. More CPU, fewer system calls.</td></tr>
+<tr><td data-label="Field"><code>iopoll_enabled</code></td><td data-label="Default"><code>false</code></td><td data-label="What it sets">Busy-waits for completions instead of interrupts. Only for files opened with <code>O_DIRECT</code> on file systems that support polling.</td></tr>
+<tr><td data-label="Field"><code>per_numa_bounded_worker_count</code></td><td data-label="Default"><code>Some(256)</code></td><td data-label="What it sets">The kernel&rsquo;s limit on io_uring worker threads per NUMA node for IO bound in time (regular files, block devices).</td></tr>
+<tr><td data-label="Field"><code>per_numa_unbounded_worker_count</code></td><td data-label="Default"><code>Some(512)</code></td><td data-label="What it sets">The same limit for IO that may never complete, such as sockets.</td></tr>
+<tr><td data-label="Field"><code>aggressive_poll</code></td><td data-label="Default"><code>false</code></td><td data-label="What it sets">Kept for code written against earlier versions; the 0.5 ring does not read it.</td></tr>
+</tbody>
+</table>
+<p>Four presets fill the struct from a queue length: <code>interrupt_driven</code> (no polling; the one to pick when unsure), <code>low_latency_driven</code> and <code>kernel_poll_only</code> (both with a kernel submission thread that sleeps after 2 idle milliseconds), and <code>io_poll</code> (with <code>iopoll_enabled</code>). <code>NucleiConfig</code> also carries <code>backend</code>, the backend of every runtime that names none.</p>
+
+<h2 id="stats">Counters</h2>
+<p><code>nuclei::stats()</code> takes a snapshot of every shard alive in the process (the workers of each runtime, then the shard of each thread that runs <code>block_on</code>) and of the blocking pools. It reads the shards without stopping them, so a running shard pays nothing for it. Most counts are published by a shard as it is about to wait for work, and by a busy shard at least once every few hundred task runs.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-3"><code><span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{}).</span><span class="kw">await</span><span class="pu">;</span>
+
+    <span class="kw">let</span> stats <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">stats</span><span class="pu">();</span>
+    <span class="kw">for</span> shard <span class="kw">in</span> <span class="pu">&amp;</span>stats<span class="pu">.</span>shards <span class="pu">{</span>
+        <span class="ma">println!</span><span class="pu">(</span>
+            <span class="st">"{:?} on {:?}: {} tasks, {} polls, {} IO in flight, {} of {} buffer bytes"</span><span class="pu">,</span>
+            shard<span class="pu">.</span>worker<span class="pu">,</span> shard<span class="pu">.</span>backend<span class="pu">,</span> shard<span class="pu">.</span>tasks<span class="pu">,</span> shard<span class="pu">.</span>polls<span class="pu">,</span>
+            shard<span class="pu">.</span>ops_in_flight<span class="pu">,</span> shard<span class="pu">.</span>buffer_bytes<span class="pu">,</span> shard<span class="pu">.</span>buffer_cap<span class="pu">,</span>
+        <span class="pu">);</span>
+        <span class="kw">for</span> <span class="pu">(</span>kind<span class="pu">,</span> count<span class="pu">)</span> <span class="kw">in</span> shard<span class="pu">.</span>errors<span class="pu">.</span><span class="fn">iter</span><span class="pu">()</span> <span class="pu">{</span>
+            <span class="ma">println!</span><span class="pu">(</span><span class="st">"  {count} errors of kind {kind:?}"</span><span class="pu">);</span>
+        <span class="pu">}</span>
+    <span class="pu">}</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"{} blocking threads"</span><span class="pu">,</span> stats<span class="pu">.</span>blocking_threads<span class="pu">);</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-3" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<table class="table">
+<thead><tr><th><code>ShardStats</code> field</th><th>What it counts</th></tr></thead>
+<tbody>
+<tr><td data-label="Field"><code>worker</code>, <code>backend</code></td><td data-label="What it counts">The shard&rsquo;s place among its runtime&rsquo;s workers (<code>None</code> for a <code>block_on</code> thread&rsquo;s shard) and its kernel interface.</td></tr>
+<tr><td data-label="Field"><code>tasks</code>, <code>polls</code>, <code>remote_wakes</code></td><td data-label="What it counts">Tasks on the shard not done yet; task polls run; tasks woken or spawned onto it from other threads.</td></tr>
+<tr><td data-label="Field"><code>ops_in_flight</code>, <code>cq_overflows</code></td><td data-label="What it counts">Operations handed to the kernel and not ended (io_uring, IOCP; always 0 on epoll and kqueue); times the kernel held completions for want of room in the completion queue (none is lost).</td></tr>
+<tr><td data-label="Field"><code>buffer_bytes</code>, <code>buffer_cap</code>, <code>buffer_exhausted</code></td><td data-label="What it counts">Bytes the buffer pool holds; the most it may hold; times IO waited because every byte under the cap was in use.</td></tr>
+<tr><td data-label="Field"><code>timers</code>, <code>errors</code></td><td data-label="What it counts">Timers armed; IO errors by <code>io::ErrorKind</code> (<code>get</code>, <code>iter</code>), with refused registrations and accepts out of descriptors counted apart.</td></tr>
+</tbody>
+</table>
+<p><code>Stats</code> also has <code>blocking_threads</code> and <code>off_shard_errors</code>, the errors of IO run on threads that run no shard.</p>
+
+<h2 id="shutdown">A clean shutdown</h2>
+<p>A server stops taking connections when asked, lets the open ones finish, and gives up after a deadline. A <code>CancellationToken</code> carries the request to every task, <code>ctrl_c</code> raises it, and <code>timeout</code> bounds the drain.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-4"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::</span><span class="ty">TcpListener</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">sync</span><span class="pu">::</span><span class="ty">CancellationToken</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::main]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> shutdown <span class="pu">=</span> <span class="ty">CancellationToken</span><span class="pu">::</span><span class="fn">new</span><span class="pu">();</span>
+
+    <span class="cm">// Ctrl-C cancels the token.</span>
+    <span class="kw">let</span> trigger <span class="pu">=</span> shutdown<span class="pu">.</span><span class="fn">clone</span><span class="pu">();</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="kw">if</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">signal</span><span class="pu">::</span><span class="fn">ctrl_c</span><span class="pu">().</span><span class="kw">await</span><span class="pu">.</span><span class="fn">is_ok</span><span class="pu">()</span> <span class="pu">{</span>
+            trigger<span class="pu">.</span><span class="fn">cancel</span><span class="pu">();</span>
+        <span class="pu">}</span>
+    <span class="pu">})</span>
+    <span class="pu">.</span><span class="fn">detach</span><span class="pu">();</span>
+
+    <span class="kw">let</span> <span class="kw">mut</span> connections <span class="pu">=</span> <span class="ty">Vec</span><span class="pu">::</span><span class="fn">new</span><span class="pu">();</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"listening on {}"</span><span class="pu">,</span> listener<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?);</span>
+    <span class="kw">while</span> <span class="kw">let</span> <span class="ty">Some</span><span class="pu">(</span>accepted<span class="pu">)</span> <span class="pu">=</span> shutdown<span class="pu">.</span><span class="fn">run_until_cancelled</span><span class="pu">(</span>listener<span class="pu">.</span><span class="fn">accept</span><span class="pu">()).</span><span class="kw">await</span> <span class="pu">{</span>
+        <span class="kw">let</span> <span class="pu">(</span>stream<span class="pu">,</span> <span class="pu">_)</span> <span class="pu">=</span> accepted<span class="pu">?;</span>
+        <span class="kw">let</span> token <span class="pu">=</span> shutdown<span class="pu">.</span><span class="fn">child_token</span><span class="pu">();</span>
+        connections<span class="pu">.</span><span class="fn">push</span><span class="pu">(</span><span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+            <span class="kw">let</span> <span class="kw">mut</span> buf <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">1024</span><span class="pu">];</span>
+            <span class="kw">while</span> <span class="kw">let</span> <span class="ty">Some</span><span class="pu">(</span><span class="ty">Ok</span><span class="pu">(</span>n <span class="pu">@</span> <span class="nu">1</span><span class="pu">..))</span> <span class="pu">=</span> token<span class="pu">.</span><span class="fn">run_until_cancelled</span><span class="pu">(</span>stream<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">)).</span><span class="kw">await</span> <span class="pu">{</span>
+                <span class="kw">let</span> <span class="pu">_</span> <span class="pu">=</span> stream<span class="pu">.</span><span class="fn">send</span><span class="pu">(&amp;</span>buf<span class="pu">[..</span>n<span class="pu">]).</span><span class="kw">await</span><span class="pu">;</span>
+            <span class="pu">}</span>
+        <span class="pu">}));</span>
+    <span class="pu">}</span>
+
+    <span class="cm">// Give open connections a moment to finish, then stop.</span>
+    <span class="kw">let</span> drain <span class="pu">=</span> <span class="kw">async</span> <span class="pu">{</span>
+        <span class="kw">for</span> connection <span class="kw">in</span> connections <span class="pu">{</span>
+            connection<span class="pu">.</span><span class="kw">await</span><span class="pu">;</span>
+        <span class="pu">}</span>
+    <span class="pu">};</span>
+    <span class="kw">if</span> <span class="md">nuclei</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="fn">timeout</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_secs</span><span class="pu">(</span><span class="nu">5</span><span class="pu">),</span> drain<span class="pu">).</span><span class="kw">await</span><span class="pu">.</span><span class="fn">is_err</span><span class="pu">()</span> <span class="pu">{</span>
+        <span class="ma">eprintln!</span><span class="pu">(</span><span class="st">"some connections did not finish in time"</span><span class="pu">);</span>
+    <span class="pu">}</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-4" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="compat">The process default, the earlier way</h2>
+<p>Programs written against earlier versions of Nuclei set up the default runtime with <code>init</code> or <code>init_with_config</code>; both still work, on the shards. <code>GlobalExecutorConfig</code> sets the workers to start (<code>with_min_threads</code>, or from an environment variable with <code>with_env_var</code>), the most it may run (<code>with_max_threads</code>) and their names. <code>spawn_more_threads</code> and <code>stop_thread</code> grow and shrink it within those bounds.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-5"><code><span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">GlobalExecutorConfig</span><span class="pu">;</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="cm">// The default runtime, set up the way earlier versions of nuclei did it.</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">init_with_config</span><span class="pu">(</span>
+        <span class="ty">GlobalExecutorConfig</span><span class="pu">::</span><span class="fn">default</span><span class="pu">()</span>
+            <span class="pu">.</span><span class="fn">with_env_var</span><span class="pu">(</span><span class="st">"APP_WORKERS"</span><span class="pu">)</span> <span class="cm">// read the worker count from here first</span>
+            <span class="pu">.</span><span class="fn">with_min_threads</span><span class="pu">(</span><span class="nu">2</span><span class="pu">)</span>
+            <span class="pu">.</span><span class="fn">with_max_threads</span><span class="pu">(</span><span class="nu">4</span><span class="pu">),</span>
+    <span class="pu">);</span>
+
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">block_on</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span>
+        <span class="kw">let</span> started <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn_more_threads</span><span class="pu">(</span><span class="nu">2</span><span class="pu">).</span><span class="kw">await</span><span class="pu">.</span><span class="fn">expect</span><span class="pu">(</span><span class="st">"workers start"</span><span class="pu">);</span>
+        <span class="ma">println!</span><span class="pu">(</span><span class="st">"started {started} more workers"</span><span class="pu">);</span>
+        <span class="kw">let</span> stopped <span class="pu">=</span> <span class="md">nuclei</span><span class="pu">::</span><span class="fn">stop_thread</span><span class="pu">().</span><span class="kw">await</span><span class="pu">;</span>
+        <span class="ma">println!</span><span class="pu">(</span><span class="st">"stopped one: {stopped}"</span><span class="pu">);</span>
+    <span class="pu">});</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-5" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="testing">Tests</h2>
+<p><code>#[nuclei::test]</code> makes an async test: its body runs in <code>block_on</code> on the default runtime, or on a runtime of its own with <code>threads = N</code>. A test may return a <code>Result</code>, like any test.</p>
+<figure class="snippet"><figcaption class="snippet__label">tests/echo.rs</figcaption><div class="code code--corner"><pre id="code-6"><code><span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">net</span><span class="pu">::{</span><span class="ty">TcpListener</span><span class="pu">,</span> <span class="ty">TcpStream</span><span class="pu">};</span>
+<span class="kw">use</span> <span class="md">std</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="ty">Duration</span><span class="pu">;</span>
+<span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::</span><span class="ty">Handle</span><span class="pu">;</span>
+
+<span class="at">#[nuclei::test]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">echoes_a_line</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="kw">let</span> listener <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpListener</span><span class="pu">&gt;::</span><span class="fn">bind</span><span class="pu">(</span><span class="st">"127.0.0.1:0"</span><span class="pu">)?;</span>
+    <span class="kw">let</span> addr <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">local_addr</span><span class="pu">()?;</span>
+    <span class="md">nuclei</span><span class="pu">::</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="kw">move</span> <span class="pu">{</span>
+        <span class="kw">let</span> <span class="pu">(</span>stream<span class="pu">,</span> <span class="pu">_)</span> <span class="pu">=</span> listener<span class="pu">.</span><span class="fn">accept</span><span class="pu">().</span><span class="kw">await</span><span class="pu">?;</span>
+        <span class="kw">let</span> <span class="kw">mut</span> buf <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">64</span><span class="pu">];</span>
+        <span class="kw">let</span> n <span class="pu">=</span> stream<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+        stream<span class="pu">.</span><span class="fn">send</span><span class="pu">(&amp;</span>buf<span class="pu">[..</span>n<span class="pu">]).</span><span class="kw">await</span><span class="pu">?;</span>
+        <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">::</span><span class="ty">Ok</span><span class="pu">(())</span>
+    <span class="pu">})</span>
+    <span class="pu">.</span><span class="fn">detach</span><span class="pu">();</span>
+
+    <span class="kw">let</span> client <span class="pu">=</span> <span class="ty">Handle</span><span class="pu">::&lt;</span><span class="ty">TcpStream</span><span class="pu">&gt;::</span><span class="fn">connect</span><span class="pu">(</span>addr<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    client<span class="pu">.</span><span class="fn">send</span><span class="pu">(</span><span class="st">b"ping"</span><span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="kw">let</span> <span class="kw">mut</span> buf <span class="pu">=</span> <span class="pu">[</span><span class="nu">0u8</span><span class="pu">;</span> <span class="nu">4</span><span class="pu">];</span>
+    client<span class="pu">.</span><span class="fn">recv</span><span class="pu">(&amp;</span><span class="kw">mut</span> buf<span class="pu">).</span><span class="kw">await</span><span class="pu">?;</span>
+    <span class="ma">assert_eq!</span><span class="pu">(&amp;</span>buf<span class="pu">,</span> <span class="st">b"ping"</span><span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span>
+
+<span class="cm">// Its own runtime with one worker, for a test that needs a known shape.</span>
+<span class="at">#[nuclei::test(threads = 1)]</span>
+<span class="kw">async</span> <span class="kw">fn</span> <span class="fn">times_out</span><span class="pu">()</span> <span class="pu">{</span>
+    <span class="kw">let</span> never <span class="pu">=</span> <span class="md">std</span><span class="pu">::</span><span class="md">future</span><span class="pu">::</span><span class="md">pending</span><span class="pu">::&lt;()&gt;();</span>
+    <span class="ma">assert!</span><span class="pu">(</span><span class="md">nuclei</span><span class="pu">::</span><span class="md">time</span><span class="pu">::</span><span class="fn">timeout</span><span class="pu">(</span><span class="ty">Duration</span><span class="pu">::</span><span class="fn">from_millis</span><span class="pu">(</span><span class="nu">10</span><span class="pu">),</span> never<span class="pu">).</span><span class="kw">await</span><span class="pu">.</span><span class="fn">is_err</span><span class="pu">());</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-6" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<figure class="snippet"><div class="code code--corner code--shell"><pre id="code-7"><code><span class="fn">cargo</span> <span class="kw">test</span></code></pre><button class="copy" type="button" data-copy="code-7" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+<p><code>#[nuclei::bench]</code> makes an async benchmark for the nightly test harness: the crate that uses it writes <code>#![feature(test)]</code> and <code>extern crate test;</code> at its root, and each run of the body is timed on <code>block_on</code>.</p>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="processes.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Processes</span></a><a href="backends.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Backends</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>

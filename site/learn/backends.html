@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Backends: Learn Nuclei</title>
+  <meta name="description" content="io_uring, epoll, kqueue and IOCP: how one is picked and what differs.">
+  <link rel="canonical" href="https://vertexclique.com/nuclei/learn/backends.html">
+  <meta property="og:title" content="Backends: Learn Nuclei">
+  <meta property="og:description" content="io_uring, epoll, kqueue and IOCP: how one is picked and what differs.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://vertexclique.com/nuclei/learn/backends.html">
+  <meta property="og:image" content="https://vertexclique.com/nuclei/media/hero.jpg">
+  <meta name="theme-color" content="#05090f">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="../tokens.css">
+  <link rel="stylesheet" href="../site.css">
+  <link rel="stylesheet" href="../code.css">
+  <link rel="stylesheet" href="../cards.css">
+  <link rel="stylesheet" href="../learn.css">
+  <link rel="stylesheet" href="../motion.css">
+</head>
+<body id="top">
+  <header class="nav">
+    <a class="nav__mark" href="../">Nuclei</a>
+    <nav class="nav__links" aria-label="Primary">
+      <a class="nav__link" href="./">Learn</a>
+      <a class="nav__link" href="https://docs.rs/nuclei">API</a>
+      <a class="nav__link nav__link--wide" href="https://github.com/vertexclique/nuclei">Source</a>
+      <a class="nav__cta" href="../#install">Install</a>
+    </nav>
+  </header>
+
+  <div class="learn-wrap">
+    <nav class="chapters" aria-label="Chapters">
+      <p class="chapters__title"><a href="./">Learn Nuclei</a></p>
+      <ol><li><a href="setup.html">Setup</a></li><li><a href="runtime.html">Runtime</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="proactive.html">Proactive IO</a></li><li><a href="handles.html">Handles</a></li><li><a href="time.html">Time</a></li><li><a href="sync.html">Sync</a></li><li><a href="processes.html">Processes</a></li><li><a href="production.html">Production</a></li><li><a href="backends.html" aria-current="page">Backends</a></li><li><a href="errors.html">Errors</a></li><li><a href="migrate.html">Migrate</a></li></ol>
+    </nav>
+    <main class="learn-main">
+      <header class="chapter-head">
+        <p class="chapter-head__step ink">Chapter 10 of 12</p>
+        <h1>Backends</h1>
+        <p class="chapter-head__lede">One API over four kernel interfaces. How the backend is picked, and what each one changes.</p>
+      </header>
+      <article class="prose">
+<h2 id="picking">How the backend is picked</h2>
+<ol>
+<li><code>NUCLEI_BACKEND</code>, when set and not empty: <code>auto</code>, <code>io_uring</code>, or the platform&rsquo;s poller by name (<code>epoll</code>, <code>kqueue</code>, <code>iocp</code>).</li>
+<li>Else the runtime&rsquo;s own <code>Builder::backend</code>, if it named one.</li>
+<li>Else the <code>backend</code> of <code>NucleiConfig</code>, the process&rsquo;s choice for every runtime that names none.</li>
+<li>Else <code>auto</code>: io_uring when the kernel lets this process make the ring its shards use, the platform&rsquo;s poller otherwise.</li>
+</ol>
+<p>A backend named in any of these ways that the process cannot have fails with the reason when the first shard starts; it never falls back. <code>Proactor::backend()</code> says which one the calling thread&rsquo;s shard runs.</p>
+<figure class="snippet"><figcaption class="snippet__label">src/main.rs</figcaption><div class="code code--corner"><pre id="code-1"><code><span class="kw">use</span> <span class="md">nuclei</span><span class="pu">::{</span><span class="ty">Builder</span><span class="pu">,</span> <span class="ty">IoBackend</span><span class="pu">,</span> <span class="ty">Proactor</span><span class="pu">};</span>
+
+<span class="kw">fn</span> <span class="fn">main</span><span class="pu">()</span> <span class="pu">-&gt;</span> <span class="md">std</span><span class="pu">::</span><span class="md">io</span><span class="pu">::</span><span class="ty">Result</span><span class="pu">&lt;()&gt;</span> <span class="pu">{</span>
+    <span class="cm">// What the process picked: NUCLEI_BACKEND if set, else io_uring where it may, else the poller.</span>
+    <span class="ma">println!</span><span class="pu">(</span><span class="st">"default: {:?}"</span><span class="pu">,</span> <span class="ty">Proactor</span><span class="pu">::</span><span class="fn">backend</span><span class="pu">());</span>
+
+    <span class="cm">// One runtime on the platform's poller, whatever the default is.</span>
+    <span class="kw">let</span> poller <span class="pu">=</span> <span class="kw">if</span> <span class="ma">cfg!</span><span class="pu">(</span>target_os <span class="pu">=</span> <span class="st">"linux"</span><span class="pu">)</span> <span class="pu">{</span>
+        <span class="ty">IoBackend</span><span class="pu">::</span><span class="ty">Epoll</span>
+    <span class="pu">}</span> <span class="kw">else</span> <span class="kw">if</span> <span class="ma">cfg!</span><span class="pu">(</span>windows<span class="pu">)</span> <span class="pu">{</span>
+        <span class="ty">IoBackend</span><span class="pu">::</span><span class="ty">Iocp</span>
+    <span class="pu">}</span> <span class="kw">else</span> <span class="pu">{</span>
+        <span class="ty">IoBackend</span><span class="pu">::</span><span class="ty">Kqueue</span>
+    <span class="pu">};</span>
+    <span class="kw">let</span> runtime <span class="pu">=</span> <span class="ty">Builder</span><span class="pu">::</span><span class="fn">new</span><span class="pu">().</span><span class="fn">worker_threads</span><span class="pu">(</span><span class="nu">1</span><span class="pu">).</span><span class="fn">backend</span><span class="pu">(</span>poller<span class="pu">).</span><span class="fn">build</span><span class="pu">()?;</span>
+    <span class="kw">let</span> used <span class="pu">=</span> runtime<span class="pu">.</span><span class="fn">block_on</span><span class="pu">(</span>runtime<span class="pu">.</span><span class="fn">spawn</span><span class="pu">(</span><span class="kw">async</span> <span class="pu">{</span> <span class="ty">Proactor</span><span class="pu">::</span><span class="fn">backend</span><span class="pu">()</span> <span class="pu">}));</span>
+    <span class="ma">assert_eq!</span><span class="pu">(</span>used<span class="pu">,</span> poller<span class="pu">);</span>
+    <span class="ty">Ok</span><span class="pu">(())</span>
+<span class="pu">}</span></code></pre><button class="copy" type="button" data-copy="code-1" hidden><span class="copy__face copy__face--idle">Copy</span><span class="copy__face copy__face--done" aria-hidden="true">Copied</span><span class="copy__face copy__face--error" aria-hidden="true">Select it</span></button><span class="visually-hidden" role="status" aria-live="polite"></span></div></figure>
+
+<h2 id="io-uring">io_uring</h2>
+<ul>
+<li>Linux (and Android) 6.1 or later, with the <code>iouring</code> feature (on by default). The ring is Nuclei&rsquo;s own, on <code>libc</code> alone.</li>
+<li>The probe is safe even under a seccomp filter that kills a process for calling <code>io_uring_setup</code>; where io_uring is refused (an older kernel, a container&rsquo;s policy), <code>auto</code> runs epoll.</li>
+<li>Each shard owns one ring, enabled and used by the shard&rsquo;s own thread alone: single issuer with deferred task work, unless a kernel submission thread is configured (<code>sqpoll_wake_interval</code>), which rules those two out.</li>
+<li>A stream keeps one multishot receive armed, and <code>accept_multi</code> one multishot accept, from the shard&rsquo;s receive group (<a href="production.html#iouring">configured</a> with <code>recv_buffers</code> and <code>recv_buffer_size</code>).</li>
+<li>Regular files are read and written with ring operations at the handle&rsquo;s cursor.</li>
+</ul>
+
+<h2 id="epoll">epoll</h2>
+<ul>
+<li>Linux, Android and illumos. On Linux it is what <code>auto</code> picks where io_uring cannot be had, and what <code>NUCLEI_BACKEND=epoll</code> asks for.</li>
+<li>A readiness poller: the shard&rsquo;s driver makes each call when the descriptor may be ready, into the shard&rsquo;s buffers. Your code sees the same completion-style API.</li>
+<li>Regular files run as <code>pread</code> and <code>pwrite</code> jobs on the blocking pool. A child&rsquo;s exit comes through its pidfd.</li>
+</ul>
+
+<h2 id="kqueue">kqueue</h2>
+<ul>
+<li>macOS, iOS, FreeBSD, NetBSD, OpenBSD and DragonFly.</li>
+<li>A readiness poller, served like epoll; a child&rsquo;s exit comes through <code>EVFILT_PROC</code>, wakes through <code>EVFILT_USER</code>.</li>
+<li>Regular files run on the blocking pool.</li>
+</ul>
+
+<h2 id="iocp">I/O completion ports</h2>
+<ul>
+<li>Windows. One completion port per shard; operations are overlapped calls the kernel completes.</li>
+<li>A handle takes std&rsquo;s <code>TcpStream</code>, <code>TcpListener</code>, <code>UdpSocket</code> and <code>File</code>, and a child&rsquo;s pipes. There are no Unix sockets on Windows.</li>
+<li>A pipe or console opened for synchronous IO cannot complete on a port, so its calls run as jobs of the blocking pool and come back to the shard like the kernel&rsquo;s completions.</li>
+<li>A TCP write, once issued, is always finished: a cancelled send there may have handed bytes to the stack while saying it took none.</li>
+<li>Timed waits use a high-resolution waitable timer where the system offers one, so timers are not rounded to the 15.6 ms system tick; elsewhere a wait is rounded up, never ending early.</li>
+</ul>
+
+<h2 id="ci">What is tested where</h2>
+<p>CI runs the test suite on io_uring and on epoll on Linux 6.1, 6.6 and 6.12, on kqueue on macOS, and on completion ports on Windows, and runs it under AddressSanitizer on both Linux backends.</p>
+      </article>
+      <nav class="pager" aria-label="Chapters"><a href="production.html" rel="prev"><span class="visually-hidden">Previous chapter: </span><span class="pager__title">Production</span></a><a href="errors.html" rel="next"><span class="visually-hidden">Next chapter: </span><span class="pager__title">Errors</span></a></nav>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <div class="foot__meta">
+      <span class="foot__mark">Nuclei</span>
+      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span class="foot__links"><a href="../">Home</a> <a href="./">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a></span>
+    </div>
+  </footer>
+
+  <script src="../site.js"></script>
+</body>
+</html>
