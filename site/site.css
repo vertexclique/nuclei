@@ -448,9 +448,13 @@ a:active {
   }
 }
 
-/* The verb landmark: colour and a drawn bar, never a slanted glyph. */
+/* The verb landmark: colour and a drawn bar, never a slanted glyph. The bar sits in padding the
+ * verb's own box reserves under its line, so it clears the descenders above it and the line
+ * below it at every size: a bar hung from an inline box at line-height 1 lands on the next line. */
 .hero__verb {
   position: relative;
+  display: inline-block;
+  padding-block-end: 0.16em;
   white-space: nowrap;
 }
 
