@@ -80,14 +80,8 @@ fn tcp_pair() -> (TcpStream, Handle<TcpStream>) {
 }
 
 /// An address nothing listens on.
-/// A port nobody listens on: a socket bound to it and not listening holds
-/// it, so no test running meanwhile is given it, and a connect is refused.
-/// The socket is the caller's to keep while it connects.
-fn closed_addr() -> (crate::net::TcpSocket, std::net::SocketAddr) {
-    let socket = crate::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = socket.local_addr().unwrap();
-    (socket, addr)
+fn closed_addr() -> (Option<crate::net::TcpSocket>, std::net::SocketAddr) {
+    crate::net::refused_addr()
 }
 
 #[test]

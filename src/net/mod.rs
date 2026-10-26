@@ -66,6 +66,24 @@ pub type UnixStream = Handle<std::os::unix::net::UnixStream>;
 #[cfg(unix)]
 pub type UnixDatagram = Handle<std::os::unix::net::UnixDatagram>;
 
+/// A port nobody listens on, so a connect to it is refused. On Linux a
+/// socket bound to it and not listening holds it, so no test running
+/// meanwhile is handed the port; macOS drops a connect to such a socket
+/// rather than refusing it, and hands out ports in turn, so there (and on
+/// Windows) the port is bound and freed again. The socket, if any, is the
+/// caller's to keep while it connects.
+#[cfg(test)]
+pub(crate) fn refused_addr() -> (Option<TcpSocket>, std::net::SocketAddr) {
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        return (Some(socket), addr);
+    }
+    let freed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    (None, freed.local_addr().unwrap())
+}
+
 /// The error when every address failed (the last one's), or none was given.
 fn none_worked(last: Option<io::Error>) -> io::Error {
     last.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address was given"))

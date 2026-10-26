@@ -85,11 +85,19 @@ fn a_tcp_socket_binds_listens_and_connects() {
 #[test]
 fn a_connect_to_a_closed_port_is_refused() {
     nuclei::block_on(async {
-        // Held by a socket bound to it and not listening: no test running
-        // meanwhile is given the port, and nothing accepts on it.
-        let held = TcpSocket::new_v4().unwrap();
-        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = held.local_addr().unwrap();
+        // On Linux a socket bound to the port and not listening holds it, so
+        // no test running meanwhile is handed it; macOS drops a connect to
+        // such a socket rather than refusing it, and hands out ports in turn,
+        // so there (and on Windows) the port is bound and freed again.
+        let (_held, addr) = if cfg!(any(target_os = "linux", target_os = "android")) {
+            let held = TcpSocket::new_v4().unwrap();
+            held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = held.local_addr().unwrap();
+            (Some(held), addr)
+        } else {
+            let freed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            (None, freed.local_addr().unwrap())
+        };
         let err = TcpSocket::new_v4()
             .unwrap()
             .connect(addr)
