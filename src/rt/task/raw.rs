@@ -346,10 +346,12 @@ where
             }
 
             let previous = super::enter(header.id);
+            let budget = crate::coop::enter();
             let poll = catch_unwind(AssertUnwindSafe(|| {
                 cell.core
                     .with_mut(|core| F::poll(Pin::new_unchecked(&mut *(*core).future), cx))
             }));
+            crate::coop::leave(budget);
             super::leave(previous);
             // The poll may have woken the task, cloned its waker, or a handle
             // may have registered meanwhile: the word is read again rather

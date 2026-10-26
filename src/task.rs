@@ -7,6 +7,15 @@ use core::task::{Context, Poll};
 use std::io;
 
 pub use crate::join_set::JoinSet;
+
+/// Cooperative scheduling: the budget of operations each poll of a task may
+/// complete before it yields to the other tasks of its shard.
+pub mod coop {
+    pub use crate::coop::{
+        BUDGET, Cooperative, Unconstrained, consume_budget, cooperative, has_budget_remaining,
+        unconstrained,
+    };
+}
 pub use crate::rt::task::{AbortHandle, FallibleTask, Id, Join, JoinError, Task};
 pub use crate::runtime::{spawn, spawn_blocking, spawn_local};
 pub use crate::task_local::{AccessError, LocalKey, TaskLocalFuture};

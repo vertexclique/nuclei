@@ -824,8 +824,10 @@ impl Source {
             return Poll::Ready(Ok(0));
         }
         let kind = self.kind;
-        self.poll_reading(cx, |st, io, waker, after| {
-            st.read(io, kind, out, peek, waker, after)
+        crate::coop::poll_budget(cx, |cx| {
+            self.poll_reading(cx, |st, io, waker, after| {
+                st.read(io, kind, out, peek, waker, after)
+            })
         })
     }
 
@@ -906,8 +908,10 @@ impl Source {
             return Poll::Ready(Ok(0));
         }
         let kind = self.kind;
-        self.poll_reading(cx, |st, io, waker, after| {
-            st.read_vectored(io, kind, bufs, waker, after)
+        crate::coop::poll_budget(cx, |cx| {
+            self.poll_reading(cx, |st, io, waker, after| {
+                st.read_vectored(io, kind, bufs, waker, after)
+            })
         })
     }
 

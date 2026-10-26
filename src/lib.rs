@@ -73,6 +73,7 @@ mod syscore {
 }
 #[cfg(test)]
 mod alone;
+mod coop;
 mod join_set;
 /// Tasks: spawning, their handles and ids, cancellation from anywhere, and yielding.
 pub mod task;

@@ -833,7 +833,9 @@ impl Shard {
         loop {
             if signal.woken.load(Ordering::Relaxed) && signal.woken.swap(false, Ordering::SeqCst) {
                 let outer = self.in_task.replace(true);
+                let budget = crate::coop::enter();
                 let poll = future.as_mut().poll(&mut cx);
+                crate::coop::leave(budget);
                 self.in_task.set(outer);
                 if let Poll::Ready(output) = poll {
                     return output;

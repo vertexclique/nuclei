@@ -820,8 +820,10 @@ impl Source {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
-        self.poll_writing(cx, |st, io, waker, after| {
-            st.write(io, kind, bufs, waker, after)
+        crate::coop::poll_budget(cx, |cx| {
+            self.poll_writing(cx, |st, io, waker, after| {
+                st.write(io, kind, bufs, waker, after)
+            })
         })
     }
 

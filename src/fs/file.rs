@@ -391,14 +391,16 @@ impl FileIo {
         if out.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        self.with_state(cx, |st, io, waker, after| {
-            match st.fill(io, out.len(), waker, after) {
-                Poll::Ready(Ok(true)) => {}
-                other => return other.map_ok(|_| 0),
-            }
-            let n = st.ahead.as_mut().map_or(0, |ahead| ahead.read_into(out));
-            st.consumed(n, after);
-            Poll::Ready(Ok(n))
+        crate::coop::poll_budget(cx, |cx| {
+            self.with_state(cx, |st, io, waker, after| {
+                match st.fill(io, out.len(), waker, after) {
+                    Poll::Ready(Ok(true)) => {}
+                    other => return other.map_ok(|_| 0),
+                }
+                let n = st.ahead.as_mut().map_or(0, |ahead| ahead.read_into(out));
+                st.consumed(n, after);
+                Poll::Ready(Ok(n))
+            })
         })
     }
 
@@ -441,6 +443,15 @@ impl FileIo {
         if want == 0 {
             return Poll::Ready(Ok(0));
         }
+        crate::coop::poll_budget(cx, |cx| self.poll_read_vectored_unbudgeted(cx, bufs, want))
+    }
+
+    fn poll_read_vectored_unbudgeted(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        want: usize,
+    ) -> Poll<io::Result<usize>> {
         self.with_state(cx, |st, io, waker, after| {
             match st.fill(io, want, waker, after) {
                 Poll::Ready(Ok(true)) => {}
@@ -551,7 +562,9 @@ impl FileIo {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.with_state(cx, |st, io, waker, after| st.write(io, bufs, waker, after))
+        crate::coop::poll_budget(cx, |cx| {
+            self.with_state(cx, |st, io, waker, after| st.write(io, bufs, waker, after))
+        })
     }
 
     pub(crate) fn poll_flush(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
