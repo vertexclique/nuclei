@@ -1,5 +1,5 @@
 <h1 align="center">
-    <img src="https://github.com/vertexclique/nuclei/raw/master/img/nuclei.gif"/>
+    <img src="https://github.com/vertexclique/nuclei/raw/master/art/nuclei-logo-square-512.png" width="256" alt="Nuclei"/>
 </h1>
 <div align="center">
  <strong>
