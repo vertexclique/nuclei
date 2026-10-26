@@ -80,11 +80,14 @@ fn tcp_pair() -> (TcpStream, Handle<TcpStream>) {
 }
 
 /// An address nothing listens on.
-fn closed_addr() -> std::net::SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+/// A port nobody listens on: a socket bound to it and not listening holds
+/// it, so no test running meanwhile is given it, and a connect is refused.
+/// The socket is the caller's to keep while it connects.
+fn closed_addr() -> (crate::net::TcpSocket, std::net::SocketAddr) {
+    let socket = crate::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
 }
 
 #[test]
@@ -214,9 +217,8 @@ fn ops_in_flight_count_what_the_kernel_holds() {
 fn an_error_counts_its_kind_against_the_shard_that_met_it() {
     run(async {
         let before = here().errors;
-        let refused = Handle::<TcpStream>::connect(closed_addr())
-            .await
-            .unwrap_err();
+        let (_held, closed) = closed_addr();
+        let refused = Handle::<TcpStream>::connect(closed).await.unwrap_err();
         assert_eq!(refused.kind(), ErrorKind::ConnectionRefused);
         let missing = Handle::<File>::open("/nonexistent/nuclei/stats")
             .await

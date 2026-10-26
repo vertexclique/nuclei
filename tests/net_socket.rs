@@ -85,9 +85,11 @@ fn a_tcp_socket_binds_listens_and_connects() {
 #[test]
 fn a_connect_to_a_closed_port_is_refused() {
     nuclei::block_on(async {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = closed.local_addr().unwrap();
-        drop(closed);
+        // Held by a socket bound to it and not listening: no test running
+        // meanwhile is given the port, and nothing accepts on it.
+        let held = TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = held.local_addr().unwrap();
         let err = TcpSocket::new_v4()
             .unwrap()
             .connect(addr)

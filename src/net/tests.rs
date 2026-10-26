@@ -266,11 +266,11 @@ fn send_recv_and_peek_on_tcp() {
 fn connect_tries_each_address_and_reports_the_last_error() {
     let rt = runtime();
     rt.block_on(async {
-        // A port nobody listens on: bound and closed again.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        // A port nobody listens on, held by a socket bound to it and not
+        // listening, so no test running meanwhile is given it.
+        let held = crate::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let closed = held.local_addr().unwrap();
         let err = within(Handle::<TcpStream>::connect(closed))
             .await
             .unwrap_err();
