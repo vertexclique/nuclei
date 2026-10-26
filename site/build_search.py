@@ -382,10 +382,22 @@ def read_module_file(module, file):
     parse_module(module.path, toks, 0, len(toks), module, files_dir, own_dir)
 
 
+# A `macro_rules!` with the attributes and doc lines right above it.
+MACRO_DEF = re.compile(r"(?P<attrs>(?:[ \t]*(?:///[^\n]*|#\[[^\n]*\])\n)*)[ \t]*macro_rules!\s*(?P<name>\w+)")
+
+
 def source_modules():
     """Every public module of the crate, keyed by its path below `nuclei` ("" for the root)."""
     root = SourceModule([], set(PLATFORMS))
     read_module_file(root, ROOT / "src" / "lib.rs")
+    # A `#[macro_export]` macro is a public name of the crate root wherever it is written, in a
+    # private or hidden module too, which the walk above does not read.
+    for file in sorted((ROOT / "src").rglob("*.rs")):
+        for m in MACRO_DEF.finditer(file.read_text()):
+            attrs = m.group("attrs")
+            if "#[macro_export]" in attrs and "doc(hidden)" not in attrs:
+                docs = [line.strip() for line in attrs.splitlines() if line.strip().startswith("///")]
+                root.items[m.group("name")] = Item(m.group("name"), "macro", set(PLATFORMS), first_paragraph(docs))
     out, stack = {}, [root]
     while stack:
         module = stack.pop()
