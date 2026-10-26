@@ -69,6 +69,7 @@ mod going;
 mod port;
 mod spin;
 mod stats;
+mod timers;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 #[cfg(ring)]
 pub(crate) mod recv;
@@ -627,25 +628,6 @@ impl Shard {
         }
     }
 
-    /// The shard's timers.
-    pub(crate) fn wheel(&self) -> &RefCell<Wheel> {
-        &self.wheel
-    }
-
-    /// The wheel's time for the deadline `at`, rounded up to its
-    /// millisecond: a timer never fires before its deadline.
-    pub(crate) fn wheel_time(&self, at: Instant) -> u64 {
-        let since = at.saturating_duration_since(self.epoch);
-        u64::try_from(since.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
-    }
-
-    /// The wheel's time now on the runtime's clock, rounded down: the wheel
-    /// never runs ahead of the clock.
-    fn wheel_now(&self) -> u64 {
-        let since = crate::time::clock::now().saturating_duration_since(self.epoch);
-        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-    }
-
     /// The next runnable, in the loop's order.
     fn next(&self) -> Option<Runnable> {
         let tick = self.tick.get().wrapping_add(1);
@@ -800,101 +782,6 @@ impl Shard {
             Ok(events) => events > 0,
             Err(err) => panic!("the shard's poller failed: {err}"),
         }
-    }
-
-    /// How long the shard's wait may last for its next timer, if it has one.
-    ///
-    /// On a paused clock the timer's wait is not real time: a due timer
-    /// fires at once, and otherwise the wait is unbounded, for a waker or for
-    /// the clock to move. A shard about to park (`parking`, its deadline
-    /// published by `before_park`) tries to move the clock to the runtime's
-    /// earliest deadline (`paused::try_advance`); if that makes its own timer
-    /// due, it does not wait.
-    fn timer_wait(&self, parking: bool) -> Option<Duration> {
-        // From the clock's own nanoseconds, so the wait ends at the
-        // deadline's millisecond and not one early.
-        let next = self
-            .wheel
-            .borrow()
-            .next_deadline()
-            .map(|ms| self.epoch + Duration::from_millis(ms));
-        if !crate::time::clock::any_altered() {
-            return next.map(|at| at.saturating_duration_since(Instant::now()));
-        }
-        let Some(inner) = super::context::runtime() else {
-            return next.map(|at| at.saturating_duration_since(crate::time::clock::now()));
-        };
-        let now = inner.clock.now();
-        if !inner.clock.is_paused() {
-            return next.map(|at| at.saturating_duration_since(now));
-        }
-        if next.is_some_and(|at| at <= now) {
-            return Some(Duration::ZERO);
-        }
-        if !parking {
-            return None;
-        }
-        if super::paused::try_advance(&inner, Some(&self.shared)) {
-            Some(Duration::ZERO)
-        } else {
-            None
-        }
-    }
-
-    /// Before a park, for a paused clock: publishes the shard's earliest
-    /// deadline and counts the park, both before the shard says it parks, so
-    /// a shard deciding a jump that sees this one parked sees its deadline
-    /// (`proofs/tla/clock/`, publish_late). Nothing to do while no clock is
-    /// paused.
-    fn before_park(&self) {
-        if crate::time::clock::any_altered() {
-            let at = self.wheel.borrow().next_deadline().map_or(u64::MAX, |ms| {
-                crate::time::clock::to_nanos(self.epoch + Duration::from_millis(ms))
-            });
-            self.shared.timer_at.store(at, Ordering::SeqCst);
-            self.shared.parks.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// After a park, slept or given up for work that came: a jump of a paused
-    /// clock in progress ends before this shard runs and reads the clock
-    /// (`proofs/tla/clock/`, busy_no_wait and no_wait_advance).
-    fn after_park(&self) {
-        if crate::time::clock::any_altered()
-            && let Some(inner) = super::context::runtime()
-        {
-            inner.clock.wait_advance();
-        }
-    }
-
-    /// Fires the due timers from inside a task's poll (`time::advance`): the
-    /// tasks they wake go to the queue in deadline order, ahead of a task
-    /// that yields next, and not to the LIFO slot.
-    pub(crate) fn fire_timers_now(&self) {
-        let outer = self.in_task.replace(false);
-        self.fire_timers();
-        self.in_task.set(outer);
-    }
-
-    fn fire_timers(&self) {
-        if !self.shared.timer_ops.is_empty() {
-            let mut wheel = self.wheel.borrow_mut();
-            while let Ok(op) = self.shared.timer_ops.try_pop() {
-                op.apply(self, &mut wheel);
-            }
-        }
-        if self.wheel.borrow().armed() == 0 {
-            return;
-        }
-        let now = self.wheel_now();
-        // The buffer is taken out, so the wheel and the buffer are let go
-        // while the wakers run (a wake may arm a timer again).
-        let mut fired = self.fired.take();
-        self.wheel.borrow_mut().advance(now, &mut fired);
-        for waker in fired.drain(..) {
-            waker.wake();
-        }
-        self.fired.replace(fired);
     }
 
     /// Runs `future` to its end on this shard, running the shard's tasks,
