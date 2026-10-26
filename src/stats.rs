@@ -45,6 +45,17 @@ pub struct ShardStats {
     pub tasks: usize,
     /// Task polls the shard has run (published).
     pub polls: u64,
+    /// Times the shard slept with nothing to run (published).
+    pub parks: u64,
+    /// Time the shard spent asleep, in all (published).
+    pub parked: std::time::Duration,
+    /// Time since the shard was made that it did not spend asleep: running
+    /// tasks, driving its IO and timers, spinning before a park (from the
+    /// published time asleep).
+    pub busy: std::time::Duration,
+    /// Runnables waiting in the shard's own queue, its LIFO slot included
+    /// (published).
+    pub queue_depth: usize,
     /// Runnables of the shard's tasks it took from other threads: a task
     /// woken there, or spawned onto it from there (published).
     pub remote_wakes: u64,

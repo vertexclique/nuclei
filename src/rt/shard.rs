@@ -40,11 +40,11 @@ use core::task::{Context, Poll, Waker};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
-use std::task::Wake;
 use std::time::{Duration, Instant};
 
 use kovan_queue::seg_queue::SegQueue;
 
+use self::signal::Signal;
 use super::backend::Backend;
 use super::counters::{self, Counters};
 use super::handshake::ParkState;
@@ -67,6 +67,7 @@ mod children;
 mod going;
 #[cfg(port)]
 mod port;
+mod signal;
 mod spin;
 mod stats;
 mod timers;
@@ -389,6 +390,9 @@ pub(crate) struct Shard {
     /// starts again), and runnables taken from other threads: published for
     /// `stats` with the rest of the shard's cells.
     polls: Cell<u64>,
+    /// Sleeps with nothing to run, and their time in all, for `stats`.
+    sleeps: Cell<u64>,
+    slept: Cell<Duration>,
     remote_wakes: Cell<u64>,
     /// Looks at the driver from the run loop.
     looks: Cell<u32>,
@@ -515,6 +519,8 @@ impl Shard {
             tick: Cell::new(0),
             since_drive: Cell::new(0),
             polls: Cell::new(0),
+            sleeps: Cell::new(0),
+            slept: Cell::new(Duration::ZERO),
             remote_wakes: Cell::new(0),
             looks: Cell::new(0),
             spin: Spin::new(),
@@ -905,7 +911,7 @@ impl Shard {
                 if let Some(unpark) = &self.tuning.hooks.unpark {
                     unpark();
                 }
-                self.spin.parked_for(slept.elapsed());
+                self.slept_for(slept.elapsed());
             }
             self.after_park();
         }
@@ -973,23 +979,6 @@ impl Shard {
         if let Err(err) = self.drive(wait) {
             panic!("the shard's poller failed: {err}");
         }
-    }
-}
-
-/// The waker of a `block_on` future: marks it woken and wakes the shard.
-struct Signal {
-    woken: AtomicBool,
-    shared: Arc<Shared>,
-}
-
-impl Wake for Signal {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.woken.store(true, Ordering::SeqCst);
-        self.shared.unpark();
     }
 }
 

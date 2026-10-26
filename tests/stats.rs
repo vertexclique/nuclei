@@ -159,3 +159,44 @@ fn an_error_lists_with_its_kind() {
     );
     assert!(format!("{errors:?}").contains("NotFound"), "{errors:?}");
 }
+
+#[test]
+fn a_workers_sleeps_and_busy_time_are_counted() {
+    let _one = one();
+    let rt = Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .build()
+        .unwrap();
+    // The worker runs a task, then has nothing to do: it parks.
+    std::thread::spawn({
+        let handle = rt.handle();
+        move || {
+            handle.block_on(async {
+                nuclei::spawn(async {
+                    nuclei::time::sleep(Duration::from_millis(30)).await;
+                })
+                .await;
+            })
+        }
+    })
+    .join()
+    .unwrap();
+    until("the worker's parks published", |stats| {
+        stats.shards.iter().any(|shard| {
+            shard.worker == Some(0) && shard.parks >= 1 && shard.parked > Duration::ZERO
+        })
+    });
+    let stats = nuclei::stats();
+    let worker = stats
+        .shards
+        .iter()
+        .find(|shard| shard.worker == Some(0) && shard.parks >= 1)
+        .unwrap();
+    assert!(worker.busy + worker.parked > Duration::ZERO);
+    assert!(
+        worker.queue_depth <= 1,
+        "an idle worker's queue is empty: {worker:?}"
+    );
+    drop(rt);
+}

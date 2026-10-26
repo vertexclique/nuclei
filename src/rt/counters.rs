@@ -97,6 +97,11 @@ pub(crate) fn kind_index(kind: io::ErrorKind) -> usize {
 #[repr(align(128))]
 pub(crate) struct Counters {
     polls: AtomicU64,
+    parks: AtomicU64,
+    parked_nanos: AtomicU64,
+    queue_depth: AtomicUsize,
+    /// When the shard was made: its busy time is its age less its parks.
+    born: std::time::Instant,
     remote_wakes: AtomicU64,
     timers: AtomicUsize,
     buffer_bytes: AtomicUsize,
@@ -115,6 +120,9 @@ pub(crate) struct Counters {
 /// What a shard's own cells hold, as it publishes them.
 pub(crate) struct Published {
     pub(crate) polls: u64,
+    pub(crate) parks: u64,
+    pub(crate) parked: std::time::Duration,
+    pub(crate) queue_depth: usize,
     pub(crate) remote_wakes: u64,
     pub(crate) timers: usize,
     pub(crate) buffer_bytes: usize,
@@ -129,6 +137,10 @@ impl Counters {
     pub(crate) fn new(backend: IoBackend, buffer_cap: usize, worker: Option<usize>) -> Self {
         Self {
             polls: AtomicU64::new(0),
+            parks: AtomicU64::new(0),
+            parked_nanos: AtomicU64::new(0),
+            queue_depth: AtomicUsize::new(0),
+            born: std::time::Instant::now(),
             remote_wakes: AtomicU64::new(0),
             timers: AtomicUsize::new(0),
             buffer_bytes: AtomicUsize::new(0),
@@ -146,6 +158,10 @@ impl Counters {
     /// Publishes what the shard's own cells hold. Its own thread only.
     pub(crate) fn publish(&self, now: Published) {
         self.polls.store(now.polls, Ordering::Relaxed);
+        self.parks.store(now.parks, Ordering::Relaxed);
+        let parked = u64::try_from(now.parked.as_nanos()).unwrap_or(u64::MAX);
+        self.parked_nanos.store(parked, Ordering::Relaxed);
+        self.queue_depth.store(now.queue_depth, Ordering::Relaxed);
         self.remote_wakes.store(now.remote_wakes, Ordering::Relaxed);
         self.timers.store(now.timers, Ordering::Relaxed);
         self.buffer_bytes.store(now.buffer_bytes, Ordering::Relaxed);
@@ -179,6 +195,15 @@ impl Counters {
             backend: self.backend,
             tasks,
             polls: self.polls.load(Ordering::Relaxed),
+            parks: self.parks.load(Ordering::Relaxed),
+            parked: std::time::Duration::from_nanos(self.parked_nanos.load(Ordering::Relaxed)),
+            busy: self
+                .born
+                .elapsed()
+                .saturating_sub(std::time::Duration::from_nanos(
+                    self.parked_nanos.load(Ordering::Relaxed),
+                )),
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
             remote_wakes: self.remote_wakes.load(Ordering::Relaxed),
             ops_in_flight: self.ops_in_flight.load(Ordering::Relaxed),
             cq_overflows: self.cq_overflows.load(Ordering::Relaxed),

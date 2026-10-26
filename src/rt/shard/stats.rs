@@ -24,8 +24,16 @@ impl Shard {
         self.publish();
     }
 
-    /// Publishes the polls, the remote wakes, the timers, the buffer pool
-    /// and the driver's operations.
+    /// Counts a sleep of `slept` for `stats` and tells the spin how long it
+    /// was.
+    pub(super) fn slept_for(&self, slept: std::time::Duration) {
+        self.sleeps.set(self.sleeps.get() + 1);
+        self.slept.set(self.slept.get() + slept);
+        self.spin.parked_for(slept);
+    }
+
+    /// Publishes the polls, the sleeps, the queue, the remote wakes, the
+    /// timers, the buffer pool and the driver's operations.
     pub(super) fn publish(&self) {
         let (ops_in_flight, cq_overflows) = match &self.driver {
             #[cfg(ring)]
@@ -38,6 +46,9 @@ impl Shard {
         };
         self.shared.counters.publish(Published {
             polls: self.polls.get(),
+            parks: self.sleeps.get(),
+            parked: self.slept.get(),
+            queue_depth: self.queued(),
             remote_wakes: self.remote_wakes.get(),
             timers: self.wheel.borrow().armed(),
             buffer_bytes: self.pool.charged(),
