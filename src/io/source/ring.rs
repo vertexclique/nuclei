@@ -17,7 +17,8 @@ use std::sync::Arc;
 use super::ops::{Answer, Dial, Done, Outcome, Want};
 use super::{Addr, Kind, Source, Target};
 use crate::buf::PoolBuf;
-use crate::io::side::After;
+use crate::buf::spare::Spare;
+use crate::io::side::{After, Hooks};
 use crate::io::sys;
 use crate::rt::shard::ring::ShardRing;
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
@@ -38,7 +39,7 @@ pub(crate) struct RingOp {
 /// What an operation's entry points at, kept until its completion.
 pub(crate) enum RingMem {
     Ready,
-    Accept(Box<RawAddr>),
+    Accept(Spare<RawAddr>),
     /// A multishot accept: `handed` connections so far; `stopping`: past
     /// the cap, a cancel of it is on its way.
     AcceptMulti {
@@ -63,15 +64,15 @@ pub(crate) enum RingMem {
         msg: RecvHdr,
     },
     RecvLent(Vec<u8>),
-    RecvFrom(Box<Msg>, PoolBuf),
+    RecvFrom(Spare<Msg>, PoolBuf),
     Connect(
         Dial,
-        #[expect(dead_code, reason = "the kernel reads it until the completion")] Box<RawAddr>,
+        #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<RawAddr>,
     ),
     Send(PoolBuf),
     SendLent(Vec<u8>),
     SendTo(
-        #[expect(dead_code, reason = "the kernel reads it until the completion")] Box<Msg>,
+        #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
         PoolBuf,
         Target,
     ),
@@ -108,7 +109,7 @@ impl RingMem {
                 Answer::Done(Ok(fd)) => {
                     // SAFETY: the kernel made this descriptor for us.
                     let conn = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-                    Answer::Done(addr.to_addr(kind).map(|peer| (conn, peer)))
+                    Answer::Done(addr.decode(kind).map(|peer| (conn, peer)))
                 }
                 Answer::Done(Err(err)) => {
                     crate::rt::counters::accept_error(&err);
@@ -181,28 +182,32 @@ impl RingMem {
     }
 }
 
-/// A socket address in its raw form, as an entry points at it.
+/// A socket address in its raw form, as an entry points at it: on the
+/// stack where it is only read, in a [`Spare`] box while the kernel holds it.
+#[derive(Clone, Copy)]
 pub(crate) struct RawAddr {
     pub(crate) storage: libc::sockaddr_storage,
     pub(crate) len: libc::socklen_t,
 }
 
+crate::buf::spare::reused!(RawAddr, Msg);
+
 impl RawAddr {
     /// Room for any address, for the kernel to fill.
-    pub(crate) fn empty() -> Box<Self> {
-        Box::new(Self {
+    pub(crate) fn empty() -> Self {
+        Self {
             // SAFETY: plain data; all zeroes is a valid value.
             storage: unsafe { core::mem::zeroed() },
             len: size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-        })
+        }
     }
 
-    pub(crate) fn inet(addr: &std::net::SocketAddr) -> Box<Self> {
+    pub(crate) fn inet(addr: &std::net::SocketAddr) -> Self {
         let (storage, len) = sys::raw_inet(addr);
-        Box::new(Self { storage, len })
+        Self { storage, len }
     }
 
-    pub(crate) fn unix(addr: &sys::UnixAddr) -> Box<Self> {
+    pub(crate) fn unix(addr: &sys::UnixAddr) -> Self {
         let mut raw = Self::empty();
         // SAFETY: `sockaddr_storage` is large and aligned enough for any
         // address; the address is plain data.
@@ -216,10 +221,10 @@ impl RawAddr {
         raw
     }
 
-    fn of(dial: &Dial) -> io::Result<Box<Self>> {
+    fn of(dial: &Dial) -> Self {
         match dial {
-            Dial::Inet(addr) => Ok(Self::inet(addr)),
-            Dial::Unix(addr) => Ok(Self::unix(addr)),
+            Dial::Inet(addr) => Self::inet(addr),
+            Dial::Unix(addr) => Self::unix(addr),
         }
     }
 
@@ -232,7 +237,7 @@ impl RawAddr {
     }
 
     /// The address the kernel left, for a source of `kind`.
-    pub(crate) fn to_addr(&self, kind: Kind) -> io::Result<Addr> {
+    pub(crate) fn decode(&self, kind: Kind) -> io::Result<Addr> {
         match kind {
             Kind::UnixListener | Kind::UnixDatagram | Kind::Stream => {
                 // SAFETY: an `AF_UNIX` address fits `sockaddr_un`, which the
@@ -247,12 +252,12 @@ impl RawAddr {
     }
 }
 
-/// A message header with its one buffer and its address, boxed so the
-/// header's pointers into it stay put.
+/// A message header with its one buffer and its address, in a [`Spare`]
+/// box so the header's pointers into it stay put.
 pub(crate) struct Msg {
     pub(crate) hdr: libc::msghdr,
     pub(crate) iov: libc::iovec,
-    pub(crate) addr: Box<RawAddr>,
+    pub(crate) addr: RawAddr,
 }
 
 // SAFETY: the header's pointers point into the message's own box and into
@@ -263,9 +268,9 @@ unsafe impl Send for Msg {}
 impl Msg {
     /// A header over `buf` (`len` bytes at `ptr`) and `addr`; for a send
     /// to the connected peer, `addr` is `None`.
-    pub(crate) fn new(ptr: *mut u8, len: usize, addr: Option<Box<RawAddr>>) -> Box<Self> {
+    pub(crate) fn new(ptr: *mut u8, len: usize, addr: Option<RawAddr>) -> Spare<Self> {
         let named = addr.is_some();
-        let mut msg = Box::new(Self {
+        let mut msg = Spare::new(Self {
             // SAFETY: plain data; all zeroes is a valid value.
             hdr: unsafe { core::mem::zeroed() },
             iov: libc::iovec {
@@ -274,27 +279,30 @@ impl Msg {
             },
             addr: addr.unwrap_or_else(RawAddr::empty),
         });
-        msg.hdr.msg_iov = &mut msg.iov;
-        msg.hdr.msg_iovlen = 1 as _;
+        // The pointers are made once the message is in its box.
+        let msg_ref = &mut *msg;
+        msg_ref.hdr.msg_iov = &mut msg_ref.iov;
+        msg_ref.hdr.msg_iovlen = 1 as _;
         if named {
-            msg.hdr.msg_name = msg.addr.as_mut_ptr().cast();
-            msg.hdr.msg_namelen = msg.addr.len;
+            msg_ref.hdr.msg_name = msg_ref.addr.as_mut_ptr().cast();
+            msg_ref.hdr.msg_namelen = msg_ref.addr.len;
         }
         msg
     }
 
     /// A header for a receive: room for the sender's address.
-    pub(crate) fn receiving(ptr: *mut u8, len: usize) -> Box<Self> {
+    pub(crate) fn receiving(ptr: *mut u8, len: usize) -> Spare<Self> {
         let mut msg = Self::new(ptr, len, None);
-        msg.hdr.msg_name = msg.addr.as_mut_ptr().cast();
-        msg.hdr.msg_namelen = msg.addr.len;
+        let msg_ref = &mut *msg;
+        msg_ref.hdr.msg_name = msg_ref.addr.as_mut_ptr().cast();
+        msg_ref.hdr.msg_namelen = msg_ref.addr.len;
         msg
     }
 
     /// The sender's address the kernel left.
     pub(crate) fn sender(&mut self, kind: Kind) -> io::Result<Addr> {
         self.addr.len = self.hdr.msg_namelen;
-        self.addr.to_addr(kind)
+        self.addr.decode(kind)
     }
 }
 
@@ -466,7 +474,7 @@ pub(crate) fn datagram_of(
         name.len = parts.header.namelen as libc::socklen_t;
         (start, parts.payload.len(), name)
     };
-    let from = name.to_addr(kind).ok()?;
+    let from = name.decode(kind).ok()?;
     chunk.narrow(start, start + len);
     Some((chunk, from))
 }
@@ -485,7 +493,7 @@ pub(crate) fn peer_of(conn: &OwnedFd, kind: Kind) -> io::Result<Addr> {
             _ => err,
         });
     }
-    addr.to_addr(kind)
+    addr.decode(kind)
 }
 
 /// The entry for `want` on slot `slot`, with the memory it points at (a
@@ -503,7 +511,7 @@ fn entry(
             (RingMem::Ready, Sqe::poll_add(slot, events as u32))
         }
         Want::Accept => {
-            let mut addr = RawAddr::empty();
+            let mut addr = Spare::new(RawAddr::empty());
             let sqe = Sqe::accept(
                 slot,
                 addr.as_mut_ptr(),
@@ -575,16 +583,11 @@ fn entry(
             let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
             (RingMem::RecvFrom(msg, buf), sqe)
         }
-        Want::Connect(dial) => match RawAddr::of(&dial) {
-            Ok(addr) => {
-                let sqe = Sqe::connect(slot, addr.as_ptr(), addr.len);
-                (RingMem::Connect(dial, addr), sqe)
-            }
-            Err(err) => {
-                crate::rt::counters::io_error(&err);
-                return Err(Box::new(Outcome::Connect(dial, Answer::Done(Err(err)))));
-            }
-        },
+        Want::Connect(dial) => {
+            let addr = Spare::new(RawAddr::of(&dial));
+            let sqe = Sqe::connect(slot, addr.as_ptr(), addr.len);
+            (RingMem::Connect(dial, addr), sqe)
+        }
         Want::Send(buf) => {
             let sqe = stream_write(kind, slot, buf.filled());
             (RingMem::Send(buf), sqe)
@@ -632,11 +635,24 @@ impl Source {
     /// receive or accept, submitted in `epoch`. The side takes it at once if
     /// free, else its holder does as it lets go.
     pub(crate) fn ring_arrival(self: &Arc<Self>, arrival: Arrival, epoch: u32) {
-        self.read_arrivals.push((arrival, epoch));
         let mut after = After::default();
         let hooks = self.hooks();
-        self.read
-            .defer(super::read_work::ARRIVALS, &mut after, &hooks);
+        // The side free: the arrival goes in now, with no trip through the
+        // queue (whose segments would be allocated as it grows). Only this
+        // thread pushes to the queue, so what waits there came before this
+        // arrival and goes in first: the order holds.
+        if let Some(mut held) = self.read.try_hold() {
+            hooks.taken(held.get(), &mut after);
+            while let Ok((queued, at)) = self.read_arrivals.try_pop() {
+                held.get().take_arrival(queued, at, &mut after);
+            }
+            held.get().take_arrival(arrival, epoch, &mut after);
+            held.release(&mut after, &hooks);
+        } else {
+            self.read_arrivals.push((arrival, epoch));
+            self.read
+                .defer(super::read_work::ARRIVALS, &mut after, &hooks);
+        }
         self.settle(after);
     }
 

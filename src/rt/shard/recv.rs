@@ -21,7 +21,7 @@
 use std::io;
 use std::sync::Arc;
 
-use kovan_queue::seg_queue::SegQueue;
+use kovan_queue::array_queue::ArrayQueue;
 
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::Ring;
@@ -52,10 +52,12 @@ pub(crate) struct RecvGroup {
 unsafe impl Send for RecvGroup {}
 
 /// What chunks share with their group: the buffers, and the queue of
-/// buffers given back.
+/// buffers given back, one slot per buffer of the group: a buffer is out at
+/// most once, so the queue never fills and never allocates after it is
+/// made.
 pub(crate) struct Returns {
     mem: Arc<BufMem>,
-    queue: SegQueue<u16>,
+    queue: ArrayQueue<u16>,
 }
 
 /// Bytes `start..end` of a buffer a receive's completion handed out, read
@@ -78,7 +80,7 @@ impl RecvGroup {
         buffers.commit();
         let back = Arc::new(Returns {
             mem: Arc::clone(buffers.memory()),
-            queue: SegQueue::new(),
+            queue: ArrayQueue::new(usize::from(entries)),
         });
         let total = usize::from(entries) * size as usize;
         Ok(Self {
@@ -143,7 +145,7 @@ impl RecvGroup {
     /// len)`.
     pub(crate) fn take_back(&mut self, mut release: impl FnMut(u64, u32)) {
         let mut any = false;
-        while let Ok(bid) = self.back.queue.try_pop() {
+        while let Some(bid) = self.back.queue.pop() {
             if let Some(owner) = self.owners.get_mut(usize::from(bid)) {
                 let (user_data, len) = core::mem::replace(owner, (NOT_AN_OP, 0));
                 if user_data != NOT_AN_OP {
@@ -206,7 +208,9 @@ impl RingChunk {
 
 impl Drop for RingChunk {
     fn drop(&mut self) {
-        self.back.queue.push(self.bid);
+        let given_back = self.back.queue.push(self.bid);
+        // One slot per buffer, and this buffer out once: always room.
+        debug_assert!(given_back.is_ok(), "buffer {} came back twice", self.bid);
     }
 }
 

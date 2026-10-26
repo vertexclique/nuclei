@@ -29,6 +29,9 @@
 //! whoever waits for one; nothing that drops a buffer may hold a source's
 //! guard (see `io::source`), since the wake reaches into sources.
 
+#[cfg(ring)]
+pub(crate) mod spare;
+
 use core::cell::{Cell, RefCell};
 use core::ptr::NonNull;
 use core::task::Waker;

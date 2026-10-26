@@ -115,8 +115,8 @@ impl<S> Side<S> {
         })
     }
 
-    /// The side, if it is free: a test's look.
-    #[cfg(test)]
+    /// The side, if it is free.
+    #[cfg(any(test, ring))]
     pub(crate) fn try_hold(&self) -> Option<Held<'_, S>> {
         self.take(0)
     }
