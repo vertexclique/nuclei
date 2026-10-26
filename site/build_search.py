@@ -57,10 +57,14 @@ def squash(text):
 
 # Rust source: the public names of every public module, per platform. ------------------------
 
+# The build script's short cfg names (build.rs) as they come out with the default features.
 PLATFORMS = {
-    "linux": {"unix": True, "windows": False, "target_os": "linux", "target_family": "unix"},
-    "macos": {"unix": True, "windows": False, "target_os": "macos", "target_family": "unix"},
-    "windows": {"unix": False, "windows": True, "target_os": "windows", "target_family": "windows"},
+    "linux": {"unix": True, "windows": False, "target_os": "linux", "target_family": "unix",
+              "ring": True, "port": False, "completion": True, "readiness": True},
+    "macos": {"unix": True, "windows": False, "target_os": "macos", "target_family": "unix",
+              "ring": False, "port": False, "completion": False, "readiness": True},
+    "windows": {"unix": False, "windows": True, "target_os": "windows", "target_family": "windows",
+                "ring": False, "port": True, "completion": True, "readiness": False},
 }
 PLATFORM_NAMES = {"linux": "Linux", "macos": "macOS", "windows": "Windows"}
 
@@ -142,7 +146,7 @@ def cfg_true(tokens_, platform):
             if name == "target_pointer_width":
                 return value == "64"
             fail(f"unknown cfg key {name!r}: teach build_search.py its value")
-        if name in ("unix", "windows"):
+        if name in ("unix", "windows", "ring", "port", "completion", "readiness"):
             return facts[name]
         if name in ("test", "loom", "nuclei_nightly", "miri"):
             return False
