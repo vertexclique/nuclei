@@ -11,6 +11,7 @@ mod misc;
 mod read_buf;
 mod read_ext;
 mod split;
+mod stdio;
 mod write_ext;
 
 pub use self::buf_read_ext::{
@@ -25,6 +26,7 @@ pub use self::read_ext::{
     AsyncReadExt, Chain, Read, ReadBufFuture, ReadExact, ReadNumber, ReadToEnd, ReadToString, Take,
 };
 pub use self::split::{ReadHalf, WriteHalf, split};
+pub use self::stdio::{Stderr, Stdin, Stdout, stderr, stdin, stdout};
 pub use self::write_ext::{
     AsyncWriteExt, Flush, Shutdown, Write, WriteAll, WriteNumber, WriteVectored,
 };
