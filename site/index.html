@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Nuclei: a proactive, thread-per-core async runtime for Rust</title>
-  <meta name="description" content="Nuclei is a proactive async runtime for Rust. A task hands its IO to the driver and gets the result back completed, one shard per core, on io_uring, epoll, kqueue and I/O completion ports.">
+  <title>Nuclei: proactive, thread-per-core async runtime for Rust</title>
+  <meta name="description" content="Nuclei: proactive async runtime for Rust. A task hands its IO to the driver and gets the result back completed, one shard per core, on io_uring, epoll, kqueue and I/O completion ports.">
   <link rel="canonical" href="https://nuclei.rs/">
-  <meta property="og:title" content="Nuclei: a proactive async runtime for Rust">
+  <meta property="og:title" content="Nuclei: proactive async runtime for Rust">
   <meta property="og:description" content="Hand over the IO, get back the result. One shard per core, each driving its own IO: io_uring or epoll on Linux, kqueue on macOS and the BSDs, completion ports on Windows.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://nuclei.rs/">
@@ -55,7 +55,7 @@
 
       <div class="hero__copy">
         <h1 class="hero__title" id="hero-title"><span class="hero__line">Each core</span> <span class="hero__line"><span class="hero__verb ink">completes</span></span> <span class="hero__line">its own&nbsp;IO.</span></h1>
-        <p class="hero__lede">Nuclei is a <strong class="ink">proactive</strong> async runtime for Rust. A task hands its IO to the driver and gets the result back completed: no task waits for readiness and then makes the call itself. One shard per core, each with its own tasks, timers, buffers and driver.</p>
+        <p class="hero__lede">Nuclei: <strong class="ink">proactive</strong> async runtime for Rust. A task hands its IO to the driver and gets the result back completed: no task waits for readiness and then makes the call itself. One shard per core, each with its own tasks, timers, buffers and driver.</p>
         <div class="hero__actions">
           <a class="btn btn--primary" href="#install">Use Nuclei</a>
           <a class="btn btn--ghost" href="learn/">Learn Nuclei</a>

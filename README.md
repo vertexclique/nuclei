@@ -33,8 +33,8 @@
     </a>
 </div>
 
-Nuclei is a proactive IO runtime: thread-per-core shards that each run their own tasks and drive
-their own IO, timers and buffers. Every operation is completed for the task that asked for it; no
+Nuclei: proactive IO runtime. Thread-per-core shards each run their own tasks and drive their
+own IO, timers and buffers. Every operation is completed for the task that asked for it; no
 task waits for readiness and then makes the call itself.
 
 It needs no configuration: the first `spawn` or `block_on` starts a runtime with one shard per

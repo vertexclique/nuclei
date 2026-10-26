@@ -1,6 +1,6 @@
 //! # Nuclei
 //!
-//! A proactive IO runtime: thread-per-core shards that run tasks and drive
+//! Proactive IO runtime: thread-per-core shards that run tasks and drive
 //! their own IO, timers and buffers. Every operation is completed for the
 //! task that asked for it; no task waits for readiness and then makes the
 //! call itself.
