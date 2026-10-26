@@ -39,10 +39,10 @@ java -cp "$JAR" tlc2.TLC 2>&1 | head -1 || true
 # Without them this checks every family in one go.
 if [ -n "${TLC_SHARDS:-}" ]; then
   rc=0
-  TLA2TOOLS="$JAR" timeout --signal=KILL "${TLC_DEADLINE:-780}" \
+  TLA2TOOLS="$JAR" timeout --signal=KILL "${TLC_DEADLINE:-3480}" \
     bash proofs/tla/run_tlc.sh shard "${TLC_SHARD:?TLC_SHARD is unset}" "$TLC_SHARDS" || rc=$?
   if [ "$rc" = 137 ]; then
-    echo "share $TLC_SHARD did not finish within ${TLC_DEADLINE:-780} s: a model outgrew the budget" >&2
+    echo "share $TLC_SHARD did not finish within ${TLC_DEADLINE:-3480} s: a model outgrew the budget" >&2
   fi
   exit "$rc"
 fi

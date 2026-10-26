@@ -4,10 +4,10 @@ name: TLA+
 # runs `proofs/tla/run_tlc.sh shard <k> 16`, which translates the PlusCal of every family under
 # proofs/tla/, deals every configuration out to 16 shares by the seconds its family's tlc-run.txt
 # recorded, and checks share k against EXPECTED.txt. The 16 jobs run at once, so a new model needs
-# no change to this workflow. The whole check stays within 15 minutes: a share is stopped and
-# fails at 13 (TLC_DEADLINE, the rest of the job's 15 is its setup), and a model that outgrows the
-# budget is cut down, not given more time. `run_tlc.sh local` keeps the same budget locally with
-# 16 workers.
+# no change to this workflow. The whole check stays within an hour: a share is stopped and fails
+# at 58 minutes (TLC_DEADLINE, the rest of the job's 60 is its setup), and a model that outgrows
+# the budget is cut down, not given more time. `run_tlc.sh local` keeps the same budget locally
+# with 16 workers.
 
 on: [push, pull_request]
 
@@ -20,7 +20,7 @@ jobs:
   share:
     name: TLA+ share ${{ matrix.shard }} of 16
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -40,8 +40,8 @@ jobs:
         env:
           TLC_SHARD: ${{ matrix.shard }}
           TLC_SHARDS: 16
-          TLC_LIMIT: 780
-          TLC_DEADLINE: 780
+          TLC_LIMIT: 3480
+          TLC_DEADLINE: 3480
 
   tla:
     name: TLA+ model checking

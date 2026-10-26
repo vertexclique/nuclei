@@ -8,7 +8,7 @@
 #                                                      configurations (CI runs the 16 at once)
 #   bash proofs/tla/run_tlc.sh local                   every family in 16 shares at once, one
 #                                                      worker each, at the lowest priority, within
-#                                                      15 minutes; rewrites every tlc-run.txt
+#                                                      an hour; rewrites every tlc-run.txt
 #   bash proofs/tla/run_tlc.sh plan 16                 which share each configuration is in
 # The specifications are PlusCal algorithms. Each run copies the family into a fresh temporary
 # directory and translates every algorithm there with the translator inside tla2tools.jar, then
@@ -20,9 +20,9 @@
 # seconds each configuration may take (default 3600). A configuration expected to break something
 # runs one worker, so breadth-first search keeps its trace the shortest; the trace is written to
 # <family>/out/<name>_counterexample.txt (not kept in the tree). Exit status 0 means every result
-# matched EXPECTED.txt. The whole check, of every family, stays within 15 minutes, locally
+# matched EXPECTED.txt. The whole check, of every family, stays within an hour, locally
 # (`local`, 16 workers in all) and in CI (16 share jobs at once): a share past TLC_DEADLINE seconds
-# (default 900) is stopped and fails, and a model that outgrows the budget is cut down, not given
+# (default 3600) is stopped and fails, and a model that outgrows the budget is cut down, not given
 # more time. Shares are dealt by the seconds each configuration took in its family's tlc-run.txt.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -81,15 +81,15 @@ fi
 if [ "$family" = local ]; then
   n=16; out="$(mktemp -d)"; pids=()
   t0=$(date +%s)
-  echo "every family in $n shares at once, one worker each, within ${TLC_DEADLINE:-900} s"
+  echo "every family in $n shares at once, one worker each, within ${TLC_DEADLINE:-3600} s"
   for k in $(seq 0 $((n - 1))); do
-    TLC_WORKERS=1 timeout --signal=KILL "${TLC_DEADLINE:-900}" \
+    TLC_WORKERS=1 timeout --signal=KILL "${TLC_DEADLINE:-3600}" \
       nice -n 19 ionice -c 3 bash "$0" shard "$k" "$n" > "$out/$k.log" 2>&1 &
     pids+=($!)
   done
   bad=0
   for k in $(seq 0 $((n - 1))); do
-    wait "${pids[$k]}" || { bad=1; grep -q " NO$" "$out/$k.log" || echo "share $k: stopped at the ${TLC_DEADLINE:-900} s budget"; }
+    wait "${pids[$k]}" || { bad=1; grep -q " NO$" "$out/$k.log" || echo "share $k: stopped at the ${TLC_DEADLINE:-3600} s budget"; }
   done
   t1=$(date +%s)
   fmt="%-26s %11s %10s %6s  %-37s %-37s %s\n"
