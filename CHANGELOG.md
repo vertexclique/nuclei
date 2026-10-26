@@ -41,7 +41,7 @@ their own IO, timers and buffers.
 - `Handle<T>` takes an `IoObject`: on Unix anything that implements `AsFd` (it was `AsRawFd`),
   on Windows TCP and UDP sockets, files and a child's pipes.
 - The io_uring ring is nuclei's own, on `libc` only, and needs Linux 6.1 or later.
-- Edition 2024; the minimum Rust version is 1.90.
+- Edition 2024; the minimum Rust version is 1.99.
 
 ### Removed
 
