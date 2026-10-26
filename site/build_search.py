@@ -667,21 +667,27 @@ def text(node):
     """The readable text of a node: no copy buttons, no status regions, no file labels."""
     out = []
 
-    def walk(item):
+    def walk(item, in_code):
         if isinstance(item, str):
             out.append(item)
             return
         if item.tag in ("button", "script", "style", "svg") or SKIP_CLASSES & set(item.classes()):
             return
         block = item.tag in ("p", "li", "pre", "tr", "td", "th", "dt", "dd", "h1", "h2", "h3", "div", "figure", "table", "br")
+        in_code = in_code or item.tag in ("pre", "code")
         if block:
             out.append(" ")
-        for child in item.children:
-            walk(child)
+        children = item.children
+        for index, child in enumerate(children):
+            walk(child, in_code)
+            # Inline elements set side by side with no space between (the facts under the
+            # headline) read as separate words; code keeps its tokens together.
+            if not in_code and isinstance(child, Node) and index + 1 < len(children) and isinstance(children[index + 1], Node):
+                out.append(" ")
         if block:
             out.append(" ")
 
-    walk(node)
+    walk(node, False)
     return squash("".join(out))
 
 
