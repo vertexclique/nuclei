@@ -312,6 +312,23 @@ witnesses (a busy queue, the stub pushed behind the last task, a sleep a push en
 sequentially consistent: the unit tests in `src/rt/inbox.rs` run four pushing threads against
 the taker.
 
+## The blocking pool
+
+`pool` (`tla/pool/Pool.tla`) checks a runtime's blocking pool (`src/rt/blocking.rs`): the
+jobs, the threads that take them and the slots idle threads wait in, at the grain of each
+atomic access. A submitter pushes its job (into the inbox's queue, checked in `inbox`), then,
+if the idle count says a thread waits, claims an idle slot and wakes its thread, else starts a
+thread while the pool has room. A thread with nothing to take counts itself idle, marks its
+slot idle and looks at the queue once more; at its keep-alive it frees its slot, leaves the
+thread count and looks once more, taking back a job no thread was started for. 9
+configurations: 3 that must pass (two submitters and two threads that may time out, with
+`RunOnce`, `Bounded`, `OneOwner` and `IdleCounted`, the idle count never below zero; liveness
+there and with one thread), 2 mutations that break `AllRan` (a thread that waits without the
+look after going idle, a leaving thread without its last look), and 4 witnesses (a wake, a look
+that finds a job, a time-out, a job taken back). The unit tests in `src/rt/blocking.rs` run a
+submit landing as the only thread goes idle (the first mutation fails it) and submitters on
+threads against threads that keep timing out.
+
 ## The remote wake handshake on a store buffer
 
 `handshake` (`tla/handshake/Handshake.tla`) checks the Dekker pair of the park handshake

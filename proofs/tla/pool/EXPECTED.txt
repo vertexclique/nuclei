@@ -1,0 +1,10 @@
+# configuration                spec                 expected
+PO_safe                        MC_Pool              pass
+PO_live                        MC_Pool              pass
+PO_one                         MC_Pool              pass
+MO_no_look                     MC_Pool              violated:AllRan
+MO_no_last_look                MC_Pool              violated:AllRan
+WO_wake                        MC_Pool              violated:NoWake
+WO_look_found                  MC_Pool              violated:NoLookFound
+WO_timeout                     MC_Pool              violated:NoTimeout
+WO_reclaim                     MC_Pool              violated:NoReclaim
