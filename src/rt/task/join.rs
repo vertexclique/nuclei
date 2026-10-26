@@ -404,6 +404,18 @@ pub struct Join<T> {
     task: Task<T>,
 }
 
+impl<T> Join<T> {
+    /// Lets the task run to its end without a handle; see [`Task::detach`].
+    pub fn detach(self) {
+        self.task.detach()
+    }
+
+    /// The task's id.
+    pub fn id(&self) -> super::Id {
+        self.task.id()
+    }
+}
+
 impl<T> Future for Join<T> {
     type Output = Result<T, JoinError>;
 
