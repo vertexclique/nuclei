@@ -271,6 +271,7 @@ where
                 cell.core
                     .with_mut(|core| ManuallyDrop::drop(&mut (*core).future))
             });
+            cell.schedule.terminated(cell.header.id);
         }
     }
 
@@ -347,10 +348,20 @@ where
 
             let previous = super::enter(header.id);
             let budget = crate::coop::enter();
+            // Read once: while no runtime of the process has task hooks, the
+            // poll costs one predictable branch more, not two calls.
+            let hooked =
+                crate::rt::tuning::ANY_TASK_HOOKS.load(core::sync::atomic::Ordering::Relaxed);
+            if hooked {
+                cell.schedule.before_poll(header.id);
+            }
             let poll = catch_unwind(AssertUnwindSafe(|| {
                 cell.core
                     .with_mut(|core| F::poll(Pin::new_unchecked(&mut *(*core).future), cx))
             }));
+            if hooked {
+                cell.schedule.after_poll(header.id);
+            }
             crate::coop::leave(budget);
             super::leave(previous);
             // The poll may have woken the task, cloned its waker, or a handle

@@ -175,3 +175,92 @@ fn the_scheduler_knobs_keep_the_runtime_working() {
 fn a_zero_event_interval_is_refused() {
     let _ = Runtime::builder().event_interval(0);
 }
+
+#[test]
+fn task_hooks_see_every_spawn_poll_and_end() {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    let spawned = Arc::new(Mutex::new(HashSet::new()));
+    let ended = Arc::new(Mutex::new(HashSet::new()));
+    let (before, after) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (s, e, b, a) = (
+        Arc::clone(&spawned),
+        Arc::clone(&ended),
+        Arc::clone(&before),
+        Arc::clone(&after),
+    );
+    let rt = Runtime::builder()
+        .worker_threads(2)
+        .pin_workers(false)
+        .on_task_spawn(move |meta| {
+            assert!(s.lock().unwrap().insert(meta.id()), "a task spawned twice");
+        })
+        .on_before_task_poll(move |_| {
+            b.fetch_add(1, Ordering::SeqCst);
+        })
+        .on_after_task_poll(move |_| {
+            a.fetch_add(1, Ordering::SeqCst);
+        })
+        .on_task_terminate(move |meta| {
+            assert!(e.lock().unwrap().insert(meta.id()), "a task ended twice");
+        })
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            let task = nuclei::spawn(async {
+                nuclei::task::yield_now().await;
+                nuclei::task::yield_now().await;
+            });
+            ids.push(task.id());
+            task.await;
+        }
+        let local = nuclei::spawn_local(async {});
+        ids.push(local.id());
+        local.await;
+        // A cancelled task ends too.
+        let pending = nuclei::spawn(std::future::pending::<()>());
+        ids.push(pending.id());
+        pending.abort();
+        let _ = pending.join().await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ended.lock().unwrap().len() < ids.len() && Instant::now() < deadline {
+            nuclei::task::yield_now().await;
+        }
+        let spawned = spawned.lock().unwrap().clone();
+        let ended = ended.lock().unwrap().clone();
+        for id in &ids {
+            assert!(spawned.contains(id), "no spawn hook for {id}");
+            assert!(ended.contains(id), "no terminate hook for {id}");
+        }
+    });
+    let (b, a) = (before.load(Ordering::SeqCst), after.load(Ordering::SeqCst));
+    assert_eq!(b, a, "every poll has both hooks");
+    assert!(b >= 10 * 3, "each spawned task was polled three times: {b}");
+}
+
+#[test]
+fn a_runtime_without_task_hooks_calls_none() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&calls);
+    // A runtime with a hook, so the process-wide flag is up.
+    let _hooked = Runtime::builder()
+        .worker_threads(1)
+        .pin_workers(false)
+        .on_task_spawn(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        })
+        .build()
+        .unwrap();
+    let plain = runtime(1, "plain-worker");
+    plain.block_on(async {
+        nuclei::spawn(async {}).await;
+        nuclei::spawn_local(async {}).await;
+    });
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "another runtime's hook ran"
+    );
+}

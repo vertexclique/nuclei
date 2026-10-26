@@ -107,6 +107,15 @@ impl ScheduleInfo {
 /// reference to the task before the handoff (a [`Runnable::waker`]).
 pub(crate) unsafe trait Schedule {
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo);
+
+    /// Just before each poll of the task's future.
+    fn before_poll(&self, _id: Id) {}
+
+    /// Just after each poll of the task's future.
+    fn after_poll(&self, _id: Id) {}
+
+    /// The task's future was dropped: it completed or was cancelled.
+    fn terminated(&self, _id: Id) {}
 }
 
 /// A scheduled task: running it polls the task's future once.

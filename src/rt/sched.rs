@@ -16,6 +16,8 @@ pub(crate) struct Sched {
     pub(crate) shard: Arc<Shared>,
     /// The task's future is not `Send`: it runs on the shard's thread only.
     pub(crate) bound: bool,
+    /// Its runtime's task hooks, if it has any.
+    pub(crate) hooks: Option<Arc<super::tuning::TaskHooks>>,
 }
 
 // SAFETY: the remote path holds a waker of the task across the push, so
@@ -36,6 +38,24 @@ unsafe impl Schedule for Sched {
             let keep = runnable.waker();
             self.shard.push_remote(runnable, self.bound);
             drop(keep);
+        }
+    }
+
+    fn before_poll(&self, id: super::task::Id) {
+        if let Some(hooks) = &self.hooks {
+            super::tuning::call(hooks.before_poll.as_ref(), id);
+        }
+    }
+
+    fn after_poll(&self, id: super::task::Id) {
+        if let Some(hooks) = &self.hooks {
+            super::tuning::call(hooks.after_poll.as_ref(), id);
+        }
+    }
+
+    fn terminated(&self, id: super::task::Id) {
+        if let Some(hooks) = &self.hooks {
+            super::tuning::call(hooks.terminate.as_ref(), id);
         }
     }
 }

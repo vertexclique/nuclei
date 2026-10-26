@@ -36,6 +36,7 @@ use super::workers::{Start, Workers};
 
 mod enter;
 pub use self::enter::{EnterGuard, RuntimeId, TryCurrentError, worker_index};
+pub use super::tuning::TaskMeta;
 
 /// What a runtime's threads share.
 pub(crate) struct Inner {
@@ -55,6 +56,8 @@ pub(crate) struct Inner {
     /// is paused, by address: with the workers, the shards a paused clock
     /// waits for before it moves by itself.
     pub(crate) guests: kovan_map::HashMap<usize, Arc<Shared>>,
+    /// The task hooks every task of this runtime carries, if any is set.
+    task_hooks: Option<Arc<super::tuning::TaskHooks>>,
 }
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
@@ -79,6 +82,7 @@ pub struct Builder {
     backend: Option<crate::IoBackend>,
     start_paused: bool,
     tuning: super::tuning::Tuning,
+    task_hooks: super::tuning::TaskHooks,
 }
 
 impl Default for Builder {
@@ -111,6 +115,7 @@ impl Builder {
             backend: None,
             start_paused: false,
             tuning: super::tuning::Tuning::default(),
+            task_hooks: super::tuning::TaskHooks::default(),
         }
     }
 
@@ -240,6 +245,37 @@ impl Builder {
         self
     }
 
+    /// Called with each task this runtime spawns (not the blocking pool's
+    /// jobs), on the spawning thread, once the task exists.
+    pub fn on_task_spawn(mut self, f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static) -> Self {
+        self.task_hooks.spawn = Some(Arc::new(f));
+        self
+    }
+
+    /// Called just before each poll of a task of this runtime, on the thread
+    /// that polls it.
+    pub fn on_before_task_poll(
+        mut self,
+        f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static,
+    ) -> Self {
+        self.task_hooks.before_poll = Some(Arc::new(f));
+        self
+    }
+
+    /// Called just after each poll of a task of this runtime, on the thread
+    /// that polled it.
+    pub fn on_after_task_poll(mut self, f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static) -> Self {
+        self.task_hooks.after_poll = Some(Arc::new(f));
+        self
+    }
+
+    /// Called when a task of this runtime is done with: its future completed
+    /// or was dropped by a cancel, on the thread that dropped it.
+    pub fn on_task_terminate(mut self, f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static) -> Self {
+        self.task_hooks.terminate = Some(Arc::new(f));
+        self
+    }
+
     /// Task runs between a worker's looks at its timers and IO when it is
     /// busy (default 61): lower answers IO sooner, higher runs tasks with
     /// fewer interruptions.
@@ -349,6 +385,10 @@ impl Builder {
             #[cfg(ring)]
             rings,
             clock: crate::time::clock::Clock::new(self.start_paused),
+            task_hooks: self.task_hooks.any().then(|| {
+                super::tuning::ANY_TASK_HOOKS.store(true, std::sync::atomic::Ordering::Release);
+                Arc::new(self.task_hooks.clone())
+            }),
             guests: kovan_map::HashMap::new(),
         });
         inner.pool.set_owner(Arc::downgrade(&inner));
@@ -627,15 +667,34 @@ where
         // No worker takes tasks: the spawning thread's own shard runs it.
         return spawn_here(future, false);
     };
+    let hooks = inner.task_hooks.clone();
     let (runnable, task) = task::spawn(
         Counted::new(future, shard),
         Sched {
             shard: Arc::clone(shard),
             bound: false,
+            hooks: hooks.clone(),
         },
     );
+    spawned(hooks.as_deref(), &task);
     runnable.schedule();
     task
+}
+
+/// Calls the spawn hook, if the task's runtime has one.
+fn spawned<T>(hooks: Option<&super::tuning::TaskHooks>, task: &Task<T>) {
+    if let Some(hooks) = hooks {
+        super::tuning::call(hooks.spawn.as_ref(), task.id());
+    }
+}
+
+/// The task hooks of the runtime set on this thread, looked for only while
+/// some runtime of the process has any.
+fn context_hooks() -> Option<Arc<super::tuning::TaskHooks>> {
+    if !super::tuning::ANY_TASK_HOOKS.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    context::runtime().and_then(|inner| inner.task_hooks.clone())
 }
 
 /// Spawns `future` on the shard of the calling thread: the worker it runs,
@@ -656,15 +715,18 @@ where
     // it, and a bound task only to the shard's own thread (its local inbox,
     // leaked rather than dropped if that thread is gone); the future is
     // 'static.
+    let hooks = context_hooks();
     let (runnable, task) = unsafe {
         task::spawn_unchecked(
             Counted::new(future, &shared),
             Sched {
                 shard: shared,
                 bound,
+                hooks: hooks.clone(),
             },
         )
     };
+    spawned(hooks.as_deref(), &task);
     runnable.schedule();
     task
 }
@@ -767,6 +829,8 @@ where
             Sched {
                 shard: shared,
                 bound: false,
+                // The runtime's own service task: not a task of its user's.
+                hooks: None,
             },
         )
     };

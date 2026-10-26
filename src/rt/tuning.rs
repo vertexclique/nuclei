@@ -73,3 +73,58 @@ impl core::fmt::Debug for ThreadHooks {
             .finish()
     }
 }
+
+/// What a task hook is told about the task.
+#[derive(Debug)]
+pub struct TaskMeta<'a> {
+    id: crate::task::Id,
+    _task: core::marker::PhantomData<&'a ()>,
+}
+
+impl TaskMeta<'_> {
+    pub(crate) fn new(id: crate::task::Id) -> Self {
+        Self {
+            id,
+            _task: core::marker::PhantomData,
+        }
+    }
+
+    /// The task's id.
+    pub fn id(&self) -> crate::task::Id {
+        self.id
+    }
+}
+
+/// A task hook.
+pub(crate) type TaskHook = Arc<dyn Fn(&TaskMeta<'_>) + Send + Sync>;
+
+/// A runtime's task hooks; a task of a runtime with none carries none.
+#[derive(Clone, Default)]
+pub(crate) struct TaskHooks {
+    pub(crate) spawn: Option<TaskHook>,
+    pub(crate) before_poll: Option<TaskHook>,
+    pub(crate) after_poll: Option<TaskHook>,
+    pub(crate) terminate: Option<TaskHook>,
+}
+
+impl TaskHooks {
+    pub(crate) fn any(&self) -> bool {
+        self.spawn.is_some()
+            || self.before_poll.is_some()
+            || self.after_poll.is_some()
+            || self.terminate.is_some()
+    }
+}
+
+/// Whether any runtime of the process has task hooks: while none does, a
+/// spawn that does not know its runtime looks for none.
+pub(crate) static ANY_TASK_HOOKS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Calls `hook`, if set, for the task `id`. A hook that panics aborts the
+/// process: it runs in the middle of a task's change of state.
+pub(crate) fn call(hook: Option<&TaskHook>, id: crate::task::Id) {
+    if let Some(hook) = hook {
+        crate::rt::task::abort_on_panic(|| hook(&TaskMeta::new(id)));
+    }
+}
