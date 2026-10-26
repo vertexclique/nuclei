@@ -15,12 +15,13 @@
 
 @media (min-width: 64rem) {
   .learn-wrap {
-    grid-template-columns: 13rem minmax(0, 1fr);
+    grid-template-columns: 15rem minmax(0, 1fr);
     gap: var(--space-2xl);
   }
 }
 
-/* The chapter list. */
+/* Chapters on a narrow screen: wrapping chips of links above the chapter, which opens with its
+ * own list of sections (.toc). */
 
 .chapters {
   display: grid;
@@ -39,18 +40,18 @@
   text-decoration: none;
 }
 
-.chapters > ol {
+.chapters ol {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-xs);
   counter-reset: chapter;
 }
 
-.chapters > ol > li {
+.chapters li {
   counter-increment: chapter;
 }
 
-.chapters > ol > li > a {
+.chapters li a {
   display: inline-flex;
   align-items: baseline;
   gap: var(--space-xs);
@@ -62,84 +63,140 @@
   white-space: nowrap;
 }
 
-.chapters > ol > li > a::before {
+.chapters li a::before {
   content: counter(chapter, decimal-leading-zero);
   font-family: var(--font-mono);
   font-size: var(--text-micro);
   color: var(--color-muted);
 }
 
-.chapters > ol > li > a[aria-current="page"] {
+.chapters li a[aria-current="page"] {
   border-color: var(--color-accent);
   background: var(--color-card-lit);
   color: var(--color-ink);
 }
 
-.chapters > ol > li > a[aria-current="page"]::before {
+.chapters li a[aria-current="page"]::before {
   color: var(--color-accent);
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .chapters > ol > li > a:hover {
+  .chapters li a:hover {
     border-color: var(--color-accent);
     color: var(--color-ink);
   }
 }
 
-@media (min-width: 64rem) {
-  .chapters {
-    position: sticky;
-    inset-block-start: var(--space-lg);
-    align-self: start;
-    max-block-size: calc(100dvh - 2 * var(--space-lg));
-    overflow-y: auto;
-  }
+/* The sidebar on a wide screen: every chapter closed to its title (native details, one open at
+ * a time through their shared name), the current page's chapter open on its numbered sections.
+ * It follows the viewport (sticky, with its own scroll when taller than the window). The script
+ * animates the opening and closing and marks the section being read with an indicator that
+ * slides to it; without the script it opens and closes all the same. */
 
-  .chapters > ol {
-    display: grid;
-    gap: 0;
-  }
-
-  .chapters > ol > li > a {
-    display: flex;
-    padding: var(--space-xs) var(--space-sm);
-    border: 0;
-    border-inline-start: 2px solid var(--color-rule);
-  }
-
-  .chapters > ol > li > a[aria-current="page"] {
-    border-image: var(--fill-liquid) 1;
-  }
-
-  @media (hover: hover) and (pointer: fine) {
-    .chapters > ol > li > a:hover {
-      border-inline-start-color: var(--color-accent);
-    }
-  }
-}
-
-/* Each chapter's sections, numbered and indented under it: the whole table of contents on a
- * wide screen. On a narrow one the chips stay as they are and the chapter opens with its own
- * list of sections (.toc). */
-.chapters__sections {
+.sidebar {
   display: none;
 }
 
-.chapters__num {
+.sidebar__num {
   flex: none;
   font-family: var(--font-mono);
   font-size: var(--text-micro);
   color: var(--color-muted);
 }
 
+/* An entry is one line: a long section title ends in an ellipsis (its title attribute holds
+ * all of it). */
+.sidebar__text {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 @media (min-width: 64rem) {
-  .chapters__sections {
+  .chapters {
+    display: none;
+  }
+
+  .sidebar {
+    position: sticky;
+    inset-block-start: var(--space-lg);
+    align-self: start;
     display: grid;
-    padding-block-end: var(--space-xs);
+    grid-template-columns: minmax(0, 1fr);
+    align-content: start;
+    max-block-size: calc(100dvh - 2 * var(--space-lg));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .sidebar .chapters__title {
+    padding-block-end: var(--space-sm);
+  }
+
+  .sidebar details {
     border-inline-start: 2px solid var(--color-rule);
   }
 
-  .chapters__sections a {
+  .sidebar details.is-current {
+    border-image: var(--fill-liquid) 1;
+  }
+
+  .sidebar summary {
+    display: flex;
+    align-items: baseline;
+    white-space: nowrap;
+    gap: var(--space-xs);
+    padding: var(--space-xs) var(--space-sm);
+    color: var(--color-ink-2);
+    font-size: var(--text-sm);
+    list-style: none;
+    cursor: pointer;
+  }
+
+  .sidebar summary::-webkit-details-marker {
+    display: none;
+  }
+
+  /* A chevron at the end of the title: right when closed, down when open. */
+  .sidebar summary::after {
+    content: "";
+    align-self: center;
+    margin-inline-start: auto;
+    inline-size: 0.45rem;
+    block-size: 0.45rem;
+    border-block-start: 1.5px solid currentColor;
+    border-inline-end: 1.5px solid currentColor;
+    color: var(--color-muted);
+    transform: translateX(-2px) rotate(45deg);
+    transition: transform var(--dur-short) var(--ease-out);
+  }
+
+  .sidebar details[open] > summary::after {
+    transform: translateY(-2px) rotate(135deg);
+  }
+
+  .sidebar details.is-current > summary {
+    background: var(--color-card-lit);
+    color: var(--color-ink);
+  }
+
+  .sidebar details.is-current > summary .sidebar__num {
+    color: var(--color-accent);
+  }
+
+  .sidebar summary:focus-visible {
+    outline-offset: -2px;
+  }
+
+  .sidebar ol {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    padding-block-end: var(--space-xs);
+  }
+
+  .sidebar ol a {
+    min-width: 0;
     display: flex;
     align-items: baseline;
     gap: var(--space-xs);
@@ -150,19 +207,54 @@
     text-decoration: none;
   }
 
-  li:has(> a[aria-current="page"]) > .chapters__sections a {
+  .sidebar details.is-current ol a {
     color: var(--color-ink-2);
   }
 
   @media (hover: hover) and (pointer: fine) {
-    .chapters__sections a:hover {
+    .sidebar summary:hover,
+    .sidebar ol a:hover {
       color: var(--color-ink);
     }
 
-    .chapters__sections a:hover .chapters__num {
+    .sidebar summary:hover::after,
+    .sidebar ol a:hover .sidebar__num {
       color: var(--color-accent);
     }
   }
+
+  /* The indicator on the rule beside the section being read. */
+  .sidebar__spy {
+    position: absolute;
+    z-index: 1;
+    inset-block-start: 0;
+    inset-inline-start: 0;
+    inline-size: 2px;
+    block-size: 1px;
+    background: var(--fill-liquid);
+    box-shadow: 0 0 10px 0 var(--color-glow);
+    opacity: 0;
+    pointer-events: none;
+    transform-origin: top;
+    transition:
+      transform 320ms var(--ease-out),
+      opacity var(--dur-short) var(--ease-out);
+  }
+
+  .sidebar__spy.is-on {
+    opacity: 1;
+  }
+}
+
+/* The section being read: brighter, its number in the accent. */
+.sidebar ol a[aria-current="location"],
+.toc a[aria-current="location"] {
+  color: var(--color-ink);
+}
+
+.sidebar ol a[aria-current="location"] .sidebar__num,
+.toc a[aria-current="location"] .sidebar__num {
+  color: var(--color-accent);
 }
 
 .toc {
@@ -179,10 +271,12 @@
 
 .toc ol {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-2xs);
 }
 
 .toc a {
+  min-width: 0;
   display: flex;
   align-items: baseline;
   gap: var(--space-sm);

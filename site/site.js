@@ -35,11 +35,129 @@ for (const button of document.querySelectorAll("[data-copy]")) {
   });
 }
 
-// The Learn sidebar is long on a wide screen: it opens scrolled to the chapter being read.
-const chapters = document.querySelector(".chapters");
-const reading = chapters?.querySelector('[aria-current="page"]');
-if (reading && chapters.scrollHeight > chapters.clientHeight) {
-  chapters.scrollTop = reading.offsetTop - chapters.clientHeight / 4;
+// The Learn sidebar on a wide screen. Every chapter is a closed <details> but the current
+// page's; one opens at a time (their shared name does that natively). This script animates the
+// opening and closing, marks the section being read with an indicator that slides to it and
+// stays in view in the sidebar's own scroll, reopens the chapter of the section being read, and
+// keeps the address bar on it without new history entries.
+const sidebar = document.querySelector(".sidebar");
+if (sidebar) {
+  const groups = [...sidebar.querySelectorAll("details")];
+  const ease = "cubic-bezier(0.16, 1, 0.3, 1)";
+  // Where an element sits in the sidebar's scrolled content.
+  const offset = (el) => el.getBoundingClientRect().top - sidebar.getBoundingClientRect().top + sidebar.scrollTop;
+  const keepInView = (y, height) => {
+    const margin = 48;
+    if (y < sidebar.scrollTop + margin || y + height > sidebar.scrollTop + sidebar.clientHeight - margin) {
+      sidebar.scrollTo({ top: y - sidebar.clientHeight / 3, behavior: still.matches ? "auto" : "smooth" });
+    }
+  };
+
+  const spy = document.createElement("span");
+  spy.className = "sidebar__spy";
+  spy.setAttribute("aria-hidden", "true");
+  sidebar.append(spy);
+  const links = new Map();
+  let active = null;
+
+  const placeSpy = () => {
+    const link = active && links.get(active.id)?.find((l) => sidebar.contains(l));
+    if (!link || link.getClientRects().length === 0) {
+      spy.classList.remove("is-on");
+      return;
+    }
+    const y = offset(link);
+    const height = link.getBoundingClientRect().height;
+    spy.style.transform = `translateY(${y}px) scaleY(${height})`;
+    spy.classList.add("is-on");
+    keepInView(y, height);
+  };
+
+  // Opens one chapter (closing the others) or closes it. The sections that go fade out first;
+  // then the change lands at once and every chapter slides from where it was to where it is,
+  // while the sections that come fade in. Only transform and opacity move; reduced motion makes
+  // it instant.
+  let busy = false;
+  const setOpen = async (group, open) => {
+    if (busy) return;
+    busy = true;
+    const closing = open ? groups.filter((g) => g !== group && g.open) : [group];
+    const motion = !still.matches;
+    if (motion) {
+      await Promise.all(closing.map((g) => g.querySelector("ol").animate(
+        [{ opacity: 1 }, { opacity: 0, transform: "translateY(-4px)" }],
+        { duration: 140, easing: "cubic-bezier(0.7, 0, 0.84, 0)" },
+      ).finished));
+    }
+    const before = groups.map((g) => g.getBoundingClientRect().top);
+    for (const g of closing) g.open = false;
+    if (open) group.open = true;
+    placeSpy();
+    if (motion) {
+      groups.forEach((g, i) => {
+        const dy = before[i] - g.getBoundingClientRect().top;
+        if (dy) g.animate([{ transform: `translateY(${dy}px)` }, { transform: "none" }], { duration: 300, easing: ease });
+      });
+      if (open) {
+        group.querySelector("ol").animate([{ opacity: 0, transform: "translateY(-6px)" }, { opacity: 1, transform: "none" }], { duration: 300, easing: ease });
+      }
+    }
+    busy = false;
+  };
+
+  for (const group of groups) {
+    group.querySelector("summary").addEventListener("click", (event) => {
+      event.preventDefault();
+      setOpen(group, !group.open);
+    });
+  }
+
+  // The sidebar opens scrolled to the chapter being read.
+  const current = sidebar.querySelector("details.is-current");
+  if (current) sidebar.scrollTop = offset(current) - sidebar.clientHeight / 4;
+
+  // Scroll spy: the section being read is the last heading above a line at 30% of the window
+  // (at the end of the page, any heading on screen). Its links, in the sidebar and in the
+  // chapter's own list, get aria-current, and its chapter opens if it was closed. The hash
+  // follows once the reader has scrolled, so a page opened at a hash keeps it.
+  for (const link of document.querySelectorAll(".sidebar ol a, .toc a")) {
+    const url = new URL(link.href);
+    if (url.pathname !== location.pathname) continue;
+    const id = decodeURIComponent(url.hash.slice(1));
+    if (!links.has(id)) links.set(id, []);
+    links.get(id).push(link);
+  }
+  const headings = [...links.keys()].map((id) => document.getElementById(id)).filter(Boolean);
+  let atEnd = false;
+  let scrolled = false;
+  addEventListener("scroll", () => (scrolled = true), { once: true, passive: true });
+
+  const pick = () => {
+    const line = atEnd ? innerHeight : innerHeight * 0.3;
+    let next = null;
+    for (const heading of headings) if (heading.getBoundingClientRect().top < line) next = heading;
+    if (next === active) return;
+    for (const link of active ? links.get(active.id) : []) link.removeAttribute("aria-current");
+    active = next;
+    for (const link of active ? links.get(active.id) : []) link.setAttribute("aria-current", "location");
+    const group = active && links.get(active.id).find((l) => sidebar.contains(l))?.closest("details");
+    if (group && !group.open) setOpen(group, true);
+    else placeSpy();
+    if (scrolled) history.replaceState(history.state, "", active ? `#${active.id}` : location.pathname + location.search);
+  };
+
+  if (headings.length && "IntersectionObserver" in window) {
+    const lines = new IntersectionObserver(pick, { rootMargin: "0px 0px -70% 0px" });
+    for (const heading of headings) lines.observe(heading);
+    const pager = document.querySelector(".pager");
+    if (pager) {
+      new IntersectionObserver(([entry]) => {
+        atEnd = entry.isIntersecting;
+        pick();
+      }).observe(pager);
+    }
+    addEventListener("resize", placeSpy, { passive: true });
+  }
 }
 
 if (!still.matches && "IntersectionObserver" in window) {

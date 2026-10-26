@@ -106,13 +106,15 @@
           <div class="seq">
             <div class="seq__actors" aria-hidden="true"><span>task</span><span>driver</span><span>kernel</span></div>
             <ol class="seq__msgs">
-              <li class="to-right" style="--a: 0; --b: 1; --n: 0"><span class="seq__label">read: the task hands it over</span><span class="seq__arrow" aria-hidden="true"></span></li>
-              <li class="to-right free" style="--a: 1; --b: 2; --n: 1"><span class="seq__aside">the task&rsquo;s shard runs other tasks</span><span class="seq__label">submit, with a buffer the kernel fills</span><span class="seq__arrow" aria-hidden="true"></span></li>
-              <li class="to-left free" style="--a: 1; --b: 2; --n: 2"><span class="seq__label">done: the bytes are in the buffer</span><span class="seq__arrow" aria-hidden="true"></span></li>
-              <li class="to-left" style="--a: 0; --b: 1; --n: 3"><span class="seq__label">the result, to the task that asked</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-right" style="--a: 0; --b: 1; --r: 1"><span class="seq__label">read: hand it over</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-right" style="--a: 1; --b: 2; --r: 2"><span class="seq__label">submit, with the buffer</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__note seq__note--task" style="--a: 0; --b: 1; --r: 2; --rs: 4">the task&rsquo;s shard runs other tasks</li>
+              <li class="seq__note seq__note--kernel" style="--a: 1; --b: 2; --r: 3; --rs: 2">the kernel fills the buffer</li>
+              <li class="seq__msg to-left" style="--a: 1; --b: 2; --r: 5"><span class="seq__label">done: bytes in the buffer</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-left" style="--a: 0; --b: 1; --r: 6"><span class="seq__label">the result, to the task</span><span class="seq__arrow" aria-hidden="true"></span></li>
             </ol>
           </div>
-          <p class="lane__legend"><strong>One hand-over, one completion.</strong> The task never calls the kernel and never retries. On epoll and kqueue the driver makes the call when the socket may be ready; the task&rsquo;s side is the same.</p>
+          <p class="lane__legend"><strong>One hand-over, one completion.</strong> The task never calls the kernel and never retries. On epoll and kqueue the driver makes the call when the socket may be ready; the task&rsquo;s side stays the same.</p>
         </figure>
 
         <figure class="lane lane--re" aria-labelledby="lane-re-name">
@@ -120,15 +122,15 @@
           <div class="seq">
             <div class="seq__actors" aria-hidden="true"><span>task</span><span>reactor</span><span>kernel</span></div>
             <ol class="seq__msgs">
-              <li class="to-right" style="--a: 0; --b: 1; --n: 0"><span class="seq__label">watch this socket for me</span><span class="seq__arrow" aria-hidden="true"></span></li>
-              <li class="to-left" style="--a: 1; --b: 2; --n: 1"><span class="seq__label">readable</span><span class="seq__arrow" aria-hidden="true"></span></li>
-              <li class="to-left" style="--a: 0; --b: 1; --n: 2"><span class="seq__label">wake the task</span><span class="seq__arrow" aria-hidden="true"></span></li>
-              <li class="span-all to-right own-call" style="--a: 0; --b: 2; --n: 3"><span class="seq__label">read(): the task makes the call itself</span><span class="seq__arrow" aria-hidden="true"></span></li>
-              <li class="span-all to-left own-call maybe" style="--a: 0; --b: 2; --n: 4"><span class="seq__label">would block? back to 2, and wait again</span><span class="seq__arrow" aria-hidden="true"></span></li>
-              <li class="span-all to-left" style="--a: 0; --b: 2; --n: 5"><span class="seq__label">the bytes, copied into the task&rsquo;s buffer</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-right" style="--a: 0; --b: 1; --r: 1"><span class="seq__label">watch this socket</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-left" style="--a: 1; --b: 2; --r: 2"><span class="seq__label">readable</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-left" style="--a: 0; --b: 1; --r: 3"><span class="seq__label">wake the task</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-right own-call span-all" style="--a: 0; --b: 2; --r: 4"><span class="seq__label">read(): the task makes the call itself</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-left own-call span-all maybe" style="--a: 0; --b: 2; --r: 5"><span class="seq__label">would block? back to 2, and wait again</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="seq__msg to-left span-all" style="--a: 0; --b: 2; --r: 6"><span class="seq__label">the bytes, copied into the task&rsquo;s buffer</span><span class="seq__arrow" aria-hidden="true"></span></li>
             </ol>
           </div>
-          <p class="lane__legend"><strong>A readiness wait, a wake, then the task&rsquo;s own call</strong>, which can find nothing and go back to waiting (dashed: it happens when another reader got there first, or the readiness was spurious).</p>
+          <p class="lane__legend"><strong>A readiness wait, a wake, then the task&rsquo;s own call</strong>, which can find nothing and go back to waiting (dashed: when another reader got there first, or the readiness was spurious).</p>
         </figure>
       </div>
       <p class="flow-note" data-reveal>The same read in both. The pictures count steps, not the time they take.</p>

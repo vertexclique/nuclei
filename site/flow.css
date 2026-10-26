@@ -1,17 +1,22 @@
-/* Proactive, not reactive: the same read, drawn as two sequence diagrams.
+/* Proactive, not reactive: the same read, drawn as two sequence diagrams on one rhythm.
  *
- * Each lane has three lifelines (task, middle, kernel) and a list of messages between them,
- * top to bottom in the order they happen. A message is a list item: its label (the step,
- * readable as text) and an arrow from one lifeline to another. --a and --b are the lifelines
- * the arrow spans (0, 1 or 2; a < b), and .to-left points it back toward the task.
+ * Each lane has three lifelines (task, middle, kernel) and six rows of equal height, one per
+ * moment, top to bottom. A message is a list item on its row (--r): its label (the step,
+ * readable as text) and, a fixed gap below it, an arrow from one lifeline to another. --a and
+ * --b are the lifelines the arrow spans (0, 1 or 2; a < b), and .to-left points it back toward
+ * the task. A note (.seq__note) spans rows (--r, --rs) beside a lifeline: a bar on the lifeline
+ * and a word in the space next to it. The reactor fills all six rows; the proactor uses four,
+ * and its notes fill the two between: the task's shard is free while the kernel works.
  *
- * Standing still (no script, reduced motion, or off screen) the whole diagram shows. In view
- * the page's script sets .is-playing: the messages appear one by one, each lane over the same
- * time (--pass), so the picture counts steps and never claims speed; then .is-clearing fades
- * them out and the pass starts again. */
+ * Side by side, the two lanes share their rows (a subgrid), so heads, diagrams and captions line
+ * up and both boxes are one height; stacked, each keeps its own. Standing still (no script,
+ * reduced motion, or off screen) the whole diagram shows. In view the page's script sets
+ * .is-playing: each row appears at its moment, the same moments in both lanes, so the picture
+ * counts steps and never claims speed; then .is-clearing fades it and the pass starts again. */
 
 .flow {
   --pass: 4.8s;
+  --step: calc(var(--pass) / 5);
 
   display: grid;
   gap: var(--space-md);
@@ -20,7 +25,13 @@
 @media (min-width: 64rem) {
   .flow {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    align-items: start;
+    grid-template-rows: auto auto auto;
+    row-gap: 0;
+  }
+
+  .flow .lane {
+    grid-row: span 3;
+    grid-template-rows: subgrid;
   }
 }
 
@@ -29,7 +40,7 @@
   --call-ink: var(--color-accent-3);
 
   display: grid;
-  gap: var(--space-lg);
+  row-gap: var(--space-lg);
   align-content: start;
   padding: var(--space-lg);
 }
@@ -69,9 +80,13 @@
  * 0%, 50% or 100% of it, and the actors' boxes hang half outside. */
 .seq {
   --actor: clamp(4.5rem, 20vw, 5.75rem);
+  --row: 3.5rem;
+  --line: 1.5px;
+  --gap: 0.4rem;
 
   display: grid;
   gap: var(--space-xs);
+  align-content: start;
   margin-inline: calc(var(--actor) / 2);
 }
 
@@ -96,65 +111,101 @@
   white-space: nowrap;
 }
 
+/* On a phone the diagram takes more of the lane: tighter padding and slimmer actors, so every
+ * label fits its row in two lines. */
+@media (max-width: 29.99rem) {
+  .lane {
+    padding: var(--space-lg) var(--space-md);
+  }
+
+  .seq {
+    --actor: 3.75rem;
+    --row: 4.25rem;
+  }
+
+  .seq__actors span {
+    font-size: var(--text-micro);
+  }
+
+  .seq__label {
+    padding-inline: var(--space-2xs);
+  }
+
+  .seq__note {
+    padding-inline: var(--space-xs);
+  }
+}
+
 .seq__msgs {
   position: relative;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: repeat(6, var(--row));
+  padding-block-end: var(--space-sm);
   counter-reset: msg;
 }
 
-/* The three lifelines. */
+/* The three lifelines, all ending at the bottom of the sixth row. */
 .seq__msgs::before {
   content: "";
   position: absolute;
-  inset-block: 0;
-  inset-inline: 0;
+  inset: 0;
   background:
     linear-gradient(var(--color-rule-2), var(--color-rule-2)) 0 0 / 1px 100% no-repeat,
     linear-gradient(var(--color-rule-2), var(--color-rule-2)) 50% 0 / 1px 100% no-repeat,
     linear-gradient(var(--color-rule-2), var(--color-rule-2)) 100% 0 / 1px 100% no-repeat;
 }
 
-.seq__msgs li {
+.seq__msgs > li {
   --ink: var(--lane-ink);
 
   position: relative;
-  display: grid;
-  padding-block: var(--space-sm) var(--space-md);
+  grid-row: var(--r) / span var(--rs, 1);
+  grid-column: 1;
+}
+
+/* A message: its label, then its arrow at the bottom of the row, one gap below the label. */
+.seq__msg {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: var(--gap);
+  padding-block-end: var(--space-xs);
   counter-increment: msg;
 }
 
 /* The task makes the call itself: the reactor's own read, in violet, label and all. */
-.seq__msgs li.own-call {
+.seq__msg.own-call {
   --ink: var(--call-ink);
+}
+
+.seq__label,
+.seq__arrow {
+  position: relative;
+  z-index: 1;
+  margin-inline-start: calc(var(--a) * 50%);
+  inline-size: calc((var(--b) - var(--a)) * 50%);
+}
+
+.seq__label {
+  padding-inline: var(--space-sm);
+  color: var(--color-ink-2);
+  font-size: var(--text-xs);
+  line-height: 1.3;
+  text-align: center;
+  text-wrap: balance;
 }
 
 .own-call .seq__label {
   color: var(--call-ink);
 }
 
-.own-call .seq__arrow {
-  block-size: 2px;
-}
-
-/* A label across all three lifelines sits on the lane's own paper, so the middle lifeline
- * never runs through its words; it stops short of the outer two. */
-.seq__msgs li.span-all .seq__label {
+/* A label across all three lifelines sits on the lane's paper, so the middle lifeline never
+ * runs through its words; it stops short of the outer two. */
+.span-all .seq__label {
   margin-inline-start: 3px;
   inline-size: calc(100% - 6px);
   background: var(--color-paper);
-}
-
-.seq__label {
-  position: relative;
-  z-index: 1;
-  margin-inline-start: calc(var(--a) * 50%);
-  inline-size: calc((var(--b) - var(--a)) * 50%);
-  padding-inline: var(--space-xs);
-  color: var(--color-ink-2);
-  font-size: var(--text-xs);
-  line-height: 1.35;
-  text-align: center;
-  text-wrap: balance;
 }
 
 .seq__label::before {
@@ -165,12 +216,8 @@
 }
 
 .seq__arrow {
-  position: absolute;
-  z-index: 1;
-  inset-block-end: var(--space-xs);
-  inset-inline-start: calc(var(--a) * 50%);
-  inline-size: calc((var(--b) - var(--a)) * 50%);
-  block-size: 1.5px;
+  flex: none;
+  block-size: var(--line);
   background: var(--ink);
   box-shadow: 0 0 8px -1px var(--ink);
   transform-origin: left;
@@ -180,16 +227,16 @@
   transform-origin: right;
 }
 
-/* The arrowhead: two sides of a square, turned to point. */
+/* The arrowhead: two sides of a square, turned to point. Every arrow has the same one. */
 .seq__arrow::after {
   content: "";
   position: absolute;
-  inset-block-start: -3.25px;
+  inset-block-start: calc(var(--line) / 2 - 4px);
   inset-inline-end: 0;
   inline-size: 8px;
   block-size: 8px;
-  border-block-start: 1.5px solid var(--ink);
-  border-inline-end: 1.5px solid var(--ink);
+  border-block-start: var(--line) solid var(--ink);
+  border-inline-end: var(--line) solid var(--ink);
   rotate: 45deg;
 }
 
@@ -199,32 +246,50 @@
 }
 
 /* A step that may happen, or not: dashed. */
-.seq__msgs li.maybe .seq__arrow {
+.maybe .seq__arrow {
   background: repeating-linear-gradient(90deg, var(--ink) 0 6px, transparent 6px 10px);
   box-shadow: none;
 }
 
-/* While the kernel works, the task's lifeline is free for other tasks: a bar of the liquid
- * beside it, and a word in the space the message leaves. */
-.seq__msgs li.free::before {
-  content: "";
-  position: absolute;
-  inset-block: 0;
-  inset-inline-start: -2px;
-  inline-size: 4px;
-  background: var(--color-accent);
-  box-shadow: 0 0 10px -2px var(--color-glow);
-}
-
-.seq__aside {
-  position: absolute;
-  inset-block-start: var(--space-sm);
-  inset-inline-start: var(--space-sm);
-  max-inline-size: calc(50% - 2 * var(--space-sm));
-  color: var(--color-accent);
+/* A note beside a lifeline over several rows: a bar on the lifeline, and its words centred in
+ * the space it leaves (no arrow crosses that space in those rows). */
+.seq__note {
+  display: grid;
+  place-items: center;
+  margin-inline-start: calc(var(--a) * 50%);
+  inline-size: calc((var(--b) - var(--a)) * 50%);
+  padding: var(--space-sm) var(--space-md);
+  color: var(--note-ink);
   font-family: var(--font-mono);
   font-size: var(--text-micro);
-  line-height: 1.35;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.seq__note--task {
+  --note-ink: var(--color-accent);
+}
+
+.seq__note--kernel {
+  --note-ink: var(--color-accent-2);
+}
+
+.seq__note::before {
+  content: "";
+  position: absolute;
+  inset-block: var(--space-sm);
+  inline-size: 4px;
+  background: var(--note-ink);
+  box-shadow: 0 0 10px -2px var(--note-ink);
+  transform-origin: top;
+}
+
+.seq__note--task::before {
+  inset-inline-start: -2px;
+}
+
+.seq__note--kernel::before {
+  inset-inline-end: -2px;
 }
 
 .lane__legend {
@@ -291,20 +356,26 @@
 .points > :nth-child(2) { --n: 1; }
 .points > :nth-child(3) { --n: 2; }
 
-/* A pass: each message's label fades in and its arrow draws from where it starts. */
-/* Step k of n appears at k / (n - 1) of the pass, so both lanes show their last step together. */
-.lane--pro .seq { --step: calc(var(--pass) / 3); }
-.lane--re .seq { --step: calc(var(--pass) / 5); }
-
-.flow.is-playing .seq__msgs li {
-  animation: msg-in 480ms var(--ease-out) calc(var(--n) * var(--step)) backwards;
+/* A pass: each row appears at its moment, row r at (r - 1) / 5 of the pass in both lanes. A
+ * message's label fades in and its arrow draws from where it starts; a note's bar grows down
+ * its rows while its words fade in. */
+.flow.is-playing .seq__msg {
+  animation: msg-in 480ms var(--ease-out) calc((var(--r) - 1) * var(--step)) backwards;
 }
 
 .flow.is-playing .seq__arrow {
-  animation: arrow-draw 620ms var(--ease-out) calc(var(--n) * var(--step) + 80ms) backwards;
+  animation: arrow-draw 620ms var(--ease-out) calc((var(--r) - 1) * var(--step) + 80ms) backwards;
 }
 
-.flow.is-clearing .seq__msgs li {
+.flow.is-playing .seq__note {
+  animation: msg-in 600ms var(--ease-out) calc((var(--r) - 0.5) * var(--step)) backwards;
+}
+
+.flow.is-playing .seq__note::before {
+  animation: note-grow calc(var(--rs) * var(--step)) var(--ease-in-out) calc((var(--r) - 1) * var(--step)) backwards;
+}
+
+.flow.is-clearing .seq__msgs > li {
   opacity: 0;
   transition: opacity 400ms var(--ease-in);
 }
@@ -315,4 +386,8 @@
 
 @keyframes arrow-draw {
   from { transform: scaleX(0); }
+}
+
+@keyframes note-grow {
+  from { transform: scaleY(0); }
 }
