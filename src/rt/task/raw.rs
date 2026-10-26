@@ -344,10 +344,12 @@ where
                 }
             }
 
+            let previous = super::enter(header.id);
             let poll = catch_unwind(AssertUnwindSafe(|| {
                 cell.core
                     .with_mut(|core| F::poll(Pin::new_unchecked(&mut *(*core).future), cx))
             }));
+            super::leave(previous);
             // The poll may have woken the task, cloned its waker, or a handle
             // may have registered meanwhile: the word is read again rather
             // than fed stale into the exchanges below, which would fail once.

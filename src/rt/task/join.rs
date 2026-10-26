@@ -88,11 +88,62 @@ impl<T> Task<T> {
         self.header().state.load(Ordering::Acquire) & (COMPLETED | CLOSED) != 0
     }
 
-    /// Closes the task unless it completed. An idle task is scheduled once
-    /// more, so its future is dropped where the task runs.
+    /// Closes the task unless it completed; see [`cancel`].
     fn set_canceled(&mut self) {
+        // SAFETY: the TASK flag keeps the task alive.
+        unsafe { cancel(self.ptr.as_ptr().cast_const()) }
+    }
+
+    /// The task's id.
+    pub fn id(&self) -> super::Id {
+        self.header().id
+    }
+
+    /// Cancels the task without waiting: its future is dropped where it runs,
+    /// and awaiting the handle then finds no output (unless the task had
+    /// completed). [`join`](Self::join) reports it as a cancelled
+    /// [`JoinError`].
+    pub fn abort(&self) {
+        // SAFETY: the TASK flag keeps the task alive.
+        unsafe { cancel(self.ptr.as_ptr().cast_const()) }
+    }
+
+    /// A handle that cancels the task from anywhere, without the [`Task`]:
+    /// it can be cloned and sent to another thread, and outlives the handle.
+    pub fn abort_handle(&self) -> AbortHandle {
         let ptr = self.ptr.as_ptr().cast_const();
         let header = self.header();
+        // A waker clone holds one reference of the task, and its drop, the
+        // last one, drops an open task's future where the task runs (never on
+        // the dropping thread): what an abort handle needs.
+        // SAFETY: the TASK flag keeps the task alive while the clone is made.
+        let waker = core::mem::ManuallyDrop::new(unsafe {
+            core::task::Waker::from_raw(core::task::RawWaker::new(ptr, &header.vtable.waker))
+        });
+        AbortHandle {
+            waker: (*waker).clone(),
+            id: header.id,
+        }
+    }
+
+    /// A future that gives the task's output, or a [`JoinError`] saying why
+    /// there is none: the task was cancelled (its runtime dropped it too), or
+    /// its future panicked, with the payload.
+    pub fn join(self) -> Join<T> {
+        Join { task: self }
+    }
+}
+
+/// Closes the task `ptr` unless it completed. An idle task is scheduled once
+/// more, so its future is dropped where the task runs, and an awaiter is told.
+///
+/// # Safety
+///
+/// `ptr` is a live task (its handle or a reference keeps it alive).
+unsafe fn cancel(ptr: *const ()) {
+    // SAFETY: the caller's contract.
+    let header = unsafe { &*ptr.cast::<Header>() };
+    {
         let mut state = header.state.load(Ordering::Acquire);
         loop {
             if state & (COMPLETED | CLOSED) != 0 {
@@ -125,7 +176,9 @@ impl<T> Task<T> {
             }
         }
     }
+}
 
+impl<T> Task<T> {
     /// Lets go of the handle. Returns the output when the task had completed
     /// and nobody took it, so the caller drops it outside the transition.
     fn set_detached(&mut self) -> Option<Result<T, Panic>> {
@@ -205,10 +258,21 @@ impl<T> Task<T> {
         }
     }
 
-    /// `Some(output)` once the task completed, `None` once it was closed
-    /// without an output for the handle (cancelled, or dropped by its
-    /// runtime) and its future is gone.
+    /// `Some(output)` once the task completed (resuming a panic of its
+    /// future), `None` once it was closed without an output for the handle.
     fn poll_task(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        match self.poll_raw(cx) {
+            Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(output)),
+            Poll::Ready(Some(Err(panic))) => std::panic::resume_unwind(panic),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// The output once the task completed (or the panic of its future),
+    /// `None` once it was closed without an output for the handle (cancelled,
+    /// or dropped by its runtime) and its future is gone.
+    fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, Panic>>> {
         let header = self.header();
         let mut state = header.state.load(Ordering::Acquire);
         loop {
@@ -247,10 +311,7 @@ impl<T> Task<T> {
                     if state & AWAITER != 0 {
                         header.notify(Some(cx.waker()));
                     }
-                    return match self.read_output() {
-                        Ok(output) => Poll::Ready(Some(output)),
-                        Err(panic) => std::panic::resume_unwind(panic),
-                    };
+                    return Poll::Ready(Some(self.read_output()));
                 }
                 Err(actual) => state = actual,
             }
@@ -316,6 +377,11 @@ impl<T> FallibleTask<T> {
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
     }
+
+    /// The task's id.
+    pub fn id(&self) -> super::Id {
+        self.task.id()
+    }
 }
 
 impl<T> Future for FallibleTask<T> {
@@ -329,5 +395,148 @@ impl<T> Future for FallibleTask<T> {
 impl<T> fmt::Debug for FallibleTask<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("FallibleTask").field(&self.task).finish()
+    }
+}
+
+/// The future of [`Task::join`]: the task's output, or why there is none.
+#[must_use = "dropping it cancels the task, as dropping the `Task` does"]
+pub struct Join<T> {
+    task: Task<T>,
+}
+
+impl<T> Future for Join<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let id = self.task.id();
+        self.task.poll_raw(cx).map(|output| match output {
+            Some(Ok(output)) => Ok(output),
+            Some(Err(panic)) => Err(JoinError {
+                id,
+                panic: Some(panic),
+            }),
+            None => Err(JoinError { id, panic: None }),
+        })
+    }
+}
+
+impl<T> fmt::Debug for Join<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Join").field(&self.task).finish()
+    }
+}
+
+/// Why a task gave no output: it was cancelled (by its handle, an
+/// [`AbortHandle`], or its runtime shutting down), or its future panicked.
+pub struct JoinError {
+    id: super::Id,
+    panic: Option<Panic>,
+}
+
+impl JoinError {
+    /// The task was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.panic.is_none()
+    }
+
+    /// The task's future panicked.
+    pub fn is_panic(&self) -> bool {
+        self.panic.is_some()
+    }
+
+    /// The payload of the panic.
+    ///
+    /// # Panics
+    ///
+    /// When the task was cancelled, not panicked; [`try_into_panic`](Self::try_into_panic)
+    /// answers it instead.
+    pub fn into_panic(self) -> Box<dyn core::any::Any + Send + 'static> {
+        match self.try_into_panic() {
+            Ok(panic) => panic,
+            Err(error) => panic!("`JoinError::into_panic` on a cancelled task ({error})"),
+        }
+    }
+
+    /// The payload of the panic, or the error itself when the task was
+    /// cancelled.
+    pub fn try_into_panic(self) -> Result<Box<dyn core::any::Any + Send + 'static>, JoinError> {
+        match self.panic {
+            Some(panic) => Ok(panic),
+            None => Err(self),
+        }
+    }
+
+    /// The id of the task.
+    pub fn id(&self) -> super::Id {
+        self.id
+    }
+}
+
+impl fmt::Display for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.panic {
+            None => write!(f, "task {} was cancelled", self.id),
+            Some(panic) => match panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            {
+                Some(message) => write!(f, "task {} panicked: {message}", self.id),
+                None => write!(f, "task {} panicked", self.id),
+            },
+        }
+    }
+}
+
+impl fmt::Debug for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JoinError")
+            .field("id", &self.id)
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl std::error::Error for JoinError {}
+
+impl From<JoinError> for std::io::Error {
+    fn from(error: JoinError) -> Self {
+        std::io::Error::other(error.to_string())
+    }
+}
+
+/// Cancels a task from anywhere: made by [`Task::abort_handle`], cloned and
+/// sent freely, and it outlives the [`Task`]. It keeps the task's memory, not
+/// its future: an aborted task's future is dropped where the task runs.
+#[derive(Clone)]
+pub struct AbortHandle {
+    /// A reference of the task, as a waker of it holds one.
+    waker: core::task::Waker,
+    id: super::Id,
+}
+
+impl AbortHandle {
+    /// Cancels the task unless it completed; see [`Task::abort`].
+    pub fn abort(&self) {
+        // SAFETY: the waker's reference keeps the task alive.
+        unsafe { cancel(self.waker.data()) }
+    }
+
+    /// Whether the task completed or was cancelled.
+    pub fn is_finished(&self) -> bool {
+        // SAFETY: the waker's reference keeps the task alive.
+        let header = unsafe { &*self.waker.data().cast::<Header>() };
+        header.state.load(Ordering::Acquire) & (COMPLETED | CLOSED) != 0
+    }
+
+    /// The task's id.
+    pub fn id(&self) -> super::Id {
+        self.id
+    }
+}
+
+impl fmt::Debug for AbortHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AbortHandle").field("id", &self.id).finish()
     }
 }

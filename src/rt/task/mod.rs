@@ -44,7 +44,39 @@ use core::ptr::NonNull;
 use core::task::{RawWaker, Waker};
 
 use self::header::Header;
-pub use self::join::{FallibleTask, Task};
+pub use self::join::{AbortHandle, FallibleTask, Join, JoinError, Task};
+
+/// A task's id: unique among the tasks of the process, never reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Id(pub(super) core::num::NonZeroU64);
+
+impl core::fmt::Display for Id {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+std::thread_local! {
+    /// The id of the task this thread is polling, if any.
+    static CURRENT: core::cell::Cell<Option<Id>> = const { core::cell::Cell::new(None) };
+}
+
+/// The id of the task being polled on this thread, `None` outside a task (in
+/// `block_on`'s own future, on a blocking-pool thread).
+pub(crate) fn current_id() -> Option<Id> {
+    CURRENT.try_with(core::cell::Cell::get).ok().flatten()
+}
+
+/// Sets the current task while polling it, and answers the one before it
+/// (a `block_on` inside a task polls other tasks in between).
+pub(super) fn enter(id: Id) -> Option<Id> {
+    CURRENT.try_with(|c| c.replace(Some(id))).ok().flatten()
+}
+
+/// Puts back the task `enter` replaced.
+pub(super) fn leave(previous: Option<Id>) {
+    let _ = CURRENT.try_with(|c| c.set(previous));
+}
 use self::raw::RawTask;
 
 /// How a task came to be scheduled.

@@ -22,16 +22,24 @@ pub(super) struct Header {
     /// The waker of the handle's awaiter; see the module docs.
     awaiter: UnsafeCell<Option<Waker>>,
     pub(super) vtable: &'static TaskVTable,
+    /// The task's id, unique in the process.
+    pub(super) id: super::Id,
 }
+
+/// The next task id: ids start at 1 and are never reused (a `u64` does not
+/// wrap in the life of a process).
+static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 impl Header {
     /// A new task's header: scheduled, with its handle and one reference,
-    /// the `Runnable` that spawning returns.
+    /// the `Runnable` that spawning returns, and the next id.
     pub(super) fn new(vtable: &'static TaskVTable) -> Self {
+        let id = NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self {
             state: AtomicUsize::new(SCHEDULED | TASK | REFERENCE),
             awaiter: UnsafeCell::new(None),
             vtable,
+            id: super::Id(core::num::NonZeroU64::new(id).unwrap_or(core::num::NonZeroU64::MIN)),
         }
     }
 
