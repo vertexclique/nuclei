@@ -1,15 +1,18 @@
-/* Proactive, not reactive: two lanes, the same read in each.
+/* Proactive, not reactive: the same read, drawn as two sequence diagrams.
  *
- * A lane is three nodes on two rails: the upper rail carries what goes toward the kernel, the
- * lower rail what comes back. A packet is a square that starts at the task's centre; the
- * track is a size container, so --span (the rail's length, in container units) carries it to
- * the kernel's centre. Standing still (no script, reduced motion, or the section off screen) every packet
- * sits on its rail between two nodes with a chevron for its direction, which already reads
- * as the whole exchange; when the section is in view (.is-live, set by the page's script) the
- * packets run their legs in turn. Both lanes take the same time on purpose: the picture is
- * about the shape of an exchange, not its speed. */
+ * Each lane has three lifelines (task, middle, kernel) and a list of messages between them,
+ * top to bottom in the order they happen. A message is a list item: its label (the step,
+ * readable as text) and an arrow from one lifeline to another. --a and --b are the lifelines
+ * the arrow spans (0, 1 or 2; a < b), and .to-left points it back toward the task.
+ *
+ * Standing still (no script, reduced motion, or off screen) the whole diagram shows. In view
+ * the page's script sets .is-playing: the messages appear one by one, each lane over the same
+ * time (--pass), so the picture counts steps and never claims speed; then .is-clearing fades
+ * them out and the pass starts again. */
 
 .flow {
+  --pass: 4.8s;
+
   display: grid;
   gap: var(--space-md);
 }
@@ -17,12 +20,13 @@
 @media (min-width: 64rem) {
   .flow {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
   }
 }
 
 .lane {
   --lane-ink: var(--color-accent);
-  --lane-node: var(--color-ink);
+  --call-ink: var(--color-accent-3);
 
   display: grid;
   gap: var(--space-lg);
@@ -32,7 +36,6 @@
 
 .lane--re {
   --lane-ink: var(--color-accent-2);
-  --lane-node: var(--color-dim-node);
 
   background:
     linear-gradient(180deg, var(--color-gloss) 0%, transparent 42%),
@@ -62,153 +65,183 @@
   white-space: nowrap;
 }
 
-.lane__track {
-  --node: clamp(4.25rem, 18vw, 6rem);
-  --span: calc(100cqi - var(--node));
-  --dot: 0.625rem;
+/* The diagram. Its inner box runs from the first lifeline to the last, so a lifeline sits at
+ * 0%, 50% or 100% of it, and the actors' boxes hang half outside. */
+.seq {
+  --actor: clamp(4.5rem, 20vw, 5.75rem);
 
-  container-type: inline-size;
-  position: relative;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  block-size: 6.5rem;
+  display: grid;
+  gap: var(--space-xs);
+  margin-inline: calc(var(--actor) / 2);
 }
 
-.lane__node {
-  position: relative;
-  z-index: 2;
+.seq__actors {
+  display: flex;
+  justify-content: space-between;
+  margin-inline: calc(var(--actor) / -2);
+}
+
+.seq__actors span {
   display: grid;
   place-items: center;
-  inline-size: var(--node);
-  block-size: 3.25rem;
+  inline-size: var(--actor);
+  block-size: 2.25rem;
   border: var(--rule-hair) solid var(--color-rule-2);
   background:
     linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
     var(--color-paper-3);
-  color: var(--lane-node);
+  color: var(--color-ink);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   white-space: nowrap;
 }
 
-/* A node lights as a packet reaches it. */
-.lane__node::after {
+.seq__msgs {
+  position: relative;
+  display: grid;
+  counter-reset: msg;
+}
+
+/* The three lifelines. */
+.seq__msgs::before {
   content: "";
   position: absolute;
-  inset: calc(-1 * var(--rule-hair));
-  border: var(--rule-hair) solid var(--lane-ink);
-  box-shadow: 0 0 18px -4px var(--lane-ink);
-  opacity: 0;
+  inset-block: 0;
+  inset-inline: 0;
+  background:
+    linear-gradient(var(--color-rule-2), var(--color-rule-2)) 0 0 / 1px 100% no-repeat,
+    linear-gradient(var(--color-rule-2), var(--color-rule-2)) 50% 0 / 1px 100% no-repeat,
+    linear-gradient(var(--color-rule-2), var(--color-rule-2)) 100% 0 / 1px 100% no-repeat;
 }
 
-.lane__rail {
-  position: absolute;
-  inset-inline: calc(var(--node) / 2);
-  z-index: 1;
-  block-size: var(--rule-hair);
-  background: var(--color-rule-2);
+.seq__msgs li {
+  --ink: var(--lane-ink);
+
+  position: relative;
+  display: grid;
+  padding-block: var(--space-sm) var(--space-md);
+  counter-increment: msg;
 }
 
-.lane__rail--out {
-  inset-block-start: 1.1rem;
+/* The task makes the call itself: the reactor's own read, in violet, label and all. */
+.seq__msgs li.own-call {
+  --ink: var(--call-ink);
 }
 
-.lane__rail--back {
-  inset-block-end: 1.1rem;
+.own-call .seq__label {
+  color: var(--call-ink);
 }
 
-/* The rails' chevrons sit in the gaps between nodes: right on the way out, left on the way back. */
-.lane__rail::before,
-.lane__rail::after {
-  content: "";
-  position: absolute;
-  inset-block-start: -3px;
-  inline-size: 7px;
-  block-size: 7px;
-  border-block-start: var(--rule-hair) solid var(--color-rule-2);
-  border-inline-end: var(--rule-hair) solid var(--color-rule-2);
+.own-call .seq__arrow {
+  block-size: 2px;
 }
 
-.lane__rail--out::before,
-.lane__rail--out::after {
-  rotate: 45deg;
-}
-
-.lane__rail--back::before,
-.lane__rail--back::after {
-  rotate: -135deg;
-}
-
-.lane__rail::before {
-  inset-inline-start: calc(25% - 4px);
-}
-
-.lane__rail::after {
-  inset-inline-start: calc(75% - 4px);
-}
-
-.lane__packet {
-  position: absolute;
-  z-index: 1;
-  inset-inline-start: calc(var(--node) / 2 - var(--dot) / 2);
-  inline-size: var(--dot);
-  block-size: var(--dot);
-  box-shadow: 0 0 10px -2px var(--lane-ink);
-  transform: translateX(calc(var(--span) * var(--at)));
-}
-
-.lane__packet--out {
-  inset-block-start: calc(1.1rem - var(--dot) / 2);
-}
-
-.lane__packet--back {
-  inset-block-end: calc(1.1rem - var(--dot) / 2);
-}
-
-/* A request is an empty square; what comes back with bytes is a full one; a readiness event
- * is a small one, with no bytes in it. */
-.lane__packet--ask {
-  border: 1.5px solid var(--lane-ink);
+/* A label across all three lifelines sits on the lane's own paper, so the middle lifeline
+ * never runs through its words; it stops short of the outer two. */
+.seq__msgs li.span-all .seq__label {
+  margin-inline-start: 3px;
+  inline-size: calc(100% - 6px);
   background: var(--color-paper);
 }
 
-.lane__packet--bytes {
-  background: var(--lane-ink);
-}
-
-.lane__packet--ready {
-  --dot: 0.25rem;
-
-  background: var(--lane-ink);
-}
-
-/* Where each packet stands in the still picture: in a gap, heading its way. */
-/* The reactor's readiness event and its bytes share the lower rail: the event waits by the
- * kernel, the bytes travel nearer the task. */
-.lane__packet { --at: 0.25; }
-.lane--re .lane__packet--ready { --at: 0.75; }
-
-.lane__steps {
-  display: grid;
-  gap: var(--space-sm);
-  counter-reset: step;
-}
-
-.lane__steps li {
-  display: grid;
-  grid-template-columns: 1.75rem minmax(0, 1fr);
-  align-items: baseline;
-  font-size: var(--text-sm);
-  line-height: 1.5;
-  counter-increment: step;
-}
-
-.lane__steps li::before {
-  content: counter(step);
-  font-family: var(--font-mono);
+.seq__label {
+  position: relative;
+  z-index: 1;
+  margin-inline-start: calc(var(--a) * 50%);
+  inline-size: calc((var(--b) - var(--a)) * 50%);
+  padding-inline: var(--space-xs);
+  color: var(--color-ink-2);
   font-size: var(--text-xs);
-  color: var(--lane-ink);
+  line-height: 1.35;
+  text-align: center;
+  text-wrap: balance;
+}
+
+.seq__label::before {
+  content: counter(msg) "  ";
+  font-family: var(--font-mono);
+  color: var(--ink);
+  white-space: pre;
+}
+
+.seq__arrow {
+  position: absolute;
+  z-index: 1;
+  inset-block-end: var(--space-xs);
+  inset-inline-start: calc(var(--a) * 50%);
+  inline-size: calc((var(--b) - var(--a)) * 50%);
+  block-size: 1.5px;
+  background: var(--ink);
+  box-shadow: 0 0 8px -1px var(--ink);
+  transform-origin: left;
+}
+
+.to-left .seq__arrow {
+  transform-origin: right;
+}
+
+/* The arrowhead: two sides of a square, turned to point. */
+.seq__arrow::after {
+  content: "";
+  position: absolute;
+  inset-block-start: -3.25px;
+  inset-inline-end: 0;
+  inline-size: 8px;
+  block-size: 8px;
+  border-block-start: 1.5px solid var(--ink);
+  border-inline-end: 1.5px solid var(--ink);
+  rotate: 45deg;
+}
+
+.to-left .seq__arrow::after {
+  inset-inline: 0 auto;
+  rotate: -135deg;
+}
+
+/* A step that may happen, or not: dashed. */
+.seq__msgs li.maybe .seq__arrow {
+  background: repeating-linear-gradient(90deg, var(--ink) 0 6px, transparent 6px 10px);
+  box-shadow: none;
+}
+
+/* While the kernel works, the task's lifeline is free for other tasks: a bar of the liquid
+ * beside it, and a word in the space the message leaves. */
+.seq__msgs li.free::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: -2px;
+  inline-size: 4px;
+  background: var(--color-accent);
+  box-shadow: 0 0 10px -2px var(--color-glow);
+}
+
+.seq__aside {
+  position: absolute;
+  inset-block-start: var(--space-sm);
+  inset-inline-start: var(--space-sm);
+  max-inline-size: calc(50% - 2 * var(--space-sm));
+  color: var(--color-accent);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: 1.35;
+}
+
+.lane__legend {
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--color-muted);
+}
+
+.lane__legend strong {
+  font-weight: 500;
+  color: var(--color-ink-2);
+}
+
+.flow-note {
+  max-inline-size: var(--measure);
+  font-size: var(--text-sm);
+  color: var(--color-muted);
 }
 
 /* The three points under the diagram, each under a rule that draws in from the left. */
@@ -258,75 +291,28 @@
 .points > :nth-child(2) { --n: 1; }
 .points > :nth-child(3) { --n: 2; }
 
-/* The legs, as fractions of one cycle. The proactor: the request out (0 to 35%), the kernel
- * lights, the completed bytes back (47 to 82%), the task lights. The reactor: the readiness
- * event back (0 to 24%), the task lights, its own call out (29 to 53%), the kernel lights,
- * the bytes back (58 to 82%), the task lights. */
-.flow.is-live .lane__packet,
-.flow.is-live .lane__node::after {
-  animation: var(--leg) var(--dur-lane) var(--ease-in-out) infinite;
+/* A pass: each message's label fades in and its arrow draws from where it starts. */
+/* Step k of n appears at k / (n - 1) of the pass, so both lanes show their last step together. */
+.lane--pro .seq { --step: calc(var(--pass) / 3); }
+.lane--re .seq { --step: calc(var(--pass) / 5); }
+
+.flow.is-playing .seq__msgs li {
+  animation: msg-in 480ms var(--ease-out) calc(var(--n) * var(--step)) backwards;
 }
 
-.lane--pro .lane__packet--ask { --leg: leg-pro-ask; }
-.lane--pro .lane__packet--bytes { --leg: leg-pro-bytes; }
-.lane--pro .lane__node--task::after { --leg: lit-pro-task; }
-.lane--pro .lane__node--kernel::after { --leg: lit-pro-kernel; }
-.lane--re .lane__packet--ready { --leg: leg-re-ready; }
-.lane--re .lane__packet--ask { --leg: leg-re-ask; }
-.lane--re .lane__packet--bytes { --leg: leg-re-bytes; }
-.lane--re .lane__node--task::after { --leg: lit-re-task; }
-.lane--re .lane__node--kernel::after { --leg: lit-re-kernel; }
-.flow.is-live .lane__node--mid::after { animation: none; }
-
-@keyframes leg-pro-ask {
-  0% { transform: translateX(0); opacity: 1; }
-  35% { transform: translateX(var(--span)); opacity: 1; }
-  36%, 100% { transform: translateX(var(--span)); opacity: 0; }
+.flow.is-playing .seq__arrow {
+  animation: arrow-draw 620ms var(--ease-out) calc(var(--n) * var(--step) + 80ms) backwards;
 }
 
-@keyframes leg-pro-bytes {
-  0%, 46% { transform: translateX(var(--span)); opacity: 0; }
-  47% { transform: translateX(var(--span)); opacity: 1; }
-  82% { transform: translateX(0); opacity: 1; }
-  83%, 100% { transform: translateX(0); opacity: 0; }
+.flow.is-clearing .seq__msgs li {
+  opacity: 0;
+  transition: opacity 400ms var(--ease-in);
 }
 
-@keyframes lit-pro-kernel {
-  0%, 33%, 52%, 100% { opacity: 0; }
-  38%, 44% { opacity: 1; }
+@keyframes msg-in {
+  from { opacity: 0; }
 }
 
-@keyframes lit-pro-task {
-  0%, 80%, 98%, 100% { opacity: 0; }
-  85%, 90% { opacity: 1; }
-}
-
-@keyframes leg-re-ready {
-  0% { transform: translateX(var(--span)); opacity: 1; }
-  24% { transform: translateX(0); opacity: 1; }
-  25%, 100% { transform: translateX(0); opacity: 0; }
-}
-
-@keyframes leg-re-ask {
-  0%, 28% { transform: translateX(0); opacity: 0; }
-  29% { transform: translateX(0); opacity: 1; }
-  53% { transform: translateX(var(--span)); opacity: 1; }
-  54%, 100% { transform: translateX(var(--span)); opacity: 0; }
-}
-
-@keyframes leg-re-bytes {
-  0%, 57% { transform: translateX(var(--span)); opacity: 0; }
-  58% { transform: translateX(var(--span)); opacity: 1; }
-  82% { transform: translateX(0); opacity: 1; }
-  83%, 100% { transform: translateX(0); opacity: 0; }
-}
-
-@keyframes lit-re-kernel {
-  0%, 51%, 64%, 100% { opacity: 0; }
-  55%, 59% { opacity: 1; }
-}
-
-@keyframes lit-re-task {
-  0%, 22%, 33%, 80%, 98%, 100% { opacity: 0; }
-  25%, 28%, 85%, 90% { opacity: 1; }
+@keyframes arrow-draw {
+  from { transform: scaleX(0); }
 }

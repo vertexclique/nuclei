@@ -52,7 +52,7 @@
           <a class="btn btn--primary" href="#install">Use Nuclei</a>
           <a class="btn btn--ghost" href="learn/">Learn Nuclei</a>
         </div>
-        <p class="hero__meta"><span>Rust 1.99 or later</span><span>Apache-2.0 or MIT</span><a href="https://crates.io/crates/nuclei"><span>0.5 on crates.io</span></a></p>
+        <p class="hero__meta"><span>Rust @@RUST_VERSION@@ or later</span><span>Apache-2.0 or MIT</span><a href="https://crates.io/crates/nuclei"><span>crates.io</span></a></p>
       </div>
 
       <figure class="apparatus" aria-label="Four cores, each running a shard with its own driver">
@@ -100,44 +100,38 @@
         <p class="section-head__dek">A reactor tells a task when a socket is ready, and the task makes the call itself. Nuclei is a <strong class="ink">proactor</strong>: the task hands the operation over, and the result comes back to it.</p>
       </div>
 
-      <div class="flow">
-        <figure class="lane lane--pro" data-reveal aria-labelledby="lane-pro-name">
+      <div class="flow" data-reveal>
+        <figure class="lane lane--pro" aria-labelledby="lane-pro-name">
           <figcaption class="lane__head"><span class="lane__name" id="lane-pro-name">Nuclei, a <span class="ink">proactor</span></span><span class="lane__tag">hand over, take back</span></figcaption>
-          <div class="lane__track" aria-hidden="true">
-            <span class="lane__node lane__node--task">task</span>
-            <span class="lane__node lane__node--mid">driver</span>
-            <span class="lane__node lane__node--kernel">kernel</span>
-            <span class="lane__rail lane__rail--out"></span>
-            <span class="lane__rail lane__rail--back"></span>
-            <span class="lane__packet lane__packet--out lane__packet--ask"></span>
-            <span class="lane__packet lane__packet--back lane__packet--bytes"></span>
+          <div class="seq">
+            <div class="seq__actors" aria-hidden="true"><span>task</span><span>driver</span><span>kernel</span></div>
+            <ol class="seq__msgs">
+              <li class="to-right" style="--a: 0; --b: 1; --n: 0"><span class="seq__label">read: the task hands it over</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="to-right free" style="--a: 1; --b: 2; --n: 1"><span class="seq__aside">the task&rsquo;s shard runs other tasks</span><span class="seq__label">submit, with a buffer the kernel fills</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="to-left free" style="--a: 1; --b: 2; --n: 2"><span class="seq__label">done: the bytes are in the buffer</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="to-left" style="--a: 0; --b: 1; --n: 3"><span class="seq__label">the result, to the task that asked</span><span class="seq__arrow" aria-hidden="true"></span></li>
+            </ol>
           </div>
-          <ol class="lane__steps">
-            <li>The task hands the read to the driver.</li>
-            <li>The read completes: in the kernel on io_uring and IOCP, by the driver&rsquo;s own call on epoll and kqueue.</li>
-            <li>The bytes come back to the task that asked.</li>
-          </ol>
+          <p class="lane__legend"><strong>One hand-over, one completion.</strong> The task never calls the kernel and never retries. On epoll and kqueue the driver makes the call when the socket may be ready; the task&rsquo;s side is the same.</p>
         </figure>
 
-        <figure class="lane lane--re" data-reveal aria-labelledby="lane-re-name">
-          <figcaption class="lane__head"><span class="lane__name" id="lane-re-name">A reactor</span><span class="lane__tag">wait, then call</span></figcaption>
-          <div class="lane__track" aria-hidden="true">
-            <span class="lane__node lane__node--task">task</span>
-            <span class="lane__node lane__node--mid">reactor</span>
-            <span class="lane__node lane__node--kernel">kernel</span>
-            <span class="lane__rail lane__rail--out"></span>
-            <span class="lane__rail lane__rail--back"></span>
-            <span class="lane__packet lane__packet--back lane__packet--ready"></span>
-            <span class="lane__packet lane__packet--out lane__packet--ask"></span>
-            <span class="lane__packet lane__packet--back lane__packet--bytes"></span>
+        <figure class="lane lane--re" aria-labelledby="lane-re-name">
+          <figcaption class="lane__head"><span class="lane__name" id="lane-re-name">A reactor</span><span class="lane__tag">wait, wake, call, retry</span></figcaption>
+          <div class="seq">
+            <div class="seq__actors" aria-hidden="true"><span>task</span><span>reactor</span><span>kernel</span></div>
+            <ol class="seq__msgs">
+              <li class="to-right" style="--a: 0; --b: 1; --n: 0"><span class="seq__label">watch this socket for me</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="to-left" style="--a: 1; --b: 2; --n: 1"><span class="seq__label">readable</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="to-left" style="--a: 0; --b: 1; --n: 2"><span class="seq__label">wake the task</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="span-all to-right own-call" style="--a: 0; --b: 2; --n: 3"><span class="seq__label">read(): the task makes the call itself</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="span-all to-left own-call maybe" style="--a: 0; --b: 2; --n: 4"><span class="seq__label">would block? back to 2, and wait again</span><span class="seq__arrow" aria-hidden="true"></span></li>
+              <li class="span-all to-left" style="--a: 0; --b: 2; --n: 5"><span class="seq__label">the bytes, copied into the task&rsquo;s buffer</span><span class="seq__arrow" aria-hidden="true"></span></li>
+            </ol>
           </div>
-          <ol class="lane__steps">
-            <li>The task waits to hear that the socket is readable.</li>
-            <li>Woken, it makes the read call itself.</li>
-            <li>If the call would block, it waits again.</li>
-          </ol>
+          <p class="lane__legend"><strong>A readiness wait, a wake, then the task&rsquo;s own call</strong>, which can find nothing and go back to waiting (dashed: it happens when another reader got there first, or the readiness was spurious).</p>
         </figure>
       </div>
+      <p class="flow-note" data-reveal>The same read in both. The pictures count steps, not the time they take.</p>
 
       <dl class="points">
         <div class="point" data-reveal><dt>Completed by the kernel</dt><dd>On io_uring and I/O completion ports the kernel performs the read or the write, in memory the runtime keeps alive until the kernel is done with it.</dd></div>
@@ -149,7 +143,7 @@
     <section class="install" id="install" aria-labelledby="install-title">
       <div class="section-head" data-reveal>
         <h2 id="install-title"><span class="ink">Use Nuclei</span> in your project</h2>
-        <p class="section-head__dek">Nuclei 0.5 is on crates.io. The default features include the io_uring driver and the attribute macros.</p>
+        <p class="section-head__dek">Nuclei is on crates.io. The default features include the io_uring driver and the attribute macros.</p>
       </div>
       <div class="install__steps">
         <div class="install__step" data-reveal>
@@ -170,7 +164,7 @@
           </div>
           <div class="code">
             <pre id="dependency"><code><span class="pu">[</span><span class="kw">dependencies</span><span class="pu">]</span>
-<span class="fn">nuclei</span> <span class="pu">=</span> <span class="st">"0.5"</span></code></pre>
+<span class="fn">nuclei</span> <span class="pu">=</span> <span class="st">"@@NUCLEI_MINOR@@"</span></code></pre>
           </div>
         </div>
       </div>
@@ -250,12 +244,32 @@
           <h3>IO memory with a ceiling</h3>
           <p>Each worker&rsquo;s IO buffers hold at most 64 MiB unless you set otherwise. At the cap, IO waits for buffers to come back, so a worker&rsquo;s IO memory never grows past it.</p>
         </li>
+        <li class="card card--wide tile" data-reveal>
+          <svg class="glyph" viewBox="0 0 32 32" aria-hidden="true"><rect class="b g g-cancel" x="20" y="4" width="8" height="8"/><path class="d" d="M5 20v7h22v-7"/><rect class="f g g-keep" x="17" y="22" width="4" height="4"/></svg>
+          <h3>Cancel-safe IO</h3>
+          <p>Dropping a future halfway loses nothing. A read cut off by a timeout leaves the bytes the driver already took for the next read, and a lent buffer reaches the stream whole or not at all.</p>
+        </li>
+        <li class="card tile" data-reveal>
+          <svg class="glyph" viewBox="0 0 32 32" aria-hidden="true"><g><rect class="f g g-gather" x="4" y="14" width="8" height="4" style="--sx: 0px; --sy: -8px"/><rect class="fb g g-gather" x="13" y="14" width="5" height="4" style="--sx: -9px; --sy: 0px; --go: 120ms"/><rect class="fv g g-gather" x="19" y="14" width="6" height="4" style="--sx: -15px; --sy: 8px; --go: 240ms"/></g><path class="g g-send" d="M27 16h3"/></svg>
+          <h3>Vectored on every backend</h3>
+          <p><code>write_vectored</code> gathers its slices into the write-behind in one call, all of them when it starts empty, on io_uring, epoll, kqueue and IOCP alike; <code>read_vectored</code> scatters what came in across yours. Streams and files both.</p>
+        </li>
+        <li class="card tile" data-reveal>
+          <svg class="glyph" viewBox="0 0 32 32" aria-hidden="true"><rect class="f" x="4" y="8" width="4" height="18"/><rect class="f" x="11" y="8" width="4" height="18"/><rect class="d" x="18" y="8" width="4" height="18"/><rect class="d" x="25" y="8" width="4" height="18"/><g><rect class="fb shut g g-grow" x="18.5" y="8.5" width="3" height="17"/><rect class="fb shut g g-grow" x="25.5" y="8.5" width="3" height="17"/></g></svg>
+          <h3>Workers that grow and drain</h3>
+          <p>A running runtime starts more workers, up to its maximum, with <code>spawn_more_threads</code>, and drains them with <code>stop_thread</code>: a stopped worker takes no new task and exits once its tasks are done.</p>
+        </li>
+        <li class="card card--wide tile" data-reveal>
+          <svg class="glyph" viewBox="0 0 32 32" aria-hidden="true"><g><rect class="f g g-pip" x="3" y="5" width="3" height="3"/><rect class="f g g-pip" x="8" y="5" width="3" height="3"/><rect class="f g g-pip" x="13" y="5" width="3" height="3"/><rect class="f g g-pip" x="18" y="5" width="3" height="3"/></g><rect x="20" y="11" width="9" height="14"/><rect class="d" x="3" y="16" width="4" height="4"/><rect class="fb g g-handoff" x="22.5" y="16" width="4" height="4"/></svg>
+          <h3>Fairness counted, not timed</h3>
+          <p>Locks and semaphores let a caller take what is free even while others wait, so a release never waits for a sleeping task. A waiter passed over 16 times is owed a handoff: nobody gets in ahead of it, and the next release goes straight to it.</p>
+        </li>
       </ul>
     </section>
 
     <section class="kit" aria-labelledby="kit-title">
       <div class="section-head" data-reveal>
-        <h2 id="kit-title">What comes <span class="ink">with it</span></h2>
+        <h2 id="kit-title"><span class="ink">Modules</span></h2>
         <p class="section-head__dek">The pieces a server needs, in the one crate.</p>
       </div>
       <ul class="kit__grid">
@@ -342,7 +356,7 @@
     <p class="foot__line" data-reveal>A task <span class="ink">stays</span> where you put it.</p>
     <div class="foot__meta" data-reveal>
       <span class="foot__mark">Nuclei</span>
-      <span>0.5 on crates.io &middot; Apache-2.0 or MIT</span>
+      <span><a href="https://crates.io/crates/nuclei">crates.io</a> &middot; Apache-2.0 or MIT</span>
       <span class="foot__links"><a href="learn/">Learn</a> <a href="https://docs.rs/nuclei">API</a> <a href="https://github.com/vertexclique/nuclei">Source</a> <a href="https://github.com/vertexclique/nuclei/blob/master/CHANGELOG.md">Changes</a> <a href="https://github.com/vertexclique/nuclei/blob/master/proofs/README.md">Proofs</a></span>
       <p class="foot__credit">The footage behind the headline is from the documentary Particle Fever.</p>
     </div>

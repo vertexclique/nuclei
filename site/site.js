@@ -35,6 +35,13 @@ for (const button of document.querySelectorAll("[data-copy]")) {
   });
 }
 
+// The Learn sidebar is long on a wide screen: it opens scrolled to the chapter being read.
+const chapters = document.querySelector(".chapters");
+const reading = chapters?.querySelector('[aria-current="page"]');
+if (reading && chapters.scrollHeight > chapters.clientHeight) {
+  chapters.scrollTop = reading.offsetTop - chapters.clientHeight / 4;
+}
+
 if (!still.matches && "IntersectionObserver" in window) {
   // Reveals. What is in view at load stays shown and plays only its decorations (reveal-now);
   // what starts below the fold is held back (reveal-wait) and rises in as it arrives. The
@@ -62,7 +69,8 @@ if (!still.matches && "IntersectionObserver" in window) {
   });
 
   // Loops run only on screen: the hero's footage, dots and tanks (.is-idle when away), and
-  // the proactor diagram (.is-live when in view).
+  // the proactor diagram, which plays a pass (.is-playing), fades it (.is-clearing) and
+  // plays again while it is in view.
   const hero = document.querySelector(".hero");
   const video = hero?.querySelector("video");
   const saveData = navigator.connection?.saveData === true;
@@ -77,19 +85,38 @@ if (!still.matches && "IntersectionObserver" in window) {
       video.pause();
     }
   };
+  const passes = new Map();
+  const pass = (flow) => {
+    flow.classList.remove("is-clearing");
+    flow.classList.add("is-playing");
+    passes.set(flow, setTimeout(() => {
+      flow.classList.replace("is-playing", "is-clearing");
+      passes.set(flow, setTimeout(() => pass(flow), 450));
+    }, 8600));
+  };
+  const rest = (flow) => {
+    clearTimeout(passes.get(flow));
+    passes.delete(flow);
+    flow.classList.remove("is-playing", "is-clearing");
+  };
   const sight = new IntersectionObserver((entries) => {
     for (const { target, isIntersecting } of entries) {
       if (target === hero) {
         heroInView = isIntersecting;
         hero.classList.toggle("is-idle", !isIntersecting);
         playback();
-      } else {
-        target.classList.toggle("is-live", isIntersecting);
+      } else if (isIntersecting && !passes.has(target)) {
+        pass(target);
+      } else if (!isIntersecting) {
+        rest(target);
       }
     }
   });
   if (hero) sight.observe(hero);
   for (const flow of document.querySelectorAll(".flow")) sight.observe(flow);
-  still.addEventListener("change", playback);
+  still.addEventListener("change", () => {
+    playback();
+    if (still.matches) for (const flow of [...passes.keys()]) rest(flow);
+  });
   document.addEventListener("visibilitychange", playback);
 }

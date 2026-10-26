@@ -31,6 +31,8 @@
 
 .glyph .f { fill: var(--color-accent); stroke: none; }
 .glyph .fb { fill: var(--color-accent-2); stroke: none; }
+.glyph .fv { fill: var(--color-accent-3); stroke: none; }
+.glyph .shut { transform: scaleY(0); transform-origin: bottom; }
 .glyph .d { stroke: var(--color-rule-2); }
 .glyph .b { stroke: var(--color-accent-2); }
 
@@ -188,7 +190,9 @@
   pointer-events: none;
 }
 
-/* What comes with it: a ruled grid, one cell per piece, its API under its name. */
+/* Modules: a ruled grid, one cell per piece, its API under its name. Each cell takes a tone of
+ * the palette in turn (turquoise, blue, violet) for its glyph, its mark, its API line and its
+ * light; every tone reads at 7.6:1 or more on the paper. */
 
 .kit__grid {
   display: grid;
@@ -204,13 +208,45 @@
 }
 
 /* The cell fills with a faint light from its top corner as the pointer rests on it. */
+.kit__item {
+  --tone: var(--color-accent);
+}
+
+.kit__item:nth-child(3n + 2) {
+  --tone: var(--color-accent-2);
+}
+
+.kit__item:nth-child(3n) {
+  --tone: var(--color-accent-3);
+}
+
 .kit__item::before {
   content: "";
   position: absolute;
   z-index: -1;
   inset: 0;
-  background: radial-gradient(70% 80% at 0% 0%, var(--color-card-lit) 0%, transparent 70%);
-  opacity: 0;
+  background: radial-gradient(70% 80% at 0% 0%, color-mix(in oklch, var(--tone) 14%, transparent) 0%, transparent 70%);
+  opacity: 0.45;
+}
+
+/* The tone's mark on the cell's top rule. */
+.kit__item::after {
+  content: "";
+  position: absolute;
+  inset-block-start: -1px;
+  inset-inline-start: 0;
+  inline-size: 2.5rem;
+  block-size: 2px;
+  background: var(--tone);
+  box-shadow: 0 0 10px -2px var(--tone);
+}
+
+.kit__item .glyph {
+  stroke: var(--tone);
+}
+
+.kit__item .glyph .f {
+  fill: var(--tone);
 }
 
 .kit__top {
@@ -232,6 +268,14 @@
   justify-self: start;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+}
+
+@supports ((background-clip: text) or (-webkit-background-clip: text)) {
+  .kit__api.ink {
+    background: linear-gradient(90deg, var(--tone) 0%, var(--color-liquid-top) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+  }
 }
 
 .kit__api code {
@@ -578,4 +622,53 @@
   6% { transform: none; opacity: 0; }
   7%, 48% { transform: translateX(-10px); opacity: 0; }
   58% { opacity: 1; }
+}
+
+/* Cancel-safe IO: the task goes away mid-read; its bytes drop into the read-ahead for the next read. */
+.g-keep { --g: g-keep; --gt: 1.5s; }
+.g-cancel { --g: g-cancel; --gt: 1.5s; }
+
+@keyframes g-keep {
+  0% { transform: translate(-14px, -14px); opacity: 0; }
+  10% { opacity: 1; }
+  45% { transform: translate(0, -14px); }
+}
+
+@keyframes g-cancel {
+  35%, 70% { opacity: 0.2; }
+}
+
+/* Vectored writes: three slices gather into one write, which goes out. */
+.g-gather { --g: g-gather; --gt: 800ms; --ge: var(--ease-out); }
+.g-send { --g: g-send; --gt: 600ms; --go: 700ms; --ge: var(--ease-out); transform-origin: left; }
+
+@keyframes g-gather {
+  from { transform: translate(var(--sx), var(--sy)); }
+}
+
+@keyframes g-send {
+  from { transform: scaleX(0); opacity: 0; }
+}
+
+/* Workers that grow and drain: two more workers start, run, and stop again. */
+.g-grow { --g: g-grow; --gt: 1.8s; }
+.g-grow + .g-grow { --go: 160ms; }
+
+@keyframes g-grow {
+  30%, 65% { transform: scaleY(1); }
+}
+
+/* Fairness: each pass-over is counted; at the count, the waiter is handed the lock. */
+.g-pip { --g: g-pip; --gt: 320ms; --ge: var(--ease-out); }
+.g-pip:nth-of-type(2) { --go: 160ms; }
+.g-pip:nth-of-type(3) { --go: 320ms; }
+.g-pip:nth-of-type(4) { --go: 480ms; }
+.g-handoff { --g: g-handoff; --gt: 1.5s; }
+
+@keyframes g-pip {
+  from { opacity: 0.15; }
+}
+
+@keyframes g-handoff {
+  0%, 55% { transform: translateX(-14px); }
 }

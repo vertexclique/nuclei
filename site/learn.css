@@ -39,18 +39,18 @@
   text-decoration: none;
 }
 
-.chapters ol {
+.chapters > ol {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-xs);
   counter-reset: chapter;
 }
 
-.chapters li {
+.chapters > ol > li {
   counter-increment: chapter;
 }
 
-.chapters li a {
+.chapters > ol > li > a {
   display: inline-flex;
   align-items: baseline;
   gap: var(--space-xs);
@@ -62,25 +62,25 @@
   white-space: nowrap;
 }
 
-.chapters li a::before {
+.chapters > ol > li > a::before {
   content: counter(chapter, decimal-leading-zero);
   font-family: var(--font-mono);
   font-size: var(--text-micro);
   color: var(--color-muted);
 }
 
-.chapters li a[aria-current="page"] {
+.chapters > ol > li > a[aria-current="page"] {
   border-color: var(--color-accent);
   background: var(--color-card-lit);
   color: var(--color-ink);
 }
 
-.chapters li a[aria-current="page"]::before {
+.chapters > ol > li > a[aria-current="page"]::before {
   color: var(--color-accent);
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .chapters li a:hover {
+  .chapters > ol > li > a:hover {
     border-color: var(--color-accent);
     color: var(--color-ink);
   }
@@ -95,26 +95,105 @@
     overflow-y: auto;
   }
 
-  .chapters ol {
+  .chapters > ol {
     display: grid;
     gap: 0;
   }
 
-  .chapters li a {
+  .chapters > ol > li > a {
     display: flex;
     padding: var(--space-xs) var(--space-sm);
     border: 0;
     border-inline-start: 2px solid var(--color-rule);
   }
 
-  .chapters li a[aria-current="page"] {
+  .chapters > ol > li > a[aria-current="page"] {
     border-image: var(--fill-liquid) 1;
   }
 
   @media (hover: hover) and (pointer: fine) {
-    .chapters li a:hover {
+    .chapters > ol > li > a:hover {
       border-inline-start-color: var(--color-accent);
     }
+  }
+}
+
+/* Each chapter's sections, numbered and indented under it: the whole table of contents on a
+ * wide screen. On a narrow one the chips stay as they are and the chapter opens with its own
+ * list of sections (.toc). */
+.chapters__sections {
+  display: none;
+}
+
+.chapters__num {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  color: var(--color-muted);
+}
+
+@media (min-width: 64rem) {
+  .chapters__sections {
+    display: grid;
+    padding-block-end: var(--space-xs);
+    border-inline-start: 2px solid var(--color-rule);
+  }
+
+  .chapters__sections a {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-xs);
+    padding: var(--space-3xs) var(--space-sm) var(--space-3xs) var(--space-lg);
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+    line-height: 1.4;
+    text-decoration: none;
+  }
+
+  li:has(> a[aria-current="page"]) > .chapters__sections a {
+    color: var(--color-ink-2);
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .chapters__sections a:hover {
+      color: var(--color-ink);
+    }
+
+    .chapters__sections a:hover .chapters__num {
+      color: var(--color-accent);
+    }
+  }
+}
+
+.toc {
+  display: grid;
+  gap: var(--space-xs);
+  padding-block: var(--space-lg) var(--space-xs);
+}
+
+.toc__title {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+}
+
+.toc ol {
+  display: grid;
+  gap: var(--space-2xs);
+}
+
+.toc a {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  color: var(--color-ink-2);
+  font-size: var(--text-sm);
+  text-decoration: none;
+}
+
+@media (min-width: 64rem) {
+  .toc {
+    display: none;
   }
 }
 
@@ -316,6 +395,11 @@
 .table th:first-child,
 .table td:first-child {
   padding-inline-start: 0;
+}
+
+/* A name in the first column stays whole; the row wraps between names instead. */
+.table td:first-child code {
+  white-space: nowrap;
 }
 
 @media (max-width: 39.99rem) {
