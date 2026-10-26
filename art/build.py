@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Draws the Nuclei mark and writes every logo file from that one drawing.
+
+Rebuild all of them, from the repository root, with:
+
+    python3 art/build.py
+
+The mark sits on a 1024 grid centred on (512, 512): a diamond inside a larger diamond, and two
+arm units, one along an axis (an arrow and the chevron beyond it) and one along a diagonal (an
+arrow and the corner bracket beyond it), each placed four times by rotation about the centre.
+The diagonal arrow carries a hook on one side, so the mark turns one way: it is symmetric under
+the four rotations, as the original drawing is. Every line has the same width, and every colour
+is a linear gradient from turquoise and cyan through blue to violet.
+
+It writes the SVG files with no comments and no metadata, renders the PNG files from them with
+rsvg-convert, and keeps only the image chunks of each PNG (no text, time, EXIF or colour
+profile). Files written:
+
+    art/nuclei-logo.svg              the mark on a transparent background, cropped to it
+    art/nuclei-logo-dark.svg         the mark on its navy square
+    art/nuclei-logo-512.png          nuclei-logo.svg at 512 by 512
+    art/nuclei-logo-1024.png         nuclei-logo.svg at 1024 by 1024
+    art/nuclei-logo-square.png       nuclei-logo-dark.svg at 1024 by 1024
+    art/nuclei-logo-square-512.png   nuclei-logo-dark.svg at 512 by 512
+    site/logo.svg                    the site's header mark: lines drawn heavier for small sizes
+    site/favicon.svg                 the favicon: the mark, heavier still, on a navy square
+    site/favicon-32.png              site/favicon.svg at 32 by 32, for browsers without SVG icons
+    site/apple-touch-icon.png        site/favicon.svg at 180 by 180
+    site/media/social.png            the link preview: the mark on navy, 1200 by 630
+"""
+
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# The line width of the original drawing, on the 1024 grid.
+STROKE = 11
+NAVY = ("#0d0f2b", "#0e0a22")
+
+# Paint servers. Each is a linear gradient in the coordinates of the unit it colours, as drawn
+# pointing up (the axial unit) or up and left (the diagonal unit), so a rotated copy carries its
+# colours round with it. "core" is the exception: the diamonds are drawn once, unrotated.
+GRADIENTS = [
+    ("core", (600, 400, 424, 624), [(0, "#56f2e0"), (1, "#24a6f2")]),
+    ("ax-shaft", (512, 395, 512, 232), [(0, "#4ef0e2"), (1, "#4684dd")]),
+    ("ax-head", (454, 0, 570, 0), [(0, "#2ee3ee"), (0.42, "#33c3ef"), (0.58, "#5856c8"), (1, "#6a3bba")]),
+    ("chev-a", (0, 190, 0, 294), [(0, "#42e9e8"), (1, "#4ef2de")]),
+    ("chev-b", (0, 190, 0, 294), [(0, "#1fa3f5"), (1, "#2cb2ec")]),
+    ("dg-shaft-a", (453.5, 453.5, 260, 260), [(0, "#4cf4e6"), (1, "#22e8e8")]),
+    ("dg-shaft-b", (453.5, 453.5, 260, 260), [(0, "#3de8f4"), (1, "#5262cc")]),
+    ("dg-head-a", (314, 398, 398, 314), [(0, "#36ebe3"), (0.5, "#2bc6ec"), (1, "#4a7fd8")]),
+    ("dg-head-b", (314, 398, 398, 314), [(0, "#3a98e2"), (0.5, "#4f6ad2"), (1, "#6240bb")]),
+    ("bracket", (367, 226, 226, 367), [(0, "#6243b6"), (0.5, "#5a44bb"), (1, "#4290d6")]),
+]
+
+# The units, as drawn for the arm pointing up (axial) and up and left (diagonal).
+#   ax-shaft:   from the outer diamond's top corner to the arrow's tip.
+#   ax-head:    the arrowhead; its inner sides run down to the gap around the outer diamond,
+#               where the clip cuts them parallel to its edges.
+#   ax-chev:    the chevron beyond the tip.
+#   dg-shaft:   from the middle of the outer diamond's edge to the tip.
+#   dg-head:    the square arrowhead: its sides turn back along the shaft, one ending at the
+#               gap, the other turning into the hook.
+#   dg-bracket: the corner bracket beyond the tip.
+PATHS = [
+    ("ax-shaft", "M512 395V232", False),
+    ("ax-head", "M482 400V318L454 290L512 232L570 290L542 318V400", True),
+    ("ax-chev", "M408 294L512 190L616 294", False),
+    ("dg-shaft", "M453.5 453.5L260 260", False),
+    ("dg-head", "M458.25 416.75L367 325.5V260H260V367H325.5L408.5 450H348", False),
+    ("dg-bracket", "M367 226H226V367", False),
+]
+
+DIAMONDS = ["M512 448L576 512L512 576L448 512Z", "M512 395L629 512L512 629L395 512Z"]
+
+# The paint of each part, per rotation. The chevrons up and right are turquoise, down and left
+# blue; the diagonal arrows up-left and down-right lean turquoise, the other two violet.
+ROTATIONS = [
+    (0, "chev-a", "a"),
+    (90, "chev-a", "b"),
+    (180, "chev-b", "a"),
+    (270, "chev-b", "b"),
+]
+
+# The mark's extent on the grid, chevron tips included: 182 to 842 on both axes.
+TIGHT = (176, 176, 672, 672)
+
+
+def num(value):
+    return f"{value:g}"
+
+
+def drawing(stroke, transform=None):
+    """The defs and the mark, as lines of SVG."""
+    out = ["  <defs>"]
+    for name, (x1, y1, x2, y2), stops in GRADIENTS:
+        out.append(
+            f'    <linearGradient id="{name}" gradientUnits="userSpaceOnUse" '
+            f'x1="{num(x1)}" y1="{num(y1)}" x2="{num(x2)}" y2="{num(y2)}">'
+        )
+        out += [f'      <stop offset="{num(o)}" stop-color="{c}"/>' for o, c in stops]
+        out.append("    </linearGradient>")
+    out.append('    <clipPath id="gap">')
+    out.append('      <path clip-rule="evenodd" d="M0 0H1024V1024H0ZM512 363L661 512L512 661L363 512Z"/>')
+    out.append("    </clipPath>")
+    for name, d, clipped in PATHS:
+        clip = ' clip-path="url(#gap)"' if clipped else ""
+        out.append(f'    <path id="p-{name}"{clip} d="{d}"/>')
+    out.append("  </defs>")
+    group = f'  <g fill="none" stroke-width="{num(stroke)}" stroke-linejoin="miter" stroke-miterlimit="4"'
+    out.append(group + (f' transform="{transform}">' if transform else ">"))
+    out += [f'    <path stroke="url(#core)" d="{d}"/>' for d in DIAMONDS]
+    for angle, chevron, kind in ROTATIONS:
+        out.append(f'    <g transform="rotate({angle} 512 512)">' if angle else "    <g>")
+        out.append('      <use href="#p-ax-shaft" stroke="url(#ax-shaft)"/>')
+        out.append('      <use href="#p-ax-head" stroke="url(#ax-head)"/>')
+        out.append(f'      <use href="#p-ax-chev" stroke="url(#{chevron})"/>')
+        out.append(f'      <use href="#p-dg-shaft" stroke="url(#dg-shaft-{kind})"/>')
+        out.append(f'      <use href="#p-dg-head" stroke="url(#dg-head-{kind})"/>')
+        out.append('      <use href="#p-dg-bracket" stroke="url(#bracket)"/>')
+        out.append("    </g>")
+    out.append("  </g>")
+    return out
+
+
+def svg(view_box, width, height, stroke, navy=None, transform=None):
+    """A whole SVG file. `navy` is the rectangle (x, y, w, h) the navy background fills."""
+    x, y, w, h = view_box
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{num(x)} {num(y)} {num(w)} {num(h)}" '
+        f'width="{num(width)}" height="{num(height)}">'
+    ]
+    if navy:
+        bx, by, bw, bh = navy
+        cx, cy = bx + bw / 2, by + bh / 2
+        radius = (bw * bw + bh * bh) ** 0.5 / 2
+        out.append("  <defs>")
+        out.append(
+            f'    <radialGradient id="navy" gradientUnits="userSpaceOnUse" '
+            f'cx="{num(cx)}" cy="{num(cy)}" r="{num(radius)}">'
+        )
+        out.append(f'      <stop offset="0" stop-color="{NAVY[0]}"/>')
+        out.append(f'      <stop offset="1" stop-color="{NAVY[1]}"/>')
+        out.append("    </radialGradient>")
+        out.append("  </defs>")
+        out.append(f'  <rect x="{num(bx)}" y="{num(by)}" width="{num(bw)}" height="{num(bh)}" fill="url(#navy)"/>')
+    out += drawing(stroke, transform)
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
+def bare_png(path):
+    """Rewrites a PNG with only the chunks that make the image (IHDR, PLTE, tRNS, IDAT, IEND)."""
+    data = path.read_bytes()
+    signature = b"\x89PNG\r\n\x1a\n"
+    if not data.startswith(signature):
+        raise SystemExit(f"{path}: not a PNG file")
+    keep = {b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND"}
+    out, pos = [signature], len(signature)
+    while pos < len(data):
+        (length,) = struct.unpack(">I", data[pos : pos + 4])
+        end = pos + 12 + length
+        if data[pos + 4 : pos + 8] in keep:
+            out.append(data[pos:end])
+        pos = end
+    path.write_bytes(b"".join(out))
+
+
+def render(source, target, width, height):
+    subprocess.run(
+        ["rsvg-convert", "--width", str(width), "--height", str(height), "--output", str(target), str(source)],
+        check=True,
+    )
+    bare_png(target)
+
+
+def main():
+    if shutil.which("rsvg-convert") is None:
+        sys.exit("rsvg-convert is needed to render the PNG files: install librsvg and run this again")
+
+    social_scale = 430 / TIGHT[2]
+    svgs = {
+        "art/nuclei-logo.svg": svg(TIGHT, 672, 672, STROKE),
+        "art/nuclei-logo-dark.svg": svg((0, 0, 1024, 1024), 1024, 1024, STROKE, navy=(0, 0, 1024, 1024)),
+        # Heavier lines where the mark is shown a few dozen pixels wide.
+        "site/logo.svg": svg(TIGHT, 672, 672, 16),
+        "site/favicon.svg": svg((136, 136, 752, 752), 752, 752, 20, navy=(136, 136, 752, 752)),
+    }
+    for name, text in svgs.items():
+        (ROOT / name).write_text(text)
+
+    with tempfile.TemporaryDirectory() as scratch:
+        social = Path(scratch) / "social.svg"
+        social.write_text(
+            svg(
+                (0, 0, 1200, 630),
+                1200,
+                630,
+                STROKE * 1.4,
+                navy=(0, 0, 1200, 630),
+                transform=f"translate(600 315) scale({social_scale:.6f}) translate(-512 -512)",
+            )
+        )
+        render(social, ROOT / "site/media/social.png", 1200, 630)
+
+    renders = [
+        ("art/nuclei-logo.svg", "art/nuclei-logo-512.png", 512, 512),
+        ("art/nuclei-logo.svg", "art/nuclei-logo-1024.png", 1024, 1024),
+        ("art/nuclei-logo-dark.svg", "art/nuclei-logo-square.png", 1024, 1024),
+        ("art/nuclei-logo-dark.svg", "art/nuclei-logo-square-512.png", 512, 512),
+        ("site/favicon.svg", "site/favicon-32.png", 32, 32),
+        ("site/favicon.svg", "site/apple-touch-icon.png", 180, 180),
+    ]
+    for source, target, width, height in renders:
+        render(ROOT / source, ROOT / target, width, height)
+    for name in [*svgs, "site/media/social.png", *(target for _, target, _, _ in renders)]:
+        print(name)
+
+
+if __name__ == "__main__":
+    main()

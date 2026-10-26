@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="176 176 672 672" width="672" height="672">
+  <defs>
+    <linearGradient id="core" gradientUnits="userSpaceOnUse" x1="600" y1="400" x2="424" y2="624">
+      <stop offset="0" stop-color="#56f2e0"/>
+      <stop offset="1" stop-color="#24a6f2"/>
+    </linearGradient>
+    <linearGradient id="ax-shaft" gradientUnits="userSpaceOnUse" x1="512" y1="395" x2="512" y2="232">
+      <stop offset="0" stop-color="#4ef0e2"/>
+      <stop offset="1" stop-color="#4684dd"/>
+    </linearGradient>
+    <linearGradient id="ax-head" gradientUnits="userSpaceOnUse" x1="454" y1="0" x2="570" y2="0">
+      <stop offset="0" stop-color="#2ee3ee"/>
+      <stop offset="0.42" stop-color="#33c3ef"/>
+      <stop offset="0.58" stop-color="#5856c8"/>
+      <stop offset="1" stop-color="#6a3bba"/>
+    </linearGradient>
+    <linearGradient id="chev-a" gradientUnits="userSpaceOnUse" x1="0" y1="190" x2="0" y2="294">
+      <stop offset="0" stop-color="#42e9e8"/>
+      <stop offset="1" stop-color="#4ef2de"/>
+    </linearGradient>
+    <linearGradient id="chev-b" gradientUnits="userSpaceOnUse" x1="0" y1="190" x2="0" y2="294">
+      <stop offset="0" stop-color="#1fa3f5"/>
+      <stop offset="1" stop-color="#2cb2ec"/>
+    </linearGradient>
+    <linearGradient id="dg-shaft-a" gradientUnits="userSpaceOnUse" x1="453.5" y1="453.5" x2="260" y2="260">
+      <stop offset="0" stop-color="#4cf4e6"/>
+      <stop offset="1" stop-color="#22e8e8"/>
+    </linearGradient>
+    <linearGradient id="dg-shaft-b" gradientUnits="userSpaceOnUse" x1="453.5" y1="453.5" x2="260" y2="260">
+      <stop offset="0" stop-color="#3de8f4"/>
+      <stop offset="1" stop-color="#5262cc"/>
+    </linearGradient>
+    <linearGradient id="dg-head-a" gradientUnits="userSpaceOnUse" x1="314" y1="398" x2="398" y2="314">
+      <stop offset="0" stop-color="#36ebe3"/>
+      <stop offset="0.5" stop-color="#2bc6ec"/>
+      <stop offset="1" stop-color="#4a7fd8"/>
+    </linearGradient>
+    <linearGradient id="dg-head-b" gradientUnits="userSpaceOnUse" x1="314" y1="398" x2="398" y2="314">
+      <stop offset="0" stop-color="#3a98e2"/>
+      <stop offset="0.5" stop-color="#4f6ad2"/>
+      <stop offset="1" stop-color="#6240bb"/>
+    </linearGradient>
+    <linearGradient id="bracket" gradientUnits="userSpaceOnUse" x1="367" y1="226" x2="226" y2="367">
+      <stop offset="0" stop-color="#6243b6"/>
+      <stop offset="0.5" stop-color="#5a44bb"/>
+      <stop offset="1" stop-color="#4290d6"/>
+    </linearGradient>
+    <clipPath id="gap">
+      <path clip-rule="evenodd" d="M0 0H1024V1024H0ZM512 363L661 512L512 661L363 512Z"/>
+    </clipPath>
+    <path id="p-ax-shaft" d="M512 395V232"/>
+    <path id="p-ax-head" clip-path="url(#gap)" d="M482 400V318L454 290L512 232L570 290L542 318V400"/>
+    <path id="p-ax-chev" d="M408 294L512 190L616 294"/>
+    <path id="p-dg-shaft" d="M453.5 453.5L260 260"/>
+    <path id="p-dg-head" d="M458.25 416.75L367 325.5V260H260V367H325.5L408.5 450H348"/>
+    <path id="p-dg-bracket" d="M367 226H226V367"/>
+  </defs>
+  <g fill="none" stroke-width="16" stroke-linejoin="miter" stroke-miterlimit="4">
+    <path stroke="url(#core)" d="M512 448L576 512L512 576L448 512Z"/>
+    <path stroke="url(#core)" d="M512 395L629 512L512 629L395 512Z"/>
+    <g>
+      <use href="#p-ax-shaft" stroke="url(#ax-shaft)"/>
+      <use href="#p-ax-head" stroke="url(#ax-head)"/>
+      <use href="#p-ax-chev" stroke="url(#chev-a)"/>
+      <use href="#p-dg-shaft" stroke="url(#dg-shaft-a)"/>
+      <use href="#p-dg-head" stroke="url(#dg-head-a)"/>
+      <use href="#p-dg-bracket" stroke="url(#bracket)"/>
+    </g>
+    <g transform="rotate(90 512 512)">
+      <use href="#p-ax-shaft" stroke="url(#ax-shaft)"/>
+      <use href="#p-ax-head" stroke="url(#ax-head)"/>
+      <use href="#p-ax-chev" stroke="url(#chev-a)"/>
+      <use href="#p-dg-shaft" stroke="url(#dg-shaft-b)"/>
+      <use href="#p-dg-head" stroke="url(#dg-head-b)"/>
+      <use href="#p-dg-bracket" stroke="url(#bracket)"/>
+    </g>
+    <g transform="rotate(180 512 512)">
+      <use href="#p-ax-shaft" stroke="url(#ax-shaft)"/>
+      <use href="#p-ax-head" stroke="url(#ax-head)"/>
+      <use href="#p-ax-chev" stroke="url(#chev-b)"/>
+      <use href="#p-dg-shaft" stroke="url(#dg-shaft-a)"/>
+      <use href="#p-dg-head" stroke="url(#dg-head-a)"/>
+      <use href="#p-dg-bracket" stroke="url(#bracket)"/>
+    </g>
+    <g transform="rotate(270 512 512)">
+      <use href="#p-ax-shaft" stroke="url(#ax-shaft)"/>
+      <use href="#p-ax-head" stroke="url(#ax-head)"/>
+      <use href="#p-ax-chev" stroke="url(#chev-b)"/>
+      <use href="#p-dg-shaft" stroke="url(#dg-shaft-b)"/>
+      <use href="#p-dg-head" stroke="url(#dg-head-b)"/>
+      <use href="#p-dg-bracket" stroke="url(#bracket)"/>
+    </g>
+  </g>
+</svg>
