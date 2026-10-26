@@ -46,7 +46,7 @@ mod compat;
 /// Nuclei's configuration options reside here.
 pub mod config;
 mod fs;
-mod io;
+pub mod io;
 mod net;
 mod proactor;
 /// Child processes: spawn one, wait for its exit and talk to it through async pipes.
