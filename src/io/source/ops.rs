@@ -97,7 +97,7 @@ impl Want {
 pub(crate) enum Dial {
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(std::path::PathBuf),
+    Unix(crate::io::sys::UnixAddr),
 }
 
 /// The kernel's answer to an operation.

@@ -395,11 +395,10 @@ pub(crate) fn bind_inet(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
         .map(drop)
 }
 
-/// Binds the socket `fd` to the Unix socket path `path`.
-pub(crate) fn bind_unix(fd: RawFd, path: &Path) -> io::Result<()> {
-    let (addr, len) = raw_unix(path)?;
-    // SAFETY: the address is `len` bytes of our own `sockaddr_un`.
-    cvt_int(unsafe { libc::bind(fd, (&addr as *const libc::sockaddr_un).cast(), len) }).map(drop)
+/// Binds the socket `fd` to the Unix socket address `addr`.
+pub(crate) fn bind_unix(fd: RawFd, addr: &UnixAddr) -> io::Result<()> {
+    // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
+    cvt_int(unsafe { libc::bind(fd, addr.as_ptr(), addr.len) }).map(drop)
 }
 
 /// Makes the socket `fd` listen, with room for `backlog` connections not
@@ -417,30 +416,122 @@ pub(crate) fn connect_inet(fd: RawFd, addr: &SocketAddr) -> io::Result<bool> {
     connect_raw(fd, (&storage as *const libc::sockaddr_storage).cast(), len)
 }
 
-/// Starts a connect of a non-blocking Unix socket to `path`, as
+/// Starts a connect of a non-blocking Unix socket to `addr`, as
 /// [`connect_inet`]. A listener whose backlog is full answers `WouldBlock`.
-pub(crate) fn connect_unix(fd: RawFd, path: &Path) -> io::Result<bool> {
-    let (un, len) = raw_unix(path)?;
-    connect_raw(fd, (&un as *const libc::sockaddr_un).cast(), len)
+pub(crate) fn connect_unix(fd: RawFd, addr: &UnixAddr) -> io::Result<bool> {
+    connect_raw(fd, addr.as_ptr(), addr.len)
 }
 
-/// The raw form of the Unix socket address `path`.
-pub(crate) fn raw_unix(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-    // SAFETY: plain data; all zeroes is a valid value.
-    let mut un: libc::sockaddr_un = unsafe { core::mem::zeroed() };
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= un.sun_path.len() || bytes.contains(&0) {
-        return Err(io::Error::new(
+/// A Unix stream connected to `addr` by a connect that waits: what a full
+/// backlog leaves, made on the blocking pool.
+pub(crate) fn connect_unix_waiting(addr: &UnixAddr) -> io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let socket = socket(libc::AF_UNIX, libc::SOCK_STREAM)?;
+    let fd = socket.as_raw_fd();
+    // SAFETY: plain fcntl calls on our own descriptor.
+    unsafe {
+        let flags = cvt_int(libc::fcntl(fd, libc::F_GETFL))?;
+        cvt_int(libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK))?;
+        // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
+        retry(|| cvt_int(libc::connect(fd, addr.as_ptr(), addr.len)))?;
+        cvt_int(libc::fcntl(fd, libc::F_SETFL, flags))?;
+    }
+    Ok(socket)
+}
+
+/// A Unix socket address in its raw form: a path, or on Linux an
+/// abstract name. Made once on the caller's stack and copied by value, so
+/// no send, connect or bind allocates for its address.
+#[derive(Clone, Copy)]
+pub(crate) struct UnixAddr {
+    pub(crate) raw: libc::sockaddr_un,
+    pub(crate) len: libc::socklen_t,
+}
+
+impl UnixAddr {
+    /// The address of the socket file at `path`.
+    pub(crate) fn path(path: &Path) -> io::Result<UnixAddr> {
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the socket path holds a NUL byte",
+            ));
+        }
+        // The path, then its terminating zero.
+        Self::from_bytes(bytes, 1)
+    }
+
+    /// The address in Linux's abstract namespace named `name`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn abstract_name(name: &[u8]) -> io::Result<UnixAddr> {
+        let mut with_nul = [0u8; 108];
+        let len = name.len() + 1;
+        if len > with_nul.len() {
+            return Err(too_long());
+        }
+        with_nul[1..len].copy_from_slice(name);
+        Self::from_bytes(&with_nul[..len], 0)
+    }
+
+    /// The raw form of std's address: a path, or (Linux) an abstract name.
+    pub(crate) fn of(addr: &unix::SocketAddr) -> io::Result<UnixAddr> {
+        if let Some(path) = addr.as_pathname() {
+            return Self::path(path);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            #[cfg(target_os = "android")]
+            use std::os::android::net::SocketAddrExt;
+            #[cfg(target_os = "linux")]
+            use std::os::linux::net::SocketAddrExt;
+            if let Some(name) = addr.as_abstract_name() {
+                return Self::abstract_name(name);
+            }
+        }
+        Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the socket path is too long or holds a NUL byte",
-        ));
+            "an unnamed Unix socket address names no socket",
+        ))
     }
-    un.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (dst, &src) in un.sun_path.iter_mut().zip(bytes) {
-        *dst = src as libc::c_char;
+
+    /// `bytes` in `sun_path`, followed by `extra` counted zero bytes.
+    fn from_bytes(bytes: &[u8], extra: usize) -> io::Result<UnixAddr> {
+        // SAFETY: plain data; all zeroes is a valid value.
+        let mut raw: libc::sockaddr_un = unsafe { core::mem::zeroed() };
+        if bytes.len() + extra > raw.sun_path.len() {
+            return Err(too_long());
+        }
+        raw.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (dst, &src) in raw.sun_path.iter_mut().zip(bytes) {
+            *dst = src as libc::c_char;
+        }
+        let len = core::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + extra;
+        Ok(UnixAddr {
+            raw,
+            len: len as libc::socklen_t,
+        })
     }
-    let len = core::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-    Ok((un, len as libc::socklen_t))
+
+    pub(crate) fn as_ptr(&self) -> *const libc::sockaddr {
+        (&self.raw as *const libc::sockaddr_un).cast()
+    }
+}
+
+fn too_long() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "the socket address is too long",
+    )
+}
+
+impl core::fmt::Debug for UnixAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match unix_addr(&self.raw, self.len) {
+            Ok(addr) => write!(f, "{addr:?}"),
+            Err(_) => f.write_str("(unnamed)"),
+        }
+    }
 }
 
 fn connect_raw(fd: RawFd, addr: *const libc::sockaddr, len: libc::socklen_t) -> io::Result<bool> {
@@ -478,11 +569,22 @@ pub(crate) fn send_to_udp(fd: RawFd, buf: &[u8], addr: SocketAddr) -> io::Result
     retry(|| socket.send_to(buf, addr))
 }
 
-/// A datagram to `path` on a Unix datagram socket.
-pub(crate) fn send_to_unix(fd: RawFd, buf: &[u8], path: &Path) -> io::Result<usize> {
-    // SAFETY: see `borrow`; the fd is a Unix datagram socket.
-    let socket = unsafe { borrow::<UnixDatagram>(fd) };
-    retry(|| socket.send_to(buf, path))
+/// A datagram to `addr` on a Unix datagram socket.
+pub(crate) fn send_to_unix(fd: RawFd, buf: &[u8], addr: &UnixAddr) -> io::Result<usize> {
+    retry(|| {
+        // SAFETY: reads at most `buf.len()` bytes; the address is `len`
+        // bytes of the caller's `sockaddr_un`.
+        cvt(unsafe {
+            libc::sendto(
+                fd,
+                buf.as_ptr().cast(),
+                buf.len(),
+                SEND_FLAGS,
+                addr.as_ptr(),
+                addr.len,
+            )
+        })
+    })
 }
 
 /// A Unix socket address from its raw form: a path, an abstract name

@@ -50,8 +50,6 @@ use std::io;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::net as unix;
-#[cfg(unix)]
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::{Poll, Wake};
 
@@ -217,7 +215,7 @@ pub(crate) enum Target {
     Connected,
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(PathBuf),
+    Unix(crate::io::sys::UnixAddr),
 }
 
 /// An error kept to be reported again: the kernel's code, or its kind.

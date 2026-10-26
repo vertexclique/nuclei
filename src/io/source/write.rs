@@ -28,8 +28,6 @@ use std::io;
 use std::net::SocketAddr;
 #[cfg(readiness)]
 use std::os::fd::RawFd;
-#[cfg(unix)]
-use std::path::Path;
 use std::sync::Arc;
 use std::task::Context;
 
@@ -45,10 +43,10 @@ mod ops;
 /// one buffer rather than waiting on each.
 const BEHIND_MIN: usize = 16 * 1024;
 
-/// A Unix socket's path, borrowed; on Windows, which has none, nothing can
-/// be one.
+/// A Unix socket's address, borrowed; on Windows, which has none, nothing
+/// can be one.
 #[cfg(unix)]
-pub(crate) type UnixPath<'a> = &'a Path;
+pub(crate) type UnixPath<'a> = &'a crate::io::sys::UnixAddr;
 #[cfg(windows)]
 pub(crate) type UnixPath<'a> = (core::convert::Infallible, core::marker::PhantomData<&'a ()>);
 
@@ -67,7 +65,7 @@ impl Dest<'_> {
             Dest::Connected => Target::Connected,
             Dest::Inet(addr) => Target::Inet(addr),
             #[cfg(unix)]
-            Dest::Unix(path) => Target::Unix(path.to_path_buf()),
+            Dest::Unix(addr) => Target::Unix(*addr),
             #[cfg(windows)]
             Dest::Unix((never, _)) => match never {},
         }
@@ -711,7 +709,7 @@ impl WriteState {
                     self.dial = Some(match peer {
                         Peer::Inet(addr) => super::ops::Dial::Inet(addr),
                         #[cfg(unix)]
-                        Peer::Unix(path) => super::ops::Dial::Unix(path.to_path_buf()),
+                        Peer::Unix(addr) => super::ops::Dial::Unix(*addr),
                         #[cfg(windows)]
                         Peer::Unix((never, _)) => match never {},
                     });

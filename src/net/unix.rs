@@ -1,4 +1,5 @@
-//! Unix domain sockets: listeners, streams and datagrams.
+//! Unix domain sockets: listeners, streams and datagrams, and [`UCred`], the
+//! credentials of a stream's peer.
 
 use core::future::poll_fn;
 use core::pin::Pin;
@@ -12,7 +13,90 @@ use futures_core::Stream;
 
 use crate::io::source::write::{Dest, Peer};
 use crate::io::source::{Addr, Kind};
-use crate::io::{Handle, sys};
+use crate::io::sys::UnixAddr;
+use crate::io::{Handle, IoObject, sys};
+
+/// The credentials of a Unix stream's peer: its user and group, and its
+/// process where the system tells it (Linux, Android, macOS, iOS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UCred {
+    uid: u32,
+    gid: u32,
+    pid: Option<i32>,
+}
+
+impl UCred {
+    /// The peer's user id.
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    /// The peer's group id.
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    /// The peer's process id, where the system tells it.
+    pub fn pid(&self) -> Option<i32> {
+        self.pid
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_cred(fd: std::os::fd::RawFd) -> io::Result<UCred> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED answers a `ucred`, written into our own.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            core::ptr::from_mut(&mut cred).cast(),
+            &mut len,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(UCred {
+        uid: cred.uid,
+        gid: cred.gid,
+        pid: Some(cred.pid),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_cred(fd: std::os::fd::RawFd) -> io::Result<UCred> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: the call writes the two ids into our own.
+    if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let pid = {
+        let mut pid: libc::pid_t = 0;
+        let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: LOCAL_PEERPID answers a `pid_t`, written into our own.
+        let r = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                core::ptr::from_mut(&mut pid).cast(),
+                &mut len,
+            )
+        };
+        (r == 0).then_some(pid)
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let pid = None;
+    Ok(UCred { uid, gid, pid })
+}
 
 fn unix(addr: Addr) -> io::Result<UnixSocketAddr> {
     match addr {
@@ -32,6 +116,16 @@ impl Handle<UnixListener> {
     /// As [`UnixListener::bind`].
     pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixListener>> {
         Handle::adopt(UnixListener::bind(path)?, Kind::UnixListener)
+    }
+
+    /// A listener bound to `addr`: a path, or on Linux a name in the
+    /// abstract namespace.
+    ///
+    /// # Errors
+    ///
+    /// As [`UnixListener::bind_addr`].
+    pub fn bind_addr(addr: &UnixSocketAddr) -> io::Result<Handle<UnixListener>> {
+        Handle::adopt(UnixListener::bind_addr(addr)?, Kind::UnixListener)
     }
 
     /// The next connection, with its peer's address.
@@ -80,6 +174,28 @@ impl Stream for Incoming<'_> {
     }
 }
 
+/// The connect of the non-blocking Unix stream `socket` to `addr`.
+pub(super) async fn connect(socket: OwnedFd, addr: &UnixAddr) -> io::Result<Handle<UnixStream>> {
+    let stream = Handle::from_nonblocking(UnixStream::from(socket), Kind::Stream);
+    match poll_fn(|cx| stream.source().poll_connect(cx, Peer::Unix(addr))).await {
+        Ok(()) => Ok(stream),
+        // The listener's backlog is full: nothing tells a socket when it
+        // has room, so a thread of the blocking pool waits in a blocking
+        // connect instead.
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            drop(stream);
+            let addr = *addr;
+            let connected =
+                crate::rt::blocking::call(move || sys::connect_unix_waiting(&addr)).await?;
+            Ok(Handle::from_nonblocking(
+                UnixStream::from(connected),
+                Kind::Stream,
+            ))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 impl Handle<UnixStream> {
     /// A stream connected to the listener at `path`.
     ///
@@ -87,26 +203,35 @@ impl Handle<UnixStream> {
     ///
     /// As `connect(2)`.
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Handle<UnixStream>> {
-        let stream = Handle::from_nonblocking(
-            UnixStream::from(sys::socket(libc::AF_UNIX, libc::SOCK_STREAM)?),
-            Kind::Stream,
-        );
-        let peer = Peer::Unix(path.as_ref());
-        match poll_fn(|cx| stream.source().poll_connect(cx, peer)).await {
-            Ok(()) => Ok(stream),
-            // The listener's backlog is full: nothing tells a socket when it
-            // has room, so a thread of the blocking pool waits in a blocking
-            // connect instead.
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                drop(stream);
-                let path = path.as_ref().to_path_buf();
-                let connected = crate::runtime::spawn_blocking(move || UnixStream::connect(path))
-                    .await
-                    .inspect_err(crate::rt::counters::io_error)?;
-                Handle::adopt(connected, Kind::Stream)
-            }
-            Err(err) => Err(err),
-        }
+        connect(
+            sys::socket(libc::AF_UNIX, libc::SOCK_STREAM)?,
+            &UnixAddr::path(path.as_ref())?,
+        )
+        .await
+    }
+
+    /// A stream connected to the listener at `addr`: a path, or on Linux a
+    /// name in the abstract namespace.
+    ///
+    /// # Errors
+    ///
+    /// As `connect(2)`; an unnamed address names no listener.
+    pub async fn connect_addr(addr: &UnixSocketAddr) -> io::Result<Handle<UnixStream>> {
+        connect(
+            sys::socket(libc::AF_UNIX, libc::SOCK_STREAM)?,
+            &UnixAddr::of(addr)?,
+        )
+        .await
+    }
+
+    /// The credentials of the process at the other end, as the connection
+    /// was made.
+    ///
+    /// # Errors
+    ///
+    /// When the system cannot tell them.
+    pub fn peer_cred(&self) -> io::Result<UCred> {
+        peer_cred(self.raw_io())
     }
 
     /// Two streams connected to each other.
@@ -160,6 +285,29 @@ impl Handle<UnixDatagram> {
         Handle::adopt(UnixDatagram::bind(path)?, Kind::UnixDatagram)
     }
 
+    /// A socket bound to `addr`: a path, or on Linux a name in the abstract
+    /// namespace.
+    ///
+    /// # Errors
+    ///
+    /// As [`UnixDatagram::bind_addr`].
+    pub fn bind_addr(addr: &UnixSocketAddr) -> io::Result<Handle<UnixDatagram>> {
+        Handle::adopt(UnixDatagram::bind_addr(addr)?, Kind::UnixDatagram)
+    }
+
+    /// A socket bound to no address: it sends with `send_to`, or to the peer
+    /// its `connect` names.
+    ///
+    /// # Errors
+    ///
+    /// When the system has no socket to give.
+    pub fn unbound() -> io::Result<Handle<UnixDatagram>> {
+        Ok(Handle::from_nonblocking(
+            UnixDatagram::from(sys::socket(libc::AF_UNIX, libc::SOCK_DGRAM)?),
+            Kind::UnixDatagram,
+        ))
+    }
+
     /// Two sockets connected to each other.
     ///
     /// # Errors
@@ -207,8 +355,8 @@ impl Handle<UnixDatagram> {
     ///
     /// As `sendto(2)`, or an earlier datagram's.
     pub async fn send_to<P: AsRef<Path>>(&self, buf: &[u8], path: P) -> io::Result<usize> {
-        let path = path.as_ref();
-        poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Unix(path))).await
+        let addr = UnixAddr::path(path.as_ref())?;
+        poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Unix(&addr))).await
     }
 
     /// Receives a datagram with its sender's address.

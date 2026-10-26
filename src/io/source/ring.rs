@@ -202,25 +202,24 @@ impl RawAddr {
         Box::new(Self { storage, len })
     }
 
-    pub(crate) fn unix(path: &std::path::Path) -> io::Result<Box<Self>> {
-        let (un, len) = sys::raw_unix(path)?;
+    pub(crate) fn unix(addr: &sys::UnixAddr) -> Box<Self> {
         let mut raw = Self::empty();
         // SAFETY: `sockaddr_storage` is large and aligned enough for any
-        // address; `un` is plain data.
+        // address; the address is plain data.
         unsafe {
             core::ptr::write(
                 (&mut raw.storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_un>(),
-                un,
+                addr.raw,
             )
         };
-        raw.len = len;
-        Ok(raw)
+        raw.len = addr.len;
+        raw
     }
 
     fn of(dial: &Dial) -> io::Result<Box<Self>> {
         match dial {
             Dial::Inet(addr) => Ok(Self::inet(addr)),
-            Dial::Unix(path) => Self::unix(path),
+            Dial::Unix(addr) => Ok(Self::unix(addr)),
         }
     }
 
@@ -598,17 +597,7 @@ fn entry(
             let to = match &target {
                 Target::Connected => None,
                 Target::Inet(addr) => Some(RawAddr::inet(addr)),
-                Target::Unix(path) => match RawAddr::unix(path) {
-                    Ok(addr) => Some(addr),
-                    Err(err) => {
-                        crate::rt::counters::io_error(&err);
-                        return Err(Box::new(Outcome::SendTo(
-                            buf,
-                            target,
-                            Answer::Done(Err(err)),
-                        )));
-                    }
-                },
+                Target::Unix(addr) => Some(RawAddr::unix(addr)),
             };
             let bytes = buf.filled();
             let msg = Msg::new(bytes.as_ptr().cast_mut(), bytes.len(), to);

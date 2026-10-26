@@ -34,7 +34,7 @@ mod stream;
 mod tcp;
 mod udp;
 #[cfg(unix)]
-mod unix;
+pub mod unix;
 #[cfg(unix)]
 mod unix_socket;
 

@@ -5,14 +5,12 @@
 //!
 //! As [`TcpSocket`](super::TcpSocket), it is its descriptor alone.
 
-use core::future::poll_fn;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::path::Path;
 
 use crate::io::source::Kind;
-use crate::io::source::write::Peer;
 use crate::io::{Handle, sys};
 
 /// A Unix domain socket, of streams or of datagrams, to bind before it
@@ -76,7 +74,10 @@ impl UnixSocket {
     ///
     /// As `bind(2)`: the path exists, or is too long.
     pub fn bind(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        sys::bind_unix(self.socket.as_raw_fd(), path.as_ref())
+        sys::bind_unix(
+            self.socket.as_raw_fd(),
+            &sys::UnixAddr::path(path.as_ref())?,
+        )
     }
 
     /// Makes a socket of streams a listener, with room for `backlog`
@@ -107,9 +108,7 @@ impl UnixSocket {
                 "a socket of datagrams connects as a datagram socket",
             ));
         }
-        let stream = Handle::from_nonblocking(UnixStream::from(self.socket), Kind::Stream);
-        poll_fn(|cx| stream.source().poll_connect(cx, Peer::Unix(path.as_ref()))).await?;
-        Ok(stream)
+        super::unix::connect(self.socket, &sys::UnixAddr::path(path.as_ref())?).await
     }
 
     /// Makes a socket of datagrams a datagram socket, bound or not.
