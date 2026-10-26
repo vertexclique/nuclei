@@ -179,5 +179,9 @@ impl Drop for Shard {
                 break;
             }
         }
+        // The inbox's taker's role goes, looking at the inbox once more: a
+        // pusher that saw the flag while the role was held left its
+        // runnable to this drain.
+        self.shared.drop_stopped(true);
     }
 }

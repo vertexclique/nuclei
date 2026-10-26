@@ -20,3 +20,6 @@ MS_no_pusher_drop              MC_ShardStop         violated:NothingLeft
 MS_one_pass                    MC_ShardStop         violated:NothingLeft
 WS_pusher_drain                MC_ShardStop         violated:NoPusherDrain
 WS_second_pass                 MC_ShardStop         violated:NoSecondPass
+MS_no_role                     MC_ShardStop         violated:OneTaker
+MS_no_look_again               MC_ShardStop         violated:NothingLeft
+WS_hand_back                   MC_ShardStop         violated:NoHandBack

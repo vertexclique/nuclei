@@ -156,6 +156,26 @@ impl Runnable {
         unsafe { self.ptr.cast::<Header>().as_ref() }
     }
 
+    /// The task's inbox link, keeping the reference:
+    /// [`from_link`](Self::from_link) makes the runnable again.
+    pub(crate) fn into_link(self) -> NonNull<crate::rt::inbox::Link> {
+        let header = self.into_raw().cast::<Header>();
+        // SAFETY: a field of the live header the reference keeps.
+        unsafe { NonNull::new_unchecked(&raw mut (*header.as_ptr()).link) }
+    }
+
+    /// # Safety
+    ///
+    /// `link` came from [`into_link`](Self::into_link), whose reference the
+    /// runnable takes over.
+    pub(crate) unsafe fn from_link(link: NonNull<crate::rt::inbox::Link>) -> Self {
+        let offset = core::mem::offset_of!(Header, link);
+        // SAFETY: the link is the `link` field of a task's header.
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(link.as_ptr().cast::<u8>().sub(offset).cast()) },
+        }
+    }
+
     /// Polls the task's future once. Returns true when the task woke itself
     /// during the poll and was handed to its schedule again.
     pub(crate) fn run(self) -> bool {

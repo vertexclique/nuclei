@@ -42,6 +42,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::inbox::{Inbox, Pop};
 use kovan_queue::seg_queue::SegQueue;
 
 use self::signal::Signal;
@@ -89,12 +90,15 @@ pub(crate) const PUBLISH_INTERVAL: u32 = 8;
 
 /// The part of a shard any thread may touch.
 pub(crate) struct Shared {
-    /// Runnables of `Send` tasks pushed by other threads.
-    inbox: SegQueue<Runnable>,
+    /// Runnables of `Send` tasks pushed by other threads, linked through
+    /// the tasks (see `rt::inbox`). Its taker is the shard, and once the
+    /// shard stopped whoever drains it.
+    inbox: Inbox,
     /// Runnables of tasks bound to this shard's thread, pushed by others.
     /// Kept apart: if the shard is gone, they are leaked rather than dropped
-    /// on a thread their future may not be dropped on.
-    local_inbox: SegQueue<Runnable>,
+    /// on a thread their future may not be dropped on. The shard alone takes
+    /// from it.
+    local_inbox: Inbox,
     park: ParkState,
     notifier: Notifier,
     /// Live tasks placed on the shard: what placement compares.
@@ -165,15 +169,13 @@ impl Shared {
         } else {
             self.inbox.push(runnable);
             // A shard that stopped runs nothing more, and its last drain of
-            // the inbox may be over: what is pushed then is dropped here (its
+            // the inbox may be over: what is pushed then is dropped (its
             // future may be dropped on any thread), or it would keep itself
             // and, through its schedule, the shard for good. The push and the
             // flag's store are both sequentially consistent: either the
             // drain finds it, or this sees the flag.
             if self.stopped.load(Ordering::SeqCst) {
-                while let Ok(runnable) = self.inbox.try_pop() {
-                    drop(runnable);
-                }
+                self.drop_stopped(false);
                 return;
             }
         }
@@ -229,8 +231,16 @@ impl Shared {
         format!(
             "parked {}, inbox {}, local inbox {}, timer ops {}, io ops {}, load {}, stopped {}, draining {}",
             self.park.is_parked(),
-            self.inbox.len(),
-            self.local_inbox.len(),
+            if self.inbox.is_empty() {
+                "empty"
+            } else {
+                "not empty"
+            },
+            if self.local_inbox.is_empty() {
+                "empty"
+            } else {
+                "not empty"
+            },
             self.timer_ops.len(),
             self.io_ops.len(),
             self.load.load(Ordering::SeqCst),
@@ -334,6 +344,28 @@ impl Shared {
         self.parks.load(Ordering::SeqCst)
     }
 
+    /// Drops what the inbox of a stopped shard holds, while this thread
+    /// holds the inbox's taker's role (`holding`: it holds it already).
+    /// Each drainer looks again after it lets go, and takes the role back
+    /// if something came: a push that found the role held is not left
+    /// (proofs/tla/park, `ShardStop`).
+    pub(crate) fn drop_stopped(&self, mut holding: bool) {
+        loop {
+            if !holding && !self.inbox.try_take() {
+                return;
+            }
+            // SAFETY: the role is this thread's.
+            unsafe {
+                self.inbox.drain(drop);
+                self.inbox.release();
+            }
+            holding = false;
+            if self.inbox.is_empty() {
+                return;
+            }
+        }
+    }
+
     fn has_remote_work(&self) -> bool {
         !self.inbox.is_empty()
             || !self.local_inbox.is_empty()
@@ -347,9 +379,8 @@ impl Drop for Shared {
         // A runnable of a thread-bound task pushed after its shard was gone:
         // its future may only be dropped on that thread, which has exited,
         // so the task is leaked instead.
-        while let Ok(runnable) = self.local_inbox.try_pop() {
-            core::mem::forget(runnable);
-        }
+        // SAFETY: the shard is gone; nothing else reaches the queue.
+        unsafe { self.local_inbox.drain(core::mem::forget) };
     }
 }
 
@@ -492,8 +523,8 @@ impl Shard {
         };
         let pool = Pool::new(limits.buffer_cap);
         let shared = Arc::new(Shared {
-            inbox: SegQueue::new(),
-            local_inbox: SegQueue::new(),
+            inbox: Inbox::new(),
+            local_inbox: Inbox::new(),
             park: ParkState::new(),
             notifier,
             load: AtomicUsize::new(0),
@@ -667,12 +698,19 @@ impl Shard {
     }
 
     fn pop_inbox(&self) -> Option<Runnable> {
-        let runnable = self
-            .shared
-            .inbox
-            .try_pop()
-            .or_else(|_| self.shared.local_inbox.try_pop())
-            .ok()?;
+        // SAFETY: the shard holds both inboxes' taker's role until it goes
+        // (`stop` lets go of the inbox's, last).
+        let popped = unsafe {
+            match self.shared.inbox.pop() {
+                Pop::Task(runnable) => Some(runnable),
+                // A push under way counts as work: the loop comes back.
+                Pop::Empty | Pop::Busy => match self.shared.local_inbox.pop() {
+                    Pop::Task(runnable) => Some(runnable),
+                    Pop::Empty | Pop::Busy => None,
+                },
+            }
+        };
+        let runnable = popped?;
         self.remote_wakes.set(self.remote_wakes.get() + 1);
         Some(runnable)
     }

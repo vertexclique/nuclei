@@ -282,12 +282,35 @@ the work, a notification that lands while the shard is awake, a timer fired on t
 park). `ShardStop.tla` checks a shard that stops while other threads push to it: a pusher
 that sees the shard stopped drops what its inbox holds, and the stopping shard drains pass
 after pass until nothing more comes (a timer's waker, a channel its tasks held), so no
-runnable is left to keep itself and the shard for good: 2 that must pass, 3 mutations that
-break `NothingLeft` (a pusher looking before it pushes, one that leaves its runnable, a single
-drain pass), and 2 witnesses. TLA+ steps are
+runnable is left to keep itself and the shard for good. The inbox has one taker at a time:
+the shard holds the role until its last pass, a pusher drains only if it takes the role, and
+every drainer looks at the inbox again after it lets go. 2 that must pass (with `OneTaker`,
+only the role's holder takes), 5 mutations (a pusher looking before it pushes, one that leaves
+its runnable, a single drain pass, and a drainer that lets go without looking again break
+`NothingLeft`; a pusher draining without the role breaks `OneTaker`), and 3 witnesses (a
+pusher that drains, a second pass, a drainer taking the role back). TLA+ steps are
 sequentially consistent, so the model checks the protocol; the loom models in
 `src/rt/handshake.rs` check the code, with two calibrations that must lose a wake (no look
 after publishing; the pair relaxed with no fence).
+
+## A shard's inbox
+
+`inbox` (`tla/inbox/Inbox.tla`) checks the queue other threads hand a shard its runnables
+through (`src/rt/inbox.rs`), linked through the tasks so a push allocates nothing, with the
+shard's park around it, at the grain of each atomic access. A pusher clears its task's link,
+swaps it in as the head, links the old head to it, then wakes the shard if it parks; each task
+is in the queue at most once and is pushed again as soon as it was taken. The shard walks from
+its own end past a stub node, hands a task out only once it read the task's link, and pushes
+the stub behind the last task before handing it out; between a push's swap and its link the
+queue is busy. Empty is the head on the stub, which the shard looks at once more after it says
+it parks. 9 configurations: 3 that must pass (two pushers three rounds each, three pushers two
+rounds each, liveness), with `NoDuplicate` (no task handed out that is not queued), `Counted`,
+`EmptyAtSleep` (a shard asleep with the head on the stub has no task queued) and no deadlock;
+3 mutations (a pusher that leaves its task's old link, and a last task handed out with the
+shard's end left on it, break `NoDuplicate`; sleeping without the look again deadlocks); and 3
+witnesses (a busy queue, the stub pushed behind the last task, a sleep a push ends). TLA+ is
+sequentially consistent: the unit tests in `src/rt/inbox.rs` run four pushing threads against
+the taker.
 
 ## The remote wake handshake on a store buffer
 

@@ -24,6 +24,9 @@ pub(super) struct Header {
     pub(super) vtable: &'static TaskVTable,
     /// The task's id, unique in the process.
     pub(super) id: super::Id,
+    /// Its place in a shard's inbox, which it is in at most once (see
+    /// `rt::inbox`).
+    pub(super) link: crate::rt::inbox::Link,
 }
 
 /// The next task id: ids start at 1 and are never reused (a `u64` does not
@@ -40,6 +43,7 @@ impl Header {
             awaiter: UnsafeCell::new(None),
             vtable,
             id: super::Id(core::num::NonZeroU64::new(id).unwrap_or(core::num::NonZeroU64::MIN)),
+            link: crate::rt::inbox::Link::new(),
         }
     }
 
