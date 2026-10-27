@@ -1,16 +1,18 @@
-TLC run of every configuration in proofs/tla/inbox, 2026-10-26 23:22 UTC.
+TLC run of every configuration in proofs/tla/inbox, 2026-10-27 15:28 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-I_safe                          894295     347036      2  pass                                  pass                                  yes
-I_three                       51858609   15609642     31  pass                                  pass                                  yes
-I_live                          894295     347036      8  pass                                  pass                                  yes
-MI_no_reset                      39275      16595      1  violated:NoDuplicate                  violated:NoDuplicate                  yes
-MI_take_last                      5004       2133      1  violated:NoDuplicate                  violated:NoDuplicate                  yes
-MI_no_recheck                     4003       1728      1  deadlock                              deadlock                              yes
+I_safe                         1145479     445564      2  pass                                  pass                                  yes
+I_three                       70777761   21366870     40  pass                                  pass                                  yes
+I_live                         1145479     445564     10  pass                                  pass                                  yes
+MI_no_reset                      38197      16137      2  violated:NoDuplicate                  violated:NoDuplicate                  yes
+MI_take_last                      5144       2175      1  violated:NoDuplicate                  violated:NoDuplicate                  yes
+MI_no_recheck                     3837       1694      1  deadlock                              deadlock                              yes
+MI_head_only                      6273       2678      1  violated:EmptyAtSleep                 violated:EmptyAtSleep                 yes
 WI_busy                            194         96      1  violated:NoBusy                       violated:NoBusy                       yes
-WI_restub                         2284        995      1  violated:NoRestub                     violated:NoRestub                     yes
-WI_sleep                           940        443      1  violated:NoSleep                      violated:NoSleep                      yes
+WI_restub                         2358       1033      1  violated:NoRestub                     violated:NoRestub                     yes
+WI_sleep                           946        449      0  violated:NoSleep                      violated:NoSleep                      yes
+WI_hidden                         6213       2644      1  violated:NoHidden                     violated:NoHidden                     yes
 
-results matching EXPECTED.txt: 9 of 9
+results matching EXPECTED.txt: 11 of 11

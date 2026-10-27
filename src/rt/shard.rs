@@ -366,6 +366,9 @@ impl Shared {
         }
     }
 
+    /// Whether work was handed to the shard, as any thread sees it (for a
+    /// paused clock deciding whether the shard is idle); its own thread looks
+    /// with [`Shard::has_remote_work`].
     fn has_remote_work(&self) -> bool {
         !self.inbox.is_empty()
             || !self.local_inbox.is_empty()
@@ -715,6 +718,19 @@ impl Shard {
         Some(runnable)
     }
 
+    /// Whether other threads handed the shard work it has not taken yet, as
+    /// the taker of its inboxes sees it: the look of its spin and the one a
+    /// park makes once more. [`Shared::has_remote_work`], a look from any
+    /// thread, misses the tasks this shard's last pop left behind its end
+    /// as it put an inbox's stub back ([`Inbox::is_drained`]).
+    fn has_remote_work(&self) -> bool {
+        let shared = &self.shared;
+        // SAFETY: the shard holds both inboxes' taker's role until it goes
+        // (`stop` lets go of the inbox's, last).
+        let drained = unsafe { shared.inbox.is_drained() && shared.local_inbox.is_drained() };
+        !drained || !shared.timer_ops.is_empty() || !shared.io_ops.is_empty()
+    }
+
     /// Runnables queued on this thread now, the LIFO slot's included.
     fn queued(&self) -> usize {
         let lifo = self.lifo.take();
@@ -937,7 +953,7 @@ impl Shard {
             // The spin looks at the poller too: IO that comes within it
             // costs neither a park nor the kernel's wake of this thread.
             if self.spin.run(|| {
-                shared.has_remote_work()
+                self.has_remote_work()
                     || signal.woken.load(Ordering::Relaxed)
                     || self.io_ready_now()
             }) {
@@ -946,7 +962,7 @@ impl Shard {
             self.before_park();
             if shared
                 .park
-                .begin_park(|| shared.has_remote_work() || signal.woken.load(Ordering::SeqCst))
+                .begin_park(|| self.has_remote_work() || signal.woken.load(Ordering::SeqCst))
             {
                 let slept = Instant::now();
                 if let Some(park) = &self.tuning.hooks.park {
@@ -979,7 +995,7 @@ impl Shard {
         if quiet {
             self.before_park();
         }
-        let sleeps = quiet && shared.park.begin_park(|| shared.has_remote_work());
+        let sleeps = quiet && shared.park.begin_park(|| self.has_remote_work());
         let wait = if sleeps || wait == Some(Duration::ZERO) {
             wait
         } else {

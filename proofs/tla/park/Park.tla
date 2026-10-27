@@ -23,8 +23,11 @@
 (* not begun ends as soon as it does.                                      *)
 (*                                                                          *)
 (* What is abstract: the inbox is a count (the order of work does not     *)
-(* matter here); the poller is one flag that a notification raises and a   *)
-(* wait lowers (an eventfd's counter, collapsed).                          *)
+(* matter here), which the shard's look reads exactly: that its look at   *)
+(* the real queue does (both ends, not the head alone) is checked in      *)
+(* `inbox` (EmptyAtSleep, MI_head_only); the poller is one flag that a     *)
+(* notification raises and a wait lowers (an eventfd's counter,           *)
+(* collapsed).                                                             *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 

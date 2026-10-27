@@ -12,9 +12,13 @@
 (* read the node's link; the last node is handed out only after the stub   *)
 (* is pushed behind it, so the shard's end never points at a task it gave  *)
 (* away. Between a push's swap and its link the queue is busy: not empty,  *)
-(* nothing to take yet. The queue is empty exactly when its head is the    *)
-(* stub, which is what the shard looks at once more after it says it      *)
-(* parks. A task popped may be pushed again at once, and is, here.        *)
+(* nothing to take yet. A pop that hands out nothing, the queue empty or   *)
+(* busy, sends the shard on to its park, as the code's loop does. There it *)
+(* says it parks and looks once more, at both ends: a head on the stub is  *)
+(* not enough, as the stub is the head while the shard's own pop puts it   *)
+(* back behind the last task with a push that swapped in just before it   *)
+(* still linking, both tasks behind the shard's end. A task popped may be  *)
+(* pushed again at once, and is, here.                                     *)
 (*                                                                          *)
 (* What is abstract: a task is its node; the wake is the park handshake's *)
 (* (checked in `park`): a pusher that finds the flag raised lowers it.     *)
@@ -43,6 +47,7 @@ variables
     dup = FALSE,                          \* (record) a task was handed out that was not queued
     busySeen = FALSE,                     \* (record) the shard found the queue busy
     restubbed = FALSE,                    \* (record) the shard pushed the stub behind the last task
+    hidden = FALSE,                       \* (record) the park's look found tasks behind the shard's end, the head on the stub
     slept = FALSE;                        \* (record) the shard slept and was woken
 
 define
@@ -87,12 +92,10 @@ S_read:
 S_stub:
         if cur = Stub then
             if nx = Null then
-                if head = Stub then
-                    goto S_park;
-                else
+                if head # Stub then
                     busySeen := TRUE;
-                    goto S_loop;
                 end if;
+                goto S_park;
             end if;
 S_past_stub:
             tail := nx;
@@ -109,7 +112,7 @@ S_head:
         hd := head;
         if cur # hd then
             busySeen := TRUE;
-            goto S_loop;
+            goto S_park;
         end if;
 S_last:
         \* MUTATION take_last: the last task is handed out with the shard's
@@ -132,7 +135,7 @@ S_reread:
             goto S_take;
         else
             busySeen := TRUE;
-            goto S_loop;
+            goto S_park;
         end if;
 S_take:
         if ~queued[cur] then
@@ -144,8 +147,14 @@ S_take:
 S_park:
         parked := TRUE;
 S_recheck:
+        \* The shard alone moves its end, so it reads it with the head.
         \* MUTATION no_recheck: the shard sleeps without looking again.
-        if head # Stub /\ Mutation # "no_recheck" then
+        \* MUTATION head_only: the look is at the head alone.
+        if Mutation # "no_recheck"
+           /\ (head # Stub \/ (tail # Stub /\ Mutation # "head_only")) then
+            if head = Stub then
+                hidden := TRUE;
+            end if;
             parked := FALSE;
             goto S_loop;
         end if;
@@ -189,6 +198,9 @@ AllTaken == <>Done
 NoBusy == ~busySeen
 \* The shard pushes the stub behind the last task.
 NoRestub == ~restubbed
+\* The park's look finds tasks behind the shard's end with the head on the
+\* stub: the case a look at the head alone sleeps through.
+NoHidden == ~hidden
 \* The shard sleeps and a push wakes it.
 NoSleep == ~slept
 =============================================================================

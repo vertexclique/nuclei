@@ -15,13 +15,16 @@
 //! it, so the taker's end never points at a task it gave away.
 //!
 //! Between a push's swap and its link the queue is busy: not empty, but with
-//! nothing to take yet ([`Pop::Busy`]). It is empty exactly when its head is
-//! the stub ([`Inbox::is_empty`]), which is the look a shard makes once more
-//! after it says it parks; the swap and that look are both sequentially
-//! consistent, so either the look sees the push or the pusher sees the park.
-//! proofs/tla/inbox checks the queue and its park at the grain of these
-//! steps, and proofs/tla/park (`ShardStop`) the taker's role once the shard
-//! stopped.
+//! nothing to take yet ([`Pop::Busy`]). A head on the stub says the queue is
+//! empty ([`Inbox::is_empty`]) to any thread but while the taker puts the
+//! stub back: then the stub is the head while a push that swapped in just
+//! before it may still link the last task to its own, both behind the
+//! taker's end. So the taker looks at both ends ([`Inbox::is_drained`]): that
+//! is the look a shard makes once more after it says it parks. The swap and
+//! the look at the head are both sequentially consistent, so either the look
+//! sees the push or the pusher sees the park. proofs/tla/inbox checks the
+//! queue and its park at the grain of these steps, and proofs/tla/park
+//! (`ShardStop`) the taker's role once the shard stopped.
 
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
@@ -143,9 +146,24 @@ impl<T: Linked> Inbox<T> {
     }
 
     /// Whether the queue holds nothing, a push under way counting as
-    /// something. Any thread may look.
+    /// something. Any thread may look; while the taker puts the stub back,
+    /// this says empty with tasks still behind the taker's end, which only
+    /// [`is_drained`](Self::is_drained) sees.
     pub(crate) fn is_empty(&self) -> bool {
         self.head.load(Ordering::SeqCst) == self.stub()
+    }
+
+    /// Whether the queue holds nothing, as its taker sees it: both ends on
+    /// the stub. A push under way counts as something, and so do the tasks a
+    /// pop left behind the taker's end as it put the stub back.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds the taker's role.
+    pub(crate) unsafe fn is_drained(&self) -> bool {
+        // SAFETY: the role's holder alone reaches the taker's end.
+        let tail = self.tail.with(|tail| unsafe { *tail });
+        tail == self.stub() && self.is_empty()
     }
 
     /// Takes the next item.
@@ -306,6 +324,53 @@ mod tests {
             r.run();
         }
         assert_eq!(*log.lock().unwrap(), [1, 2, 3, 5, 4]);
+    }
+
+    /// The state that lost a shard's wake: the taker put the stub back behind
+    /// the last task while a push that swapped in just before it had not
+    /// linked yet. The head is the stub, so the queue looks empty from any
+    /// thread, with both tasks still in it; its taker sees them.
+    #[test]
+    fn a_push_racing_the_stub_put_back_is_seen_by_the_taker() {
+        let log = Log::default();
+        let inbox: Inbox = Inbox::new();
+        let stub = inbox.stub();
+        inbox.push(task(&log, 1));
+        // SAFETY: the steps of a pop and of a push, one at a time, by the
+        // only thread; the test holds the role.
+        unsafe {
+            // The pop: past the stub, onto the last task, the head on it.
+            let last = inbox.head.load(Ordering::SeqCst);
+            inbox.tail.with_mut(|tail| *tail = last);
+            // The push swaps in before the taker puts the stub back.
+            let pushed = task(&log, 2).into_link();
+            pushed
+                .as_ref()
+                .next
+                .store(ptr::null_mut(), Ordering::Relaxed);
+            let prev = inbox.head.swap(pushed.as_ptr(), Ordering::SeqCst);
+            assert_eq!(prev, last);
+            // The taker puts the stub back, then finds the last task's link
+            // still empty: busy.
+            inbox.push_link(NonNull::new_unchecked(stub));
+            assert!((*last).next.load(Ordering::Acquire).is_null());
+            let looks = (inbox.is_empty(), inbox.is_drained());
+            // The push links (before the checks, so a failed one leaves a
+            // whole queue to drop).
+            (*prev).next.store(pushed.as_ptr(), Ordering::Release);
+            assert!(looks.0, "the head is the stub");
+            assert!(!looks.1, "the taker sees the two tasks behind its end");
+        }
+        // Both come out, in order, and then nothing.
+        let mut taken = 0;
+        while let Some(r) = take(&inbox) {
+            r.run();
+            taken += 1;
+        }
+        assert_eq!(taken, 2);
+        assert_eq!(*log.lock().unwrap(), [1, 2]);
+        // SAFETY: the test holds the role.
+        assert!(unsafe { inbox.is_drained() });
     }
 
     #[test]
