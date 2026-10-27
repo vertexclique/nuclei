@@ -13,3 +13,5 @@ examples/target
 /site/api.md
 /site/api/
 __pycache__/
+# A design tool's local state; never part of the repository.
+/.hallmark/
