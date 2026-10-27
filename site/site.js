@@ -434,6 +434,15 @@ if (location.hash) {
   addEventListener("load", land, { once: true });
 }
 
+// Back to top on the Learn pages rests while the bar at the top of the page is in view and comes
+// in once it scrolls away; one observer, no scroll handler.
+const toTop = document.querySelector("[data-to-top]");
+const bar = document.querySelector(".nav");
+if (toTop && bar) {
+  toTop.toggleAttribute("data-rest", scrollY < bar.offsetHeight);
+  new IntersectionObserver(([entry]) => toTop.toggleAttribute("data-rest", entry.isIntersecting)).observe(bar);
+}
+
 // The Learn sidebar on a wide screen. Every chapter is a closed <details> but the current
 // page's; one opens at a time (their shared name does that natively). This script animates the
 // opening and closing, marks the section being read with an indicator that slides to it and

@@ -419,6 +419,7 @@ class Builder:
     </div>
   </footer>
 
+  <a class="to-top" href="#top" data-to-top aria-label="Back to top" title="Back to top"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 10 8 5.5l4.5 4.5"/></svg></a>
   <script src="../site.js"></script>
 </body>
 </html>

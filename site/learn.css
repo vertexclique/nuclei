@@ -654,3 +654,51 @@ a.card {
 .card p:last-child {
   font-size: var(--text-sm);
 }
+
+/* Back to top: a square in the mark's colours at the corner of the screen. Without the script it
+ * is always there; site.js rests it while the bar at the top of the page is in view. */
+
+.to-top {
+  position: fixed;
+  inset-block-end: var(--space-lg);
+  inset-inline-end: var(--page-gutter);
+  z-index: var(--z-raised);
+  display: grid;
+  place-items: center;
+  inline-size: 2.75rem;
+  block-size: 2.75rem;
+  background: var(--fill-square);
+  box-shadow: inset 0 1px 0 var(--color-gloss-strong), 0 12px 32px -12px var(--color-glow);
+  color: var(--color-paper);
+}
+
+.to-top svg {
+  inline-size: 1.25rem;
+  block-size: 1.25rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: square;
+}
+
+.to-top[data-rest] {
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(var(--rise));
+}
+
+.to-top:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 3px;
+}
+
+/* The pager and the footer's links keep clear of it at the bottom of the page. */
+.learn-wrap ~ .foot {
+  padding-block-end: calc(var(--space-lg) + 2.75rem + var(--space-lg));
+}
+
+@media print {
+  .to-top {
+    display: none;
+  }
+}

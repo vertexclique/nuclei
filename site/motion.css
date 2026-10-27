@@ -174,6 +174,24 @@
   transition: transform var(--dur-short) var(--ease-out);
 }
 
+/* Back to top fades and rises in once the bar scrolls away, lifts toward the pointer and the
+ * keyboard, and presses in on a click. */
+.to-top {
+  transition:
+    opacity var(--dur-short) var(--ease-out),
+    transform var(--dur-short) var(--ease-out),
+    box-shadow var(--dur-short) var(--ease-out),
+    visibility var(--dur-short);
+}
+
+.to-top:focus-visible {
+  transform: translateY(var(--nudge));
+}
+
+.to-top:active {
+  transform: translateY(var(--press));
+}
+
 .btn--ghost::before,
 .nav__cta::before,
 .btn--primary::before,
@@ -222,6 +240,15 @@
   .btn:hover,
   .nav__cta:hover {
     transform: translateY(var(--nudge));
+  }
+
+  .to-top:hover {
+    transform: translateY(var(--nudge));
+    box-shadow: inset 0 1px 0 var(--color-gloss-strong), 0 16px 40px -10px var(--color-glow);
+  }
+
+  .to-top:hover:active {
+    transform: translateY(var(--press));
   }
 
   .btn:hover::before,

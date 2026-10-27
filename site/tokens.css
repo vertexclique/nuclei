@@ -66,6 +66,8 @@
   /* Text in colour: turquoise through pale liquid to blue and violet. Every stop is 6.8:1 or
    * more on the paper, so a word set in it reads as well as the ink around it. */
   --fill-text: linear-gradient(90deg, var(--color-accent) 0%, var(--color-liquid-top) 38%, var(--color-accent-2) 72%, var(--color-accent-3) 100%);
+  /* The mark's colours across a square, corner to corner: the back-to-top button. */
+  --fill-square: linear-gradient(135deg, var(--color-liquid-top) 0%, var(--color-accent) 30%, var(--color-accent-2) 68%, var(--color-accent-3) 100%);
 
   --font-display: "Geist", ui-sans-serif, sans-serif;
   --font-body:    "Geist", ui-sans-serif, sans-serif;
