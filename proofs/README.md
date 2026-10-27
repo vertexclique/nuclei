@@ -329,6 +329,28 @@ that finds a job, a time-out, a job taken back). The unit tests in `src/rt/block
 submit landing as the only thread goes idle (the first mutation fails it) and submitters on
 threads against threads that keep timing out.
 
+## Task blocks given back to their thread
+
+`remote` (`tla/remote/RemoteFree.tla`) checks how a task's block freed on another thread than
+its owner's goes back to the owner (`src/rt/task/memory.rs`), at the grain of each atomic access.
+Each thread that allocates holds a record: a list other threads push the blocks they free onto,
+linked through the blocks, and a count that bounds it. A freeing thread counts itself in, gives
+up at the bound, reads the head, gives up if the list is closed, and swaps its block in only if
+the head is still the one it read. The owner takes the whole list when its cache has no block,
+and as its thread ends swaps the list out and the head to closed in one step, frees all it
+holds, then lets the record go; the next thread to claim the record opens it again. 10
+configurations: 3 that must pass (three blocks, two owners one after the other and two freeing
+threads, with `ListConsistent`, `ClosedEmpty`, `BoundedList`, `OpenWhileOwned`, `CountOK` and
+`AllFreed`, every block back with the system once every thread is done; the same with a bound of
+one; and `Terminates`), 4 mutations (a push that swaps its block in whatever the head is, and a
+close in two steps, each break `ListConsistent`; a record let go before its list is closed breaks
+`OpenWhileOwned`; a push that ignores the count breaks `BoundedList`), and 3 witnesses (a push
+that finds the list closed, one that finds it full, the next owner taking back a block the first
+allocated). The unit tests in `src/rt/task/memory.rs` give a block back across threads, refuse
+one at a closed record and at the bound (a take-back that never runs fails two, a push past the
+bound one); `tests/zero_alloc.rs` counts no allocation for blocking jobs, detached spawns onto a
+worker and the pool's file jobs.
+
 ## The remote wake handshake on a store buffer
 
 `handshake` (`tla/handshake/Handshake.tla`) checks the Dekker pair of the park handshake

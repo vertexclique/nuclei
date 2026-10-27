@@ -1,0 +1,11 @@
+# configuration                spec                 expected
+RF_safe                        MC_RemoteFree        pass
+RF_live                        MC_RemoteFree        pass
+RF_tight                       MC_RemoteFree        pass
+MRF_blind_push                 MC_RemoteFree        violated:ListConsistent
+MRF_store_close                MC_RemoteFree        violated:ListConsistent
+MRF_release_first              MC_RemoteFree        violated:OpenWhileOwned
+MRF_no_bound                   MC_RemoteFree        violated:BoundedList
+WRF_closed                     MC_RemoteFree        violated:NoRefusedClosed
+WRF_full                       MC_RemoteFree        violated:NoRefusedFull
+WRF_reclaimed                  MC_RemoteFree        violated:NoReclaimed

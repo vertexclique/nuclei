@@ -149,9 +149,8 @@ fn a_tcp_round_trip_allocates_nothing() {
 }
 
 /// File writes, flushes, seeks and reads through a handle: on the ring, a
-/// call's slot is a spare once the ring let go of it, and none is made; on
-/// the pool, a job is a task of the cache in the pool's linked queue, with
-/// the rare block of a blocking job (see below).
+/// call's slot is a spare once the ring let go of it; on the pool, a job is
+/// a task of the cache in the pool's linked queue.
 #[test]
 fn file_reads_and_writes_allocate_nothing() {
     use nuclei::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -160,20 +159,15 @@ fn file_reads_and_writes_allocate_nothing() {
         .worker_threads(0)
         .build()
         .unwrap();
-    let (file, ring) = rt.block_on(async {
-        let ring = nuclei::stats()
-            .shards
-            .iter()
-            .all(|shard| shard.backend == nuclei::IoBackend::IoUring);
-        let file = nuclei::fs::OpenOptions::new()
+    let file = rt.block_on(async {
+        nuclei::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)
             .await
-            .unwrap();
-        (file, ring)
+            .unwrap()
     });
     drop(rt);
     let mut file = file;
@@ -186,9 +180,8 @@ fn file_reads_and_writes_allocate_nothing() {
         file.read_exact(&mut buf).await.unwrap();
     });
     let _ = std::fs::remove_file(&path);
-    let most = if ring { 0 } else { RUNS as u64 / 1_000 };
-    assert!(
-        made <= most,
+    assert_eq!(
+        made, 0,
         "{made} allocations in {RUNS} write, flush, seek and read rounds"
     );
 }
@@ -203,18 +196,53 @@ fn a_local_spawn_allocates_nothing() {
 }
 
 /// A blocking job is a task of the cache, in the pool's linked queue. A
-/// handle that sees its job end before the pool thread lets go of the job
-/// leaves the block to that thread's cache, so this thread's cache is one
-/// short now and then (N-ZERO-11: a block freed on another thread back to
-/// its own): at most one allocation per thousand jobs, none per job.
+/// job whose last reference the pool thread drops gives its block back to
+/// this thread's cache.
 #[test]
-fn a_blocking_job_allocates_nothing_but_a_rare_block() {
+fn a_blocking_job_allocates_nothing() {
     let made = steady(async || {
         nuclei::spawn_blocking(|| 1u8).await;
     });
-    assert!(
-        made <= RUNS as u64 / 1_000,
+    assert_eq!(
+        made, 0,
         "{made} allocations in {RUNS} spawn_blocking and await"
+    );
+}
+
+/// A task spawned onto a worker and left to run (detached) ends there: its
+/// block goes back to the spawning thread's cache.
+#[test]
+fn a_detached_spawn_onto_a_worker_allocates_nothing_on_the_spawning_thread() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DONE: AtomicUsize = AtomicUsize::new(0);
+    let rt = nuclei::Runtime::builder()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let made = rt.block_on(async {
+        let mut spawned = 0;
+        let mut round = async || {
+            nuclei::spawn(async {
+                DONE.fetch_add(1, Ordering::Release);
+            })
+            .detach();
+            spawned += 1;
+            while DONE.load(Ordering::Acquire) < spawned {
+                nuclei::task::yield_now().await;
+            }
+        };
+        for _ in 0..WARM {
+            round().await;
+        }
+        let before = allocations();
+        for _ in 0..RUNS {
+            round().await;
+        }
+        allocations() - before
+    });
+    assert_eq!(
+        made, 0,
+        "{made} allocations in {RUNS} detached spawns onto a worker"
     );
 }
 
