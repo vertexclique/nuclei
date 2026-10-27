@@ -186,10 +186,6 @@ impl Kind {
     }
 
     /// A datagram socket: its reads and writes are whole datagrams.
-    #[cfg_attr(
-        not(completion),
-        expect(dead_code, reason = "the completion drivers' only")
-    )]
     pub(crate) fn datagrams(self) -> bool {
         match self {
             Kind::Udp => true,

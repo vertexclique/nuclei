@@ -84,6 +84,53 @@ pub(crate) fn refused_addr() -> (Option<TcpSocket>, std::net::SocketAddr) {
     (None, freed.local_addr().unwrap())
 }
 
+/// One poll of `poll`, outside the task's budget, with no waker kept: what
+/// a `try_` call answers, `WouldBlock` for one that would wait (which still
+/// sets the driver going, so a later call finds what came).
+fn at_once<T>(
+    poll: impl FnOnce(&mut core::task::Context<'_>) -> core::task::Poll<io::Result<T>>,
+) -> io::Result<T> {
+    crate::coop::outside(|| {
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        match poll(&mut cx) {
+            core::task::Poll::Ready(result) => result,
+            core::task::Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+        }
+    })
+}
+
+/// What `interest` asks for of `source`, once some of it is ready.
+fn poll_ready(
+    source: &std::sync::Arc<crate::io::Source>,
+    cx: &mut core::task::Context<'_>,
+    interest: crate::io::Interest,
+) -> core::task::Poll<io::Result<crate::io::Ready>> {
+    use crate::io::Ready;
+    use core::task::Poll;
+    let mut ready = Ready::EMPTY;
+    if interest.is_readable()
+        && let Poll::Ready(closed) = source.poll_read_ready(cx)
+    {
+        ready = ready | Ready::READABLE;
+        if closed? {
+            ready = ready | Ready::READ_CLOSED;
+        }
+    }
+    if interest.is_writable()
+        && let Poll::Ready(closed) = source.poll_write_ready(cx)
+    {
+        ready = ready | Ready::WRITABLE;
+        if closed? {
+            ready = ready | Ready::WRITE_CLOSED;
+        }
+    }
+    if ready.is_empty() {
+        Poll::Pending
+    } else {
+        Poll::Ready(Ok(ready))
+    }
+}
+
 /// The error when every address failed (the last one's), or none was given.
 fn none_worked(last: Option<io::Error>) -> io::Error {
     last.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address was given"))

@@ -35,6 +35,15 @@ pub(crate) fn leave(previous: Option<u8>) {
     let _ = LEFT.try_with(|left| left.set(previous));
 }
 
+/// Runs `f` outside the budget, as a call that does not wait (a `try_`
+/// read or write) is: it neither spends nor yields.
+pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
+    let saved = LEFT.try_with(|left| left.replace(None)).ok().flatten();
+    let result = f();
+    let _ = LEFT.try_with(|left| left.set(saved));
+    result
+}
+
 /// Spends one operation of the budget for `poll`, or yields when it is spent:
 /// `Pending`, with the task woken to run again after the others. A `poll`
 /// that answers `Pending` gets its operation back.

@@ -4,6 +4,15 @@
 use super::*;
 
 impl Source {
+    /// Ready once a write would be taken at once (see `WriteState::ready`);
+    /// `true` once writing failed.
+    pub(crate) fn poll_write_ready(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<bool>> {
+        self.poll_writing(cx, |st, _io, waker, _after| st.ready(waker).map(Ok))
+    }
+
     /// Writes `bytes` to a stream: copied into the write-behind and written
     /// out by the driver.
     pub(crate) fn poll_write(

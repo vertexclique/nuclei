@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 
 use futures_io::{AsyncRead, AsyncWrite};
 
-use crate::io::Handle;
+use crate::io::{Handle, Interest, Ready};
 
 macro_rules! stream_io {
     ($($ty:ty),* $(,)?) => {$(
@@ -42,6 +42,100 @@ macro_rules! stream_io {
             /// says it took none.
             pub async fn write_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
                 self.source().write_owned(buf).await
+            }
+        }
+
+        /// Readiness, and the reads and writes that do not wait. Ready means
+        /// the handle's own buffers: readable once a read would end at once
+        /// (bytes read ahead, the end of the stream, or an error, which the
+        /// read reports), writable once a write would be taken at once (room
+        /// in the write-behind, or an error).
+        impl Handle<$ty> {
+            /// Waits until a read would end at once.
+            ///
+            /// # Errors
+            ///
+            /// When the stream cannot be watched.
+            pub async fn readable(&self) -> io::Result<()> {
+                self.ready(Interest::READABLE).await.map(drop)
+            }
+
+            /// Waits until a write would be taken at once.
+            ///
+            /// # Errors
+            ///
+            /// When the stream cannot be watched.
+            pub async fn writable(&self) -> io::Result<()> {
+                self.ready(Interest::WRITABLE).await.map(drop)
+            }
+
+            /// Waits until some of `interest` is ready, and says what is.
+            ///
+            /// # Errors
+            ///
+            /// When the stream cannot be watched.
+            pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+                core::future::poll_fn(|cx| super::poll_ready(self.source(), cx, interest)).await
+            }
+
+            /// Polls until a read would end at once.
+            ///
+            /// # Errors
+            ///
+            /// When the stream cannot be watched.
+            pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.source().poll_read_ready(cx).map(|r| r.map(drop))
+            }
+
+            /// Polls until a write would be taken at once.
+            ///
+            /// # Errors
+            ///
+            /// When the stream cannot be watched.
+            pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.source().poll_write_ready(cx).map(|r| r.map(drop))
+            }
+
+            /// Reads what came ahead into `buf` without waiting; zero at the
+            /// end of the stream.
+            ///
+            /// # Errors
+            ///
+            /// `WouldBlock` when nothing came yet (the driver goes on reading,
+            /// so a later call finds what comes), and as `recv(2)`.
+            pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+                super::at_once(|cx| self.source().poll_read(cx, buf, false))
+            }
+
+            /// Reads what came ahead into `bufs` without waiting, as
+            /// [`try_read`](Self::try_read).
+            ///
+            /// # Errors
+            ///
+            /// As [`try_read`](Self::try_read).
+            pub fn try_read_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+                super::at_once(|cx| self.source().poll_read_vectored(cx, bufs))
+            }
+
+            /// Hands `buf` to the write-behind without waiting; returns how
+            /// many bytes it took.
+            ///
+            /// # Errors
+            ///
+            /// `WouldBlock` when the write-behind has no room, and the error
+            /// that stopped earlier bytes.
+            pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+                super::at_once(|cx| self.source().poll_write(cx, buf))
+            }
+
+            /// Hands the bytes of `bufs`, in order, to the write-behind
+            /// without waiting, as [`try_write`](Self::try_write).
+            ///
+            /// # Errors
+            ///
+            /// As [`try_write`](Self::try_write).
+            pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+                super::at_once(|cx| self.source().poll_write_vectored(cx, bufs))
             }
         }
 

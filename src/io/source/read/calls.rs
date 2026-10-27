@@ -4,6 +4,18 @@
 use super::*;
 
 impl Source {
+    /// Ready once a read would end at once (see `ReadState::ready`); `true`
+    /// at the end of the stream.
+    pub(crate) fn poll_read_ready(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<bool>> {
+        let kind = self.kind;
+        self.poll_reading(cx, |st, io, waker, after| {
+            st.ready(io, kind, waker, after).map(Ok)
+        })
+    }
+
     /// Reads from a stream into `out`; `peek` leaves the bytes to be read
     /// again.
     pub(crate) fn poll_read(

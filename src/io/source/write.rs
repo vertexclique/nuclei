@@ -191,6 +191,26 @@ impl WriteState {
         self.lent.as_ref().is_some_and(|l| l.done.is_none())
     }
 
+    /// Whether a write or send would be taken now: room in the write-behind
+    /// (no datagram queued, for a socket of datagrams), or an error, which
+    /// stays for it. `Ready` with `true` once writing failed.
+    pub(super) fn ready(&mut self, waker: &Waker) -> Poll<bool> {
+        if self.failed.is_some() || self.error.is_some() {
+            return Poll::Ready(true);
+        }
+        let room = !self.lent_waits()
+            && self.queued.is_none()
+            && self
+                .behind
+                .as_ref()
+                .is_none_or(|behind| behind.filled().len() < behind.capacity());
+        if room {
+            return Poll::Ready(false);
+        }
+        self.waiters.register(waker);
+        Poll::Pending
+    }
+
     /// A buffer from this thread's pool, or the side starves until one
     /// comes back. A whole datagram no buffer of the pool could hold fails
     /// the operation instead.

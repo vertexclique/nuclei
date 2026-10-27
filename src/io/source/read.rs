@@ -183,6 +183,35 @@ impl ReadState {
         self.want = self.want.max(len);
     }
 
+    /// Whether a read, receive or accept would end now, taking nothing:
+    /// what came ahead, the end, or an error, which stays for it. `Ready`
+    /// with `true` at the end of the stream.
+    pub(super) fn ready(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<bool> {
+        // A datagram read ahead is read whole: the receive that takes it may
+        // ask for any size, and one read into less would be cut. The pool's
+        // largest buffer holds any datagram UDP carries; a pool too small
+        // for one reads into what it has, as a receive would.
+        let len = if kind.datagrams() {
+            let largest = crate::buf::LARGEST;
+            let room = with_pool(|pool| pool.is_some_and(|p| p.could_hold_whole(largest)));
+            self.want.max(if room { largest } else { 1 })
+        } else {
+            self.want.max(1)
+        };
+        self.complete(io, kind, len, after);
+        if self.has_result() {
+            return Poll::Ready(self.eof);
+        }
+        self.wait(waker, len);
+        Poll::Pending
+    }
+
     /// A buffer from this thread's pool, or the side starves until one
     /// comes back. A whole datagram no buffer of the pool could hold fails
     /// the operation instead.

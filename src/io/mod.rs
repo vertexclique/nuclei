@@ -4,8 +4,9 @@
 //! [`AsyncSeekExt`] as futures, [`ReadBuf`], [`copy`] and
 //! [`copy_bidirectional`], [`BufReader`], [`BufWriter`] and [`BufStream`],
 //! the in-memory pipes [`duplex`] and [`simplex`], [`split`], [`empty`],
-//! [`repeat`] and [`sink`], and the process's [`stdin`], [`stdout`] and
-//! [`stderr`].
+//! [`repeat`] and [`sink`], the process's [`stdin`], [`stdout`] and
+//! [`stderr`], and what the sockets' readiness calls take and answer
+//! ([`Interest`], [`Ready`]).
 //!
 //! Inside, the shards' half of IO: sources, the drivers' half of every
 //! handle, and the system calls they make. A handle's IO object stays its own
@@ -16,6 +17,7 @@
 
 mod handle;
 pub(crate) mod raw;
+mod ready;
 pub(crate) mod side;
 pub(crate) mod source;
 pub(crate) mod sys;
@@ -24,6 +26,7 @@ mod util;
 pub use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
 
 pub use self::handle::{Handle, IoObject};
+pub use self::ready::{Interest, Ready};
 pub(crate) use self::source::Source;
 pub use self::util::{
     AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufStream, BufWriter,

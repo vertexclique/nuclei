@@ -14,7 +14,7 @@ use futures_core::Stream;
 use crate::io::source::write::{Dest, Peer};
 use crate::io::source::{Addr, Kind};
 use crate::io::sys::UnixAddr;
-use crate::io::{Handle, IoObject, sys};
+use crate::io::{Handle, Interest, IoObject, Ready, sys};
 
 /// The credentials of a Unix stream's peer: its user and group, and its
 /// process where the system tells it (Linux, Android, macOS, iOS).
@@ -378,7 +378,100 @@ impl Handle<UnixDatagram> {
     }
 
     async fn receive(&self, buf: &mut [u8], peek: bool) -> io::Result<(usize, UnixSocketAddr)> {
-        let (n, addr) = poll_fn(|cx| self.source().poll_receive(cx, buf, peek)).await?;
-        Ok((n, unix(addr)?))
+        poll_fn(|cx| self.poll_receive(cx, buf, peek)).await
+    }
+
+    fn poll_receive(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+        peek: bool,
+    ) -> Poll<io::Result<(usize, UnixSocketAddr)>> {
+        let (n, addr) = core::task::ready!(self.source().poll_receive(cx, buf, peek))?;
+        Poll::Ready(unix(addr).map(|addr| (n, addr)))
+    }
+
+    /// Waits until a receive would end at once: a datagram came, or an
+    /// error (which the receive reports).
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub async fn readable(&self) -> io::Result<()> {
+        self.ready(Interest::READABLE).await.map(drop)
+    }
+
+    /// Waits until a send would be taken at once.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub async fn writable(&self) -> io::Result<()> {
+        self.ready(Interest::WRITABLE).await.map(drop)
+    }
+
+    /// Waits until some of `interest` is ready, and says what is.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+        poll_fn(|cx| super::poll_ready(self.source(), cx, interest)).await
+    }
+
+    /// Polls until a receive would end at once.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.source().poll_read_ready(cx).map(|r| r.map(drop))
+    }
+
+    /// Polls until a send would be taken at once.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.source().poll_write_ready(cx).map(|r| r.map(drop))
+    }
+
+    /// Sends a datagram to the connected peer without waiting.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when a datagram is still queued, and as `send(2)`.
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        super::at_once(|cx| self.source().poll_send(cx, buf, Dest::Connected))
+    }
+
+    /// Sends a datagram to the socket at `path` without waiting.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when a datagram is still queued, and as `sendto(2)`.
+    pub fn try_send_to<P: AsRef<Path>>(&self, buf: &[u8], path: P) -> io::Result<usize> {
+        let addr = UnixAddr::path(path.as_ref())?;
+        super::at_once(|cx| self.source().poll_send(cx, buf, Dest::Unix(&addr)))
+    }
+
+    /// Receives a datagram from the connected peer without waiting; what
+    /// does not fit `buf` is cut.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when none came yet, and as `recv(2)`.
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        super::at_once(|cx| self.poll_receive(cx, buf, false)).map(|(n, _)| n)
+    }
+
+    /// Receives a datagram and its sender's address without waiting.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when none came yet, and as `recvfrom(2)`.
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, UnixSocketAddr)> {
+        super::at_once(|cx| self.poll_receive(cx, buf, false))
     }
 }

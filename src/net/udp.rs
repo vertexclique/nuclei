@@ -9,7 +9,7 @@ use super::addr::{ToSocketAddrs, resolve};
 use super::none_worked;
 use crate::io::source::write::Dest;
 use crate::io::source::{Addr, Kind};
-use crate::io::{Handle, ReadBuf};
+use crate::io::{Handle, Interest, ReadBuf, Ready};
 
 impl Handle<UdpSocket> {
     /// A socket bound to the first of the addresses `addr` names that it
@@ -114,6 +114,114 @@ impl Handle<UdpSocket> {
     /// As `recvfrom(2)` with `MSG_PEEK`.
     pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.receive(buf, true).await
+    }
+
+    /// Waits until a receive would end at once: a datagram came, or an
+    /// error (which the receive reports).
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub async fn readable(&self) -> io::Result<()> {
+        self.ready(Interest::READABLE).await.map(drop)
+    }
+
+    /// Waits until a send would be taken at once.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub async fn writable(&self) -> io::Result<()> {
+        self.ready(Interest::WRITABLE).await.map(drop)
+    }
+
+    /// Waits until some of `interest` is ready, and says what is.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+        poll_fn(|cx| super::poll_ready(self.source(), cx, interest)).await
+    }
+
+    /// Polls until a receive would end at once.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub fn poll_recv_ready(
+        &self,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<io::Result<()>> {
+        self.source().poll_read_ready(cx).map(|r| r.map(drop))
+    }
+
+    /// Polls until a send would be taken at once.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be watched.
+    pub fn poll_send_ready(
+        &self,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<io::Result<()>> {
+        self.source().poll_write_ready(cx).map(|r| r.map(drop))
+    }
+
+    /// Sends a datagram to the connected peer without waiting.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when a datagram is still queued, and as `send(2)`.
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        super::at_once(|cx| self.source().poll_send(cx, buf, Dest::Connected))
+    }
+
+    /// Receives a datagram from the connected peer without waiting; what
+    /// does not fit `buf` is cut.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when none came yet, and as `recv(2)`.
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        super::at_once(|cx| self.poll_receive(cx, buf, false)).map(|(n, _)| n)
+    }
+
+    /// Looks at the next datagram without taking it or waiting.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when none came yet, and as `recv(2)` with `MSG_PEEK`.
+    pub fn try_peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        super::at_once(|cx| self.poll_receive(cx, buf, true)).map(|(n, _)| n)
+    }
+
+    /// Sends a datagram to `target` without waiting.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when a datagram is still queued, and as `sendto(2)`.
+    pub fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        super::at_once(|cx| self.source().poll_send(cx, buf, Dest::Inet(target)))
+    }
+
+    /// Receives a datagram and its sender's address without waiting.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when none came yet, and as `recvfrom(2)`.
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        super::at_once(|cx| self.poll_receive(cx, buf, false))
+    }
+
+    /// Looks at the next datagram and its sender without taking it or
+    /// waiting.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` when none came yet, and as `recvfrom(2)` with `MSG_PEEK`.
+    pub fn try_peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        super::at_once(|cx| self.poll_receive(cx, buf, true))
     }
 
     /// The sender of the next datagram, which stays to be received.
