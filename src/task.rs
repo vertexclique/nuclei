@@ -66,8 +66,8 @@ impl Future for YieldNow {
     }
 }
 
-/// Spawns tasks with options: for now a name, which the task dump and
-/// tracing show.
+/// Spawns tasks with options: for now a name, kept with the task's id while
+/// the task lives.
 ///
 /// ```
 /// # nuclei::block_on(async {
