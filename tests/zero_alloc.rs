@@ -270,7 +270,8 @@ fn a_join_set_spawn_and_join_allocates_nothing() {
 }
 
 /// A task spawned onto a worker and left to run (detached) ends there: its
-/// block goes back to the spawning thread's cache.
+/// block goes back to the spawning thread's cache, after a burst of two
+/// left a second block there (see `burst`).
 #[test]
 fn a_detached_spawn_onto_a_worker_allocates_nothing_on_the_spawning_thread() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -280,7 +281,11 @@ fn a_detached_spawn_onto_a_worker_allocates_nothing_on_the_spawning_thread() {
         .build()
         .unwrap();
     let made = rt.block_on(async {
-        let mut spawned = 0;
+        let first = || nuclei::spawn(async { DONE.fetch_add(1, Ordering::Release) });
+        let (a, b) = (first(), first());
+        a.await;
+        b.await;
+        let mut spawned = 2;
         let mut round = async || {
             nuclei::spawn(async {
                 DONE.fetch_add(1, Ordering::Release);
