@@ -61,6 +61,10 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
+**[Learn Nuclei](https://nuclei.rs/learn/)** goes from this program to a server in production, with
+an example that compiles and runs for every idea; the [API reference](https://docs.rs/nuclei) has
+every item.
+
 ## Backends
 
 | Platform | Backend |
@@ -72,22 +76,27 @@ async fn main() -> std::io::Result<()> {
 On Linux the runtime first tries io_uring and falls back to epoll when it cannot be used: on a
 kernel before 6.1 (its rings are single-issuer with deferred task work), or where a sandbox
 refuses it. It probes safely, even under a seccomp filter that kills a process for calling
-`io_uring_setup`. CI runs the
-suite on io_uring and on epoll on Linux 6.1, 6.6 and 6.12, on kqueue on macOS, and on completion
-ports on Windows. `NUCLEI_BACKEND` picks one: `auto`, `io_uring` or `epoll` on Linux, `kqueue` on
-macOS and the BSDs, `iocp` on Windows.
+`io_uring_setup`. CI runs the suite on io_uring and on epoll on Linux 6.1, 6.6 and 6.12, on kqueue
+on macOS, and on completion ports on Windows. `NUCLEI_BACKEND` picks one: `auto`, `io_uring` or
+`epoll` on Linux, `kqueue` on macOS and the BSDs, `iocp` on Windows.
 
 ## What it has
 
 * **Shards.** A shard per worker thread runs its tasks and owns its driver; a task stays on the
   shard it was placed on. `block_on` works anywhere, nested in a task too, and keeps its shard's
-  other tasks and IO going. `spawn_local` runs tasks that are not `Send` on the current shard;
-  `spawn_blocking` runs blocking work on a pool.
-* **IO.** `Handle<T>` takes over one of std's IO objects: on Unix anything with a file
-  descriptor (TCP, UDP and Unix sockets, files, pipes), on Windows TCP and UDP sockets, files and
-  a child's pipes. It implements the `futures-io` traits, and on streams lends the driver the
-  caller's own buffer (`read_owned`, `write_owned`).
-* **Time.** `sleep`, `timeout` and intervals, on a timer wheel per shard.
+  other tasks and IO going.
+* **Tasks.** `spawn`, `spawn_local` for tasks that are not `Send`, `spawn_blocking` for blocking
+  work; `JoinSet`, abort handles, task ids, task-local values and a cooperative budget.
+  `select!`, `join!` and `try_join!` wait on several futures in one task.
+* **Networking.** `nuclei::net`: TCP, UDP and Unix sockets, names looked up off the shards,
+  socket builders, stream halves, pipes and FIFOs, readiness waits and `try_` calls.
+* **IO.** `nuclei::io`: reads and writes as futures, copies, buffered readers and writers,
+  in-memory pipes, the standard streams, and `AsyncFd` for descriptors of one's own. A stream
+  lends the driver the caller's own buffer with `read_owned` and `write_owned`.
+* **Files.** `nuclei::fs`: files, whole-file calls, metadata and directories read a page at a
+  time.
+* **Time.** `sleep`, `timeout` and intervals on a timer wheel per shard, and a clock tests can
+  pause and move by hand.
 * **Sync.** `nuclei::sync` has mutexes, reader-writer locks (with upgradable reads), reentrant
   locks, semaphores, `Notify`, barriers, events, latches, once-cells, cancellation tokens, and
   mpsc, oneshot, broadcast and watch channels. They need only futures and wakers, so they work
@@ -96,6 +105,9 @@ macOS and the BSDs, `iocp` on Windows.
   `nuclei::signal` delivers Unix signals and Windows console events as streams.
 * **Stats.** `nuclei::stats()` takes a snapshot of every shard: its tasks, polls, IO in flight,
   buffers, timers and errors by kind.
+* **No allocation in steady state.** Once warm, a TCP round trip, UDP datagrams, file reads and
+  writes, a spawn, a `JoinSet` spawn and join and a oneshot channel make no call into the
+  allocator on the thread that runs them (`tests/zero_alloc.rs` counts it).
 * **Dependencies.** `libc` (on Unix), the `kovan` crates, `futures-io` and `futures-core`.
 
 ## Checked
@@ -119,6 +131,13 @@ $ cargo run --example tcp-server
 $ cargo test                       # io_uring where available, else epoll
 $ NUCLEI_BACKEND=epoll cargo test  # epoll on Linux
 ```
+
+## The site
+
+The site, [nuclei.rs](https://nuclei.rs), is built from the commit: `python3 site/build.py` writes
+its pages (from `site/src/` and the Learn examples in `site/examples/`), the API reference and the
+search index into `site/`, and `python3 site/build.py --examples` also builds, lints and runs every
+example on io_uring and on epoll. The Pages workflow does both for each deploy and pull request.
 
 #### License
 
