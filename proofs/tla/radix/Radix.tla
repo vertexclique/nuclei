@@ -11,9 +11,14 @@
 (* swap it loses was another push's growth). It then descends a level at a *)
 (* time to the position's leaf, making a missing node (a swap it loses     *)
 (* leaves the other push's node), writes its value and marks it ready.     *)
-(* The receiver takes the value of its position once ready; done with a    *)
-(* leaf, it waits until the next leaf exists, then retires the leaf it     *)
-(* leaves and every inner node whose span ended with it.                   *)
+(* The receiver takes the value of its head position once ready. When it   *)
+(* is not ready and the next one is written (or was taken past it), it     *)
+(* looks ahead, within Window positions, for the first ready one, then     *)
+(* looks at the positions it passed once more and takes the earliest ready *)
+(* now: one sender's later value is claimed only after its earlier one is  *)
+(* written. Its head is the lowest position not taken. Once its head is    *)
+(* past a leaf and the next leaf exists, it retires that leaf and every    *)
+(* inner node whose span ended with it.                                    *)
 (*                                                                          *)
 (* kovan, abstractly: a push holds a guard for its whole push, and a node  *)
 (* it loads while not yet retired is protected until the push ends; a      *)
@@ -21,10 +26,11 @@
 (* `Free`). Following a pointer reads the node it names, and that must     *)
 (* never meet a freed node.                                                *)
 (*                                                                          *)
-(* What is abstract: a leaf holds one position, so the receiver leaves a   *)
-(* leaf after every value; a node is its level and its index at that level *)
-(* (`<<level, index>>`, a leaf at level 0), which the swaps keep unique; a *)
-(* node a push made and could not link is freed unseen and not modelled.   *)
+(* What is abstract: a leaf holds one position, so the head leaves a leaf   *)
+(* with every value it passes; a node is its level and its index at that    *)
+(* level (`<<level, index>>`, a leaf at level 0), which the swaps keep      *)
+(* unique; a node a push made and could not link is freed unseen and not    *)
+(* modelled.                                                                *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -32,6 +38,7 @@ CONSTANTS
     Producers,  \* the pushers
     Pushes,     \* how many values each pushes
     Fan,        \* children per inner node
+    Window,     \* how far past its head the receiver looks
     Mutation    \* "none", or the name of the one rule this run takes away
 
 Total == Cardinality(Producers) * Pushes
@@ -54,21 +61,30 @@ variables
     tail = 0,
     rootLevel = 1,                        \* the root is <<rootLevel, 0>>
     made = {<<1, 0>>},                    \* nodes linked into the tree
-    ready = [p \in Positions |-> FALSE],
-    taken = [p \in Positions |-> 0],
-    cur = 0,                              \* the receiver's leaf (its position)
+    ready = [x \in Positions |-> FALSE],
+    taken = [x \in Positions |-> 0],
+    owner = [x \in Positions |-> "none"], \* the push that claimed the position
+    seqOf = [x \in Positions |-> 0],      \* its place among that push's values
+    lastSeq = [x \in Producers |-> -1],   \* the place of each push's value taken last
+    head = 0,                             \* the lowest position not taken
+    cur = 0,                              \* the lowest leaf not retired
     retired = {},
     freed = {},
     prot = [p \in Producers |-> {}],
     steps = [p \in Producers |-> 0],      \* the steps of each push's current push
     touchedFreed = FALSE,                 \* (record) a node was read after it was freed
     grown = FALSE,                        \* (record) the root grew
-    raced = FALSE;                        \* (record) a push found a node another made first
+    raced = FALSE,                        \* (record) a push found a node another made first
+    outOfOrder = FALSE,                   \* (record) a push's values were taken out of its order
+    past = FALSE;                         \* (record) a value taken past a position not written
 
 define
     Protect(self, k) == IF k \in retired THEN prot[self] ELSE prot[self] \cup {k}
     Touch(k) == touchedFreed \/ k \in freed
-    Done == cur = Total - 1 /\ taken[Total - 1] = 1
+    Done == head = Total
+    \* The lowest position at or after `h` that `t` has not taken.
+    NextHead(h, t) == CHOOSE x \in h .. Total :
+        (x = Total \/ t[x] = 0) /\ \A y \in h .. x - 1 : t[y] = 1
     \* The inner nodes whose span ends with leaf `n`, and the leaf.
     EndedBy(n) == {NodeOf(0, n)} \cup
         {NodeOf(l, n) : l \in {m \in 1 .. rootLevel : (n + 1) % Pow(m) = 0}}
@@ -83,6 +99,8 @@ P_loop:
 P_claim:
         pos := tail;
         tail := tail + 1;
+        owner[pos] := self;
+        seqOf[pos] := n;
         steps[self] := 0;
 P_root:
         \* Load the root; the guard protects it (it is never retired as the root).
@@ -130,21 +148,63 @@ P_unpin:
 end process;
 
 fair process receiver = ReceiverT
+variables at = 0, found = 0, take = 0;
 begin
 R_loop:
     while ~Done do
-R_take:
-        \* The receiver reads its leaf, which only it retires.
-        touchedFreed := Touch(NodeOf(0, cur));
-        if ready[cur] /\ taken[cur] = 0 then
-            taken[cur] := 1;
+R_look:
+        \* The head's leaf is the receiver's, and not retired.
+        touchedFreed := Touch(NodeOf(0, head));
+        if ready[head] then
+            take := head;
+            goto R_take;
+        \* Past the head only when the next position is written, or was taken
+        \* past it before: a stall shown, not a queue run down to its head.
+        elsif head + 1 < Total /\ tail > head + 1
+              /\ (taken[head + 1] = 1 \/ (NodeOf(0, head + 1) \in made /\ ready[head + 1])) then
+            at := head + 1;
+            goto R_scan;
+        else
+            goto R_retire;
         end if;
-R_next:
-        \* Done with the leaf (its value taken): on once the next leaf exists.
-        \* MUTATION leave_early: it leaves without waiting for the next leaf.
-        if taken[cur] = 1 /\ cur < Total - 1
+R_scan:
+        \* The first ready position past the head, within the window.
+        if at < tail /\ at < head + Window then
+            if taken[at] = 0 /\ NodeOf(0, at) \in made /\ ready[at] then
+                found := at;
+                goto R_recheck;
+            else
+                at := at + 1;
+                goto R_scan;
+            end if;
+        else
+            goto R_retire;
+        end if;
+R_recheck:
+        \* Once more over the positions passed: the earliest ready one first.
+        \* MUTATION no_recheck: the one found is taken.
+        if Mutation = "no_recheck" then
+            take := found;
+        else
+            take := CHOOSE x \in head .. found :
+                (x = found \/ (taken[x] = 0 /\ ready[x]))
+                /\ \A y \in head .. x - 1 : ~(taken[y] = 0 /\ ready[y]);
+        end if;
+R_take:
+        touchedFreed := Touch(NodeOf(0, take));
+        if seqOf[take] < lastSeq[owner[take]] then
+            outOfOrder := TRUE;
+        end if;
+        lastSeq[owner[take]] := seqOf[take];
+        past := past \/ take > head;
+        taken[take] := 1;
+        head := NextHead(head, [taken EXCEPT ![take] = 1]);
+R_retire:
+        \* Every leaf the head passed goes, with the inner nodes it ended, once
+        \* the next leaf exists.
+        \* MUTATION leave_early: without waiting for the next leaf.
+        if cur < head /\ cur < Total - 1
            /\ (NodeOf(0, cur + 1) \in made \/ Mutation = "leave_early") then
-R_leave:
             \* MUTATION retire_parent_early: the parent goes with every leaf.
             if Mutation = "retire_parent_early" then
                 retired := retired \cup EndedBy(cur) \cup {NodeOf(1, cur)};
@@ -152,6 +212,7 @@ R_leave:
                 retired := retired \cup EndedBy(cur);
             end if;
             cur := cur + 1;
+            goto R_retire;
         end if;
     end while;
 end process;
@@ -191,11 +252,14 @@ NoFreedTouch == ~touchedFreed
 RootLive == <<rootLevel, 0>> \notin retired
 
 \* Every value is taken at most once, and only once it was written.
-TakenOnce == \A p \in Positions : taken[p] <= 1 /\ (taken[p] = 1 => ready[p])
+TakenOnce == \A x \in Positions : taken[x] <= 1 /\ (taken[x] = 1 => ready[x])
+
+\* One push's values come out in the order it sent them.
+PerSenderOrder == ~outOfOrder
 
 \* Wait-free: a push takes a bounded number of its own steps, whatever the
 \* others do.
-WaitFree == \A p \in Producers : steps[p] <= StepBound
+WaitFree == \A x \in Producers : steps[x] <= StepBound
 
 \* Every value is taken.
 AllTaken == <>Done
@@ -211,4 +275,6 @@ NoGrow == ~grown
 NoRace == ~raced
 \* kovan frees a node the receiver left.
 NoFree == freed = {}
+\* The receiver takes a value past a position not written yet.
+NoPast == ~past
 =============================================================================

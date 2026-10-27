@@ -107,10 +107,13 @@
 //! and nothing another thread contends for, and never waits for a sender:
 //! when the next cell is claimed by a send that has not written it yet, the
 //! receive finds nothing for now, registers its waker and returns `Pending`,
-//! and that send wakes it once its value is in. So a sender
-//! the scheduler stops between its claim and its write holds back the values
-//! behind its own until it runs again, but no call waits for it, and other
-//! senders are never held up by it.
+//! and that send wakes it once its value is in. A sender the scheduler stops
+//! between its claim and its write holds back no one else's value in the
+//! radix directory, unless the position right after it is stalled too: the
+//! receive takes the ready values past it (within 64 positions), each
+//! sender's still in its order, and its own once written. In
+//! a bounded channel's ring the values behind it wait until it runs again, as
+//! its cell holds their place in the lap; no call waits for it either way.
 //!
 //! - **Wait-free** (a bounded number of the caller's own atomic steps, whatever
 //!   other threads do): the accessors (`is_closed`, `len`, `is_empty`,

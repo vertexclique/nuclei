@@ -13,9 +13,21 @@
 //! whatever other threads do. It writes its value and marks the cell ready.
 //!
 //! The receiver reads its cell's ready mark and nothing else another thread
-//! writes. Done with a leaf, it finds the next one the same way (without
-//! making anything: a leaf no send made yet means nothing is there), then
-//! retires the leaf it leaves and every inner node whose span ended with it.
+//! writes. When that cell is not ready and the next one is (a send stopped
+//! between its claim and its write, another past it done), it takes the
+//! first ready value past it, within `WINDOW` positions, so a stalled send
+//! holds back no one else's value unless the position right after it is
+//! stalled too: having read that one ready, it looks at the positions it
+//! passed once more and takes the earliest that is ready now. (Looking at the
+//! next cell, and only then at the tail's word, keeps a queue run down to its
+//! head from reading the word every send writes.) One sender's
+//! later value is claimed only after its earlier one is written, so a sender's
+//! values still come out in its order. A value taken past the head is marked
+//! in the receiver's own window, and the head moves past marks as it moves.
+//! Done with a leaf (the head past it), the receiver finds the next one the
+//! same way (without making anything: a leaf no send made yet means nothing
+//! is there), then retires the leaf it leaves and every inner node whose span
+//! ended with it. A leaf holding a stalled position is never left before it.
 //! No send ever descends into a span the receiver finished: its own position
 //! is in no such span, and a root that span is no longer the root. So every
 //! node a send loads was reachable when it loaded it, which is what kovan's
@@ -48,6 +60,9 @@ const FAN: usize = 1 << FAN_BITS;
 /// The highest level a root reaches: `FAN.pow(MAX_LEVEL)` leaves span every
 /// 64-bit position.
 const MAX_LEVEL: u32 = 10;
+/// How far past its head the receiver looks for a ready value: the bits of
+/// its window of values taken ahead.
+const WINDOW: u64 = 64;
 
 /// Leaves spanned by a node of `level`.
 const fn span(level: u32) -> u64 {
@@ -168,11 +183,14 @@ impl Inner {
 
 /// The receiver's end.
 struct Head<T> {
-    /// The next position to take: written by the receiver only, read by
+    /// The lowest position not taken: written by the receiver only, read by
     /// [`Radix::len`].
     pos: AtomicU64,
     /// The leaf of that position and its number; the receiver's alone.
     leaf: UnsafeCell<(*mut Leaf<T>, u64)>,
+    /// The values taken past the head: bit `k` for position `pos + k` (bit 0
+    /// is never set); the receiver's alone, read by [`Radix::len`] as a count.
+    ahead: AtomicU64,
 }
 
 /// The queue.
@@ -213,6 +231,7 @@ impl<T> Radix<T> {
             head: CachePadded::new(Head {
                 pos: AtomicU64::new(start),
                 leaf: UnsafeCell::new((ptr::null_mut(), 0)),
+                ahead: AtomicU64::new(0),
             }),
             _values: PhantomData,
         };
@@ -227,8 +246,15 @@ impl<T> Radix<T> {
     /// Appends `value`. Wait-free: see the module.
     pub(in crate::sync::mpsc) fn push(&self, value: T) {
         let guard = pin();
-        let pos = self.tail.fetch_add(1, Ordering::AcqRel);
-        let leaf = self.leaf(pos / CELLS, true, &guard);
+        // SeqCst: the receiver reads the tail in its look past a stalled cell,
+        // part of the wake handshake as the cell's mark is.
+        let pos = self.tail.fetch_add(1, Ordering::SeqCst);
+        self.write(pos, value, &guard);
+    }
+
+    /// Writes `value` into position `pos`, which this send claimed.
+    fn write(&self, pos: u64, value: T, guard: &Guard) {
+        let leaf = self.leaf(pos / CELLS, true, guard);
         // SAFETY: `leaf` was made or found on this position's path, which the
         // receiver has not passed (this position is not written yet), so it
         // was reachable when loaded and the guard keeps it.
@@ -318,41 +344,153 @@ impl<T> Radix<T> {
         slot.load(Ordering::SeqCst, guard).as_raw()
     }
 
-    /// Takes the oldest value, without waiting: `None` when there is none
-    /// yet, or when the next one is still being written.
+    /// Takes the oldest value ready, without waiting: `None` when there is
+    /// none. A position still being written is passed over for the first
+    /// ready one behind it (see the module).
     ///
     /// # Safety
     ///
     /// The caller is the queue's one receiver: no two calls of this function
     /// on one queue run at once.
     pub(in crate::sync::mpsc) unsafe fn try_pop(&self) -> Option<T> {
-        let pos = self.head.pos.load(Ordering::Relaxed);
+        let head = self.head.pos.load(Ordering::Relaxed);
+        // SAFETY: the caller's contract.
+        if let Some(cell) = unsafe { self.head_cell(head) } {
+            // SeqCst: the receiver's look in the channel's wake handshake.
+            if cell.ready.load(Ordering::SeqCst) {
+                // SAFETY: ready: its send wrote the value first; the head
+                // moves past it below, so it is moved out once.
+                let value = unsafe { cell.value.get().read().assume_init() };
+                // SAFETY: the caller's contract.
+                unsafe { self.taken(head, head) };
+                return Some(value);
+            }
+        }
+        // SAFETY: the caller's contract.
+        unsafe { self.take_past(head) }
+    }
+
+    /// The head's cell, the head's leaf moved on (and the leaves it left
+    /// retired) while the head is past it; `None` while the next leaf is not
+    /// made yet.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the receiver.
+    unsafe fn head_cell(&self, head: u64) -> Option<&Cell<T>> {
         // SAFETY: the caller's contract: the head's leaf is ours.
         let (mut leaf, mut number) = unsafe { *self.head.leaf.get() };
-        if pos / CELLS != number {
-            // Used up: on to the next leaf, once a send made it.
+        if head / CELLS != number {
             let guard = pin();
-            let next = self.leaf(number + 1, false, &guard);
-            if next.is_null() {
-                return None;
+            while head / CELLS != number {
+                let next = self.leaf(number + 1, false, &guard);
+                if next.is_null() {
+                    return None;
+                }
+                // SAFETY: the head is past every position of leaf `number`,
+                // each taken, and leaf `number + 1` exists.
+                unsafe { self.leave(number, &guard) };
+                (leaf, number) = (next.cast_mut(), number + 1);
+                // SAFETY: the caller's contract.
+                unsafe { *self.head.leaf.get() = (leaf, number) };
             }
-            // SAFETY: the caller's contract; `number` is the leaf left.
-            unsafe { self.leave(number, &guard) };
-            (leaf, number) = (next.cast_mut(), number + 1);
-            // SAFETY: the caller's contract.
-            unsafe { *self.head.leaf.get() = (leaf, number) };
         }
         // SAFETY: the head's leaf is retired by this end alone, and not yet.
-        let cell = unsafe { &(*leaf).cells[(pos % CELLS) as usize] };
-        // SeqCst: the receiver's look in the channel's wake handshake.
-        if !cell.ready.load(Ordering::SeqCst) {
+        Some(unsafe { &(*leaf).cells[(head % CELLS) as usize] })
+    }
+
+    /// The head's cell is not ready: takes the first ready value past it,
+    /// within the window, or the earliest one that came ready before it.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the receiver.
+    unsafe fn take_past(&self, head: u64) -> Option<T> {
+        let ahead = self.head.ahead.load(Ordering::Relaxed);
+        // A queue run down to its head has nothing after it: only a value
+        // written past the head (or one taken past it before) says the head is
+        // stalled, and the look past it is worth the tail's word, which every
+        // send writes.
+        // SAFETY: the caller's contract.
+        if ahead & 0b10 == 0 && !unsafe { self.next_ready(head) } {
             return None;
         }
-        // SAFETY: ready: its send wrote the value before the store this load
-        // read; the position is passed below, so it is moved out once.
+        // SeqCst: in the wake handshake, as the cells' marks (see `push`).
+        let tail = self.tail.load(Ordering::SeqCst);
+        if tail <= head + 1 {
+            return None;
+        }
+        let guard = pin();
+        let ready = |pos: u64| {
+            let leaf = self.leaf(pos / CELLS, false, &guard);
+            // SAFETY: a leaf the head has not passed, so not retired (this end
+            // alone retires leaves).
+            (!leaf.is_null())
+                .then(|| unsafe { &(*leaf).cells[(pos % CELLS) as usize] })
+                .filter(|cell| cell.ready.load(Ordering::SeqCst))
+        };
+        let end = tail.min(head + WINDOW);
+        let found = (head + 1..end)
+            .find(|&pos| ahead & (1 << (pos - head)) == 0 && ready(pos).is_some())?;
+        // Read ready, it makes visible every value its sender wrote before:
+        // one that came ready before it in claim order comes out first.
+        let pos = (head..found)
+            .find(|&pos| (pos == head || ahead & (1 << (pos - head)) == 0) && ready(pos).is_some())
+            .unwrap_or(found);
+        let cell = ready(pos)?;
+        // SAFETY: ready, and not taken: marked below, so moved out once.
         let value = unsafe { cell.value.get().read().assume_init() };
-        self.head.pos.store(pos + 1, Ordering::Relaxed);
+        drop(guard);
+        // SAFETY: the caller's contract.
+        unsafe { self.taken(head, pos) };
         Some(value)
+    }
+
+    /// Whether the value of the position after `head` is written: from the
+    /// head's leaf when it is there, else from the next leaf, if made.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the receiver.
+    unsafe fn next_ready(&self, head: u64) -> bool {
+        let next = head + 1;
+        // SAFETY: the caller's contract: the head's leaf is ours.
+        let (leaf, number) = unsafe { *self.head.leaf.get() };
+        let leaf = if next / CELLS == number {
+            leaf.cast_const()
+        } else {
+            self.leaf(next / CELLS, false, &pin())
+        };
+        // SAFETY: a leaf the head has not passed, so not retired (this end
+        // alone retires leaves). SeqCst: the receiver's look, as the head's.
+        !leaf.is_null()
+            && unsafe { &(*leaf).cells[(next % CELLS) as usize] }
+                .ready
+                .load(Ordering::SeqCst)
+    }
+
+    /// The value of `pos` was taken, the head being `head`: the head moves on
+    /// past it and every mark after it, or `pos` is marked.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the receiver.
+    unsafe fn taken(&self, head: u64, pos: u64) {
+        let mut ahead = self.head.ahead.load(Ordering::Relaxed);
+        if pos != head {
+            self.head
+                .ahead
+                .store(ahead | (1 << (pos - head)), Ordering::Relaxed);
+            return;
+        }
+        let mut next = head + 1;
+        ahead >>= 1;
+        while ahead & 1 != 0 {
+            next += 1;
+            ahead >>= 1;
+        }
+        self.head.ahead.store(ahead, Ordering::Relaxed);
+        self.head.pos.store(next, Ordering::Relaxed);
     }
 
     /// The receiver is done with leaf `number`: it retires that leaf and every
@@ -404,8 +542,9 @@ impl<T> Radix<T> {
     /// a pop in progress does not.
     pub(in crate::sync::mpsc) fn len(&self) -> usize {
         let front = self.head.pos.load(Ordering::Acquire);
+        let ahead = u64::from(self.head.ahead.load(Ordering::Acquire).count_ones());
         let back = self.tail.load(Ordering::Acquire);
-        usize::try_from(back.saturating_sub(front)).unwrap_or(usize::MAX)
+        usize::try_from(back.saturating_sub(front).saturating_sub(ahead)).unwrap_or(usize::MAX)
     }
 }
 
@@ -415,6 +554,7 @@ impl<T> Drop for Radix<T> {
         // position claimed holds its value. The receiver retired every node
         // whose span ended before its leaf; what is left is the rest.
         let head = *self.head.pos.get_mut();
+        let ahead = *self.head.ahead.get_mut();
         let tail = *self.tail.get_mut();
         let (_, from) = *self.head.leaf.get_mut();
         let guard = pin();
@@ -423,19 +563,25 @@ impl<T> Drop for Radix<T> {
         drop(guard);
         // SAFETY: the root and the nodes below it whose span reaches the
         // receiver's leaf are this queue's, retired by nobody.
-        unsafe { free_tree::<T>(root, 0, from, head, tail) };
+        unsafe { free_tree::<T>(root, 0, from, (head, ahead), tail) };
     }
 }
 
 /// Frees `node`, whose span starts at leaf `base`, and the nodes below it
 /// that reach leaf `from` (the earlier ones were retired), dropping the values
-/// of positions `head..tail` it holds.
+/// of positions `head..tail` it holds but those marked taken in `ahead`.
 ///
 /// # Safety
 ///
 /// Nothing else reaches the tree, and every position `head..tail` holds its
 /// value.
-unsafe fn free_tree<T>(node: *mut Header, base: u64, from: u64, head: u64, tail: u64) {
+unsafe fn free_tree<T>(
+    node: *mut Header,
+    base: u64,
+    from: u64,
+    (head, ahead): (u64, u64),
+    tail: u64,
+) {
     // SAFETY: the caller's contract; an inner node.
     let inner = unsafe { &*node.cast::<Inner>() };
     let level = inner.level;
@@ -457,7 +603,8 @@ unsafe fn free_tree<T>(node: *mut Header, base: u64, from: u64, head: u64, tail:
             let start = child_base * CELLS;
             for pos in head.max(start)..tail.min(start + CELLS) {
                 let cell = &mut leaf.cells[(pos - start) as usize];
-                if *cell.ready.get_mut() {
+                let taken_ahead = pos - head < WINDOW && ahead & (1 << (pos - head)) != 0;
+                if *cell.ready.get_mut() && !taken_ahead {
                     // SAFETY: written and not taken: dropped once, here.
                     unsafe { cell.value.get_mut().assume_init_drop() };
                 }
@@ -466,7 +613,7 @@ unsafe fn free_tree<T>(node: *mut Header, base: u64, from: u64, head: u64, tail:
             unsafe { free_leaf::<T>(child) };
         } else {
             // SAFETY: the caller's contract, passed on.
-            unsafe { free_tree::<T>(child, child_base, from, head, tail) };
+            unsafe { free_tree::<T>(child, child_base, from, (head, ahead), tail) };
         }
     }
     drop(guard);
@@ -566,6 +713,130 @@ mod tests {
             drops.load(std::sync::atomic::Ordering::SeqCst),
             (CELLS * 2 + 6) as usize
         );
+    }
+
+    /// A send that claimed its position and has not written it yet: its
+    /// position, written later with `finish`.
+    fn stall<T>(queue: &Radix<T>) -> u64 {
+        queue.tail.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn finish<T>(queue: &Radix<T>, pos: u64, value: T) {
+        queue.write(pos, value, &pin());
+    }
+
+    #[test]
+    fn a_stalled_send_holds_back_no_one_else() {
+        let queue = Radix::new();
+        let stalled = stall(&queue);
+        queue.push(1);
+        queue.push(2);
+        assert_eq!(pop(&queue), Some(1));
+        assert_eq!(pop(&queue), Some(2));
+        assert_eq!(pop(&queue), None);
+        assert_eq!(queue.len(), 1, "the stalled position counts");
+        finish(&queue, stalled, 0);
+        assert_eq!(pop(&queue), Some(0));
+        assert_eq!(pop(&queue), None);
+        assert_eq!(queue.len(), 0);
+        // The head moved past the values taken ahead of it.
+        queue.push(3);
+        assert_eq!(pop(&queue), Some(3));
+    }
+
+    /// A stall near a leaf's end, values past it in the next leaves: they come
+    /// out, the leaves are left only once the stalled value is taken, and the
+    /// queue goes on.
+    #[test]
+    fn values_past_a_stall_come_out_across_leaves() {
+        let queue = Radix::new();
+        for i in 0..CELLS - 2 {
+            queue.push(i);
+            assert_eq!(pop(&queue), Some(i));
+        }
+        let stalled = stall(&queue);
+        for i in 0..40 {
+            queue.push(1000 + i);
+        }
+        for i in 0..40 {
+            assert_eq!(pop(&queue), Some(1000 + i));
+        }
+        assert_eq!(pop(&queue), None);
+        finish(&queue, stalled, 7);
+        assert_eq!(pop(&queue), Some(7));
+        for i in 0..CELLS * 3 {
+            queue.push(i);
+        }
+        for i in 0..CELLS * 3 {
+            assert_eq!(pop(&queue), Some(i));
+        }
+        assert_eq!(pop(&queue), None);
+    }
+
+    /// Two stalled positions in a row: the value behind them waits until one
+    /// of them is written (the receiver looks past its head only once the next
+    /// position is written), then everything comes out, each once.
+    #[test]
+    fn two_stalls_in_a_row_hold_back_what_is_behind_them_until_one_is_written() {
+        let queue = Radix::new();
+        let first = stall(&queue);
+        let second = stall(&queue);
+        queue.push(2);
+        assert_eq!(pop(&queue), None, "behind two stalls");
+        finish(&queue, second, 1);
+        assert_eq!(pop(&queue), Some(1));
+        assert_eq!(pop(&queue), Some(2));
+        assert_eq!(pop(&queue), None);
+        finish(&queue, first, 0);
+        assert_eq!(pop(&queue), Some(0));
+        assert_eq!(pop(&queue), None);
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// The receiver looks at most `WINDOW` positions past its head: values
+    /// further on wait for the stalled one, then come out in order.
+    #[test]
+    fn values_past_the_window_wait_for_the_stall() {
+        let queue = Radix::new();
+        let stalled = stall(&queue);
+        for i in 1..100u64 {
+            queue.push(i);
+        }
+        for i in 1..WINDOW {
+            assert_eq!(pop(&queue), Some(i));
+        }
+        assert_eq!(pop(&queue), None, "past the window");
+        finish(&queue, stalled, 0);
+        assert_eq!(pop(&queue), Some(0));
+        for i in WINDOW..100 {
+            assert_eq!(pop(&queue), Some(i));
+        }
+        assert_eq!(pop(&queue), None);
+    }
+
+    /// Dropped with values taken ahead of a stall written since: what is left
+    /// is dropped once, what was taken not again.
+    #[test]
+    fn a_drop_after_values_taken_ahead_drops_the_rest_once() {
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let queue = Radix::new();
+        let stalled = stall(&queue);
+        for _ in 0..5 {
+            queue.push(Counted(Arc::clone(&drops)));
+        }
+        for _ in 0..3 {
+            assert!(pop(&queue).is_some());
+        }
+        finish(&queue, stalled, Counted(Arc::clone(&drops)));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 3);
+        drop(queue);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 6);
     }
 
     /// Values that borrow from the test's frame: no `T: 'static`.
