@@ -320,6 +320,11 @@ fn a_spawn_onto_a_worker_allocates_nothing_on_the_spawning_thread() {
         .build()
         .unwrap();
     let made = rt.block_on(async {
+        // A burst of two first (see `burst`): a block on its way back from
+        // the worker as the next spawn starts finds a second one.
+        let (a, b) = (nuclei::spawn(async { 1u8 }), nuclei::spawn(async { 1u8 }));
+        a.await;
+        b.await;
         for _ in 0..WARM {
             nuclei::spawn(async { 1u8 }).await;
         }
