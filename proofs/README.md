@@ -337,7 +337,8 @@ threads against threads that keep timing out.
 `remote` (`tla/remote/RemoteFree.tla`) checks how a task's block freed on another thread than
 its owner's goes back to the owner (`src/mem/mod.rs`), at the grain of each atomic access.
 Each thread that allocates holds a record: a list other threads push the blocks they free onto,
-linked through the blocks, and a count that bounds it. A freeing thread counts itself in, gives
+linked through the blocks, and a count that bounds it (in the code, the bytes of the blocks in
+it, at most 16 KiB; the model counts blocks against an abstract bound). A freeing thread counts itself in, gives
 up at the bound, reads the head, gives up if the list is closed, and swaps its block in only if
 the head is still the one it read. The owner takes the whole list when its cache has no block,
 and as its thread ends swaps the list out and the head to closed in one step, frees all it

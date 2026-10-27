@@ -5,14 +5,15 @@
 //!
 //! Blocks come in classes of [`STEP`] bytes up to [`CLASSES`] steps, all
 //! aligned to [`STEP`]; a task larger than that, or more aligned, goes to
-//! the global allocator as it is. A thread keeps at most [`KEPT`] blocks
-//! of a class, so the memory a cache holds is bounded; it frees them as the
-//! thread ends. In steady state a spawn allocates nothing.
+//! the global allocator as it is. A thread keeps at most [`KEPT_BYTES`] of
+//! blocks of a class (many small blocks, few large ones), so the memory a
+//! cache holds is bounded by bytes; it frees them as the thread ends. In
+//! steady state a spawn allocates nothing.
 //!
 //! A block freed on another thread than its owner's (a task spawned here
 //! and ended on a worker or a pool thread) goes back to its owner through
 //! the owner's record: a list other threads push the blocks onto, linked
-//! through the blocks themselves, bounded by a count of [`KEPT`], and taken
+//! through the blocks themselves, bounded by [`KEPT_BYTES`], and taken
 //! whole by the owner when one of its classes has no block left. A push
 //! the list refuses (full, or closed because its thread ended) leaves the
 //! block to the freeing thread's cache, or to the global allocator.
@@ -35,8 +36,13 @@ pub(crate) use self::arc::BlockArc;
 pub(crate) const STEP: usize = 64;
 /// Classes cached: blocks up to `STEP * CLASSES` bytes.
 pub(crate) const CLASSES: usize = 16;
-/// Blocks a thread keeps of one class, and blocks its record holds.
-pub(crate) const KEPT: usize = 32;
+/// The bytes of blocks a thread keeps of one class, and its record holds.
+pub(crate) const KEPT_BYTES: usize = 16 * 1024;
+
+/// The blocks a thread keeps of `class`.
+fn kept(class: usize) -> usize {
+    KEPT_BYTES / block(class).size()
+}
 
 /// The class of a task of `layout`, if it is cached.
 fn class_of(layout: Layout) -> Option<usize> {
@@ -70,7 +76,7 @@ mod cache {
     use core::ptr::{self, NonNull};
     use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
-    use super::{CLASSES, KEPT, Owner, block};
+    use super::{CLASSES, KEPT_BYTES, Owner, block, kept};
 
     /// A block given back, as it lies in the list: the next one, and its
     /// class. A block is at least `STEP` bytes, aligned to `STEP`.
@@ -87,8 +93,9 @@ mod cache {
     /// A thread's record: the blocks other threads gave back to it.
     pub(super) struct Record {
         head: AtomicPtr<Freed>,
-        /// Blocks in the list, and pushes under way: it bounds the list.
-        count: AtomicUsize,
+        /// Bytes of blocks in the list, and of pushes under way: it bounds
+        /// the list.
+        bytes: AtomicUsize,
         claimed: AtomicBool,
         /// The record made before this one, set before it was published.
         next: AtomicPtr<Record>,
@@ -101,7 +108,7 @@ mod cache {
     #[cfg(test)]
     pub(super) static CLOSED_RECORD: Record = Record {
         head: AtomicPtr::new(CLOSED),
-        count: AtomicUsize::new(0),
+        bytes: AtomicUsize::new(0),
         claimed: AtomicBool::new(true),
         next: AtomicPtr::new(ptr::null_mut()),
     };
@@ -128,7 +135,7 @@ mod cache {
         // a live thread's.
         let record: &'static Record = Box::leak(Box::new(Record {
             head: AtomicPtr::new(ptr::null_mut()),
-            count: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
             claimed: AtomicBool::new(true),
             next: AtomicPtr::new(ptr::null_mut()),
         }));
@@ -150,16 +157,17 @@ mod cache {
     /// Gives `ptr`, a block of `class`, back to `record`'s thread; `false`
     /// if its list is full or closed.
     fn give_back(record: &Record, ptr: NonNull<u8>, class: usize) -> bool {
-        // The count's old value decides; giving up undoes it.
-        if record.count.fetch_add(1, Ordering::Relaxed) >= KEPT {
-            record.count.fetch_sub(1, Ordering::Relaxed);
+        // The bytes' old value decides; giving up undoes the count.
+        let size = block(class).size();
+        if record.bytes.fetch_add(size, Ordering::Relaxed) + size > KEPT_BYTES {
+            record.bytes.fetch_sub(size, Ordering::Relaxed);
             return false;
         }
         let freed = ptr.cast::<Freed>().as_ptr();
         let mut head = record.head.load(Ordering::Relaxed);
         loop {
             if head == CLOSED {
-                record.count.fetch_sub(1, Ordering::Relaxed);
+                record.bytes.fetch_sub(size, Ordering::Relaxed);
                 return false;
             }
             // SAFETY: the block is no task's and holds a `Freed`; it is
@@ -188,12 +196,12 @@ mod cache {
         /// Keeps `ptr`, a block of `class`; `false` if the list is full.
         fn keep(&mut self, class: usize, ptr: NonNull<u8>) -> bool {
             let blocks = &mut self.lists[class];
-            if blocks.len() >= KEPT {
+            if blocks.len() >= kept(class) {
                 return false;
             }
             // The list's own room is made once, at its full size.
             if blocks.capacity() == 0 {
-                blocks.reserve_exact(KEPT);
+                blocks.reserve_exact(kept(class));
             }
             blocks.push(ptr);
             true
@@ -216,10 +224,10 @@ mod cache {
                     // SAFETY: allocated with its class's layout, no task's.
                     unsafe { std::alloc::dealloc(ptr.as_ptr(), block(class)) };
                 }
-                taken += 1;
+                taken += block(class).size();
                 list = next;
             }
-            record.count.fetch_sub(taken, Ordering::Relaxed);
+            record.bytes.fetch_sub(taken, Ordering::Relaxed);
         }
     }
 
@@ -235,10 +243,10 @@ mod cache {
                     let Freed { next, class } = unsafe { list.read() };
                     // SAFETY: allocated with its class's layout, no task's.
                     unsafe { std::alloc::dealloc(list.cast(), block(class)) };
-                    taken += 1;
+                    taken += block(class).size();
                     list = next;
                 }
-                record.count.fetch_sub(taken, Ordering::Relaxed);
+                record.bytes.fetch_sub(taken, Ordering::Relaxed);
             }
             for (class, blocks) in self.lists.iter_mut().enumerate() {
                 for ptr in blocks.drain(..) {
@@ -445,12 +453,13 @@ mod tests {
         .unwrap();
     }
 
-    /// The owner's list takes `KEPT` blocks; the next stays with the thread
-    /// that freed it, and the owner gets its `KEPT` back.
+    /// The owner's list takes `KEPT_BYTES` of blocks; the next stays with
+    /// the thread that freed it, and the owner gets the rest back.
     #[test]
     fn an_owners_list_takes_at_most_its_bound() {
         std::thread::spawn(|| {
-            let blocks: Vec<_> = (0..=KEPT)
+            let bound = KEPT_BYTES / block(class_of(LAYOUT).unwrap()).size();
+            let blocks: Vec<_> = (0..=bound)
                 .map(|_| {
                     let (ptr, owner) = alloc(LAYOUT);
                     Sent(ptr, owner)
@@ -471,9 +480,9 @@ mod tests {
                 unsafe { free(b, LAYOUT, owner) };
             });
             last.join().unwrap();
-            let back: Vec<_> = (0..KEPT).map(|_| alloc(LAYOUT)).collect();
+            let back: Vec<_> = (0..bound).map(|_| alloc(LAYOUT)).collect();
             for (b, _) in &back {
-                assert!(addrs[..KEPT].contains(b), "a block given back");
+                assert!(addrs[..bound].contains(b), "a block given back");
             }
             for (b, owner) in back {
                 // SAFETY: as above.
