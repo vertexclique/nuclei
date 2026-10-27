@@ -4,6 +4,31 @@
 use super::*;
 
 impl Source {
+    /// A caller's descriptor: `Ready` with the write side's edge count while
+    /// it may be ready to write.
+    #[cfg(unix)]
+    pub(crate) fn poll_fd_write_ready(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<u32>> {
+        self.poll_writing(cx, |st, io, waker, after| {
+            st.fd_ready(io, waker, after).map(Ok)
+        })
+    }
+
+    /// A caller's descriptor would block on a write: the side waits for its
+    /// next edge, unless one came after `tick`.
+    #[cfg(unix)]
+    pub(crate) fn fd_clear_write(self: &Arc<Self>, tick: u32) {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // Nothing to wait for and nothing to fail: a registration that
+        // failed is the next readiness call's to report.
+        let _ = self.poll_writing(&mut cx, |st, _io, _waker, _after| {
+            st.fd_clear(tick);
+            Poll::Ready(Ok(()))
+        });
+    }
+
     /// Ready once a write would be taken at once (see `WriteState::ready`);
     /// `true` once writing failed.
     pub(crate) fn poll_write_ready(

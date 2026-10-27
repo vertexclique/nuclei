@@ -158,6 +158,10 @@ pub(crate) enum Kind {
     Udp,
     #[cfg(unix)]
     UnixDatagram,
+    /// A caller's own descriptor (`AsyncFd`): the driver makes no call on
+    /// it, and only says when it may be ready.
+    #[cfg(unix)]
+    Fd,
 }
 
 impl Kind {

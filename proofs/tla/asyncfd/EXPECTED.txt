@@ -1,0 +1,6 @@
+# configuration                spec                 expected
+AF_edges                       MC_AsyncFd           pass
+AF_edges_safe                  MC_AsyncFd           pass
+AF_ring                        MC_AsyncFd           pass
+MAF_no_tick                    MC_AsyncFd           violated:AllTaken
+WAF_kept                       MC_AsyncFd           violated:NoKept

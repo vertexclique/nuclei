@@ -52,6 +52,19 @@ impl ReadState {
             self.multi_stopping = true;
             route.cancel(id);
         }
+        // A caller's descriptor: only a poll, while it is not ready and a
+        // task waits.
+        #[cfg(ring)]
+        if self.user_fd {
+            if self.out.is_none()
+                && self.blocked
+                && !self.waiters.is_empty()
+                && let Some(issuer) = route.issuer(after)
+            {
+                self.out = Some(issuer.issue(Want::Ready { read: true }, kind, self.epoch, after));
+            }
+            return;
+        }
         if self.out.is_some() || self.has_result() || self.lent_done() {
             return;
         }
@@ -165,6 +178,11 @@ impl ReadState {
                     self.poll_first = false;
                     if let Err(err) = result {
                         self.error = Some(err);
+                    }
+                    if self.user_fd {
+                        self.blocked = false;
+                        self.edges = self.edges.wrapping_add(1);
+                        after.wake(&mut self.waiters);
                     }
                 }
             }

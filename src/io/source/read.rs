@@ -124,6 +124,14 @@ pub(super) struct ReadState {
     unsure: bool,
     /// The source's epoch this state is of.
     epoch: u32,
+    /// Edges (and, on a ring, polls that completed) since the source was
+    /// made: a caller's descriptor clears its ready only if none came after
+    /// the look its guard was made from (proofs/tla/asyncfd).
+    #[cfg(unix)]
+    edges: u32,
+    /// The side is a caller's own descriptor's (`AsyncFd`).
+    #[cfg(unix)]
+    user_fd: bool,
     /// The id of the operation out with the completion driver; only its
     /// completion clears this.
     #[cfg(completion)]
@@ -212,6 +220,28 @@ impl ReadState {
         Poll::Pending
     }
 
+    /// A caller's descriptor: `Ready` with the edge count while the side
+    /// may be ready, else the task waits (on a ring, for a poll armed now).
+    #[cfg(unix)]
+    pub(super) fn fd_ready(&mut self, io: Io<'_>, waker: &Waker, after: &mut After) -> Poll<u32> {
+        self.user_fd = true;
+        if !self.blocked {
+            return Poll::Ready(self.edges);
+        }
+        self.waiters.register(waker);
+        self.complete(io, Kind::Fd, 0, after);
+        Poll::Pending
+    }
+
+    /// The caller found its descriptor not ready: the side waits for the
+    /// next edge, unless one came after the look `tick` is of.
+    #[cfg(unix)]
+    pub(super) fn fd_clear(&mut self, tick: u32) {
+        if self.edges == tick {
+            self.blocked = true;
+        }
+    }
+
     /// A buffer from this thread's pool, or the side starves until one
     /// comes back. A whole datagram no buffer of the pool could hold fails
     /// the operation instead.
@@ -235,6 +265,11 @@ impl ReadState {
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         if edge {
             self.blocked = false;
+            self.edges = self.edges.wrapping_add(1);
+            if self.user_fd {
+                after.wake(&mut self.waiters);
+                return;
+            }
         }
         if self.waiters.is_empty() && !self.lent_waits() {
             return;
@@ -278,6 +313,8 @@ impl ReadState {
             }
             Kind::TcpListener | Kind::UnixListener => self.accept_ahead(fd, kind),
             Kind::Udp | Kind::UnixDatagram => self.receive_ahead(fd, kind, len, after),
+            // The caller makes its own calls.
+            Kind::Fd => {}
         }
     }
 

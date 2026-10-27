@@ -510,6 +510,22 @@ rule is checked for any path that moves the cursor back.
 The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
 rules on real sockets and files, each with a mutation of the code that makes one of them fail.
 
+## A caller's own descriptor
+
+`asyncfd` (`tla/asyncfd/AsyncFd.tla`) checks `AsyncFd` (`src/io/async_fd.rs`) and the side's
+state for a caller's descriptor (`Kind::Fd`), at the grain of each atomic access. A peer writes;
+on epoll and kqueue each write brings an edge that marks the side ready and counts it, and on
+io_uring a poll armed while the side is not ready and a task waits completes once the socket
+holds bytes. The task waits until the side is ready, notes the count (its guard's tick) and
+makes its own call; a call that would block clears the side only if the count is still the
+tick, since an edge after the call is the only one it gets. 5 configurations: 3 that must pass
+(edges and the ring's poll with `AllTaken`, every byte taken, and edges with `Counted`), a
+mutation that breaks `AllTaken` (a clear that does not look at the count), and a witness (a
+clear that finds a newer edge and keeps the side ready). The unit tests in
+`src/io/async_fd.rs` place an edge between the call and the clear on each side (the mutation
+fails both), and `tests/async_fd.rs` reads every byte of a peer that writes while the caller
+reads, on each backend.
+
 ## A source's operations on its shard's ring
 
 `ring` (`tla/ring/RingOp.tla`) checks how a side of a source works on an io_uring ring

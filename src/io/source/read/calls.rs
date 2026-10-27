@@ -4,6 +4,31 @@
 use super::*;
 
 impl Source {
+    /// A caller's descriptor: `Ready` with the read side's edge count while
+    /// it may be ready to read.
+    #[cfg(unix)]
+    pub(crate) fn poll_fd_read_ready(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<u32>> {
+        self.poll_reading(cx, |st, io, waker, after| {
+            st.fd_ready(io, waker, after).map(Ok)
+        })
+    }
+
+    /// A caller's descriptor would block on a read: the side waits for its
+    /// next edge, unless one came after `tick`.
+    #[cfg(unix)]
+    pub(crate) fn fd_clear_read(self: &Arc<Self>, tick: u32) {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // Nothing to wait for and nothing to fail: a registration that
+        // failed is the next readiness call's to report.
+        let _ = self.poll_reading(&mut cx, |st, _io, _waker, _after| {
+            st.fd_clear(tick);
+            Poll::Ready(Ok(()))
+        });
+    }
+
     /// Ready once a read would end at once (see `ReadState::ready`); `true`
     /// at the end of the stream.
     pub(crate) fn poll_read_ready(

@@ -132,6 +132,13 @@ pub(super) struct WriteState {
     shut: bool,
     /// The source's epoch this state is of.
     epoch: u32,
+    /// Edges (and, on a ring, polls that completed) since the source was
+    /// made, as the read side counts them (proofs/tla/asyncfd).
+    #[cfg(unix)]
+    edges: u32,
+    /// The side is a caller's own descriptor's (`AsyncFd`).
+    #[cfg(unix)]
+    user_fd: bool,
     /// The id of the operation out with the completion driver; only its
     /// completion clears this.
     #[cfg(completion)]
@@ -191,6 +198,28 @@ impl WriteState {
         self.lent.as_ref().is_some_and(|l| l.done.is_none())
     }
 
+    /// A caller's descriptor: `Ready` with the edge count while the side
+    /// may be ready, else the task waits (on a ring, for a poll armed now).
+    #[cfg(unix)]
+    pub(super) fn fd_ready(&mut self, io: Io<'_>, waker: &Waker, after: &mut After) -> Poll<u32> {
+        self.user_fd = true;
+        if !self.blocked {
+            return Poll::Ready(self.edges);
+        }
+        self.waiters.register(waker);
+        self.push(io, Kind::Fd, after);
+        Poll::Pending
+    }
+
+    /// The caller found its descriptor not ready: the side waits for the
+    /// next edge, unless one came after the look `tick` is of.
+    #[cfg(unix)]
+    pub(super) fn fd_clear(&mut self, tick: u32) {
+        if self.edges == tick {
+            self.blocked = true;
+        }
+    }
+
     /// Whether a write or send would be taken now: room in the write-behind
     /// (no datagram queued, for a socket of datagrams), or an error, which
     /// stays for it. `Ready` with `true` once writing failed.
@@ -234,6 +263,11 @@ impl WriteState {
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         if edge {
             self.blocked = false;
+            self.edges = self.edges.wrapping_add(1);
+            if self.user_fd {
+                after.wake(&mut self.waiters);
+                return;
+            }
         }
         if self.push_fd(fd, kind, after) {
             after.wake(&mut self.waiters);

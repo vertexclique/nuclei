@@ -54,6 +54,18 @@ impl WriteState {
         if self.out.is_some() {
             return;
         }
+        // A caller's descriptor: only a poll, while it is not ready and a
+        // task waits.
+        #[cfg(ring)]
+        if self.user_fd {
+            if self.blocked
+                && !self.waiters.is_empty()
+                && let Some(issuer) = route.issuer(after)
+            {
+                self.out = Some(issuer.issue(Want::Ready { read: false }, kind, self.epoch, after));
+            }
+            return;
+        }
         if let Some(failure) = self.failed
             && let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none() && !l.out)
         {
@@ -168,6 +180,10 @@ impl WriteState {
             Outcome::Ready(answer) => {
                 if !stale && let Answer::Done(_) = answer {
                     self.poll_first = false;
+                    if self.user_fd {
+                        self.blocked = false;
+                        self.edges = self.edges.wrapping_add(1);
+                    }
                     if self.connecting {
                         // A connect under way ended: the socket says how.
                         self.connected(match fd.map(sys::take_error) {
