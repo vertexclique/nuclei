@@ -1,0 +1,22 @@
+TLC run of every configuration in proofs/tla/handoff, 2026-10-26 13:00 UTC.
+Written by proofs/tla/run_tlc.sh local, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; one worker, 16 shares of every family at once. Limit: 780 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+H_safe                               0          0      -  not-run                               pass                                  NO
+H_rescue                             0          0      -  not-run                               pass                                  NO
+M_no_fence                           0          0      -  not-run                               violated:Exclusive                    NO
+M_no_recheck                      1235        541      2  deadlock                              deadlock                              yes
+M_no_poll_check                      0          0      -  not-run                               violated:Exclusive                    NO
+M_no_bracket_check                   0          0      -  not-run                               violated:Exclusive                    NO
+M_slot_reuse                         0          0      -  not-run                               violated:Exclusive                    NO
+M_bound_any                          0          0      -  not-run                               violated:BoundOnCreator               NO
+M_no_handoff                         0          0      -  not-run                               violated:Rescued                      NO
+W_handoff                        15334       8985      3  violated:NoHandoff                    violated:NoHandoff                    yes
+W_cancel                             0          0      -  not-run                               violated:NoCancel                     NO
+W_detached_call                      0          0      -  not-run                               violated:NoDetachedCall               NO
+R_seqcst                             0          0      -  not-run                               pass                                  NO
+M_retarget_relaxed                   0          0      -  not-run                               violated:WokenPolled                  NO
+W_old_wake                           0          0      -  not-run                               violated:NoOldWake                    NO
+
+results matching EXPECTED.txt: 2 of 15
