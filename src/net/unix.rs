@@ -1,6 +1,7 @@
 //! Unix domain sockets: listeners, streams and datagrams, and [`UCred`], the
-//! credentials of a stream's peer.
+//! credentials of a stream's peer; and Unix pipes ([`pipe`]).
 
+pub mod pipe;
 use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
