@@ -45,7 +45,8 @@ for (const button of document.querySelectorAll("[data-copy]")) {
 // closing it gives focus back to what had it.
 {
   const apple = /Mac|iPhone|iPad|iPod/.test(navigator.userAgentData?.platform ?? navigator.platform ?? "");
-  const docs = "https://docs.rs/nuclei/latest/nuclei/";
+  // The API reference the deploy builds from the same commit as the index (build_search.py).
+  const docs = new URL("api/nuclei/", siteRoot).href;
   const groups = { learn: "Learn", api: "API", site: "Home page" };
   const shown = { learn: 6, api: 8, site: 4 };
   const memberKinds = new Set(["method", "variant", "field"]);

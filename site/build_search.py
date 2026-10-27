@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Builds site/search.json, the index behind the site's search (Cmd+K or Ctrl+K).
+"""Builds site/search.json, the index behind the site's search (Cmd+K or Ctrl+K), and site/api/,
+the API reference its results open.
 
-Rebuild it, from the repository root, with one command:
+Neither is committed: the Pages workflow builds both from the commit it deploys, and checks every
+pull request the same way, so the index never lags the source. To preview the site locally, run
+from the repository root:
 
     python3 site/build_search.py
-
-Commit the new site/search.json with the change that made it stale: any change to the Learn
-pages, the landing page or the public API.
 
 What it indexes:
 
@@ -14,16 +14,16 @@ What it indexes:
   that exact heading), and the text under each, code included.
 - The landing page: every section, and every card, point and note in it.
 - The API: every public item of the crate, its methods, associated constants, variants and
-  fields, each linked to its page on https://docs.rs/nuclei/latest/nuclei/.
+  fields, each linked to its page in site/api/, the rustdoc of the same commit.
 
 Where the API comes from. The public names come from the source: src/lib.rs, its re-exports and
 the public modules under src/, read with their cfg attributes evaluated for each platform. The
 pages, kinds, anchors and summaries come from rustdoc, which the script runs for the target
-docs.rs builds (x86_64-unknown-linux-gnu, default features), so every link is the page docs.rs
-serves and never a guess. The two must agree: a name public in the source that rustdoc does not
-document, or the other way round, stops the build. A name public only on another platform (the
-Windows console events) is indexed from the source with its platform, and links to the docs.rs
-page of the nearest module docs.rs has.
+docs.rs builds (x86_64-unknown-linux-gnu, default features) and copies to site/api/, so every
+link is a page the site serves and never a guess. The two must agree: a name public in the source
+that rustdoc does not document, or the other way round, stops the build. A name public only on
+another platform (the Windows console events) is indexed from the source with its platform, and
+links to the page of the nearest module rustdoc has.
 
 Options:
 
@@ -35,6 +35,7 @@ import argparse
 import html
 import json
 import re
+import shutil
 import subprocess
 import sys
 from html.parser import HTMLParser
@@ -43,6 +44,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SITE = ROOT / "site"
 OUT = SITE / "search.json"
+API = SITE / "api"
 DOCS_TARGET = "x86_64-unknown-linux-gnu"
 DEFAULT_FEATURES = {"iouring", "epoll", "attributes"}
 
@@ -410,7 +412,7 @@ def source_modules():
     return out
 
 
-# rustdoc: the pages, kinds, anchors and summaries docs.rs serves. -----------------------------
+# rustdoc: the pages, kinds, anchors and summaries of the API reference. ---------------------
 
 KINDS = {
     "struct": "struct",
@@ -612,7 +614,7 @@ def api_entries(doc):
                 member["i"] = impl_type
             entries.append(member)
 
-    # Public only on a platform docs.rs does not build: from the source, with that platform.
+    # Public only on a platform the reference is not built for: from the source, with that platform.
     for mod_path, module in sorted(source.items()):
         for name, item in sorted(module.items.items()):
             if "linux" in item.platforms or item.keyword == "use":
@@ -794,11 +796,20 @@ def site_entries():
     return entries
 
 
+def publish_api(doc_dir):
+    """Copies the rustdoc output to site/api/, the pages the index links to, replacing any copy
+    an earlier build left."""
+    shutil.rmtree(API, ignore_errors=True)
+    shutil.copytree(doc_dir, API, ignore=shutil.ignore_patterns(".lock"))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--doc", type=Path, help="rustdoc output to use instead of running cargo doc")
     args = parser.parse_args()
-    doc = DocCrate(args.doc if args.doc else run_rustdoc())
+    doc_dir = args.doc if args.doc else run_rustdoc()
+    doc = DocCrate(doc_dir)
+    publish_api(doc_dir)
     index = {"learn": learn_entries(), "api": api_entries(doc), "site": site_entries()}
     OUT.write_text(json.dumps(index, ensure_ascii=False, separators=(",", ":")) + "\n")
 

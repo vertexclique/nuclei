@@ -1,16 +1,24 @@
 name: Pages
 
-# The site is the static site/ folder, published as it is but for its version placeholders,
-# which the deploy fills from Cargo.toml (no other build step). It deploys on a push that
-# touches it or Cargo.toml, on master and on the 0.5 branch, and by hand.
+# The site is site/ as the commit holds it plus what the build derives from the same commit: the
+# search index (site/search.json) and the API reference it links to (site/api/), both written by
+# site/build_search.py from the source and from rustdoc, and the version placeholders, filled from
+# Cargo.toml. Nothing derived is committed. A push to master or to the 0.5 branch that touches
+# anything the site reads builds and deploys it; a pull request builds it the same way and fails
+# when the build does (a name public in the source that rustdoc does not document, a cfg the index
+# cannot evaluate, a placeholder left unfilled), so a disagreement shows before the merge.
 on:
   push:
     branches: [master, modernize-2026]
-    paths:
+    paths: &site-inputs
       - "site/**"
-      - ".github/workflows/pages.yml"
-      # A version bump redeploys, so the site shows the new version.
+      - "src/**"
+      - "nuclei-macros/**"
+      - "build.rs"
       - "Cargo.toml"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths: *site-inputs
   workflow_dispatch:
 
 permissions:
@@ -18,29 +26,27 @@ permissions:
   pages: write
   id-token: write
 
-# One deployment at a time; a newer push waits rather than cancelling one under way.
+# Deployments run one at a time and a newer push waits rather than cancelling one under way; a
+# pull request's check is replaced by its next push.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('pages-check-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  deploy:
-    name: Deploy site/
+  build:
+    name: Build site/
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
-      # The site never states a version by hand. Its files hold placeholders, and this step fills
-      # them from Cargo.toml in the copy that is deployed (the committed files keep the
-      # placeholders), so a version bump needs no edit to the site:
+      # The site never states a version by hand: its files hold placeholders, filled here from
+      # Cargo.toml in the copy that is built (the committed files keep the placeholders):
       #   @@NUCLEI_MINOR@@  major.minor of [package] version, what a dependency line asks for ("0.5")
       #   @@RUST_VERSION@@  [package] rust-version, the minimum Rust ("1.99")
-      # The deploy stops if Cargo.toml lacks a value or a placeholder is left unfilled.
-      - name: Fill in the version from Cargo.toml
+      # The build stops if Cargo.toml lacks a value or a placeholder is left unfilled.
+      - name: Read the versions from Cargo.toml
+        id: versions
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
           rust=$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
@@ -50,18 +56,47 @@ jobs:
             exit 1
           fi
           echo "nuclei $version (dependency line $minor), Rust $rust"
+          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+
+      # rustdoc of the minimum Rust the crate declares, for the target the reference is built for.
+      - name: Rust ${{ steps.versions.outputs.rust }}
+        run: |
+          rustup toolchain install "${{ steps.versions.outputs.rust }}" --profile minimal --target x86_64-unknown-linux-gnu
+          rustup default "${{ steps.versions.outputs.rust }}"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: The search index and the API reference
+        run: python3 site/build_search.py
+
+      - name: Fill in the versions
+        run: |
           grep -rlIZ -e '@@NUCLEI_MINOR@@' -e '@@RUST_VERSION@@' site \
-            | xargs -0 -r sed -i -e "s/@@NUCLEI_MINOR@@/$minor/g" -e "s/@@RUST_VERSION@@/$rust/g"
-          if grep -rnI '@@[A-Z_]*@@' site; then
+            | xargs -0 -r sed -i -e "s/@@NUCLEI_MINOR@@/${{ steps.versions.outputs.minor }}/g" \
+                                 -e "s/@@RUST_VERSION@@/${{ steps.versions.outputs.rust }}/g"
+          if grep -rnI --exclude-dir=api '@@[A-Z_]*@@' site; then
             echo "a placeholder above was left unfilled" >&2
             exit 1
           fi
 
       - uses: actions/configure-pages@v6
+        if: github.event_name != 'pull_request'
 
       - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
         with:
           path: site
 
+  deploy:
+    name: Deploy site/
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v5
