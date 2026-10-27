@@ -55,6 +55,49 @@ fn a_buffer_dropped_on_another_thread_comes_back_through_the_queue() {
     assert_eq!(pool.charged(), 512);
 }
 
+/// Threads that give buffers back at once each push onto the one list: the
+/// pool gets every buffer back exactly once, and allocates none anew.
+#[test]
+fn buffers_given_back_by_many_threads_at_once_each_come_back_once() {
+    const EACH: usize = 64;
+    let pool = Pool::new(1 << 22);
+    let _entered = enter(&pool);
+    let sent: Vec<Vec<_>> = (0..4)
+        .map(|_| (0..EACH).map(|_| pool.get(512).unwrap()).collect())
+        .collect();
+    let mut addrs: Vec<usize> = sent
+        .iter()
+        .flatten()
+        .map(|b| b.filled().as_ptr() as usize)
+        .collect();
+    let charged = pool.charged();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(sent.len()));
+    let threads: Vec<_> = sent
+        .into_iter()
+        .map(|bufs| {
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                drop(bufs);
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let mut back: Vec<_> = (0..addrs.len()).map(|_| pool.get(512).unwrap()).collect();
+    assert_eq!(
+        pool.charged(),
+        charged,
+        "every one came back, none was made"
+    );
+    let mut got: Vec<usize> = back.iter().map(|b| b.filled().as_ptr() as usize).collect();
+    addrs.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(got, addrs, "each buffer once");
+    back.clear();
+}
+
 #[test]
 fn buffers_outliving_their_pool_are_freed_by_its_home() {
     let pool = Pool::new(1 << 20);

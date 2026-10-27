@@ -22,8 +22,12 @@
 //!
 //! A buffer dropped on its pool's own thread goes straight to the free list.
 //! Dropped anywhere else (its read-ahead moved with a handle to another
-//! thread), it goes into the pool's return queue, lock-free, which the pool
-//! takes buffers from when its free list runs dry. The shared part of a pool
+//! thread, its write-behind written by a blocking-pool job), it goes onto
+//! the pool's return list, linked through the returned buffers themselves:
+//! pushed with a compare-and-swap, taken whole by the pool when its free
+//! list runs dry, so nothing is allocated for it and nothing waits for
+//! reclamation (the push and the take of proofs/tla/remote, without its
+//! close: the home outlives every buffer). The shared part of a pool
 //! ([`Home`]) lives as long as any of its buffers, and frees what comes back
 //! after the pool itself is gone. Either way a buffer coming back wakes
 //! whoever waits for one; nothing that drops a buffer may hold a source's
@@ -37,7 +41,7 @@ use core::ptr::NonNull;
 use core::task::Waker;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering, fence};
 
 use kovan_queue::seg_queue::SegQueue;
 
@@ -89,9 +93,20 @@ struct Returned {
     cap: u32,
 }
 
+/// A returned buffer as it lies on the return list, written into its first
+/// bytes: every buffer is at least 512 bytes, aligned to 64. No padding, so
+/// every byte of the buffer stays initialized (a slice over it is sound).
+#[repr(C)]
+struct Back {
+    next: *mut Back,
+    cap: u32,
+    class: u32,
+}
+
 /// The part of a pool its buffers go back to from any thread.
 pub(crate) struct Home {
-    returned: SegQueue<Returned>,
+    /// The buffers given back, last first.
+    returned: AtomicPtr<Back>,
     /// Someone waits for a buffer to come back.
     waiting: AtomicBool,
     /// Who: woken, all of them, by the next buffer that comes back.
@@ -101,13 +116,42 @@ pub(crate) struct Home {
 impl Home {
     /// Takes back a buffer dropped on a thread that is not its pool's.
     fn give_back(&self, returned: Returned) {
-        self.returned.push(returned);
+        let back = returned.raw.0.cast::<Back>().as_ptr();
+        let mut head = self.returned.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: the buffer is no one's but this call's until the
+            // exchange publishes it, and holds a `Back`.
+            unsafe {
+                back.write(Back {
+                    next: head,
+                    cap: returned.cap,
+                    class: u32::from(returned.class),
+                });
+            }
+            match self.returned.compare_exchange_weak(
+                head,
+                back,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => head = now,
+            }
+        }
         // Pairs with the fence of `wait_for_return`: either this sees the
         // waiter's flag, or the waiter sees this buffer in the queue.
         fence(Ordering::SeqCst);
         if self.waiting.load(Ordering::Relaxed) {
             self.wake_waiters();
         }
+    }
+
+    /// Every buffer given back so far, the last first.
+    fn take_all(&self) -> Taken {
+        if self.returned.load(Ordering::Relaxed).is_null() {
+            return Taken(core::ptr::null_mut());
+        }
+        Taken(self.returned.swap(core::ptr::null_mut(), Ordering::Acquire))
     }
 
     fn wake_waiters(&self) {
@@ -122,10 +166,31 @@ impl Home {
 impl Drop for Home {
     fn drop(&mut self) {
         // The pool is gone: what came back after it goes to the allocator.
-        while let Ok(r) = self.returned.try_pop() {
+        for r in self.take_all() {
             // SAFETY: allocated with this layout, owned by nobody else.
             unsafe { dealloc(r.raw.0.as_ptr(), returned_layout(r.class, r.cap)) };
         }
+    }
+}
+
+/// Buffers taken off a return list, theirs alone now.
+struct Taken(*mut Back);
+
+impl Iterator for Taken {
+    type Item = Returned;
+
+    fn next(&mut self) -> Option<Returned> {
+        let back = NonNull::new(self.0)?;
+        // SAFETY: a buffer given back, this list's since the swap that took
+        // it (Acquire, against the push's Release).
+        let Back { next, cap, class } = unsafe { back.as_ptr().read() };
+        self.0 = next;
+        Some(Returned {
+            raw: Raw(back.cast()),
+            // Written from a `u8` by `give_back`.
+            class: class as u8,
+            cap,
+        })
     }
 }
 
@@ -165,7 +230,7 @@ impl Pool {
         let cap = cap.max(CLASSES[0]);
         Self {
             home: Arc::new(Home {
-                returned: SegQueue::new(),
+                returned: AtomicPtr::new(core::ptr::null_mut()),
                 waiting: AtomicBool::new(false),
                 waiters: SegQueue::new(),
             }),
@@ -256,17 +321,17 @@ impl Pool {
     /// A buffer of `class` that came back from another thread; others found
     /// on the way go to their free lists, and wholes to the allocator.
     fn take_returned(&self, class: usize) -> Option<NonNull<u8>> {
-        while let Ok(r) = self.home.returned.try_pop() {
+        let mut found = None;
+        for r in self.home.take_all() {
             if r.class == WHOLE {
                 self.free_whole(r.raw.0, r.cap);
-                continue;
+            } else if found.is_none() && usize::from(r.class) == class {
+                found = Some(r.raw.0);
+            } else {
+                self.free[usize::from(r.class)].borrow_mut().push(r.raw.0);
             }
-            if usize::from(r.class) == class {
-                return Some(r.raw.0);
-            }
-            self.free[usize::from(r.class)].borrow_mut().push(r.raw.0);
         }
-        None
+        found
     }
 
     /// A new buffer of `class`, charged first; none past the cap.
@@ -340,7 +405,7 @@ impl Pool {
         // Pairs with the fence of `Home::give_back`.
         fence(Ordering::SeqCst);
         let idle = self.free.iter().any(|f| !f.borrow().is_empty());
-        if idle || !self.home.returned.is_empty() {
+        if idle || !self.home.returned.load(Ordering::SeqCst).is_null() {
             self.home.wake_waiters();
         }
     }
