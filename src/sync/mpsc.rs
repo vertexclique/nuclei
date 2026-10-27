@@ -38,8 +38,8 @@
 //! # Ordering
 //!
 //! What one sender sends comes out in the order it was sent, as the
-//! established API promises. The message queue is kovan's segment queue, a
-//! linearizable FIFO queue: a send claims the next cell, and the receiver
+//! established API promises. The message queue is a lock-free segment queue,
+//! a linearizable FIFO queue: a send claims the next cell, and the receiver
 //! takes cells in the order they were claimed, so a send that returned before
 //! another began comes out first. Values that different senders send at the
 //! same time come out in the order their sends claimed cells.
@@ -96,7 +96,7 @@
 //!
 //! # Progress
 //!
-//! The message queue is kovan's segment queue. A send claims the next cell
+//! The message queue is that segment queue. A send claims the next cell
 //! with one fetch-add, writes its value into it and publishes it with a
 //! compare-and-swap. It retries only when another send linked the next
 //! segment first, so a send never waits for another thread, and some send

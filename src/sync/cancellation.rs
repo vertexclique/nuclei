@@ -144,7 +144,7 @@ use self::rc::{Arc, Weak};
 /// - Lock-free: [`cancel`](CancellationToken::cancel) and the first poll of a
 ///   future of an uncancelled token. Setting a flag is a lock-free queue
 ///   operation, and the visit of the descendants reads each registry with
-///   kovan's map iterator, which restarts a bucket whose walk was disturbed
+///   the map's iterator, which restarts a bucket whose walk was disturbed
 ///   by a concurrent update. A `cancel` never waits for another `cancel`:
 ///   each walks the subtree on its own. The time it takes grows with the
 ///   number of descendants, whether or not they were cancelled already.

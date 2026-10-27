@@ -6,8 +6,9 @@
 //! with its own [`Waker`](core::task::Waker). Every primitive also has
 //! `try_` forms that never wait. The core of this module makes no system
 //! call: no futex, no thread park, no sleep and no clock read. The one
-//! exception is inside kovan's queues, which recycle waiter nodes and yield
-//! the thread when they meet contention. The other exception is the
+//! exception is inside the lock-free queues the primitives use, which recycle
+//! waiter nodes and yield the thread when they meet contention. The other
+//! exception is the
 //! `blocking_*` methods, which exist for threads that may block and park
 //! the calling thread until their wait is over. Called on a nuclei shard
 //! (inside one of its tasks) they run a nested `block_on` instead, so the
@@ -101,8 +102,10 @@
 //!   such pass is another thread's own operation getting done, which is
 //!   what lock-free means, and there is no cap on the passes of one call.
 //!
-//! Besides the primitives, this module re-exports kovan's lock-free map,
-//! queues and [`Atom`](crate::sync::Atom), so one module holds every synchronization structure.
+//! Besides the primitives, this module re-exports a lock-free map
+//! ([`HopscotchMap`](crate::sync::HopscotchMap)), queues
+//! ([`SegQueue`](crate::sync::SegQueue), [`ArrayQueue`](crate::sync::ArrayQueue)) and
+//! [`Atom`](crate::sync::Atom), so one module holds every synchronization structure.
 
 /// Defines a constructor as a `const fn` in an ordinary build and as a
 /// plain `fn` under `--cfg loom`, whose instrumented atomics cannot be

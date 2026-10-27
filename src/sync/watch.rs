@@ -31,10 +31,10 @@
 //! assert_eq!(*rx.borrow_and_update(), "world");
 //! ```
 //!
-//! # The value lives in a `kovan::Atom`
+//! # The value lives in an `Atom`
 //!
 //! Where a lock-based channel guards the value with a read-write lock, this
-//! one keeps it in a [`kovan::Atom`]. A send publishes a new allocation with
+//! one keeps it in an [`Atom`]. A send publishes a new allocation with
 //! one swap; a borrow is one protected load and never blocks a sender, and a
 //! sender never blocks a borrow. Two consequences follow, and both differ
 //! from the lock-based API:
@@ -64,7 +64,7 @@
 //!   [`Receiver::mark_changed`], [`Receiver::mark_unchanged`],
 //!   [`Sender::borrow`], [`Sender::is_closed`], [`Sender::subscribe`],
 //!   [`Sender::receiver_count`], [`Sender::sender_count`], both `same_channel`
-//!   checks, the clones, and dropping a [`Ref`]. A borrow is a kovan `Atom`
+//!   checks, the clones, and dropping a [`Ref`]. A borrow is an `Atom`
 //!   load, which is wait-free.
 //! - The *publication* of [`Sender::send`] and [`Sender::send_replace`] (the
 //!   swap and the version bump) is wait-free, but each ends by waking the

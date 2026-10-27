@@ -24,9 +24,9 @@
 //! assert_eq!(rx1.try_recv(), Ok(20));
 //! ```
 //!
-//! # Values live in nodes published through kovan
+//! # Values live in nodes published lock-free
 //!
-//! The channel is a ring of `capacity` slots, each a [`kovan::Atomic`]
+//! The channel is a ring of `capacity` slots, each an atomic pointer
 //! holding the node of the latest value sent to it with that value's
 //! position. A sender takes the next position with one `fetch_add`,
 //! publishes its node into the position's slot with a compare-and-swap that
@@ -43,8 +43,8 @@
 //!   up to `capacity` values whatever the receivers have read. [`Sender::len`]
 //!   still counts what the slowest receiver has yet to take.
 //!
-//! Nodes come from kovan's node helpers, so under nuclei's `recycle` feature
-//! a channel in steady use makes no call into the global allocator.
+//! Under the `recycle` feature its nodes come from a per-thread cache instead
+//! of the global allocator.
 //!
 //! # Progress
 //!

@@ -1,24 +1,43 @@
 //! # Nuclei
 //!
-//! Proactive IO runtime: thread-per-core shards that run tasks and drive
-//! their own IO, timers and buffers. Every operation is completed for the
-//! task that asked for it; no task waits for readiness and then makes the
-//! call itself.
+//! A proactive async runtime: thread-per-core shards that run tasks and
+//! drive their own IO, timers and buffers. Every operation is completed for
+//! the task that asked for it; no task waits for readiness and then makes
+//! the call itself. IO runs on io_uring on Linux where the kernel allows it,
+//! else on epoll; on kqueue on macOS and the BSDs; and on I/O completion
+//! ports on Windows.
 //!
-//! IO runs on io_uring on Linux where the kernel allows it, else on epoll;
-//! on kqueue on macOS and the BSDs; and on I/O completion ports on Windows.
-//! A [`Handle`] wraps std's own socket or file types and gives them async
-//! operations (`accept`, `connect`, `send`, `recv`, ...) and the
-//! `futures-io` traits. [`spawn`], [`block_on`] and the rest place work on
-//! the process default [`Runtime`], which starts on first use with no
-//! configuration; a [`Builder`] sets every setting for a runtime of one's
-//! own. [`stats()`] takes a snapshot of what every shard is doing: its
-//! tasks, polls, IO in flight, buffers, timers and errors.
+//! [`spawn`], [`block_on`] and the rest place work on the process default
+//! [`Runtime`], which starts on first use with no configuration; a
+//! [`Builder`] sets every setting for a runtime of one's own.
+//!
+//! # What is where
+//!
+//! - [`runtime`]: runtimes, their builder and handles, and `block_on`.
+//! - [`task`]: spawning, [`JoinSet`](task::JoinSet), abort handles, ids,
+//!   task-local values and yielding.
+//! - [`net`]: TCP, UDP and Unix sockets, names, socket options, stream
+//!   halves and pipes.
+//! - [`io`]: [`Handle`], async operations on std's own IO objects, and the
+//!   helpers every stream gets: reads and writes as futures, copies,
+//!   buffers, in-memory pipes, the standard streams and readiness.
+//! - [`fs`]: files, whole-file calls, metadata and directories.
+//! - [`time`]: sleeps, timeouts, intervals and a clock tests can pause.
+//! - [`sync`]: locks, semaphores, notifications, once-cells, channels and
+//!   cancellation tokens, for any executor.
+//! - [`process`] and [`signal`]: child processes, signals and console events.
+//! - [`stats()`]: a snapshot of what every shard is doing.
+//! - [`select!`], [`join!`] and [`try_join!`] wait on several futures in one
+//!   task; `#[nuclei::main]`, `#[nuclei::test]` and `#[nuclei::bench]` run
+//!   an async function in the runtime.
 //!
 //! A call that needs the default runtime or the calling thread's shard
 //! panics if that cannot start (the system refused its poller: no
 //! descriptors or memory left); [`Builder::build`] and [`task::Builder`]
 //! answer the error instead.
+//!
+//! The guide, a path from the first program to production with an example
+//! that runs for every idea, is at <https://nuclei.rs/learn/>.
 //!
 //! ```no_run
 //! use nuclei::net::TcpListener;
@@ -62,7 +81,7 @@
 
 mod buf;
 mod compat;
-/// Nuclei's configuration options reside here.
+/// The proactor's configuration: the io_uring settings of every shard and the default backend.
 pub mod config;
 pub mod fs;
 pub mod io;
