@@ -27,9 +27,9 @@ profile). Files written:
     site/apple-touch-icon.png        site/favicon.svg at 180 by 180
     site/media/social.png            the link preview: the mark on navy, 1200 by 630
 
-and it writes the header mark inline into every page with the bar (site/index.html and
-site/learn/*.html), in heavier lines for its size, its arrows grouped for the animation in
-site/motion.css.
+and it writes the header mark inline into the landing page's source (site/src/index.html), in
+heavier lines for its size, its arrows grouped for the animation in site/motion.css; the site's
+build (site/build_pages.py) copies it from there into every page with the bar.
 """
 
 import re
@@ -154,8 +154,9 @@ def header_mark():
 
 
 def put_header_mark(mark):
-    """Writes the header mark into every page that has the bar: the home page and Learn."""
-    pages = [ROOT / "site/index.html", *sorted((ROOT / "site/learn").glob("*.html"))]
+    """Writes the header mark into the landing page's source, where the site's build takes it for
+    every page with the bar."""
+    pages = [ROOT / "site/src/index.html"]
     pattern = re.compile(r'(<span class="nav__logo">).*?(</span>)', re.S)
     for page in pages:
         text = page.read_text()
@@ -257,7 +258,7 @@ def main():
     pages = put_header_mark(header_mark())
     for name in [*svgs, "site/media/social.png", *(target for _, target, _, _ in renders)]:
         print(name)
-    print(f"the header mark, inline in {len(pages)} pages")
+    print(f"the header mark, inline in {pages[0].relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,56 @@
+<!--title How it works-->
+<!--lede Shards, a driver that completes the IO, and buffers it keeps: the ideas the other chapters build on.-->
+<h2 id="shards">One shard per core</h2>
+<p>A runtime starts one worker thread per core, and each runs a <strong>shard</strong>: a run queue, a timer wheel, a buffer pool and a <strong>driver</strong>, its own handle on the kernel's IO interface. On Linux each worker is pinned to its core.</p>
+<ul>
+<li><strong>A task stays where it was placed.</strong> Nothing steals it: no lock or cache line is shared to move it, and its timers and IO stay on one core.</li>
+<li><strong>Placement keeps work near.</strong> A task spawned on a worker stays on that worker while it is no busier than the others (a margin you can set); the first spawn from another thread picks the less loaded of two shards.</li>
+<li><strong>A long computation holds its shard.</strong> Code that runs for a long time without an <code>.await</code> keeps the shard's other tasks waiting. Give it to <a href="tasks.html#blocking">the blocking pool</a>, or split it with <a href="tasks.html#yield">yields</a>.</li>
+</ul>
+
+<h2 id="proactor">The driver completes the IO</h2>
+<p>A readiness-based runtime tells a task when a socket may be ready, and the task then makes the read or write call itself; if another reader got there first, the call would block and the task waits again. Nuclei is a <strong>proactor</strong>: the task hands its operation to its shard's driver, and the operation completes for it. Only the driver touches a descriptor.</p>
+<table class="table">
+<thead><tr><th>Backend</th><th>How an operation completes</th></tr></thead>
+<tbody>
+<tr><td data-label="Backend">io_uring</td><td data-label="How an operation completes">The driver submits it to the shard's ring, and the kernel performs it.</td></tr>
+<tr><td data-label="Backend">I/O completion ports</td><td data-label="How an operation completes">It is issued as an overlapped call; the kernel completes it, and the shard takes the completion from its port.</td></tr>
+<tr><td data-label="Backend">epoll, kqueue</td><td data-label="How an operation completes">The driver makes the call: at once when the socket may be ready, otherwise on its next edge.</td></tr>
+</tbody>
+</table>
+<p>The task's side is the same on all four: it asks, and later takes the result.</p>
+
+<h2 id="buffers">Where the bytes go</h2>
+<p>The kernel may hold an operation's memory after the future that asked is gone, so Nuclei never lends the kernel memory a future borrows:</p>
+<ul>
+<li><strong>Reads land in the shard's pool.</strong> The driver reads ahead into a pool buffer; <code>recv</code> or <code>read</code> copies into your slice.</li>
+<li><strong>Writes go to a write-behind.</strong> A write is copied into the stream's write-behind buffer and taken at once; the driver writes it out, in order, as the socket takes it.</li>
+<li><strong>The pool has a ceiling.</strong> Each worker's buffers hold at most <a href="api:nuclei::Builder::io_buffer_cap"><code>io_buffer_cap</code></a> bytes. At the cap, IO waits for buffers to come back, so IO memory never grows past it.</li>
+</ul>
+<p>So a write that returned means the bytes are Nuclei's to deliver, not that the kernel has them. <code>flush</code> waits until the kernel has every byte and reports a write that failed; <code>shutdown</code> flushes, then ends the write side so the peer sees the end of the stream.</p>
+<!--example proactive_write_behind-->
+<p>A write that fails keeps its error: later writes fail with it until a flush reports it. Bytes written behind are delivered even if the handle is dropped first: a copy of its descriptor sends them, for a bounded time, and then closes.</p>
+
+<h2 id="lending">Lending a buffer</h2>
+<p>Where the copy matters, lend the driver your own <code>Vec&lt;u8&gt;</code>. <code>read_owned</code> reads into its spare capacity and gives it back with the count; <code>write_owned</code> writes all of it and gives it back once the kernel took the last byte. TCP streams, Unix streams and files have both.</p>
+<!--example proactive_owned-->
+
+<h2 id="cancel">Dropping a future halfway</h2>
+<p>Async code drops futures all the time: a timeout fires, a token is cancelled, a <code>select!</code> takes another branch. No byte is lost when it does:</p>
+<ul>
+<li>A read dropped halfway leaves what the driver already read for the next read.</li>
+<li>A lent read (<code>read_owned</code>) dropped halfway hands the bytes read into its buffer to the next read, ahead of anything after them.</li>
+<li>A lent write (<code>write_owned</code>) dropped halfway reaches the stream whole or not at all: withdrawn if none of it went out, finished by the driver if some did. On Windows a TCP write is always finished.</li>
+</ul>
+
+<h2 id="allocation">No allocation in steady state</h2>
+<p>Once warm, these operations make no call into the allocator. The crate's tests measure it with a counting allocator (<code>tests/zero_alloc.rs</code>), on a runtime that runs everything on one thread:</p>
+<ul>
+<li>a TCP round trip; UDP datagrams, to an address and on a connected socket; file reads and writes;</li>
+<li>a local spawn; a spawn onto a worker, on the spawning thread; a job on the blocking pool;</li>
+<li>a <code>JoinSet</code> spawn and join; a oneshot channel.</li>
+</ul>
+<p>A timer takes a slot of its shard's wheel, and arming and cancelling reuse the slots once the wheel has grown to the most timers alive at once.</p>
+
+<h2 id="checked">Checked, not assumed</h2>
+<p>The concurrent protocols are model-checked with TLA+: the task's states, the park and wake handshake, an IO source's sides, the ring's operations and the sync primitives' queues. TLC tries every order of every thread's steps for small sizes, and each model has mutations that must break it. Lean proves the arithmetic under them (counts, state words, generations) for every size. Loom runs the real code under every interleaving it reaches, and CI runs the suite under AddressSanitizer on io_uring and on epoll. <a href="@@SOURCE@@proofs/README.md"><code>proofs/README.md</code></a> says what each check covers and what it leaves out.</p>

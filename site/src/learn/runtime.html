@@ -1,0 +1,42 @@
+<!--title Runtime-->
+<!--lede The ways into the runtime: the attribute, block_on, and runtimes of your own.-->
+<h2 id="attribute">The attribute</h2>
+<p><code>#[nuclei::main]</code> turns an async <code>main</code> into a program: its body runs in <code>block_on</code> on the default runtime. It may return anything <code>main</code> may, such as <code>std::io::Result&lt;()&gt;</code>. Its options, comma separated:</p>
+<ul>
+<li><code>threads = N</code>: a runtime of its own with N workers; <code>0</code> runs every task on the thread inside <code>block_on</code>.</li>
+<li><code>start_paused = true</code>: a runtime of its own whose clock starts paused (see <a href="time.html#paused">Time</a>).</li>
+<li><code>crate = "path"</code>: where the crate is, for code that re-exports it.</li>
+</ul>
+<!--example runtime_attribute-->
+<!--output runtime_attribute-->
+2 worker shards
+<!--/output-->
+
+<h2 id="block-on">block_on</h2>
+<p><code>nuclei::block_on</code> runs a future to its end on the calling thread. The first call, or the first <code>spawn</code>, starts the default runtime, so a plain <code>fn main</code> needs nothing else. (<code>nuclei::drive</code> is the same call under the name earlier versions used.)</p>
+<!--example runtime_block_on-->
+
+<h2 id="nesting">block_on nests</h2>
+<p><code>block_on</code> works anywhere, inside a task too. There it nests: the shard keeps running its other tasks, timers and IO until the future completes, so synchronous code deep in a call stack can wait on a future without holding the shard.</p>
+<!--example runtime_nested-->
+<p>Two rules come with it. The task that called <code>block_on</code> is not polled again until the call returns, so a future that waits for that very task never completes. And each level runs on the thread's stack, so the depth is bounded by <a href="api:nuclei::Builder::max_nesting"><code>max_nesting</code></a>; one level more panics with a message that says so.</p>
+
+<h2 id="own">A runtime of your own</h2>
+<p><code>Runtime::new()</code> starts one with every setting at its default; <code>Runtime::builder()</code> sets them (<a href="production.html#builder">every setting</a>). A runtime spawns, runs <code>block_on</code> and runs blocking work, as the free functions do on the default runtime.</p>
+<!--example runtime_builder-->
+<p>Dropping a <code>Runtime</code> stops its workers, drops the tasks they still hold, and waits for the threads to exit. <code>shutdown_timeout</code> bounds that wait; <code>shutdown_background</code> does not wait at all.</p>
+
+<h2 id="handle">Handles and entering</h2>
+<p><code>runtime.handle()</code> gives a <code>RuntimeHandle</code>: cheap to clone, usable from any thread to spawn on that runtime or to <code>block_on</code>. A handle does not keep its runtime running.</p>
+<!--example runtime_handle-->
+<ul>
+<li><code>RuntimeHandle::current()</code>: the runtime this thread is inside, or the default one.</li>
+<li><code>RuntimeHandle::try_current()</code>: the runtime this thread is inside, or an error; it never starts the default one.</li>
+<li><code>runtime.enter()</code>: makes the free functions (<code>spawn</code>, <code>spawn_blocking</code>, ...) use this runtime on this thread until the guard drops.</li>
+<li><code>id()</code>: a <code>RuntimeId</code>, different for every runtime of the process.</li>
+</ul>
+
+<h2 id="default">The default runtime, configured</h2>
+<p>The free functions use the runtime the calling thread is inside, or else the default runtime. To configure the default one, build it with <code>build_global</code> before anything starts it.</p>
+<!--example runtime_global-->
+<p><code>build_global</code> fails with <a href="errors.html#already-running">the default runtime is already running</a> once a free function, the attribute or an earlier <code>build_global</code> started it: call it first thing in <code>main</code>.</p>

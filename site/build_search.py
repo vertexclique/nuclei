@@ -1,12 +1,8 @@
-#!/usr/bin/env python3
 """Builds site/search.json, the index behind the site's search (Cmd+K or Ctrl+K), and site/api/,
 the API reference its results open.
 
-Neither is committed: the Pages workflow builds both from the commit it deploys, and checks every
-pull request the same way, so the index never lags the source. To preview the site locally, run
-from the repository root:
-
-    python3 site/build_search.py
+Neither is committed: site/build.py builds both, after the pages, and the Pages workflow runs it
+for the commit it deploys and for every pull request, so the index never lags the source.
 
 What it indexes:
 
@@ -24,14 +20,8 @@ link is a page the site serves and never a guess. The two must agree: a name pub
 that rustdoc does not document, or the other way round, stops the build. A name public only on
 another platform (the Windows console events) is indexed from the source with its platform, and
 links to the page of the nearest module rustdoc has.
-
-Options:
-
-    --doc DIR   use the rustdoc output in DIR (the folder holding nuclei/) instead of running
-                cargo doc; it must be a build for x86_64-unknown-linux-gnu with default features
 """
 
-import argparse
 import html
 import json
 import re
@@ -729,7 +719,10 @@ def joined_text(nodes):
 def learn_entries():
     entries = []
     for page in sorted((SITE / "learn").glob("*.html")):
-        tree = Tree(page.read_text()).root
+        source = page.read_text()
+        if 'http-equiv="refresh"' in source:
+            continue
+        tree = Tree(source).root
         url = "learn/" + ("" if page.name == "index.html" else page.name)
         head = tree.find(lambda n: n.tag == "header" and "chapter-head" in n.classes())
         article = tree.find(lambda n: n.tag == "article" and "prose" in n.classes())
@@ -803,17 +796,11 @@ def publish_api(doc_dir):
     shutil.copytree(doc_dir, API, ignore=shutil.ignore_patterns(".lock"))
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--doc", type=Path, help="rustdoc output to use instead of running cargo doc")
-    args = parser.parse_args()
-    doc_dir = args.doc if args.doc else run_rustdoc()
-    doc = DocCrate(doc_dir)
-    publish_api(doc_dir)
-    index = {"learn": learn_entries(), "api": api_entries(doc), "site": site_entries()}
+def write_index(api):
+    """Writes site/search.json from the built pages and the API records, and says what it holds."""
+    index = {"learn": learn_entries(), "api": api, "site": site_entries()}
     OUT.write_text(json.dumps(index, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-    api = index["api"]
     items = [e for e in api if e["k"] not in MEMBER_KINDS.values() or e["k"] in ("const", "type") and "#" not in e["u"]]
     learn_text = " ".join(e["t"] + " " + e["b"] for e in index["learn"])
     unnamed = sorted({e["p"] for e in items if e["k"] != "mod" and not re.search(rf"\b{re.escape(e['n'])}\b", learn_text)})
@@ -823,7 +810,3 @@ def main():
           f"{len(api) - len(items)} members; {len(index['site'])} landing page entries; {OUT.stat().st_size} bytes")
     if unnamed:
         print(f"public items the Learn never names ({len(unnamed)}): " + ", ".join(unnamed))
-
-
-if __name__ == "__main__":
-    main()

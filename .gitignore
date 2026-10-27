@@ -4,6 +4,9 @@ Cargo.lock
 target
 examples/target
 *.json
-# Built by site/build_search.py from the commit (the Pages workflow builds them to deploy).
+# Built by site/build.py from the commit (the Pages workflow builds them to deploy).
+/site/index.html
+/site/learn/
 /site/search.json
 /site/api/
+__pycache__/

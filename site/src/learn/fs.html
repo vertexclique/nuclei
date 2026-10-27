@@ -1,0 +1,25 @@
+<!--title Files-->
+<!--lede Files and directories, as async calls that never hold a shard.-->
+<h2 id="whole">Whole files</h2>
+<p><code>nuclei::fs</code> mirrors <code>std::fs</code>, with each call a future: <code>read</code>, <code>read_to_string</code>, <code>write</code>, <code>copy</code>, <code>rename</code>, <code>remove_file</code>, <code>metadata</code>, <code>try_exists</code> and the rest take a path and do the whole job.</p>
+<!--example fs_whole-->
+
+<h2 id="file">Opening a file</h2>
+<p>A <a href="api:nuclei::fs::File"><code>File</code></a> is std's file in a <code>Handle</code>: <code>File::open</code> reads, <code>File::create</code> writes (creating or cutting the file), <code>File::create_new</code> fails if the file exists, and <a href="api:nuclei::fs::OpenOptions"><code>OpenOptions</code></a> sets the rest (append, truncate, the mode and the open flags on Unix). A file reads and writes through the <a href="io.html#traits">IO helpers</a> and has a cursor that <code>seek</code> moves.</p>
+<!--example fs_file-->
+<ul>
+<li><code>flush</code> waits until the system has the bytes written behind; <code>sync_all</code> and <code>sync_data</code> put them on the device.</li>
+<li><code>metadata</code>, <code>set_len</code>, <code>set_permissions</code>, <code>set_times</code> and <code>set_modified</code> work on the open file; <code>try_clone</code> gives a second handle with a cursor of its own.</li>
+</ul>
+
+<h2 id="owned">Lending buffers</h2>
+<p>As on streams (<a href="proactive.html#lending">How it works</a>), <code>read_owned</code> and <code>write_owned</code> take your vector and give it back, so no byte is copied.</p>
+<!--example fs_owned-->
+
+<h2 id="dirs">Directories</h2>
+<p><code>create_dir</code>, <code>create_dir_all</code> and <a href="api:nuclei::fs::DirBuilder"><code>DirBuilder</code></a> (recursive, with a mode on Unix) make them; <code>remove_dir</code> and <code>remove_dir_all</code> take them away. <code>read_dir</code> streams the entries a page at a time, so a directory of any size is read without holding it all.</p>
+<!--example fs_dirs-->
+<p>Links: <code>hard_link</code>, <code>read_link</code> and <code>canonicalize</code>, <code>symlink</code> on Unix, <code>symlink_file</code> and <code>symlink_dir</code> on Windows.</p>
+
+<h2 id="where">Where file IO runs</h2>
+<p>A regular file is always ready to the kernel, so no poller can say when its IO would wait. On io_uring a file's reads and writes go to the shard's ring; on the other backends each is a job of the blocking pool, at the handle's own cursor. Calls by path, and the calls beside a file's reads and writes, run on the blocking pool. A <code>File</code> that is not a regular file (a FIFO, a terminal, a pipe) is a byte stream the driver serves like a socket.</p>

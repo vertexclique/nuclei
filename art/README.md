@@ -14,9 +14,10 @@ through blue to violet.
 | `build.py` | Draws the mark and writes every file above, and the site's copies. |
 
 The site uses the same drawing with heavier lines where it is shown small: the header mark,
-which `build.py` writes inline into every page (`site/index.html`, `site/learn/*.html`) so its
-arrows can breathe, `site/favicon.svg` with `site/favicon-32.png` and
-`site/apple-touch-icon.png`, and `site/media/social.png` (the link preview).
+which `build.py` writes inline into the landing page's source (`site/src/index.html`) and the
+site's build copies into every page with the bar, so its arrows can breathe; `site/favicon.svg`
+with `site/favicon-32.png` and `site/apple-touch-icon.png`; and `site/media/social.png` (the link
+preview).
 
 Change the drawing in `build.py`, never the output files, and rebuild everything with:
 

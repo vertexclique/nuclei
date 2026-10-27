@@ -1,0 +1,42 @@
+<!--title IO utilities-->
+<!--lede The helpers every stream gets: reads and writes as futures, copies, buffers, in-memory pipes.-->
+<h2 id="traits">Reads and writes as futures</h2>
+<p>Streams implement the <code>futures-io</code> traits (<code>AsyncRead</code>, <code>AsyncWrite</code>, <code>AsyncBufRead</code>, <code>AsyncSeek</code>), so code written against them works unchanged. <code>nuclei::io</code> adds the calls you await, in four extension traits:</p>
+<table class="table">
+<thead><tr><th>Trait</th><th>Calls</th></tr></thead>
+<tbody>
+<tr><td data-label="Trait"><a href="api:nuclei::io::AsyncReadExt"><code>AsyncReadExt</code></a></td><td data-label="Calls"><code>read</code>, <code>read_exact</code>, <code>read_to_end</code>, <code>read_to_string</code>, <code>read_buf</code>, <code>read_u32</code> and every number (big-endian, or <code>_le</code>), <code>take</code>, <code>chain</code></td></tr>
+<tr><td data-label="Trait"><a href="api:nuclei::io::AsyncWriteExt"><code>AsyncWriteExt</code></a></td><td data-label="Calls"><code>write</code>, <code>write_all</code>, <code>write_vectored</code>, <code>write_u32</code> and every number, <code>flush</code>, <code>shutdown</code></td></tr>
+<tr><td data-label="Trait"><a href="api:nuclei::io::AsyncBufReadExt"><code>AsyncBufReadExt</code></a></td><td data-label="Calls"><code>read_line</code>, <code>read_until</code>, <code>lines</code>, <code>split</code>, <code>fill_buf</code>, <code>consume</code></td></tr>
+<tr><td data-label="Trait"><a href="api:nuclei::io::AsyncSeekExt"><code>AsyncSeekExt</code></a></td><td data-label="Calls"><code>seek</code>, <code>rewind</code>, <code>stream_position</code></td></tr>
+</tbody>
+</table>
+<!--example io_ext-->
+
+<h2 id="lines">Lines and buffers</h2>
+<p><code>BufReader</code> puts a buffer in front of a reader, so small reads and line reads take from memory; <code>BufWriter</code> gathers small writes into one; <code>BufStream</code> is both, for a stream that reads and writes.</p>
+<!--example io_lines-->
+<!--example io_bufwriter-->
+
+<h2 id="copy">Copies</h2>
+<p><code>io::copy</code> moves everything a reader gives into a writer, then flushes; <code>copy_buf</code> does it from a buffered reader's own buffer. <code>copy_bidirectional</code> runs both directions between two streams at once, the heart of a proxy, and answers the bytes moved each way.</p>
+<!--example io_copy-->
+
+<h2 id="memory">In memory</h2>
+<p>Streams with no socket behind them, for tests and for joining parts of a program:</p>
+<ul>
+<li><code>duplex(n)</code>: two connected streams, <code>n</code> bytes of buffer each way. <code>simplex(n)</code>: one pipe, a reader and a writer.</li>
+<li><code>io::split(stream)</code>: a read half and a write half of any stream, put back with <code>unsplit</code>.</li>
+<li><code>empty()</code>, <code>repeat(byte)</code>, <code>sink()</code>: a reader at its end, a reader without end, a writer that keeps nothing.</li>
+</ul>
+
+<h2 id="stdio">The standard streams</h2>
+<p><code>io::stdin()</code>, <code>io::stdout()</code> and <code>io::stderr()</code> are the process's own, as async streams.</p>
+<!--example io_stdio-->
+<!--output io_stdio-->
+written to stdout
+<!--/output-->
+
+<h2 id="handle">Any std object</h2>
+<p>The socket and file types are <code>Handle</code>s over std's own objects, and <code>Handle::new</code> takes over any other one: on Unix anything with a file descriptor, on Windows sockets, files and a child's pipes. <code>get_ref</code> reaches the object; <code>into_inner</code> gives it back once the bytes written behind went out.</p>
+<!--example io_handle-->

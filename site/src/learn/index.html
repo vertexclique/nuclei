@@ -1,0 +1,10 @@
+<!--title Learn <span class="ink">Nuclei</span>-->
+<!--lede From the first line in Cargo.toml to a server in production, one idea at a time.-->
+<p>Nuclei is a proactive async runtime for Rust. A task hands its IO to the driver of its core and gets the result back completed; every core runs a shard of its own, with its tasks, timers, buffers and driver. The chapters follow the path below: start, the core ideas, then each area of the crate.</p>
+<div class="note"><p class="note__title">Every example runs</p><p>Each program on these pages is a file the site's build compiles, lints and runs on Linux, on io_uring and on epoll, before every deploy. The ones that need Unix (Unix sockets, signals, programs such as <code>sort</code>) say so.</p></div>
+<h2 id="start">Where to start</h2>
+<ul>
+<li><strong>New to async Rust:</strong> read in order. <a href="setup.html">Setup</a>, <a href="proactive.html">How it works</a>, <a href="runtime.html">Runtime</a> and <a href="tasks.html">Tasks</a> are the core.</li>
+<li><strong>Coming from a readiness-based runtime:</strong> start with <a href="migrate.html">Migrate</a>. Most names carry over; dropping a task handle and a write's completion behave differently.</li>
+<li><strong>Looking for one item:</strong> press <kbd>Ctrl K</kbd> (<kbd>⌘ K</kbd> on a Mac) to search these pages and the <a href="../api/nuclei/">API reference</a>.</li>
+</ul>

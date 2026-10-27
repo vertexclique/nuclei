@@ -1,0 +1,63 @@
+<!--title Errors-->
+<!--lede The messages you may meet, what each means, and the fix.-->
+<h2 id="cancelled">A spawned task never ran, or stopped halfway</h2>
+<p>No message at all: the <code>Task</code> was dropped, and dropping a task cancels it. A loop that spawns per connection and throws the handle away cancels every connection at once.</p>
+<p><strong>Fix:</strong> call <code>.detach()</code> on tasks nobody waits for, keep them in a <code>JoinSet</code>, or keep the handles and await them. See <a href="tasks.html#lifetime">Tasks</a>.</p>
+
+<h2 id="no-output">the task has no output</h2>
+<!--code text panic-->
+the task has no output: it was cancelled or its runtime shut down before it completed, or it was awaited again after completing
+<!--/code-->
+<p>A <code>Task</code> was awaited where it has no output to give: it was aborted, or its runtime was dropped before it completed.</p>
+<p><strong>Fix:</strong> keep the runtime alive until its tasks are done, or await <code>task.join()</code> (a <code>JoinError</code> says why) or <code>task.fallible()</code> (<code>None</code>) instead.</p>
+
+<h2 id="backend-unknown">names no backend of this platform</h2>
+<!--code text panic-->
+the default runtime could not start: NUCLEI_BACKEND=kqueue names no backend of this platform (use auto, epoll or io_uring)
+<!--/code-->
+<p><code>NUCLEI_BACKEND</code> holds a name this system has no backend for. The message lists the names that work here.</p>
+<p><strong>Fix:</strong> set one of the names listed, or unset the variable.</p>
+
+<h2 id="backend-io-uring">asks for io_uring, but</h2>
+<!--code text panic-->
+the default runtime could not start: NUCLEI_BACKEND=io_uring asks for io_uring, but this build has no io_uring; leave it unset to use the poller
+<!--/code-->
+<p>io_uring was asked for by name (<code>NUCLEI_BACKEND</code>, <code>Builder::backend</code> or <code>NucleiConfig</code>) and this process cannot have it; the reason follows <em>but</em>. Here the crate was built without the <code>iouring</code> feature; elsewhere it may be the kernel or a sandbox refusing the ring. A backend named by hand never falls back.</p>
+<p><strong>Fix:</strong> leave the backend unset, so <code>auto</code> picks io_uring where it can; turn the <code>iouring</code> feature back on; or run where io_uring is allowed (Linux 6.1 or later, and a sandbox that permits it).</p>
+
+<h2 id="configured">the proactor is configured already</h2>
+<!--code text panic-->
+the proactor is configured already: call `with_config` once, before any IO
+<!--/code-->
+<p><code>Proactor::with_config</code> was called twice, or after the first IO, <code>spawn</code> or <code>block_on</code>, which configures the defaults.</p>
+<p><strong>Fix:</strong> call it once, first thing in a plain <code>fn main</code>, then enter the runtime with <code>nuclei::block_on</code>, as in <a href="production.html#iouring">Production</a>. Under <code>#[nuclei::main]</code> the body already runs on the runtime.</p>
+
+<h2 id="already-running">the default runtime is already running</h2>
+<!--code text error-->
+the default runtime is already running
+<!--/code-->
+<p><code>Builder::build_global</code> returned this: a free function, the attribute or an earlier <code>build_global</code> started the default runtime first.</p>
+<p><strong>Fix:</strong> call <code>build_global</code> before anything spawns, or build a <code>Runtime</code> of your own and use its methods.</p>
+
+<h2 id="nesting">block_on is nested too deep</h2>
+<!--code text panic-->
+block_on is nested 2 deep on one thread, the most allowed: each level runs on the thread's stack (raise the limit with `Builder::max_nesting`)
+<!--/code-->
+<p>(Here the limit was set to 2.) Each nested <code>block_on</code> runs on the thread's stack, and one level past the limit panics before the stack would overflow.</p>
+<p><strong>Fix:</strong> await instead of nesting where you can; raise <code>Builder::max_nesting</code> where you cannot.</p>
+
+<h2 id="hang">block_on never returns</h2>
+<p>No message: a task called <code>block_on</code> on a future that waits for that very task. The task is not polled again until the call returns, so neither can finish.</p>
+<p><strong>Fix:</strong> inside a task, wait for the other work with <code>.await</code>, not with <code>block_on</code>.</p>
+
+<h2 id="unflushed">Data seems lost, or an error came late</h2>
+<p>Writes are taken into the stream's write-behind and sent by the driver, so a failed write can surface on a later write or on <code>flush</code>.</p>
+<p><strong>Fix:</strong> <code>flush().await</code> (or <code>shutdown().await</code>) where you need to know the bytes reached the kernel. See <a href="proactive.html#buffers">How it works</a>.</p>
+
+<h2 id="busy">A call of your own answers ResourceBusy</h2>
+<p><code>try_io</code> or <code>async_io</code> on a socket found bytes the handle had read ahead: a read of your own would skip them.</p>
+<p><strong>Fix:</strong> read what the handle holds first (<code>try_read</code> until <code>WouldBlock</code>), then make your call. See <a href="readiness.html#own-calls">Readiness</a>.</p>
+
+<h2 id="echild">A child's wait fails with ECHILD</h2>
+<p>Something other than Nuclei reaped the child: the program ignores <code>SIGCHLD</code>, or calls <code>waitpid</code> itself.</p>
+<p><strong>Fix:</strong> leave <code>SIGCHLD</code> at its default and let <code>Child::wait</code> reap your children.</p>

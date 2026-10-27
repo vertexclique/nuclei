@@ -1,0 +1,55 @@
+<!--title Sync-->
+<!--lede Locks, semaphores, notifications, once-cells and lock-free structures for async code.-->
+<h2 id="model">Futures and wakers, nothing else</h2>
+<p>Every wait in <code>nuclei::sync</code> is a future built from futures and wakers alone, so it works under any executor, not only Nuclei's. A contended wait queues and returns <code>Pending</code>; it never blocks a thread.</p>
+<ul>
+<li><strong>Familiar names.</strong> <code>Mutex</code>, <code>RwLock</code>, <code>Semaphore</code>, <code>Notify</code>, <code>Barrier</code>, <code>OnceCell</code> and <code>SetOnce</code> keep the names, signatures and errors of the established async sync API: code written against it compiles after a change of import.</li>
+<li><strong>Every wait has a <code>try_</code> form</strong> that never waits, and a <code>blocking_</code> form for threads that may block. On a Nuclei shard a <code>blocking_</code> call nests a <code>block_on</code>, so the shard keeps running its other tasks.</li>
+<li><strong>Dropping a wait loses nothing.</strong> A dropped future withdraws its place in line and passes on what was handed to it, so no wakeup is lost. A <code>Barrier</code> wait is the one exception: an arrival that was counted stays counted.</li>
+</ul>
+
+<h2 id="mutex">Mutex</h2>
+<!--example sync_mutex-->
+<p>Uncontended, taking and releasing the lock is one atomic operation each. It does not poison: a panic in a holder unlocks it. <code>lock_owned</code> holds the lock through an <code>Arc</code>, so the guard can move into a task; <code>MutexGuard::map</code> narrows a guard to a part of the value.</p>
+
+<h2 id="rwlock">RwLock</h2>
+<p>Readers share the lock, a writer has it alone. An <strong>upgradable read</strong> sits beside plain readers (one at a time) and turns into a write without letting another writer in between: read, decide, then write.</p>
+<!--example sync_rwlock-->
+<p>A write guard <code>downgrade</code>s to a read guard, and <code>with_max_readers</code> bounds how many readers share it.</p>
+
+<h2 id="reentrant">Reentrant locks</h2>
+<p><code>ReentrantMutex</code> and <code>ReentrantRwLock</code> may be taken again by the holder that has them. The holder is an <a href="api:nuclei::sync::Owner"><code>Owner</code></a> token, not a thread: a task can move between threads, and many tasks can share one.</p>
+<!--example sync_reentrant-->
+
+<h2 id="semaphore">Semaphore</h2>
+<p>A semaphore hands out permits; a permit goes back when it drops. It bounds how many tasks do something at once.</p>
+<!--example sync_semaphore-->
+<p><code>acquire_many</code> takes several at once, <code>forget</code> keeps a permit from going back, <code>add_permits</code> adds more, and <code>close</code> makes every wait fail.</p>
+
+<h2 id="signals">Notify, Event, Latch, Barrier</h2>
+<table class="table">
+<thead><tr><th>Type</th><th>Waits end when</th></tr></thead>
+<tbody>
+<tr><td data-label="Type"><code>Notify</code></td><td data-label="Waits end when"><code>notify_one</code> wakes the oldest waiter, or keeps one permit for the next when nobody waits; <code>notify_waiters</code> wakes every waiter there is.</td></tr>
+<tr><td data-label="Type"><code>Event</code></td><td data-label="Waits end when">it is set; it stays set, so later waits end at once.</td></tr>
+<tr><td data-label="Type"><code>Latch</code></td><td data-label="Waits end when">its count, counted down by <code>count_down</code>, reaches zero; it stays open.</td></tr>
+<tr><td data-label="Type"><code>Barrier</code></td><td data-label="Waits end when"><code>n</code> tasks wait at once; one of them is told it is the leader.</td></tr>
+</tbody>
+</table>
+<!--example sync_signals-->
+
+<h2 id="once">Once-cells and lazy values</h2>
+<p><code>OnceCell</code> holds a value set once; <code>get_or_init</code> runs an async initializer, and callers that come meanwhile wait for it. <code>SetOnce</code> is set from anywhere, and <code>wait</code> waits until someone has. <code>Lazy</code> computes its value on first use.</p>
+<!--example sync_once-->
+
+<h2 id="fairness">Fast, and fair by count</h2>
+<p>The locks and the semaphore let a caller take what is free even while others wait, so a release never waits for a sleeping task to run. A waiter that loses <a href="api:nuclei::sync::MAX_BYPASS"><code>MAX_BYPASS</code></a> times is owed a handoff: nobody gets in ahead of it, and the next release goes to it directly. Fairness is counted, never timed.</p>
+
+<h2 id="lock-free">Lock-free maps and queues</h2>
+<p>For state shared across threads without a lock at all:</p>
+<ul>
+<li><a href="api:nuclei::sync::HopscotchMap"><code>HopscotchMap</code></a>: a concurrent hash map; values are cloned out.</li>
+<li><a href="api:nuclei::sync::SegQueue"><code>SegQueue</code></a>: an unbounded queue. <a href="api:nuclei::sync::ArrayQueue"><code>ArrayQueue</code></a>: a bounded one whose push refuses when full.</li>
+<li><a href="api:nuclei::sync::Atom"><code>Atom</code></a>: a value read without a lock and replaced whole.</li>
+</ul>
+<!--example sync_lockfree-->

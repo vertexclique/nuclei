@@ -1,0 +1,97 @@
+<!--title Production-->
+<!--lede Every runtime setting, the hooks, the counters, a clean shutdown, and tests.-->
+<h2 id="builder">Every runtime setting</h2>
+<p>Every setting is optional, and an unset one takes a default that needs no configuration to work well. Set them on a <code>Builder</code>, then <code>build</code> a runtime of your own or <code>build_global</code> the default one (<a href="runtime.html#default">Runtime</a>).</p>
+<!--example prod_builder-->
+<!--api-table
+Setting | What it sets (its default)
+nuclei::runtime::Builder::worker_threads
+nuclei::runtime::Builder::max_worker_threads
+nuclei::runtime::Builder::pin_workers
+nuclei::runtime::Builder::thread_name
+nuclei::runtime::Builder::thread_name_fn
+nuclei::runtime::Builder::thread_stack_size
+nuclei::runtime::Builder::max_nesting
+nuclei::runtime::Builder::max_blocking_threads
+nuclei::runtime::Builder::thread_keep_alive
+nuclei::runtime::Builder::local_spawn_margin
+nuclei::runtime::Builder::io_buffer_cap
+nuclei::runtime::Builder::event_interval
+nuclei::runtime::Builder::global_queue_interval
+nuclei::runtime::Builder::max_io_events_per_tick
+nuclei::runtime::Builder::disable_lifo_slot
+nuclei::runtime::Builder::rng_seed
+nuclei::runtime::Builder::unhandled_panic
+nuclei::runtime::Builder::start_paused
+nuclei::runtime::Builder::backend
+-->
+
+<h2 id="hooks">Hooks</h2>
+<p>A runtime calls hooks of yours on its threads and around its tasks: for metrics, tracing or thread setup. Each task hook is given the task's <code>Id</code>.</p>
+<!--example prod_hooks-->
+<!--api-table
+Hook | When it is called
+nuclei::runtime::Builder::on_thread_start
+nuclei::runtime::Builder::on_thread_stop
+nuclei::runtime::Builder::on_thread_park
+nuclei::runtime::Builder::on_thread_unpark
+nuclei::runtime::Builder::on_task_spawn
+nuclei::runtime::Builder::on_before_task_poll
+nuclei::runtime::Builder::on_after_task_poll
+nuclei::runtime::Builder::on_task_terminate
+-->
+<p>A hook runs in the middle of the runtime's work: keep it short, and never panic in one.</p>
+
+<h2 id="iouring">The io_uring configuration</h2>
+<p>The ring of every shard is configured once per process, before any IO, with <code>Proactor::with_config</code>. A second call, or one after IO has started (which configures the defaults), panics.</p>
+<!--example prod_config-->
+<!--api-table
+Field | What it sets (its default)
+nuclei::config::IoUringConfiguration::queue_len
+nuclei::config::IoUringConfiguration::recv_buffers
+nuclei::config::IoUringConfiguration::recv_buffer_size
+nuclei::config::IoUringConfiguration::sqpoll_wake_interval
+nuclei::config::IoUringConfiguration::iopoll_enabled
+nuclei::config::IoUringConfiguration::per_numa_bounded_worker_count
+nuclei::config::IoUringConfiguration::per_numa_unbounded_worker_count
+nuclei::config::IoUringConfiguration::aggressive_poll
+-->
+<p>Four presets fill the struct from a queue length: <code>interrupt_driven</code> (the one to pick when unsure), <code>low_latency_driven</code> and <code>kernel_poll_only</code> (a kernel submission thread), and <code>io_poll</code>. <code>NucleiConfig::backend</code> is the backend of every runtime that names none.</p>
+
+<h2 id="stats">Counters</h2>
+<p><code>nuclei::stats()</code> takes a snapshot of every shard alive in the process (each runtime's workers, then the shard of each thread in <code>block_on</code>) and of the blocking pools. It reads the shards without stopping them; most counts are published by a shard as it is about to wait for work, and by a busy one every few hundred task runs.</p>
+<!--example prod_stats-->
+<!--api-table
+Field | What it counts
+nuclei::stats::ShardStats::worker
+nuclei::stats::ShardStats::backend
+nuclei::stats::ShardStats::tasks
+nuclei::stats::ShardStats::polls
+nuclei::stats::ShardStats::queue_depth
+nuclei::stats::ShardStats::remote_wakes
+nuclei::stats::ShardStats::parks
+nuclei::stats::ShardStats::parked
+nuclei::stats::ShardStats::busy
+nuclei::stats::ShardStats::ops_in_flight
+nuclei::stats::ShardStats::cq_overflows
+nuclei::stats::ShardStats::buffer_bytes
+nuclei::stats::ShardStats::buffer_cap
+nuclei::stats::ShardStats::buffer_exhausted
+nuclei::stats::ShardStats::timers
+nuclei::stats::ShardStats::errors
+-->
+<p><code>Stats</code> also has <code>blocking_threads</code>, and <code>off_shard_errors</code> for IO run on threads that run no shard.</p>
+
+<h2 id="shutdown">A clean shutdown</h2>
+<p>A server stops taking connections when asked, lets the open ones finish, and gives up after a deadline. A <code>CancellationToken</code> carries the request to every task, Ctrl-C raises it, a <code>JoinSet</code> holds the connections, and <code>timeout</code> bounds the drain.</p>
+<!--example prod_shutdown-->
+
+<h2 id="testing">Tests</h2>
+<p><code>#[nuclei::test]</code> makes an async test: its body runs in <code>block_on</code> on the default runtime, or on a runtime of its own with <code>threads = N</code> or <code>start_paused = true</code> (<a href="time.html#paused">paused time</a>). A test may return a <code>Result</code>, like any test.</p>
+<!--example echo tests/echo.rs-->
+<p><code>#[nuclei::bench]</code> does the same for a benchmark on the nightly test harness.</p>
+
+<h2 id="compat">The earlier entry points</h2>
+<p>Programs written against earlier versions set up the default runtime with <code>init</code> or <code>init_with_config</code>; both still work, on the shards. <code>GlobalExecutorConfig</code> sets the workers to start (<code>with_min_threads</code>, or from an environment variable with <code>with_env_var</code>), the most to run (<code>with_max_threads</code>) and their names. <code>spawn_more_threads</code> starts more workers, up to the maximum, and <code>stop_thread</code> drains one: it takes no new task and exits once its tasks are done.</p>
+<!--example prod_compat-->
+<p>Code that drove the proactor by hand still can: <code>Proactor::get().wait(max_events, timeout)</code> drives the calling thread's shard once, and <code>wake</code> ends every wait in progress.</p>

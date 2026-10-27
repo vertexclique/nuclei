@@ -87,8 +87,9 @@
   }
 }
 
-/* The sidebar on a wide screen: every chapter closed to its title (native details, one open at
- * a time through their shared name), the current page's chapter open on its numbered sections.
+/* The sidebar on a wide screen: the chapters under the parts of the path, every chapter closed to
+ * its title (native details, one open at a time through their shared name), the current page's
+ * chapter open on its numbered sections.
  * It follows the viewport (sticky, with its own scroll when taller than the window). The script
  * animates the opening and closing and marks the section being read with an indicator that
  * slides to it; without the script it opens and closes all the same. */
@@ -132,6 +133,17 @@
 
   .sidebar .chapters__title {
     padding-block-end: var(--space-sm);
+  }
+
+  .sidebar__part {
+    padding-block: var(--space-md) var(--space-2xs);
+    font-family: var(--font-mono);
+    font-size: var(--text-micro);
+    color: var(--color-muted);
+  }
+
+  .sidebar .chapters__title + .sidebar__part {
+    padding-block-start: 0;
   }
 
   .sidebar details {
@@ -598,11 +610,21 @@
   }
 }
 
-/* The Learn index: a card per chapter, each a link. */
+/* The Learn index: the parts of the path, each a heading over a card per chapter. */
+.learn-part {
+  padding-block-start: var(--space-2xl);
+}
+
+.learn-part h2 {
+  font-size: var(--text-xl);
+  line-height: 1.12;
+  letter-spacing: var(--tracking-head);
+}
+
 .learn-cards {
   display: grid;
   gap: var(--space-md);
-  padding-block-start: var(--space-xl);
+  padding-block-start: var(--space-lg);
 }
 
 @media (min-width: 40rem) {
