@@ -30,6 +30,7 @@
 mod addr;
 mod opt;
 mod socket;
+mod split;
 mod stream;
 mod tcp;
 mod udp;
@@ -42,6 +43,7 @@ pub use self::addr::{ToSocketAddrs, lookup_host};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use self::socket::DeviceName;
 pub use self::socket::TcpSocket;
+pub use self::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};
 pub use self::tcp::TcpStreamGenerator;
 #[cfg(unix)]
 pub use self::unix_socket::UnixSocket;

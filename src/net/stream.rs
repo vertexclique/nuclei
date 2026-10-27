@@ -11,6 +11,9 @@ use std::os::unix::net::UnixStream;
 
 use futures_io::{AsyncRead, AsyncWrite};
 
+use std::sync::Arc;
+
+use super::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 use crate::io::{Handle, Interest, Ready};
 
 macro_rules! stream_io {
@@ -51,6 +54,19 @@ macro_rules! stream_io {
         /// read reports), writable once a write would be taken at once (room
         /// in the write-behind, or an error).
         impl Handle<$ty> {
+            /// The stream's two halves, borrowed: to read on one task and
+            /// write on another. Nothing is allocated.
+            pub fn split(&self) -> (ReadHalf<'_, $ty>, WriteHalf<'_, $ty>) {
+                (ReadHalf(self), WriteHalf(self))
+            }
+
+            /// The stream's two halves, owning it together; see
+            /// [`OwnedReadHalf::reunite`].
+            pub fn into_split(self) -> (OwnedReadHalf<$ty>, OwnedWriteHalf<$ty>) {
+                let both = Arc::new(self);
+                (OwnedReadHalf(Arc::clone(&both)), OwnedWriteHalf(both))
+            }
+
             /// Waits until a read would end at once.
             ///
             /// # Errors
