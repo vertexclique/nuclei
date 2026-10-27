@@ -28,23 +28,28 @@
 //!   the state. The waker cell is a handshake on one state word, so for any
 //!   pair of a registration and a wake one of them sees the other: see the
 //!   `atomic_waker` module. A value still being written (the queue answers
-//!   `Busy`) is one of these: its push wakes the receiver once it returned.
+//!   that nothing is there yet) is one of these: its push wakes the receiver
+//!   once it returned, and its sender still counts, so the receiver never
+//!   takes that answer for the end.
 //! - **Single consumer.** Only the [`Receiver`](super::Receiver) halves call
 //!   the receive-side methods, each through `&mut self`, so there is one
-//!   registrant at a time.
+//!   registrant and one taker at a time.
 //!
-//! # Why this file has no `unsafe`
+//! # Where this file uses `unsafe`
 //!
-//! The queue is multi-consumer safe, the waker cell takes care of its own
-//! slot, and the counts are atomics, so none of the state here relies on a
-//! rule the compiler cannot check. The auto traits follow the value: a
-//! channel is `Send + Sync` when `T: Send`.
+//! The queue's receiving end belongs to one thread at a time, which only the
+//! receiver halves can promise (their `&mut self`), so the receive-side steps
+//! here are `unsafe` functions with that contract, and nothing else is: the
+//! waker cell takes care of its own slot and the counts are atomics. The auto
+//! traits follow the value: a channel is `Send + Sync` when `T: Send`.
+
+#![allow(unsafe_code)]
 
 use core::task::{Context, Poll};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use super::error::TryRecvError;
-use super::queue::{Queue, TryPopError};
+use super::queue::Queue;
 use crate::sync::Event;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicUsize, Ordering};
@@ -71,11 +76,9 @@ enum Pop<T> {
     Value(T),
     /// Empty, and every sender is gone: nothing will ever come.
     Closed,
-    /// Empty for now.
+    /// Nothing for now (or the next value is still being written: its
+    /// sender wakes the receiver once its push returned).
     Empty,
-    /// The next value is still being written: its sender wakes the receiver
-    /// once its push returned.
-    Busy,
 }
 
 /// The shared state of one channel.
@@ -221,34 +224,43 @@ impl<T, L: Limit> Chan<T, L> {
     }
 
     /// Looks at the queue once.
-    fn pop(&self) -> Pop<T> {
-        match self.queue.try_pop() {
-            Ok(value) => return Pop::Value(value),
-            Err(TryPopError::Busy) => return Pop::Busy,
-            Err(TryPopError::Empty) => {}
+    ///
+    /// # Safety
+    ///
+    /// The caller is the channel's one receiver (see the module).
+    unsafe fn pop(&self) -> Pop<T> {
+        // SAFETY: the caller's contract.
+        if let Some(value) = unsafe { self.queue.try_pop() } {
+            return Pop::Value(value);
         }
         // Count first, then look again: the count reads zero only after every
-        // sender's pushes, so an empty queue behind a zero count is final.
+        // sender's pushes, so an empty queue behind a zero count is final. A
+        // value still being written keeps its sender counted.
         if self.tx_count.load(Ordering::Acquire) != 0 {
             return Pop::Empty;
         }
-        match self.queue.try_pop() {
-            Ok(value) => Pop::Value(value),
-            Err(TryPopError::Busy) => Pop::Busy,
-            Err(TryPopError::Empty) => Pop::Closed,
+        // SAFETY: the caller's contract.
+        match unsafe { self.queue.try_pop() } {
+            Some(value) => Pop::Value(value),
+            None => Pop::Closed,
         }
     }
 
     /// One value, or the end of the channel, if either is there. A value
     /// taken here is given back to the limit.
-    fn next(&self) -> Option<Option<T>> {
-        match self.pop() {
+    ///
+    /// # Safety
+    ///
+    /// As for [`pop`](Self::pop).
+    unsafe fn next(&self) -> Option<Option<T>> {
+        // SAFETY: the caller's contract.
+        match unsafe { self.pop() } {
             Pop::Value(value) => {
                 self.limit.release(1);
                 Some(Some(value))
             }
             Pop::Closed => Some(None),
-            Pop::Empty | Pop::Busy => None,
+            Pop::Empty => None,
         }
     }
 
@@ -259,14 +271,20 @@ impl<T, L: Limit> Chan<T, L> {
     }
 
     /// The receiver's poll: register, then look again, then decide.
-    pub(super) fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if let Some(done) = self.next() {
+    ///
+    /// # Safety
+    ///
+    /// The caller is the channel's one receiver (see the module).
+    pub(super) unsafe fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        // SAFETY: the caller's contract.
+        if let Some(done) = unsafe { self.next() } {
             return Poll::Ready(done);
         }
         self.rx_waker.register(cx.waker());
         // A value pushed, or a last sender dropped, between the look above
         // and the registration is found here, or woke the waker.
-        if let Some(done) = self.next() {
+        // SAFETY: the caller's contract.
+        if let Some(done) = unsafe { self.next() } {
             return Poll::Ready(done);
         }
         if self.finished() {
@@ -279,19 +297,24 @@ impl<T, L: Limit> Chan<T, L> {
     /// Moves up to `limit` values into `buf`. `Some(n)` when it moved `n > 0`
     /// of them or the channel has ended (`n == 0`), `None` when it is empty
     /// for now. One release to the limit for the whole batch.
-    fn take_many(&self, buf: &mut Vec<T>, limit: usize) -> Option<usize> {
+    ///
+    /// # Safety
+    ///
+    /// As for [`pop`](Self::pop).
+    unsafe fn take_many(&self, buf: &mut Vec<T>, limit: usize) -> Option<usize> {
         let mut taken = 0;
         let ended = loop {
             if taken == limit {
                 break false;
             }
-            match self.pop() {
+            // SAFETY: the caller's contract.
+            match unsafe { self.pop() } {
                 Pop::Value(value) => {
                     buf.push(value);
                     taken += 1;
                 }
                 Pop::Closed => break true,
-                Pop::Empty | Pop::Busy => break false,
+                Pop::Empty => break false,
             }
         };
         if taken > 0 {
@@ -301,7 +324,11 @@ impl<T, L: Limit> Chan<T, L> {
     }
 
     /// The receiver's batch poll; see [`take_many`](Self::take_many).
-    pub(super) fn poll_recv_many(
+    ///
+    /// # Safety
+    ///
+    /// The caller is the channel's one receiver (see the module).
+    pub(super) unsafe fn poll_recv_many(
         &self,
         cx: &mut Context<'_>,
         buf: &mut Vec<T>,
@@ -310,11 +337,13 @@ impl<T, L: Limit> Chan<T, L> {
         if limit == 0 {
             return Poll::Ready(0);
         }
-        if let Some(taken) = self.take_many(buf, limit) {
+        // SAFETY: the caller's contract.
+        if let Some(taken) = unsafe { self.take_many(buf, limit) } {
             return Poll::Ready(taken);
         }
         self.rx_waker.register(cx.waker());
-        if let Some(taken) = self.take_many(buf, limit) {
+        // SAFETY: the caller's contract.
+        if let Some(taken) = unsafe { self.take_many(buf, limit) } {
             return Poll::Ready(taken);
         }
         if self.finished() {
@@ -329,15 +358,20 @@ impl<T, L: Limit> Chan<T, L> {
     /// It does not wait for a send that is still in progress on another
     /// thread: that value is not in the channel yet, and its sender wakes the
     /// receiver when it is.
-    pub(super) fn try_recv(&self) -> Result<T, TryRecvError> {
-        match self.pop() {
+    ///
+    /// # Safety
+    ///
+    /// The caller is the channel's one receiver (see the module).
+    pub(super) unsafe fn try_recv(&self) -> Result<T, TryRecvError> {
+        // SAFETY: the caller's contract.
+        match unsafe { self.pop() } {
             Pop::Value(value) => {
                 self.limit.release(1);
                 Ok(value)
             }
             Pop::Closed => Err(TryRecvError::Disconnected),
             Pop::Empty if self.finished() => Err(TryRecvError::Disconnected),
-            Pop::Empty | Pop::Busy => Err(TryRecvError::Empty),
+            Pop::Empty => Err(TryRecvError::Empty),
         }
     }
 
@@ -355,8 +389,13 @@ impl<T, L: Limit> Chan<T, L> {
     /// value, and any behind it, stay queued and are dropped with the channel
     /// when its last handle goes. Nothing waits for their admissions, as the
     /// channel admits nothing after the close.
-    fn drain(&self) {
-        while let Ok(value) = self.queue.try_pop() {
+    ///
+    /// # Safety
+    ///
+    /// As for [`pop`](Self::pop).
+    unsafe fn drain(&self) {
+        // SAFETY: the caller's contract.
+        while let Some(value) = unsafe { self.queue.try_pop() } {
             self.limit.release(1);
             drop(value);
         }
@@ -364,19 +403,25 @@ impl<T, L: Limit> Chan<T, L> {
 
     /// What dropping the receiver does: close, let go of its waker so the
     /// task is not kept alive, and drop everything still queued.
-    pub(super) fn drop_rx(&self) {
+    ///
+    /// # Safety
+    ///
+    /// The caller is the channel's one receiver (see the module), dropping.
+    pub(super) unsafe fn drop_rx(&self) {
         /// Finishes the drain when a value's destructor panics.
         struct Drain<'a, T, L: Limit>(&'a Chan<T, L>);
 
         impl<T, L: Limit> Drop for Drain<'_, T, L> {
             fn drop(&mut self) {
-                self.0.drain();
+                // SAFETY: made only by `drop_rx`, whose caller is the receiver.
+                unsafe { self.0.drain() };
             }
         }
 
         self.close_rx();
         drop(self.rx_waker.take());
         let guard = Drain(self);
-        guard.0.drain();
+        // SAFETY: the caller's contract.
+        unsafe { guard.0.drain() };
     }
 }

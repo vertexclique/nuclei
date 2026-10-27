@@ -151,7 +151,8 @@ impl<T> Receiver<T> {
     /// assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
     /// ```
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        self.chan.try_recv()
+        // SAFETY: `&mut self` of the channel's one receiver.
+        unsafe { self.chan.try_recv() }
     }
 
     /// Receives the next value from a thread that may block.
@@ -308,7 +309,8 @@ impl<T> Receiver<T> {
     /// channel closes. Only the waker of the most recent call to `poll_recv`
     /// or [`poll_recv_many`](Self::poll_recv_many) is kept.
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.chan.poll_recv(cx)
+        // SAFETY: `&mut self` of the channel's one receiver.
+        unsafe { self.chan.poll_recv(cx) }
     }
 
     /// Polls to receive several values into `buffer`, at most `limit`.
@@ -324,7 +326,8 @@ impl<T> Receiver<T> {
         buffer: &mut Vec<T>,
         limit: usize,
     ) -> Poll<usize> {
-        self.chan.poll_recv_many(cx, buffer, limit)
+        // SAFETY: `&mut self` of the channel's one receiver.
+        unsafe { self.chan.poll_recv_many(cx, buffer, limit) }
     }
 
     /// How many [`Sender`](super::Sender) handles exist.
@@ -340,7 +343,8 @@ impl<T> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.chan.drop_rx();
+        // SAFETY: the channel's one receiver, dropping.
+        unsafe { self.chan.drop_rx() };
     }
 }
 

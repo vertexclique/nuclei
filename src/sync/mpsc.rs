@@ -96,12 +96,14 @@
 //!
 //! # Progress
 //!
-//! The message queue is that segment queue. A send claims the next cell
-//! with one fetch-add, writes its value into it and publishes it with a
-//! compare-and-swap. It retries only when another send linked the next
-//! segment first, so a send never waits for another thread, and some send
-//! completes whenever any retries: the push is lock-free. A receive takes the
-//! next cell with a compare-and-swap no other thread contends for, and never
+//! The message queue is that segment queue, built for its one receiver. A
+//! send claims the next cell with one fetch-add, walks to the cell's
+//! segment (linking the next one where the list ends), writes its value and
+//! marks the cell ready with a plain store. Its walk starts again, from the
+//! receiver's segment, only when the receiver passed the segment it was about
+//! to step onto, and a link it loses was made by another send, so a send never
+//! waits for another thread: the push is lock-free. A receive reads the next cell's mark and takes the value, with
+//! no read-modify-write and nothing another thread contends for, and never
 //! waits for a sender: when the next cell is claimed by a send that has not
 //! written it yet, the receive finds nothing for now, registers its waker and
 //! returns `Pending`, and that send wakes it once its value is in. So a sender

@@ -22,12 +22,14 @@
 (*                                                                          *)
 (* The message queue is a FIFO sequence of cells in the order sends       *)
 (* claimed them. A send claims its cell in one step and writes its value   *)
-(* in a later one, as in kovan's segment queue, so the receiver can find   *)
-(* the oldest cell claimed and not written yet: the queue's `Busy`. Then   *)
-(* it takes nothing and waits for that send's wake.                        *)
+(* in a later one, as in the channel's segment queue, so the receiver can  *)
+(* find the oldest cell claimed and not written yet. The queue answers     *)
+(* that nothing is there, as for an empty queue, so the receiver reads the *)
+(* sender count, which the send still writing keeps above zero, takes      *)
+(* nothing and waits for that send's wake.                                 *)
 (*                                                                          *)
-(* What is abstract: the queue's lock-free implementation is kovan's,      *)
-(* checked there (its claim order is this sequence's order); the           *)
+(* What is abstract: the queue's lock-free implementation, checked in     *)
+(* `segments` (its claim order is this sequence's order); the              *)
 (* receiver's waker cell is one flag that a wake empties (its handshake is *)
 (* checked by the loom models); a pass's look at the head of the waiting   *)
 (* list, which skips withdrawn waiters, is one step (a waiter never comes  *)
@@ -574,11 +576,12 @@ R_look:
     if FrontReady then
         take_value();
         goto R_release;
-    elsif FrontBusy then
-        \* `Busy`: a value is on its way, so the sender count is not read.
-        \* MUTATION skip_busy: the receiver passes over the cell being written and, in a
-        \* later step, takes the first written cell behind it (the queue kovan had before).
-        if Mutation = "skip_busy" then goto R_skip; else goto R_register; end if;
+    \* MUTATION skip_busy: the receiver passes over the cell being written and, in a
+    \* later step, takes the first written cell behind it (the queue kovan had before).
+    elsif FrontBusy /\ Mutation = "skip_busy" then
+        goto R_skip;
+    \* A cell being written reads as an empty queue does: the sender count is read, and
+    \* the send writing it still counts, so this is never the end.
     elsif txCount = 0 then
         goto R_end;                         \* empty, and nobody can send: the end
     else
@@ -694,6 +697,10 @@ CloseReturnsShare == closedBit /\ ~draining => setAside = 0
 \* every value any slot could still carry.
 EndMeansDrained == ~pushAfterEnd
 
+\* A receive returns the end only with nothing in the queue, a cell claimed and not written
+\* yet included: the cell being written reads as empty, and its send keeps the sender count
+\* above zero, so the count's look never ends the channel in front of it.
+EndOnEmpty == pc[Rx] = "R_end" => mq = <<>>
 \* Every value is delivered exactly once: received at most once, and every value put in is
 \* received, still in the queue, or thrown away by the receiver's drop.
 ExactlyOnce ==

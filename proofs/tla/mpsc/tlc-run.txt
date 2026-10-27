@@ -1,30 +1,30 @@
-TLC run of every configuration in proofs/tla/mpsc, 2026-10-24 09:44 UTC.
+TLC run of every configuration in proofs/tla/mpsc, 2026-10-27 18:13 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-BC_sends                       1221434     441348      7  pass                                  pass                                  yes
-BC_many                       11316754    4032007     46  pass                                  pass                                  yes
-BC_large_small                 6475985    2323684     27  pass                                  pass                                  yes
-BC_cancel_many                15810004    5617705     62  pass                                  pass                                  yes
-BC_cancel_one                 29079120   10369892    111  pass                                  pass                                  yes
+BC_sends                       1221434     441348      5  pass                                  pass                                  yes
+BC_many                       11316754    4032007     26  pass                                  pass                                  yes
+BC_large_small                 6475985    2323684     17  pass                                  pass                                  yes
+BC_cancel_many                15810004    5617705     31  pass                                  pass                                  yes
+BC_cancel_one                 29079120   10369892     56  pass                                  pass                                  yes
 BC_try                          404799     146573      3  pass                                  pass                                  yes
 BC_pair                           1101        597      1  pass                                  pass                                  yes
-BC_close                      13974453    5009017     54  pass                                  pass                                  yes
-BC_close_cancel               30224847   10779026    113  pass                                  pass                                  yes
-BC_drop                        1921108     704819      9  pass                                  pass                                  yes
-BC_live_sends                  1221434     441348     35  pass                                  pass                                  yes
-BC_live_cancel                 3029289    1084708     89  pass                                  pass                                  yes
-BC_live_many                   2551646     908186     70  pass                                  pass                                  yes
-BC_live_close                  5627766    2012967    174  pass                                  pass                                  yes
+BC_close                      13974453    5009017     32  pass                                  pass                                  yes
+BC_close_cancel               30224847   10779026     55  pass                                  pass                                  yes
+BC_drop                        1921108     704819      7  pass                                  pass                                  yes
+BC_live_sends                  1221434     441348     19  pass                                  pass                                  yes
+BC_live_cancel                 3029289    1084708     49  pass                                  pass                                  yes
+BC_live_many                   2551646     908186     37  pass                                  pass                                  yes
+BC_live_close                  5627766    2012967     80  pass                                  pass                                  yes
 M_try_ignores_queue               8220       3500      1  violated:FifoFair                     violated:FifoFair                     yes
 M_skip_unfit_front               24230      10016      2  violated:FifoFair                     violated:FifoFair                     yes
-M_drop_pass_on                  187158      76830      3  violated:Conservation                 violated:Conservation                 yes
+M_drop_pass_on                  187158      76830      4  violated:Conservation                 violated:Conservation                 yes
 M_park_no_look                  206077      82144      4  deadlock                              deadlock                              yes
 M_grant_no_wake                 294197     115836      4  deadlock                              deadlock                              yes
 M_release_no_pass               122609      48243      3  deadlock                              deadlock                              yes
 M_exit_ignores_release          158824      64132      3  deadlock                              deadlock                              yes
-M_rx_no_recheck                  32031      13463      1  deadlock                              deadlock                              yes
+M_rx_no_recheck                  32031      13463      2  deadlock                              deadlock                              yes
 M_close_keeps_set_aside         301254     125100      5  violated:CloseReturnsShare            violated:CloseReturnsShare            yes
 M_try_ignores_close               3543       1563      1  violated:CloseSemantics               violated:CloseSemantics               yes
 M_take_after_close               47678      19878      2  violated:CloseSemantics               violated:CloseSemantics               yes
@@ -33,19 +33,19 @@ M_queue_lifo                       270        175      1  violated:PerSenderOrde
 M_double_delivery                  212        109      1  violated:ExactlyOnce                  violated:ExactlyOnce                  yes
 M_skip_busy                        355        220      1  violated:PerSenderOrder               violated:PerSenderOrder               yes
 M_wake_before_write              75493      31477      2  deadlock                              deadlock                              yes
-ML_park_no_look                 679316     252664     60  violated:Termination                  violated:Termination                  yes
-ML_grant_no_wake                724657     271991     65  violated:Termination                  violated:Termination                  yes
-W_share_held                     10268       4314      1  violated:NoShareHeldBetweenPasses     violated:NoShareHeldBetweenPasses     yes
-W_withdraw_at_grant             155937      64044      4  violated:NoWithdrawAtGrant            violated:NoWithdrawAtGrant            yes
+ML_park_no_look                 679316     252664     64  violated:Termination                  violated:Termination                  yes
+ML_grant_no_wake                686515     258438     64  violated:Termination                  violated:Termination                  yes
+W_share_held                     10268       4314      2  violated:NoShareHeldBetweenPasses     violated:NoShareHeldBetweenPasses     yes
+W_withdraw_at_grant             155937      64044      3  violated:NoWithdrawAtGrant            violated:NoWithdrawAtGrant            yes
 W_grant_then_drop               117185      49657      3  violated:NoGrantThenDrop              violated:NoGrantThenDrop              yes
-W_cancel_with_share              15908       6627      1  violated:NoCancelWithShare            violated:NoCancelWithShare            yes
+W_cancel_with_share              15908       6627      2  violated:NoCancelWithShare            violated:NoCancelWithShare            yes
 W_refusal_for_queue               6547       2821      1  violated:NoRefusalForQueue            violated:NoRefusalForQueue            yes
 W_wake_by_grant                 142362      57664      3  violated:NoWakeByGrant                violated:NoWakeByGrant                yes
-W_pass_again                     11973       5185      2  violated:NoPassAgain                  violated:NoPassAgain                  yes
+W_pass_again                     11973       5185      1  violated:NoPassAgain                  violated:NoPassAgain                  yes
 W_close_refund                  206171      86134      4  violated:NoCloseRefund                violated:NoCloseRefund                yes
-W_fail_by_close                  30997      12904      1  violated:NoFailByClose                violated:NoFailByClose                yes
-W_value_after_close               1962        900      2  violated:NoValueAfterClose            violated:NoValueAfterClose            yes
-W_end_by_idle                    46364      19318      1  violated:NoEndByIdle                  violated:NoEndByIdle                  yes
+W_fail_by_close                  30997      12904      2  violated:NoFailByClose                violated:NoFailByClose                yes
+W_value_after_close               1962        900      1  violated:NoValueAfterClose            violated:NoValueAfterClose            yes
+W_end_by_idle                    46364      19318      2  violated:NoEndByIdle                  violated:NoEndByIdle                  yes
 W_grant_before_park              29910      12737      2  violated:NoGrantBeforePark            violated:NoGrantBeforePark            yes
 W_park_on_busy                     266        133      1  violated:NoParkOnBusy                 violated:NoParkOnBusy                 yes
 
