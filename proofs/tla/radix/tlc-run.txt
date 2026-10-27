@@ -1,0 +1,16 @@
+TLC run of every configuration in proofs/tla/radix, 2026-10-27 21:03 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+X_safe                          270775      79572      3  pass                                  pass                                  yes
+X_deep                       134633387   21040098     79  pass                                  pass                                  yes
+X_three                         763183     207438      4  pass                                  pass                                  yes
+X_live                          270775      79572      5  pass                                  pass                                  yes
+MX_leave_early                   12543       4762      1  violated:RootLive                     violated:RootLive                     yes
+MX_retire_parent_early           19183       7341      1  violated:NoFreedTouch                 violated:NoFreedTouch                 yes
+WX_grow                           2182        874      1  violated:NoGrow                       violated:NoGrow                       yes
+WX_race                           4603       1872      1  violated:NoRace                       violated:NoRace                       yes
+WX_free                           4167       1686      1  violated:NoFree                       violated:NoFree                       yes
+
+results matching EXPECTED.txt: 9 of 9

@@ -56,13 +56,19 @@ use core::task::{Context, Poll};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use super::error::TryRecvError;
-use super::queue::Queue;
+use super::queue::MessageQueue;
 use crate::sync::Event;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering, seq_cst_handshake};
 
 /// A channel flavor's admission control and closed bit.
 pub(super) trait Limit {
+    /// The flavor's message queue.
+    type Queue<T>: MessageQueue<T>;
+
+    /// A queue for this limit.
+    fn queue<T>(&self) -> Self::Queue<T>;
+
     /// Whether every admitted value has been received and no reservation is
     /// outstanding.
     fn is_idle(&self) -> bool;
@@ -89,8 +95,8 @@ enum Pop<T> {
 }
 
 /// The shared state of one channel.
-pub(super) struct Chan<T, L> {
-    queue: Queue<T>,
+pub(super) struct Chan<T, L: Limit> {
+    queue: L::Queue<T>,
     /// The receiver's task, woken when a value arrives or the channel ends.
     rx_waker: AtomicWaker,
     /// The receiver registered its waker and is about to sleep: the next push
@@ -108,14 +114,14 @@ pub(super) struct Chan<T, L> {
 // A channel holds no invariant that a panic in a caller's closure could break
 // half way: every shared word is an atomic and every step is complete before
 // the next, so a panic leaves it usable.
-impl<T, L> UnwindSafe for Chan<T, L> {}
-impl<T, L> RefUnwindSafe for Chan<T, L> {}
+impl<T, L: Limit> UnwindSafe for Chan<T, L> {}
+impl<T, L: Limit> RefUnwindSafe for Chan<T, L> {}
 
 impl<T, L: Limit> Chan<T, L> {
     /// A channel with one sender counted.
     pub(super) fn new(limit: L) -> Self {
         Self {
-            queue: Queue::new(),
+            queue: limit.queue(),
             rx_waker: AtomicWaker::new(),
             rx_waiting: AtomicBool::new(false),
             rx_closed: Event::new(),

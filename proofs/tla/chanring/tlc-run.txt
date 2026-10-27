@@ -1,0 +1,17 @@
+TLC run of every configuration in proofs/tla/chanring, 2026-10-27 21:24 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+R_safe                           18723       7394      1  pass                                  pass                                  yes
+R_odd                            33283      12546      2  pass                                  pass                                  yes
+R_three                         205199      66676      1  pass                                  pass                                  yes
+R_live                           18723       7394      1  pass                                  pass                                  yes
+MR_small_ring                      247        123      1  violated:NoClobber                    violated:NoClobber                    yes
+MR_release_before_read             283        145      1  violated:NoClobber                    violated:NoClobber                    yes
+MR_bool_ready                      274        137      1  violated:RightValue                   violated:RightValue                   yes
+MR_no_admit                        247        123      1  violated:NoClobber                    violated:NoClobber                    yes
+WR_lap                             332        162      1  violated:NoLap                        violated:NoLap                        yes
+WR_busy                             50         26      1  violated:NoBusy                       violated:NoBusy                       yes
+
+results matching EXPECTED.txt: 10 of 10

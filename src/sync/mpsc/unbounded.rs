@@ -14,6 +14,7 @@ use core::task::{Context, Poll};
 
 use super::chan::{Chan, Limit};
 use super::error::{SendError, TryRecvError};
+use super::queue;
 use crate::sync::internal::{self, Arc, AtomicUsize, Ordering};
 
 /// Set when the receiver closed; the count of values in flight sits above it.
@@ -51,6 +52,12 @@ impl Unbounded {
 }
 
 impl Limit for Unbounded {
+    type Queue<T> = queue::Radix<T>;
+
+    fn queue<T>(&self) -> queue::Radix<T> {
+        queue::Radix::new()
+    }
+
     fn is_idle(&self) -> bool {
         self.0.load(Ordering::Acquire) >> 1 == 0
     }

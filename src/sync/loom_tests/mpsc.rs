@@ -43,16 +43,15 @@
 //!   that withdrew as it was granted, a set-aside returned to the free count)
 //!   and fails unless its search reached the ones it is about.
 //!
-//! What the models do not cover. The message queue is kovan's segment queue,
-//! which loom cannot instrument; under `--cfg loom` the channel puts a loom
-//! `Mutex` around a deque of cells behind the same type (see
-//! `src/sync/mpsc/queue.rs`; the cancellation token's registry is modelled the
-//! same way). A push there is two steps, a claim and a write, as in the
-//! segment queue. So the models check the protocol around the queue: the
-//! waker handshake (a value still being written included), the sender count,
-//! the closed bit and the limit's idle test. The queue's own order, progress
-//! and memory reclamation are kovan's, checked by its TLA+ model and its
-//! tests.
+//! What the models do not cover. The message queues (a ring, a radix
+//! directory on kovan) are not instrumented; under `--cfg loom` the channel
+//! takes a row of cells on loom's atomics behind the same trait (see
+//! `src/sync/mpsc/queue.rs`). A push there is two steps, a claim and a write
+//! with its mark, as in the real queues. So the models check the protocol
+//! around the queue: the waker handshake and the receiver's flag (a value
+//! still being written included), the sender count, the closed bit and the
+//! limit's idle test. The queues' own order, progress and memory reclamation
+//! are checked by proofs/tla/chanring, proofs/tla/radix and their unit tests.
 //!
 //! Every calibration expects a failure the protocol does not allow, or an
 //! outcome the model must be able to reach, and must fail: without them a

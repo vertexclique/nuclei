@@ -38,10 +38,10 @@
 //! # Ordering
 //!
 //! What one sender sends comes out in the order it was sent, as the
-//! established API promises. The message queue is a lock-free segment queue,
-//! a linearizable FIFO queue: a send claims the next cell, and the receiver
-//! takes cells in the order they were claimed, so a send that returned before
-//! another began comes out first. Values that different senders send at the
+//! established API promises. The message queue is a linearizable FIFO queue
+//! of cells: a send claims the next cell, and the receiver takes cells in the
+//! order they were claimed, so a send that returned before another began
+//! comes out first. Values that different senders send at the
 //! same time come out in the order their sends claimed cells.
 //!
 //! # Disconnection
@@ -96,17 +96,18 @@
 //!
 //! # Progress
 //!
-//! The message queue is that segment queue, built for its one receiver. A
-//! send claims the next cell with one fetch-add, walks to the cell's
-//! segment (linking the next one where the list ends), writes its value and
-//! marks the cell ready with a plain store. Its walk starts again, from the
-//! receiver's segment, only when the receiver passed the segment it was about
-//! to step onto, and a link it loses was made by another send, so a send never
-//! waits for another thread: the push is lock-free. A receive reads the next cell's mark and takes the value, with
-//! no read-modify-write and nothing another thread contends for, and never
-//! waits for a sender: when the next cell is claimed by a send that has not
-//! written it yet, the receive finds nothing for now, registers its waker and
-//! returns `Pending`, and that send wakes it once its value is in. So a sender
+//! The message queue is built for its one receiver: a bounded channel's is a
+//! ring of cells used lap after lap (a radix directory past 65,536 cells), an
+//! unbounded channel's a radix directory of leaves. A send claims the next
+//! cell with one fetch-add, finds its segment (in the ring by its position, in
+//! the directory by at most one level per ten of a 64-bit position, making a
+//! missing node with one compare-and-swap that, lost, leaves another send's),
+//! writes its value and marks the cell ready: the push is wait-free. A receive
+//! reads the next cell's mark and takes the value, with no read-modify-write
+//! and nothing another thread contends for, and never waits for a sender:
+//! when the next cell is claimed by a send that has not written it yet, the
+//! receive finds nothing for now, registers its waker and returns `Pending`,
+//! and that send wakes it once its value is in. So a sender
 //! the scheduler stops between its claim and its write holds back the values
 //! behind its own until it runs again, but no call waits for it, and other
 //! senders are never held up by it.

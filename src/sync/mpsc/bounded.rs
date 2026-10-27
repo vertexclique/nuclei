@@ -22,6 +22,7 @@ use core::task::{Context, Poll};
 use super::chan::{Chan, Limit};
 use super::error::{SendError, SendTimeoutError, TrySendError};
 use super::permit::{OwnedPermit, Permit, PermitIterator};
+use super::queue;
 use super::receiver::Receiver;
 use crate::sync::fair_semaphore::{FairSemaphore, FairWait};
 use crate::sync::internal::{self, Arc};
@@ -34,6 +35,12 @@ pub(super) struct Bounded {
 }
 
 impl Limit for Bounded {
+    type Queue<T> = queue::Bounded<T>;
+
+    fn queue<T>(&self) -> queue::Bounded<T> {
+        queue::Bounded::with_capacity(self.bound)
+    }
+
     fn is_idle(&self) -> bool {
         self.sem.available() == self.bound
     }
