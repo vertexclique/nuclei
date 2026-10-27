@@ -199,11 +199,17 @@ impl<T> Radix<T> {
     }
 
     /// A queue whose first position is `start` (tests reach the root's
-    /// growth this way without sending billions of values).
+    /// growth this way without sending billions of values). Its root is made
+    /// at the level that spans `start`: grown there from level 1, the first
+    /// roots would hang on, spanning only leaves before `start`, which no
+    /// receiver passes and so none retires.
     pub(super) fn starting_at(start: u64) -> Self {
+        let level = (1..MAX_LEVEL)
+            .find(|&level| start / CELLS < span(level))
+            .unwrap_or(MAX_LEVEL);
         let queue = Self {
             tail: CachePadded::new(AtomicU64::new(start)),
-            root: CachePadded::new(Atomic::new(Inner::alloc(1))),
+            root: CachePadded::new(Atomic::new(Inner::alloc(level))),
             head: CachePadded::new(Head {
                 pos: AtomicU64::new(start),
                 leaf: UnsafeCell::new((ptr::null_mut(), 0)),
