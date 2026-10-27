@@ -702,10 +702,10 @@ impl Shard {
         // (`stop` lets go of the inbox's, last).
         let popped = unsafe {
             match self.shared.inbox.pop() {
-                Pop::Task(runnable) => Some(runnable),
+                Pop::Item(runnable) => Some(runnable),
                 // A push under way counts as work: the loop comes back.
                 Pop::Empty | Pop::Busy => match self.shared.local_inbox.pop() {
-                    Pop::Task(runnable) => Some(runnable),
+                    Pop::Item(runnable) => Some(runnable),
                     Pop::Empty | Pop::Busy => None,
                 },
             }

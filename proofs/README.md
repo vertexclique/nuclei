@@ -310,7 +310,10 @@ rounds each, liveness), with `NoDuplicate` (no task handed out that is not queue
 shard's end left on it, break `NoDuplicate`; sleeping without the look again deadlocks); and 3
 witnesses (a busy queue, the stub pushed behind the last task, a sleep a push ends). TLA+ is
 sequentially consistent: the unit tests in `src/rt/inbox.rs` run four pushing threads against
-the taker.
+the taker. The same queue holds a `JoinSet`'s woken members (`src/join_set.rs`), linked through
+each slot's waker: its `queued` flag keeps a waker in the queue at most once, as the scheduled
+bit does a task, and the set (`&mut self`) is the one taker; there the model's park is the set's
+awaiter, which a pusher wakes after its link.
 
 ## The blocking pool
 

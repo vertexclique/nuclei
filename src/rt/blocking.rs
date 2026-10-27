@@ -211,7 +211,7 @@ impl Pool {
                     popped
                 };
                 match popped {
-                    Pop::Task(runnable) => return Some(runnable),
+                    Pop::Item(runnable) => return Some(runnable),
                     Pop::Empty => return None,
                     Pop::Busy => {}
                 }

@@ -144,6 +144,24 @@ fn every_subsystem_holds_steady() {
         });
     });
 
+    steady("join sets", 100, 2000, || {
+        rt.block_on(async {
+            let mut set = nuclei::task::JoinSet::new();
+            for i in 0..8u32 {
+                set.spawn(async move {
+                    for _ in 0..i {
+                        nuclei::task::yield_now().await;
+                    }
+                    i
+                });
+            }
+            for _ in 0..4 {
+                set.join_next().await.unwrap().unwrap();
+            }
+            // The rest are cancelled with the set, some of them waking.
+        });
+    });
+
     let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
     steady("tcp", 100, 2000, || {
         rt.block_on(async {

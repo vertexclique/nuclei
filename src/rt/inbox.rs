@@ -1,5 +1,7 @@
 //! A shard's inbox: the runnables other threads hand the shard, in a queue
-//! linked through the tasks themselves, so a push allocates nothing.
+//! linked through the tasks themselves, so a push allocates nothing. The
+//! queue holds any [`Linked`] item the same way (a `JoinSet`'s woken
+//! members, linked through their wakers).
 //!
 //! Each task has one [`Link`] in its header, and a task is in a run queue at
 //! most once (its scheduled bit), so its link is free for this queue
@@ -21,12 +23,47 @@
 //! steps, and proofs/tla/park (`ShardStop`) the taker's role once the shard
 //! stopped.
 
+use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 
 use super::task::Runnable;
 use crate::sync::internal::{AtomicBool, AtomicPtr, Ordering, UnsafeCell};
 
-/// A task's place in an inbox.
+/// An item an inbox holds through the [`Link`] it carries: owned, in the
+/// queue at most once, its link free while it is out of it.
+///
+/// # Safety
+///
+/// `into_link` gives up the item as a pointer to its link, valid until
+/// `from_link` takes the item back from it; an item may be taken on another
+/// thread than the one that pushed it.
+pub(crate) unsafe trait Linked {
+    /// The item, given up as its link.
+    fn into_link(self) -> NonNull<Link>;
+
+    /// The item back from its link.
+    ///
+    /// # Safety
+    ///
+    /// `link` came from `into_link` and was not taken back since.
+    unsafe fn from_link(link: NonNull<Link>) -> Self;
+}
+
+// SAFETY: a runnable is its task's reference, its link the header's; the
+// tasks an inbox holds are `Send` ones, or a shard's bound tasks, which only
+// its own thread takes.
+unsafe impl Linked for Runnable {
+    fn into_link(self) -> NonNull<Link> {
+        Runnable::into_link(self)
+    }
+
+    unsafe fn from_link(link: NonNull<Link>) -> Self {
+        // SAFETY: the caller's contract.
+        unsafe { Runnable::from_link(link) }
+    }
+}
+
+/// An item's place in an inbox.
 pub(crate) struct Link {
     next: AtomicPtr<Link>,
 }
@@ -40,8 +77,8 @@ impl Link {
 }
 
 /// What a take found.
-pub(crate) enum Pop {
-    Task(Runnable),
+pub(crate) enum Pop<T = Runnable> {
+    Item(T),
     /// Nothing in the queue.
     Empty,
     /// A push is between its swap and its link: something is coming.
@@ -49,7 +86,7 @@ pub(crate) enum Pop {
 }
 
 /// The queue.
-pub(crate) struct Inbox {
+pub(crate) struct Inbox<T: Linked = Runnable> {
     /// The pushers' end: the task pushed last, or the stub.
     head: AtomicPtr<Link>,
     /// The taker's end; only the role's holder reaches it.
@@ -58,16 +95,16 @@ pub(crate) struct Inbox {
     stub: Box<Link>,
     /// The taker's role is held.
     taken: AtomicBool,
+    items: PhantomData<T>,
 }
 
-// SAFETY: the tasks it holds are `Send` runnables (or, for a shard's bound
-// tasks, ones only its thread takes), and the taker's end is reached only by
-// the role's holder.
-unsafe impl Send for Inbox {}
+// SAFETY: its items may move between threads (`Linked`), and the taker's
+// end is reached only by the role's holder.
+unsafe impl<T: Linked> Send for Inbox<T> {}
 // SAFETY: as for `Send`.
-unsafe impl Sync for Inbox {}
+unsafe impl<T: Linked> Sync for Inbox<T> {}
 
-impl Inbox {
+impl<T: Linked> Inbox<T> {
     /// An empty inbox, its taker's role held by its maker.
     pub(crate) fn new() -> Self {
         let stub = Box::new(Link::new());
@@ -77,6 +114,7 @@ impl Inbox {
             tail: UnsafeCell::new(at),
             stub,
             taken: AtomicBool::new(true),
+            items: PhantomData,
         }
     }
 
@@ -84,13 +122,13 @@ impl Inbox {
         ptr::from_ref::<Link>(&self.stub).cast_mut()
     }
 
-    /// Hands `runnable` to the queue, with its reference.
-    pub(crate) fn push(&self, runnable: Runnable) {
-        self.push_link(runnable.into_link());
+    /// Hands `item` to the queue.
+    pub(crate) fn push(&self, item: T) {
+        self.push_link(item.into_link());
     }
 
     fn push_link(&self, link: NonNull<Link>) {
-        // SAFETY: the link is a task's (or the stub) and is in no queue now,
+        // SAFETY: the link is an item's (or the stub) and is in no queue now,
         // so nothing else writes it.
         unsafe { link.as_ref() }
             .next
@@ -110,12 +148,12 @@ impl Inbox {
         self.head.load(Ordering::SeqCst) == self.stub()
     }
 
-    /// Takes the next task.
+    /// Takes the next item.
     ///
     /// # Safety
     ///
     /// The caller holds the taker's role.
-    pub(crate) unsafe fn pop(&self) -> Pop {
+    pub(crate) unsafe fn pop(&self) -> Pop<T> {
         let stub = self.stub();
         // SAFETY: the role's holder alone reaches the taker's end.
         self.tail.with_mut(|tail| unsafe {
@@ -135,7 +173,7 @@ impl Inbox {
             }
             if !next.is_null() {
                 *tail = next;
-                return Pop::Task(Runnable::from_link(NonNull::new_unchecked(cur)));
+                return Pop::Item(T::from_link(NonNull::new_unchecked(cur)));
             }
             if cur != self.head.load(Ordering::Acquire) {
                 return Pop::Busy;
@@ -148,7 +186,7 @@ impl Inbox {
                 return Pop::Busy;
             }
             *tail = next;
-            Pop::Task(Runnable::from_link(NonNull::new_unchecked(cur)))
+            Pop::Item(T::from_link(NonNull::new_unchecked(cur)))
         })
     }
 
@@ -168,18 +206,18 @@ impl Inbox {
         self.taken.store(false, Ordering::SeqCst);
     }
 
-    /// Hands every task in the queue to `each`, waiting out pushes under
+    /// Hands every item in the queue to `each`, waiting out pushes under
     /// way.
     ///
     /// # Safety
     ///
     /// The caller holds the taker's role.
-    pub(crate) unsafe fn drain(&self, mut each: impl FnMut(Runnable)) {
+    pub(crate) unsafe fn drain(&self, mut each: impl FnMut(T)) {
         let mut spins = 0u32;
         loop {
             // SAFETY: the caller's contract.
             match unsafe { self.pop() } {
-                Pop::Task(runnable) => each(runnable),
+                Pop::Item(item) => each(item),
                 Pop::Empty => return,
                 // A pusher between two of its steps: it links next.
                 Pop::Busy => {
@@ -195,7 +233,7 @@ impl Inbox {
     }
 }
 
-impl Drop for Inbox {
+impl<T: Linked> Drop for Inbox<T> {
     fn drop(&mut self) {
         // Nothing else reaches the inbox now: the role is as good as held.
         // What is left is dropped (a stopped shard drained it already).
@@ -235,7 +273,7 @@ mod tests {
     fn take(inbox: &Inbox) -> Option<Runnable> {
         // SAFETY: the test holds the role (the inbox's maker).
         match unsafe { inbox.pop() } {
-            Pop::Task(r) => Some(r),
+            Pop::Item(r) => Some(r),
             Pop::Empty => None,
             Pop::Busy => panic!("no push is under way"),
         }
@@ -244,7 +282,7 @@ mod tests {
     #[test]
     fn tasks_come_out_in_the_order_they_went_in() {
         let log = Log::default();
-        let inbox = Inbox::new();
+        let inbox: Inbox = Inbox::new();
         assert!(inbox.is_empty());
         inbox.push(task(&log, 1));
         assert!(!inbox.is_empty());
@@ -272,7 +310,7 @@ mod tests {
 
     #[test]
     fn the_role_goes_to_one_taker_at_a_time() {
-        let inbox = Inbox::new();
+        let inbox: Inbox = Inbox::new();
         assert!(!inbox.try_take(), "its maker holds it");
         // SAFETY: the maker holds it.
         unsafe { inbox.release() };
@@ -285,7 +323,7 @@ mod tests {
     #[test]
     fn a_dropped_inbox_drops_what_it_holds() {
         let log = Log::default();
-        let inbox = Inbox::new();
+        let inbox: Inbox = Inbox::new();
         inbox.push(task(&log, 1));
         inbox.push(task(&log, 2));
         assert_eq!(Arc::strong_count(&log), 3);
@@ -302,7 +340,7 @@ mod tests {
         const THREADS: u32 = 4;
         const EACH: u32 = 2_000;
         let log = Log::default();
-        let inbox = Arc::new(Inbox::new());
+        let inbox: Arc<Inbox> = Arc::new(Inbox::new());
         let pushers: Vec<_> = (0..THREADS)
             .map(|t| {
                 let (inbox, log) = (Arc::clone(&inbox), Arc::clone(&log));
@@ -317,7 +355,7 @@ mod tests {
         while got < THREADS * EACH {
             // SAFETY: this thread holds the role.
             match unsafe { inbox.pop() } {
-                Pop::Task(r) => {
+                Pop::Item(r) => {
                     r.run();
                     got += 1;
                 }

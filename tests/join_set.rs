@@ -206,3 +206,54 @@ fn join_all_resumes_a_members_panic() {
         set.join_all().await;
     });
 }
+
+/// A task detached with its slot wakes that slot's old waker as it ends,
+/// after a new member took the slot's place: the stale wake costs a look
+/// and nothing else, and the new member's output comes back.
+#[test]
+fn a_detached_task_waking_a_reused_slot_meets_no_member_of_its_own() {
+    let rt = runtime(2);
+    rt.block_on(async {
+        let mut set = JoinSet::new();
+        let (tx, rx) = oneshot::channel::<()>();
+        set.spawn(async move {
+            rx.await.unwrap();
+            0u32
+        });
+        // Polled once, so the task holds the slot's waker.
+        assert!(set.try_join_next().is_none());
+        set.detach_all();
+        let (newer_tx, newer_rx) = oneshot::channel::<()>();
+        set.spawn(async move {
+            newer_rx.await.unwrap();
+            1u32
+        });
+        assert!(set.try_join_next().is_none());
+        // The detached task ends and wakes its old slot's waker.
+        tx.send(()).unwrap();
+        task::yield_now().await;
+        newer_tx.send(()).unwrap();
+        assert_eq!(set.join_next().await.unwrap().unwrap(), 1);
+        assert!(set.join_next().await.is_none());
+    });
+}
+
+/// Slots are kept and reused: many rounds of spawning and joining through
+/// a set leave as many slots as tasks at once, and every output comes back.
+#[test]
+fn slots_are_reused_round_after_round() {
+    let rt = runtime(2);
+    rt.block_on(async {
+        let mut set = JoinSet::new();
+        let mut total = 0u64;
+        for round in 0..200u64 {
+            for i in 0..4 {
+                set.spawn(async move { round * 4 + i });
+            }
+            while let Some(out) = set.join_next().await {
+                total += out.unwrap();
+            }
+        }
+        assert_eq!(total, (0..800).sum::<u64>());
+    });
+}

@@ -242,6 +242,21 @@ fn a_blocking_job_allocates_nothing() {
     );
 }
 
+/// A spawn into a set with a free slot and its join: the slot's waker is
+/// kept, and the ready queue is linked through the wakers.
+#[test]
+fn a_join_set_spawn_and_join_allocates_nothing() {
+    let mut set = nuclei::task::JoinSet::new();
+    let made = steady(async || {
+        set.spawn_local(async { 1u8 });
+        set.join_next().await.unwrap().unwrap();
+    });
+    assert_eq!(
+        made, 0,
+        "{made} allocations in {RUNS} spawns into a set and joins"
+    );
+}
+
 /// A task spawned onto a worker and left to run (detached) ends there: its
 /// block goes back to the spawning thread's cache.
 #[test]

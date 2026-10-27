@@ -1,55 +1,90 @@
 //! [`JoinSet`]: a set of tasks whose outputs come back in the order the tasks
 //! finish.
 //!
-//! Each member is polled with a waker of its own, which queues the member's
-//! slot when its task wakes it and wakes the set's awaiter: `join_next` polls
-//! only members that were woken, never the whole set. A slot reused by a later
-//! member may get a stale wake from the member before it, which costs one
-//! spurious poll and nothing else.
+//! Each slot of the set has a waker of its own, made once with the slot and
+//! kept for every member it holds: woken, it queues itself (at most once,
+//! its `queued` flag) in the set's ready queue, linked through the waker
+//! itself (the shard inbox's queue, proofs/tla/inbox), and wakes the set's
+//! awaiter. `join_next` polls only members that were woken, never the whole
+//! set, and a spawn into a set that has a free slot allocates nothing for
+//! the set. A slot reused by a later member may get a stale wake from the
+//! member before it, which costs one spurious poll and nothing else. A
+//! waker holds the set weakly: one that wakes after the set is gone does
+//! nothing, and nothing queued keeps the set alive.
 
 use core::future::Future;
 use core::pin::Pin;
+use core::ptr::NonNull;
 use core::task::{Context, Poll, Waker};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::Wake;
 
+use crate::rt::inbox::{Inbox, Link, Linked, Pop};
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::task::{AbortHandle, Id, Join, JoinError, Task};
 
-/// What the members' wakers share with the set.
+/// What the slots' wakers share with the set.
 struct Shared {
-    /// Slots of woken members, in wake order.
-    ready: kovan_queue::seg_queue::SegQueue<usize>,
+    /// Wakers of woken members, in wake order.
+    ready: Inbox<Queued>,
     /// The task awaiting `join_next`.
     awaiter: AtomicWaker,
 }
 
-/// A member's waker: queues its slot once per wake.
-struct MemberWake {
-    shared: Arc<Shared>,
+/// A slot's waker: queues itself once per wake.
+struct SlotWake {
+    link: Link,
+    shared: Weak<Shared>,
     slot: usize,
     queued: AtomicBool,
 }
 
-impl Wake for MemberWake {
+impl Wake for SlotWake {
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        if !self.queued.swap(true, Ordering::AcqRel) {
-            self.shared.ready.push(self.slot);
-            self.shared.awaiter.wake();
+        if !self.queued.swap(true, Ordering::AcqRel)
+            && let Some(shared) = self.shared.upgrade()
+        {
+            shared.ready.push(Queued(Arc::clone(self)));
+            shared.awaiter.wake();
         }
     }
 }
 
+/// A slot's waker in the ready queue, with the reference that keeps it.
+struct Queued(Arc<SlotWake>);
+
+// SAFETY: the link is the waker's own field, kept alive by the reference
+// the item holds; a waker is `Send` and `Sync`.
+unsafe impl Linked for Queued {
+    fn into_link(self) -> NonNull<Link> {
+        let wake = Arc::into_raw(self.0);
+        // SAFETY: `wake` points at a live waker, whose link is in it.
+        unsafe { NonNull::new_unchecked(core::ptr::addr_of!((*wake).link).cast_mut()) }
+    }
+
+    unsafe fn from_link(link: NonNull<Link>) -> Self {
+        let offset = core::mem::offset_of!(SlotWake, link);
+        // SAFETY: the link is a waker's `link` field, given up by
+        // `into_link` with its reference.
+        Self(unsafe { Arc::from_raw(link.as_ptr().cast::<u8>().sub(offset).cast::<SlotWake>()) })
+    }
+}
+
+/// A place in the set: its waker, kept, and the member it holds.
+struct Slot<T> {
+    wake: Arc<SlotWake>,
+    waker: Waker,
+    member: Option<Member<T>>,
+}
+
 struct Member<T> {
     join: Join<T>,
-    wake: Arc<MemberWake>,
-    waker: Waker,
     abort: AbortHandle,
 }
 
@@ -72,7 +107,7 @@ struct Member<T> {
 /// # });
 /// ```
 pub struct JoinSet<T> {
-    members: Vec<Option<Member<T>>>,
+    slots: Vec<Slot<T>>,
     free: Vec<usize>,
     len: usize,
     shared: Arc<Shared>,
@@ -88,11 +123,11 @@ impl<T> JoinSet<T> {
     /// An empty set.
     pub fn new() -> Self {
         Self {
-            members: Vec::new(),
+            slots: Vec::new(),
             free: Vec::new(),
             len: 0,
             shared: Arc::new(Shared {
-                ready: kovan_queue::seg_queue::SegQueue::new(),
+                ready: Inbox::new(),
                 awaiter: AtomicWaker::new(),
             }),
         }
@@ -111,26 +146,36 @@ impl<T> JoinSet<T> {
     /// Takes `task` into the set and answers a handle that cancels it.
     pub fn insert(&mut self, task: Task<T>) -> AbortHandle {
         let abort = task.abort_handle();
-        let slot = self.free.pop().unwrap_or(self.members.len());
-        let wake = Arc::new(MemberWake {
-            shared: Arc::clone(&self.shared),
-            slot,
-            // Queued at once: the first `join_next` polls the new member.
-            queued: AtomicBool::new(true),
-        });
         let member = Member {
             join: task.join(),
-            waker: Waker::from(Arc::clone(&wake)),
-            wake,
             abort: abort.clone(),
         };
-        if slot == self.members.len() {
-            self.members.push(Some(member));
-        } else {
-            self.members[slot] = Some(member);
-        }
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                let slot = self.slots.len();
+                let wake = Arc::new(SlotWake {
+                    link: Link::new(),
+                    shared: Arc::downgrade(&self.shared),
+                    slot,
+                    queued: AtomicBool::new(false),
+                });
+                self.slots.push(Slot {
+                    waker: Waker::from(Arc::clone(&wake)),
+                    wake,
+                    member: None,
+                });
+                slot
+            }
+        };
+        let place = &mut self.slots[slot];
+        place.member = Some(member);
         self.len += 1;
-        self.shared.ready.push(slot);
+        // Queued at once, unless a stale wake queued the slot already: the
+        // next `join_next` polls the new member.
+        if !place.wake.queued.swap(true, Ordering::AcqRel) {
+            self.shared.ready.push(Queued(Arc::clone(&place.wake)));
+        }
         abort
     }
 
@@ -206,17 +251,29 @@ impl<T> JoinSet<T> {
         // At most one look at each member per poll: a member that keeps
         // waking itself cannot hold the caller here.
         for _ in 0..self.len {
-            let Some(slot) = self.shared.ready.pop() else {
-                return Poll::Pending;
+            // SAFETY: the set alone takes from its queue (`&mut self`).
+            let wake = match unsafe { self.shared.ready.pop() } {
+                Pop::Item(Queued(wake)) => wake,
+                // A wake between its two steps wakes the awaiter after it.
+                Pop::Empty | Pop::Busy => return Poll::Pending,
             };
-            let Some(member) = self.members.get_mut(slot).and_then(Option::as_mut) else {
+            wake.queued.store(false, Ordering::Release);
+            let slot = wake.slot;
+            // A stale wake of an earlier set's slot (after `detach_all`).
+            let Some(place) = self
+                .slots
+                .get_mut(slot)
+                .filter(|p| Arc::ptr_eq(&p.wake, &wake))
+            else {
                 continue;
             };
-            member.wake.queued.store(false, Ordering::Release);
-            let mut member_cx = Context::from_waker(&member.waker);
+            let Some(member) = place.member.as_mut() else {
+                continue;
+            };
+            let mut member_cx = Context::from_waker(&place.waker);
             if let Poll::Ready(out) = Pin::new(&mut member.join).poll(&mut member_cx) {
                 let id = member.abort.id();
-                self.members[slot] = None;
+                place.member = None;
                 self.free.push(slot);
                 self.len -= 1;
                 return Poll::Ready(Some(out.map(|value| (id, value))));
@@ -251,19 +308,23 @@ impl<T> JoinSet<T> {
     /// Cancels every task in the set; they stay in it, and `join_next` gives
     /// each one's cancellation (or its output, if it finished first).
     pub fn abort_all(&mut self) {
-        for member in self.members.iter().flatten() {
+        for member in self.slots.iter().filter_map(|p| p.member.as_ref()) {
             member.abort.abort();
         }
     }
 
-    /// Takes every task out of the set and lets each run to its end.
+    /// Takes every task out of the set and lets each run to its end. The
+    /// slots go with them, so a detached task's later wake meets none.
     pub fn detach_all(&mut self) {
-        for member in self.members.drain(..).flatten() {
-            member.join.detach();
+        for place in self.slots.drain(..) {
+            if let Some(member) = place.member {
+                member.join.detach();
+            }
         }
         self.free.clear();
         self.len = 0;
-        while self.shared.ready.pop().is_some() {}
+        // SAFETY: the set alone takes from its queue (`&mut self`).
+        unsafe { self.shared.ready.drain(drop) };
     }
 
     /// Cancels every task and waits until each one is out of the set.
