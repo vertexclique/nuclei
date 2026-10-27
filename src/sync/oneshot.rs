@@ -95,7 +95,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use super::atomic_waker::AtomicWaker;
-use super::internal::{Arc, AtomicUsize, Ordering, UnsafeCell};
+use super::internal::{AtomicUsize, BlockArc, Ordering, UnsafeCell};
 
 /// The sender wrote the value and published it, in the same step that
 /// raised `TX_DROPPED`.
@@ -240,9 +240,9 @@ impl<T> Inner<T> {
 /// assert_eq!(rx.try_recv(), Ok("hello"));
 /// ```
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let inner = Arc::new(Inner::new());
+    let inner = BlockArc::new(Inner::new());
     let tx = Sender {
-        inner: Some(Arc::clone(&inner)),
+        inner: Some(BlockArc::clone(&inner)),
     };
     let rx = Receiver {
         inner: Some(inner),
@@ -268,7 +268,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 /// [`Option::take`].
 pub struct Sender<T> {
     /// `None` only after `send` took it.
-    inner: Option<Arc<Inner<T>>>,
+    inner: Option<BlockArc<Inner<T>>>,
 }
 
 impl<T> Sender<T> {
@@ -450,7 +450,7 @@ impl<T> fmt::Debug for Sender<T> {
 /// ```
 pub struct Receiver<T> {
     /// `None` once the receiver completed: it returned its value or an error.
-    inner: Option<Arc<Inner<T>>>,
+    inner: Option<BlockArc<Inner<T>>>,
     close: RxClose,
 }
 

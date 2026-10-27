@@ -335,7 +335,7 @@ threads against threads that keep timing out.
 ## Task blocks given back to their thread
 
 `remote` (`tla/remote/RemoteFree.tla`) checks how a task's block freed on another thread than
-its owner's goes back to the owner (`src/rt/task/memory.rs`), at the grain of each atomic access.
+its owner's goes back to the owner (`src/mem/mod.rs`), at the grain of each atomic access.
 Each thread that allocates holds a record: a list other threads push the blocks they free onto,
 linked through the blocks, and a count that bounds it. A freeing thread counts itself in, gives
 up at the bound, reads the head, gives up if the list is closed, and swaps its block in only if
@@ -349,7 +349,7 @@ one; and `Terminates`), 4 mutations (a push that swaps its block in whatever the
 close in two steps, each break `ListConsistent`; a record let go before its list is closed breaks
 `OpenWhileOwned`; a push that ignores the count breaks `BoundedList`), and 3 witnesses (a push
 that finds the list closed, one that finds it full, the next owner taking back a block the first
-allocated). The unit tests in `src/rt/task/memory.rs` give a block back across threads, refuse
+allocated). The unit tests in `src/mem/mod.rs` give a block back across threads, refuse
 one at a closed record and at the bound (a take-back that never runs fails two, a push past the
 bound one); `tests/zero_alloc.rs` counts no allocation for blocking jobs, detached spawns onto a
 worker and the pool's file jobs.

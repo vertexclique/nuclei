@@ -36,9 +36,15 @@
 // vertexia: the whole crate-private surface of this module stays declared;
 // names no primitive imports yet are allowed unused, and any that stay unused
 // are trimmed.
+/// The shared state made per operation, in a block of the thread's cache.
+#[cfg(not(loom))]
+pub(crate) use crate::mem::BlockArc;
 #[cfg(loom)]
 #[allow(unused_imports)]
 pub(crate) use loom::sync::Arc;
+/// The shared state made per operation: loom's `Arc` in the models.
+#[cfg(loom)]
+pub(crate) use loom::sync::Arc as BlockArc;
 #[cfg(not(loom))]
 #[allow(unused_imports)]
 pub(crate) use std::sync::Arc;

@@ -66,6 +66,7 @@ mod compat;
 pub mod config;
 pub mod fs;
 pub mod io;
+mod mem;
 pub mod net;
 mod proactor;
 /// Child processes: spawn one, wait for its exit and talk to it through async pipes.

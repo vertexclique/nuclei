@@ -27,8 +27,8 @@ pub(super) struct Header {
     /// Its place in a shard's inbox, which it is in at most once (see
     /// `rt::inbox`).
     pub(super) link: crate::rt::inbox::Link,
-    /// The thread its memory came from (see `memory`).
-    pub(super) owner: super::memory::Owner,
+    /// The thread its memory came from (see `mem`).
+    pub(super) owner: crate::mem::Owner,
 }
 
 /// The next task id: ids start at 1 and are never reused (a `u64` does not
@@ -38,7 +38,7 @@ static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 impl Header {
     /// A new task's header: scheduled, with its handle and one reference,
     /// the `Runnable` that spawning returns, and the next id.
-    pub(super) fn new(vtable: &'static TaskVTable, owner: super::memory::Owner) -> Self {
+    pub(super) fn new(vtable: &'static TaskVTable, owner: crate::mem::Owner) -> Self {
         let id = NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self {
             state: AtomicUsize::new(SCHEDULED | TASK | REFERENCE),

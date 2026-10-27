@@ -103,7 +103,7 @@ where
     /// Allocates a task, scheduled, with its handle and its `Runnable`; its
     /// memory comes from the thread's cache of task blocks (see `memory`).
     pub(super) fn allocate(future: F, schedule: S) -> NonNull<()> {
-        let (ptr, owner) = super::memory::alloc(core::alloc::Layout::new::<Cell<F, S>>());
+        let (ptr, owner) = crate::mem::alloc(core::alloc::Layout::new::<Cell<F, S>>());
         let ptr = ptr.cast::<Cell<F, S>>();
         // SAFETY: fresh memory of the cell's layout, written once here.
         unsafe {
@@ -301,9 +301,9 @@ where
             let owner = header.owner;
             let cell = ptr.cast_mut().cast::<Cell<F, S>>();
             abort_on_panic(|| core::ptr::drop_in_place(cell));
-            // SAFETY: the memory came from `memory::alloc` with the cell's
+            // SAFETY: the memory came from `mem::alloc` with the cell's
             // layout and `owner`, and nothing uses it now.
-            super::memory::free(
+            crate::mem::free(
                 NonNull::new_unchecked(cell.cast()),
                 core::alloc::Layout::new::<Cell<F, S>>(),
                 owner,

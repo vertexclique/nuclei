@@ -1,6 +1,7 @@
-//! Task memory: each task is one block, taken from this thread's cache of
-//! blocks of its size when one is there, and given back to the cache of
-//! the thread it came from when it is freed.
+//! Small blocks: each task is one, and each piece of shared state made and
+//! dropped per operation ([`BlockArc`], a oneshot channel's), taken from this
+//! thread's cache of blocks of its size when one is there, and given back to
+//! the cache of the thread it came from when it is freed.
 //!
 //! Blocks come in classes of [`STEP`] bytes up to [`CLASSES`] steps, all
 //! aligned to [`STEP`]; a task larger than that, or more aligned, goes to
@@ -26,6 +27,9 @@
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
+
+mod arc;
+pub(crate) use self::arc::BlockArc;
 
 /// The size step of a class, and the alignment of every cached block.
 pub(crate) const STEP: usize = 64;

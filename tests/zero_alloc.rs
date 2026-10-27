@@ -242,6 +242,18 @@ fn a_blocking_job_allocates_nothing() {
     );
 }
 
+/// A oneshot channel made, sent on and received from: its shared state is
+/// a block of the thread's cache.
+#[test]
+fn a_oneshot_channel_allocates_nothing() {
+    let made = steady(async || {
+        let (tx, rx) = nuclei::sync::oneshot::channel::<u64>();
+        tx.send(7).unwrap();
+        assert_eq!(rx.await.unwrap(), 7);
+    });
+    assert_eq!(made, 0, "{made} allocations in {RUNS} oneshot channels");
+}
+
 /// A spawn into a set with a free slot and its join: the slot's waker is
 /// kept, and the ready queue is linked through the wakers.
 #[test]

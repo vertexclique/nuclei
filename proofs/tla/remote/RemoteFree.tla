@@ -1,7 +1,7 @@
 ---------------------------- MODULE RemoteFree ----------------------------
 (***************************************************************************)
 (* Task blocks freed on a thread other than their owner's going back to    *)
-(* the owner (src/rt/task/memory.rs), at the grain of each atomic access.  *)
+(* the owner (src/mem/mod.rs), at the grain of each atomic access.  *)
 (*                                                                          *)
 (* In plain words: each thread that allocates task blocks holds a record:  *)
 (* a list head other threads push the blocks they free onto, linked        *)
