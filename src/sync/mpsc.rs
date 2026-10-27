@@ -117,8 +117,12 @@
 //!   `capacity`, `max_capacity`, the sender counts, `same_channel`), `clone`,
 //!   `downgrade`, and dropping a sender or weak sender (the last sender's
 //!   drop also wakes the receiver, a two-step handshake on the waker cell).
-//!   Registering the receiver's waker is wait-free too.
-//! - **Lock-free**: every send, `try_send`, reservation and permit send;
+//!   Registering the receiver's waker is wait-free too, and so is
+//!   [`UnboundedSender::send`]: its admission is one fetch-add (taken back
+//!   with one fetch-sub on a closed channel), its push the queue's.
+//! - **Lock-free**: every bounded send, `try_send`, reservation and permit
+//!   send, whose admission is the semaphore's compare-and-swap (exact: it
+//!   never refuses a free slot);
 //!   `closed`; `WeakSender::upgrade` (a compare-and-swap loop on the sender
 //!   count); and `Receiver::close`. A bounded wait that has to queue is
 //!   lock-free for the reason every wait queue is (see the

@@ -579,6 +579,28 @@ fn an_unbounded_send_racing_close_is_received_or_refused_never_lost() {
     );
 }
 
+/// A send refused by a closed channel counts itself in for an instant before
+/// it takes itself back out: a receiver waiting for the closed channel to go
+/// idle that saw the count up is woken by the refusal itself. A clone of the
+/// sender lives on, so no last sender's drop wakes it instead.
+#[test]
+fn an_unbounded_send_refused_by_the_close_wakes_a_receiver_waiting_for_idle() {
+    explore(
+        "an_unbounded_send_refused_by_the_close_wakes_a_receiver_waiting_for_idle",
+        3,
+        60,
+        || {
+            let (tx, mut rx) = mpsc::unbounded_channel::<u8>();
+            let keep = tx.clone();
+            rx.close();
+            let sender = thread::spawn(move || tx.send(5).is_err());
+            assert_eq!(block_on(rx.recv()), None, "the closed, idle channel ends");
+            assert!(sender.join().expect("sender"), "refused: closed before it");
+            drop(keep);
+        },
+    );
+}
+
 /// A reservation racing the close either holds a slot it can still send
 /// through, which the receiver then receives, or fails.
 #[test]

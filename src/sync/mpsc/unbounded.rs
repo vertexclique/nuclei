@@ -26,28 +26,21 @@ const ONE: usize = 2;
 pub(super) struct Unbounded(AtomicUsize);
 
 impl Unbounded {
-    /// Admits one more value unless the channel is closed. Lock-free: the
-    /// compare-and-swap retries only when another sender or the receiver
-    /// changed the word first.
+    /// Admits one more value unless the channel is closed. Wait-free: one
+    /// fetch-add, and on a closed channel one fetch-sub that takes it back.
+    /// The count was up for that instant, so a receiver waiting for its closed
+    /// channel to go idle may have seen it: the caller wakes it after a refusal
+    /// ([`Chan::wake_if_finished`](super::chan::Chan::wake_if_finished)).
     fn admit(&self) -> bool {
-        let mut state = self.0.load(Ordering::Acquire);
-        loop {
-            if state & CLOSED != 0 {
-                return false;
-            }
-            // Cannot overflow into the closed bit: it would take 2^62 values
-            // queued at once, and each one occupies at least a word of the
-            // message queue's memory.
-            match self.0.compare_exchange_weak(
-                state,
-                state + ONE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => state = actual,
-            }
+        // Cannot overflow into the closed bit: it would take 2^62 values in
+        // flight at once, and each one occupies at least a word of the message
+        // queue's memory (a refused one for an instant only).
+        let before = self.0.fetch_add(ONE, Ordering::AcqRel);
+        if before & CLOSED == 0 {
+            return true;
         }
+        self.0.fetch_sub(ONE, Ordering::AcqRel);
+        false
     }
 }
 
@@ -214,6 +207,8 @@ impl<T> UnboundedSender<T> {
     /// ```
     pub fn send(&self, message: T) -> Result<(), SendError<T>> {
         if !self.chan.limit.admit() {
+            // The refused admission was counted for an instant (see `admit`).
+            self.chan.wake_if_finished();
             return Err(SendError(message));
         }
         self.chan.send(message);

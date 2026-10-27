@@ -1,0 +1,10 @@
+TLC run of every configuration in proofs/tla/unbounded, 2026-10-27 21:58 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+U_safe                           58038      18838      1  pass                                  pass                                  yes
+U_live                           58038      18838      2  pass                                  pass                                  yes
+MU_no_undo_wake                   2409       1119      1  deadlock                              deadlock                              yes
+
+results matching EXPECTED.txt: 3 of 3

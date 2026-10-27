@@ -1,0 +1,4 @@
+# configuration                spec                 expected
+U_safe                         MC_Unbounded         pass
+U_live                         MC_Unbounded         pass
+MU_no_undo_wake                MC_Unbounded         deadlock
