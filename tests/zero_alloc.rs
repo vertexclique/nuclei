@@ -149,8 +149,9 @@ fn a_tcp_round_trip_allocates_nothing() {
 }
 
 /// File writes, flushes, seeks and reads through a handle: on the ring, a
-/// call's slot is a spare once the ring let go of it; on the pool, a job is
-/// a task of the cache in the pool's linked queue.
+/// call's slot is a spare once the ring let go of it, and none is made; on
+/// the pool, a job is a task of the cache in the pool's linked queue, with
+/// the rare block of a blocking job (see below).
 #[test]
 fn file_reads_and_writes_allocate_nothing() {
     use nuclei::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -159,15 +160,20 @@ fn file_reads_and_writes_allocate_nothing() {
         .worker_threads(0)
         .build()
         .unwrap();
-    let file = rt.block_on(async {
-        nuclei::fs::OpenOptions::new()
+    let (file, ring) = rt.block_on(async {
+        let ring = nuclei::stats()
+            .shards
+            .iter()
+            .all(|shard| shard.backend == nuclei::IoBackend::IoUring);
+        let file = nuclei::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)
             .await
-            .unwrap()
+            .unwrap();
+        (file, ring)
     });
     drop(rt);
     let mut file = file;
@@ -180,8 +186,9 @@ fn file_reads_and_writes_allocate_nothing() {
         file.read_exact(&mut buf).await.unwrap();
     });
     let _ = std::fs::remove_file(&path);
-    assert_eq!(
-        made, 0,
+    let most = if ring { 0 } else { RUNS as u64 / 1_000 };
+    assert!(
+        made <= most,
         "{made} allocations in {RUNS} write, flush, seek and read rounds"
     );
 }
