@@ -43,7 +43,7 @@
 
 mod node;
 mod pool;
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 pub(super) mod spin_probe;
 mod wait;
 mod wake;

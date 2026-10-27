@@ -113,18 +113,18 @@
 macro_rules! loom_const_fn {
     ($(#[$attr:meta])* $vis:vis fn $name:ident($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty $body:block) => {
         $(#[$attr])*
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         $vis const fn $name($($arg: $ty),*) -> $ret $body
 
         $(#[$attr])*
-        #[cfg(loom)]
+        #[cfg(all(loom, test))]
         $vis fn $name($($arg: $ty),*) -> $ret $body
     };
 }
 
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 pub(crate) mod atomic_waker;
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 #[doc(hidden)]
 pub mod atomic_waker;
 mod barrier;
@@ -137,9 +137,11 @@ pub(crate) mod internal;
 mod latch;
 mod lazy;
 mod list;
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 #[doc(hidden)]
-pub mod loom_model;
+pub(crate) mod loom_model;
+#[cfg(all(test, loom))]
+mod loom_tests;
 pub mod mpsc;
 mod mutex;
 mod notify;

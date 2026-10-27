@@ -62,12 +62,12 @@
 
 // A model-checking build (`--cfg loom`) compiles the loom models and leaves
 // the ordinary tests out, so the helpers only those tests use go unused.
-#![cfg_attr(loom, allow(dead_code, unused_imports))]
+#![cfg_attr(all(loom, test), allow(dead_code, unused_imports))]
 // No unwrap, expect or panic outside a documented contract, each marked
 // where it is; every unsafe block names what it rests on. Tests and the
 // model-checking build may assert.
 #![cfg_attr(
-    not(any(test, loom)),
+    not(test),
     warn(
         clippy::unwrap_used,
         clippy::expect_used,

@@ -2,25 +2,25 @@
 
 #![allow(unsafe_code)]
 
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 use core::ptr;
 use core::ptr::NonNull;
 
 use super::node::Waiter;
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 use crate::sync::internal::Ordering;
 
 /// Nodes a primitive keeps for reuse; past this the allocator gets them
 /// back, so a burst of contention cannot pin memory forever.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 const POOL_CAPACITY: usize = 16;
 
 /// A pooled node, owned by whoever holds this value.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 struct Pooled(NonNull<Waiter>);
 
 // SAFETY: a pooled node is referenced by nothing but its `Pooled`.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 unsafe impl Send for Pooled {}
 
 /// A primitive's free list of waiter nodes.
@@ -31,20 +31,20 @@ unsafe impl Send for Pooled {}
 /// allocator: loom cannot see inside kovan's queue, and a hand-off it
 /// cannot see would read to it as a data race.
 pub(in crate::sync) struct Pool {
-    #[cfg(not(loom))]
+    #[cfg(not(all(loom, test)))]
     ring: core::sync::atomic::AtomicPtr<kovan_queue::array_queue::ArrayQueue<Pooled>>,
 }
 
 impl Pool {
     pub(in crate::sync) const fn new() -> Self {
         Self {
-            #[cfg(not(loom))]
+            #[cfg(not(all(loom, test)))]
             ring: core::sync::atomic::AtomicPtr::new(ptr::null_mut()),
         }
     }
 
     pub(super) fn take(&self) -> NonNull<Waiter> {
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         {
             let ring = self.ring.load(Ordering::Acquire);
             // SAFETY: a published ring lives until the pool drops.
@@ -58,19 +58,19 @@ impl Pool {
     pub(super) fn put(&self, node: NonNull<Waiter>) {
         // SAFETY: every reference is gone, so the caller owns the node.
         unsafe { node.as_ref() }.clear_slots();
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         let node = match self.ring().push(Pooled(node)) {
             Ok(()) => return,
             Err(Pooled(node)) => node,
         };
         // SAFETY: as above, the caller owns the node outright.
-        #[cfg(loom)]
+        #[cfg(all(loom, test))]
         unsafe { &mut *node.as_ptr() }.retire();
         // SAFETY: every node is a leaked `Box` and this one is unreferenced.
         drop(unsafe { Box::from_raw(node.as_ptr()) });
     }
 
-    #[cfg(not(loom))]
+    #[cfg(not(all(loom, test)))]
     fn ring(&self) -> &kovan_queue::array_queue::ArrayQueue<Pooled> {
         let ring = self.ring.load(Ordering::Acquire);
         // SAFETY: a published ring lives until the pool drops.
@@ -100,7 +100,7 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         {
             let ring = *self.ring.get_mut();
             if !ring.is_null() {

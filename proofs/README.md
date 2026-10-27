@@ -68,7 +68,7 @@ moment a waiter is dropped while a pass is granting it.
 | TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer, the guard of an IO source's side, the reads and writes from a task's own buffer and a source's operations on its shard's ring the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
 | Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, the timer wheel's arithmetic and a ring's file slots (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
 
-The loom models in `tests/sync_loom_mpsc.rs` complement both: they run the real Rust code
+The loom models in `src/sync/loom_tests/mpsc.rs` complement both: they run the real Rust code
 under every interleaving loom reaches (with the weak memory orderings of the atomics), for a
 handful of operations.
 

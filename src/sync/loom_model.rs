@@ -1,10 +1,9 @@
-//! Loom models that need the crate-private half of `nuclei::sync`.
+//! Loom models that need the crate-private half of `crate::sync`.
 //!
-//! `tests/sync_loom.rs` drives the primitives through their public API,
-//! which cannot see how often a drain passes. The model here wraps the
+//! `sync::loom_tests::primitives` drives the primitives through their public
+//! API, which cannot see how often a drain passes. The model here wraps the
 //! semaphore's [`Policy`] to count the passes of the drain one waiter runs,
-//! so it lives inside the crate and `tests/sync_loom.rs` calls it through
-//! `nuclei::sync::loom_model`.
+//! and the primitives' models call it.
 //!
 //! What it checks: a waiter that queues takes the drain role
 //! in the same poll when nobody holds it. While it serves the queue, the
@@ -38,7 +37,7 @@
 //! must fail.
 //!
 //! Last, three entry points for the channel models in
-//! `tests/sync_loom_mpsc.rs`: the counts of the places the bounded channel's
+//! `sync::loom_tests::mpsc`: the counts of the places the bounded channel's
 //! fair semaphore handed a leaving waiter's share on, the switch of the
 //! calibration that drops every such share instead, and how often a
 //! receiver found the next value still being written.
@@ -609,7 +608,7 @@ fn node_spin_model(name: &'static str, floors: [usize; 3]) {
 /// How often the bounded channel's fair semaphore handed a leaving waiter's
 /// share on since the last call, by place: a wait granted then dropped, a
 /// front waiter that withdrew as it was granted, and a set-aside returned to
-/// the state word. The models in `tests/sync_loom_mpsc.rs` read it to show
+/// the state word. The models in `sync::loom_tests::mpsc` read it to show
 /// their search reached each place.
 pub fn fair_handoff_counts() -> [usize; 3] {
     super::fair_semaphore::probe::take()
@@ -636,7 +635,7 @@ pub(super) fn busy_look() {
 }
 
 /// How often a channel's receiver found the next value still being written
-/// since the last call. The models in `tests/sync_loom_mpsc.rs` read it to
+/// since the last call. The models in `sync::loom_tests::mpsc` read it to
 /// show their search reached that answer.
 pub fn mpsc_busy_looks() -> usize {
     BUSY_LOOKS.with(|n| n.replace(0))

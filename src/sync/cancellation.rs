@@ -70,7 +70,7 @@ use core::hash::{Hash, Hasher};
 
 mod guard;
 mod node;
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 mod rc;
 mod wait;
 
@@ -80,10 +80,10 @@ pub use wait::{WaitForCancellationFuture, WaitForCancellationFutureOwned};
 use node::Node;
 use wait::RunUntilCancelled;
 
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 use std::sync::{Arc, Weak};
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 use self::rc::{Arc, Weak};
 
 /// A token which can be used to signal a cancellation request to one or more

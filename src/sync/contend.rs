@@ -41,11 +41,11 @@ use super::waiter::{Cancel, Park, Wait};
 /// How many times a waiter can be passed over before it is owed a
 /// handoff: a woken waiter that loses its retry this many times is handed
 /// the next release directly, and nobody barges past it meanwhile.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 pub const MAX_BYPASS: u32 = 16;
 /// Small under loom, so a model with a handful of operations reaches the
 /// handoff.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 pub const MAX_BYPASS: u32 = 2;
 
 /// The payload a drain pass leaves on a waiter it granted because the

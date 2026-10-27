@@ -5,7 +5,7 @@
 //! The waits are driven by hand under a waker that counts its wakes
 //! (`Polled`), so a test can say exactly who was woken; the `blocking_*`
 //! methods run on plain threads, as they must. The interleavings are the
-//! loom models' business (`tests/sync_loom.rs`).
+//! loom models' business (`sync::loom_tests` in the crate).
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::error::Error;

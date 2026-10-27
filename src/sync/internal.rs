@@ -37,24 +37,24 @@
 // names no primitive imports yet are allowed unused, and any that stay unused
 // are trimmed.
 /// The shared state made per operation, in a block of the thread's cache.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 pub(crate) use crate::mem::BlockArc;
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 #[allow(unused_imports)]
 pub(crate) use loom::sync::Arc;
 /// The shared state made per operation: loom's `Arc` in the models.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 pub(crate) use loom::sync::Arc as BlockArc;
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 #[allow(unused_imports)]
 pub(crate) use std::sync::Arc;
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 #[allow(unused_imports)]
 pub(crate) use loom::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 #[allow(unused_imports)]
 pub(crate) use std::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
@@ -71,11 +71,11 @@ pub(crate) use std::sync::atomic::{
 /// loom's.
 #[inline(always)]
 pub(crate) fn take_ptr<T>(atomic: &mut AtomicPtr<T>) -> *mut T {
-    #[cfg(not(loom))]
+    #[cfg(not(all(loom, test)))]
     {
         std::mem::replace(atomic.get_mut(), std::ptr::null_mut())
     }
-    #[cfg(loom)]
+    #[cfg(all(loom, test))]
     {
         atomic.swap(std::ptr::null_mut(), Ordering::AcqRel)
     }
@@ -96,7 +96,7 @@ pub(crate) fn take_ptr<T>(atomic: &mut AtomicPtr<T>) -> *mut T {
 /// accesses carry the order themselves.
 #[inline(always)]
 pub(crate) fn seq_cst_handshake() {
-    #[cfg(loom)]
+    #[cfg(all(loom, test))]
     fence(Ordering::SeqCst);
 }
 
@@ -107,11 +107,11 @@ pub(crate) use os_mutex::Mutex;
 /// in one place: tests, and a target that is none of Unix, Windows or WASI.
 #[cfg(any(test, not(any(unix, windows, target_os = "wasi"))))]
 // A loom build compiles the tests that use it out.
-#[cfg_attr(loom, allow(dead_code))]
+#[cfg_attr(all(loom, test), allow(dead_code))]
 mod os_mutex {
-    #[cfg(loom)]
+    #[cfg(all(loom, test))]
     use loom::sync as imp;
-    #[cfg(not(loom))]
+    #[cfg(not(all(loom, test)))]
     use std::sync as imp;
 
     use imp::MutexGuard;
@@ -126,7 +126,7 @@ mod os_mutex {
 
     impl<T> Mutex<T> {
         /// A new mutex holding `value`.
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         pub(crate) const fn new(value: T) -> Self {
             Self(imp::Mutex::new(value))
         }
@@ -134,7 +134,7 @@ mod os_mutex {
         /// A new mutex holding `value`.
         ///
         /// Not `const` under loom: the mock allocates its own state.
-        #[cfg(loom)]
+        #[cfg(all(loom, test))]
         pub(crate) fn new(value: T) -> Self {
             Self(imp::Mutex::new(value))
         }
@@ -174,10 +174,10 @@ mod os_mutex {
 /// before or after every other access fails the model; in a normal build
 /// it is `std::cell::UnsafeCell` behind the same `with`/`with_mut` shape,
 /// so the code the model checks is the code that ships.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
 
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 impl<T> UnsafeCell<T> {
     /// A new cell holding `value`.
     pub(crate) const fn new(value: T) -> Self {
@@ -196,7 +196,7 @@ impl<T> UnsafeCell<T> {
     }
 }
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 pub(crate) use loom::cell::UnsafeCell;
 
 /// Wakes a thread parked in [`block_on`].
@@ -219,7 +219,7 @@ impl std::task::Wake for Unpark {
 /// may wait waits on a [`crate::sync`] primitive. A wake that comes before
 /// the park is kept by the thread, so the park returns at once and nothing is
 /// lost.
-#[cfg(not(any(loom, target_arch = "wasm32")))]
+#[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
 pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
     use core::task::{Context, Poll};
 
@@ -237,7 +237,7 @@ pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
 /// Under loom a wait parks the model's thread on a tracked notification,
 /// so a wake that never comes parks it for good and fails the model as a
 /// deadlock.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
     use core::task::{Context, Poll};
 
@@ -313,7 +313,7 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
     reason = "documented under `# Panics`: a wait that would park the only thread"
 )]
 pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
-    #[cfg(not(any(loom, target_arch = "wasm32")))]
+    #[cfg(not(any(all(loom, test), target_arch = "wasm32")))]
     {
         if crate::rt::context::current(|current| current.is_some()) {
             return crate::runtime::block_on(future);

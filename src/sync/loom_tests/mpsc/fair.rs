@@ -2,7 +2,7 @@
 //! served in order, and a waiter that leaves passes its share on (see the
 //! parent file's docs).
 
-use nuclei::sync::loom_model::fair_handoff_counts;
+use crate::sync::loom_model::fair_handoff_counts;
 
 use super::*;
 

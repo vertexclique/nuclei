@@ -25,7 +25,7 @@
 //! the close, and every wait ends.
 //!
 //! Single-threaded schedules cover the protocol's decisions; the loom
-//! models in `tests/sync_loom.rs` cover the interleavings.
+//! models in `sync::loom_tests` (in the crate) cover the interleavings.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::VecDeque;

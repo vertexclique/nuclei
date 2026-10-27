@@ -1,8 +1,8 @@
 //! Loom models for the waker cell, the one-shot channel, the watch channel and
-//! the cancellation token of `nuclei::sync`.
+//! the cancellation token of `crate::sync`.
 //!
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test --release --test sync_loom_new
+//! RUSTFLAGS="--cfg loom" cargo test --release --lib -- sync::loom_tests::signals
 //! ```
 //!
 //! Under `--cfg loom` the atomics, the unsafe cells and the wait queues these
@@ -38,8 +38,6 @@
 //! fail: without them a search that never reached the bad interleaving would
 //! pass for the same reason a correct one does.
 
-#![cfg(loom)]
-
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
 use std::task::{Context, Poll};
@@ -48,10 +46,10 @@ use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use loom::sync::{Arc, Notify as Park};
 use loom::thread;
 
-use nuclei::sync::CancellationToken;
-use nuclei::sync::atomic_waker::AtomicWaker;
-use nuclei::sync::oneshot::{self, error::TryRecvError};
-use nuclei::sync::watch;
+use crate::sync::CancellationToken;
+use crate::sync::atomic_waker::AtomicWaker;
+use crate::sync::oneshot::{self, error::TryRecvError};
+use crate::sync::watch;
 
 /// Runs `model` under loom with at most `preemptions` preemptions per
 /// schedule (`LOOM_MAX_PREEMPTIONS` overrides it) and fails it if the search

@@ -67,10 +67,10 @@
 #![allow(unsafe_code)]
 
 /// The queue of one channel.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 pub(super) use self::segments::Queue;
 
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 mod segments {
     use core::cell::UnsafeCell;
     use core::marker::PhantomData;
@@ -449,11 +449,11 @@ mod segments {
 
 /// How many values one loom model's channel may ever take in: its models
 /// send a handful.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 const LOOM_CELLS: usize = 8;
 
 /// A cell of the loom model.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 struct LoomCell<T> {
     /// The value is written, as the real queue's mark.
     ready: crate::sync::internal::AtomicBool,
@@ -468,7 +468,7 @@ struct LoomCell<T> {
 /// of the real queue without its segments: a row of cells, a push claiming
 /// the next with a fetch-add, writing its value and marking it ready (both
 /// sequentially consistent, as there), and the receiver's position its own.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 pub(super) struct Queue<T> {
     tail: crate::sync::internal::AtomicU64,
     head: crate::sync::internal::AtomicU64,
@@ -478,13 +478,13 @@ pub(super) struct Queue<T> {
 // SAFETY: as for the real queue: values move between threads, which is all
 // `T: Send` allows; the receiver's end is reached by one thread at a time
 // (`try_pop`'s contract), and every shared word is an atomic.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 unsafe impl<T: Send> Send for Queue<T> {}
 // SAFETY: as above.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 unsafe impl<T: Send> Sync for Queue<T> {}
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 impl<T> Queue<T> {
     pub(super) fn new() -> Self {
         Self {

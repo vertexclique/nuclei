@@ -135,7 +135,7 @@ impl OwnedLock {
 
     /// Whether the state word carries `owner`'s name, a handoff's marked one
     /// included: what a poll must not take for a hold.
-    #[cfg(loom)]
+    #[cfg(all(loom, test))]
     pub(crate) fn names(&self, owner: OwnerId) -> bool {
         self.holder() & !GRANTING == owner.word()
     }

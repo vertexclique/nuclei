@@ -108,7 +108,7 @@ jobs:
         run: cargo test --release -p nuclei --lib -- rt::task::loom_tests rt::handshake::loom_tests io::side::loom_tests
 
       - name: the sync models
-        run: cargo test --release -p nuclei --test sync_loom --test sync_loom_new --test sync_loom_mpsc
+        run: cargo test --release -p nuclei --lib -- sync::loom_tests
 
   # The io_uring probe in each sandbox it meets (benches/reference/probe-matrix.sh): the plain
   # host, systemd units that kill or deny the io_uring calls, Docker's default seccomp profile

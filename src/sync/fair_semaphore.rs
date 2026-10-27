@@ -301,7 +301,7 @@ impl FairWait {
 
 /// The places a share of permits that a leaving waiter held is handed on.
 /// Outside loom each one hands on the whole share and costs nothing.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 mod probe {
     pub(super) enum Site {
         GrantedThenDropped,
@@ -320,7 +320,7 @@ mod probe {
 /// handed on, and the one guard their calibration takes away. Loom runs a
 /// model's threads as coroutines on the test's own thread, so these are per
 /// test.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 pub(super) mod probe {
     use core::cell::Cell;
 

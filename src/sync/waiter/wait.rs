@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 use core::task::{Poll, Waker};
 
 use super::node::{FUTURE_REF, Seen, Waiter, release};
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 use super::spin_probe;
 use crate::sync::queue::WaitQueue;
 use crate::sync::spin::pause;
@@ -94,7 +94,7 @@ impl Wait {
             // SAFETY: this future holds its reference until it clears `node`.
             let waiter = unsafe { node.as_ref() };
             if rounds > 0 && waiter.begin_spin() {
-                #[cfg(loom)]
+                #[cfg(all(loom, test))]
                 spin_probe::count(&spin_probe::SPINS);
                 if (0..rounds).any(|_| {
                     pause();
@@ -102,12 +102,12 @@ impl Wait {
                 }) {
                     // A grant or nudge landed on the node while it was
                     // unarmed, and the spin saw it.
-                    #[cfg(loom)]
+                    #[cfg(all(loom, test))]
                     spin_probe::count(&spin_probe::MARKED_WHILE_SPINNING);
                     queue.spin.won(rounds);
                 } else {
                     queue.spin.ran_out(rounds);
-                    #[cfg(loom)]
+                    #[cfg(all(loom, test))]
                     {
                         if spin_probe::SKIP_LOOK.with(core::cell::Cell::get) {
                             return waiter.arm_without_look(waker);

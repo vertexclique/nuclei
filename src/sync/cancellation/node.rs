@@ -26,9 +26,9 @@ fn next_id() -> u64 {
 /// `--cfg loom` it is an ordered map behind a loom `Mutex` with the same
 /// three operations.
 pub(super) struct Children {
-    #[cfg(not(loom))]
+    #[cfg(not(all(loom, test)))]
     map: kovan_map::HashMap<u64, Weak<Node>>,
-    #[cfg(loom)]
+    #[cfg(all(loom, test))]
     map: loom::sync::Mutex<std::collections::BTreeMap<u64, Weak<Node>>>,
 }
 
@@ -36,14 +36,14 @@ impl Children {
     /// An empty registry. The real map starts small: most nodes never get a
     /// child, and the map grows when one gets many.
     fn new() -> Self {
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         {
             // 64 is the smallest table the map accepts.
             Self {
                 map: kovan_map::HashMap::with_capacity(64),
             }
         }
-        #[cfg(loom)]
+        #[cfg(all(loom, test))]
         {
             Self {
                 map: loom::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -52,11 +52,11 @@ impl Children {
     }
 
     fn insert(&self, id: u64, child: Weak<Node>) {
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         {
             self.map.insert(id, child);
         }
-        #[cfg(loom)]
+        #[cfg(all(loom, test))]
         {
             let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
             map.insert(id, child);
@@ -64,11 +64,11 @@ impl Children {
     }
 
     fn remove(&self, id: u64) {
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         {
             self.map.remove(&id);
         }
-        #[cfg(loom)]
+        #[cfg(all(loom, test))]
         {
             let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
             map.remove(&id);
@@ -81,11 +81,11 @@ impl Children {
     /// dies meanwhile removes itself from the map, which is not done from
     /// inside the walk because the caller owns the handles it gets.
     fn collect(&self, out: &mut Vec<Arc<Node>>) {
-        #[cfg(not(loom))]
+        #[cfg(not(all(loom, test)))]
         {
             out.extend(self.map.iter().filter_map(|(_, child)| child.upgrade()));
         }
-        #[cfg(loom)]
+        #[cfg(all(loom, test))]
         {
             let weak: Vec<Weak<Node>> = {
                 let map = self.map.lock().unwrap_or_else(|e| e.into_inner());

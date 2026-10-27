@@ -34,17 +34,17 @@ use super::internal::{AtomicU8, Ordering};
 /// at start-up would need a clock read, which this module does not make.
 // vertexia: the cap counts pauses, not time; a per-target cap measured once
 // at build or start-up if spins on short-pause cores prove too short.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 pub(super) const MAX: u8 = 128;
 /// Under loom one round, so the models explore a spin that runs out and
 /// one that sees what it waited for, and stay small.
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 pub(super) const MAX: u8 = 1;
 
 /// The rounds a fresh lock starts with.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 const START: u8 = 64;
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 const START: u8 = 1;
 
 /// No spin where nobody else can run while the caller spins: a
@@ -56,17 +56,17 @@ const SPINLESS: bool = cfg!(all(target_family = "wasm", not(target_feature = "at
 /// for run.
 #[inline]
 pub(super) fn pause() {
-    #[cfg(loom)]
+    #[cfg(all(loom, test))]
     loom::hint::spin_loop();
-    #[cfg(not(loom))]
+    #[cfg(not(all(loom, test)))]
     core::hint::spin_loop();
 }
 
 /// The longest gap between two loads of a spin on the state word, in
 /// pauses.
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 const GAP_MAX: u32 = 16;
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 const GAP_MAX: u32 = 1;
 
 /// The pauses of a spin on the state word: gaps that double from one

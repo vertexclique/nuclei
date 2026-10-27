@@ -70,7 +70,7 @@ impl Owner {
     const NONE: Owner = Owner(core::ptr::null());
 }
 
-#[cfg(not(loom))]
+#[cfg(not(all(loom, test)))]
 mod cache {
     use core::cell::RefCell;
     use core::ptr::{self, NonNull};
@@ -313,7 +313,7 @@ mod cache {
     }
 }
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 mod cache {
     use core::ptr::NonNull;
 

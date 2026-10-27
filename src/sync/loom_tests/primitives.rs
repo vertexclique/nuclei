@@ -1,8 +1,8 @@
-//! Loom models for `nuclei::sync`.
+//! Loom models for `crate::sync`.
 //!
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test --release --test sync_loom
-//! RUSTFLAGS="--cfg loom" cargo test --release --test sync_loom -- --ignored
+//! RUSTFLAGS="--cfg loom" cargo test --release --lib -- sync::loom_tests::primitives
+//! RUSTFLAGS="--cfg loom" cargo test --release --lib -- sync::loom_tests::primitives -- --ignored
 //! ```
 //!
 //! The second line runs the `#[ignore]`d twins: the models whose three
@@ -83,8 +83,6 @@
 //! a search that never reached the bad interleaving would pass for the
 //! same reason a broken one does.
 
-#![cfg(loom)]
-
 use std::future::Future;
 
 use std::pin::Pin;
@@ -101,7 +99,7 @@ use loom::sync::{Arc, Notify as Park};
 
 use loom::thread;
 
-use nuclei::sync::{
+use crate::sync::{
     Barrier, Event, Latch, MAX_BYPASS, Mutex, Notify, OnceCell, Owner, ReentrantMutex,
     ReentrantRwLock, RwLock, RwLockWriteGuard, Semaphore, SetOnce, TryAcquireError,
 };
@@ -244,26 +242,18 @@ fn read(cell: &UnsafeCell<usize>) -> usize {
     cell.with(|value| unsafe { *value })
 }
 
-#[path = "sync_loom/mutex.rs"]
 mod mutex;
 
-#[path = "sync_loom/semaphore.rs"]
 mod semaphore;
 
-#[path = "sync_loom/rwlock.rs"]
 mod rwlock;
 
-#[path = "sync_loom/reentrant.rs"]
 mod reentrant;
 
-#[path = "sync_loom/notify.rs"]
 mod notify;
 
-#[path = "sync_loom/events_and_cells.rs"]
 mod events_and_cells;
 
-#[path = "sync_loom/drain.rs"]
 mod drain;
 
-#[path = "sync_loom/transitions.rs"]
 mod transitions;

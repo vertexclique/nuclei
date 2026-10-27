@@ -1,8 +1,8 @@
 //! Loom models for the multi-producer, single-consumer channels of
-//! `nuclei::sync::mpsc`.
+//! `crate::sync::mpsc`.
 //!
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test --release --test sync_loom_mpsc
+//! RUSTFLAGS="--cfg loom" cargo test --release --lib -- sync::loom_tests::mpsc
 //! ```
 //!
 //! Under `--cfg loom` the atomics, the wait queues, the unsafe cells and the
@@ -61,8 +61,6 @@
 //! mutation inside the crate (`loom_model::fair_drop_pass_on`) that drops a
 //! leaving waiter's share instead of handing it on, and must fail.
 
-#![cfg(loom)]
-
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
 use std::task::{Context, Poll};
@@ -71,9 +69,9 @@ use loom::sync::Notify as Park;
 use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::thread;
 
-use nuclei::sync::atomic_waker::AtomicWaker;
-use nuclei::sync::loom_model::{fair_drop_pass_on, mpsc_busy_looks};
-use nuclei::sync::mpsc::{
+use crate::sync::atomic_waker::AtomicWaker;
+use crate::sync::loom_model::{fair_drop_pass_on, mpsc_busy_looks};
+use crate::sync::mpsc::{
     self,
     error::{SendError, TrySendError},
 };
@@ -666,7 +664,6 @@ fn an_upgrade_racing_the_last_strong_drop_wins_cleanly_or_finds_the_end() {
     );
 }
 
-#[path = "sync_loom_mpsc/fair.rs"]
 mod fair;
 use fair::poll_once;
 

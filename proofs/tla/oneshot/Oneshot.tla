@@ -23,7 +23,7 @@
 (*                                                                          *)
 (* What is abstract: each waker cell is one flag that a register fills      *)
 (* and a wake empties (the cell's own two-phase handshake is checked by     *)
-(* the loom models in tests/sync_loom_new.rs); the receiver's close and     *)
+(* the loom models in sync::loom_tests::signals); the receiver's close and  *)
 (* drop do their fetch-or and the wake it may trigger in one step here      *)
 (* (an interleaving between the two changes nothing either side answers    *)
 (* for; the sender's publish and its wake stay two steps, because the       *)

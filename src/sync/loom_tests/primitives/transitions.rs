@@ -1,7 +1,7 @@
 //! The loom models of the state transitions added with the completed API:
 //! a semaphore that closes, a write that becomes a read (and the reader
 //! bound), the notification calls, and the cells. They use the helpers and
-//! the `explore` driver of `tests/sync_loom.rs`.
+//! the `explore` driver of `sync::loom_tests::primitives`.
 
 use super::*;
 

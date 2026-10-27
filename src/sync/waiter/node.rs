@@ -9,7 +9,7 @@
 use core::ptr::{self, NonNull};
 use core::task::Waker;
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 use super::wait::Park;
 use crate::sync::internal::{AtomicPtr, AtomicUsize, Ordering, UnsafeCell};
 use crate::sync::queue::WaitQueue;
@@ -402,7 +402,7 @@ impl Waiter {
     /// before the free, so a party that touches the node after letting go
     /// of its reference fails the model instead of reading freed memory
     /// unseen.
-    #[cfg(loom)]
+    #[cfg(all(loom, test))]
     pub(super) fn retire(&mut self) {
         self.state.with_mut(|_| ());
         self.next.with_mut(|_| ());
@@ -412,7 +412,7 @@ impl Waiter {
     }
 }
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 impl Waiter {
     /// The calibration's broken end of a spin: registers `waker` and arms it
     /// without reading the marks, which is what `park` does in one swap
