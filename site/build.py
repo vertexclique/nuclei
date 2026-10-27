@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Builds the site into site/: the pages, the API reference and the search index.
+"""Builds the site into site/: the pages, the API reference, the search index and the files for
+language models.
 
 From the repository root:
 
@@ -13,6 +14,9 @@ features) and writes, none of it committed:
     site/index.html    the landing page, from site/src/index.html (build_pages.py)
     site/learn/        the Learn pages, from site/src/learn/ and site/examples/ (build_pages.py)
     site/search.json   the index of the search (build_search.py)
+    site/llms.txt      what Nuclei is and where each page is as Markdown, for language models;
+                       site/llms-full.txt all of it in one file, site/api.md the API reference
+                       as Markdown and site/learn/*.md each Learn page (build_llms.py)
 
 A local preview is any static server over site/, for example `python3 -m http.server -d site`.
 
@@ -36,6 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_pages  # noqa: E402
 import build_search  # noqa: E402
+import build_llms  # noqa: E402
 
 ROOT = build_pages.ROOT
 EXAMPLES = build_pages.EXAMPLES
@@ -119,6 +124,7 @@ def main():
             urls.setdefault(path, (entry["u"], entry["s"]))
     outputs = build_pages.build(urls)
     build_search.write_index(api)
+    build_llms.write(doc, api)
     if args.examples:
         run_examples(outputs)
 

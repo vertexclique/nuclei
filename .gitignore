@@ -8,5 +8,8 @@ examples/target
 /site/index.html
 /site/learn/
 /site/search.json
+/site/llms.txt
+/site/llms-full.txt
+/site/api.md
 /site/api/
 __pycache__/

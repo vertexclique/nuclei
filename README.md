@@ -63,7 +63,8 @@ async fn main() -> std::io::Result<()> {
 
 **[Learn Nuclei](https://nuclei.rs/learn/)** goes from this program to a server in production, with
 an example that compiles and runs for every idea; the [API reference](https://docs.rs/nuclei) has
-every item.
+every item. For a language model, [nuclei.rs/llms.txt](https://nuclei.rs/llms.txt) points to all of
+it as Markdown, and [llms-full.txt](https://nuclei.rs/llms-full.txt) holds it in one file.
 
 ## Backends
 
@@ -135,8 +136,9 @@ $ NUCLEI_BACKEND=epoll cargo test  # epoll on Linux
 ## The site
 
 The site, [nuclei.rs](https://nuclei.rs), is built from the commit: `python3 site/build.py` writes
-its pages (from `site/src/` and the Learn examples in `site/examples/`), the API reference and the
-search index into `site/`, and `python3 site/build.py --examples` also builds, lints and runs every
+its pages (from `site/src/` and the Learn examples in `site/examples/`), the API reference, the
+search index and the files for language models (`llms.txt`, `llms-full.txt`, the API reference and
+each Learn page as Markdown) into `site/`, and `python3 site/build.py --examples` also builds, lints and runs every
 example on io_uring and on epoll. The Pages workflow does both for each deploy and pull request.
 
 #### License

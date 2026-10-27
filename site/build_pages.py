@@ -252,14 +252,14 @@ class Page:
         code = code.strip("\n")
         caption = f'<figcaption class="snippet__label">{html.escape(label)}</figcaption>' if label else ""
         if lang == "text":
-            return (f'<figure class="snippet snippet--output">{caption}<div class="code"><pre><code>'
+            return (f'<figure class="snippet snippet--output">{caption}<div class="code" data-lang="text"><pre><code>'
                     f'{html.escape(code, quote=False)}</code></pre></div></figure>')
         if lang not in HIGHLIGHT:
             fail(f"{self.where}: no highlighting for {lang!r}")
         self.panels += 1
         ident = f"code-{self.panels}"
         shell_class = " code--shell" if lang == "sh" else ""
-        return (f'<figure class="snippet">{caption}<div class="code code--corner{shell_class}">'
+        return (f'<figure class="snippet">{caption}<div class="code code--corner{shell_class}" data-lang="{lang}">'
                 f'<pre id="{ident}"><code>{render(HIGHLIGHT[lang](code))}</code></pre>{COPY.format(id=ident)}</div></figure>')
 
     def expand(self, text):
