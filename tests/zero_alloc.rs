@@ -72,6 +72,21 @@ fn steady<F: AsyncFnMut()>(mut round: F) -> u64 {
     })
 }
 
+/// Runs `f` on a runtime of its own, once: two rounds at once leave a
+/// second block of each task class in this thread's cache (the cache is
+/// the thread's, not the runtime's), as any burst of a program would. A
+/// round whose last block is on its way back from the pool thread as the
+/// next one starts takes that second block; without it, the first such
+/// moment allocates one, once.
+fn burst<F: core::future::Future>(f: F) -> F::Output {
+    nuclei::Runtime::builder()
+        .worker_threads(0)
+        .max_blocking_threads(2)
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
 #[test]
 fn udp_datagrams_to_an_address_allocate_nothing() {
     let rt = nuclei::Runtime::builder()
@@ -148,38 +163,50 @@ fn a_tcp_round_trip_allocates_nothing() {
     assert_eq!(made, 0, "{made} allocations in {RUNS} round trips");
 }
 
+/// A write, flush, seek and read round on `file`.
+async fn file_round(file: &mut nuclei::fs::File, buf: &mut [u8; 4096]) {
+    use nuclei::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+    file.write_all(&[7u8; 4096]).await.unwrap();
+    file.flush().await.unwrap();
+    file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+    file.read_exact(buf).await.unwrap();
+}
+
 /// File writes, flushes, seeks and reads through a handle: on the ring, a
 /// call's slot is a spare once the ring let go of it; on the pool, a job is
 /// a task of the cache in the pool's linked queue.
 #[test]
 fn file_reads_and_writes_allocate_nothing() {
-    use nuclei::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-    let path = std::env::temp_dir().join(format!("nuclei-zero-alloc-{}", std::process::id()));
-    let rt = nuclei::Runtime::builder()
-        .worker_threads(0)
-        .build()
-        .unwrap();
-    let file = rt.block_on(async {
+    let dir = std::env::temp_dir();
+    let paths =
+        ["a", "b"].map(|n| dir.join(format!("nuclei-zero-alloc-{}-{n}", std::process::id())));
+    let open = async |path| {
         nuclei::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)
+            .open(path)
             .await
             .unwrap()
+    };
+    let (mut file, other) = burst(async {
+        let mut file = open(&paths[0]).await;
+        let mut other = open(&paths[1]).await;
+        let (mut a, mut b) = ([0u8; 4096], [0u8; 4096]);
+        nuclei::join!(
+            file_round(&mut file, &mut a),
+            file_round(&mut other, &mut b)
+        );
+        (file, other)
     });
-    drop(rt);
-    let mut file = file;
     let mut buf = [0u8; 4096];
-    let made = steady(async || {
-        file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
-        file.write_all(&[7u8; 4096]).await.unwrap();
-        file.flush().await.unwrap();
-        file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
-        file.read_exact(&mut buf).await.unwrap();
-    });
-    let _ = std::fs::remove_file(&path);
+    let made = steady(async || file_round(&mut file, &mut buf).await);
+    drop(other);
+    for path in &paths {
+        let _ = std::fs::remove_file(path);
+    }
     assert_eq!(
         made, 0,
         "{made} allocations in {RUNS} write, flush, seek and read rounds"
@@ -200,6 +227,12 @@ fn a_local_spawn_allocates_nothing() {
 /// this thread's cache.
 #[test]
 fn a_blocking_job_allocates_nothing() {
+    burst(async {
+        nuclei::join!(
+            nuclei::spawn_blocking(|| 1u8),
+            nuclei::spawn_blocking(|| 1u8)
+        )
+    });
     let made = steady(async || {
         nuclei::spawn_blocking(|| 1u8).await;
     });
