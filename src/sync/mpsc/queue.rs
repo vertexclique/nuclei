@@ -56,13 +56,13 @@
 //! # Under loom
 //!
 //! kovan is not instrumented, so loom cannot interleave its steps. Under
-//! `--cfg loom` the same type is a loom `Mutex` around a deque of cells, and a
-//! push is two steps, as here: it claims the next cell, then writes its value
-//! into it. So a receiver can find the next cell claimed and empty, and the
-//! models check the handshake the channel builds around that answer (the
-//! waker, the counts, the close bit), and count how often their search met
-//! it. The same split is made for the cancellation token's registry (see
-//! `cancellation/rc.rs`). proofs/tla/segments checks this queue's own steps.
+//! `--cfg loom` the same type is a row of cells on loom's atomics, with no
+//! segments and no lock: a push claims the next cell with a fetch-add, writes
+//! its value and marks it ready, as here. So a receiver can find the next
+//! cell claimed and empty, and the models check the handshake the channel
+//! builds around that answer (the waker, the flag, the counts, the close
+//! bit), and count how often their search met it. proofs/tla/segments checks
+//! this queue's own steps, segments and reclamation included.
 
 #![allow(unsafe_code)]
 
@@ -447,39 +447,71 @@ mod segments {
     pub(in crate::sync::mpsc) const SEGMENT_CELLS: u64 = SEGMENT;
 }
 
-/// The queue of one channel, modelled for loom.
+/// How many values one loom model's channel may ever take in: its models
+/// send a handful.
 #[cfg(loom)]
-pub(super) struct Queue<T>(loom::sync::Mutex<Cells<T>>);
+const LOOM_CELLS: usize = 8;
 
-/// The loom model's cells: the claimed ones from the oldest on, `None` while
-/// the push that claimed it has not written it yet.
+/// A cell of the loom model.
 #[cfg(loom)]
-pub(super) struct Cells<T> {
-    /// How many cells were taken: the position of the deque's front.
-    taken: u64,
-    cells: std::collections::VecDeque<Option<T>>,
+struct LoomCell<T> {
+    /// The value is written, as the real queue's mark.
+    ready: crate::sync::internal::AtomicBool,
+    /// A push claimed the cell: kept outside loom's view (a plain std atomic),
+    /// so counting the receiver's looks at a cell being written adds no
+    /// access the model checks.
+    claimed: std::sync::atomic::AtomicBool,
+    value: crate::sync::internal::UnsafeCell<Option<T>>,
 }
+
+/// The queue of one channel, modelled for loom with atomics alone, the steps
+/// of the real queue without its segments: a row of cells, a push claiming
+/// the next with a fetch-add, writing its value and marking it ready (both
+/// sequentially consistent, as there), and the receiver's position its own.
+#[cfg(loom)]
+pub(super) struct Queue<T> {
+    tail: crate::sync::internal::AtomicU64,
+    head: crate::sync::internal::AtomicU64,
+    cells: [LoomCell<T>; LOOM_CELLS],
+}
+
+// SAFETY: as for the real queue: values move between threads, which is all
+// `T: Send` allows; the receiver's end is reached by one thread at a time
+// (`try_pop`'s contract), and every shared word is an atomic.
+#[cfg(loom)]
+unsafe impl<T: Send> Send for Queue<T> {}
+// SAFETY: as above.
+#[cfg(loom)]
+unsafe impl<T: Send> Sync for Queue<T> {}
 
 #[cfg(loom)]
 impl<T> Queue<T> {
     pub(super) fn new() -> Self {
-        Self(loom::sync::Mutex::new(Cells {
-            taken: 0,
-            cells: std::collections::VecDeque::new(),
-        }))
+        Self {
+            tail: crate::sync::internal::AtomicU64::new(0),
+            head: crate::sync::internal::AtomicU64::new(0),
+            cells: core::array::from_fn(|_| LoomCell {
+                ready: crate::sync::internal::AtomicBool::new(false),
+                claimed: std::sync::atomic::AtomicBool::new(false),
+                value: crate::sync::internal::UnsafeCell::new(None),
+            }),
+        }
     }
 
     /// Claims the next cell, then writes it, in two steps.
     pub(super) fn push(&self, value: T) {
-        let at = {
-            let mut q = self.lock();
-            q.cells.push_back(None);
-            q.taken + q.cells.len() as u64 - 1
-        };
-        let mut q = self.lock();
-        // Only a written cell is taken, so the claimed one is still here.
-        let index = (at - q.taken) as usize;
-        q.cells[index] = Some(value);
+        use crate::sync::internal::Ordering;
+        let pos = self.tail.fetch_add(1, Ordering::SeqCst) as usize;
+        assert!(
+            pos < LOOM_CELLS,
+            "a loom model sent more than {LOOM_CELLS} values"
+        );
+        let cell = &self.cells[pos];
+        cell.claimed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the claim made the cell this push's alone until it is ready.
+        cell.value.with_mut(|v| unsafe { *v = Some(value) });
+        cell.ready.store(true, Ordering::SeqCst);
     }
 
     /// As the real queue's: `None` for an empty queue and for a next cell
@@ -487,33 +519,28 @@ impl<T> Queue<T> {
     ///
     /// # Safety
     ///
-    /// None needed here; the signature is the real queue's.
+    /// The caller is the queue's one receiver, as for the real queue.
     pub(super) unsafe fn try_pop(&self) -> Option<T> {
-        let mut q = self.lock();
-        match q.cells.front_mut() {
-            None => None,
-            Some(cell) => match cell.take() {
-                Some(value) => {
-                    q.cells.pop_front();
-                    q.taken += 1;
-                    Some(value)
-                }
-                None => {
-                    crate::sync::loom_model::busy_look();
-                    None
-                }
-            },
+        use crate::sync::internal::Ordering;
+        let pos = self.head.load(Ordering::Relaxed) as usize;
+        let cell = self.cells.get(pos)?;
+        if !cell.ready.load(Ordering::SeqCst) {
+            if cell.claimed.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::sync::loom_model::busy_look();
+            }
+            return None;
         }
+        // SAFETY: ready: its push wrote it; the receiver takes it once.
+        let value = cell.value.with_mut(|v| unsafe { (*v).take() });
+        self.head.store(pos as u64 + 1, Ordering::Relaxed);
+        value
     }
 
     pub(super) fn len(&self) -> usize {
-        self.lock().cells.len()
-    }
-
-    fn lock(&self) -> loom::sync::MutexGuard<'_, Cells<T>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        use crate::sync::internal::Ordering;
+        let front = self.head.load(Ordering::Acquire);
+        let back = self.tail.load(Ordering::Acquire);
+        back.saturating_sub(front) as usize
     }
 }
 
