@@ -51,10 +51,13 @@ fn allocations() -> u64 {
 const WARM: usize = 1_000;
 const RUNS: usize = 10_000;
 
-/// Allocations this thread made in `RUNS` rounds of `round`, after `WARM`.
+/// Allocations this thread made in `RUNS` rounds of `round`, after `WARM`,
+/// on a runtime with no workers and one blocking thread: once warm, no
+/// thread is started that would allocate for itself.
 fn steady<F: AsyncFnMut()>(mut round: F) -> u64 {
     let rt = nuclei::Runtime::builder()
         .worker_threads(0)
+        .max_blocking_threads(1)
         .build()
         .unwrap();
     rt.block_on(async {
@@ -145,11 +148,11 @@ fn a_tcp_round_trip_allocates_nothing() {
     assert_eq!(made, 0, "{made} allocations in {RUNS} round trips");
 }
 
-/// File reads and writes through a handle: measured, not yet held to zero
-/// (N-ZERO-4: a ring operation's slot, a pool job's task).
+/// File writes, flushes, seeks and reads through a handle: on the ring, a
+/// call's slot is a spare once the ring let go of it; on the pool, a job is
+/// a task of the cache in the pool's linked queue.
 #[test]
-#[ignore = "a measurement: run with --ignored --nocapture"]
-fn file_reads_and_writes_measured() {
+fn file_reads_and_writes_allocate_nothing() {
     use nuclei::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     let path = std::env::temp_dir().join(format!("nuclei-zero-alloc-{}", std::process::id()));
     let rt = nuclei::Runtime::builder()
@@ -176,8 +179,11 @@ fn file_reads_and_writes_measured() {
         file.seek(std::io::SeekFrom::Start(0)).await.unwrap();
         file.read_exact(&mut buf).await.unwrap();
     });
-    eprintln!("FILE: {made} allocations in {RUNS} write, flush, seek and read rounds");
     let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        made, 0,
+        "{made} allocations in {RUNS} write, flush, seek and read rounds"
+    );
 }
 
 /// A task's memory comes from the thread's cache of task blocks.
@@ -189,22 +195,31 @@ fn a_local_spawn_allocates_nothing() {
     assert_eq!(made, 0, "{made} allocations in {RUNS} spawns and awaits");
 }
 
-/// Spawns through queues to other threads: measured, not yet held to zero
-/// (N-ZERO-7: the blocking pool's channel takes a node per job, a shard's
-/// inbox a segment per 32 tasks from other threads).
+/// A blocking job is a task of the cache, in the pool's linked queue. A
+/// handle that sees its job end before the pool thread lets go of the job
+/// leaves the block to that thread's cache, so this thread's cache is one
+/// short now and then (N-ZERO-11: a block freed on another thread back to
+/// its own): at most one allocation per thousand jobs, none per job.
 #[test]
-#[ignore = "a measurement: run with --ignored --nocapture"]
-fn spawns_to_other_threads_measured() {
-    let blocking = steady(async || {
+fn a_blocking_job_allocates_nothing_but_a_rare_block() {
+    let made = steady(async || {
         nuclei::spawn_blocking(|| 1u8).await;
     });
-    eprintln!("SPAWN_BLOCKING: {blocking} allocations in {RUNS} spawn_blocking and await");
-    // Onto a worker, from this thread: counted on this thread only.
+    assert!(
+        made <= RUNS as u64 / 1_000,
+        "{made} allocations in {RUNS} spawn_blocking and await"
+    );
+}
+
+/// A spawn onto a worker goes through its inbox, linked through the tasks:
+/// counted on the spawning thread.
+#[test]
+fn a_spawn_onto_a_worker_allocates_nothing_on_the_spawning_thread() {
     let rt = nuclei::Runtime::builder()
         .worker_threads(1)
         .build()
         .unwrap();
-    let remote = rt.block_on(async {
+    let made = rt.block_on(async {
         for _ in 0..WARM {
             nuclei::spawn(async { 1u8 }).await;
         }
@@ -214,7 +229,8 @@ fn spawns_to_other_threads_measured() {
         }
         allocations() - before
     });
-    eprintln!(
-        "SPAWN_REMOTE: {remote} allocations on the spawning thread in {RUNS} spawn and await"
+    assert_eq!(
+        made, 0,
+        "{made} allocations in {RUNS} spawns onto a worker and awaits"
     );
 }

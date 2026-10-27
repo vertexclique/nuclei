@@ -65,13 +65,59 @@ unsafe impl Send for Slot {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for Slot {}
 
+/// Slots a thread keeps for its next calls.
+const SPARE_SLOTS: usize = 8;
+
+thread_local! {
+    /// Slots of this thread's ended calls. One is used again only once the
+    /// ring let go of it too: in steady state a call allocates no slot.
+    static SPARES: core::cell::RefCell<Vec<Arc<Slot>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
 impl Slot {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
+    fn fresh() -> Self {
+        Self {
             full: AtomicBool::new(false),
             outcome: UnsafeCell::new(None),
             waker: AtomicWaker::new(),
-        })
+        }
+    }
+
+    /// A slot for a new call: a spare nobody else holds, made fresh, or a
+    /// new one.
+    fn new() -> Arc<Self> {
+        let spare = SPARES.try_with(|spares| {
+            let mut spares = spares.try_borrow_mut().ok()?;
+            let at = spares
+                .iter_mut()
+                .position(|slot| Arc::get_mut(slot).is_some())?;
+            let mut slot = spares.swap_remove(at);
+            // Unique (`get_mut` is), so nothing else reaches it: an outcome
+            // or waker left from its last call goes here.
+            if let Some(only) = Arc::get_mut(&mut slot) {
+                *only = Self::fresh();
+            }
+            Some(slot)
+        });
+        spare
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Arc::new(Self::fresh()))
+    }
+
+    /// Keeps `slot`, whose task is done with it, for a later call.
+    fn spare(slot: Arc<Self>) {
+        let _ = SPARES.try_with(|spares| {
+            if let Ok(mut spares) = spares.try_borrow_mut()
+                && spares.len() < SPARE_SLOTS
+            {
+                if spares.capacity() == 0 {
+                    spares.reserve_exact(SPARE_SLOTS);
+                }
+                spares.push(slot);
+            }
+        });
     }
 
     fn put(&self, outcome: FileOutcome) {
@@ -99,20 +145,32 @@ type LentWriteEnd = (io::Result<()>, Vec<u8>);
 
 /// A file's call in flight on a ring, as the task that waits for it sees it.
 pub(crate) struct RingJob<T> {
-    slot: Arc<Slot>,
+    /// `None` once dropped: it went to this thread's spares.
+    slot: Option<Arc<Slot>>,
     map: fn(FileOutcome) -> T,
 }
 
 impl<T> RingJob<T> {
     /// The call's end once it came, else `Pending` with `waker` woken then.
     pub(crate) fn poll(&mut self, waker: &Waker) -> Poll<T> {
-        if let Some(outcome) = self.slot.take() {
+        let Some(slot) = &self.slot else {
+            return Poll::Pending;
+        };
+        if let Some(outcome) = slot.take() {
             return Poll::Ready((self.map)(outcome));
         }
-        self.slot.waker.register(waker);
-        match self.slot.take() {
+        slot.waker.register(waker);
+        match slot.take() {
             Some(outcome) => Poll::Ready((self.map)(outcome)),
             None => Poll::Pending,
+        }
+    }
+}
+
+impl<T> Drop for RingJob<T> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            Slot::spare(slot);
         }
     }
 }
@@ -138,7 +196,10 @@ fn submit<B, T>(
             mem: mem(buf),
             slot: Arc::clone(&slot),
         });
-        Ok(RingJob { slot, map })
+        Ok(RingJob {
+            slot: Some(slot),
+            map,
+        })
     })
 }
 
