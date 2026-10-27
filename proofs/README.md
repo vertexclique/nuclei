@@ -548,6 +548,20 @@ clear that finds a newer edge and keeps the side ready). The unit tests in
 fails both), and `tests/async_fd.rs` reads every byte of a peer that writes while the caller
 reads, on each backend.
 
+The same family checks a socket's side turning from the handle's own IO to its caller's calls
+(`try_io`, `async_io` on the sockets; `CallerMode.tla`, `CallerWrite.tla`). On the read side the
+task reads once through the handle, which reads ahead and, on io_uring, keeps a multishot
+receive out; then its own calls fail while the handle holds data read ahead (the handle's reads
+take it first), stop a receive still out and wait for it to end, and from then on follow the
+edges and polls as above. On the write side the bytes the handle wrote behind go out before a
+send of the caller's. 11 more configurations: 6 that must pass (edges and the ring, four writes,
+with `InOrder`, every byte taken once in the order written, and `AllTaken`; four bytes behind and
+three of the task's own with `OutOrder` and `AllOut`), 3 mutations (a call with data read ahead
+breaks `InOrder`; a stopped receive that ends with the side ready and wakes nobody breaks
+`AllTaken`; a send with bytes still behind breaks `OutOrder`), and 2 witnesses (a call that finds
+data read ahead, a stop that ends the receive with nothing brought). `tests/net_caller.rs` runs
+each case on both Linux backends, and the three code mutations fail it.
+
 ## A source's operations on its shard's ring
 
 `ring` (`tla/ring/RingOp.tla`) checks how a side of a source works on an io_uring ring

@@ -11,8 +11,8 @@ impl Source {
         self: &Arc<Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<u32>> {
-        self.poll_reading(cx, |st, io, waker, after| {
-            st.fd_ready(io, waker, after).map(Ok)
+        self.poll_read_side(cx, false, |st, io, waker, after| {
+            st.fd_ready(io, waker, after)
         })
     }
 
@@ -23,7 +23,7 @@ impl Source {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         // Nothing to wait for and nothing to fail: a registration that
         // failed is the next readiness call's to report.
-        let _ = self.poll_reading(&mut cx, |st, _io, _waker, _after| {
+        let _ = self.poll_read_side(&mut cx, false, |st, _io, _waker, _after| {
             st.fd_clear(tick);
             Poll::Ready(Ok(()))
         });
@@ -60,17 +60,34 @@ impl Source {
         })
     }
 
-    /// Polls the read side with `step`, given the way this thread reaches
-    /// the descriptor.
+    /// Polls the read side with `step` for the handle's own reads, given
+    /// the way this thread reaches the descriptor.
     fn poll_reading<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
+        step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
+    ) -> Poll<io::Result<R>> {
+        self.poll_read_side(cx, true, step)
+    }
+
+    /// Polls the read side with `step`: for the handle's own reads when
+    /// `drive`, else for its caller's calls.
+    fn poll_read_side<R>(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        drive: bool,
         mut step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
         let mut after = After::default();
         let polled = self.with_io(|io| {
             self.read
                 .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+                    #[cfg(unix)]
+                    if drive {
+                        st.drive();
+                    }
+                    #[cfg(not(unix))]
+                    let _ = drive;
                     step(st, io, cx.waker(), after)
                 })
         });

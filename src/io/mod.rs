@@ -18,6 +18,8 @@
 
 #[cfg(unix)]
 mod async_fd;
+#[cfg(unix)]
+pub(crate) mod caller;
 mod handle;
 pub(crate) mod raw;
 mod ready;

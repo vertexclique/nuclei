@@ -129,9 +129,18 @@ pub(super) struct ReadState {
     /// the look its guard was made from (proofs/tla/asyncfd).
     #[cfg(unix)]
     edges: u32,
-    /// The side is a caller's own descriptor's (`AsyncFd`).
+    /// The side takes its caller's own calls (`AsyncFd`, a socket's
+    /// `try_io` and `async_io`): the driver makes none, and says only when
+    /// it may be ready.
     #[cfg(unix)]
     user_fd: bool,
+    /// The operation out is the caller's poll.
+    #[cfg(ring)]
+    polling: bool,
+    /// A receive of the driver's still out as the side turned to its
+    /// caller's calls is being stopped.
+    #[cfg(ring)]
+    stopping: bool,
     /// The id of the operation out with the completion driver; only its
     /// completion clears this.
     #[cfg(completion)]
@@ -220,17 +229,49 @@ impl ReadState {
         Poll::Pending
     }
 
-    /// A caller's descriptor: `Ready` with the edge count while the side
+    /// The caller's own calls: `Ready` with the edge count while the side
     /// may be ready, else the task waits (on a ring, for a poll armed now).
+    /// What the driver read for the side comes first: an error it met is
+    /// reported, and data it holds fails the call, since a call of the
+    /// caller's would take what comes after it; a receive still out on a
+    /// ring is stopped and waited for.
     #[cfg(unix)]
-    pub(super) fn fd_ready(&mut self, io: Io<'_>, waker: &Waker, after: &mut After) -> Poll<u32> {
+    pub(super) fn fd_ready(
+        &mut self,
+        io: Io<'_>,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<u32>> {
+        if let Some(err) = self.error.take() {
+            return Poll::Ready(Err(err));
+        }
+        if !self.ahead.is_empty()
+            || !self.accepted.is_empty()
+            || !self.datagrams.is_empty()
+            || self.lent.is_some()
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "the socket holds data it read ahead; read it before calls of your own",
+            )));
+        }
         self.user_fd = true;
-        if !self.blocked {
-            return Poll::Ready(self.edges);
+        #[cfg(ring)]
+        let driver_out = self.out.is_some() && !self.polling;
+        #[cfg(not(ring))]
+        let driver_out = false;
+        if !self.blocked && !driver_out {
+            return Poll::Ready(Ok(self.edges));
         }
         self.waiters.register(waker);
         self.complete(io, Kind::Fd, 0, after);
         Poll::Pending
+    }
+
+    /// The handle's own reads: the driver reads for the side again.
+    #[cfg(unix)]
+    pub(super) fn drive(&mut self) {
+        self.user_fd = false;
     }
 
     /// The caller found its descriptor not ready: the side waits for the

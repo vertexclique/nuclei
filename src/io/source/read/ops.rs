@@ -52,15 +52,27 @@ impl ReadState {
             self.multi_stopping = true;
             route.cancel(id);
         }
-        // A caller's descriptor: only a poll, while it is not ready and a
-        // task waits.
+        // The caller's own calls: only a poll, while the side is not ready
+        // and a task waits. A receive of the driver's still out is stopped
+        // first; what it brings comes before the caller's calls.
         #[cfg(ring)]
         if self.user_fd {
-            if self.out.is_none()
-                && self.blocked
-                && !self.waiters.is_empty()
-                && let Some(issuer) = route.issuer(after)
-            {
+            if let Some(id) = self.out {
+                if !self.polling && !self.stopping {
+                    self.stopping = true;
+                    self.multi_stopping = self.multi;
+                    route.cancel(id);
+                }
+                return;
+            }
+            if self.waiters.is_empty() {
+                return;
+            }
+            if !self.blocked {
+                // The receive stopped with the side ready.
+                after.wake(&mut self.waiters);
+            } else if let Some(issuer) = route.issuer(after) {
+                self.polling = true;
                 self.out = Some(issuer.issue(Want::Ready { read: true }, kind, self.epoch, after));
             }
             return;
@@ -168,6 +180,11 @@ impl ReadState {
     /// for the accepted connection to take its context from).
     pub(crate) fn op_done(&mut self, done: Done, fd: Option<Raw>, after: &mut After) {
         self.out = None;
+        #[cfg(ring)]
+        {
+            self.polling = false;
+            self.stopping = false;
+        }
         // An operation of a descriptor that is gone: what it holds is
         // dropped.
         let stale = done.epoch != self.epoch;

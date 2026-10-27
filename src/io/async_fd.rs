@@ -36,6 +36,7 @@ use core::task::{Context, Poll, ready};
 use std::io;
 use std::os::fd::AsFd;
 
+use super::caller::{self, Marks};
 use super::source::Kind;
 use super::{Handle, Interest, Ready};
 
@@ -62,14 +63,6 @@ pub struct AsyncFdReadyMutGuard<'a, T: AsFd> {
 /// cleared.
 #[derive(Debug)]
 pub struct TryIoError(());
-
-/// A guard's readiness and the edge counts it is of.
-#[derive(Clone, Copy)]
-struct Marks {
-    ready: Ready,
-    read: Option<u32>,
-    write: Option<u32>,
-}
 
 impl<T: AsFd> AsyncFd<T> {
     /// Drives `inner` by readiness for reading and writing both.
@@ -150,35 +143,27 @@ impl<T: AsFd> AsyncFd<T> {
         }))
     }
 
-    /// What of `interest` may be ready now, waiting until some is.
-    fn poll_marks(&self, cx: &mut Context<'_>, interest: Interest) -> Poll<io::Result<Marks>> {
-        let read = interest.is_readable() && self.interest.is_readable();
-        let write = interest.is_writable() && self.interest.is_writable();
+    /// The sides of `interest` the descriptor is watched for; none is an
+    /// error, since a wait for them could never end.
+    fn sides(&self, interest: Interest) -> io::Result<(bool, bool)> {
+        let (read, write) = caller::sides(interest);
+        let (read, write) = (
+            read && self.interest.is_readable(),
+            write && self.interest.is_writable(),
+        );
         if !read && !write {
-            // A wait that could never end.
-            return Poll::Ready(Err(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the descriptor is not watched for that readiness",
-            )));
+            ));
         }
-        let mut marks = Marks {
-            ready: Ready::EMPTY,
-            read: None,
-            write: None,
-        };
-        if read && let Poll::Ready(tick) = self.handle.source().poll_fd_read_ready(cx) {
-            marks.read = Some(tick?);
-            marks.ready = marks.ready | Ready::READABLE;
-        }
-        if write && let Poll::Ready(tick) = self.handle.source().poll_fd_write_ready(cx) {
-            marks.write = Some(tick?);
-            marks.ready = marks.ready | Ready::WRITABLE;
-        }
-        if marks.ready.is_empty() {
-            Poll::Pending
-        } else {
-            Poll::Ready(Ok(marks))
-        }
+        Ok((read, write))
+    }
+
+    /// What of `interest` may be ready now, waiting until some is.
+    fn poll_marks(&self, cx: &mut Context<'_>, interest: Interest) -> Poll<io::Result<Marks>> {
+        let (read, write) = self.sides(interest)?;
+        caller::poll_marks(self.handle.source(), cx, read, write)
     }
 
     /// Waits until the descriptor may be readable.
@@ -249,18 +234,15 @@ impl<T: AsFd> AsyncFd<T> {
     ///
     /// # Errors
     ///
-    /// What `f` answers, and when the descriptor cannot be watched.
+    /// What `f` answers, when the descriptor cannot be watched, and
+    /// `InvalidInput` when it is not watched for any of `interest`.
     pub async fn async_io<R>(
         &self,
         interest: Interest,
         mut f: impl FnMut(&T) -> io::Result<R>,
     ) -> io::Result<R> {
-        loop {
-            let mut guard = self.ready(interest).await?;
-            if let Ok(result) = guard.try_io(|fd| f(fd.get_ref())) {
-                return result;
-            }
-        }
+        let sides = self.sides(interest)?;
+        caller::async_io(self.handle.source(), sides, || f(self.get_ref())).await
     }
 
     /// Runs `f` on the descriptor now if some of `interest` may be ready,
@@ -268,32 +250,21 @@ impl<T: AsFd> AsyncFd<T> {
     ///
     /// # Errors
     ///
-    /// `WouldBlock` when none of `interest` may be ready, and what `f`
+    /// `WouldBlock` when none of `interest` may be ready, `InvalidInput`
+    /// when the descriptor is not watched for any of it, and what `f`
     /// answers.
     pub fn try_io<R>(
         &self,
         interest: Interest,
         f: impl FnOnce(&T) -> io::Result<R>,
     ) -> io::Result<R> {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        let marks = match self.poll_marks(&mut cx, interest) {
-            Poll::Ready(marks) => marks?,
-            Poll::Pending => return Err(io::ErrorKind::WouldBlock.into()),
-        };
-        let result = f(self.get_ref());
-        if matches!(&result, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
-            self.clear(marks);
-        }
-        result
+        caller::try_io(self.handle.source(), self.sides(interest)?, || {
+            f(self.get_ref())
+        })
     }
 
     fn clear(&self, marks: Marks) {
-        if let Some(tick) = marks.read {
-            self.handle.source().fd_clear_read(tick);
-        }
-        if let Some(tick) = marks.write {
-            self.handle.source().fd_clear_write(tick);
-        }
+        caller::clear(self.handle.source(), marks);
     }
 }
 

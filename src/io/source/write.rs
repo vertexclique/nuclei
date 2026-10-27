@@ -136,7 +136,7 @@ pub(super) struct WriteState {
     /// made, as the read side counts them (proofs/tla/asyncfd).
     #[cfg(unix)]
     edges: u32,
-    /// The side is a caller's own descriptor's (`AsyncFd`).
+    /// The side takes its caller's own calls (as the read side's).
     #[cfg(unix)]
     user_fd: bool,
     /// The id of the operation out with the completion driver; only its
@@ -198,17 +198,43 @@ impl WriteState {
         self.lent.as_ref().is_some_and(|l| l.done.is_none())
     }
 
-    /// A caller's descriptor: `Ready` with the edge count while the side
+    /// The caller's own calls: `Ready` with the edge count while the side
     /// may be ready, else the task waits (on a ring, for a poll armed now).
+    /// What the handle wrote behind goes out first: until it has, the
+    /// driver writes it and the task waits; an error it met is reported.
     #[cfg(unix)]
-    pub(super) fn fd_ready(&mut self, io: Io<'_>, waker: &Waker, after: &mut After) -> Poll<u32> {
+    pub(super) fn fd_ready(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<u32>> {
+        if let Some(err) = self.error.take() {
+            return Poll::Ready(Err(err));
+        }
+        if let Some(failure) = self.failed.take() {
+            return Poll::Ready(Err(failure.error()));
+        }
+        if self.has_unsent() {
+            self.user_fd = false;
+            self.waiters.register(waker);
+            self.push(io, kind, after);
+            return Poll::Pending;
+        }
         self.user_fd = true;
         if !self.blocked {
-            return Poll::Ready(self.edges);
+            return Poll::Ready(Ok(self.edges));
         }
         self.waiters.register(waker);
         self.push(io, Kind::Fd, after);
         Poll::Pending
+    }
+
+    /// The handle's own writes: the driver writes for the side again.
+    #[cfg(unix)]
+    pub(super) fn drive(&mut self) {
+        self.user_fd = false;
     }
 
     /// The caller found its descriptor not ready: the side waits for the

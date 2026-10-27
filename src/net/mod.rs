@@ -133,6 +133,60 @@ fn poll_ready(
     }
 }
 
+/// A socket's calls of its caller's own: `try_io` and `async_io`.
+macro_rules! caller_io {
+    ($($ty:ty),* $(,)?) => {$(
+        #[cfg(unix)]
+        impl Handle<$ty> {
+            /// Runs `f`, a call of the caller's own on the socket (through
+            /// [`get_ref`](Handle::get_ref) or its descriptor), if the socket
+            /// may be ready for `interest`, and clears that readiness if `f`
+            /// answers `WouldBlock`. The side then takes its caller's calls
+            /// only, until the handle's own next read or write on it. Nothing
+            /// is reordered: bytes the handle wrote behind go out first, and
+            /// data it read ahead must be read before.
+            ///
+            /// # Errors
+            ///
+            /// `WouldBlock` when none of `interest` may be ready (or bytes
+            /// written behind are still going out), `ResourceBusy` when the
+            /// handle holds data it read ahead, and what `f` answers.
+            pub fn try_io<R>(
+                &self,
+                interest: crate::io::Interest,
+                f: impl FnOnce() -> io::Result<R>,
+            ) -> io::Result<R> {
+                crate::io::caller::try_io(self.source(), crate::io::caller::sides(interest), f)
+            }
+
+            /// Runs `f`, a call of the caller's own on the socket, each time
+            /// it may be ready for `interest`, until `f` answers other than
+            /// `WouldBlock`, clearing the readiness each time it does; as
+            /// [`try_io`](Self::try_io), bytes written behind go out first.
+            ///
+            /// # Errors
+            ///
+            /// `ResourceBusy` when the handle holds data it read ahead, and
+            /// what `f` answers.
+            pub async fn async_io<R>(
+                &self,
+                interest: crate::io::Interest,
+                f: impl FnMut() -> io::Result<R>,
+            ) -> io::Result<R> {
+                crate::io::caller::async_io(self.source(), crate::io::caller::sides(interest), f)
+                    .await
+            }
+        }
+    )*};
+}
+
+caller_io!(std::net::TcpStream, std::net::UdpSocket);
+#[cfg(unix)]
+caller_io!(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixDatagram
+);
+
 /// The error when every address failed (the last one's), or none was given.
 fn none_worked(last: Option<io::Error>) -> io::Error {
     last.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address was given"))

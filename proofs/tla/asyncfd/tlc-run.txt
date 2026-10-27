@@ -1,12 +1,23 @@
-TLC run of every configuration in proofs/tla/asyncfd, 2026-10-27 00:22 UTC.
+TLC run of every configuration in proofs/tla/asyncfd, 2026-10-27 03:18 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-AF_edges                          5233       2078      2  pass                                  pass                                  yes
+AF_edges                          5233       2078      1  pass                                  pass                                  yes
 AF_edges_safe                     5233       2078      1  pass                                  pass                                  yes
 AF_ring                           4123       1753      1  pass                                  pass                                  yes
 MAF_no_tick                       1870        806      1  violated:AllTaken                     violated:AllTaken                     yes
 WAF_kept                           175         94      1  violated:NoKept                       violated:NoKept                       yes
+CM_edges_safe                     2860       1280      1  pass                                  pass                                  yes
+CM_edges                          2860       1280      1  pass                                  pass                                  yes
+CM_ring_safe                      2134       1160      1  pass                                  pass                                  yes
+CM_ring                           2134       1160      1  pass                                  pass                                  yes
+MCM_no_held_check                  318        169      1  violated:InOrder                      violated:InOrder                      yes
+MCM_no_wake                        504        300      1  violated:AllTaken                     violated:AllTaken                     yes
+WCM_busy                            59         36      1  violated:NoBusy                       violated:NoBusy                       yes
+WCM_stopped_empty                   37         25      1  violated:NoStoppedEmpty               violated:NoStoppedEmpty               yes
+CW_safe                             59         40      1  pass                                  pass                                  yes
+CW_live                             59         40      1  pass                                  pass                                  yes
+MCW_no_flush_wait                   16         12      0  violated:OutOrder                     violated:OutOrder                     yes
 
-results matching EXPECTED.txt: 5 of 5
+results matching EXPECTED.txt: 16 of 16
