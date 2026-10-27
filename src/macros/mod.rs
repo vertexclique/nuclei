@@ -67,10 +67,15 @@ pub mod support {
         /// # Panics
         ///
         /// When the output was taken already.
+        #[expect(
+            clippy::panic,
+            reason = "polled after its output was taken, which the macros never do"
+        )]
         pub fn poll_done(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> bool {
             // SAFETY: the future is structurally pinned: it is polled where it
             // is and dropped in place by `set`, never moved out.
             let output = match unsafe { self.as_mut().get_unchecked_mut() } {
+                // SAFETY: as above, the future stays where it is.
                 Self::Future(future) => match unsafe { Pin::new_unchecked(future) }.poll(cx) {
                     Poll::Ready(output) => output,
                     Poll::Pending => return false,

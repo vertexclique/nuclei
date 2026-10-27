@@ -343,12 +343,12 @@ impl Waiter {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                // SAFETY: an armed current slot is the future's, and a take
-                // under way reads the other one (module docs).
                 Ok(_) if armed => {
-                    let waker = self
-                        .slot(state, CURRENT)
-                        .with_mut(|slot| unsafe { (*slot).take() });
+                    let waker = self.slot(state, CURRENT).with_mut(|slot| {
+                        // SAFETY: an armed current slot is the future's, and
+                        // a take under way reads the other one (module docs).
+                        unsafe { (*slot).take() }
+                    });
                     return Some((waker, nudged));
                 }
                 Ok(_) => return Some((None, nudged)),

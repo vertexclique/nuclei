@@ -62,6 +62,7 @@ impl<F: Future> Future for Timeout<F> {
         // SAFETY: the future is pinned structurally and never moved out while
         // pinned; the sleep is `Unpin`.
         let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: as above, the future stays where it is.
         let future = unsafe { Pin::new_unchecked(&mut this.future) };
         if let Poll::Ready(output) = future.poll(cx) {
             return Poll::Ready(Ok(output));

@@ -290,8 +290,9 @@ pub(crate) fn raw_addr(addr: &SocketAddr) -> (SOCKADDR_STORAGE, i32) {
 /// `addr` points at `len` readable bytes of a socket address.
 pub(crate) unsafe fn socket_addr(addr: *const SOCKADDR, len: i32) -> io::Result<SocketAddr> {
     let len = usize::try_from(len).unwrap_or(0);
-    // SAFETY: the caller's; the family is the first field of every address.
     let family = if len >= 2 {
+        // SAFETY: the caller's; the family is the first field of every
+        // address.
         unsafe { (*addr).sa_family }
     } else {
         0

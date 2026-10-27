@@ -532,6 +532,10 @@ impl Inner {
 }
 
 /// The process default runtime, started now if it is not running.
+#[expect(
+    clippy::panic,
+    reason = "no caller to hand the error to; documented under `# Panics`"
+)]
 pub(crate) fn default_runtime() -> &'static Runtime {
     DEFAULT.get_or_init(|| {
         Builder::new()
@@ -585,10 +589,19 @@ pub(crate) fn service_shard() -> Arc<Shared> {
     let inner = current();
     match inner.workers.place(inner.id, inner.local_margin) {
         Some(shard) => Arc::clone(shard),
-        None => match context::own_shard() {
-            Ok(shard) => Arc::clone(&shard.shared),
-            Err(err) => panic!("this thread's shard could not start: {err}"),
-        },
+        None => Arc::clone(&own_shard().shared),
+    }
+}
+
+/// This thread's own shard, started now if it is not running.
+#[expect(
+    clippy::panic,
+    reason = "no caller to hand the error to; documented under `# Panics`"
+)]
+fn own_shard() -> std::rc::Rc<Shard> {
+    match context::own_shard() {
+        Ok(shard) => shard,
+        Err(err) => panic!("this thread's shard could not start: {err}"),
     }
 }
 
@@ -639,18 +652,13 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    let shared =
-        context::current(|current| current.map(|s| Arc::clone(&s.shared))).unwrap_or_else(|| {
-            match context::own_shard() {
-                Ok(shard) => Arc::clone(&shard.shared),
-                Err(err) => panic!("this thread's shard could not start: {err}"),
-            }
-        });
+    let shared = context::current(|current| current.map(|s| Arc::clone(&s.shared)))
+        .unwrap_or_else(|| Arc::clone(&own_shard().shared));
+    let hooks = context_hooks();
     // SAFETY: the task's schedule sends a woken task of this shard back to
     // it, and a bound task only to the shard's own thread (its local inbox,
     // leaked rather than dropped if that thread is gone); the future is
     // 'static.
-    let hooks = context_hooks();
     let (runnable, task) = unsafe {
         task::spawn_unchecked(
             Counted::new(future, &shared),
@@ -685,10 +693,7 @@ fn block_on_here<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
         // call.
         return unsafe { (*running).block_on(future) };
     }
-    let shard = match context::own_shard() {
-        Ok(shard) => shard,
-        Err(err) => panic!("this thread's shard could not start: {err}"),
-    };
+    let shard = own_shard();
     let _current = context::enter(&shard);
     let _guest = super::paused::Guest::enter(inner, &shard.shared);
     // A seeded runtime's choices made here repeat, call after call.
@@ -726,6 +731,12 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 ///
 /// Dropping the returned [`Task`] cancels it; call [`Task::detach`] to let
 /// it run on its own.
+///
+/// # Panics
+///
+/// When the default runtime or this thread's shard cannot start (its
+/// poller cannot be made); [`task::Builder::spawn`](crate::task::Builder::spawn)
+/// answers the error instead.
 pub fn spawn<F>(future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
@@ -737,6 +748,12 @@ where
 /// Spawns a task that stays on the calling thread: a worker's shard, or the
 /// thread's own (where it runs while the thread is inside `block_on`). The
 /// future need not be `Send`.
+///
+/// # Panics
+///
+/// When this thread's shard cannot start (its poller cannot be made);
+/// [`task::Builder::spawn_local`](crate::task::Builder::spawn_local) answers
+/// the error instead.
 pub fn spawn_local<F>(future: F) -> Task<F::Output>
 where
     F: Future + 'static,
@@ -747,6 +764,10 @@ where
 
 /// Runs `f` on the blocking pool of the runtime this thread is inside, or of
 /// the default runtime, so it never holds a shard up.
+///
+/// # Panics
+///
+/// When the default runtime cannot start.
 pub fn spawn_blocking<F, T>(f: F) -> Task<T>
 where
     F: FnOnce() -> T + Send + 'static,

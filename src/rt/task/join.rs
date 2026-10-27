@@ -329,6 +329,10 @@ impl<T> Drop for Task<T> {
 impl<T> Future for Task<T> {
     type Output = T;
 
+    #[expect(
+        clippy::panic,
+        reason = "documented under `# Panics` of `Task`; `Task::fallible` answers `None` instead"
+    )]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
         match self.poll_task(cx) {
             Poll::Ready(Some(output)) => Poll::Ready(output),
@@ -462,6 +466,7 @@ impl JoinError {
     ///
     /// When the task was cancelled, not panicked; [`try_into_panic`](Self::try_into_panic)
     /// answers it instead.
+    #[expect(clippy::panic, reason = "documented under `# Panics`")]
     pub fn into_panic(self) -> Box<dyn core::any::Any + Send + 'static> {
         match self.try_into_panic() {
             Ok(panic) => panic,

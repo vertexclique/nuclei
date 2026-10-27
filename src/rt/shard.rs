@@ -831,6 +831,10 @@ impl Shard {
 
     /// Completes the IO that is ready now, without waiting: whether there
     /// was any.
+    #[expect(
+        clippy::panic,
+        reason = "a failure of the poller itself cannot be handed to any task: it ends the shard loudly"
+    )]
     fn io_ready_now(&self) -> bool {
         match self.poll_io(usize::MAX, Some(Duration::ZERO)) {
             Ok(events) => events > 0,
@@ -840,6 +844,10 @@ impl Shard {
 
     /// Runs `future` to its end on this shard, running the shard's tasks,
     /// timers and poller between its polls.
+    #[expect(
+        clippy::panic,
+        reason = "documented under `# Panics` of `block_on` (`Builder::max_nesting`)"
+    )]
     pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
         let depth = self.depth.get();
         if depth >= self.limits.max_nesting {
@@ -1013,6 +1021,10 @@ impl Shard {
 
     /// Drives the poller; a failure of the poller itself cannot be handed to
     /// any task, so it ends the shard loudly.
+    #[expect(
+        clippy::panic,
+        reason = "a failure of the poller itself cannot be handed to any task: it ends the shard loudly"
+    )]
     fn drive_or_report(&self, wait: Option<Duration>) {
         if let Err(err) = self.drive(wait) {
             panic!("the shard's poller failed: {err}");

@@ -240,6 +240,10 @@ impl<T: ?Sized> ReentrantRwLock<T> {
         }
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "a count that cannot overflow in practice, checked rather than wrapped"
+    )]
     fn reenter_write(&self, owner: &Owner) -> bool {
         if self.writer.load(Ordering::Relaxed) != owner.id() {
             return false;

@@ -170,8 +170,8 @@ impl Runnable {
     /// runnable takes over.
     pub(crate) unsafe fn from_link(link: NonNull<crate::rt::inbox::Link>) -> Self {
         let offset = core::mem::offset_of!(Header, link);
-        // SAFETY: the link is the `link` field of a task's header.
         Self {
+            // SAFETY: the link is the `link` field of a task's header.
             ptr: unsafe { NonNull::new_unchecked(link.as_ptr().cast::<u8>().sub(offset).cast()) },
         }
     }

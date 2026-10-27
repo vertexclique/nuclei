@@ -120,6 +120,7 @@ impl<'a> ReadBuf<'a> {
     /// # Panics
     ///
     /// When that passes the initialized part.
+    #[expect(clippy::expect_used, reason = "documented under `# Panics`")]
     pub fn advance(&mut self, n: usize) {
         let filled = self.filled.checked_add(n).expect("filled overflows");
         self.set_filled(filled);

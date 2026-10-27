@@ -15,6 +15,11 @@
 //! own. [`stats()`] takes a snapshot of what every shard is doing: its
 //! tasks, polls, IO in flight, buffers, timers and errors.
 //!
+//! A call that needs the default runtime or the calling thread's shard
+//! panics if that cannot start (the system refused its poller: no
+//! descriptors or memory left); [`Builder::build`] and [`task::Builder`]
+//! answer the error instead.
+//!
 //! ```no_run
 //! use nuclei::net::TcpListener;
 //!
@@ -39,6 +44,21 @@
 // A model-checking build (`--cfg loom`) compiles the loom models and leaves
 // the ordinary tests out, so the helpers only those tests use go unused.
 #![cfg_attr(loom, allow(dead_code, unused_imports))]
+// No unwrap, expect or panic outside a documented contract, each marked
+// where it is; every unsafe block names what it rests on. Tests and the
+// model-checking build may assert.
+#![cfg_attr(
+    not(any(test, loom)),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::undocumented_unsafe_blocks
+    )
+)]
 
 mod buf;
 mod compat;

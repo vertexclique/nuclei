@@ -233,6 +233,7 @@ impl<T> JoinSet<T> {
     /// # Panics
     ///
     /// When a task panicked (its panic is resumed) or was cancelled.
+    #[expect(clippy::panic, reason = "documented under `# Panics`")]
     pub async fn join_all(mut self) -> Vec<T> {
         let mut outputs = Vec::with_capacity(self.len);
         while let Some(out) = self.join_next().await {

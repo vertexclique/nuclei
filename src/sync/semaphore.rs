@@ -310,6 +310,10 @@ impl Semaphore {
 }
 
 /// `n` as a permit count, or a panic when no semaphore could ever satisfy it.
+#[expect(
+    clippy::panic,
+    reason = "documented under `# Panics` of the calls that take permits"
+)]
 fn checked_permits(n: u32) -> usize {
     match usize::try_from(n) {
         Ok(permits) if permits <= MAX => permits,
@@ -356,10 +360,8 @@ impl<'a> SemaphorePermit<'a> {
             core::ptr::eq(self.sem, other.sem),
             "merging permits from different semaphore instances"
         );
-        self.permits = self
-            .permits
-            .checked_add(other.permits)
-            .expect("number of permits overflowed");
+        // Both are of one semaphore, whose permits never pass `MAX_PERMITS`.
+        self.permits += other.permits;
         other.permits = 0;
     }
 
@@ -433,10 +435,8 @@ impl OwnedSemaphorePermit {
             Arc::ptr_eq(&self.sem, &other.sem),
             "merging permits from different semaphore instances"
         );
-        self.permits = self
-            .permits
-            .checked_add(other.permits)
-            .expect("number of permits overflowed");
+        // Both are of one semaphore, whose permits never pass `MAX_PERMITS`.
+        self.permits += other.permits;
         other.permits = 0;
     }
 

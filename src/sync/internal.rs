@@ -302,6 +302,10 @@ pub(crate) fn wait_here<F: core::future::Future>(future: F) -> std::io::Result<F
 /// # Panics
 ///
 /// On `wasm32`, when the future is not ready at once: see [`wait_here`].
+#[expect(
+    clippy::panic,
+    reason = "documented under `# Panics`: a wait that would park the only thread"
+)]
 pub(crate) fn blocking<F: core::future::Future>(future: F) -> F::Output {
     #[cfg(not(any(loom, target_arch = "wasm32")))]
     {

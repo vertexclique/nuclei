@@ -228,6 +228,10 @@ impl RawSemaphore {
     ///
     /// When the semaphore would hold more than
     /// [`Semaphore::MAX_PERMITS`](super::Semaphore::MAX_PERMITS).
+    #[expect(
+        clippy::panic,
+        reason = "documented under `# Panics` of the calls that add permits"
+    )]
     pub(super) fn add(&self, n: usize) {
         if n == 0 {
             return;

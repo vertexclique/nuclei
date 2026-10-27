@@ -26,6 +26,10 @@ pub use crate::task_local::{AccessError, LocalKey, TaskLocalFuture};
 ///
 /// Outside a task: in `block_on`'s own future, or on a blocking-pool thread.
 /// [`try_id`] answers `None` there instead.
+#[expect(
+    clippy::expect_used,
+    reason = "documented under `# Panics`; `try_id` answers `None` instead"
+)]
 pub fn id() -> Id {
     try_id().expect("`nuclei::task::id` called outside a task")
 }

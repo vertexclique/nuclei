@@ -284,6 +284,10 @@ pub struct FillBuf<'a, R: ?Sized> {
 impl<'a, R: AsyncBufRead + Unpin + ?Sized> Future for FillBuf<'a, R> {
     type Output = io::Result<&'a [u8]>;
 
+    #[expect(
+        clippy::panic,
+        reason = "polled after it completed, which the `Future` contract rules out"
+    )]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&'a [u8]>> {
         let this = self.get_mut();
         let Some(reader) = this.reader.take() else {

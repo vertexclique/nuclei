@@ -87,6 +87,10 @@ impl<T> ReadHalf<T> {
     /// # Panics
     ///
     /// When `write` is not this half's write half.
+    #[expect(
+        clippy::unreachable,
+        reason = "the other half is dropped above, so this one holds the last reference"
+    )]
     pub fn unsplit(self, write: WriteHalf<T>) -> T
     where
         T: Unpin,

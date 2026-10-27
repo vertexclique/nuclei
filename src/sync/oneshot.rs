@@ -628,6 +628,10 @@ impl<T> Drop for Receiver<T> {
 impl<T> Future for Receiver<T> {
     type Output = Result<T, RecvError>;
 
+    #[expect(
+        clippy::panic,
+        reason = "polled after it completed, which the `Future` contract rules out"
+    )]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let Some(inner) = this.inner.as_ref() else {

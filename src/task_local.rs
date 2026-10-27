@@ -99,6 +99,10 @@ impl<T: 'static> LocalKey<T> {
     ///
     /// Where no scope set the key; [`try_with`](Self::try_with) answers an
     /// [`AccessError`] instead.
+    #[expect(
+        clippy::panic,
+        reason = "documented under `# Panics`; `try_with` answers the error instead"
+    )]
     pub fn with<F: FnOnce(&T) -> R, R>(&'static self, f: F) -> R {
         match self.try_with(f) {
             Ok(r) => r,
@@ -130,6 +134,10 @@ impl<T: 'static> LocalKey<T> {
 
     /// Moves `slot`'s value into the key for `f`, and back out after it, even
     /// when `f` panics: an outer scope's value is put back too.
+    #[expect(
+        clippy::panic,
+        reason = "a key used during this thread's teardown, where no value can be swapped in"
+    )]
     fn enter<F: FnOnce() -> R, R>(&'static self, slot: &mut Option<T>, f: F) -> R {
         struct Restore<'a, T: 'static> {
             key: &'static LocalKey<T>,
@@ -172,6 +180,10 @@ pub struct TaskLocalFuture<T: 'static, F> {
 impl<T: 'static, F: Future> Future for TaskLocalFuture<T, F> {
     type Output = F::Output;
 
+    #[expect(
+        clippy::panic,
+        reason = "polled after it completed, which the `Future` contract rules out"
+    )]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         // SAFETY: `future` is never moved out while pinned (it is dropped in
         // place, by `Option::take` only after it completed or in `Drop`), and

@@ -45,6 +45,10 @@ pub(super) async fn watched<F: Future>(inner: &Inner, future: F) -> F::Output {
 }
 
 #[cold]
+#[expect(
+    clippy::panic,
+    reason = "`UnhandledPanic::ShutdownRuntime`: every `block_on` of the runtime panics, as documented"
+)]
 fn shut_down() -> ! {
     panic!("the runtime shut down because one of its tasks panicked")
 }

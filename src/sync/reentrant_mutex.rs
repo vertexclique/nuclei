@@ -100,6 +100,10 @@ impl<T: ?Sized> ReentrantMutex<T> {
     }
 
     /// Deepens the hold if `owner` has it.
+    #[expect(
+        clippy::panic,
+        reason = "a count that cannot overflow in practice, checked rather than wrapped"
+    )]
     fn reenter(&self, owner: &Owner) -> bool {
         if self.holder.load(Ordering::Relaxed) != owner.id() {
             return false;
