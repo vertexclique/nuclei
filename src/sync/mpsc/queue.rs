@@ -48,6 +48,11 @@
 //! it is freed through a type-erased header that knows only its layout, and
 //! the queue needs no `T: 'static`.
 //!
+//! The ready mark's store and the receiver's loads of a mark and of a link are
+//! sequentially consistent: they are this queue's half of the channel's wake
+//! handshake, in which a send wakes the receiver only if it says it waits
+//! (see `chan`).
+//!
 //! # Under loom
 //!
 //! kovan is not instrumented, so loom cannot interleave its steps. Under
@@ -298,7 +303,9 @@ mod segments {
             // SAFETY: the position is this push's alone, and the receiver reads
             // the value only after it reads the ready mark stored below.
             unsafe { cell.value.get().write(MaybeUninit::new(value)) };
-            cell.ready.store(true, Ordering::Release);
+            // SeqCst: the first half of the channel's wake handshake, with the
+            // receiver's look after it says it waits (see `chan`).
+            cell.ready.store(true, Ordering::SeqCst);
             if !spare.is_null() {
                 // SAFETY: never published, and holds no value.
                 unsafe { free_node(spare) };
@@ -324,8 +331,9 @@ mod segments {
                 // SAFETY: segments from the head on are retired by this end
                 // alone, so the successor stays allocated without the guard's
                 // protection.
+                // SeqCst: in the wake handshake, as the cell's mark below.
                 let next_ptr =
-                    unsafe { seg.next.load_unprotected(Ordering::Acquire, &guard) }.as_raw();
+                    unsafe { seg.next.load_unprotected(Ordering::SeqCst, &guard) }.as_raw();
                 if next_ptr.is_null() {
                     return None;
                 }
@@ -339,12 +347,14 @@ mod segments {
                 seg = unsafe { &*next_ptr };
             }
             let cell = &seg.cells[(pos - seg.start) as usize];
-            if !cell.ready.load(Ordering::Acquire) {
+            // SeqCst: the receiver's look in the channel's wake handshake: after
+            // it says it waits, this load or the push's look at that sees the
+            // other (see `chan`).
+            if !cell.ready.load(Ordering::SeqCst) {
                 return None;
             }
-            // SAFETY: ready: its push wrote the value before the release store
-            // this load read; the position is passed below, so it is moved out
-            // once.
+            // SAFETY: ready: its push wrote the value before the store this load
+            // read; the position is passed below, so it is moved out once.
             let value = unsafe { cell.value.get().read().assume_init() };
             head.pos.store(pos + 1, Ordering::Relaxed);
             Some(value)

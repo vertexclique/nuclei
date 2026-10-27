@@ -106,6 +106,8 @@ variables
     txCount = Cardinality(Senders),     \* how many senders are alive
     rxRegistered = FALSE,               \* the receiver's waker cell holds its waker
     rxWoken = FALSE,                    \* the receiver's waker was called
+    rxWaiting = FALSE,                  \* the receiver says it waits: a send then wakes it
+    skippedRegistered = FALSE,          \* (record) a send left the waker cell alone while it held the waker
     \* ---- records the properties read; the code has no such variables ----
     status = [r \in Reqs |-> "new"],    \* how far each request got (see Status below)
     ahead = [r \in Reqs |-> {}],        \* the requests already waiting when this one began
@@ -155,6 +157,20 @@ macro wake_rx() begin
     if rxRegistered then
         rxRegistered := FALSE;   \* the cell is empty again
         rxWoken := TRUE;         \* and the receiver's task is told
+    end if;
+end macro;
+
+\* A send's wake (`Chan::send`): the waker cell only when the receiver says it waits, the
+\* flag lowered first, so a burst of sends wakes it once; otherwise the cell is left alone.
+macro send_wake() begin
+    if rxWaiting then
+        rxWaiting := FALSE;
+        if rxRegistered then
+            rxRegistered := FALSE;
+            rxWoken := TRUE;
+        end if;
+    else
+        skippedRegistered := skippedRegistered \/ rxRegistered;
     end if;
 end macro;
 
@@ -505,6 +521,9 @@ S_send:
         held[self] := held[self] - 1;       \* the permit is used up: its slot carries the value
         left := left - 1;                   \* one fewer to send
         if rxEnded then pushAfterEnd := TRUE; end if;   \* (record) a value after the end
+        \* MUTATION flag_before_write: the send looks at the receiver's flag before its
+        \* value is written, and wakes on what it saw then.
+        if Mutation = "flag_before_write" then send_wake(); end if;
         \* MUTATION wake_before_write: the receiver is woken before the value is written.
         if Mutation = "wake_before_write" then goto S_early_wake; end if;
     else
@@ -514,12 +533,12 @@ S_write:
     \* The push writes the value into its cell: the receiver can take it now.
     unready := unready \ {<<self, sq>>};
 S_send_wake:
-    \* Then, once the push returned, the receiver's waker.
-    wake_rx();
+    \* Then, once the push returned, the receiver's waker, if it says it waits.
+    if Mutation # "flag_before_write" then send_wake(); end if;
     goto S_send;
 S_early_wake:
     \* (mutation wake_before_write only) The wake comes first ...
-    wake_rx();
+    send_wake();
 S_late_write:
     \* ... and the value is written after it.
     unready := unready \ {<<self, sq>>};
@@ -602,18 +621,30 @@ R_register:
     rxRegistered := TRUE;                   \* the waker cell now holds the receiver's waker
     \* MUTATION rx_no_recheck: the receiver sleeps without looking again.
     if Mutation = "rx_no_recheck" then goto R_sleep; end if;
+R_raise:
+    \* Then it says it waits, before it looks again: a send whose value it does not see
+    \* finds the flag up after its write.
+    \* MUTATION raise_after_look: it says so only after its look again.
+    if Mutation # "raise_after_look" then rxWaiting := TRUE; end if;
 R_look_again:
     \* The look after the registration: whatever came before it is seen here. A value
     \* still being written is not: its send wakes the receiver after the write.
     if FrontReady then
         take_value();
-        goto R_release;
+        goto R_lower;
     \* MUTATION finish_early: a closed channel counts as finished before it is idle.
     elsif (mq = <<>> /\ txCount = 0) \/ Finished \/ (Mutation = "finish_early" /\ closedBit) then
         goto R_end;                         \* the end: no sender, or closed and idle
     else
-        goto R_sleep;
+        goto R_raise_late;
     end if;
+R_lower:
+    \* A value after all: the flag comes down again (a send may have taken it first).
+    rxWaiting := FALSE;
+    goto R_release;
+R_raise_late:
+    \* (mutation raise_after_look only) The flag goes up after the look.
+    if Mutation = "raise_after_look" then rxWaiting := TRUE; end if;
 R_sleep:
     \* `Pending`: the receiver sleeps until its waker is called.
     await rxWoken;                          \* nothing happens to it until then
@@ -748,6 +779,9 @@ NoFailByClose == \A r \in Reqs : ~closedG[r]
 NoValueAfterClose == \A p \in Senders : pc[p] = "S_send_wake" => ~closedBit
 \* The receiver parks while the oldest cell is claimed and not written yet.
 NoParkOnBusy == pc[Rx] = "R_sleep" => ~FrontBusy
+\* A send leaves the waker cell alone while the receiver's waker is in it (it had not said
+\* it waits yet, or a send before already woke it).
+NoSkipRegistered == ~skippedRegistered
 \* The receiver ends a closed channel by finding it idle while a sender still lives.
 NoEndByIdle == rxEnded => txCount = 0
 \* A grant reaches a node between its push and its park, so the future sees it without

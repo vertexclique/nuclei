@@ -27,7 +27,14 @@
 //!   idle limit that is closed) wakes the registered waker after it changed
 //!   the state. The waker cell is a handshake on one state word, so for any
 //!   pair of a registration and a wake one of them sees the other: see the
-//!   `atomic_waker` module. A value still being written (the queue answers
+//!   `atomic_waker` module. A push goes through the cell only when the
+//!   receiver says it waits: it raises `rx_waiting` after it registered and
+//!   before it looks again, and a push looks at the flag after its value is
+//!   ready. Both pairs of accesses are sequentially consistent (the queue's
+//!   mark, the flag), so either the receiver's look finds the value or the
+//!   push finds the flag up; the push that lowers it wakes the receiver, and
+//!   the pushes after it leave the cell alone. A receiver busy taking values
+//!   never raises it, so a stream of sends touches nothing it writes. A value still being written (the queue answers
 //!   that nothing is there yet) is one of these: its push wakes the receiver
 //!   once it returned, and its sender still counts, so the receiver never
 //!   takes that answer for the end.
@@ -52,7 +59,7 @@ use super::error::TryRecvError;
 use super::queue::Queue;
 use crate::sync::Event;
 use crate::sync::atomic_waker::AtomicWaker;
-use crate::sync::internal::{AtomicUsize, Ordering};
+use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering, seq_cst_handshake};
 
 /// A channel flavor's admission control and closed bit.
 pub(super) trait Limit {
@@ -86,6 +93,9 @@ pub(super) struct Chan<T, L> {
     queue: Queue<T>,
     /// The receiver's task, woken when a value arrives or the channel ends.
     rx_waker: AtomicWaker,
+    /// The receiver registered its waker and is about to sleep: the next push
+    /// lowers it and wakes the receiver (see the module).
+    rx_waiting: AtomicBool,
     /// Set when the receiver closes or is dropped; `Sender::closed` waits on it.
     rx_closed: Event,
     pub(super) limit: L,
@@ -107,6 +117,7 @@ impl<T, L: Limit> Chan<T, L> {
         Self {
             queue: Queue::new(),
             rx_waker: AtomicWaker::new(),
+            rx_waiting: AtomicBool::new(false),
             rx_closed: Event::new(),
             limit,
             tx_count: AtomicUsize::new(1),
@@ -116,13 +127,34 @@ impl<T, L: Limit> Chan<T, L> {
 
     // ===== the sending side =====
 
-    /// Pushes a value the limit admitted, then wakes the receiver.
+    /// Pushes a value the limit admitted, then wakes the receiver if it says
+    /// it waits.
     ///
     /// The value is in the queue before the waker is touched, so a panic in
     /// the receiver's waker leaves the channel consistent.
     pub(super) fn send(&self, value: T) {
         self.queue.push(value);
-        self.rx_waker.wake();
+        // The push's mark is sequentially consistent, and so is this look:
+        // either the receiver's look after it raised the flag finds the value,
+        // or this finds the flag up (a fence for loom, whose queue model is a
+        // lock).
+        seq_cst_handshake();
+        if self.rx_waiting.load(Ordering::SeqCst) && self.rx_waiting.swap(false, Ordering::SeqCst) {
+            self.rx_waker.wake();
+        }
+    }
+
+    /// The receiver registered its waker: it says it waits, before it looks
+    /// again.
+    fn rx_says_it_waits(&self) {
+        self.rx_waiting.store(true, Ordering::SeqCst);
+        seq_cst_handshake();
+    }
+
+    /// The receiver's look again found something: it does not wait after all.
+    /// A push that saw the flag up first wakes it once more, which is harmless.
+    fn rx_does_not_wait(&self) {
+        self.rx_waiting.store(false, Ordering::Relaxed);
     }
 
     /// Gives back `n` admissions that were reserved and never used, and wakes
@@ -281,10 +313,12 @@ impl<T, L: Limit> Chan<T, L> {
             return Poll::Ready(done);
         }
         self.rx_waker.register(cx.waker());
+        self.rx_says_it_waits();
         // A value pushed, or a last sender dropped, between the look above
         // and the registration is found here, or woke the waker.
         // SAFETY: the caller's contract.
         if let Some(done) = unsafe { self.next() } {
+            self.rx_does_not_wait();
             return Poll::Ready(done);
         }
         if self.finished() {
@@ -342,8 +376,10 @@ impl<T, L: Limit> Chan<T, L> {
             return Poll::Ready(taken);
         }
         self.rx_waker.register(cx.waker());
+        self.rx_says_it_waits();
         // SAFETY: the caller's contract.
         if let Some(taken) = unsafe { self.take_many(buf, limit) } {
+            self.rx_does_not_wait();
             return Poll::Ready(taken);
         }
         if self.finished() {

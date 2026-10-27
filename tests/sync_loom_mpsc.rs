@@ -226,6 +226,46 @@ fn an_unbounded_send_racing_the_receivers_wait_is_delivered_once() {
     );
 }
 
+/// A send wakes a waiting receiver by itself: a clone of the sender lives on
+/// until the value is in, so no last sender's drop wakes it instead. The
+/// receiver says it waits before it looks again, and the send looks at that
+/// after its value is ready; a wake lost between them parks the receiver for
+/// good, which loom reports.
+#[test]
+fn a_bounded_send_wakes_the_receiver_while_another_sender_lives() {
+    explore(
+        "a_bounded_send_wakes_the_receiver_while_another_sender_lives",
+        3,
+        100,
+        || {
+            let (tx, mut rx) = mpsc::channel::<u32>(1);
+            let keep = tx.clone();
+            let sender = thread::spawn(move || block_on(tx.send(7)).is_ok());
+            assert_eq!(block_on(rx.recv()), Some(7));
+            assert!(sender.join().expect("sender"));
+            drop(keep);
+        },
+    );
+}
+
+/// As above, for the unbounded channel.
+#[test]
+fn an_unbounded_send_wakes_the_receiver_while_another_sender_lives() {
+    explore(
+        "an_unbounded_send_wakes_the_receiver_while_another_sender_lives",
+        3,
+        100,
+        || {
+            let (tx, mut rx) = mpsc::unbounded_channel::<u32>();
+            let keep = tx.clone();
+            let sender = thread::spawn(move || tx.send(7).is_ok());
+            assert_eq!(block_on(rx.recv()), Some(7));
+            assert!(sender.join().expect("sender"));
+            drop(keep);
+        },
+    );
+}
+
 /// Two senders, one receiver waiting for both values: neither wake is lost,
 /// and each value arrives once.
 #[test]
