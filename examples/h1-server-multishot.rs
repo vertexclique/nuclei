@@ -1,4 +1,3 @@
-#[cfg(target_os = "linux")]
 #[nuclei::main]
 async fn main() -> anyhow::Result<()> {
     use nuclei::*;
@@ -8,19 +7,15 @@ async fn main() -> anyhow::Result<()> {
     use async_dup::Arc;
     use futures::stream::StreamExt;
 
-    use futures::prelude::*;
     use http_types::{Request, Response, StatusCode};
 
-    /////////////////////////////////////////////////////////////////////////
-    ////// NOTE: This example can only be run by IO_URING backend.
-    ////// If you try to use epoll, it will not compile.
-    ////// Reason is: Multishot based IO is only part of io_uring backend.
-    /////////////////////////////////////////////////////////////////////////
+    // Accepts through `accept_multi`: a stream of connections that owns its
+    // own copy of the listener.
 
-    static DATA: &'static str = include_str!("data/quark-gluon-plasma");
+    static DATA: &str = include_str!("data/quark-gluon-plasma");
 
     /// Serves a request and returns a response.
-    async fn serve(req: Request) -> http_types::Result<Response> {
+    async fn serve(_req: Request) -> http_types::Result<Response> {
         // println!("Serving {}", req.url());
 
         let mut res = Response::new(StatusCode::Ok);
@@ -51,13 +46,8 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     }
 
-    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
+    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000").await?);
 
     http.await?;
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn main() {
-    panic!("This example can only be run by IO_URING backend.");
 }

@@ -1,0 +1,13 @@
+# configuration                spec                 expected
+PW_safe                        MC_ExitWatch         pass
+PW_live                        MC_ExitWatch         pass
+MW_early_let_go                MC_ExitWatch         violated:OneWatch
+MW_no_recheck                  MC_ExitWatch         violated:Settles
+MW_unwatched_orphan            MC_ExitWatch         violated:Settles
+WW_rewatch                     MC_ExitWatch         violated:NoRewatch
+WW_seen_on_b                   MC_ExitWatch         violated:NoSeenOnB
+PK_safe                        MC_KillReap          pass
+PK_live                        MC_KillReap          pass
+MK_no_busy                     MC_KillReap          violated:NoKillAfterReap
+WK_kill                        MC_KillReap          violated:NoKill
+WK_skip                        MC_KillReap          violated:NoSkip

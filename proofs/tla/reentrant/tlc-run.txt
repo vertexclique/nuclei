@@ -1,0 +1,31 @@
+TLC run of every configuration in proofs/tla/reentrant, 2026-10-25 21:58 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_two                              442        264      1  pass                                  pass                                  yes
+L_deep_shallow                     569        334      1  pass                                  pass                                  yes
+M_release_before_clear             698        416      1  violated:AllOwnersEnd                 violated:AllOwnersEnd                 yes
+M_clear_each_unlock                133         81      1  violated:AllOwnersEnd                 violated:AllOwnersEnd                 yes
+M_never_clear                      168        104      1  violated:Exclusion                    violated:Exclusion                    yes
+M_never_clear_end                 1288        735      1  violated:FreeAtEnd                    violated:FreeAtEnd                    yes
+M_never_clear_reenter              112         70      0  violated:NoFalseReenter               violated:NoFalseReenter               yes
+M_reenter_skips_depth               52         34      1  violated:DepthMatches                 violated:DepthMatches                 yes
+MW_reenter                          52         34      1  violated:OneLevel                     violated:OneLevel                     yes
+MW_contend                          25         18      1  violated:NoWaitBehind                 violated:NoWaitBehind                 yes
+RW_downgrade                       823        459      1  pass                                  pass                                  yes
+RW_refused                         583        334      2  pass                                  pass                                  yes
+RW_claims                         7124       3555      1  pass                                  pass                                  yes
+RWM_forgets_reads                  132         82      1  violated:GuardsCovered                violated:GuardsCovered                yes
+RWM_read_unlock_while_writing         122         76      1  violated:SharesMatch                  violated:SharesMatch                  yes
+RWM_write_waits_for_own_read         244        145      1  violated:AllOwnersEnd                 violated:AllOwnersEnd                 yes
+RWM_read_beside_any_writer          86         57      1  violated:Exclusion                    violated:Exclusion                    yes
+RWM_claim_without_cas              868        485      1  violated:ReadsMatch                   violated:ReadsMatch                   yes
+RWM_read_ignores_own_record         100         63      1  violated:OneRecordEach                violated:OneRecordEach                yes
+RWM_keeps_writer_id                818        458      1  violated:FreeAtEnd                    violated:FreeAtEnd                    yes
+RWW_refusal                         71         45      1  violated:NoRefusal                    violated:NoRefusal                    yes
+RWW_downgrade                      132         82      1  violated:NoDowngrade                  violated:NoDowngrade                  yes
+RWW_reuse                          207        124      1  violated:NoReuse                      violated:NoReuse                      yes
+RWW_lost_claim                     741        415      1  violated:NoLostClaim                  violated:NoLostClaim                  yes
+
+results matching EXPECTED.txt: 24 of 24

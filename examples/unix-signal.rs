@@ -16,3 +16,8 @@ async fn main() -> std::io::Result<()> {
     println!("Done!");
     Ok(())
 }
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("this example forwards a Unix signal, so it runs on Unix systems only");
+}

@@ -1,0 +1,15 @@
+# configuration                spec                 expected
+L_read_write                   MC_RwLock            pass
+L_writers                      MC_RwLock            pass
+L_upgrade                      MC_RwLock            pass
+L_downgrade                    MC_RwLock            pass
+L_upg_upg                      MC_RwLock            pass
+L_barge_writer                 MC_RwLock            pass
+L_drop                         MC_RwLock            pass
+L_drop_live                    MC_RwLock            pass
+M_read_ignores_upgrading       MC_RwLock            violated:NoReaderWhileUpgrading
+M_upgrade_over_readers         MC_RwLock            violated:NoUpgradeOverReaders
+M_release_no_pass              MC_RwLock            violated:AllTasksEnd
+M_exit_ignores_dirty           MC_RwLock            violated:NoStrandedArrival
+W_upgrade_wait                 MC_RwLock            violated:NoUpgradeWait
+W_downgrade                    MC_RwLock            violated:NoDowngrade

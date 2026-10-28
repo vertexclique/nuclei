@@ -1,0 +1,18 @@
+TLC run of every configuration in proofs/tla/clock, 2026-10-26 18:30 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 16, or 1 worker where a violation is expected. Limit: 1500 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+C_safe                        11338191    3705462    178  pass                                  pass                                  yes
+C_three                       10101891    2662564    201  pass                                  pass                                  yes
+C_pair                        13499621    4563672    215  pass                                  pass                                  yes
+M_publish_late                 1334314     460445      9  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_busy_no_wait                 1978288     678615     12  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_no_recheck                     71484      25218      1  violated:NoBadJump                    violated:NoBadJump                    yes
+M_no_wait_advance              1989847     678569     13  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_no_job_check                  138352      46384      2  violated:NoBadJump                    violated:NoBadJump                    yes
+M_no_attempt                   2794611     848083    276  violated:TimersFire                   violated:TimersFire                   yes
+W_jump                         1495792     481178     10  violated:NoJumpW                      violated:NoJumpW                      yes
+C_rearm                         736515     257356     12  pass                                  pass                                  yes
+
+results matching EXPECTED.txt: 11 of 11

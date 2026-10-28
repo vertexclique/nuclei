@@ -1,0 +1,5 @@
+# configuration                spec                 expected
+L_bounded                      MC_RunLoop           pass
+M_no_self_woken_count          MC_RunLoop           violated:BoundedGap
+W_self_woken_look              MC_RunLoop           violated:NoSelfWokenLook
+W_gap_reaches_its_bound        MC_RunLoop           violated:GapBelowItsBound

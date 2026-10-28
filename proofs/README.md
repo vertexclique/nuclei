@@ -1,0 +1,1088 @@
+# Proofs of nuclei
+
+## What is checked, in plain words
+
+nuclei's bounded channel (`nuclei::sync::mpsc::channel`) has a fixed number of slots. A sender
+takes a slot before it puts a value in, and the receiver gives a slot back for every value it
+takes out. When no slot is free, a sender waits in line, and the line is served strictly first
+come, first served: slots that come free are set aside for the oldest waiter until it has all
+it asked for, and nobody behind it, however little it asks for, gets a slot first. A waiter may
+give up (its future is dropped); whatever was set aside or handed to it then goes on to the
+next one. The receiver can close the channel, after which no new value gets in, and it can drop
+it.
+
+Many threads do this at once, and a bug in that kind of code often shows up only when their
+steps happen in one particular order. A test can run millions of times without hitting that
+order. A proof does not run the code and hope: it takes a precise description of the code and
+checks every case the description allows. Two tools do the checking here, and they work
+together:
+
+- **TLA+** (checked by TLC) looks at several threads at once, every order of their steps, but
+  only for small sizes: two slots, two senders with two operations each, and a receiver.
+- **Lean** looks at one thread doing one whole operation at a time, but for every size and
+  every sequence of operations.
+
+What a check covers is said with it, and nothing beyond.
+
+### A worked example: why a `try_send` must not take a free slot
+
+Take a channel of one slot, two senders A and B, and the receiver R.
+
+1. A sends a value: the slot is taken.
+2. B sends and finds no slot. It joins the line and sleeps.
+3. R takes A's value and gives its slot back. In the code that is one atomic addition to a
+   counter. Handing the slot to B is a separate step a moment later: the "pass" over the line.
+4. Between the two, A calls `try_send`, which never waits. It sees a free slot.
+
+If A took it, it would get ahead of B, who has waited longer. The rule that prevents it: an
+attempt that does not wait refuses while the line's `QUEUED` bit is up. The TLA+ model has a
+configuration that takes this one rule away (`tla/mpsc/M_try_ignores_queue.cfg`), and TLC finds
+the bad order and writes it down step by step (`tla/mpsc/out/M_try_ignores_queue_counterexample.txt`,
+written by the run). With the rule in place (`tla/mpsc/BC_try.cfg`), TLC checks every order of
+the same program and finds none.
+
+### A second example: a waiter that leaves passes its share on
+
+A channel of three slots, in the order things happen (this run is computed by Lean in
+`lean/Nuclei/FairSemaphore/Theorems.lean`, `example_ops`):
+
+1. Request 0 takes all 3 slots.
+2. Request 1 asks for 2 and waits; request 2 asks for 1 and waits behind it.
+3. Request 0 gives its 3 slots back. Request 1 is at the front: 2 slots are set aside for it
+   and it is granted. The third goes to request 2. No slot is free.
+4. Request 3 asks for 3 and waits. Request 1 gives its 2 back: both are set aside for request
+   3, which still lacks one. Request 4 asks for 1 and waits behind request 3, even though 2
+   slots came back a moment ago: they belong to request 3 now.
+5. Request 3 is dropped. Its 2 set-aside slots are not lost: they go to request 4, the next in
+   line, which is granted, and the one left over is free again.
+
+The Lean proofs show that this is not luck of the example: for every sequence of operations,
+no slot is lost or made up, and a dropped front waiter's share goes to the next waiter. The
+TLA+ model checks the same with the steps of several threads interleaved, including the
+moment a waiter is dropped while a pass is granting it.
+
+## The tools
+
+| tool | what it checks here | how far a check goes |
+|------|---------------------|----------------------|
+| TLA+, checked by TLC (`tla/`) | the bounded channel at the grain of its atomic steps: the semaphore's state word, the arrival stack, the waiting line and its set-aside, every waiter node, the drain pass, the waker handshake, cancellation, permits, the receiver's receive, close and drop; the one-shot channel, the runtime's task, the park handshake, the remote timer, the guard of an IO source's side, the reads and writes from a task's own buffer and a source's operations on its shard's ring the same way (sections below) | every order of every thread's steps, for the slots, senders and programs each configuration sets |
+| Lean 4 (`lean/`) | the bookkeeping of the fair semaphore: conservation of slots, first come first served, the hand-on of a dropped waiter's share, the close; the one-shot channel's ownership, the task's references, future and output, the timer wheel's arithmetic and a ring's file slots (sections below) | every sequence of operations and every size, for a model of one thread doing one whole operation at a time |
+
+The loom models in `src/sync/loom_tests/mpsc.rs` complement both: they run the real Rust code
+under every interleaving loom reaches (with the weak memory orderings of the atomics), for a
+handful of operations.
+
+## How to run them
+
+TLA+ needs Java on `PATH` (CI uses Java 21). The runner fetches the pinned TLA+ tools (release
+v1.7.4, checked against its SHA-256) on first use, or takes the jar named by `TLA2TOOLS`:
+
+```sh
+bash proofs/tla/run_tlc.sh mpsc                  # every configuration; rewrites tla/mpsc/tlc-run.txt
+bash proofs/tla/run_tlc.sh mpsc BC_try M_try_ignores_queue   # only those
+bash proofs/tla/run_tlc.sh all                   # every family
+```
+
+The model is written in PlusCal, an algorithm language that the TLA+ tools translate into a
+TLA+ specification. The runner copies the family into a temporary directory and translates it
+there before it checks it, so the translation is never stored in the tree and can never be
+out of date. It compares each configuration's result with the family's `EXPECTED.txt` and
+exits non-zero on any mismatch; a configuration expected to break something keeps its trace in
+`tla/mpsc/out/` (not kept in the tree). `tla/mpsc/tlc-run.txt` records the last full run:
+states, time and result of every configuration.
+
+Lean: install elan once (`curl https://elan.lean-lang.org/elan-init.sh -sSf | sh`); it fetches
+the Lean release `lean/lean-toolchain` names (4.35.0) on first use. Then:
+
+```sh
+bash proofs/lean/check.sh          # the scan for unfinished proofs, the build, the axiom check
+bash proofs/lean/check.sh build    # `lake build`, failing on any warning
+bash proofs/lean/check.sh sorry    # fail if `sorry` or `admit` appears in a Lean source
+bash proofs/lean/check.sh axioms   # fail unless every theorem rests only on Lean's standard axioms
+```
+
+CI runs both: `.github/workflows/tla.yml` (every TLA+ family) and `.github/workflows/lean.yml`
+(build, scan, axioms), each with its tools pinned by checksum.
+
+## What the TLA+ model checks
+
+`tla/mpsc/BoundedChannel.tla` is the algorithm; `tla/mpsc/MC_BoundedChannel.tla` holds the
+programs the configurations run. One labelled step of the algorithm is one atomic step of the
+code (a compare-and-swap, a fetch-and-add, a load), named after the Rust function it stands
+for, with two exceptions the spec's header explains: the pass's look past withdrawn waiters at
+the head of the line is one step, and so is the receiver's look at the queue and the sender
+count. The message queue is a sequence of cells in the order sends claimed them: a send claims
+its cell in one step and writes its value in a later one, as in kovan's segment queue, so the
+receiver can find the oldest cell claimed and not written yet. It then takes nothing, does not
+read the sender count, and waits for that send's wake, which comes after the write. Every
+line carries a comment.
+
+The properties:
+
+| property | what it says |
+|----------|--------------|
+| `Conservation` | every slot is free, set aside, held by a grant, held as a permit, on its way back, or carrying a value in the queue: the counts add up to the channel's size, and the queue never holds more values than there are slots |
+| `FifoFair` | a request that was already waiting when another began is never still waiting once that other one has its slots; a `try_` that took slots counts too, and so does a `reserve_many` |
+| `CloseSemantics` | after the close no slot leaves the free count, and every operation that began after the close fails |
+| `CloseReturnsShare` | once the channel is closed and no pass is running, nothing is set aside any more: the close's pass hands every share back to the free count |
+| `EndMeansDrained` | once a receive returned the end of the channel, no value ever goes in again |
+| `ExactlyOnce` | every value put in is received once, or is still in the queue, or was thrown away by the receiver's drop |
+| `PerSenderOrder` | each sender's values come out in the order it put them in |
+| `Termination` (under weak fairness of every thread) | every thread finishes: no waiter whose request can be served sleeps forever, so no wakeup is lost; checked with the waiter's park and the grant's wake modelled step by step |
+| deadlock freedom (TLC's own check, on every configuration that must pass) | no state where some thread is stuck while every other one is done |
+
+The 45 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
+`.cfg` file says in its first lines what it checks):
+
+- **14 that must pass.** Ten check every safety property and deadlock freedom: three sends on
+  one slot; a request for both slots among single sends; a request for both slots that gives
+  them back unused; a request for both slots that is dropped after one poll; a single send that
+  is dropped; a `try_` racing waiting sends; one sender's two values; the receiver closing in
+  the middle, with and without a dropped request; the receiver dropped while sends wait. Four
+  check `Termination` under weak fairness: plain sends, a dropped send, a request for both
+  slots, and a close.
+- **18 mutations that must fail.** Each takes one rule out of the algorithm and must break the
+  property that rule protects: `try_ignores_queue` and `skip_unfit_front` (an attempt, or a
+  pass, that serves a later request first) break `FifoFair`; `drop_pass_on` (a leaving
+  waiter's share is dropped) breaks `Conservation`; `park_no_look`, `grant_no_wake`,
+  `release_no_pass`, `exit_ignores_release` and `rx_no_recheck` (a wakeup or a hand-over that
+  never comes) end in a deadlock, and `park_no_look` and `grant_no_wake` also break
+  `Termination`; `close_keeps_set_aside` (the close keeps what was set aside for the front
+  waiter, so the channel can never go idle) breaks `CloseReturnsShare`;
+  `try_ignores_close` and `take_after_close` break
+  `CloseSemantics`; `finish_early` breaks `EndMeansDrained`; `queue_lifo` breaks
+  `PerSenderOrder`, and so does `skip_busy` (the receiver passes over a cell still being
+  written and takes a written one behind it, as the queue of kovan before 0.2 did: a sender's
+  second value comes out first); `wake_before_write` (a send wakes the receiver before it
+  writes, so a receiver that looked in between sleeps through the value) ends in a deadlock;
+  `double_delivery` breaks `ExactlyOnce`.
+- **13 witnesses that must fail.** Each claims an interesting case never happens, and must be
+  proved wrong, which shows the search really reaches it: a share held between passes; a
+  waiter that withdraws at the very moment a pass grants it; a grant that its future never
+  looks at before the drop; the front waiter dropped while it holds a share; an attempt
+  refused only because somebody waits; a sleeping waiter woken by a grant; a drain that passes
+  again because something changed while it worked; the close giving a share back; a waiter
+  failed by the close; a value sent after the close through a slot reserved before it; the
+  receiver ending a closed channel because it went idle; a grant that lands between a
+  waiter's arrival and its park; and the receiver parking while the oldest cell is still being
+  written.
+
+## What the Lean proofs check
+
+`lean/Nuclei/FairSemaphore/Model.lean` models the fair semaphore with one thread doing one
+whole operation at a time: acquire (wait if needed), try-acquire (never wait), release,
+cancel and close, each followed by the pass. For every sequence of operations from a fresh
+semaphore of any size, `lean/Nuclei/FairSemaphore/Theorems.lean` proves:
+
+| theorem | what it says |
+|---------|--------------|
+| `conservation` | free slots, the set-aside and the slots held add up to the size, always |
+| `waiting_means_nothing_free` | while anybody waits, no slot is free (so an attempt that does not wait takes nothing from a waiter) |
+| `queue_in_arrival_order` | the line is ordered by arrival |
+| `no_overtaking` | a step grants a waiter only after everybody who arrived before it and still waited, or that waiter's own cancellation |
+| `fresh_only_when_nobody_waits` | a request granted without waiting found the line empty, or asked for nothing |
+| `cancel_passes_share_on` | when the front waiter is dropped, the next one is granted, or holds the whole share that was set aside for the dropped one |
+| `closed_admits_nothing` | after the close the semaphore stays closed and nobody is granted again |
+
+and computes the worked example above (`example_after_release`, `example_share_held`,
+`example_after_cancel`). `lean/Axioms.lean` prints the axioms each theorem rests on; the check
+accepts only Lean's standard axioms (`propext`, `Quot.sound`, `Classical.choice`); the fair
+semaphore and one-shot theorems need only the first two. No proof has a `sorry` or an
+`admit`.
+
+## The one-shot channel
+
+`oneshot` (`tla/oneshot/Oneshot.tla`, `lean/Nuclei/Oneshot.lean`) gets the same treatment with
+its own story: one value, one sender, one receiver. The sender publishes two bits of the state
+word in one step; if the receiver had closed first the send fails and the value comes back.
+The receiver registers its waker and looks again before sleeping, and so does a sender waiting
+in `closed()`. Whoever owns the cell when the dust settles reads the value exactly once: the
+receiver by receiving, the receiver's drop for a value nobody took, or the sender of a failed
+send.
+
+A worked example: the receiver polls once and stays pending; the sender sends; the next poll
+takes the value (computed by Lean, `Nuclei.Oneshot.example_pending_then_taken`). Two more in
+one line each: sent, closed, receiver dropped, and the close owns the value so the drop
+destroys it; closed empty, then sent, and the failed send takes its value back.
+
+The TLA+ family checks 23 configurations: 9 that must pass (sends, drops, a close, parking
+races, and liveness under weak fairness), 8 mutations that each take one rule away (a wake
+lost or early, a value read twice or dropped, a send past the close, both rechecks) and 6
+witnesses that prove the search reaches the interesting cases. The Lean file proves the
+ownership story for every sequence of operations: the value sits in exactly one of its four
+places, at most one send succeeds, and every answer agrees with what the channel did. What the
+models leave out is said in each file's header: the waker cells are single flags (their
+handshake is loom's), and the value is one unlabelled token.
+
+## The task
+
+`task` (`tla/task/Task.tla`, `lean/Nuclei/Task.lean`) checks the runtime's task
+(`src/rt/task/`): one allocation holding a future, one state word of flags and a count of
+references, reached through a runnable, any number of wakers and one handle. A runner pops the
+runnable and polls the future once. A wake that lands during the poll only marks the task, and
+the runner puts it back in its queue after the poll, so the future is never polled twice at
+once. The handle awaits the output, cancels the task (an idle one is scheduled once more, so a
+runner drops its future), or lets go of it. Whoever lets go of the last reference frees the
+memory, and never before the future and the output are gone.
+
+A worked example (computed by Lean, `Nuclei.Task.example_detached_last_waker`): spawn; run,
+Pending, the future keeps a waker; detach; wake by reference, which makes a new runnable; run
+again, and the future drops that waker during the poll. The run's reference is now the last
+one and nobody holds the handle, so nothing can wake the task or await it: the run drops the
+future, then frees the memory. The established task crate frees the memory there and leaves
+the future behind, never dropped. The TLA+ model found it (the mutation `pending_leaks_future`
+brings that behaviour back and must fail), and nuclei's task drops the future in its last
+decrement instead.
+
+The TLA+ family checks 26 configurations: 11 that must pass (the handle awaiting, detaching,
+dropped or cancelling, with one or two runners, wakes by value and by reference, a future that
+wakes itself, a waker dropped without a wake, and liveness under weak fairness), 9 mutations
+that each take one rule away (a wake during the poll that schedules a second runnable breaks
+`OnePoll`; a run that drops a wake from its own poll, and a handle that sleeps without looking
+again, end in a deadlock; freeing the memory while the handle lives, and a wake by reference
+that makes a runnable without its own reference, break `NothingAfterFree`; a cancel that drops
+the future itself breaks `FutureOnce`; a detach that skips the last-reference free, and a
+completion that leaves the output behind, break `CleanEnd`; the established crate's leak
+breaks `FreedAfterFuture`), and 6 witnesses: a wake during the poll, a cancel during the poll,
+a cancel found in the queue, a registration of the handle's waker meeting a notification, the
+last waker closing an idle task, and the handle woken from its sleep.
+
+The Lean file proves, for every sequence of operations and any number of wakers: the count of
+references is exactly the runnable plus the wakers; the future is dropped at most once, and a
+runnable always has a live future; the output is used at most once; the memory is freed at
+most once and only after the future and the output are gone; freed memory is never touched
+again (every operation needs a reference or the handle, and none is left); and memory nobody
+refers to is freed. The loom models in `src/rt/task/loom_tests.rs` run the real code under
+weak memory orderings, with a calibration that loses a wake and must fail.
+
+What the models leave out: the Lean model runs one whole operation at a time, so a poll is
+never seen in progress (that is TLA+'s part); the TLA+ model treats the future as one step per
+poll and the run queue as a count; the awaiter's waker cell is modelled by TLA+ only. The task
+theorems also rest on `Classical.choice`, which the arithmetic tactic brings in for its case
+analysis.
+
+## The park handshake
+
+`park` (`tla/park/Park.tla`) checks how a shard goes to sleep without losing a wake
+(`src/rt/handshake.rs`, `src/rt/shard.rs`). A shard with nothing to run (after a short spin that
+only looks at its inbox) publishes that it parks, looks at its inbox once more, and only then
+sleeps until its poller is notified. A
+thread that gives it work pushes the work, then looks whether the shard parks; if it does, it
+swaps the flag back and notifies, so only the first of a burst of wakes notifies. Every access
+of the pair is sequentially consistent, so whichever publication comes second, the look after
+it sees the other: the shard finds the work, or the waker finds the shard parked.
+
+The family checks 21 configurations. `Park.tla`: 6 that must pass (one waker, three wakers
+racing, liveness under weak fairness, a timer of the shard's own, its liveness, and a
+`Proactor::wake` that ends a `Proactor::wait` wherever it lands), 4 mutations that must
+deadlock (the shard sleeping without its look after publishing; a waker looking before it
+pushes; the drive waiting on the poller after a timer it fired; a `Proactor::wake` that
+notifies only a shard that parks already), and 4 witnesses (a notification, a look that finds
+the work, a notification that lands while the shard is awake, a timer fired on the way to
+park). `ShardStop.tla` checks a shard that stops while other threads push to it: a pusher
+that sees the shard stopped drops what its inbox holds, and the stopping shard drains pass
+after pass until nothing more comes (a timer's waker, a channel its tasks held), so no
+runnable is left to keep itself and the shard for good. The inbox has one taker at a time:
+the shard holds the role until its last pass, a pusher drains only if it takes the role, and
+every drainer looks at the inbox again after it lets go. 2 that must pass (with `OneTaker`,
+only the role's holder takes), 5 mutations (a pusher looking before it pushes, one that leaves
+its runnable, a single drain pass, and a drainer that lets go without looking again break
+`NothingLeft`; a pusher draining without the role breaks `OneTaker`), and 3 witnesses (a
+pusher that drains, a second pass, a drainer taking the role back). TLA+ steps are
+sequentially consistent, so the model checks the protocol; the loom models in
+`src/rt/handshake.rs` check the code, with two calibrations that must lose a wake (no look
+after publishing; the pair relaxed with no fence).
+
+## A shard's inbox
+
+`inbox` (`tla/inbox/Inbox.tla`) checks the queue other threads hand a shard its runnables
+through (`src/rt/inbox.rs`), linked through the tasks so a push allocates nothing, with the
+shard's park around it, at the grain of each atomic access. A pusher clears its task's link,
+swaps it in as the head, links the old head to it, then wakes the shard if it parks; each task
+is in the queue at most once and is pushed again as soon as it was taken. The shard walks from
+its own end past a stub node, hands a task out only once it read the task's link, and pushes
+the stub behind the last task before handing it out; between a push's swap and its link the
+queue is busy. Empty is the head on the stub, which the shard looks at once more after it says
+it parks. 9 configurations: 3 that must pass (two pushers three rounds each, three pushers two
+rounds each, liveness), with `NoDuplicate` (no task handed out that is not queued), `Counted`,
+`EmptyAtSleep` (a shard asleep with the head on the stub has no task queued) and no deadlock;
+3 mutations (a pusher that leaves its task's old link, and a last task handed out with the
+shard's end left on it, break `NoDuplicate`; sleeping without the look again deadlocks); and 3
+witnesses (a busy queue, the stub pushed behind the last task, a sleep a push ends). TLA+ is
+sequentially consistent: the unit tests in `src/rt/inbox.rs` run four pushing threads against
+the taker. The same queue holds a `JoinSet`'s woken members (`src/join_set.rs`), linked through
+each slot's waker: its `queued` flag keeps a waker in the queue at most once, as the scheduled
+bit does a task, and the set (`&mut self`) is the one taker; there the model's park is the set's
+awaiter, which a pusher wakes after its link.
+
+## The blocking pool
+
+`pool` (`tla/pool/Pool.tla`) checks a runtime's blocking pool (`src/rt/blocking.rs`): the
+jobs, the threads that take them and the slots idle threads wait in, at the grain of each
+atomic access. A submitter pushes its job (into the inbox's queue, checked in `inbox`), then,
+if the idle count says a thread waits, claims an idle slot and wakes its thread, else starts a
+thread while the pool has room. A thread with nothing to take counts itself idle, marks its
+slot idle and looks at the queue once more; at its keep-alive it frees its slot, leaves the
+thread count and looks once more, taking back a job no thread was started for. 9
+configurations: 3 that must pass (two submitters and two threads that may time out, with
+`RunOnce`, `Bounded`, `OneOwner` and `IdleCounted`, the idle count never below zero; liveness
+there and with one thread), 2 mutations that break `AllRan` (a thread that waits without the
+look after going idle, a leaving thread without its last look), and 4 witnesses (a wake, a look
+that finds a job, a time-out, a job taken back). The unit tests in `src/rt/blocking.rs` run a
+submit landing as the only thread goes idle (the first mutation fails it) and submitters on
+threads against threads that keep timing out.
+
+## Task blocks given back to their thread
+
+`remote` (`tla/remote/RemoteFree.tla`) checks how a task's block freed on another thread than
+its owner's goes back to the owner (`src/mem/mod.rs`), at the grain of each atomic access.
+Each thread that allocates holds a record: a list other threads push the blocks they free onto,
+linked through the blocks, and a count that bounds it (in the code, the bytes of the blocks in
+it, at most 16 KiB; the model counts blocks against an abstract bound). A freeing thread counts itself in, gives
+up at the bound, reads the head, gives up if the list is closed, and swaps its block in only if
+the head is still the one it read. The owner takes the whole list when its cache has no block,
+and as its thread ends swaps the list out and the head to closed in one step, frees all it
+holds, then lets the record go; the next thread to claim the record opens it again. 10
+configurations: 3 that must pass (three blocks, two owners one after the other and two freeing
+threads, with `ListConsistent`, `ClosedEmpty`, `BoundedList`, `OpenWhileOwned`, `CountOK` and
+`AllFreed`, every block back with the system once every thread is done; the same with a bound of
+one; and `Terminates`), 4 mutations (a push that swaps its block in whatever the head is, and a
+close in two steps, each break `ListConsistent`; a record let go before its list is closed breaks
+`OpenWhileOwned`; a push that ignores the count breaks `BoundedList`), and 3 witnesses (a push
+that finds the list closed, one that finds it full, the next owner taking back a block the first
+allocated). The unit tests in `src/mem/mod.rs` give a block back across threads, refuse
+one at a closed record and at the bound (a take-back that never runs fails two, a push past the
+bound one); `tests/zero_alloc.rs` counts no allocation for blocking jobs, detached spawns onto a
+worker and the pool's file jobs.
+
+## The remote wake handshake on a store buffer
+
+`handshake` (`tla/handshake/Handshake.tla`) checks the Dekker pair of the park handshake
+(`src/rt/handshake.rs`, measured in `src/syscore/linux/bench/wake_handshake.rs`) on a machine
+whose stores wait in a store buffer, as x86's do: each thread's buffer in order, the flush of
+its oldest store at any time, and each store, load, fence and swap of the pair. A store passed by
+a later load of another word is the one reordering of the pair a weaker ordering lets through.
+7 configurations: 2 that must pass (every access sequentially consistent, a store that waits for
+its buffer and a push that is a locked read-modify-write; relaxed accesses with a sequentially
+consistent fence on both sides), each with two wakers notifying once (`OneNotify`) and no wake
+lost (`AllEnd`); 3 mutations that lose a wake (relaxed with no fence, as the measurement's
+control lost wakes on hardware; a fence on the shard's side only; on the waker's side only);
+and 2 witnesses (both sides see each other; a notification). `lean/Nuclei/Handshake.lean` proves
+the two facts the pair takes from the total order: one load comes after the other side's store,
+and of a burst of swaps of the raised flag exactly the first reads it up.
+
+## A timer for a thread that runs no shard
+
+`timer` (`tla/timer/Timer.tla`) checks how a sleep polled on another runtime's thread is fired
+by a nuclei shard (`src/time/sleep.rs`). The sleep cannot touch the shard's wheel, so it posts
+an arm request into the shard's mailbox and waits on a small shared cell (a fired flag and a
+waker slot). The shard applies its mailbox in order, arms the timer, and when the deadline
+passes sets the flag, wakes the waker and removes the entry. Dropping the sleep marks the cell
+cancelled, takes the waker out and posts a cancel; the shard removes the entry if it has it. The
+family checks 10 configurations: 4 that must pass (awaited and dropped, each with every safety
+property and with liveness), 3 mutations (a fire that leaves its entry in the wheel and a
+cancel that does not remove it break `NothingLeft`; a drop that leaves its waker in the cell
+breaks `NoWakeAfterDrop`), and 3 witnesses (a drop after the timer was armed, a drop before
+the shard applied the arm request, a fire that wakes the task). A dropped sleep's deadline may
+never come within a run, so a cancel that did not remove its entry shows as a leak, as it would
+be for a far deadline. The waker slot's register-then-look-again handshake guards a waker that
+changed between polls; one task cannot show that, and it is checked by the loom models of the
+sync module's waker cell.
+
+## A paused clock that moves by itself
+
+`clock` (`tla/clock/Clock.tla`) checks how a runtime's paused clock jumps to the earliest
+armed timer when the runtime has nothing else to do (`src/rt/paused.rs`, the park path of
+`src/rt/shard.rs`, the job count of `src/rt/blocking.rs`). Each shard publishes its deadline
+and counts a park before it says it parks; parked, it claims the advance, looks at every shard
+(parked with nothing pushed, noting its park count and deadline), looks again (the same,
+unchanged), moves the clock to the earliest deadline and wakes the shards whose timers came
+due. A shard that wakes, or that finds work as it is about to sleep, waits for an advance in
+progress before it reads the clock. A blocking job wakes its task before it counts itself out
+of the jobs in flight, then tries the advance too. The family checks configurations that must
+pass (two shards with a pusher and a blocking job; two shards with a timer each, the scenario the
+races below need; three shards; timers armed again by the tasks they wake), each with
+`ClockNeverPassesArmed` (no jump leaves an armed timer behind),
+`NoBadJump` (every jump comes over a moment, between its two looks, at which every shard was
+idle, with no job in flight) and the liveness property `TimersFire` (every armed timer fires:
+no runtime hangs with its shards asleep and a timer armed); one mutation per rule (a deadline
+published after the park, a busy path that does not wait for the advance, one look instead of
+two, a woken shard that does not wait, no look at the jobs, no attempt at the park); and a
+witness that the clock jumps at all. Writing the model found the first two of those races in the
+first version of the code (a deadline published after the park, a busy path that did not wait);
+the code was fixed before it was committed.
+
+## The guard of an IO source's side
+
+`side` (`tla/side/Side.tla`) checks how a poll and the shard's driver share one side of an IO
+source without losing an edge or a wake, and without either ever waiting for the other
+(`src/io/side.rs`, `src/io/source/read.rs`). The side's word has a busy bit (someone holds it
+for one step), a ready bit (an edge came while it was held) and a waiting bit (a poll found it
+held and waits to be woken). Bytes arrive in the kernel, each with an edge for the driver,
+which takes the side with one fetch-or of busy and ready: free, it holds the side and serves
+the edge (the cache is cleared, and with a reader waiting it reads into the read-ahead and wakes
+the reader, or marks the cache blocked); held, the ready bit it left is the holder's to serve.
+The reader takes the side with one fetch-or of busy: free, it takes the read-ahead, or (unless
+the cache says the call would block) runs the driver's read at once into the read-ahead and
+takes that, or registers its waker. Held, it stores its waker in the contended set and raises
+the waiting bit; if that showed the side free, it takes the side once more, else it sleeps until
+the holder wakes it. Letting go is one compare-and-swap from the word the holder took to zero;
+when flags came meanwhile it fails, and the holder takes them with one swap, still holding: the
+ready bit, it does the driver's part (and its own step again if it waited); the waiting bit, it
+takes the contended wakers, which it wakes once it has let go.
+
+16 configurations: 3 that must pass (two and three bytes with `Conservation`, no byte lost or
+made up, and `Exclusive`, one holder at a time; and liveness under weak fairness), 7 mutations
+(a driver that drops an edge on a held side, one that flags in a step of its own after looking,
+a holder that lets go without serving the ready bit, an edge that leaves the cache blocked, a
+holder that wakes nobody for the waiting bit, and a contended reader that sleeps without looking
+whether the side came free each end in a deadlock; a take that refuses a free side carrying a
+flag breaks `Termination`), and 6 witnesses (a flag, a reader doing the driver's part, a read
+the driver completes on an edge, a reader's submit that runs the driver's read at once, a
+contended reader woken by the holder, and a contended reader that finds the side free and takes
+it). Bytes are a count and there is one reader: several tasks waiting on one side share its
+waker list, which the driver wakes whole. The loom models in `src/io/side/loom_tests.rs` check
+the code's word with two calibrations that must strand a thread (a driver's part that forgets
+the reader's wake, and a contended poll that is never woken).
+
+`Requests.tla`, in the same family, checks the work that needs both sides of a source, a
+dropped handle's close in particular (`src/io/source/requests.rs`), against a holder on each
+side that loads the descriptor and uses it. The dropper raises the close in the source's request
+word and takes the read side with one fetch-or that also raises the side's request bit; holding
+it, it tries the write side the same way, and with both it performs the close and drops its
+object. Taking fewer, it lets go and hands its object to the source, never waiting. Sides are
+taken in one order: a holder of the read side that sees the request bit tries the write side; a
+holder of the write side lets go first, then tries the read side once. Whoever performs the
+close marks it done, and whichever of the dropper's hand-over and that mark comes second drops
+the object. The close lingers: once the dropper is done, a task drains what the handle wrote
+through a copy of the descriptor, holding the write side; finding the close not performed yet,
+it waits on the write side, and the performer wakes the write side's waiters rather than
+forget them as it does the handle's others. 11 configurations: 2 that must pass
+(`NoUseOfClosed`, no holder uses a descriptor closed under it; `PerformedOnce`; `Closed`, once
+everything else is done the close was performed and the object dropped; and liveness), 6
+mutations (a holder that ignores the request bit, or takes a raised bit for its own, breaks
+`Closed`; a dropper that performs holding one side, or drops its object before the close is
+done, breaks `NoUseOfClosed`; a holder of the write side that tries the read side while still
+holding its own livelocks, and a close that forgets the lingering drain's wake strands it, both
+breaking `Termination`), and 3 witnesses (a holder performs the close; the dropper hands its
+object over; the lingering drain waits before the close is performed). The Rust tests in
+`src/io/source/tests/requests.rs` hold a side from the test and check the same on real sockets,
+each with a mutation of the code that makes one of them fail.
+
+## Reads and writes from a task's own buffer
+
+`lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`, `tla/lent/LentFile.tla`) checks
+`read_owned` and `write_owned` on streams (`src/io/source/read.rs`, `src/io/source/write.rs`),
+where the task hands the side its own buffer and the driver reads into it or writes from it
+with no copy, and on files (`src/fs/file.rs`), where the buffer goes to a job of the blocking
+pool. The guards are abstract here (a step under one runs whole; `side` checks the side's).
+
+The read: bytes arrive in order, each with an edge, and then the stream ends. The lending task
+takes what another read left first (bytes, or the end); otherwise it lends its buffer, which
+the driver fills at once if the socket may hold bytes or on a later edge, and wakes it; the
+task takes the buffer back. It may go away while the buffer is lent: what the driver read into
+it then becomes the read-ahead. A second task reads as usual until it reads the end. While a
+filled buffer waits to be taken back, the driver reads nothing more, so a task that went away
+hands its bytes on ahead of anything read after them. 12 configurations: 5 that must pass
+(buffers of one and two bytes, a lender that may go away and one that stays, with
+`Conservation`, no byte lost or made up; `Order`, each task gets its bytes in order;
+`NoScribble`, the driver reads only into a buffer the side has; `AllTaken`, every byte is
+taken; and liveness), 4 mutations (a lender that goes away and takes its bytes with it breaks
+`Conservation`; reads that go on while a filled buffer waits break `Order`; a buffer taken back
+while the side still counts it lent breaks `NoScribble`; a fill that wakes nobody ends in a
+deadlock), and 3 witnesses (the driver fills the buffer on an edge, the lender's own poll fills
+it at once, a lender that went away leaves its bytes to the read-ahead).
+
+The write: the socket is full and a byte waits in the write-behind. The lending task lends a
+buffer of three bytes, which the driver writes after the write-behind as the peer makes room,
+and a later copied write waits until it is out. A lender that goes away has its write withdrawn
+if none of it went out, and finished by the driver if some did, so the wire carries 1 2 3 4 5
+or 1 5 and never part of the buffer. 12 configurations: 5 that must pass (sockets that hold one
+and two bytes, a lender that may go away and one that stays, with `WireOrder`, the bytes in
+order and the buffer whole or not at all; `Delivered`, everything written reaches the peer;
+`NoScribble`; and liveness), 4 mutations (withdrawing a write that started and a copied write
+that passes the lent buffer break `WireOrder`; a task that takes its buffer back once some of
+it went out breaks `NoScribble`; an end that wakes nobody deadlocks), and 3 witnesses (a buffer
+that goes out over several calls, the driver finishing the write of a task that went away, a
+withdrawn write).
+
+The file (`LentFile.tla`): the file has a cursor and an epoch, which every write and seek
+moves on, and its jobs run on the blocking pool or the ring of the task's shard, in any order;
+a write on the ring may land in two parts, and a shard that goes has its ring's calls made on
+the pool, from where they stopped. Two tasks each read one cell at the cursor into their own
+buffers: a read waits for the write in flight, its job reads at the cursor, and its result
+counts only if the cursor and the epoch are still those it read at, else it reads again. A
+third task writes a cell from the pool, then one from its own buffer (which waits for the write
+in flight and then is that write), then seeks back to the start. Any task may go away while its
+job is out: a read job is cancelled or its result dropped, and a lent write still lands. A file
+opened to append makes its writes on the pool at its end, wherever the cursor was; once one
+landed the cursor is the end of it; and its writer appends once more after the seek. 18
+configurations: 5 that must pass (tasks that may go away and tasks that stay, and a file opened
+to append, with `NoStaleRead`, a read counts only a value its cell still holds; `NoTornRead`,
+no read counts a cell a write landed only part of; `AllLanded`, every accepted write is in the
+file at the end; for the append, `NoOverwrite`, no append writes over what the file holds, and
+`CursorAtEnd`, the cursor is the file's end once an append landed; and liveness, twice), 7
+mutations (a result that counts on the cursor alone breaks `NoStaleRead`, through the seek back;
+a lent write that goes in flight over the one there, a lent write cancelled when its task goes
+away, a write cut short on the ring that counts as done, and a write on the ring cancelled with
+its shard that ends there break `AllLanded`; an append that lands where the cursor was breaks
+`NoOverwrite`; a cursor that stays where an append was made breaks `CursorAtEnd`), and 6
+witnesses (a read that reads again, the write of a task that went away landing, a read after the
+seek that counts the lent write's value, a write on the ring landing in two parts, one cut short
+whose shard went finished on the pool, an append after the seek landing at the end). In Rust a
+seek needs the handle exclusively, so it cannot overlap a read; the model lets it, so the epoch
+rule is checked for any path that moves the cursor back.
+
+The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
+rules on real sockets and files, each with a mutation of the code that makes one of them fail.
+
+## A caller's own descriptor
+
+`asyncfd` (`tla/asyncfd/AsyncFd.tla`) checks `AsyncFd` (`src/io/async_fd.rs`) and the side's
+state for a caller's descriptor (`Kind::Fd`), at the grain of each atomic access. A peer writes;
+on epoll and kqueue each write brings an edge that marks the side ready and counts it, and on
+io_uring a poll armed while the side is not ready and a task waits completes once the socket
+holds bytes. The task waits until the side is ready, notes the count (its guard's tick) and
+makes its own call; a call that would block clears the side only if the count is still the
+tick, since an edge after the call is the only one it gets. 5 configurations: 3 that must pass
+(edges and the ring's poll with `AllTaken`, every byte taken, and edges with `Counted`), a
+mutation that breaks `AllTaken` (a clear that does not look at the count), and a witness (a
+clear that finds a newer edge and keeps the side ready). The unit tests in
+`src/io/async_fd.rs` place an edge between the call and the clear on each side (the mutation
+fails both), and `tests/async_fd.rs` reads every byte of a peer that writes while the caller
+reads, on each backend.
+
+The same family checks a socket's side turning from the handle's own IO to its caller's calls
+(`try_io`, `async_io` on the sockets; `CallerMode.tla`, `CallerWrite.tla`). On the read side the
+task reads once through the handle, which reads ahead and, on io_uring, keeps a multishot
+receive out; then its own calls fail while the handle holds data read ahead (the handle's reads
+take it first), stop a receive still out and wait for it to end, and from then on follow the
+edges and polls as above. On the write side the bytes the handle wrote behind go out before a
+send of the caller's. 11 more configurations: 6 that must pass (edges and the ring, four writes,
+with `InOrder`, every byte taken once in the order written, and `AllTaken`; four bytes behind and
+three of the task's own with `OutOrder` and `AllOut`), 3 mutations (a call with data read ahead
+breaks `InOrder`; a stopped receive that ends with the side ready and wakes nobody breaks
+`AllTaken`; a send with bytes still behind breaks `OutOrder`), and 2 witnesses (a call that finds
+data read ahead, a stop that ends the receive with nothing brought). `tests/net_caller.rs` runs
+each case on both Linux backends, and the three code mutations fail it.
+
+## A source's operations on its shard's ring
+
+`ring` (`tla/ring/RingOp.tla`) checks how a side of a source works on an io_uring ring
+(`src/io/source/ring.rs`, `src/io/source/write/ring.rs`, `src/rt/shard/ring.rs`) when the
+side is held from another thread than the ring's. A task there writes twice; each write is
+accepted into the side, and the side's operation goes to the ring one at a time. Only the
+ring's own thread submits: a task elsewhere posts a kick once it has let go of the side, and
+the ring's thread submits what the side wants. Submitting raises the side's flag (an operation
+is out) and the source's count of operations in the kernel. When the kernel completes one, the
+ring's thread lowers the count, leaves the completion in the side's one-slot mailbox and
+defers it to the side: applied at once if the side is free, else by its holder as it lets go,
+which then asks for the next operation. A retire deregisters the source, cancels what is out
+and waits until the count is zero: it puts its waker in, raises a flag, and only then looks at
+the count, while the ring's thread lowers the count and then looks at the flag. 11
+configurations: 3 that must pass (`OneOut` and `NoOverwrite`, one operation out and one
+completion in the mailbox at most; `SingleIssuer`, only the ring's thread submits;
+`RetiredIdle`, once the retire returned the kernel holds no operation of the source; the
+retire returns; and with no retire, both writes go out), 6 mutations (a second operation out
+while one is breaks `OneOut`; a task that submits from its own thread breaks `SingleIssuer`;
+a want left unkicked keeps the writes from going out; a completion that wakes nobody, and a
+retire that looks at the count before raising its flag, keep the retire from returning; a
+retire that does not wait breaks `RetiredIdle`), and 2 witnesses (the task's thread applies a
+completion as it lets go; the retire waits for one).
+
+`tla/ring/RingLent.tla` checks `write_owned` through the ring when its task may go away while
+the buffer is out with the kernel: the kernel takes some of the buffer, or, if a cancel came
+before it took any, completes cancelled; the task's going asks for that cancel when nothing
+went out yet; a completion that leaves an abandoned buffer with nothing sent withdraws it, and
+one that leaves part of it sent goes on to the end. 6 configurations: 2 that must pass
+(`WholeOrNothing`, the stream gets the buffer whole or not at all; and the write ends), 2
+mutations (withdrawing a write part of which went out breaks `WholeOrNothing`; leaving the rest
+of an abandoned write unsent keeps it from ending), and 2 witnesses (a withdrawn write; an
+abandoned write finished after part of it went out).
+
+`lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
+every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
+table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its
+submission to its completion. For every sequence of operations from a fresh table it proves
+that a free slot is held by nobody, named by no entry and holds no open copy (`inv_run`); that
+a slot a source takes has no entry naming it, so an entry on its way never reaches the next
+source's file (`taken_slot_is_unnamed`); that a free slot is never freed again
+(`no_double_free`); and that a copy closes only once no source holds it and no entry names it
+(`copy_closes_unnamed`); and it computes the worked example of a slot released with a read out
+and handed out again only once the read completed (`example_reuse_waits`). The Rust tests in
+`src/rt/shard/ring/tests.rs` run sources past a full table, a retire with a read out and a
+shard that goes with one, each with a mutation of the code that makes one of them fail.
+
+## The timer wheel
+
+`lean/Nuclei/Wheel.lean` checks the arithmetic of each shard's timing wheel
+(`src/time/wheel.rs`): six levels of 64 slots, one millisecond wide on level 0 and 64 times
+wider on each level up. A timer goes to the lowest level whose window holds both the wheel's
+time and the timer's deadline, in the slot the deadline falls in; when the wheel's time reaches
+that slot, a level-0 timer fires and a higher one is placed again. For every wheel time and
+every deadline the file proves: the slot is after the wheel's own on its level (the wheel has
+not passed it); the deadline lies inside the slot, so the slot comes no later than the
+deadline; on level 0 the slot is the deadline itself, so a timer fires exactly on time; placing
+a timer again from its slot's start puts it on a lower level, so it always reaches level 0; and
+a deadline in the next top window goes to a slot the code reads as the next window's, which
+starts no later than the deadline. It computes a worked example: the wheel at 1000 and a timer
+due at 70000 go through level 2, slot 17 (from 69632), level 1, slot 5 (from 69952), and fire
+at 70000. Every theorem rests on `propext` and `Quot.sound` only.
+
+The code finds a timer's level with one exclusive-or and a count of leading zeros; the Lean
+file states the level by its definition, and a property test checks the two agree. The slot
+lists, the bitmaps and the slab of entries are checked by unit tests and by a property test
+that runs random arms, cancels, resets and advances against a model keeping every deadline: a
+timer fires in the advance that first reaches its deadline, never earlier, never later, once.
+The wheel has no unsafe code and runs on one thread, so it has no TLA+ model and no loom model.
+
+## A ring source's attach from another thread
+
+`attach` (`tla/attach/Attach.tla`) checks the attach of a source to a ring performed off the
+ring's thread, racing a close or an evict (`src/io/source/requests.rs`,
+`src/io/source/ring.rs`). The performing thread marks the registration under way and posts the
+ring a copy of the descriptor; the ring's thread puts the file into its table and hands the
+slot back as a request, which whoever performs it (both sides held) keeps if the attach is
+still wanted, or lets go. After the evict the source may attach to another shard under a token
+of the same number (every shard numbers its own), so the ring's look and the install's taking
+check the registration's shard with its token. 12 configurations: 5 that must pass (a close, an
+evict, both, liveness, and an evict followed by an attach to another shard), 3 mutations (2
+that leak the file into the table of a closed source, `NoLeak`; a look and a taking by the
+token alone, which hand the source registered with the other shard a slot of this ring's table,
+`NoForeignSlot`), and 4 witnesses.
+
+## A shard that goes
+
+`going` (`tla/going/Going.tla`) checks how a shard that goes waits for the evictions of its
+sources (`src/rt/shard/going.rs`, `src/io/source.rs`, `src/io/source/requests.rs`) before it
+looks at what its ring has out. The shard evicts a source with a receive out on its ring, at
+once or, while another thread holds a side, by that holder as it lets go, and waits until the
+source is no longer registered with it; then its mailbox, where the eviction left the cancel,
+ends the receive. A task on another shard registers the source as soon as the eviction is done,
+under a token of the same number, and its receive goes out once the old one has ended. The
+wait checks the registration's shard with its token, and every end of a registration (a failed
+ring attach too) clears the shard. 9 configurations: 4 that must pass (the shard's own
+eviction, a holder's, a registration that was a failed attach, and that with a holder and the
+other shard), with nothing left out on the ring once the shard has gone and everything ending;
+3 mutations (a wait by the token alone, which waits for the other shard's registration while
+that one's receive waits for this shard's cancel, `AllEnd`; a failed attach that keeps its
+shard, `AllEnd`; no wait, which lands the holder's cancel after the shard has gone,
+`NoStrandedOp`); and 2 witnesses (the other shard's registration under the same number while
+the shard waits; a holder's eviction).
+
+## A blocking job of a Windows handle
+
+`job` (`tla/job/Job.tla`) checks the cancel of a pool thread's call on a Windows handle opened
+for synchronous IO (`src/io/source/port.rs`, `Job`): `CancelSynchronousIo` ends whatever call
+the thread is in, so a cancel must never land after the job's call, in a later call of the
+same thread, and must never be lost. 8 configurations: 2 that must pass, 3 mutations (no
+CANCELLING flag lets a cancel stray into a later call; no retry deadlocks; no OUT flag breaks
+termination), and 3 witnesses.
+
+## A stopped shard's completion port
+
+`port` (`tla/port/PortKeep.tla`) checks how a Windows shard that stops running hands its
+completion port to a keeper, and how a source moves off that port while operations are still
+out (`src/rt/shard/port.rs`, `src/rt/park/iocp.rs`, `src/io/source/port.rs`). The shard
+waits for every eviction a side's holder performs, delivers what the port has ready, and
+hands the rest to a keeper job, which drains the port until nothing is out or the shard runs
+again; the shard calls off a keeper that has not started, and stops and waits for one that
+keeps, so one thread at most drains the port. A source's registration on another port waits
+while its handle has operations out (Windows cannot move it then) and is made again as the
+last one ends: the registration raises a flag and looks at the count again, the last
+completion lowers the count and looks at the flag. 13 configurations: 3 that must pass (one
+drainer and no failed registration, every packet delivered and the source registered,
+whether the shard runs again or not), 6 mutations (no keeper and no wait for the evictions
+strand packets, `AllDelivered`; no wait for the keeper and a keeper that ignores being called
+off break `OneDrainer`; no look at the count after the flag breaks `Registers`; a bind failure
+that fails the registration breaks `NoFailure`), and 4 witnesses.
+
+## Signals
+
+`signal` (`tla/signal/Signal.tla`) checks how a unix signal's deliveries reach a listener
+(`src/signal/unix.rs`, `src/signal/mod.rs`). The handler raises the signal's count, then
+writes to the process's wake descriptor; each shard's pump drains the descriptor, then
+dispatches: it loads the count, swaps it into the count the last dispatch woke for, and wakes
+the listeners if it moved. A listener takes an item when the count moved since it last looked,
+else registers its waker and looks again before it sleeps. 7 configurations: 2 that must pass
+(never an item more than the deliveries; every delivery seen), 3 mutations that lose a
+delivery (`SeesAll`: the handler writing before it counts, a pump looking before it drains, a
+listener sleeping without its second look), and 2 witnesses (deliveries coalesced into one
+item, a pump's wake).
+
+## Child processes
+
+`process` (`tla/process/ExitWatch.tla`, `tla/process/KillReap.tla`) checks how a child's exit
+is watched and reaped (`src/process/exit.rs`, `src/rt/shard/children.rs`,
+`src/rt/shard/ring/exits.rs`). `ExitWatch`: one shard at a time watches a child; a ring's
+watch is a `WAITID` that reaps the child itself, so a second watch would find ECHILD. A shard
+that stops running cancels its watch and lets the child go only at that watch's completion; a
+waiter registers its waker, has its shard watch the child unless one does (a `try_wait` before
+may have, with no waker), and looks again before it sleeps; a dropped `Child`'s child is
+watched elsewhere. `KillReap`: a kill by pid and a reap by pid exclude each other through the
+child's state, so no signal goes by pid after the reap. 12 configurations: 4 that must pass, 4
+mutations (letting go at the cancel breaks `OneWatch`; no second look and an unwatched orphan
+break `Settles`; a killer that only looks breaks `NoKillAfterReap`), and 4 witnesses.
+
+## The broadcast channel
+
+`broadcast` (`tla/broadcast/Broadcast.tla`) checks the broadcast channel's senders and a
+receiver (`src/sync/broadcast.rs`). A sender takes the next position from the tail and
+publishes it into the position's slot unless the slot holds a later position (a send a ring
+later got there first: its value goes, every receiver is past it); the last sender to go
+closes the channel. A weak sender's upgrade counts one more sender only while one is left (a
+compare-and-swap on the count), and the sender it makes sends and goes as any does. The
+receiver looks at its next position's slot: its own position is a value taken, a later one is
+a lag (it goes on from the tail, read then, less the ring's size, counting what it skipped),
+anything else is nothing yet, unless the channel is closed and its next position is the tail.
+10 configurations: 2 that must pass, with a weak sender upgrading at any point (what was taken
+plus what was reported lost is every value sent; the receiver reaches the close), 4 mutations
+(a send publishing over a later position leaves the receiver waiting for good, `Finishes`;
+stopping at the close with values in the ring, an uncounted lag, and an upgrade that makes a
+sender after the last one went, whose values come after the receiver saw the close, break
+`Counted`), and 4 witnesses (a lag; a send that finds a later position in its slot; an upgrade
+that makes a sender; one that finds none left). `lean/Nuclei/Broadcast.lean` proves the
+arithmetic, for every size: a later position found in a receiver's slot is at least a whole
+ring later, so the receiver's new position is past its old one; the ring's last positions sit
+in different slots; and a take or a lag keeps taken plus lost equal to the positions passed,
+so at the close a receiver accounts for every value sent after it subscribed.
+
+## The watch channel
+
+`watch` (`tla/watch/Watch.tla`) checks the watch channel (`src/sync/watch.rs`) at the grain of
+its atomic steps: a send's store of the value, its version bump and its wake; a modifying send's
+load, its compare-and-swap and its retry; the last sender's close and wake; `changed` making its
+`Notified`, reading the state word and deciding; a borrow's read of the version and of the value;
+the receivers' count and its wake; and a sender's `closed` waiting for the receivers to go. A
+`Notified` is abstracted to what `Notify` promises: it hears every wake made after it was made. 12
+configurations: 4 that must pass (sends; modifying sends, where no change is lost; the two mixed;
+a sender waiting for the receivers to go, which ends), with `changed` never answering closed
+while a version it has not seen is there (`ErrOnlyWhenSeen`), a borrow never pairing a version
+with an older value (`PairedNoOlder`), the version counting every publication, the receiver
+seeing the last version and ending; 5 mutations (a modifying send that stores without comparing
+loses a change, `NoLostModify`; `changed` reading the state before making its `Notified` misses a
+wake and never ends, `ReceiverEnds`; answering the closed bit first misses the last change,
+`ErrOnlyWhenSeen`; a borrow that loads the value before the version pairs it with a newer
+version, `PairedNoOlder`; a `closed` that counts the receivers before making its `Notified` never
+ends, `ProducerEnds`); and 3 witnesses (a change seen; a compare-and-swap that lost and started
+over; a borrow whose value is one send ahead of its version, the harmless extra change the docs of
+`borrow` warn of). `lean/Nuclei/Watch.lean` proves the state word's arithmetic for every word: a
+send keeps the closed bit and moves the version one step, wrapping; a close keeps the version;
+after any number of sends short of a whole turn of the word (2^63) the version differs from the
+one before them, so a receiver that slept through them hears of a change; and `mark_changed`
+always makes a change.
+
+## The cancellation token's tree
+
+`cancel` (`tla/cancel/Cancel.tla`) checks the tree behind `CancellationToken`
+(`src/sync/cancellation.rs`, `node.rs`) at the grain of its atomic steps: the making of a child
+node, its insert into its parent's registry and its read of the parent's flag; a cancel's flag
+set and its walk, reading each registry with an upgrade of each weak handle, marking what it
+found and going into all of it; and each strong handle let go, with the free, the removal from the
+registry and the walk up the chain. The tree is a root, its child and a grandchild made while one
+cancel runs on the root and, in some configurations, another on the child. The SeqCst fences are
+abstract (a TLA+ step is seen by every thread at once; the module docs and the loom models cover
+the fences), and so is the registry's walk, taken as one read. 10 configurations: 3 that must
+pass (one cancel; two at once; both, with every token dropped at the end), with a cancel that
+returned leaving every descendant that existed as it began cancelled or freed
+(`CancelReturnsWithSubtree`), a child made during a cancel cancelled once both returned, no walk
+touching a freed node, a freed node in no registry, and with every token gone the whole tree freed;
+5 mutations (a child reading its parent's flag before its insert stays uncancelled,
+`RacingChildCancelled`; a walk that does not go into a child another cancel marked returns before
+that subtree is cancelled, `CancelReturnsWithSubtree`; a walk using the weak handles without
+upgrading them reaches a freed node, `NoTouchFreed`; a freed node left in its parent's registry,
+`RegistryHoldsTheLive`; a freed node that does not let go of its parent leaks the chain, `NoLeak`);
+and 2 witnesses (a new child cancelling itself; a walk going into a child another cancel had
+marked). `lean/Nuclei/Cancel.lean` proves the free's walk up a chain of any length: letting go of
+one handle frees exactly the nodes at the start of the chain that held their last handle, the next
+one loses one handle and stays, no node with another handle is freed, and a chain of last handles
+goes whole, whatever its length.
+
+## The barging semaphore
+
+`semaphore` (`tla/semaphore/Semaphore.tla`) checks the semaphore that `Semaphore`, `Mutex` (one
+permit) and `ReentrantMutex` build on (`src/sync/raw_semaphore.rs`, with the acquire of
+`src/sync/contend.rs` and the drain role of `src/sync/queue.rs`), at the grain of its atomic
+steps: the state word (free permits, the closed bit, `QUEUED`, `NUDGE_OUT`, `HANDOFF`,
+`WAKE_FRONT`, and the drain role's `DRAINING` and `DIRTY`), the owed count, the arrival stack and
+the waiting list, and every waiter node (its phase, its nudge and owed marks, what a grant gave
+it); each compare-and-swap of an attempt, an enqueue, a release, the owe-or-take and its
+settling, a withdrawal and the close; and the drain's passes, each grant and each nudge. The
+spin before queueing is abstract (more attempts of the kind other callers' barging already
+makes), so is the node's waker handshake (the waiter machinery's part), and so is the list's
+sweep of withdrawn waiters (one step). 15 configurations: 6 that must
+pass (a mutex locked three times past one wait; two tasks locking twice each; a wait given up
+between two locks, with a handoff owed from the first loss; the same with two tasks, where every
+task's ending is checked too; two permits with a request for both behind requests for one; a close
+while two tasks lock), with the permits always adding up (`Conservation`) and all back at the end,
+one holder at a time for a mutex, no waiter passed over more than `MAX_BYPASS` times while it
+waits (`BypassBounded`), nobody barging while the handoff bit is up, nothing admitted after the
+close, no waiter left on the arrival stack once the drain role is free (`NoStrandedArrival`), and
+every task ending; 6 mutations (a release that never asks for a pass leaves a waiter for good,
+`AllTasksEnd`; a drain that gives up its role over a change made during its pass strands a
+waiter that queued meanwhile, `NoStrandedArrival`; the last allowed loss raising no handoff lets
+the waiter be passed over again, `BypassBounded`; an attempt that ignores the handoff bit barges
+past the owed waiter, `NoBargePastOwed`; a waiter that leaves keeping what a grant gave it leaks
+the permits, `PermitsBackAtEnd`; an attempt that ignores the closed bit is admitted after the
+close, `NoAdmitAfterClose`); and 3 witnesses (the handoff raised; a grant given back by a waiter
+that took on its own or left; a nudge finding its waiter still carrying the last one, which keeps
+the marker up). Two of the model's first properties were stronger than the code's promises and
+were corrected to them: a caller may take between a waiter's owe mark and its compare-and-swap,
+which then raises the bit (`NoBargePastOwed` is about the bit), and a waiter granted while it
+retried loses only to the permits taken for itself, which passes it over for nobody (the code
+counts it, capped at `MAX_BYPASS`). `lean/Nuclei/Semaphore.lean` proves the pass's choice of whom
+to nudge, for every line and budget: never more than the line, within the free permits (plus the
+front's request after a release), an unfit front stops the walk, a release wakes the front, and
+the walk stops at the first waiter that does not fit what those before it left, so a smaller
+request behind a large front is never served first by a nudge.
+
+## Notify
+
+`notify` (`tla/notify/Notify.tla`) checks `Notify` (`src/sync/notify.rs`, on the drain role of
+`src/sync/queue.rs`) at the grain of its atomic steps: the stored permit, `QUEUED` and the drain
+role's bits; the generation and the owed counts of `notify_one` and `notify_last`; the arrival
+stack and the waiting list; each node's phase and payload; and each transition, pass and grant,
+with a waiter's first look (a moved generation, or the permit with nobody queued), its enqueue
+and its drop. The node's waker handshake and the list's sweep are abstract, as in the semaphore
+model. 12 configurations: 6 that must pass (two waiters and a `notify_waiters`, and a
+`notify_one` then a `notify_waiters`, in any order, where every waiter made before the last
+`notify_waiters` ends; two queued waiters and two `notify_one` calls, and a `notify_last` then a
+`notify_one`, where both end; the same calls in any order, safety only, since two calls before
+anybody waits store one permit; a waiter dropped beside one that awaits, which ends), with no
+waiter done without a notification made since its `Notified` was (`NoSpuriousWake`), no
+`notify_one` serving more than one waiter, and no waiter left on the arrival stack once the role
+is free; 4 mutations (a `notify_waiters` that asks for no pass leaves its waiters,
+`AwaitersMadeBeforeAWaitersCallEnd`; a pass that reads the generation before it takes the
+arrivals wakes a newer arrival, `NoSpuriousWake`; a dropped waiter keeping a `notify_one`'s grant
+leaves the other waiting, `EveryAwaiterEnds`; a drain giving up its role over a change made
+during its pass strands an arrival, `NoStrandedArrival`); and 2 witnesses (a permit stored; a
+grant passed on). `lean/Nuclei/Notify.lean` proves the pass's accounting of owed wakes for every
+line and count (each served or left over for the permit, no more served than wait, something
+left over only once every waiter was served) and that a masked generation is never one of the two
+grant markers.
+
+## The barrier
+
+`barrier` (`tla/barrier/Barrier.tla`) checks the reusable barrier (`src/sync/barrier.rs`, on the
+drain role of `src/sync/queue.rs`) at the grain of its atomic steps: the arrival count's
+`fetch_add` (an arrival's generation, and whether it leads), the leader's transition, each
+waiter's enqueue and drop, and each pass, which reads the current generation from the count after
+it took the arrivals. The node's waker handshake and the list's sweep are abstract, as in the other
+models of the drain role. 8 configurations: 3 that must pass (two tasks waiting twice at a barrier
+of two, two generations; three tasks at a barrier of two, the third waiting for a second
+generation by design; a wait dropped, its arrival still counted), with no wait completing before
+its generation had every arrival (`NoEarlyRelease`), one leader per generation, no waiter left on
+the arrival stack, and every wait of a finished generation that was not dropped completing; 4
+mutations (a leader that asks for no pass leaves its generation waiting, `ReleasedTogether`; a
+pass that reads the count before it takes the arrivals, and one that grants arrivals of the
+current generation, release a wait early, `NoEarlyRelease`; a drain giving up its role over a
+change strands an arrival, `NoStrandedArrival`); and 1 witness (a wait of the second generation
+completes: the barrier is reused). `lean/Nuclei/Barrier.lean` proves the generation arithmetic for
+every size: a generation is exactly `n` arrivals, its last leads it and only it, the leader's
+arrival completes it, and a generation behind the count had every arrival.
+
+## The event and the latch
+
+`event` (`tla/event/Event.tla`) checks the one-shot `Event` and the `Latch` built on it
+(`src/sync/event.rs`, `src/sync/latch.rs`): the `SET` bit and its transition (nothing when set,
+a draining one when somebody is queued), each wait's first look, enqueue and drop, each pass,
+and the latch's count with each compare-and-swap of `count_down`, the one that takes it to zero
+setting the event. 7 configurations: 4 that must pass (two waiters and an event set twice; a
+waiter dropped beside one that awaits; a latch of two counted down by two threads; and by three,
+the third finding it open), with no waiter done before the set (`NoEarlyWake`), the latch never
+open before its count reached zero, no waiter left on the arrival stack, every waiter not dropped
+ending once the event is set, and the latch opening once counted; 3 mutations (a set with
+waiters queued that asks for no pass leaves them, `AllWokenAfterSet`; a latch that sets the event
+one count early, `LatchOpensAtZero`; a drain giving up its role over a change,
+`NoStrandedArrival`).
+
+## The once-cell
+
+`oncecell` (`tla/oncecell/OnceCell.tla`) checks `OnceCell` (`src/sync/once_cell.rs`) at the grain
+of its atomic steps: the value pointer (null, the slot's marker, or a racing builder's box) and
+each compare-and-swap on it; the slot's write and its take-back after a lost publication; the turn
+to write the slot (its permit, the close that ends every wait for it, and each wait); and each
+asynchronous initializer's look, wait, second look, run (which may fail or be dropped) and
+publication, each racing builder's, and each `set`. The turn's semaphore is abstract here (one
+permit and a closed bit); its own protocol is the semaphore family's. `SetOnce` is a once-cell with
+an `Event` beside it (the event family), and `Lazy` fills its cell as a racing builder does, so
+both are covered by these two models. 10 configurations: 5 that must pass (two initializers; one
+that fails, then one that succeeds; one dropped mid-run, then one that succeeds; an initializer, a
+racing builder and a `set`; three initializers, one failing and one dropped, with a builder and a
+`set`), with every call answering the one published value (`OneValue`), one writer of the slot at
+a time, no initializer run over a value that was there as it took the turn, every call ending, and
+the cell filled; 4 mutations (a publication that does not close the turn's semaphore leaves a
+waiter for good, `EveryCallEnds`; an initializer that does not look again after taking the turn
+runs over a builder's value, `NoInitAfterPublish`; a failed initializer that keeps the turn,
+`EveryCallEnds`; a `set` that writes without the turn, `OneWriter`); and 1 witness (an initializer
+that loses its publication to a builder and answers the builder's value).
+`lean/Nuclei/OnceCell.lean` proves the pointer's state machine for every sequence of attempts: a
+published value stays, every answer after it is that value, and from an empty cell the first
+attempt wins.
+
+## The reader-writer lock
+
+`rwlock` (`tla/rwlock/RwLock.tla`) checks the lock that `RwLock` and `ReentrantRwLock` build on
+(`src/sync/raw_rwlock.rs`, with the acquire of `src/sync/contend.rs` and the drain role of
+`src/sync/queue.rs`) at the grain of its atomic steps: the state word (the readers, the writer,
+upgradable and upgrading bits, and the queue's bits), the owed count, the arrival stack, the
+waiting list and the upgrade's own slot, every node, each compare-and-swap of an attempt, an
+enqueue, each kind's release, a downgrade, an upgrade (the upgrading bit, the write at once with
+no reader inside, or the wait in its slot and the finish) and the owe-or-take, and each pass with
+its upgrade grant, its handoffs in order (stopping after a writer) and its nudges (the front, and
+the readers behind a sharing front). The spin, the node's waker handshake and the list's sweep
+are abstract, as in the semaphore model. 14 configurations: 8 that must pass (reads beside a write;
+writers; an upgrade beside a read; a downgrade beside a read; two upgradable reads; reads barging
+past a waiting writer, which is owed a handoff in the end; a write dropped beside readers, with
+three tasks for safety and with two for the ending too), with the state word matching exactly
+who holds what (`StateMatches`), a writer alone and one upgradable read at most (`Exclusion`), no
+read entering while an upgrade is under way, no upgrade finishing over a reader, the bypass bound,
+no barging while a handoff is owed, no waiter left on the arrival stack, the lock free at the end,
+and every task ending; 4 mutations (a read that ignores the upgrading bit,
+`NoReaderWhileUpgrading`; a pass that grants the upgrade with a reader inside,
+`NoUpgradeOverReaders`; a release that never asks for a pass, `AllTasksEnd`; a drain giving up
+its role over a change, `NoStrandedArrival`); and 2 witnesses (an upgrade that waits in its slot;
+a downgrade). `lean/Nuclei/RwLock.lean` proves the state word's rules for every state: each
+admitted entry, each release, a downgrade and an upgrade's finish keep a writer alone with
+upgrading tied to the upgradable read; an upgrade holds reads back; and a write needs the lock
+empty.
+
+## The reentrant locks
+
+`reentrant` checks the two locks an owner may lock again, at the grain of their atomic steps.
+`tla/reentrant/ReentrantMutex.tla` checks `ReentrantMutex` (`src/sync/reentrant_mutex.rs`, keyed
+by `src/sync/owner.rs`): the holder id's loads and stores, the depth, and the permit's take, wait
+and release, with the semaphore under it abstract (its protocol is the semaphore family's).
+`tla/reentrant/ReentrantRwLock.tla` checks `ReentrantRwLock` (`src/sync/reentrant_rwlock.rs`): the
+writer id, the write depth, each record's owner and reads, each lookup, a claim's look and its
+compare-and-swap (which a racing claim can beat, and whose walk may miss a record freed behind
+it), the push, and the plain lock's shares, with the plain lock abstract (its protocol is the
+rwlock family's). 24 configurations: 5 that must pass (two owners that lock two deep, let one go
+and lock again; one three deep beside one that locks twice; a writer that reads inside and lets
+the write go first, a downgrade, beside a reader two deep; a writer that lets its read go first
+beside a reader refused the write; two readers whose claims race for a freed record), with one
+holder at a time and its depth its guards, a lock again only ever the holder's, a writer alone,
+the plain lock's shares exactly the owners', every guard covered by a share, one record per
+reading owner holding its read guards, the lock free at the end, and every owner ending; 13
+mutations (the permit given back before the id is cleared, and every unlock clearing it,
+`AllOwnersEnd`; the id never cleared, `Exclusion`, `FreeAtEnd` and `NoFalseReenter`; a lock again
+that leaves the depth, `DepthMatches`; the last write given back though its owner reads,
+`GuardsCovered`; the last read giving a share back under its owner's write, `SharesMatch`; a
+reading owner's write not refused, `AllOwnersEnd`; a read taking no share beside any writer,
+`Exclusion`; a claim without its compare-and-swap, `ReadsMatch`; a read that does not look for
+its own record, `OneRecordEach`; the writer id kept, `FreeAtEnd`); and 6 witnesses (two deep; a
+wait behind the holder; a refusal; a downgrade; a record claimed again; a claim beaten by a
+racing one). `lean/Nuclei/Reentrant.lean` proves, for one owner at every depth (the TLA+ model
+checks a few levels), that the mutex's owner holds the permit exactly while its depth is above
+zero, and that the reader-writer lock's owner holds exactly the share its read and write depths
+call for after any steps, a write being refused exactly when the owner reads without writing.
+
+## The waiter node
+
+`waiter` (`tla/waiter/Waiter.tla`) checks the node every contended future of the sync primitives
+parks in their queues (`src/sync/waiter/`), at the grain of its state word's compare-and-swaps and
+of each access to its two waker slots: a future arms the node and queues it, registers a new
+waker in the slot a take under way is not reading and reads the marks in the swap that arms it,
+spins with its waker disarmed, is polled without a wake (a combinator, say), marks itself owed,
+and leaves by withdrawing; drain passes in turn nudge and grant it, claiming the armed waker for
+the pass's wake list; each wake list takes the waker, claims again one armed meanwhile on a
+granted or nudged node, and calls them beside the later passes; and the node goes back to the
+pool with its last reference, for the next future to take. 16 configurations: 4 that must pass (a
+spin and a spurious poll; a leave and an owed mark; two nudges; two futures through the pool),
+with no slot touched by two parties at once, no party acting after it let go of its reference,
+nothing referenced in the pool, the waker never armed while the future registers, the owed count
+settling to zero, no waker claimed while the future spins, and everything ending with the
+future's latest waker the one called; 7 mutations (a claim while the future registers and a
+registration in the slot a take reads, `SlotExclusive`; a take that does not claim again and an
+arming swap that does not read the marks, `AllEnd`; a spin that keeps its waker armed,
+`NoClaimWhileSpinning`; a queue release that frees the node whoever holds it, `NoStaleAccess`; a
+queue release that forgets the owed mark, `OwedSettled`); and 5 witnesses (a claim again, a mark
+during a spin, a reuse through the pool, an owed mark settled by the queue, a leave that takes
+back its armed waker). The registering test of `claimable` is implied by its armed test, since
+every swap that sets the registering bit clears the armed one (`ArmedApart`): the mutation takes
+both away. `lean/Nuclei/Waiter.lean` checks the word's own constants and expressions over all
+4096 values: a claim takes the current slot, sets the taking bit and the wake reference and keeps
+the phase, the marks and the other references, and a node just claimed is not claimable; the
+register swap disarms, picks the slot a take under way is not reading and keeps the marks; the
+arming swap arms and takes the nudge; a take that claims again keeps its bits, and one that ends
+clears only its own.
+
+## The run loop's looks at its driver
+
+`loop` (`tla/loop/RunLoop.tla`) checks how often a shard's run loop looks at its IO driver
+(`src/rt/shard.rs`, `Shard::block_on`). Each turn, in any order, either a task runs, or no
+task runs and the future woke itself again, or nothing is ready and the loop spins and parks
+(both look). Every `N` task runs bring a look without waiting, and so do every `N` turns of
+the future's own. 4 configurations: 1 that must pass (the driver gets a look at least once
+every `2N - 1` turns, `BoundedGap`), 1 mutation (not counting the future's own turns lets a
+future that keeps waking itself starve the driver, breaking `BoundedGap`: the bug a test
+caught, where IO such a future waited on never completed), and 2 witnesses (a look that came
+from the future's turns; `2N - 2` turns without a look, so the bound is the tightest).
+
+## A ring's overflow count
+
+`lean/Nuclei/Overflow.lean` checks how a ring's poller counts completion-queue overflows for
+`stats` (`src/rt/park/ring.rs`): it looks at the kernel's overflow flag before each wait's
+enter and after it took the completions, and counts a look that finds the flag set after one
+that found it clear. Over every sequence of looks it proves that an overflow counts once however
+many waits it lasts (`stutter`), that the count never passes the looks that saw the flag set
+(`at_most_seen`), that a set look after a clear one counts (`counted_after_clear`), and that two
+stretches of looks add up when the first ends clear (`split_at_clear`). Its witness shows why
+the look after the completions is there: with it two floods count two, and without it they count
+one; its mutation, counting every set look, breaks `stutter`. An overflow that begins and ends
+between two looks is seen by neither the code nor the model.
+
+## A shard handed to another thread
+
+`handoff` (`tla/handoff/Handoff.tla`) checks the shard handoff (`src/rt/handoff/`,
+`src/rt/context.rs`) on a machine whose stores wait in a store buffer of two entries, as x86's do:
+a runner leaves its shard for a task's poll (a release store of its word), comes back at the
+poll's end and at each call into the runtime from the task (a store of its word, the compiler's
+fence, a load of its claim), and cancels a pending claim with a compare-and-swap; the monitor
+sets the claim pending, runs the heavy fence (every buffer flushed at once), reads the word again
+and takes with the opposite compare-and-swap, then hands the shard to a spare with a fresh slot.
+16 configurations: 2 that must pass (two handoffs, a remote push and a bound task: at most one
+thread inside the shard, `Exclusive`, a detached thread staying out, a bound task on its creator
+only; a first poll that never returns, every remote push run anyway, `Rescued`); 6 mutations,
+each of which must break a property (no heavy fence, no second read of the word, no look at the
+claim at a poll's end or in a call into the runtime, the old runner's slot handed on: each breaks
+`Exclusive`; the new runner taking the bound tasks breaks `BoundOnCreator`; no handoff at all
+breaks `Rescued`); and 4 witnesses (a handoff, a cancel by the monitor, a call into the runtime
+from a detached thread, a cancel by the runner). `tla/handoff/Retarget.tla` checks the waker of a
+`block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
+the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
+1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old
+shard). `lean/Nuclei/Handoff.lean` proves the word's packing (its epoch and its side come back
+out, a new poll writes a word no earlier poll wrote, every epoch below `2^63` fits) and the watch:
+the monitor's streak of four is five equal reads outside the shard, which a tick apart or more
+mean the poll has run at least four ticks, and a read that missed the poll just before one that
+saw it means the poll began after it. The model takes a bound task's home as its creator thread
+and a hand-over to a spare as one step.
+
+## What is not checked
+
+- **Sizes beyond the configurations.** TLC checks every order of steps, but only for the
+  programs the configurations set: at most two slots, two senders with at most two operations
+  each, and a receiver with at most three operations. Larger cases are not checked by TLA+.
+  Lean covers every size, but only one whole operation at a time.
+- **The message queue.** The TLA+ model treats it as a sequence of cells in claim order, each
+  claimed by a send before it is written, so `PerSenderOrder` is proved for a queue that hands
+  cells out in claim order. Its lock-free implementation is kovan's, checked there (kovan's
+  own TLA+ model of the segment queue checks that order).
+- **The receiver's waker cell.** The TLA+ model treats it as one flag that a wake empties; its
+  own handshake is covered by the loom models.
+- **Memory ordering.** A TLA+ step is atomic and seen by every thread at once. Whether the
+  orderings the Rust code gives its atomics are strong enough is what the loom models check,
+  for small cases; neither TLA+ nor Lean says anything about it.
+- **The rest of the channel.** The unbounded channel, weak senders and their upgrade,
+  `Sender::closed`, `recv_many`, the waiter nodes' recycling, the waiting list's sweep of
+  withdrawn nodes, and the destructors of values are not in these models.
+- **The newer families' abstractions.** The signal model leaves out the handler's
+  async-signal-safety and its errno (code review and the signal tests' part); the process
+  models abstract the kernel's reap to one step; the port model abstracts Windows'
+  refusal to rebind a handle with operations out to a bind that fails while any are; the
+  broadcast model leaves the wake to `Notify` (checked with the sync primitives) and the
+  reclamation of nodes to kovan.
+- **How soon.** `Termination` says every waiter is eventually served under weak fairness; it
+  says nothing about how long that takes, and nothing about a thread the scheduler stops for
+  good.

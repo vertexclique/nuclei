@@ -1,0 +1,173 @@
+/* Code on the page: the panels, the copy button and the syntax colours.
+ *
+ * The snippets are written out as spans in the HTML (no highlighter runs in the browser), one
+ * class per kind of token: kw keyword, ty type, fn function or method, st string, nu number,
+ * at attribute, ma macro, md module path, pu punctuation, cm comment. The copy button copies
+ * the element's text, so the spans never reach the clipboard. */
+
+.code {
+  position: relative;
+  min-width: 0;
+  overflow: clip;
+}
+
+.code pre {
+  margin: 0;
+  padding: var(--space-lg);
+  overflow-x: auto;
+  color: var(--color-ink-2);
+  font-size: var(--text-sm);
+  line-height: 1.7;
+  tab-size: 4;
+}
+
+.code pre code {
+  font-size: inherit;
+  color: inherit;
+}
+
+.code .kw { color: var(--color-syn-keyword); }
+.code .ty { color: var(--color-syn-type); }
+.code .fn { color: var(--color-syn-function); }
+.code .st { color: var(--color-syn-string); }
+.code .nu { color: var(--color-syn-number); }
+.code .at { color: var(--color-syn-attribute); }
+.code .ma { color: var(--color-syn-macro); }
+.code .md { color: var(--color-syn-module); }
+.code .pu { color: var(--color-syn-punct); }
+.code .cm { color: var(--color-syn-comment); }
+
+/* A shell line: the prompt is drawn, not written, so selecting or copying the line never takes it. */
+.code--shell code::before {
+  content: "$ ";
+  color: var(--color-syn-punct);
+}
+
+/* A copy button in the code's top corner, over the short first line; on a narrow screen the
+ * code starts below it. */
+.code--corner .copy {
+  position: absolute;
+  z-index: 1;
+  inset-block-start: var(--space-sm);
+  inset-inline-end: var(--space-sm);
+}
+
+.code--corner pre {
+  padding-block-start: calc(var(--space-lg) + var(--space-xl));
+}
+
+@media (min-width: 40rem) {
+  .code--corner pre {
+    padding-block-start: var(--space-lg);
+  }
+}
+
+/* The copy button: default, hover, focus, active, disabled, loading (none: the copy is
+ * instant), error and success. Its three faces share one cell, so a change of state never
+ * changes its size; motion.css slides one out and the next in. */
+.copy {
+  position: relative;
+  isolation: isolate;
+  display: inline-grid;
+  flex: none;
+  min-inline-size: 5.5rem;
+  padding: var(--space-2xs) var(--space-sm);
+  overflow: clip;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  background: linear-gradient(180deg, var(--color-paper-3) 0%, var(--color-paper-2) 100%);
+  box-shadow: inset 0 1px 0 var(--color-gloss-edge);
+  color: var(--color-ink-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.copy__face {
+  grid-area: 1 / 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45em;
+}
+
+.copy__face--done,
+.copy__face--error {
+  opacity: 0;
+  transform: translateY(110%);
+}
+
+/* The success mark: a square of the liquid. */
+.copy__face--done::before {
+  content: "";
+  inline-size: 0.55em;
+  block-size: 0.55em;
+  background: var(--fill-liquid);
+}
+
+/* Light poured across the button when the copy lands. */
+.copy::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: var(--fill-accent-rule);
+  opacity: 0;
+  transform: scaleX(0);
+  transform-origin: left;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .copy:hover {
+    border-color: var(--color-accent);
+    color: var(--color-ink);
+  }
+}
+
+.copy:focus-visible {
+  border-color: var(--color-accent);
+  color: var(--color-ink);
+}
+
+.copy:active {
+  transform: translateY(var(--press));
+}
+
+.copy:disabled {
+  border-color: var(--color-rule);
+  color: var(--color-muted);
+  cursor: not-allowed;
+}
+
+.copy[data-state="copied"] {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.copy[data-state="error"] {
+  border-color: var(--color-accent-2);
+  color: var(--color-accent-2);
+}
+
+.copy[data-state] .copy__face--idle {
+  opacity: 0;
+  transform: translateY(-110%);
+}
+
+.copy[data-state="copied"] .copy__face--done,
+.copy[data-state="error"] .copy__face--error {
+  opacity: 1;
+  transform: none;
+}
+
+/* The panel the copy came from: a band of light passes over it once. */
+.code::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: var(--fill-sheen);
+  opacity: 0;
+  transform: translateX(-100%);
+}

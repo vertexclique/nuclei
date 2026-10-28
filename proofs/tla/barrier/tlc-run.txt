@@ -1,0 +1,15 @@
+TLC run of every configuration in proofs/tla/barrier, 2026-10-25 20:51 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_two_gens                        7927       4370      2  pass                                  pass                                  yes
+L_three                         141673      55328      4  pass                                  pass                                  yes
+L_drop                           13870       7588      2  pass                                  pass                                  yes
+M_leader_no_pass                  4169       2304      2  violated:ReleasedTogether             violated:ReleasedTogether             yes
+M_count_first                     1724       1054      1  violated:NoEarlyRelease               violated:NoEarlyRelease               yes
+M_grant_current                    306        197      1  violated:NoEarlyRelease               violated:NoEarlyRelease               yes
+M_exit_ignores_dirty             10628       4972      1  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
+W_second_generation               2185       1321      1  violated:NoSecondGeneration           violated:NoSecondGeneration           yes
+
+results matching EXPECTED.txt: 8 of 8

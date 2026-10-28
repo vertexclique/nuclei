@@ -1,0 +1,36 @@
+<!--title Time-->
+<!--lede Sleeps, timeouts and intervals, and a clock that tests can stop.-->
+<h2 id="sleep">Sleeps and timeouts</h2>
+<!--example time_sleep-->
+<ul>
+<li><code>sleep(duration)</code> and <code>sleep_until(instant)</code> give a <code>Sleep</code>; <code>reset</code> moves its deadline, <code>deadline</code> and <code>is_elapsed</code> read it.</li>
+<li><code>timeout(duration, future)</code> and <code>timeout_at(deadline, future)</code> give <code>Ok(output)</code>, or <code>Err(Elapsed)</code> if the time ran out first. The future is polled before the clock is read, so one that is ready at once always wins.</li>
+<li>Dropping a timer's future cancels it.</li>
+</ul>
+
+<h2 id="wheel">The clock and the wheel</h2>
+<p>Every shard has a timer wheel with millisecond slots. A timer waits at least its duration, rounded up to the next millisecond, and fires on the shard that polls it; a shard busy with a task fires it once that task yields. Arming and cancelling take constant time. A timer polled on a thread that runs no shard (another runtime's) is fired for it by a shard of the current runtime, or of the default one.</p>
+<p><code>nuclei::time::Instant</code> is the runtime's clock. It reads the system's monotonic clock until it is paused.</p>
+
+<h2 id="interval">Intervals</h2>
+<p><code>interval(period)</code> ticks every period, the first tick at once; <code>interval_at(start, period)</code> starts at <code>start</code>. <code>tick().await</code> gives the instant the tick was due, and <code>poll_tick</code> is the same wait for a hand-written future. A period of zero panics.</p>
+<!--example time_interval-->
+<table class="table">
+<thead><tr><th>MissedTickBehavior</th><th>When the interval was polled late</th></tr></thead>
+<tbody>
+<tr><td data-label="MissedTickBehavior"><code>Burst</code> (the default)</td><td data-label="When the interval was polled late">Every missed tick fires at once, one after another, until the interval is back on its schedule.</td></tr>
+<tr><td data-label="MissedTickBehavior"><code>Delay</code></td><td data-label="When the interval was polled late">The next tick comes one period after the late one: the schedule moves.</td></tr>
+<tr><td data-label="MissedTickBehavior"><code>Skip</code></td><td data-label="When the interval was polled late">Missed ticks are skipped: the next tick is the next one on the original schedule after now.</td></tr>
+</tbody>
+</table>
+
+<h2 id="paused">Paused time</h2>
+<p>Code that sleeps is slow to test. A paused clock stands still and moves only when asked, so an hour's timeout passes at once and the test still sees an hour on the clock.</p>
+<ul>
+<li><code>time::pause()</code> stops the clock of the runtime the code runs in. <code>Builder::start_paused(true)</code>, <code>#[nuclei::main(start_paused = true)]</code> and <code>#[nuclei::test(start_paused = true)]</code> start it stopped.</li>
+<li><strong>It moves by itself when nothing else can.</strong> Once every shard of the runtime is idle with a timer armed, the clock jumps to the earliest timer.</li>
+<li><code>time::advance(duration).await</code> moves it by hand and lets the timers that came due fire before it returns.</li>
+<li><code>time::resume()</code> starts it again from where it stands.</li>
+</ul>
+<!--example time_paused-->
+<p>A paused clock never goes backwards, on any thread, across a pause, a resume or an advance. While no runtime's clock is paused or advanced, reading it costs one load more than reading the system clock.</p>

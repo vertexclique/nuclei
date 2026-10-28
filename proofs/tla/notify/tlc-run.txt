@@ -1,0 +1,19 @@
+TLC run of every configuration in proofs/tla/notify, 2026-10-25 20:45 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_broadcast                     101619      40048      3  pass                                  pass                                  yes
+L_mixed                         218360      84363      6  pass                                  pass                                  yes
+L_ones                           82222      32061      4  pass                                  pass                                  yes
+L_ones_any                      186255      71036      2  pass                                  pass                                  yes
+L_last                           92943      36385      3  pass                                  pass                                  yes
+L_drop                           96897      37895      4  pass                                  pass                                  yes
+M_waiters_no_pass                15346       6160      3  violated:AwaitersMadeBeforeAWaitersCallEnd violated:AwaitersMadeBeforeAWaitersCallEnd yes
+M_generation_first               17918       7695      1  violated:NoSpuriousWake               violated:NoSpuriousWake               yes
+M_drop_keeps_grant               40327      16408      4  violated:EveryAwaiterEnds             violated:EveryAwaiterEnds             yes
+M_exit_ignores_dirty             18938       8059      2  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
+W_permit_stored                      8          7      1  violated:NoPermitStored               violated:NoPermitStored               yes
+W_pass_on                         9093       3933      1  violated:NoPassOn                     violated:NoPassOn                     yes
+
+results matching EXPECTED.txt: 12 of 12

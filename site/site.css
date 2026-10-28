@@ -1,0 +1,983 @@
+/* Hallmark · genre: atmospheric · macrostructure: Marquee Hero · theme: custom (Abyss) · enrichment: footage behind a dot screen, Tier A CSS apparatus (liquid core bank) · nav: N9 · footer: Ft5
+ * tone: atmospheric, serious, square · anchor hue: 245 (blue-black) · accent: turquoise 188 poured into blue 258
+ * pre-emit critique: P5 H4 E5 S5 R4 V4 · contrast: pass (40-41) · slop: pass (42-45)
+ */
+
+/* The page's still form: type, surfaces and layout. code.css holds the code panels,
+ * cards.css the cards and their glyphs, flow.css the proactor diagram, motion.css every
+ * animation. Two registers: headings and prose in Geist, written as sentences; code and small
+ * machine labels in JetBrains Mono, in their own case. Nothing on the page is rounded. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  overflow-x: clip;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  color-scheme: dark;
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink-2);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+pre {
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+}
+
+code {
+  font-size: 0.9em;
+  color: var(--color-ink);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-style: normal;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+h2 {
+  font-size: var(--text-3xl);
+  line-height: 1.08;
+  letter-spacing: var(--tracking-head);
+  text-wrap: balance;
+}
+
+h3 {
+  font-size: var(--text-lg);
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+}
+
+p,
+ul,
+ol,
+dl,
+dd,
+figure {
+  margin: 0;
+}
+
+ul,
+ol {
+  padding: 0;
+  list-style: none;
+}
+
+a {
+  color: var(--color-ink);
+  text-decoration-line: underline;
+  text-decoration-thickness: var(--rule-hair);
+  text-decoration-color: var(--color-rule-2);
+  text-underline-offset: 0.22em;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  a:hover {
+    text-decoration-color: var(--color-accent);
+  }
+}
+
+a:active {
+  text-decoration-color: var(--color-accent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 3px;
+}
+
+/* The hidden attribute wins over any display a class sets (the copy buttons rely on it). */
+[hidden] {
+  display: none !important;
+}
+
+.visually-hidden {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The wet surface: a sheen falling from a lit top edge, light pooled in one corner, and a
+ * soft shadow beneath. Every raised panel on the page is this one surface. */
+.code,
+.card,
+.lane {
+  border: var(--rule-hair) solid var(--color-rule);
+  background:
+    linear-gradient(180deg, var(--color-gloss) 0%, transparent 42%),
+    radial-gradient(120% 90% at 0% 0%, var(--color-card-emit) 0%, transparent 60%),
+    var(--color-paper-2);
+  box-shadow:
+    inset 0 1px 0 var(--color-gloss-edge),
+    0 28px 48px -32px var(--color-shadow);
+}
+
+/* Everything that holds the liquid. */
+.btn--primary,
+.chamber__liquid {
+  background: var(--fill-liquid);
+}
+
+/* A light edge laid over a surface, shown on hover and focus (motion.css fades it). */
+.btn--ghost::before,
+.nav__cta::before {
+  content: "";
+  position: absolute;
+  inset: calc(-1 * var(--rule-hair));
+  border: var(--rule-hair) solid var(--color-accent);
+  box-shadow: 0 0 22px -6px var(--color-glow);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* A band of light that crosses a button once on hover. */
+.btn::after,
+.nav__cta::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--fill-sheen);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-110%);
+}
+
+/* N9 · edge-aligned: the wordmark at one edge, the links and the call to action at the other. */
+
+.nav {
+  position: relative;
+  z-index: var(--z-raised);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-md);
+  max-inline-size: var(--page-max);
+  margin-inline: auto;
+  padding: var(--space-lg) var(--page-gutter);
+}
+
+.nav__mark {
+  --mark-size: clamp(2.125rem, 1.75rem + 1.25vw, 2.75rem);
+
+  display: inline-flex;
+  align-items: center;
+  gap: 0.625rem;
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  color: var(--color-ink);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+/* The logo, inline (art/build.py writes it into every page) in lines heavy enough for its size,
+ * with the liquid's glow around them. It is sized by the bar, never by the text, so it stays
+ * crisp; motion.css makes its arrows breathe. */
+.nav__logo {
+  display: block;
+  flex: none;
+  inline-size: var(--mark-size);
+  block-size: var(--mark-size);
+}
+
+.nav__mark-svg {
+  display: block;
+  inline-size: 100%;
+  block-size: 100%;
+  overflow: visible;
+  filter: drop-shadow(0 0 4px var(--color-glow-2));
+  transition: filter var(--dur-short) var(--ease-out);
+}
+
+.nav__links {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+}
+
+/* A drawn underline, scaled in from the left on hover and focus. */
+.nav__link,
+.foot__links a {
+  position: relative;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.nav__link::after,
+.foot__links a::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: -0.2em;
+  block-size: var(--rule-hair);
+  background: var(--fill-accent-rule);
+  transform: scaleX(0);
+  transform-origin: left;
+}
+
+.nav__link {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--color-ink-2);
+}
+
+.nav__cta {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-block-size: 2.25rem;
+  padding: 0 var(--space-md);
+  overflow: clip;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  background:
+    linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
+    var(--color-paper-2);
+  box-shadow: inset 0 1px 0 var(--color-gloss-edge);
+  color: var(--color-ink);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+/* Narrow screens close the bar up so nothing wraps or runs off: Source leaves it below 30rem
+ * and API below 22.5rem (both are in the footer, and search reaches the API too). */
+@media (max-width: 29.99rem) {
+  .nav__links {
+    gap: var(--space-sm);
+  }
+
+  .nav__link--wide {
+    display: none;
+  }
+}
+
+@media (max-width: 23.99rem) {
+  .nav__mark {
+    gap: var(--space-xs);
+  }
+
+  .nav__links {
+    gap: var(--space-xs);
+  }
+
+  .nav__cta {
+    padding: 0 var(--space-sm);
+  }
+}
+
+@media (max-width: 22.49rem) {
+  .nav__link--mid {
+    display: none;
+  }
+}
+
+/* Buttons: square, one line, the primary one filled with the liquid. */
+
+.btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-block-size: 2.875rem;
+  padding: 0 var(--space-lg);
+  overflow: clip;
+  font-size: var(--text-base);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.btn--primary {
+  color: var(--color-paper);
+  box-shadow:
+    inset 0 1px 0 var(--color-gloss-strong),
+    0 10px 28px -12px var(--color-glow);
+}
+
+.btn--ghost {
+  overflow: visible;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  background:
+    linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
+    var(--color-paper-2);
+  box-shadow: inset 0 1px 0 var(--color-gloss-edge);
+  color: var(--color-ink);
+}
+
+/* Hero: the headline left, the apparatus right, over the footage. It runs the full width so
+ * its backdrop is never cut at the column's edge; the padding keeps its content in the page
+ * column. */
+.hero {
+  --hero-inline: max(var(--page-gutter), calc((100% - var(--page-max)) / 2 + var(--page-gutter)));
+
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  gap: var(--space-2xl);
+  align-items: center;
+  padding: var(--space-xl) var(--hero-inline) var(--space-3xl);
+  overflow: clip;
+  background: var(--color-paper);
+}
+
+@media (min-width: 60rem) {
+  .hero {
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  }
+}
+
+/* The backdrop: the footage, seen through a screen of square holes, a drifting field of dots
+ * over it, and a scrim of the paper that keeps the text side dark and fades every edge. */
+.hero__backdrop {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  isolation: isolate;
+  pointer-events: none;
+}
+
+.hero__video {
+  position: absolute;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: cover;
+  object-position: 62% 50%;
+  opacity: 0.9;
+}
+
+/* The screen: one-pixel bars of the paper on a four-pixel pitch, so the footage shows only
+ * through square holes. */
+.hero__backdrop::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  background:
+    linear-gradient(90deg, var(--color-paper) 1px, transparent 1px) 0 0 / 4px 4px,
+    linear-gradient(180deg, var(--color-paper) 1px, transparent 1px) 0 0 / 4px 4px;
+}
+
+.hero__dots {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  overflow: clip;
+  mask-image: radial-gradient(70% 80% at 72% 48%, #000 0%, transparent 100%);
+}
+
+/* One cell larger than its frame on every side, so a drift of one cell never shows an edge. */
+.hero__dots-field {
+  position: absolute;
+  inset: calc(-1 * var(--dot-cell));
+  background:
+    conic-gradient(at 2px 2px, transparent 75%, var(--color-dot) 0) 0 0 / var(--dot-cell) var(--dot-cell),
+    conic-gradient(at 2px 2px, transparent 75%, var(--color-dot-2) 0) calc(var(--dot-cell) / 2) calc(var(--dot-cell) / 2) / var(--dot-cell) var(--dot-cell);
+}
+
+.hero__backdrop::after {
+  content: "";
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  background:
+    radial-gradient(42% 52% at 78% 46%, var(--color-pool) 0%, transparent 72%),
+    linear-gradient(180deg, var(--color-paper) 0%, transparent 12%, transparent 70%, var(--color-paper) 100%),
+    linear-gradient(180deg, var(--color-scrim) 0%, var(--color-scrim) 62%, var(--color-scrim-soft) 100%);
+}
+
+@media (min-width: 60rem) {
+  .hero__backdrop::after {
+    background:
+      radial-gradient(42% 52% at 78% 46%, var(--color-pool) 0%, transparent 72%),
+      radial-gradient(38% 46% at 8% 92%, var(--color-pool-2) 0%, transparent 72%),
+      linear-gradient(180deg, var(--color-paper) 0%, transparent 14%, transparent 46%, var(--color-scrim-soft) 60%, var(--color-scrim) 76%, var(--color-paper) 100%),
+      linear-gradient(90deg, var(--color-scrim) 0%, var(--color-scrim) 38%, var(--color-scrim-soft) 62%, var(--color-scrim-thin) 100%);
+  }
+}
+
+.hero__copy,
+.apparatus {
+  position: relative;
+  z-index: var(--z-base);
+}
+
+.hero__copy {
+  display: grid;
+  gap: var(--space-lg);
+  justify-items: start;
+}
+
+.hero__title {
+  max-inline-size: 10ch;
+  font-size: var(--text-display);
+  line-height: 1;
+  letter-spacing: var(--tracking-display);
+}
+
+/* Each line is its own box, so the lines can rise one after another. */
+.hero__line {
+  display: inline-block;
+}
+
+/* Words in colour: the text gradient, clipped to the glyphs. Where clipping to text is not
+ * supported the word keeps the plain accent, and forced colours get the system's own. */
+.ink {
+  color: var(--color-accent);
+}
+
+/* A background clipped to the text paints only inside the word's box, and the headings' negative
+ * tracking pulls that box in past the last glyph: room on the right (--ink-room), given back by
+ * an equal negative margin so nothing moves, keeps the whole last letter lit. */
+@supports ((background-clip: text) or (-webkit-background-clip: text)) {
+  :is(span, strong, em).ink {
+    --ink-room: 0.12em;
+
+    margin-inline-end: calc(-1 * var(--ink-room));
+    padding-inline-end: var(--ink-room);
+  }
+
+  .ink {
+    background: var(--fill-text);
+    background-size: 100% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+  }
+}
+
+@media (forced-colors: active) {
+  .ink {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+  }
+}
+
+/* The verb landmark: colour and a drawn bar, never a slanted glyph. The bar sits in padding the
+ * verb's own box reserves under its line, so it clears the descenders above it and the line
+ * below it at every size: a bar hung from an inline box at line-height 1 lands on the next line. */
+.hero__verb {
+  position: relative;
+  display: inline-block;
+  padding-block-end: 0.16em;
+  white-space: nowrap;
+}
+
+.hero__verb::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0.04em calc(0.04em + var(--ink-room, 0em));
+  inset-block-end: 0.02em;
+  block-size: 0.07em;
+  background: var(--fill-accent-rule);
+  transform-origin: left;
+}
+
+.hero__lede {
+  max-inline-size: 46ch;
+  font-size: var(--text-md);
+  line-height: 1.6;
+}
+
+.hero__lede strong {
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.hero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  padding-block-start: var(--space-xs);
+}
+
+/* Three plain facts, set apart by small squares. */
+.hero__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs) var(--space-md);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+}
+
+.hero__meta > * {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-md);
+  white-space: nowrap;
+}
+
+.hero__meta > * + *::before {
+  content: "";
+  inline-size: 0.3rem;
+  block-size: 0.3rem;
+  background: var(--color-rule-2);
+}
+
+.hero__meta a {
+  color: var(--color-ink-2);
+  text-decoration: none;
+}
+
+.hero__meta a span {
+  text-decoration-line: underline;
+  text-decoration-thickness: var(--rule-hair);
+  text-decoration-color: var(--color-rule-2);
+  text-underline-offset: 0.22em;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .hero__meta a:hover span {
+    text-decoration-color: var(--color-accent);
+  }
+}
+
+/* On a phone the three facts stack without separators, and the buttons fill the width. */
+@media (max-width: 29.99rem) {
+  .hero__meta {
+    flex-direction: column;
+    align-items: start;
+  }
+
+  .hero__meta > * + *::before {
+    display: none;
+  }
+
+  .hero__actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    inline-size: 100%;
+  }
+}
+
+/* The apparatus: a bank of four glass tanks, one per core, each holding its own liquid. */
+
+.apparatus {
+  display: grid;
+  gap: var(--space-lg);
+  justify-items: center;
+}
+
+.bank {
+  position: relative;
+  display: flex;
+  gap: clamp(0.75rem, 1.6vw, 1.25rem);
+  align-items: flex-end;
+  padding: var(--space-lg) var(--space-md) var(--space-xl);
+  isolation: isolate;
+}
+
+/* The halo sits inside the bank: never larger than the apparatus. */
+.bank::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: radial-gradient(50% 55% at 50% 50%, var(--color-glow-2) 0%, transparent 70%);
+}
+
+/* The base plate the tanks stand on, lit along its top; labels hang below. */
+.bank::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: calc(var(--space-xl) - 0.375rem);
+  block-size: 0.375rem;
+  background: linear-gradient(180deg, var(--color-rule-2) 0%, var(--color-paper-3) 100%);
+  box-shadow: inset 0 1px 0 var(--color-gloss-edge);
+  transform-origin: center;
+}
+
+/* A slow glint that crosses the glass of the whole bank. */
+.bank__glint {
+  position: absolute;
+  z-index: 3;
+  inset-block: var(--space-lg) var(--space-xl);
+  inset-inline: 0;
+  overflow: clip;
+  pointer-events: none;
+}
+
+.bank__glint::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  inline-size: 40%;
+  background: var(--fill-sheen);
+  opacity: 0;
+  transform: translateX(-100%) skewX(-12deg);
+}
+
+.chamber {
+  position: relative;
+  inline-size: clamp(2.5rem, 4.4vw, 3.25rem);
+  block-size: clamp(9rem, 18vw, 13.5rem);
+  margin-block-end: 0.375rem;
+  background: linear-gradient(90deg, var(--color-paper-3) 0%, var(--color-paper-2) 50%, var(--color-paper) 100%);
+  box-shadow:
+    inset 0 0 0 var(--rule-hair) var(--color-rule-2),
+    inset 0 -14px 18px -12px var(--color-shade),
+    0 24px 36px -22px var(--color-shadow);
+}
+
+/* The glass: one long highlight down the left of the tank, over the liquid. */
+.chamber::after {
+  content: "";
+  position: absolute;
+  z-index: 2;
+  inset-block: 9%;
+  inset-inline-start: 20%;
+  inline-size: 3px;
+  background: linear-gradient(180deg, var(--color-gloss-strong) 0%, var(--color-gloss-edge) 50%, transparent 100%);
+}
+
+.chamber__tick {
+  position: absolute;
+  z-index: 1;
+  inset-inline-end: 0;
+  inset-block-start: var(--y);
+  inline-size: 28%;
+  block-size: var(--rule-hair);
+  background: var(--color-rule-2);
+}
+
+/* Poured to its own level, with a lit line at its surface. */
+.chamber__liquid {
+  position: absolute;
+  inset-inline: 4px;
+  inset-block-end: 4px;
+  block-size: var(--fill);
+  overflow: hidden;
+  box-shadow:
+    inset 0 1px 0 var(--color-filament-tip),
+    0 0 14px 1px var(--color-glow),
+    0 0 40px 8px var(--color-glow-2);
+  transform-origin: bottom;
+}
+
+/* The surface flares softly when an operation completes there (motion.css times it). */
+.chamber__liquid::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+  block-size: 30%;
+  background: linear-gradient(180deg, var(--color-filament-tip) 0%, transparent 100%);
+  opacity: 0;
+}
+
+/* An operation rising through the liquid: the frame spans the liquid's height, so moving it
+ * up by its own height carries the square from the floor to the surface. */
+.chamber__bubble {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: var(--x);
+  inline-size: 4px;
+  opacity: 0;
+}
+
+.chamber__bubble::before {
+  content: "";
+  position: absolute;
+  inset-block-end: 0;
+  inline-size: 4px;
+  block-size: 4px;
+  background: var(--color-filament-tip);
+  box-shadow: 0 0 6px var(--color-glow);
+}
+
+.chamber__label {
+  position: absolute;
+  inset-block-start: calc(100% + var(--space-md));
+  inset-inline-start: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  color: var(--color-ink-2);
+  white-space: nowrap;
+}
+
+/* Four facts under the bank, each a proper heading and one line, behind a bar of the liquid. */
+.facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-lg) var(--space-xl);
+  inline-size: 100%;
+  max-inline-size: 32rem;
+  padding-block-start: var(--space-xl);
+}
+
+.fact {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: var(--space-2xs);
+  padding-inline-start: var(--space-md);
+}
+
+.fact::before {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  inline-size: 2px;
+  background: linear-gradient(180deg, var(--color-accent) 0%, var(--color-accent-deep) 100%);
+  transform-origin: top;
+}
+
+.fact dt {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: var(--color-ink);
+}
+
+.fact dd {
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--color-muted);
+}
+
+@media (max-width: 26rem) {
+  .facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Sections */
+
+main > section:not(.hero, .band) {
+  display: grid;
+  gap: var(--space-xl);
+  max-inline-size: var(--page-max);
+  margin-inline: auto;
+  padding: var(--space-3xl) var(--page-gutter) var(--space-2xl);
+}
+
+.section-head {
+  display: grid;
+  gap: var(--space-md);
+  max-inline-size: 44rem;
+}
+
+.section-head__dek {
+  max-inline-size: var(--measure);
+  font-size: var(--text-md);
+  color: var(--color-muted);
+}
+
+.section-head__dek strong {
+  font-weight: 600;
+  color: var(--color-ink-2);
+}
+
+.section-note {
+  max-inline-size: var(--measure);
+  color: var(--color-muted);
+}
+
+/* Install: the two forms side by side once there is room, each with its copy button above it. */
+
+.install {
+  max-inline-size: 64rem;
+}
+
+.install__steps {
+  display: grid;
+  gap: var(--space-lg);
+}
+
+@media (min-width: 48rem) {
+  .install__steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.install__step {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+/* The label and its copy button on one line above the code, so a long line never runs under it. */
+.install__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: var(--space-md);
+}
+
+.install__label {
+  font-size: var(--text-base);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--color-ink-2);
+}
+
+.install .code {
+  display: grid;
+  align-content: center;
+}
+
+/* First program */
+
+.program__body {
+  display: grid;
+  gap: var(--space-xl);
+  align-items: start;
+}
+
+@media (min-width: 64rem) {
+  .program__body {
+    grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+    gap: var(--space-2xl);
+  }
+}
+
+.notes {
+  display: grid;
+  gap: var(--space-lg);
+}
+
+.notes > div {
+  position: relative;
+  display: grid;
+  gap: var(--space-2xs);
+  padding-block-start: var(--space-md);
+}
+
+.notes > div::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+  block-size: var(--rule-hair);
+  background: var(--color-rule);
+  transform-origin: left;
+}
+
+.notes dt {
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+.notes dd {
+  max-inline-size: 48ch;
+}
+
+/* Ft5 · statement */
+
+.foot {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  gap: var(--space-xl);
+  max-inline-size: var(--page-max);
+  margin-inline: auto;
+  padding: var(--space-3xl) var(--page-gutter) var(--space-xl);
+}
+
+/* Light pooled under the closing line, the page's last glow. */
+.foot::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: radial-gradient(40% 60% at 12% 40%, var(--color-pool-2) 0%, transparent 70%);
+}
+
+.foot__line {
+  max-inline-size: 16ch;
+  font-family: var(--font-display);
+  font-size: var(--text-3xl);
+  font-weight: 600;
+  line-height: 1.05;
+  letter-spacing: var(--tracking-head);
+  color: var(--color-ink);
+}
+
+.foot__meta {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm) var(--space-lg);
+  align-items: baseline;
+  padding-block-start: var(--space-md);
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+}
+
+.foot__meta::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  inset-block-start: 0;
+  block-size: var(--rule-hair);
+  background: var(--color-rule);
+  transform-origin: left;
+}
+
+.foot__mark {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  color: var(--color-ink);
+}
+
+.foot__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2xs) var(--space-md);
+  margin-inline-start: auto;
+}
+
+.foot__links a {
+  color: var(--color-ink);
+}
+
+.foot__credit {
+  flex-basis: 100%;
+  font-size: var(--text-xs);
+}

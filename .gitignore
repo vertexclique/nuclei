@@ -4,3 +4,14 @@ Cargo.lock
 target
 examples/target
 *.json
+# Built by site/build.py from the commit (the Pages workflow builds them to deploy).
+/site/index.html
+/site/learn/
+/site/search.json
+/site/llms.txt
+/site/llms-full.txt
+/site/api.md
+/site/api/
+__pycache__/
+# A design tool's local state; never part of the repository.
+/.hallmark/

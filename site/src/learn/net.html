@@ -1,0 +1,38 @@
+<!--title Networking-->
+<!--lede TCP, UDP and Unix sockets, addresses and names, socket options, halves and pipes.-->
+<h2 id="tcp">TCP</h2>
+<p><code>nuclei::net</code> has the socket types: <code>TcpListener</code>, <code>TcpStream</code>, <code>UdpSocket</code> and, on Unix, <code>UnixListener</code>, <code>UnixStream</code> and <code>UnixDatagram</code>. Each is std's own socket in a <a href="api:nuclei::io::Handle"><code>Handle</code></a>: the handle adds the async calls, and std's methods (<code>local_addr</code>, <code>peer_addr</code>, <code>set_ttl</code>, ...) work through it.</p>
+<!--example net_tcp-->
+<ul>
+<li><code>bind</code> and <code>connect</code> are async, since a name may need looking up. Each takes the first address that works.</li>
+<li><code>recv</code> and <code>send</code> work on a shared reference; the stream is also <code>AsyncRead</code> and <code>AsyncWrite</code>, on the handle and on <code>&amp;</code> the handle, so one task can read while another writes.</li>
+<li><code>incoming()</code> gives the connections as a stream. <code>accept_multi()</code> gives a stream that owns a copy of the listener, so it may outlive the handle; on io_uring one accept stays armed for every connection that comes.</li>
+</ul>
+
+<h2 id="names">Addresses and names</h2>
+<p>Every call that takes an address takes anything <a href="api:nuclei::net::ToSocketAddrs"><code>ToSocketAddrs</code></a> accepts: a <code>SocketAddr</code>, an <code>(ip, port)</code> pair, a <code>"host:port"</code> string, a <code>(host, port)</code> pair, or a slice of addresses. Numbers are used at once; a name is looked up on the blocking pool, so no shard waits on the resolver. <code>net::lookup_host</code> looks one up alone.</p>
+<!--example net_names-->
+
+<h2 id="udp">UDP</h2>
+<p>A bound socket sends datagrams to any address and receives them with their sender's; a connected one talks to one peer. A datagram larger than the buffer is cut to fit.</p>
+<!--example net_udp-->
+<p><code>peek</code> and <code>peek_from</code> look at the next datagram without taking it, <code>peek_sender</code> names its sender without copying a byte, and <code>recv_buf</code> and <code>recv_buf_from</code> receive into a <a href="api:nuclei::io::ReadBuf"><code>ReadBuf</code></a> that need not be initialized.</p>
+
+<h2 id="unix">Unix sockets</h2>
+<p>Streams and datagrams over a path in the file system, or a connected pair. A stream knows its peer: <code>peer_cred</code> gives the user and group, and the process where the system tells it (Linux, Android, macOS, iOS).</p>
+<!--example net_unix-->
+<p>On Linux a socket may also take a name in the abstract namespace, with no file behind it: <code>bind_addr</code> and <code>connect_addr</code> take std's <code>SocketAddr</code>, made with <code>from_abstract_name</code>.</p>
+<!--example net_abstract-->
+
+<h2 id="options">Socket options</h2>
+<p>A socket to set up before it listens or connects is a <a href="api:nuclei::net::TcpSocket"><code>TcpSocket</code></a>: buffer sizes, address and port reuse, keepalive, <code>TCP_NODELAY</code>, linger, the type of service, and on Linux the network interface (<code>bind_device</code>). Then <code>listen</code> or <code>connect</code> turns it into a listener or a stream. A stream that is connected already sets linger and no-delay on the handle.</p>
+<!--example net_socket-->
+<p><a href="api:nuclei::net::UnixSocket"><code>UnixSocket</code></a> is the same for Unix sockets: <code>new_stream</code> or <code>new_datagram</code>, <code>bind</code>, then <code>listen</code>, <code>connect</code> or <code>datagram</code>.</p>
+
+<h2 id="split">Two halves</h2>
+<p>A TCP or Unix stream splits into a read half and a write half: <code>split()</code> borrows the stream and allocates nothing; <code>into_split()</code> gives owned halves that move into tasks of their own, and <code>reunite</code> puts them back together.</p>
+<!--example net_split-->
+
+<h2 id="pipes">Pipes and FIFOs</h2>
+<p><code>net::unix::pipe::pipe()</code> makes an anonymous pipe: a <code>Sender</code> and a <code>Receiver</code>, async streams like any other. A named pipe in the file system opens with <a href="api:nuclei::net::unix::pipe::OpenOptions"><code>pipe::OpenOptions</code></a>, as a receiver or a sender.</p>
+<!--example net_pipe-->

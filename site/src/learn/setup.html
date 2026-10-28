@@ -1,0 +1,53 @@
+<!--title Setup-->
+<!--lede Add Nuclei, run a first program, and see which kernel interface it picked.-->
+<h2 id="requirements">What you need</h2>
+<p>Rust @@RUST_VERSION@@ or later. Nuclei is written in the 2024 edition; your crate may use any edition. Each system runs on its own kernel interface:</p>
+<table class="table">
+<thead><tr><th>System</th><th>Backend</th></tr></thead>
+<tbody>
+<tr><td data-label="System">Linux, Android</td><td data-label="Backend">io_uring where the kernel (6.1 or later) and the sandbox allow it, else epoll</td></tr>
+<tr><td data-label="System">illumos</td><td data-label="Backend">epoll</td></tr>
+<tr><td data-label="System">macOS, iOS, FreeBSD, NetBSD, OpenBSD, DragonFly</td><td data-label="Backend">kqueue</td></tr>
+<tr><td data-label="System">Windows</td><td data-label="Backend">I/O completion ports</td></tr>
+</tbody>
+</table>
+
+<h2 id="add">Add it</h2>
+<!--code sh-->
+cargo add nuclei
+<!--/code-->
+<p>or in <code>Cargo.toml</code>:</p>
+<!--code toml Cargo.toml-->
+[dependencies]
+nuclei = "@@NUCLEI_MINOR@@"
+<!--/code-->
+<p>Nothing else is needed: the read and write helpers, the stream traits and the macros all come with the crate.</p>
+
+<h2 id="first">A first program</h2>
+<!--example setup_hello-->
+<!--output setup_hello-->
+the answer is 42
+<!--/output-->
+<p><code>#[nuclei::main]</code> runs the async <code>main</code> on the runtime, and <code>nuclei::spawn</code> places a task on one of its shards; awaiting the task gives its output. There is nothing to configure: the first <code>spawn</code> or <code>block_on</code> starts the default runtime, with one worker per core the process may run on.</p>
+
+<h2 id="features">Features</h2>
+<!--features-->
+iouring: The io_uring driver, on Linux and Android. Without it those systems run on epoll.
+epoll: Names epoll beside <code>iouring</code>. Epoll is built on Linux either way.
+attributes: <code>#[nuclei::main]</code>, <code>#[nuclei::test]</code> and <code>#[nuclei::bench]</code>.
+recycle: Node memory of the lock-free queues, maps and channels underneath, from a per-thread cache instead of the global allocator.
+<!--/features-->
+<p><code>recycle</code> is for applications: cargo turns a feature on for every user of a crate in a build, so a library that enabled it would enable it for all of them.</p>
+<!--code toml Cargo.toml-->
+[dependencies]
+# Linux on epoll only, keeping the attribute macros:
+nuclei = { version = "@@NUCLEI_MINOR@@", default-features = false, features = ["attributes"] }
+<!--/code-->
+
+<h2 id="backend">Which backend runs</h2>
+<!--example setup_backend-->
+<p>With nothing set, Nuclei takes io_uring where the kernel lets the process have the rings its shards use, and the platform's poller otherwise. The probe is safe, even under a seccomp filter that kills a process for calling <code>io_uring_setup</code>. <code>NUCLEI_BACKEND</code> picks one by hand: <code>auto</code>, <code>io_uring</code> or <code>epoll</code> on Linux, <code>kqueue</code> on macOS and the BSDs, <code>iocp</code> on Windows.</p>
+<!--code sh-->
+NUCLEI_BACKEND=epoll cargo run
+<!--/code-->
+<p>A backend named by hand that the process cannot have is an error with the reason, never a silent fallback. <a href="backends.html">Backends</a> has the details, <a href="errors.html#backend-io-uring">Errors</a> the messages.</p>

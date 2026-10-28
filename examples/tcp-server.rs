@@ -10,7 +10,7 @@ async fn echo(stream: Handle<TcpStream>) -> io::Result<()> {
 #[nuclei::main]
 async fn main() -> io::Result<()> {
     // Create a listener.
-    let listener = Handle::<TcpListener>::bind("0.0.0.0:7000")?;
+    let listener = Handle::<TcpListener>::bind("0.0.0.0:7000").await?;
     println!("Listening on {}", listener.get_ref().local_addr()?);
     println!("Now start a TCP client.");
 

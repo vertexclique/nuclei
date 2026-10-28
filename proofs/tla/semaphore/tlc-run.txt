@@ -1,0 +1,22 @@
+TLC run of every configuration in proofs/tla/semaphore, 2026-10-25 20:43 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_barge                         426063     232297     17  pass                                  pass                                  yes
+L_pair                         2314039    1270065     85  pass                                  pass                                  yes
+L_cancel                      34929041   13175268    160  pass                                  pass                                  yes
+L_cancel_live                    10939       6119      2  pass                                  pass                                  yes
+L_weighted                      134215      73932      7  pass                                  pass                                  yes
+L_close                         214224      87231     10  pass                                  pass                                  yes
+M_release_no_pass                  952        536      1  violated:AllTasksEnd                  violated:AllTasksEnd                  yes
+M_exit_ignores_dirty             38018      16740      2  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
+M_owe_without_handoff           158997      89493      4  violated:BypassBounded                violated:BypassBounded                yes
+M_try_ignores_handoff            32416      18751      2  violated:NoBargePastOwed              violated:NoBargePastOwed              yes
+M_keep_grant                   3071884    1235419     44  violated:PermitsBackAtEnd             violated:PermitsBackAtEnd             yes
+M_close_admits                      20         16      1  violated:NoAdmitAfterClose            violated:NoAdmitAfterClose            yes
+W_handoff                        15334       8985      1  violated:NoHandoff                    violated:NoHandoff                    yes
+W_grant_given_back              695886     286503     12  violated:NoGrantGivenBack             violated:NoGrantGivenBack             yes
+W_nudge_pending                   4063       2312      1  violated:NoNudgePending               violated:NoNudgePending               yes
+
+results matching EXPECTED.txt: 15 of 15

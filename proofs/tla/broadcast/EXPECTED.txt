@@ -1,0 +1,11 @@
+# configuration                spec                 expected
+PB_safe                        MC_Broadcast         pass
+PB_live                        MC_Broadcast         pass
+MB_over_later                  MC_Broadcast         violated:Finishes
+MB_closed_only                 MC_Broadcast         violated:Counted
+MB_lag_uncounted               MC_Broadcast         violated:Counted
+WB_lag                         MC_Broadcast         violated:NoLag
+WB_superseded                  MC_Broadcast         violated:NoSuperseded
+MB_upgrade_closed              MC_Broadcast         violated:Counted
+WB_upgraded                    MC_Broadcast         violated:NoUpgrade
+WB_refused                     MC_Broadcast         violated:NoRefused

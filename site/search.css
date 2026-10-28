@@ -1,0 +1,423 @@
+/* Search: the button in the bar and the dialog it opens (site.js builds the dialog).
+ *
+ * The dialog is one square panel over a blurred, darkened page: the input on top, a status
+ * line, the results grouped by kind, and the keys at the foot. The active result carries the
+ * liquid's bar on its left edge; matched words are lit in turquoise. It rises in like every
+ * other surface (motion.css stops it under reduced motion), and it fits a 320 pixel screen. */
+
+/* The button: a square key in the bar. On a narrow screen only its icon shows; its label stays
+ * for assistive technology. The shortcut shows only where there is a keyboard to press it. */
+.nav__search {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-xs);
+  min-block-size: 2.25rem;
+  min-inline-size: 2.25rem;
+  padding: 0 var(--space-sm);
+  border: var(--rule-hair) solid var(--color-rule-2);
+  background:
+    linear-gradient(180deg, var(--color-gloss) 0%, transparent 100%),
+    var(--color-paper-2);
+  box-shadow: inset 0 1px 0 var(--color-gloss-edge);
+  color: var(--color-ink-2);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-short) var(--ease-out),
+    color var(--dur-short) var(--ease-out),
+    transform var(--dur-short) var(--ease-out);
+}
+
+.nav__search-icon,
+.search__icon {
+  flex: none;
+  inline-size: 1rem;
+  block-size: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+
+.nav__kbd {
+  padding: 0.2em 0.4em;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: 1;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .nav__search:hover {
+    border-color: var(--color-accent);
+    color: var(--color-ink);
+    transform: translateY(var(--nudge));
+  }
+}
+
+.nav__search:active {
+  transform: translateY(var(--press));
+}
+
+@media (max-width: 47.99rem) {
+  .nav__search {
+    padding: 0;
+  }
+
+  .nav__search-label {
+    position: absolute;
+    inline-size: 1px;
+    block-size: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 47.99rem), (hover: none), (pointer: coarse) {
+  .nav__kbd {
+    display: none;
+  }
+}
+
+/* The dialog. */
+
+.search,
+.search kbd {
+  font-variant-ligatures: none;
+}
+
+html:has(.search[open]) {
+  overflow: hidden;
+}
+
+.search {
+  --search-top: clamp(1rem, 10vh, 6rem);
+
+  inline-size: min(40rem, 100vw - 2rem);
+  max-inline-size: none;
+  max-block-size: min(40rem, 100dvh - var(--search-top) - 1rem);
+  margin: var(--search-top) auto auto;
+  padding: 0;
+  overflow: hidden;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  background:
+    linear-gradient(180deg, var(--color-gloss) 0%, transparent 30%),
+    radial-gradient(120% 60% at 0% 0%, var(--color-card-emit) 0%, transparent 60%),
+    var(--color-paper-2);
+  box-shadow:
+    inset 0 1px 0 var(--color-gloss-edge),
+    0 40px 80px -30px var(--color-shadow),
+    0 0 0 1px var(--color-shade);
+  color: var(--color-ink-2);
+}
+
+.search[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.search::backdrop {
+  background: oklch(6% 0.014 245 / 0.62);
+  -webkit-backdrop-filter: blur(6px) saturate(120%);
+  backdrop-filter: blur(6px) saturate(120%);
+}
+
+.search__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-sm) var(--space-sm) var(--space-md);
+  border-block-end: var(--rule-hair) solid var(--color-rule);
+  color: var(--color-accent);
+}
+
+/* Sixteen pixels at least, so a phone does not zoom in on focus. */
+.search__input {
+  flex: 1;
+  min-width: 0;
+  min-block-size: 2.25rem;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: none;
+  color: var(--color-ink);
+  font: inherit;
+  font-size: max(1rem, var(--text-md));
+  caret-color: var(--color-accent);
+}
+
+.search__input::placeholder {
+  color: var(--color-muted);
+  opacity: 1;
+}
+
+.search__close {
+  flex: none;
+  min-block-size: 2rem;
+  min-inline-size: 2.75rem;
+  padding: 0 var(--space-xs);
+  border: var(--rule-hair) solid var(--color-rule-2);
+  background: var(--color-paper);
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  cursor: pointer;
+}
+
+.search__close:hover {
+  border-color: var(--color-accent);
+  color: var(--color-ink);
+}
+
+.search__close-word {
+  display: none;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .search__close-key {
+    display: none;
+  }
+
+  .search__close-word {
+    display: inline;
+  }
+}
+
+.search__status {
+  padding: var(--space-sm) var(--space-md) 0;
+  color: var(--color-muted);
+  font-size: var(--text-sm);
+}
+
+.search__status:empty {
+  display: none;
+}
+
+.search__results {
+  flex: 1;
+  min-block-size: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 var(--space-xs) var(--space-sm);
+}
+
+.search__results:empty {
+  display: none;
+}
+
+.search__group {
+  display: grid;
+  padding-block-start: var(--space-sm);
+}
+
+.search__label {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding: var(--space-2xs) var(--space-sm);
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+}
+
+.search__hit {
+  position: relative;
+  display: grid;
+  gap: var(--space-3xs);
+  min-width: 0;
+  padding: var(--space-xs) var(--space-sm) var(--space-xs) var(--space-md);
+  color: var(--color-ink-2);
+  text-decoration: none;
+  scroll-margin-block: var(--space-xl) var(--space-sm);
+}
+
+/* The liquid's bar beside the result the keys point at. */
+.search__hit::before {
+  content: "";
+  position: absolute;
+  inset-block: var(--space-2xs);
+  inset-inline-start: var(--space-3xs);
+  inline-size: 2px;
+  background: var(--fill-liquid);
+  box-shadow: 0 0 10px 0 var(--color-glow);
+  opacity: 0;
+  transform: scaleY(0.4);
+  transition:
+    opacity var(--dur-micro) var(--ease-out),
+    transform var(--dur-short) var(--ease-out);
+}
+
+.search__hit.is-active {
+  background: var(--color-card-lit);
+}
+
+.search__hit.is-active::before {
+  opacity: 1;
+  transform: none;
+}
+
+.search__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.search__title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink);
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* An API title is its owner's path, then its name: the path gives way first, so the name
+ * shows whole for as long as it fits. */
+.search__hit--api .search__title {
+  display: flex;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.search__path,
+.search__name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.search__path {
+  flex: 0 1 auto;
+  color: var(--color-muted);
+  font-weight: 400;
+}
+
+.search__name {
+  flex: 0 0.001 auto;
+}
+
+.search__meta {
+  display: inline-flex;
+  flex: none;
+  min-width: 0;
+  gap: var(--space-2xs);
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+}
+
+/* Where a Learn or home page result sits gives way before its title does. */
+.search__hit--learn .search__meta,
+.search__hit--site .search__meta {
+  flex: 0 1 auto;
+}
+
+.search__where {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.search__kind {
+  padding: 0.1em 0.45em;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  color: var(--color-accent);
+}
+
+.search__kind--platform {
+  color: var(--color-accent-3);
+}
+
+.search__sig,
+.search__text {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.search__sig {
+  color: var(--color-syn-function);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.search__text {
+  color: var(--color-muted);
+  font-size: var(--text-sm);
+}
+
+/* On a phone a result's text takes two lines rather than one. */
+@media (max-width: 29.99rem) {
+  .search__text {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .search__head {
+    flex-wrap: wrap;
+    row-gap: var(--space-3xs);
+  }
+}
+
+.search mark {
+  background: oklch(82% 0.13 188 / 0.16);
+  box-shadow: inset 0 -1px 0 var(--color-accent);
+  color: var(--color-ink);
+}
+
+.search__more {
+  color: var(--color-accent);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.search__help {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs) var(--space-xs);
+  padding: var(--space-xs) var(--space-md);
+  border-block-start: var(--rule-hair) solid var(--color-rule);
+  color: var(--color-muted);
+  font-size: var(--text-xs);
+}
+
+.search__help kbd {
+  padding: 0.1em 0.4em;
+  border: var(--rule-hair) solid var(--color-rule-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+}
+
+.search__help kbd + kbd {
+  margin-inline-start: calc(-1 * var(--space-2xs));
+}
+
+@media (hover: none), (pointer: coarse) {
+  .search__help {
+    display: none;
+  }
+}
+
+/* It rises in as every surface does, over a backdrop that fades up. */
+.search[open] {
+  animation: rise-in var(--dur-short) var(--ease-out);
+}
+
+.search[open]::backdrop {
+  animation: fade-in var(--dur-short) var(--ease-out);
+}

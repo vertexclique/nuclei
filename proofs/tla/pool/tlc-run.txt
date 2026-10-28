@@ -1,0 +1,16 @@
+TLC run of every configuration in proofs/tla/pool, 2026-10-26 23:44 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+PO_safe                        2416093     673172      3  pass                                  pass                                  yes
+PO_live                        2416093     673172     11  pass                                  pass                                  yes
+PO_one                            3904       2130      2  pass                                  pass                                  yes
+MO_no_look                         218        133      0  violated:AllRan                       violated:AllRan                       yes
+MO_no_last_look                    718        420      1  violated:AllRan                       violated:AllRan                       yes
+WO_wake                            115         76      1  violated:NoWake                       violated:NoWake                       yes
+WO_look_found                       99         65      1  violated:NoLookFound                  violated:NoLookFound                  yes
+WO_timeout                          34         25      1  violated:NoTimeout                    violated:NoTimeout                    yes
+WO_reclaim                         283        179      1  violated:NoReclaim                    violated:NoReclaim                    yes
+
+results matching EXPECTED.txt: 9 of 9

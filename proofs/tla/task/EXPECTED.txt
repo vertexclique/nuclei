@@ -1,0 +1,27 @@
+# configuration                spec                 expected
+T_await                        MC_Task              pass
+T_await_self                   MC_Task              pass
+T_cancel                       MC_Task              pass
+T_cancel_dropped_waker         MC_Task              pass
+T_detach                       MC_Task              pass
+T_drop                         MC_Task              pass
+T_drop_ref                     MC_Task              pass
+T_last_waker                   MC_Task              pass
+T_live_await                   MC_Task              pass
+T_live_cancel                  MC_Task              pass
+T_live_detach                  MC_Task              pass
+M_wake_running_schedules       MC_Task              violated:OnePoll
+M_run_drops_woken              MC_Task              deadlock
+M_free_ignores_handle          MC_Task              violated:NothingAfterFree
+M_cancel_drops_future          MC_Task              violated:FutureOnce
+M_no_recheck                   MC_Task              deadlock
+M_wake_no_ref                  MC_Task              violated:NothingAfterFree
+M_detach_skips_last            MC_Task              violated:CleanEnd
+M_complete_leaks_output        MC_Task              violated:CleanEnd
+M_pending_leaks_future         MC_Task              violated:FreedAfterFuture
+W_wake_while_running           MC_Task              violated:NoWakeWhileRunning
+W_cancel_while_running         MC_Task              violated:NoCancelWhileRunning
+W_cancel_in_queue              MC_Task              violated:NoCancelInQueue
+W_register_meets_notify        MC_Task              violated:NoRegisterMeetsNotify
+W_last_waker_close             MC_Task              violated:NoLastWakerClose
+W_park_woken                   MC_Task              violated:NoParkWoken

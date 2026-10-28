@@ -1,0 +1,11 @@
+# configuration                spec                 expected
+R_safe                         MC_Ring              pass
+R_odd                          MC_Ring              pass
+R_three                        MC_Ring              pass
+R_live                         MC_Ring              pass
+MR_small_ring                  MC_Ring              violated:NoClobber
+MR_release_before_read         MC_Ring              violated:NoClobber
+MR_bool_ready                  MC_Ring              violated:RightValue
+MR_no_admit                    MC_Ring              violated:NoClobber
+WR_lap                         MC_Ring              violated:NoLap
+WR_busy                        MC_Ring              violated:NoBusy

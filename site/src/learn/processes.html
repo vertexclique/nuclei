@@ -1,0 +1,36 @@
+<!--title Processes-->
+<!--lede Run programs with async pipes, and take signals as streams.-->
+<h2 id="commands">Running a program</h2>
+<p><a href="api:nuclei::process::Command"><code>nuclei::process::Command</code></a> is shaped like std's: arguments, environment, working directory and standard streams, then <code>output</code> (collect what it printed), <code>status</code> (only the exit) or <code>spawn</code> (a <code>Child</code> to talk to). The examples run Unix programs.</p>
+<!--example process_output-->
+<p>A shard's driver watches each child's exit (a pidfd on Linux, a process event on kqueue, a wait on the process handle on Windows) and reaps it, so a wait holds no thread, and a child whose <code>Child</code> was dropped leaves no zombie behind.</p>
+
+<h2 id="pipes">Talking to a child</h2>
+<p>Piped streams are async: write to <code>stdin</code>, read <code>stdout</code> and <code>stderr</code> with the <a href="io.html#traits">IO helpers</a>. Dropping <code>stdin</code> ends the child's input; <code>wait</code> closes it first too, so a child that reads to the end can exit.</p>
+<!--example process_pipes-->
+
+<h2 id="ending">Ending a child</h2>
+<!--example process_kill-->
+<ul>
+<li><code>kill().await</code> ends the child (SIGKILL on Unix, TerminateProcess on Windows) and waits for its exit; <code>start_kill()</code> only starts it.</li>
+<li><code>kill_on_drop(true)</code> ends the child when its <code>Child</code> is dropped before it exits. By default a dropped child runs on.</li>
+<li><code>try_wait()</code> gives the status if the child exited, without waiting.</li>
+<li>For what <code>Command</code> does not mirror, <code>as_std_mut</code> reaches std's command underneath, <code>spawn_with</code> starts the child through your own code, and <code>into_std</code> takes std's command back.</li>
+</ul>
+
+<h2 id="ctrl-c">Ctrl-C</h2>
+<p><code>nuclei::signal::ctrl_c()</code> completes when the process gets a Ctrl-C: SIGINT on Unix, the console's CTRL_C_EVENT on Windows. Listening starts with its first poll, and replaces the default action, which would end the process.</p>
+<!--example signal_ctrl_c-->
+<!--output signal_ctrl_c-->
+the work finished first
+<!--/output-->
+
+<h2 id="unix-signals">Unix signals</h2>
+<p><code>signal::unix::signal(kind)</code> listens to one signal from then on, as a stream: <code>recv().await</code> ends once it was delivered, once or more, since the last <code>recv</code>. <code>SignalKind</code> names the usual ones (<code>hangup</code>, <code>terminate</code>, <code>user_defined1</code>, ...) and <code>from_raw</code> any other.</p>
+<!--example signal_unix-->
+<!--output signal_unix-->
+reloading
+<!--/output-->
+
+<h2 id="windows-events">Windows console events</h2>
+<p><code>signal::windows</code> has <code>ctrl_c</code>, <code>ctrl_break</code>, <code>ctrl_close</code>, <code>ctrl_logoff</code> and <code>ctrl_shutdown</code>, each a <code>CtrlEvent</code> whose <code>recv().await</code> ends at the next such event.</p>

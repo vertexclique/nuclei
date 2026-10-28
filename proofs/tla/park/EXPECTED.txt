@@ -1,0 +1,25 @@
+# configuration                spec                 expected
+P_one                          MC_Park              pass
+P_three                        MC_Park              pass
+P_live                         MC_Park              pass
+M_no_recheck                   MC_Park              deadlock
+M_check_first                  MC_Park              deadlock
+W_notify                       MC_Park              violated:NoNotify
+W_recheck                      MC_Park              violated:NoRecheckFind
+W_spurious                     MC_Park              violated:NoSpurious
+P_timer                        MC_Park              pass
+P_timer_live                   MC_Park              pass
+M_drive_waits                  MC_Park              deadlock
+W_drive_fire                   MC_Park              violated:NoDriveFire
+P_proactor                     MC_Park              pass
+M_handshake_wake               MC_Park              deadlock
+PS_safe                        MC_ShardStop         pass
+PS_live                        MC_ShardStop         pass
+MS_check_first                 MC_ShardStop         violated:NothingLeft
+MS_no_pusher_drop              MC_ShardStop         violated:NothingLeft
+MS_one_pass                    MC_ShardStop         violated:NothingLeft
+WS_pusher_drain                MC_ShardStop         violated:NoPusherDrain
+WS_second_pass                 MC_ShardStop         violated:NoSecondPass
+MS_no_role                     MC_ShardStop         violated:OneTaker
+MS_no_look_again               MC_ShardStop         violated:NothingLeft
+WS_hand_back                   MC_ShardStop         violated:NoHandBack

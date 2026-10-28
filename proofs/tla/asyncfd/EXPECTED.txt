@@ -1,0 +1,17 @@
+# configuration                spec                 expected
+AF_edges                       MC_AsyncFd           pass
+AF_edges_safe                  MC_AsyncFd           pass
+AF_ring                        MC_AsyncFd           pass
+MAF_no_tick                    MC_AsyncFd           violated:AllTaken
+WAF_kept                       MC_AsyncFd           violated:NoKept
+CM_edges_safe                  MC_CallerMode        pass
+CM_edges                       MC_CallerMode        pass
+CM_ring_safe                   MC_CallerMode        pass
+CM_ring                        MC_CallerMode        pass
+MCM_no_held_check              MC_CallerMode        violated:InOrder
+MCM_no_wake                    MC_CallerMode        violated:AllTaken
+WCM_busy                       MC_CallerMode        violated:NoBusy
+WCM_stopped_empty              MC_CallerMode        violated:NoStoppedEmpty
+CW_safe                        MC_CallerWrite       pass
+CW_live                        MC_CallerWrite       pass
+MCW_no_flush_wait              MC_CallerWrite       violated:OutOrder

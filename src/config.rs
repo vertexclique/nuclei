@@ -1,20 +1,31 @@
-///
-/// Nuclei's proactor configuration.
+/// Nuclei's proactor configuration: the io_uring settings of every shard, and
+/// the backend of every runtime that names none. It is set once, before any
+/// IO, with [`Proactor::with_config`](crate::Proactor::with_config).
 #[derive(Clone, Debug, Default)]
 pub struct NucleiConfig {
-    /// **IO_URING Configuration** allows you to configure [io_uring](https://unixism.net/loti/what_is_io_uring.html) backend.
+    /// The settings every shard's io_uring ring is made with.
     pub iouring: IoUringConfiguration,
+    /// The kernel interface every runtime that names none runs its IO on
+    /// ([`Builder::backend`](crate::Builder::backend) names one for one
+    /// runtime). `None` (the default) picks io_uring where the kernel lets
+    /// this process have it and the platform's poller otherwise; a backend
+    /// named here that this process cannot have makes the first shard fail
+    /// with the reason. A non-empty `NUCLEI_BACKEND` overrides it.
+    pub backend: Option<crate::IoBackend>,
 }
 
-/// **IO_URING Configuration**
-/// 5.19+ Kernel is required to operate IO_URING.
+/// The settings of every shard's io_uring ring (Linux 6.1 or later).
+///
+/// The default is [`interrupt_driven`](Self::interrupt_driven) with 2048
+/// queue entries and the io-wq worker limits `Some(256)` and `Some(512)`.
 #[derive(Clone, Debug)]
 pub struct IoUringConfiguration {
-    /// Allowed entries in both submission and completion queues.
-    ///
-    /// **[default]**: By default this value is 2048.
+    /// Entries in each ring's submission and completion queues (default
+    /// 2048).
     pub queue_len: u32,
-    /// SQPOLL kernel thread wake up interval.
+    /// With `Some(ms)`, a kernel thread polls the submission queue and sleeps
+    /// after that many idle milliseconds: fewer system calls for more CPU
+    /// (default `None`: no polling thread).
     ///
     /// Before version 5.11 of the Linux kernel, to successfully use this feature, the application
     /// must register a set of files to be used for IO through io_uring_register(2) using the
@@ -26,63 +37,62 @@ pub struct IoUringConfiguration {
     /// for SQPOLL in newer kernels. Certain stable kernels older than 5.13 may also support
     /// unprivileged SQPOLL.
     ///
-    /// Decreasing this will put more pressure to kernel, increases cpu usage.
-    /// Increasing it will slow down completion push rate from kernel.
-    /// This config is in milliseconds.
-    ///
-    /// **[default]**: If [None] then SQPOLL will be disabled.
+    /// A shorter interval keeps the kernel thread awake more, for more CPU; a
+    /// longer one lets it sleep, and a submission after it slept wakes it.
     pub sqpoll_wake_interval: Option<u32>,
 
-    /// Get and/or set the limit for number of io_uring worker threads per NUMA
-    /// node. `per_numa_bounded_worker_count` holds the limit for bounded workers,
-    /// which process I/O operations expected to be bound in time,
-    /// that is I/O on regular files or block devices. Passing `0` does not change
-    /// the current limit.
+    /// The most io_uring worker threads per NUMA node for IO bound in time,
+    /// on regular files and block devices (default `Some(256)`).
     ///
-    /// **[default]**: If [None] then Nuclei default value of will be used `256`.
-    ///
-    /// If [None] passed, by default, the amount of bounded IO workers is limited to how
-    /// many SQ entries the ring was setup with, or 4 times the number of
-    /// online CPUs in the system, whichever is smaller.
+    /// `Some(0)` leaves the kernel's limit as it is; with `None` the kernel
+    /// limits them to the ring's submission entries or four times the online
+    /// CPUs, whichever is smaller.
     pub per_numa_bounded_worker_count: Option<u32>,
 
-    /// This `per_numa_unbounded_worker_count` holds the limit for unbounded workers,
-    /// which carry out I/O operations that can never complete, for instance I/O
-    /// on sockets. Passing `0` does not change the current limit.
+    /// The most io_uring worker threads per NUMA node for IO that may never
+    /// complete, such as on sockets (default `Some(512)`).
     ///
-    /// **[default]**: If [None] then Nuclei default value of will be used `512`.
-    ///
-    /// If [None] passed unbounded workers will be limited by the process task limit,
-    /// as indicated by the rlimit [RLIMIT_NPROC](https://man7.org/linux/man-pages/man2/getrlimit.2.html) limit.
+    /// `Some(0)` leaves the kernel's limit as it is; with `None` the
+    /// process's task limit (`RLIMIT_NPROC`) bounds them.
     pub per_numa_unbounded_worker_count: Option<u32>,
 
-    /// This argument allows aggressively waiting on CQ(completion queue) to have low latency of IO completions.
-    /// Basically, this argument polls CQEs(completion queue events) directly on cq at userspace.
-    /// Mind that, using this increase pressure on CPUs from userspace side. By default, nuclei reaps the CQ with
-    /// aggressive wait. This is double polling approach for nuclei where Kernel gets submissions by itself (SQPOLL),
-    /// processes it and puts completions to completion queue and we immediately pick up without latency
-    /// (aggressive_poll).
-    ///
-    /// **[default]**: `true`.
+    /// Kept for code written against earlier versions; the ring does not read
+    /// it (default `false`).
     pub aggressive_poll: bool,
 
-    /// Perform busy-waiting for I/O completion events, as opposed to getting notifications via an
-    /// asynchronous IRQ (Interrupt Request). This will reduce latency, but increases CPU usage.
-    /// This is only usable on file systems that support polling and files opened with `O_DIRECT`.
-    ///
-    /// **[default]**: `false`.
+    /// Busy-waits for file completions instead of taking interrupts (default
+    /// `false`): lower latency for more CPU, and only for files opened with
+    /// `O_DIRECT` on file systems that support polling.
     pub iopoll_enabled: bool,
-    // XXX: `redrive_kthread_wake` = bool, syncs queue changes so kernel threads got awakened. increased cpu usage.
+
+    /// Buffers in each shard's group for multishot receives (default 256): the
+    /// kernel fills one as bytes arrive, so a stream's receive stays armed for
+    /// every arrival and a receive that waits holds no buffer of its own.
+    ///
+    /// A power of two up to 32768; 0 turns multishot receives off, and each
+    /// read then takes a buffer of the shard's own pool for its receive.
+    pub recv_buffers: u16,
+
+    /// The size in bytes of each of those buffers (default 16384); for UDP,
+    /// one that holds the largest datagram expected.
+    ///
+    /// A receive is stopped once the bytes it handed out and its reader has
+    /// not taken pass an eighth of the group (at least one buffer), and asked
+    /// for again when its reader catches up. What the kernel took for it
+    /// before the stop stays with it, so a reader with a long backlog may
+    /// hold more until it reads; other receives take buffers of the shard's
+    /// own pool meanwhile.
+    pub recv_buffer_size: u32,
 }
 
+/// The default of [`IoUringConfiguration::recv_buffers`].
+const DEFAULT_RECV_BUFFERS: u16 = 256;
+/// The default of [`IoUringConfiguration::recv_buffer_size`].
+const DEFAULT_RECV_BUFFER_SIZE: u32 = 16 * 1024;
+
 impl IoUringConfiguration {
-    ///
-    /// Standard way to use IO_URING. No polling, purely IRQ awaken IO completion.
-    /// This is a normal way to process IO, mind that with this approach
-    /// `actual completion time != userland reception of completion`.
-    /// Throughput is low compared to all the other config alternatives.
-    ///
-    /// **NOTE:** If you don't know what to select as configuration, please select this.
+    /// No polling: a completion wakes its shard by interrupt. The one to pick
+    /// when unsure.
     pub fn interrupt_driven(queue_len: u32) -> Self {
         Self {
             queue_len,
@@ -91,12 +101,13 @@ impl IoUringConfiguration {
             per_numa_unbounded_worker_count: None,
             aggressive_poll: false,
             iopoll_enabled: false,
+            recv_buffers: DEFAULT_RECV_BUFFERS,
+            recv_buffer_size: DEFAULT_RECV_BUFFER_SIZE,
         }
     }
 
-    ///
-    /// Low Latency Driven version of IO_URING, where it is suitable for high traffic environments.
-    /// High throughput low latency solution where it consumes a lot of resources.
+    /// A kernel thread polls the submission queue and sleeps after 2 idle
+    /// milliseconds: lower latency under steady traffic, for more CPU.
     pub fn low_latency_driven(queue_len: u32) -> Self {
         Self {
             queue_len,
@@ -106,9 +117,8 @@ impl IoUringConfiguration {
         }
     }
 
-    ///
-    /// Kernel poll only version of IO_URING, where it is suitable for high traffic environments.
-    /// This version won't allow aggressive polling on completion queue(CQ).
+    /// A kernel thread polls the submission queue and sleeps after 2 idle
+    /// milliseconds, as [`low_latency_driven`](Self::low_latency_driven).
     pub fn kernel_poll_only(queue_len: u32) -> Self {
         Self {
             queue_len,
@@ -118,8 +128,8 @@ impl IoUringConfiguration {
         }
     }
 
-    ///
-    /// IOPOLL enabled ring configuration for operating on files with low-latency.
+    /// Busy-waits for file completions ([`iopoll_enabled`](Self::iopoll_enabled)):
+    /// low-latency IO on files opened with `O_DIRECT`.
     pub fn io_poll(queue_len: u32) -> Self {
         Self {
             queue_len,
@@ -129,15 +139,14 @@ impl IoUringConfiguration {
     }
 }
 
+/// The interrupt-driven profile, with the io-wq worker limits nuclei sets on
+/// every ring.
 impl Default for IoUringConfiguration {
     fn default() -> Self {
         Self {
-            queue_len: 1 << 11,
-            sqpoll_wake_interval: Some(2),
             per_numa_bounded_worker_count: Some(1 << 8),
             per_numa_unbounded_worker_count: Some(1 << 9),
-            aggressive_poll: true,
-            iopoll_enabled: false,
+            ..Self::interrupt_driven(1 << 11)
         }
     }
 }

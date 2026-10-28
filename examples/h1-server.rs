@@ -4,13 +4,12 @@ use std::net::TcpListener;
 use anyhow::Result;
 use async_dup::Arc;
 
-use futures::prelude::*;
 use http_types::{Request, Response, StatusCode};
 
-static DATA: &'static str = include_str!("data/quark-gluon-plasma");
+static DATA: &str = include_str!("data/quark-gluon-plasma");
 
 /// Serves a request and returns a response.
-async fn serve(req: Request) -> http_types::Result<Response> {
+async fn serve(_req: Request) -> http_types::Result<Response> {
     // println!("Serving {}", req.url());
 
     let mut res = Response::new(StatusCode::Ok);
@@ -42,7 +41,7 @@ async fn listen(listener: Handle<TcpListener>) -> Result<()> {
 
 #[nuclei::main]
 async fn main() -> Result<()> {
-    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000")?);
+    let http = listen(Handle::<TcpListener>::bind("0.0.0.0:8000").await?);
 
     http.await?;
     Ok(())

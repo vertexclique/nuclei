@@ -1,0 +1,47 @@
+<!--title Backends-->
+<!--lede io_uring, epoll, kqueue and I/O completion ports: how one is picked, and what each does.-->
+<h2 id="picking">How the backend is picked</h2>
+<p>The first of these that says something decides, when a runtime's first shard starts:</p>
+<ol>
+<li><code>NUCLEI_BACKEND</code>, when set and not empty: <code>auto</code>, <code>io_uring</code>, or the platform's poller by name (<code>epoll</code>, <code>kqueue</code>, <code>iocp</code>).</li>
+<li>The runtime's own <code>Builder::backend</code>.</li>
+<li><code>NucleiConfig::backend</code>, the process's choice for every runtime that names none.</li>
+<li><code>auto</code>: io_uring where the kernel lets the process have the rings its shards use, the platform's poller otherwise.</li>
+</ol>
+<p>A backend named in any of these ways that the process cannot have fails with the reason; it never falls back. <code>Proactor::backend()</code> says which one the calling thread's shard runs.</p>
+<!--example backends_pick-->
+
+<h2 id="io-uring">io_uring</h2>
+<ul>
+<li>Linux and Android 6.1 or later, with the <code>iouring</code> feature (on by default). The ring is Nuclei's own, on <code>libc</code> alone.</li>
+<li>The probe is safe even under a seccomp filter that kills a process for calling <code>io_uring_setup</code>; where io_uring is refused (an older kernel, a container's policy), <code>auto</code> runs epoll.</li>
+<li>Each shard owns one ring, used by its own thread alone: single issuer with deferred task work, unless a kernel submission thread is configured (<code>sqpoll_wake_interval</code>).</li>
+<li>A stream keeps one multishot receive armed, and <code>accept_multi</code> one multishot accept, filled from the shard's receive group (<a href="production.html#iouring"><code>recv_buffers</code>, <code>recv_buffer_size</code></a>).</li>
+<li>Regular files are read and written with ring operations at the handle's cursor.</li>
+</ul>
+
+<h2 id="epoll">epoll</h2>
+<ul>
+<li>Linux, Android and illumos. On Linux it is what <code>auto</code> picks where io_uring cannot be had.</li>
+<li>A readiness poller: the shard's driver makes each call when the descriptor may be ready, into the shard's buffers. Your code sees the same completion API.</li>
+<li>Regular files run as <code>pread</code> and <code>pwrite</code> jobs on the blocking pool. A child's exit comes through its pidfd.</li>
+</ul>
+
+<h2 id="kqueue">kqueue</h2>
+<ul>
+<li>macOS, iOS, FreeBSD, NetBSD, OpenBSD and DragonFly.</li>
+<li>A readiness poller, served like epoll; a child's exit comes through <code>EVFILT_PROC</code>, wakes through <code>EVFILT_USER</code>.</li>
+<li>Regular files run on the blocking pool.</li>
+</ul>
+
+<h2 id="iocp">I/O completion ports</h2>
+<ul>
+<li>Windows. One completion port per shard; operations are overlapped calls the kernel completes.</li>
+<li>A handle takes std's TCP and UDP sockets, files, and a child's pipes. There are no Unix sockets on Windows.</li>
+<li>A pipe or console opened for synchronous IO cannot complete on a port, so its calls run as jobs of the blocking pool and come back to the shard like the kernel's completions.</li>
+<li>A TCP write, once issued, is always finished: a cancelled send there may have handed bytes to the network stack while saying it took none.</li>
+<li>Timed waits use a high-resolution waitable timer where the system offers one, so timers are not rounded to the 15.6 ms system tick.</li>
+</ul>
+
+<h2 id="ci">What is tested where</h2>
+<p>CI runs the suite on io_uring and on epoll on Linux @@CI_KERNELS@@ and on the runner's own kernel, on kqueue on macOS, and on completion ports on Windows; it runs it under AddressSanitizer on both Linux backends. The examples on these pages run on Linux, on io_uring and on epoll.</p>

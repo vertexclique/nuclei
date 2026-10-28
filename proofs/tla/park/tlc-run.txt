@@ -1,0 +1,31 @@
+TLC run of every configuration in proofs/tla/park, 2026-10-27 15:47 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+P_one                             1219        520      1  pass                                  pass                                  yes
+P_three                         152659      40856      1  pass                                  pass                                  yes
+P_live                           14979       4996      2  pass                                  pass                                  yes
+M_no_recheck                       565        240      1  deadlock                              deadlock                              yes
+M_check_first                      571        254      1  deadlock                              deadlock                              yes
+W_notify                           246        114      1  violated:NoNotify                     violated:NoNotify                     yes
+W_recheck                          165         80      1  violated:NoRecheckFind                violated:NoRecheckFind                yes
+W_spurious                         779        312      1  violated:NoSpurious                   violated:NoSpurious                   yes
+P_timer                           2418       1150      1  pass                                  pass                                  yes
+P_timer_live                     31655      11392      3  pass                                  pass                                  yes
+M_drive_waits                     1144        530      1  deadlock                              deadlock                              yes
+W_drive_fire                       158         82      1  violated:NoDriveFire                  violated:NoDriveFire                  yes
+P_proactor                          57         30      0  pass                                  pass                                  yes
+M_handshake_wake                    66         38      1  deadlock                              deadlock                              yes
+PS_safe                           4144       1797      1  pass                                  pass                                  yes
+PS_live                           4144       1797      2  pass                                  pass                                  yes
+MS_check_first                     372        211      1  violated:NothingLeft                  violated:NothingLeft                  yes
+MS_no_pusher_drop                  823        384      1  violated:NothingLeft                  violated:NothingLeft                  yes
+MS_one_pass                       1154        540      1  violated:NothingLeft                  violated:NothingLeft                  yes
+WS_pusher_drain                    937        437      1  violated:NoPusherDrain                violated:NoPusherDrain                yes
+WS_second_pass                     101         55      1  violated:NoSecondPass                 violated:NoSecondPass                 yes
+MS_no_role                          79         46      0  violated:OneTaker                     violated:OneTaker                     yes
+MS_no_look_again                  1712        775      1  violated:NothingLeft                  violated:NothingLeft                  yes
+WS_hand_back                       596        281      1  violated:NoHandBack                   violated:NoHandBack                   yes
+
+results matching EXPECTED.txt: 24 of 24

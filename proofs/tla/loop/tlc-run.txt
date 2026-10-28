@@ -1,0 +1,11 @@
+TLC run of every configuration in proofs/tla/loop, 2026-10-25 16:49 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_bounded                          109         36      1  pass                                  pass                                  yes
+M_no_self_woken_count               39         16      2  violated:BoundedGap                   violated:BoundedGap                   yes
+W_self_woken_look                   18         10      1  violated:NoSelfWokenLook              violated:NoSelfWokenLook              yes
+W_gap_reaches_its_bound             24         14      1  violated:GapBelowItsBound             violated:GapBelowItsBound             yes
+
+results matching EXPECTED.txt: 4 of 4

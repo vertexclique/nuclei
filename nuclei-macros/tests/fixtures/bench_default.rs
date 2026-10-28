@@ -1,0 +1,1 @@
+#[::core::prelude::v1::bench] fn bench_hello(__nuclei_bencher: &mut test::Bencher) { let mut __nuclei_last =::core::option::Option::None; __nuclei_bencher.iter(|| __nuclei_last =::core::option::Option::Some(::nuclei::block_on(async { "hello" }))); __nuclei_last.expect("the benchmark harness never ran the body") }

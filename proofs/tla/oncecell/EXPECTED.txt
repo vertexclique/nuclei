@@ -1,0 +1,11 @@
+# configuration                spec                 expected
+L_inits                        MC_OnceCell          pass
+L_fail                         MC_OnceCell          pass
+L_drop                         MC_OnceCell          pass
+L_race                         MC_OnceCell          pass
+L_crowd                        MC_OnceCell          pass
+M_no_close                     MC_OnceCell          violated:EveryCallEnds
+M_skip_relook                  MC_OnceCell          violated:NoInitAfterPublish
+M_fail_keeps_turn              MC_OnceCell          violated:EveryCallEnds
+M_set_without_turn             MC_OnceCell          violated:OneWriter
+W_lost_to_racer                MC_OnceCell          violated:NoLostPublish

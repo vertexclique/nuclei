@@ -1,0 +1,39 @@
+<!--title Migrate-->
+<!--lede Coming from a readiness-based runtime: where each piece is, and what behaves differently.-->
+<h2 id="map">The map</h2>
+<p>Most names carry over; the import path changes. The last column is what to watch.</p>
+<table class="table">
+<thead><tr><th>What you use today</th><th>In Nuclei</th><th>Mind</th></tr></thead>
+<tbody>
+<tr><td data-label="What you use today">An attribute on an async main or test</td><td data-label="In Nuclei"><code>#[nuclei::main]</code>, <code>#[nuclei::test]</code></td><td data-label="Mind"><code>threads = N</code> and <code>start_paused = true</code> give a runtime of its own.</td></tr>
+<tr><td data-label="What you use today">Run a future from synchronous code</td><td data-label="In Nuclei"><code>nuclei::block_on</code></td><td data-label="Mind">Allowed inside a task too: it nests and keeps the shard running.</td></tr>
+<tr><td data-label="What you use today">Spawn and keep a join handle</td><td data-label="In Nuclei"><code>nuclei::spawn</code> gives a <code>Task&lt;T&gt;</code></td><td data-label="Mind">Awaiting gives <code>T</code> itself; <code>join()</code> gives <code>Result&lt;T, JoinError&gt;</code>.</td></tr>
+<tr><td data-label="What you use today">Drop the handle to let the task run on</td><td data-label="In Nuclei"><code>.detach()</code></td><td data-label="Mind"><strong>Dropping a <code>Task</code> cancels it.</strong></td></tr>
+<tr><td data-label="What you use today">Abort a task, a join set</td><td data-label="In Nuclei"><code>abort()</code>, <code>abort_handle()</code>, <code>nuclei::task::JoinSet</code></td><td data-label="Mind"><code>cancel().await</code> also gives back an output that was ready.</td></tr>
+<tr><td data-label="What you use today">Blocking work, tasks that are not Send</td><td data-label="In Nuclei"><code>spawn_blocking</code>, <code>spawn_local</code></td><td data-label="Mind">No local set to create: a local task runs on the calling thread's shard.</td></tr>
+<tr><td data-label="What you use today">Task-local values, yielding, the budget</td><td data-label="In Nuclei"><code>nuclei::task_local!</code>, <code>task::yield_now</code>, <code>task::coop</code></td><td data-label="Mind">A task-local value is set with <code>scope</code> around the task's future.</td></tr>
+<tr><td data-label="What you use today">A runtime builder and handle</td><td data-label="In Nuclei"><code>nuclei::Builder</code>, <code>RuntimeHandle</code></td><td data-label="Mind">A handle does not keep the runtime running. See <a href="production.html#builder">every setting</a>.</td></tr>
+<tr><td data-label="What you use today">TCP, UDP and Unix socket types</td><td data-label="In Nuclei"><code>nuclei::net</code></td><td data-label="Mind">std's own sockets inside; std's methods work through them.</td></tr>
+<tr><td data-label="What you use today">Socket builders, stream halves</td><td data-label="In Nuclei"><code>TcpSocket</code>, <code>UnixSocket</code>, <code>split</code>, <code>into_split</code></td><td data-label="Mind">A shared reference to a stream reads and writes too.</td></tr>
+<tr><td data-label="What you use today">Read and write extension traits, copies, buffers</td><td data-label="In Nuclei"><code>nuclei::io</code></td><td data-label="Mind">On the <code>futures-io</code> traits; closing a write side is <code>shutdown</code>.</td></tr>
+<tr><td data-label="What you use today">Wait until readable, then try a read</td><td data-label="In Nuclei"><code>readable()</code>, <code>try_read()</code></td><td data-label="Mind">Rarely needed: <code>recv().await</code> completes the read for you.</td></tr>
+<tr><td data-label="What you use today">A descriptor of your own, by readiness</td><td data-label="In Nuclei"><code>nuclei::io::unix::AsyncFd</code></td><td data-label="Mind">The descriptor must be in non-blocking mode.</td></tr>
+<tr><td data-label="What you use today">Files and directories</td><td data-label="In Nuclei"><code>nuclei::fs</code></td><td data-label="Mind"><code>read_dir</code> gives entries with <code>next_entry().await</code>.</td></tr>
+<tr><td data-label="What you use today">Sleep, timeout, interval, paused time</td><td data-label="In Nuclei"><code>nuclei::time</code></td><td data-label="Mind">A millisecond wheel; missed ticks burst by default.</td></tr>
+<tr><td data-label="What you use today">Locks, semaphores, channels, a cancellation token</td><td data-label="In Nuclei"><code>nuclei::sync</code></td><td data-label="Mind">The established names and signatures; they work under any executor.</td></tr>
+<tr><td data-label="What you use today">select!, join!, try_join!</td><td data-label="In Nuclei"><code>nuclei::select!</code>, <code>join!</code>, <code>try_join!</code></td><td data-label="Mind"><code>select!</code> starts at a random branch unless <code>biased;</code>.</td></tr>
+<tr><td data-label="What you use today">Ctrl-C, Unix signals, child processes</td><td data-label="In Nuclei"><code>nuclei::signal</code>, <code>nuclei::process</code></td><td data-label="Mind">A signal is a stream: <code>recv().await</code>.</td></tr>
+</tbody>
+</table>
+
+<h2 id="pitfalls">Pitfalls</h2>
+<h3 id="drop-cancels">Dropping a task cancels it</h3>
+<p>The most common bug after a move. A task whose <code>Task</code> is dropped stops at its next <code>.await</code>, and never runs if it had not started. Every fire-and-forget spawn needs <code>.detach()</code>. See <a href="tasks.html#lifetime">Tasks</a>.</p>
+<h3 id="write-done">A write is taken, not delivered</h3>
+<p>A write returns once its bytes are copied into the stream's write-behind. Code that writes and then exits, or expects an error right away, should <code>flush().await</code> or <code>shutdown().await</code>. See <a href="proactive.html#buffers">How it works</a>.</p>
+<h3 id="no-stealing">No work stealing</h3>
+<p>A task stays on its shard. One that computes for long without an <code>.await</code> holds every other task of that shard, and no idle core takes them over: give such work to <code>spawn_blocking</code>, or break it up.</p>
+<h3 id="copies">Buffers are copied, unless you lend them</h3>
+<p><code>recv</code> and <code>read</code> copy from the shard's buffer into your slice; writes copy into the write-behind. Where the copy matters, <code>read_owned</code> and <code>write_owned</code> lend the driver your vector.</p>
+<h3 id="config-once">Configure io_uring before any IO</h3>
+<p><code>Proactor::with_config</code> runs once, before the first IO, <code>spawn</code> or <code>block_on</code>; it panics otherwise. Configure from a plain <code>fn main</code>, then enter the runtime.</p>

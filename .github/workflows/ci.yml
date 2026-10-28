@@ -2,78 +2,147 @@ name: CI
 
 on: [push, pull_request]
 
+# One run per ref: a new push or PR update cancels the run it supersedes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build_and_test:
     strategy:
       fail-fast: false
       matrix:
-        toolchain:
-          - x86_64-unknown-linux-gnu
-          - x86_64-apple-darwin
-        version:
-          - stable
-          - nightly
         include:
           - toolchain: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - toolchain: x86_64-apple-darwin
-            os: macOS-latest
+          # The macOS runners are Apple Silicon: the aarch64 toolchain runs
+          # natively there (an x86_64 one cannot run on the arm64 hosts).
+          - toolchain: aarch64-apple-darwin
+            os: macos-latest
+          # The completion port backend.
+          - toolchain: x86_64-pc-windows-msvc
+            os: windows-latest
 
-    name: ${{ matrix.version }} - ${{ matrix.toolchain }}
+    name: stable - ${{ matrix.toolchain }}
     runs-on: ${{ matrix.os }}
+    # A test that hangs fails the job here, not at the runner's six hours.
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@master
+      - uses: actions/checkout@v7
 
-      - name: Install ${{ matrix.version }}
-        uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.version }}-${{ matrix.toolchain }}
-          default: true
+          targets: ${{ matrix.toolchain }}
 
-      - name: check nightly - linux + windows
-        if: matrix.version == 'nightly' && matrix.os != 'macOS-latest'
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --all --benches --bins --tests
+      - name: check
+        run: cargo check --all --bins --tests
 
-      - name: check stable
-        if: matrix.version == 'stable'
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --all --bins --tests
+      - name: tests
+        run: cargo test --all
 
-      - name: tests nightly - linux + windows
-        if: matrix.version == 'nightly' && matrix.os != 'macOS-latest'
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --all
+      - name: tests on epoll
+        if: runner.os == 'Linux'
+        run: cargo test --all
+        env:
+          NUCLEI_BACKEND: epoll
 
-      - name: tests stable
-        if: matrix.version == 'stable'
-        uses: actions-rs/cargo@v1
+  # `#[nuclei::bench]` expands to a benchmark, which only nightly's test
+  # harness takes: built and run here, each benchmark's body once.
+  bench_macro_on_nightly:
+    name: The bench macro on nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: bench macro
+        run: cargo test --test macros_bench
+        env:
+          RUSTFLAGS: --cfg nuclei_nightly
+
+  # The suite under AddressSanitizer on both Linux backends: shards that
+  # go with operations out and tasks and timers left, and the memory the
+  # driver lends the kernel. It sees what this process does with that
+  # memory (that the kernel never writes memory that is gone is the slots'
+  # rules), and LeakSanitizer what is never freed. The test that no sync
+  # primitive makes a system call is left out: the sanitizer's runtime
+  # makes its own.
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      RUSTDOCFLAGS: -Zsanitizer=address
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: tests on io_uring
+        run: cargo test -p nuclei --target x86_64-unknown-linux-gnu -- --skip hot_loops_make_no_system_call_but_sched_yield
+
+      - name: tests on epoll
+        run: cargo test -p nuclei --target x86_64-unknown-linux-gnu -- --skip hot_loops_make_no_system_call_but_sched_yield
+        env:
+          NUCLEI_BACKEND: epoll
+
+  # The loom models: every interleaving each model reaches within its preemption bound, of the
+  # runtime's task, park handshake and IO source sides, and of the sync primitives. The commands
+  # are the ones the models' own docs give; the long models marked ignored stay a local run.
+  loom:
+    name: Loom models
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: the runtime's models
+        run: cargo test --release -p nuclei --lib -- rt::task::loom_tests rt::handshake::loom_tests io::side::loom_tests
+
+      - name: the sync models
+        run: cargo test --release -p nuclei --lib -- sync::loom_tests
+
+  # The io_uring probe in each sandbox it meets (benches/reference/probe-matrix.sh): the plain
+  # host, systemd units that kill or deny the io_uring calls, Docker's default seccomp profile
+  # and unconfined, and the io_uring_disabled sysctl; each must report what that sandbox gives.
+  probe_matrix:
+    name: The io_uring probe in each sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          command: test
-          args: --all
+          targets: x86_64-unknown-linux-musl
+
+      - name: probe matrix
+        run: bash benches/reference/probe-matrix.sh
+        env:
+          PROBE_SYSTEMD_RUN: sudo systemd-run
+          PROBE_SYSCTL: "1"
 
   check_fmt_and_docs:
     name: Checking fmt and docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@master
+      - uses: actions/checkout@v7
 
-      - name: Setup
-        uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          default: true
           components: rustfmt
 
       - name: fmt
         run: cargo fmt --all -- --check
 
+      # Doc warnings stay visible but not fatal while the legacy runtime is
+      # in the tree; it is on its way out and its doc nits go with it.
       - name: doc
         run: cargo doc

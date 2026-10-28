@@ -1,0 +1,30 @@
+<!--title Readiness-->
+<!--lede Wait until a socket may be ready, try a call without waiting, and make calls of your own.-->
+<h2 id="model">Readiness on a proactor</h2>
+<p>The driver completes IO for the task (<a href="proactive.html#proactor">How it works</a>), so most code never asks whether a socket is ready: it awaits <code>recv</code> or <code>read</code>. Readiness is for code that wants to try first and wait only when it must, and for calls the driver does not make. On a Nuclei socket:</p>
+<ul>
+<li><strong>A read is ready</strong> when the handle holds bytes the driver read ahead, or the stream ended.</li>
+<li><strong>A write is ready</strong> when the stream's write-behind has room.</li>
+</ul>
+
+<h2 id="try">Wait, then try</h2>
+<p><code>readable()</code>, <code>writable()</code> and <code>ready(interest)</code> wait until a read or a write would end at once; the <code>try_</code> calls make it without waiting, or answer <code>WouldBlock</code>. They answer from the handle's own read-ahead and write-behind, which the driver keeps filling and draining: a <code>try_read</code> that finds nothing leaves the driver reading, so a later one finds what came.</p>
+<!--example readiness_try-->
+<p>Streams have <code>try_read</code>, <code>try_read_vectored</code>, <code>try_write</code> and <code>try_write_vectored</code>. A <code>try_</code> call after a wait can still answer <code>WouldBlock</code>, when another task got there first: wait again, as the loop does.</p>
+
+<h2 id="datagrams">Datagrams</h2>
+<p>Datagram sockets have <code>try_send</code>, <code>try_send_to</code>, <code>try_recv</code> and <code>try_recv_from</code> the same way, and UDP sockets <code>try_peek</code> and <code>try_peek_from</code> too.</p>
+<!--example readiness_udp-->
+
+<h2 id="poll">For futures of your own</h2>
+<p>A future or stream written by hand polls instead: <code>poll_accept</code>, <code>poll_peek</code>, <code>poll_read_ready</code>, <code>poll_write_ready</code>, and for datagrams <code>poll_recv_ready</code>, <code>poll_send_ready</code> and <code>poll_peek_sender</code>. Each keeps the waker of its <code>Context</code> until the answer is ready.</p>
+<!--example readiness_poll-->
+
+<h2 id="own-calls">Calls of your own on a socket</h2>
+<p>For a socket option or a system call Nuclei does not make, <code>async_io(interest, f)</code> runs <code>f</code>, your own call on the socket, each time it may be ready, until it answers other than <code>WouldBlock</code>; <code>try_io</code> runs it once, now (Unix).</p>
+<!--example readiness_try_io-->
+<p>Nothing is reordered around your call. Bytes the handle wrote behind go out before it, and a read of your own while the handle holds bytes it read ahead answers <code>ResourceBusy</code>: read those first.</p>
+
+<h2 id="async-fd">A descriptor of your own</h2>
+<p><code>nuclei::io::unix::AsyncFd</code> drives any descriptor you own by readiness: an eventfd, a device, a socket of a kind Nuclei does not wrap. Wait with <code>readable</code> or <code>writable</code>, then make your call through the guard's <code>try_io</code>; a call that answers <code>WouldBlock</code> clears the readiness, and the next wait lasts until the driver says so again. The descriptor must be in non-blocking mode.</p>
+<!--example readiness_async_fd-->

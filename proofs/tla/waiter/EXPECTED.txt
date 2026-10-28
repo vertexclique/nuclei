@@ -1,0 +1,17 @@
+# configuration          spec     expected
+L_spin                   Waiter   pass
+L_cancel                 Waiter   pass
+L_nudges                 Waiter   pass
+L_reuse                  Waiter   pass
+M_claim_registering      Waiter   violated:SlotExclusive
+M_park_ignores_taking    Waiter   violated:SlotExclusive
+M_no_again               Waiter   violated:AllEnd
+M_arm_without_look       Waiter   violated:AllEnd
+M_spin_keeps_armed       Waiter   violated:NoClaimWhileSpinning
+M_free_on_queue_release  Waiter   violated:NoStaleAccess
+M_release_forgets_owed   Waiter   violated:OwedSettled
+W_again                  Waiter   violated:NoAgain
+W_spin_mark              Waiter   violated:NoSpinMark
+W_reuse                  Waiter   violated:NoReuse
+W_forgive                Waiter   violated:NoForgive
+W_cancel_take            Waiter   violated:NoCancelTake

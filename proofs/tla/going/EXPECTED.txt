@@ -1,0 +1,10 @@
+# configuration   spec    expected
+G_alone           Going   pass
+G_held            Going   pass
+G_failed          Going   pass
+G_failed_held     Going   pass
+M_token_only      Going   violated:AllEnd
+M_keep_home       Going   violated:AllEnd
+M_no_wait         Going   violated:NoStrandedOp
+W_collision       Going   violated:NoCollision
+W_held            Going   violated:NoHolderEvict

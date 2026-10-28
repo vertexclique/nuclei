@@ -1,12 +1,6 @@
-pub(crate) mod fs;
-mod iouring;
-mod net;
-mod nethandle;
-mod processor;
+//! io_uring over raw system calls.
 
-pub(crate) use fs::*;
-pub(crate) use iouring::*;
+pub(crate) mod ring;
 
-pub(crate) use processor::*;
-
-pub const BACKEND: crate::sys::IoBackend = crate::sys::IoBackend::IoUring;
+pub(crate) mod files;
+pub(crate) mod ops;

@@ -1,0 +1,14 @@
+TLC run of every configuration in proofs/tla/signal, 2026-10-25 09:20 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+SG_safe                          12736       5340      1  pass                                  pass                                  yes
+SG_live                          12736       5340      1  pass                                  pass                                  yes
+MG_write_first                   25354      10432      1  violated:SeesAll                      violated:SeesAll                      yes
+MG_dispatch_first                72854      25900      3  violated:SeesAll                      violated:SeesAll                      yes
+MG_no_recheck                     8210       3444      1  violated:SeesAll                      violated:SeesAll                      yes
+WG_coalesce                         19         17      1  violated:NoCoalesce                   violated:NoCoalesce                   yes
+WG_pump_wake                       837        480      1  violated:NoPumpWake                   violated:NoPumpWake                   yes
+
+results matching EXPECTED.txt: 7 of 7

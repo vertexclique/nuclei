@@ -1,0 +1,17 @@
+TLC run of every configuration in proofs/tla/remote, 2026-10-27 02:13 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+RF_safe                       13281142    4791885     17  pass                                  pass                                  yes
+RF_live                       13281142    4791885    147  pass                                  pass                                  yes
+RF_tight                       3646326    1302085      8  pass                                  pass                                  yes
+MRF_blind_push                   18368       7658      1  violated:ListConsistent               violated:ListConsistent               yes
+MRF_store_close                  72807      29767      2  violated:ListConsistent               violated:ListConsistent               yes
+MRF_release_first                18142       7661      1  violated:OpenWhileOwned               violated:OpenWhileOwned               yes
+MRF_no_bound                     18000       7514      2  violated:BoundedList                  violated:BoundedList                  yes
+WRF_closed                        7395       3079      1  violated:NoRefusedClosed              violated:NoRefusedClosed              yes
+WRF_full                          6224       2780      1  violated:NoRefusedFull                violated:NoRefusedFull                yes
+WRF_reclaimed                    15075       6242      2  violated:NoReclaimed                  violated:NoReclaimed                  yes
+
+results matching EXPECTED.txt: 10 of 10

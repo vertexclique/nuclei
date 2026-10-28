@@ -1,0 +1,19 @@
+# The programs the Learn pages show, each one src/bin/<name>.rs, shown on its page byte for byte.
+# `python3 site/build.py --examples` builds, lints and runs every one of them on io_uring and on
+# epoll; the Pages workflow does so before each deploy and on every pull request.
+[package]
+name = "nuclei-learn"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+nuclei = { path = "../.." }
+
+[package.metadata.learn]
+# Servers that run until they are stopped: built and linted, never run.
+build-only = ["echo_server"]
+
+# A workspace of its own: the examples are checked by the site's build on Linux, apart from the
+# crate's suite on every platform.
+[workspace]

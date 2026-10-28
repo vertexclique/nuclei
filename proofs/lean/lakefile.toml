@@ -1,0 +1,7 @@
+# The Lean proofs of nuclei: core Lean only, no other package. `lake build` checks every module
+# that Nuclei.lean imports.
+name = "nuclei"
+defaultTargets = ["Nuclei"]
+
+[[lean_lib]]
+name = "Nuclei"

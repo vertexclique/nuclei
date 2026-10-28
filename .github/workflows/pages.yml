@@ -1,0 +1,85 @@
+name: Pages
+
+# The site is built from the commit, all of it: `python3 site/build.py --examples` writes the
+# pages (site/src/ with the Learn examples and the values of the source: versions from Cargo.toml,
+# the kernel series from kernels.yml, links pinned to the commit), the API reference (rustdoc), the
+# search index and the files for language models (llms.txt, llms-full.txt, every page as Markdown),
+# then builds, lints and runs every Learn example on io_uring and on epoll.
+# Nothing it writes is committed. A push to master or to the 0.5 branch that touches anything the
+# site reads deploys it; a pull request runs the same build, so a page, an example or the index
+# that disagrees with the source fails before the merge.
+on:
+  push:
+    branches: [master, modernize-2026]
+    paths: &site-inputs
+      - "site/**"
+      - "src/**"
+      - "nuclei-macros/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "CHANGELOG.md"
+      - ".github/workflows/pages.yml"
+      - ".github/workflows/kernels.yml"
+  pull_request:
+    paths: *site-inputs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Deployments run one at a time and a newer push waits rather than cancelling one under way; a
+# pull request's check is replaced by its next push.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pages-check-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build site/
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # The minimum Rust the crate declares builds the reference and the examples.
+      - name: Rust from Cargo.toml
+        run: |
+          rust=$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$rust" ]; then
+            echo "Cargo.toml gives no rust-version" >&2
+            exit 1
+          fi
+          rustup toolchain install "$rust" --profile minimal --component rustfmt,clippy --target x86_64-unknown-linux-gnu
+          rustup default "$rust"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the site, and check every Learn example
+        run: python3 site/build.py --examples
+
+      # What is served: the built site without its sources and build scripts.
+      - name: Stage the site
+        run: rsync -a --exclude '/src/' --exclude '/examples/' --exclude '*.py' --exclude '__pycache__/' site/ _site/
+
+      - uses: actions/configure-pages@v6
+        if: github.event_name != 'pull_request'
+
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy site/
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

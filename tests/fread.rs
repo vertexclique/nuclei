@@ -1,20 +1,15 @@
-use futures::AsyncReadExt;
-use nuclei::*;
+mod io_support;
+
 use std::fs::File;
-use std::path::PathBuf;
+
+use io_support::{read_to_end, testdata};
+use nuclei::Handle;
 
 #[nuclei::test]
-async fn read_file() -> std::io::Result<()> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("testdata");
-    path.push("quark-gluon-plasma");
-
-    let fo = File::open(&path).unwrap();
-    let mut file = Handle::<File>::new(fo).unwrap();
-    let mut buffer = String::new();
-    let _ = file.read_to_string(&mut buffer).await;
-
-    assert_eq!(11587, buffer.len());
-
-    Ok(())
+async fn read_file() {
+    let path = testdata("quark-gluon-plasma");
+    let mut file = Handle::<File>::new(File::open(&path).unwrap()).unwrap();
+    let got = read_to_end(&mut file).await.unwrap();
+    assert_eq!(got.len(), 11587);
+    assert_eq!(got, std::fs::read(&path).unwrap());
 }

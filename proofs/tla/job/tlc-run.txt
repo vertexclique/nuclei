@@ -1,0 +1,15 @@
+TLC run of every configuration in proofs/tla/job, 2026-10-25 02:39 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+J_safe                            2201       1270      1  pass                                  pass                                  yes
+J_live                             638        428      2  pass                                  pass                                  yes
+M_no_cancelling                    136         88      1  violated:NoStray                      violated:NoStray                      yes
+M_no_retry                          33         26      1  deadlock                              deadlock                              yes
+M_no_out                           154         98      1  violated:Termination                  violated:Termination                  yes
+W_abort                              8          7      1  violated:NoAbort                      violated:NoAbort                      yes
+W_cancel_ends                       22         17      1  violated:NoCancelEnd                  violated:NoCancelEnd                  yes
+W_retry                             24         19      1  violated:NoRetry                      violated:NoRetry                      yes
+
+results matching EXPECTED.txt: 8 of 8

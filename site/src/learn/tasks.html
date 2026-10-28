@@ -1,0 +1,48 @@
+<!--title Tasks-->
+<!--lede Spawn work, wait for it, cancel it, and run what is not Send or not async.-->
+<h2 id="spawn">Spawn and await</h2>
+<p><code>nuclei::spawn</code> takes a future that is <code>Send + 'static</code> and returns a <code>Task&lt;T&gt;</code>. A task is a future itself: awaiting it gives the task's output. If the task panics, awaiting it resumes the panic.</p>
+<!--example tasks_spawn-->
+
+<h2 id="lifetime">Dropping, detaching, cancelling</h2>
+<p>A <code>Task</code> owns its task: <strong>dropping it cancels the task</strong>. To let a task run on with nobody waiting for it, call <code>detach</code>.</p>
+<!--example tasks_lifetime-->
+<table class="table">
+<thead><tr><th>Call</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td data-label="Call"><code>detach()</code></td><td data-label="What it does">The task runs to its end; its output is dropped.</td></tr>
+<tr><td data-label="Call"><code>cancel().await</code></td><td data-label="What it does">Cancels and waits until the future is dropped; gives the output back if the task had finished.</td></tr>
+<tr><td data-label="Call"><code>abort()</code></td><td data-label="What it does">Cancels without waiting. <code>abort_handle()</code> gives an <code>AbortHandle</code> that does it from anywhere and outlives the task.</td></tr>
+<tr><td data-label="Call"><code>is_finished()</code></td><td data-label="What it does">Whether the task completed or was cancelled.</td></tr>
+</tbody>
+</table>
+<div class="note"><p class="note__title">The most common surprise</p><p>A server loop that spawns a task per connection and drops each handle cancels every connection at once. Write <code>nuclei::spawn(handler).detach()</code>, or keep the tasks in a <a href="#join-set">JoinSet</a>.</p></div>
+
+<h2 id="join">Why a task gave no output</h2>
+<p>Awaiting a task panics where it has no output to give. <code>join()</code> gives a <code>Result</code> instead: the output, or a <code>JoinError</code> that says the task was cancelled or panicked (with the panic's payload). <code>fallible()</code> gives an <code>Option</code>.</p>
+<!--example tasks_join_error-->
+
+<h2 id="join-set">Many tasks: JoinSet</h2>
+<p>A <code>JoinSet</code> holds tasks and gives their outputs in the order they finish. Dropping the set cancels whatever is still in it, so no task outlives the code that owns it.</p>
+<!--example tasks_join_set-->
+<p><code>join_next_with_id</code> says which task finished, <code>try_join_next</code> never waits, <code>join_all</code> collects every output, and <code>abort_all</code>, <code>detach_all</code> and <code>shutdown</code> end or release them all.</p>
+
+<h2 id="names">Ids and names</h2>
+<p>Every task has an <code>Id</code>, unique in the process and never reused: <code>task.id()</code> from the handle, <code>task::id()</code> from inside it, and the <a href="production.html#hooks">task hooks</a> are given it too. <code>task::Builder</code> spawns with options, a name today, and answers an <code>io::Result</code>.</p>
+<!--example tasks_builder-->
+
+<h2 id="local">Tasks that are not Send</h2>
+<p><code>nuclei::spawn_local</code> takes a future that need not be <code>Send</code> and keeps it on the calling thread's shard. There is no local set to create first.</p>
+<!--example tasks_local-->
+
+<h2 id="blocking">Work that blocks</h2>
+<p>A blocking call (a synchronous library, a long computation) would hold its shard and every task on it. <code>nuclei::spawn_blocking</code> runs a closure on the runtime's blocking pool instead and returns a <code>Task</code> for its result. The pool grows on demand up to <a href="api:nuclei::Builder::max_blocking_threads"><code>max_blocking_threads</code></a>, and idle threads leave after <a href="api:nuclei::Builder::thread_keep_alive"><code>thread_keep_alive</code></a>.</p>
+<!--example tasks_blocking-->
+
+<h2 id="task-local">Task-local values</h2>
+<p><code>task_local!</code> declares a key whose value belongs to one task: <code>scope</code> runs a future with it set, and any code that future runs reads it with <code>get</code>, <code>with</code> or <code>try_with</code>.</p>
+<!--example tasks_task_local-->
+
+<h2 id="yield">Yielding and the budget</h2>
+<p>Each poll of a task may complete a budget of operations (<a href="api:nuclei::task::coop::BUDGET"><code>coop::BUDGET</code></a>) before it yields, so one busy task cannot hold its shard. A loop that awaits nothing else can spend the budget itself with <code>coop::consume_budget()</code>; <code>task::yield_now()</code> gives the other tasks a turn at once, and <code>coop::unconstrained</code> runs a future with no budget.</p>
+<!--example tasks_yield-->

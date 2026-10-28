@@ -1,0 +1,12 @@
+# configuration                spec                 expected
+I_safe                         MC_Inbox             pass
+I_three                        MC_Inbox             pass
+I_live                         MC_Inbox             pass
+MI_no_reset                    MC_Inbox             violated:NoDuplicate
+MI_take_last                   MC_Inbox             violated:NoDuplicate
+MI_no_recheck                  MC_Inbox             deadlock
+MI_head_only                   MC_Inbox             violated:EmptyAtSleep
+WI_busy                        MC_Inbox             violated:NoBusy
+WI_restub                      MC_Inbox             violated:NoRestub
+WI_sleep                       MC_Inbox             violated:NoSleep
+WI_hidden                      MC_Inbox             violated:NoHidden

@@ -1,0 +1,18 @@
+<!--title Select and join-->
+<!--lede Wait on several futures at once, inside one task.-->
+<h2 id="join">join! and try_join!</h2>
+<p><code>nuclei::join!</code> polls every future given, all at once, in the task that awaits it, and gives their outputs as a tuple in the order written. <code>nuclei::try_join!</code> does the same with futures that give a <code>Result</code>: it gives <code>Ok</code> with every output, or the first error at once, dropping the rest.</p>
+<!--example select_join-->
+<p>The futures run concurrently, not in parallel: they share the task. To use more cores, <a href="tasks.html#spawn">spawn</a> them. Each poll starts one future later than the last, so a future that is always ready cannot starve the others; <code>biased;</code> as the first argument polls in the order written.</p>
+
+<h2 id="select">select!</h2>
+<p><code>nuclei::select!</code> waits on several branches and runs the handler of the first to finish, dropping the other futures. Each branch is <code>pattern = future =&gt; handler</code>.</p>
+<!--example select_select-->
+<ul>
+<li><strong>Patterns filter.</strong> A future whose output does not match its pattern disables its branch, and the others go on: <code>Some(job) = jobs.recv()</code> stops matching once the channel closes.</li>
+<li><strong><code>else</code> ends it.</strong> When every branch is disabled, the <code>else</code> branch runs; without one, <code>select!</code> panics.</li>
+<li><strong>Preconditions.</strong> <code>pattern = future, if condition =&gt; handler</code> leaves a branch out when the condition is false.</li>
+<li><strong>Fair by default.</strong> Polling starts at a random branch; <code>biased;</code> first polls in the order written.</li>
+<li><strong>Handlers are plain code.</strong> They run after the futures are dropped, so <code>return</code>, <code>?</code>, <code>break</code> and <code>continue</code> act on the code around the <code>select!</code>.</li>
+</ul>
+<div class="note"><p class="note__title">What a losing branch loses</p><p>A branch that loses is dropped where it stood. Nuclei's IO loses no byte when dropped (see <a href="proactive.html#cancel">How it works</a>), and a sync wait or a channel receive withdraws without losing a value or a wakeup; a <code>Barrier</code> wait is the one exception, its arrival stays counted. State a future of your own holds halfway is dropped with it.</p></div>

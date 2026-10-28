@@ -1,0 +1,44 @@
+<!--title Channels-->
+<!--lede Send values between tasks, and tell many tasks to stop.-->
+<h2 id="which">Which channel</h2>
+<table class="table">
+<thead><tr><th>Channel</th><th>For</th></tr></thead>
+<tbody>
+<tr><td data-label="Channel"><code>mpsc::channel(n)</code></td><td data-label="For">Many senders, one receiver, at most <code>n</code> messages waiting: a send waits for room, so a fast sender cannot run away.</td></tr>
+<tr><td data-label="Channel"><code>mpsc::unbounded_channel()</code></td><td data-label="For">The same with no bound: a send never waits.</td></tr>
+<tr><td data-label="Channel"><code>oneshot::channel()</code></td><td data-label="For">One value, once: a reply to a request.</td></tr>
+<tr><td data-label="Channel"><code>broadcast::channel(n)</code></td><td data-label="For">Every receiver sees every message; one that falls <code>n</code> behind is told how many it missed.</td></tr>
+<tr><td data-label="Channel"><code>watch::channel(v)</code></td><td data-label="For">One value many tasks read, and the news that it changed.</td></tr>
+</tbody>
+</table>
+<p>Like everything in <a href="sync.html#model"><code>nuclei::sync</code></a>, they work under any executor, and their receives are safe to drop halfway.</p>
+
+<h2 id="mpsc">mpsc</h2>
+<p>Senders clone; the channel closes when the last one drops, and <code>recv</code> then gives <code>None</code>. <code>recv_many</code> takes up to a limit at once; the receiver's <code>close</code> stops new sends and lets it drain what is there.</p>
+<!--example chan_mpsc-->
+
+<h2 id="permits">Permits, timeouts, weak senders</h2>
+<p><code>reserve</code> takes a slot before the value exists, so the send that uses the permit cannot fail; <code>reserve_many</code> takes several, <code>reserve_owned</code> one that moves. <code>try_send</code> never waits, and <code>send_timeout</code> gives up after a while and gives the value back. A weak sender does not keep the channel open.</p>
+<!--example chan_permits-->
+
+<h2 id="oneshot">oneshot</h2>
+<!--example chan_oneshot-->
+<p>The sender can wait for the receiver to go away (<code>closed</code>), to stop work nobody will read.</p>
+
+<h2 id="broadcast">broadcast</h2>
+<!--example chan_broadcast-->
+<p><code>subscribe</code> on the sender, and <code>resubscribe</code> on a receiver, add a receiver that takes what is sent from then on. A <code>WeakSender</code> sends only once upgraded, and does not keep the channel open.</p>
+
+<h2 id="watch">watch</h2>
+<!--example chan_watch-->
+<p><code>borrow</code> reads the current value; <code>changed</code> waits for one this receiver has not seen, and <code>wait_for</code> for one that passes a test. <code>send_modify</code> changes the value in place, and <code>send_if_modified</code> tells the receivers only when the change says so.</p>
+
+<h2 id="cancel">Cancellation tokens</h2>
+<p>A <a href="api:nuclei::sync::CancellationToken"><code>CancellationToken</code></a> tells any number of tasks to stop. Clones share one state; a child token is cancelled with its parent, and on its own without touching the parent.</p>
+<!--example chan_cancel-->
+<ul>
+<li><code>cancelled().await</code> waits for it; <code>is_cancelled()</code> checks.</li>
+<li><code>run_until_cancelled(future)</code> gives <code>Some(output)</code>, or <code>None</code> once the token is cancelled first, dropping the future.</li>
+<li><code>drop_guard()</code> cancels the token when the guard drops, however the scope ends.</li>
+</ul>
+<p><a href="production.html#shutdown">A clean shutdown</a> puts it to work.</p>

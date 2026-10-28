@@ -1,0 +1,12 @@
+# configuration                spec                 expected
+X_safe                         MC_Radix             pass
+X_deep                         MC_Radix             pass
+X_three                        MC_Radix             pass
+X_live                         MC_Radix             pass
+MX_leave_early                 MC_Radix             violated:RootLive
+MX_retire_parent_early         MC_Radix             violated:NoFreedTouch
+MX_no_recheck                  MC_Radix             violated:PerSenderOrder
+WX_grow                        MC_Radix             violated:NoGrow
+WX_race                        MC_Radix             violated:NoRace
+WX_free                        MC_Radix             violated:NoFree
+WX_past                        MC_Radix             violated:NoPast
