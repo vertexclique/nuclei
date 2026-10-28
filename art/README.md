@@ -14,6 +14,7 @@ through blue to violet.
 | `nuclei-banner-2000x500.png` | The banner: the mark and the word Nuclei on navy, 2000 by 500. |
 | `nuclei-banner-1280x640.png` | The banner at 1280 by 640, the size of a repository's social preview. |
 | `fonts/Geist-SemiBold.ttf` | The banners' word: Geist SemiBold, the site's wordmark font, under its licence `fonts/OFL.txt`. |
+| `nuclei.gif` | The animation from the documentary Particle Fever that the README once showed; not drawn by `build.py`. |
 | `build.py` | Draws the mark and writes every file above, and the site's copies. |
 
 The site uses the same drawing with heavier lines where it is shown small: the header mark,
