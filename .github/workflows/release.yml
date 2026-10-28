@@ -1,0 +1,29 @@
+name: Release
+
+# The tag `cargo release --execute` pushes for the nuclei crate (v0.5.0 and on; the macros
+# crate's nuclei-macros-v* tags do not count) makes its GitHub release: named `v<version>
+# "<Codename>"`, with the version's CHANGELOG.md section and every commit since the previous
+# version tag as its notes. release.sh says how the codename is chosen (never one used before).
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Every tag and commit: the notes list the commits since the last version tag.
+          fetch-depth: 0
+
+      - name: Make the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/workflows/release.sh "${{ github.ref_name }}"
