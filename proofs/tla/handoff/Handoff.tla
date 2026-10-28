@@ -52,6 +52,10 @@ Slots == 1..(1 + MaxHandoffs)
 NONE == 0
 PENDING == 1
 TAKEN == 2
+\* A store buffer holds this many stores; a store into a full one waits, as a CPU's does.
+BufCap == 2
+\* Calls into the runtime one poll makes.
+MaxBrackets == 1
 
 \* What actor `a` reads at (kind, slot): its own newest buffered store, else memory.
 Newest(sq, k, s) ==
@@ -90,7 +94,7 @@ define
     Exclusive == Cardinality(inS) <= 1
     \* A thread that saw its shard taken stays out of it until handed it again.
     DetachedStaysOut ==
-        \A t \in Threads : pc[t] \in {"D_unwind", "D_bound", "Spare"} => t \notin inS
+        \A t \in Threads : pc[t] \in {"D_unwind", "D_bound", "D_drain", "D_spare", "Spare"} => t \notin inS
     \* A bound task runs on the thread that created it, never elsewhere.
     BoundOnCreator == boundBy \subseteq {Creator}
     \* Every remote push is run, the first runner blocked for good or not.
@@ -132,7 +136,7 @@ P_push:
 end process;
 
 fair process thread \in Threads
-variables sl = 0, e = 0, polls = 0, c = NONE;
+variables sl = 0, e = 0, polls = 0, c = NONE, br = 0;
 begin
 T_begin:
     if self = 1 then
@@ -166,10 +170,14 @@ R_loop:
     end if;
 R_poll:
     \* word := (task, e), a release store; the task's code runs outside the shard.
+    await Len(buf[self]) < BufCap;
     buf[self] := Append(buf[self], <<"word", sl, e>>);
+    br := 0;
     inS := inS \ {self};
 R_task:
     either
+        await br < MaxBrackets;
+        br := br + 1;
         goto B_store;
     or
         goto E_store;
@@ -179,6 +187,7 @@ R_task:
     end either;
 B_store:
     \* A bracket: the task calls into the runtime. word := loop, a compiler fence only.
+    await Len(buf[self]) < BufCap;
     buf[self] := Append(buf[self], <<"word", sl, 0>>);
 B_check:
     c := ReadAt(claim, buf[self], "claim", sl);
@@ -190,17 +199,21 @@ B_wait:
     await ReadAt(claim, buf[self], "claim", sl) # PENDING;
     if ReadAt(claim, buf[self], "claim", sl) = TAKEN then
         \* The call goes through the shard's remote paths instead.
-        detachedCalls := detachedCalls + 1;
+        detachedCalls := 1;
         goto D_unwind;
+    else
+        inS := inS \cup {self};
     end if;
-    inS := inS \cup {self};
 B_in:
     \* The runtime's work, inside the shard; then word := (task, e), a release store.
     inS := inS \ {self};
+B_out:
+    await Len(buf[self]) < BufCap;
     buf[self] := Append(buf[self], <<"word", sl, e>>);
     goto R_task;
 E_store:
     \* The poll ends: word := loop, a compiler fence only.
+    await Len(buf[self]) < BufCap;
     buf[self] := Append(buf[self], <<"word", sl, 0>>);
 E_check:
     c := ReadAt(claim, buf[self], "claim", sl);
@@ -212,9 +225,10 @@ E_wait:
     await ReadAt(claim, buf[self], "claim", sl) # PENDING;
     if ReadAt(claim, buf[self], "claim", sl) = TAKEN then
         goto D_unwind;
+    else
+        inS := inS \cup {self};
+        goto R_loop;
     end if;
-    inS := inS \cup {self};
-    goto R_loop;
 Blocked:
     await FALSE;
 D_unwind:
@@ -223,25 +237,28 @@ D_unwind:
 D_bound:
     \* The creator runs its bound tasks on a shard of its own.
     if self = Creator then
+D_drain:
         while boundQ > 0 do
             boundQ := boundQ - 1;
             boundBy := boundBy \cup {self};
         end while;
     end if;
+D_spare:
     goto Spare;
 end process;
 
 fair process monitor = Mon
-variables s = 0, v = 0;
+variables ms = 0, mv = 0;
 begin
 M_tick:
     while handoffs < MaxHandoffs do
         \* A runner in one poll, and a spare to hand its shard to.
         await word[runnerSlot] > 0 /\ \E t \in Threads : pc[t] = "Spare";
-        s := runnerSlot;
-        v := word[s];
+        ms := runnerSlot;
+        mv := word[ms];
 M_claim:
-        buf[Mon] := Append(buf[Mon], <<"claim", s, PENDING>>);
+        await Len(buf[Mon]) < BufCap;
+        buf[Mon] := Append(buf[Mon], <<"claim", ms, PENDING>>);
 M_fence:
         \* membarrier: every thread's buffered stores reach memory.
         if Mode # "no_fence" then
@@ -250,22 +267,23 @@ M_fence:
             buf := [a \in Actors |-> <<>>];
         end if;
 M_check:
-        if ReadAt(word, buf[Mon], "word", s) = v \/ Mode = "no_recheck" then
+        await Len(buf[Mon]) < BufCap;
+        if ReadAt(word, buf[Mon], "word", ms) = mv \/ Mode = "no_recheck" then
             \* claim := taken, a release store; the shard is the monitor's.
-            buf[Mon] := Append(buf[Mon], <<"claim", s, TAKEN>>);
+            buf[Mon] := Append(buf[Mon], <<"claim", ms, TAKEN>>);
             inS := inS \cup {Mon};
         else
-            buf[Mon] := Append(buf[Mon], <<"claim", s, NONE>>);
-            cancels := cancels + 1;
+            buf[Mon] := Append(buf[Mon], <<"claim", ms, NONE>>);
+            cancels := 1;
             goto M_tick;
         end if;
 M_give:
         with t \in {u \in Threads : pc[u] = "Spare"} do
             if Mode = "slot_reuse" then
-                \* The spare is handed the old slot, its claim cleared.
-                buf[Mon] := Append(buf[Mon], <<"claim", s, NONE>>);
-                assign[t] := s;
-                runnerSlot := s;
+                \* The spare is handed the old slot, its claim cleared, in memory.
+                claim[ms] := NONE;
+                assign[t] := ms;
+                runnerSlot := ms;
             else
                 assign[t] := nextSlot;
                 runnerSlot := nextSlot;

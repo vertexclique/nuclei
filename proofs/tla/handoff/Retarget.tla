@@ -86,7 +86,7 @@ M_sleep:
 end process;
 
 fair process waker = Waker
-variables t = 0;
+variables aim = 0;
 begin
 K_set:
     woke := TRUE;
@@ -97,9 +97,9 @@ K_set:
         buf[Waker] := Append(buf[Waker], <<"woken", 1>>);
     end if;
 K_look:
-    t := Read(mem, buf, Waker, "target");
+    aim := Read(mem, buf, Waker, "target");
 K_wake:
-    if t = OWN then
+    if aim = OWN then
         wakesOwn := wakesOwn + 1;
     else
         wakesOld := wakesOld + 1;
