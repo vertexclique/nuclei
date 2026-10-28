@@ -1,7 +1,7 @@
 [package]
 name = "nuclei-examples"
 version = "0.0.0"
-authors = ["Mahmut Bulut <vertexclique@gmail.com>"]
+authors = ["Theo M. Bulut <vertexclique@gmail.com>"]
 edition = "2018"
 publish = false
 
