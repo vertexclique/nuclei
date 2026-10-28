@@ -9,7 +9,7 @@ keywords = ["io", "async", "uring", "iouring", "proactor"]
 categories = ["concurrency", "asynchronous"]
 repository = "https://github.com/vertexclique/nuclei"
 documentation = "https://docs.rs/nuclei"
-license = "Apache-2.0/MIT"
+license = "Apache-2.0 OR MIT"
 readme = "README.md"
 exclude = [
     "data/*",
@@ -17,7 +17,9 @@ exclude = [
 	"examples/*",
 	"graphstore/*",
 	"tests/*",
-	"img/*",
+	"art/*",
+	"proofs/*",
+	"proptest-regressions/*",
 	"ci/*",
 	"benches/*",
 	"doc/*",
