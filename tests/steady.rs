@@ -130,8 +130,13 @@ async fn tcp_pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
 
 #[test]
 fn every_subsystem_holds_steady() {
+    // No handoff here: a machine that stops a worker in a poll past the
+    // threshold (a slow sanitizer, a busy runner) would hand its shard over
+    // and start the runtime's first spare thread, once, which is no round's
+    // growth. The handoff has a round of its own below, one every round.
     let rt = nuclei::Runtime::builder()
         .worker_threads(2)
+        .handoff_after(None)
         .build()
         .unwrap();
     steady("spawns", 200, 5000, || {
@@ -306,6 +311,22 @@ fn every_subsystem_holds_steady() {
         });
     });
     drop(listener);
+    drop(rt);
+
+    // A worker blocked in a poll each round: its shard goes to a spare, and
+    // the blocked thread waits as the next one.
+    let rt = nuclei::Runtime::builder()
+        .worker_threads(1)
+        .handoff_after(Some(std::time::Duration::from_millis(5)))
+        .build()
+        .unwrap();
+    steady("handoffs", 10, 100, || {
+        rt.block_on(rt.spawn(async {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }));
+        // The shard moved: a task of it runs.
+        rt.block_on(rt.spawn(async {}));
+    });
     drop(rt);
 
     steady("runtimes started and stopped", 10, 100, || {
