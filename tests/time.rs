@@ -241,12 +241,23 @@ fn a_dropped_foreign_sleep_never_wakes_its_task() {
     // The deadline leaves the drop far ahead of it even on a loaded
     // machine: a timer that fires before its sleep is dropped wakes the task
     // rightly, and is not what this checks.
-    let mut s = Box::pin(time::sleep(Duration::from_millis(50)));
+    let deadline = Duration::from_millis(50);
+    let armed = std::time::Instant::now();
+    let mut s = Box::pin(time::sleep(deadline));
     assert!(s.as_mut().poll(&mut cx).is_pending());
     drop(s);
+    let dropped_after = armed.elapsed();
     // Past the deadline: a timer left armed would have fired by now.
     std::thread::sleep(Duration::from_millis(120));
-    assert!(!woke.load(Ordering::SeqCst));
+    // A drop that came only after the deadline (a stalled machine) may have
+    // been beaten by the fire, which wakes the task rightly: only a drop
+    // before it says anything.
+    if dropped_after < deadline {
+        assert!(
+            !woke.load(Ordering::SeqCst),
+            "a dropped sleep woke its task"
+        );
+    }
 }
 
 #[test]
