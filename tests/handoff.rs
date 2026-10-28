@@ -311,8 +311,8 @@ fn a_storm_of_tasks_blocking_in_turn_keeps_the_threads_bounded() {
 fn a_shutdown_does_not_wait_for_a_thread_still_blocked() {
     let rt = on();
     let _blocked = blocker(&rt, || std::thread::sleep(Duration::from_secs(3)), 0);
-    // The shard goes to another thread first.
-    std::thread::sleep(Duration::from_millis(60));
+    // The shard goes to another thread first: a task of it runs only then.
+    rt.block_on(rt.spawn(async {}));
     let start = Instant::now();
     drop(rt);
     assert!(
