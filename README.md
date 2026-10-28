@@ -1,5 +1,5 @@
 <h1 align="center">
-    <img src="https://github.com/vertexclique/nuclei/raw/master/art/nuclei-logo-square-512.png" width="256" alt="Nuclei"/>
+    <img src="art/nuclei-banner-2000x500.png" width="100%" alt="Nuclei"/>
 </h1>
 <div align="center">
  <strong>
@@ -157,7 +157,3 @@ Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
 be dual licensed as above, without any additional terms or conditions.
 </sub>
-
-##### Credits
-
-<sub><sup>Gif is from the documentary called "Particle Fever".<sup><sub>
