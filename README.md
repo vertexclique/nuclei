@@ -146,8 +146,8 @@ example on io_uring and on epoll. The Pages workflow does both for each deploy a
 #### License
 
 <sup>
-Licensed under either of <a href="LICENSE-APACHE">Apache License, Version
-2.0</a> or <a href="LICENSE-MIT">MIT license</a> at your option.
+Licensed under either of <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License,
+Version 2.0</a> or <a href="https://opensource.org/license/mit">MIT license</a> at your option.
 </sup>
 
 <br>
