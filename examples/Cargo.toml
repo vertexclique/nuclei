@@ -5,6 +5,10 @@ authors = ["Mahmut Bulut <vertexclique@gmail.com>"]
 edition = "2018"
 publish = false
 
+# Not released: no version bump, no tag, no publish.
+[package.metadata.release]
+release = false
+
 [dev-dependencies]
 #nuclei = { path = "../" }
 nuclei = { path = "../" }
