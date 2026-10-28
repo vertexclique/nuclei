@@ -75,9 +75,16 @@ impl Drop for TempFile {
     }
 }
 
-/// A file of `testdata/`.
-pub fn testdata(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join(name)
+/// A file of the test's own holding 11587 bytes of text, and those bytes:
+/// more than one read buffer, and not a whole number of them.
+pub fn sample_file() -> (TempFile, Vec<u8>) {
+    let bytes: Vec<u8> = b"quark-gluon plasma\n"
+        .iter()
+        .copied()
+        .cycle()
+        .take(11_587)
+        .collect();
+    let file = TempFile::new("sample");
+    std::fs::write(&file.0, &bytes).unwrap();
+    (file, bytes)
 }
