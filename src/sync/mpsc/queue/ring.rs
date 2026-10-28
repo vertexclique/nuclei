@@ -132,23 +132,25 @@ impl<T> Ring<T> {
             if !make {
                 return ptr::null();
             }
-            let fresh = Self::alloc_segment(self.per_segment());
-            segment = match slot.compare_exchange(
-                ptr::null_mut(),
-                fresh,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => fresh,
-                Err(made) => {
-                    // SAFETY: never published.
-                    unsafe { Self::free_segment(fresh, self.per_segment()) };
-                    made
-                }
-            };
+            segment = self.make_segment(slot);
         }
         // SAFETY: a segment of `per_segment` cells, kept for the queue's life.
         unsafe { segment.add((pos & self.cell_mask) as usize) }
+    }
+
+    /// The segment of `slot`, made now: once per segment, so out of line.
+    #[cold]
+    #[inline(never)]
+    fn make_segment(&self, slot: &AtomicPtr<Cell<T>>) -> *mut Cell<T> {
+        let fresh = Self::alloc_segment(self.per_segment());
+        match slot.compare_exchange(ptr::null_mut(), fresh, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => fresh,
+            Err(made) => {
+                // SAFETY: never published.
+                unsafe { Self::free_segment(fresh, self.per_segment()) };
+                made
+            }
+        }
     }
 
     fn alloc_segment(cells: usize) -> *mut Cell<T> {
@@ -172,6 +174,7 @@ impl<T> Ring<T> {
 
     /// Appends `value`, which the channel's semaphore admitted. Wait-free:
     /// see the module.
+    #[inline]
     pub(in crate::sync::mpsc) fn push(&self, value: T) {
         let pos = self.tail.fetch_add(1, Ordering::AcqRel);
         // SAFETY: made, and kept for the queue's life.
@@ -191,6 +194,7 @@ impl<T> Ring<T> {
     ///
     /// The caller is the queue's one receiver: no two calls of this function
     /// on one queue run at once.
+    #[inline]
     pub(in crate::sync::mpsc) unsafe fn try_pop(&self) -> Option<T> {
         let pos = self.head.pos.load(Ordering::Relaxed);
         let number = (pos >> self.cell_bits) & self.segment_mask;

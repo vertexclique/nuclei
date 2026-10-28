@@ -31,6 +31,7 @@ impl Unbounded {
     /// The count was up for that instant, so a receiver waiting for its closed
     /// channel to go idle may have seen it: the caller wakes it after a refusal
     /// ([`Chan::wake_if_finished`](super::chan::Chan::wake_if_finished)).
+    #[inline]
     fn admit(&self) -> bool {
         // Cannot overflow into the closed bit: it would take 2^62 values in
         // flight at once, and each one occupies at least a word of the message
@@ -51,10 +52,12 @@ impl Limit for Unbounded {
         queue::Radix::new()
     }
 
+    #[inline]
     fn is_idle(&self) -> bool {
         self.0.load(Ordering::Acquire) >> 1 == 0
     }
 
+    #[inline]
     fn release(&self, n: usize) {
         let before = self.0.fetch_sub(n * ONE, Ordering::AcqRel);
         debug_assert!(before >> 1 >= n, "released more values than were admitted");
@@ -64,6 +67,7 @@ impl Limit for Unbounded {
         self.0.fetch_or(CLOSED, Ordering::AcqRel);
     }
 
+    #[inline]
     fn is_closed(&self) -> bool {
         self.0.load(Ordering::Acquire) & CLOSED != 0
     }

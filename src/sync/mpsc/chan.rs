@@ -138,6 +138,7 @@ impl<T, L: Limit> Chan<T, L> {
     ///
     /// The value is in the queue before the waker is touched, so a panic in
     /// the receiver's waker leaves the channel consistent.
+    #[inline]
     pub(super) fn send(&self, value: T) {
         self.queue.push(value);
         // The push's mark is sequentially consistent, and so is this look:
@@ -145,7 +146,16 @@ impl<T, L: Limit> Chan<T, L> {
         // or this finds the flag up (a fence for loom, whose queue model is a
         // lock).
         seq_cst_handshake();
-        if self.rx_waiting.load(Ordering::SeqCst) && self.rx_waiting.swap(false, Ordering::SeqCst) {
+        if self.rx_waiting.load(Ordering::SeqCst) {
+            self.wake_waiting_rx();
+        }
+    }
+
+    /// The wake a send owes a receiver that says it waits, out of line: a
+    /// send to a receiver that is busy pays one load for it.
+    #[inline(never)]
+    fn wake_waiting_rx(&self) {
+        if self.rx_waiting.swap(false, Ordering::SeqCst) {
             self.rx_waker.wake();
         }
     }

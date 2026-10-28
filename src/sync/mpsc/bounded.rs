@@ -41,10 +41,12 @@ impl Limit for Bounded {
         queue::Bounded::with_capacity(self.bound)
     }
 
+    #[inline]
     fn is_idle(&self) -> bool {
         self.sem.available() == self.bound
     }
 
+    #[inline]
     fn release(&self, n: usize) {
         self.sem.release(n);
     }
@@ -53,6 +55,7 @@ impl Limit for Bounded {
         self.sem.close();
     }
 
+    #[inline]
     fn is_closed(&self) -> bool {
         self.sem.is_closed()
     }

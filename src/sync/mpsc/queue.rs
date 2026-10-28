@@ -85,6 +85,7 @@ impl<T> Bounded<T> {
 
 #[cfg(not(all(loom, test)))]
 impl<T> MessageQueue<T> for Bounded<T> {
+    #[inline]
     fn push(&self, value: T) {
         match self {
             Self::Ring(ring) => ring.push(value),
@@ -92,6 +93,7 @@ impl<T> MessageQueue<T> for Bounded<T> {
         }
     }
 
+    #[inline]
     unsafe fn try_pop(&self) -> Option<T> {
         match self {
             // SAFETY: the caller's contract, passed on.
@@ -111,10 +113,12 @@ impl<T> MessageQueue<T> for Bounded<T> {
 
 #[cfg(not(all(loom, test)))]
 impl<T> MessageQueue<T> for Radix<T> {
+    #[inline]
     fn push(&self, value: T) {
         Radix::push(self, value);
     }
 
+    #[inline]
     unsafe fn try_pop(&self) -> Option<T> {
         // SAFETY: the caller's contract, passed on.
         unsafe { Radix::try_pop(self) }

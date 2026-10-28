@@ -244,6 +244,7 @@ impl<T> Radix<T> {
     }
 
     /// Appends `value`. Wait-free: see the module.
+    #[inline]
     pub(in crate::sync::mpsc) fn push(&self, value: T) {
         let guard = pin();
         // SeqCst: the receiver reads the tail in its look past a stalled cell,
@@ -301,21 +302,29 @@ impl<T> Radix<T> {
             if !make {
                 return None;
             }
-            let higher = Inner::alloc(level + 1);
-            // SAFETY: unpublished; its first child is the root it would
-            // replace, which spans leaves 0 to `span(level)`.
-            unsafe { (*higher.cast::<Inner>()).children[0].store(root, Ordering::Relaxed) };
-            // SAFETY: a fresh node, swapped in once.
-            let higher_ptr = unsafe { Ptr::from_raw(higher) };
-            if self
-                .root
-                .compare_exchange(root, higher_ptr, Ordering::SeqCst, Ordering::SeqCst, guard)
-                .is_err()
-            {
-                // Another send grew it: this one was never seen.
-                // SAFETY: unpublished; its child is not its own.
-                unsafe { free_inner(higher) };
-            }
+            self.grow(root, level, guard);
+        }
+    }
+
+    /// Swaps in a root one level above `root`, of `level`, unless another
+    /// send grew it first. Rare, so out of line.
+    #[cold]
+    #[inline(never)]
+    fn grow(&self, root: Ptr<'_, Header>, level: u32, guard: &Guard) {
+        let higher = Inner::alloc(level + 1);
+        // SAFETY: unpublished; its first child is the root it would replace,
+        // which spans leaves 0 to `span(level)`.
+        unsafe { (*higher.cast::<Inner>()).children[0].store(root, Ordering::Relaxed) };
+        // SAFETY: a fresh node, swapped in once.
+        let higher_ptr = unsafe { Ptr::from_raw(higher) };
+        if self
+            .root
+            .compare_exchange(root, higher_ptr, Ordering::SeqCst, Ordering::SeqCst, guard)
+            .is_err()
+        {
+            // Another send grew it: this one was never seen.
+            // SAFETY: unpublished; its child is not its own.
+            unsafe { free_inner(higher) };
         }
     }
 
@@ -326,6 +335,14 @@ impl<T> Radix<T> {
         if !found.is_null() || !make {
             return found.as_raw();
         }
+        Self::make_child(slot, level, guard)
+    }
+
+    /// The missing child in `slot`, a node of `level`, made now (or the one
+    /// another send made first): once per node, so out of line.
+    #[cold]
+    #[inline(never)]
+    fn make_child(slot: &Atomic<Header>, level: u32, guard: &Guard) -> *const Header {
         let fresh = if level == 0 {
             Leaf::<T>::alloc()
         } else {
@@ -352,6 +369,7 @@ impl<T> Radix<T> {
     ///
     /// The caller is the queue's one receiver: no two calls of this function
     /// on one queue run at once.
+    #[inline]
     pub(in crate::sync::mpsc) unsafe fn try_pop(&self) -> Option<T> {
         let head = self.head.pos.load(Ordering::Relaxed);
         // SAFETY: the caller's contract.
@@ -377,26 +395,42 @@ impl<T> Radix<T> {
     /// # Safety
     ///
     /// The caller is the receiver.
+    #[inline]
     unsafe fn head_cell(&self, head: u64) -> Option<&Cell<T>> {
         // SAFETY: the caller's contract: the head's leaf is ours.
-        let (mut leaf, mut number) = unsafe { *self.head.leaf.get() };
+        let (mut leaf, number) = unsafe { *self.head.leaf.get() };
         if head / CELLS != number {
-            let guard = pin();
-            while head / CELLS != number {
-                let next = self.leaf(number + 1, false, &guard);
-                if next.is_null() {
-                    return None;
-                }
-                // SAFETY: the head is past every position of leaf `number`,
-                // each taken, and leaf `number + 1` exists.
-                unsafe { self.leave(number, &guard) };
-                (leaf, number) = (next.cast_mut(), number + 1);
-                // SAFETY: the caller's contract.
-                unsafe { *self.head.leaf.get() = (leaf, number) };
-            }
+            // SAFETY: the caller's contract.
+            leaf = unsafe { self.move_head_leaf(head, number) }?;
         }
         // SAFETY: the head's leaf is retired by this end alone, and not yet.
         Some(unsafe { &(*leaf).cells[(head % CELLS) as usize] })
+    }
+
+    /// Moves the head's leaf on from leaf `number` to the head's, retiring
+    /// the leaves it leaves; `None` while the next leaf is not made yet. Once
+    /// per leaf, so out of line.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the receiver.
+    #[inline(never)]
+    unsafe fn move_head_leaf(&self, head: u64, mut number: u64) -> Option<*mut Leaf<T>> {
+        let guard = pin();
+        let mut leaf = ptr::null_mut();
+        while head / CELLS != number {
+            let next = self.leaf(number + 1, false, &guard);
+            if next.is_null() {
+                return None;
+            }
+            // SAFETY: the head is past every position of leaf `number`, each
+            // taken, and leaf `number + 1` exists.
+            unsafe { self.leave(number, &guard) };
+            (leaf, number) = (next.cast_mut(), number + 1);
+            // SAFETY: the caller's contract.
+            unsafe { *self.head.leaf.get() = (leaf, number) };
+        }
+        Some(leaf)
     }
 
     /// The head's cell is not ready: takes the first ready value past it,
@@ -405,6 +439,7 @@ impl<T> Radix<T> {
     /// # Safety
     ///
     /// The caller is the receiver.
+    #[inline(never)]
     unsafe fn take_past(&self, head: u64) -> Option<T> {
         let ahead = self.head.ahead.load(Ordering::Relaxed);
         // A queue run down to its head has nothing after it: only a value

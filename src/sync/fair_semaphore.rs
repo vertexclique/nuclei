@@ -112,6 +112,7 @@ impl FairSemaphore {
     /// succeeds unless the semaphore is closed. On failure, the state word
     /// it saw, which says whether the semaphore closed (see
     /// [`observed_closed`]).
+    #[inline]
     pub(super) fn try_acquire(&self, n: usize) -> Result<(), usize> {
         let state = &self.queue.state;
         let mut current = state.load(Ordering::Relaxed);
@@ -142,14 +143,23 @@ impl FairSemaphore {
     /// It cannot overflow: the permits were in the semaphore before. A
     /// waiter queueing concurrently either is seen by the pass this asks
     /// for, or reads the permits in the pass its own enqueue runs.
+    #[inline]
     pub(super) fn release(&self, n: usize) {
         if n == 0 {
             return;
         }
         let before = self.queue.state.fetch_add(n << SHIFT, Ordering::AcqRel);
         if wants_drain(before) {
-            self.released();
+            self.release_wakes();
         }
+    }
+
+    /// The pass a release asks for, out of line: inlined, the drain would
+    /// make every release, the one-instruction kind too, pay for the
+    /// registers it saves.
+    #[inline(never)]
+    fn release_wakes(&self) {
+        self.released();
     }
 
     /// Closes the semaphore: every waiter ends in [`Closed`], and nothing is
