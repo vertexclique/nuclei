@@ -26,12 +26,15 @@ profile). Files written:
     site/favicon-32.png              site/favicon.svg at 32 by 32, for browsers without SVG icons
     site/apple-touch-icon.png        site/favicon.svg at 180 by 180
     site/media/social.png            the link preview: the mark on navy, 1200 by 630
+    art/nuclei-banner-2000x500.png   the banner: the mark and the word Nuclei on navy, 2000 by 500
+    art/nuclei-banner-1280x640.png   the banner at 1280 by 640 (a repository's social preview)
 
 and it writes the header mark inline into the landing page's source (site/src/index.html), in
 heavier lines for its size, its arrows grouped for the animation in site/motion.css; the site's
 build (site/build_pages.py) copies it from there into every page with the bar.
 """
 
+import os
 import re
 import shutil
 import struct
@@ -41,6 +44,12 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# The word of the banners is the site's wordmark: Geist SemiBold (art/fonts, under its OFL),
+# tracked -0.04 em, in the site's ink, --color-ink: oklch(96% 0.008 230).
+FONT = ROOT / "art/fonts/Geist-SemiBold.ttf"
+INK = "#edf3f6"
+TRACKING = -0.04
 
 # The line width of the original drawing, on the 1024 grid.
 STROKE = 11
@@ -210,12 +219,58 @@ def bare_png(path):
     path.write_bytes(b"".join(out))
 
 
-def render(source, target, width, height):
+def render(source, target, width, height, env=None):
     subprocess.run(
         ["rsvg-convert", "--width", str(width), "--height", str(height), "--output", str(target), str(source)],
         check=True,
+        env=env,
     )
     bare_png(target)
+
+
+def banner(width, height, mark_share):
+    """A banner of `width` by `height`: the mark, `mark_share` of the height tall, and the word
+    Nuclei beside it in the site's wordmark, both centred as one on navy. The word's width and
+    cap height, for the centring, are measured with Pillow from the same font file."""
+    from PIL import ImageFont
+
+    word = "Nuclei"
+    mark = height * mark_share
+    size = mark * 0.6
+    font = ImageFont.truetype(str(FONT), round(size))
+    left, _, right, _ = font.getbbox(word, anchor="ls")
+    cap = -font.getbbox("N", anchor="ls")[1]
+    tracking = TRACKING * size
+    text_width = right - left + tracking * (len(word) - 1)
+    gap = mark * 0.2
+    x0 = (width - (mark + gap + text_width)) / 2
+    scale = mark / TIGHT[2]
+    out = svg(
+        (0, 0, width, height),
+        width,
+        height,
+        STROKE * 1.4,
+        navy=(0, 0, width, height),
+        transform=f"translate({num(x0 + mark / 2)} {num(height / 2)}) scale({scale:.6f}) translate(-512 -512)",
+    ).replace(
+        "</svg>",
+        f'  <text x="{num(x0 + mark + gap - left)}" y="{num(height / 2 + cap / 2)}" font-family="Geist" '
+        f'font-weight="600" font-size="{num(size)}" letter-spacing="{num(tracking)}" fill="{INK}">{word}</text>\n</svg>',
+    )
+    return out
+
+
+def font_env(scratch):
+    """The environment rsvg-convert renders the banners in: fontconfig that finds Geist in
+    art/fonts, the system's fonts kept."""
+    conf = Path(scratch) / "fonts.conf"
+    conf.write_text(
+        '<?xml version="1.0"?>\n<fontconfig>\n'
+        f"  <dir>{FONT.parent}</dir>\n"
+        '  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>\n'
+        f"  <cachedir>{scratch}/fontcache</cachedir>\n</fontconfig>\n"
+    )
+    return {**os.environ, "FONTCONFIG_FILE": str(conf)}
 
 
 def main():
@@ -244,6 +299,11 @@ def main():
             )
         )
         render(social, ROOT / "site/media/social.png", 1200, 630)
+        env = font_env(scratch)
+        for width, height, share in [(2000, 500, 0.6), (1280, 640, 0.42)]:
+            source = Path(scratch) / f"banner-{width}x{height}.svg"
+            source.write_text(banner(width, height, share))
+            render(source, ROOT / f"art/nuclei-banner-{width}x{height}.png", width, height, env)
 
     renders = [
         ("art/nuclei-logo.svg", "art/nuclei-logo-512.png", 512, 512),
@@ -256,7 +316,8 @@ def main():
     for source, target, width, height in renders:
         render(ROOT / source, ROOT / target, width, height)
     pages = put_header_mark(header_mark())
-    for name in [*svgs, "site/media/social.png", *(target for _, target, _, _ in renders)]:
+    banners = ["art/nuclei-banner-2000x500.png", "art/nuclei-banner-1280x640.png"]
+    for name in [*svgs, "site/media/social.png", *banners, *(target for _, target, _, _ in renders)]:
         print(name)
     print(f"the header mark, inline in {pages[0].relative_to(ROOT)}")
 

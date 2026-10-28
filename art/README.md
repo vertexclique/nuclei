@@ -11,6 +11,9 @@ through blue to violet.
 | `nuclei-logo-512.png`, `nuclei-logo-1024.png` | `nuclei-logo.svg` rendered at 512 and 1024 pixels square. |
 | `nuclei-logo-square.png` | `nuclei-logo-dark.svg` rendered at 1024 by 1024. |
 | `nuclei-logo-square-512.png` | `nuclei-logo-dark.svg` rendered at 512 by 512. |
+| `nuclei-banner-2000x500.png` | The banner: the mark and the word Nuclei on navy, 2000 by 500. |
+| `nuclei-banner-1280x640.png` | The banner at 1280 by 640, the size of a repository's social preview. |
+| `fonts/Geist-SemiBold.ttf` | The banners' word: Geist SemiBold, the site's wordmark font, under its licence `fonts/OFL.txt`. |
 | `build.py` | Draws the mark and writes every file above, and the site's copies. |
 
 The site uses the same drawing with heavier lines where it is shown small: the header mark,
@@ -25,5 +28,5 @@ Change the drawing in `build.py`, never the output files, and rebuild everything
 python3 art/build.py
 ```
 
-It needs `rsvg-convert` (librsvg) for the PNG files. The SVG files carry no metadata, and the
+It needs `rsvg-convert` (librsvg) for the PNG files, and Pillow to measure the banners' word. The SVG files carry no metadata, and the
 PNG files keep only their image chunks.
