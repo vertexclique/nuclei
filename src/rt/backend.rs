@@ -34,6 +34,26 @@ pub(crate) enum Backend {
 }
 
 impl Backend {
+    /// The backend for a worker shard that may be handed to another thread:
+    /// its ring (if it runs one) takes submissions from any thread.
+    pub(crate) fn handed_over(self) -> Self {
+        match self {
+            #[cfg(ring)]
+            Backend::Ring(cfg) => Backend::Ring(crate::syscore::linux::iouring::ring::RingConfig {
+                multi_issuer: true,
+                ..cfg
+            }),
+            #[cfg(ring)]
+            Backend::RingOrPoll(cfg) => {
+                Backend::RingOrPoll(crate::syscore::linux::iouring::ring::RingConfig {
+                    multi_issuer: true,
+                    ..cfg
+                })
+            }
+            other => other,
+        }
+    }
+
     /// Whether shards on this backend run rings.
     pub(crate) fn rings(self) -> bool {
         #[cfg(ring)]

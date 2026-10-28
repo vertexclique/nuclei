@@ -108,6 +108,10 @@ pub(crate) struct Counters {
     buffer_exhausted: AtomicU64,
     ops_in_flight: AtomicUsize,
     cq_overflows: AtomicU64,
+    /// Times the shard was handed to another thread, its runner blocked.
+    handoffs: AtomicU64,
+    /// The longest poll the runtime's monitor saw, in nanoseconds.
+    longest_poll_nanos: AtomicU64,
     /// The shard's place among its runtime's workers.
     worker: Option<usize>,
     /// The shard went: its `Shared` may outlive it, held by a waker.
@@ -147,6 +151,8 @@ impl Counters {
             buffer_exhausted: AtomicU64::new(0),
             ops_in_flight: AtomicUsize::new(0),
             cq_overflows: AtomicU64::new(0),
+            handoffs: AtomicU64::new(0),
+            longest_poll_nanos: AtomicU64::new(0),
             worker,
             gone: AtomicBool::new(false),
             backend,
@@ -170,6 +176,17 @@ impl Counters {
         self.ops_in_flight
             .store(now.ops_in_flight, Ordering::Relaxed);
         self.cq_overflows.store(now.cq_overflows, Ordering::Relaxed);
+    }
+
+    /// The shard was handed to another thread, its runner blocked.
+    pub(crate) fn handed_off(&self) {
+        self.handoffs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The monitor saw a poll of at least `length`.
+    pub(crate) fn longest_poll(&self, length: std::time::Duration) {
+        let nanos = u64::try_from(length.as_nanos()).unwrap_or(u64::MAX);
+        self.longest_poll_nanos.fetch_max(nanos, Ordering::Relaxed);
     }
 
     /// The shard went: `stats` lists it no more.
@@ -211,6 +228,10 @@ impl Counters {
             buffer_cap: self.buffer_cap,
             buffer_exhausted: self.buffer_exhausted.load(Ordering::Relaxed),
             timers: self.timers.load(Ordering::Relaxed),
+            handoffs: self.handoffs.load(Ordering::Relaxed),
+            longest_poll: std::time::Duration::from_nanos(
+                self.longest_poll_nanos.load(Ordering::Relaxed),
+            ),
             errors: self.errors.read(),
         }
     }

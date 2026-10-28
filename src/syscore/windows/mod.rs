@@ -283,6 +283,13 @@ pub(crate) type PTIMERAPCROUTINE = *const c_void;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    pub(crate) fn FlushProcessWriteBuffers();
+    pub(crate) fn GetCurrentThreadId() -> DWORD;
+    pub(crate) fn OpenThread(
+        dwDesiredAccess: DWORD,
+        bInheritHandle: BOOL,
+        dwThreadId: DWORD,
+    ) -> HANDLE;
     pub(crate) fn SetConsoleCtrlHandler(
         HandlerRoutine: Option<unsafe extern "system" fn(u32) -> BOOL>,
         Add: BOOL,

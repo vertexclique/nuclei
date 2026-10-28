@@ -85,7 +85,9 @@ on macOS, and on completion ports on Windows. `NUCLEI_BACKEND` picks one: `auto`
 
 * **Shards.** A shard per worker thread runs its tasks and owns its driver; a task stays on the
   shard it was placed on. `block_on` works anywhere, nested in a task too, and keeps its shard's
-  other tasks and IO going.
+  other tasks and IO going. A task that blocks inside its poll holds up only itself: past
+  `Builder::handoff_after` (10 ms) its shard, with every other task, timer and IO of it, goes on
+  on another thread.
 * **Tasks.** `spawn`, `spawn_local` for tasks that are not `Send`, `spawn_blocking` for blocking
   work; `JoinSet`, abort handles, task ids, task-local values and a cooperative budget.
   `select!`, `join!` and `try_join!` wait on several futures in one task.

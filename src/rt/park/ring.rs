@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use super::Notifier;
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
+use crate::syscore::linux::iouring::ring::sys::IORING_SETUP_SINGLE_ISSUER;
 use crate::syscore::linux::iouring::ring::{IoUringCqe, Ring, RingConfig, SqFull, Sqe};
 
 /// A shard's ring.
@@ -36,11 +37,13 @@ pub(crate) struct RingPoller {
     overflows: u64,
 }
 
-// SAFETY: the ring is used by one thread only. A shard is built on one
-// thread and moved to the thread that runs it before its first submission
-// or wait; the ring is made disabled, and that first use enables it, which
-// makes the running thread its one issuer. The thread that built it never
-// touches it after the move.
+// SAFETY: the ring is used by one thread at a time: the thread that runs
+// its shard. A shard is built on one thread and moved to the thread that
+// runs it before its first submission or wait; the ring is made disabled,
+// and that first use enables it, which makes a single-issuer ring's running
+// thread its one issuer. A ring that takes submissions from any thread (a
+// worker shard that may be handed over, `rt::handoff`) moves with its shard
+// at a hand-over, once its old runner touches it no more.
 unsafe impl Send for RingPoller {}
 
 impl RingPoller {
@@ -82,8 +85,12 @@ impl RingPoller {
         self.ring.enable()?;
         self.enabled = true;
         // One fd lookup less per enter; a ring that cannot register it still
-        // works.
-        let _ = self.ring.register_ring_fd();
+        // works. The registration is the calling thread's own, so a ring any
+        // thread may submit to keeps none: its next runner could not use it,
+        // and an old runner's would hold the ring open.
+        if self.ring.flags() & IORING_SETUP_SINGLE_ISSUER != 0 {
+            let _ = self.ring.register_ring_fd();
+        }
         Ok(())
     }
 

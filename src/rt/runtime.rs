@@ -29,7 +29,7 @@ use kovan_channel::flavors::RecvDeadline;
 
 use super::blocking::{Pool, PoolConfig};
 use super::context;
-use super::sched::{Counted, Sched};
+use super::sched::{AtHome, Counted, Sched};
 use super::shard::{Limits, Shard, Shared};
 use super::task::{self, Task};
 use super::workers::{Start, Workers};
@@ -90,6 +90,7 @@ pub struct Builder {
     io_buffer_cap: Option<usize>,
     max_worker_threads: Option<usize>,
     backend: Option<crate::IoBackend>,
+    handoff_after: Option<Option<Duration>>,
     start_paused: bool,
     tuning: super::tuning::Tuning,
     task_hooks: super::tuning::TaskHooks,
@@ -109,6 +110,8 @@ const DEFAULT_BLOCKING_THREADS: usize = 512;
 const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// See [`Builder::local_spawn_margin`].
 const DEFAULT_LOCAL_MARGIN: usize = 32;
+/// See [`Builder::handoff_after`].
+const DEFAULT_HANDOFF: Duration = Duration::from_millis(10);
 
 impl Builder {
     /// A builder with every setting at its default.
@@ -125,6 +128,7 @@ impl Builder {
             io_buffer_cap: None,
             max_worker_threads: None,
             backend: None,
+            handoff_after: None,
             start_paused: false,
             tuning: super::tuning::Tuning::default(),
             task_hooks: super::tuning::TaskHooks::default(),
@@ -233,6 +237,21 @@ impl Builder {
         self
     }
 
+    /// How long one poll of a task may run on a worker before the worker's
+    /// other tasks go on without it (default 10 ms; `None`: never).
+    ///
+    /// A task that blocks inside its poll (a blocking call, a long loop
+    /// without an `.await`) then holds up only itself: its worker's shard,
+    /// with every other task, timer and IO of it, goes to another thread on
+    /// the same core, and the blocked task carries on once its poll returns.
+    /// Tasks that `spawn_local` keeps on the blocked thread wait for it. The
+    /// watch costs each poll two plain stores and a load; with it on, an
+    /// io_uring worker's ring takes submissions from any thread.
+    pub fn handoff_after(mut self, after: Option<Duration>) -> Self {
+        self.handoff_after = Some(after);
+        self
+    }
+
     /// Whether each worker thread is pinned to its own core (Linux; default
     /// true). A pinned shard keeps its cache warm; unpinned, the scheduler may
     /// move it.
@@ -307,6 +326,7 @@ impl Builder {
                         stack,
                         name: worker_name,
                         cores,
+                        handoff_after: self.handoff_after.unwrap_or(Some(DEFAULT_HANDOFF)),
                     },
                     exit_tx,
                 ),
@@ -620,7 +640,7 @@ where
         Counted::new(future, shard),
         Sched {
             shard: Arc::clone(shard),
-            bound: false,
+            home: None,
             hooks: hooks.clone(),
         },
     );
@@ -652,22 +672,43 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    let shared = context::current(|current| current.map(|s| Arc::clone(&s.shared)))
-        .unwrap_or_else(|| Arc::clone(&own_shard().shared));
-    let hooks = context_hooks();
-    // SAFETY: the task's schedule sends a woken task of this shard back to
-    // it, and a bound task only to the shard's own thread (its local inbox,
-    // leaked rather than dropped if that thread is gone); the future is
-    // 'static.
-    let (runnable, task) = unsafe {
-        task::spawn_unchecked(
-            Counted::new(future, &shared),
-            Sched {
-                shard: shared,
-                bound,
-                hooks: hooks.clone(),
-            },
+    let place = |shard: &Shard| {
+        (
+            Arc::clone(&shard.shared),
+            bound.then(|| context::home_for(shard)),
         )
+    };
+    let (shared, home) =
+        context::current(|current| current.map(place)).unwrap_or_else(|| place(&own_shard()));
+    let hooks = context_hooks();
+    let (runnable, task) = if let Some(home) = home {
+        // SAFETY: the task's schedule sends a woken bound task only to its
+        // home's thread (leaked rather than dropped if that thread is gone);
+        // the future is 'static.
+        unsafe {
+            task::spawn_unchecked(
+                Counted::new(AtHome::new(future, &home), &shared),
+                Sched {
+                    shard: shared,
+                    home: Some(home),
+                    hooks: hooks.clone(),
+                },
+            )
+        }
+    } else {
+        // SAFETY: the task's schedule sends a woken task of this shard back
+        // to it; the future is 'static, and `Send` (a caller with `bound`
+        // false is `spawn`'s, whose future is).
+        unsafe {
+            task::spawn_unchecked(
+                Counted::new(future, &shared),
+                Sched {
+                    shard: shared,
+                    home: None,
+                    hooks: hooks.clone(),
+                },
+            )
+        }
     };
     spawned(hooks.as_deref(), &task);
     runnable.schedule();
@@ -685,13 +726,13 @@ fn block_on_with<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
 
 fn block_on_here<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
     let _runtime = context::set_runtime(inner);
-    let running: *const Shard =
-        context::current(|current| current.map_or(core::ptr::null(), |s| s as *const Shard));
-    if !running.is_null() {
-        // SAFETY: the shard this thread runs is kept alive by the guard that
-        // entered it, further up this thread's stack, for longer than this
-        // call.
-        return unsafe { (*running).block_on(future) };
+    // Pinned here once: the calls below take it by reference.
+    let mut future = core::pin::pin!(future);
+    // On the shard this thread runs, the call nests, inside the shard.
+    if let Some(output) =
+        context::current(|current| current.map(|shard| shard.block_on(future.as_mut())))
+    {
+        return output;
     }
     let shard = own_shard();
     let _current = context::enter(&shard);
@@ -702,7 +743,7 @@ fn block_on_here<F: Future>(inner: &Arc<Inner>, future: F) -> F::Output {
         .map(|seed| super::rng::Reseeded::new(seed, 0));
     #[cfg(port)]
     shard.take_port_back();
-    shard.block_on_then_leave(future)
+    shard.block_on_then_leave(future.as_mut())
 }
 
 /// Runs `future` to its end on the calling thread, running other tasks of
@@ -793,7 +834,7 @@ where
             future,
             Sched {
                 shard: shared,
-                bound: false,
+                home: None,
                 // The runtime's own service task: not a task of its user's.
                 hooks: None,
             },
@@ -820,7 +861,7 @@ pub(crate) fn spawn_blocking_inside(f: impl FnOnce() + Send + 'static) -> bool {
 /// The cores this process may run on, in order (Linux; Windows, in the
 /// process's processor group); empty where that is not known, so nothing
 /// is pinned.
-fn allowed_cores() -> Vec<usize> {
+pub(crate) fn allowed_cores() -> Vec<usize> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: a plain syscall into a zeroed set of our own.

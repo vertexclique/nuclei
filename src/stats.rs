@@ -78,6 +78,13 @@ pub struct ShardStats {
     pub buffer_exhausted: u64,
     /// Timers armed on the shard (published).
     pub timers: usize,
+    /// Times the shard went to another thread because the thread running it
+    /// stayed in one poll past [`Builder::handoff_after`](crate::Builder::handoff_after).
+    pub handoffs: u64,
+    /// The longest poll the runtime saw on the shard, at the resolution of
+    /// its watch (a quarter of the handoff threshold); zero when no poll
+    /// lasted that long, or with the handoff off.
+    pub longest_poll: std::time::Duration,
     /// Errors of IO run on the shard.
     pub errors: ErrorCounts,
 }

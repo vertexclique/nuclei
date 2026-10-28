@@ -1,5 +1,5 @@
 //! A runtime's worker shards: the slots they fill, starting and stopping
-//! one, and where `spawn` places a task.
+//! one, where `spawn` places a task, and the threads that run them.
 //!
 //! A runtime has room for a set number of workers over its life, fixed when
 //! it is built (four times the workers it starts with unless set
@@ -7,17 +7,30 @@
 //! keeps its shard, so placement reads them without a lock. A worker asked
 //! to stop takes no new task from then on, runs the ones it has to their
 //! end, and exits; its slot is not filled again.
+//!
+//! With the handoff on (`rt::handoff`), a worker's thread is a runner: it
+//! runs the shard it is given until the shard stops, or is taken from it
+//! while it is blocked in one poll; it then finishes its bound tasks on its
+//! own shard, and waits as a spare for the next shard the monitor hands
+//! over. Spares never exit while the runtime runs (a thread that exits
+//! cancels the ring requests it submitted), and a shutdown waits for every
+//! thread but the ones still blocked in the poll their shard was taken in.
 
 use super::rng::random_below;
 use core::cell::Cell;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use super::context;
+use super::handoff::home::Home;
+use super::handoff::life::Life;
+use super::handoff::slot::Slot;
+use super::handoff::{Gift, Monitor, Owned, Runner, Spare};
 use super::runtime::Inner;
-use super::shard::{Limits, Shard, Shared};
-use crate::sync::internal::{AtomicUsize, Ordering};
+use super::shard::{Limits, Shard, Shared, Worked};
+use crate::sync::internal::{AtomicPtr, AtomicUsize, Ordering};
 
 thread_local! {
     /// The runtime and the shard the spawns of this thread (one that is not
@@ -35,6 +48,8 @@ pub(crate) struct Start {
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
     /// The cores workers are pinned to, in turn; empty for none.
     pub(crate) cores: Vec<usize>,
+    /// A poll this long hands its shard to another thread; `None` for never.
+    pub(crate) handoff_after: Option<Duration>,
 }
 
 /// A runtime's worker shards.
@@ -48,8 +63,31 @@ pub(crate) struct Workers {
     /// The fewest workers a stop leaves running.
     min: usize,
     start: Start,
-    threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Every thread the runtime started for its workers (and its monitor),
+    /// with its life.
+    threads: Mutex<Vec<(JoinHandle<()>, Arc<Life>)>>,
     exits: kovan_channel::unbounded::Sender<()>,
+    /// The watch over the workers, with the handoff on.
+    monitor: Option<Arc<Monitor>>,
+    monitor_started: OnceLock<()>,
+}
+
+/// A shard for a runner to run: worker place `place`, watched through
+/// `slot` with the handoff on.
+struct Run {
+    place: usize,
+    shard: Owned,
+    slot: Option<Arc<Slot>>,
+}
+
+impl From<Gift> for Run {
+    fn from(gift: Gift) -> Self {
+        Self {
+            place: gift.place,
+            shard: gift.shard,
+            slot: Some(gift.slot),
+        }
+    }
 }
 
 impl Workers {
@@ -59,6 +97,16 @@ impl Workers {
         start: Start,
         exits: kovan_channel::unbounded::Sender<()>,
     ) -> Self {
+        let monitor = start
+            .handoff_after
+            .filter(|_| capacity > 0 && super::handoff::SUPPORTED)
+            .map(|after| {
+                Arc::new(Monitor::new(
+                    after,
+                    capacity,
+                    super::runtime::allowed_cores(),
+                ))
+            });
         Self {
             slots: (0..capacity).map(|_| OnceLock::new()).collect(),
             claimed: AtomicUsize::new(0),
@@ -67,6 +115,8 @@ impl Workers {
             start,
             threads: Mutex::new(Vec::new()),
             exits,
+            monitor,
+            monitor_started: OnceLock::new(),
         }
     }
 
@@ -157,59 +207,129 @@ impl Workers {
         }
         // A shard that cannot be made leaves its slot empty; placement
         // skips it.
-        let shard = Shard::worker(
-            workers.start.limits,
+        let mut limits = workers.start.limits;
+        if workers.monitor.is_some() {
+            limits.backend = limits.backend.handed_over();
+        }
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "the count is what is shared: the shard itself moves between threads only at a hand-over (`rt::handoff`)"
+        )]
+        let shard = Arc::new(Shard::worker(
+            limits,
             workers.start.tuning.clone(),
             inner.id(),
             index,
-        )?;
-        let hooks = workers.start.tuning.hooks.clone();
+            workers.monitor.clone(),
+        )?);
         let shared = Arc::clone(&shard.shared);
         let _ = workers.slots[index].set(Arc::clone(&shared));
         workers.running.fetch_add(1, Ordering::AcqRel);
-        let cores = &workers.start.cores;
-        let core = (!cores.is_empty()).then(|| cores[index % cores.len()]);
-        let exits = workers.exits.clone();
-        let seed = workers.start.seed;
-        let worker_inner = Arc::clone(inner);
-        let spawned = std::thread::Builder::new()
-            .name((workers.start.name)())
-            .stack_size(workers.start.stack)
-            .spawn(move || {
-                /// Reports the worker's exit once its shard is dropped, even
-                /// when the loop ends by a panic.
-                struct Exit(kovan_channel::unbounded::Sender<()>);
-                impl Drop for Exit {
-                    fn drop(&mut self) {
-                        self.0.send(());
-                    }
-                }
-                let _exit = Exit(exits);
-                let _stopping = hooks.started();
-                let _seeded = seed.map(|seed| super::rng::Reseeded::new(seed, index as u64 + 1));
-                if let Some(core) = core {
-                    super::runtime::pin_to(core);
-                }
-                let _runtime = context::set_runtime(&worker_inner);
-                {
-                    let _current = context::enter(&shard);
-                    shard.block_on(shard.shared.stopped());
-                }
-                // While the worker's runtime is still this thread's: what the
-                // shard hands on as it goes (a port's keeper) goes there.
-                drop(shard);
-            });
-        match spawned {
-            Ok(thread) => {
-                lock(&workers.threads).push(thread);
+        let life = Arc::new(Life::new());
+        let slot = workers.monitor.as_ref().map(|monitor| {
+            let slot = monitor.slot();
+            monitor.started(
+                index,
+                &shard,
+                Runner {
+                    slot: Arc::clone(&slot),
+                    life: Arc::clone(&life),
+                },
+            );
+            slot
+        });
+        let run = Run {
+            place: index,
+            shard: Owned(shard),
+            slot,
+        };
+        match Self::spawn_thread(inner, Some(run), life) {
+            Ok(()) => {
+                Self::start_monitor(inner)?;
                 Ok(true)
             }
-            Err(err) => {
-                // The shard went with the closure; its slot takes no tasks.
+            Err((err, _)) => {
+                // The shard went with the run; its slot takes no tasks.
                 shared.stop();
                 workers.running.fetch_sub(1, Ordering::AcqRel);
                 Err(err)
             }
+        }
+    }
+
+    /// Starts the monitor's thread, with the handoff on, once.
+    fn start_monitor(inner: &Arc<Inner>) -> io::Result<()> {
+        let workers = &inner.workers;
+        let Some(monitor) = &workers.monitor else {
+            return Ok(());
+        };
+        if workers.monitor_started.set(()).is_err() {
+            return Ok(());
+        }
+        let (monitor, runtime) = (Arc::clone(monitor), Arc::downgrade(inner));
+        let exit = Exit(workers.exits.clone());
+        let thread = std::thread::Builder::new()
+            .name("nuclei-monitor".to_string())
+            .spawn(move || {
+                let _exit = exit;
+                super::handoff::run(&monitor, &runtime);
+            })?;
+        lock(&workers.threads).push((thread, Arc::new(Life::new())));
+        // One spare waits from the start: a handoff starts no thread then.
+        Self::spawn_thread(inner, None, Arc::new(Life::new())).map_err(|(err, _)| err)
+    }
+
+    /// Starts a thread for a shard the monitor took: the gift back if no
+    /// thread could start.
+    pub(crate) fn spawn_runner(
+        inner: &Arc<Inner>,
+        gift: Gift,
+        life: Arc<Life>,
+    ) -> Result<(), Gift> {
+        let gift_back = |run: Run| Gift {
+            place: run.place,
+            shard: run.shard,
+            slot: run.slot.unwrap_or_else(|| inner.workers.monitor_slot()),
+        };
+        match Self::spawn_thread(inner, Some(Run::from(gift)), life) {
+            Ok(()) => Ok(()),
+            Err((_, Some(run))) => Err(gift_back(run)),
+            // Never: the run went in, and comes back with the error.
+            Err((_, None)) => Ok(()),
+        }
+    }
+
+    /// A slot for a runner, from the monitor (a fresh one if there is none).
+    fn monitor_slot(&self) -> Arc<Slot> {
+        self.monitor
+            .as_ref()
+            .map_or_else(|| Arc::new(Slot::new(true)), |monitor| monitor.slot())
+    }
+
+    /// Starts a runner thread for `run`; on failure the error and the run.
+    fn spawn_thread(
+        inner: &Arc<Inner>,
+        run: Option<Run>,
+        life: Arc<Life>,
+    ) -> Result<(), (io::Error, Option<Run>)> {
+        let workers = &inner.workers;
+        // The run waits here until the thread takes it, so a thread that
+        // cannot start hands it back; none: a spare from the start.
+        let handed = Arc::new(Handed(AtomicPtr::new(
+            run.map_or(core::ptr::null_mut(), |run| Box::into_raw(Box::new(run))),
+        )));
+        let (taken, thread_inner, thread_life) =
+            (Arc::clone(&handed), Arc::clone(inner), Arc::clone(&life));
+        let spawned = std::thread::Builder::new()
+            .name((workers.start.name)())
+            .stack_size(workers.start.stack)
+            .spawn(move || runner(&thread_inner, taken.take(), &thread_life));
+        match spawned {
+            Ok(thread) => {
+                lock(&workers.threads).push((thread, life));
+                Ok(())
+            }
+            Err(err) => Err((err, handed.take())),
         }
     }
 
@@ -259,15 +379,141 @@ impl Workers {
         true
     }
 
-    /// Stops every worker now, tasks and all.
+    /// Stops every worker now, tasks and all, the monitor and the spares.
     pub(crate) fn stop_all(&self) {
+        if let Some(monitor) = &self.monitor {
+            monitor.close();
+        }
         self.shards().for_each(|s| s.stop());
     }
 
-    /// The worker threads started so far, taken for joining.
+    /// The runtime's threads started so far, taken for joining: every one
+    /// but a thread still blocked in the poll its shard was taken in, which
+    /// is left to exit on its own.
     pub(crate) fn take_threads(&self) -> Vec<JoinHandle<()>> {
         core::mem::take(&mut *lock(&self.threads))
+            .into_iter()
+            .filter(|(_, life)| !life.is_detached())
+            .map(|(thread, _)| thread)
+            .collect()
     }
+}
+
+/// Reports a runtime thread's exit, once what it held is dropped, even when
+/// it ends by a panic.
+struct Exit(kovan_channel::unbounded::Sender<()>);
+
+impl Drop for Exit {
+    fn drop(&mut self) {
+        self.0.send(());
+    }
+}
+
+/// A run handed to a thread that may not start.
+struct Handed(AtomicPtr<Run>);
+
+impl Handed {
+    fn take(&self) -> Option<Run> {
+        let run = self.0.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: the box was given up to this cell, and is taken out once.
+        (!run.is_null()).then(|| *unsafe { Box::from_raw(run) })
+    }
+}
+
+impl Drop for Handed {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
+
+/// A runner thread: runs `first` (a spare from the start has none), then,
+/// with the handoff on, each shard the monitor hands it, until the runtime
+/// shuts down.
+fn runner(inner: &Arc<Inner>, first: Option<Run>, life: &Arc<Life>) {
+    let workers = &inner.workers;
+    let _exit = Exit(workers.exits.clone());
+    let _stopping = workers.start.tuning.hooks.started();
+    life.here();
+    let _runtime = context::set_runtime(inner);
+    let spare = workers
+        .monitor
+        .as_ref()
+        .map(|_| Spare::here(Arc::clone(life)));
+    let mut next = first;
+    loop {
+        if let Some(run) = next.take()
+            && run_shard(inner, run) == Worked::Detached
+        {
+            life.back();
+        }
+        // A spare now, with the handoff on; else the thread is done.
+        let (Some(monitor), Some(spare)) = (&workers.monitor, &spare) else {
+            return;
+        };
+        next = monitor.wait_for_shard(spare).map(Run::from);
+        if next.is_none() {
+            return;
+        }
+    }
+}
+
+/// Runs the shard of `run` as its worker's runner until it stops or is
+/// taken from this thread; then, taken, the thread's bound tasks on its own
+/// shard, until none is live or the runtime shuts down.
+fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
+    let workers = &inner.workers;
+    let Run {
+        place,
+        shard: Owned(shard),
+        slot,
+    } = run;
+    let cores = &workers.start.cores;
+    if !cores.is_empty() {
+        super::runtime::pin_to(cores[place % cores.len()]);
+    }
+    let _seeded = workers
+        .start
+        .seed
+        .map(|seed| super::rng::Reseeded::new(seed, place as u64 + 1));
+    let home = Arc::new(Home::new(Arc::clone(&shard.shared)));
+    context::set_home(Arc::clone(&home));
+    let worked = {
+        let _current = context::enter_watched(&shard, slot.as_deref());
+        shard.run_worker()
+    };
+    if worked == Worked::Detached
+        && let Some(monitor) = &workers.monitor
+    {
+        finish_home(monitor, &home);
+    }
+    // While the runtime is still this thread's: what the shard hands on as it
+    // goes (a port's keeper) goes there. Its last drop runs where its last
+    // holder lets go.
+    drop(shard);
+    worked
+}
+
+/// A thread whose shard was taken: its bound tasks finish on its own shard,
+/// their home's target moved there first.
+#[expect(
+    clippy::panic,
+    reason = "a thread whose shard cannot start cannot run its bound tasks, which would wait forever"
+)]
+fn finish_home(monitor: &Monitor, home: &Home) {
+    // No bound task, nothing to finish: no own shard is made for it. None
+    // can begin meanwhile: only this thread spawns onto its home.
+    if home.is_idle() {
+        return;
+    }
+    let own = match context::own_shard() {
+        Ok(own) => own,
+        Err(err) => panic!("this thread's shard could not start: {err}"),
+    };
+    home.target().move_to(&own.shared);
+    let _current = context::enter(&own);
+    #[cfg(port)]
+    own.take_port_back();
+    own.block_on_then_leave(monitor.home_done(home));
 }
 
 /// The list of threads; a panic while it was held (pushing a handle) left
@@ -322,6 +568,20 @@ mod tests {
             }
             set
         })
+    }
+
+    #[test]
+    fn a_runtime_watches_its_workers_only_with_the_handoff_on() {
+        let off = Builder::new()
+            .worker_threads(1)
+            .pin_workers(false)
+            .handoff_after(None)
+            .build()
+            .unwrap();
+        assert!(off.inner().workers.monitor.is_none());
+        let on = runtime(1, 1);
+        assert!(on.inner().workers.monitor.is_some(), "on by default");
+        assert!(on.inner().workers.monitor_started.get().is_some());
     }
 
     #[test]

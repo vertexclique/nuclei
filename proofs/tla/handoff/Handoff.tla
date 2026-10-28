@@ -11,13 +11,17 @@
 (* the shard to the task's code; after the poll, and whenever the task's   *)
 (* code calls into the runtime (a bracket), it writes "loop", then reads   *)
 (* its claim, with no fence between the two (a compiler fence only): none  *)
-(* and it goes in, else it waits for the monitor's verdict. The monitor,   *)
+(* and it goes in; a claim pending it cancels with a compare-and-swap      *)
+(* (pending to none) and goes in, a claim taken it leaves the shard. The   *)
+(* monitor, *)
 (* seeing a runner in one poll too long, writes "pending", runs the heavy  *)
 (* fence (membarrier: every thread's buffered stores reach memory), then   *)
 (* reads the runner's word again: still the same "task", and the runner is *)
 (* outside the shard and will see the claim before it goes back in, so the *)
-(* monitor takes the shard and hands it to a spare thread with a fresh     *)
-(* slot; anything else, and it cancels. A runner that sees "taken" never   *)
+(* monitor takes the shard with a compare-and-swap (pending to taken),     *)
+(* unless the runner cancelled first, and hands it to a spare thread with  *)
+(* a fresh slot; anything else, and it cancels. Neither side waits for the *)
+(* other: one of the two swaps wins. A runner that sees "taken" never      *)
 (* touches the shard again (it is detached), drains the bound tasks it     *)
 (* created, then waits as a spare itself.                                  *)
 (*                                                                          *)
@@ -87,7 +91,8 @@ variables
     boundBy = {},                        \* threads that ran a bound task
     handoffs = 0,
     cancels = 0,
-    detachedCalls = 0;
+    detachedCalls = 0,
+    runnerCancels = 0;                   \* (record) a runner cancelled a pending claim
 
 define
     \* At most one actor is inside the shard's owned part.
@@ -103,6 +108,7 @@ define
     NoHandoff == handoffs = 0
     NoCancel == cancels = 0
     NoDetachedCall == detachedCalls = 0
+    NoRunnerCancel == runnerCancels = 0
 end define;
 
 \* The memory: a buffer's oldest store reaches memory, at any time.
@@ -195,13 +201,19 @@ B_check:
         inS := inS \cup {self};
         goto B_in;
     end if;
-B_wait:
-    await ReadAt(claim, buf[self], "claim", sl) # PENDING;
-    if ReadAt(claim, buf[self], "claim", sl) = TAKEN then
+B_cas:
+    \* A claim is up: cancel it if still pending (a locked instruction, so the
+    \* buffer drains first), or leave a shard that is taken.
+    await buf[self] = <<>>;
+    if claim[sl] = TAKEN then
         \* The call goes through the shard's remote paths instead.
         detachedCalls := 1;
         goto D_unwind;
     else
+        if claim[sl] = PENDING then
+            runnerCancels := 1;
+        end if;
+        claim[sl] := NONE;
         inS := inS \cup {self};
     end if;
 B_in:
@@ -221,11 +233,15 @@ E_check:
         inS := inS \cup {self};
         goto R_loop;
     end if;
-E_wait:
-    await ReadAt(claim, buf[self], "claim", sl) # PENDING;
-    if ReadAt(claim, buf[self], "claim", sl) = TAKEN then
+E_cas:
+    await buf[self] = <<>>;
+    if claim[sl] = TAKEN then
         goto D_unwind;
     else
+        if claim[sl] = PENDING then
+            runnerCancels := 1;
+        end if;
+        claim[sl] := NONE;
         inS := inS \cup {self};
         goto R_loop;
     end if;
@@ -267,13 +283,22 @@ M_fence:
             buf := [a \in Actors |-> <<>>];
         end if;
 M_check:
-        await Len(buf[Mon]) < BufCap;
-        if ReadAt(word, buf[Mon], "word", ms) = mv \/ Mode = "no_recheck" then
-            \* claim := taken, a release store; the shard is the monitor's.
-            buf[Mon] := Append(buf[Mon], <<"claim", ms, TAKEN>>);
+        if ReadAt(word, buf[Mon], "word", ms) # mv /\ Mode # "no_recheck" then
+            \* The runner is back in, or in a bracket: cancel (pending to none).
+            await buf[Mon] = <<>>;
+            if claim[ms] = PENDING then
+                claim[ms] := NONE;
+            end if;
+            cancels := 1;
+            goto M_tick;
+        end if;
+M_take:
+        \* Pending to taken, a compare-and-swap: lost when the runner cancelled first.
+        await buf[Mon] = <<>>;
+        if claim[ms] = PENDING then
+            claim[ms] := TAKEN;
             inS := inS \cup {Mon};
         else
-            buf[Mon] := Append(buf[Mon], <<"claim", ms, NONE>>);
             cancels := 1;
             goto M_tick;
         end if;

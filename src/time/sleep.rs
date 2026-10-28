@@ -204,15 +204,10 @@ impl Future for Sleep {
         if let State::Done = this.state {
             return Poll::Ready(());
         }
-        let shard: *const Shard =
-            context::current(|current| current.map_or(core::ptr::null(), |s| s as *const Shard));
-        if shard.is_null() {
-            this.poll_remote(cx)
-        } else {
-            // SAFETY: the shard this thread runs is kept alive by the guard
-            // that entered it, further up this thread's stack.
-            this.poll_local(unsafe { &*shard }, cx)
-        }
+        context::current(|current| match current {
+            Some(shard) => this.poll_local(shard, cx),
+            None => this.poll_remote(cx),
+        })
     }
 }
 

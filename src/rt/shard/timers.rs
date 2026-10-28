@@ -98,9 +98,7 @@ impl Shard {
     /// tasks they wake go to the queue in deadline order, ahead of a task
     /// that yields next, and not to the LIFO slot.
     pub(crate) fn fire_timers_now(&self) {
-        let outer = self.in_task.replace(false);
-        self.fire_timers();
-        self.in_task.set(outer);
+        crate::rt::context::with_in_task(false, || self.fire_timers());
     }
 
     pub(super) fn fire_timers(&self) {

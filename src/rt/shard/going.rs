@@ -17,14 +17,11 @@ impl Shard {
     /// the outermost `block_on` of the thread; then leaves, whether the
     /// call returned or unwound, so what waits on this shard is handed on.
     pub(crate) fn block_on_then_leave<F: core::future::Future>(&self, future: F) -> F::Output {
-        struct Leaving<'a>(&'a Shard);
-        impl Drop for Leaving<'_> {
-            fn drop(&mut self) {
-                self.0.leave();
-            }
-        }
-        let _leaving = Leaving(self);
-        self.block_on(future)
+        let mut future = core::pin::pin!(future);
+        crate::rt::context::deeper(self.limits.max_nesting, || {
+            let signal = Arc::new(super::signal::Signal::new(&self.shared));
+            self.run_then_leave(future.as_mut(), &signal)
+        })
     }
 
     /// The outermost `block_on` of a thread outside the runtime returned,

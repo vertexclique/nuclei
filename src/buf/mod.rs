@@ -427,50 +427,27 @@ impl Drop for Pool {
 }
 
 thread_local! {
-    /// The pool of the shard this thread runs, while it runs it.
-    static CURRENT: Cell<*const Pool> = const { Cell::new(core::ptr::null()) };
     /// The pool of a thread that runs no shard (a task of another executor
     /// writing to a handle), made on first need.
     static FALLBACK: Pool = Pool::new(DEFAULT_CAP);
 }
 
-/// Marks `pool` as the one buffers dropped on this thread go back to, until
-/// the guard drops.
-pub(crate) fn enter(pool: &Pool) -> Entered<'_> {
-    let previous = CURRENT.with(|c| c.replace(pool));
-    Entered {
-        previous,
-        _pool: core::marker::PhantomData,
-    }
-}
-
-/// Restores the pool that was current before [`enter`].
-pub(crate) struct Entered<'a> {
-    previous: *const Pool,
-    _pool: core::marker::PhantomData<&'a Pool>,
-}
-
-impl Drop for Entered<'_> {
-    fn drop(&mut self) {
-        let _ = CURRENT.try_with(|c| c.set(self.previous));
-    }
-}
-
-/// Runs `f` with this thread's pool: its shard's, or its own if it runs
-/// none. `None` only while the thread exits, after its pool is gone.
+/// Runs `f` with this thread's pool: the pool of the shard it runs (a call
+/// from a task's code comes back into the shard first, see `rt::context`),
+/// or its own if it runs none. `None` only while the thread exits, after its
+/// pool is gone.
 pub(crate) fn with_pool<R>(f: impl FnOnce(Option<&Pool>) -> R) -> R {
-    let current = CURRENT.try_with(Cell::get).unwrap_or(core::ptr::null());
-    let pool = if current.is_null() {
-        FALLBACK
-            .try_with(|p| p as *const Pool)
-            .unwrap_or(core::ptr::null())
-    } else {
-        current
-    };
-    // SAFETY: `CURRENT` points at a pool only while its `Entered` guard
-    // lives on this thread, and the fallback lives until the thread's
-    // destructors run, which `try_with` would have reported.
-    f(unsafe { pool.as_ref() })
+    crate::rt::context::current(|shard| match shard {
+        Some(shard) => f(Some(shard.pool())),
+        None => {
+            let fallback = FALLBACK
+                .try_with(core::ptr::from_ref)
+                .unwrap_or(core::ptr::null());
+            // SAFETY: the fallback lives until the thread's destructors run,
+            // which `try_with` would have reported.
+            f(unsafe { fallback.as_ref() })
+        }
+    })
 }
 
 /// Copies the front of `src` into `bufs`, in order; returns how many bytes.
@@ -631,18 +608,19 @@ impl PoolBuf {
 
 impl Drop for PoolBuf {
     fn drop(&mut self) {
-        let pool = CURRENT.try_with(Cell::get).unwrap_or(core::ptr::null());
-        // SAFETY: `CURRENT` points at a pool only while its `Entered` guard
-        // lives on this thread.
-        match unsafe { pool.as_ref() } {
-            Some(pool) if pool.is_home(&self.home) => {
-                pool.take_back(self.ptr, self.class, self.cap);
+        let returned = crate::rt::context::current(|shard| match shard {
+            Some(shard) if shard.pool().is_home(&self.home) => {
+                shard.pool().take_back(self.ptr, self.class, self.cap);
+                false
             }
-            _ => self.home.give_back(Returned {
+            _ => true,
+        });
+        if returned {
+            self.home.give_back(Returned {
                 raw: Raw(self.ptr),
                 class: self.class,
                 cap: self.cap,
-            }),
+            });
         }
     }
 }

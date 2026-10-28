@@ -17,6 +17,13 @@ with a program that compiles and runs.
   `global_queue_interval`, `max_io_events_per_tick`, `disable_lifo_slot`, `rng_seed`,
   `unhandled_panic`, `start_paused` and the backend, and hooks on threads and tasks. A runtime
   may start more workers up to a maximum and drain them again.
+- **Shard handoff.** A worker whose task stays in one poll past `Builder::handoff_after` (10 ms
+  by default; `None` turns it off) hands its shard to another thread on the same core: the
+  shard's other tasks, timers and IO in flight go on, the blocked task carries on once its poll
+  returns, a nested `block_on` and the tasks `spawn_local` keeps on that thread finish on it, and
+  a shutdown does not wait for it. A poll pays two plain stores and a load. `ShardStats` counts
+  `handoffs` and the `longest_poll`. With the handoff on, an io_uring worker's ring takes
+  submissions from any thread.
 - **Tasks.** `Task` with `detach`, `cancel`, `abort`, `abort_handle`, `join` (a `JoinError`
   says why a task gave no output) and `fallible`; `JoinSet`; task ids; `task::Builder`;
   `task_local!`; `yield_now`; the cooperative budget in `task::coop`.

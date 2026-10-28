@@ -57,6 +57,10 @@ pub(crate) struct RingConfig {
     pub iopoll: bool,
     /// Create the ring disabled; [`Ring::enable`] turns it on.
     pub start_disabled: bool,
+    /// Any thread may submit (one at a time): neither single-issuer nor with
+    /// deferred task work, for a worker shard that may be handed to another
+    /// thread.
+    pub multi_issuer: bool,
     /// Worker thread limits for `[bounded, unbounded]` async work; 0 leaves a limit unchanged.
     pub iowq_max_workers: Option<[u32; 2]>,
     /// Buffers of the group multishot receives draw from (0: no group), and their size.
@@ -73,6 +77,7 @@ impl RingConfig {
             sqpoll_idle_ms: None,
             iopoll: false,
             start_disabled: false,
+            multi_issuer: false,
             iowq_max_workers: None,
             recv_buffers: 0,
             recv_buffer_size: 0,
@@ -88,6 +93,7 @@ impl From<&IoUringConfiguration> for RingConfig {
             sqpoll_idle_ms: c.sqpoll_wake_interval,
             iopoll: c.iopoll_enabled,
             start_disabled: false,
+            multi_issuer: false,
             iowq_max_workers: (c.per_numa_bounded_worker_count.is_some()
                 || c.per_numa_unbounded_worker_count.is_some())
             .then(|| {
@@ -105,11 +111,16 @@ impl From<&IoUringConfiguration> for RingConfig {
 /// The `io_uring_setup` flags for `cfg`, with or without the submission index array.
 ///
 /// Without a kernel submission thread the ring is single-issuer with deferred task work; with one,
-/// those two cannot be combined with it, so they are left out. `NO_SQARRAY` needs Linux 6.6.
+/// those two cannot be combined with it, so they are left out, and so they are for a ring any
+/// thread may submit to (`multi_issuer`), whose completion work runs on the thread that submitted
+/// the operation: at its next return from the kernel, interrupting it if it runs, waking it if it
+/// sleeps. `NO_SQARRAY` needs Linux 6.6.
 pub(crate) fn setup_flags(cfg: &RingConfig, no_sqarray: bool) -> u32 {
     let mut flags = IORING_SETUP_SUBMIT_ALL | IORING_SETUP_CLAMP | IORING_SETUP_CQSIZE;
     flags |= if cfg.sqpoll_idle_ms.is_some() {
         IORING_SETUP_SQPOLL
+    } else if cfg.multi_issuer {
+        0
     } else {
         IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN
     };

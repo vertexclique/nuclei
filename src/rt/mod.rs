@@ -5,6 +5,7 @@ pub(crate) mod backend;
 pub(crate) mod blocking;
 pub(crate) mod context;
 pub(crate) mod counters;
+pub(crate) mod handoff;
 mod handshake;
 pub(crate) mod inbox;
 pub(crate) mod park;

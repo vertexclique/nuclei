@@ -11,6 +11,7 @@ M_no_handoff          Handoff     violated:Rescued
 W_handoff             Handoff     violated:NoHandoff
 W_cancel              Handoff     violated:NoCancel
 W_detached_call       Handoff     violated:NoDetachedCall
+W_runner_cancel       Handoff     violated:NoRunnerCancel
 R_seqcst              Retarget    pass
 M_retarget_relaxed    Retarget    violated:WokenPolled
 W_old_wake            Retarget    violated:NoOldWake

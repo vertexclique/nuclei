@@ -92,6 +92,17 @@ open Nuclei.FairSemaphore
 -- A ring's overflow count: an overflow counts once however many waits it lasts, never more than
 -- the looks that saw it, a set look after a clear one counts, and stretches split at a clear
 -- look add up.
+#print axioms Nuclei.Handoff.epoch_outside
+#print axioms Nuclei.Handoff.epoch_inside
+#print axioms Nuclei.Handoff.isOutside_outside
+#print axioms Nuclei.Handoff.isOutside_inside
+#print axioms Nuclei.Handoff.outside_ne_inside
+#print axioms Nuclei.Handoff.outside_inj
+#print axioms Nuclei.Handoff.outside_fits
+#print axioms Nuclei.Handoff.streak_succ
+#print axioms Nuclei.Handoff.four_is_five_reads
+#print axioms Nuclei.Handoff.ran_four_ticks
+#print axioms Nuclei.Handoff.began_after
 #print axioms Nuclei.Overflow.stutter
 #print axioms Nuclei.Overflow.at_most_seen
 #print axioms Nuclei.Overflow.counted_after_clear

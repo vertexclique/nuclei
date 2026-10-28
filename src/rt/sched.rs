@@ -1,5 +1,6 @@
-//! Where a task of a shard goes when it is woken, and the count of live
-//! tasks placement reads.
+//! Where a task of a shard goes when it is woken, and the counts of live
+//! tasks placement reads (a shard's) and a detached thread waits on (a
+//! home's).
 
 use core::future::Future;
 use core::pin::Pin;
@@ -7,6 +8,7 @@ use core::task::{Context, Poll};
 use std::sync::Arc;
 
 use super::context;
+use super::handoff::home::Home;
 use super::shard::Shared;
 use super::task::{Runnable, Schedule, ScheduleInfo};
 use crate::sync::internal::Ordering;
@@ -14,8 +16,9 @@ use crate::sync::internal::Ordering;
 /// The schedule of a task placed on a shard.
 pub(crate) struct Sched {
     pub(crate) shard: Arc<Shared>,
-    /// The task's future is not `Send`: it runs on the shard's thread only.
-    pub(crate) bound: bool,
+    /// The home of a task whose future is not `Send`: it runs on its home's
+    /// thread only, whichever shard that thread runs.
+    pub(crate) home: Option<Arc<Home>>,
     /// Its runtime's task hooks, if it has any.
     pub(crate) hooks: Option<Arc<super::tuning::TaskHooks>>,
 }
@@ -24,6 +27,22 @@ pub(crate) struct Sched {
 // `self` (in the task's memory) stays alive until it is done with it.
 unsafe impl Schedule for Sched {
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo) {
+        if let Some(home) = &self.home {
+            let remote = context::current(|current| match current {
+                Some(shard) if context::is_home(home) || shard.owns_home(home) => {
+                    shard.push_local(runnable, info);
+                    None
+                }
+                _ => Some(runnable),
+            });
+            if let Some(runnable) = remote {
+                // As below: the waker keeps the task until the push is done.
+                let keep = runnable.waker();
+                home.push(runnable);
+                drop(keep);
+            }
+            return;
+        }
         let remote = context::current(|current| match current {
             Some(shard) if shard.is(&self.shard) => {
                 shard.push_local(runnable, info);
@@ -36,7 +55,7 @@ unsafe impl Schedule for Sched {
             // it, this schedule with it: the waker keeps it until the push
             // and the wake are done.
             let keep = runnable.waker();
-            self.shard.push_remote(runnable, self.bound);
+            self.shard.push_remote(runnable);
             drop(keep);
         }
     }
@@ -107,5 +126,37 @@ impl<F> Drop for Counted<F> {
         if shard.load.fetch_sub(1, Ordering::Release) == 1 {
             shard.last_task_done();
         }
+    }
+}
+
+/// A bound task's future, counted in its home's live tasks until it
+/// completes or is dropped.
+pub(crate) struct AtHome<F> {
+    future: F,
+    home: *const Home,
+}
+
+impl<F> AtHome<F> {
+    /// Counts the task in `home` from now on.
+    pub(crate) fn new(future: F, home: &Home) -> Self {
+        home.began();
+        Self { future, home }
+    }
+}
+
+impl<F: Future> Future for AtHome<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        // SAFETY: the future is never moved out of its place: structural pin.
+        unsafe { self.map_unchecked_mut(|c| &mut c.future) }.poll(cx)
+    }
+}
+
+impl<F> Drop for AtHome<F> {
+    fn drop(&mut self) {
+        // SAFETY: the task's schedule holds the home for as long as the
+        // future lives.
+        unsafe { &*self.home }.ended();
     }
 }

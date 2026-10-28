@@ -1032,6 +1032,33 @@ the look after the completions is there: with it two floods count two, and witho
 one; its mutation, counting every set look, breaks `stutter`. An overflow that begins and ends
 between two looks is seen by neither the code nor the model.
 
+## A shard handed to another thread
+
+`handoff` (`tla/handoff/Handoff.tla`) checks the shard handoff (`src/rt/handoff/`,
+`src/rt/context.rs`) on a machine whose stores wait in a store buffer of two entries, as x86's do:
+a runner leaves its shard for a task's poll (a release store of its word), comes back at the
+poll's end and at each call into the runtime from the task (a store of its word, the compiler's
+fence, a load of its claim), and cancels a pending claim with a compare-and-swap; the monitor
+sets the claim pending, runs the heavy fence (every buffer flushed at once), reads the word again
+and takes with the opposite compare-and-swap, then hands the shard to a spare with a fresh slot.
+16 configurations: 2 that must pass (two handoffs, a remote push and a bound task: at most one
+thread inside the shard, `Exclusive`, a detached thread staying out, a bound task on its creator
+only; a first poll that never returns, every remote push run anyway, `Rescued`); 6 mutations,
+each of which must break a property (no heavy fence, no second read of the word, no look at the
+claim at a poll's end or in a call into the runtime, the old runner's slot handed on: each breaks
+`Exclusive`; the new runner taking the bound tasks breaks `BoundOnCreator`; no handoff at all
+breaks `Rescued`); and 4 witnesses (a handoff, a cancel by the monitor, a call into the runtime
+from a detached thread, a cancel by the runner). `tla/handoff/Retarget.tla` checks the waker of a
+`block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
+the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
+1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old
+shard). `lean/Nuclei/Handoff.lean` proves the word's packing (its epoch and its side come back
+out, a new poll writes a word no earlier poll wrote, every epoch below `2^63` fits) and the watch:
+the monitor's streak of four is five equal reads outside the shard, which a tick apart or more
+mean the poll has run at least four ticks, and a read that missed the poll just before one that
+saw it means the poll began after it. The model takes a bound task's home as its creator thread
+and a hand-over to a spare as one step.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the

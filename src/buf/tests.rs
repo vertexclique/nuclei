@@ -1,4 +1,16 @@
-use super::{CLASSES, Pool, enter};
+use super::{CLASSES, Pool};
+use crate::rt::shard::{Limits, Shard};
+
+/// A shard whose pool holds `cap` bytes, for a test to enter: buffers
+/// dropped on this thread then go back to its pool.
+fn shard_with_pool(cap: usize) -> Shard {
+    Shard::new(Limits {
+        max_nesting: crate::rt::context::DEFAULT_MAX_NESTING,
+        buffer_cap: cap,
+        backend: crate::rt::backend::Backend::Poll,
+    })
+    .unwrap()
+}
 
 #[test]
 fn a_request_takes_the_smallest_class_that_holds_it() {
@@ -16,8 +28,9 @@ fn a_request_takes_the_smallest_class_that_holds_it() {
 
 #[test]
 fn a_buffer_dropped_on_its_shard_is_reused() {
-    let pool = Pool::new(1 << 20);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(1 << 20);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let a = pool.get(4096).unwrap();
     let addr = a.filled().as_ptr() as usize;
     drop(a);
@@ -28,8 +41,9 @@ fn a_buffer_dropped_on_its_shard_is_reused() {
 
 #[test]
 fn the_pool_takes_nothing_past_its_cap() {
-    let pool = Pool::new(8 * 1024);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(8 * 1024);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let a = pool.get(4096).unwrap();
     let b = pool.get(4096).unwrap();
     assert!(pool.get(4096).is_none(), "at the cap");
@@ -45,8 +59,9 @@ fn the_pool_takes_nothing_past_its_cap() {
 
 #[test]
 fn a_buffer_dropped_on_another_thread_comes_back_through_the_queue() {
-    let pool = Pool::new(1 << 20);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(1 << 20);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let a = pool.get(512).unwrap();
     let addr = a.filled().as_ptr() as usize;
     std::thread::spawn(move || drop(a)).join().unwrap();
@@ -60,8 +75,9 @@ fn a_buffer_dropped_on_another_thread_comes_back_through_the_queue() {
 #[test]
 fn buffers_given_back_by_many_threads_at_once_each_come_back_once() {
     const EACH: usize = 64;
-    let pool = Pool::new(1 << 22);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(1 << 22);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let sent: Vec<Vec<_>> = (0..4)
         .map(|_| (0..EACH).map(|_| pool.get(512).unwrap()).collect())
         .collect();
@@ -108,8 +124,9 @@ fn buffers_outliving_their_pool_are_freed_by_its_home() {
 
 #[test]
 fn filled_bytes_are_read_out_in_order() {
-    let pool = Pool::new(1 << 20);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(1 << 20);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let mut b = pool.get(16).unwrap();
     assert!(b.is_empty());
     assert_eq!(b.fill_from(b"hello world"), 11);
@@ -140,8 +157,9 @@ fn a_fill_larger_than_the_buffer_takes_what_fits() {
 
 #[test]
 fn a_whole_buffer_holds_a_request_past_the_largest_class_and_is_not_kept() {
-    let pool = Pool::new(1 << 20);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(1 << 20);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let b = pool.get_whole(100_000).unwrap();
     assert!(b.capacity() >= 100_000);
     assert_eq!(b.capacity() % 4096, 0);
@@ -154,8 +172,9 @@ fn a_whole_buffer_holds_a_request_past_the_largest_class_and_is_not_kept() {
 
 #[test]
 fn a_whole_buffer_dropped_elsewhere_is_freed_when_the_pool_looks() {
-    let pool = Pool::new(1 << 20);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(1 << 20);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let b = pool.get_whole(200_000).unwrap();
     let size = b.capacity();
     std::thread::spawn(move || drop(b)).join().unwrap();
@@ -167,8 +186,9 @@ fn a_whole_buffer_dropped_elsewhere_is_freed_when_the_pool_looks() {
 
 #[test]
 fn at_the_cap_idle_buffers_of_other_classes_make_room() {
-    let pool = Pool::new(64 * 1024);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(64 * 1024);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let small: Vec<_> = (0..128).map(|_| pool.get(512).unwrap()).collect();
     assert_eq!(pool.charged(), 64 * 1024);
     assert!(pool.get(64 * 1024).is_none(), "all in use");
@@ -224,8 +244,9 @@ fn waker() -> (std::sync::Arc<Woken>, std::task::Waker) {
 
 #[test]
 fn a_waiter_is_woken_by_the_next_buffer_that_comes_back_from_any_thread() {
-    let pool = Pool::new(4096);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(4096);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let held = pool.get(4096).unwrap();
     assert!(pool.get(4096).is_none());
     let (count, w) = waker();
@@ -259,8 +280,9 @@ fn a_waiter_is_woken_at_once_when_nothing_is_out_to_come_back() {
 
 #[test]
 fn a_buffer_that_came_back_before_the_wait_wakes_it_at_once() {
-    let pool = Pool::new(4096);
-    let _entered = enter(&pool);
+    let shard = shard_with_pool(4096);
+    let _entered = crate::rt::context::enter(&shard);
+    let pool = shard.pool();
     let held = pool.get(4096).unwrap();
     std::thread::spawn(move || drop(held)).join().unwrap();
     let (count, w) = waker();

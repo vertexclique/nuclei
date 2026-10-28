@@ -1,22 +1,23 @@
-TLC run of every configuration in proofs/tla/handoff, 2026-10-28 07:46 UTC.
+TLC run of every configuration in proofs/tla/handoff, 2026-10-28 07:58 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 1500 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-H_safe                        12161625    3025355     25  pass                                  pass                                  yes
-H_rescue                       2288497     551951     31  pass                                  pass                                  yes
-M_no_fence                        1333        561      1  violated:Exclusive                    violated:Exclusive                    yes
-M_no_recheck                      1297        556      1  violated:Exclusive                    violated:Exclusive                    yes
-M_no_poll_check                   1426        607      2  violated:Exclusive                    violated:Exclusive                    yes
-M_no_bracket_check                1323        567      1  violated:Exclusive                    violated:Exclusive                    yes
-M_slot_reuse                      2644       1115      1  violated:Exclusive                    violated:Exclusive                    yes
-M_bound_any                       1754        739      1  violated:BoundOnCreator               violated:BoundOnCreator               yes
-M_no_handoff                      9585       2968      1  violated:Rescued                      violated:Rescued                      yes
-W_handoff                          736        324      1  violated:NoHandoff                    violated:NoHandoff                    yes
-W_cancel                           953        410      1  violated:NoCancel                     violated:NoCancel                     yes
-W_detached_call                   2446       1000      1  violated:NoDetachedCall               violated:NoDetachedCall               yes
+H_safe                         9368961    2663009     14  pass                                  pass                                  yes
+H_rescue                       1572360     431306     23  pass                                  pass                                  yes
+M_no_fence                        2387        959      1  violated:Exclusive                    violated:Exclusive                    yes
+M_no_recheck                      1737        726      1  violated:Exclusive                    violated:Exclusive                    yes
+M_no_poll_check                   1885        789      1  violated:Exclusive                    violated:Exclusive                    yes
+M_no_bracket_check                1756        737      1  violated:Exclusive                    violated:Exclusive                    yes
+M_slot_reuse                      3062       1274      1  violated:Exclusive                    violated:Exclusive                    yes
+M_bound_any                       2241        931      1  violated:BoundOnCreator               violated:BoundOnCreator               yes
+M_no_handoff                      9585       2968      2  violated:Rescued                      violated:Rescued                      yes
+W_handoff                         1024        441      1  violated:NoHandoff                    violated:NoHandoff                    yes
+W_cancel                           951        408      1  violated:NoCancel                     violated:NoCancel                     yes
+W_detached_call                   2982       1225      1  violated:NoDetachedCall               violated:NoDetachedCall               yes
+W_runner_cancel                   1291        549      1  violated:NoRunnerCancel               violated:NoRunnerCancel               yes
 R_seqcst                            25         19      1  pass                                  pass                                  yes
 M_retarget_relaxed                  99         52      1  violated:WokenPolled                  violated:WokenPolled                  yes
 W_old_wake                          12         11      1  violated:NoOldWake                    violated:NoOldWake                    yes
 
-results matching EXPECTED.txt: 15 of 15
+results matching EXPECTED.txt: 16 of 16

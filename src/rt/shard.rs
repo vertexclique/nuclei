@@ -35,8 +35,7 @@
 
 use core::cell::{Cell, RefCell};
 use core::future::Future;
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
+use core::task::{Poll, Waker};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
@@ -45,7 +44,6 @@ use std::time::{Duration, Instant};
 use super::inbox::{Inbox, Pop};
 use kovan_queue::seg_queue::SegQueue;
 
-use self::signal::Signal;
 use super::backend::Backend;
 use super::counters::{self, Counters};
 use super::handshake::ParkState;
@@ -54,7 +52,7 @@ use super::park::Registrar;
 use super::park::{Notifier, Poller};
 use super::sources::Sources;
 use super::task::{Runnable, ScheduleInfo};
-use crate::buf::{self, Pool};
+use crate::buf::Pool;
 use crate::io::Source;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -68,11 +66,13 @@ mod children;
 mod going;
 #[cfg(port)]
 mod port;
-mod signal;
+mod run;
+pub(crate) mod signal;
 mod spin;
 mod stats;
 mod timers;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
+pub(crate) use run::Worked;
 #[cfg(ring)]
 pub(crate) mod recv;
 #[cfg(ring)]
@@ -94,11 +94,6 @@ pub(crate) struct Shared {
     /// the tasks (see `rt::inbox`). Its taker is the shard, and once the
     /// shard stopped whoever drains it.
     inbox: Inbox,
-    /// Runnables of tasks bound to this shard's thread, pushed by others.
-    /// Kept apart: if the shard is gone, they are leaked rather than dropped
-    /// on a thread their future may not be dropped on. The shard alone takes
-    /// from it.
-    local_inbox: Inbox,
     park: ParkState,
     notifier: Notifier,
     /// Live tasks placed on the shard: what placement compares.
@@ -161,23 +156,19 @@ pub(crate) enum IoOp {
 }
 
 impl Shared {
-    /// Hands a runnable to the shard from another thread and wakes it if it
-    /// sleeps. `bound`: the task must run on the shard's thread only.
-    pub(crate) fn push_remote(&self, runnable: Runnable, bound: bool) {
-        if bound {
-            self.local_inbox.push(runnable);
-        } else {
-            self.inbox.push(runnable);
-            // A shard that stopped runs nothing more, and its last drain of
-            // the inbox may be over: what is pushed then is dropped (its
-            // future may be dropped on any thread), or it would keep itself
-            // and, through its schedule, the shard for good. The push and the
-            // flag's store are both sequentially consistent: either the
-            // drain finds it, or this sees the flag.
-            if self.stopped.load(Ordering::SeqCst) {
-                self.drop_stopped(false);
-                return;
-            }
+    /// Hands a runnable of a `Send` task to the shard from another thread
+    /// and wakes it if it sleeps.
+    pub(crate) fn push_remote(&self, runnable: Runnable) {
+        self.inbox.push(runnable);
+        // A shard that stopped runs nothing more, and its last drain of the
+        // inbox may be over: what is pushed then is dropped (its future may
+        // be dropped on any thread), or it would keep itself and, through its
+        // schedule, the shard for good. The push and the flag's store are
+        // both sequentially consistent: either the drain finds it, or this
+        // sees the flag.
+        if self.stopped.load(Ordering::SeqCst) {
+            self.drop_stopped(false);
+            return;
         }
         // The queue's push is sequentially consistent: the shard either finds
         // the runnable after it parks, or is parked now.
@@ -229,14 +220,9 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn state_line(&self) -> String {
         format!(
-            "parked {}, inbox {}, local inbox {}, timer ops {}, io ops {}, load {}, stopped {}, draining {}",
+            "parked {}, inbox {}, timer ops {}, io ops {}, load {}, stopped {}, draining {}",
             self.park.is_parked(),
             if self.inbox.is_empty() {
-                "empty"
-            } else {
-                "not empty"
-            },
-            if self.local_inbox.is_empty() {
                 "empty"
             } else {
                 "not empty"
@@ -264,6 +250,11 @@ impl Shared {
         if !done {
             self.post_io(IoOp::Release(token));
         }
+    }
+
+    /// Whether the shard sleeps in its park now.
+    pub(crate) fn is_parked(&self) -> bool {
+        self.park.is_parked()
     }
 
     /// Whether the shard stopped.
@@ -370,20 +361,7 @@ impl Shared {
     /// paused clock deciding whether the shard is idle); its own thread looks
     /// with [`Shard::has_remote_work`].
     fn has_remote_work(&self) -> bool {
-        !self.inbox.is_empty()
-            || !self.local_inbox.is_empty()
-            || !self.timer_ops.is_empty()
-            || !self.io_ops.is_empty()
-    }
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // A runnable of a thread-bound task pushed after its shard was gone:
-        // its future may only be dropped on that thread, which has exited,
-        // so the task is leaked instead.
-        // SAFETY: the shard is gone; nothing else reaches the queue.
-        unsafe { self.local_inbox.drain(core::mem::forget) };
+        !self.inbox.is_empty() || !self.timer_ops.is_empty() || !self.io_ops.is_empty()
     }
 }
 
@@ -434,9 +412,13 @@ pub(crate) struct Shard {
     /// The runtime and the place this shard is a worker of, set when its
     /// worker thread starts: what `spawn` uses to keep a task local.
     owner: Cell<Option<(u64, usize)>>,
-    /// A task is being polled: a wake it makes goes to the LIFO slot.
-    in_task: Cell<bool>,
-    depth: Cell<usize>,
+    /// The monitor of the shard's runtime, for a worker shard it watches:
+    /// told when the shard's park ends.
+    monitor: Option<Arc<super::handoff::Monitor>>,
+    /// A thread's own shard: the home of the bound tasks spawned on it,
+    /// made on the first, and dropped with the shard (so a task woken as the
+    /// shard goes is dropped on its thread).
+    home: core::cell::OnceCell<Arc<super::handoff::home::Home>>,
     limits: Limits,
     tuning: super::tuning::Tuning,
     driver: Driver,
@@ -474,10 +456,42 @@ impl Shard {
         tuning: super::tuning::Tuning,
         runtime: u64,
         index: usize,
+        monitor: Option<Arc<super::handoff::Monitor>>,
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
         shard.tuning = tuning;
+        shard.monitor = monitor;
         Ok(shard)
+    }
+
+    /// The shard's buffer pool.
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// The home of the bound tasks spawned on this shard, a thread's own,
+    /// made now if it has none.
+    pub(crate) fn own_home(&self) -> Arc<super::handoff::home::Home> {
+        Arc::clone(
+            self.home.get_or_init(|| {
+                Arc::new(super::handoff::home::Home::new(Arc::clone(&self.shared)))
+            }),
+        )
+    }
+
+    /// Whether `home` is this shard's own.
+    pub(crate) fn owns_home(&self, home: &super::handoff::home::Home) -> bool {
+        self.home
+            .get()
+            .is_some_and(|own| core::ptr::eq(Arc::as_ptr(own), home))
+    }
+
+    /// The shard's park ended: its runtime's monitor, asleep while every
+    /// worker was parked, wakes.
+    fn parked_ended(&self) {
+        if let Some(monitor) = &self.monitor {
+            monitor.worker_woke();
+        }
     }
 
     /// A shard, worker `owner` (a runtime and a place) if it is one. Its
@@ -527,7 +541,6 @@ impl Shard {
         let pool = Pool::new(limits.buffer_cap);
         let shared = Arc::new(Shared {
             inbox: Inbox::new(),
-            local_inbox: Inbox::new(),
             park: ParkState::new(),
             notifier,
             load: AtomicUsize::new(0),
@@ -559,8 +572,8 @@ impl Shard {
             looks: Cell::new(0),
             spin: Spin::new(),
             owner: Cell::new(owner),
-            in_task: Cell::new(false),
-            depth: Cell::new(0),
+            monitor: None,
+            home: core::cell::OnceCell::new(),
             limits,
             tuning: super::tuning::Tuning::default(),
             driver,
@@ -669,7 +682,7 @@ impl Shard {
     /// task being polled runs next (the LIFO slot), unless it is that task
     /// itself yielding.
     pub(crate) fn push_local(&self, runnable: Runnable, info: ScheduleInfo) {
-        if self.tuning.lifo && self.in_task.get() && !info.woken_while_running {
+        if self.tuning.lifo && !info.woken_while_running && super::context::in_task() {
             if let Some(previous) = self.lifo.replace(Some(runnable)) {
                 self.queue.borrow_mut().push_back(previous);
             }
@@ -701,17 +714,17 @@ impl Shard {
     }
 
     fn pop_inbox(&self) -> Option<Runnable> {
-        // SAFETY: the shard holds both inboxes' taker's role until it goes
-        // (`stop` lets go of the inbox's, last).
-        let popped = unsafe {
-            match self.shared.inbox.pop() {
-                Pop::Item(runnable) => Some(runnable),
-                // A push under way counts as work: the loop comes back.
-                Pop::Empty | Pop::Busy => match self.shared.local_inbox.pop() {
-                    Pop::Item(runnable) => Some(runnable),
-                    Pop::Empty | Pop::Busy => None,
-                },
-            }
+        // SAFETY: the shard holds the inbox's taker's role until it goes
+        // (`stop` lets go of it, last).
+        let popped = match unsafe { self.shared.inbox.pop() } {
+            Pop::Item(runnable) => Some(runnable),
+            // A push under way counts as work: the loop comes back. Then the
+            // bound tasks of the thread that runs the shard: a runner's, or
+            // the ones of this shard, a thread's own.
+            Pop::Empty | Pop::Busy => super::context::pop_home().or_else(|| {
+                // SAFETY: an own shard runs on its thread only, its home's.
+                self.home.get().and_then(|home| unsafe { home.pop() })
+            }),
         };
         let runnable = popped?;
         self.remote_wakes.set(self.remote_wakes.get() + 1);
@@ -719,15 +732,19 @@ impl Shard {
     }
 
     /// Whether other threads handed the shard work it has not taken yet, as
-    /// the taker of its inboxes sees it: the look of its spin and the one a
-    /// park makes once more. [`Shared::has_remote_work`], a look from any
-    /// thread, misses the tasks this shard's last pop left behind its end
-    /// as it put an inbox's stub back ([`Inbox::is_drained`]).
+    /// the taker of its inbox (and of its runner's home) sees it: the look of
+    /// its spin and the one a park makes once more.
+    /// [`Shared::has_remote_work`], a look from any thread, misses the tasks
+    /// this shard's last pop left behind its end as it put an inbox's stub
+    /// back ([`Inbox::is_drained`]).
     fn has_remote_work(&self) -> bool {
         let shared = &self.shared;
-        // SAFETY: the shard holds both inboxes' taker's role until it goes
-        // (`stop` lets go of the inbox's, last).
-        let drained = unsafe { shared.inbox.is_drained() && shared.local_inbox.is_drained() };
+        // SAFETY: the shard holds the inbox's taker's role until it goes
+        // (`stop` lets go of it, last).
+        let drained = unsafe { shared.inbox.is_drained() }
+            && super::context::home_is_drained()
+            // SAFETY: as in `pop_inbox`.
+            && self.home.get().is_none_or(|home| unsafe { home.is_drained() });
         !drained || !shared.timer_ops.is_empty() || !shared.io_ops.is_empty()
     }
 
@@ -745,13 +762,6 @@ impl Shard {
         let busy = lifo.is_some() || !self.queue.borrow().is_empty();
         self.lifo.set(lifo);
         busy
-    }
-
-    /// Polls a runnable's task, marking that a task runs.
-    fn run(&self, runnable: Runnable) {
-        let outer = self.in_task.replace(true);
-        runnable.run();
-        self.in_task.set(outer);
     }
 
     /// Applies registration changes and fires due timers, then looks at the
@@ -855,195 +865,6 @@ impl Shard {
         match self.poll_io(usize::MAX, Some(Duration::ZERO)) {
             Ok(events) => events > 0,
             Err(err) => panic!("the shard's poller failed: {err}"),
-        }
-    }
-
-    /// Runs `future` to its end on this shard, running the shard's tasks,
-    /// timers and poller between its polls.
-    #[expect(
-        clippy::panic,
-        reason = "documented under `# Panics` of `block_on` (`Builder::max_nesting`)"
-    )]
-    pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
-        let depth = self.depth.get();
-        if depth >= self.limits.max_nesting {
-            panic!(
-                "block_on is nested {} deep on one thread, the most allowed: each level runs on \
-                 the thread's stack (raise the limit with `Builder::max_nesting`)",
-                self.limits.max_nesting
-            );
-        }
-        struct Depth<'a>(&'a Cell<usize>);
-        impl Drop for Depth<'_> {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() - 1);
-            }
-        }
-        self.depth.set(depth + 1);
-        let _depth = Depth(&self.depth);
-        let _pool = buf::enter(&self.pool);
-
-        let signal = Arc::new(Signal {
-            woken: AtomicBool::new(true),
-            shared: Arc::clone(&self.shared),
-        });
-        let waker = Waker::from(Arc::clone(&signal));
-        let mut cx = Context::from_waker(&waker);
-        let mut future = pin!(future);
-        // Turns in which the future woke itself and no task ran.
-        let mut self_woken = 0u32;
-        // Tasks to run before the future's next poll: a future that woke
-        // itself (a yield) lets the tasks queued at that moment run first,
-        // one pass of the queue.
-        let mut owed = 0usize;
-        loop {
-            if owed == 0
-                && signal.woken.load(Ordering::Relaxed)
-                && signal.woken.swap(false, Ordering::SeqCst)
-            {
-                let outer = self.in_task.replace(true);
-                let budget = crate::coop::enter();
-                let poll = future.as_mut().poll(&mut cx);
-                crate::coop::leave(budget);
-                self.in_task.set(outer);
-                if let Poll::Ready(output) = poll {
-                    return output;
-                }
-                if signal.woken.load(Ordering::Relaxed) {
-                    owed = self.queued();
-                }
-            }
-            if let Some(runnable) = self.next() {
-                owed = owed.saturating_sub(1);
-                self.run(runnable);
-                let since = self.since_drive.get() + 1;
-                if since >= self.tuning.driver_interval {
-                    // Timers and the poller get a look, without a wait.
-                    self.count_again(since);
-                    self.drive_or_report(Some(Duration::ZERO));
-                } else {
-                    self.since_drive.set(since);
-                }
-                continue;
-            }
-            // The queue ran dry: nothing is owed any more.
-            owed = 0;
-            // Nothing to run: due timers may have made work, and work other
-            // threads posted (which the spin and the park count as work) is
-            // applied here, so it never keeps the loop from sleeping.
-            if !self.shared.io_ops.is_empty() {
-                self.apply_io_ops();
-            }
-            self.fire_timers();
-            if self.has_local_work() || signal.woken.load(Ordering::SeqCst) {
-                // The future woke itself again, or a task is ready: the
-                // driver gets a look every `DRIVER_INTERVAL` such turns too,
-                // or IO the future waits on (on a ring, an operation not even
-                // submitted yet) would never complete.
-                self_woken += 1;
-                if self_woken >= self.tuning.driver_interval {
-                    self_woken = 0;
-                    self.count_again(self.since_drive.get());
-                    self.drive_or_report(Some(Duration::ZERO));
-                }
-                continue;
-            }
-            self.count_again(self.since_drive.get());
-            let shared = &self.shared;
-            // The spin looks at the poller too: IO that comes within it
-            // costs neither a park nor the kernel's wake of this thread.
-            if self.spin.run(|| {
-                self.has_remote_work()
-                    || signal.woken.load(Ordering::Relaxed)
-                    || self.io_ready_now()
-            }) {
-                continue;
-            }
-            self.before_park();
-            if shared
-                .park
-                .begin_park(|| self.has_remote_work() || signal.woken.load(Ordering::SeqCst))
-            {
-                let slept = Instant::now();
-                if let Some(park) = &self.tuning.hooks.park {
-                    park();
-                }
-                self.drive_or_report(None);
-                shared.park.end_park();
-                if let Some(unpark) = &self.tuning.hooks.unpark {
-                    unpark();
-                }
-                self.slept_for(slept.elapsed());
-            }
-            self.after_park();
-        }
-    }
-
-    /// One turn of the shard, for a caller driving it by hand: runs every
-    /// task ready now, waits once on the poller (up to `wait`, at once if
-    /// work is ready; at most `max` events) and runs what the IO woke.
-    /// Returns how many IO events it handled.
-    pub(crate) fn turn(&self, max: usize, wait: Option<Duration>) -> io::Result<usize> {
-        let _pool = buf::enter(&self.pool);
-        self.run_ready();
-        if !self.shared.io_ops.is_empty() {
-            self.apply_io_ops();
-        }
-        self.fire_timers();
-        let shared = &self.shared;
-        let quiet = wait != Some(Duration::ZERO) && !self.has_local_work();
-        if quiet {
-            self.before_park();
-        }
-        let sleeps = quiet && shared.park.begin_park(|| self.has_remote_work());
-        let wait = if sleeps || wait == Some(Duration::ZERO) {
-            wait
-        } else {
-            Some(Duration::ZERO)
-        };
-        let timeout = match (wait, self.timer_wait(sleeps)) {
-            (Some(w), Some(t)) => Some(w.min(t)),
-            (w, t) => w.or(t),
-        };
-        self.publish();
-        let result = self.poll_io(max, timeout);
-        if sleeps {
-            shared.park.end_park();
-        }
-        if quiet {
-            self.after_park();
-        }
-        let events = result?;
-        self.fire_timers();
-        self.run_ready();
-        Ok(events)
-    }
-
-    /// Runs every task that is ready now, and the ones they wake.
-    fn run_ready(&self) {
-        while let Some(runnable) = self.next() {
-            self.run(runnable);
-            self.polls.set(self.polls.get() + 1);
-        }
-    }
-
-    /// Starts the count of runs before the next look at the driver again,
-    /// adding the `runs` it held to the polls: the run loop counts its
-    /// polls there, never one by one.
-    pub(super) fn count_again(&self, runs: u32) {
-        self.polls.set(self.polls.get() + u64::from(runs));
-        self.since_drive.set(0);
-    }
-
-    /// Drives the poller; a failure of the poller itself cannot be handed to
-    /// any task, so it ends the shard loudly.
-    #[expect(
-        clippy::panic,
-        reason = "a failure of the poller itself cannot be handed to any task: it ends the shard loudly"
-    )]
-    fn drive_or_report(&self, wait: Option<Duration>) {
-        if let Err(err) = self.drive(wait) {
-            panic!("the shard's poller failed: {err}");
         }
     }
 }
