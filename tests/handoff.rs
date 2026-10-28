@@ -341,17 +341,15 @@ fn with_the_handoff_off_a_blocked_task_holds_up_its_shard_as_before() {
 #[test]
 fn the_stats_count_the_handoff_and_the_long_poll() {
     let rt = on();
-    let before: u64 = nuclei::stats().shards.iter().map(|s| s.handoffs).sum();
     let blocked = blocker(&rt, sleep_in_poll, 0);
     rt.block_on(blocked);
-    let stats = nuclei::stats();
-    let after: u64 = stats.shards.iter().map(|s| s.handoffs).sum();
-    assert!(after > before, "no handoff counted");
+    // This runtime's shard is alive, and others may be too: the stats list
+    // every shard of the process, and other tests' come and go.
     assert!(
-        stats
+        nuclei::stats()
             .shards
             .iter()
-            .any(|s| s.longest_poll >= Duration::from_millis(10)),
-        "no long poll counted"
+            .any(|s| s.handoffs >= 1 && s.longest_poll >= Duration::from_millis(10)),
+        "no shard counted the handoff and its long poll"
     );
 }

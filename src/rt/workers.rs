@@ -243,7 +243,7 @@ impl Workers {
             shard: Owned(shard),
             slot,
         };
-        match Self::spawn_thread(inner, Some(run), life) {
+        match Self::spawn_thread(inner, run, life) {
             Ok(()) => {
                 Self::start_monitor(inner)?;
                 Ok(true)
@@ -275,8 +275,7 @@ impl Workers {
                 super::handoff::run(&monitor, &runtime);
             })?;
         lock(&workers.threads).push((thread, Arc::new(Life::new())));
-        // One spare waits from the start: a handoff starts no thread then.
-        Self::spawn_thread(inner, None, Arc::new(Life::new())).map_err(|(err, _)| err)
+        Ok(())
     }
 
     /// Starts a thread for a shard the monitor took: the gift back if no
@@ -286,17 +285,11 @@ impl Workers {
         gift: Gift,
         life: Arc<Life>,
     ) -> Result<(), Gift> {
-        let gift_back = |run: Run| Gift {
+        Self::spawn_thread(inner, Run::from(gift), life).map_err(|(_, run)| Gift {
             place: run.place,
             shard: run.shard,
             slot: run.slot.unwrap_or_else(|| inner.workers.monitor_slot()),
-        };
-        match Self::spawn_thread(inner, Some(Run::from(gift)), life) {
-            Ok(()) => Ok(()),
-            Err((_, Some(run))) => Err(gift_back(run)),
-            // Never: the run went in, and comes back with the error.
-            Err((_, None)) => Ok(()),
-        }
+        })
     }
 
     /// A slot for a runner, from the monitor (a fresh one if there is none).
@@ -307,29 +300,31 @@ impl Workers {
     }
 
     /// Starts a runner thread for `run`; on failure the error and the run.
-    fn spawn_thread(
-        inner: &Arc<Inner>,
-        run: Option<Run>,
-        life: Arc<Life>,
-    ) -> Result<(), (io::Error, Option<Run>)> {
+    fn spawn_thread(inner: &Arc<Inner>, run: Run, life: Arc<Life>) -> Result<(), (io::Error, Run)> {
         let workers = &inner.workers;
         // The run waits here until the thread takes it, so a thread that
-        // cannot start hands it back; none: a spare from the start.
-        let handed = Arc::new(Handed(AtomicPtr::new(
-            run.map_or(core::ptr::null_mut(), |run| Box::into_raw(Box::new(run))),
-        )));
+        // cannot start hands it back.
+        let handed = Arc::new(Handed(AtomicPtr::new(Box::into_raw(Box::new(run)))));
         let (taken, thread_inner, thread_life) =
             (Arc::clone(&handed), Arc::clone(inner), Arc::clone(&life));
         let spawned = std::thread::Builder::new()
             .name((workers.start.name)())
             .stack_size(workers.start.stack)
-            .spawn(move || runner(&thread_inner, taken.take(), &thread_life));
+            .spawn(move || {
+                if let Some(run) = taken.take() {
+                    runner(&thread_inner, run, &thread_life);
+                }
+            });
         match spawned {
             Ok(thread) => {
                 lock(&workers.threads).push((thread, life));
                 Ok(())
             }
-            Err(err) => Err((err, handed.take())),
+            Err(err) => match handed.take() {
+                Some(run) => Err((err, run)),
+                // Never: the closure did not run.
+                None => Ok(()),
+            },
         }
     }
 
@@ -426,10 +421,9 @@ impl Drop for Handed {
     }
 }
 
-/// A runner thread: runs `first` (a spare from the start has none), then,
-/// with the handoff on, each shard the monitor hands it, until the runtime
-/// shuts down.
-fn runner(inner: &Arc<Inner>, first: Option<Run>, life: &Arc<Life>) {
+/// A runner thread: runs `first`, then, with the handoff on, each shard the
+/// monitor hands it, until the runtime shuts down.
+fn runner(inner: &Arc<Inner>, first: Run, life: &Arc<Life>) {
     let workers = &inner.workers;
     let _exit = Exit(workers.exits.clone());
     let _stopping = workers.start.tuning.hooks.started();
@@ -439,20 +433,14 @@ fn runner(inner: &Arc<Inner>, first: Option<Run>, life: &Arc<Life>) {
         .monitor
         .as_ref()
         .map(|_| Spare::here(Arc::clone(life)));
-    let mut next = first;
-    loop {
-        if let Some(run) = next.take()
-            && run_shard(inner, run) == Worked::Detached
-        {
+    let mut next = Some(first);
+    while let Some(run) = next.take() {
+        if run_shard(inner, run) == Worked::Detached {
             life.back();
         }
         // A spare now, with the handoff on; else the thread is done.
-        let (Some(monitor), Some(spare)) = (&workers.monitor, &spare) else {
-            return;
-        };
-        next = monitor.wait_for_shard(spare).map(Run::from);
-        if next.is_none() {
-            return;
+        if let (Some(monitor), Some(spare)) = (&workers.monitor, &spare) {
+            next = monitor.wait_for_shard(spare).map(Run::from);
         }
     }
 }
