@@ -40,6 +40,16 @@ pub(super) fn ring_or_skip() -> Option<Ring> {
     ring_with_or_skip(RingConfig::new(64))
 }
 
+/// A buffer ring of `entries` buffers of `size` bytes as group `bgid`, or `None` to skip the calling
+/// test when the kernel lacks provided buffer rings (some distribution kernels do).
+pub(super) fn buf_ring_or_skip(ring: &Ring, bgid: u16, entries: u16, size: u32) -> Option<BufRing> {
+    match BufRing::new(ring, bgid, entries, size) {
+        Ok(pool) => Some(pool),
+        Err(e) if e.kind() == ErrorKind::Unsupported => unavailable(e),
+        Err(e) => panic!("a buffer ring was not made: {e}"),
+    }
+}
+
 /// Runs `f` until it returns `Some`, backing off between tries, and panics at the deadline.
 pub(super) fn wait_until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(10);

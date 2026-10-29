@@ -35,6 +35,7 @@ use crate::fs::ring::FileOp;
 use crate::io::source::ops::Done;
 use crate::io::source::ring::{Arrival, RingMem, RingOp};
 use crate::io::sys;
+use crate::rt::backend::with_room;
 use crate::rt::park::Notifier;
 use crate::rt::park::ring::RingPoller;
 use crate::syscore::linux::iouring::files::Files;
@@ -88,7 +89,8 @@ impl ShardRing {
             entries => match RecvGroup::new(poller.ring(), entries, cfg.recv_buffer_size) {
                 Ok(group) => Some(group),
                 // A count or a size no group can have is the configuration's
-                // mistake, said at once.
+                // mistake, said at once. Only nuclei's own checks answer this
+                // way: the kernel's refusal of the feature is `Unsupported`.
                 Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -96,7 +98,11 @@ impl ShardRing {
                     ));
                 }
                 // Short of memory: each read takes a buffer of the pool.
-                Err(_) => None,
+                Err(err) if err.raw_os_error() == Some(libc::ENOMEM) => None,
+                // Anything else, a kernel without the feature included, is
+                // the ring's failure: a shard never runs without the group
+                // its configuration asked for, unseen.
+                Err(err) => return Err(err),
             },
         };
         // Room in the completion queue for every arrival the group's buffers
@@ -128,6 +134,22 @@ impl ShardRing {
             #[cfg(test)]
             file_calls: Cell::new(0),
         })
+    }
+
+    /// The ring of a shard of `cfg`: with fewer entries while the system has
+    /// no memory for `cfg.entries`, down to [`MIN_RING_ENTRIES`], and the
+    /// table of [`table_len`] fixed files. The one place a shard's ring is
+    /// made, so [`check`] sees exactly what a shard gets.
+    pub(crate) fn for_shard(cfg: RingConfig) -> io::Result<Self> {
+        with_room(cfg.entries, MIN_RING_ENTRIES, |entries| {
+            Self::new(&RingConfig { entries, ..cfg }, table_len())
+        })
+    }
+
+    /// Makes the calling thread the ring's issuer, as a shard's first wait
+    /// or submission does.
+    pub(crate) fn enable(&self) -> io::Result<()> {
+        self.poller.borrow_mut().enable()
     }
 
     /// The group id multishot receives draw from, if the ring has a group.
@@ -662,6 +684,20 @@ pub(crate) fn table_len() -> u32 {
 
 /// The most fixed files a ring's table holds.
 const MAX_TABLE: u32 = 1 << 14;
+
+/// The fewest submission entries a ring short of memory is made with.
+const MIN_RING_ENTRIES: u32 = 64;
+
+/// Whether the kernel gives a shard of `cfg` everything its ring needs: the
+/// ring, its disabled start, the table of fixed files, the group of buffers
+/// for multishot receives, and the enabling by the thread that runs it. It
+/// makes the ring through [`ShardRing::for_shard`] and enables it here, then
+/// drops it (nothing is in flight in a ring that never waited), so the
+/// backend choice sees every feature a shard needs and never disagrees with
+/// the shard.
+pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
+    ShardRing::for_shard(cfg)?.enable()
+}
 
 pub(crate) mod exits;
 #[cfg(test)]

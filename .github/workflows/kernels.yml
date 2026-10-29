@@ -2,7 +2,9 @@ name: Kernels
 
 # The suite on each Linux kernel series nuclei supports on io_uring (6.1 is the floor), on
 # io_uring and on epoll, each in a virtual machine (`kernels.sh`). The newest kernel is the
-# runner's own, which the main CI runs on.
+# runner's own, which the main CI runs on. Ubuntu 24.04's own 6.8 kernel has no provided buffer
+# rings, which the mainline kernels all have: it runs the suite on `auto`, which must choose
+# epoll, and on epoll.
 
 on: [push, pull_request]
 
@@ -35,3 +37,24 @@ jobs:
 
       - name: the suite on Linux ${{ matrix.series }}
         run: .github/workflows/kernels.sh ${{ matrix.series }}
+
+  ubuntu:
+    name: Ubuntu 24.04 kernel (6.8 generic)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: virtme-ng, qemu and KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 busybox-static
+          pipx install virtme-ng
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: the suite on the Ubuntu 24.04 kernel
+        run: .github/workflows/kernels.sh ubuntu-24.04

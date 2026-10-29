@@ -83,6 +83,15 @@ impl RingConfig {
             recv_buffer_size: 0,
         }
     }
+
+    /// This ring for a worker shard that may be handed to another thread: any thread may submit
+    /// to it, one at a time.
+    pub(crate) fn handed_over(self) -> Self {
+        Self {
+            multi_issuer: true,
+            ..self
+        }
+    }
 }
 
 impl From<&IoUringConfiguration> for RingConfig {
@@ -177,6 +186,18 @@ impl std::error::Error for Refusal {}
 impl From<Refusal> for io::Error {
     fn from(r: Refusal) -> Self {
         io::Error::new(io::ErrorKind::Unsupported, r)
+    }
+}
+
+/// Maps the kernel's refusal of a feature's registration to [`Refusal::Feature`] of `name`, and
+/// passes any other error through. The arguments of a registration are validated before the call,
+/// so an `EINVAL` or `EOPNOTSUPP` from the kernel means it does not have the feature, not that the
+/// caller asked for something wrong; the two must stay apart so a missing feature is never taken
+/// for a configuration mistake.
+pub(crate) fn lacking(name: &'static str) -> impl FnOnce(io::Error) -> io::Error {
+    move |e| match e.raw_os_error() {
+        Some(libc::EINVAL | libc::EOPNOTSUPP) => Refusal::Feature(name).into(),
+        _ => e,
     }
 }
 
@@ -493,7 +514,8 @@ impl Ring {
                 ptr::from_ref(&table).cast(),
                 size_of::<IoUringRsrcRegister>() as u32,
             )
-        }?;
+        }
+        .map_err(lacking("sparse registered file tables"))?;
         Ok(())
     }
 

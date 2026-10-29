@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.1
+
+### Fixed
+
+- **A kernel without provided buffer rings no longer stops a runtime from starting.** Ubuntu
+  24.04's own 6.8 kernel refuses every buffer ring registration while its io_uring otherwise
+  works, and a runtime there failed to start with `io_uring recv_buffers and recv_buffer_size:
+  Invalid argument`. The backend choice now builds the ring a shard runs (the ring, its table of
+  fixed files, the buffer ring for multishot receives while `recv_buffers` is not 0, and its
+  enabling), so a kernel that refuses a feature a shard needs makes `auto` pick the poller. A
+  backend named as io_uring on such a kernel fails with the missing feature in plain words, and a
+  shard of an `auto` runtime whose ring is refused anyway runs the poller. With `recv_buffers: 0`
+  io_uring stays in use there.
+- **A kernel's refusal and a configuration mistake are told apart.** The kernel's `EINVAL` from a
+  buffer ring or a fixed file table registration is now an `Unsupported` error naming the feature,
+  and only nuclei's own checks of `recv_buffers` and `recv_buffer_size` are reported as the
+  configuration's mistake. A shard whose receive group fails for any reason other than memory
+  is no longer started without it, unseen.
+
+### Added
+
+- **A CI job on Ubuntu 24.04's own kernel** (6.8 generic) beside the mainline ones, running the
+  suite with the backend left to `auto`, which must choose epoll, and with epoll named.
+
 ## Unreleased: 0.5.0
 
 Nuclei is now a runtime of its own: thread-per-core shards that each run their tasks and drive

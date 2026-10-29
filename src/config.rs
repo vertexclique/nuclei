@@ -8,9 +8,13 @@ pub struct NucleiConfig {
     /// The kernel interface every runtime that names none runs its IO on
     /// ([`Builder::backend`](crate::Builder::backend) names one for one
     /// runtime). `None` (the default) picks io_uring where the kernel lets
-    /// this process have it and the platform's poller otherwise; a backend
-    /// named here that this process cannot have makes the first shard fail
-    /// with the reason. A non-empty `NUCLEI_BACKEND` overrides it.
+    /// this process have it, and the platform's poller otherwise. Having it
+    /// means every kernel feature a shard's ring needs with this
+    /// configuration: the buffer ring for multishot receives while
+    /// [`recv_buffers`](IoUringConfiguration::recv_buffers) is not 0, and the
+    /// table of fixed files. A backend named here that this process cannot
+    /// have makes the first shard fail with the reason. A non-empty
+    /// `NUCLEI_BACKEND` overrides it.
     pub backend: Option<crate::IoBackend>,
 }
 
@@ -71,6 +75,10 @@ pub struct IoUringConfiguration {
     ///
     /// A power of two up to 32768; 0 turns multishot receives off, and each
     /// read then takes a buffer of the shard's own pool for its receive.
+    ///
+    /// A kernel without provided buffer rings (some distribution kernels
+    /// lack them) makes the default backend choice pick the poller; 0 keeps
+    /// io_uring there.
     pub recv_buffers: u16,
 
     /// The size in bytes of each of those buffers (default 16384); for UDP,

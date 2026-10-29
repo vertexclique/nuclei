@@ -230,6 +230,9 @@ fn correctness(path: Path) {
     if path != Path::Epoll && !uring_available() {
         return;
     }
+    if path == Path::Pool && !buffer_rings_available() {
+        return;
+    }
     let pool = |count| PoolCfg {
         buf_size: 4096,
         count,
