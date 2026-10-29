@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.5.2
+
+### Fixed
+
+- **IO of a shard handed over repeatedly no longer waits for 61 task runs.** When a task blocks its
+  thread past the handoff threshold the shard goes to another thread, and the count of runs before
+  the next look at the driver went with it. If the first task of every new runner blocked as well,
+  the shard was handed on before any runner reached the driver, and an operation a task had queued
+  (a socket receive pushed into the ring's submission queue) reached the kernel only after 61 runs,
+  about 0.9 s with 15 ms blockers. The runner that takes a shard over now drives its IO once, without
+  waiting, before it runs any task.
+- **IO is driven at least every 1 ms of task running, not only every 61 runs.** A single runner whose
+  tasks each ran just under the handoff threshold looked at the driver once per 61 runs (61 x 9 ms is
+  half a second). The run loop now reads a coarse monotonic clock of its own, `Quartz` (a vDSO read on
+  Linux, a few nanoseconds, never a system call), once every 16 task runs and looks at the driver when
+  the last look is older than 1 ms. It costs one masked branch per run and needs no extra thread.
+
+- **A ring shrunk under memory pressure no longer deadlocks a request behind its own reply's
+  receive.** Its receive group now fits within half its completion queue (a ring whose queue cannot
+  hold one buffer runs without a group), and long-lived receives and accepts no longer count against
+  the admission cap, so no finite operation waits behind idle connections. Before, a ring made with
+  128 entries or fewer and the default 256-buffer group had a cap of 1: the multishot receive armed
+  for an HTTP client's reply held it, and the request's send waited for the receive to end.
+
+### Changed
+
+- **Sizes are validated where they take effect**, and a value outside what the runtime can work
+  with is refused as `InvalidInput` naming the setting, its value and the allowed range (the first
+  runtime build for the io_uring settings, `Builder::build` for the builder's). Values that were
+  accepted before and are refused now:
+  - `queue_len` below 64: the floor a ring is shrunk to under memory pressure.
+  - `recv_buffers` that is not 0 or a power of two, or not below twice `queue_len`: the group would
+    take more than half the completion queue. The profiles (`interrupt_driven` and the others) now
+    give a `queue_len` under 256 that many buffers, rounded up to a power of two, where they gave 256,
+    which left a cap of 1 for a `queue_len` from 64 to 128.
+  - `recv_buffer_size` below 512 or above 1 GiB while `recv_buffers` is not 0.
+  - `Builder::thread_stack_size` below 64 KiB: the runtime's frames do not fit.
+  - `Builder::max_nesting(0)`: no `block_on` could run.
+  - `Builder::max_blocking_threads(0)`, which was raised to 1 silently.
+  - `Builder::handoff_after(Some(d))` with `d` under 1 ms: the watch measures in milliseconds.
+
+### Added
+
+- **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
+  whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
+  bound each breaks it.
+- **A TLA+ model of the admission cap** (`proofs/tla/admission`): a finite operation never waits in
+  room while none is in the kernel, and arrivals plus finite completions fit the queue; counting
+  long-lived operations breaks the first, an uncut group the second. An accept's connections and
+  the last completion of a multishot operation have no room kept: past the queue the kernel holds
+  them (`IORING_FEAT_NODROP`), as before.
+- **Tests** (`tests/cadence.rs`, `rt::quartz`, `rt::shard::ring::tests_cap`, `config::tests`,
+  `tests/config_sizes.rs`, `tests/config_refused.rs`) for these fixes and for the clock, and
+  benchmarks of the cost of a task run and of IO on a shard.
+
 ## 0.5.1
 
 ### Fixed

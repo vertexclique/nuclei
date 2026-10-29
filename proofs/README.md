@@ -1019,6 +1019,37 @@ future that keeps waking itself starve the driver, breaking `BoundedGap`: the bu
 caught, where IO such a future waited on never completed), and 2 witnesses (a look that came
 from the future's turns; `2N - 2` turns without a look, so the bound is the tightest).
 
+## How long queued IO waits on a busy shard
+
+`cadence` (`tla/cadence/Cadence.tla`) checks how long an IO operation a task queued (a receive
+pushed into the ring's submission queue) waits before the shard's run loop hands it to the
+kernel (`src/rt/shard/run.rs`, the coarse clock in `src/rt/quartz.rs`). Each step one task runs,
+quick, slow (a while, under the handoff threshold) or long (past it, so the shard is handed on
+and the old runner is detached). The loop drives its IO every `N` runs, every `Q`th run when the
+coarse clock says the last drive is older than the bound, and a runner that takes a shard over
+drives before it runs a task. 6 configurations: 1 that must pass (whatever mix of tasks, the
+operation waits at most `Bound`, `Bounded`), 2 mutations (no first drive: a shard handed on again
+and again is looked at only every `Q`th run, so the wait is `Q` long tasks; no time rule: slow
+tasks wait for the count of `N` runs; each breaks `Bounded`), and 3 witnesses (the first drive
+submits, the time rule submits, the wait reaches the worst the guards allow, so `Bound` is not
+slack). Time is whole units: a quick run adds none, a slow one `Slow`, a long one `Long`.
+
+## What a ring lets into the kernel
+
+`admission` (`tla/admission/Admission.tla`) checks how a shard's ring (`src/rt/shard/ring.rs`)
+admits operations: a completion queue of `C` slots, a receive group whose buffers are arrivals'
+share of it, a cap on the operations counted in the kernel, long-lived operations (receives and
+accepts that wait on idle connections and may never end) and finite ones (sends) that wait in
+room when the cap is used. 5 configurations: 1 that must pass (the group cut to half the queue,
+long-lived operations not counted: a finite operation never waits in room while none is in the
+kernel, `NoRoomDeadlock`, and arrivals plus finite completions fit the queue,
+`CqNeverOverfull`), 2 mutations (the group not cut breaks `CqNeverOverfull`; long-lived
+operations counted lets idle receives use the cap and breaks `NoRoomDeadlock`: the request
+waiting for its reply's receive), and 2 witnesses (a finite operation does wait in room; a
+long-lived one is let in past the cap). An accept's connections and the last entry of each
+long-lived operation are not modelled: no room is kept for them, and past the queue the kernel
+holds them (`IORING_FEAT_NODROP`) until the shard takes them.
+
 ## A ring's overflow count
 
 `lean/Nuclei/Overflow.lean` checks how a ring's poller counts completion-queue overflows for
