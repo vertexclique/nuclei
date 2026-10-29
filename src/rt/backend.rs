@@ -105,35 +105,37 @@ fn usable() -> Result<(), String> {
 /// (`probe`), and then whether the kernel gives a shard of `cfg` all its ring
 /// needs (`check`), as a shard that stays on its thread runs it and as one
 /// that may be handed over does.
+///
+/// Decided on a thread of its own: tearing a ring down makes the kernel queue
+/// io_uring task work, with a signal, on every thread that made or used it,
+/// which cuts that thread's next blocking wait short (`EINTR`); and a ring
+/// one thread enables registers in that thread's table of ring fds. The
+/// caller's thread makes no ring of its own this way.
 #[cfg(ring)]
 pub(crate) fn usable_with(
     cfg: crate::syscore::linux::iouring::ring::RingConfig,
 ) -> Result<(), String> {
+    let apart = std::thread::Builder::new()
+        .name("nuclei-check".into())
+        .spawn(move || usable_here(cfg));
+    match apart {
+        Ok(thread) => thread
+            .join()
+            .unwrap_or_else(|_| Err("the io_uring check panicked".into())),
+        // No thread to spare: decided here, side effects and all.
+        Err(_) => usable_here(cfg),
+    }
+}
+
+/// [`usable_with`] on the calling thread.
+#[cfg(ring)]
+fn usable_here(cfg: crate::syscore::linux::iouring::ring::RingConfig) -> Result<(), String> {
+    use crate::rt::shard::ring::check;
     use crate::syscore::linux::probe::{Probe, probe};
     match probe() {
         Probe::Available => {}
         Probe::Unavailable(why) => return Err(why.to_string()),
     }
-    // On a thread of its own: tearing the trial rings down leaves the
-    // kernel's io_uring task work on the thread that made them, which would
-    // cut the caller's next blocking wait short (`EINTR`), and a ring that
-    // one thread enables registers in that thread's table of ring fds.
-    let apart = std::thread::Builder::new()
-        .name("nuclei-check".into())
-        .spawn(move || checked(cfg));
-    match apart {
-        Ok(thread) => thread
-            .join()
-            .unwrap_or_else(|_| Err("the io_uring check panicked".into())),
-        // No thread to spare: checked here, side effects and all.
-        Err(_) => checked(cfg),
-    }
-}
-
-/// The checks of [`usable_with`] past the probe, on the calling thread.
-#[cfg(ring)]
-fn checked(cfg: crate::syscore::linux::iouring::ring::RingConfig) -> Result<(), String> {
-    use crate::rt::shard::ring::check;
     for cfg in [cfg, cfg.handed_over()] {
         match check(cfg) {
             Ok(()) => {}
