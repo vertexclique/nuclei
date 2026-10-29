@@ -5,7 +5,9 @@
 # of. The test binaries are built once, on the runner, and each runs in the machine twice.
 #
 # `ubuntu-24.04` instead boots Ubuntu 24.04's own distribution kernel (the newest 6.8 generic of
-# its archive), which lacks provided buffer rings: there io_uring is correctly refused, so each
+# its archive), which refuses every valid provided buffer ring registration from 6.8.0-136 on (a
+# backport inverted the check of its reserved words:
+# https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843). nuclei does not use io_uring there, so each
 # binary runs with the backend left to `auto` (which must pick epoll and say why) and with epoll
 # named, and never with io_uring required.
 set -euo pipefail
@@ -25,7 +27,7 @@ if [[ $series == ubuntu-24.04 ]]; then
     sudo env INITRD=No DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
     sudo chmod a+r "/boot/vmlinuz-$release"
     version=/boot/vmlinuz-$release
-    passes=("auto|NUCLEI_EXPECT_MISSING='provided buffer rings'" "epoll|NUCLEI_BACKEND=epoll NUCLEI_REQUIRE_IO_URING=0")
+    passes=("auto|NUCLEI_EXPECT_REFUSED='provided buffer rings'" "epoll|NUCLEI_BACKEND=epoll NUCLEI_REQUIRE_IO_URING=0")
     echo "kernel: $release"
 else
     # The series' releases, newest first; the first with an amd64 kernel package is the one.

@@ -348,18 +348,18 @@ impl Reader {
     }
 }
 
-/// Whether this kernel gives provided buffer rings (some distribution kernels do not); a refusal
-/// skips (or fails when io_uring is required).
+/// Whether this kernel registers provided buffer rings (Ubuntu's 6.8 kernels from 6.8.0-136 on
+/// refuse them); a refusal skips (or fails when io_uring is required).
 pub fn buffer_rings_available() -> bool {
     let refused =
         Ring::new(&RingConfig::new(8)).and_then(|ring| BufRing::new(&ring, 0, 8, 4096).map(drop));
     match refused {
         Ok(()) => true,
         Err(e) if env::var("NUCLEI_REQUIRE_IO_URING").as_deref() == Ok("1") => {
-            panic!("io_uring is required but has no buffer rings: {e}")
+            panic!("io_uring is required but refuses buffer rings: {e}")
         }
         Err(e) => {
-            eprintln!("skipping: no provided buffer rings: {e}");
+            eprintln!("skipping: the kernel refuses provided buffer rings: {e}");
             false
         }
     }

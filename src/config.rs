@@ -76,9 +76,11 @@ pub struct IoUringConfiguration {
     /// A power of two up to 32768; 0 turns multishot receives off, and each
     /// read then takes a buffer of the shard's own pool for its receive.
     ///
-    /// A kernel without provided buffer rings (some distribution kernels
-    /// lack them) makes the default backend choice pick the poller; 0 keeps
-    /// io_uring there.
+    /// A kernel that refuses provided buffer rings makes the default backend
+    /// choice pick the poller; 0 keeps io_uring there. Ubuntu's 6.8 kernels
+    /// from 6.8.0-136 on refuse every valid registration: a backport inverted
+    /// the check of its reserved words
+    /// (<https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843>).
     pub recv_buffers: u16,
 
     /// The size in bytes of each of those buffers (default 16384); for UDP,

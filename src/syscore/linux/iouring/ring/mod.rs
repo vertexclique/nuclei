@@ -167,6 +167,8 @@ pub(crate) enum Refusal {
     FloorFlags,
     /// The kernel's ring lacks a feature every ring requires, named in plain words.
     Feature(&'static str),
+    /// The kernel refused to register a feature a shard's ring needs, named in plain words.
+    Registration(&'static str),
 }
 
 impl fmt::Display for Refusal {
@@ -177,6 +179,7 @@ impl fmt::Display for Refusal {
                 f.write_str("the kernel lacks the io_uring features this runtime needs")
             }
             Self::Feature(name) => write!(f, "the kernel's io_uring lacks {name}"),
+            Self::Registration(name) => write!(f, "the kernel's io_uring refuses {name}"),
         }
     }
 }
@@ -189,14 +192,16 @@ impl From<Refusal> for io::Error {
     }
 }
 
-/// Maps the kernel's refusal of a feature's registration to [`Refusal::Feature`] of `name`, and
-/// passes any other error through. The arguments of a registration are validated before the call,
-/// so an `EINVAL` or `EOPNOTSUPP` from the kernel means it does not have the feature, not that the
-/// caller asked for something wrong; the two must stay apart so a missing feature is never taken
-/// for a configuration mistake.
-pub(crate) fn lacking(name: &'static str) -> impl FnOnce(io::Error) -> io::Error {
+/// Maps the kernel's refusal of a registration to [`Refusal::Registration`] of `name`, and passes
+/// any other error through. The arguments of a registration are validated before the call, so an
+/// `EINVAL` or `EOPNOTSUPP` from the kernel is its refusal, not the caller's mistake: a kernel
+/// without the operation, or one that refuses valid input, as Ubuntu's 6.8 kernels from 6.8.0-136
+/// on do for every provided buffer ring (a backport inverted the check of its reserved words,
+/// <https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843>). The two must stay apart so a refusal is never taken for a configuration
+/// mistake.
+pub(crate) fn refused(name: &'static str) -> impl FnOnce(io::Error) -> io::Error {
     move |e| match e.raw_os_error() {
-        Some(libc::EINVAL | libc::EOPNOTSUPP) => Refusal::Feature(name).into(),
+        Some(libc::EINVAL | libc::EOPNOTSUPP) => Refusal::Registration(name).into(),
         _ => e,
     }
 }
@@ -515,7 +520,7 @@ impl Ring {
                 size_of::<IoUringRsrcRegister>() as u32,
             )
         }
-        .map_err(lacking("sparse registered file tables"))?;
+        .map_err(refused("sparse registered file tables"))?;
         Ok(())
     }
 

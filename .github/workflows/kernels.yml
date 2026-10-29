@@ -2,9 +2,10 @@ name: Kernels
 
 # The suite on each Linux kernel series nuclei supports on io_uring (6.1 is the floor), on
 # io_uring and on epoll, each in a virtual machine (`kernels.sh`). The newest kernel is the
-# runner's own, which the main CI runs on. Ubuntu 24.04's own 6.8 kernel has no provided buffer
-# rings, which the mainline kernels all have: it runs the suite on `auto`, which must choose
-# epoll, and on epoll.
+# runner's own, which the main CI runs on. Ubuntu 24.04's own 6.8 kernel refuses every valid
+# provided buffer ring registration from 6.8.0-136 on, which the mainline kernels all accept
+# (https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843): it runs the suite on `auto`,
+# which must choose epoll, and on epoll.
 
 on: [push, pull_request]
 

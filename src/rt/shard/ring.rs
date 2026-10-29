@@ -99,7 +99,7 @@ impl ShardRing {
                 }
                 // Short of memory: each read takes a buffer of the pool.
                 Err(err) if err.raw_os_error() == Some(libc::ENOMEM) => None,
-                // Anything else, a kernel without the feature included, is
+                // Anything else, a kernel's refusal included, is
                 // the ring's failure: a shard never runs without the group
                 // its configuration asked for, unseen.
                 Err(err) => return Err(err),

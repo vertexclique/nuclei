@@ -1,5 +1,5 @@
 //! A kernel that refuses a feature a shard's ring needs (provided buffer
-//! rings, as Ubuntu 24.04's 6.8 kernel does) is told apart from a
+//! rings, as Ubuntu's 6.8 kernels from 6.8.0-136 on do) is told apart from a
 //! configuration mistake, and never stops a runtime from starting: `auto`
 //! runs the poller, and a named io_uring fails with the feature's name. The
 //! refusal is made by a seccomp filter answering the registration with
@@ -60,7 +60,7 @@ fn default_runtime_runs_the_poller() {
         .worker_threads(1)
         .pin_workers(false)
         .build()
-        .expect("a runtime that names no backend starts on a kernel lacking a ring feature");
+        .expect("a runtime that names no backend starts on a kernel that refuses a ring feature");
     let backend = rt.block_on(async {
         crate::runtime::spawn(async {
             round_trip().await;
@@ -95,7 +95,7 @@ fn a_buffer_ring_the_kernel_refuses_is_unsupported() {
         let ring = Ring::new(&RingConfig::new(8)).unwrap();
         assert!(BufRing::new(&ring, 0, 8, 4096).is_ok());
     } else {
-        eprintln!("this kernel has no buffer rings of its own");
+        eprintln!("this kernel refuses buffer rings of its own accord");
     }
 }
 
@@ -179,7 +179,7 @@ fn a_runtime_on_a_kernel_without_buffer_rings_runs_the_poller() {
         .build()
     else {
         panic!(
-            "a runtime that asked for io_uring by name started on a kernel without a ring feature"
+            "a runtime that asked for io_uring by name started on a kernel that refuses a ring feature"
         );
     };
     assert_eq!(err.kind(), ErrorKind::Unsupported, "{err}");
@@ -191,13 +191,13 @@ fn a_runtime_on_a_kernel_without_buffer_rings_runs_the_poller() {
     );
 }
 
-/// For a job on a real distribution kernel that lacks a ring feature:
-/// `NUCLEI_EXPECT_MISSING` names it, and this process must find io_uring
+/// For a job on a real distribution kernel that refuses a ring feature:
+/// `NUCLEI_EXPECT_REFUSED` names it, and this process must find io_uring
 /// unusable for that reason, with its default runtime on the poller. Does
 /// nothing where the variable is unset.
 #[test]
-fn a_kernel_expected_to_lack_a_feature_gives_the_poller() {
-    let Some(missing) = std::env::var("NUCLEI_EXPECT_MISSING")
+fn a_kernel_expected_to_refuse_a_feature_gives_the_poller() {
+    let Some(refused) = std::env::var("NUCLEI_EXPECT_REFUSED")
         .ok()
         .filter(|m| !m.is_empty())
     else {
@@ -212,7 +212,7 @@ fn a_kernel_expected_to_lack_a_feature_gives_the_poller() {
         "the kernel has no io_uring at all"
     );
     let why =
-        usable().expect_err("io_uring was found usable on a kernel expected to lack a feature");
-    assert!(why.contains(&missing), "{why}");
+        usable().expect_err("io_uring was found usable on a kernel expected to refuse a feature");
+    assert!(why.contains(&refused), "{why}");
     default_runtime_runs_the_poller();
 }

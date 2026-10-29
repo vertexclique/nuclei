@@ -466,7 +466,7 @@ fn buffer_ring_rejects_bad_shapes() {
         BufRing::new(&ring, 1, 4, 0).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
-    // Past nuclei's own checks, only a kernel without buffer rings refuses it.
+    // Past nuclei's own checks, only a kernel that refuses every buffer ring refuses it.
     if buf_ring_or_skip(&ring, 2, 4, 16).is_some() {
         BufRing::new(&ring, 1, 32768, 1).expect("the largest ring is accepted");
     }

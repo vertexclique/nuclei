@@ -159,7 +159,9 @@ fn classify(e: &io::Error) -> Unavailable {
     {
         return match refusal {
             Refusal::NotInKernel => Unavailable::NotInKernel,
-            Refusal::FloorFlags | Refusal::Feature(_) => Unavailable::MissingFeatures,
+            Refusal::FloorFlags | Refusal::Feature(_) | Refusal::Registration(_) => {
+                Unavailable::MissingFeatures
+            }
         };
     }
     match e.raw_os_error() {
@@ -471,6 +473,10 @@ pub(crate) mod tests {
             (Refusal::NotInKernel.into(), NotInKernel),
             (Refusal::FloorFlags.into(), MissingFeatures),
             (Refusal::Feature("timed waits").into(), MissingFeatures),
+            (
+                Refusal::Registration("provided buffer rings").into(),
+                MissingFeatures,
+            ),
             (io::Error::other("odd"), ProbeFailed("odd".into())),
         ];
         for (error, want) in table {
@@ -669,7 +675,8 @@ pub(crate) mod tests {
     }
 
     /// A filter program that makes the kernel refuse every provided buffer ring registration
-    /// with `EINVAL`, as Ubuntu 24.04's 6.8 kernel does, and allows everything else.
+    /// with `EINVAL`, as Ubuntu's 6.8 kernels from 6.8.0-136 on do
+    /// (<https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843>), and allows everything else.
     pub(crate) fn refuse_buffer_rings() -> Vec<libc::sock_filter> {
         answer_when_arg1(
             libc::SYS_io_uring_register,

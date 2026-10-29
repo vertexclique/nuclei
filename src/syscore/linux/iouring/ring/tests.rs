@@ -41,7 +41,7 @@ pub(super) fn ring_or_skip() -> Option<Ring> {
 }
 
 /// A buffer ring of `entries` buffers of `size` bytes as group `bgid`, or `None` to skip the calling
-/// test when the kernel lacks provided buffer rings (some distribution kernels do).
+/// test when the kernel refuses provided buffer rings (Ubuntu's 6.8 kernels from 6.8.0-136 on do).
 pub(super) fn buf_ring_or_skip(ring: &Ring, bgid: u16, entries: u16, size: u32) -> Option<BufRing> {
     match BufRing::new(ring, bgid, entries, size) {
         Ok(pool) => Some(pool),
