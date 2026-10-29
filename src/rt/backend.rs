@@ -72,15 +72,32 @@ pub(crate) fn chosen() -> io::Result<Backend> {
         })
         .clone()
         .map_err(unsupported)
+        .and_then(checked)
 }
 
 /// The backend of a runtime that names `named`: the process's default if it
 /// names none, or if `NUCLEI_BACKEND` overrides it.
 pub(crate) fn for_runtime(named: Option<IoBackend>) -> io::Result<Backend> {
     match (env_override(), named) {
-        (None, Some(named)) => decide(None, Some(named), usable).map_err(unsupported),
+        (None, Some(named)) => decide(None, Some(named), usable)
+            .map_err(unsupported)
+            .and_then(checked),
         _ => chosen(),
     }
+}
+
+/// `backend`, once the process's io_uring sizes are known to be ones a ring
+/// can work with: a configuration's mistake is reported where it takes
+/// effect, never run with. Only a ring backend reads them.
+fn checked(backend: Backend) -> io::Result<Backend> {
+    #[cfg(ring)]
+    if matches!(backend, Backend::Ring(_) | Backend::RingOrPoll(_)) {
+        crate::proactor::Proactor::get()
+            .config()
+            .iouring
+            .validate()?;
+    }
+    Ok(backend)
 }
 
 fn unsupported(why: String) -> io::Error {
