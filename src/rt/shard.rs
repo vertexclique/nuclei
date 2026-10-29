@@ -17,8 +17,12 @@
 //! inbox (first every [`INBOX_INTERVAL`] runs, so remote work is not
 //! starved). Every [`DRIVER_INTERVAL`] runs, and every [`DRIVER_INTERVAL`]
 //! turns in which only the future ran (it keeps waking itself), it fires
-//! due timers and polls the poller without waiting, which completes the IO
-//! of every source that became ready (see `io::source`); with the queues
+//! due timers and polls the poller without waiting, as does every
+//! [`QUARTZ_EVERY`](super::tuning::QUARTZ_EVERY)th run once the coarse clock says
+//! [`DRIVE_BOUND`](super::tuning::DRIVE_BOUND) has passed since the last look, so a
+//! few long runs hold the driver off no longer than many short ones; a runner
+//! that takes the shard over looks before it runs a task. The look completes
+//! the IO of every source that became ready (see `io::source`); with the queues
 //! empty it fires due timers each turn. With nothing to run and the future
 //! not woken it spins briefly (see [`Spin`]), looking at the poller as it
 //! does, then parks until the next timer, a remote push or a wake of the
@@ -396,6 +400,8 @@ pub(crate) struct Shard {
     tick: Cell<u32>,
     /// Runs since timers and the poller were last looked at.
     since_drive: Cell<u32>,
+    /// The `Quartz` reading of the last look at timers and the poller.
+    last_drive: Cell<u64>,
     /// Task polls run (the run loop's are added from `since_drive` as it
     /// starts again), and runnables taken from other threads: published for
     /// `stats` with the rest of the shard's cells.
@@ -560,6 +566,7 @@ impl Shard {
             lifo_streak: Cell::new(0),
             tick: Cell::new(0),
             since_drive: Cell::new(0),
+            last_drive: Cell::new(super::quartz::Quartz::now()),
             polls: Cell::new(0),
             sleeps: Cell::new(0),
             slept: Cell::new(Duration::ZERO),
@@ -766,6 +773,7 @@ impl Shard {
         // The run loop's look between tasks, or its park (which may not wait
         // after all, its timer due): a park publishes the counts always, the
         // shard about to go quiet, and a look once every few.
+        self.last_drive.set(super::quartz::Quartz::now());
         let looks = self.looks.get().wrapping_add(1);
         self.looks.set(looks);
         let publish = wait != Some(Duration::ZERO) || looks.is_multiple_of(PUBLISH_INTERVAL);

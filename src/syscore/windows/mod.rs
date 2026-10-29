@@ -285,6 +285,7 @@ pub(crate) type PTIMERAPCROUTINE = *const c_void;
 unsafe extern "system" {
     pub(crate) fn FlushProcessWriteBuffers();
     pub(crate) fn GetCurrentThreadId() -> DWORD;
+    pub(crate) fn GetTickCount64() -> u64;
     pub(crate) fn OpenThread(
         dwDesiredAccess: DWORD,
         bInheritHandle: BOOL,

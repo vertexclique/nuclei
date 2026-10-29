@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use super::Shard;
 use super::signal::Signal;
 use crate::rt::context::{self, Polled};
+use crate::rt::quartz::Quartz;
 use crate::rt::task::Runnable;
+use crate::rt::tuning::QUARTZ_EVERY;
 use crate::sync::internal::Ordering;
 
 /// The shard was taken from this thread while the loop ran.
@@ -60,6 +62,13 @@ impl Shard {
     /// A worker's loop: until the shard stops, drains of its tasks, or is
     /// taken from this thread.
     pub(crate) fn run_worker(&self) -> Worked {
+        // The IO a task queued on this shard (a receive in the ring's
+        // submission queue) reaches the kernel before any task runs: a shard
+        // handed on again and again, each runner's first task blocking, would
+        // otherwise be handed on before any runner reached the driver, and
+        // the operation would wait out `driver_interval` runs.
+        self.count_again(self.since_drive.get());
+        self.drive_or_report(Some(Duration::ZERO));
         let stopped = pin!(self.shared.stopped());
         let signal = Arc::new(Signal::new(&self.shared));
         match self.run_loop(stopped, &signal) {
@@ -134,7 +143,12 @@ impl Shard {
                     return Err(Detached);
                 }
                 let since = self.since_drive.get() + 1;
-                if since >= self.tuning.driver_interval {
+                // Past the run count, or (checked once every `QUARTZ_EVERY`
+                // runs, by a mask) past the time bound since the last look:
+                // a few long runs hold the driver off as much as many short.
+                if since >= self.tuning.driver_interval
+                    || (since & (QUARTZ_EVERY - 1) == 0 && self.drive_overdue())
+                {
                     // Timers and the poller get a look, without a wait.
                     self.count_again(since);
                     self.drive_or_report(Some(Duration::ZERO));
@@ -253,6 +267,12 @@ impl Shard {
             self.polls.set(self.polls.get() + 1);
         }
         Polled::In
+    }
+
+    /// Whether more than the drive bound has passed since the last look at
+    /// timers and the poller, by the coarse clock.
+    fn drive_overdue(&self) -> bool {
+        Quartz::now().wrapping_sub(self.last_drive.get()) >= self.tuning.drive_bound
     }
 
     /// Starts the count of runs before the next look at the driver again,

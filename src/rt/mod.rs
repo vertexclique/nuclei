@@ -10,6 +10,7 @@ mod handshake;
 pub(crate) mod inbox;
 pub(crate) mod park;
 pub(crate) mod paused;
+pub(crate) mod quartz;
 pub(crate) mod rng;
 pub(crate) mod runtime;
 mod sched;
