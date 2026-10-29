@@ -4,6 +4,10 @@
 //! answer is [`Probe::Available`] or [`Probe::Unavailable`] with the reason, never a panic and
 //! never a hang.
 //!
+//! The probe answers only for the ring itself. The features a shard's ring needs beyond it (the
+//! buffer ring for multishot receives, the table of fixed files) are checked next, by building a
+//! shard's ring (`rt::shard::ring::check`), so the backend choice needs every one of them.
+//!
 //! The danger is a seccomp filter whose default action kills the caller (some systemd units and
 //! sandboxes do this for `io_uring_setup`): calling the syscall in-process would end the whole
 //! program, not just fail. So the probe first asks `prctl(PR_GET_SECCOMP)`:
@@ -155,7 +159,9 @@ fn classify(e: &io::Error) -> Unavailable {
     {
         return match refusal {
             Refusal::NotInKernel => Unavailable::NotInKernel,
-            Refusal::FloorFlags | Refusal::Feature(_) => Unavailable::MissingFeatures,
+            Refusal::FloorFlags | Refusal::Feature(_) | Refusal::Registration(_) => {
+                Unavailable::MissingFeatures
+            }
         };
     }
     match e.raw_os_error() {
@@ -409,6 +415,7 @@ impl Drop for Stack {
 pub(crate) mod tests {
     use std::{env, fs, thread};
 
+    use super::super::iouring::ring::sys::IORING_REGISTER_PBUF_RING;
     use super::*;
 
     /// Whether this machine is declared to have a working io_uring (`NUCLEI_REQUIRE_IO_URING=1`).
@@ -417,7 +424,7 @@ pub(crate) mod tests {
     }
 
     /// `true` when a ring was found; otherwise panics if io_uring is required, else says it skips.
-    fn found_or_skip(probe: &Probe) -> bool {
+    pub(crate) fn found_or_skip(probe: &Probe) -> bool {
         if *probe == Probe::Available {
             return true;
         }
@@ -466,6 +473,10 @@ pub(crate) mod tests {
             (Refusal::NotInKernel.into(), NotInKernel),
             (Refusal::FloorFlags.into(), MissingFeatures),
             (Refusal::Feature("timed waits").into(), MissingFeatures),
+            (
+                Refusal::Registration("provided buffer rings").into(),
+                MissingFeatures,
+            ),
             (io::Error::other("odd"), ProbeFailed("odd".into())),
         ];
         for (error, want) in table {
@@ -620,6 +631,13 @@ pub(crate) mod tests {
         36
     };
 
+    /// Offset of the low word of a syscall's second argument in `seccomp_data`.
+    const ARG1_LOW: u32 = if cfg!(target_endian = "little") {
+        24
+    } else {
+        28
+    };
+
     fn insn(code: u32, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
         libc::sock_filter {
             code: code as u16,
@@ -637,6 +655,34 @@ pub(crate) mod tests {
             insn(RET, 0, 0, action),
             insn(RET, 0, 0, libc::SECCOMP_RET_ALLOW),
         ]
+    }
+
+    /// A filter program that answers syscall `nr` with `action` only when the low word of its
+    /// second argument is `arg1`, and allows everything else.
+    pub(crate) fn answer_when_arg1(
+        nr: libc::c_long,
+        arg1: u32,
+        action: u32,
+    ) -> Vec<libc::sock_filter> {
+        vec![
+            insn(LD, 0, 0, 0),
+            insn(JEQ, 0, 3, nr as u32),
+            insn(LD, 0, 0, ARG1_LOW),
+            insn(JEQ, 0, 1, arg1),
+            insn(RET, 0, 0, action),
+            insn(RET, 0, 0, libc::SECCOMP_RET_ALLOW),
+        ]
+    }
+
+    /// A filter program that makes the kernel refuse every provided buffer ring registration
+    /// with `EINVAL`, as Ubuntu's 6.8 kernels from 6.8.0-136 on do
+    /// (<https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843>), and allows everything else.
+    pub(crate) fn refuse_buffer_rings() -> Vec<libc::sock_filter> {
+        answer_when_arg1(
+            libc::SYS_io_uring_register,
+            IORING_REGISTER_PBUF_RING,
+            libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32,
+        )
     }
 
     /// A filter program that kills a `prlimit64` which sets a limit (new-limit pointer not null)
@@ -675,6 +721,28 @@ pub(crate) mod tests {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// What `f` finds on a thread of its own that carries [`refuse_buffer_rings`] (the filter is
+    /// irreversible, and threads `f` starts inherit it), or `None` when io_uring is not usable
+    /// here (a failure instead under `NUCLEI_REQUIRE_IO_URING=1`) or the machine does not let the
+    /// test install a filter.
+    pub(crate) fn without_buffer_rings<T, F>(f: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        if !found_or_skip(&probe()) {
+            return None;
+        }
+        thread::spawn(move || {
+            install(refuse_buffer_rings())
+                .map_err(|e| eprintln!("skipping: cannot install a seccomp filter here: {e}"))
+                .ok()
+                .map(|()| f())
+        })
+        .join()
+        .expect("the filtered thread does not panic")
     }
 
     /// What the probe finds on a thread of its own that carries `program` (the filter is

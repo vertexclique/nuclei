@@ -26,7 +26,7 @@ use std::{
 };
 
 use super::{
-    Ring,
+    Ring, refused,
     sys::{
         IORING_REGISTER_PBUF_RING, IORING_UNREGISTER_PBUF_RING, IoUringBuf, IoUringBufReg, Mapping,
         cqe_buffer_id, io_uring_register,
@@ -127,7 +127,8 @@ impl BufRing {
                 ptr::from_ref(&reg).cast(),
                 1,
             )
-        }?;
+        }
+        .map_err(refused("provided buffer rings"))?;
         Ok(Self {
             ring_fd,
             bgid,

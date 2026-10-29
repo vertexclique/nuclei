@@ -221,7 +221,9 @@ fn multishot_recv_recycles_buffers_and_ends_when_the_pool_is_empty() {
     let Some(mut ring) = ring_or_skip() else {
         return;
     };
-    let mut pool = BufRing::new(&ring, 7, 4, 64).unwrap();
+    let Some(mut pool) = buf_ring_or_skip(&ring, 7, 4, 64) else {
+        return;
+    };
     fill(&mut pool);
     let (a, b) = socketpair();
     push(
@@ -287,7 +289,9 @@ fn one_shot_recv_selects_a_buffer_from_the_group() {
     let Some(mut ring) = ring_or_skip() else {
         return;
     };
-    let mut pool = BufRing::new(&ring, 4, 2, 32).unwrap();
+    let Some(mut pool) = buf_ring_or_skip(&ring, 4, 2, 32) else {
+        return;
+    };
     fill(&mut pool);
     let (a, b) = socketpair();
     write_fd(a.as_raw_fd(), b"xyz");
@@ -313,7 +317,9 @@ fn multishot_recvmsg_on_udp_carries_source_address_and_payload() {
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     let client_port = client.local_addr().unwrap().port();
 
-    let mut pool = BufRing::new(&ring, 3, 4, 256).unwrap();
+    let Some(mut pool) = buf_ring_or_skip(&ring, 3, 4, 256) else {
+        return;
+    };
     fill(&mut pool);
     let mut msg: libc::msghdr = zeroed();
     msg.msg_namelen = size_of::<libc::sockaddr_in>() as _;
@@ -460,13 +466,18 @@ fn buffer_ring_rejects_bad_shapes() {
         BufRing::new(&ring, 1, 4, 0).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
-    BufRing::new(&ring, 1, 32768, 1).expect("the largest ring is accepted");
+    // Past nuclei's own checks, only a kernel that refuses every buffer ring refuses it.
+    if buf_ring_or_skip(&ring, 2, 4, 16).is_some() {
+        BufRing::new(&ring, 1, 32768, 1).expect("the largest ring is accepted");
+    }
 }
 
 #[test]
 fn buffer_ring_add_and_buffer_check_their_bounds() {
     let Some(ring) = ring_or_skip() else { return };
-    let mut pool = BufRing::new(&ring, 1, 4, 16).unwrap();
+    let Some(mut pool) = buf_ring_or_skip(&ring, 1, 4, 16) else {
+        return;
+    };
     assert_eq!((pool.bgid(), pool.entries(), pool.buf_size()), (1, 4, 16));
     assert!(pool.add(4).is_err(), "bid 4 is outside a 4-buffer pool");
     for bid in 0..4 {
@@ -492,7 +503,9 @@ fn buffer_ring_add_and_buffer_check_their_bounds() {
 #[test]
 fn buffer_ring_writes_descriptors_and_keeps_the_tail_intact() {
     let Some(ring) = ring_or_skip() else { return };
-    let mut pool = BufRing::new(&ring, 2, 4, 32).unwrap();
+    let Some(mut pool) = buf_ring_or_skip(&ring, 2, 4, 32) else {
+        return;
+    };
     let base = pool.buffer(0, 1).unwrap().as_ptr() as u64;
     pool.add(2).unwrap();
     pool.add(0).unwrap();
@@ -546,7 +559,9 @@ fn buffer_id_decodes_the_completion_flags() {
 #[test]
 fn dropping_a_buffer_ring_unregisters_its_group() {
     let Some(ring) = ring_or_skip() else { return };
-    let first = BufRing::new(&ring, 9, 2, 16).unwrap();
+    let Some(first) = buf_ring_or_skip(&ring, 9, 2, 16) else {
+        return;
+    };
     let clash = BufRing::new(&ring, 9, 2, 16).unwrap_err();
     assert_eq!(clash.raw_os_error(), Some(libc::EEXIST));
     drop(first);
@@ -556,7 +571,9 @@ fn dropping_a_buffer_ring_unregisters_its_group() {
 #[test]
 fn a_buffer_ring_outlives_its_ring() {
     let Some(ring) = ring_or_skip() else { return };
-    let pool = BufRing::new(&ring, 1, 2, 16).unwrap();
+    let Some(pool) = buf_ring_or_skip(&ring, 1, 2, 16) else {
+        return;
+    };
     drop(ring);
     assert_eq!(pool.buffer(1, 16).unwrap().len(), 16);
     drop(pool);

@@ -7,8 +7,11 @@
 //! `iocp`), when set, overrides both. Named by nobody, it is `auto`:
 //! io_uring when the kernel lets this process make the ring its shards use
 //! (see `syscore::linux::probe`, which checks without risking the process
-//! under a seccomp filter), and the platform's own poller otherwise (its
-//! I/O completion port on Windows).
+//! under a seccomp filter, and `rt::shard::ring::check`, which builds that
+//! ring as a shard does so every feature it needs is known to be there: the
+//! buffer ring for multishot receives while `recv_buffers` is not 0, the
+//! table of fixed files), and the platform's own poller otherwise (its I/O
+//! completion port on Windows).
 //! A backend named explicitly that this process cannot have fails with the
 //! reason when the first shard starts, and never falls back.
 
@@ -39,17 +42,9 @@ impl Backend {
     pub(crate) fn handed_over(self) -> Self {
         match self {
             #[cfg(ring)]
-            Backend::Ring(cfg) => Backend::Ring(crate::syscore::linux::iouring::ring::RingConfig {
-                multi_issuer: true,
-                ..cfg
-            }),
+            Backend::Ring(cfg) => Backend::Ring(cfg.handed_over()),
             #[cfg(ring)]
-            Backend::RingOrPoll(cfg) => {
-                Backend::RingOrPoll(crate::syscore::linux::iouring::ring::RingConfig {
-                    multi_issuer: true,
-                    ..cfg
-                })
-            }
+            Backend::RingOrPoll(cfg) => Backend::RingOrPoll(cfg.handed_over()),
             other => other,
         }
     }
@@ -99,17 +94,62 @@ fn env_override() -> Option<String> {
         .filter(|b| !b.is_empty())
 }
 
-/// Whether this process can use io_uring (the probe runs once), or why not.
+/// Whether this process can use io_uring (the checks run once), or why not.
 #[cfg(ring)]
 fn usable() -> Result<(), String> {
-    use crate::syscore::linux::probe::{Probe, probe};
     static PROBED: OnceLock<Result<(), String>> = OnceLock::new();
-    PROBED
-        .get_or_init(|| match probe() {
-            Probe::Available => Ok(()),
-            Probe::Unavailable(why) => Err(why.to_string()),
-        })
-        .clone()
+    PROBED.get_or_init(|| usable_with(ring_config())).clone()
+}
+
+/// [`usable`], not remembered: whether a ring can be made here at all
+/// (`probe`), and then whether the kernel gives a shard of `cfg` all its ring
+/// needs (`check`), as a shard that stays on its thread runs it and as one
+/// that may be handed over does.
+///
+/// Decided on a thread of its own: tearing a ring down makes the kernel queue
+/// io_uring task work, with a signal, on every thread that made or used it,
+/// which cuts that thread's next blocking wait short (`EINTR`); and a ring
+/// one thread enables registers in that thread's table of ring fds. The
+/// caller's thread makes no ring of its own this way.
+#[cfg(ring)]
+pub(crate) fn usable_with(
+    cfg: crate::syscore::linux::iouring::ring::RingConfig,
+) -> Result<(), String> {
+    let apart = std::thread::Builder::new()
+        .name("nuclei-check".into())
+        .spawn(move || usable_here(cfg));
+    match apart {
+        Ok(thread) => thread
+            .join()
+            .unwrap_or_else(|_| Err("the io_uring check panicked".into())),
+        // No thread to spare: decided here, side effects and all.
+        Err(_) => usable_here(cfg),
+    }
+}
+
+/// [`usable_with`] on the calling thread.
+#[cfg(ring)]
+fn usable_here(cfg: crate::syscore::linux::iouring::ring::RingConfig) -> Result<(), String> {
+    use crate::rt::shard::ring::check;
+    use crate::syscore::linux::probe::{Probe, probe};
+    match probe() {
+        Probe::Available => {}
+        Probe::Unavailable(why) => return Err(why.to_string()),
+    }
+    for cfg in [cfg, cfg.handed_over()] {
+        match check(cfg) {
+            Ok(()) => {}
+            // Short of memory is no missing feature, and a shard makes its
+            // ring with less memory on its own (`with_room`). A configuration
+            // mistake is the shard's to report when it starts, not a reason
+            // to run another backend unseen.
+            Err(err)
+                if err.raw_os_error() == Some(libc::ENOMEM)
+                    || err.kind() == io::ErrorKind::InvalidInput => {}
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(ring))]
@@ -191,12 +231,20 @@ fn ask_for(backend: IoBackend) -> Result<Ask, String> {
     }
 }
 
+/// The ring configuration of a shard of a runtime that names no backend: the
+/// process's, as `Proactor::with_config` set it. The one place it is derived,
+/// for the shards and for the check that chooses their backend.
+#[cfg(ring)]
+fn ring_config() -> crate::syscore::linux::iouring::ring::RingConfig {
+    (&crate::proactor::Proactor::get().config().iouring).into()
+}
+
 /// The ring the shards make, as the process's configuration says; `auto`:
 /// whether `auto` chose it.
 fn ring(auto: bool) -> Backend {
     #[cfg(ring)]
     {
-        let cfg = (&crate::proactor::Proactor::get().config().iouring).into();
+        let cfg = ring_config();
         if auto {
             Backend::RingOrPoll(cfg)
         } else {
@@ -229,6 +277,9 @@ pub(crate) fn with_room<T>(
         }
     }
 }
+
+#[cfg(all(test, ring, target_os = "linux"))]
+mod tests_refused;
 
 #[cfg(test)]
 mod tests {
@@ -361,12 +412,12 @@ mod tests {
     }
 
     /// This machine's answer, as the process takes it: with no backend named,
-    /// its shards run rings exactly when io_uring is usable here.
+    /// its shards run rings exactly when io_uring is usable here, the ring a
+    /// shard runs included.
     #[cfg(all(target_os = "linux", feature = "iouring"))]
     #[test]
     fn the_probe_decides_auto_on_this_machine() {
-        use crate::syscore::linux::probe::{Probe, probe};
-        let available = probe() == Probe::Available;
+        let available = super::usable().is_ok();
         assert_eq!(is_ring(&decide(None, None, super::usable)), available);
         let named = std::env::var("NUCLEI_BACKEND").unwrap_or_default();
         if (named.is_empty() || named == "auto")

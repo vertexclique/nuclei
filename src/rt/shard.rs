@@ -56,8 +56,6 @@ use crate::buf::Pool;
 use crate::io::Source;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[cfg(ring)]
-use crate::syscore::linux::iouring::ring::RingConfig;
 use crate::time::TimerOp;
 use crate::time::wheel::Wheel;
 use spin::Spin;
@@ -440,10 +438,6 @@ pub(crate) struct Shard {
     keeper: RefCell<Option<Arc<port::Keeper>>>,
 }
 
-/// The fewest submission entries a ring short of memory is made with.
-#[cfg(ring)]
-const MIN_RING_ENTRIES: u32 = 64;
-
 impl Shard {
     pub(crate) fn new(limits: Limits) -> io::Result<Self> {
         Self::made(limits, None)
@@ -520,17 +514,18 @@ impl Shard {
             Backend::Ring(cfg) | Backend::RingOrPoll(cfg) => {
                 // Under a tight memory limit the ring gets fewer entries; one
                 // `auto` chose runs the poller if even the least finds none.
-                let made = super::backend::with_room(cfg.entries, MIN_RING_ENTRIES, |entries| {
-                    ring::ShardRing::new(&RingConfig { entries, ..cfg }, ring::table_len())
-                });
-                match made {
+                match ring::ShardRing::for_shard(cfg) {
                     Ok(ring) => {
                         let notifier = ring.notifier();
                         (Driver::Ring(ring), notifier, None)
                     }
+                    // The choice of `auto` checked the kernel already (see
+                    // `backend::usable`); a shard that still finds the ring
+                    // refused, or no memory, runs the poller rather than fail.
                     Err(err)
                         if matches!(limits.backend, Backend::RingOrPoll(_))
-                            && err.raw_os_error() == Some(libc::ENOMEM) =>
+                            && (err.raw_os_error() == Some(libc::ENOMEM)
+                                || err.kind() == io::ErrorKind::Unsupported) =>
                     {
                         poller()?
                     }
