@@ -353,3 +353,30 @@ fn the_stats_count_the_handoff_and_the_long_poll() {
         "no shard counted the handoff and its long poll"
     );
 }
+
+#[test]
+fn a_poll_blocked_for_four_thresholds_hands_its_shard_over_before_it_ends() {
+    // The watch ticks every quarter of the 10 ms threshold, so the shard moves
+    // about 12.5 ms in: a tick at the system timer's 15.6 ms (Windows' timed
+    // park) would need about 62 ms, and the queued task would wait out the poll.
+    let rt = on();
+    let started = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicBool::new(false));
+    let (up, seen) = (Arc::clone(&started), Arc::clone(&ran));
+    let blocked = rt.spawn(async move {
+        up.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(40));
+        seen.load(Ordering::SeqCst)
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !started.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the blocking task never ran");
+        std::thread::yield_now();
+    }
+    let quick = rt.spawn(async move { ran.store(true, Ordering::SeqCst) });
+    assert!(
+        rt.block_on(blocked),
+        "the queued task waited out the 40 ms poll"
+    );
+    rt.block_on(quick);
+}

@@ -16,6 +16,13 @@
   half a second). The run loop now reads a coarse monotonic clock of its own, `Quartz` (a vDSO read on
   Linux, a few nanoseconds, never a system call), once every 16 task runs and looks at the driver when
   the last look is older than 1 ms. It costs one masked branch per run and needs no extra thread.
+  The clock steps by no more than the bound on every platform: the coarse clock where its tick is
+  1 ms or shorter (a 1000 Hz kernel), else `CLOCK_MONOTONIC`; `CLOCK_UPTIME_RAW` on macOS; the
+  performance counter on Windows, whose tick count would step by 15.6 ms.
+- **The handoff acts at its threshold on Windows.** The watch ticks every quarter of the threshold,
+  but a timed park on Windows ends at the system timer's tick (15.6 ms), so `handoff_after(10 ms)`
+  handed a shard over only after about 62 ms. The watch now waits on a high-resolution waitable
+  timer and an event there, and its ticks end on time; elsewhere it parks as before.
 
 - **A ring shrunk under memory pressure no longer deadlocks a request behind its own reply's
   receive.** Its receive group now fits within half its completion queue (a ring whose queue cannot
