@@ -15,7 +15,10 @@ fn base() -> Builder {
 fn a_size_below_its_minimum_is_refused_naming_the_setting() {
     let refused: Vec<(&str, Builder)> = vec![
         ("thread_stack_size", base().thread_stack_size(0)),
-        ("thread_stack_size", base().thread_stack_size(64 * 1024 - 1)),
+        (
+            "thread_stack_size",
+            base().thread_stack_size(128 * 1024 - 1),
+        ),
         ("max_nesting", base().max_nesting(0)),
         ("max_blocking_threads", base().max_blocking_threads(0)),
         ("handoff_after", base().handoff_after(Some(Duration::ZERO))),
@@ -37,7 +40,7 @@ fn a_size_below_its_minimum_is_refused_naming_the_setting() {
 fn the_boundary_values_and_the_defaults_start_a_runtime() {
     let accepted = [
         base(),
-        base().thread_stack_size(64 * 1024),
+        base().thread_stack_size(128 * 1024),
         base().max_nesting(1),
         base().max_blocking_threads(1),
         base().max_worker_threads(1),
@@ -52,4 +55,21 @@ fn the_boundary_values_and_the_defaults_start_a_runtime() {
         let rt = builder.build().expect("the runtime starts");
         assert_eq!(rt.block_on(async { 7 }), 7);
     }
+}
+
+#[test]
+fn the_smallest_stack_runs_a_timer_and_a_connect_on_the_worker() {
+    let rt = base()
+        .thread_stack_size(128 * 1024)
+        .build()
+        .expect("the runtime starts");
+    let task = rt.spawn(async {
+        nuclei::time::sleep(Duration::from_millis(1)).await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        nuclei::Handle::<std::net::TcpStream>::connect(addr)
+            .await
+            .expect("the worker connects");
+    });
+    rt.block_on(task);
 }

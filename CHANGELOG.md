@@ -36,7 +36,8 @@
     give a `queue_len` under 256 that many buffers, rounded up to a power of two, where they gave 256,
     which left a cap of 1 for a `queue_len` from 64 to 128.
   - `recv_buffer_size` below 512 or above 1 GiB while `recv_buffers` is not 0.
-  - `Builder::thread_stack_size` below 64 KiB: the runtime's frames do not fit.
+  - `Builder::thread_stack_size` below 128 KiB: a worker starting, a timer and a TCP connect take
+    77 KiB in a debug build and 64 KiB in a release one.
   - `Builder::max_nesting(0)`: no `block_on` could run.
   - `Builder::max_blocking_threads(0)`, which was raised to 1 silently.
   - `Builder::handoff_after(Some(d))` with `d` under 1 ms: the watch measures in milliseconds.

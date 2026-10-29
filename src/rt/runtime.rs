@@ -113,9 +113,11 @@ const DEFAULT_LOCAL_MARGIN: usize = 32;
 /// See [`Builder::handoff_after`].
 const DEFAULT_HANDOFF: Duration = Duration::from_millis(10);
 
-/// The smallest worker or blocking thread stack: below it the runtime's own
-/// frames and a nested `block_on` do not fit.
-const MIN_STACK: usize = 64 * 1024;
+/// The smallest worker or blocking thread stack. A worker starting, a timer
+/// and a TCP connect take 77 KiB in a debug build and 64 KiB in a release
+/// one (the shard is built on the stack before it moves to the heap), on
+/// glibc 2.39 and 2.44 alike; this leaves room over the deepest of them.
+const MIN_STACK: usize = 128 * 1024;
 /// The shortest `handoff_after`: the watch measures in milliseconds.
 const MIN_HANDOFF: Duration = Duration::from_millis(1);
 
@@ -195,7 +197,7 @@ impl Builder {
     }
 
     /// The stack size of every thread the runtime starts, in bytes (default
-    /// 8 MiB). At least 64 KiB; [`build`](Self::build) fails with `InvalidInput`
+    /// 8 MiB). At least 128 KiB; [`build`](Self::build) fails with `InvalidInput`
     /// below.
     pub fn thread_stack_size(mut self, bytes: usize) -> Self {
         self.thread_stack_size = Some(bytes);
