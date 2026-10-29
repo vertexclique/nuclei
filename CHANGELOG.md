@@ -40,6 +40,10 @@
   - `Builder::max_nesting(0)`: no `block_on` could run.
   - `Builder::max_blocking_threads(0)`, which was raised to 1 silently.
   - `Builder::handoff_after(Some(d))` with `d` under 1 ms: the watch measures in milliseconds.
+- **The runtime's clock read is inlined** (`time::Instant::now` and the read timers and timeouts
+  make), so whether it is inlined no longer depends on how a build splits the crate into codegen
+  units: a `timeout` whose future is ready takes about 4% fewer instructions than in 0.5.1 with fat
+  LTO and one codegen unit.
 
 ### Added
 

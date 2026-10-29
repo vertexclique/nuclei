@@ -218,6 +218,7 @@ pub(crate) fn to_nanos(at: Instant) -> u64 {
 
 /// The time now on the clock of the runtime this thread is inside (or of the
 /// default runtime, if one runs), or the system's.
+#[inline]
 pub(crate) fn now() -> Instant {
     if ALTERED.load(Ordering::Relaxed) == 0 {
         return Instant::now();
