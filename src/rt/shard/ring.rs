@@ -23,6 +23,18 @@
 //! ends the operation. Its arrivals are bounded by the group's buffers, so
 //! the operations let into the kernel leave the completion queue room for
 //! them.
+//!
+//! The group is sized to the ring: at most half its completion queue, so a
+//! small ring (made so under memory pressure) is never filled by arrivals.
+//! Multishot receives and accepts wait on the network for as long as their
+//! connection lives, so they are let into the kernel at once and do not
+//! count against the cap that finite operations wait behind: a sleeping
+//! connection would otherwise hold the room a request's send needs. The
+//! receives' arrivals are bounded by the group's buffers, which the queue
+//! keeps room for. An accept's connections (up to [`ACCEPT_CAP`] each) and
+//! the last completion of each multishot operation have no room kept: past
+//! the queue the kernel holds them (`IORING_FEAT_NODROP`, which the poller
+//! requires) until the poller takes them, and none is lost.
 
 use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -62,7 +74,8 @@ pub(crate) struct ShardRing {
     /// Operations submitted but not in the kernel yet, by user data, with
     /// their entries, in order.
     room: RefCell<VecDeque<(u64, Sqe)>>,
-    /// Operations in the kernel, and the most it may hold.
+    /// Finite operations in the kernel (see [`counts_against_cap`]), and the
+    /// most it may hold.
     in_kernel: Cell<usize>,
     cap: usize,
     /// Completions of the last wait, reused.
@@ -84,7 +97,7 @@ impl ShardRing {
     /// disabled until its first wait or submission.
     pub(crate) fn new(cfg: &RingConfig, files: u32) -> io::Result<Self> {
         let poller = RingPoller::new(cfg, files)?;
-        let recv = match cfg.recv_buffers {
+        let recv = match group_entries(cfg.recv_buffers, poller.cq_entries()) {
             0 => None,
             entries => match RecvGroup::new(poller.ring(), entries, cfg.recv_buffer_size) {
                 Ok(group) => Some(group),
@@ -185,6 +198,7 @@ impl ShardRing {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed + 1, arrived, dry));
         }
+        let counted = counts_against_cap(&op.mem);
         let inserted = self.ops.borrow_mut().insert(op);
         let user_data = match inserted {
             Ok(user_data) => user_data,
@@ -194,15 +208,18 @@ impl ShardRing {
                 return IGNORED;
             }
         };
-        self.enter(user_data, sqe);
+        self.enter(user_data, sqe, counted);
         user_data
     }
 
     /// Puts the entry of the operation of `user_data` into the kernel, or
-    /// behind the ones waiting for room.
-    fn enter(&self, user_data: u64, sqe: Sqe) {
+    /// behind the ones waiting for room. A long-lived operation (`counted`
+    /// false) goes in at once and is not counted.
+    pub(super) fn enter(&self, user_data: u64, sqe: Sqe, counted: bool) {
         let sqe = sqe.user_data(user_data);
-        if self.room.borrow().is_empty() && self.in_kernel.get() < self.cap {
+        if !counted {
+            self.poller.borrow_mut().push(sqe);
+        } else if self.room.borrow().is_empty() && self.in_kernel.get() < self.cap {
             self.in_kernel.set(self.in_kernel.get() + 1);
             self.poller.borrow_mut().push(sqe);
         } else {
@@ -226,7 +243,7 @@ impl ShardRing {
                 return;
             }
         };
-        self.enter(user_data, sqe);
+        self.enter(user_data, sqe, true);
     }
 
     /// A file's call completed: the rest of a write goes on, else its end
@@ -353,8 +370,10 @@ impl ShardRing {
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
             return;
         };
-        self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
-        self.admit_waiting();
+        if counts_against_cap(&op.mem) {
+            self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
+            self.admit_waiting();
+        }
         self.end(op, cqe.res);
     }
 
@@ -574,6 +593,36 @@ impl ShardRing {
     }
 }
 
+/// How many buffers the receive group of a ring with `cq_entries`
+/// completion slots gets when the configuration asks for `configured`: no
+/// more than the largest power of two within half the queue, so arrivals
+/// never fill it; none when the queue cannot hold one. A count that is not a
+/// power of two is passed on unchanged, for the group to refuse as the
+/// configuration's mistake.
+fn group_entries(configured: u16, cq_entries: u32) -> u16 {
+    if configured == 0 || !configured.is_power_of_two() {
+        return configured;
+    }
+    let half = cq_entries / 2;
+    if half == 0 {
+        return 0;
+    }
+    let fit = 1u32 << half.ilog2();
+    configured.min(u16::try_from(fit.min(1 << 15)).unwrap_or(1 << 15))
+}
+
+/// Whether the operation of `mem` counts against the cap on operations in
+/// the kernel. A multishot receive or accept waits on the network for as long
+/// as its connection lives, so counting it would let idle connections fill
+/// the cap and starve the sends that wake them. The one place both the
+/// submission and the end of an operation decide it.
+fn counts_against_cap(mem: &RingMem) -> bool {
+    !matches!(
+        mem,
+        RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } | RingMem::AcceptMulti { .. }
+    )
+}
+
 /// The bit of the user data of a file's call (in the slot index, which the
 /// sources' operations never reach).
 const FILE_TAG: u64 = 1 << 31;
@@ -644,6 +693,11 @@ impl ShardRing {
             .count()
     }
 
+    /// The buffers the receive group has.
+    pub(crate) fn group_buffers(&self) -> Option<u16> {
+        self.recv.borrow().as_ref().map(RecvGroup::entries)
+    }
+
     /// The bytes one receive may hold before the ring stops it.
     pub(crate) fn recv_cap(&self) -> Option<usize> {
         self.recv.borrow().as_ref().map(RecvGroup::cap)
@@ -686,7 +740,7 @@ pub(crate) fn table_len() -> u32 {
 const MAX_TABLE: u32 = 1 << 14;
 
 /// The fewest submission entries a ring short of memory is made with.
-const MIN_RING_ENTRIES: u32 = 64;
+const MIN_RING_ENTRIES: u32 = crate::config::MIN_QUEUE_LEN;
 
 /// Whether the kernel gives a shard of `cfg` everything its ring needs: the
 /// ring, its disabled start, the table of fixed files, the group of buffers
@@ -702,5 +756,7 @@ pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
 pub(crate) mod exits;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_cap;
 #[cfg(test)]
 mod tests_recv;

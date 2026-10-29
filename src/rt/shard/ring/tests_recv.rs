@@ -27,7 +27,7 @@ fn recv_shard(buffers: u16, size: u32) -> Option<Shard> {
 /// As [`recv_shard`], on a ring of `entries` submission entries (twice as
 /// many completions): a ring whose completion queue overflows ends its
 /// multishot operations itself.
-fn ring_shard_of(entries: u32, buffers: u16, size: u32) -> Option<Shard> {
+pub(super) fn ring_shard_of(entries: u32, buffers: u16, size: u32) -> Option<Shard> {
     let shard = Shard::new(Limits {
         max_nesting: 8,
         buffer_cap: crate::buf::DEFAULT_CAP,
@@ -51,7 +51,7 @@ fn ring_shard_of(entries: u32, buffers: u16, size: u32) -> Option<Shard> {
 }
 
 /// A socket of a pair with its source, and the pair's other end.
-fn source_pair() -> (UnixStream, Arc<Source>, UnixStream) {
+pub(super) fn source_pair() -> (UnixStream, Arc<Source>, UnixStream) {
     let (mine, peer) = UnixStream::pair().unwrap();
     sys::set_nonblocking(mine.as_raw_fd()).unwrap();
     let src = Source::new(mine.as_raw_fd(), Kind::Stream);
