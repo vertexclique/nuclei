@@ -296,6 +296,19 @@ unsafe extern "system" {
     ) -> BOOL;
     pub(crate) fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
     pub(crate) fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
+    pub(crate) fn WaitForMultipleObjects(
+        nCount: DWORD,
+        lpHandles: *const HANDLE,
+        bWaitAll: BOOL,
+        dwMilliseconds: DWORD,
+    ) -> DWORD;
+    pub(crate) fn CreateEventW(
+        lpEventAttributes: *mut c_void,
+        bManualReset: BOOL,
+        bInitialState: BOOL,
+        lpName: *const u16,
+    ) -> HANDLE;
+    pub(crate) fn SetEvent(hEvent: HANDLE) -> BOOL;
     pub(crate) fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> BOOL;
     pub(crate) fn CreateIoCompletionPort(
         FileHandle: HANDLE,

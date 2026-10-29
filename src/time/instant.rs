@@ -16,6 +16,7 @@ pub struct Instant(std::time::Instant);
 
 impl Instant {
     /// The time now on the runtime's clock.
+    #[inline]
     pub fn now() -> Self {
         Self(super::clock::now())
     }

@@ -5,12 +5,23 @@
 
 use std::sync::Arc;
 
+/// Task runs between reads of the coarse clock; a power of two, so the run
+/// loop tells the runs apart with a mask.
+pub(crate) const QUARTZ_EVERY: u32 = 16;
+/// Nanoseconds of task running after which a worker shard looks at its driver
+/// (1 ms), whatever the count of runs.
+pub(crate) const DRIVE_BOUND: u64 = 1_000_000;
+
 /// How a worker shard runs its loop, and the hooks it calls when it parks;
 /// a shard that is not a worker keeps the defaults.
 #[derive(Clone, Debug)]
 pub(crate) struct Tuning {
     /// Task runs between looks at the driver (timers and IO).
     pub(crate) driver_interval: u32,
+    /// Nanoseconds of task running after which the driver gets a look, however
+    /// few runs that was (read from [`Quartz`](super::quartz::Quartz) every
+    /// [`QUARTZ_EVERY`] runs).
+    pub(crate) drive_bound: u64,
     /// Task runs between looks at the inbox first.
     pub(crate) inbox_interval: u32,
     /// The most IO events one look at the driver takes.
@@ -24,6 +35,7 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             driver_interval: super::shard::DRIVER_INTERVAL,
+            drive_bound: DRIVE_BOUND,
             inbox_interval: super::shard::INBOX_INTERVAL,
             max_io_events: usize::MAX,
             lifo: true,

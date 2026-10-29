@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use kovan_queue::seg_queue::SegQueue;
 
+use super::bell::Bell;
 use super::life::Life;
 use super::slot::{self, Slot};
 use crate::rt::runtime::Inner;
@@ -110,7 +111,7 @@ pub(crate) struct Monitor {
     spares: SegQueue<Arc<Spare>>,
     /// The monitor sleeps: every worker parked.
     asleep: AtomicBool,
-    thread: OnceLock<Thread>,
+    bell: Bell,
     closed: AtomicBool,
     /// Wakes the threads waiting for their bound tasks once closed.
     closing: crate::sync::Notify,
@@ -128,7 +129,7 @@ impl Monitor {
             places: (0..places).map(|_| OnceLock::new()).collect(),
             spares: SegQueue::new(),
             asleep: AtomicBool::new(false),
-            thread: OnceLock::new(),
+            bell: Bell::new(),
             closed: AtomicBool::new(false),
             closing: crate::sync::Notify::new(),
             cores,
@@ -155,10 +156,8 @@ impl Monitor {
     /// A worker's park ended, or a worker started: an asleep monitor wakes.
     pub(crate) fn worker_woke(&self) {
         fence(Ordering::SeqCst);
-        if self.asleep.load(Ordering::SeqCst)
-            && let Some(thread) = self.thread.get()
-        {
-            thread.unpark();
+        if self.asleep.load(Ordering::SeqCst) {
+            self.bell.ring();
         }
     }
 
@@ -166,9 +165,7 @@ impl Monitor {
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.closing.notify_waiters();
-        if let Some(thread) = self.thread.get() {
-            thread.unpark();
-        }
+        self.bell.ring();
         while let Ok(spare) = self.spares.try_pop() {
             spare.thread.unpark();
         }
@@ -232,7 +229,7 @@ struct Watch {
 /// The monitor's thread: watches the workers of the runtime of `runtime`
 /// until it shuts down.
 pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
-    let _ = monitor.thread.set(std::thread::current());
+    monitor.bell.bind();
     let tick = (monitor.after / STREAK).max(Duration::from_micros(100));
     let mut watches: Vec<Option<Watch>> = (0..monitor.places.len()).map(|_| None).collect();
     let mut waiting: Option<Gift> = None;
@@ -255,7 +252,7 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
             monitor.asleep.store(true, Ordering::SeqCst);
             fence(Ordering::SeqCst);
             if monitor.all_parked() && !monitor.is_closed() {
-                std::thread::park();
+                monitor.bell.wait();
             }
             monitor.asleep.store(false, Ordering::SeqCst);
             watches
@@ -272,7 +269,7 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
             && !left.is_zero()
             && !monitor.is_closed()
         {
-            std::thread::park_timeout(left);
+            monitor.bell.wait_for(left);
         }
         for (index, place) in monitor.places.iter().enumerate() {
             let Some(place) = place.get() else {

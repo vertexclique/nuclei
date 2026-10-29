@@ -1,6 +1,6 @@
 [package]
 name = "nuclei"
-version = "0.5.1"
+version = "0.5.2"
 authors = ["Theo M. Bulut <vertexclique@gmail.com>"]
 edition = "2024"
 rust-version = "1.99"
@@ -88,6 +88,14 @@ harness = false
 
 [[bench]]
 name = "sync_mpsc"
+harness = false
+
+[[bench]]
+name = "run_loop"
+harness = false
+
+[[bench]]
+name = "features"
 harness = false
 
 # Declaring `loom` keeps `unexpected_cfgs` quiet in the ordinary build

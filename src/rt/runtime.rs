@@ -113,7 +113,44 @@ const DEFAULT_LOCAL_MARGIN: usize = 32;
 /// See [`Builder::handoff_after`].
 const DEFAULT_HANDOFF: Duration = Duration::from_millis(10);
 
+/// The smallest worker or blocking thread stack. A worker starting, a timer
+/// and a TCP connect take 77 KiB in a debug build and 64 KiB in a release
+/// one (the shard is built on the stack before it moves to the heap), on
+/// glibc 2.39 and 2.44 alike; this leaves room over the deepest of them.
+const MIN_STACK: usize = 128 * 1024;
+/// The shortest `handoff_after`: the watch measures in milliseconds.
+const MIN_HANDOFF: Duration = Duration::from_millis(1);
+
 impl Builder {
+    /// Refuses a size no runtime can work with, as the configuration's mistake.
+    fn validate(&self) -> io::Result<()> {
+        use crate::config::refuse;
+        if let Some(bytes) = self.thread_stack_size.filter(|&b| b < MIN_STACK) {
+            return Err(refuse(
+                "thread_stack_size",
+                bytes,
+                format_args!("at least {MIN_STACK} bytes"),
+            ));
+        }
+        if let Some(depth) = self.max_nesting.filter(|&d| d < 1) {
+            return Err(refuse("max_nesting", depth, "at least 1"));
+        }
+        if let Some(n) = self.max_blocking_threads.filter(|&n| n < 1) {
+            return Err(refuse("max_blocking_threads", n, "at least 1"));
+        }
+        if let Some(Some(after)) = self
+            .handoff_after
+            .filter(|a| a.is_some_and(|a| a < MIN_HANDOFF))
+        {
+            return Err(refuse(
+                "handoff_after",
+                format_args!("{after:?}"),
+                format_args!("at least {MIN_HANDOFF:?}, or None"),
+            ));
+        }
+        Ok(())
+    }
+
     /// A builder with every setting at its default.
     pub fn new() -> Self {
         Self {
@@ -160,20 +197,23 @@ impl Builder {
     }
 
     /// The stack size of every thread the runtime starts, in bytes (default
-    /// 8 MiB).
+    /// 8 MiB). At least 128 KiB; [`build`](Self::build) fails with `InvalidInput`
+    /// below.
     pub fn thread_stack_size(mut self, bytes: usize) -> Self {
         self.thread_stack_size = Some(bytes);
         self
     }
 
     /// How deep `block_on` may nest on one thread (default 256). A call one
-    /// level deeper panics instead of running the thread out of stack.
+    /// level deeper panics instead of running the thread out of stack. At least
+    /// 1; [`build`](Self::build) fails with `InvalidInput` below.
     pub fn max_nesting(mut self, depth: usize) -> Self {
         self.max_nesting = Some(depth);
         self
     }
 
-    /// The most threads the blocking pool runs at once (default 512).
+    /// The most threads the blocking pool runs at once (default 512). At least 1;
+    /// [`build`](Self::build) fails with `InvalidInput` below.
     pub fn max_blocking_threads(mut self, n: usize) -> Self {
         self.max_blocking_threads = Some(n);
         self
@@ -202,7 +242,9 @@ impl Builder {
     /// The most worker threads the runtime may start over its life, the
     /// ones it starts with included (default four times
     /// [`worker_threads`](Self::worker_threads)): what `spawn_more_threads`
-    /// may add up to. A stopped worker's place is not taken again.
+    /// may add up to. A stopped worker's place is not taken again. A value
+    /// below the worker threads is raised to them, whose count may come from
+    /// the machine.
     pub fn max_worker_threads(mut self, n: usize) -> Self {
         self.max_worker_threads = Some(n);
         self
@@ -211,7 +253,9 @@ impl Builder {
     /// The most bytes each worker's IO buffers hold (default 64 MiB). Reads
     /// that had to wait land in these buffers, and writes that had to wait
     /// are copied into them; at the cap, IO waits for buffers to come back,
-    /// so a worker's IO memory never grows past it.
+    /// so a worker's IO memory never grows past it. Any value is accepted; a
+    /// request that cannot fit under a cap too small for it fails with an error
+    /// that names this setting.
     pub fn io_buffer_cap(mut self, bytes: usize) -> Self {
         self.io_buffer_cap = Some(bytes);
         self
@@ -244,6 +288,7 @@ impl Builder {
     /// without an `.await`) then holds up only itself: its worker's shard,
     /// with every other task, timer and IO of it, goes to another thread on
     /// the same core, and the blocked task carries on once its poll returns.
+    /// At least 1 ms; [`build`](Self::build) fails with `InvalidInput` below.
     /// Tasks that `spawn_local` keeps on the blocked thread wait for it. The
     /// watch costs each poll two plain stores and a load; with it on, an
     /// io_uring worker's ring takes submissions from any thread.
@@ -269,6 +314,7 @@ impl Builder {
         let workers = self
             .worker_threads
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+        self.validate()?;
         let stack = self.thread_stack_size.unwrap_or(DEFAULT_STACK);
         let limits = Limits {
             max_nesting: self.max_nesting.unwrap_or(context::DEFAULT_MAX_NESTING),

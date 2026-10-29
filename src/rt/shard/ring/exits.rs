@@ -63,7 +63,7 @@ impl ShardRing {
         let op = ExitOp { exit, info, waitid };
         let inserted = self.exit_ops.borrow_mut().insert(op);
         match inserted {
-            Ok(user_data) => self.enter(user_data | FILE_TAG | EXIT_TAG, sqe),
+            Ok(user_data) => self.enter(user_data | FILE_TAG | EXIT_TAG, sqe, true),
             // Past 2^30 children watched at once on one ring.
             Err(op) => op.exit.finish(Err(libc::ENOBUFS)),
         }

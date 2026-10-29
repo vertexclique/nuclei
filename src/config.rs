@@ -24,8 +24,15 @@ pub struct NucleiConfig {
 /// queue entries and the io-wq worker limits `Some(256)` and `Some(512)`.
 #[derive(Clone, Debug)]
 pub struct IoUringConfiguration {
-    /// Entries in each ring's submission and completion queues (default
-    /// 2048).
+    /// Entries in each ring's submission queue (default 2048); the completion
+    /// queue holds twice as many.
+    ///
+    /// At least 64, the
+    /// floor a ring is shrunk to when the system has no memory for more; a
+    /// smaller value is refused as the configuration's mistake when the first
+    /// shard starts. The kernel rounds the count up to a power of two and
+    /// clamps it to its own maximum (32768 on current kernels), so a larger
+    /// value is accepted and gets what the kernel allows.
     pub queue_len: u32,
     /// With `Some(ms)`, a kernel thread polls the submission queue and sleeps
     /// after that many idle milliseconds: fewer system calls for more CPU
@@ -69,12 +76,20 @@ pub struct IoUringConfiguration {
     /// `O_DIRECT` on file systems that support polling.
     pub iopoll_enabled: bool,
 
-    /// Buffers in each shard's group for multishot receives (default 256): the
-    /// kernel fills one as bytes arrive, so a stream's receive stays armed for
-    /// every arrival and a receive that waits holds no buffer of its own.
+    /// Buffers in each shard's group for multishot receives (default 256, or
+    /// [`queue_len`](Self::queue_len) rounded up to a power of two when that is
+    /// fewer): the kernel fills one as bytes arrive, so a stream's receive
+    /// stays armed for every arrival and a receive that waits holds no buffer
+    /// of its own.
     ///
-    /// A power of two up to 32768; 0 turns multishot receives off, and each
-    /// read then takes a buffer of the shard's own pool for its receive.
+    /// 0 turns multishot receives off, and each read then takes a buffer of
+    /// the shard's own pool for its receive. Otherwise a power of two from 1 to
+    /// 32768 and below twice `queue_len`, so the group never takes more than
+    /// half the completion queue (twice `queue_len`, rounded up to a power of
+    /// two); any other value is refused as the configuration's mistake when
+    /// the first shard starts. A ring the system could only make with fewer
+    /// entries than `queue_len` (it had no memory for more) gets a group cut to
+    /// the same rule.
     ///
     /// A kernel that refuses provided buffer rings makes the default backend
     /// choice pick the poller; 0 keeps io_uring there. Ubuntu's 6.8 kernels
@@ -86,6 +101,11 @@ pub struct IoUringConfiguration {
     /// The size in bytes of each of those buffers (default 16384); for UDP,
     /// one that holds the largest datagram expected.
     ///
+    /// From 512 (smaller buffers split a stream into chunks of a few packets
+    /// each) to 1 GiB; a
+    /// value outside is refused as the configuration's mistake when the first
+    /// shard starts. Not checked while `recv_buffers` is 0.
+    ///
     /// A receive is stopped once the bytes it handed out and its reader has
     /// not taken pass an eighth of the group (at least one buffer), and asked
     /// for again when its reader catches up. What the kernel took for it
@@ -95,12 +115,85 @@ pub struct IoUringConfiguration {
     pub recv_buffer_size: u32,
 }
 
+/// The fewest entries a ring may be asked for: the floor a ring made short of
+/// memory is shrunk to.
+#[cfg(ring)]
+pub(crate) const MIN_QUEUE_LEN: u32 = 64;
+/// The smallest receive buffer.
+#[cfg(ring)]
+pub(crate) const MIN_RECV_BUFFER_SIZE: u32 = 512;
+/// The largest receive buffer.
+#[cfg(ring)]
+pub(crate) const MAX_RECV_BUFFER_SIZE: u32 = 1 << 30;
+
+/// The error for a setting outside what the runtime can work with: the
+/// configuration's mistake, naming the setting, its value and what is allowed.
+/// The one place every refused setting is worded.
+pub(crate) fn refuse(
+    setting: &str,
+    value: impl core::fmt::Display,
+    allowed: impl core::fmt::Display,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{setting} is {value}; it must be {allowed}"),
+    )
+}
+
 /// The default of [`IoUringConfiguration::recv_buffers`].
 const DEFAULT_RECV_BUFFERS: u16 = 256;
+
+/// The default receive buffers of a ring of `queue_len` entries: as many as
+/// half its completion queue holds, up to [`DEFAULT_RECV_BUFFERS`].
+fn default_recv_buffers(queue_len: u32) -> u16 {
+    u16::try_from(
+        queue_len
+            .min(u32::from(DEFAULT_RECV_BUFFERS))
+            .next_power_of_two(),
+    )
+    .unwrap_or(DEFAULT_RECV_BUFFERS)
+}
 /// The default of [`IoUringConfiguration::recv_buffer_size`].
 const DEFAULT_RECV_BUFFER_SIZE: u32 = 16 * 1024;
 
 impl IoUringConfiguration {
+    /// Checks the sizes against what a ring can work with.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` naming the setting, its value and the allowed range.
+    #[cfg(ring)]
+    pub(crate) fn validate(&self) -> std::io::Result<()> {
+        if self.queue_len < MIN_QUEUE_LEN {
+            return Err(refuse(
+                "io_uring queue_len",
+                self.queue_len,
+                format_args!("at least {MIN_QUEUE_LEN}"),
+            ));
+        }
+        if self.recv_buffers == 0 {
+            return Ok(());
+        }
+        let twice = self.queue_len.saturating_mul(2);
+        if !self.recv_buffers.is_power_of_two() || u32::from(self.recv_buffers) >= twice {
+            return Err(refuse(
+                "io_uring recv_buffers",
+                self.recv_buffers,
+                format_args!(
+                    "0, or a power of two from 1 to 32768 and below twice queue_len ({twice})"
+                ),
+            ));
+        }
+        if !(MIN_RECV_BUFFER_SIZE..=MAX_RECV_BUFFER_SIZE).contains(&self.recv_buffer_size) {
+            return Err(refuse(
+                "io_uring recv_buffer_size",
+                self.recv_buffer_size,
+                format_args!("from {MIN_RECV_BUFFER_SIZE} to {MAX_RECV_BUFFER_SIZE}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// No polling: a completion wakes its shard by interrupt. The one to pick
     /// when unsure.
     pub fn interrupt_driven(queue_len: u32) -> Self {
@@ -111,7 +204,7 @@ impl IoUringConfiguration {
             per_numa_unbounded_worker_count: None,
             aggressive_poll: false,
             iopoll_enabled: false,
-            recv_buffers: DEFAULT_RECV_BUFFERS,
+            recv_buffers: default_recv_buffers(queue_len),
             recv_buffer_size: DEFAULT_RECV_BUFFER_SIZE,
         }
     }
@@ -123,6 +216,7 @@ impl IoUringConfiguration {
             queue_len,
             sqpoll_wake_interval: Some(2),
             aggressive_poll: true,
+            recv_buffers: default_recv_buffers(queue_len),
             ..Self::default()
         }
     }
@@ -134,6 +228,7 @@ impl IoUringConfiguration {
             queue_len,
             sqpoll_wake_interval: Some(2),
             aggressive_poll: false,
+            recv_buffers: default_recv_buffers(queue_len),
             ..Self::default()
         }
     }
@@ -144,6 +239,7 @@ impl IoUringConfiguration {
         Self {
             queue_len,
             iopoll_enabled: true,
+            recv_buffers: default_recv_buffers(queue_len),
             ..Self::default()
         }
     }
@@ -160,3 +256,6 @@ impl Default for IoUringConfiguration {
         }
     }
 }
+
+#[cfg(all(test, ring))]
+mod tests;
