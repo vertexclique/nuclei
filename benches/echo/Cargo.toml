@@ -8,9 +8,9 @@ publish = false
 
 [dependencies]
 nuclei = { path = "../..", default-features = false, features = ["iouring", "epoll"] }
-monoio = "0.2"
+monoio = { version = "0.2", features = ["sync"] }
 glommio = "0.9"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "fs"] }
 futures-lite = "2"
 socket2 = "0.6"
 hdrhistogram = "7"
