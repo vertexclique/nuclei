@@ -656,10 +656,23 @@ impl Source {
                     }
                     self.ensure_registered()?;
                 }
-                Ok(f(Io {
-                    via: Via::Ops(self.route(current).unwrap_or(route::Route::NotYet)),
+                let route = self.route(current).unwrap_or(route::Route::NotYet);
+                let not_yet = matches!(route, route::Route::NotYet);
+                let out = f(Io {
+                    via: Via::Ops(route),
                     shard: current,
-                }))
+                });
+                // The route was read before the sides were taken: a
+                // registration that finished meanwhile submitted nothing for
+                // what this step left, so the sides are asked to submit.
+                if not_yet && self.reg.state.load(Ordering::Acquire) == REGISTERED {
+                    let mut after = After::default();
+                    let hooks = self.hooks_in(current);
+                    self.read.defer(read_work::SUBMIT, &mut after, &hooks);
+                    self.write.defer(write_work::SUBMIT, &mut after, &hooks);
+                    self.settle(after);
+                }
+                Ok(out)
             });
         }
         #[cfg(readiness)]
