@@ -15,7 +15,16 @@
 //! order, entry and memory together, and go in as completions free room.
 //! One that is cancelled or whose source goes while it waits ends here,
 //! never submitted. A side has one operation out at a time, so the
-//! operations here are bounded by the sources.
+//! operations here are bounded by the sources, apart from the zero-copy
+//! sends below.
+//!
+//! A zero-copy send ends for its side at its first completion, and stays here
+//! only to hold its write's buffer until the kernel's notification, which
+//! comes once the peer acknowledged the bytes: the side goes on meanwhile, so
+//! one side may leave several. Each holds at most a chunk the socket's send
+//! buffer took, and none names its slot or counts against the cap once it
+//! only waits. One still waiting as the shard goes keeps its buffer for good,
+//! as any operation the kernel did not finish does.
 //!
 //! A multishot receive stays in flight across its arrivals: each completion
 //! that says more come (`IORING_CQE_F_MORE`) hands its buffer of the
@@ -410,7 +419,7 @@ impl ShardRing {
         Ok((handled, woken?))
     }
 
-    fn complete(&self, shard: Option<&Shard>, mut cqe: IoUringCqe) {
+    fn complete(&self, shard: Option<&Shard>, cqe: IoUringCqe) {
         if cqe.user_data & FILE_TAG != 0 {
             if cqe.user_data & EXIT_TAG != 0 {
                 self.complete_exit(cqe.user_data, cqe.res);
@@ -419,7 +428,7 @@ impl ShardRing {
             }
             return;
         }
-        if self.zc_first(&cqe) {
+        if self.zero_copy(shard, &cqe) {
             return;
         }
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
@@ -440,20 +449,6 @@ impl ShardRing {
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
             return;
         };
-        if op.mem.is_zc() {
-            #[cfg(test)]
-            self.zc_seen
-                .set((self.zc_seen.get().0, self.zc_seen.get().1 + 1));
-            // The notification: the memory is free, and the send ended as its
-            // first completion said (a send refused before it ran has no
-            // notification, and says it at once).
-            cqe.res = op.mem.zc_result().unwrap_or(cqe.res);
-            if zc_refused(cqe.res) {
-                // No memory to pin: nothing was sent, and the send goes again with a copy.
-                self.zc_denied.set(true);
-                cqe.res = -libc::ECANCELED;
-            }
-        }
         if counts_against_cap(&op.mem) {
             self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
             self.admit_waiting();
@@ -461,24 +456,64 @@ impl ShardRing {
         self.end(shard, op, cqe.res);
     }
 
-    /// The first completion of a zero-copy send, which says how many bytes went and that a
-    /// notification follows (`IORING_CQE_F_MORE`): kept for the notification, which ends the
-    /// send once the kernel is done with its memory. True when `cqe` was such a first completion.
-    fn zc_first(&self, cqe: &IoUringCqe) -> bool {
-        if cqe.flags & IORING_CQE_F_MORE == 0 || cqe.flags & IORING_CQE_F_NOTIF != 0 {
+    /// A completion of a zero-copy send, handled here; false for any other. The first completion,
+    /// with the bytes the kernel took, ends the send for its side at once, which goes on to its
+    /// next chunk or write; the send then stays in the ring only to hold the buffer the kernel may
+    /// still read, until its notification (`IORING_CQE_F_NOTIF`), and no longer names its slot or
+    /// counts against the cap, since it waits on the network. A first completion without
+    /// `IORING_CQE_F_MORE` (a send refused before it ran) has no notification after it. The
+    /// kernel posts the notification after the first completion; one that comes before it is kept
+    /// for it. `proofs/tla/lent/LentZc.tla` checks the rule.
+    fn zero_copy(&self, shard: Option<&Shard>, cqe: &IoUringCqe) -> bool {
+        let notif = cqe.flags & IORING_CQE_F_NOTIF != 0;
+        let mut ops = self.ops.borrow_mut();
+        let Some(op) = ops.get_mut(cqe.user_data) else {
             return false;
-        }
-        let kept = self
-            .ops
-            .borrow_mut()
-            .get_mut(cqe.user_data)
-            .is_some_and(|op| op.mem.zc_first(cqe.res));
+        };
+        let waits = match &mut op.mem {
+            RingMem::SendZc { notified, .. } if notif => {
+                *notified = true;
+                return true;
+            }
+            RingMem::SendZc { notified, .. } => cqe.flags & IORING_CQE_F_MORE != 0 && !*notified,
+            RingMem::ZcHeld(_) if notif => {
+                // The kernel let go of what the send took: so does the send, and the last hold
+                // hands the buffer back.
+                let held = ops.remove(cqe.user_data);
+                drop(ops);
+                #[cfg(test)]
+                self.zc_seen
+                    .set((self.zc_seen.get().0, self.zc_seen.get().1 + 1));
+                drop(held);
+                return true;
+            }
+            _ => return false,
+        };
+        let (source, file, epoch) = (Arc::clone(&op.source), op.file, op.epoch);
+        let ended = if waits {
+            op.mem.hold_for_notification();
+            None
+        } else {
+            ops.remove(cqe.user_data)
+        };
+        drop(ops);
         #[cfg(test)]
-        if kept {
+        if waits {
             self.zc_seen
                 .set((self.zc_seen.get().0 + 1, self.zc_seen.get().1));
         }
-        kept
+        self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
+        self.admit_waiting();
+        let mut res = cqe.res;
+        if zc_refused(res) {
+            // No memory to pin: nothing was sent, and the chunk goes again with a copy.
+            self.zc_denied.set(true);
+            res = -libc::ECANCELED;
+        }
+        let outcome = crate::io::source::ring::zc_outcome(res);
+        self.hand_over(shard, &source, file, epoch, false, outcome);
+        drop(ended);
+        true
     }
 
     /// Buffer `bid` of the receive group came with `res` bytes for the
@@ -635,14 +670,30 @@ impl ShardRing {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed, arrived, dry + 1));
         }
-        let freed = self.files.borrow_mut().done(op.file);
-        self.freed(op.file, freed);
         let kind = op.source.kind();
-        op.source.op_done(
+        let outcome = op.mem.complete(res, kind);
+        self.hand_over(shard, &op.source, op.file, op.epoch, op.read, outcome);
+    }
+
+    /// An operation of `source` on slot `file`, issued in `epoch` for its read side (`read`) or
+    /// its write side, ended for that side with `outcome`: the slot is named once less, and the
+    /// side gets the completion.
+    fn hand_over(
+        &self,
+        shard: Option<&Shard>,
+        source: &Arc<crate::io::source::Source>,
+        file: u32,
+        epoch: u32,
+        read: bool,
+        outcome: crate::io::source::ops::Outcome,
+    ) {
+        let freed = self.files.borrow_mut().done(file);
+        self.freed(file, freed);
+        source.op_done(
             Done {
-                outcome: op.mem.complete(res, kind),
-                epoch: op.epoch,
-                read: op.read,
+                outcome,
+                epoch,
+                read,
             },
             shard,
         );
@@ -763,13 +814,17 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
 
 /// Whether the operation of `mem` counts against the cap on operations in
 /// the kernel. A multishot receive or accept waits on the network for as long
-/// as its connection lives, so counting it would let idle connections fill
-/// the cap and starve the sends that wake them. The one place both the
+/// as its connection lives, and a zero-copy send past its first completion
+/// until the peer acknowledged its bytes, so counting them would let idle
+/// connections fill the cap and starve the sends that wake them. The one place both the
 /// submission and the end of an operation decide it.
 fn counts_against_cap(mem: &RingMem) -> bool {
     !matches!(
         mem,
-        RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } | RingMem::AcceptMulti { .. }
+        RingMem::RecvMulti { .. }
+            | RingMem::RecvFromMulti { .. }
+            | RingMem::AcceptMulti { .. }
+            | RingMem::ZcHeld(_)
     )
 }
 

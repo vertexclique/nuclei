@@ -21,7 +21,10 @@
 //! kernel took the last byte. Writes after it wait until it is out. A lent
 //! buffer whose task went away is withdrawn if none of it went out, and
 //! written to its end by the driver if some did, so the stream gets it whole
-//! or not at all.
+//! or not at all. A zero-copy write ([`Source::write_zero_copy`]) is a lent
+//! write whose large chunks the ring sends without the kernel's copy: it
+//! ends the same way, and its buffer comes back later, once the kernel let
+//! go of it (see `lent`).
 
 use core::future::poll_fn;
 use core::task::{Poll, Waker};
@@ -41,8 +44,14 @@ mod calls;
 mod lent;
 #[cfg(completion)]
 mod ops;
+#[cfg(ring)]
+mod pinned;
 
-use lent::Lent;
+#[cfg(ring)]
+use crate::sync::oneshot;
+use lent::{Held, Lent};
+#[cfg(ring)]
+pub(crate) use pinned::Pinned;
 
 /// The least a write-behind buffer holds, so a run of small writes fills
 /// one buffer rather than waiting on each.
@@ -110,11 +119,13 @@ pub(crate) struct FileRange {
 }
 
 /// Where a lent write goes besides the stream's own bytes: one datagram's destination, or a range
-/// of a file the kernel sends.
+/// of a file the kernel sends; and whether its large chunks go out zero-copy.
 #[derive(Clone, Default)]
 pub(crate) struct Lending<'d> {
     pub(crate) to: Option<Dest<'d>>,
     pub(crate) file: Option<FileRange>,
+    #[cfg(ring)]
+    pub(crate) zero_copy: bool,
 }
 
 #[derive(Default)]

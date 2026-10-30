@@ -67,6 +67,10 @@ pub(crate) enum Want {
     Send(PoolBuf),
     /// Send a stream a task's buffer, from `.1` on.
     SendLent(Vec<u8>, usize),
+    /// Send a stream the buffer of a zero-copy write, from `.1` on: zero-copy when `.2`, the send
+    /// then keeping its hold until the kernel's notification.
+    #[cfg(ring)]
+    SendPinned(crate::io::source::write::Pinned, usize, bool),
     /// Send a datagram from a buffer of the pool.
     SendTo(PoolBuf, Target),
     /// Send a datagram from a task's buffer.
@@ -94,6 +98,8 @@ impl Want {
             | Want::SendLent(..)
             | Want::SendTo(..)
             | Want::SendLentTo(..) => false,
+            #[cfg(ring)]
+            Want::SendPinned(..) => false,
             #[cfg(windows)]
             Want::SendFile(_) => false,
         }
@@ -155,6 +161,9 @@ pub(crate) enum Outcome {
     Connect(Dial, Answer<()>),
     Send(PoolBuf, Answer<usize>),
     SendLent(Vec<u8>, Answer<usize>),
+    /// A send of a zero-copy write's buffer ended for its side; the side holds the buffer.
+    #[cfg(ring)]
+    SendPinned(Answer<usize>),
     SendTo(PoolBuf, Target, Answer<usize>),
     SendLentTo(Vec<u8>, Answer<usize>),
 }

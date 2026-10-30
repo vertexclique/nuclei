@@ -2,6 +2,11 @@
 //! driver writes it out with no copy, and the task takes it back once the kernel took the last
 //! byte. A lent buffer whose task went away is withdrawn if none of it went out, and finished by
 //! the driver if some did.
+//!
+//! A zero-copy write lends its buffer the same way, and the ring sends its large chunks with
+//! zero-copy sends: the first of those shares the buffer (`Pinned`), each send keeping a hold on
+//! it until the kernel's notification. The write still ends for its task once the kernel took the
+//! last byte, and the task gets the receiver the last hold hands the buffer back through.
 
 use super::*;
 
@@ -28,6 +33,50 @@ pub(super) struct Lent {
     /// The range of a file sent in the kernel, with `buf` empty.
     #[cfg(windows)]
     pub(super) file: Option<FileRange>,
+    /// The task asked for zero-copy sends, which the ring makes of large chunks.
+    #[cfg(ring)]
+    pub(super) zero_copy: bool,
+    /// Once a send of it went out zero-copy: the buffer, shared with the sends the kernel may
+    /// still read it for (`buf` is empty), and the receiver that hands it back to the task.
+    #[cfg(ring)]
+    pub(super) pinned: Option<(Pinned, oneshot::Receiver<Vec<u8>>)>,
+}
+
+/// A lent write's buffer on its task's side: the buffer while the task has it, and once a
+/// zero-copy send shares it, the receiver it comes back through.
+#[derive(Default)]
+pub(crate) struct Held {
+    pub(crate) buf: Option<Vec<u8>>,
+    #[cfg(ring)]
+    back: Option<oneshot::Receiver<Vec<u8>>>,
+}
+
+impl Held {
+    pub(crate) fn of(buf: Vec<u8>) -> Self {
+        Self {
+            buf: Some(buf),
+            #[cfg(ring)]
+            back: None,
+        }
+    }
+
+    /// The task holds nothing of it: the buffer is lent to the side.
+    pub(crate) fn lent(&self) -> bool {
+        #[cfg(ring)]
+        if self.back.is_some() {
+            return false;
+        }
+        self.buf.is_none()
+    }
+
+    /// What a zero-copy write gives its task once it ended: the buffer, or what hands it back.
+    #[cfg(ring)]
+    pub(crate) fn released(&mut self) -> crate::net::Released {
+        if let Some(back) = self.back.take() {
+            return crate::net::Released::waiting(back);
+        }
+        crate::net::Released::ready(self.buf.take().unwrap_or_default())
+    }
 }
 
 impl Lent {
@@ -38,7 +87,29 @@ impl Lent {
         if let Some(file) = &self.file {
             return file.len as usize;
         }
-        self.buf.len()
+        self.bytes().len()
+    }
+
+    /// The buffer's bytes, wherever the buffer is.
+    pub(super) fn bytes(&self) -> &[u8] {
+        #[cfg(ring)]
+        if let Some((pinned, _)) = &self.pinned {
+            return pinned.bytes();
+        }
+        &self.buf
+    }
+
+    /// The task's side of it, as the write ends or the task takes it back: the buffer, or once a
+    /// zero-copy send shares it, the receiver it comes back through (this hold goes now).
+    fn into_held(self) -> Held {
+        #[cfg(ring)]
+        if let Some((_, back)) = self.pinned {
+            return Held {
+                buf: None,
+                back: Some(back),
+            };
+        }
+        Held::of(self.buf)
     }
 }
 
@@ -69,15 +140,16 @@ impl WriteState {
             }
         }
         while lent.done.is_none() && !self.blocked {
-            let rest = lent.buf.get(lent.sent..).unwrap_or_default();
+            let rest = lent.bytes().get(lent.sent..).unwrap_or_default();
             match sys::ready(write_bytes(fd, kind, rest)) {
                 None => self.blocked = true,
                 Some(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
                 Some(Ok(n)) => {
                     lent.sent += n;
                     progress = true;
-                    if lent.sent >= lent.buf.len() {
-                        lent.done = Some(Ok(lent.buf.len()));
+                    let len = lent.bytes().len();
+                    if lent.sent >= len {
+                        lent.done = Some(Ok(len));
                     }
                 }
                 Some(Err(err)) => lent.done = Some(Err(err)),
@@ -108,20 +180,21 @@ impl WriteState {
         }
     }
 
-    /// A write of all of a task's own buffer (`held`; `None` while it is
-    /// lent): lent to the side, and written out by the driver at once if
-    /// the socket may take it and on its edges if not. Ready once all of it
-    /// went out (or failed), with the buffer back in `held`.
+    /// A write of all of a task's own buffer (`held`, which holds nothing
+    /// while it is lent): lent to the side, and written out by the driver at
+    /// once if the socket may take it and on its edges if not. Ready once all
+    /// of it went out (or failed), with the buffer, or what hands it back,
+    /// in `held`.
     pub(super) fn write_owned(
         &mut self,
         io: Io<'_>,
         kind: Kind,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Held,
         lending: &Lending<'_>,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
-        if let Some(buf) = held.as_ref() {
+        if let Some(buf) = held.buf.as_ref() {
             if let Some(failure) = self.failed {
                 return Poll::Ready(Err(failure.error()));
             }
@@ -136,7 +209,7 @@ impl WriteState {
                 self.waiters.register(waker);
                 return Poll::Pending;
             }
-            self.lent = held.take().map(|buf| Lent {
+            self.lent = held.buf.take().map(|buf| Lent {
                 buf,
                 sent: 0,
                 done: None,
@@ -146,6 +219,10 @@ impl WriteState {
                 to: lending.to.map(Dest::to_owned),
                 #[cfg(windows)]
                 file: lending.file.clone(),
+                #[cfg(ring)]
+                zero_copy: lending.zero_copy,
+                #[cfg(ring)]
+                pinned: None,
             });
         }
         // The task polls, so the driver's write needs no wake for it.
@@ -169,10 +246,11 @@ impl WriteState {
         if let Some(w) = old {
             after.forget_one(w);
         }
-        let Some(Lent { buf, done, .. }) = self.lent.take() else {
+        let Some(mut lent) = self.lent.take() else {
             return Poll::Ready(Err(io::Error::other("the write lost its buffer")));
         };
-        *held = Some(buf);
+        let done = lent.done.take();
+        *held = lent.into_held();
         // Writes that waited for the lent buffer go on.
         after.wake(&mut self.waiters);
         Poll::Ready(done.unwrap_or(Ok(0)))
@@ -204,19 +282,22 @@ impl WriteState {
         after.wake(&mut self.waiters);
     }
 
-    /// The lent buffer back, as it is, for a poll that ends in an error.
-    pub(super) fn reclaim(&mut self, after: &mut After) -> Option<Vec<u8>> {
+    /// The lent buffer back, as it is, for a poll that ends in an error:
+    /// nothing if it cannot come back now.
+    pub(super) fn reclaim(&mut self, after: &mut After) -> Held {
         if self.lent.as_ref().is_some_and(|l| l.out) {
             // Out with a ring operation, it cannot come back now: the
             // write goes on as if its task went away.
             self.abandon_lent(after);
-            return None;
+            return Held::default();
         }
-        let lent = self.lent.take()?;
-        if let Some(w) = lent.waker {
+        let Some(mut lent) = self.lent.take() else {
+            return Held::default();
+        };
+        if let Some(w) = lent.waker.take() {
             after.forget_one(w);
         }
         after.wake(&mut self.waiters);
-        Some(lent.buf)
+        lent.into_held()
     }
 }
