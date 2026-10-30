@@ -895,33 +895,38 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         return;
     }
     let rt = runtime();
-    let (mine, peer) = UnixStream::pair().unwrap();
-    let (sent, number) = rt.block_on(async {
-        let handle = Handle::new(mine).unwrap();
-        let sent = fill_behind(&handle).await;
-        let number = handle.as_raw_fd();
-        drop(handle);
-        (sent, number)
-    });
-    // A new socket takes the lowest free number. Until the drop's number is
-    // free (its close may come from another thread, and the runtime's own
-    // descriptors may come and go meanwhile), the sockets made are kept, so
-    // every number below it stays taken and the first made after it closes
-    // takes it.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut kept = Vec::new();
-    let (taker, taker_peer) = loop {
-        let (a, b) = UnixStream::pair().unwrap();
-        if a.as_raw_fd() == number {
-            break (a, b);
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the dropped handle's number {number} never came free"
-        );
-        kept.push((a, b));
-        std::thread::sleep(Duration::from_millis(1));
-    };
+    // The runtime may take the number itself the moment it frees (the task
+    // that delivers the bytes makes a copy of the descriptor): the case is
+    // then made again, with a new handle.
+    let (peer, sent, kept, taker, taker_peer) = (0..20)
+        .find_map(|_| {
+            let (mine, peer) = UnixStream::pair().unwrap();
+            let (sent, number) = rt.block_on(async {
+                let handle = Handle::new(mine).unwrap();
+                let sent = fill_behind(&handle).await;
+                let number = handle.as_raw_fd();
+                drop(handle);
+                (sent, number)
+            });
+            // A new socket takes the lowest free number. Until the drop's
+            // number is free (its close may come from another thread), the
+            // sockets made below it are kept, so every number under it stays
+            // taken and the first made after it closes takes it; those made
+            // above it are let go at once, which bounds the descriptors used.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut kept = Vec::new();
+            while std::time::Instant::now() < deadline {
+                let (a, b) = UnixStream::pair().unwrap();
+                match a.as_raw_fd().cmp(&number) {
+                    core::cmp::Ordering::Equal => return Some((peer, sent, kept, a, b)),
+                    core::cmp::Ordering::Less => kept.push((a, b)),
+                    core::cmp::Ordering::Greater => {}
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            None
+        })
+        .expect("the dropped handle's number never came free to the test");
     let got = std::thread::spawn(move || read_to_end_blocking(peer))
         .join()
         .unwrap();
@@ -940,6 +945,45 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         matches!((&taker_peer).read(&mut buf), Ok(0)),
         "bytes leaked into the new socket"
     );
+}
+
+/// Many handles dropped with bytes still to send, under a lowered limit on
+/// descriptors: each cycle's descriptors (the handle's, its copy, the peer's)
+/// are all closed again, so the count returns to where it began and the limit
+/// is never met.
+#[cfg(unix)]
+#[test]
+fn dropped_handles_with_unsent_bytes_leave_no_descriptor_open() {
+    if !alone("net::tests::dropped_handles_with_unsent_bytes_leave_no_descriptor_open") {
+        return;
+    }
+    let open = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let rt = runtime();
+    let before = open();
+    let limit = libc::rlimit {
+        rlim_cur: before as libc::rlim_t + 64,
+        rlim_max: before as libc::rlim_t + 64,
+    };
+    // SAFETY: lowers this process's own limit with a valid struct.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    for _ in 0..1500 {
+        let (mine, peer) = UnixStream::pair().unwrap();
+        rt.block_on(async {
+            let handle = Handle::new(mine).unwrap();
+            fill_behind(&handle).await;
+            drop(handle);
+        });
+        drop(peer);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while open() > before + 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} descriptors open, {before} before",
+            open()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(windows)]
