@@ -122,6 +122,17 @@ fn on_poller() -> bool {
 /// On a driver without zero-copy sends the write is copied, and its buffer is back at once.
 #[test]
 fn a_zero_copy_write_on_a_poller_is_copied_and_ready_at_once() {
+    let poller = if cfg!(windows) {
+        "iocp"
+    } else if cfg!(target_os = "linux") {
+        "epoll"
+    } else {
+        "kqueue"
+    };
+    if std::env::var("NUCLEI_BACKEND").is_ok_and(|b| !b.is_empty() && b != "auto" && b != poller) {
+        eprintln!("skipping: NUCLEI_BACKEND names another backend than the poller");
+        return;
+    }
     let rt = Builder::new()
         .worker_threads(1)
         .pin_workers(false)
