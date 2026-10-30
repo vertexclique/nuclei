@@ -1,7 +1,8 @@
 //! `send_file`: a range of a file sent to a stream.
 //!
-//! Where the system has a call for it (`sendfile(2)`), the bytes go from the
-//! page cache to the socket in the kernel and never enter user space; the
+//! Where the system has a call for it (`sendfile(2)`, or `TransmitFile` on
+//! Windows), the bytes go from the page cache to the socket in the kernel
+//! and never enter user space; the
 //! call reads the file, so a page that is not cached blocks the thread that
 //! makes it, and it is made on the blocking pool, a chunk at a time, never
 //! on a shard. A full socket is waited for through the stream's own
@@ -58,9 +59,11 @@ macro_rules! send_file {
             /// the file ends first.
             ///
             /// Where the system has `sendfile(2)` (Linux, Android, macOS,
-            /// FreeBSD) the bytes go from the page cache to the socket in the
-            /// kernel and never enter user space; elsewhere they are read at
-            /// `offset` and written, which works the same and copies. The
+            /// FreeBSD) or `TransmitFile` (Windows, through the completion
+            /// port) the bytes go from the page cache to the socket in the
+            /// kernel and never enter user space; elsewhere (and on a Windows
+            /// provider without `TransmitFile`) they are read at `offset` and
+            /// written, which works the same and copies. The
             /// file's own cursor does not move. Bytes written to the stream
             /// before the call go out first; do not write to the stream
             /// while the call runs, or its bytes may land between the
@@ -85,6 +88,10 @@ macro_rules! send_file {
                 #[cfg(unix)]
                 if crate::io::sys::SENDS_FILES {
                     return self.send_file_in_kernel(file, offset, len).await;
+                }
+                #[cfg(windows)]
+                if crate::io::sys::transmit_file_available() {
+                    return self.send_file_transmitted(file, offset, len).await;
                 }
                 self.send_file_by_copy(file, offset, len).await
             }
@@ -117,6 +124,26 @@ macro_rules! send_file {
                             return Err(err);
                         }
                     }
+                }
+                Ok(sent)
+            }
+
+            /// `TransmitFile` on the completion port, a chunk at a time. The range is cut to
+            /// the file first, as the call sends exactly what it is asked for or fails.
+            #[cfg(windows)]
+            async fn send_file_transmitted(&self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
+                use std::os::windows::io::AsRawHandle;
+                let raw = file.get_ref().as_raw_handle() as usize as crate::io::raw::Raw;
+                let handle = Arc::new(crate::io::sys::duplicate_file(raw)?);
+                let len = len.min(file.get_ref().metadata()?.len().saturating_sub(offset));
+                let mut sent = 0u64;
+                while sent < len {
+                    let want = (len - sent).min(SEND_FILE_CHUNK) as u32;
+                    let wrote = self
+                        .source()
+                        .send_file_range(Arc::clone(&handle), offset + sent, want)
+                        .await?;
+                    sent += wrote as u64;
                 }
                 Ok(sent)
             }

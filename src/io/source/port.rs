@@ -72,6 +72,8 @@ enum PortMem {
     SendLent(Vec<u8>),
     SendTo(PoolBuf, Target),
     SendLentTo(Vec<u8>),
+    /// The file a `TransmitFile` reads, kept open until its packet.
+    SendFile(#[expect(dead_code, reason = "kept open until the packet")] Arc<OwnedHandle>),
 }
 
 /// A source's state on a port.
@@ -515,6 +517,26 @@ fn start(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET, want: Want) -> 
                 }
             }
         }
+        NotStream::SendFile(file) => {
+            let Some(transmit) = winsock::ext().ok().and_then(|ext| ext.transmit_file) else {
+                return fail(
+                    inner,
+                    PortMem::SendFile(file.handle),
+                    io::ErrorKind::Unsupported.into(),
+                );
+            };
+            let raw = file.handle.as_raw_handle();
+            inner.mem = Some(PortMem::SendFile(file.handle));
+            // SAFETY: the slot's OVERLAPPED is ours until the packet; the offset is where the
+            // file is read.
+            unsafe {
+                (*ov).Offset = file.offset as DWORD;
+                (*ov).OffsetHigh = (file.offset >> 32) as DWORD;
+            }
+            // SAFETY: the socket is the source's, the file handle is kept in the slot until the
+            // packet, and `ov` is the slot's.
+            queued_bool(unsafe { transmit(socket, raw.cast(), file.len, 0, ov, null.cast(), 0) })
+        }
         NotStream::Accept => {
             let made = winsock::ext().and_then(|ext| {
                 let family = sys::family(socket as Raw)?;
@@ -619,6 +641,7 @@ enum NotStream {
     Connect(Dial),
     SendTo(PoolBuf, Target),
     SendLentTo(Vec<u8>, Target),
+    SendFile(super::write::FileRange),
 }
 
 impl NotStream {
@@ -630,6 +653,7 @@ impl NotStream {
             NotStream::RecvFrom(buf) => PortMem::RecvFrom(buf),
             NotStream::RecvLentFrom(buf) => PortMem::RecvLentFrom(buf),
             NotStream::SendLentTo(buf, _) => PortMem::SendLentTo(buf),
+            NotStream::SendFile(file) => PortMem::SendFile(file.handle),
             NotStream::Connect(dial) => PortMem::Connect(dial),
             NotStream::SendTo(buf, target) => PortMem::SendTo(buf, target),
         });
@@ -672,6 +696,7 @@ fn stream_memory(inner: &mut Inner, want: Want) -> Result<bool, NotStream> {
         Want::Accept => Err(NotStream::Accept),
         Want::RecvFrom(buf) => Err(NotStream::RecvFrom(buf)),
         Want::RecvLentFrom(buf) => Err(NotStream::RecvLentFrom(buf)),
+        Want::SendFile(file) => Err(NotStream::SendFile(file)),
         Want::SendLentTo(buf, target) => Err(NotStream::SendLentTo(buf, target)),
         Want::Connect(dial) => Err(NotStream::Connect(dial)),
         Want::SendTo(buf, target) => Err(NotStream::SendTo(buf, target)),
@@ -932,6 +957,8 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         PortMem::SendLent(buf) => Outcome::SendLent(buf, answer),
         PortMem::SendTo(buf, target) => Outcome::SendTo(buf, target, answer),
         PortMem::SendLentTo(buf) => Outcome::SendLentTo(buf, answer),
+        // The lent write's end, with no buffer to give back.
+        PortMem::SendFile(_) => Outcome::SendLent(Vec::new(), answer),
     }
 }
 

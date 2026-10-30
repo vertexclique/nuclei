@@ -35,6 +35,16 @@ pub(crate) type ConnectExFn = unsafe extern "system" fn(
     lpOverlapped: *mut OVERLAPPED,
 ) -> BOOL;
 
+pub(crate) type TransmitFileFn = unsafe extern "system" fn(
+    hSocket: SOCKET,
+    hFile: super::HANDLE,
+    nNumberOfBytesToWrite: DWORD,
+    nNumberOfBytesPerSend: DWORD,
+    lpOverlapped: *mut OVERLAPPED,
+    lpTransmitBuffers: *const c_void,
+    dwReserved: DWORD,
+) -> BOOL;
+
 pub(crate) type GetAcceptExSockaddrsFn = unsafe extern "system" fn(
     lpOutputBuffer: *const c_void,
     dwReceiveDataLength: DWORD,
@@ -58,6 +68,12 @@ const WSAID_GETACCEPTEXSOCKADDRS: GUID = GUID {
     data3: 0x11cf,
     data4: [0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92],
 };
+const WSAID_TRANSMITFILE: GUID = GUID {
+    data1: 0xb536_7df0,
+    data2: 0xcbac,
+    data3: 0x11cf,
+    data4: [0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92],
+};
 const WSAID_CONNECTEX: GUID = GUID {
     data1: 0x25a2_07b9,
     data2: 0xddf3,
@@ -71,6 +87,8 @@ pub(crate) struct Ext {
     pub(crate) accept_ex: AcceptExFn,
     pub(crate) get_accept_ex_sockaddrs: GetAcceptExSockaddrsFn,
     pub(crate) connect_ex: ConnectExFn,
+    /// `TransmitFile`, which a provider may lack: a file is then sent by reading and writing.
+    pub(crate) transmit_file: Option<TransmitFileFn>,
 }
 
 /// Winsock started, and the extension functions, looked up once.
@@ -131,6 +149,9 @@ fn look_up() -> io::Result<Ext> {
                     probe,
                     &WSAID_CONNECTEX,
                 )?),
+                transmit_file: pointer(probe, &WSAID_TRANSMITFILE)
+                    .ok()
+                    .map(|f| core::mem::transmute::<*const c_void, TransmitFileFn>(f)),
             })
         }
     })();

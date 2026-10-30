@@ -21,6 +21,19 @@ use crate::io::source::route::Route;
 use crate::io::source::{Failure, Io, Via};
 use crate::io::sys;
 
+/// The operation that sends a lent write, whose buffer moves into it: a file range, a datagram or
+/// the rest of a stream's bytes.
+fn lent_want(lent: &mut Lent) -> Want {
+    #[cfg(windows)]
+    if let Some(file) = lent.file.clone() {
+        return Want::SendFile(file);
+    }
+    match lent.to.clone() {
+        Some(to) => Want::SendLentTo(core::mem::take(&mut lent.buf), to),
+        None => Want::SendLent(core::mem::take(&mut lent.buf), lent.sent),
+    }
+}
+
 impl WriteState {
     /// What the side holds for the driver: a connect, bytes, a lent buffer
     /// not out yet, or a datagram.
@@ -92,10 +105,7 @@ impl WriteState {
             Want::Send(buf)
         } else if let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none() && !l.out) {
             lent.out = true;
-            match lent.to.clone() {
-                Some(to) => Want::SendLentTo(core::mem::take(&mut lent.buf), to),
-                None => Want::SendLent(core::mem::take(&mut lent.buf), lent.sent),
-            }
+            lent_want(lent)
         } else if let Some((buf, target)) = self.queued.take() {
             Want::SendTo(buf, target)
         } else {
@@ -235,8 +245,8 @@ impl WriteState {
             Answer::Done(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
             Answer::Done(Ok(n)) => {
                 lent.sent += n;
-                if lent.sent >= lent.buf.len() {
-                    lent.done = Some(Ok(lent.buf.len()));
+                if lent.sent >= lent.total() {
+                    lent.done = Some(Ok(lent.total()));
                 }
             }
             Answer::Done(Err(err)) => lent.done = Some(Err(err)),

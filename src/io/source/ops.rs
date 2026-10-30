@@ -71,6 +71,9 @@ pub(crate) enum Want {
     SendTo(PoolBuf, Target),
     /// Send a datagram from a task's buffer.
     SendLentTo(Vec<u8>, Target),
+    /// Send a range of a file to a stream, in the kernel.
+    #[cfg(windows)]
+    SendFile(crate::io::source::write::FileRange),
 }
 
 impl Want {
@@ -91,6 +94,8 @@ impl Want {
             | Want::SendLent(..)
             | Want::SendTo(..)
             | Want::SendLentTo(..) => false,
+            #[cfg(windows)]
+            Want::SendFile(_) => false,
         }
     }
 
