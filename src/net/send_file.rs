@@ -134,7 +134,12 @@ macro_rules! send_file {
             async fn send_file_transmitted(&self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
                 use std::os::windows::io::AsRawHandle;
                 let raw = file.get_ref().as_raw_handle() as usize as crate::io::raw::Raw;
-                let handle = Arc::new(crate::io::sys::duplicate_file(raw)?);
+                // A file whose sharing forbids another reader is sent by copy, which reads at
+                // the offsets through the handle itself.
+                let Ok(handle) = crate::io::sys::reopen_overlapped(raw) else {
+                    return self.send_file_by_copy(file, offset, len).await;
+                };
+                let handle = Arc::new(handle);
                 let len = len.min(file.get_ref().metadata()?.len().saturating_sub(offset));
                 let mut sent = 0u64;
                 while sent < len {

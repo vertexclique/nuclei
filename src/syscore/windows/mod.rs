@@ -22,6 +22,10 @@ pub(crate) type ULONG_PTR = usize;
 pub(crate) type NTSTATUS = i32;
 
 pub(crate) const INVALID_HANDLE_VALUE: HANDLE = usize::MAX as HANDLE;
+pub(crate) const GENERIC_READ: DWORD = 0x8000_0000;
+pub(crate) const FILE_SHARE_READ: DWORD = 0x1;
+pub(crate) const FILE_SHARE_WRITE: DWORD = 0x2;
+pub(crate) const FILE_SHARE_DELETE: DWORD = 0x4;
 pub(crate) const INVALID_SOCKET: SOCKET = !0;
 pub(crate) const SOCKET_ERROR: i32 = -1;
 pub(crate) const INFINITE: DWORD = 0xFFFF_FFFF;
@@ -237,7 +241,6 @@ pub(crate) const FILE_TYPE_DISK: DWORD = 1;
 pub(crate) const DUPLICATE_SAME_ACCESS: DWORD = 2;
 #[cfg(test)]
 pub(crate) const PIPE_ACCESS_DUPLEX: DWORD = 0x3;
-#[cfg(test)]
 pub(crate) const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
 pub(crate) const ERROR_MORE_DATA: i32 = 234;
 
@@ -356,6 +359,12 @@ unsafe extern "system" {
         lpSecurityAttributes: *const c_void,
     ) -> HANDLE;
     pub(crate) fn CancelSynchronousIo(hThread: HANDLE) -> BOOL;
+    pub(crate) fn ReOpenFile(
+        hOriginalFile: HANDLE,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        dwFlagsAndAttributes: DWORD,
+    ) -> HANDLE;
     pub(crate) fn DuplicateHandle(
         hSourceProcessHandle: HANDLE,
         hSourceHandle: HANDLE,

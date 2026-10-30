@@ -226,9 +226,19 @@ pub(crate) fn datagram_too_long(raw: Raw, len: usize) -> Option<io::Error> {
     }
 }
 
-/// Keeps an ICMP port-unreachable from failing the next receive of a UDP
-/// socket (Windows' default), as unix sockets behave.
+/// Keeps an ICMP port-unreachable from failing the next receive of an
+/// unconnected UDP socket (Windows' default), as an unconnected unix socket
+/// behaves. A connected socket keeps the report, as a connected unix socket's
+/// next receive fails once its peer is gone: without it a receive from a gone
+/// peer would wait for good.
 pub(crate) fn udp_connreset_off(raw: Raw) -> io::Result<()> {
+    // SAFETY: the caller keeps the socket open for the call; the copy is never dropped.
+    let socket = core::mem::ManuallyDrop::new(unsafe {
+        std::net::UdpSocket::from_raw_socket(socket_of(raw) as _)
+    });
+    if socket.peer_addr().is_ok() {
+        return Ok(());
+    }
     let off: u32 = 0;
     let mut bytes: DWORD = 0;
     // SAFETY: the control code takes a BOOL in and nothing out.
@@ -447,6 +457,33 @@ pub(crate) fn file_size(raw: Raw) -> io::Result<u64> {
 pub(crate) fn duplicate_file(raw: Raw) -> io::Result<OwnedHandle> {
     // SAFETY: the caller keeps the handle open for the call.
     unsafe { BorrowedHandle::borrow_raw(handle_of(raw).cast()) }.try_clone_to_owned()
+}
+
+/// A handle of its own on the file `raw` names, opened for overlapped IO, for `TransmitFile`:
+/// it reads at the offset each call names. A copy made with `DuplicateHandle` shares the
+/// file's position, and on a handle opened without overlapped IO `TransmitFile` reads from
+/// that position and moves it, so a send would start where an earlier one stopped and move
+/// the caller's cursor.
+pub(crate) fn reopen_overlapped(raw: Raw) -> io::Result<OwnedHandle> {
+    use crate::syscore::windows::{
+        FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
+        INVALID_HANDLE_VALUE, ReOpenFile,
+    };
+    use std::os::windows::io::FromRawHandle;
+    // SAFETY: the caller keeps the handle open for the call; the new handle is owned at once.
+    let handle = unsafe {
+        ReOpenFile(
+            handle_of(raw),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OVERLAPPED,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a handle just opened, owned by nothing else.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
 /// Whether the provider has `TransmitFile`, which sends a file range in the kernel.
