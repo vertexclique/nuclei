@@ -54,7 +54,8 @@
 (* no room is kept for: an accept's connections and the end of each        *)
 (* long-lived operation. Past the queue the kernel holds those             *)
 (* (IORING_FEAT_NODROP, which the poller requires) until the shard takes   *)
-(* them: none is lost, and none holds up a finite operation.               *)
+(* them: none is lost, and none holds up a finite operation                *)
+(* (tests/cq_overflow.rs ends many times the queue's entries at once).     *)
 (***************************************************************************)
 EXTENDS Integers
 

@@ -1489,7 +1489,12 @@ many waits it lasts (`stutter`), that the count never passes the looks that saw 
 stretches of looks add up when the first ends clear (`split_at_clear`). Its witness shows why
 the look after the completions is there: with it two floods count two, and without it they count
 one; its mutation, counting every set look, breaks `stutter`. An overflow that begins and ends
-between two looks is seen by neither the code nor the model.
+between two looks is seen by neither the code nor the model. `tests/cq_overflow.rs` overflows
+the smallest ring's queue for real: while its shard's thread is held, three times the queue's
+entries of peers connect to a listener with a multishot accept armed and send a request each, and
+once the thread enters the kernel again the accept fills the queue and its last completion goes
+past it. The test checks the overflow was counted and that every peer is accepted and gets its
+own bytes back.
 
 ## A shard handed to another thread
 
