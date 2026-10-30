@@ -669,7 +669,7 @@ fn entry(
         }
         Want::SendLent(buf, from) => {
             let rest = buf.get(from..).unwrap_or_default();
-            if matches!(kind, Kind::Tcp | Kind::Stream)
+            if kind == Kind::Tcp
                 && rest.len() >= SEND_ZC_MIN
                 && ring.zc_stream()
             {

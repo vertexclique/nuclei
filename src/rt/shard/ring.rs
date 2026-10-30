@@ -709,9 +709,9 @@ impl ShardRing {
     }
 }
 
-/// Whether the kernel refused a zero-copy send for lack of memory it may pin.
+/// Whether the kernel refused a zero-copy send: no memory it may pin, or a socket that has none.
 fn zc_refused(res: i32) -> bool {
-    [-libc::ENOBUFS, -libc::ENOMEM, -libc::EPERM].contains(&res)
+    [-libc::ENOBUFS, -libc::ENOMEM, -libc::EPERM, -libc::EOPNOTSUPP].contains(&res)
 }
 
 /// How many buffers the receive group of a ring with `cq_entries`
