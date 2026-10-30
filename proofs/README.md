@@ -425,13 +425,19 @@ and counts a park before it says it parks; parked, it claims the advance, looks 
 unchanged), moves the clock to the earliest deadline and wakes the shards whose timers came
 due. A shard that wakes, or that finds work as it is about to sleep, waits for an advance in
 progress before it reads the clock. A blocking job wakes its task before it counts itself out
-of the jobs in flight, then tries the advance too. The family checks configurations that must
-pass (two shards with a pusher and a blocking job; two shards with a timer each, the scenario the
-races below need; three shards; timers armed again by the tasks they wake), each with
-`ClockNeverPassesArmed` (no jump leaves an armed timer behind),
+of the jobs in flight, then tries the advance too. The family checks five configurations that
+must pass. Three check `ClockNeverPassesArmed` (no jump leaves an armed timer behind) and
 `NoBadJump` (every jump comes over a moment, between its two looks, at which every shard was
-idle, with no job in flight) and the liveness property `TimersFire` (every armed timer fires:
-no runtime hangs with its shards asleep and a timer armed); one mutation per rule (a deadline
+idle, with no job in flight) at full size: two shards with a pusher and a blocking job; two
+shards with a timer each, the scenario the races below need; three shards. With no blocking job
+the shards are alike, so those two (and the races' own runs) check each state once up to the
+shards' names (a symmetry set), and every run forgets a value nobody reads again (whether a
+shard's own timer came due, the shard a push went to) once it was read. Two smaller ones
+check both and, over every behaviour, the liveness property `TimersFire` (every armed timer
+fires: no runtime hangs with its shards asleep and a timer armed): two shards with the blocking
+job alone, and two shards with the pusher alone, whose timers the tasks they wake arm again. A
+timer on each of two shards, or three shards, are too many states to check every behaviour, so
+`TimersFire` is checked where one shard arms its timers. Then one mutation per rule (a deadline
 published after the park, a busy path that does not wait for the advance, one look instead of
 two, a woken shard that does not wait, no look at the jobs, no attempt at the park); and a
 witness that the clock jumps at all. Writing the model found the first two of those races in the

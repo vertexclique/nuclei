@@ -22,6 +22,12 @@
 (* back and a notification left). What is abstract: a shard's work is a    *)
 (* count; running one item may arm the shard's timer (at most `Timers`     *)
 (* times) some delay after the clock; the clock moves only by the jump.    *)
+(*                                                                          *)
+(* What is forgotten: a value no step reads again before it is next        *)
+(* written goes back to its start once read for the last time (whether a   *)
+(* shard's own timer came due, once it has slept; the shard a push went    *)
+(* to, once it was woken). Two states that differ only there have the same *)
+(* futures, so TLC walks one of them; every check sees what it saw before. *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, Sequences, TLC
 
@@ -150,6 +156,9 @@ S_try: \* parked: try to move the clock, unless the own timer is due already
 S_sleep: \* until a notification (a shard with nothing left sleeps here for good)
     if ~due[self] then await notified[self] end if;
     notified[self] := FALSE;
+    \* Whether the own timer came due is read here for the last time before the next
+    \* attempt sets it again: forgotten, so two states that differ only in it are one.
+    due[self] := FALSE;
 S_end:
     parked[self] := FALSE;
 S_wait: \* an advance in progress ends before the shard reads the clock
@@ -176,6 +185,9 @@ P1:
         end with;
 P2: \* the wake: the parked flag swapped back, a notification left
         if parked[target] then parked[target] := FALSE || notified[target] := TRUE end if;
+        \* The shard just pushed to is not read again before the next push picks one:
+        \* forgotten, so two states that differ only in it are one.
+        target := 0;
     end while;
 end process;
 
@@ -624,5 +636,10 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 \* Every armed timer eventually fires: a runtime whose shards all sleep with a timer armed and
 \* nothing to wake them hangs, and breaks this. (A quiet runtime, every shard asleep with no timer,
 \* is a final state: the configurations do not check deadlock.)
-TimersFire == \A s \in Shards : [](deadline[s] # Inf => <>(deadline[s] = Inf))
+\* Written as "from every moment on, a moment comes (now or later) at which the shard has no timer
+\* armed", which is the same promise as "always, once a timer is armed, it later fires": from a
+\* moment with no timer armed, that moment itself is the one; from a moment with one armed, the
+\* moment it fires is. And a timer that never fired would leave no such moment after it was armed.
+\* TLC checks this form directly, without the extra automaton the other form needs, so it costs less.
+TimersFire == \A s \in Shards : []<>(deadline[s] = Inf)
 =============================================================================
