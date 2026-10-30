@@ -757,11 +757,14 @@ unsafe fn finish(slot: &Slot, code: Option<i32>, bytes: usize) {
         return;
     };
     let outcome = outcome(inner, mem, code, bytes);
-    source.op_done(Done {
-        outcome,
-        epoch: inner.epoch,
-        read: inner.read,
-    });
+    source.op_done(
+        Done {
+            outcome,
+            epoch: inner.epoch,
+            read: inner.read,
+        },
+        None,
+    );
 }
 
 /// The outcome of an operation on `mem`, from what the kernel left in the

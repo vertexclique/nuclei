@@ -840,7 +840,7 @@ impl Shard {
                 Ok(events)
             }
             #[cfg(ring)]
-            Driver::Ring(ring) => ring.wait(timeout).map(|(handled, _)| handled),
+            Driver::Ring(ring) => ring.wait(Some(self), timeout).map(|(handled, _)| handled),
         }
     }
 

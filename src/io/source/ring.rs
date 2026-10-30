@@ -377,11 +377,14 @@ impl RingIssuer<'_> {
             ),
             Err(outcome) => {
                 self.source.op_out();
-                self.source.op_done(Done {
-                    outcome: *outcome,
-                    epoch,
-                    read,
-                });
+                self.source.op_done(
+                    Done {
+                        outcome: *outcome,
+                        epoch,
+                        read,
+                    },
+                    None,
+                );
                 NOT_AN_OP
             }
         }
@@ -635,9 +638,14 @@ impl Source {
     /// receive or accept, submitted in `epoch`. The side takes it at once if
     /// free, else its holder does as it lets go. The wakes and drops come
     /// back to be run once the caller no longer borrows the source.
-    pub(crate) fn ring_arrival(self: &Arc<Self>, arrival: Arrival, epoch: u32) -> After {
+    pub(crate) fn ring_arrival(
+        self: &Arc<Self>,
+        arrival: Arrival,
+        epoch: u32,
+        shard: Option<&crate::rt::shard::Shard>,
+    ) -> After {
         let mut after = After::default();
-        let hooks = self.hooks();
+        let hooks = self.hooks_in(shard);
         // The side free: the arrival goes in now, with no trip through the
         // queue (whose segments would be allocated as it grows). Only this
         // thread pushes to the queue, so what waits there came before this

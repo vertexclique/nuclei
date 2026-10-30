@@ -30,7 +30,7 @@ use crate::io::raw::Owned;
 use std::sync::Arc;
 use std::task::Context;
 
-use super::{Addr, Failure, Io, Kind, Source};
+use super::{Addr, Failure, Io, Kind, Source, Via};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
 #[cfg(readiness)]
@@ -287,7 +287,7 @@ impl ReadState {
     /// comes back. A whole datagram no buffer of the pool could hold fails
     /// the operation instead.
     fn buffer(&mut self, len: usize, whole: bool, after: &mut After) -> Option<PoolBuf> {
-        if whole && let Some(err) = crate::io::side::whole_too_large(len) {
+        if whole && let Some(err) = crate::io::side::whole_too_large(None, len) {
             self.error = Some(err);
             return None;
         }
@@ -328,13 +328,13 @@ impl ReadState {
     /// while the last call would have blocked and no edge came since, or
     /// while a result waits to be taken.
     fn complete(&mut self, io: Io<'_>, kind: Kind, len: usize, after: &mut After) {
-        match io {
+        match io.via {
             #[cfg(readiness)]
-            Io::Fd(fd) => self.complete_fd(fd, kind, len, after),
+            Via::Fd(fd) => self.complete_fd(fd, kind, len, after),
             #[cfg(completion)]
-            Io::Ops(route) => self.submit_ops(route, kind, len, after),
+            Via::Ops(route) => self.submit_ops(route, kind, len, after),
             #[cfg(not(completion))]
-            Io::None(never, _) => match never {},
+            Via::None(never, _) => match never {},
         }
     }
 

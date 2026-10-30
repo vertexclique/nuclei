@@ -18,7 +18,7 @@ use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::ops::{Answer, Done, Outcome, Want};
 use crate::io::source::route::Route;
-use crate::io::source::{Failure, Io};
+use crate::io::source::{Failure, Io, Via};
 use crate::io::sys;
 
 impl WriteState {
@@ -42,7 +42,7 @@ impl WriteState {
         expect(irrefutable_let_patterns, reason = "a port is the only driver there")
     )]
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
-        if let Io::Ops(route) = io {
+        if let Via::Ops(route) = io.via {
             self.submit_ops(route, kind, after);
         }
     }

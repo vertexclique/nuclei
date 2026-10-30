@@ -80,8 +80,11 @@ impl Source {
     ) -> Poll<io::Result<R>> {
         let mut after = After::default();
         let polled = self.with_io(|io| {
-            self.read
-                .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+            self.read.poll(
+                &mut after,
+                cx.waker(),
+                &self.hooks_in(io.shard),
+                |st, after| {
                     #[cfg(unix)]
                     if drive {
                         st.drive();
@@ -89,7 +92,8 @@ impl Source {
                     #[cfg(not(unix))]
                     let _ = drive;
                     step(st, io, cx.waker(), after)
-                })
+                },
+            )
         });
         match polled {
             Ok(poll) => self.finish_poll(after, poll),

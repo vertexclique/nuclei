@@ -42,6 +42,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
+use super::Shard;
 use super::recv::RecvGroup;
 use crate::fs::ring::FileOp;
 use crate::io::source::ops::Done;
@@ -204,7 +205,7 @@ impl ShardRing {
             Ok(user_data) => user_data,
             // Past 2^32 - 2 operations at once (two per source at most).
             Err(op) => {
-                self.end(op, -libc::ENOBUFS);
+                self.end(None, op, -libc::ENOBUFS);
                 return IGNORED;
             }
         };
@@ -281,7 +282,7 @@ impl ShardRing {
         };
         if waiting.is_some() {
             if let Some(op) = self.ops.borrow_mut().remove(user_data) {
-                self.end(op, -libc::ECANCELED);
+                self.end(None, op, -libc::ECANCELED);
             }
             return;
         }
@@ -337,19 +338,26 @@ impl ShardRing {
     /// Submits what is queued and waits up to `timeout` for completions,
     /// which are handed to their sources. Returns how many it handled and
     /// whether a wake came.
-    pub(crate) fn wait(&self, timeout: Option<Duration>) -> io::Result<(usize, bool)> {
+    ///
+    /// `shard` is the shard whose thread calls, when it is at hand: the
+    /// sources then do not look it up for each completion.
+    pub(crate) fn wait(
+        &self,
+        shard: Option<&Shard>,
+        timeout: Option<Duration>,
+    ) -> io::Result<(usize, bool)> {
         self.take_back();
         let mut cqes = core::mem::take(&mut *self.cqes.borrow_mut());
         let woken = self.poller.borrow_mut().wait(timeout, &mut cqes);
         let handled = cqes.len();
         for cqe in cqes.drain(..) {
-            self.complete(cqe);
+            self.complete(shard, cqe);
         }
         *self.cqes.borrow_mut() = cqes;
         Ok((handled, woken?))
     }
 
-    fn complete(&self, cqe: IoUringCqe) {
+    fn complete(&self, shard: Option<&Shard>, cqe: IoUringCqe) {
         if cqe.user_data & FILE_TAG != 0 {
             if cqe.user_data & EXIT_TAG != 0 {
                 self.complete_exit(cqe.user_data, cqe.res);
@@ -359,9 +367,9 @@ impl ShardRing {
             return;
         }
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
-            self.arrived(cqe.user_data, bid, cqe.res);
+            self.arrived(shard, cqe.user_data, bid, cqe.res);
         } else if cqe.res >= 0 {
-            self.accepted(cqe.user_data, cqe.res);
+            self.accepted(shard, cqe.user_data, cqe.res);
         }
         // More of a multishot receive's arrivals come: it stays in flight.
         if cqe.flags & IORING_CQE_F_MORE != 0 {
@@ -374,14 +382,14 @@ impl ShardRing {
             self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
             self.admit_waiting();
         }
-        self.end(op, cqe.res);
+        self.end(shard, op, cqe.res);
     }
 
     /// Buffer `bid` of the receive group came with `res` bytes for the
     /// multishot receive of `user_data`: its source gets them as a chunk.
     /// Past the cap of bytes it holds, the receive is stopped; its source
     /// asks for another once its reader took them.
-    fn arrived(&self, user_data: u64, bid: u16, res: i32) {
+    fn arrived(&self, shard: Option<&Shard>, user_data: u64, bid: u16, res: i32) {
         let mut stop = false;
         let delivery = {
             let mut recv = self.recv.borrow_mut();
@@ -428,6 +436,8 @@ impl ShardRing {
         }
         // Handed over with nothing borrowed: the source may submit at once.
         if let Some((source, chunk, epoch, datagram)) = delivery {
+            // Before the view, so it drops after it.
+            let _unwound = crate::io::side::Unwound::enter();
             let (after, starved) = {
                 // SAFETY: the op's slab entry owns a strong count of the
                 // source until its final completion, which this thread
@@ -454,7 +464,7 @@ impl ShardRing {
                 } else {
                     Arrival::Chunk(chunk)
                 };
-                let after = source.ring_arrival(arrival, epoch);
+                let after = source.ring_arrival(arrival, epoch, shard);
                 let starved = after.starved.then(|| std::sync::Arc::clone(&source));
                 (after, starved)
             };
@@ -470,7 +480,7 @@ impl ShardRing {
     /// to the source as it comes. Past the cap of connections one accept
     /// hands over, the accept is stopped; its source asks for another once
     /// its tasks took them.
-    fn accepted(&self, user_data: u64, res: i32) {
+    fn accepted(&self, shard: Option<&Shard>, user_data: u64, res: i32) {
         let delivery = {
             let mut ops = self.ops.borrow_mut();
             let Some(op) = ops.get_mut(user_data) else {
@@ -493,7 +503,7 @@ impl ShardRing {
         if stop {
             self.cancel(user_data);
         }
-        let after = source.ring_arrival(Arrival::Conn(conn), epoch);
+        let after = source.ring_arrival(Arrival::Conn(conn), epoch, shard);
         if after.starved {
             std::sync::Arc::clone(&source).wait_for_buffer();
         }
@@ -519,7 +529,7 @@ impl ShardRing {
 
     /// `op` ended with `res`: its slot is named once less, and its source
     /// gets the completion.
-    fn end(&self, op: RingOp, res: i32) {
+    fn end(&self, shard: Option<&Shard>, op: RingOp, res: i32) {
         #[cfg(test)]
         if res == -libc::ENOBUFS && matches!(op.mem, RingMem::RecvMulti { .. }) {
             let (armed, arrived, dry) = self.counts.get();
@@ -528,11 +538,14 @@ impl ShardRing {
         let freed = self.files.borrow_mut().done(op.file);
         self.freed(op.file, freed);
         let kind = op.source.kind();
-        op.source.op_done(Done {
-            outcome: op.mem.complete(res, kind),
-            epoch: op.epoch,
-            read: op.read,
-        });
+        op.source.op_done(
+            Done {
+                outcome: op.mem.complete(res, kind),
+                epoch: op.epoch,
+                read: op.read,
+            },
+            shard,
+        );
     }
 
     /// The shard is going, its sources detached: every operation still out
@@ -554,7 +567,7 @@ impl ShardRing {
             } else {
                 let op = self.ops.borrow_mut().remove(user_data);
                 if let Some(op) = op {
-                    self.end(op, -libc::ECANCELED);
+                    self.end(None, op, -libc::ECANCELED);
                 }
             }
         }
@@ -610,7 +623,7 @@ impl ShardRing {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero()
                 || self
-                    .wait(Some(left.min(Duration::from_millis(10))))
+                    .wait(None, Some(left.min(Duration::from_millis(10))))
                     .is_err()
             {
                 return;

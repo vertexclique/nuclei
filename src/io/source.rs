@@ -63,9 +63,26 @@ use crate::rt::context;
 use crate::rt::park::Readiness;
 use crate::rt::shard::{IoOp, Shared};
 
+/// How the driver's part of a source reaches the descriptor, and the pool
+/// of the thread that reaches it, looked up once for the whole step.
+#[derive(Clone, Copy)]
+pub(crate) struct Io<'a> {
+    pub(crate) via: Via<'a>,
+    /// The shard this thread runs, or `None` where it runs none: a buffer
+    /// then comes from the thread's fallback pool.
+    pub(crate) shard: Option<&'a crate::rt::shard::Shard>,
+}
+
+impl Io<'_> {
+    /// The pool of the shard this thread runs, if the step knows it.
+    pub(crate) fn pool(&self) -> Option<&crate::buf::Pool> {
+        self.shard.map(crate::rt::shard::Shard::pool)
+    }
+}
+
 /// How the driver's part of a source reaches the descriptor.
 #[derive(Clone, Copy)]
-pub(crate) enum Io<'a> {
+pub(crate) enum Via<'a> {
     /// Calls on the descriptor, made by the driver itself (epoll, kqueue).
     #[cfg(readiness)]
     Fd(Raw),
@@ -324,9 +341,23 @@ unsafe impl Sync for Source {}
 #[derive(Clone, Copy)]
 struct SourceHooks<'a> {
     src: &'a Arc<Source>,
+    /// The shard this thread runs, when the caller already looked it up.
+    #[cfg_attr(
+        not(completion),
+        expect(dead_code, reason = "only a completion driver routes")
+    )]
+    shard: Option<&'a crate::rt::shard::Shard>,
     /// For the driver's own edge: the registration the event came for.
     #[cfg(readiness)]
     token: Option<u64>,
+}
+
+#[cfg(completion)]
+impl SourceHooks<'_> {
+    /// [`Source::with_route`], with the shard the step knew, if it did.
+    fn with_route(&self, f: impl FnOnce(Io<'_>)) {
+        self.src.with_route(self.shard, f);
+    }
 }
 
 impl Hooks<ReadState> for SourceHooks<'_> {
@@ -374,8 +405,7 @@ impl Hooks<ReadState> for SourceHooks<'_> {
             // side still wants goes to the ring: the tasks that wait are
             // woken by what it brings.
             if bits & (read_work::DONE | read_work::SUBMIT) != 0 {
-                self.src
-                    .with_route(|io| st.submit_wanted(io, self.src.kind, after));
+                self.with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
         }
         #[cfg(port)]
@@ -425,8 +455,7 @@ impl Hooks<WriteState> for SourceHooks<'_> {
                 st.op_done(done, self.src.serving_fd(None), after);
             }
             if bits & (write_work::DONE | write_work::SUBMIT) != 0 {
-                self.src
-                    .with_route(|io| st.submit_wanted(io, self.src.kind, after));
+                self.with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
         }
         #[cfg(port)]
@@ -493,8 +522,18 @@ impl Source {
 
     /// The hooks of a poll's or a request's hold.
     fn hooks(self: &Arc<Self>) -> SourceHooks<'_> {
+        self.hooks_in(None)
+    }
+
+    /// [`hooks`](Self::hooks) for a step that knows the shard its thread
+    /// runs, so the hooks do not look it up again.
+    fn hooks_in<'a>(
+        self: &'a Arc<Self>,
+        shard: Option<&'a crate::rt::shard::Shard>,
+    ) -> SourceHooks<'a> {
         SourceHooks {
             src: self,
+            shard,
             #[cfg(readiness)]
             token: None,
         }
@@ -536,18 +575,25 @@ impl Source {
                         let rings = current
                             .map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
                         if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
-                            return Ok(f(Io::Fd(fd)));
+                            return Ok(f(Io {
+                                via: Via::Fd(fd),
+                                shard: current,
+                            }));
                         }
                     }
                     self.ensure_registered()?;
                 }
-                Ok(f(Io::Ops(
-                    self.route(current).unwrap_or(route::Route::NotYet),
-                )))
+                Ok(f(Io {
+                    via: Via::Ops(self.route(current).unwrap_or(route::Route::NotYet)),
+                    shard: current,
+                }))
             });
         }
         #[cfg(readiness)]
-        return Ok(f(Io::Fd(fd)));
+        return Ok(f(Io {
+            via: Via::Fd(fd),
+            shard: None,
+        }));
         // A regular file's IO goes through the file's jobs, never here.
         #[cfg(not(readiness))]
         {
@@ -786,6 +832,7 @@ impl Source {
         let mut after = After::default();
         let hooks = SourceHooks {
             src: self,
+            shard: None,
             token: Some(token),
         };
         if readiness.readable {

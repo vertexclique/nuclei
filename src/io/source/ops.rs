@@ -210,12 +210,28 @@ impl Source {
 
     /// Runs `f` with the way this thread reaches the driver the source is
     /// registered with, if it is registered with a completion driver.
-    pub(super) fn with_route(self: &Arc<Self>, f: impl FnOnce(super::Io<'_>)) {
-        crate::rt::context::current(|current| {
-            if let Some(route) = self.route(current) {
-                f(super::Io::Ops(route));
-            }
-        });
+    pub(super) fn with_route(
+        self: &Arc<Self>,
+        known: Option<&crate::rt::shard::Shard>,
+        f: impl FnOnce(super::Io<'_>),
+    ) {
+        match known {
+            Some(shard) => self.route_with(Some(shard), f),
+            None => crate::rt::context::current(|current| self.route_with(current, f)),
+        }
+    }
+
+    fn route_with(
+        self: &Arc<Self>,
+        current: Option<&crate::rt::shard::Shard>,
+        f: impl FnOnce(super::Io<'_>),
+    ) {
+        if let Some(route) = self.route(current) {
+            f(super::Io {
+                via: super::Via::Ops(route),
+                shard: current,
+            });
+        }
     }
 
     /// One of the sides' operations goes to the kernel.
@@ -230,7 +246,7 @@ impl Source {
 
     /// The kernel completed one of the source's operations: its side takes
     /// the completion at once if free, else its holder does as it lets go.
-    pub(crate) fn op_done(self: &Arc<Self>, done: Done) {
+    pub(crate) fn op_done(self: &Arc<Self>, done: Done, shard: Option<&crate::rt::shard::Shard>) {
         // SeqCst, with the flags after it: against a retire, or a
         // registration, that raises its flag and then looks at the count
         // (see `retire`, `waits_for_ops`).
@@ -242,7 +258,7 @@ impl Source {
             waker.wake();
         }
         let mut after = After::default();
-        let hooks = self.hooks();
+        let hooks = self.hooks_in(shard);
         if done.read {
             self.read_done.put(done);
             self.read.defer(super::read_work::DONE, &mut after, &hooks);
@@ -286,7 +302,7 @@ impl Source {
         write: &mut super::write::WriteState,
         after: &mut After,
     ) {
-        self.with_route(|io| {
+        self.with_route(None, |io| {
             read.submit_wanted(io, self.kind, after);
             write.submit_wanted(io, self.kind, after);
         });

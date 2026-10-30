@@ -24,6 +24,14 @@
 //! Nothing that may run code of its own happens under the guard: wakers
 //! are woken and buffers dropped (a dropped buffer may wake a source that
 //! waits for one) only after the guard is let go, through [`After`].
+//!
+//! A step that unwinds while a non-owning view of a source is live (a ring
+//! arrival, `ShardRing::arrived`) must not run those wakes either, for a
+//! waker that re-enters the runtime could free the source under the view.
+//! While [`Unwound`], declared before the view, is alive, an [`After`]
+//! dropped during unwinding moves its work to a thread-local list instead,
+//! and the guard runs it once the view is gone. Anywhere else an unwinding
+//! step wakes at once, as always.
 
 use core::task::{Poll, Waker};
 
@@ -336,9 +344,9 @@ impl<S> Drop for Held<'_, S> {
     fn drop(&mut self) {
         let flags = self.side.state.swap(0, Ordering::AcqRel);
         if flags & WAITING != 0 {
+            // Dropped, not run: during unwinding the wakes are parked.
             let mut after = After::default();
             self.side.wake_contended(&mut after);
-            after.run();
         }
     }
 }
@@ -408,8 +416,11 @@ impl<const N: usize> WakerSet<N> {
 
 /// The error of a whole datagram larger than any buffer the thread's pool
 /// may hold, or `None` when it could get one.
-pub(crate) fn whole_too_large(len: usize) -> Option<std::io::Error> {
-    crate::buf::with_pool(|pool| {
+pub(crate) fn whole_too_large(
+    known: Option<&crate::buf::Pool>,
+    len: usize,
+) -> Option<std::io::Error> {
+    crate::buf::with_pool_or(known, |pool| {
         pool.filter(|p| !p.could_hold_whole(len)).map(|p| {
             std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
@@ -521,7 +532,106 @@ impl After {
 
 impl Drop for After {
     fn drop(&mut self) {
-        self.flush();
+        if parking() {
+            self.park();
+        } else {
+            self.flush();
+        }
+    }
+}
+
+impl After {
+    fn is_empty(&self) -> bool {
+        self.wake.is_none() && self.drop_one.is_none() && self.more.is_none() && !self.has_kick()
+    }
+
+    #[cfg(ring)]
+    fn has_kick(&self) -> bool {
+        self.kick.is_some()
+    }
+
+    #[cfg(not(ring))]
+    fn has_kick(&self) -> bool {
+        false
+    }
+
+    /// Unwinding: the work goes to the thread's list for [`Unwound`] or the
+    /// end of the poll to run, else (the list gone, at thread exit) runs now.
+    #[cold]
+    fn park(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+        let mut work = core::mem::take(self);
+        let parked = UNWOUND.try_with(|list| match list.try_borrow_mut() {
+            Ok(mut list) => {
+                list.push(core::mem::take(&mut work));
+                true
+            }
+            Err(_) => false,
+        });
+        if parked != Ok(true) {
+            work.flush();
+        }
+    }
+}
+
+/// Whether an `After` dropped now is parked: the thread is unwinding with an
+/// [`Unwound`] guard alive.
+#[cfg(any(ring, test))]
+fn parking() -> bool {
+    VIEW_LIVE.get() && std::thread::panicking()
+}
+
+#[cfg(not(any(ring, test)))]
+fn parking() -> bool {
+    false
+}
+
+#[cfg(any(ring, test))]
+thread_local! {
+    /// A non-owning view of a source is live on this thread (see [`Unwound`]).
+    static VIEW_LIVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// What [`After`]s dropped during unwinding left to run.
+    static UNWOUND: core::cell::RefCell<Vec<After>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs what unwinding steps left in this thread's list.
+#[cfg(any(ring, test))]
+pub(crate) fn run_unwound() {
+    let Ok(work) = UNWOUND.try_with(|list| core::mem::take(&mut *list.borrow_mut())) else {
+        return;
+    };
+    work.into_iter().for_each(After::run);
+}
+
+/// Declared before a non-owning view of a source, so that it drops after it:
+/// while it lives, an `After` dropped by unwinding is parked, and when it
+/// drops by unwinding it runs what was parked.
+#[cfg(any(ring, test))]
+pub(crate) struct Unwound {
+    outer: bool,
+}
+
+#[cfg(any(ring, test))]
+impl Unwound {
+    pub(crate) fn enter() -> Self {
+        Self {
+            outer: VIEW_LIVE.replace(true),
+        }
+    }
+}
+
+#[cfg(any(ring, test))]
+impl Drop for Unwound {
+    fn drop(&mut self) {
+        VIEW_LIVE.set(self.outer);
+        if std::thread::panicking() {
+            run_unwound();
+        }
     }
 }
 

@@ -31,8 +31,8 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::task::Context;
 
-use super::{Failure, Io, Kind, Source, Target};
-use crate::buf::{PoolBuf, with_pool};
+use super::{Failure, Io, Kind, Source, Target, Via};
+use crate::buf::{Pool, PoolBuf, with_pool_or};
 use crate::io::side::{After, Wakers};
 use crate::io::sys;
 
@@ -269,13 +269,20 @@ impl WriteState {
     /// A buffer from this thread's pool, or the side starves until one
     /// comes back. A whole datagram no buffer of the pool could hold fails
     /// the operation instead.
-    fn buffer(&mut self, len: usize, whole: bool, after: &mut After) -> Option<PoolBuf> {
-        if whole && let Some(err) = crate::io::side::whole_too_large(len) {
+    fn buffer(
+        &mut self,
+        known: Option<&Pool>,
+        len: usize,
+        whole: bool,
+        after: &mut After,
+    ) -> Option<PoolBuf> {
+        if whole && let Some(err) = crate::io::side::whole_too_large(known, len) {
             self.error = Some(err);
             return None;
         }
-        let buf =
-            with_pool(|pool| pool.and_then(|p| if whole { p.get_whole(len) } else { p.get(len) }));
+        let buf = with_pool_or(known, |pool| {
+            pool.and_then(|p| if whole { p.get_whole(len) } else { p.get(len) })
+        });
         if buf.is_none() && !self.starved {
             self.starved = true;
             after.starved = true;
@@ -304,16 +311,16 @@ impl WriteState {
     /// descriptor, or its next operation on the ring. Returns whether
     /// anything changed at once.
     fn push(&mut self, io: Io<'_>, kind: Kind, after: &mut After) -> bool {
-        match io {
+        match io.via {
             #[cfg(readiness)]
-            Io::Fd(fd) => self.push_fd(fd, kind, after),
+            Via::Fd(fd) => self.push_fd(fd, kind, after),
             #[cfg(completion)]
-            Io::Ops(route) => {
+            Via::Ops(route) => {
                 self.submit_ops(route, kind, after);
                 false
             }
             #[cfg(not(completion))]
-            Io::None(never, _) => match never {},
+            Via::None(never, _) => match never {},
         }
     }
 
@@ -592,7 +599,7 @@ impl WriteState {
         let first = self.behind.is_none();
         let n = match self.behind.as_mut() {
             Some(behind) => behind.append_vectored(bufs),
-            None => match self.buffer(len.max(BEHIND_MIN), false, after) {
+            None => match self.buffer(io.pool(), len.max(BEHIND_MIN), false, after) {
                 Some(mut behind) => {
                     let n = behind.append_vectored(bufs);
                     self.behind = Some(behind);
@@ -675,7 +682,7 @@ impl WriteState {
             self.waiters.register(waker);
             return Poll::Pending;
         }
-        let Some(mut datagram) = self.buffer(bytes.len(), true, after) else {
+        let Some(mut datagram) = self.buffer(io.pool(), bytes.len(), true, after) else {
             if let Some(err) = self.error.take() {
                 return Poll::Ready(Err(err));
             }
@@ -766,9 +773,9 @@ impl WriteState {
         }
         if !self.connect_started {
             self.connect_started = true;
-            match io {
+            match io.via {
                 #[cfg(readiness)]
-                Io::Fd(fd) => {
+                Via::Fd(fd) => {
                     let started = match peer {
                         Peer::Inet(addr) => sys::connect_inet(fd, &addr),
                         Peer::Unix(path) => sys::connect_unix(fd, path),
@@ -786,7 +793,7 @@ impl WriteState {
                     }
                 }
                 #[cfg(completion)]
-                Io::Ops(route) => {
+                Via::Ops(route) => {
                     self.dial = Some(match peer {
                         Peer::Inet(addr) => super::ops::Dial::Inet(addr),
                         #[cfg(unix)]
