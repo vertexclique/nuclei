@@ -18,6 +18,7 @@ pub(crate) mod buf_ring;
 pub(crate) mod queue;
 pub(crate) mod sqe;
 pub(crate) mod sys;
+pub(crate) mod taskrun;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -66,6 +67,11 @@ pub(crate) struct RingConfig {
     /// Buffers of the group multishot receives draw from (0: no group), and their size.
     pub recv_buffers: u16,
     pub recv_buffer_size: u32,
+    /// Ask the kernel to flag pending task work in the submission queue's flags
+    /// (`IORING_SQ_TASKRUN`), so a look at the completions can tell whether it must enter. Only
+    /// for the single-issuer ring, and only where [`taskrun::flag_works`] says the kernel keeps
+    /// the flag.
+    pub taskrun_flag: bool,
 }
 
 impl RingConfig {
@@ -81,6 +87,7 @@ impl RingConfig {
             iowq_max_workers: None,
             recv_buffers: 0,
             recv_buffer_size: 0,
+            taskrun_flag: false,
         }
     }
 
@@ -113,6 +120,7 @@ impl From<&IoUringConfiguration> for RingConfig {
             }),
             recv_buffers: c.recv_buffers,
             recv_buffer_size: c.recv_buffer_size,
+            taskrun_flag: false,
         }
     }
 }
@@ -130,6 +138,8 @@ pub(crate) fn setup_flags(cfg: &RingConfig, no_sqarray: bool) -> u32 {
         IORING_SETUP_SQPOLL
     } else if cfg.multi_issuer {
         0
+    } else if cfg.taskrun_flag {
+        IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG
     } else {
         IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN
     };
@@ -412,6 +422,34 @@ impl Ring {
         let getevents = self.flags & (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_IOPOLL) != 0
             || self.cq_overflow_pending();
         self.enter(0, None, getevents)
+    }
+
+    /// Whether a look at the completion queue must enter the kernel for the completions the
+    /// kernel has for it to show: a polled ring, completions the queue had no room for, and task
+    /// work a ring that defers it (or runs it cooperatively) has not run. Such a ring that cannot
+    /// say whether it has task work (no `IORING_SQ_TASKRUN`) always does. A ring that runs task
+    /// work on its own (neither flag) posts its completions without an enter.
+    fn look_needs_enter(&self) -> bool {
+        self.flags & IORING_SETUP_IOPOLL != 0
+            || self.cq_overflow_pending()
+            || (self.flags & (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN) != 0
+                && (self.flags & IORING_SETUP_TASKRUN_FLAG == 0 || self.sq.taskrun_pending()))
+    }
+
+    /// Submits the queued entries and looks at the completions without waiting, entering the
+    /// kernel only when something is queued, `must_enter` says so, or [`Ring::look_needs_enter`]
+    /// does. Returns whether it entered.
+    pub(crate) fn submit_or_look(&mut self, must_enter: bool) -> io::Result<bool> {
+        self.sq.publish();
+        if self.sq.ready() == 0 && !must_enter && !self.look_needs_enter() {
+            return Ok(false);
+        }
+        self.enter(0, None, true).map(|_| true)
+    }
+
+    /// Whether the kernel flags task work for this ring to run (`IORING_SQ_TASKRUN`).
+    pub(crate) fn taskrun_pending(&self) -> bool {
+        self.sq.taskrun_pending()
     }
 
     /// Submits the queued entries, then waits until `min_complete` completions are available or

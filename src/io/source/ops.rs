@@ -25,7 +25,7 @@ use std::sync::Arc;
 use super::{Addr, Source, Target};
 use crate::buf::PoolBuf;
 use crate::io::raw::Owned;
-use crate::io::side::After;
+use crate::io::side::{After, Hooks};
 
 /// What a side asks its driver to do next.
 pub(crate) enum Want {
@@ -53,6 +53,9 @@ pub(crate) enum Want {
     RecvLent(Vec<u8>),
     /// Receive a datagram into a buffer of the pool, with its sender.
     RecvFrom(PoolBuf),
+    /// Receive a datagram into the spare capacity of a task's buffer, with
+    /// its sender.
+    RecvLentFrom(Vec<u8>),
     /// Receive datagrams as they come, each into a buffer of the shard's
     /// receive group with its sender, until the receive is stopped (its end
     /// as [`Outcome::RecvMultiEnd`]).
@@ -66,6 +69,11 @@ pub(crate) enum Want {
     SendLent(Vec<u8>, usize),
     /// Send a datagram from a buffer of the pool.
     SendTo(PoolBuf, Target),
+    /// Send a datagram from a task's buffer.
+    SendLentTo(Vec<u8>, Target),
+    /// Send a range of a file to a stream, in the kernel.
+    #[cfg(windows)]
+    SendFile(crate::io::source::write::FileRange),
 }
 
 impl Want {
@@ -74,10 +82,20 @@ impl Want {
         match self {
             #[cfg(ring)]
             Want::Ready { read } => *read,
-            Want::Accept | Want::Recv(_) | Want::RecvLent(_) | Want::RecvFrom(_) => true,
+            Want::Accept
+            | Want::Recv(_)
+            | Want::RecvLent(_)
+            | Want::RecvFrom(_)
+            | Want::RecvLentFrom(_) => true,
             #[cfg(ring)]
             Want::RecvMulti | Want::AcceptMulti | Want::RecvFromMulti => true,
-            Want::Connect(_) | Want::Send(_) | Want::SendLent(..) | Want::SendTo(..) => false,
+            Want::Connect(_)
+            | Want::Send(_)
+            | Want::SendLent(..)
+            | Want::SendTo(..)
+            | Want::SendLentTo(..) => false,
+            #[cfg(windows)]
+            Want::SendFile(_) => false,
         }
     }
 
@@ -97,7 +115,7 @@ impl Want {
 pub(crate) enum Dial {
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(crate::io::sys::UnixAddr),
+    Unix(crate::buf::spare::Spare<crate::io::sys::UnixAddr>),
 }
 
 /// The kernel's answer to an operation.
@@ -133,10 +151,12 @@ pub(crate) enum Outcome {
     },
     RecvLent(Vec<u8>, Answer<usize>),
     RecvFrom(PoolBuf, Answer<(usize, Addr)>),
+    RecvLentFrom(Vec<u8>, Answer<(usize, Addr)>),
     Connect(Dial, Answer<()>),
     Send(PoolBuf, Answer<usize>),
     SendLent(Vec<u8>, Answer<usize>),
     SendTo(PoolBuf, Target, Answer<usize>),
+    SendLentTo(Vec<u8>, Answer<usize>),
 }
 
 impl Outcome {
@@ -210,12 +230,28 @@ impl Source {
 
     /// Runs `f` with the way this thread reaches the driver the source is
     /// registered with, if it is registered with a completion driver.
-    pub(super) fn with_route(self: &Arc<Self>, f: impl FnOnce(super::Io<'_>)) {
-        crate::rt::context::current(|current| {
-            if let Some(route) = self.route(current) {
-                f(super::Io::Ops(route));
-            }
-        });
+    pub(super) fn with_route(
+        self: &Arc<Self>,
+        known: Option<&crate::rt::shard::Shard>,
+        f: impl FnOnce(super::Io<'_>),
+    ) {
+        match known {
+            Some(shard) => self.route_with(Some(shard), f),
+            None => crate::rt::context::current(|current| self.route_with(current, f)),
+        }
+    }
+
+    fn route_with(
+        self: &Arc<Self>,
+        current: Option<&crate::rt::shard::Shard>,
+        f: impl FnOnce(super::Io<'_>),
+    ) {
+        if let Some(route) = self.route(current) {
+            f(super::Io {
+                via: super::Via::Ops(route),
+                shard: current,
+            });
+        }
     }
 
     /// One of the sides' operations goes to the kernel.
@@ -230,7 +266,7 @@ impl Source {
 
     /// The kernel completed one of the source's operations: its side takes
     /// the completion at once if free, else its holder does as it lets go.
-    pub(crate) fn op_done(self: &Arc<Self>, done: Done) {
+    pub(crate) fn op_done(self: &Arc<Self>, done: Done, shard: Option<&crate::rt::shard::Shard>) {
         // SeqCst, with the flags after it: against a retire, or a
         // registration, that raises its flag and then looks at the count
         // (see `retire`, `waits_for_ops`).
@@ -242,14 +278,22 @@ impl Source {
             waker.wake();
         }
         let mut after = After::default();
-        let hooks = self.hooks();
+        let hooks = self.hooks_in(shard);
         if done.read {
             self.read_done.put(done);
             self.read.defer(super::read_work::DONE, &mut after, &hooks);
         } else {
             self.write_done.put(done);
-            self.write
-                .defer(super::write_work::DONE, &mut after, &hooks);
+            // The side free: the end is taken now, with no trip through the
+            // deferred bits.
+            if let Some(mut held) = self.write.try_hold_for(&hooks) {
+                hooks.taken(held.get(), &mut after);
+                hooks.deferred(held.get(), super::write_work::DONE, &mut after);
+                held.release(&mut after, &hooks);
+            } else {
+                self.write
+                    .defer(super::write_work::DONE, &mut after, &hooks);
+            }
         }
         #[cfg(port)]
         if idle && self.reg.awaits_idle.swap(false, Ordering::SeqCst) {
@@ -286,7 +330,7 @@ impl Source {
         write: &mut super::write::WriteState,
         after: &mut After,
     ) {
-        self.with_route(|io| {
+        self.with_route(None, |io| {
             read.submit_wanted(io, self.kind, after);
             write.submit_wanted(io, self.kind, after);
         });

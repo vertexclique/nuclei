@@ -33,7 +33,7 @@
 //! whoever waits for one; nothing that drops a buffer may hold a source's
 //! guard (see `io::source`), since the wake reaches into sources.
 
-#[cfg(ring)]
+#[cfg(any(ring, unix))]
 pub(crate) mod spare;
 
 use core::cell::{Cell, RefCell};
@@ -448,6 +448,14 @@ pub(crate) fn with_pool<R>(f: impl FnOnce(Option<&Pool>) -> R) -> R {
             f(unsafe { fallback.as_ref() })
         }
     })
+}
+
+/// [`with_pool`], unless the caller already holds this thread's pool.
+pub(crate) fn with_pool_or<R>(known: Option<&Pool>, f: impl FnOnce(Option<&Pool>) -> R) -> R {
+    match known {
+        Some(pool) => f(Some(pool)),
+        None => with_pool(f),
+    }
 }
 
 /// Copies the front of `src` into `bufs`, in order; returns how many bytes.

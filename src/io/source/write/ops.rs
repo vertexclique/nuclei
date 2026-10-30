@@ -18,8 +18,21 @@ use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::ops::{Answer, Done, Outcome, Want};
 use crate::io::source::route::Route;
-use crate::io::source::{Failure, Io};
+use crate::io::source::{Failure, Io, Via};
 use crate::io::sys;
+
+/// The operation that sends a lent write, whose buffer moves into it: a file range, a datagram or
+/// the rest of a stream's bytes.
+fn lent_want(lent: &mut Lent) -> Want {
+    #[cfg(windows)]
+    if let Some(file) = lent.file.clone() {
+        return Want::SendFile(file);
+    }
+    match lent.to.clone() {
+        Some(to) => Want::SendLentTo(core::mem::take(&mut lent.buf), to),
+        None => Want::SendLent(core::mem::take(&mut lent.buf), lent.sent),
+    }
+}
 
 impl WriteState {
     /// What the side holds for the driver: a connect, bytes, a lent buffer
@@ -42,7 +55,7 @@ impl WriteState {
         expect(irrefutable_let_patterns, reason = "a port is the only driver there")
     )]
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
-        if let Io::Ops(route) = io {
+        if let Via::Ops(route) = io.via {
             self.submit_ops(route, kind, after);
         }
     }
@@ -92,7 +105,7 @@ impl WriteState {
             Want::Send(buf)
         } else if let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none() && !l.out) {
             lent.out = true;
-            Want::SendLent(core::mem::take(&mut lent.buf), lent.sent)
+            lent_want(lent)
         } else if let Some((buf, target)) = self.queued.take() {
             Want::SendTo(buf, target)
         } else {
@@ -166,7 +179,9 @@ impl WriteState {
                 }
                 after.drop_buf(buf);
             }
-            Outcome::SendLent(buf, answer) => self.lent_back(buf, answer, stale, after),
+            Outcome::SendLent(buf, answer) | Outcome::SendLentTo(buf, answer) => {
+                self.lent_back(buf, answer, stale, after);
+            }
             Outcome::Connect(..) if stale => {}
             // Given back as the source moved: asked again.
             Outcome::Connect(dial, Answer::Undone { not_ready: false }) => self.dial = Some(dial),
@@ -226,11 +241,12 @@ impl WriteState {
         lent.out = false;
         match answer {
             Answer::Undone { not_ready } => self.not_ready(not_ready),
+            Answer::Done(Ok(n)) if lent.to.is_some() => lent.done = Some(Ok(n)),
             Answer::Done(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
             Answer::Done(Ok(n)) => {
                 lent.sent += n;
-                if lent.sent >= lent.buf.len() {
-                    lent.done = Some(Ok(lent.buf.len()));
+                if lent.sent >= lent.total() {
+                    lent.done = Some(Ok(lent.total()));
                 }
             }
             Answer::Done(Err(err)) => lent.done = Some(Err(err)),

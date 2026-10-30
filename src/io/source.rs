@@ -34,6 +34,8 @@
 //! index and generation, never a pointer) against the registration in
 //! place, so an event for one that is gone does nothing.
 
+#[cfg(unix)]
+mod direct;
 #[cfg(completion)]
 pub(crate) mod ops;
 #[cfg(port)]
@@ -63,9 +65,26 @@ use crate::rt::context;
 use crate::rt::park::Readiness;
 use crate::rt::shard::{IoOp, Shared};
 
+/// How the driver's part of a source reaches the descriptor, and the pool
+/// of the thread that reaches it, looked up once for the whole step.
+#[derive(Clone, Copy)]
+pub(crate) struct Io<'a> {
+    pub(crate) via: Via<'a>,
+    /// The shard this thread runs, or `None` where it runs none: a buffer
+    /// then comes from the thread's fallback pool.
+    pub(crate) shard: Option<&'a crate::rt::shard::Shard>,
+}
+
+impl Io<'_> {
+    /// The pool of the shard this thread runs, if the step knows it.
+    pub(crate) fn pool(&self) -> Option<&crate::buf::Pool> {
+        self.shard.map(crate::rt::shard::Shard::pool)
+    }
+}
+
 /// How the driver's part of a source reaches the descriptor.
 #[derive(Clone, Copy)]
-pub(crate) enum Io<'a> {
+pub(crate) enum Via<'a> {
     /// Calls on the descriptor, made by the driver itself (epoll, kqueue).
     #[cfg(readiness)]
     Fd(Raw),
@@ -138,6 +157,12 @@ mod write_work {
     pub(super) const LOOK: u8 = 16;
 }
 
+/// The least room a datagram's owned call must have before the ring lends the caller's buffer to
+/// an operation of its own; below it the call copies, as the borrowed calls do. From the
+/// `udp_bytes_*` modes of benches/vs_tokio_count.rs: total cycles per datagram favored the copy
+/// at 64 B to 8 KiB and the lent buffer from 12 KiB.
+pub(crate) const OWNED_DATAGRAM_MIN: usize = 12 * 1024;
+
 /// What kind of descriptor a source is: which system calls fit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -200,12 +225,15 @@ impl Kind {
     }
 }
 
+#[cfg(unix)]
+crate::buf::spare::reused!(unix::SocketAddr, crate::io::sys::UnixAddr);
+
 /// A peer's address.
 #[derive(Clone, Debug)]
 pub(crate) enum Addr {
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(unix::SocketAddr),
+    Unix(crate::buf::spare::Spare<unix::SocketAddr>),
 }
 
 /// Where a datagram goes.
@@ -215,7 +243,7 @@ pub(crate) enum Target {
     Connected,
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(crate::io::sys::UnixAddr),
+    Unix(crate::buf::spare::Spare<crate::io::sys::UnixAddr>),
 }
 
 /// An error kept to be reported again: the kernel's code, or its kind.
@@ -283,6 +311,9 @@ pub(crate) struct Source {
     kind: Kind,
     read: Side<ReadState>,
     write: Side<WriteState>,
+    /// The shards that claimed the sides as their owner.
+    read_owner: crate::sync::OnceCell<Arc<Shared>>,
+    write_owner: crate::sync::OnceCell<Arc<Shared>>,
     reg: Registration,
     /// Work that needs both sides, and what it carries (see `requests`).
     requests: AtomicU8,
@@ -321,9 +352,64 @@ unsafe impl Sync for Source {}
 #[derive(Clone, Copy)]
 struct SourceHooks<'a> {
     src: &'a Arc<Source>,
+    /// The shard this thread runs, when the caller already looked it up.
+    shard: Option<&'a crate::rt::shard::Shard>,
+    /// The shard a registration under way is made for by its own thread.
+    claim: Option<&'a Arc<Shared>>,
     /// For the driver's own edge: the registration the event came for.
     #[cfg(readiness)]
     token: Option<u64>,
+}
+
+#[cfg(completion)]
+impl SourceHooks<'_> {
+    /// [`Source::with_route`], with the shard the step knew, if it did.
+    fn with_route(&self, f: impl FnOnce(Io<'_>)) {
+        self.src.with_route(self.shard, f);
+    }
+}
+
+impl SourceHooks<'_> {
+    /// The owner of a biased side: the address of the shard this thread
+    /// runs, inside it, when the source is homed there or not homed yet, or
+    /// of the shard it is being registered with by that shard's thread; else
+    /// 0. A side keeps the first shard that claims it (see `Side::role`).
+    fn owner(&self) -> usize {
+        if let Some(claim) = self.claim {
+            return Arc::as_ptr(claim) as usize;
+        }
+        match self.shard {
+            Some(shard) => match self.src.reg.home.load(Ordering::Relaxed) {
+                0 => shard.shared_addr(),
+                home if home == shard.shared_addr() => home,
+                _ => 0,
+            },
+            None => 0,
+        }
+    }
+
+    /// Keeps the shard that claimed a side, for a nudge to reach.
+    fn claimed(&self, cell: &crate::sync::OnceCell<Arc<Shared>>) {
+        let shard = self
+            .claim
+            .cloned()
+            .or_else(|| self.shard.map(|s| Arc::clone(&s.shared)));
+        if let Some(shard) = shard {
+            let _ = cell.set(shard);
+        }
+    }
+
+    /// Asks the shard that owns a side to take and let go of the source's
+    /// sides (a ring source's kick, else a touch), serving what a thread
+    /// whose heavy fence failed left there.
+    fn nudge(&self, cell: &crate::sync::OnceCell<Arc<Shared>>) {
+        if let Some(owner) = cell.get() {
+            #[cfg(ring)]
+            owner.post_io(IoOp::RingKick(Arc::clone(self.src)));
+            #[cfg(not(ring))]
+            owner.post_io(IoOp::Touch(Arc::clone(self.src)));
+        }
+    }
 }
 
 impl Hooks<ReadState> for SourceHooks<'_> {
@@ -371,8 +457,7 @@ impl Hooks<ReadState> for SourceHooks<'_> {
             // side still wants goes to the ring: the tasks that wait are
             // woken by what it brings.
             if bits & (read_work::DONE | read_work::SUBMIT) != 0 {
-                self.src
-                    .with_route(|io| st.submit_wanted(io, self.src.kind, after));
+                self.with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
         }
         #[cfg(port)]
@@ -382,7 +467,19 @@ impl Hooks<ReadState> for SourceHooks<'_> {
     }
 
     fn requests(&self, st: &mut ReadState, after: &mut After) {
-        self.src.requests_holding_read(st, after);
+        self.src.requests_holding_read(self, st, after);
+    }
+
+    fn owner(&self) -> usize {
+        SourceHooks::owner(self)
+    }
+
+    fn claimed(&self) {
+        SourceHooks::claimed(self, &self.src.read_owner);
+    }
+
+    fn nudge(&self) {
+        SourceHooks::nudge(self, &self.src.read_owner);
     }
 }
 
@@ -422,8 +519,7 @@ impl Hooks<WriteState> for SourceHooks<'_> {
                 st.op_done(done, self.src.serving_fd(None), after);
             }
             if bits & (write_work::DONE | write_work::SUBMIT) != 0 {
-                self.src
-                    .with_route(|io| st.submit_wanted(io, self.src.kind, after));
+                self.with_route(|io| st.submit_wanted(io, self.src.kind, after));
             }
         }
         #[cfg(port)]
@@ -434,7 +530,7 @@ impl Hooks<WriteState> for SourceHooks<'_> {
 
     fn released(&self, saw_requests: bool, after: &mut After) {
         if saw_requests {
-            self.src.requests_after_write(after);
+            self.src.requests_after_write(self, after);
         }
     }
 
@@ -442,9 +538,32 @@ impl Hooks<WriteState> for SourceHooks<'_> {
         // Release: a drop on another thread reads it.
         self.src.unsent.store(st.has_unsent(), Ordering::Release);
     }
+
+    fn owner(&self) -> usize {
+        SourceHooks::owner(self)
+    }
+
+    fn claimed(&self) {
+        SourceHooks::claimed(self, &self.src.write_owner);
+    }
+
+    fn nudge(&self) {
+        SourceHooks::nudge(self, &self.src.write_owner);
+    }
 }
 
 impl Source {
+    /// Whether the source's operations run on a ring.
+    #[cfg(ring)]
+    fn on_ring(&self) -> bool {
+        self.reg.ops.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(ring))]
+    fn on_ring(&self) -> bool {
+        false
+    }
+
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
@@ -454,8 +573,10 @@ impl Source {
             epoch: AtomicU32::new(0),
             retired_epoch: AtomicU32::new(0),
             kind,
-            read: Side::new(ReadState::default()),
-            write: Side::new(WriteState::default()),
+            read: Side::biased(ReadState::default()),
+            write: Side::biased(WriteState::default()),
+            read_owner: Default::default(),
+            write_owner: Default::default(),
             reg: Registration {
                 state: AtomicU8::new(UNREGISTERED),
                 token: AtomicU64::new(NO_TOKEN),
@@ -490,8 +611,19 @@ impl Source {
 
     /// The hooks of a poll's or a request's hold.
     fn hooks(self: &Arc<Self>) -> SourceHooks<'_> {
+        self.hooks_in(None)
+    }
+
+    /// [`hooks`](Self::hooks) for a step that knows the shard its thread
+    /// runs, so the hooks do not look it up again.
+    fn hooks_in<'a>(
+        self: &'a Arc<Self>,
+        shard: Option<&'a crate::rt::shard::Shard>,
+    ) -> SourceHooks<'a> {
         SourceHooks {
             src: self,
+            shard,
+            claim: None,
             #[cfg(readiness)]
             token: None,
         }
@@ -533,18 +665,38 @@ impl Source {
                         let rings = current
                             .map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
                         if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
-                            return Ok(f(Io::Fd(fd)));
+                            return Ok(f(Io {
+                                via: Via::Fd(fd),
+                                shard: current,
+                            }));
                         }
                     }
                     self.ensure_registered()?;
                 }
-                Ok(f(Io::Ops(
-                    self.route(current).unwrap_or(route::Route::NotYet),
-                )))
+                let route = self.route(current).unwrap_or(route::Route::NotYet);
+                let not_yet = matches!(route, route::Route::NotYet);
+                let out = f(Io {
+                    via: Via::Ops(route),
+                    shard: current,
+                });
+                // The route was read before the sides were taken: a
+                // registration that finished meanwhile submitted nothing for
+                // what this step left, so the sides are asked to submit.
+                if not_yet && self.reg.state.load(Ordering::Acquire) == REGISTERED {
+                    let mut after = After::default();
+                    let hooks = self.hooks_in(current);
+                    self.read.defer(read_work::SUBMIT, &mut after, &hooks);
+                    self.write.defer(write_work::SUBMIT, &mut after, &hooks);
+                    self.settle(after);
+                }
+                Ok(out)
             });
         }
         #[cfg(readiness)]
-        return Ok(f(Io::Fd(fd)));
+        return Ok(f(Io {
+            via: Via::Fd(fd),
+            shard: None,
+        }));
         // A regular file's IO goes through the file's jobs, never here.
         #[cfg(not(readiness))]
         {
@@ -588,19 +740,37 @@ impl Source {
     /// What every step leaves for once no guard is held: a side that ran out
     /// of buffers waits for one of this thread's pool, then the wakes and
     /// drops.
-    fn settle(self: &Arc<Self>, mut after: After) {
+    fn settle(self: &Arc<Self>, after: After) {
+        let Err(mut after) = after.forget_if_nothing() else {
+            return;
+        };
+        self.kick(&mut after);
+        if after.starved {
+            Arc::clone(self).wait_for_buffer();
+        }
+        after.run();
+    }
+
+    /// Posts the ring thread the submit a side of a ring source asked for.
+    #[cfg_attr(
+        not(ring),
+        expect(unused_variables, reason = "only a ring source kicks")
+    )]
+    fn kick(self: &Arc<Self>, after: &mut After) {
         #[cfg(ring)]
         if let Some(home) = after.kick.take() {
             home.post_io(crate::rt::shard::IoOp::RingKick(Arc::clone(self)));
         }
-        if after.starved {
-            crate::buf::with_pool(|pool| {
-                if let Some(pool) = pool {
-                    pool.wait_for_return(Arc::clone(self).into());
-                }
-            });
-        }
-        after.run();
+    }
+
+    /// Has this thread's pool wake the source when a buffer comes back. May
+    /// wake at once, so no borrowed view of the source may be live.
+    pub(crate) fn wait_for_buffer(self: Arc<Self>) {
+        crate::buf::with_pool(|pool| {
+            if let Some(pool) = pool {
+                pool.wait_for_return(self.into());
+            }
+        });
     }
 
     /// The end of a poll: settles, and makes sure a driver watches the
@@ -764,10 +934,17 @@ impl Source {
 
     /// The driver saw readiness for `token`.
     #[cfg(readiness)]
-    pub(crate) fn on_event(self: &Arc<Self>, token: u64, readiness: Readiness) {
+    pub(crate) fn on_event(
+        self: &Arc<Self>,
+        token: u64,
+        readiness: Readiness,
+        shard: &crate::rt::shard::Shard,
+    ) {
         let mut after = After::default();
         let hooks = SourceHooks {
             src: self,
+            shard: Some(shard),
+            claim: None,
             token: Some(token),
         };
         if readiness.readable {
@@ -789,6 +966,11 @@ impl Source {
 
 #[cfg(test)]
 impl Source {
+    /// Whether the read side and the write side went to shared mode.
+    pub(crate) fn shared(&self) -> (bool, bool) {
+        (self.read.is_shared(), self.write.is_shared())
+    }
+
     /// The registration in place: its shard's address and its token.
     pub(crate) fn registration(&self) -> (usize, u64) {
         (
@@ -862,6 +1044,19 @@ impl Source {
             held.release(&mut after, &hooks);
             found
         })
+    }
+}
+
+impl Source {
+    /// A thread whose heavy fence failed left work on the sides: this shard's
+    /// thread takes and lets go of each, as their owner, which serves it.
+    #[cfg(not(ring))]
+    pub(crate) fn touch(self: &Arc<Self>, shard: &crate::rt::shard::Shard) {
+        let mut after = After::default();
+        let hooks = self.hooks_in(Some(shard));
+        self.read.defer(0, &mut after, &hooks);
+        self.write.defer(0, &mut after, &hooks);
+        self.settle(after);
     }
 }
 

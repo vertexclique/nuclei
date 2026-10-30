@@ -339,6 +339,8 @@ pub(crate) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 pub(crate) const IORING_CQE_F_MORE: u32 = 1 << 1;
 pub(crate) const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
 pub(crate) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
+/// The buffer a completion used has room left: the next completion on its group continues in it.
+pub(crate) const IORING_CQE_F_BUF_MORE: u32 = 1 << 4;
 pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
 // io_uring_register opcodes.
@@ -354,6 +356,10 @@ pub(crate) const IORING_REGISTER_FILES_UPDATE2: u32 = 14;
 /// `io_uring_rsrc_register.flags`: register an empty table.
 pub(crate) const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 pub(crate) const IORING_UNREGISTER_PBUF_RING: u32 = 23;
+
+/// `io_uring_buf_reg.flags`: the kernel fills each buffer in pieces, completing with
+/// `IORING_CQE_F_BUF_MORE` while it has room (Linux 6.12).
+pub(crate) const IOU_PBUF_RING_INC: u16 = 2;
 
 // mmap offsets of the ring regions.
 pub(crate) const IORING_OFF_SQ_RING: u64 = 0;

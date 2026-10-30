@@ -26,6 +26,19 @@ impl ReadState {
         }
     }
 
+    /// Stops the multishot receive out, once: a task takes the next bytes
+    /// itself, and its end wakes the tasks.
+    #[cfg(ring)]
+    pub(super) fn stop_multi(&mut self, route: Route<'_>) {
+        if let Some(id) = self.out
+            && self.multi
+            && !self.multi_stopping
+        {
+            self.multi_stopping = true;
+            route.cancel(id);
+        }
+    }
+
     /// The driver's part on a completion driver: issues the read the
     /// waiting tasks need (`len` asked), unless one is out or a result waits
     /// to be taken. A route that cannot issue here leaves it to the thread
@@ -40,17 +53,13 @@ impl ReadState {
         // A lent buffer that waits with nothing read ahead takes the next
         // bytes itself: a multishot receive out is stopped for it.
         #[cfg(ring)]
-        if let Some(id) = self.out
-            && self.multi
-            && !self.multi_stopping
-            && self.ahead.is_empty()
+        if self.ahead.is_empty()
             && self
                 .lent
                 .as_ref()
                 .is_some_and(|l| !l.out && l.done.is_none())
         {
-            self.multi_stopping = true;
-            route.cancel(id);
+            self.stop_multi(route);
         }
         // The caller's own calls: only a poll, while the side is not ready
         // and a task waits. A receive of the driver's still out is stopped
@@ -100,6 +109,12 @@ impl ReadState {
             }
             #[cfg(not(ring))]
             Want::Accept
+        } else if kind.datagrams() && self.lent.as_ref().is_some_and(|l| !l.out) {
+            let Some(lent) = self.lent.as_mut() else {
+                return;
+            };
+            lent.out = true;
+            Want::RecvLentFrom(core::mem::take(&mut lent.buf))
         } else if kind.datagrams() {
             #[cfg(ring)]
             let multi = !self.dry && issuer.multishot_datagrams(kind);
@@ -246,6 +261,30 @@ impl ReadState {
                     if lent.orphan {
                         // Its task went while the buffer was out: what came
                         // is the read-ahead now.
+                        self.abandon_lent(after);
+                    } else if lent.done.is_some()
+                        && let Some(w) = lent.waker.take()
+                    {
+                        after.wake_one(w);
+                    }
+                }
+            }
+            Outcome::RecvLentFrom(buf, answer) => {
+                if let Some(lent) = self.lent.as_mut().filter(|l| l.out && !stale) {
+                    lent.buf = buf;
+                    lent.out = false;
+                    match answer {
+                        Answer::Undone { not_ready } => self.not_ready(not_ready),
+                        Answer::Done(Ok((n, from))) => {
+                            lent.done = Some(Ok(n));
+                            lent.peer = Some(from);
+                        }
+                        Answer::Done(Err(err)) => lent.done = Some(Err(err)),
+                    }
+                    let Some(lent) = self.lent.as_mut() else {
+                        return;
+                    };
+                    if lent.orphan {
                         self.abandon_lent(after);
                     } else if lent.done.is_some()
                         && let Some(w) = lent.waker.take()

@@ -55,6 +55,16 @@ impl Source {
         let kind = self.kind;
         crate::coop::poll_budget(cx, |cx| {
             self.poll_reading(cx, |st, io, waker, after| {
+                #[cfg(unix)]
+                if !peek
+                    && super::super::direct::worth(io, out.len(), false)
+                    && let Some(poll) =
+                        st.read_direct(io, self.serving_fd(None), kind, out.len(), waker, |fd| {
+                            sys::read(fd, out)
+                        })
+                {
+                    return poll;
+                }
                 st.read(io, kind, out, peek, waker, after)
             })
         })
@@ -80,8 +90,11 @@ impl Source {
     ) -> Poll<io::Result<R>> {
         let mut after = After::default();
         let polled = self.with_io(|io| {
-            self.read
-                .poll(&mut after, cx.waker(), &self.hooks(), |st, after| {
+            self.read.poll(
+                &mut after,
+                cx.waker(),
+                &self.hooks_in(io.shard),
+                |st, after| {
                     #[cfg(unix)]
                     if drive {
                         st.drive();
@@ -89,7 +102,8 @@ impl Source {
                     #[cfg(not(unix))]
                     let _ = drive;
                     step(st, io, cx.waker(), after)
-                })
+                },
+            )
         });
         match polled {
             Ok(poll) => self.finish_poll(after, poll),
@@ -108,9 +122,53 @@ impl Source {
         let mut op = ReadOwned {
             source: self,
             buf: Some(buf),
+            from: None,
             lent: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
+        (result, op.buf.take().unwrap_or_default())
+    }
+
+    /// Receives one datagram into the spare capacity of `buf`, after the
+    /// bytes it holds, and gives it back with the datagram's length and
+    /// sender. The buffer is lent to the side until the driver received into
+    /// it, so the datagram lands in it with no copy (one that came before is
+    /// copied in instead); what does not fit is cut.
+    pub(crate) async fn recv_from_owned(
+        self: &Arc<Self>,
+        mut buf: Vec<u8>,
+    ) -> (io::Result<(usize, Addr)>, Vec<u8>) {
+        let start = buf.len();
+        let room = buf.capacity() - start;
+        if room < super::super::OWNED_DATAGRAM_MIN && self.on_ring() {
+            // A small datagram is cheaper taken as every other is and copied in than received
+            // by an operation of its own.
+            buf.resize(start + room, 0);
+            let received = poll_fn(|cx| self.poll_receive(cx, &mut buf[start..], false)).await;
+            return match received {
+                Ok((n, from)) => {
+                    buf.truncate(start + n);
+                    (Ok((n, from)), buf)
+                }
+                Err(err) => {
+                    buf.truncate(start);
+                    (Err(err), buf)
+                }
+            };
+        }
+        let mut op = ReadOwned {
+            source: self,
+            buf: Some(buf),
+            from: None,
+            lent: false,
+        };
+        let result = poll_fn(|cx| op.poll(cx)).await;
+        let result = result.and_then(|n| {
+            op.from
+                .take()
+                .map(|from| (n, from))
+                .ok_or_else(|| io::Error::other("the datagram came with no sender"))
+        });
         (result, op.buf.take().unwrap_or_default())
     }
 
@@ -118,13 +176,18 @@ impl Source {
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         held: &mut Option<Vec<u8>>,
+        from: &mut Option<Addr>,
     ) -> Poll<io::Result<usize>> {
-        if held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
+        let kind = self.kind;
+        if !kind.datagrams() && held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
             return Poll::Ready(Ok(0));
         }
-        let kind = self.kind;
         let poll = self.poll_reading(cx, |st, io, waker, after| {
-            st.read_owned(io, kind, held, waker, after)
+            if kind.datagrams() {
+                st.read_owned_from(io, kind, held, from, waker, after)
+            } else {
+                st.read_owned(io, kind, held, waker, after)
+            }
         });
         if poll.is_ready() && held.is_none() {
             // The poll failed with the buffer lent: it comes back as it is.
@@ -156,6 +219,18 @@ impl Source {
         let kind = self.kind;
         crate::coop::poll_budget(cx, |cx| {
             self.poll_reading(cx, |st, io, waker, after| {
+                #[cfg(unix)]
+                {
+                    let len = bufs.iter().map(|b| b.len()).sum();
+                    if super::super::direct::worth(io, len, false)
+                        && let Some(poll) =
+                            st.read_direct(io, self.serving_fd(None), kind, len, waker, |fd| {
+                                sys::read_bufs(fd, bufs)
+                            })
+                    {
+                        return poll;
+                    }
+                }
                 st.read_vectored(io, kind, bufs, waker, after)
             })
         })
@@ -201,12 +276,16 @@ impl Source {
 struct ReadOwned<'a> {
     source: &'a Arc<Source>,
     buf: Option<Vec<u8>>,
+    /// The sender, for a datagram socket's receive.
+    from: Option<Addr>,
     lent: bool,
 }
 
 impl ReadOwned<'_> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let poll = self.source.poll_read_owned(cx, &mut self.buf);
+        let poll = self
+            .source
+            .poll_read_owned(cx, &mut self.buf, &mut self.from);
         self.lent = self.buf.is_none();
         poll
     }

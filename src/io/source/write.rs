@@ -3,11 +3,12 @@
 //!
 //! Every call on the descriptor is the driver's ([`WriteState::push`]): on
 //! an edge, or at once after a task handed it work while the socket may
-//! take it. A task never makes the call itself. A write copies its bytes
-//! into a buffer of the pool (the write-behind, one per source) and is
-//! accepted; the driver writes them out as the socket takes them. Later
-//! writes add to that buffer while it has room and wait while it is full,
-//! so bytes go out in the order they were written. A write-behind that fails
+//! take it. A task makes the call itself only for a stream write of a
+//! buffer big enough (see `direct`) when the side holds nothing. Otherwise
+//! a write copies its bytes into a buffer of the pool (the write-behind, one
+//! per source) and is accepted; the driver writes them out as the socket
+//! takes them. Later writes add to that buffer while it has room and wait
+//! while it is full, so bytes go out in the order they were written. A write-behind that fails
 //! keeps its error: every write fails with it until a flush reports it,
 //! except that a write whose own bytes were the first to fail gets the error
 //! itself. A datagram is copied and queued the same way, one at a time, and
@@ -26,13 +27,13 @@ use core::future::poll_fn;
 use core::task::{Poll, Waker};
 use std::io;
 use std::net::SocketAddr;
-#[cfg(readiness)]
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::task::Context;
 
-use super::{Failure, Io, Kind, Source, Target};
-use crate::buf::{PoolBuf, with_pool};
+use super::{Failure, Io, Kind, Source, Target, Via};
+use crate::buf::{Pool, PoolBuf, with_pool_or};
 use crate::io::side::{After, Wakers};
 use crate::io::sys;
 
@@ -66,7 +67,7 @@ impl Dest<'_> {
             Dest::Connected => Target::Connected,
             Dest::Inet(addr) => Target::Inet(addr),
             #[cfg(unix)]
-            Dest::Unix(addr) => Target::Unix(*addr),
+            Dest::Unix(addr) => Target::Unix(crate::buf::spare::Spare::new(*addr)),
             #[cfg(windows)]
             Dest::Unix((never, _)) => match never {},
         }
@@ -92,6 +93,27 @@ pub(crate) enum Peer<'a> {
     Unix(UnixPath<'a>),
 }
 
+/// A range of a file the kernel sends to a stream itself: the file's handle, kept open until the
+/// send ends, and where the range starts and how long it is.
+#[derive(Clone)]
+#[cfg_attr(
+    unix,
+    allow(dead_code, reason = "only Windows sends a file in the kernel here")
+)]
+pub(crate) struct FileRange {
+    pub(crate) handle: Arc<crate::io::raw::OwnedFile>,
+    pub(crate) offset: u64,
+    pub(crate) len: u32,
+}
+
+/// Where a lent write goes besides the stream's own bytes: one datagram's destination, or a range
+/// of a file the kernel sends.
+#[derive(Clone, Default)]
+pub(crate) struct Lending<'d> {
+    pub(crate) to: Option<Dest<'d>>,
+    pub(crate) file: Option<FileRange>,
+}
+
 /// A task's own buffer, lent to the side for the driver to write out.
 struct Lent {
     buf: Vec<u8>,
@@ -109,6 +131,24 @@ struct Lent {
     // source at most, for at most `LINGER` once its handle is gone); charge
     // it to the pool if kept buffers must count against the cap.
     orphan: bool,
+    /// Where the buffer goes, when it is one datagram: the write is whole or
+    /// failed, never part.
+    to: Option<Target>,
+    /// The range of a file sent in the kernel, with `buf` empty.
+    #[cfg(windows)]
+    file: Option<FileRange>,
+}
+
+impl Lent {
+    /// The bytes the write is for: the buffer's, or a file range's.
+    #[cfg(completion)]
+    fn total(&self) -> usize {
+        #[cfg(windows)]
+        if let Some(file) = &self.file {
+            return file.len as usize;
+        }
+        self.buf.len()
+    }
 }
 
 #[derive(Default)]
@@ -266,16 +306,65 @@ impl WriteState {
         Poll::Pending
     }
 
+    /// A stream write of the bytes of `bufs` made straight on the
+    /// descriptor `fd`, from the caller's memory, if the side holds nothing
+    /// that goes first. The kernel may take part of it, as of any write.
+    /// `None` leaves it to the normal path, which writes behind and waits
+    /// for readiness when the socket took nothing.
+    #[cfg(unix)]
+    pub(super) fn write_direct(
+        &mut self,
+        io: Io<'_>,
+        fd: Option<RawFd>,
+        kind: Kind,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Option<io::Result<usize>> {
+        let fd = fd?;
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        let waits = matches!(io.via, Via::Fd(_)) && self.blocked;
+        if !kind.streams()
+            || len == 0
+            || !super::direct::worth(io, len, true)
+            || waits
+            || self.failed.is_some()
+            || self.error.is_some()
+            || self.connecting
+            || self.behind.is_some()
+            || self.lent.is_some()
+            || self.queued.is_some()
+            || self.ring_holds()
+        {
+            return None;
+        }
+        match sys::ready(sys::send_bufs(fd, bufs)) {
+            None => {
+                if matches!(io.via, Via::Fd(_)) {
+                    self.blocked = true;
+                }
+                None
+            }
+            Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
+            Some(result) => Some(result),
+        }
+    }
+
     /// A buffer from this thread's pool, or the side starves until one
     /// comes back. A whole datagram no buffer of the pool could hold fails
     /// the operation instead.
-    fn buffer(&mut self, len: usize, whole: bool, after: &mut After) -> Option<PoolBuf> {
-        if whole && let Some(err) = crate::io::side::whole_too_large(len) {
+    fn buffer(
+        &mut self,
+        known: Option<&Pool>,
+        len: usize,
+        whole: bool,
+        after: &mut After,
+    ) -> Option<PoolBuf> {
+        if whole && let Some(err) = crate::io::side::whole_too_large(known, len) {
             self.error = Some(err);
             return None;
         }
-        let buf =
-            with_pool(|pool| pool.and_then(|p| if whole { p.get_whole(len) } else { p.get(len) }));
+        let buf = with_pool_or(known, |pool| {
+            pool.and_then(|p| if whole { p.get_whole(len) } else { p.get(len) })
+        });
         if buf.is_none() && !self.starved {
             self.starved = true;
             after.starved = true;
@@ -304,16 +393,16 @@ impl WriteState {
     /// descriptor, or its next operation on the ring. Returns whether
     /// anything changed at once.
     fn push(&mut self, io: Io<'_>, kind: Kind, after: &mut After) -> bool {
-        match io {
+        match io.via {
             #[cfg(readiness)]
-            Io::Fd(fd) => self.push_fd(fd, kind, after),
+            Via::Fd(fd) => self.push_fd(fd, kind, after),
             #[cfg(completion)]
-            Io::Ops(route) => {
+            Via::Ops(route) => {
                 self.submit_ops(route, kind, after);
                 false
             }
             #[cfg(not(completion))]
-            Io::None(never, _) => match never {},
+            Via::None(never, _) => match never {},
         }
     }
 
@@ -415,6 +504,19 @@ impl WriteState {
             // The write-behind before it failed: none of it went out.
             lent.done = Some(Err(failure.error()));
         }
+        if let Some(to) = lent
+            .to
+            .as_ref()
+            .filter(|_| lent.done.is_none() && !self.blocked)
+        {
+            match sys::ready(send_datagram(fd, &lent.buf, to.as_dest())) {
+                None => self.blocked = true,
+                Some(result) => {
+                    lent.done = Some(result);
+                    progress = true;
+                }
+            }
+        }
         while lent.done.is_none() && !self.blocked {
             let rest = lent.buf.get(lent.sent..).unwrap_or_default();
             match sys::ready(write_bytes(fd, kind, rest)) {
@@ -464,6 +566,7 @@ impl WriteState {
         io: Io<'_>,
         kind: Kind,
         held: &mut Option<Vec<u8>>,
+        lending: &Lending<'_>,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -474,10 +577,10 @@ impl WriteState {
             if let Some(err) = self.error.take() {
                 return Poll::Ready(Err(err));
             }
-            if buf.is_empty() {
+            if buf.is_empty() && lending.to.is_none() && lending.file.is_none() {
                 return Poll::Ready(Ok(0));
             }
-            if self.lent.is_some() {
+            if self.lent.is_some() || (lending.to.is_some() && self.queued.is_some()) {
                 // Another buffer is lent: this one goes after it.
                 self.waiters.register(waker);
                 return Poll::Pending;
@@ -489,6 +592,9 @@ impl WriteState {
                 waker: None,
                 out: false,
                 orphan: false,
+                to: lending.to.map(Dest::to_owned),
+                #[cfg(windows)]
+                file: lending.file.clone(),
             });
         }
         // The task polls, so the driver's write needs no wake for it.
@@ -592,7 +698,7 @@ impl WriteState {
         let first = self.behind.is_none();
         let n = match self.behind.as_mut() {
             Some(behind) => behind.append_vectored(bufs),
-            None => match self.buffer(len.max(BEHIND_MIN), false, after) {
+            None => match self.buffer(io.pool(), len.max(BEHIND_MIN), false, after) {
                 Some(mut behind) => {
                     let n = behind.append_vectored(bufs);
                     self.behind = Some(behind);
@@ -671,11 +777,11 @@ impl WriteState {
         if let Some(err) = self.error.take() {
             return Poll::Ready(Err(err));
         }
-        if self.queued.is_some() {
+        if self.queued.is_some() || self.lent_waits() {
             self.waiters.register(waker);
             return Poll::Pending;
         }
-        let Some(mut datagram) = self.buffer(bytes.len(), true, after) else {
+        let Some(mut datagram) = self.buffer(io.pool(), bytes.len(), true, after) else {
             if let Some(err) = self.error.take() {
                 return Poll::Ready(Err(err));
             }
@@ -766,9 +872,9 @@ impl WriteState {
         }
         if !self.connect_started {
             self.connect_started = true;
-            match io {
+            match io.via {
                 #[cfg(readiness)]
-                Io::Fd(fd) => {
+                Via::Fd(fd) => {
                     let started = match peer {
                         Peer::Inet(addr) => sys::connect_inet(fd, &addr),
                         Peer::Unix(path) => sys::connect_unix(fd, path),
@@ -786,11 +892,13 @@ impl WriteState {
                     }
                 }
                 #[cfg(completion)]
-                Io::Ops(route) => {
+                Via::Ops(route) => {
                     self.dial = Some(match peer {
                         Peer::Inet(addr) => super::ops::Dial::Inet(addr),
                         #[cfg(unix)]
-                        Peer::Unix(addr) => super::ops::Dial::Unix(*addr),
+                        Peer::Unix(addr) => {
+                            super::ops::Dial::Unix(crate::buf::spare::Spare::new(*addr))
+                        }
                         #[cfg(windows)]
                         Peer::Unix((never, _)) => match never {},
                     });

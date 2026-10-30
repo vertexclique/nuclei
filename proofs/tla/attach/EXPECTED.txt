@@ -11,3 +11,9 @@ W_registered                   MC_Attach            violated:NoRegistered
 W_stale_drop                   MC_Attach            violated:NoStaleDrop
 W_rejected                     MC_Attach            violated:NoRejected
 W_again                        MC_Attach            violated:NoRegisteredWithB
+RT_late               MC_Route    pass
+RT_late_live          MC_Route    pass
+RT_registered         MC_Route    pass
+RT_registered_live    MC_Route    pass
+MT_no_resubmit        MC_Route    violated:Served
+WT_late               MC_Route    violated:NoLateResubmit

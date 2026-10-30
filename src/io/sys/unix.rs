@@ -110,6 +110,37 @@ pub(crate) fn send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     retry(|| cvt(unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), SEND_FLAGS) }))
 }
 
+/// The most slices one vectored call takes.
+const IOV_MAX: usize = 1024;
+
+/// `send(2)` of the bytes of `bufs` in order (one call, the first
+/// `IOV_MAX` slices at most), as [`send`] with no `SIGPIPE`.
+pub(crate) fn send_bufs(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    if let [one] = bufs {
+        return send(fd, one);
+    }
+    // SAFETY: an all-zero `msghdr` is valid (no name, no control data).
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    let bufs = bufs.get(..IOV_MAX).unwrap_or(bufs);
+    msg.msg_iov = bufs.as_ptr().cast_mut().cast();
+    msg.msg_iovlen = bufs.len() as _;
+    // SAFETY: `IoSlice` is `iovec` on unix; the kernel reads at most the
+    // lengths of `bufs` from them and writes nothing to them.
+    retry(|| cvt(unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) }))
+}
+
+/// `readv(2)` into `bufs` in order (one call, the first `IOV_MAX` slices at
+/// most).
+pub(crate) fn read_bufs(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+    if let [one] = bufs {
+        return read(fd, one);
+    }
+    let count = bufs.len().min(IOV_MAX) as libc::c_int;
+    // SAFETY: `IoSliceMut` is `iovec` on unix; the kernel writes at most the
+    // lengths of the first `count` slices.
+    retry(|| cvt(unsafe { libc::readv(fd, bufs.as_ptr().cast(), count) }))
+}
+
 /// `shutdown(2)` of the writing half.
 pub(crate) fn shutdown_write(fd: RawFd) -> io::Result<()> {
     // SAFETY: a plain syscall on a socket the caller holds.
@@ -562,6 +593,55 @@ pub(crate) fn recv_from_unix(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, un
     retry(|| socket.recv_from(buf))
 }
 
+/// `recvfrom(2)` into memory not written yet: the kernel writes the bytes it
+/// returns, and the sender's raw address.
+fn recv_from_raw(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+) -> io::Result<(usize, libc::sockaddr_storage, libc::socklen_t)> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let n = retry(|| {
+        // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
+        // `len` bytes into the storage; nothing is read from either.
+        cvt(unsafe {
+            libc::recvfrom(
+                fd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                (&raw mut storage).cast(),
+                &mut len,
+            )
+        })
+    })?;
+    Ok((n, storage, len))
+}
+
+/// A datagram from a UDP socket into memory not written yet, with its
+/// sender.
+pub(crate) fn recv_from_udp_uninit(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+) -> io::Result<(usize, SocketAddr)> {
+    let (n, storage, len) = recv_from_raw(fd, buf)?;
+    Ok((n, inet_addr(&storage, len)?))
+}
+
+/// A datagram from a Unix datagram socket into memory not written yet, with
+/// its sender.
+pub(crate) fn recv_from_unix_uninit(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+) -> io::Result<(usize, unix::SocketAddr)> {
+    let (n, storage, len) = recv_from_raw(fd, buf)?;
+    // SAFETY: an `AF_UNIX` address fits `sockaddr_un`, which the storage is
+    // at least as large as.
+    let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };
+    Ok((n, unix_addr(un, len)?))
+}
+
 /// A datagram to `addr` on a UDP socket.
 pub(crate) fn send_to_udp(fd: RawFd, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
     // SAFETY: see `borrow`; the fd is a UDP socket.
@@ -720,6 +800,89 @@ pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     let copy = cvt_int(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })?;
     // SAFETY: a new descriptor nobody else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+}
+
+/// Whether the system moves a file's bytes to a socket in the kernel.
+pub(crate) const SENDS_FILES: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+));
+
+/// Sends up to `len` bytes of the regular file `file` from `offset` to the
+/// socket `sock` in the kernel, without them entering user space. The socket
+/// is not waited for: a full one is `WouldBlock`. The count may be short, and
+/// is zero at the end of the file. This reads the file, so it may block on a
+/// page that is not cached.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn send_file(sock: RawFd, file: RawFd, offset: u64, len: usize) -> io::Result<usize> {
+    let mut at = file_offset(offset)?;
+    // SAFETY: the kernel reads the file at `at` and writes the socket; `at`
+    // is ours to advance.
+    retry(|| cvt(unsafe { libc::sendfile(sock, file, &mut at, len) }))
+}
+
+/// See the Linux form.
+#[cfg(target_os = "macos")]
+pub(crate) fn send_file(sock: RawFd, file: RawFd, offset: u64, len: usize) -> io::Result<usize> {
+    let at = file_offset(offset)?;
+    retry(|| {
+        // In: the bytes asked for. Out: the bytes sent, also when the call
+        // fails because the socket is full or a signal came.
+        let mut sent = libc::off_t::try_from(len).unwrap_or(libc::off_t::MAX);
+        // SAFETY: the kernel reads the file at `at` and writes the socket;
+        // `sent` is ours; there is no header or trailer.
+        let r = unsafe { libc::sendfile(file, sock, at, &mut sent, core::ptr::null_mut(), 0) };
+        match cvt_int(r) {
+            Ok(_) => Ok(sent as usize),
+            Err(_) if sent > 0 => Ok(sent as usize),
+            Err(err) => Err(err),
+        }
+    })
+}
+
+/// See the Linux form.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn send_file(sock: RawFd, file: RawFd, offset: u64, len: usize) -> io::Result<usize> {
+    let at = file_offset(offset)?;
+    retry(|| {
+        let mut sent: libc::off_t = 0;
+        // SAFETY: the kernel reads the file at `at` and writes the socket;
+        // `sent` is ours; there is no header or trailer.
+        let r = unsafe { libc::sendfile(file, sock, at, len, core::ptr::null_mut(), &mut sent, 0) };
+        match cvt_int(r) {
+            Ok(_) => Ok(sent as usize),
+            Err(_) if sent > 0 => Ok(sent as usize),
+            Err(err) => Err(err),
+        }
+    })
+}
+
+/// No call moves a file's bytes to a socket in the kernel here: the caller
+/// reads and writes instead (see [`SENDS_FILES`]).
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+)))]
+pub(crate) fn send_file(_: RawFd, _: RawFd, _: u64, _: usize) -> io::Result<usize> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// `Ok` when the socket `fd` may take a write now, else `WouldBlock`.
+pub(crate) fn poll_writable(fd: RawFd) -> io::Result<()> {
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`; a zero timeout does not wait.
+    match retry(|| cvt_int(unsafe { libc::poll(&mut poll, 1, 0) }))? {
+        0 => Err(io::ErrorKind::WouldBlock.into()),
+        _ => Ok(()),
+    }
 }
 
 /// `read(2)` into memory not written yet: the kernel writes the bytes it

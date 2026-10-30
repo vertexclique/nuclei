@@ -332,6 +332,32 @@ that finds a job, a time-out, a job taken back). The unit tests in `src/rt/block
 submit landing as the only thread goes idle (the first mutation fails it) and submitters on
 threads against threads that keep timing out.
 
+`tla/pool/PoolIndex.tla`, in the same family, checks the index of idle slots the network-path
+work plans for the pool (`Pool::submit`, `Pool::wake_one` and `Pool::work`, not changed yet):
+a bitmap beside the slots, one bit per slot, so a submitter finds a candidate with loads of the
+bitmap and tries the compare-and-swap (idle to woken) on that slot only, instead of on every
+slot from a hint. A bitmap rather than a queue of idle slots: finding a candidate takes loads
+only, a bit set twice is still one bit, and its size is fixed. A thread sets its bit after it
+marks its slot idle and before its look at the queue; only a slot's own thread writes its bit,
+and it clears it after taking its slot back at its look, and before its slot's compare-and-swap
+at the end of its wait, since a slot freed first may be another thread's at once. A set bit that
+is stale sends the submitter on to the next candidate; with none left it starts a thread while
+there is room. 20 configurations: 10 that must pass (two submitters with a pool of two threads,
+and of three, with `RunOnce`, `Bounded`, `OneOwner`, `IdleCounted`, `IndexComplete`, the bitmap
+misses no waiting thread, and `IndexTight`, a set bit names an idle or claimed slot or one whose
+thread is about to clear it; `AllRan` with and without the keep-alive exit and at the cap of one
+thread; the same with loads of the bitmap that may read any value and today's full scan as the
+fallback; and two mutations that lose no job: a woken slot's bit never cleared, and, with
+sequentially consistent loads, a submitter that gives up when it finds no candidate), 7
+mutations (a bit set after the look, a submitter's claim followed by its own clear of the bit,
+and, with loads that may read stale values, a submitter that gives up or only starts a thread at
+the cap, each lose a job, breaking `AllRan`; a submitter that trusts the bit and stores woken
+without the compare-and-swap breaks `IdleCounted`; a bit never cleared breaks `IndexTight`; a
+bit cleared after the slot is freed erases another thread's bit, breaking `IndexComplete`), and
+3 witnesses (a submitter sent to start a thread by a thread idle before its bit, a stale bit
+whose compare-and-swap loses, a wake through the bitmap). The model reads the bitmap one slot's
+bit per step, which covers a scan over several words, each word with its own load.
+
 ## Task blocks given back to their thread
 
 `remote` (`tla/remote/RemoteFree.tla`) checks how a task's block freed on another thread than
@@ -469,6 +495,98 @@ object over; the lingering drain waits before the close is performed). The Rust 
 `src/io/source/tests/requests.rs` hold a side from the test and check the same on real sockets,
 each with a mutation of the code that makes one of them fail.
 
+## The side's guard biased to its owner
+
+`side_biased` (`tla/side_biased/SideBiased.tla`) checks the owner-biased guard (`Side::try_hold`,
+`Side::poll`, `Side::contend`, `Side::defer`, `Side::take_for_request` and
+`Held::release_with` in `src/io/side.rs`; the heavy fence is `heavy` and `heavy_retried` in
+`src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
+x86's do. A socket's side has an owner, the thread running its home shard, which serves the
+driver's edges. The owner takes the side with a plain store of its word `own`, a compiler fence
+and a plain load of the foreign word `intent`: zero, it holds; one, it undoes `own` and takes
+today's word instead. It lets go with a plain store of `own` and a plain load of `intent`; only
+when `intent` is one does it read today's flag word, and then with a locked instruction, which
+drains its buffer first, so the read cannot run ahead of its store. Finding work left there
+(the waiting, ready, deferred or request bit), it takes the side again through today's word and
+does the work as today's holder does. A foreign call (a poll, a defer or a request) raises
+`intent` with a locked instruction, runs the heavy fence (every buffer drained at once) and reads
+`own`: zero, it switches the side to shared mode for good and takes today's word; one, it leaves
+its work for the owner (a poll its waker and the waiting bit, a defer or a request its bit),
+looks once more at `own`, and a poll sleeps while a defer or a request goes on. In shared mode
+everyone uses today's word, as `side` checks it. The monitor moves the home shard to a spare only
+through the slot protocol: its claim while the owner is outside its shard, the heavy fence, its
+take. The slot's own words are atomic here, since `handoff` checks them on the same store
+buffers; the old owner acts as a foreign thread from then on.
+
+A heavy fence may fail (`fence::heavy_retried` tries it eight times). A foreign call whose fence
+failed reads nothing the fence was to order (`Side::unserved`): after a full fence of its own it
+reads the owner's claim. With none, no owner can hold biased, so the side goes shared and is
+taken through today's word; with one, the call raises `intent`'s UNFENCED bit, leaves its work in
+the word (a poll its waker and the waiting bit) and nudges the owner's shard to take and let go
+of the side (a nudge reaches the shard once the claim recorded it; a claimant not recorded yet
+takes the side next anyway). The owner, letting go of `own` at its fallback or its release,
+switches the side to shared when it sees UNFENCED (`Side::switch_if_unfenced`), so the woken poll
+takes through the word.
+
+40 configurations: 19 that must pass (the owner and one foreign thread polling twice; one making a
+defer and a request; the owner and two foreign threads polling, and making requests; a handoff
+mid-run beside a foreign thread; a handoff after which the old owner polls and makes a request;
+fences that may fail, with one and two edges, a defer and a request, and a handoff; every fence
+failing, with an owner claimed, with none, and with two foreign threads; each with `Exclusive`,
+one holder at a time, `NoSpin`, no thread waits for another except asleep until woken,
+`NoLostWork`, every edge served and no left bit up once everything is finished, and
+`SharedAbsorbing`, shared mode for good, with no deadlock; and `Termination` under weak fairness,
+without and with a handoff, with fences that may fail, and with every fence failing with and
+without an owner), 13 mutations (no heavy fence on the foreign path, an owner that holds without
+reading `intent`, an owner that trusts a mode still biased over `intent`, a foreign thread that
+holds through its intent alone without switching, a move of the shard while its owner is inside
+a take, a move that leaves the old owner's stores in its buffer, a call that reads `own` after a
+failed fence, and a switch stored before the owner's `own := 0` each break `Exclusive`; a release
+that never looks for left work, one that reads the flag word with a plain load, and a nudge that
+never reaches the owner each end in a deadlock, a lost wake; a release that finds work but does
+not take the side again breaks `NoLostWork`; an owner that never switches on UNFENCED leaves the
+poll failing its fence for ever, breaking `Termination`), and 8 witnesses (a foreign call that
+leaves its work to the owner, a switch to shared mode, a handoff, the owner's release taking the
+side again to wake a waiting poll, and to do a deferred bit a foreign defer left, a failed fence
+the owner's switch serves, a failed fence with no owner that goes shared, a nudge served). The
+switch stored before `own := 0` breaks `Exclusive` because the model's hold lasts until that store;
+on x86 the owner touches nothing between them, so it shows the rule rather than a lost update.
+
+The plain read of the flag word (`M_release_plain_look`) is the design's first form, and the
+model found it loses a wake: the owner's loads run ahead of its `own := 0`, read `intent` as one
+and the flag word with no waiting bit yet; the poll then raises the bit and looks once more at
+`own`, which memory still says is one, and sleeps with nobody to wake it. The bit is raised
+after the foreign thread's heavy fence, so the two form a store-buffering pair, and the locked
+read puts the fence on the owner's side, only on the release in flight when the first foreign
+thread arrives (every later owner take falls back to today's word).
+
+`Retire.tla`, in the same family, checks the planned plain operation count on a ring, before its
+code is written (today `Source::op_out` and `op_done` in `src/io/source/ops.rs` still change
+`ops_out` with sequentially consistent read-modify-writes, against the flag of `Source::retire`
+in `src/io/source/requests.rs`). A ring's submit stores the count plus one and hands the operation to
+the kernel; its `op_done`, on the ring the operation went to, stores the count minus one and
+then, with a compiler fence only, reads the waiters' flags, and with the count at zero and a flag
+up takes that waiter's waker and wakes it. A plain count needs one writer at a time, so a
+source's re-home to another ring (`evict_now` and the re-attach) waits on the new ring's thread
+until the count is zero before that ring submits: a side may still have an operation out on the
+old ring. That wait and the retire's are the same: register the waker, store the flag, run the
+heavy fence, read the count; zero, go on, else sleep until woken and look again. The retire's
+request and the re-home's move are one step each (no submit of the old home after them, and
+nothing assumed of how they order memory). 14 configurations: 6 that must pass (two and three
+operations on one ring, and a re-home with an operation still out on the old ring, with one and
+two operations there, with `NoLostUpdate`, once every store landed the count is the operations
+really out, and `FreedAfterOps`, the object goes only once no operation of the source is out on
+either ring, and no deadlock; and `Termination` with and without a re-home), 5 mutations (a
+retire with no heavy fence, and one that reads the count before raising its flag, each let the
+object go while the kernel holds an operation, breaking `FreedAfterOps`; an `op_done` that reads
+the flags before its decrement breaks `Termination`; a new ring that submits before the count is
+zero, and a re-home whose wait has no heavy fence, so the old ring's completion counts down a
+count the new ring writes, each break `NoLostUpdate`), and 3 witnesses (a retire that sleeps, one
+woken by `op_done`, and a re-home that waits for the old ring's last completion). The Windows
+port keeps today's atomic count. The models take a foreign call's step as one step, leave the
+side's contents to `side`, and take the deferred and request bits as work a holder does when it
+takes them.
+
 ## Reads and writes from a task's own buffer
 
 `lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`, `tla/lent/LentFile.tla`) checks
@@ -600,6 +718,48 @@ mutations (withdrawing a write part of which went out breaks `WholeOrNothing`; l
 of an abandoned write unsent keeps it from ending), and 2 witnesses (a withdrawn write; an
 abandoned write finished after part of it went out).
 
+`tla/ring/RingMulti.tla` checks a stream's read side with multishot receives
+(`src/io/source/read/ops.rs`, `src/io/source/read.rs`, `src/rt/shard/ring.rs`): the reader's
+first read arms one receive, the kernel fills a buffer of the shard's group per message and
+posts an arrival, the ring's thread hands each arrival to the side in order and stops the
+receive past its cap, and the receive ends (cancelled, dry, at the stream's end) with one last
+completion the side applies after its arrivals. A reader of lent buffers stops an armed receive
+and reads straight into its buffer. A read into a buffer of the caller's of at least 16 KiB
+(`ReadState::read_direct`) is made by the task with `read(2)` when nothing is read ahead and no
+receive is out; with a multishot receive out it stops it through the same `stop_multi` and
+waits, so the stop's last arrivals and its end come first, and the next small read arms a
+receive again. 17 configurations: 6 that must pass (four messages through three buffers with a
+cap and a burst of one, plain, with lent buffers and with reads big and small, with `InOrder`,
+no message lost, doubled or reordered, `OneOut`, `NoArmWithAhead`, `CapHeld` and `BuffersBack`,
+every buffer back in the group at the end; and `Termination` for each), 5 mutations (a ring that
+never stops a receive breaks `CapHeld`; a receive armed while one is out, and a small read that
+arms one while a big read's stop is in flight, break `OneOut`; a big read straight on the
+socket while the receive is out, or with chunks read ahead, breaks `InOrder`), and 6 witnesses
+(a dry end, a stop past the cap, a message into a lent buffer, a message read straight on the
+socket, a big read's stop, and a receive armed again after it). The reader makes at most two
+big reads, so a reader that keeps switching between sizes cannot spin the model.
+
+`tla/ring/RingInc.tla` checks the same receives on a group filled in pieces (`IOU_PBUF_RING_INC`;
+`RecvGroup::hand_out`, `settle`, `take_back` and `charge` in `src/rt/shard/recv.rs`, `arrived` in
+`src/rt/shard/ring.rs`). The kernel keeps a buffer while it has room: each message goes after the
+bytes already there, and its completion carries BUF_MORE until the one that fills the buffer; a
+receive that ends leaves the buffer partly filled for the next. For each buffer the ring's thread
+counts where the next piece starts, the chunks of it out and whether the kernel is done with it,
+and gives it back to the kernel only when the kernel is done and no chunk of it is out. A chunk
+counts at least a minimum against its receive's cap, and a datagram socket takes pool buffers
+while the group is filled in pieces. The model keeps the message each unit of a buffer holds, so
+a buffer filled again under a live chunk shows as a wrong message read. 13 configurations: 6 that
+must pass (four and five messages, with one and two completions posted ahead of the ring, and a
+datagram socket, with `InOrder`, `NoReuse`, no buffer back under the kernel or a live chunk and
+never twice in the kernel's ring, `BuffersBack`, `CapHeld`, the chunks of a receive within its cap
+at the minimum charge plus the batch the kernel posted when the ring passed it and the cancel's
+burst, and `NoCut`, no datagram cut; and `Termination` for each), 5 mutations (a buffer back on
+its last chunk while the kernel still holds it, and back on the kernel's last piece while chunks
+are out, break `NoReuse`, and with six messages the first loses a message, breaking `InOrder`; a
+chunk that counts its length only lets a peer sending a unit at a time past the cap, breaking
+`CapHeld`; a datagram socket arming a multishot receive on the group gets a datagram cut, breaking
+`NoCut`), and 2 witnesses (a buffer handed out in two pieces, a buffer given back).
+
 `lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
 every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
 table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its
@@ -612,6 +772,26 @@ source's file (`taken_slot_is_unnamed`); that a free slot is never freed again
 and handed out again only once the read completed (`example_reuse_waits`). The Rust tests in
 `src/rt/shard/ring/tests.rs` run sources past a full table, a retire with a read out and a
 shard that goes with one, each with a mutation of the code that makes one of them fail.
+
+## A listener's stream of connections
+
+`accept` (`tla/accept/AcceptStream.tla`) checks the stream `TcpListener::accept_multi` gives
+(`TcpStreamGenerator::poll_next` in `src/net/tcp.rs`, `out_of_descriptors` in
+`src/rt/counters.rs`) when the process runs out of descriptors. Peers connect into the backlog;
+the rest of the process may take every free descriptor for a while and gives them back in the
+end. A poll asks the listener for the next connection: one there and a descriptor free, it is
+accepted and the stream's pause starts over at its least; out of descriptors (EMFILE or ENFILE),
+the connection stays in the backlog and the stream waits on a timer for its pause, which then
+doubles up to its most, and asks again when the timer fires; any other error ends the stream.
+The side hands an error over once and the connections queued before it first, so a retry asks
+the listener afresh. Time is the ticks left on the timer. 7 configurations: 3 that must pass (two
+and three connections across two outages, with `NoBusyLoop`, at most one EMFILE between two ticks,
+`FirstWaitLeast`, the first pause after an accept is the least, and `AllServed`, the whole backlog
+accepted once descriptors are free again; and an outage followed by another error of the
+listener, with `OtherEnds`, the stream ends, and `NothingAfterEnd`), 3 mutations (the stream that
+ended on EMFILE, as it did before, breaks `AllServed`; a retry with no timer breaks `NoBusyLoop`;
+a pause that does not start over after an accept breaks `FirstWaitLeast`), and 1 witness (a retry
+after a pause that accepts a connection).
 
 ## The timer wheel
 
@@ -650,6 +830,21 @@ evict, both, liveness, and an evict followed by an attach to another shard), 3 m
 that leak the file into the table of a closed source, `NoLeak`; a look and a taking by the
 token alone, which hand the source registered with the other shard a slot of this ring's table,
 `NoForeignSlot`), and 4 witnesses.
+
+`tla/attach/Route.tla`, in the same family, checks a read of a ring source from a thread that
+runs no shard while the source's registration finishes (`Source::with_io`, `ensure_registered`,
+`ops_registered`, the side's `submit_wanted`). `with_io` reads the route before the side is
+taken: NotYet while the registration is under way, which issues nothing, Elsewhere once it is in
+place, which kicks the ring's thread. The registration is done with the sides held on the ring's
+thread, where `ops_registered` submits for a waiter it finds, or by the side's holder as it lets
+go. After its step, a read whose route was NotYet looks once more and, finding the source
+registered, asks the side to submit through the same path (the fix of commit 4bc2518): without
+it a registration that lands between the route and the step finds no waiter, the step leaves one
+and asks with NotYet, and nothing ever submits. 6 configurations: 4 that must pass (the read
+during the registration and after it, each with `OneSubmit`, one submit for the waiter, and no
+deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`), 1
+mutation (no look after the step breaks `Served`), and 1 witness (the late look asks for the
+submit).
 
 ## A shard that goes
 

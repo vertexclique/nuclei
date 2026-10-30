@@ -24,6 +24,15 @@ fn recv_shard(buffers: u16, size: u32) -> Option<Shard> {
     ring_shard_of(64, buffers, size)
 }
 
+/// As [`recv_shard`], with a group of whole buffers: a datagram cannot share
+/// a buffer filled in pieces, so multishot datagrams need this one.
+fn plain_shard(buffers: u16, size: u32) -> Option<Shard> {
+    super::super::recv::INCREMENTAL_FOR_TEST.with(|t| t.set(Some(false)));
+    let shard = ring_shard_of(64, buffers, size);
+    super::super::recv::INCREMENTAL_FOR_TEST.with(|t| t.set(None));
+    shard
+}
+
 /// As [`recv_shard`], on a ring of `entries` submission entries (twice as
 /// many completions): a ring whose completion queue overflows ends its
 /// multishot operations itself.
@@ -148,8 +157,12 @@ fn a_long_stream_arrives_whole_and_in_order_across_the_buffers() {
         peer
     });
     shard.block_on(async {
+        // Reads under the size a buffer is read into directly, so the
+        // group serves them.
         let mut got = vec![0u8; expected.len()];
-        read_exact(&src, &mut got).await;
+        for piece in got.chunks_mut(4096) {
+            read_exact(&src, piece).await;
+        }
         assert!(got == expected, "the bytes arrived changed or out of order");
     });
     // Some reads may go through the pool when a burst outruns the group.
@@ -387,8 +400,33 @@ fn listener_source() -> (std::net::TcpListener, Arc<Source>, std::net::SocketAdd
     (listener, src, addr)
 }
 
+/// The next connection; a process short of descriptors (other tests run in
+/// parallel) is waited out.
 async fn accept_stream(src: &Arc<Source>) -> crate::io::raw::Owned {
-    poll_fn(|cx| src.poll_accept_stream(cx)).await.unwrap()
+    loop {
+        match poll_fn(|cx| src.poll_accept_stream(cx)).await {
+            Ok(conn) => return conn,
+            Err(err) if crate::rt::counters::out_of_descriptors(&err) => {
+                crate::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
+}
+
+/// A client connection, made again while the process has no descriptor for
+/// it: a client that died of that would leave the accepting side waiting for
+/// good.
+fn connect_patiently(addr: std::net::SocketAddr) -> std::net::TcpStream {
+    loop {
+        match std::net::TcpStream::connect(addr) {
+            Ok(c) => return c,
+            Err(err) if crate::rt::counters::out_of_descriptors(&err) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
 }
 
 /// Connections taken without their addresses are all served by the one
@@ -403,7 +441,7 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
     let clients = std::thread::spawn(move || {
         (0..16)
             .map(|i| {
-                let mut c = std::net::TcpStream::connect(addr).unwrap();
+                let mut c = connect_patiently(addr);
                 c.write_all(&[i]).unwrap();
                 std::thread::sleep(Duration::from_millis(1));
                 c
@@ -411,7 +449,7 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
             .collect::<Vec<_>>()
     });
     let mut seen = Vec::new();
-    shard.block_on(async {
+    let served = shard.block_on(crate::time::timeout(Duration::from_secs(30), async {
         for _ in 0..16 {
             let conn = std::net::TcpStream::from(accept_stream(&src).await);
             // An accepted connection is non-blocking; its byte may still be
@@ -423,7 +461,8 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
             assert_eq!(n, 1);
             seen.push(b[0]);
         }
-    });
+    }));
+    served.expect("a connection never came");
     seen.sort_unstable();
     assert_eq!(
         seen,
@@ -546,7 +585,7 @@ const DATAGRAM_BUFFERS: u32 = 66 * 1024;
 /// their senders through the one multishot receive the first armed.
 #[test]
 fn datagrams_come_whole_with_their_senders_through_one_multishot_receive() {
-    let Some(shard) = recv_shard(16, DATAGRAM_BUFFERS) else {
+    let Some(shard) = plain_shard(16, DATAGRAM_BUFFERS) else {
         return;
     };
     let _current = context::enter(&shard);
@@ -593,7 +632,7 @@ fn datagrams_come_whole_with_their_senders_through_one_multishot_receive() {
 /// cuts it, and the next one comes whole.
 #[test]
 fn a_multishot_datagram_is_cut_to_the_readers_buffer() {
-    let Some(shard) = recv_shard(16, DATAGRAM_BUFFERS) else {
+    let Some(shard) = plain_shard(16, DATAGRAM_BUFFERS) else {
         return;
     };
     let _current = context::enter(&shard);

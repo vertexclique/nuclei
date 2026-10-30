@@ -1,0 +1,8 @@
+# configuration                spec                 expected
+A_serve                        MC_AcceptStream      pass
+A_long                         MC_AcceptStream      pass
+A_other                        MC_AcceptStream      pass
+M_end_on_emfile                MC_AcceptStream      violated:AllServed
+M_no_backoff                   MC_AcceptStream      violated:NoBusyLoop
+M_no_reset                     MC_AcceptStream      violated:FirstWaitLeast
+W_retry_serves                 MC_AcceptStream      violated:NoRetryServed

@@ -101,7 +101,7 @@ fn peer_cred(fd: std::os::fd::RawFd) -> io::Result<UCred> {
 
 fn unix(addr: Addr) -> io::Result<UnixSocketAddr> {
     match addr {
-        Addr::Unix(addr) => Ok(addr),
+        Addr::Unix(addr) => Ok(addr.into_inner()),
         Addr::Inet(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "a Unix socket's peer has an internet address",
@@ -339,6 +339,57 @@ impl Handle<UnixDatagram> {
     /// As `recv(2)`.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.receive(buf, false).await.map(|(n, _)| n)
+    }
+
+    /// Sends all of `buf` as one datagram to the connected peer and gives
+    /// it back with its length. The driver sends from `buf` itself, so the
+    /// bytes are never copied.
+    ///
+    /// If the future is dropped before it completes, the datagram is sent
+    /// whole or not at all: one the driver has not handed to the kernel is
+    /// withdrawn, and one already handed over goes out.
+    pub async fn send_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.source().send_owned(buf, Dest::Connected).await
+    }
+
+    /// Sends all of `buf` as one datagram to the socket at `path` and gives
+    /// it back with its length, as [`send_owned`](Self::send_owned) sends to
+    /// the connected peer.
+    pub async fn send_to_owned<P: AsRef<Path>>(
+        &self,
+        buf: Vec<u8>,
+        path: P,
+    ) -> (io::Result<usize>, Vec<u8>) {
+        match UnixAddr::path(path.as_ref()) {
+            Ok(addr) => self.source().send_owned(buf, Dest::Unix(&addr)).await,
+            Err(err) => (Err(err), buf),
+        }
+    }
+
+    /// Receives a datagram from the connected peer into the spare capacity
+    /// of `buf`, after the bytes it holds, and gives `buf` back with the
+    /// datagram's length. The driver receives into `buf` itself, so the bytes
+    /// are never copied; what does not fit is cut.
+    ///
+    /// If the future is dropped before it completes, a datagram the driver
+    /// received into `buf` stays with the socket for its next receive, so
+    /// none is lost.
+    pub async fn recv_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        let (result, buf) = self.recv_from_owned(buf).await;
+        (result.map(|(n, _)| n), buf)
+    }
+
+    /// Receives a datagram with its sender's address into the spare capacity
+    /// of `buf`, as [`recv_owned`](Self::recv_owned).
+    pub async fn recv_from_owned(
+        &self,
+        buf: Vec<u8>,
+    ) -> (io::Result<(usize, UnixSocketAddr)>, Vec<u8>) {
+        let (result, buf) = self.source().recv_from_owned(buf).await;
+        (
+            result.and_then(|(n, addr)| unix(addr).map(|addr| (n, addr))),
+            buf,
+        )
     }
 
     /// Looks at the next datagram without taking it.

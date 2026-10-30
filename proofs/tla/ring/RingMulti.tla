@@ -18,6 +18,15 @@
 (* stops an armed receive when it has nothing read ahead, and reads the   *)
 (* next message straight into its buffer.                                 *)
 (*                                                                          *)
+(* A read into a buffer of the caller's of at least 16 KiB (`direct` in   *)
+(* src/io/source/direct.rs, `ReadState::read_direct` in                   *)
+(* src/io/source/read.rs) is made by the task itself with `read(2)`, when *)
+(* nothing is read ahead and no receive is out. With a multishot receive  *)
+(* out it stops it through the same `stop_multi` the lent path uses, and   *)
+(* waits: the stop's last arrivals and its end come first, and the woken   *)
+(* task takes them before it reads. A read that would block waits for the *)
+(* socket to be ready. The next small read arms a multishot receive again. *)
+(*                                                                          *)
 (* A multishot accept is the same shape (src/rt/shard/ring.rs,            *)
 (* `accepted`): its arrivals are connections instead of buffers, counted  *)
 (* against the accept's cap, and the side asks for another accept only    *)
@@ -38,6 +47,8 @@ CONSTANTS
     Cap,       \* buffers one receive may hold before the ring stops it
     Burst,     \* arrivals the kernel may still make for a receive before a cancel takes it
     Lent,      \* TRUE: the reader reads into lent buffers
+    Direct,    \* TRUE: the reader may read with a buffer big enough to read straight on the socket
+    Bigs,      \* the big reads (each a stop or a read straight on the socket) the reader makes at most
     Mutation   \* "none", or the name of the one rule this run takes away
 
 (* --algorithm RingMulti
@@ -64,7 +75,11 @@ variables
     armedWithAhead = FALSE, \* (record) a receive was armed with chunks unread
     dryEnds = 0,          \* (record) receives that ended dry
     stops = 0,            \* (record) receives the ring stopped
-    lentGot = 0;          \* (record) messages read straight into a lent buffer
+    lentGot = 0,          \* (record) messages read straight into a lent buffer
+    bigLeft = Bigs,       \* big reads the reader may still make
+    directGot = 0,        \* (record) messages a task read straight on the socket
+    directStops = 0,      \* (record) receives a big read stopped
+    rearmed = FALSE;      \* (record) a small read armed a receive again after a big read's stop
 
 define
     \* What a pool or lent receive brings at the stream's end.
@@ -154,7 +169,9 @@ R_loop:
                 if c.why = "dry" then dryEnds := dryEnds + 1; end if;
             end if;
         or
-            \* `take_back`, before the ring's next wait.
+            \* `take_back`, before the ring's next wait. `returned` counts the buffers
+            \* of the queue and of the ring thread's own local list alike: a chunk
+            \* dropped on the ring's thread joins the list, any other the queue.
             await returned > 0;
             free := free + returned;
             held := IF held >= returned THEN held - returned ELSE 0;
@@ -166,6 +183,7 @@ end process;
 \* The reader: each poll applies what came (the chunks, then the end), then
 \* takes the next message or asks the driver for more.
 fair process reader = "reader"
+variables bigRead = FALSE;  \* this poll's read is big enough to read straight on the socket
 begin
 D_loop:
     while ~ReaderDone /\ ~(eof /\ ahead = <<>>) do
@@ -198,7 +216,38 @@ D_res:
             poolRes := 0;
         end if;
 D_take:
-        if ahead # <<>> then
+        \* This poll's read: big enough for a read straight on the socket, or small.
+        with big \in IF Direct /\ bigLeft > 0 THEN BOOLEAN ELSE {FALSE} do
+            bigRead := big;
+        end with;
+        \* MUTATION direct_ahead: a big read goes straight to the socket with chunks read ahead.
+        if bigRead /\ ~eof /\ out \in {"none", "multi"}
+           /\ (ahead = <<>> \/ Mutation = "direct_ahead") then
+            \* MUTATION direct_in_flight: a big read goes straight to the socket while the receive is out.
+            if out = "multi" /\ Mutation # "direct_in_flight" then
+                \* A receive out: it is stopped once (`stop_multi`), and the task waits.
+                if ~stop then
+                    stop := TRUE;
+                    batch := 0;
+                    directStops := directStops + 1;
+                    bigLeft := bigLeft - 1;
+                end if;
+                await chunkq # <<>> \/ mailbox # "none";
+            elsif sock # <<>> then
+                \* `read(2)` into the caller's buffer: the next message.
+                got := Append(got, Head(sock));
+                sock := Tail(sock);
+                directGot := directGot + 1;
+                bigLeft := bigLeft - 1;
+            elsif PeerDone then
+                \* `read(2)` answers the stream's end.
+                eof := TRUE;
+                bigLeft := bigLeft - 1;
+            else
+                \* It would block: the side waits for the socket to be ready (`poll_first`).
+                await sock # <<>> \/ PeerDone;
+            end if;
+        elsif ahead # <<>> then
             \* A read takes the next message; a chunk's buffer goes back.
             got := Append(got, Head(ahead).m);
             if Head(ahead).chunk then returned := returned + 1; end if;
@@ -207,7 +256,9 @@ D_take:
             \* A lent buffer with nothing read ahead: the receive is stopped.
             stop := TRUE;
             batch := 0;
-        elsif ~eof /\ (out = "none" \/ Mutation = "arm_twice") then
+        \* MUTATION rearm_stopping: a small read arms a receive while a big read's stop is still in flight.
+        elsif ~eof /\ (out = "none" \/ Mutation = "arm_twice"
+                       \/ (Mutation = "rearm_stopping" /\ out = "multi" /\ stop)) then
             \* A lent reader reads plainly first, then into its own buffers.
             if Lent /\ Len(got) > 0 /\ out = "none" then
                 out := "lent";
@@ -216,6 +267,7 @@ D_take:
             else
                 \* MUTATION arm_twice: a receive goes out while one is.
                 armedWithAhead := armedWithAhead \/ ahead # <<>>;
+                rearmed := rearmed \/ directStops > 0;
                 out := "multi";
                 armed := TRUE;
                 stop := FALSE;
@@ -267,4 +319,10 @@ NoDry == dryEnds = 0
 NoStop == stops = 0
 \* A message comes straight into a lent buffer.
 NoLentGot == lentGot = 0
+\* A task reads a message straight on the socket.
+NoDirectGot == directGot = 0
+\* A big read stops a receive out, waits, and takes what the stop brought first.
+NoDirectStop == directStops = 0
+\* A small read arms a receive again after a big read stopped one.
+NoRearm == ~rearmed
 =============================================================================

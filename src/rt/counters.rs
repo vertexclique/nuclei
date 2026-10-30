@@ -300,7 +300,7 @@ pub(crate) fn accept_error(err: &io::Error) {
 }
 
 /// Whether `err` says the process or the system has no descriptor left.
-fn out_of_descriptors(err: &io::Error) -> bool {
+pub(crate) fn out_of_descriptors(err: &io::Error) -> bool {
     #[cfg(unix)]
     let codes = [libc::EMFILE, libc::ENFILE];
     #[cfg(windows)]

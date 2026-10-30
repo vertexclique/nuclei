@@ -29,6 +29,9 @@ pub(crate) struct Tuning {
     /// A task woken by the running task runs next.
     pub(crate) lifo: bool,
     pub(crate) hooks: ThreadHooks,
+    /// Jobs in flight on the runtime's blocking pool: while any is, a shard that
+    /// runs dry spins, as one of them may wake it.
+    pub(crate) blocking: Option<Arc<crate::sync::internal::AtomicUsize>>,
 }
 
 impl Default for Tuning {
@@ -40,6 +43,7 @@ impl Default for Tuning {
             max_io_events: usize::MAX,
             lifo: true,
             hooks: ThreadHooks::default(),
+            blocking: None,
         }
     }
 }

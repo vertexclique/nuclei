@@ -66,10 +66,14 @@ enum PortMem {
     Recv(PoolBuf),
     RecvLent(Vec<u8>),
     RecvFrom(PoolBuf),
+    RecvLentFrom(Vec<u8>),
     Connect(Dial),
     Send(PoolBuf),
     SendLent(Vec<u8>),
     SendTo(PoolBuf, Target),
+    SendLentTo(Vec<u8>),
+    /// The file a `TransmitFile` reads, kept open until its packet.
+    SendFile(#[expect(dead_code, reason = "kept open until the packet")] Arc<OwnedHandle>),
 }
 
 /// A source's state on a port.
@@ -383,7 +387,7 @@ impl PortIssuer<'_> {
         if let Err(code) = started {
             // No packet comes: the operation ends here, with the error.
             // SAFETY: the call did not take the slot.
-            unsafe { finish(slot, Some(code), 0) };
+            unsafe { finish(slot, Some(code), 0, None) };
         }
         id
     }
@@ -450,6 +454,88 @@ fn start(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET, want: Want) -> 
                     null,
                 )
             })
+        }
+        NotStream::RecvLentFrom(mut buf) => {
+            let spare = buf.spare_capacity_mut();
+            inner.buf = WSABUF {
+                len: u32::try_from(spare.len()).unwrap_or(u32::MAX),
+                buf: spare.as_mut_ptr().cast(),
+            };
+            inner.flags = 0;
+            inner.addr_len = size_of::<SOCKADDR_STORAGE>() as i32;
+            inner.mem = Some(PortMem::RecvLentFrom(buf));
+            // SAFETY: the buffer, the flags and the address room live in the
+            // slot until the packet; the kernel writes the buffer's spare
+            // room.
+            queued(unsafe {
+                WSARecvFrom(
+                    socket,
+                    &mut inner.buf,
+                    1,
+                    core::ptr::null_mut(),
+                    &mut inner.flags,
+                    core::ptr::from_mut(&mut inner.addr).cast::<SOCKADDR>(),
+                    &mut inner.addr_len,
+                    ov,
+                    null,
+                )
+            })
+        }
+        NotStream::SendLentTo(buf, target) => {
+            inner.buf = WSABUF {
+                len: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                buf: buf.as_ptr().cast_mut(),
+            };
+            let to = match &target {
+                Target::Connected => None,
+                Target::Inet(addr) => Some(sys::raw_addr(addr)),
+            };
+            inner.mem = Some(PortMem::SendLentTo(buf));
+            match to {
+                // SAFETY: the buffer lives in the slot until the packet; the
+                // kernel only reads it.
+                None => queued(unsafe {
+                    WSASend(socket, &inner.buf, 1, core::ptr::null_mut(), 0, ov, null)
+                }),
+                Some((addr, len)) => {
+                    inner.addr = addr;
+                    // SAFETY: the buffer and the address live in the slot
+                    // until the packet.
+                    queued(unsafe {
+                        WSASendTo(
+                            socket,
+                            &inner.buf,
+                            1,
+                            core::ptr::null_mut(),
+                            0,
+                            core::ptr::from_ref(&inner.addr).cast::<SOCKADDR>(),
+                            len,
+                            ov,
+                            null,
+                        )
+                    })
+                }
+            }
+        }
+        NotStream::SendFile(file) => {
+            let Some(transmit) = winsock::ext().ok().and_then(|ext| ext.transmit_file) else {
+                return fail(
+                    inner,
+                    PortMem::SendFile(file.handle),
+                    io::ErrorKind::Unsupported.into(),
+                );
+            };
+            let raw = file.handle.as_raw_handle();
+            inner.mem = Some(PortMem::SendFile(file.handle));
+            // SAFETY: the slot's OVERLAPPED is ours until the packet; the offset is where the
+            // file is read.
+            unsafe {
+                (*ov).Offset = file.offset as DWORD;
+                (*ov).OffsetHigh = (file.offset >> 32) as DWORD;
+            }
+            // SAFETY: the socket is the source's, the file handle is kept in the slot until the
+            // packet, and `ov` is the slot's.
+            queued_bool(unsafe { transmit(socket, raw.cast(), file.len, 0, ov, null.cast(), 0) })
         }
         NotStream::Accept => {
             let made = winsock::ext().and_then(|ext| {
@@ -551,8 +637,11 @@ fn start(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET, want: Want) -> 
 enum NotStream {
     Accept,
     RecvFrom(PoolBuf),
+    RecvLentFrom(Vec<u8>),
     Connect(Dial),
     SendTo(PoolBuf, Target),
+    SendLentTo(Vec<u8>, Target),
+    SendFile(super::write::FileRange),
 }
 
 impl NotStream {
@@ -562,6 +651,9 @@ impl NotStream {
         inner.mem = Some(match self {
             NotStream::Accept => PortMem::NoAccept,
             NotStream::RecvFrom(buf) => PortMem::RecvFrom(buf),
+            NotStream::RecvLentFrom(buf) => PortMem::RecvLentFrom(buf),
+            NotStream::SendLentTo(buf, _) => PortMem::SendLentTo(buf),
+            NotStream::SendFile(file) => PortMem::SendFile(file.handle),
             NotStream::Connect(dial) => PortMem::Connect(dial),
             NotStream::SendTo(buf, target) => PortMem::SendTo(buf, target),
         });
@@ -603,6 +695,9 @@ fn stream_memory(inner: &mut Inner, want: Want) -> Result<bool, NotStream> {
         }
         Want::Accept => Err(NotStream::Accept),
         Want::RecvFrom(buf) => Err(NotStream::RecvFrom(buf)),
+        Want::RecvLentFrom(buf) => Err(NotStream::RecvLentFrom(buf)),
+        Want::SendFile(file) => Err(NotStream::SendFile(file)),
+        Want::SendLentTo(buf, target) => Err(NotStream::SendLentTo(buf, target)),
         Want::Connect(dial) => Err(NotStream::Connect(dial)),
         Want::SendTo(buf, target) => Err(NotStream::SendTo(buf, target)),
     }
@@ -721,7 +816,7 @@ fn run_job(slot: &Slot, handle: &OwnedHandle, read: bool, port: &Port) {
 ///
 /// `entry` is a packet of an operation a [`PortIssuer`] issued: its
 /// `OVERLAPPED` is a slot's, which the kernel is done with.
-pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY) {
+pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY, shard: Option<&crate::rt::shard::Shard>) {
     // SAFETY: the caller's: the slot is of a live source (its reference
     // was held for the kernel), and the kernel or the job is done with it.
     let slot = unsafe { &*entry.lpOverlapped.cast::<Slot>().cast_const() };
@@ -732,7 +827,7 @@ pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY) {
         status_error(entry.Internal as i32)
     };
     // SAFETY: as above.
-    unsafe { finish(slot, code, entry.dwNumberOfBytesTransferred as usize) };
+    unsafe { finish(slot, code, entry.dwNumberOfBytesTransferred as usize, shard) };
 }
 
 /// Ends the operation of `slot`, which failed with `code` or ran (`None`)
@@ -742,7 +837,12 @@ pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY) {
 /// # Safety
 ///
 /// The kernel is done with the slot, and its operation was issued.
-unsafe fn finish(slot: &Slot, code: Option<i32>, bytes: usize) {
+unsafe fn finish(
+    slot: &Slot,
+    code: Option<i32>,
+    bytes: usize,
+    shard: Option<&crate::rt::shard::Shard>,
+) {
     // SAFETY: the caller's: the slot is this thread's until the outcome is
     // handed on below.
     let inner = unsafe { &mut *slot.inner.get() };
@@ -757,11 +857,14 @@ unsafe fn finish(slot: &Slot, code: Option<i32>, bytes: usize) {
         return;
     };
     let outcome = outcome(inner, mem, code, bytes);
-    source.op_done(Done {
-        outcome,
-        epoch: inner.epoch,
-        read: inner.read,
-    });
+    source.op_done(
+        Done {
+            outcome,
+            epoch: inner.epoch,
+            read: inner.read,
+        },
+        shard,
+    );
 }
 
 /// The outcome of an operation on `mem`, from what the kernel left in the
@@ -806,6 +909,27 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
             };
             Outcome::RecvFrom(buf, answer)
         }
+        PortMem::RecvLentFrom(mut buf) => {
+            let answer = match answer {
+                Answer::Done(Ok(n)) => {
+                    // SAFETY: the kernel wrote the first `n` bytes of the
+                    // spare capacity.
+                    unsafe { buf.set_len(buf.len() + n) };
+                    // SAFETY: the kernel wrote the sender's address and its
+                    // length into the slot.
+                    let from = unsafe {
+                        sys::socket_addr(
+                            core::ptr::from_ref(&inner.addr).cast::<SOCKADDR>(),
+                            inner.addr_len,
+                        )
+                    };
+                    Answer::Done(from.map(|from| (n, Addr::Inet(from))))
+                }
+                Answer::Done(Err(err)) => Answer::Done(Err(err)),
+                Answer::Undone { not_ready } => Answer::Undone { not_ready },
+            };
+            Outcome::RecvLentFrom(buf, answer)
+        }
         PortMem::NoAccept => Outcome::Accept(match answer {
             Answer::Done(Ok(_)) => Answer::Done(Err(io::ErrorKind::Other.into())),
             Answer::Done(Err(err)) => {
@@ -832,6 +956,9 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         PortMem::Send(buf) => Outcome::Send(buf, answer),
         PortMem::SendLent(buf) => Outcome::SendLent(buf, answer),
         PortMem::SendTo(buf, target) => Outcome::SendTo(buf, target, answer),
+        PortMem::SendLentTo(buf) => Outcome::SendLentTo(buf, answer),
+        // The lent write's end, with no buffer to give back.
+        PortMem::SendFile(_) => Outcome::SendLent(Vec::new(), answer),
     }
 }
 

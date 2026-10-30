@@ -29,6 +29,7 @@
 
 mod addr;
 mod opt;
+mod send_file;
 mod socket;
 mod split;
 mod stream;

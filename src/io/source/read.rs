@@ -2,15 +2,17 @@
 //!
 //! Every call on the descriptor is the driver's ([`ReadState::complete`]),
 //! into buffers of the pool: on an edge, for the tasks that wait, or at
-//! once when a task asks and the socket may hold something. A task never
-//! makes the call itself: it takes what the driver completed, copying it
-//! into its own buffer. What no task took yet waits here: a stream's
-//! read-ahead (in the order it came: a buffer of the pool, a lent buffer's
-//! leftover, or on a ring the buffers of the shard's receive group that a
-//! multishot receive handed out), its end or its error, a listener's
-//! accepted connections, a datagram socket's datagrams (as many as tasks
-//! wait, at most [`BATCH`]). A task whose future went away leaves it for the
-//! next operation, so nothing the kernel handed over is lost.
+//! once when a task asks and the socket may hold something. A task takes
+//! what the driver completed, copying it into its own buffer; only a
+//! stream read into a buffer big enough (see `direct`) makes the call
+//! itself, into that buffer, when the read-ahead holds nothing. What no
+//! task took yet waits here: a stream's read-ahead (in the order it came: a
+//! buffer of the pool, a lent buffer's leftover, or on a ring the buffers of
+//! the shard's receive group that a multishot receive handed out), its end
+//! or its error, a listener's accepted connections, a datagram socket's
+//! datagrams (as many as tasks wait, at most [`BATCH`]). A task whose future
+//! went away leaves it for the next operation, so nothing the kernel handed
+//! over is lost.
 //!
 //! A stream read may also lend the side a buffer of its own
 //! ([`Source::read_owned`]): the driver reads into that buffer, with no copy,
@@ -30,7 +32,7 @@ use crate::io::raw::Owned;
 use std::sync::Arc;
 use std::task::Context;
 
-use super::{Addr, Failure, Io, Kind, Source};
+use super::{Addr, Failure, Io, Kind, Source, Via};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
 #[cfg(readiness)]
@@ -47,27 +49,44 @@ use ahead::{Ahead, Piece};
 #[cfg(readiness)]
 const BATCH: usize = 32;
 
-/// A datagram received ahead: in a buffer of the pool, or on a ring in a
-/// buffer of the receive group a multishot receive filled.
+/// A datagram received ahead: in a buffer of the pool, on a ring in a
+/// buffer of the receive group a multishot receive filled, or in a task's
+/// own buffer whose task went away after the driver read into it.
 enum Datagram {
     Pool(PoolBuf),
     #[cfg(ring)]
     Ring(crate::rt::shard::recv::RingChunk),
+    Owned {
+        buf: Vec<u8>,
+        start: usize,
+    },
 }
 
 impl Datagram {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Datagram::Pool(buf) => buf.filled(),
+            #[cfg(ring)]
+            Datagram::Ring(chunk) => chunk.bytes(),
+            Datagram::Owned { buf, start } => buf.get(*start..).unwrap_or_default(),
+        }
+    }
+
     /// Copies the datagram into `out`, cut to it as the kernel cuts it.
     fn peek_into(&self, out: &mut [u8]) -> usize {
-        match self {
-            Datagram::Pool(buf) => buf.peek_into(out),
-            #[cfg(ring)]
-            Datagram::Ring(chunk) => {
-                let src = chunk.bytes();
-                let n = src.len().min(out.len());
-                out[..n].copy_from_slice(&src[..n]);
-                n
-            }
-        }
+        let src = self.bytes();
+        let n = src.len().min(out.len());
+        out[..n].copy_from_slice(&src[..n]);
+        n
+    }
+
+    /// Appends the datagram to `out`, cut to its spare capacity as the
+    /// kernel cuts it.
+    fn append_to(&self, out: &mut Vec<u8>) -> usize {
+        let src = self.bytes();
+        let n = src.len().min(out.capacity() - out.len());
+        out.extend_from_slice(&src[..n]);
+        n
     }
 
     fn release(self, after: &mut After) {
@@ -76,6 +95,7 @@ impl Datagram {
             // Goes back to its group as it drops.
             #[cfg(ring)]
             Datagram::Ring(_) => {}
+            Datagram::Owned { .. } => {}
         }
     }
 }
@@ -102,6 +122,8 @@ struct Lent {
     /// Its task went away while the buffer was out: the completion hands
     /// what came to the read-ahead.
     orphan: bool,
+    /// The sender, once a datagram was read into the buffer.
+    peer: Option<Addr>,
 }
 
 #[derive(Default)]
@@ -287,7 +309,7 @@ impl ReadState {
     /// comes back. A whole datagram no buffer of the pool could hold fails
     /// the operation instead.
     fn buffer(&mut self, len: usize, whole: bool, after: &mut After) -> Option<PoolBuf> {
-        if whole && let Some(err) = crate::io::side::whole_too_large(len) {
+        if whole && let Some(err) = crate::io::side::whole_too_large(None, len) {
             self.error = Some(err);
             return None;
         }
@@ -315,6 +337,12 @@ impl ReadState {
         if self.waiters.is_empty() && !self.lent_waits() {
             return;
         }
+        if self.leaves_to_tasks(kind) {
+            // The task reads into its own buffer when it polls.
+            self.want = 0;
+            after.wake(&mut self.waiters);
+            return;
+        }
         self.complete_fd(fd, kind, self.want, after);
         if self.has_result() {
             self.want = 0;
@@ -328,14 +356,37 @@ impl ReadState {
     /// while the last call would have blocked and no edge came since, or
     /// while a result waits to be taken.
     fn complete(&mut self, io: Io<'_>, kind: Kind, len: usize, after: &mut After) {
-        match io {
+        match io.via {
             #[cfg(readiness)]
-            Io::Fd(fd) => self.complete_fd(fd, kind, len, after),
+            Via::Fd(fd) => self.complete_fd(fd, kind, len, after),
             #[cfg(completion)]
-            Io::Ops(route) => self.submit_ops(route, kind, len, after),
+            Via::Ops(route) => {
+                if !self.armed_and_quiet() {
+                    self.submit_ops(route, kind, len, after);
+                }
+            }
             #[cfg(not(completion))]
-            Io::None(never, _) => match never {},
+            Via::None(never, _) => match never {},
         }
+    }
+
+    /// A multishot receive is out and stays: no lent buffer waits for the next bytes (which would
+    /// stop it) and the caller makes no calls of its own, so `submit_ops` would find it out and
+    /// do nothing.
+    #[cfg(completion)]
+    fn armed_and_quiet(&self) -> bool {
+        #[cfg(ring)]
+        return self.out.is_some()
+            && self.multi
+            && !self.multi_stopping
+            && !self.user_fd
+            && !(self.ahead.is_empty()
+                && self
+                    .lent
+                    .as_ref()
+                    .is_some_and(|l| !l.out && l.done.is_none()));
+        #[cfg(not(ring))]
+        false
     }
 
     #[cfg(readiness)]
@@ -353,6 +404,9 @@ impl ReadState {
                 }
             }
             Kind::TcpListener | Kind::UnixListener => self.accept_ahead(fd, kind),
+            Kind::Udp | Kind::UnixDatagram if self.lent.is_some() => {
+                self.receive_lent(fd, kind, after);
+            }
             Kind::Udp | Kind::UnixDatagram => self.receive_ahead(fd, kind, len, after),
             // The caller makes its own calls.
             Kind::Fd => {}
@@ -440,6 +494,36 @@ impl ReadState {
     }
 
     #[cfg(readiness)]
+    /// Receives one datagram into the spare capacity of the lent buffer, and
+    /// wakes its task.
+    fn receive_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) {
+        let Some(lent) = self.lent.as_mut() else {
+            return;
+        };
+        let spare = lent.buf.spare_capacity_mut();
+        let result = match kind {
+            Kind::UnixDatagram => sys::ready(sys::recv_from_unix_uninit(fd, spare))
+                .map(|r| r.map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a))))),
+            _ => sys::ready(sys::recv_from_udp_uninit(fd, spare))
+                .map(|r| r.map(|(n, a)| (n, Addr::Inet(a)))),
+        };
+        let Some(result) = result else {
+            self.blocked = true;
+            return;
+        };
+        lent.done = Some(result.map(|(n, from)| {
+            // SAFETY: the kernel wrote the first `n` bytes of the spare
+            // capacity.
+            unsafe { lent.buf.set_len(lent.buf.len() + n) };
+            lent.peer = Some(from);
+            n
+        }));
+        if let Some(waker) = lent.waker.take() {
+            after.wake_one(waker);
+        }
+    }
+
+    #[cfg(readiness)]
     fn accept_ahead(&mut self, fd: RawFd, kind: Kind) {
         let limit = self.waiters.len().clamp(1, BATCH);
         while self.accepted.len() < limit {
@@ -481,6 +565,84 @@ impl ReadState {
                     return;
                 }
             }
+        }
+    }
+
+    /// The tasks waiting asked for buffers big enough to read into directly,
+    /// and nothing is held that must come first.
+    #[cfg(readiness)]
+    fn leaves_to_tasks(&self, kind: Kind) -> bool {
+        kind.streams()
+            && self.want >= super::direct::READ_READINESS
+            && self.ahead.is_empty()
+            && self.lent.is_none()
+            && !self.eof
+            && self.error.is_none()
+    }
+
+    /// A stream read of `len` bytes made by `call` straight on the
+    /// descriptor `fd`, into the caller's memory, if the side holds nothing
+    /// that comes first. `None` leaves the read to the normal path, which
+    /// waits for readiness when the socket had nothing; `Pending` is a
+    /// multishot receive being stopped so the next poll can call.
+    #[cfg(unix)]
+    pub(super) fn read_direct(
+        &mut self,
+        io: Io<'_>,
+        fd: Option<RawFd>,
+        kind: Kind,
+        len: usize,
+        waker: &Waker,
+        call: impl FnOnce(RawFd) -> io::Result<usize>,
+    ) -> Option<Poll<io::Result<usize>>> {
+        let fd = fd?;
+        if !kind.streams()
+            || len == 0
+            || !super::direct::worth(io, len, false)
+            || !self.ahead.is_empty()
+            || self.lent.is_some()
+            || self.eof
+            || self.error.is_some()
+        {
+            return None;
+        }
+        match io.via {
+            Via::Fd(_) if self.blocked => return None,
+            Via::Fd(_) => {}
+            #[cfg(ring)]
+            Via::Ops(route) => {
+                if self.out.is_some() {
+                    if !self.multi {
+                        return None;
+                    }
+                    self.stop_multi(route);
+                    self.wait(waker, len);
+                    return Some(Poll::Pending);
+                }
+            }
+            #[cfg(not(completion))]
+            Via::None(never, _) => match never {},
+        }
+        #[cfg(not(ring))]
+        let _ = waker;
+        match sys::ready(call(fd)) {
+            None => {
+                match io.via {
+                    Via::Fd(_) => self.blocked = true,
+                    #[cfg(ring)]
+                    Via::Ops(_) => self.poll_first = true,
+                    #[cfg(not(completion))]
+                    Via::None(never, _) => match never {},
+                }
+                None
+            }
+            Some(Ok(n)) => {
+                if matches!(io.via, Via::Fd(_)) {
+                    self.blocked = drained(kind, self.unsure, n, len);
+                }
+                Some(Poll::Ready(Ok(n)))
+            }
+            Some(Err(err)) => Some(Poll::Ready(Err(err))),
         }
     }
 
@@ -567,6 +729,7 @@ impl ReadState {
                 waker: None,
                 out: false,
                 orphan: false,
+                peer: None,
             });
         }
         // The task polls, so the driver's read needs no wake for it.
@@ -599,6 +762,85 @@ impl ReadState {
         Poll::Ready(done.unwrap_or(Ok(0)))
     }
 
+    /// A datagram receive into a task's own buffer (`held`; `None` while it
+    /// is lent), as [`read_owned`](Self::read_owned) reads a stream: a
+    /// datagram that came before is copied into it; otherwise it is lent and
+    /// the driver receives into it. The sender goes to `from`.
+    fn read_owned_from(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        held: &mut Option<Vec<u8>>,
+        from: &mut Option<Addr>,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        if !self.datagrams.is_empty()
+            && self
+                .lent
+                .as_ref()
+                .is_some_and(|l| !l.out && l.done.is_none())
+        {
+            // One came while the buffer waited: it goes first.
+            *held = self.reclaim(after);
+        }
+        if let Some(buf) = held.as_mut() {
+            if let Some((datagram, addr)) = self.datagrams.pop_front() {
+                let n = datagram.append_to(buf);
+                datagram.release(after);
+                *from = Some(addr);
+                self.pass_on(after);
+                return Poll::Ready(Ok(n));
+            }
+            if let Some(err) = self.error.take() {
+                return Poll::Ready(Err(err));
+            }
+            if self.lent.is_some() {
+                self.wait(waker, 0);
+                return Poll::Pending;
+            }
+            self.lent = held.take().map(|buf| Lent {
+                from: buf.len(),
+                buf,
+                done: None,
+                waker: None,
+                out: false,
+                orphan: false,
+                peer: None,
+            });
+        }
+        let old = self.lent.as_mut().and_then(|l| l.waker.take());
+        self.complete(io, kind, 0, after);
+        let Some(lent) = self.lent.as_mut() else {
+            return Poll::Ready(Err(io::Error::other("the receive lost its buffer")));
+        };
+        if lent.done.is_none() {
+            lent.waker = Some(match old {
+                Some(w) if w.will_wake(waker) => w,
+                other => {
+                    if let Some(w) = other {
+                        after.forget_one(w);
+                    }
+                    waker.clone()
+                }
+            });
+            return Poll::Pending;
+        }
+        if let Some(w) = old {
+            after.forget_one(w);
+        }
+        let Some(Lent {
+            buf, done, peer, ..
+        }) = self.lent.take()
+        else {
+            return Poll::Ready(Err(io::Error::other("the receive lost its buffer")));
+        };
+        *held = Some(buf);
+        *from = peer;
+        after.wake(&mut self.waiters);
+        Poll::Ready(done.unwrap_or(Ok(0)))
+    }
+
     /// The task of the lent buffer went away: what the driver read into it
     /// becomes the read-ahead (its end or its error, the next read's), so
     /// nothing is lost.
@@ -620,6 +862,19 @@ impl ReadState {
         }
         match lent.done {
             None => {}
+            // A datagram, even an empty one, is received whole: the next
+            // receive takes it.
+            Some(Ok(_)) if lent.peer.is_some() => {
+                if let Some(peer) = lent.peer {
+                    self.datagrams.push_back((
+                        Datagram::Owned {
+                            buf: lent.buf,
+                            start: lent.from,
+                        },
+                        peer,
+                    ));
+                }
+            }
             Some(Ok(0)) => self.eof = true,
             Some(Ok(_)) => {
                 debug_assert!(
@@ -905,7 +1160,9 @@ const REPORTS_URGENT: bool = cfg!(any(
 /// Accepts a connection, non-blocking, with its peer's address.
 fn accept(fd: RawFd, kind: Kind) -> io::Result<(Owned, Addr)> {
     match kind {
-        Kind::UnixListener => sys::accept_unix(fd).map(|(s, a)| (s, Addr::Unix(a))),
+        Kind::UnixListener => {
+            sys::accept_unix(fd).map(|(s, a)| (s, Addr::Unix(crate::buf::spare::Spare::new(a))))
+        }
         _ => sys::accept_inet(fd).map(|(s, a)| (s, Addr::Inet(a))),
     }
 }
@@ -914,7 +1171,8 @@ fn accept(fd: RawFd, kind: Kind) -> io::Result<(Owned, Addr)> {
 /// Receives a datagram with its sender's address.
 fn receive(fd: RawFd, kind: Kind, out: &mut [u8]) -> io::Result<(usize, Addr)> {
     match kind {
-        Kind::UnixDatagram => sys::recv_from_unix(fd, out).map(|(n, a)| (n, Addr::Unix(a))),
+        Kind::UnixDatagram => sys::recv_from_unix(fd, out)
+            .map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)))),
         _ => sys::recv_from_udp(fd, out).map(|(n, a)| (n, Addr::Inet(a))),
     }
 }

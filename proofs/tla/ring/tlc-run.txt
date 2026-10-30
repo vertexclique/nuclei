@@ -1,37 +1,58 @@
-TLC run of every configuration in proofs/tla/ring, 2026-10-25 07:19 UTC.
+TLC run of every configuration in proofs/tla/ring, 2026-10-30 10:24 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-RO_safe                          13974       6109      1  pass                                  pass                                  yes
-RO_live                          13974       6109      2  pass                                  pass                                  yes
-RO_flow                           1698        814      1  pass                                  pass                                  yes
-MO_submit_while_out               3234       1504      1  violated:OneOut                       violated:OneOut                       yes
-MO_elsewhere_submits                14         11      1  violated:SingleIssuer                 violated:SingleIssuer                 yes
-MO_no_kick                          53         36      1  violated:WritesGo                     violated:WritesGo                     yes
-MO_no_wake                       10718       4729      2  violated:RetireReturns                violated:RetireReturns                yes
-MO_count_first                   16194       7075      2  violated:RetireReturns                violated:RetireReturns                yes
-MO_skip_wait                      1128        583      1  violated:RetiredIdle                  violated:RetiredIdle                  yes
-WO_task_applies                   2424       1166      1  violated:NoTaskApplies                violated:NoTaskApplies                yes
-WO_retire_waits                   3061       1439      1  violated:NoRetireWait                 violated:NoRetireWait                 yes
-RL_safe                            399        186      1  pass                                  pass                                  yes
-RL_live                            399        186      1  pass                                  pass                                  yes
-ML_withdraw_started                 41         30      1  violated:WholeOrNothing               violated:WholeOrNothing               yes
-ML_no_resubmit                     405        194      1  violated:Settles                      violated:Settles                      yes
-WL_withdraw                         63         41      1  violated:NoWithdraw                   violated:NoWithdraw                   yes
-WL_orphan_finish                    53         36      1  violated:NoOrphanFinish               violated:NoOrphanFinish               yes
-RL_port_safe                       248        108      1  pass                                  pass                                  yes
-RL_port_live                       248        108      1  pass                                  pass                                  yes
-ML_cancel_tcp                       71         49      1  violated:WholeOrNothing               violated:WholeOrNothing               yes
-WL_resend                           77         48      1  violated:NoResend                     violated:NoResend                     yes
-MU_safe                          20292       7050      1  pass                                  pass                                  yes
-MU_lent                          26697       9651      1  pass                                  pass                                  yes
-MU_live                          20292       7050      2  pass                                  pass                                  yes
-MU_live_lent                     26697       9651      2  pass                                  pass                                  yes
-MMU_no_cap                         863        319      1  violated:CapHeld                      violated:CapHeld                      yes
-MMU_arm_twice                       48         29      1  violated:OneOut                       violated:OneOut                       yes
-WMU_dry                            131         67      0  violated:NoDry                        violated:NoDry                        yes
-WMU_stop                           140         68      1  violated:NoStop                       violated:NoStop                       yes
-WMU_lent                          5903       2208      2  violated:NoLentGot                    violated:NoLentGot                    yes
+RO_safe                          13974       6109      4  pass                                  pass                                  yes
+RO_live                          13974       6109      4  pass                                  pass                                  yes
+RO_flow                           1698        814      4  pass                                  pass                                  yes
+MO_submit_while_out               3234       1504      3  violated:OneOut                       violated:OneOut                       yes
+MO_elsewhere_submits                14         11      3  violated:SingleIssuer                 violated:SingleIssuer                 yes
+MO_no_kick                          53         36      3  violated:WritesGo                     violated:WritesGo                     yes
+MO_no_wake                       10718       4729      6  violated:RetireReturns                violated:RetireReturns                yes
+MO_count_first                   13620       6032      6  violated:RetireReturns                violated:RetireReturns                yes
+MO_skip_wait                      1128        583      3  violated:RetiredIdle                  violated:RetiredIdle                  yes
+WO_task_applies                   2424       1166      4  violated:NoTaskApplies                violated:NoTaskApplies                yes
+WO_retire_waits                   3061       1439      3  violated:NoRetireWait                 violated:NoRetireWait                 yes
+RL_safe                            399        186      3  pass                                  pass                                  yes
+RL_live                            399        186      2  pass                                  pass                                  yes
+ML_withdraw_started                 41         30      3  violated:WholeOrNothing               violated:WholeOrNothing               yes
+ML_no_resubmit                     405        194      3  violated:Settles                      violated:Settles                      yes
+WL_withdraw                         63         41      3  violated:NoWithdraw                   violated:NoWithdraw                   yes
+WL_orphan_finish                    53         36      2  violated:NoOrphanFinish               violated:NoOrphanFinish               yes
+RL_port_safe                       248        108      3  pass                                  pass                                  yes
+RL_port_live                       248        108      3  pass                                  pass                                  yes
+ML_cancel_tcp                       71         49      3  violated:WholeOrNothing               violated:WholeOrNothing               yes
+WL_resend                           77         48      2  violated:NoResend                     violated:NoResend                     yes
+MU_safe                          20292       7050      3  pass                                  pass                                  yes
+MU_lent                          26697       9651      4  pass                                  pass                                  yes
+MU_live                          20292       7050      6  pass                                  pass                                  yes
+MU_live_lent                     26697       9651      7  pass                                  pass                                  yes
+MMU_no_cap                         863        319      4  violated:CapHeld                      violated:CapHeld                      yes
+MMU_arm_twice                       48         29      3  violated:OneOut                       violated:OneOut                       yes
+WMU_dry                            131         67      3  violated:NoDry                        violated:NoDry                        yes
+WMU_stop                           140         68      3  violated:NoStop                       violated:NoStop                       yes
+WMU_lent                          5903       2208      4  violated:NoLentGot                    violated:NoLentGot                    yes
+MU_direct                       204409      68425      5  pass                                  pass                                  yes
+MU_live_direct                   61195      21391      7  pass                                  pass                                  yes
+MMU_direct_in_flight               178         90      2  violated:InOrder                      violated:InOrder                      yes
+MMU_direct_ahead                  1714        802      3  violated:InOrder                      violated:InOrder                      yes
+MMU_rearm_stopping                 561        270      3  violated:OneOut                       violated:OneOut                       yes
+WMU_direct                          20         15      3  violated:NoDirectGot                  violated:NoDirectGot                  yes
+WMU_direct_stop                    184         91      3  violated:NoDirectStop                 violated:NoDirectStop                 yes
+WMU_rearm                         5835       2437      4  violated:NoRearm                      violated:NoRearm                      yes
+RI_safe                          52486      17890      4  pass                                  pass                                  yes
+RI_batch                        238884      75421      3  pass                                  pass                                  yes
+RI_live                          52486      17890      3  pass                                  pass                                  yes
+RI_live_batch                   201360      66313      6  pass                                  pass                                  yes
+RI_dgram                           253        124      0  pass                                  pass                                  yes
+RI_dgram_live                      253        124      2  pass                                  pass                                  yes
+MI_readd_with_more                 517        202      0  violated:NoReuse                      violated:NoReuse                      yes
+MI_readd_with_more_order        188806      62130      2  violated:InOrder                      violated:InOrder                      yes
+MI_readd_on_done                   341        139      1  violated:NoReuse                      violated:NoReuse                      yes
+MI_charge_len                     1740        635      1  violated:CapHeld                      violated:CapHeld                      yes
+MI_dgram_multishot                  54         32      1  violated:NoCut                        violated:NoCut                        yes
+WI_pieces                          173         83      1  violated:NoPieces                     violated:NoPieces                     yes
+WI_readd                          3938       1467      1  violated:NoReAdd                      violated:NoReAdd                      yes
 
-results matching EXPECTED.txt: 30 of 30
+results matching EXPECTED.txt: 51 of 51
