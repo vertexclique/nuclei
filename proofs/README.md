@@ -796,7 +796,8 @@ chunk that counts its length only lets a peer sending a unit at a time past the 
 every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
 table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its
 submission to its completion. For every sequence of operations from a fresh table it proves
-that a free slot is held by nobody, named by no entry and holds no open copy (`inv_run`); that
+that a free slot is held by nobody, named by no entry and holds no open copy (`inv_run`, for a
+table of any size, as the process's descriptor limit sizes it); that
 a slot a source takes has no entry naming it, so an entry on its way never reaches the next
 source's file (`taken_slot_is_unnamed`); that a free slot is never freed again
 (`no_double_free`); and that a copy closes only once no source holds it and no entry names it

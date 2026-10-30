@@ -876,9 +876,10 @@ thread_local! {
 }
 
 /// The fixed-file table of a ring: the process's descriptor limit (no more
-/// sources can be open while it holds), at most [`MAX_TABLE`], whose slots
-/// cost kernel memory per ring. Sources past it run on copies; every source
-/// does where the kernel lets go of a file out of the table only late (see
+/// sources can be open while it holds, and the kernel refuses a larger table
+/// with `EMFILE`), at most [`MAX_TABLE`], whose slots cost kernel memory per
+/// ring. Sources past it run on copies; every source does where the kernel
+/// lets go of a file out of the table only late (see
 /// `files::release_at_once`).
 pub(crate) fn table_len() -> u32 {
     #[cfg(test)]
@@ -896,9 +897,7 @@ pub(crate) fn table_len() -> u32 {
     } else {
         1024
     };
-    u32::try_from(soft)
-        .unwrap_or(MAX_TABLE)
-        .clamp(64, MAX_TABLE)
+    u32::try_from(soft).unwrap_or(MAX_TABLE).min(MAX_TABLE)
 }
 
 /// The most fixed files a ring's table holds.
@@ -933,7 +932,7 @@ pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
         },
         ..cfg
     };
-    let files = if table_len() == 0 { 0 } else { CHECK_TABLE };
+    let files = table_len().min(CHECK_TABLE);
     ShardRing::new(&small, files)?.enable()
 }
 
