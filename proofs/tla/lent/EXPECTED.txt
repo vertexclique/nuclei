@@ -48,6 +48,9 @@ PZ_short_live                  MC_LentZc            pass
 PZ_leave                       MC_LentZc            pass
 PZ_leave_live                  MC_LentZc            pass
 PZ_teardown                    MC_LentZc            pass
+PZ_teardown_live               MC_LentZc            pass
+PZ_unreapable                  MC_LentZc            pass
+PZ_unreapable_live             MC_LentZc            pass
 MZ_wait_notif                  MC_LentZc            violated:Finishes
 MZ_hand_at_first               MC_LentZc            violated:NoScribble
 MZ_drop_frees                  MC_LentZc            violated:NoScribble
@@ -55,10 +58,13 @@ MZ_resend_start                MC_LentZc            violated:WireOrder
 MZ_chunk_early                 MC_LentZc            violated:WireOrder
 MZ_withdraw_started            MC_LentZc            violated:WireOrder
 MZ_teardown_frees              MC_LentZc            violated:NoScribble
+MZ_no_keeper                   MC_LentZc            violated:Finishes
+MZ_zc_unreapable               MC_LentZc            violated:Finishes
 WZ_pipeline                    MC_LentZc            violated:NoPipeline
 WZ_short                       MC_LentZc            violated:NoShort
 WZ_late_free                   MC_LentZc            violated:NoLateFree
 WZ_withdraw                    MC_LentZc            violated:NoWithdraw
 WZ_orphan_done                 MC_LentZc            violated:NoOrphanDone
 WZ_kept                        MC_LentZc            violated:NoKept
+WZ_keeper_notif                MC_LentZc            violated:NoKeeperNotif
 WZ_failed                      MC_LentZc            violated:NoFailed

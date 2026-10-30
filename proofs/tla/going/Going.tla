@@ -22,7 +22,9 @@
 (* holder's release, and B's registration and receive. What is abstract:   *)
 (* the side's guard and its requests (a held side's eviction is performed  *)
 (* as the holder lets go, the side family's protocol), and the ring's      *)
-(* cancel and completion, which settle applies in one step.                *)
+(* cancel and completion, which settle applies in one step (or, on a ring  *)
+(* another thread can reap, the ring's keeper: src/rt/shard/ring/keeper.rs; *)
+(* LentZc.tla checks the keeper's part).                                   *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 

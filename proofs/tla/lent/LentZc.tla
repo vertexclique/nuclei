@@ -7,8 +7,10 @@
 (* `WriteState::write_owned` (src/io/source/write/lent.rs), `lent_want`, *)
 (* `submit_ops` and `lent_back` (src/io/source/write/ops.rs), `Pinned`      *)
 (* (src/io/source/write/pinned.rs), `Released` (src/net/released.rs), and  *)
-(* on the ring's thread `ShardRing::zero_copy` and `ShardRing::shut_down`  *)
-(* (src/rt/shard/ring.rs) with `entry` (src/io/source/ring.rs).            *)
+(* on the ring's thread `ShardRing::zero_copy` and `ShardRing::reapable`   *)
+(* (src/rt/shard/ring.rs) with `entry` (src/io/source/ring.rs); and the    *)
+(* shard's drop (src/rt/shard/going.rs) with `keeper::hand_off` and        *)
+(* `keeper::keep` (src/rt/shard/ring/keeper.rs).                           *)
 (*                                                                          *)
 (* In plain words: a task writes buffer A (units 1 2 3) and then buffer B  *)
 (* (unit 4) to a TCP stream, each with a zero-copy send, and then reads    *)
@@ -26,14 +28,19 @@
 (* drops the buffer at the last notification. The peer writes to the task  *)
 (* before it reads anything. The task may go away while A is lent: a write *)
 (* none of which went out is withdrawn, one that started is finished. A    *)
-(* send may fail, which breaks the socket for good. The shard's ring may   *)
-(* go while notifications are still out: what its operations hold is kept  *)
-(* for good.                                                               *)
+(* send may fail, which breaks the socket for good. The shard may go once  *)
+(* both writes ended, while notifications are still out: a keeper on the   *)
+(* blocking pool takes its ring and applies its completions, so every      *)
+(* buffer still comes back. Only a ring whose completions another thread   *)
+(* can reap sends zero-copy (`Reapable`); one only its own thread may reap *)
+(* (single-issuer, deferred task work) copies every chunk, so nothing of it *)
+(* waits for a notification when it goes.                                  *)
 (*                                                                          *)
 (* What must never happen: units on the wire out of order, twice, or a     *)
 (* withdrawn buffer partly on it (WireOrder); a buffer handed back or      *)
 (* freed while the kernel may still read it (NoScribble); and the exchange *)
-(* must end (Finishes), the write without the peer reading first.          *)
+(* must end (Finishes), the write without the peer reading first and every *)
+(* Released resolving, the shard gone or not.                              *)
 (*                                                                          *)
 (* What is abstract: the side's guard (a step under it runs whole here;    *)
 (* Side.tla checks it), a send cancelled as its source moves (RingLent.tla *)
@@ -49,7 +56,8 @@ CONSTANTS
     MayLeave,  \* whether the task may go away while buffer A is lent
     MayDrop,   \* whether the task may drop a Released instead of waiting for it
     MayFail,   \* whether a send may fail, which breaks the socket for good
-    Teardown,  \* whether the shard's ring may go while operations are still out
+    Teardown,  \* whether the shard may go (its ring to a keeper) while notifications are out
+    Reapable,  \* whether another thread can reap the ring's completions (a multi-issuer ring)
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Bufs == {"A", "B"}                                    \* the task's two buffers
@@ -83,10 +91,14 @@ VARIABLES
     pwrote,     \* units the peer wrote to the task
     back,       \* units the peer wrote that the task has not read
     broken,     \* a send failed: the socket takes nothing more
-    ringGone    \* the shard's ring went: its thread applies no completion again
+    ringGone,   \* the shard went: its own thread applies no completion again
+    kept,       \* a keeper on the blocking pool took the ring and applies its completions
+    keptBack    \* (record) the keeper applied a notification
 
 vars == <<task, rx, tread, cur, sent, out, orphan, withdrawn, lent, wdone, bufst,
-          ops, wire, kfree, got, pwrote, back, broken, ringGone>>  \* every variable, for stuttering
+          ops, wire, kfree, got, pwrote, back, broken, ringGone, kept, keptBack>>  \* every variable
+
+goneVars == <<ringGone, kept, keptBack>>                         \* who applies the ring's completions
 
 sideVars == <<cur, sent, out, orphan, withdrawn, lent, wdone>>   \* what the write side holds
 peerVars == <<got, pwrote, back>>                               \* what the peer has done
@@ -95,12 +107,21 @@ peerVars == <<got, pwrote, back>>                               \* what the peer
 (* Who holds a buffer, and when it comes back.                             *)
 (***************************************************************************)
 
-\* The kernel may still read buffer b: a send of it has not completed yet, or units it took are
-\* still in the kernel's hands.
+\* The kernel may still read buffer b: a send of it has not completed yet, or a zero-copy send of
+\* it took units the kernel still holds (a copied send's units are the kernel's own copies).
 KernelReads(b) == \E i \in DOMAIN ops :
                       /\ ops[i].buf = b                                  \* a send of this buffer
                       /\ \/ ops[i].first = "no"                          \* still in the kernel
-                         \/ ~(Range(ops[i].took) \subseteq kfree)        \* or its units still held
+                         \/ /\ ops[i].zc                                 \* or sent zero-copy
+                            /\ ~(Range(ops[i].took) \subseteq kfree)     \* with units still held
+
+\* The ring's completions are applied: by its own thread while the shard runs, by the keeper after.
+Applies == ~ringGone \/ kept
+
+\* A send goes out zero-copy only on a ring whose completions another thread can reap
+\* (`ShardRing::reapable` in `zc_stream`); on any other it is copied.
+\* MUTATION zc_unreapable: a ring only its own thread may reap sends zero-copy too.
+ZeroCopy == Reapable \/ Mutation = "zc_unreapable"
 
 \* How many hold buffer b, given the side's lent flag l and the sends o: the lent write, and every
 \* send that has not let go of it yet (each keeps it until its notification).
@@ -135,7 +156,9 @@ Init ==
     /\ pwrote = 0                           \* the peer wrote nothing
     /\ back = 0                             \* nothing waits for the task to read
     /\ broken = FALSE                       \* the socket works
-    /\ ringGone = FALSE                     \* the ring is there
+    /\ ringGone = FALSE                     \* the shard is there
+    /\ kept = FALSE                         \* no keeper holds the ring
+    /\ keptBack = FALSE                     \* no keeper applied anything yet
 
 (***************************************************************************)
 (* The task (`write_zero_copy`, then its reads, then the Releaseds).       *)
@@ -150,7 +173,7 @@ Lend(b, at, next) ==
     /\ cur' = b                                       \* the side writes b
     /\ sent' = 0                                      \* nothing of it counted yet
     /\ UNCHANGED <<rx, tread, out, orphan, withdrawn, wdone, ops, wire, kfree, peerVars,
-                   broken, ringGone>>                 \* nothing else changes
+                   broken, goneVars>>                 \* nothing else changes
 
 \* The write of b ended (every unit counted, or it failed): the task's poll takes the lent write,
 \* lets go of its hold, and gets the Released (`Released::waiting`).
@@ -166,7 +189,7 @@ Take(b, at, next) ==
                 THEN [bufst EXCEPT ![b] = "handed"]
                 ELSE SettleAll(lent', ops, rx')       \* back only if no send holds it
     /\ UNCHANGED <<tread, sent, out, orphan, withdrawn, wdone, ops, wire, kfree, peerVars,
-                   broken, ringGone>>                 \* nothing else changes
+                   broken, goneVars>>                 \* nothing else changes
 
 \* The task goes away while A is lent (its write future dropped: `abandon_lent`). A write none of
 \* which went out is withdrawn: at once if no send is out, else the send out is cancelled and its
@@ -192,7 +215,7 @@ Leave ==
                          THEN [ops EXCEPT ![out].cancel = TRUE]  \* ask the kernel to cancel it
                          ELSE ops
                /\ UNCHANGED <<withdrawn, lent, rx, cur, out, bufst>>
-    /\ UNCHANGED <<tread, sent, wdone, wire, kfree, peerVars, broken, ringGone>>
+    /\ UNCHANGED <<tread, sent, wdone, wire, kfree, peerVars, broken, goneVars>>
 
 \* The task reads one unit of what the peer wrote.
 Read ==
@@ -201,14 +224,14 @@ Read ==
     /\ back' = back - 1                               \* the task takes it
     /\ tread' = tread + 1                             \* and counts it
     /\ task' = IF tread + 1 = PeerLen THEN "relA" ELSE "read"  \* all read: on to the Releaseds
-    /\ UNCHANGED <<rx, sideVars, bufst, ops, wire, kfree, got, pwrote, broken, ringGone>>
+    /\ UNCHANGED <<rx, sideVars, bufst, ops, wire, kfree, got, pwrote, broken, goneVars>>
 
 \* The task's Released of b resolves: the buffer is back in its hands.
 GetBack(b, at, next) ==
     /\ task = at                                      \* the task waits on b's Released
     /\ bufst[b] = "handed"                            \* which has the buffer
     /\ task' = next                                   \* the task has it, and goes on
-    /\ UNCHANGED <<rx, tread, sideVars, bufst, ops, wire, kfree, peerVars, broken, ringGone>>
+    /\ UNCHANGED <<rx, tread, sideVars, bufst, ops, wire, kfree, peerVars, broken, goneVars>>
 
 \* The task drops b's Released instead of waiting for it.
 \* MUTATION drop_frees: a dropped Released frees the buffer at once.
@@ -221,7 +244,7 @@ Drop(b, at, next) ==
     /\ bufst' = IF Mutation = "drop_frees"            \* the planted bug: freed at once
                 THEN [bufst EXCEPT ![b] = "freed"]
                 ELSE bufst                            \* freed only by the last holder
-    /\ UNCHANGED <<tread, sideVars, ops, wire, kfree, peerVars, broken, ringGone>>
+    /\ UNCHANGED <<tread, sideVars, ops, wire, kfree, peerVars, broken, goneVars>>
 
 AfterB == IF PeerLen = 0 THEN "relA" ELSE "read"     \* where the task goes once B's write ended
 
@@ -253,10 +276,11 @@ Submit ==
                               notif |-> "no",         \* no notification yet
                               cancel |-> FALSE,       \* nobody asked to cancel it
                               failed |-> FALSE,       \* it has not failed
+                              zc |-> ZeroCopy,        \* sent zero-copy, or copied
                               held |-> TRUE])         \* it holds the buffer
     /\ out' = Len(ops) + 1                            \* it is the side's send out
     /\ UNCHANGED <<task, rx, tread, cur, sent, orphan, withdrawn, lent, wdone, bufst, wire,
-                   kfree, peerVars, broken, ringGone>>
+                   kfree, peerVars, broken, goneVars>>
 
 \* The side applies the first completion of send i, whose sends are o after this step: it counts
 \* the units taken (`lent_back`). A send cancelled with nothing taken withdraws an abandoned write
@@ -284,25 +308,26 @@ Deliver(i, o) ==
        /\ bufst' = SettleAll(lent', o, rx')           \* freed if that was the last holder
        /\ UNCHANGED orphan                             \* whether the task went stays as it was
 
-\* The ring's thread takes the first completion of send i and hands it to the side at once
-\* (`ShardRing::zero_copy`), while the send stays in the ring for its notification.
+\* The ring's thread (or the keeper) takes the first completion of send i and hands it to the side
+\* at once (`ShardRing::zero_copy`); a zero-copy send stays in the ring for its notification, a
+\* copied one lets go of the buffer now.
 \* MUTATION wait_notif: the side gets the first completion only with the notification (the bug
 \* that shipped: the write waited for the peer's acknowledgment).
 First(i) ==
-    /\ ~ringGone                                      \* the ring is there
+    /\ Applies                                        \* someone applies the ring's completions
     /\ i \in DOMAIN ops                               \* send i exists
     /\ ops[i].first = "posted"                        \* and the kernel posted its first completion
-    /\ LET o == [ops EXCEPT ![i].first = "applied"]   \* the ring took it
-       IN IF Mutation = "wait_notif"                  \* the planted bug: the side waits
+    /\ LET o == [ops EXCEPT ![i].first = "applied", ![i].held = ops[i].zc]  \* taken; copied lets go
+       IN IF Mutation = "wait_notif" /\ ops[i].zc     \* the planted bug: the side waits
           THEN /\ ops' = o
                /\ UNCHANGED <<sideVars, rx, bufst>>
           ELSE Deliver(i, o)                          \* the side counts it now
-    /\ UNCHANGED <<task, tread, wire, kfree, peerVars, broken, ringGone>>
+    /\ UNCHANGED <<task, tread, wire, kfree, peerVars, broken, goneVars>>
 
-\* The ring's thread takes the notification of send i: the send lets go of the buffer, and the
-\* last holder hands it back or frees it (`Pinned`'s drop).
+\* The ring's thread (or the keeper) takes the notification of send i: the send lets go of the
+\* buffer, and the last holder hands it back or frees it (`Pinned`'s drop).
 Notif(i) ==
-    /\ ~ringGone                                      \* the ring is there
+    /\ Applies                                        \* someone applies the ring's completions
     /\ i \in DOMAIN ops                               \* send i exists
     /\ ops[i].notif = "posted"                        \* the kernel posted its notification
     /\ ops[i].first = "applied"                       \* after its first completion
@@ -312,21 +337,29 @@ Notif(i) ==
           ELSE /\ ops' = o
                /\ bufst' = SettleAll(lent, o, rx)     \* back or freed if it was the last
                /\ UNCHANGED <<sideVars, rx>>
-    /\ UNCHANGED <<task, tread, wire, kfree, peerVars, broken, ringGone>>
+    /\ keptBack' = (keptBack \/ ringGone)            \* (record) the keeper applied it
+    /\ UNCHANGED <<task, tread, wire, kfree, peerVars, broken, ringGone, kept>>
 
-\* The shard's ring goes (`ShardRing::shut_down` after its bounded wait): its thread applies no
-\* completion again, and what its sends still hold is kept for good (`mem::forget`).
+\* The shard goes once both writes ended (the shard's drop, src/rt/shard/going.rs): its own thread
+\* applies no completion again. A ring another thread can reap goes to a keeper on the blocking
+\* pool (`keeper::hand_off`), which applies the ring's completions until none is out
+\* (`keeper::keep`) and only then frees it. Nothing new is sent on it.
+\* MUTATION no_keeper: the ring's sends keep what they hold for good and nobody applies their
+\* completions again (the bounded wait and `mem::forget` this replaced): a Released never resolves.
 \* MUTATION teardown_frees: the sends still out let go of their buffers as the ring goes.
 RingGo ==
-    /\ Teardown                                       \* this run lets the ring go
+    /\ Teardown                                       \* this run lets the shard go
     /\ ~ringGone                                      \* it is still there
+    /\ cur = "none"                                   \* with no write lent to its side
+    /\ task \in {"read", "relA", "relB", "done", "gone"}  \* once both writes ended, or the task went
     /\ ringGone' = TRUE                               \* and goes
+    /\ kept' = (Reapable /\ Mutation # "no_keeper")  \* a keeper takes a ring it can reap
     /\ IF Mutation = "teardown_frees"                 \* the planted bug
        THEN LET o == [i \in DOMAIN ops |-> [ops[i] EXCEPT !.held = FALSE]]  \* all let go
             IN /\ ops' = o
                /\ bufst' = SettleAll(lent, o, rx)     \* so a buffer may be freed now
        ELSE UNCHANGED <<ops, bufst>>                  \* kept: nothing is freed
-    /\ UNCHANGED <<task, rx, tread, sideVars, wire, kfree, peerVars, broken>>
+    /\ UNCHANGED <<task, rx, tread, sideVars, wire, kfree, peerVars, broken, keptBack>>
 
 (***************************************************************************)
 (* The kernel: it takes units, completes, and notifies.                    *)
@@ -342,7 +375,7 @@ Take1(i) ==
     /\ LET u == ops[i].from + Len(ops[i].took)        \* the send's next unit
        IN /\ wire' = Append(wire, u)                  \* goes on the stream
           /\ ops' = [ops EXCEPT ![i].took = Append(@, u)]  \* and the send took it
-    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, kfree, peerVars, broken, ringGone>>
+    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, kfree, peerVars, broken, goneVars>>
 
 \* The kernel posts the first completion of send i: with the units it took (a short count if
 \* fewer than asked), or with none once a cancel came. `IORING_CQE_F_MORE` says a notification
@@ -352,7 +385,7 @@ Complete(i) ==
     /\ ops[i].first = "no"                            \* and has not completed
     /\ Len(ops[i].took) > 0 \/ ops[i].cancel          \* it took some, or was cancelled
     /\ ops' = [ops EXCEPT ![i].first = "posted"]      \* its first completion is posted
-    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, wire, kfree, peerVars, broken, ringGone>>
+    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, wire, kfree, peerVars, broken, goneVars>>
 
 \* A send that has taken nothing fails (a reset peer): its first completion carries the error,
 \* and the socket takes nothing more.
@@ -363,17 +396,18 @@ Fail(i) ==
     /\ ops[i].took = <<>>                             \* and took nothing
     /\ ops' = [ops EXCEPT ![i].first = "posted", ![i].failed = TRUE]  \* it fails
     /\ broken' = TRUE                                 \* and the socket is broken for good
-    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, wire, kfree, peerVars, ringGone>>
+    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, wire, kfree, peerVars, goneVars>>
 
-\* The kernel posts the notification of send i once it let go of every unit the send took
-\* (a failed or cancelled send gets one too, as soon as it completed).
+\* The kernel posts the notification of zero-copy send i once it let go of every unit the send
+\* took (a failed or cancelled one gets one too, as soon as it completed). A copied send has none.
 Notify(i) ==
     /\ i \in DOMAIN ops                               \* send i exists
-    /\ ops[i].first # "no"                            \* it completed
+    /\ ops[i].zc                                      \* a zero-copy send
+    /\ ops[i].first # "no"                            \* that completed
     /\ ops[i].notif = "no"                            \* and has no notification yet
     /\ Range(ops[i].took) \subseteq kfree             \* the kernel let go of its units
     /\ ops' = [ops EXCEPT ![i].notif = "posted"]      \* so the notification is posted
-    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, wire, kfree, peerVars, broken, ringGone>>
+    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, wire, kfree, peerVars, broken, goneVars>>
 
 \* The network acknowledges a unit before the peer read it, so the kernel lets go of it early.
 \* Never forced: in the worst case (loopback) a unit is let go of only once the peer read it.
@@ -381,7 +415,7 @@ Ack ==
     /\ \E k \in (got + 1)..Len(wire) :                \* a unit the peer has not read
           /\ wire[k] \notin kfree                     \* that the kernel still holds
           /\ kfree' = kfree \cup {wire[k]}            \* is let go of
-    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, ops, wire, peerVars, broken, ringGone>>
+    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, ops, wire, peerVars, broken, goneVars>>
 
 (***************************************************************************)
 (* The peer: it writes first, then reads.                                  *)
@@ -393,7 +427,7 @@ PeerWrite ==
     /\ back < Room2                                   \* and there is room for it
     /\ pwrote' = pwrote + 1                           \* it wrote one more
     /\ back' = back + 1                               \* which waits for the task
-    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, ops, wire, kfree, got, broken, ringGone>>
+    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, ops, wire, kfree, got, broken, goneVars>>
 
 \* The peer reads the next unit of the stream, once its own write is done; the kernel lets go
 \* of the unit then, if it still held it.
@@ -402,7 +436,7 @@ PeerRead ==
     /\ got < Len(wire)                                \* and a unit waits on the stream
     /\ got' = got + 1                                 \* it reads that unit
     /\ kfree' = kfree \cup {wire[got + 1]}            \* and the kernel is done with it
-    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, ops, wire, pwrote, back, broken, ringGone>>
+    /\ UNCHANGED <<task, rx, tread, sideVars, bufst, ops, wire, pwrote, back, broken, goneVars>>
 
 (***************************************************************************)
 (* The whole system.                                                       *)
@@ -497,8 +531,10 @@ NoLateFree == \A b \in Bufs : bufst[b] # "freed"
 NoWithdraw == ~withdrawn
 \* The side finishes the write of a task that went away.
 NoOrphanDone == ~(orphan /\ ~withdrawn /\ cur = "none")
-\* The ring goes while a send still waits for its notification: its buffer is kept.
+\* The shard goes while a send still waits for its notification: the ring keeps its buffer.
 NoKept == ~(ringGone /\ \E i \in DOMAIN ops : ops[i].held /\ ops[i].first = "applied")
+\* The keeper applies a notification after the shard went, so the buffer comes back.
+NoKeeperNotif == ~keptBack
 \* A send fails, and its buffer still waits for its notification.
 NoFailed == ~(\E i \in DOMAIN ops : ops[i].failed /\ ops[i].first = "applied" /\ ops[i].held)
 =============================================================================
