@@ -760,6 +760,63 @@ chunk that counts its length only lets a peer sending a unit at a time past the 
 `CapHeld`; a datagram socket arming a multishot receive on the group gets a datagram cut, breaking
 `NoCut`), and 2 witnesses (a buffer handed out in two pieces, a buffer given back).
 
+`tla/ring/RingSend.tla` checks a datagram socket's sends (`WriteState::send_now` in
+`src/io/source/write.rs`, the poll it waits on in `submit_ops` and its end in `op_done`,
+`src/io/source/write/ops.rs`; on epoll and kqueue the socket's edge in `serve` stands where the
+poll does). A task sends datagrams one call after another; the first may be its own buffer lent
+to a send of the ring's, whose task may go away while it is out. Every other call hands its
+datagram to the kernel itself once nothing of the side is out, and the kernel answers at once:
+taken, refused (too large for any socket), or no room, when the call waits for the poll and
+tries again. A peer reads what the socket holds, which starts full. Before, a call copied its
+datagram and queued it for the ring, answering taken at once: a datagram too large for the
+kernel was reported sent and its refusal reached the next call, which the size sweep
+(`tests/sizes.rs`) found at 65 508 bytes of UDP. 10 configurations: 4 that must pass (a lent
+datagram whose task may go, then a refused one and one more; borrowed sends only; with
+`OwnResult`, every call answers the kernel's own verdict on its datagram, and `InOrder`, the
+kernel takes the task's datagrams in the order it sent them; and `Termination` with
+`Delivered`, every call ends and every datagram the kernel can take reaches the peer), 3
+mutations (the old queue-and-answer breaks `OwnResult`; a call that goes to the kernel with the
+lent send of a task that went still out overtakes it, breaking `InOrder`; a poll that wakes
+nobody breaks `Termination`), and 3 witnesses (a call that waits for room, a refusal answered by
+its own call, a call that waits behind the lent send of a task that went).
+
+`tla/ring/RingRecv.tla` checks a datagram socket's receives (`receive_now` and
+`datagram_ready` in `src/io/source/read.rs`, the bound in `datagram_want` and the poll's end in
+`op_done`, `src/io/source/read/ops.rs`, the edge in `serve`), on epoll or kqueue and on a ring.
+A peer sends a small datagram and then the largest the socket carries, which for a Unix socket
+is more than the pool's largest buffer holds; the task receives each into a buffer that holds
+it, maybe asking first whether the socket is readable. The task receives a datagram itself into
+its own buffer (on epoll and kqueue always, on a ring a Unix datagram), waiting for an edge or
+the ring's poll when none is there; a look at readability looks and takes nothing. Only a ring's
+UDP socket has the ring receive ahead, into a buffer that holds the largest datagram UDP
+carries. Before, the side received ahead into the pool, into a buffer as large as the task's
+(failing with `OutOfMemory` for a task's buffer the pool could not hold) or, for a look at
+readability, into the pool's largest buffer, which cut a Unix datagram past 64 KiB that the
+task's buffer would have held whole: both found by the size sweep. 15 configurations: 8 that
+must pass (Unix and UDP datagrams on epoll and on a ring, with `NoCut`, every datagram received
+whole, and `InOrder`; and `Termination` for each), 5 mutations (a look that receives ahead into
+the pool's largest buffer, a ring's UDP receive ahead into a buffer below the largest datagram,
+and a ring that receives a Unix datagram ahead for a task that receives it itself break `NoCut`;
+a poll, and an edge, that wake nobody break `Termination`), and 2 witnesses (a call that waits
+for the poll, a datagram received ahead and taken).
+
+`tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
+buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
+`reads_itself` in `src/io/source/read.rs`, `write`, `write_direct` and `writes_itself` in
+`src/io/source/write.rs`). Three connections over a pool of two buffers, two of whose peers never
+send: with no receive group to draw from (none configured, or the group dry) a read takes a buffer
+of the pool for a receive that waits in the kernel, and holds it while its peer stays idle. Before,
+a reader or a writer that found the pool empty waited for a buffer to come back and armed nothing,
+so a request that came was never read, or its reply never sent, while both buffers waited for
+peers that never send. Now it asks for a poll that holds no buffer, and once the socket has bytes,
+or room, it reads them into its own buffer or writes from its own. 8 configurations: 3 that must
+pass (`Buffers`, every buffer free, held by a receive out, a request read ahead or a reply not sent
+yet; and `Served`, every request sent is read and answered, with two idle peers and with none), 3
+mutations (a starved reader that waits for a buffer to come back, a starved writer that does, and a
+poll whose end wakes nobody break `Served`), and 2 witnesses (a reader finds the pool empty; a
+starved side uses its own buffer). `tests/idle_peers.rs` fills the pool of a 1 MiB cap with
+receives of idle peers and checks every other peer is answered.
+
 `lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
 every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
 table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its
@@ -1233,17 +1290,25 @@ slack). Time is whole units: a quick run adds none, a slow one `Slow`, a long on
 
 `admission` (`tla/admission/Admission.tla`) checks how a shard's ring (`src/rt/shard/ring.rs`)
 admits operations: a completion queue of `C` slots, a receive group whose buffers are arrivals'
-share of it, a cap on the operations counted in the kernel, long-lived operations (receives and
-accepts that wait on idle connections and may never end) and finite ones (sends) that wait in
-room when the cap is used. 5 configurations: 1 that must pass (the group cut to half the queue,
-long-lived operations not counted: a finite operation never waits in room while none is in the
-kernel, `NoRoomDeadlock`, and arrivals plus finite completions fit the queue,
-`CqNeverOverfull`), 2 mutations (the group not cut breaks `CqNeverOverfull`; long-lived
-operations counted lets idle receives use the cap and breaks `NoRoomDeadlock`: the request
-waiting for its reply's receive), and 2 witnesses (a finite operation does wait in room; a
-long-lived one is let in past the cap). An accept's connections and the last entry of each
-long-lived operation are not modelled: no room is kept for them, and past the queue the kernel
-holds them (`IORING_FEAT_NODROP`) until the shard takes them.
+share of it, a cap on the operations counted in the kernel, long-lived operations (every
+operation of a side that reads: multishot receives and accepts, which never end by themselves,
+and one-shot receives into a buffer, polls for bytes and accepts, which end when their peer acts)
+and finite ones (sends, connects, file calls) that wait in room when the cap is used. Before,
+`counts_against_cap` exempted only the multishot ones: in the vs-tokio benchmark 3840 idle
+connections, the cap of a ring of 2048 entries beside its 256-buffer group, filled it with
+one-shot receives that waited for their peers, and the next accept waited in room behind them for
+good, leaving every connection past them unaccepted. 7 configurations: 1 that must pass (the
+group cut to half the queue, long-lived operations of both kinds not counted: a finite operation
+never waits in room while none is in the kernel, `NoRoomDeadlock`, and arrivals plus finite
+completions fit the queue, `CqNeverOverfull`), 3 mutations (the group not cut breaks
+`CqNeverOverfull`; multishot operations counted, and one-shot ones counted, as they were, let idle
+receives use the cap and break `NoRoomDeadlock`: the request waiting for its reply's receive), and
+3 witnesses (a finite operation does wait in room; a multishot one, and a one-shot one, is let in
+past the cap). An accept's connections and the last entry of each long-lived operation are not
+modelled: no room is kept for them, and past the queue the kernel holds them
+(`IORING_FEAT_NODROP`) until the shard takes them. `tests/idle_peers.rs` fills the cap of the
+smallest ring with receives of idle peers and checks every other peer is still accepted and
+answered.
 
 ## A ring's overflow count
 

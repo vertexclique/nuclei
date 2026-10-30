@@ -9,7 +9,7 @@
 //! again. Only the operation's own completion clears it, so a side never
 //! has two operations out, and its mailbox never more than one completion.
 
-use super::{Datagram, Kind, Peer, Piece, ReadState};
+use super::{Datagram, Kind, Peer, Piece, ReadState, UDP_MAX};
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::Io;
@@ -116,14 +116,26 @@ impl ReadState {
             lent.out = true;
             Want::RecvLentFrom(core::mem::take(&mut lent.buf))
         } else if kind.datagrams() {
+            // A Unix datagram is its task's to receive into its own buffer
+            // (`receive_now`): the ring only polls for it.
+            #[cfg(ring)]
+            if kind == Kind::UnixDatagram {
+                return;
+            }
             #[cfg(ring)]
             let multi = !self.dry && issuer.multishot_datagrams(kind);
             #[cfg(not(ring))]
             let multi = false;
-            let Some(want) = self.datagram_want(multi, len, after) else {
-                return;
-            };
-            want
+            match self.datagram_want(multi, len, after) {
+                Some(want) => want,
+                // No buffer of the pool: a poll that holds none, and the task
+                // receives into its own buffer (`task_receives`).
+                #[cfg(ring)]
+                None if self.starved && !self.readable && self.error.is_none() => {
+                    Want::Ready { read: true }
+                }
+                None => return,
+            }
         } else {
             match self.lent.as_mut().filter(|l| !l.out) {
                 Some(lent) => {
@@ -135,12 +147,16 @@ impl ReadState {
                     self.multi = true;
                     Want::RecvMulti
                 }
-                None => {
-                    let Some(buf) = self.buffer(len, false, after) else {
-                        return;
-                    };
-                    Want::Recv(buf)
-                }
+                None => match self.buffer(len, false, after) {
+                    Some(buf) => Want::Recv(buf),
+                    // No buffer of the pool: rather than wait for one that a
+                    // receive of another connection may hold for good, a poll
+                    // that holds none, and the task reads into its own buffer
+                    // (`reads_itself`).
+                    #[cfg(ring)]
+                    None if self.starved && !self.readable => Want::Ready { read: true },
+                    None => return,
+                },
             }
         };
         self.out = Some(issuer.issue(want, kind, self.epoch, after));
@@ -157,7 +173,11 @@ impl ReadState {
         }
         #[cfg(not(ring))]
         let _ = multi;
-        self.buffer(len, true, after).map(Want::RecvFrom)
+        // Only UDP is received ahead, and no UDP datagram is longer than its
+        // length field counts: a larger buffer of the task's needs no larger
+        // one of the pool.
+        self.buffer(len.min(UDP_MAX), true, after)
+            .map(Want::RecvFrom)
     }
 
     /// A receive into a buffer of the pool completed.
@@ -210,6 +230,10 @@ impl ReadState {
                     self.poll_first = false;
                     if let Err(err) = result {
                         self.error = Some(err);
+                    }
+                    self.readable = self.starved;
+                    if core::mem::take(&mut self.task_polls) || self.starved {
+                        after.wake(&mut self.waiters);
                     }
                     if self.user_fd {
                         self.blocked = false;

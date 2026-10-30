@@ -5,9 +5,10 @@
 use super::*;
 use crate::io::Handle;
 
-/// What this thread's pool took from the allocator.
+/// What this thread's pool took from the allocator for its own buffers,
+/// beside the receive group charged to it.
 fn pool_charged() -> usize {
-    crate::buf::with_pool(|p| p.map_or(0, |p| p.charged()))
+    crate::buf::with_pool(|p| p.map_or(0, |p| p.charged() - p.reserved()))
 }
 
 /// Runs `fut` as a task on the runtime's worker, whose driver serves the

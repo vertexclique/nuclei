@@ -289,3 +289,47 @@ fn a_buffer_that_came_back_before_the_wait_wakes_it_at_once() {
     pool.wait_for_return(w);
     assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[test]
+fn a_reservation_is_charged_and_the_pool_has_the_rest_of_the_cap() {
+    let pool = Pool::new(64 * 1024);
+    assert!(pool.reserve(48 * 1024));
+    assert_eq!((pool.charged(), pool.reserved()), (48 * 1024, 48 * 1024));
+    assert_eq!(pool.room(), 16 * 1024);
+    assert_eq!(
+        pool.get(64 * 1024).unwrap().capacity(),
+        16 * 1024,
+        "the largest class beside the reservation"
+    );
+    assert!(pool.could_hold_whole(16 * 1024));
+    assert!(!pool.could_hold_whole(16 * 1024 + 1));
+    assert!(pool.get_whole(20_000).is_none());
+    pool.unreserve(48 * 1024);
+    assert_eq!((pool.charged(), pool.reserved()), (0, 0));
+    assert_eq!(pool.get(64 * 1024).unwrap().capacity(), 64 * 1024);
+}
+
+#[test]
+fn a_reservation_must_leave_room_for_one_smallest_buffer() {
+    let pool = Pool::new(64 * 1024);
+    assert!(!pool.reserve(64 * 1024 - CLASSES[0] + 1));
+    assert_eq!((pool.charged(), pool.reserved()), (0, 0), "nothing charged");
+    assert!(pool.reserve(64 * 1024 - CLASSES[0]));
+    let one = pool.get(1).unwrap();
+    assert_eq!(one.capacity(), CLASSES[0]);
+    assert!(pool.get(1).is_none(), "the cap is reached");
+    assert_eq!(pool.charged(), 64 * 1024);
+    assert!(
+        !Pool::new(0).reserve(1),
+        "a lifted cap holds no reservation"
+    );
+}
+
+#[test]
+fn a_waiter_on_a_pool_holding_only_its_reservation_is_woken_at_once() {
+    let pool = Pool::new(64 * 1024);
+    assert!(pool.reserve(32 * 1024));
+    let (count, w) = waker();
+    pool.wait_for_return(w);
+    assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

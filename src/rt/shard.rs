@@ -381,6 +381,42 @@ pub(crate) struct Limits {
     pub(crate) backend: Backend,
 }
 
+/// Charges `pool` with the receive group the ring of `backend` asks for, and
+/// returns its bytes (0 off a ring, or with no group); refuses a group that
+/// leaves the pool no room for a buffer of its own.
+fn reserve_group(pool: &Pool, backend: Backend) -> io::Result<usize> {
+    #[cfg(ring)]
+    if let Backend::Ring(cfg) | Backend::RingOrPoll(cfg) = backend {
+        let bytes = recv::reservation(cfg.recv_buffers, cfg.recv_buffer_size);
+        if !pool.reserve(bytes) {
+            return Err(recv::too_large(
+                cfg.recv_buffers,
+                cfg.recv_buffer_size,
+                bytes,
+                pool.cap(),
+            ));
+        }
+        return Ok(bytes);
+    }
+    let _ = (pool, backend);
+    Ok(0)
+}
+
+/// The least `io_buffer_cap` a runtime of the process's backend starts
+/// with: the receive group of each shard, and one buffer of the pool's
+/// smallest class.
+#[cfg(test)]
+pub(crate) fn least_buffer_cap() -> usize {
+    let group = match super::backend::chosen() {
+        #[cfg(ring)]
+        Ok(Backend::Ring(cfg) | Backend::RingOrPoll(cfg)) => {
+            recv::reservation(cfg.recv_buffers, cfg.recv_buffer_size)
+        }
+        _ => 0,
+    };
+    group + crate::buf::CLASSES[0]
+}
+
 /// What a shard waits on and does its sources' IO with.
 #[cfg_attr(
     ring,
@@ -517,6 +553,11 @@ impl Shard {
             let (notifier, port) = (poller.notifier(), Arc::clone(poller.port()));
             Ok((Driver::Poll(RefCell::new(poller)), notifier, port))
         };
+        let pool = Pool::new(limits.buffer_cap);
+        // The receive group asked for is charged before it is made; what the
+        // ring made in the end is less on a ring made smaller, and nothing on
+        // the poller, and the rest is given back below.
+        let reserved = reserve_group(&pool, limits.backend)?;
         // The poller's registrar, or the port its handles bind to.
         let (driver, notifier, kernel) = match limits.backend {
             Backend::Poll => poller()?,
@@ -543,7 +584,12 @@ impl Shard {
                 }
             }
         };
-        let pool = Pool::new(limits.buffer_cap);
+        let made = match &driver {
+            #[cfg(ring)]
+            Driver::Ring(ring) => ring.recv_reservation(),
+            Driver::Poll(_) => 0,
+        };
+        pool.unreserve(reserved.saturating_sub(made));
         let shared = Arc::new(Shared {
             inbox: Inbox::new(),
             park: ParkState::new(),

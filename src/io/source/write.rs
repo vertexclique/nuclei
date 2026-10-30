@@ -11,9 +11,11 @@
 //! while it is full, so bytes go out in the order they were written. A write-behind that fails
 //! keeps its error: every write fails with it until a flush reports it,
 //! except that a write whose own bytes were the first to fail gets the error
-//! itself. A datagram is copied and queued the same way, one at a time, and
-//! an error sending it goes to its own send or else the next one. A connect
-//! and a shutdown are the driver's calls too.
+//! itself. A datagram goes to the kernel in its own send's call on unix, so
+//! that call answers what the kernel says of it; on a completion port it is
+//! copied and queued, one at a time, and an error sending it goes to its own
+//! send or else the next one. A connect and a shutdown are the driver's calls
+//! too.
 //!
 //! A stream write may instead lend the side a buffer of its own
 //! ([`Source::write_owned`]): the driver writes all of it from there, with
@@ -38,12 +40,18 @@ use crate::io::side::{After, Wakers};
 use crate::io::sys;
 
 mod calls;
+mod datagram;
 #[cfg(completion)]
 mod ops;
 
 /// The least a write-behind buffer holds, so a run of small writes fills
 /// one buffer rather than waiting on each.
 const BEHIND_MIN: usize = 16 * 1024;
+
+/// The longest datagram every UDP socket takes (over IPv4): only a longer
+/// one is held to its socket's own limit before it is queued.
+#[cfg(port)]
+const UDP_TAKEN: usize = 65_507;
 
 /// A Unix socket's address, borrowed; on Windows, which has none, nothing
 /// can be one.
@@ -306,6 +314,19 @@ impl WriteState {
         Poll::Pending
     }
 
+    /// Whether a stream write of `len` bytes goes straight from the task's
+    /// buffer: one big enough (see `direct`), or on a ring any while the pool
+    /// has no buffer for the write-behind, so a writer never waits on buffers
+    /// that receives of other connections hold (proofs/tla/ring/RingStarve.tla).
+    #[cfg(unix)]
+    pub(super) fn writes_itself(&self, io: Io<'_>, len: usize) -> bool {
+        #[cfg(ring)]
+        if self.starved && matches!(io.via, Via::Ops(_)) {
+            return true;
+        }
+        super::direct::worth(io, len, true)
+    }
+
     /// A stream write of the bytes of `bufs` made straight on the
     /// descriptor `fd`, from the caller's memory, if the side holds nothing
     /// that goes first. The kernel may take part of it, as of any write.
@@ -324,7 +345,7 @@ impl WriteState {
         let waits = matches!(io.via, Via::Fd(_)) && self.blocked;
         if !kind.streams()
             || len == 0
-            || !super::direct::worth(io, len, true)
+            || !self.writes_itself(io, len)
             || waits
             || self.failed.is_some()
             || self.error.is_some()
@@ -376,6 +397,9 @@ impl WriteState {
     /// The driver's part: on readiness, does what the side holds and wakes
     /// the tasks that wait on any of it.
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
+        // A call that found the socket full waits for the edge itself (a
+        // datagram's, see `send_now`): it is woken even if nothing else moves.
+        let unblocked = edge && self.blocked;
         if edge {
             self.blocked = false;
             self.edges = self.edges.wrapping_add(1);
@@ -384,7 +408,7 @@ impl WriteState {
                 return;
             }
         }
-        if self.push_fd(fd, kind, after) {
+        if self.push_fd(fd, kind, after) || unblocked {
             after.wake(&mut self.waiters);
         }
     }
@@ -421,8 +445,7 @@ impl WriteState {
     #[cfg(readiness)]
     /// The driver's calls on the descriptor, while the socket takes them:
     /// ends a connect in progress, writes the write-behind out and then the
-    /// lent buffer, sends a queued datagram. Returns whether anything
-    /// changed.
+    /// lent buffer. Returns whether anything changed.
     fn push_fd(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
         if self.blocked {
             return false;
@@ -472,22 +495,6 @@ impl WriteState {
         }
         if self.behind.is_none() && self.lent_waits() {
             progress |= self.push_lent(fd, kind, after);
-        }
-        if !self.blocked
-            && let Some((datagram, target)) = self.queued.as_ref()
-        {
-            match sys::ready(send_datagram(fd, datagram.filled(), target.as_dest())) {
-                None => self.blocked = true,
-                Some(result) => {
-                    if let Err(err) = result {
-                        self.error = Some(err);
-                    }
-                    if let Some((done, _)) = self.queued.take() {
-                        after.drop_buf(done);
-                    }
-                    progress = true;
-                }
-            }
         }
         progress
     }
@@ -709,7 +716,15 @@ impl WriteState {
         };
         if n == 0 {
             // No room (the write-behind is full, or the pool has nothing):
-            // the write waits for the driver to make some.
+            // the write waits for the driver to make some. On a ring a write
+            // the pool has nothing for waits instead for a poll that says the
+            // socket takes bytes, and then writes them itself
+            // (`writes_itself`).
+            #[cfg(ring)]
+            if self.starved && self.behind.is_none() && matches!(io.via, Via::Ops(_)) {
+                self.poll_first = true;
+                self.push(io, kind, after);
+            }
             self.waiters.register(waker);
             return Poll::Pending;
         }
@@ -763,11 +778,25 @@ impl WriteState {
         Poll::Ready(Ok(()))
     }
 
-    /// A datagram to `dest`: copied and queued, and sent by the driver at
-    /// once if the socket may take it.
+    /// A datagram to `dest`. On unix the polling task hands it to the kernel
+    /// itself (see [`send_now`](Self::send_now)); on a completion port, or a
+    /// ring source with no descriptor (`fd`), it is copied and queued, and
+    /// sent by the driver.
+    #[cfg_attr(
+        not(completion),
+        expect(
+            unused_variables,
+            reason = "a readiness driver's descriptor comes with `io`"
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's context, as every step's"
+    )]
     fn send(
         &mut self,
         io: Io<'_>,
+        fd: Option<crate::io::raw::Raw>,
         kind: Kind,
         bytes: &[u8],
         dest: Dest<'_>,
@@ -781,26 +810,28 @@ impl WriteState {
             self.waiters.register(waker);
             return Poll::Pending;
         }
-        let Some(mut datagram) = self.buffer(io.pool(), bytes.len(), true, after) else {
-            if let Some(err) = self.error.take() {
-                return Poll::Ready(Err(err));
+        match io.via {
+            #[cfg(readiness)]
+            Via::Fd(fd) => self.send_now(io, fd, kind, bytes, dest, waker, after),
+            #[cfg(ring)]
+            Via::Ops(_) => match fd {
+                Some(fd) => self.send_now(io, fd, kind, bytes, dest, waker, after),
+                None => self.send_queued(io, kind, bytes, dest, waker, after),
+            },
+            #[cfg(port)]
+            Via::Ops(_) => {
+                // Refused at once, as std's call is, not queued for the next
+                // call to hear of.
+                if bytes.len() > UDP_TAKEN
+                    && let Some(err) = fd.and_then(|fd| sys::datagram_too_long(fd, bytes.len()))
+                {
+                    return Poll::Ready(Err(err));
+                }
+                self.send_queued(io, kind, bytes, dest, waker, after)
             }
-            self.waiters.register(waker);
-            return Poll::Pending;
-        };
-        datagram.fill_from(bytes);
-        self.queued = Some((datagram, dest.to_owned()));
-        self.push(io, kind, after);
-        if self.queued.is_none()
-            && let Some(err) = self.error.take()
-        {
-            // This datagram's own send failed.
-            return Poll::Ready(Err(err));
+            #[cfg(not(completion))]
+            Via::None(never, _) => match never {},
         }
-        if self.queued.is_some() {
-            after.register = true;
-        }
-        Poll::Ready(Ok(bytes.len()))
     }
 
     /// Bytes or a datagram accepted and not handed to the kernel yet, that

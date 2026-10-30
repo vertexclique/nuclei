@@ -60,8 +60,9 @@ impl Handle<UdpSocket> {
     ///
     /// # Errors
     ///
-    /// As `send(2)`, or the error of an earlier datagram sent after its call
-    /// returned.
+    /// As `send(2)` of this datagram. On Windows the completion port sends it
+    /// after the call returns, so a failure the stack finds only then (its
+    /// size is checked first) is the next send's error.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Connected)).await
     }
@@ -142,7 +143,8 @@ impl Handle<UdpSocket> {
     ///
     /// # Errors
     ///
-    /// As `sendto(2)`, the lookup's, or an earlier datagram's.
+    /// As `sendto(2)` of this datagram (on Windows, as for
+    /// [`send`](Self::send)), or the lookup's.
     pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
         let addr = resolve(&addr)
             .await?

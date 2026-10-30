@@ -26,15 +26,16 @@
 //!
 //! The group is sized to the ring: at most half its completion queue, so a
 //! small ring (made so under memory pressure) is never filled by arrivals.
-//! Multishot receives and accepts wait on the network for as long as their
-//! connection lives, so they are let into the kernel at once and do not
-//! count against the cap that finite operations wait behind: a sleeping
-//! connection would otherwise hold the room a request's send needs. The
-//! receives' arrivals are bounded by the group's buffers, which the queue
-//! keeps room for. An accept's connections (up to [`ACCEPT_CAP`] each) and
-//! the last completion of each multishot operation have no room kept: past
-//! the queue the kernel holds them (`IORING_FEAT_NODROP`, which the poller
-//! requires) until the poller takes them, and none is lost.
+//! A read side's operations (receives of every kind, accepts, polls for
+//! bytes) wait on the network for as long as their peer is idle, so they are
+//! let into the kernel at once and do not count against the cap that finite
+//! operations wait behind: a sleeping connection would otherwise hold the
+//! room a request's send, or the next accept, needs. The multishot receives'
+//! arrivals are bounded by the group's buffers, which the queue keeps room
+//! for. An accept's connections (up to [`ACCEPT_CAP`] each) and the last
+//! completion of each of these operations have no room kept: past the queue
+//! the kernel holds them (`IORING_FEAT_NODROP`, which the poller requires)
+//! until the poller takes them, and none is lost.
 
 use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -88,7 +89,7 @@ pub(crate) struct ShardRing {
     /// Completions of the last wait, reused.
     cqes: RefCell<Vec<IoUringCqe>>,
     /// The buffers multishot receives draw from; `None` when the
-    /// configuration asks for none or the kernel could not make them.
+    /// configuration asks for none, or once the ring is shut down.
     recv: RefCell<Option<RecvGroup>>,
     /// Multishot receives and accepts submitted, the receives' arrivals,
     /// and the receives that ended as the group ran dry, for a test.
@@ -126,8 +127,12 @@ impl ShardRing {
                         format!("io_uring recv_buffers and recv_buffer_size: {err}"),
                     ));
                 }
-                // Short of memory: each read takes a buffer of the pool.
-                Err(err) if err.raw_os_error() == Some(libc::ENOMEM) => None,
+                // No memory for the group is said as the group's, apart
+                // from the ring's own shortage, which the ring answers by
+                // shrinking (`with_room`) or `auto` with the poller.
+                Err(err) if err.kind() == io::ErrorKind::OutOfMemory => {
+                    return Err(super::recv::no_memory(entries, cfg.recv_buffer_size, &err));
+                }
                 // Anything else, a kernel's refusal included, is
                 // the ring's failure: a shard never runs without the group
                 // its configuration asked for, unseen.
@@ -229,6 +234,14 @@ impl ShardRing {
         self.recv.borrow().as_ref().map(RecvGroup::buf_size)
     }
 
+    /// The memory the ring's group takes (0 without one), charged to the shard's ledger.
+    pub(crate) fn recv_reservation(&self) -> usize {
+        self.recv
+            .borrow()
+            .as_ref()
+            .map_or(0, RecvGroup::reservation)
+    }
+
     pub(crate) fn notifier(&self) -> Notifier {
         self.poller.borrow().notifier()
     }
@@ -252,7 +265,7 @@ impl ShardRing {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed + 1, arrived, dry));
         }
-        let counted = counts_against_cap(&op.mem);
+        let counted = counts_against_cap(&op);
         let inserted = self.ops.borrow_mut().insert(op);
         let user_data = match inserted {
             Ok(user_data) => user_data,
@@ -454,7 +467,7 @@ impl ShardRing {
                 cqe.res = -libc::ECANCELED;
             }
         }
-        if counts_against_cap(&op.mem) {
+        if counts_against_cap(&op) {
             self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
             self.admit_waiting();
         }
@@ -652,7 +665,9 @@ impl ShardRing {
     /// is cancelled and its completion waited for, for at most
     /// [`SHUTDOWN_WAIT`]. One that never completes keeps its memory for
     /// good (the kernel may still write it), and is counted (`leaked`).
-    pub(crate) fn shut_down(&self) {
+    /// Returns the memory of the receive group it let go, for the shard's
+    /// ledger.
+    pub(crate) fn shut_down(&self) -> usize {
         let waiting: Vec<u64> = self.room.borrow_mut().drain(..).map(|(u, _)| u).collect();
         for user_data in waiting {
             // Never submitted: nothing points at its memory. A file's call
@@ -688,12 +703,19 @@ impl ShardRing {
         // descriptor for good, a child's wait its info and its pidfd.
         core::mem::forget(stuck_files);
         core::mem::forget(stuck_exits);
-        if !stuck.is_empty() {
+        let group = self.recv.borrow_mut().take();
+        let freed = if stuck.is_empty() {
+            let freed = group.as_ref().map_or(0, RecvGroup::reservation);
+            drop(group);
+            freed
+        } else {
             // A receive still in the kernel may write the group's buffers:
             // they stay registered and mapped for good.
-            core::mem::forget(self.recv.borrow_mut().take());
-        }
+            core::mem::forget(group);
+            0
+        };
         core::mem::forget(stuck);
+        freed
     }
 }
 
@@ -761,16 +783,15 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
     configured.min(u16::try_from(fit.min(1 << 15)).unwrap_or(1 << 15))
 }
 
-/// Whether the operation of `mem` counts against the cap on operations in
-/// the kernel. A multishot receive or accept waits on the network for as long
-/// as its connection lives, so counting it would let idle connections fill
-/// the cap and starve the sends that wake them. The one place both the
+/// Whether `op` counts against the cap on operations in the kernel: a write
+/// side's does, and a read side's never. Every operation of a read side (a
+/// receive of any kind, multishot or into one buffer, an accept, a poll for
+/// bytes) waits on its peer for as long as the peer is idle, so counting it
+/// would let idle connections fill the cap and hold back the sends and accepts
+/// that would wake them (proofs/tla/admission). The one place both the
 /// submission and the end of an operation decide it.
-fn counts_against_cap(mem: &RingMem) -> bool {
-    !matches!(
-        mem,
-        RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } | RingMem::AcceptMulti { .. }
-    )
+fn counts_against_cap(op: &RingOp) -> bool {
+    !op.read
 }
 
 /// The bit of the user data of a file's call (in the slot index, which the
@@ -946,5 +967,7 @@ mod tests_cap;
 mod tests_inc;
 #[cfg(test)]
 mod tests_recv;
+#[cfg(test)]
+mod tests_reserve;
 #[cfg(test)]
 mod tests_zc;

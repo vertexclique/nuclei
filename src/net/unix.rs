@@ -326,7 +326,7 @@ impl Handle<UnixDatagram> {
     ///
     /// # Errors
     ///
-    /// As `send(2)`, or an earlier datagram's.
+    /// As `send(2)` of this datagram.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Connected)).await
     }
@@ -405,7 +405,7 @@ impl Handle<UnixDatagram> {
     ///
     /// # Errors
     ///
-    /// As `sendto(2)`, or an earlier datagram's.
+    /// As `sendto(2)` of this datagram.
     pub async fn send_to<P: AsRef<Path>>(&self, buf: &[u8], path: P) -> io::Result<usize> {
         let addr = UnixAddr::path(path.as_ref())?;
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Unix(&addr))).await

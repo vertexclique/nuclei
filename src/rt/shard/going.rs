@@ -150,7 +150,7 @@ impl Drop for Shard {
         if let Driver::Ring(ring) = &self.driver {
             // Cancels a holder of a source on another thread left here.
             ring.settle(|| self.apply_io_ops());
-            ring.shut_down();
+            self.pool.unreserve(ring.shut_down());
         }
         // The port's operations to a keeper, unless one has them already.
         #[cfg(port)]

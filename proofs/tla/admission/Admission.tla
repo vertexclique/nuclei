@@ -7,20 +7,29 @@
 (*                                                                         *)
 (* In plain words: the ring's completion queue has C slots, where finished *)
 (* operations and arrived data wait for the shard to collect them. Two     *)
-(* kinds of operation go into the kernel. A long-lived one (a receive that *)
-(* waits on a connection, an accept) may sit there for as long as the      *)
-(* connection is idle, maybe forever. A finite one (a send, a file call)   *)
-(* finishes soon after it is let in. The ring has a receive group of       *)
-(* buffers: data that arrives for the long-lived receives takes one slot   *)
-(* of the queue per buffer, so the group is a share of the queue that      *)
-(* belongs to arrivals. The rest of the queue is the CAP: how many         *)
-(* operations the ring lets in at once. A finite operation that finds the  *)
-(* cap used waits in a line called room until one completes.               *)
+(* kinds of operation go into the kernel. A long-lived one, every          *)
+(* operation of a side that reads (a receive of any kind, multishot or     *)
+(* into one buffer, an accept, a poll for bytes), may sit there for as     *)
+(* long as its peer is idle, maybe forever: it ends only when the peer     *)
+(* sends or connects. A multishot one never ends by itself; a one-shot one *)
+(* ends with its peer's one arrival, and its reader arms the next. A       *)
+(* finite one (a send, a connect, a file call) finishes soon after it is   *)
+(* let in. The ring has a receive group of buffers: data that arrives for  *)
+(* the long-lived receives takes one slot of the queue per buffer, so the  *)
+(* group is a share of the queue that belongs to arrivals. The rest of the *)
+(* queue is the CAP: how many operations the ring lets in at once. A       *)
+(* finite operation that finds the cap used waits in a line called room    *)
+(* until one completes.                                                    *)
 (*                                                                         *)
 (* The two guards: (1) the group is cut to the largest power of two within *)
 (* half the queue, so arrivals never take more than half of it and the cap *)
-(* never collapses; (2) long-lived operations are let in at once and do    *)
-(* not count against the cap, so idle connections cannot use it up.        *)
+(* never collapses; (2) long-lived operations, one-shot ones too, are let  *)
+(* in at once and do not count against the cap, so idle connections cannot *)
+(* use it up. Before, the ring counted a one-shot receive, poll or accept  *)
+(* as finite: 3840 idle connections (the cap of a ring of 2048 entries     *)
+(* beside its 256-buffer group) filled it with receives that waited for    *)
+(* their peers, and the next accept waited in room behind them for good,   *)
+(* the stall the vs-tokio benchmark found at 4096 connections.             *)
 (*                                                                         *)
 (* What must never happen: (a) a finite operation waits in room while no   *)
 (* finite operation is in the kernel. Nothing then ever completes to free  *)
@@ -29,21 +38,22 @@
 (* finite completions take more than the queue's C slots: the room the cap *)
 (* keeps is for them.                                                      *)
 (*                                                                         *)
-(* What is modelled: the queue size, the group size, the cap, long-lived   *)
-(* operations that never end by themselves, finite operations that come    *)
-(* and complete, the line of room, data arriving in the group and being    *)
-(* taken. What is abstract: what the operations do, time, and the entries  *)
-(* no room is kept for: an accept's connections and the last entry of each *)
-(* long-lived operation. Past the queue the kernel holds those             *)
-(* (IORING_FEAT_NODROP, which the poller requires) until the shard takes   *)
-(* them: none is lost, and none holds up a finite operation.               *)
+(* What is modelled: the queue size, the group size, the cap, multishot    *)
+(* long-lived operations that never end by themselves, one-shot ones that  *)
+(* end when their peer acts, finite operations that come and complete, the *)
+(* line of room, data arriving in the group and being taken. What is       *)
+(* abstract: what the operations do, time, and the entries no room is kept *)
+(* for: an accept's connections and the last entry of each long-lived      *)
+(* operation. Past the queue the kernel holds those (IORING_FEAT_NODROP,   *)
+(* which the poller requires) until the shard takes them: none is lost,    *)
+(* and none holds up a finite operation.                                   *)
 (***************************************************************************)
 EXTENDS Integers
 
 CONSTANTS
     C,         \* completion queue slots of the ring
     G,         \* receive buffers the configuration asks for (a power of two)
-    MaxLong,   \* long-lived operations the environment may start
+    MaxLong,   \* long-lived operations of each kind the environment may start
     MaxFin,    \* finite operations the environment may start
     Mode       \* "ok", or the name of the one rule this run takes away
 
@@ -64,7 +74,8 @@ Cap == Max(1, C - Group)
 
 (* --algorithm Admission
 variables
-    long = 0,      \* long-lived operations in the kernel
+    long = 0,      \* multishot long-lived operations in the kernel
+    once = 0,      \* one-shot long-lived operations in the kernel, each waiting on its peer
     fin = 0,       \* finite operations in the kernel
     room = 0,      \* finite operations waiting for room
     made = 0,      \* finite operations started so far
@@ -72,7 +83,9 @@ variables
 
 define
     \* Operations the ring counts against the cap.
+    \* MUTATION once_counted: one-shot receives, polls and accepts count, as they did before.
     Counted == fin + (IF Mode = "no_long_exemption" THEN long ELSE 0)
+                   + (IF Mode = "once_counted" THEN once ELSE 0)
     \* No finite operation waits while none is in the kernel to free room.
     NoRoomDeadlock == ~(room > 0 /\ fin = 0)
     \* The queue holds no more waiting entries than it has slots.
@@ -80,6 +93,7 @@ define
     \* Witnesses.
     NoRoomEver == room = 0
     LongWithinCap == long <= Cap
+    OnceWithinCap == once <= Cap
 end define;
 
 fair process ring = 1
@@ -91,6 +105,16 @@ Step:
             \* once; without it, it counts and goes in only while the cap has room.
             await long < MaxLong /\ (Mode /= "no_long_exemption" \/ Counted < Cap);
             long := long + 1;
+        or
+            \* A one-shot long-lived operation is armed (a receive into a buffer, a poll for
+            \* bytes, an accept). With the exemption it goes in at once; counted, it goes in
+            \* only while the cap has room.
+            await once < MaxLong /\ (Mode /= "once_counted" \/ Counted < Cap);
+            once := once + 1;
+        or
+            \* Its peer sends or connects: it ends, and its reader may arm the next.
+            await once > 0;
+            once := once - 1;
         or
             \* A finite operation comes: in if the cap has room, else into room.
             await made < MaxFin;
@@ -121,4 +145,6 @@ Step:
     end while;
 end process;
 end algorithm; *)
+\* BEGIN TRANSLATION
+\* END TRANSLATION 
 =============================================================================
