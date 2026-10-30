@@ -1273,17 +1273,25 @@ slack). Time is whole units: a quick run adds none, a slow one `Slow`, a long on
 
 `admission` (`tla/admission/Admission.tla`) checks how a shard's ring (`src/rt/shard/ring.rs`)
 admits operations: a completion queue of `C` slots, a receive group whose buffers are arrivals'
-share of it, a cap on the operations counted in the kernel, long-lived operations (receives and
-accepts that wait on idle connections and may never end) and finite ones (sends) that wait in
-room when the cap is used. 5 configurations: 1 that must pass (the group cut to half the queue,
-long-lived operations not counted: a finite operation never waits in room while none is in the
-kernel, `NoRoomDeadlock`, and arrivals plus finite completions fit the queue,
-`CqNeverOverfull`), 2 mutations (the group not cut breaks `CqNeverOverfull`; long-lived
-operations counted lets idle receives use the cap and breaks `NoRoomDeadlock`: the request
-waiting for its reply's receive), and 2 witnesses (a finite operation does wait in room; a
-long-lived one is let in past the cap). An accept's connections and the last entry of each
-long-lived operation are not modelled: no room is kept for them, and past the queue the kernel
-holds them (`IORING_FEAT_NODROP`) until the shard takes them.
+share of it, a cap on the operations counted in the kernel, long-lived operations (every
+operation of a side that reads: multishot receives and accepts, which never end by themselves,
+and one-shot receives into a buffer, polls for bytes and accepts, which end when their peer acts)
+and finite ones (sends, connects, file calls) that wait in room when the cap is used. Before,
+`counts_against_cap` exempted only the multishot ones: in the vs-tokio benchmark 3840 idle
+connections, the cap of a ring of 2048 entries beside its 256-buffer group, filled it with
+one-shot receives that waited for their peers, and the next accept waited in room behind them for
+good, leaving every connection past them unaccepted. 7 configurations: 1 that must pass (the
+group cut to half the queue, long-lived operations of both kinds not counted: a finite operation
+never waits in room while none is in the kernel, `NoRoomDeadlock`, and arrivals plus finite
+completions fit the queue, `CqNeverOverfull`), 3 mutations (the group not cut breaks
+`CqNeverOverfull`; multishot operations counted, and one-shot ones counted, as they were, let idle
+receives use the cap and break `NoRoomDeadlock`: the request waiting for its reply's receive), and
+3 witnesses (a finite operation does wait in room; a multishot one, and a one-shot one, is let in
+past the cap). An accept's connections and the last entry of each long-lived operation are not
+modelled: no room is kept for them, and past the queue the kernel holds them
+(`IORING_FEAT_NODROP`) until the shard takes them. `tests/idle_peers.rs` fills the cap of the
+smallest ring with receives of idle peers and checks every other peer is still accepted and
+answered.
 
 ## A ring's overflow count
 
