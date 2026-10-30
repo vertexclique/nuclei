@@ -2,8 +2,10 @@
 //! its length, metadata, permissions and times, and a second handle to it.
 //!
 //! Each runs on the blocking pool after the handle's writes in flight landed
-//! (so a sync or a length sees them), on a duplicate of the file's
-//! descriptor, so the call never runs on a descriptor the handle closed.
+//! (so a length sees them), on a duplicate of the file's descriptor, so the
+//! call never runs on a descriptor the handle closed. A regular file's sync
+//! goes to the file's own IO state instead (`fs::file::durable`), on the
+//! shard's ring where it runs one.
 
 use core::pin::Pin;
 use std::fs::{File, FileTimes, Metadata, Permissions};
@@ -44,15 +46,38 @@ impl Handle<File> {
         OpenOptions::new()
     }
 
-    /// Writes the file's data and metadata through to the device.
+    /// Writes the file's data and metadata through to the device, as std's
+    /// `File::sync_all` does, once every write accepted before the call (at
+    /// the cursor, or positional and returned) landed. On io_uring the sync
+    /// is an operation of the shard's ring (`IORING_OP_FSYNC`); elsewhere a
+    /// job of the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// A write that failed (reported here as by a flush), or the sync's own
+    /// failure. Once a sync of the handle failed, every later one fails with
+    /// that error: the system reports a failure to write data back once, so
+    /// a later sync that succeeded would not mean the data reached the
+    /// device. Open the file again to start over.
     pub async fn sync_all(&self) -> io::Result<()> {
-        self.on_pool(File::sync_all).await
+        if !self.is_regular() {
+            return self.on_pool(File::sync_all).await;
+        }
+        self.file()?.sync(false).await
     }
 
     /// Writes the file's data through to the device, and the metadata a
-    /// read needs.
+    /// read needs, as std's `File::sync_data` does (`IORING_FSYNC_DATASYNC`
+    /// on io_uring); otherwise as [`sync_all`](Self::sync_all).
+    ///
+    /// # Errors
+    ///
+    /// As [`sync_all`](Self::sync_all).
     pub async fn sync_data(&self) -> io::Result<()> {
-        self.on_pool(File::sync_data).await
+        if !self.is_regular() {
+            return self.on_pool(File::sync_data).await;
+        }
+        self.file()?.sync(true).await
     }
 
     /// Sets the file's length: cut down, or grown with zeros. The cursor

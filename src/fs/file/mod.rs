@@ -32,13 +32,18 @@
 //! cursor nowhere. A write from a task's buffer is the write in flight like
 //! any other, so whatever comes after it waits for it; dropped, it still
 //! lands, and its buffer goes with the job.
+//!
+//! A sync (`durable`) waits for every write it covers, then is an operation
+//! of the shard's ring where it runs one; a failed sync fails every later
+//! one.
 
+mod durable;
 mod work;
 
 use core::future::poll_fn;
 use core::task::{Context, Poll, Waker};
 use std::io::{self, SeekFrom};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::Wake;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -49,6 +54,9 @@ use crate::io::raw::{OwnedFile, Raw, file_raw};
 use crate::io::side::{After, Hooks, Side, WakerSet};
 use crate::io::source::Failure;
 use crate::io::sys;
+
+#[cfg(ring)]
+pub(crate) use self::durable::sync_on;
 
 /// The least a read job asks for, so a run of small reads takes one job.
 pub(crate) const READ_MIN: usize = 64 * 1024;
@@ -79,6 +87,8 @@ pub(crate) struct FileIo {
     /// as the state's last holder left them.
     unsent: AtomicBool,
     cursor: AtomicU64,
+    /// The first sync that failed: every later sync fails with it.
+    sync_failed: OnceLock<Failure>,
     /// The file was opened to append.
     append: bool,
     /// The calls go to the blocking pool even on a ring, for a test that
@@ -155,6 +165,7 @@ impl FileIo {
             consumed: AtomicUsize::new(0),
             unsent: AtomicBool::new(false),
             cursor: AtomicU64::new(cursor),
+            sync_failed: OnceLock::new(),
             append,
             #[cfg(test)]
             on_pool: AtomicBool::new(false),

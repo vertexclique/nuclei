@@ -116,7 +116,7 @@ pub(super) fn buffer(len: usize, after: &mut After) -> Option<PoolBuf> {
 impl FileIo {
     /// Whether this thread's calls go to its shard's ring.
     #[cfg(ring)]
-    fn on_ring(&self) -> bool {
+    pub(super) fn on_ring(&self) -> bool {
         #[cfg(test)]
         if self.on_pool.load(core::sync::atomic::Ordering::Relaxed) {
             return false;

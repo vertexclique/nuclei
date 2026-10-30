@@ -3,11 +3,12 @@
 //! ([`read`], [`write`](fn@write), [`metadata`], [`rename`], [`copy`], ...),
 //! directories ([`create_dir_all`], [`DirBuilder`], [`read_dir`] streamed a
 //! page at a time) and links. Calls by path, and a regular file's calls
-//! beside its reads and writes, run on the blocking pool.
+//! beside its reads, writes and syncs, run on the blocking pool.
 //!
-//! A regular file's reads and writes, at the handle's own cursor, are
-//! operations of the shard's ring on io_uring and jobs of the blocking pool
-//! on the other backends (see `file`); a `File` that is not a regular file
+//! A regular file's reads and writes, at the handle's own cursor, and its
+//! syncs ([`Handle::sync_all`], [`Handle::sync_data`]) are operations of the
+//! shard's ring on io_uring and jobs of the blocking pool on the other
+//! backends (see `file`); a `File` that is not a regular file
 //! (a FIFO, a terminal, a pipe) is a byte stream the shard's driver serves
 //! like a socket (on Windows, through the completion port, or through jobs
 //! of the blocking pool for a handle opened for synchronous IO). Reads

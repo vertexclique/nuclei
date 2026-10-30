@@ -16,13 +16,13 @@ fn pool_charged() -> usize {
 }
 
 /// Polls `fut` once: it must wait.
-async fn pends<F: Future + Unpin>(fut: &mut F) {
+pub(super) async fn pends<F: Future + Unpin>(fut: &mut F) {
     let polled = poll_fn(|cx| core::task::Poll::Ready(Pin::new(&mut *fut).poll(cx))).await;
     assert!(polled.is_pending(), "it did not wait");
 }
 
 /// A runtime whose blocking pool has one thread.
-fn one_blocking_thread() -> Runtime {
+pub(super) fn one_blocking_thread() -> Runtime {
     Builder::new()
         .worker_threads(1)
         .max_blocking_threads(1)
@@ -35,7 +35,7 @@ fn one_blocking_thread() -> Runtime {
 /// sender sends: a file job submitted meanwhile waits in the pool's queue,
 /// so it is out (and its future pending) for certain, not by timing. The
 /// task ends once the thread is let go.
-fn hold_the_pool() -> (std::sync::mpsc::Sender<()>, crate::runtime::Task<()>) {
+pub(super) fn hold_the_pool() -> (std::sync::mpsc::Sender<()>, crate::runtime::Task<()>) {
     let (hold, held) = std::sync::mpsc::channel::<()>();
     let busy = crate::runtime::spawn_blocking(move || {
         let _ = held.recv();
@@ -44,7 +44,10 @@ fn hold_the_pool() -> (std::sync::mpsc::Sender<()>, crate::runtime::Task<()>) {
 }
 
 /// Both futures, polled together until both are done.
-async fn both<A: Future + Unpin, B: Future + Unpin>(mut a: A, mut b: B) -> (A::Output, B::Output) {
+pub(super) async fn both<A: Future + Unpin, B: Future + Unpin>(
+    mut a: A,
+    mut b: B,
+) -> (A::Output, B::Output) {
     let (mut x, mut y) = (None, None);
     poll_fn(|cx| {
         if x.is_none()

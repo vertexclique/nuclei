@@ -1,6 +1,6 @@
-//! A file's calls on io_uring: a read or a write at an offset, issued on
-//! the ring of the shard whose thread asks for it, instead of a job of the
-//! blocking pool.
+//! A file's calls on io_uring: a read or a write at an offset, or a sync,
+//! issued on the ring of the shard whose thread asks for it, instead of a
+//! job of the blocking pool.
 //!
 //! The operation keeps a copy of the file's descriptor and the buffer it
 //! reads into or writes from until its last completion, so neither goes
@@ -33,6 +33,8 @@ pub(crate) enum FileMem {
     Write { buf: PoolBuf, done: usize },
     /// A write of a task's buffer, `done` of its bytes landed.
     WriteLent { buf: Vec<u8>, done: usize },
+    /// A sync of the file's data (`data_only`) or of all of it.
+    Sync { data_only: bool },
 }
 
 /// How a file's operation ended, with its buffer.
@@ -41,6 +43,7 @@ pub(crate) enum FileOutcome {
     ReadLent(io::Result<usize>, Vec<u8>),
     Write(io::Result<()>),
     WriteLent(io::Result<()>, Vec<u8>),
+    Sync(io::Result<()>),
 }
 
 /// A file's operation on a ring.
@@ -212,6 +215,19 @@ pub(crate) fn read(
     submit(fd, at, buf, FileMem::Read, as_read)
 }
 
+/// A sync of the file's data (`data_only`) or of all of it, on this
+/// thread's ring; `Err` when the thread runs none.
+pub(crate) fn sync(fd: &Arc<OwnedFile>, data_only: bool) -> Result<RingJob<io::Result<()>>, ()> {
+    submit(
+        fd,
+        0,
+        data_only,
+        |data_only| FileMem::Sync { data_only },
+        as_sync,
+    )
+    .map_err(drop)
+}
+
 /// A read at `at` into the spare capacity of a task's `buf`.
 pub(crate) fn read_lent(
     fd: &Arc<OwnedFile>,
@@ -281,6 +297,7 @@ impl FileOp {
                     self.at + *done as u64,
                 )
             }
+            FileMem::Sync { data_only } => Sqe::fsync(fd, *data_only),
         }
     }
 
@@ -325,6 +342,7 @@ impl FileOp {
             }
             FileMem::Write { .. } => FileOutcome::Write(written(result)),
             FileMem::WriteLent { buf, .. } => FileOutcome::WriteLent(written(result), buf),
+            FileMem::Sync { .. } => FileOutcome::Sync(result.map(drop)),
         };
         self.slot.put(outcome);
         None
@@ -361,6 +379,9 @@ impl FileOp {
                     let result =
                         sys::pwrite_all(raw, buf.get(done..).unwrap_or_default(), at + done as u64);
                     FileOutcome::WriteLent(result, buf)
+                }
+                FileMem::Sync { data_only } => {
+                    FileOutcome::Sync(crate::fs::file::sync_on(&fd, data_only))
                 }
             };
             slot.put(outcome);
@@ -401,6 +422,13 @@ fn as_write(outcome: FileOutcome) -> io::Result<()> {
     match outcome {
         FileOutcome::Write(result) => result,
         _ => Err(io::Error::other("a file write ended as another call")),
+    }
+}
+
+fn as_sync(outcome: FileOutcome) -> io::Result<()> {
+    match outcome {
+        FileOutcome::Sync(result) => result,
+        _ => Err(io::Error::other("a file sync ended as another call")),
     }
 }
 
