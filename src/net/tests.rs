@@ -991,4 +991,7 @@ mod windows;
 
 mod datagram_owned;
 
+#[cfg(unix)]
+mod emfile;
+
 mod send_file;
