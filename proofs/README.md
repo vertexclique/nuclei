@@ -971,9 +971,11 @@ its atomic steps: a send's store of the value, its version bump and its wake; a 
 load, its compare-and-swap and its retry; the last sender's close and wake; `changed` making its
 `Notified`, reading the state word and deciding; a borrow's read of the version and of the value;
 the receivers' count and its wake; and a sender's `closed` waiting for the receivers to go. A
-`Notified` is abstracted to what `Notify` promises: it hears every wake made after it was made. 12
-configurations: 4 that must pass (sends; modifying sends, where no change is lost; the two mixed;
-a sender waiting for the receivers to go, which ends), with `changed` never answering closed
+`Notified` is abstracted to what `Notify` promises: it hears every wake made after it was made. 14
+configurations: 6 that must pass (sends, and sends mixed with modifying sends, each run once with
+the receiver that waits for changes and once with the borrower, as the two decide nothing by each
+other; modifying sends, where no change is lost; a sender waiting for the receivers to go, which
+ends), with `changed` never answering closed
 while a version it has not seen is there (`ErrOnlyWhenSeen`), a borrow never pairing a version
 with an older value (`PairedNoOlder`), the version counting every publication, the receiver
 seeing the last version and ending; 5 mutations (a modifying send that stores without comparing
