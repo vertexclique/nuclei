@@ -773,6 +773,26 @@ and handed out again only once the read completed (`example_reuse_waits`). The R
 `src/rt/shard/ring/tests.rs` run sources past a full table, a retire with a read out and a
 shard that goes with one, each with a mutation of the code that makes one of them fail.
 
+## A listener's stream of connections
+
+`accept` (`tla/accept/AcceptStream.tla`) checks the stream `TcpListener::accept_multi` gives
+(`TcpStreamGenerator::poll_next` in `src/net/tcp.rs`, `out_of_descriptors` in
+`src/rt/counters.rs`) when the process runs out of descriptors. Peers connect into the backlog;
+the rest of the process may take every free descriptor for a while and gives them back in the
+end. A poll asks the listener for the next connection: one there and a descriptor free, it is
+accepted and the stream's pause starts over at its least; out of descriptors (EMFILE or ENFILE),
+the connection stays in the backlog and the stream waits on a timer for its pause, which then
+doubles up to its most, and asks again when the timer fires; any other error ends the stream.
+The side hands an error over once and the connections queued before it first, so a retry asks
+the listener afresh. Time is the ticks left on the timer. 7 configurations: 3 that must pass (two
+and three connections across two outages, with `NoBusyLoop`, at most one EMFILE between two ticks,
+`FirstWaitLeast`, the first pause after an accept is the least, and `AllServed`, the whole backlog
+accepted once descriptors are free again; and an outage followed by another error of the
+listener, with `OtherEnds`, the stream ends, and `NothingAfterEnd`), 3 mutations (the stream that
+ended on EMFILE, as it did before, breaks `AllServed`; a retry with no timer breaks `NoBusyLoop`;
+a pause that does not start over after an accept breaks `FirstWaitLeast`), and 1 witness (a retry
+after a pause that accepts a connection).
+
 ## The timer wheel
 
 `lean/Nuclei/Wheel.lean` checks the arithmetic of each shard's timing wheel
