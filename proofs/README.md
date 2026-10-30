@@ -930,6 +930,28 @@ and handed out again only once the read completed (`example_reuse_waits`). The R
 `src/rt/shard/ring/tests.rs` run sources past a full table, a retire with a read out and a
 shard that goes with one, each with a mutation of the code that makes one of them fail.
 
+## A reader the pool has no buffer for
+
+`starve` (`tla/starve/FdStarve.tla`) checks the rule of `tla/ring/RingStarve.tla` on a readiness
+poller, epoll or kqueue (`serve`, `leaves_to_tasks`, `complete_fd`, `read_ahead`, `read`,
+`reads_itself`, `read_direct`, `look_again` and `unstarve` in `src/io/source/read.rs`). There no
+receive waits in the kernel: a read too small to go straight into the task's buffer has the
+driver read ahead into a buffer of the pool, and a task that peeks and then stops reading keeps
+that buffer for as long as it waits. Two connections over a pool of one buffer, one of whose
+tasks peeks and stops. Before, a reader that found the pool empty waited for a buffer to come
+back, and none ever did. Now a starved reader reads, or peeks, straight from the socket into its
+own buffer; one that finds the socket empty waits for the next edge, which wakes it to read
+itself, and one that just found the pool empty while the socket may hold bytes no edge will
+report again looks at once. A peek leaves the bytes in the socket, so it never marks the socket
+drained. 9 configurations: 3 that must pass (`Buffers`, every buffer free or holding a request
+read ahead; and `Read`, every task that reads gets its request, with a task that stops and with
+none), 4 mutations (a starved reader that waits for a buffer to come back, an edge that starves
+the side and wakes nobody, a reader that waits for the next edge after the pool turned it away,
+and a peek taken as having emptied the socket break `Read`), and 2 witnesses (a reader finds the
+pool empty; a starved reader calls on the socket itself). The second test of
+`tests/idle_peers.rs` fills a pool of a 64 KiB cap with bytes read ahead for tasks that peeked
+and stopped, on every backend, and checks every other peer is answered.
+
 ## A listener's stream of connections
 
 `accept` (`tla/accept/AcceptStream.tla`) checks the stream `TcpListener::accept_multi` gives
