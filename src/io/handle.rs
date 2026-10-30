@@ -32,7 +32,8 @@
 //! bytes go out whatever happens to the handle, as std's do: `get_mut` and
 //! `into_inner` wait until the kernel took them, and a handle dropped before
 //! that leaves them to a copy of its descriptor, which delivers them (for
-//! at most [`LINGER`]) and then closes.
+//! at most [`LINGER`]) and then closes. A process with no descriptor to spare
+//! for the copy leaves the object itself to deliver them, so no byte is lost.
 
 /// How long a dropped handle's unsent bytes may take to reach the kernel.
 // vertexia: one constant for every handle; a builder setting if a peer that
@@ -280,61 +281,53 @@ impl<T> Drop for Handle<T> {
         }
         // SAFETY: taken once, here; the field is never used again.
         let io = unsafe { ManuallyDrop::take(&mut self.io) };
-        #[cfg(unix)]
-        match self
-            .source
-            .has_unsent()
-            .then(|| self.source.duplicate())
-            .flatten()
-        {
-            // The unsent bytes go out through a copy of the descriptor,
-            // which a task keeps and closes once they are out.
-            Some(copy) => {
-                self.source.close(io, Some(copy.as_raw_fd()));
-                crate::runtime::spawn(linger(Arc::clone(&self.source), copy)).detach();
-            }
-            // The registration goes before the descriptor closes.
-            None => self.source.close(io, None),
-        }
-        // Closing a socket cancels its sends, so the object itself stays
-        // with a task until the unsent bytes are out, and closes then.
-        #[cfg(windows)]
-        match self
+        let Some(own) = self
             .source
             .raw_fd()
             .ok()
             .filter(|_| self.source.has_unsent())
-        {
-            Some(socket) => {
-                self.source.close((), Some(socket));
-                let kept = Kept::new(io);
-                crate::runtime::spawn(linger(Arc::clone(&self.source), kept)).detach();
-            }
-            None => self.source.close(io, None),
+        else {
+            // The registration goes before the descriptor closes.
+            self.source.close(io, None);
+            return;
+        };
+        // On unix the unsent bytes go out through a copy of the descriptor,
+        // which a task keeps and closes once they are out, so the handle's
+        // own number is free at once, as std's close frees it.
+        #[cfg(unix)]
+        if let Some(copy) = self.source.duplicate() {
+            self.source.close(io, Some(copy.as_raw_fd()));
+            crate::runtime::spawn(linger(Arc::clone(&self.source), Kept::new(copy))).detach();
+            return;
         }
+        // The object itself stays with a task until the unsent bytes are
+        // out, and closes then: on Windows, where closing a socket cancels
+        // its sends, and on unix when the process has no descriptor to spare
+        // for a copy.
+        self.source.close((), Some(own));
+        crate::runtime::spawn(linger(Arc::clone(&self.source), Kept::new(io))).detach();
     }
 }
 
-/// Delivers what a dropped handle's write-behind holds through `copy` (on
-/// Windows the object itself), then closes it.
-async fn linger<C: Send + 'static>(source: Arc<Source>, copy: C) {
+/// Delivers what a dropped handle's write-behind holds through `kept` (a
+/// copy of its descriptor, or its object itself), then closes it.
+async fn linger(source: Arc<Source>, kept: Kept) {
     let _ = crate::time::timeout(LINGER, core::future::poll_fn(|cx| source.poll_drain(cx))).await;
-    source.close(copy, None);
+    source.close(kept, None);
 }
 
-/// A dropped handle's object, kept while its unsent bytes go out.
-#[cfg(windows)]
+/// What a dropped handle leaves to deliver its unsent bytes, a copy of its
+/// descriptor or its object itself, kept open while they go out.
 struct Kept {
     ptr: core::ptr::NonNull<()>,
     drop: unsafe fn(core::ptr::NonNull<()>),
 }
 
-// SAFETY: a handle wraps only std's sockets and files (see `IoObject`), all
-// of them `Send`; the type is erased because `Drop` cannot say so.
-#[cfg(windows)]
+// SAFETY: a handle does IO only on std's sockets and files, all of them
+// `Send` (see the module docs), and only a handle with bytes written behind
+// lingers; the type is erased because `Drop` cannot say so.
 unsafe impl Send for Kept {}
 
-#[cfg(windows)]
 impl Kept {
     fn new<T>(io: T) -> Self {
         /// Drops the `T` boxed at `ptr`.
@@ -353,7 +346,6 @@ impl Kept {
     }
 }
 
-#[cfg(windows)]
 impl Drop for Kept {
     fn drop(&mut self) {
         // SAFETY: made by `new`, dropped once, here.

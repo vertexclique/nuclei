@@ -481,7 +481,9 @@ taken in one order: a holder of the read side that sees the request bit tries th
 holder of the write side lets go first, then tries the read side once. Whoever performs the
 close marks it done, and whichever of the dropper's hand-over and that mark comes second drops
 the object. The close lingers: once the dropper is done, a task drains what the handle wrote
-through a copy of the descriptor, holding the write side; finding the close not performed yet,
+through a copy of the descriptor (or, where the process has no descriptor to spare for one, and
+on Windows, through the handle's own object, which the task keeps open until then), holding the
+write side; finding the close not performed yet,
 it waits on the write side, and the performer wakes the write side's waiters rather than
 forget them as it does the handle's others. 11 configurations: 2 that must pass
 (`NoUseOfClosed`, no holder uses a descriptor closed under it; `PerformedOnce`; `Closed`, once
