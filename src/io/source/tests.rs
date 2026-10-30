@@ -753,6 +753,25 @@ fn a_datagram_larger_than_the_pool_allows_goes_whole_between_the_tasks_buffers()
     let group = crate::rt::shard::least_buffer_cap() - crate::buf::CLASSES[0];
     let rt = runtime(Some(group + 64 * 1024));
     let (a, b) = datagram_pair();
+    // macOS refuses a datagram larger than the sender's buffer (2 KiB for a Unix socket by
+    // default) and holds none larger than the receiver's.
+    for (fd, option) in [
+        (a.as_raw_fd(), libc::SO_SNDBUF),
+        (b.as_raw_fd(), libc::SO_RCVBUF),
+    ] {
+        let size: libc::c_int = 256 * 1024;
+        // SAFETY: a plain setsockopt with a pointer to our own int.
+        let set = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&size as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "{}", io::Error::last_os_error());
+    }
     let a = Owned::new(a, DATAGRAM);
     let b = Owned::new(b, DATAGRAM);
     rt.block_on(async {

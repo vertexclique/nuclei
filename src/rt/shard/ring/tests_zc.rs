@@ -318,8 +318,14 @@ fn zero_copy_writes_pipeline_and_every_buffer_comes_back() {
     for (buf, back) in bufs.iter().zip(released) {
         assert!(shard.block_on(back) == *buf);
     }
-    let (firsts, notifs) = shard.ring().expect("a ring shard").zc_seen();
-    assert!(firsts >= bufs.len(), "a write never went out zero-copy");
+    let ring = shard.ring().expect("a ring shard");
+    let (firsts, notifs) = ring.zc_seen();
+    // A kernel with no more memory it may pin refuses a zero-copy send, and the ring copies from
+    // then on.
+    assert!(
+        firsts >= bufs.len() || !ring.zc_stream(),
+        "a write went out copied though the kernel never refused zero-copy"
+    );
     assert_eq!(firsts, notifs, "a buffer came back before its notification");
 }
 

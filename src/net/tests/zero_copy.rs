@@ -12,8 +12,42 @@ async fn tcp_pair() -> (Handle<TcpStream>, Handle<TcpStream>) {
     let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (near, far) = join(Handle::<TcpStream>::connect(addr), listener.accept()).await;
-    (near.unwrap(), far.unwrap().0)
+    let (near, far) = (near.unwrap(), far.unwrap().0);
+    roomy(&near, true);
+    roomy(&far, true);
+    (near, far)
 }
+
+/// Gives `s` a send buffer of 4 MiB, and with `receive` a receive buffer too, on macOS, whose
+/// TCP buffers stay at 128 KiB while nothing is read: a write that must fit before the peer
+/// reads needs the room Linux's buffers grow to. Elsewhere the system's own sizing stays (a
+/// size set on Linux caps the buffer and stops it growing).
+#[cfg(target_vendor = "apple")]
+fn roomy(s: &Handle<TcpStream>, receive: bool) {
+    use std::os::fd::AsRawFd;
+    let size: libc::c_int = 4 << 20;
+    let options = if receive {
+        &[libc::SO_SNDBUF, libc::SO_RCVBUF][..]
+    } else {
+        &[libc::SO_SNDBUF][..]
+    };
+    for &option in options {
+        // SAFETY: a plain setsockopt with a pointer to our own int.
+        let set = unsafe {
+            libc::setsockopt(
+                s.get_ref().as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&size as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "{}", io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn roomy(_: &Handle<TcpStream>, _: bool) {}
 
 /// Reads `len` bytes into one buffer, with owned reads.
 async fn read_len(s: &Handle<TcpStream>, len: usize) -> Vec<u8> {
@@ -77,6 +111,14 @@ fn both_ends_write_zero_copy_and_then_read() {
     }
 }
 
+/// Whether the calling task runs on a readiness poller's shard.
+fn on_poller() -> bool {
+    #[cfg(ring)]
+    return crate::rt::context::current(|shard| shard.is_some_and(|s| s.ring().is_none()));
+    #[cfg(not(ring))]
+    true
+}
+
 /// On a driver without zero-copy sends the write is copied, and its buffer is back at once.
 #[test]
 fn a_zero_copy_write_on_a_poller_is_copied_and_ready_at_once() {
@@ -86,9 +128,21 @@ fn a_zero_copy_write_on_a_poller_is_copied_and_ready_at_once() {
         .backend(crate::proactor::POLLER)
         .build()
         .unwrap();
-    // On a worker: the thread calling `block_on` runs a shard of its own, of any backend.
+    // On the worker: the thread calling `block_on` runs a shard of its own, of any backend, and
+    // takes what is spawned before the worker has started.
     rt.block_on(async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut pause = Duration::from_millis(1);
+        while !within(spawn(async { on_poller() })).await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poller worker never started"
+            );
+            crate::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_millis(50));
+        }
         within(spawn(async {
+            assert!(on_poller(), "a task moved off the started worker");
             let (a, b) = tcp_pair().await;
             let data = pattern(2 * MIB);
             let at = data.as_ptr().addr();
@@ -168,6 +222,7 @@ fn a_buffer_comes_back_after_its_runtime_shut_down() {
     let (stream, mut released, zero_copy) = rt.block_on(async move {
         within(spawn(async move {
             let s = Handle::<TcpStream>::connect(addr).await.unwrap();
+            roomy(&s, false);
             #[cfg(ring)]
             let zero_copy = crate::rt::context::current(|shard| {
                 shard
@@ -213,6 +268,7 @@ fn a_zero_copy_write_on_a_threads_own_shard_is_copied() {
     let sent = data.clone();
     let (stream, mut released) = crate::block_on(async move {
         let s = within(Handle::<TcpStream>::connect(addr)).await.unwrap();
+        roomy(&s, false);
         let (n, released) = within(s.write_zero_copy(sent)).await;
         assert_eq!(n.unwrap(), MIB);
         (s, released)

@@ -181,7 +181,14 @@ pub async fn reset_during_a_read<S: Stream>() {
             let (got, end) = within(&what, reading).await;
             joined(peer).await;
             let next = within(&what, read_once(&ours, how, 4096)).await;
-            same_bytes(&what, &got, &want.0);
+            if cfg!(windows) {
+                // Windows drops what a reset finds unread, so std's read after the reset gets
+                // none of it, while a read already out takes what came before the reset: any
+                // prefix, in order.
+                same_bytes(&what, &got, &bytes[..got.len().min(bytes.len())]);
+            } else {
+                same_bytes(&what, &got, &want.0);
+            }
             assert_eq!(end, want.1, "{what}: the read that ended the bytes");
             assert_eq!(
                 Answer::of(&next, Vec::len),
@@ -266,11 +273,15 @@ pub async fn reset_during_a_large_write<S: Stream>() {
         });
         let wrote = std_ours.write_all(&bytes);
         joined(peer).await;
-        let err = wrote.expect_err("std's write past a reset");
-        assert!(
-            is_one_of(&err, RESET_WRITE),
-            "std's write past a reset: {err}"
-        );
+        // Windows may take the whole write into its buffers before the reset lands.
+        if let Err(err) = wrote {
+            assert!(
+                is_one_of(&err, RESET_WRITE),
+                "std's write past a reset: {err}"
+            );
+        } else if !cfg!(windows) {
+            panic!("std's write past a reset went through");
+        }
     }
     for how in WRITERS {
         let (ours, peer) = S::pair(false);
@@ -286,8 +297,11 @@ pub async fn reset_during_a_large_write<S: Stream>() {
         );
         let wrote = within(&what, write_as(&ours, how, &bytes)).await;
         joined(peer).await;
-        let err = wrote.expect_err(&what);
-        assert!(is_one_of(&err, RESET_WRITE), "{what}: {err}");
+        match wrote {
+            Err(err) => assert!(is_one_of(&err, RESET_WRITE), "{what}: {err}"),
+            Ok(()) if cfg!(windows) => {}
+            Ok(()) => panic!("{what}: the write went through"),
+        }
         let again = within(&what, write_as(&ours, Writer::Plain, b"more")).await;
         let err = again.expect_err(&format!("{what}: the write after it"));
         assert!(
