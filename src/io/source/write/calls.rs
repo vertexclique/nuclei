@@ -124,6 +124,25 @@ impl Source {
         let mut op = WriteOwned {
             source: self,
             buf: Some(buf),
+            to: None,
+            lent: false,
+        };
+        let result = poll_fn(|cx| op.poll(cx)).await;
+        (result, op.buf.take().unwrap_or_default())
+    }
+
+    /// Sends all of `buf` as one datagram to `to` and gives it back with the
+    /// send's result. The buffer is lent to the side until the kernel took
+    /// the datagram, so the bytes go out from it with no copy.
+    pub(crate) async fn send_owned(
+        self: &Arc<Self>,
+        buf: Vec<u8>,
+        to: Dest<'_>,
+    ) -> (io::Result<usize>, Vec<u8>) {
+        let mut op = WriteOwned {
+            source: self,
+            buf: Some(buf),
+            to: Some(to),
             lent: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
@@ -134,10 +153,11 @@ impl Source {
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         held: &mut Option<Vec<u8>>,
+        to: Option<Dest<'_>>,
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
         let poll = self.poll_writing(cx, |st, io, waker, after| {
-            st.write_owned(io, kind, held, waker, after)
+            st.write_owned(io, kind, held, to, waker, after)
         });
         if poll.is_ready() && held.is_none() {
             // The poll failed with the buffer lent: it comes back as it is.
@@ -218,21 +238,23 @@ impl Source {
 /// A write whose buffer may be lent to the side. Dropped while it is, the
 /// side withdraws the write if none of it went out and finishes it if some
 /// did.
-struct WriteOwned<'a> {
+struct WriteOwned<'a, 'd> {
     source: &'a Arc<Source>,
     buf: Option<Vec<u8>>,
+    /// Where a datagram goes; `None` for a stream's bytes.
+    to: Option<Dest<'d>>,
     lent: bool,
 }
 
-impl WriteOwned<'_> {
+impl WriteOwned<'_, '_> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let poll = self.source.poll_write_owned(cx, &mut self.buf);
+        let poll = self.source.poll_write_owned(cx, &mut self.buf, self.to);
         self.lent = self.buf.is_none();
         poll
     }
 }
 
-impl Drop for WriteOwned<'_> {
+impl Drop for WriteOwned<'_, '_> {
     fn drop(&mut self) {
         if self.lent {
             let mut after = After::default();

@@ -110,6 +110,9 @@ struct Lent {
     // source at most, for at most `LINGER` once its handle is gone); charge
     // it to the pool if kept buffers must count against the cap.
     orphan: bool,
+    /// Where the buffer goes, when it is one datagram: the write is whole or
+    /// failed, never part.
+    to: Option<Target>,
 }
 
 #[derive(Default)]
@@ -465,6 +468,19 @@ impl WriteState {
             // The write-behind before it failed: none of it went out.
             lent.done = Some(Err(failure.error()));
         }
+        if let Some(to) = lent
+            .to
+            .as_ref()
+            .filter(|_| lent.done.is_none() && !self.blocked)
+        {
+            match sys::ready(send_datagram(fd, &lent.buf, to.as_dest())) {
+                None => self.blocked = true,
+                Some(result) => {
+                    lent.done = Some(result);
+                    progress = true;
+                }
+            }
+        }
         while lent.done.is_none() && !self.blocked {
             let rest = lent.buf.get(lent.sent..).unwrap_or_default();
             match sys::ready(write_bytes(fd, kind, rest)) {
@@ -514,6 +530,7 @@ impl WriteState {
         io: Io<'_>,
         kind: Kind,
         held: &mut Option<Vec<u8>>,
+        to: Option<Dest<'_>>,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -524,10 +541,10 @@ impl WriteState {
             if let Some(err) = self.error.take() {
                 return Poll::Ready(Err(err));
             }
-            if buf.is_empty() {
+            if buf.is_empty() && to.is_none() {
                 return Poll::Ready(Ok(0));
             }
-            if self.lent.is_some() {
+            if self.lent.is_some() || (to.is_some() && self.queued.is_some()) {
                 // Another buffer is lent: this one goes after it.
                 self.waiters.register(waker);
                 return Poll::Pending;
@@ -539,6 +556,7 @@ impl WriteState {
                 waker: None,
                 out: false,
                 orphan: false,
+                to: to.map(Dest::to_owned),
             });
         }
         // The task polls, so the driver's write needs no wake for it.
@@ -721,7 +739,7 @@ impl WriteState {
         if let Some(err) = self.error.take() {
             return Poll::Ready(Err(err));
         }
-        if self.queued.is_some() {
+        if self.queued.is_some() || self.lent_waits() {
             self.waiters.register(waker);
             return Poll::Pending;
         }

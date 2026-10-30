@@ -109,6 +109,12 @@ impl ReadState {
             }
             #[cfg(not(ring))]
             Want::Accept
+        } else if kind.datagrams() && self.lent.as_ref().is_some_and(|l| !l.out) {
+            let Some(lent) = self.lent.as_mut() else {
+                return;
+            };
+            lent.out = true;
+            Want::RecvLentFrom(core::mem::take(&mut lent.buf))
         } else if kind.datagrams() {
             #[cfg(ring)]
             let multi = !self.dry && issuer.multishot_datagrams(kind);
@@ -255,6 +261,30 @@ impl ReadState {
                     if lent.orphan {
                         // Its task went while the buffer was out: what came
                         // is the read-ahead now.
+                        self.abandon_lent(after);
+                    } else if lent.done.is_some()
+                        && let Some(w) = lent.waker.take()
+                    {
+                        after.wake_one(w);
+                    }
+                }
+            }
+            Outcome::RecvLentFrom(buf, answer) => {
+                if let Some(lent) = self.lent.as_mut().filter(|l| l.out && !stale) {
+                    lent.buf = buf;
+                    lent.out = false;
+                    match answer {
+                        Answer::Undone { not_ready } => self.not_ready(not_ready),
+                        Answer::Done(Ok((n, from))) => {
+                            lent.done = Some(Ok(n));
+                            lent.peer = Some(from);
+                        }
+                        Answer::Done(Err(err)) => lent.done = Some(Err(err)),
+                    }
+                    let Some(lent) = self.lent.as_mut() else {
+                        return;
+                    };
+                    if lent.orphan {
                         self.abandon_lent(after);
                     } else if lent.done.is_some()
                         && let Some(w) = lent.waker.take()

@@ -122,9 +122,35 @@ impl Source {
         let mut op = ReadOwned {
             source: self,
             buf: Some(buf),
+            from: None,
             lent: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
+        (result, op.buf.take().unwrap_or_default())
+    }
+
+    /// Receives one datagram into the spare capacity of `buf`, after the
+    /// bytes it holds, and gives it back with the datagram's length and
+    /// sender. The buffer is lent to the side until the driver received into
+    /// it, so the datagram lands in it with no copy (one that came before is
+    /// copied in instead); what does not fit is cut.
+    pub(crate) async fn recv_from_owned(
+        self: &Arc<Self>,
+        buf: Vec<u8>,
+    ) -> (io::Result<(usize, Addr)>, Vec<u8>) {
+        let mut op = ReadOwned {
+            source: self,
+            buf: Some(buf),
+            from: None,
+            lent: false,
+        };
+        let result = poll_fn(|cx| op.poll(cx)).await;
+        let result = result.and_then(|n| {
+            op.from
+                .take()
+                .map(|from| (n, from))
+                .ok_or_else(|| io::Error::other("the datagram came with no sender"))
+        });
         (result, op.buf.take().unwrap_or_default())
     }
 
@@ -132,13 +158,18 @@ impl Source {
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         held: &mut Option<Vec<u8>>,
+        from: &mut Option<Addr>,
     ) -> Poll<io::Result<usize>> {
-        if held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
+        let kind = self.kind;
+        if !kind.datagrams() && held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
             return Poll::Ready(Ok(0));
         }
-        let kind = self.kind;
         let poll = self.poll_reading(cx, |st, io, waker, after| {
-            st.read_owned(io, kind, held, waker, after)
+            if kind.datagrams() {
+                st.read_owned_from(io, kind, held, from, waker, after)
+            } else {
+                st.read_owned(io, kind, held, waker, after)
+            }
         });
         if poll.is_ready() && held.is_none() {
             // The poll failed with the buffer lent: it comes back as it is.
@@ -227,12 +258,16 @@ impl Source {
 struct ReadOwned<'a> {
     source: &'a Arc<Source>,
     buf: Option<Vec<u8>>,
+    /// The sender, for a datagram socket's receive.
+    from: Option<Addr>,
     lent: bool,
 }
 
 impl ReadOwned<'_> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let poll = self.source.poll_read_owned(cx, &mut self.buf);
+        let poll = self
+            .source
+            .poll_read_owned(cx, &mut self.buf, &mut self.from);
         self.lent = self.buf.is_none();
         poll
     }

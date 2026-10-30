@@ -66,10 +66,12 @@ enum PortMem {
     Recv(PoolBuf),
     RecvLent(Vec<u8>),
     RecvFrom(PoolBuf),
+    RecvLentFrom(Vec<u8>),
     Connect(Dial),
     Send(PoolBuf),
     SendLent(Vec<u8>),
     SendTo(PoolBuf, Target),
+    SendLentTo(Vec<u8>),
 }
 
 /// A source's state on a port.
@@ -451,6 +453,68 @@ fn start(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET, want: Want) -> 
                 )
             })
         }
+        NotStream::RecvLentFrom(mut buf) => {
+            let spare = buf.spare_capacity_mut();
+            inner.buf = WSABUF {
+                len: u32::try_from(spare.len()).unwrap_or(u32::MAX),
+                buf: spare.as_mut_ptr().cast(),
+            };
+            inner.flags = 0;
+            inner.addr_len = size_of::<SOCKADDR_STORAGE>() as i32;
+            inner.mem = Some(PortMem::RecvLentFrom(buf));
+            // SAFETY: the buffer, the flags and the address room live in the
+            // slot until the packet; the kernel writes the buffer's spare
+            // room.
+            queued(unsafe {
+                WSARecvFrom(
+                    socket,
+                    &mut inner.buf,
+                    1,
+                    core::ptr::null_mut(),
+                    &mut inner.flags,
+                    core::ptr::from_mut(&mut inner.addr).cast::<SOCKADDR>(),
+                    &mut inner.addr_len,
+                    ov,
+                    null,
+                )
+            })
+        }
+        NotStream::SendLentTo(buf, target) => {
+            inner.buf = WSABUF {
+                len: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                buf: buf.as_ptr().cast_mut(),
+            };
+            let to = match &target {
+                Target::Connected => None,
+                Target::Inet(addr) => Some(sys::raw_addr(addr)),
+            };
+            inner.mem = Some(PortMem::SendLentTo(buf));
+            match to {
+                // SAFETY: the buffer lives in the slot until the packet; the
+                // kernel only reads it.
+                None => queued(unsafe {
+                    WSASend(socket, &inner.buf, 1, core::ptr::null_mut(), 0, ov, null)
+                }),
+                Some((addr, len)) => {
+                    inner.addr = addr;
+                    // SAFETY: the buffer and the address live in the slot
+                    // until the packet.
+                    queued(unsafe {
+                        WSASendTo(
+                            socket,
+                            &inner.buf,
+                            1,
+                            core::ptr::null_mut(),
+                            0,
+                            core::ptr::from_ref(&inner.addr).cast::<SOCKADDR>(),
+                            len,
+                            ov,
+                            null,
+                        )
+                    })
+                }
+            }
+        }
         NotStream::Accept => {
             let made = winsock::ext().and_then(|ext| {
                 let family = sys::family(socket as Raw)?;
@@ -551,8 +615,10 @@ fn start(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET, want: Want) -> 
 enum NotStream {
     Accept,
     RecvFrom(PoolBuf),
+    RecvLentFrom(Vec<u8>),
     Connect(Dial),
     SendTo(PoolBuf, Target),
+    SendLentTo(Vec<u8>, Target),
 }
 
 impl NotStream {
@@ -562,6 +628,8 @@ impl NotStream {
         inner.mem = Some(match self {
             NotStream::Accept => PortMem::NoAccept,
             NotStream::RecvFrom(buf) => PortMem::RecvFrom(buf),
+            NotStream::RecvLentFrom(buf) => PortMem::RecvLentFrom(buf),
+            NotStream::SendLentTo(buf, _) => PortMem::SendLentTo(buf),
             NotStream::Connect(dial) => PortMem::Connect(dial),
             NotStream::SendTo(buf, target) => PortMem::SendTo(buf, target),
         });
@@ -603,6 +671,8 @@ fn stream_memory(inner: &mut Inner, want: Want) -> Result<bool, NotStream> {
         }
         Want::Accept => Err(NotStream::Accept),
         Want::RecvFrom(buf) => Err(NotStream::RecvFrom(buf)),
+        Want::RecvLentFrom(buf) => Err(NotStream::RecvLentFrom(buf)),
+        Want::SendLentTo(buf, target) => Err(NotStream::SendLentTo(buf, target)),
         Want::Connect(dial) => Err(NotStream::Connect(dial)),
         Want::SendTo(buf, target) => Err(NotStream::SendTo(buf, target)),
     }
@@ -814,6 +884,27 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
             };
             Outcome::RecvFrom(buf, answer)
         }
+        PortMem::RecvLentFrom(mut buf) => {
+            let answer = match answer {
+                Answer::Done(Ok(n)) => {
+                    // SAFETY: the kernel wrote the first `n` bytes of the
+                    // spare capacity.
+                    unsafe { buf.set_len(buf.len() + n) };
+                    // SAFETY: the kernel wrote the sender's address and its
+                    // length into the slot.
+                    let from = unsafe {
+                        sys::socket_addr(
+                            core::ptr::from_ref(&inner.addr).cast::<SOCKADDR>(),
+                            inner.addr_len,
+                        )
+                    };
+                    Answer::Done(from.map(|from| (n, Addr::Inet(from))))
+                }
+                Answer::Done(Err(err)) => Answer::Done(Err(err)),
+                Answer::Undone { not_ready } => Answer::Undone { not_ready },
+            };
+            Outcome::RecvLentFrom(buf, answer)
+        }
         PortMem::NoAccept => Outcome::Accept(match answer {
             Answer::Done(Ok(_)) => Answer::Done(Err(io::ErrorKind::Other.into())),
             Answer::Done(Err(err)) => {
@@ -840,6 +931,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         PortMem::Send(buf) => Outcome::Send(buf, answer),
         PortMem::SendLent(buf) => Outcome::SendLent(buf, answer),
         PortMem::SendTo(buf, target) => Outcome::SendTo(buf, target, answer),
+        PortMem::SendLentTo(buf) => Outcome::SendLentTo(buf, answer),
     }
 }
 

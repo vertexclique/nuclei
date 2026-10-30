@@ -593,6 +593,55 @@ pub(crate) fn recv_from_unix(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, un
     retry(|| socket.recv_from(buf))
 }
 
+/// `recvfrom(2)` into memory not written yet: the kernel writes the bytes it
+/// returns, and the sender's raw address.
+fn recv_from_raw(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+) -> io::Result<(usize, libc::sockaddr_storage, libc::socklen_t)> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let n = retry(|| {
+        // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
+        // `len` bytes into the storage; nothing is read from either.
+        cvt(unsafe {
+            libc::recvfrom(
+                fd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                (&raw mut storage).cast(),
+                &mut len,
+            )
+        })
+    })?;
+    Ok((n, storage, len))
+}
+
+/// A datagram from a UDP socket into memory not written yet, with its
+/// sender.
+pub(crate) fn recv_from_udp_uninit(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+) -> io::Result<(usize, SocketAddr)> {
+    let (n, storage, len) = recv_from_raw(fd, buf)?;
+    Ok((n, inet_addr(&storage, len)?))
+}
+
+/// A datagram from a Unix datagram socket into memory not written yet, with
+/// its sender.
+pub(crate) fn recv_from_unix_uninit(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+) -> io::Result<(usize, unix::SocketAddr)> {
+    let (n, storage, len) = recv_from_raw(fd, buf)?;
+    // SAFETY: an `AF_UNIX` address fits `sockaddr_un`, which the storage is
+    // at least as large as.
+    let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };
+    Ok((n, unix_addr(un, len)?))
+}
+
 /// A datagram to `addr` on a UDP socket.
 pub(crate) fn send_to_udp(fd: RawFd, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
     // SAFETY: see `borrow`; the fd is a UDP socket.

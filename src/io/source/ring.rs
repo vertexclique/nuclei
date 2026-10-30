@@ -65,6 +65,7 @@ pub(crate) enum RingMem {
     },
     RecvLent(Vec<u8>),
     RecvFrom(Spare<Msg>, PoolBuf),
+    RecvLentFrom(Spare<Msg>, Vec<u8>),
     Connect(
         Dial,
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<RawAddr>,
@@ -75,6 +76,10 @@ pub(crate) enum RingMem {
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
         PoolBuf,
         Target,
+    ),
+    SendLentTo(
+        #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
+        Vec<u8>,
     ),
 }
 
@@ -164,6 +169,19 @@ impl RingMem {
                 };
                 Outcome::RecvFrom(buf, answer)
             }
+            RingMem::RecvLentFrom(mut msg, mut buf) => {
+                let answer = match answer(res) {
+                    Answer::Done(Ok(n)) => {
+                        // SAFETY: the kernel wrote the first `n` bytes of the
+                        // buffer's spare capacity.
+                        unsafe { buf.set_len(buf.len() + n) };
+                        Answer::Done(msg.sender(kind).map(|from| (n, from)))
+                    }
+                    Answer::Done(Err(err)) => Answer::Done(Err(err)),
+                    Answer::Undone { not_ready } => Answer::Undone { not_ready },
+                };
+                Outcome::RecvLentFrom(buf, answer)
+            }
             RingMem::Connect(dial, _) => Outcome::Connect(
                 dial,
                 match res {
@@ -178,6 +196,7 @@ impl RingMem {
             RingMem::Send(buf) => Outcome::Send(buf, answer(res)),
             RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
             RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, answer(res)),
+            RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, answer(res)),
         }
     }
 }
@@ -586,6 +605,12 @@ fn entry(
             let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
             (RingMem::RecvFrom(msg, buf), sqe)
         }
+        Want::RecvLentFrom(mut buf) => {
+            let spare = buf.spare_capacity_mut();
+            let mut msg = Msg::receiving(spare.as_mut_ptr().cast(), spare.len());
+            let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
+            (RingMem::RecvLentFrom(msg, buf), sqe)
+        }
         Want::Connect(dial) => {
             let addr = Spare::new(RawAddr::of(&dial));
             let sqe = Sqe::connect(slot, addr.as_ptr(), addr.len);
@@ -609,6 +634,16 @@ fn entry(
             let msg = Msg::new(bytes.as_ptr().cast_mut(), bytes.len(), to);
             let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
             (RingMem::SendTo(msg, buf, target), sqe)
+        }
+        Want::SendLentTo(buf, target) => {
+            let to = match &target {
+                Target::Connected => None,
+                Target::Inet(addr) => Some(RawAddr::inet(addr)),
+                Target::Unix(addr) => Some(RawAddr::unix(addr)),
+            };
+            let msg = Msg::new(buf.as_ptr().cast_mut(), buf.len(), to);
+            let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
+            (RingMem::SendLentTo(msg, buf), sqe)
         }
     })
 }

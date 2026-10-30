@@ -49,27 +49,44 @@ use ahead::{Ahead, Piece};
 #[cfg(readiness)]
 const BATCH: usize = 32;
 
-/// A datagram received ahead: in a buffer of the pool, or on a ring in a
-/// buffer of the receive group a multishot receive filled.
+/// A datagram received ahead: in a buffer of the pool, on a ring in a
+/// buffer of the receive group a multishot receive filled, or in a task's
+/// own buffer whose task went away after the driver read into it.
 enum Datagram {
     Pool(PoolBuf),
     #[cfg(ring)]
     Ring(crate::rt::shard::recv::RingChunk),
+    Owned {
+        buf: Vec<u8>,
+        start: usize,
+    },
 }
 
 impl Datagram {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Datagram::Pool(buf) => buf.filled(),
+            #[cfg(ring)]
+            Datagram::Ring(chunk) => chunk.bytes(),
+            Datagram::Owned { buf, start } => buf.get(*start..).unwrap_or_default(),
+        }
+    }
+
     /// Copies the datagram into `out`, cut to it as the kernel cuts it.
     fn peek_into(&self, out: &mut [u8]) -> usize {
-        match self {
-            Datagram::Pool(buf) => buf.peek_into(out),
-            #[cfg(ring)]
-            Datagram::Ring(chunk) => {
-                let src = chunk.bytes();
-                let n = src.len().min(out.len());
-                out[..n].copy_from_slice(&src[..n]);
-                n
-            }
-        }
+        let src = self.bytes();
+        let n = src.len().min(out.len());
+        out[..n].copy_from_slice(&src[..n]);
+        n
+    }
+
+    /// Appends the datagram to `out`, cut to its spare capacity as the
+    /// kernel cuts it.
+    fn append_to(&self, out: &mut Vec<u8>) -> usize {
+        let src = self.bytes();
+        let n = src.len().min(out.capacity() - out.len());
+        out.extend_from_slice(&src[..n]);
+        n
     }
 
     fn release(self, after: &mut After) {
@@ -78,6 +95,7 @@ impl Datagram {
             // Goes back to its group as it drops.
             #[cfg(ring)]
             Datagram::Ring(_) => {}
+            Datagram::Owned { .. } => {}
         }
     }
 }
@@ -104,6 +122,8 @@ struct Lent {
     /// Its task went away while the buffer was out: the completion hands
     /// what came to the read-ahead.
     orphan: bool,
+    /// The sender, once a datagram was read into the buffer.
+    peer: Option<Addr>,
 }
 
 #[derive(Default)]
@@ -384,6 +404,9 @@ impl ReadState {
                 }
             }
             Kind::TcpListener | Kind::UnixListener => self.accept_ahead(fd, kind),
+            Kind::Udp | Kind::UnixDatagram if self.lent.is_some() => {
+                self.receive_lent(fd, kind, after);
+            }
             Kind::Udp | Kind::UnixDatagram => self.receive_ahead(fd, kind, len, after),
             // The caller makes its own calls.
             Kind::Fd => {}
@@ -465,6 +488,36 @@ impl ReadState {
             self.blocked = drained(kind, self.unsure, n, asked);
         }
         lent.done = Some(result);
+        if let Some(waker) = lent.waker.take() {
+            after.wake_one(waker);
+        }
+    }
+
+    #[cfg(readiness)]
+    /// Receives one datagram into the spare capacity of the lent buffer, and
+    /// wakes its task.
+    fn receive_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) {
+        let Some(lent) = self.lent.as_mut() else {
+            return;
+        };
+        let spare = lent.buf.spare_capacity_mut();
+        let result = match kind {
+            Kind::UnixDatagram => sys::ready(sys::recv_from_unix_uninit(fd, spare))
+                .map(|r| r.map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a))))),
+            _ => sys::ready(sys::recv_from_udp_uninit(fd, spare))
+                .map(|r| r.map(|(n, a)| (n, Addr::Inet(a)))),
+        };
+        let Some(result) = result else {
+            self.blocked = true;
+            return;
+        };
+        lent.done = Some(result.map(|(n, from)| {
+            // SAFETY: the kernel wrote the first `n` bytes of the spare
+            // capacity.
+            unsafe { lent.buf.set_len(lent.buf.len() + n) };
+            lent.peer = Some(from);
+            n
+        }));
         if let Some(waker) = lent.waker.take() {
             after.wake_one(waker);
         }
@@ -676,6 +729,7 @@ impl ReadState {
                 waker: None,
                 out: false,
                 orphan: false,
+                peer: None,
             });
         }
         // The task polls, so the driver's read needs no wake for it.
@@ -708,6 +762,85 @@ impl ReadState {
         Poll::Ready(done.unwrap_or(Ok(0)))
     }
 
+    /// A datagram receive into a task's own buffer (`held`; `None` while it
+    /// is lent), as [`read_owned`](Self::read_owned) reads a stream: a
+    /// datagram that came before is copied into it; otherwise it is lent and
+    /// the driver receives into it. The sender goes to `from`.
+    fn read_owned_from(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        held: &mut Option<Vec<u8>>,
+        from: &mut Option<Addr>,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        if !self.datagrams.is_empty()
+            && self
+                .lent
+                .as_ref()
+                .is_some_and(|l| !l.out && l.done.is_none())
+        {
+            // One came while the buffer waited: it goes first.
+            *held = self.reclaim(after);
+        }
+        if let Some(buf) = held.as_mut() {
+            if let Some((datagram, addr)) = self.datagrams.pop_front() {
+                let n = datagram.append_to(buf);
+                datagram.release(after);
+                *from = Some(addr);
+                self.pass_on(after);
+                return Poll::Ready(Ok(n));
+            }
+            if let Some(err) = self.error.take() {
+                return Poll::Ready(Err(err));
+            }
+            if self.lent.is_some() {
+                self.wait(waker, 0);
+                return Poll::Pending;
+            }
+            self.lent = held.take().map(|buf| Lent {
+                from: buf.len(),
+                buf,
+                done: None,
+                waker: None,
+                out: false,
+                orphan: false,
+                peer: None,
+            });
+        }
+        let old = self.lent.as_mut().and_then(|l| l.waker.take());
+        self.complete(io, kind, 0, after);
+        let Some(lent) = self.lent.as_mut() else {
+            return Poll::Ready(Err(io::Error::other("the receive lost its buffer")));
+        };
+        if lent.done.is_none() {
+            lent.waker = Some(match old {
+                Some(w) if w.will_wake(waker) => w,
+                other => {
+                    if let Some(w) = other {
+                        after.forget_one(w);
+                    }
+                    waker.clone()
+                }
+            });
+            return Poll::Pending;
+        }
+        if let Some(w) = old {
+            after.forget_one(w);
+        }
+        let Some(Lent {
+            buf, done, peer, ..
+        }) = self.lent.take()
+        else {
+            return Poll::Ready(Err(io::Error::other("the receive lost its buffer")));
+        };
+        *held = Some(buf);
+        *from = peer;
+        after.wake(&mut self.waiters);
+        Poll::Ready(done.unwrap_or(Ok(0)))
+    }
+
     /// The task of the lent buffer went away: what the driver read into it
     /// becomes the read-ahead (its end or its error, the next read's), so
     /// nothing is lost.
@@ -729,6 +862,19 @@ impl ReadState {
         }
         match lent.done {
             None => {}
+            // A datagram, even an empty one, is received whole: the next
+            // receive takes it.
+            Some(Ok(_)) if lent.peer.is_some() => {
+                if let Some(peer) = lent.peer {
+                    self.datagrams.push_back((
+                        Datagram::Owned {
+                            buf: lent.buf,
+                            start: lent.from,
+                        },
+                        peer,
+                    ));
+                }
+            }
             Some(Ok(0)) => self.eof = true,
             Some(Ok(_)) => {
                 debug_assert!(

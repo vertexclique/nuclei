@@ -76,6 +76,59 @@ impl Handle<UdpSocket> {
         self.receive(buf, false).await.map(|(n, _)| n)
     }
 
+    /// Sends all of `buf` as one datagram to the connected peer and gives
+    /// it back with its length. The driver sends from `buf` itself, so the
+    /// bytes are never copied.
+    ///
+    /// If the future is dropped before it completes, the datagram is sent
+    /// whole or not at all: one the driver has not handed to the kernel is
+    /// withdrawn, and one already handed over goes out.
+    pub async fn send_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.source().send_owned(buf, Dest::Connected).await
+    }
+
+    /// Sends all of `buf` as one datagram to the first address `addr` names
+    /// and gives it back with its length, as [`send_owned`](Self::send_owned)
+    /// sends to the connected peer.
+    pub async fn send_to_owned<A: ToSocketAddrs>(
+        &self,
+        buf: Vec<u8>,
+        addr: A,
+    ) -> (io::Result<usize>, Vec<u8>) {
+        let target = match resolve(&addr).await {
+            Ok(mut addrs) => addrs.next().ok_or_else(|| none_worked(None)),
+            Err(err) => Err(err),
+        };
+        match target {
+            Ok(target) => self.source().send_owned(buf, Dest::Inet(target)).await,
+            Err(err) => (Err(err), buf),
+        }
+    }
+
+    /// Receives a datagram from the connected peer into the spare capacity
+    /// of `buf`, after the bytes it holds, and gives `buf` back with the
+    /// datagram's length. The driver receives into `buf` itself, so the bytes
+    /// are never copied; what does not fit is cut.
+    ///
+    /// If the future is dropped before it completes, a datagram the driver
+    /// received into `buf` stays with the socket for its next receive, so
+    /// none is lost.
+    pub async fn recv_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        let (result, buf) = self.recv_from_owned(buf).await;
+        (result.map(|(n, _)| n), buf)
+    }
+
+    /// Receives a datagram with its sender's address into the spare capacity
+    /// of `buf`, as [`recv_owned`](Self::recv_owned).
+    pub async fn recv_from_owned(
+        &self,
+        buf: Vec<u8>,
+    ) -> (io::Result<(usize, SocketAddr)>, Vec<u8>) {
+        let (result, buf) = self.source().recv_from_owned(buf).await;
+        let result = result.and_then(|(n, addr)| inet(addr).map(|addr| (n, addr)));
+        (result, buf)
+    }
+
     /// Looks at the next datagram without taking it.
     ///
     /// # Errors
@@ -289,5 +342,17 @@ impl Handle<UdpSocket> {
                 "a UDP datagram came with no internet address",
             )),
         })
+    }
+}
+
+/// The internet address of a UDP datagram's sender.
+fn inet(addr: Addr) -> io::Result<SocketAddr> {
+    match addr {
+        Addr::Inet(addr) => Ok(addr),
+        #[cfg(unix)]
+        Addr::Unix(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a UDP datagram came with no internet address",
+        )),
     }
 }

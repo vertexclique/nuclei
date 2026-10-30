@@ -92,7 +92,10 @@ impl WriteState {
             Want::Send(buf)
         } else if let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none() && !l.out) {
             lent.out = true;
-            Want::SendLent(core::mem::take(&mut lent.buf), lent.sent)
+            match lent.to.clone() {
+                Some(to) => Want::SendLentTo(core::mem::take(&mut lent.buf), to),
+                None => Want::SendLent(core::mem::take(&mut lent.buf), lent.sent),
+            }
         } else if let Some((buf, target)) = self.queued.take() {
             Want::SendTo(buf, target)
         } else {
@@ -166,7 +169,9 @@ impl WriteState {
                 }
                 after.drop_buf(buf);
             }
-            Outcome::SendLent(buf, answer) => self.lent_back(buf, answer, stale, after),
+            Outcome::SendLent(buf, answer) | Outcome::SendLentTo(buf, answer) => {
+                self.lent_back(buf, answer, stale, after);
+            }
             Outcome::Connect(..) if stale => {}
             // Given back as the source moved: asked again.
             Outcome::Connect(dial, Answer::Undone { not_ready: false }) => self.dial = Some(dial),
@@ -226,6 +231,7 @@ impl WriteState {
         lent.out = false;
         match answer {
             Answer::Undone { not_ready } => self.not_ready(not_ready),
+            Answer::Done(Ok(n)) if lent.to.is_some() => lent.done = Some(Ok(n)),
             Answer::Done(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
             Answer::Done(Ok(n)) => {
                 lent.sent += n;
