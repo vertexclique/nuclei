@@ -153,6 +153,10 @@ pub(crate) enum IoOp {
     /// Cancel the ring operation of this user data.
     #[cfg(ring)]
     RingCancel(u64),
+    /// A thread whose heavy fence failed left work on a source's sides: the
+    /// owner takes and lets go of them, which serves it.
+    #[cfg(not(ring))]
+    Touch(Arc<Source>),
     /// Watch a child's exit for a thread that runs no shard.
     Watch(Arc<crate::process::exit::Exit>),
 }
@@ -650,7 +654,9 @@ impl Shard {
                     }
                 }
                 #[cfg(ring)]
-                IoOp::RingKick(source) => source.ring_kick(),
+                IoOp::RingKick(source) => source.ring_kick(self),
+                #[cfg(not(ring))]
+                IoOp::Touch(source) => source.touch(self),
                 #[cfg(ring)]
                 IoOp::RingCancel(user_data) => {
                     if let Some(ring) = self.ring() {
@@ -817,7 +823,7 @@ impl Shard {
                         if token & crate::rt::sources::CHILD != 0 {
                             self.exit_came(token);
                         } else if let Some(source) = sources.get(token) {
-                            source.on_event(token, readiness);
+                            source.on_event(token, readiness, self);
                         }
                     })?;
                 Ok(events)
@@ -835,7 +841,7 @@ impl Shard {
                     // SAFETY: a packet of a source's key is one of its
                     // operations, its OVERLAPPED the first field of a
                     // slot the operation's strong reference keeps.
-                    unsafe { crate::io::source::port::complete(entry) };
+                    unsafe { crate::io::source::port::complete(entry, Some(self)) };
                 })?;
                 Ok(events)
             }

@@ -37,7 +37,7 @@ use std::sync::Arc;
 use super::Kind;
 use super::read::ReadState;
 use super::write::WriteState;
-use super::{Failure, NO_FD, NO_TOKEN, REGISTERED, Source, UNREGISTERED};
+use super::{Failure, NO_FD, NO_TOKEN, REGISTERED, Source, SourceHooks, UNREGISTERED};
 use crate::io::side::After;
 use crate::rt::shard::Shared;
 use crate::sync::atomic_waker::AtomicWaker;
@@ -138,16 +138,29 @@ impl Source {
     /// free; else leaves them to the sides' holders. Only the read side is
     /// taken here: performing goes through it (see the module docs).
     fn request(self: &Arc<Self>, bits: u8, after: &mut After) -> Done {
+        // The shard this thread runs is looked up inside the bracket that
+        // keeps it in the shard, so a request from its thread is its owner's.
+        crate::rt::context::current(|current| {
+            self.request_with(bits, after, &self.hooks_in(current))
+        })
+    }
+
+    fn request_with(
+        self: &Arc<Self>,
+        bits: u8,
+        after: &mut After,
+        hooks: &SourceHooks<'_>,
+    ) -> Done {
         // Release: the performer that takes the bits reads what they carry.
         self.requests.fetch_or(bits, Ordering::Release);
-        let Some(mut read) = self.read.take_for_request() else {
+        let Some(mut read) = self.read.take_for_request(hooks) else {
             return Done {
                 here: false,
                 attached: None,
             };
         };
-        let done = self.try_write_and_perform(read.get(), after, true);
-        read.release(after, &self.hooks());
+        let done = self.try_write_and_perform(hooks, read.get(), after, true);
+        read.release(after, hooks);
         done
     }
 
@@ -156,6 +169,7 @@ impl Source {
     /// pending requests.
     fn try_write_and_perform(
         self: &Arc<Self>,
+        hooks: &SourceHooks<'_>,
         read: &mut ReadState,
         after: &mut After,
         here: bool,
@@ -166,14 +180,14 @@ impl Source {
                 attached: None,
             };
         }
-        let Some(mut write) = self.write.take_for_request() else {
+        let Some(mut write) = self.write.take_for_request(hooks) else {
             return Done {
                 here: false,
                 attached: None,
             };
         };
         let attached = self.perform(read, write.get(), after, here);
-        write.release(after, &self.hooks());
+        write.release(after, hooks);
         Done {
             here: true,
             attached,
@@ -181,8 +195,13 @@ impl Source {
     }
 
     /// For the read side's holder that saw `REQ`.
-    pub(super) fn requests_holding_read(self: &Arc<Self>, read: &mut ReadState, after: &mut After) {
-        self.try_write_and_perform(read, after, false);
+    pub(super) fn requests_holding_read(
+        self: &Arc<Self>,
+        hooks: &SourceHooks<'_>,
+        read: &mut ReadState,
+        after: &mut After,
+    ) {
+        self.try_write_and_perform(hooks, read, after, false);
     }
 
     /// For a holder of the write side that saw `REQ` and has let it go: one
@@ -190,13 +209,17 @@ impl Source {
     /// read side while it holds its own, so two holders never pass the
     /// request back and forth); getting it, it goes on as the read side's
     /// holder.
-    pub(super) fn requests_after_write(self: &Arc<Self>, after: &mut After) {
+    pub(super) fn requests_after_write(
+        self: &Arc<Self>,
+        hooks: &SourceHooks<'_>,
+        after: &mut After,
+    ) {
         if self.requests.load(Ordering::Acquire) == 0 {
             return;
         }
-        if let Some(mut read) = self.read.take_for_request() {
-            self.try_write_and_perform(read.get(), after, false);
-            read.release(after, &self.hooks());
+        if let Some(mut read) = self.read.take_for_request(hooks) {
+            self.try_write_and_perform(hooks, read.get(), after, false);
+            read.release(after, hooks);
         }
     }
 
@@ -523,7 +546,13 @@ impl Source {
             drop(unsafe { Box::from_raw(old) });
         }
         let mut after = After::default();
-        let done = self.request(ATTACH, &mut after);
+        // Called on the shard's own thread, inside it: the owner of the
+        // sides the registration will home there.
+        let hooks = SourceHooks {
+            claim: Some(shard),
+            ..self.hooks()
+        };
+        let done = self.request_with(ATTACH, &mut after, &hooks);
         after.run();
         done.attached.filter(|_| done.here)
     }

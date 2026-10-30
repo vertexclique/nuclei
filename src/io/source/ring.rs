@@ -650,7 +650,7 @@ impl Source {
         // queue (whose segments would be allocated as it grows). Only this
         // thread pushes to the queue, so what waits there came before this
         // arrival and goes in first: the order holds.
-        if let Some(mut held) = self.read.try_hold() {
+        if let Some(mut held) = self.read.try_hold_for(&hooks) {
             hooks.taken(held.get(), &mut after);
             while let Ok((queued, at)) = self.read_arrivals.try_pop() {
                 held.get().take_arrival(queued, at, &mut after);
@@ -687,9 +687,9 @@ impl Source {
 
     /// The ring's thread submits what the source's sides want: a side held
     /// on another thread asked for it.
-    pub(crate) fn ring_kick(self: &Arc<Self>) {
+    pub(crate) fn ring_kick(self: &Arc<Self>, shard: &crate::rt::shard::Shard) {
         let mut after = After::default();
-        let hooks = self.hooks();
+        let hooks = self.hooks_in(Some(shard));
         self.read
             .defer(super::read_work::SUBMIT, &mut after, &hooks);
         self.write

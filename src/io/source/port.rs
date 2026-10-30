@@ -383,7 +383,7 @@ impl PortIssuer<'_> {
         if let Err(code) = started {
             // No packet comes: the operation ends here, with the error.
             // SAFETY: the call did not take the slot.
-            unsafe { finish(slot, Some(code), 0) };
+            unsafe { finish(slot, Some(code), 0, None) };
         }
         id
     }
@@ -721,7 +721,7 @@ fn run_job(slot: &Slot, handle: &OwnedHandle, read: bool, port: &Port) {
 ///
 /// `entry` is a packet of an operation a [`PortIssuer`] issued: its
 /// `OVERLAPPED` is a slot's, which the kernel is done with.
-pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY) {
+pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY, shard: Option<&crate::rt::shard::Shard>) {
     // SAFETY: the caller's: the slot is of a live source (its reference
     // was held for the kernel), and the kernel or the job is done with it.
     let slot = unsafe { &*entry.lpOverlapped.cast::<Slot>().cast_const() };
@@ -732,7 +732,7 @@ pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY) {
         status_error(entry.Internal as i32)
     };
     // SAFETY: as above.
-    unsafe { finish(slot, code, entry.dwNumberOfBytesTransferred as usize) };
+    unsafe { finish(slot, code, entry.dwNumberOfBytesTransferred as usize, shard) };
 }
 
 /// Ends the operation of `slot`, which failed with `code` or ran (`None`)
@@ -742,7 +742,12 @@ pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY) {
 /// # Safety
 ///
 /// The kernel is done with the slot, and its operation was issued.
-unsafe fn finish(slot: &Slot, code: Option<i32>, bytes: usize) {
+unsafe fn finish(
+    slot: &Slot,
+    code: Option<i32>,
+    bytes: usize,
+    shard: Option<&crate::rt::shard::Shard>,
+) {
     // SAFETY: the caller's: the slot is this thread's until the outcome is
     // handed on below.
     let inner = unsafe { &mut *slot.inner.get() };
@@ -763,7 +768,7 @@ unsafe fn finish(slot: &Slot, code: Option<i32>, bytes: usize) {
             epoch: inner.epoch,
             read: inner.read,
         },
-        None,
+        shard,
     );
 }
 
