@@ -6,6 +6,9 @@ publish = false
 
 [workspace]
 
+# No [profile.release]: benches/db_matrix.sh builds this crate under cargo's default release
+# profile and again with fat LTO and one codegen unit, as benches/vs_tokio_matrix.sh does.
+
 [dependencies]
 nuclei = { path = "../..", default-features = false, features = ["iouring", "epoll"] }
 monoio = { version = "0.2", features = ["sync"] }
@@ -15,7 +18,3 @@ futures-lite = "2"
 socket2 = "0.6"
 hdrhistogram = "7"
 libc = "0.2"
-
-[profile.release]
-lto = "fat"
-codegen-units = 1
