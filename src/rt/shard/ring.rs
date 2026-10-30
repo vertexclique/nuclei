@@ -140,11 +140,12 @@ impl ShardRing {
                         format!("io_uring recv_buffers and recv_buffer_size: {err}"),
                     ));
                 }
-                // No memory for the group is said as the group's, apart
-                // from the ring's own shortage, which the ring answers by
-                // shrinking (`with_room`) or `auto` with the poller.
+                // No memory for the group: the shard starts without it, said
+                // and counted (`went_without`), apart from the ring's own
+                // shortage, which the ring answers by shrinking (`with_room`).
                 Err(err) if err.kind() == io::ErrorKind::OutOfMemory => {
-                    return Err(super::recv::no_memory(entries, cfg.recv_buffer_size, &err));
+                    super::recv::went_without(entries, cfg.recv_buffer_size, &err);
+                    None
                 }
                 // Anything else, a kernel's refusal included, is
                 // the ring's failure: a shard never runs without the group

@@ -157,8 +157,8 @@ fn usable_here(cfg: crate::syscore::linux::iouring::ring::RingConfig) -> Result<
         match check(cfg) {
             Ok(()) => {}
             // Short of memory is no missing feature: a shard makes its ring
-            // with less memory on its own (`with_room`), and reports a
-            // receive group it has no memory for when it starts. A
+            // with less memory on its own (`with_room`), and starts without a
+            // receive group it has no memory for (`recv::went_without`). A
             // configuration mistake is the shard's to report too, not a
             // reason to run another backend unseen.
             Err(err)

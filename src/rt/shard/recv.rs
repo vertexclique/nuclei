@@ -142,14 +142,30 @@ pub(crate) fn too_large(buffers: u16, size: u32, bytes: usize, cap: usize) -> io
     )
 }
 
-/// The error of a group of `buffers` of `size` bytes the system had no memory for.
-pub(crate) fn no_memory(buffers: u16, size: u32, err: &io::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::OutOfMemory,
-        format!(
-            "no memory for the io_uring receive buffers, {buffers} of {size} bytes ({err}): lower recv_buffers or recv_buffer_size"
-        ),
-    )
+/// A shard starts without a group of `buffers` of `size` bytes the system had no memory for:
+/// its reads take the pool's buffers. Counted in the stats every time, and said once per
+/// process, so a machine whose locked-memory limit is too low for its shards is told why
+/// and what to change, and a runtime never fails to start over it.
+pub(crate) fn went_without(buffers: u16, size: u32, err: &io::Error) {
+    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    crate::rt::counters::receive_buffers_missing();
+    if SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a plain getrlimit into a struct of our own.
+    let known = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0;
+    let limit = match (known, limit.rlim_cur) {
+        (false, _) => "unknown".to_string(),
+        (true, libc::RLIM_INFINITY) => "unlimited".to_string(),
+        (true, bytes) => format!("{} KiB", bytes / 1024),
+    };
+    log::warn!(
+        "io_uring receive buffers ({buffers} x {size} bytes) could not be set up ({err}); reads use pool buffers instead. The locked-memory limit is {limit}: raise it (ulimit -l) or lower recv_buffers or recv_buffer_size."
+    );
 }
 
 impl RecvGroup {

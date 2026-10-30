@@ -1,6 +1,6 @@
 //! A shard's receive group is charged to its IO buffer ledger: the pool has
 //! the cap less the group, a cap that leaves it no buffer is refused, and a
-//! group the system has no memory for fails the shard's start.
+//! shard whose group the system has no memory for starts without it, counted.
 
 use std::io;
 
@@ -114,10 +114,11 @@ fn a_ring_that_goes_gives_its_group_back() {
 }
 
 #[test]
-fn a_group_the_system_has_no_memory_for_fails_the_start_under_auto_too() {
+fn a_group_the_system_has_no_memory_for_is_left_out_and_counted() {
     if !rings() {
         return;
     }
+    let before = crate::stats().receive_buffers_missing;
     NO_MEMORY_FOR_TEST.with(|t| t.set(true));
     let made = [
         Backend::Ring(ring(BUFFERS)),
@@ -126,14 +127,15 @@ fn a_group_the_system_has_no_memory_for_fails_the_start_under_auto_too() {
     .map(|backend| shard(backend, crate::buf::DEFAULT_CAP));
     NO_MEMORY_FOR_TEST.with(|t| t.set(false));
     for made in made {
-        let Err(err) = made else {
-            panic!("a shard started without the group it asked for");
-        };
-        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
-        assert_eq!(err.raw_os_error(), None, "no shortage of the ring's own");
-        let message = err.to_string();
-        for named in ["recv_buffers", "recv_buffer_size", &format!("{SIZE} bytes")] {
-            assert!(message.contains(named), "{message} names no {named}");
-        }
+        let shard = made.expect("a shard with no memory for its group still starts");
+        let ring = shard.ring().expect("still a ring");
+        assert_eq!(ring.recv_group(), None, "the group was made after all");
+        assert_eq!(ring.recv_reservation(), 0);
+        assert_eq!(
+            shard.pool().room(),
+            crate::buf::DEFAULT_CAP,
+            "the group's charge was not given back"
+        );
     }
+    assert!(crate::stats().receive_buffers_missing >= before + 2);
 }

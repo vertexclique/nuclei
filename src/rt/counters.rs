@@ -265,6 +265,15 @@ impl Errors {
 /// The errors met on threads that run no shard.
 static OFF_SHARD: Errors = Errors::new();
 
+/// Shards that started without their receive group for want of memory.
+static GROUPS_MISSING: AtomicU64 = AtomicU64::new(0);
+
+/// A shard started without its receive group for want of memory.
+#[cfg(ring)]
+pub(crate) fn receive_buffers_missing() {
+    GROUPS_MISSING.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Runs `f` with the error table of the shard this thread runs, or the one
 /// of the threads that run none.
 fn errors_here(f: impl FnOnce(&Errors)) {
@@ -351,6 +360,7 @@ pub(crate) fn snapshot() -> Stats {
         shards,
         blocking_threads: super::blocking::threads_alive(),
         off_shard_errors: OFF_SHARD.read(),
+        receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
     }
 }
 

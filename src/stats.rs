@@ -29,6 +29,11 @@ pub struct Stats {
     /// outside nuclei's `block_on` and its tasks, or a completion delivered
     /// while its shard was not running.
     pub off_shard_errors: ErrorCounts,
+    /// Shards that started without the io_uring receive buffers their
+    /// configuration asked for, because the system had no memory for them
+    /// (most often the locked-memory limit); their reads use the pool's
+    /// buffers instead.
+    pub receive_buffers_missing: u64,
 }
 
 /// One shard's counters. Those marked "published" are as the shard last
