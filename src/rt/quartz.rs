@@ -1,20 +1,23 @@
-//! Quartz: a coarse monotonic clock for bounding how long a shard's run
-//! loop goes without looking at its IO driver.
+//! Quartz: a monotonic clock for bounding how long a shard's run loop goes
+//! without looking at its IO driver.
 //!
-//! A reading is nanoseconds from an arbitrary start, never going backwards.
-//! It costs a few nanoseconds and never a system call: on Linux and Android
-//! the kernel's coarse clock is read from the vDSO (`CLOCK_MONOTONIC_COARSE`,
-//! which the kernel advances once per scheduler tick), on macOS the
-//! approximate raw clock (`CLOCK_MONOTONIC_RAW_APPROX`), on Windows the tick
-//! count (`GetTickCount64`), and elsewhere `std::time::Instant` from the
-//! first reading.
+//! A reading is nanoseconds from an arbitrary start, never going backwards,
+//! in steps no longer than [`DRIVE_BOUND`], so the bound holds on every
+//! platform. It costs a few nanoseconds and never a system call:
+//! - Linux and Android: the kernel's coarse clock (`CLOCK_MONOTONIC_COARSE`,
+//!   advanced once per scheduler tick) where its tick is no longer than the
+//!   bound (a 1000 Hz kernel), else `CLOCK_MONOTONIC`; both from the vDSO, the
+//!   choice made once from `clock_getres`;
+//! - macOS: `CLOCK_UPTIME_RAW` (the `_APPROX` clocks may read a value
+//!   milliseconds old);
+//! - elsewhere, Windows included, `std::time::Instant` from the first reading
+//!   (on Windows the performance counter; its tick count steps by 15.6 ms).
 //!
-//! The resolution is coarse: 1 to 4 ms on Linux (one tick), about 16 ms on
-//! Windows. A reading is therefore good for telling "a while has passed", never
-//! for a timer, a deadline or a measurement: the timers and the runtime's
-//! clock are `time::clock`.
+//! A reading is for telling "a while has passed", never for a timer, a
+//! deadline or a measurement: the timers and the runtime's clock are
+//! `time::clock`.
 
-/// Reads the coarse monotonic clock.
+/// Reads the drive bound's clock.
 pub(crate) struct Quartz;
 
 impl Quartz {
@@ -28,39 +31,60 @@ impl Quartz {
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 #[inline]
 fn read() -> u64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC_COARSE;
-    #[cfg(target_os = "macos")]
-    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW_APPROX;
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: `ts` is a valid timespec for the call to fill in.
-    let rc = unsafe { libc::clock_gettime(CLOCK, &mut ts) };
+    let rc = unsafe { libc::clock_gettime(clock(), &mut ts) };
     if rc != 0 {
         // A clock the platform refuses reads as standing still, so a caller
         // that bounds by it drives at its other cadence only.
         return 0;
     }
+    nanos(&ts)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn nanos(ts: &libc::timespec) -> u64 {
     (ts.tv_sec as u64)
         .wrapping_mul(1_000_000_000)
         .wrapping_add(ts.tv_nsec as u64)
 }
 
-#[cfg(windows)]
+/// The coarse clock where it steps by no more than the bound, else the
+/// precise one, chosen at the first reading.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[inline]
-fn read() -> u64 {
-    // SAFETY: takes nothing and touches no memory.
-    unsafe { crate::syscore::windows::GetTickCount64() }.wrapping_mul(1_000_000)
+fn clock() -> libc::clockid_t {
+    use core::sync::atomic::{AtomicI32, Ordering};
+    static CLOCK: AtomicI32 = AtomicI32::new(-1);
+    let clock = CLOCK.load(Ordering::Relaxed);
+    if clock >= 0 {
+        return clock;
+    }
+    let mut tick = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `tick` is a valid timespec for the call to fill in.
+    let known = unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC_COARSE, &mut tick) } == 0;
+    let chosen = if known && nanos(&tick) <= super::tuning::DRIVE_BOUND {
+        libc::CLOCK_MONOTONIC_COARSE
+    } else {
+        libc::CLOCK_MONOTONIC
+    };
+    CLOCK.store(chosen, Ordering::Relaxed);
+    chosen
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    windows
-)))]
+#[cfg(target_os = "macos")]
+#[inline]
+fn clock() -> libc::clockid_t {
+    libc::CLOCK_UPTIME_RAW
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 fn read() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -72,7 +96,28 @@ fn read() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::Quartz;
+    use crate::rt::tuning::DRIVE_BOUND;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn it_steps_by_no_more_than_the_drive_bound() {
+        // The smallest change between readings is one step of the clock;
+        // NTP may stretch a coarse tick a little.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut last = Quartz::now();
+        let mut step = u64::MAX;
+        while Instant::now() < deadline {
+            let now = Quartz::now();
+            if now != last {
+                step = step.min(now - last);
+                last = now;
+            }
+        }
+        assert!(
+            step <= DRIVE_BOUND + DRIVE_BOUND / 10,
+            "the clock steps by {step} ns"
+        );
+    }
 
     #[test]
     fn it_never_goes_backwards_and_advances() {
