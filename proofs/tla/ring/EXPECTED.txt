@@ -29,3 +29,11 @@ MMU_arm_twice                  MC_RingMulti         violated:OneOut
 WMU_dry                        MC_RingMulti         violated:NoDry
 WMU_stop                       MC_RingMulti         violated:NoStop
 WMU_lent                       MC_RingMulti         violated:NoLentGot
+MU_direct                      MC_RingMulti         pass
+MU_live_direct                 MC_RingMulti         pass
+MMU_direct_in_flight           MC_RingMulti         violated:InOrder
+MMU_direct_ahead               MC_RingMulti         violated:InOrder
+MMU_rearm_stopping             MC_RingMulti         violated:OneOut
+WMU_direct                     MC_RingMulti         violated:NoDirectGot
+WMU_direct_stop                MC_RingMulti         violated:NoDirectStop
+WMU_rearm                      MC_RingMulti         violated:NoRearm
