@@ -43,10 +43,10 @@ impl FileIo {
         self.with_state(cx, |st, io, waker, after| st.poll_writes(io, waker, after))
     }
 
-    /// A buffer of the pool for `len` bytes of a task's memory, and how many
-    /// of them the call moves (see `work::bounce`).
-    async fn bounce_for(&self, len: usize) -> (crate::buf::PoolBuf, usize) {
-        poll_fn(|cx| match bounce(len, cx.waker()) {
+    /// A buffer of the pool for the bytes of a task's memory at `addr`, and
+    /// where in it and how many of `len` the call moves (see `work::bounce`).
+    async fn bounce_for(&self, len: usize, addr: usize) -> (crate::buf::PoolBuf, usize, usize) {
+        poll_fn(|cx| match bounce(len, addr, self.direct, cx.waker()) {
             Some(got) => Poll::Ready(got),
             None => Poll::Pending,
         })
@@ -58,8 +58,8 @@ impl FileIo {
             return Ok(0);
         }
         poll_fn(|cx| self.poll_ordered(cx)).await;
-        let (buf, n) = self.bounce_for(out.len()).await;
-        let mut job = self.submit_read(buf, 0, n, at);
+        let (buf, from, n) = self.bounce_for(out.len(), out.as_ptr() as usize).await;
+        let mut job = self.submit_read(buf, from, n, at);
         let buf = poll_fn(|cx| job.poll(cx.waker())).await?;
         Ok(buf.peek_into(out))
     }
@@ -69,8 +69,8 @@ impl FileIo {
             return Ok(0);
         }
         poll_fn(|cx| self.poll_ordered(cx)).await;
-        let (mut buf, n) = self.bounce_for(bytes.len()).await;
-        buf.fill_at(0, &bytes[..n]);
+        let (mut buf, from, n) = self.bounce_for(bytes.len(), bytes.as_ptr() as usize).await;
+        buf.fill_at(from, &bytes[..n]);
         let mut out = Out {
             io: self,
             work: Some(self.submit_pwrite(buf, at)),
@@ -182,7 +182,10 @@ impl Handle<StdFile> {
     /// and every positional write that returned before it.
     ///
     /// The bytes come through a buffer of the runtime's pool, at most 64 KiB
-    /// a call (a short read, as `read_at` may answer).
+    /// a call (a short read, as `read_at` may answer). On a file opened for
+    /// direct IO the call reads exactly `buf.len()` bytes at `offset`, into
+    /// memory placed in its page as `buf` is, so the kernel refuses (with
+    /// `EINVAL`) exactly what it would refuse of `buf` itself.
     /// [`read_at_owned`](Self::read_at_owned) reads into the caller's own
     /// buffer with no copy.
     ///
@@ -207,7 +210,10 @@ impl Handle<StdFile> {
     /// still lands, and every later call of the handle waits for it.
     ///
     /// The bytes go through a buffer of the runtime's pool, at most 64 KiB a
-    /// call (a short write, as `write_at` may answer).
+    /// call (a short write, as `write_at` may answer). On a file opened for
+    /// direct IO the call writes exactly `buf` at `offset`, from memory
+    /// placed in its page as `buf` is, so the kernel refuses (with `EINVAL`)
+    /// exactly what it would refuse of `buf` itself.
     /// [`write_at_owned`](Self::write_at_owned) writes from the caller's own
     /// buffer with no copy.
     ///
@@ -275,7 +281,9 @@ impl Handle<StdFile> {
     /// it holds, in one call of the system's positional read, and gives
     /// `buf` back with how many bytes came: zero at the end of the file, or
     /// when `buf` has no spare capacity. The bytes are read into `buf`
-    /// itself, never copied. Otherwise as [`read_at`](Self::read_at).
+    /// itself, never copied; on a file opened for direct IO the kernel's
+    /// alignment rules apply to `buf`'s own memory, which is the caller's to
+    /// align. Otherwise as [`read_at`](Self::read_at).
     pub async fn read_at_owned(&self, buf: Vec<u8>, offset: u64) -> (io::Result<usize>, Vec<u8>) {
         match self.file() {
             Ok(file) => file.read_at_owned(buf, offset).await,
@@ -285,8 +293,10 @@ impl Handle<StdFile> {
 
     /// Writes all of `buf` at `offset` and gives it back with its length
     /// once the bytes landed. They are written from `buf` itself, never
-    /// copied. If the future is dropped while the write is out, it still
-    /// lands, `buf` going with it. Otherwise as [`write_at`](Self::write_at).
+    /// copied; on a file opened for direct IO the kernel's alignment rules
+    /// apply to `buf`'s own memory, which is the caller's to align. If the
+    /// future is dropped while the write is out, it still lands, `buf` going
+    /// with it. Otherwise as [`write_at`](Self::write_at).
     pub async fn write_at_owned(&self, buf: Vec<u8>, offset: u64) -> (io::Result<usize>, Vec<u8>) {
         match self.file() {
             Ok(file) => file.write_at_owned(buf, offset).await,

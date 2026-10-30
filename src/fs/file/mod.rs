@@ -42,6 +42,14 @@
 //! began in. A positional write whose task went away is kept in the state
 //! (`orphans`) until it landed, and everything after it waits for it.
 //!
+//! A file opened for direct IO (`O_DIRECT` on Linux, `FILE_FLAG_NO_BUFFERING`
+//! on Windows, as the descriptor says when the state is made) has no
+//! read-ahead and no write-behind: each read or write goes to the kernel with
+//! exactly the caller's length and offset, from or into memory placed in its
+//! page as the caller's (see `work`), so the kernel's alignment rules give
+//! the answer they would give the caller's own call. A write at the cursor
+//! then waits for the one in flight instead of joining it.
+//!
 //! `proofs/tla/lent/LentFile.tla` checks these rules.
 
 mod durable;
@@ -58,7 +66,7 @@ use std::task::Wake;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use self::orphans::{Orphan, Orphans};
-use self::work::{Job, Lent, LentRead, Writing, buffer, poll_task};
+use self::work::{Job, Lent, LentRead, Writing, bounce, buffer, poll_task};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::raw::{OwnedFile, Raw, file_raw};
 use crate::io::side::{After, Hooks, Side, WakerSet};
@@ -67,6 +75,8 @@ use crate::io::sys;
 
 #[cfg(ring)]
 pub(crate) use self::durable::sync_on;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use self::work::bounce as bounce_for_test;
 
 /// The least a read job asks for, so a run of small reads takes one job.
 pub(crate) const READ_MIN: usize = 64 * 1024;
@@ -108,6 +118,8 @@ pub(crate) struct FileIo {
     sync_failed: OnceLock<Failure>,
     /// The file was opened to append.
     append: bool,
+    /// The file was opened for direct IO.
+    direct: bool,
     /// The calls go to the blocking pool even on a ring, for a test that
     /// holds the pool to keep a call in flight.
     #[cfg(test)]
@@ -177,7 +189,7 @@ impl FileIo {
     /// opened by std and read some way already goes on from there).
     pub(crate) fn new(fd: Raw) -> io::Result<Arc<Self>> {
         let cursor = sys::seek(fd, None)?;
-        let append = sys::appends(fd)?;
+        let mode = sys::file_mode(fd)?;
         Ok(Arc::new(Self {
             fd: Arc::new(sys::duplicate_file(fd)?),
             state: Side::new(FileState {
@@ -191,7 +203,8 @@ impl FileIo {
             generation: AtomicU64::new(0),
             orphans: Orphans::new(),
             sync_failed: OnceLock::new(),
-            append,
+            append: mode.append,
+            direct: mode.direct,
             #[cfg(test)]
             on_pool: AtomicBool::new(false),
         }))
@@ -207,6 +220,12 @@ impl FileIo {
     #[cfg(test)]
     pub(crate) fn back_to_ring(&self) {
         self.on_pool.store(false, Ordering::Relaxed);
+    }
+
+    /// The jobs' own descriptor, whose calls the system's test record keeps.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn jobs_fd(&self) -> std::os::fd::RawFd {
+        file_raw(&self.fd)
     }
 
     /// The file's generation now.
@@ -254,7 +273,7 @@ impl FileIo {
         }
         crate::coop::poll_budget(cx, |cx| {
             self.with_state(cx, |st, io, waker, after| {
-                match st.fill(io, out.len(), waker, after) {
+                match st.fill(io, out.len(), out.as_ptr() as usize, waker, after) {
                     Poll::Ready(Ok(true)) => {}
                     other => return other.map_ok(|_| 0),
                 }
@@ -267,13 +286,14 @@ impl FileIo {
 
     /// The bytes at the cursor, read ahead: their address and length, empty
     /// at the end of the file. They stay in place until the next call on
-    /// this state that consumes, writes or seeks.
+    /// this state that consumes, writes or seeks. On a file opened for
+    /// direct IO they are one read of [`READ_MIN`] bytes at the cursor.
     pub(crate) fn poll_fill_buf(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<(*const u8, usize)>> {
         self.with_state(cx, |st, io, waker, after| {
-            st.fill(io, READ_MIN, waker, after).map_ok(|filled| {
+            st.fill(io, READ_MIN, 0, waker, after).map_ok(|filled| {
                 match st.ahead.as_ref().filter(|_| filled) {
                     Some(ahead) => (ahead.filled().as_ptr(), ahead.filled().len()),
                     None => (
@@ -294,12 +314,20 @@ impl FileIo {
         after.run();
     }
 
-    /// A read scattered into `bufs`, in order.
+    /// A read scattered into `bufs`, in order. On a file opened for direct
+    /// IO, a read into the first buffer that has room, as the kernel's
+    /// alignment rules apply to each.
     pub(crate) fn poll_read_vectored(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         bufs: &mut [io::IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
+        if self.direct {
+            return match bufs.iter_mut().find(|b| !b.is_empty()) {
+                Some(buf) => self.poll_read(cx, buf),
+                None => Poll::Ready(Ok(0)),
+            };
+        }
         let want: usize = bufs.iter().map(|b| b.len()).sum();
         if want == 0 {
             return Poll::Ready(Ok(0));
@@ -314,7 +342,7 @@ impl FileIo {
         want: usize,
     ) -> Poll<io::Result<usize>> {
         self.with_state(cx, |st, io, waker, after| {
-            match st.fill(io, want, waker, after) {
+            match st.fill(io, want, 0, waker, after) {
                 Poll::Ready(Ok(true)) => {}
                 other => return other.map_ok(|_| 0),
             }
@@ -430,7 +458,8 @@ impl FileIo {
         self.poll_write_vectored(cx, &[io::IoSlice::new(bytes)])
     }
 
-    /// A write of the bytes of `bufs`, gathered in order.
+    /// A write of the bytes of `bufs`, gathered in order (on a file opened
+    /// for direct IO, of the first one that has any).
     pub(crate) fn poll_write_vectored(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -616,11 +645,13 @@ impl FileState {
 
     /// Makes sure bytes at the cursor are read ahead: `true`, or `false` at
     /// the end of the file. A read job asks for `want` bytes, at least
-    /// [`READ_MIN`].
+    /// [`READ_MIN`]; on a file opened for direct IO exactly `want`, into
+    /// memory placed in its page as the caller's at `addr`.
     fn fill(
         &mut self,
         io: &FileIo,
         want: usize,
+        addr: usize,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<bool>> {
@@ -658,15 +689,23 @@ impl FileState {
                 }
                 continue;
             }
-            let Some(buf) = buffer(want.max(READ_MIN), after) else {
-                return Poll::Pending;
+            let (buf, from, len) = if io.direct {
+                match bounce(want, addr, true, waker) {
+                    Some(got) => got,
+                    None => return Poll::Pending,
+                }
+            } else {
+                let Some(buf) = buffer(want.max(READ_MIN), after) else {
+                    return Poll::Pending;
+                };
+                let len = buf.capacity();
+                (buf, 0, len)
             };
-            let len = buf.capacity();
             // Read before the call, so a positional write that ends while it
             // runs is seen to have.
             let generation = io.generation();
             self.reading = Some(Job {
-                task: io.submit_read(buf, 0, len, self.cursor),
+                task: io.submit_read(buf, from, len, self.cursor),
                 at: self.cursor,
                 epoch: self.epoch,
                 generation,
@@ -747,6 +786,9 @@ impl FileState {
         if let Some(failure) = self.failed {
             return Poll::Ready(Err(failure.error()));
         }
+        if io.direct {
+            return self.write_direct(io, bufs, waker, after);
+        }
         let len: usize = bufs.iter().map(|b| b.len()).sum();
         if len == 0 {
             return Poll::Ready(Ok(0));
@@ -775,6 +817,34 @@ impl FileState {
             self.behind_at = self.cursor;
             n
         };
+        self.cursor += n as u64;
+        Poll::Ready(Ok(n))
+    }
+
+    /// A write at the cursor of a file opened for direct IO: the bytes of
+    /// the first buffer that has any, as one call of exactly them, once the
+    /// write in flight landed. Accepted as it is submitted; its error, as
+    /// any write's, fails the next write or the flush.
+    fn write_direct(
+        &mut self,
+        io: &FileIo,
+        bufs: &[io::IoSlice<'_>],
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        let Some(bytes) = bufs.iter().find(|b| !b.is_empty()) else {
+            return Poll::Ready(Ok(0));
+        };
+        if self.writing.is_some() || !self.orphans.is_empty() {
+            return Poll::Pending;
+        }
+        let Some((mut buf, from, n)) = bounce(bytes.len(), bytes.as_ptr() as usize, true, waker)
+        else {
+            return Poll::Pending;
+        };
+        buf.fill_at(from, &bytes[..n]);
+        self.invalidate(after);
+        self.writing = Some(io.submit_write(buf, self.cursor));
         self.cursor += n as u64;
         Poll::Ready(Ok(n))
     }

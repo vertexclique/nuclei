@@ -3,7 +3,10 @@
 //! buffers of the pool they read into and write from.
 //!
 //! Every call names exactly the bytes it moves: a read the range of its
-//! buffer it fills, a write the bytes its buffer holds.
+//! buffer it fills, a write the bytes its buffer holds. A call into a buffer
+//! of the pool for a task's own memory (a positional call, or any call on a
+//! file opened for direct IO) mirrors that memory's place in its page, so
+//! the kernel finds the alignment the task's memory has.
 
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -17,6 +20,10 @@ use crate::io::raw::file_raw;
 use crate::io::side::After;
 use crate::io::sys;
 use crate::rt::task::Task;
+
+/// The page a task's memory is mirrored within, for the kernel's alignment
+/// rules of direct IO (which never ask for more than a page of memory).
+pub(super) const PAGE: usize = 4096;
 
 /// A file's call in flight: a job of the blocking pool, or an operation on
 /// the ring of the shard whose thread issued it.
@@ -134,25 +141,73 @@ pub(super) fn buffer(len: usize, after: &mut After) -> Option<PoolBuf> {
     buf
 }
 
+/// The most bytes one call on a file opened for direct IO moves through a
+/// buffer of the pool: the largest power of two within a quarter of what
+/// the pool may hold, so the buffer always fits beside others.
+fn direct_bound(cap: usize) -> usize {
+    match cap / 4 {
+        0 => LARGEST,
+        quarter => (1usize << quarter.ilog2()).max(LARGEST),
+    }
+}
+
+/// How many of `len` bytes the first call takes when a call may move at most
+/// `bound`: all of them when they fit; else the remainder past a multiple of
+/// `bound` first, so a length the kernel refuses is refused at once, and
+/// every later call moves `bound` bytes from an offset as aligned as the
+/// caller's.
+fn first_part(len: usize, bound: usize) -> usize {
+    if len <= bound {
+        return len;
+    }
+    match len % bound {
+        0 => bound,
+        rest => rest,
+    }
+}
+
 /// A buffer of this thread's pool for a call of up to `len` bytes of a
-/// task's memory, and how many of them the call moves: up to a buffer of the
-/// pool's largest class. `None` while the pool has no room: `waker` is woken
-/// once a buffer comes back.
-pub(super) fn bounce(len: usize, waker: &Waker) -> Option<(PoolBuf, usize)> {
+/// task's memory at `addr`, and how many bytes the call moves: with
+/// `direct`, the bytes start in the buffer where `addr` lies in its page
+/// (see [`PAGE`]) and the call moves all `len` bytes (or a first part of
+/// them past what one buffer may hold); else from the buffer's start, up to
+/// a buffer of the pool's largest class. `None` while the pool has no room:
+/// `waker` is woken once a buffer comes back.
+pub(crate) fn bounce(
+    len: usize,
+    addr: usize,
+    direct: bool,
+    waker: &Waker,
+) -> Option<(PoolBuf, usize, usize)> {
+    let shift = if direct { addr % PAGE } else { 0 };
     with_pool(|pool| {
         let pool = pool?;
-        let want = len.min(LARGEST);
-        let buf = if pool.could_hold_whole(want) {
-            pool.get_whole(want)
+        let want = if direct {
+            first_part(len, direct_bound(pool.cap()))
         } else {
-            pool.get(want)
+            len.min(LARGEST)
+        };
+        // Classes below a page are aligned to a cache line only: a mirrored
+        // call takes a page-aligned one.
+        let size = if direct {
+            (want + shift).max(PAGE)
+        } else {
+            want
+        };
+        let buf = if pool.could_hold_whole(size) {
+            pool.get_whole(size)
+        } else {
+            pool.get(size)
         };
         let Some(buf) = buf else {
             pool.wait_for_return(waker.clone());
             return None;
         };
-        let n = want.min(buf.capacity());
-        Some((buf, n))
+        // vertexia: a pool too small to hold a page mirrors nothing; such a
+        // pool cannot serve direct IO's alignment anyway.
+        let shift = if buf.capacity() > shift { shift } else { 0 };
+        let n = want.min(buf.capacity() - shift);
+        Some((buf, shift, n))
     })
 }
 

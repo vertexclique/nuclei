@@ -16,15 +16,15 @@ use crate::io::raw::Raw;
 use crate::io::source::Kind;
 use crate::syscore::windows::{
     AF_INET, AF_INET6, DWORD, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION,
-    FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT,
-    FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType,
-    HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, NtQueryInformationFile,
-    OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_TYPE,
-    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
-    SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
-    WSA_FLAG_OVERLAPPED, WSAIoctl, WSASocketW, WriteFile, bind, getsockname, getsockopt,
-    last_error, setsockopt, shutdown, wsa_error,
+    FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION,
+    FILE_NO_INTERMEDIATE_BUFFERING, FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT,
+    FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType, HANDLE, IN_ADDR, INVALID_SOCKET,
+    IO_STATUS_BLOCK, IPPROTO_TCP, NtQueryInformationFile, OVERLAPPED, ReadFile, SD_SEND,
+    SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
+    SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAIoctl, WSASocketW, WriteFile, bind,
+    getsockname, getsockopt, last_error, setsockopt, shutdown, wsa_error,
 };
 
 fn socket_of(raw: Raw) -> SOCKET {
@@ -92,11 +92,25 @@ pub(crate) fn synchronous(raw: Raw) -> io::Result<bool> {
     Ok(mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) != 0)
 }
 
-/// Whether the file handle `raw` appends: it may add to the file's end and
-/// not write over it (std's `append`).
-pub(crate) fn appends(raw: Raw) -> io::Result<bool> {
+/// How a file's handle was opened, as its handle's IO needs to know.
+pub(crate) struct FileMode {
+    /// It appends: it may add to the file's end and not write over it
+    /// (std's `append`).
+    pub(crate) append: bool,
+    /// With no buffering (`FILE_FLAG_NO_BUFFERING`): the system moves the
+    /// bytes straight between the caller's memory and the device, by its
+    /// alignment rules.
+    pub(crate) direct: bool,
+}
+
+/// How the file handle `raw` was opened.
+pub(crate) fn file_mode(raw: Raw) -> io::Result<FileMode> {
     let access = file_information(raw, FILE_ACCESS_INFORMATION)?;
-    Ok(access & FILE_APPEND_DATA != 0 && access & FILE_WRITE_DATA == 0)
+    let mode = file_information(raw, FILE_MODE_INFORMATION)?;
+    Ok(FileMode {
+        append: access & FILE_APPEND_DATA != 0 && access & FILE_WRITE_DATA == 0,
+        direct: mode & FILE_NO_INTERMEDIATE_BUFFERING != 0,
+    })
 }
 
 /// What the handle `raw` tells of itself in `class`, one ULONG.

@@ -10,7 +10,10 @@
 //! their forms, which many tasks may make at once on one handle), and its
 //! syncs ([`Handle::sync_all`], [`Handle::sync_data`]), are operations of
 //! the shard's ring on io_uring and jobs of the blocking pool on the other
-//! backends (see `file`). A `File` that is not a regular file (a FIFO, a terminal, a
+//! backends (see `file`). A file opened for direct IO (`O_DIRECT`,
+//! `FILE_FLAG_NO_BUFFERING`) is read and written with exactly the caller's
+//! lengths and offsets, never through the handle's read-ahead or
+//! write-behind. A `File` that is not a regular file (a FIFO, a terminal, a
 //! pipe) is a byte stream the shard's driver serves like a socket (on
 //! Windows, through the completion port, or through jobs of the blocking
 //! pool for a handle opened for synchronous IO). Reads and writes at the

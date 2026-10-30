@@ -721,6 +721,8 @@ fn file_offset(offset: u64) -> io::Result<libc::off_t> {
 
 /// `pread(2)`: reads at `offset` without moving the file's own offset.
 pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(test)]
+    file_calls::note(fd, (b'r', buf.len(), offset));
     let offset = file_offset(offset)?;
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
     retry(|| cvt(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) }))
@@ -730,6 +732,8 @@ pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize>
 /// file's own offset.
 pub(crate) fn pwrite_all(fd: RawFd, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
+        #[cfg(test)]
+        file_calls::note(fd, (b'w', buf.len(), offset));
         let at = file_offset(offset)?;
         // SAFETY: reads at most `buf.len()` bytes from `buf`.
         let n = retry(|| cvt(unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), at) }))?;
@@ -757,11 +761,28 @@ pub(crate) fn append_all(fd: RawFd, mut buf: &[u8]) -> io::Result<u64> {
     seek(fd, None)
 }
 
-/// Whether the file `fd` was opened to append (`O_APPEND`).
-pub(crate) fn appends(fd: RawFd) -> io::Result<bool> {
+/// How a file's descriptor was opened, as its handle's IO needs to know.
+pub(crate) struct FileMode {
+    /// To append (`O_APPEND`): every write lands at the end.
+    pub(crate) append: bool,
+    /// For direct IO (`O_DIRECT`, on Linux): the kernel moves the bytes
+    /// straight between the caller's memory and the device, by its alignment
+    /// rules. Apple's `F_NOCACHE` sets no such rule and is not this.
+    pub(crate) direct: bool,
+}
+
+/// How the file `fd` was opened (`F_GETFL`).
+pub(crate) fn file_mode(fd: RawFd) -> io::Result<FileMode> {
     // SAFETY: a plain fcntl on the caller's open descriptor.
     let flags = cvt_int(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
-    Ok(flags & libc::O_APPEND != 0)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let direct = flags & libc::O_DIRECT != 0;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let direct = false;
+    Ok(FileMode {
+        append: flags & libc::O_APPEND != 0,
+        direct,
+    })
 }
 
 /// Moves the file's own offset to `offset` (`SEEK_SET`); with `None`, only
@@ -899,6 +920,8 @@ pub(crate) fn pread_uninit(
     buf: &mut [core::mem::MaybeUninit<u8>],
     offset: u64,
 ) -> io::Result<usize> {
+    #[cfg(test)]
+    file_calls::note(fd, (b'r', buf.len(), offset));
     let offset = file_offset(offset)?;
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
     retry(|| cvt(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) }))
@@ -915,4 +938,36 @@ pub(crate) fn adopt_accepted(_listener: RawFd, _conn: &OwnedFd) -> io::Result<()
 #[cfg(ring)]
 pub(crate) fn adopt_connected(_fd: RawFd) -> io::Result<()> {
     Ok(())
+}
+
+/// The file calls the blocking pool made, for a test: each `pread` and
+/// `pwrite` with its descriptor, length and offset.
+#[cfg(test)]
+pub(crate) mod file_calls {
+    use std::os::fd::RawFd;
+    use std::sync::Mutex;
+
+    /// A `pread` (`b'r'`) or a `pwrite` (`b'w'`) of `len` bytes at `at`.
+    pub(crate) type Call = (u8, usize, u64);
+
+    static CALLS: Mutex<Vec<(RawFd, Call)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn note(fd: RawFd, call: Call) {
+        if let Ok(mut calls) = CALLS.lock() {
+            calls.push((fd, call));
+        }
+    }
+
+    /// The calls made on `fd` since the last look, in order.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take(fd: RawFd) -> Vec<Call> {
+        let Ok(mut calls) = CALLS.lock() else {
+            return Vec::new();
+        };
+        let (mine, rest) = core::mem::take(&mut *calls)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(of, _)| *of == fd);
+        *calls = rest;
+        mine.into_iter().map(|(_, call)| call).collect()
+    }
 }

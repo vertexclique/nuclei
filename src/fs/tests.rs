@@ -335,6 +335,8 @@ fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
     });
 }
 
+#[cfg(target_os = "linux")]
+mod direct;
 mod durable;
 mod owned;
 mod positional;
