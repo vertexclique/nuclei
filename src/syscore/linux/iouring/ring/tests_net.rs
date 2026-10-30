@@ -707,7 +707,7 @@ fn has_send_zc(ring: &Ring) -> bool {
 
 /// A zero-copy send completes twice: the byte count with `MORE`, then a
 /// notification that the memory is free. The sender's buffer is released only
-/// after the second.
+/// after the second, which may come only once the peer has read the data.
 #[test]
 fn send_zc_completes_with_the_bytes_and_then_a_notification() {
     let Some(mut ring) = ring_or_skip() else {
@@ -727,13 +727,16 @@ fn send_zc_completes_with_the_bytes_and_then_a_notification() {
     assert_eq!((first.user_data, first.res), (9, 100_000));
     assert_ne!(first.flags & IORING_CQE_F_MORE, 0, "a notification follows");
     assert_eq!(first.flags & IORING_CQE_F_NOTIF, 0);
+    // TCP keeps the memory until the peer acknowledged it, and a peer that does not read stops
+    // acknowledging once its window is full: the notification may wait for the reader, so the
+    // data is read before it is waited for.
+    let mut got = vec![0u8; 100_000];
+    b.read_exact(&mut got).unwrap();
+    assert_eq!(got, data);
     let notif = events.next(&mut ring);
     assert_eq!(notif.user_data, 9);
     assert_ne!(notif.flags & IORING_CQE_F_NOTIF, 0);
     assert_eq!(notif.flags & IORING_CQE_F_MORE, 0);
-    let mut got = vec![0u8; 100_000];
-    b.read_exact(&mut got).unwrap();
-    assert_eq!(got, data);
 }
 
 /// A zero-copy send that fails when it runs still gets its notification: the
