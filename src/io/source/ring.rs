@@ -65,6 +65,7 @@ pub(crate) enum RingMem {
     },
     RecvLent(Vec<u8>),
     RecvFrom(Spare<Msg>, PoolBuf),
+    RecvLentFrom(Spare<Msg>, Vec<u8>),
     Connect(
         Dial,
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<RawAddr>,
@@ -76,7 +77,30 @@ pub(crate) enum RingMem {
         PoolBuf,
         Target,
     ),
+    SendLentTo(
+        #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
+        Vec<u8>,
+    ),
+    /// A zero-copy send of a lent buffer: the buffer stays until the
+    /// notification, `first` the byte count its first completion brought.
+    SendLentZc {
+        buf: Vec<u8>,
+        first: Option<i32>,
+    },
 }
+
+/// The least a stream send must carry to go out zero-copy: below it, pinning
+/// the pages costs more than the copy it saves. From the `owned_size_*` modes
+/// of benches/vs_tokio_count.rs on the development host (loopback, where the
+/// receive path copies what a send pinned): total cycles per write were above
+/// the copy's from 16 KiB to 512 KiB and level with it at 1 MiB, so no
+/// smaller write is sent zero-copy. A datagram never is: the same sweep from
+/// 16 KiB to 60 KiB, all UDP carries, cost 30 to 50 percent more kernel cycles.
+pub(crate) const SEND_ZC_MIN: usize = 1 << 20;
+
+/// The most one zero-copy entry carries: what the kernel pins at a time is
+/// bounded, and a longer write goes in several.
+const SEND_ZC_CHUNK: usize = 1 << 20;
 
 /// The kernel's answer `res` (a count, or a negated errno) to an operation
 /// that takes bytes or gives a descriptor.
@@ -97,6 +121,32 @@ fn failed(code: i32) -> io::Error {
 }
 
 impl RingMem {
+    /// Whether the operation is a zero-copy send, which ends on a
+    /// notification.
+    pub(crate) fn is_zc(&self) -> bool {
+        matches!(self, RingMem::SendLentZc { .. })
+    }
+
+    /// Keeps the first completion's `res` of a zero-copy send, whose
+    /// notification ends it. False for an operation that is not one.
+    pub(crate) fn zc_first(&mut self, res: i32) -> bool {
+        match self {
+            RingMem::SendLentZc { first, .. } => {
+                *first = Some(res);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The first completion's result of a zero-copy send that got one.
+    pub(crate) fn zc_result(&self) -> Option<i32> {
+        match self {
+            RingMem::SendLentZc { first, .. } => *first,
+            _ => None,
+        }
+    }
+
     /// The completion of an operation of a source of `kind`, whose kernel
     /// answer is `res`.
     pub(crate) fn complete(self, res: i32, kind: Kind) -> Outcome {
@@ -164,6 +214,19 @@ impl RingMem {
                 };
                 Outcome::RecvFrom(buf, answer)
             }
+            RingMem::RecvLentFrom(mut msg, mut buf) => {
+                let answer = match answer(res) {
+                    Answer::Done(Ok(n)) => {
+                        // SAFETY: the kernel wrote the first `n` bytes of the
+                        // buffer's spare capacity.
+                        unsafe { buf.set_len(buf.len() + n) };
+                        Answer::Done(msg.sender(kind).map(|from| (n, from)))
+                    }
+                    Answer::Done(Err(err)) => Answer::Done(Err(err)),
+                    Answer::Undone { not_ready } => Answer::Undone { not_ready },
+                };
+                Outcome::RecvLentFrom(buf, answer)
+            }
             RingMem::Connect(dial, _) => Outcome::Connect(
                 dial,
                 match res {
@@ -178,6 +241,8 @@ impl RingMem {
             RingMem::Send(buf) => Outcome::Send(buf, answer(res)),
             RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
             RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, answer(res)),
+            RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, answer(res)),
+            RingMem::SendLentZc { buf, .. } => Outcome::SendLent(buf, answer(res)),
         }
     }
 }
@@ -364,7 +429,7 @@ impl RingIssuer<'_> {
     /// address no socket can have) completes at once with the reason.
     pub(crate) fn issue(&self, want: Want, kind: Kind, epoch: u32, _after: &mut After) -> u64 {
         let read = want.of_read();
-        match entry(want, kind, self.file as RawFd, self.ring.recv_group()) {
+        match entry(want, kind, self.file as RawFd, self.ring) {
             Ok((mem, sqe)) => self.ring.submit(
                 RingOp {
                     source: Arc::clone(self.source),
@@ -399,10 +464,12 @@ impl RingIssuer<'_> {
     }
 
     /// Whether a datagram receive of a source of `kind` goes out as a
-    /// multishot one: a UDP socket's, on a ring whose group's buffers hold
-    /// any datagram whole (a Unix datagram may be larger than any buffer).
+    /// multishot one: a UDP socket's, on a ring whose group's whole buffers
+    /// hold any datagram (a Unix datagram may be larger than any buffer, and
+    /// a buffer filled in pieces may have less room left than a datagram).
     pub(crate) fn multishot_datagrams(&self, kind: Kind) -> bool {
         kind == Kind::Udp
+            && !self.ring.recv_group_incremental()
             && self
                 .ring
                 .recv_buf_size()
@@ -506,8 +573,9 @@ fn entry(
     want: Want,
     kind: Kind,
     slot: RawFd,
-    group: Option<u16>,
+    ring: &ShardRing,
 ) -> Result<(RingMem, Sqe), Box<Outcome>> {
+    let group = ring.recv_group();
     Ok(match want {
         Want::Ready { read } => {
             let events = if read { libc::POLLIN } else { libc::POLLOUT };
@@ -586,6 +654,12 @@ fn entry(
             let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
             (RingMem::RecvFrom(msg, buf), sqe)
         }
+        Want::RecvLentFrom(mut buf) => {
+            let spare = buf.spare_capacity_mut();
+            let mut msg = Msg::receiving(spare.as_mut_ptr().cast(), spare.len());
+            let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
+            (RingMem::RecvLentFrom(msg, buf), sqe)
+        }
         Want::Connect(dial) => {
             let addr = Spare::new(RawAddr::of(&dial));
             let sqe = Sqe::connect(slot, addr.as_ptr(), addr.len);
@@ -596,8 +670,15 @@ fn entry(
             (RingMem::Send(buf), sqe)
         }
         Want::SendLent(buf, from) => {
-            let sqe = stream_write(kind, slot, buf.get(from..).unwrap_or_default());
-            (RingMem::SendLent(buf), sqe)
+            let rest = buf.get(from..).unwrap_or_default();
+            if kind == Kind::Tcp && rest.len() >= SEND_ZC_MIN && ring.zc_stream() {
+                let len = rest.len().min(SEND_ZC_CHUNK) as u32;
+                let sqe = Sqe::send_zc(slot, rest.as_ptr(), len, sys::SEND_FLAGS);
+                (RingMem::SendLentZc { buf, first: None }, sqe)
+            } else {
+                let sqe = stream_write(kind, slot, rest);
+                (RingMem::SendLent(buf), sqe)
+            }
         }
         Want::SendTo(buf, target) => {
             let to = match &target {
@@ -609,6 +690,16 @@ fn entry(
             let msg = Msg::new(bytes.as_ptr().cast_mut(), bytes.len(), to);
             let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
             (RingMem::SendTo(msg, buf, target), sqe)
+        }
+        Want::SendLentTo(buf, target) => {
+            let to = match &target {
+                Target::Connected => None,
+                Target::Inet(addr) => Some(RawAddr::inet(addr)),
+                Target::Unix(addr) => Some(RawAddr::unix(addr)),
+            };
+            let msg = Msg::new(buf.as_ptr().cast_mut(), buf.len(), to);
+            let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
+            (RingMem::SendLentTo(msg, buf), sqe)
         }
     })
 }

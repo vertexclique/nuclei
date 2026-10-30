@@ -436,3 +436,8 @@ pub(crate) fn duplicate_file(raw: Raw) -> io::Result<OwnedHandle> {
     // SAFETY: the caller keeps the handle open for the call.
     unsafe { BorrowedHandle::borrow_raw(handle_of(raw).cast()) }.try_clone_to_owned()
 }
+
+/// Whether the provider has `TransmitFile`, which sends a file range in the kernel.
+pub(crate) fn transmit_file_available() -> bool {
+    crate::syscore::windows::winsock::ext().is_ok_and(|ext| ext.transmit_file.is_some())
+}

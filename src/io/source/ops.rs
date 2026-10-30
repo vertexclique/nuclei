@@ -53,6 +53,9 @@ pub(crate) enum Want {
     RecvLent(Vec<u8>),
     /// Receive a datagram into a buffer of the pool, with its sender.
     RecvFrom(PoolBuf),
+    /// Receive a datagram into the spare capacity of a task's buffer, with
+    /// its sender.
+    RecvLentFrom(Vec<u8>),
     /// Receive datagrams as they come, each into a buffer of the shard's
     /// receive group with its sender, until the receive is stopped (its end
     /// as [`Outcome::RecvMultiEnd`]).
@@ -66,6 +69,11 @@ pub(crate) enum Want {
     SendLent(Vec<u8>, usize),
     /// Send a datagram from a buffer of the pool.
     SendTo(PoolBuf, Target),
+    /// Send a datagram from a task's buffer.
+    SendLentTo(Vec<u8>, Target),
+    /// Send a range of a file to a stream, in the kernel.
+    #[cfg(windows)]
+    SendFile(crate::io::source::write::FileRange),
 }
 
 impl Want {
@@ -74,10 +82,20 @@ impl Want {
         match self {
             #[cfg(ring)]
             Want::Ready { read } => *read,
-            Want::Accept | Want::Recv(_) | Want::RecvLent(_) | Want::RecvFrom(_) => true,
+            Want::Accept
+            | Want::Recv(_)
+            | Want::RecvLent(_)
+            | Want::RecvFrom(_)
+            | Want::RecvLentFrom(_) => true,
             #[cfg(ring)]
             Want::RecvMulti | Want::AcceptMulti | Want::RecvFromMulti => true,
-            Want::Connect(_) | Want::Send(_) | Want::SendLent(..) | Want::SendTo(..) => false,
+            Want::Connect(_)
+            | Want::Send(_)
+            | Want::SendLent(..)
+            | Want::SendTo(..)
+            | Want::SendLentTo(..) => false,
+            #[cfg(windows)]
+            Want::SendFile(_) => false,
         }
     }
 
@@ -133,10 +151,12 @@ pub(crate) enum Outcome {
     },
     RecvLent(Vec<u8>, Answer<usize>),
     RecvFrom(PoolBuf, Answer<(usize, Addr)>),
+    RecvLentFrom(Vec<u8>, Answer<(usize, Addr)>),
     Connect(Dial, Answer<()>),
     Send(PoolBuf, Answer<usize>),
     SendLent(Vec<u8>, Answer<usize>),
     SendTo(PoolBuf, Target, Answer<usize>),
+    SendLentTo(Vec<u8>, Answer<usize>),
 }
 
 impl Outcome {

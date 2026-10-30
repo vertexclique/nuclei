@@ -124,6 +124,34 @@ impl Source {
         let mut op = WriteOwned {
             source: self,
             buf: Some(buf),
+            lending: Lending::default(),
+            lent: false,
+        };
+        let result = poll_fn(|cx| op.poll(cx)).await;
+        (result, op.buf.take().unwrap_or_default())
+    }
+
+    /// Sends all of `buf` as one datagram to `to` and gives it back with the
+    /// send's result. The buffer is lent to the side until the kernel took
+    /// the datagram, so the bytes go out from it with no copy.
+    pub(crate) async fn send_owned(
+        self: &Arc<Self>,
+        buf: Vec<u8>,
+        to: Dest<'_>,
+    ) -> (io::Result<usize>, Vec<u8>) {
+        if buf.len() < super::super::OWNED_DATAGRAM_MIN && self.on_ring() {
+            // A small datagram is cheaper copied and queued, which ends at once, than lent
+            // to the ring and waited for.
+            let result = poll_fn(|cx| self.poll_send(cx, &buf, to)).await;
+            return (result, buf);
+        }
+        let mut op = WriteOwned {
+            source: self,
+            buf: Some(buf),
+            lending: Lending {
+                to: Some(to),
+                file: None,
+            },
             lent: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
@@ -134,10 +162,11 @@ impl Source {
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         held: &mut Option<Vec<u8>>,
+        lending: &Lending<'_>,
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
         let poll = self.poll_writing(cx, |st, io, waker, after| {
-            st.write_owned(io, kind, held, waker, after)
+            st.write_owned(io, kind, held, lending, waker, after)
         });
         if poll.is_ready() && held.is_none() {
             // The poll failed with the buffer lent: it comes back as it is.
@@ -155,6 +184,32 @@ impl Source {
             }
         }
         poll
+    }
+
+    /// Sends `len` bytes of the file `handle` names, from `offset`, to a stream in the kernel, and
+    /// answers how many went. The handle is kept open until the send ends, and a task that goes
+    /// away leaves the send to the driver, which finishes what started.
+    #[cfg(windows)]
+    pub(crate) async fn send_file_range(
+        self: &Arc<Self>,
+        handle: Arc<crate::io::raw::OwnedFile>,
+        offset: u64,
+        len: u32,
+    ) -> io::Result<usize> {
+        let mut op = WriteOwned {
+            source: self,
+            buf: Some(Vec::new()),
+            lending: Lending {
+                to: None,
+                file: Some(FileRange {
+                    handle,
+                    offset,
+                    len,
+                }),
+            },
+            lent: false,
+        };
+        poll_fn(|cx| op.poll(cx)).await
     }
 
     /// Completes once the write-behind is out (or reports why it stopped).
@@ -218,21 +273,25 @@ impl Source {
 /// A write whose buffer may be lent to the side. Dropped while it is, the
 /// side withdraws the write if none of it went out and finishes it if some
 /// did.
-struct WriteOwned<'a> {
+struct WriteOwned<'a, 'd> {
     source: &'a Arc<Source>,
     buf: Option<Vec<u8>>,
+    /// Where a datagram goes; `None` for a stream's bytes.
+    lending: Lending<'d>,
     lent: bool,
 }
 
-impl WriteOwned<'_> {
+impl WriteOwned<'_, '_> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let poll = self.source.poll_write_owned(cx, &mut self.buf);
+        let poll = self
+            .source
+            .poll_write_owned(cx, &mut self.buf, &self.lending);
         self.lent = self.buf.is_none();
         poll
     }
 }
 
-impl Drop for WriteOwned<'_> {
+impl Drop for WriteOwned<'_, '_> {
     fn drop(&mut self) {
         if self.lent {
             let mut after = After::default();

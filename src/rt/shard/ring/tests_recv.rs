@@ -24,6 +24,15 @@ fn recv_shard(buffers: u16, size: u32) -> Option<Shard> {
     ring_shard_of(64, buffers, size)
 }
 
+/// As [`recv_shard`], with a group of whole buffers: a datagram cannot share
+/// a buffer filled in pieces, so multishot datagrams need this one.
+fn plain_shard(buffers: u16, size: u32) -> Option<Shard> {
+    super::super::recv::INCREMENTAL_FOR_TEST.with(|t| t.set(Some(false)));
+    let shard = ring_shard_of(64, buffers, size);
+    super::super::recv::INCREMENTAL_FOR_TEST.with(|t| t.set(None));
+    shard
+}
+
 /// As [`recv_shard`], on a ring of `entries` submission entries (twice as
 /// many completions): a ring whose completion queue overflows ends its
 /// multishot operations itself.
@@ -550,7 +559,7 @@ const DATAGRAM_BUFFERS: u32 = 66 * 1024;
 /// their senders through the one multishot receive the first armed.
 #[test]
 fn datagrams_come_whole_with_their_senders_through_one_multishot_receive() {
-    let Some(shard) = recv_shard(16, DATAGRAM_BUFFERS) else {
+    let Some(shard) = plain_shard(16, DATAGRAM_BUFFERS) else {
         return;
     };
     let _current = context::enter(&shard);
@@ -597,7 +606,7 @@ fn datagrams_come_whole_with_their_senders_through_one_multishot_receive() {
 /// cuts it, and the next one comes whole.
 #[test]
 fn a_multishot_datagram_is_cut_to_the_readers_buffer() {
-    let Some(shard) = recv_shard(16, DATAGRAM_BUFFERS) else {
+    let Some(shard) = plain_shard(16, DATAGRAM_BUFFERS) else {
         return;
     };
     let _current = context::enter(&shard);

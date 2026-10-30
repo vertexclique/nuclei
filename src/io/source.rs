@@ -157,6 +157,12 @@ mod write_work {
     pub(super) const LOOK: u8 = 16;
 }
 
+/// The least room a datagram's owned call must have before the ring lends the caller's buffer to
+/// an operation of its own; below it the call copies, as the borrowed calls do. From the
+/// `udp_bytes_*` modes of benches/vs_tokio_count.rs: total cycles per datagram favored the copy
+/// at 64 B to 8 KiB and the lent buffer from 12 KiB.
+pub(crate) const OWNED_DATAGRAM_MIN: usize = 12 * 1024;
+
 /// What kind of descriptor a source is: which system calls fit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -547,6 +553,17 @@ impl Hooks<WriteState> for SourceHooks<'_> {
 }
 
 impl Source {
+    /// Whether the source's operations run on a ring.
+    #[cfg(ring)]
+    fn on_ring(&self) -> bool {
+        self.reg.ops.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(ring))]
+    fn on_ring(&self) -> bool {
+        false
+    }
+
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {

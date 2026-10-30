@@ -685,3 +685,80 @@ fn a_fixed_file_outlives_the_descriptor_it_came_from() {
     assert_eq!(reap(&mut ring, 1)[0].res, -libc::EBADF);
     drop((reused, other, other_peer, peer));
 }
+
+/// A connected TCP pair over loopback.
+fn tcp_pair() -> (TcpStream, TcpStream) {
+    let (listener, addr) = listener();
+    let a = TcpStream::connect(addr).unwrap();
+    let (b, _) = listener.accept().unwrap();
+    (a, b)
+}
+
+/// Whether the kernel has the zero-copy send; a test that needs it skips when not.
+fn has_send_zc(ring: &Ring) -> bool {
+    let has = ring
+        .register_probe()
+        .is_ok_and(|ops| ops.contains(Opcode::SendZc));
+    if !has {
+        eprintln!("skipping: the kernel has no zero-copy send");
+    }
+    has
+}
+
+/// A zero-copy send completes twice: the byte count with `MORE`, then a
+/// notification that the memory is free. The sender's buffer is released only
+/// after the second.
+#[test]
+fn send_zc_completes_with_the_bytes_and_then_a_notification() {
+    let Some(mut ring) = ring_or_skip() else {
+        return;
+    };
+    if !has_send_zc(&ring) {
+        return;
+    }
+    let (a, mut b) = tcp_pair();
+    let data = vec![7u8; 100_000];
+    push(
+        &mut ring,
+        Sqe::send_zc(a.as_raw_fd(), data.as_ptr(), data.len() as u32, 0).user_data(9),
+    );
+    let mut events = Events::default();
+    let first = events.next(&mut ring);
+    assert_eq!((first.user_data, first.res), (9, 100_000));
+    assert_ne!(first.flags & IORING_CQE_F_MORE, 0, "a notification follows");
+    assert_eq!(first.flags & IORING_CQE_F_NOTIF, 0);
+    let notif = events.next(&mut ring);
+    assert_eq!(notif.user_data, 9);
+    assert_ne!(notif.flags & IORING_CQE_F_NOTIF, 0);
+    assert_eq!(notif.flags & IORING_CQE_F_MORE, 0);
+    let mut got = vec![0u8; 100_000];
+    b.read_exact(&mut got).unwrap();
+    assert_eq!(got, data);
+}
+
+/// A zero-copy send that fails when it runs still gets its notification: the
+/// first completion carries the error and `MORE`.
+#[test]
+fn a_failed_send_zc_still_gets_a_notification() {
+    let Some(mut ring) = ring_or_skip() else {
+        return;
+    };
+    if !has_send_zc(&ring) {
+        return;
+    }
+    let (a, b) = tcp_pair();
+    a.shutdown(std::net::Shutdown::Write).unwrap();
+    drop(b);
+    push(
+        &mut ring,
+        Sqe::send_zc(a.as_raw_fd(), b"x".as_ptr(), 1, libc::MSG_NOSIGNAL).user_data(5),
+    );
+    let mut events = Events::default();
+    let first = events.next(&mut ring);
+    assert_eq!(first.user_data, 5);
+    assert!(first.res < 0, "the send must fail");
+    assert_ne!(first.flags & IORING_CQE_F_MORE, 0, "a notification follows");
+    let notif = events.next(&mut ring);
+    assert_eq!(notif.user_data, 5);
+    assert_ne!(notif.flags & IORING_CQE_F_NOTIF, 0);
+}

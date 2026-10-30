@@ -93,6 +93,27 @@ pub(crate) enum Peer<'a> {
     Unix(UnixPath<'a>),
 }
 
+/// A range of a file the kernel sends to a stream itself: the file's handle, kept open until the
+/// send ends, and where the range starts and how long it is.
+#[derive(Clone)]
+#[cfg_attr(
+    unix,
+    allow(dead_code, reason = "only Windows sends a file in the kernel here")
+)]
+pub(crate) struct FileRange {
+    pub(crate) handle: Arc<crate::io::raw::OwnedFile>,
+    pub(crate) offset: u64,
+    pub(crate) len: u32,
+}
+
+/// Where a lent write goes besides the stream's own bytes: one datagram's destination, or a range
+/// of a file the kernel sends.
+#[derive(Clone, Default)]
+pub(crate) struct Lending<'d> {
+    pub(crate) to: Option<Dest<'d>>,
+    pub(crate) file: Option<FileRange>,
+}
+
 /// A task's own buffer, lent to the side for the driver to write out.
 struct Lent {
     buf: Vec<u8>,
@@ -110,6 +131,24 @@ struct Lent {
     // source at most, for at most `LINGER` once its handle is gone); charge
     // it to the pool if kept buffers must count against the cap.
     orphan: bool,
+    /// Where the buffer goes, when it is one datagram: the write is whole or
+    /// failed, never part.
+    to: Option<Target>,
+    /// The range of a file sent in the kernel, with `buf` empty.
+    #[cfg(windows)]
+    file: Option<FileRange>,
+}
+
+impl Lent {
+    /// The bytes the write is for: the buffer's, or a file range's.
+    #[cfg(completion)]
+    fn total(&self) -> usize {
+        #[cfg(windows)]
+        if let Some(file) = &self.file {
+            return file.len as usize;
+        }
+        self.buf.len()
+    }
 }
 
 #[derive(Default)]
@@ -465,6 +504,19 @@ impl WriteState {
             // The write-behind before it failed: none of it went out.
             lent.done = Some(Err(failure.error()));
         }
+        if let Some(to) = lent
+            .to
+            .as_ref()
+            .filter(|_| lent.done.is_none() && !self.blocked)
+        {
+            match sys::ready(send_datagram(fd, &lent.buf, to.as_dest())) {
+                None => self.blocked = true,
+                Some(result) => {
+                    lent.done = Some(result);
+                    progress = true;
+                }
+            }
+        }
         while lent.done.is_none() && !self.blocked {
             let rest = lent.buf.get(lent.sent..).unwrap_or_default();
             match sys::ready(write_bytes(fd, kind, rest)) {
@@ -514,6 +566,7 @@ impl WriteState {
         io: Io<'_>,
         kind: Kind,
         held: &mut Option<Vec<u8>>,
+        lending: &Lending<'_>,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -524,10 +577,10 @@ impl WriteState {
             if let Some(err) = self.error.take() {
                 return Poll::Ready(Err(err));
             }
-            if buf.is_empty() {
+            if buf.is_empty() && lending.to.is_none() && lending.file.is_none() {
                 return Poll::Ready(Ok(0));
             }
-            if self.lent.is_some() {
+            if self.lent.is_some() || (lending.to.is_some() && self.queued.is_some()) {
                 // Another buffer is lent: this one goes after it.
                 self.waiters.register(waker);
                 return Poll::Pending;
@@ -539,6 +592,9 @@ impl WriteState {
                 waker: None,
                 out: false,
                 orphan: false,
+                to: lending.to.map(Dest::to_owned),
+                #[cfg(windows)]
+                file: lending.file.clone(),
             });
         }
         // The task polls, so the driver's write needs no wake for it.
@@ -721,7 +777,7 @@ impl WriteState {
         if let Some(err) = self.error.take() {
             return Poll::Ready(Err(err));
         }
-        if self.queued.is_some() {
+        if self.queued.is_some() || self.lent_waits() {
             self.waiters.register(waker);
             return Poll::Pending;
         }

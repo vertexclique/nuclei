@@ -209,6 +209,20 @@ impl Sqe {
         })
     }
 
+    /// Zero-copy `send(2)` of `len` bytes from `buf`: the first completion carries the byte count
+    /// and `IORING_CQE_F_MORE`, and a second one with `IORING_CQE_F_NOTIF` says the kernel is done
+    /// with the memory. The notification follows a failed send too (its first completion carries
+    /// the error with `MORE`); a first completion without `MORE` is a send refused before it ran,
+    /// and none follows.
+    /// Every pointer argument must stay valid and unmoved until the notification.
+    pub(crate) fn send_zc(fd: RawFd, buf: *const u8, len: u32, flags: i32) -> Self {
+        Self::new(Opcode::SendZc, fd).with(|s| {
+            s.addr = addr(buf);
+            s.len = len;
+            s.op_flags = flags as u32;
+        })
+    }
+
     /// `recv(2)` of up to `len` bytes into `buf`.
     /// Every pointer argument must stay valid and unmoved until the final completion.
     pub(crate) fn recv(fd: RawFd, buf: *mut u8, len: u32, flags: i32) -> Self {
