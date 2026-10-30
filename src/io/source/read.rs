@@ -245,6 +245,14 @@ impl ReadState {
         self.lent.as_ref().is_some_and(|l| l.done.is_some())
     }
 
+    /// A lent buffer waits for the driver, and no operation has it: its
+    /// task may take it back.
+    fn lent_idle(&self) -> bool {
+        self.lent
+            .as_ref()
+            .is_some_and(|l| !l.out && l.done.is_none())
+    }
+
     /// A lent buffer waits for the driver.
     fn lent_waits(&self) -> bool {
         self.lent.as_ref().is_some_and(|l| l.done.is_none())
@@ -775,6 +783,12 @@ impl ReadState {
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
+        if held.is_none() && self.has_result() && self.lent_idle() {
+            // An operation out before the buffer was lent brought bytes, the
+            // end or an error to the read-ahead: they go first, taken into
+            // the buffer.
+            *held = self.reclaim(after);
+        }
         if let Some(buf) = held.as_mut() {
             if let Some(result) =
                 self.take_stream(false, after, |ahead, after| ahead.append_to(buf, after))

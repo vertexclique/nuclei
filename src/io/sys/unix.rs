@@ -694,15 +694,11 @@ pub(crate) fn unix_addr(
     unix::SocketAddr::from_pathname(std::ffi::OsStr::from_bytes(path))
 }
 
-/// The unnamed address: std makes one only from an unbound socket, so it is
-/// made once.
+/// The unnamed address, from an empty path: no socket is made for it, so a
+/// datagram the kernel handed over is never lost to a process with no
+/// descriptor to spare.
 fn unnamed() -> io::Result<unix::SocketAddr> {
-    static UNNAMED: std::sync::OnceLock<unix::SocketAddr> = std::sync::OnceLock::new();
-    if let Some(addr) = UNNAMED.get() {
-        return Ok(addr.clone());
-    }
-    let addr = UnixDatagram::unbound()?.local_addr()?;
-    Ok(UNNAMED.get_or_init(|| addr).clone())
+    unix::SocketAddr::from_pathname("")
 }
 
 /// `offset` as the system's file offset.

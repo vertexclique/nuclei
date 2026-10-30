@@ -363,8 +363,15 @@ impl ReadState {
             // The write side's.
             other => other.release(after),
         }
-        // The tasks waiting take what came, or ask again.
+        // The tasks waiting take what came, or ask again; a lent buffer
+        // that waits takes it first.
         self.want = 0;
+        if self.has_result()
+            && self.lent_idle()
+            && let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take())
+        {
+            after.wake_one(w);
+        }
         after.wake(&mut self.waiters);
     }
 }

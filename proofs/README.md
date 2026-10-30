@@ -503,7 +503,9 @@ taken in one order: a holder of the read side that sees the request bit tries th
 holder of the write side lets go first, then tries the read side once. Whoever performs the
 close marks it done, and whichever of the dropper's hand-over and that mark comes second drops
 the object. The close lingers: once the dropper is done, a task drains what the handle wrote
-through a copy of the descriptor, holding the write side; finding the close not performed yet,
+through a copy of the descriptor (or, where the process has no descriptor to spare for one, and
+on Windows, through the handle's own object, which the task keeps open until then), holding the
+write side; finding the close not performed yet,
 it waits on the write side, and the performer wakes the write side's waiters rather than
 forget them as it does the handle's others. 11 configurations: 2 that must pass
 (`NoUseOfClosed`, no holder uses a descriptor closed under it; `PerformedOnce`; `Closed`, once
@@ -633,6 +635,20 @@ while the side still counts it lent breaks `NoScribble`; a fill that wakes nobod
 deadlock), and 3 witnesses (the driver fills the buffer on an edge, the lender's own poll fills
 it at once, a lender that went away leaves its bytes to the read-ahead).
 
+`LentReadRing.tla` checks the same read on a ring (`read_owned` and `lent_idle` in
+`src/io/source/read.rs`, `submit_ops` and `op_done` in `src/io/source/read/ops.rs`), where a
+read is an operation the kernel completes later and a side has one out at a time. A plain read
+asks for one into a buffer of the pool and its task goes away while it is out; then a task reads
+with its own buffer until the stream ends. Its first lend finds the operation out, so none goes
+out for the buffer, and the operation completes into the read-ahead: the completion wakes the
+lender, whose buffer comes back to take those bytes before it is lent again. 6 configurations: 3
+that must pass (three bytes through a buffer of two and two through a buffer of one, with
+`Conservation`, `Order`, `NoScribble` and `AllTaken`, the lender takes every byte; and
+`Termination`), 2 mutations (a waiting buffer that stays lent while bytes wait in the read-ahead,
+and a completion that wakes only the plain readers, both leave the lender waiting forever: a
+deadlock), and 1 witness (the buffer comes back for the bytes the dropped read's operation
+brought).
+
 The write: the socket is full and a byte waits in the write-behind. The lending task lends a
 buffer of three bytes, which the driver writes after the write-behind as the peer makes room,
 and a later copied write waits until it is out. A lender that goes away has its write withdrawn
@@ -675,6 +691,22 @@ rule is checked for any path that moves the cursor back.
 
 The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
 rules on real sockets and files, each with a mutation of the code that makes one of them fail.
+
+## A datagram's sender
+
+`sender` (`tla/sender/Sender.tla`) checks that a receive on a Unix datagram socket names its
+sender without a descriptor (`unix_addr` and `unnamed` in `src/io/sys/unix.rs`, used by the
+receives of `src/io/source/read.rs` and `src/io/source/ring.rs`). A peer sends datagrams over a
+socket pair, whose ends have no name; a receive takes one from the kernel and then makes the
+sender's address for the task, while other code takes the process's last descriptors and gives
+them back. Once the kernel handed a datagram over it is the receive's, so naming its sender must
+not fail: the unnamed address is made from an empty path, with no socket. 4 configurations: 2
+that must pass (`Conservation`, no datagram lost, and `Order`; and `Termination`), 1 mutation
+(naming the sender by opening a socket, which fails with no descriptor free and loses the
+datagram the kernel handed over, breaks `Conservation`), and 1 witness (a receive names an
+unnamed sender while no descriptor is free). The Rust test
+`emfile::datagram_sockets_open_before_send_and_receive_with_no_descriptor_left` in
+`tests/faults/emfile.rs` receives on a real pair with no descriptor left.
 
 ## A caller's own descriptor
 
@@ -843,7 +875,8 @@ receives of idle peers and checks every other peer is answered.
 every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
 table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its
 submission to its completion. For every sequence of operations from a fresh table it proves
-that a free slot is held by nobody, named by no entry and holds no open copy (`inv_run`); that
+that a free slot is held by nobody, named by no entry and holds no open copy (`inv_run`, for a
+table of any size, as the process's descriptor limit sizes it); that
 a slot a source takes has no entry naming it, so an entry on its way never reaches the next
 source's file (`taken_slot_is_unnamed`); that a free slot is never freed again
 (`no_double_free`); and that a copy closes only once no source holds it and no entry names it

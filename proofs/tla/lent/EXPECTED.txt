@@ -11,6 +11,12 @@ MR_no_wake                     MC_LentRead          deadlock
 WR_driver_fill                 MC_LentRead          violated:NoDriverFill
 WR_submit_fill                 MC_LentRead          violated:NoSubmitFill
 WR_left_bytes                  MC_LentRead          violated:NoLeftBytes
+PRR_three                      MC_LentReadRing      pass
+PRR_one                        MC_LentReadRing      pass
+PRR_live                       MC_LentReadRing      pass
+MRR_skips_ahead                MC_LentReadRing      deadlock
+MRR_wakes_no_lender            MC_LentReadRing      deadlock
+WRR_took_ahead                 MC_LentReadRing      violated:NoTookAhead
 PW_two                         MC_LentWrite         pass
 PW_one                         MC_LentWrite         pass
 PW_stays                       MC_LentWrite         pass
