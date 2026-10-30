@@ -88,7 +88,7 @@ pub(crate) struct ShardRing {
     /// Completions of the last wait, reused.
     cqes: RefCell<Vec<IoUringCqe>>,
     /// The buffers multishot receives draw from; `None` when the
-    /// configuration asks for none.
+    /// configuration asks for none, or once the ring is shut down.
     recv: RefCell<Option<RecvGroup>>,
     /// Multishot receives and accepts submitted, the receives' arrivals,
     /// and the receives that ended as the group ran dry, for a test.
@@ -231,6 +231,14 @@ impl ShardRing {
     /// The size of the group's buffers, if the ring has a group.
     pub(crate) fn recv_buf_size(&self) -> Option<u32> {
         self.recv.borrow().as_ref().map(RecvGroup::buf_size)
+    }
+
+    /// The memory the ring's group takes (0 without one), charged to the shard's ledger.
+    pub(crate) fn recv_reservation(&self) -> usize {
+        self.recv
+            .borrow()
+            .as_ref()
+            .map_or(0, RecvGroup::reservation)
     }
 
     pub(crate) fn notifier(&self) -> Notifier {
@@ -656,7 +664,9 @@ impl ShardRing {
     /// is cancelled and its completion waited for, for at most
     /// [`SHUTDOWN_WAIT`]. One that never completes keeps its memory for
     /// good (the kernel may still write it), and is counted (`leaked`).
-    pub(crate) fn shut_down(&self) {
+    /// Returns the memory of the receive group it let go, for the shard's
+    /// ledger.
+    pub(crate) fn shut_down(&self) -> usize {
         let waiting: Vec<u64> = self.room.borrow_mut().drain(..).map(|(u, _)| u).collect();
         for user_data in waiting {
             // Never submitted: nothing points at its memory. A file's call
@@ -692,12 +702,19 @@ impl ShardRing {
         // descriptor for good, a child's wait its info and its pidfd.
         core::mem::forget(stuck_files);
         core::mem::forget(stuck_exits);
-        if !stuck.is_empty() {
+        let group = self.recv.borrow_mut().take();
+        let freed = if stuck.is_empty() {
+            let freed = group.as_ref().map_or(0, RecvGroup::reservation);
+            drop(group);
+            freed
+        } else {
             // A receive still in the kernel may write the group's buffers:
             // they stay registered and mapped for good.
-            core::mem::forget(self.recv.borrow_mut().take());
-        }
+            core::mem::forget(group);
+            0
+        };
         core::mem::forget(stuck);
+        freed
     }
 }
 

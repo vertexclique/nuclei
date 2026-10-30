@@ -69,9 +69,11 @@ pub struct ShardStats {
     /// room in the ring's completion queue (none is lost: the kernel keeps
     /// them until there is room); 0 on other backends (published).
     pub cq_overflows: u64,
-    /// Bytes the shard's buffer pool holds, in use and free (published).
+    /// Bytes the shard's IO buffers hold: its pool's, in use and free, and on
+    /// io_uring its receive buffers' (published).
     pub buffer_bytes: usize,
-    /// The most bytes the shard's buffer pool may hold.
+    /// The most bytes the shard's IO buffers may hold, its receive buffers
+    /// included ([`Builder::io_buffer_cap`](crate::Builder::io_buffer_cap)).
     pub buffer_cap: usize,
     /// Times a buffer was wanted while every byte under the pool's cap was
     /// in use; the IO waits for one to come back (published).

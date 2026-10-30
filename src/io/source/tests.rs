@@ -658,11 +658,11 @@ fn a_revival_with_the_same_descriptor_keeps_the_read_ahead() {
     });
 }
 
-/// A pool asked to hold nothing holds one small buffer: reads still
-/// complete, all through it, as it comes back for each.
+/// A pool given the least cap holds one small buffer beside the receive
+/// group: reads still complete, all through either, as each comes back.
 #[test]
 fn reads_complete_through_a_pool_of_one_small_buffer() {
-    let rt = runtime(Some(0));
+    let rt = runtime(Some(crate::rt::shard::least_buffer_cap()));
     let (a, b) = pair();
     let data = pattern(256 * 1024);
     let expected = data.clone();
@@ -748,7 +748,8 @@ fn a_thread_that_runs_no_shard_is_served_by_the_runtime() {
 /// or sent through it: the operation fails at once, saying what to raise.
 #[test]
 fn a_datagram_larger_than_the_pool_allows_fails_loudly() {
-    let rt = runtime(Some(64 * 1024));
+    let group = crate::rt::shard::least_buffer_cap() - crate::buf::CLASSES[0];
+    let rt = runtime(Some(group + 64 * 1024));
     let (a, b) = datagram_pair();
     let a = Owned::new(a, DATAGRAM);
     let b = Owned::new(b, DATAGRAM);

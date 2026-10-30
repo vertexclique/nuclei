@@ -799,7 +799,7 @@ pub(crate) fn whole_too_large(
                 std::io::ErrorKind::OutOfMemory,
                 format!(
                     "a datagram of {len} bytes needs more IO buffer memory than the runtime allows ({} bytes); raise `Builder::io_buffer_cap`",
-                    p.cap()
+                    p.room()
                 ),
             )
         })

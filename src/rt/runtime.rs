@@ -255,9 +255,15 @@ impl Builder {
     /// The most bytes each worker's IO buffers hold (default 64 MiB). Reads
     /// that had to wait land in these buffers, and writes that had to wait
     /// are copied into them; at the cap, IO waits for buffers to come back,
-    /// so a worker's IO memory never grows past it. Any value is accepted; a
-    /// request that cannot fit under a cap too small for it fails with an error
-    /// that names this setting.
+    /// so a worker's IO memory never grows past it. On io_uring the worker's
+    /// receive buffers count against the cap too
+    /// ([`recv_buffers`](crate::config::IoUringConfiguration::recv_buffers) of
+    /// [`recv_buffer_size`](crate::config::IoUringConfiguration::recv_buffer_size)
+    /// bytes, 4 MiB by default, with their descriptors), and the rest is
+    /// left for the others. A cap that leaves less than 512 bytes beside the
+    /// receive buffers is refused with `InvalidInput` when the worker starts;
+    /// otherwise any value is accepted, and a request that cannot fit under a
+    /// cap too small for it fails with an error that names this setting.
     pub fn io_buffer_cap(mut self, bytes: usize) -> Self {
         self.io_buffer_cap = Some(bytes);
         self
