@@ -516,7 +516,11 @@ impl ShardRing {
                             }
                             Some((source, chunk, epoch, datagram))
                         }
-                        None => None,
+                        // An id or a length outside the group: the buffer goes back.
+                        None => {
+                            group.give_back(bid, len, more);
+                            None
+                        }
                     }
                 }
                 // No bytes, or no receive to give them to: the buffer goes

@@ -94,3 +94,44 @@ fn a_long_stream_comes_whole_and_in_order_through_whole_buffers() {
 fn small_and_large_reads_mix_over_whole_buffers() {
     run(false, &[1, 7, 64 * 1024, 3, 1500, 256 * 1024, 1]);
 }
+
+/// A completion whose id or length lies outside the group is refused by
+/// `hand_out`, and giving the buffer back puts it with the kernel again.
+#[test]
+fn a_buffer_the_group_refuses_goes_back() {
+    use crate::rt::shard::recv::RecvGroup;
+    use crate::syscore::linux::iouring::ring::{Ring, RingConfig};
+    let Ok(ring) = Ring::new(&RingConfig::new(8)) else {
+        return;
+    };
+    for plain in [false, true] {
+        INCREMENTAL_FOR_TEST.with(|t| t.set(plain.then_some(false)));
+        let made = RecvGroup::new(&ring, 4, 4096);
+        INCREMENTAL_FOR_TEST.with(|t| t.set(None));
+        let Ok(mut group) = made else { return };
+        assert!(
+            group.hand_out(1, 4, 10, false).is_none(),
+            "an id past the group"
+        );
+        assert!(
+            group.hand_out(1, 0, 4097, false).is_none(),
+            "a length past the buffer"
+        );
+        assert_eq!(group.readded(), 0);
+        group.give_back(0, 4097, false);
+        assert_eq!(group.readded(), 1, "the refused buffer never went back");
+        group.give_back(9, 1, false);
+        assert_eq!(
+            group.readded(),
+            1,
+            "an id outside the group changes nothing"
+        );
+        // A refused piece of a buffer with room left keeps the buffer with the kernel.
+        if group.incremental() {
+            group.give_back(1, 100, true);
+            assert_eq!(group.readded(), 1);
+            group.give_back(1, 100, false);
+            assert_eq!(group.readded(), 2);
+        }
+    }
+}

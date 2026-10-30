@@ -64,6 +64,9 @@ pub(crate) struct RecvGroup {
     /// Bytes handed out in chunks not given back yet.
     #[cfg(test)]
     out: usize,
+    /// Buffers given to the kernel again since the group was made.
+    #[cfg(test)]
+    readded: usize,
 }
 
 /// One buffer of the group.
@@ -146,6 +149,8 @@ impl RecvGroup {
             incremental,
             #[cfg(test)]
             out: 0,
+            #[cfg(test)]
+            readded: 0,
         })
     }
 
@@ -241,6 +246,10 @@ impl RecvGroup {
             return false;
         }
         *fill = Fill::default();
+        #[cfg(test)]
+        {
+            self.readded += 1;
+        }
         // A full ring cannot happen: a buffer comes back once per
         // fill, so at most `entries` are added since the last commit.
         self.ring.add(bid).is_ok()
@@ -287,6 +296,11 @@ impl RecvGroup {
     /// The bytes of the chunks handed out and not given back yet.
     pub(crate) fn out(&self) -> usize {
         self.out
+    }
+
+    /// Buffers given to the kernel again so far.
+    pub(crate) fn readded(&self) -> usize {
+        self.readded
     }
 
     /// Chunks handed out and not given back yet, over all buffers.
