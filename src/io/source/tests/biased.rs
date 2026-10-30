@@ -112,6 +112,9 @@ fn a_foreign_poll_during_the_owners_write_leaves_the_write_whole() {
     let rt = runtime(None);
     let (a, b) = pair();
     home_on_worker(&rt, &a, &b);
+    // The socket takes no more before the write starts, so the write cannot
+    // go straight to it: it is left to the driver, and the task waits.
+    let filled = fill(a.io());
     let data = pattern(4 << 20);
     let pending = Arc::new(AtomicBool::new(false));
     let writer = {
@@ -130,7 +133,15 @@ fn a_foreign_poll_during_the_owners_write_leaves_the_write_whole() {
                 .unwrap();
                 at += n;
             }
-            flush(&src).await.unwrap();
+            within(poll_fn(|cx| {
+                let polled = src.poll_flush(cx);
+                if polled.is_pending() {
+                    seen.store(true, Ordering::SeqCst);
+                }
+                polled
+            }))
+            .await
+            .unwrap();
         })
     };
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -147,12 +158,19 @@ fn a_foreign_poll_during_the_owners_write_leaves_the_write_whole() {
     }
     // Read through the source: its driver reads ahead on the socket.
     let got = rt.block_on(async {
-        let mut got = vec![0u8; data.len()];
+        let mut got = vec![0u8; filled.len() + data.len()];
         within(read_exact(&b.src, &mut got)).await.unwrap();
         got
     });
     rt.block_on(writer);
-    assert!(got == data, "the write lost or reordered bytes");
+    assert!(
+        got[..filled.len()] == filled[..],
+        "the filled bytes were damaged"
+    );
+    assert!(
+        got[filled.len()..] == data[..],
+        "the write lost or reordered bytes"
+    );
 }
 
 /// The shard moves to a spare thread while a read and a write wait on it:
