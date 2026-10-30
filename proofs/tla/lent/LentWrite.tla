@@ -1,7 +1,8 @@
 ----------------------------- MODULE LentWrite -----------------------------
 (***************************************************************************)
 (* A stream write that lends the side the task's own buffer                *)
-(* (src/io/source/write.rs: `write_owned`, `push_lent`, `abandon_lent`).   *)
+(* (src/io/source/write/lent.rs: `write_owned`, `push_lent`,               *)
+(* `abandon_lent`).                                                        *)
 (*                                                                          *)
 (* In plain words: the socket's buffer is full and byte 1 waits in the    *)
 (* write-behind. The lending task hands the side its buffer, bytes 2 to 4; *)

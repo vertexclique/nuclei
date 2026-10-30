@@ -1,11 +1,12 @@
 //! A shard that stops running: for now (the outermost `block_on` of its
 //! thread returned) or for good (dropped). What it watches goes, each to be
 //! watched where its user polls next: the sources, each told; the
-//! children, each once its registration ended. A ring waits for the
-//! operations still out to end; a port hands them to a keeper. A source
-//! whose writes left bytes behind that the kernel has not taken goes to a
-//! task that writes them out where it runs, for no task of the handle's may
-//! poll that side again (`tla/going/Behind.tla`).
+//! children, each once its registration ended. A port hands the operations
+//! still out to a keeper; so does a ring another thread can reap, as its
+//! shard is dropped (`ring::keeper`), and any other ring waits for them a
+//! bounded time. A source whose writes left bytes behind that the kernel has
+//! not taken goes to a task that writes them out where it runs, for no task
+//! of the handle's may poll that side again (`tla/going/Behind.tla`).
 
 use core::future::poll_fn;
 use core::sync::atomic::Ordering;
@@ -170,14 +171,19 @@ impl Drop for Shard {
             crate::rt::runtime::spawn_on_worker(drain(source));
         });
         self.let_go_of_children();
-        // The ring's operations still out are cancelled and their
-        // completions waited for, so no memory they point at goes while the
-        // kernel may write it.
+        // The ring's operations still out are cancelled, and their completions waited for or
+        // left to a keeper, so no memory they point at goes while the kernel may write it.
         #[cfg(ring)]
         if let Driver::Ring(ring) = &self.driver {
-            // Cancels a holder of a source on another thread left here.
-            ring.settle(|| self.apply_io_ops());
-            self.pool.unreserve(ring.shut_down());
+            if ring.reapable() {
+                // Cancels a holder of a source on another thread left here; the keeper applies
+                // what comes later.
+                self.apply_io_ops();
+                ring.cancel_all();
+            } else {
+                ring.settle(|| self.apply_io_ops());
+                self.pool.unreserve(ring.shut_down());
+            }
         }
         // The port's operations to a keeper, unless one has them already.
         #[cfg(port)]
@@ -207,5 +213,33 @@ impl Drop for Shard {
         // pusher that saw the flag while the role was held left its
         // runnable to this drain.
         self.shared.drop_stopped(true);
+        #[cfg(ring)]
+        self.keep_ring();
+    }
+}
+
+impl Shard {
+    /// The shard is dropped: a ring another thread can reap goes to a keeper with what is still
+    /// out once the ready completions are applied. Where no keeper can be had, the shard waits
+    /// for them a bounded time, and what is still out keeps its memory for good.
+    #[cfg(ring)]
+    fn keep_ring(&mut self) {
+        // A ring no keeper can reap was shut down as the shard went.
+        let Driver::Ring(ring) = &self.driver else {
+            return;
+        };
+        if !ring.reapable() {
+            return;
+        }
+        // A look that fails leaves the ready completions to the keeper, whose wait meets the
+        // same failure and keeps what is out for good.
+        let looked = ring.wait(None, Some(std::time::Duration::ZERO)).is_ok();
+        if looked && ring.in_flight() == 0 {
+            return;
+        }
+        let Driver::Ring(ring) = core::mem::replace(&mut self.driver, Driver::Gone) else {
+            return;
+        };
+        super::ring::keeper::hand_off(ring, Arc::clone(&self.shared));
     }
 }

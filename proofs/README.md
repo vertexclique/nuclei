@@ -613,11 +613,12 @@ takes them.
 
 ## Reads and writes from a task's own buffer
 
-`lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`, `tla/lent/LentFile.tla`) checks
-`read_owned` and `write_owned` on streams (`src/io/source/read.rs`, `src/io/source/write.rs`),
-where the task hands the side its own buffer and the driver reads into it or writes from it
-with no copy, and on files (`src/fs/file.rs`), where the buffer goes to a job of the blocking
-pool. The guards are abstract here (a step under one runs whole; `side` checks the side's).
+`lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`, `tla/lent/LentFile.tla`,
+`tla/lent/LentZc.tla`) checks `read_owned`, `write_owned` and `write_zero_copy` on streams
+(`src/io/source/read.rs`, `src/io/source/write/lent.rs`), where the task hands the side its own
+buffer and the driver reads into it or writes from it with no copy, and on files
+(`src/fs/file.rs`), where the buffer goes to a job of the blocking pool. The guards are abstract
+here (a step under one runs whole; `side` checks the side's).
 
 The read: bytes arrive in order, each with an edge, and then the stream ends. The lending task
 takes what another read left first (bytes, or the end); otherwise it lends its buffer, which
@@ -689,8 +690,52 @@ whose shard went finished on the pool, an append after the seek landing at the e
 seek needs the handle exclusively, so it cannot overlap a read; the model lets it, so the epoch
 rule is checked for any path that moves the cursor back.
 
+The zero-copy write (`LentZc.tla`): `TcpStream::write_zero_copy` (`src/net/stream.rs`,
+`src/io/source/write/calls.rs`), its chunks (`lent_want`, `submit_ops` and `lent_back` in
+`src/io/source/write/ops.rs`, `entry` in `src/io/source/ring.rs`), the buffer its sends share
+(`src/io/source/write/pinned.rs`), the `Released` it hands back (`src/net/released.rs`), the
+ring's side of it (`ShardRing::zero_copy` and `reapable` in `src/rt/shard/ring.rs`), and the
+shard's drop (`src/rt/shard/going.rs`) with the ring's keeper (`hand_off` and `keep` in
+`src/rt/shard/ring/keeper.rs`). A task writes a buffer of three units and then one of one unit,
+each with zero-copy sends of at most two units, one chunk at a time, and then reads what its peer
+wrote; the peer writes to the task before it reads anything. For each chunk the kernel takes what
+the socket has room for (or fewer: a short count) and posts a first completion, then keeps reading
+the task's memory until it lets go of every unit it took (once the peer read it, or earlier if the
+network acknowledged it, which may never happen) and posts the chunk's notification, as separate
+steps. The side counts the first completion and sends the next chunk from where the kernel
+stopped; the write ends for the task once every unit was counted, so its next write may go out
+while the first buffer is still pinned. The buffer comes back through its `Released` once the last
+hold on it let go: the lent write's, and each send's until its notification. The task may drop a
+`Released`, go away while its first buffer is lent, or see a send fail. The shard may go once both
+writes ended, with notifications still out: its ring goes to a keeper, which applies the ring's
+completions until none is out. Only a ring another thread can reap sends zero-copy; on any other
+every chunk is copied, and lets go of the buffer at its completion. 27 configurations: 10 that
+must pass (both ends writing before they read with the bytes fitting the socket; a socket of one
+unit, so every chunk is cut short, with dropped `Released`s and failures; a task that may go away;
+a shard that may go; and a ring only its own thread may reap; with `WireOrder`, the units in
+order, each once, and a withdrawn write not at all; `Delivered`, the stream whole at the end, or
+for a task that went the first buffer whole or not at all; `NoScribble`, no buffer handed back or
+freed while the kernel may read it; and `Finishes`, every write ends and every buffer comes back,
+for each), 9 mutations (a side that gets the first completion only with the notification, the bug
+that shipped in `write_owned`, keeps the exchange from finishing; a shard that goes with no
+keeper, its sends keeping what they hold for good (the bounded wait and forget the keeper
+replaced), and a ring only its own thread may reap sending zero-copy, keep a `Released` from
+resolving, breaking `Finishes`; a buffer handed back as the write ends, a dropped `Released` that
+frees the buffer at once, and sends that let go of their buffers as the shard goes break
+`NoScribble`; a short count sent again from the start, a chunk sent before the previous one
+completed, and a started write withdrawn when its task goes break `WireOrder`), and 8 witnesses (a
+write that pipelines behind a pinned buffer, a short count, a buffer freed at its last
+notification after its `Released` was dropped, a withdrawn write, an abandoned write finished, a
+send still holding its buffer as the shard went, a notification the keeper applied, a failed send
+whose buffer waits for its notification).
+
 The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
 rules on real sockets and files, each with a mutation of the code that makes one of them fail.
+`src/net/tests/zero_copy.rs` and `src/rt/shard/ring/tests_zc.rs` check the zero-copy write on real
+sockets: both ends that write before they read finish, the buffer comes back whole only after the
+notifications, a dropped `Released` and a dropped write, pipelined writes, a shard and a runtime
+that go while a notification waits for a peer that reads only after (the buffer comes back once it
+read, and nothing waits for it), and a ring only its own thread may reap copying.
 
 ## A datagram's sender
 
@@ -741,7 +786,7 @@ each case on both Linux backends, and the three code mutations fail it.
 ## A source's operations on its shard's ring
 
 `ring` (`tla/ring/RingOp.tla`) checks how a side of a source works on an io_uring ring
-(`src/io/source/ring.rs`, `src/io/source/write/ring.rs`, `src/rt/shard/ring.rs`) when the
+(`src/io/source/ring.rs`, `src/io/source/write/ops.rs`, `src/rt/shard/ring.rs`) when the
 side is held from another thread than the ring's. A task there writes twice; each write is
 accepted into the side, and the side's operation goes to the ring one at a time. Only the
 ring's own thread submits: a task elsewhere posts a kick once it has let go of the side, and

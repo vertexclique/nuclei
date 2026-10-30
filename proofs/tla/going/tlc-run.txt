@@ -1,23 +1,16 @@
-TLC run of every configuration in proofs/tla/going, 2026-10-30 17:30 UTC.
+TLC run of every configuration in proofs/tla/going, 2026-10-30 19:54 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 2, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-G_alone                             49         26      1  pass                                  pass                                  yes
-G_held                              42         28      2  pass                                  pass                                  yes
-G_failed                            30         16      1  pass                                  pass                                  yes
-G_failed_held                      127         67      1  pass                                  pass                                  yes
-M_token_only                        47         26      1  violated:AllEnd                       violated:AllEnd                       yes
-M_keep_home                         13          8      1  violated:AllEnd                       violated:AllEnd                       yes
-M_no_wait                           12         10      2  violated:NoStrandedOp                 violated:NoStrandedOp                 yes
-W_collision                         19         13      2  violated:NoCollision                  violated:NoCollision                  yes
-W_held                               5          5      2  violated:NoHolderEvict                violated:NoHolderEvict                yes
-B_poller                             8          8      1  pass                                  pass                                  yes
-B_port                              15         12      2  pass                                  pass                                  yes
-B_ring                              24         17      1  pass                                  pass                                  yes
-M_no_drain                           8          6      2  violated:AllSent                      violated:AllSent                      yes
-M_no_register                        4          4      1  violated:AllSent                      violated:AllSent                      yes
-M_no_wake                           13         11      2  violated:AllSent                      violated:AllSent                      yes
-W_moves                              4          4      1  violated:NoMove                       violated:NoMove                       yes
+G_alone                             49         26      4  pass                                  pass                                  yes
+G_held                              42         28      3  pass                                  pass                                  yes
+G_failed                            30         16      4  pass                                  pass                                  yes
+G_failed_held                      127         67      4  pass                                  pass                                  yes
+M_token_only                        47         26      4  violated:AllEnd                       violated:AllEnd                       yes
+M_keep_home                         13          8      3  violated:AllEnd                       violated:AllEnd                       yes
+M_no_wait                           12         10      5  violated:NoStrandedOp                 violated:NoStrandedOp                 yes
+W_collision                         19         13      3  violated:NoCollision                  violated:NoCollision                  yes
+W_held                               5          5      3  violated:NoHolderEvict                violated:NoHolderEvict                yes
 
-results matching EXPECTED.txt: 16 of 16
+results matching EXPECTED.txt: 9 of 9

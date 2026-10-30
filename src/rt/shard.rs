@@ -429,6 +429,10 @@ enum Driver {
     /// A ring: the sources' IO is its operations.
     #[cfg(ring)]
     Ring(ring::ShardRing),
+    /// The ring went to a keeper as the shard went (`ring::keeper`): only the shard's drop sees
+    /// this.
+    #[cfg(ring)]
+    Gone,
 }
 
 /// The part of a shard its own thread owns.
@@ -587,6 +591,8 @@ impl Shard {
         let made = match &driver {
             #[cfg(ring)]
             Driver::Ring(ring) => ring.recv_reservation(),
+            #[cfg(ring)]
+            Driver::Gone => 0,
             Driver::Poll(_) => 0,
         };
         pool.unreserve(reserved.saturating_sub(made));
@@ -893,6 +899,8 @@ impl Shard {
             }
             #[cfg(ring)]
             Driver::Ring(ring) => ring.wait(Some(self), timeout).map(|(handled, _)| handled),
+            #[cfg(ring)]
+            Driver::Gone => Ok(0),
         }
     }
 
@@ -927,7 +935,7 @@ impl Shard {
     pub(crate) fn ring(&self) -> Option<&ring::ShardRing> {
         match &self.driver {
             Driver::Ring(ring) => Some(ring),
-            Driver::Poll(_) => None,
+            Driver::Poll(_) | Driver::Gone => None,
         }
     }
 

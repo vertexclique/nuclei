@@ -14,7 +14,7 @@ use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::{self as unix, UnixDatagram};
+use std::os::unix::net as unix;
 use std::path::Path;
 
 /// A std socket of type `S` over `fd` for one call, never closed by it.
