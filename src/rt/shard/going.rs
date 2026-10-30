@@ -2,8 +2,12 @@
 //! thread returned) or for good (dropped). What it watches goes, each to be
 //! watched where its user polls next: the sources, each told; the
 //! children, each once its registration ended. A ring waits for the
-//! operations still out to end; a port hands them to a keeper.
+//! operations still out to end; a port hands them to a keeper. A source
+//! whose writes left bytes behind that the kernel has not taken goes to a
+//! task that writes them out where it runs, for no task of the handle's may
+//! poll that side again (`tla/going/Behind.tla`).
 
+use core::future::poll_fn;
 use core::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -28,7 +32,12 @@ impl Shard {
     /// and this, its own shard, runs again only at its next one.
     pub(crate) fn leave(&self) {
         let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
-        evict_all(gone, self.shared_addr());
+        evict_all(&gone, self.shared_addr());
+        // On a worker, or with none on this thread's shard, which runs it at
+        // the thread's next `block_on`, as any task spawned here.
+        drain_unsent(&gone, |source| {
+            crate::runtime::spawn(drain(source)).detach()
+        });
         self.let_go_of_children();
         // Sources that went before (a dropped handle's) may have left a
         // cancel queued, or their operations still out.
@@ -50,11 +59,24 @@ impl Shard {
 /// holder as it lets go, which comes a driver call later; until then the
 /// holder may still hand this shard's driver an operation, so the
 /// operations out here are only known once every eviction happened.
-fn evict_all(gone: Vec<(u64, Arc<Source>)>, home: usize) {
-    for (_, source) in &gone {
+fn evict_all(gone: &[(u64, Arc<Source>)], home: usize) {
+    for (_, source) in gone {
         source.evict();
     }
-    wait_for_evictions(&gone, home);
+    wait_for_evictions(gone, home);
+}
+
+/// Hands each source of `gone`, evicted, whose write side holds bytes the
+/// kernel has not taken to `spawn`, for a task that writes them out.
+fn drain_unsent(gone: &[(u64, Arc<Source>)], spawn: impl Fn(Arc<Source>)) {
+    gone.iter()
+        .filter(|(_, source)| source.has_unsent())
+        .for_each(|(_, source)| spawn(Arc::clone(source)));
+}
+
+/// Writes out what the write side of `source` holds, on the shard it runs on.
+async fn drain(source: Arc<Source>) {
+    poll_fn(|cx| source.poll_drain(cx)).await;
 }
 
 /// Waits until no source of `gone` is registered under its token with the
@@ -141,7 +163,12 @@ impl Drop for Shard {
         // The sources registered here lose their driver: each is told, and
         // registers where it is polled next.
         let gone: Vec<(u64, Arc<Source>)> = self.sources.get_mut().drain_tokens().collect();
-        evict_all(gone, self.shared_addr());
+        evict_all(&gone, self.shared_addr());
+        // With no worker taking tasks the runtime is going: the bytes wait
+        // for the side's next poll.
+        drain_unsent(&gone, |source| {
+            crate::rt::runtime::spawn_on_worker(drain(source));
+        });
         self.let_go_of_children();
         // The ring's operations still out are cancelled and their
         // completions waited for, so no memory they point at goes while the

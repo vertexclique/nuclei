@@ -6,6 +6,22 @@ use super::*;
 use crate::io::Handle;
 use crate::io::side::After;
 
+/// Waits, the pause doubling up to 5 ms, until `done` gives a value; at the
+/// deadline it fails with `what`.
+#[cfg(unix)]
+fn until_some<T>(what: &str, mut done: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pause = Duration::from_micros(50);
+    loop {
+        if let Some(value) = done() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(5));
+    }
+}
+
 /// The peer of a socket, polled once: still open (nothing to read), or at
 /// its end.
 fn peer_sees_end(peer: &Stream) -> bool {
@@ -188,7 +204,10 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
         }
     });
     phase.store(1, Ordering::SeqCst);
-    let held = src.read.try_hold().expect("the read side is free");
+    // The runtime took the bytes behind over as `block_on` returned: its
+    // drain task may hold a side for a moment, and then performs the close
+    // as it lets go.
+    let held = until_some("the read side never came free", || src.read.try_hold());
     let copy = src.duplicate().expect("a copy of the descriptor");
     src.close(mine, Some(copy.as_raw_fd()));
     let waker = Waker::from(Arc::clone(&woken));
@@ -201,10 +220,9 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
     let mut after = After::default();
     held.release(&mut after, &src.hooks());
     after.run();
-    assert!(
-        woken.0.load(Ordering::SeqCst),
-        "the drain waiting before the close was never woken"
-    );
+    until_some("the drain waiting before the close was never woken", || {
+        woken.0.load(Ordering::SeqCst).then_some(())
+    });
     phase.store(3, Ordering::SeqCst);
     drop(peer);
     src.close(copy, None);

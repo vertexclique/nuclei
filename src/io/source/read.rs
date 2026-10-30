@@ -164,6 +164,10 @@ pub(super) struct ReadState {
     /// Urgent data or a hangup was reported: a short read may leave bytes
     /// behind it from now on (see [`drained`]).
     unsure: bool,
+    /// The last accept failed for want of a descriptor: the next one looks
+    /// for a free one first (see [`ReadState::accept_checked`]).
+    #[cfg(readiness)]
+    short_of_fds: bool,
     /// The source's epoch this state is of.
     epoch: u32,
     /// Edges (and, on a ring, polls that completed) since the source was
@@ -577,19 +581,37 @@ impl ReadState {
     fn accept_ahead(&mut self, fd: RawFd, kind: Kind) {
         let limit = self.waiters.len().clamp(1, BATCH);
         while self.accepted.len() < limit {
-            match sys::ready(accept(fd, kind)) {
+            match sys::ready(self.accept_checked(fd, kind)) {
                 None => {
                     self.blocked = true;
                     break;
                 }
-                Some(Ok((conn, peer))) => self.accepted.push_back((conn, Peer::Known(peer))),
+                Some(Ok((conn, peer))) => {
+                    self.short_of_fds = false;
+                    self.accepted.push_back((conn, Peer::Known(peer)));
+                }
                 Some(Err(err)) => {
                     crate::rt::counters::accept_error(&err);
+                    self.short_of_fds = crate::rt::counters::out_of_descriptors(&err);
                     self.error = Some(err);
                     break;
                 }
             }
         }
+    }
+
+    /// An accept from the listener `fd`; after one that failed for want of a
+    /// descriptor, only once a copy of `fd` (closed at once) says one is free.
+    /// On macOS an accept that finds none closes the connection it took off
+    /// the backlog (XNU's `accept_nocancel`, bsd/kern/uipc_syscalls.c), so a
+    /// retry while none is free would close one connection each; the copy's
+    /// EMFILE leaves the backlog whole (proofs/tla/accept).
+    #[cfg(readiness)]
+    fn accept_checked(&self, fd: RawFd, kind: Kind) -> io::Result<(Owned, Addr)> {
+        if self.short_of_fds {
+            drop(sys::duplicate(fd)?);
+        }
+        accept(fd, kind)
     }
 
     /// The tasks waiting asked for buffers big enough to read into directly,

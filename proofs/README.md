@@ -834,21 +834,30 @@ shard that goes with one, each with a mutation of the code that makes one of the
 
 `accept` (`tla/accept/AcceptStream.tla`) checks the stream `TcpListener::accept_multi` gives
 (`TcpStreamGenerator::poll_next` in `src/net/tcp.rs`, `out_of_descriptors` in
-`src/rt/counters.rs`) when the process runs out of descriptors. Peers connect into the backlog;
-the rest of the process may take every free descriptor for a while and gives them back in the
-end. A poll asks the listener for the next connection: one there and a descriptor free, it is
-accepted and the stream's pause starts over at its least; out of descriptors (EMFILE or ENFILE),
-the connection stays in the backlog and the stream waits on a timer for its pause, which then
-doubles up to its most, and asks again when the timer fires; any other error ends the stream.
-The side hands an error over once and the connections queued before it first, so a retry asks
-the listener afresh. Time is the ticks left on the timer. 7 configurations: 3 that must pass (two
-and three connections across two outages, with `NoBusyLoop`, at most one EMFILE between two ticks,
-`FirstWaitLeast`, the first pause after an accept is the least, and `AllServed`, the whole backlog
-accepted once descriptors are free again; and an outage followed by another error of the
-listener, with `OtherEnds`, the stream ends, and `NothingAfterEnd`), 3 mutations (the stream that
-ended on EMFILE, as it did before, breaks `AllServed`; a retry with no timer breaks `NoBusyLoop`;
-a pause that does not start over after an accept breaks `FirstWaitLeast`), and 1 witness (a retry
-after a pause that accepts a connection).
+`src/rt/counters.rs`), and the accept under it on a readiness poller (`ReadState::accept_ahead`
+and `accept_checked` in `src/io/source/read.rs`), when the process runs out of descriptors.
+Peers connect into the backlog; the rest of the process may take every free descriptor for a
+while and gives them back in the end. A poll asks the listener for the next connection: one
+there and a descriptor free, it is accepted and the stream's pause starts over at its least; out
+of descriptors (EMFILE or ENFILE), the stream waits on a timer for its pause, which then doubles
+up to its most, and asks again when the timer fires; any other error ends the stream. On macOS an
+accept that fails for want of a descriptor closes the connection it took off the backlog
+(`Drops`), so after one the side first copies the listener's descriptor and closes the copy: none
+free, it answers EMFILE and takes nothing; one free, it accepts, though the rest of the process
+may take the last descriptor in between. The side hands an error over once and the connections
+queued before it first, so a retry asks the listener afresh. Time is the ticks left on the timer.
+11 configurations: 4 that must pass (two and three connections across two outages, with
+`NoBusyLoop`, at most one EMFILE between two ticks, `FirstWaitLeast`, the first pause after an
+accept the least, `LostPerOutage`, no more connections closed than outages began, and
+`AllServed`, every connection accepted once descriptors are free again or closed by a failed
+accept; the same on macOS, where a failed accept closes the connection it took; and an outage
+followed by another error of the listener, with `OtherEnds`, the stream ends, and
+`NothingAfterEnd`), 5 mutations (the stream that ended on EMFILE, as it did before, breaks
+`AllServed`; a retry with no timer breaks `NoBusyLoop`; a pause that does not start over after an
+accept breaks `FirstWaitLeast`; on macOS a retry with no check for a free descriptor, as before,
+and a failed accept that does not mark the side for that check, break `LostPerOutage`), and 2
+witnesses (a retry after a pause that accepts a connection; a check that found a descriptor free
+and an accept that still closed a connection, the race the check cannot close).
 
 ## The timer wheel
 
@@ -921,6 +930,21 @@ that one's receive waits for this shard's cancel, `AllEnd`; a failed attach that
 shard, `AllEnd`; no wait, which lands the holder's cancel after the shard has gone,
 `NoStrandedOp`); and 2 witnesses (the other shard's registration under the same number while
 the shard waits; a holder's eviction).
+
+`Behind` (`tla/going/Behind.tla`) checks the bytes a source's writes took into its write-behind
+when the shard that drove them goes (`Shard::leave` and `drain_unsent` in
+`src/rt/shard/going.rs`, `Source::poll_drain`, `WriteState::submit_ops` and `op_done`,
+`attach_port` and `waits_for_ops`): no task of the handle's may poll that side again, so the
+shard hands a source that still holds bytes to a drain task on a worker. The task looks each
+time it is woken: with nothing left it ends; registered nowhere with nothing out, it registers
+the source with its worker, whose driver writes the bytes out; with an operation still out (a
+port's TCP send, which the eviction never cancels, or a ring's send it cancels, which may come
+back undone) it waits for that operation's end, which wakes it. 7 configurations: 3 that must
+pass (a readiness poller with every byte behind, a port with a send out, a ring with a send
+cancelled), with `Conserved`, no byte lost or sent twice, `AllSent`, every byte reaches the
+kernel, and `DrainEnds`; 3 mutations (no drain task, as before, which left the peer waiting for
+good, `AllSent`; a drain task that does not register the source, `AllSent`; an operation's end
+that wakes nobody, `AllSent`); and 1 witness (the drain task moves the source to the worker).
 
 ## A blocking job of a Windows handle
 

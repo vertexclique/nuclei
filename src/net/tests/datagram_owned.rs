@@ -2,10 +2,24 @@
 //! buffer, truncation, and a receive dropped mid-wait.
 
 use super::*;
+use crate::io::IoObject;
+use crate::net::opt;
+
+/// Socket buffers that hold the largest datagram these tests send: macOS
+/// refuses a datagram larger than the send buffer (by default 9216 bytes for
+/// UDP and 2048 for a Unix socket) and a Unix socket's default 4096-byte
+/// receive buffer holds none of the large ones.
+fn room_for_large<T: IoObject>(socket: &Handle<T>) {
+    for name in [opt::SO_SNDBUF, opt::SO_RCVBUF] {
+        opt::set_size(socket.get_ref().raw_io(), opt::SOL_SOCKET, name, 256 << 10).unwrap();
+    }
+}
 
 async fn udp_pair() -> (Handle<UdpSocket>, Handle<UdpSocket>) {
     let a = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
     let b = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+    room_for_large(&a);
+    room_for_large(&b);
     (a, b)
 }
 
@@ -20,10 +34,11 @@ fn udp_owned_datagrams_arrive_whole() {
             let recv = b.recv_from_owned(Vec::with_capacity(65_536));
             let send = async {
                 crate::time::sleep(Duration::from_millis(2)).await;
-                a.send_to_owned(data.clone(), b_addr).await
+                let (sent, back) = a.send_to_owned(data.clone(), b_addr).await;
+                assert_eq!(sent.unwrap(), len);
+                back
             };
-            let ((got, buf), (sent, back)) = within(join(recv, send)).await;
-            assert_eq!(sent.unwrap(), len);
+            let ((got, buf), back) = within(join(recv, send)).await;
             assert_eq!(back, data);
             let (n, from) = got.unwrap();
             assert_eq!((n, from), (len, a_addr));
@@ -118,15 +133,16 @@ fn unix_datagram_owned_calls_arrive_whole() {
         let (pa, pb) = (dir.join("a"), dir.join("b"));
         let a = Handle::<UnixDatagram>::bind(&pa).unwrap();
         let b = Handle::<UnixDatagram>::bind(&pb).unwrap();
+        room_for_large(&a);
+        room_for_large(&b);
         for len in [0usize, 5, 3000, 60_000] {
             let data = pattern(len);
             let recv = b.recv_from_owned(Vec::with_capacity(65_536));
             let send = async {
                 crate::time::sleep(Duration::from_millis(2)).await;
-                a.send_to_owned(data.clone(), &pb).await
+                assert_eq!(a.send_to_owned(data.clone(), &pb).await.0.unwrap(), len);
             };
-            let ((got, buf), (sent, _)) = within(join(recv, send)).await;
-            assert_eq!(sent.unwrap(), len);
+            let ((got, buf), ()) = within(join(recv, send)).await;
             let (n, from) = got.unwrap();
             assert_eq!(n, len);
             assert_eq!(from.as_pathname(), Some(pa.as_path()));

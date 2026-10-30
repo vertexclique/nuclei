@@ -40,6 +40,11 @@ impl Handle<TcpListener> {
 
     /// The next connection, with its peer's address.
     ///
+    /// On macOS an accept that finds the process out of descriptors closes
+    /// the connection it took off the backlog, as the system's own does; the
+    /// next ones fail with the same error and take none until a descriptor
+    /// is free.
+    ///
     /// # Errors
     ///
     /// As `accept(2)`: a connection reset before it was taken, or the
@@ -85,7 +90,9 @@ impl Handle<TcpListener> {
     /// the listener, so it may outlive this handle. A connection reset before
     /// it was taken is skipped, and so is the process having no descriptor
     /// left to accept into: the stream waits, with a growing pause, until
-    /// there is one, and the connections wait in the listener's backlog.
+    /// there is one, and the connections wait in the listener's backlog (on
+    /// macOS but for the one the first accept to find none took, which the
+    /// system closes, as [`accept`](Self::accept) says).
     /// Any other error ends the stream, and
     /// [`TcpStreamGenerator::take_error`] says what it was.
     ///
