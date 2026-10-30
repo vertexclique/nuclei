@@ -1032,15 +1032,20 @@ it); each compare-and-swap of an attempt, an enqueue, a release, the owe-or-take
 settling, a withdrawal and the close; and the drain's passes, each grant and each nudge. The
 spin before queueing is abstract (more attempts of the kind other callers' barging already
 makes), so is the node's waker handshake (the waiter machinery's part), and so is the list's
-sweep of withdrawn waiters (one step). 15 configurations: 6 that must
-pass (a mutex locked three times past one wait; two tasks locking twice each; a wait given up
+sweep of withdrawn waiters (one step). States that differ only in what nobody reads again are one
+state: a pass's working values start over once read for the last time, and a node its future and
+the queue are both done with is forgotten. 16 configurations: 7 that must
+pass (a mutex locked three times past one wait; two tasks locking twice each, and one task locking
+twice beside one locking once, where every task's ending is checked too; a wait given up
 between two locks, with a handoff owed from the first loss; the same with two tasks, where every
 task's ending is checked too; two permits with a request for both behind requests for one; a close
 while two tasks lock), with the permits always adding up (`Conservation`) and all back at the end,
 one holder at a time for a mutex, no waiter passed over more than `MAX_BYPASS` times while it
 waits (`BypassBounded`), nobody barging while the handoff bit is up, nothing admitted after the
 close, no waiter left on the arrival stack once the drain role is free (`NoStrandedArrival`), and
-every task ending; 6 mutations (a release that never asks for a pass leaves a waiter for good,
+every task ending; the two tasks locking twice each and the wait given up between two locks check
+each state once up to the names of the tasks that run the same program (a symmetry set,
+`MC_SemaphoreSym.tla`); 6 mutations (a release that never asks for a pass leaves a waiter for good,
 `AllTasksEnd`; a drain that gives up its role over a change made during its pass strands a
 waiter that queued meanwhile, `NoStrandedArrival`; the last allowed loss raising no handoff lets
 the waiter be passed over again, `BypassBounded`; an attempt that ignores the handoff bit barges
