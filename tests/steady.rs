@@ -72,6 +72,9 @@ static ALLOCATOR: Live = Live;
 /// zero on both Linux backends.
 const SLACK: isize = 16 * 1024;
 
+/// How long the live bytes get to come down to the slack after the rounds.
+const SETTLE: Duration = Duration::from_secs(5);
+
 /// The descriptors this process holds open.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn open_handles() -> usize {
@@ -103,10 +106,10 @@ struct Watch<'a> {
 }
 
 impl Watch<'_> {
-    /// Submits what every worker and this thread retired to reclamation.
-    /// kovan batches 64 retired nodes a thread, and a worker that popped a
-    /// queue's segments keeps them until its batch fills, 100 KB of
-    /// 1600-byte segments, so the live bytes swing with where the batch
+    /// Submits what every worker, the blocking pool and this thread retired
+    /// to reclamation. kovan batches 64 retired nodes a thread, and a worker
+    /// that popped a queue's segments keeps them until its batch fills, 100
+    /// KB of 1600-byte segments, so the live bytes swing with where the batch
     /// stands. Tasks flush the workers they land on until every worker has.
     fn reclaim(&self) {
         if let Some(rt) = self.rt {
@@ -142,8 +145,28 @@ impl Watch<'_> {
                     }
                 }
             }
+            rt.block_on(rt.spawn_blocking(kovan::flush));
         }
         kovan::flush();
+    }
+
+    /// The live bytes above `bytes` once what was retired is reclaimed. A
+    /// batch a thread submitted is freed when the threads that held a view
+    /// of it have moved on, which takes them another turn, so the count is
+    /// taken again after each pass until it is within the slack or `SETTLE`
+    /// has passed. A leak does not shrink.
+    fn grew_since(&self, bytes: isize) -> isize {
+        let deadline = std::time::Instant::now() + SETTLE;
+        let mut pause = Duration::from_millis(1);
+        loop {
+            self.reclaim();
+            let grew = LIVE.load(Ordering::Relaxed) - bytes;
+            if grew <= SLACK || std::time::Instant::now() >= deadline {
+                return grew;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(50));
+        }
     }
 
     /// Runs `round` `warm` times, then `rounds` more, and checks that the
@@ -158,13 +181,12 @@ impl Watch<'_> {
         for _ in 0..rounds {
             round();
         }
-        self.reclaim();
-        let (handles_after, bytes_after) = (open_handles(), LIVE.load(Ordering::Relaxed));
+        let grew = self.grew_since(bytes);
+        let handles_after = open_handles();
         assert!(
             handles_after <= handles,
             "{name}: {handles} open handles after the warm-up, {handles_after} after {rounds} more rounds"
         );
-        let grew = bytes_after - bytes;
         assert!(
             grew <= SLACK,
             "{name}: {grew} live bytes more after {rounds} rounds than after the warm-up"
