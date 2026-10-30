@@ -341,6 +341,7 @@ impl Builder {
             keep_alive: self.blocking_keep_alive.unwrap_or(DEFAULT_KEEP_ALIVE),
             stack_size: self.thread_stack_size,
             name: blocking_name,
+            cpu_mask: current_mask(),
         });
         static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (exit_tx, exits) = kovan_channel::unbounded();
@@ -915,16 +916,12 @@ pub(crate) fn spawn_blocking_inside(f: impl FnOnce() + Send + 'static) -> bool {
 pub(crate) fn allowed_cores() -> Vec<usize> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: a plain syscall into a zeroed set of our own.
-        unsafe {
-            let mut set: libc::cpu_set_t = core::mem::zeroed();
-            if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-                return (0..libc::CPU_SETSIZE as usize)
-                    .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
-                    .collect();
-            }
-        }
-        Vec::new()
+        current_mask().map_or_else(Vec::new, |set| {
+            (0..libc::CPU_SETSIZE as usize)
+                // SAFETY: a plain read of a set of our own.
+                .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+                .collect()
+        })
     }
     #[cfg(windows)]
     {
@@ -942,6 +939,37 @@ pub(crate) fn allowed_cores() -> Vec<usize> {
     {
         Vec::new()
     }
+}
+
+/// A thread's CPU affinity mask.
+#[cfg(target_os = "linux")]
+pub(crate) type CpuMask = libc::cpu_set_t;
+/// A thread's CPU affinity mask; none is kept where threads are not pinned.
+#[cfg(not(target_os = "linux"))]
+pub(crate) type CpuMask = ();
+
+/// The calling thread's affinity mask, `None` where it is not known.
+pub(crate) fn current_mask() -> Option<CpuMask> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain syscall into a zeroed set of our own.
+        unsafe {
+            let mut set: libc::cpu_set_t = core::mem::zeroed();
+            (libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) == 0).then_some(set)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// Runs the calling thread on `mask`. A failure leaves the mask it had,
+/// which costs locality and nothing else.
+pub(crate) fn apply_mask(mask: &CpuMask) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: a plain syscall with a set of our own.
+    let _ = unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), mask) };
+    #[cfg(not(target_os = "linux"))]
+    let _ = mask;
 }
 
 /// Pins the calling thread to `core` (Linux, Windows). A failure leaves it
