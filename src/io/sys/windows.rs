@@ -19,7 +19,7 @@ use crate::syscore::windows::{
     FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT,
     FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType,
     HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, NtQueryInformationFile,
-    OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_TYPE,
+    OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
     SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
     SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
@@ -211,6 +211,18 @@ pub(crate) fn bind_any(raw: Raw, family: u16) -> io::Result<()> {
     match check(unsafe { bind(socket_of(raw), core::ptr::from_ref(&storage).cast(), len) }) {
         Err(err) if err.raw_os_error() == Some(crate::syscore::windows::WSAEINVAL) => Ok(()),
         other => other,
+    }
+}
+
+/// The error Winsock's own check gives a datagram of `len` bytes on the
+/// socket `raw` before it sends it: longer than the socket's
+/// `SO_MAX_MSG_SIZE`.
+pub(crate) fn datagram_too_long(raw: Raw, len: usize) -> Option<io::Error> {
+    match int_option(raw, SO_MAX_MSG_SIZE) {
+        Ok(max) => usize::try_from(max)
+            .is_ok_and(|max| len > max)
+            .then(|| io::Error::from_raw_os_error(crate::syscore::windows::WSAEMSGSIZE)),
+        Err(err) => Some(err),
     }
 }
 

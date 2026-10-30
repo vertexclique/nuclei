@@ -611,6 +611,7 @@ impl PoolBuf {
     }
 
     /// Fills the buffer with `bytes` (as many as fit); returns how many.
+    #[cfg(any(completion, test))]
     pub(crate) fn fill_from(&mut self, bytes: &[u8]) -> usize {
         let n = bytes.len().min(self.capacity());
         self.spare()[..n].copy_from_slice(&bytes[..n]);

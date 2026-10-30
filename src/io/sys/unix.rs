@@ -579,25 +579,13 @@ fn connect_raw(fd: RawFd, addr: *const libc::sockaddr, len: libc::socklen_t) -> 
     }
 }
 
-/// A datagram from a UDP socket, with its sender.
-pub(crate) fn recv_from_udp(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-    // SAFETY: see `borrow`; the fd is a UDP socket.
-    let socket = unsafe { borrow::<UdpSocket>(fd) };
-    retry(|| socket.recv_from(buf))
-}
-
-/// A datagram from a Unix datagram socket, with its sender.
-pub(crate) fn recv_from_unix(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, unix::SocketAddr)> {
-    // SAFETY: see `borrow`; the fd is a Unix datagram socket.
-    let socket = unsafe { borrow::<UnixDatagram>(fd) };
-    retry(|| socket.recv_from(buf))
-}
-
 /// `recvfrom(2)` into memory not written yet: the kernel writes the bytes it
-/// returns, and the sender's raw address.
+/// returns, and the sender's raw address. With `peek` the datagram stays on
+/// the socket.
 fn recv_from_raw(
     fd: RawFd,
     buf: &mut [core::mem::MaybeUninit<u8>],
+    peek: bool,
 ) -> io::Result<(usize, libc::sockaddr_storage, libc::socklen_t)> {
     // SAFETY: plain data; all zeroes is a valid value.
     let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
@@ -610,7 +598,7 @@ fn recv_from_raw(
                 fd,
                 buf.as_mut_ptr().cast(),
                 buf.len(),
-                0,
+                if peek { libc::MSG_PEEK } else { 0 },
                 (&raw mut storage).cast(),
                 &mut len,
             )
@@ -620,22 +608,24 @@ fn recv_from_raw(
 }
 
 /// A datagram from a UDP socket into memory not written yet, with its
-/// sender.
+/// sender; with `peek` it stays on the socket.
 pub(crate) fn recv_from_udp_uninit(
     fd: RawFd,
     buf: &mut [core::mem::MaybeUninit<u8>],
+    peek: bool,
 ) -> io::Result<(usize, SocketAddr)> {
-    let (n, storage, len) = recv_from_raw(fd, buf)?;
+    let (n, storage, len) = recv_from_raw(fd, buf, peek)?;
     Ok((n, inet_addr(&storage, len)?))
 }
 
 /// A datagram from a Unix datagram socket into memory not written yet, with
-/// its sender.
+/// its sender; with `peek` it stays on the socket.
 pub(crate) fn recv_from_unix_uninit(
     fd: RawFd,
     buf: &mut [core::mem::MaybeUninit<u8>],
+    peek: bool,
 ) -> io::Result<(usize, unix::SocketAddr)> {
-    let (n, storage, len) = recv_from_raw(fd, buf)?;
+    let (n, storage, len) = recv_from_raw(fd, buf, peek)?;
     // SAFETY: an `AF_UNIX` address fits `sockaddr_un`, which the storage is
     // at least as large as.
     let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };

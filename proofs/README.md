@@ -760,6 +760,46 @@ chunk that counts its length only lets a peer sending a unit at a time past the 
 `CapHeld`; a datagram socket arming a multishot receive on the group gets a datagram cut, breaking
 `NoCut`), and 2 witnesses (a buffer handed out in two pieces, a buffer given back).
 
+`tla/ring/RingSend.tla` checks a datagram socket's sends (`WriteState::send_now` in
+`src/io/source/write.rs`, the poll it waits on in `submit_ops` and its end in `op_done`,
+`src/io/source/write/ops.rs`; on epoll and kqueue the socket's edge in `serve` stands where the
+poll does). A task sends datagrams one call after another; the first may be its own buffer lent
+to a send of the ring's, whose task may go away while it is out. Every other call hands its
+datagram to the kernel itself once nothing of the side is out, and the kernel answers at once:
+taken, refused (too large for any socket), or no room, when the call waits for the poll and
+tries again. A peer reads what the socket holds, which starts full. Before, a call copied its
+datagram and queued it for the ring, answering taken at once: a datagram too large for the
+kernel was reported sent and its refusal reached the next call, which the size sweep
+(`tests/sizes.rs`) found at 65 508 bytes of UDP. 10 configurations: 4 that must pass (a lent
+datagram whose task may go, then a refused one and one more; borrowed sends only; with
+`OwnResult`, every call answers the kernel's own verdict on its datagram, and `InOrder`, the
+kernel takes the task's datagrams in the order it sent them; and `Termination` with
+`Delivered`, every call ends and every datagram the kernel can take reaches the peer), 3
+mutations (the old queue-and-answer breaks `OwnResult`; a call that goes to the kernel with the
+lent send of a task that went still out overtakes it, breaking `InOrder`; a poll that wakes
+nobody breaks `Termination`), and 3 witnesses (a call that waits for room, a refusal answered by
+its own call, a call that waits behind the lent send of a task that went).
+
+`tla/ring/RingRecv.tla` checks a datagram socket's receives (`receive_now` and
+`datagram_ready` in `src/io/source/read.rs`, the bound in `datagram_want` and the poll's end in
+`op_done`, `src/io/source/read/ops.rs`, the edge in `serve`), on epoll or kqueue and on a ring.
+A peer sends a small datagram and then the largest the socket carries, which for a Unix socket
+is more than the pool's largest buffer holds; the task receives each into a buffer that holds
+it, maybe asking first whether the socket is readable. The task receives a datagram itself into
+its own buffer (on epoll and kqueue always, on a ring a Unix datagram), waiting for an edge or
+the ring's poll when none is there; a look at readability looks and takes nothing. Only a ring's
+UDP socket has the ring receive ahead, into a buffer that holds the largest datagram UDP
+carries. Before, the side received ahead into the pool, into a buffer as large as the task's
+(failing with `OutOfMemory` for a task's buffer the pool could not hold) or, for a look at
+readability, into the pool's largest buffer, which cut a Unix datagram past 64 KiB that the
+task's buffer would have held whole: both found by the size sweep. 15 configurations: 8 that
+must pass (Unix and UDP datagrams on epoll and on a ring, with `NoCut`, every datagram received
+whole, and `InOrder`; and `Termination` for each), 5 mutations (a look that receives ahead into
+the pool's largest buffer, a ring's UDP receive ahead into a buffer below the largest datagram,
+and a ring that receives a Unix datagram ahead for a task that receives it itself break `NoCut`;
+a poll, and an edge, that wake nobody break `Termination`), and 2 witnesses (a call that waits
+for the poll, a datagram received ahead and taken).
+
 `lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
 every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
 table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its

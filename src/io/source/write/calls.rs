@@ -140,8 +140,8 @@ impl Source {
         to: Dest<'_>,
     ) -> (io::Result<usize>, Vec<u8>) {
         if buf.len() < super::super::OWNED_DATAGRAM_MIN && self.on_ring() {
-            // A small datagram is cheaper copied and queued, which ends at once, than lent
-            // to the ring and waited for.
+            // A small datagram is cheaper sent by the call itself, which ends at once, than
+            // lent to the ring and waited for.
             let result = poll_fn(|cx| self.poll_send(cx, &buf, to)).await;
             return (result, buf);
         }
@@ -239,7 +239,7 @@ impl Source {
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
         self.poll_writing(cx, |st, io, waker, after| {
-            st.send(io, kind, bytes, dest, waker, after)
+            st.send(io, self.serving_fd(None), kind, bytes, dest, waker, after)
         })
     }
 

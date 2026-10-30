@@ -37,7 +37,8 @@ impl Source {
     ) -> Poll<io::Result<bool>> {
         let kind = self.kind;
         self.poll_reading(cx, |st, io, waker, after| {
-            st.ready(io, kind, waker, after).map(Ok)
+            st.ready(io, self.serving_fd(None), kind, waker, after)
+                .map(Ok)
         })
     }
 
@@ -266,7 +267,7 @@ impl Source {
     ) -> Poll<io::Result<(usize, Addr)>> {
         let kind = self.kind;
         self.poll_reading(cx, |st, io, waker, after| {
-            st.receive(io, kind, out, peek, waker, after)
+            st.receive(io, self.serving_fd(None), kind, out, peek, waker, after)
         })
     }
 }

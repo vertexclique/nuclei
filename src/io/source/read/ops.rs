@@ -9,7 +9,7 @@
 //! again. Only the operation's own completion clears it, so a side never
 //! has two operations out, and its mailbox never more than one completion.
 
-use super::{Datagram, Kind, Peer, Piece, ReadState};
+use super::{Datagram, Kind, Peer, Piece, ReadState, UDP_MAX};
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::Io;
@@ -116,6 +116,12 @@ impl ReadState {
             lent.out = true;
             Want::RecvLentFrom(core::mem::take(&mut lent.buf))
         } else if kind.datagrams() {
+            // A Unix datagram is its task's to receive into its own buffer
+            // (`receive_now`): the ring only polls for it.
+            #[cfg(ring)]
+            if kind == Kind::UnixDatagram {
+                return;
+            }
             #[cfg(ring)]
             let multi = !self.dry && issuer.multishot_datagrams(kind);
             #[cfg(not(ring))]
@@ -157,7 +163,11 @@ impl ReadState {
         }
         #[cfg(not(ring))]
         let _ = multi;
-        self.buffer(len, true, after).map(Want::RecvFrom)
+        // Only UDP is received ahead, and no UDP datagram is longer than its
+        // length field counts: a larger buffer of the task's needs no larger
+        // one of the pool.
+        self.buffer(len.min(UDP_MAX), true, after)
+            .map(Want::RecvFrom)
     }
 
     /// A receive into a buffer of the pool completed.
@@ -210,6 +220,9 @@ impl ReadState {
                     self.poll_first = false;
                     if let Err(err) = result {
                         self.error = Some(err);
+                    }
+                    if core::mem::take(&mut self.task_polls) {
+                        after.wake(&mut self.waiters);
                     }
                     if self.user_fd {
                         self.blocked = false;
