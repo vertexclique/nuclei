@@ -139,6 +139,12 @@ impl Source {
         buf: Vec<u8>,
         to: Dest<'_>,
     ) -> (io::Result<usize>, Vec<u8>) {
+        if buf.len() < super::super::OWNED_DATAGRAM_MIN && self.on_ring() {
+            // A small datagram is cheaper copied and queued, which ends at once, than lent
+            // to the ring and waited for.
+            let result = poll_fn(|cx| self.poll_send(cx, &buf, to)).await;
+            return (result, buf);
+        }
         let mut op = WriteOwned {
             source: self,
             buf: Some(buf),

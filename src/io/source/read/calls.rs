@@ -136,8 +136,26 @@ impl Source {
     /// copied in instead); what does not fit is cut.
     pub(crate) async fn recv_from_owned(
         self: &Arc<Self>,
-        buf: Vec<u8>,
+        mut buf: Vec<u8>,
     ) -> (io::Result<(usize, Addr)>, Vec<u8>) {
+        let start = buf.len();
+        let room = buf.capacity() - start;
+        if room < super::super::OWNED_DATAGRAM_MIN && self.on_ring() {
+            // A small datagram is cheaper taken as every other is and copied in than received
+            // by an operation of its own.
+            buf.resize(start + room, 0);
+            let received = poll_fn(|cx| self.poll_receive(cx, &mut buf[start..], false)).await;
+            return match received {
+                Ok((n, from)) => {
+                    buf.truncate(start + n);
+                    (Ok((n, from)), buf)
+                }
+                Err(err) => {
+                    buf.truncate(start);
+                    (Err(err), buf)
+                }
+            };
+        }
         let mut op = ReadOwned {
             source: self,
             buf: Some(buf),
