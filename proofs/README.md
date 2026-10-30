@@ -303,12 +303,15 @@ is in the queue at most once and is pushed again as soon as it was taken. The sh
 its own end past a stub node, hands a task out only once it read the task's link, and pushes
 the stub behind the last task before handing it out; between a push's swap and its link the
 queue is busy. Empty is the head on the stub, which the shard looks at once more after it says
-it parks. 9 configurations: 3 that must pass (two pushers three rounds each, three pushers two
+it parks. 11 configurations: 3 that must pass (two pushers three rounds each, three pushers two
 rounds each, liveness), with `NoDuplicate` (no task handed out that is not queued), `Counted`,
 `EmptyAtSleep` (a shard asleep with the head on the stub has no task queued) and no deadlock;
-3 mutations (a pusher that leaves its task's old link, and a last task handed out with the
-shard's end left on it, break `NoDuplicate`; sleeping without the look again deadlocks); and 3
-witnesses (a busy queue, the stub pushed behind the last task, a sleep a push ends). TLA+ is
+the three-pusher one checks each state once up to the pushers' names (a symmetry set), as the
+pushers run the same code; 4 mutations (a pusher that leaves its task's old link, and a last
+task handed out with the shard's end left on it, break `NoDuplicate`; a park whose look is at
+the head alone breaks `EmptyAtSleep`; sleeping without the look again deadlocks); and 4
+witnesses (a busy queue, the stub pushed behind the last task, tasks behind the shard's end with
+the head on the stub, a sleep a push ends). TLA+ is
 sequentially consistent: the unit tests in `src/rt/inbox.rs` run four pushing threads against
 the taker. The same queue holds a `JoinSet`'s woken members (`src/join_set.rs`), linked through
 each slot's waker: its `queued` flag keeps a waker in the queue at most once, as the scheduled
