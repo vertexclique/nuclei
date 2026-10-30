@@ -120,6 +120,8 @@ const DEFAULT_HANDOFF: Duration = Duration::from_millis(10);
 const MIN_STACK: usize = 128 * 1024;
 /// The shortest `handoff_after`: the watch measures in milliseconds.
 const MIN_HANDOFF: Duration = Duration::from_millis(1);
+/// The smallest table the guest map accepts; it grows past it on demand.
+const GUESTS_CAPACITY: usize = 64;
 
 impl Builder {
     /// Refuses a size no runtime can work with, as the configuration's mistake.
@@ -367,7 +369,10 @@ impl Builder {
                     workers,
                     Start {
                         limits,
-                        tuning: self.tuning.clone(),
+                        tuning: super::tuning::Tuning {
+                            blocking: Some(pool.jobs_counter()),
+                            ..self.tuning.clone()
+                        },
                         seed: self.rng_seed,
                         stack,
                         name: worker_name,
@@ -389,7 +394,7 @@ impl Builder {
                 panicked: std::sync::atomic::AtomicBool::new(false),
                 on_panic: crate::sync::Notify::new(),
                 rng_seed: self.rng_seed,
-                guests: kovan_map::HashMap::new(),
+                guests: kovan_map::HashMap::with_capacity(GUESTS_CAPACITY),
             }
         });
         inner.pool.set_owner(Arc::downgrade(&inner));

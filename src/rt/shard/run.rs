@@ -183,7 +183,7 @@ impl Shard {
             let shared = &self.shared;
             // The spin looks at the poller too: IO that comes within it
             // costs neither a park nor the kernel's wake of this thread.
-            if self.spin.run(|| {
+            if self.spin.run(self.work_may_come_soon(), || {
                 self.has_remote_work()
                     || signal.woken.load(Ordering::Relaxed)
                     || self.io_ready_now()

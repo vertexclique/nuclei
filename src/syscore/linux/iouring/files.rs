@@ -35,10 +35,13 @@ struct Slot {
 
 /// A ring's file slots.
 pub(crate) struct Files {
-    slots: Vec<Slot>,
+    /// The kernel's table, grown as slots are first taken, up to `fixed`.
+    table: Vec<Slot>,
+    /// The slots past it, by their number less `fixed`.
+    copies: Vec<Slot>,
     /// The kernel's table has the slots below this.
     fixed: u32,
-    /// Free slots of the kernel's table.
+    /// Free slots of the kernel's table, those taken before.
     free: Vec<u32>,
     /// Free slots past it.
     spare: Vec<u32>,
@@ -48,30 +51,53 @@ impl Files {
     /// The slots of a kernel table of `fixed` files, all free.
     pub(crate) fn new(fixed: u32) -> Self {
         Self {
-            slots: (0..fixed).map(|_| Slot::default()).collect(),
+            table: Vec::new(),
+            copies: Vec::new(),
             fixed,
-            free: (0..fixed).rev().collect(),
+            free: Vec::new(),
             spare: Vec::new(),
+        }
+    }
+
+    fn slot(&self, slot: u32) -> Option<&Slot> {
+        match slot.checked_sub(self.fixed) {
+            None => self.table.get(slot as usize),
+            Some(copy) => self.copies.get(copy as usize),
+        }
+    }
+
+    fn slot_mut(&mut self, slot: u32) -> Option<&mut Slot> {
+        match slot.checked_sub(self.fixed) {
+            None => self.table.get_mut(slot as usize),
+            Some(copy) => self.copies.get_mut(copy as usize),
         }
     }
 
     /// A free slot of the kernel's table, or `None` when every one is held
     /// or still named.
     pub(crate) fn take(&mut self) -> Option<u32> {
-        let slot = self.free.pop()?;
-        self.slots[slot as usize].held = true;
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None if self.table.len() < self.fixed as usize => {
+                self.table.push(Slot::default());
+                (self.table.len() - 1) as u32
+            }
+            None => return None,
+        };
+        self.table[slot as usize].held = true;
         Some(slot)
     }
 
     /// A slot past the kernel's table, holding `copy`.
     pub(crate) fn take_copy(&mut self, copy: OwnedFd) -> u32 {
         let slot = self.spare.pop().unwrap_or_else(|| {
-            self.slots.push(Slot::default());
-            (self.slots.len() - 1) as u32
+            self.copies.push(Slot::default());
+            self.fixed + (self.copies.len() - 1) as u32
         });
-        let s = &mut self.slots[slot as usize];
-        s.held = true;
-        s.copy = Some(copy);
+        if let Some(s) = self.slot_mut(slot) {
+            s.held = true;
+            s.copy = Some(copy);
+        }
         slot
     }
 
@@ -83,15 +109,14 @@ impl Files {
     /// The descriptor entries name `slot` by: `None` for the kernel's
     /// table, whose entries name the index.
     pub(crate) fn copy_of(&self, slot: u32) -> Option<RawFd> {
-        self.slots
-            .get(slot as usize)
+        self.slot(slot)
             .and_then(|s| s.copy.as_ref())
             .map(AsRawFd::as_raw_fd)
     }
 
     /// An entry naming `slot` was queued.
     pub(crate) fn named(&mut self, slot: u32) {
-        if let Some(s) = self.slots.get_mut(slot as usize) {
+        if let Some(s) = self.slot_mut(slot) {
             s.entries += 1;
         }
     }
@@ -100,7 +125,7 @@ impl Files {
     /// now: a slot of the kernel's table then still holds its file, which
     /// the caller lets go.
     pub(crate) fn done(&mut self, slot: u32) -> bool {
-        match self.slots.get_mut(slot as usize) {
+        match self.slot_mut(slot) {
             // A slot no entry names is never freed by one (it would go back
             // to its list twice).
             Some(s) if s.entries > 0 => {
@@ -114,7 +139,7 @@ impl Files {
     /// The source of `slot` closed: the slot is free once no entry names
     /// it. Returns whether it is free now, as [`done`](Self::done).
     pub(crate) fn release(&mut self, slot: u32) -> bool {
-        match self.slots.get_mut(slot as usize) {
+        match self.slot_mut(slot) {
             Some(s) if s.held => {
                 s.held = false;
                 s.entries == 0 && self.free_slot(slot)
@@ -128,7 +153,9 @@ impl Files {
         if self.is_fixed(slot) {
             self.free.push(slot);
         } else {
-            self.slots[slot as usize].copy = None;
+            if let Some(s) = self.slot_mut(slot) {
+                s.copy = None;
+            }
             self.spare.push(slot);
         }
         true
@@ -137,13 +164,13 @@ impl Files {
     /// Slots held or still named.
     #[cfg(test)]
     pub(crate) fn in_use(&self) -> usize {
-        self.slots.len() - self.free.len() - self.spare.len()
+        self.table.len() + self.copies.len() - self.free.len() - self.spare.len()
     }
 
     /// Slots past the kernel's table held or still named.
     #[cfg(test)]
     pub(crate) fn copies_in_use(&self) -> usize {
-        self.slots.len() - self.fixed as usize - self.spare.len()
+        self.copies.len() - self.spare.len()
     }
 }
 

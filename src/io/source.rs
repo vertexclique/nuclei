@@ -637,7 +637,10 @@ impl Source {
     /// What every step leaves for once no guard is held: a side that ran out
     /// of buffers waits for one of this thread's pool, then the wakes and
     /// drops.
-    fn settle(self: &Arc<Self>, mut after: After) {
+    fn settle(self: &Arc<Self>, after: After) {
+        let Err(mut after) = after.forget_if_nothing() else {
+            return;
+        };
         self.kick(&mut after);
         if after.starved {
             Arc::clone(self).wait_for_buffer();

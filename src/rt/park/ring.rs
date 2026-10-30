@@ -35,6 +35,9 @@ pub(crate) struct RingPoller {
     /// look; how many times that began.
     overflowed: bool,
     overflows: u64,
+    /// The last look that entered the kernel brought completions: the kernel may run only part of
+    /// its task work in one enter, so the next look enters too.
+    entered_with_more: bool,
 }
 
 // SAFETY: the ring is used by one thread at a time: the thread that runs
@@ -73,6 +76,7 @@ impl RingPoller {
             enabled: false,
             overflowed: false,
             overflows: 0,
+            entered_with_more: false,
         })
     }
 
@@ -149,9 +153,17 @@ impl RingPoller {
         // The enter below flushes what the kernel holds into the queue as
         // room frees up.
         self.look_for_overflow();
-        let min = u32::from(timeout != Some(Duration::ZERO));
-        match self.ring.submit_and_wait(min, timeout) {
-            Ok(_) => {}
+        let looking = timeout == Some(Duration::ZERO);
+        let mut entered = false;
+        let result = if looking {
+            self.ring
+                .submit_or_look(self.entered_with_more)
+                .map(|e| entered = e)
+        } else {
+            self.ring.submit_and_wait(1, timeout).map(drop)
+        };
+        match result {
+            Ok(()) => {}
             Err(err)
                 if matches!(
                     err.raw_os_error(),
@@ -160,6 +172,7 @@ impl RingPoller {
             Err(err) => return Err(err),
         }
         let mut woken = false;
+        let before = out.len();
         for cqe in self.ring.completions() {
             if cqe.user_data == NOT_AN_OP {
                 woken = true;
@@ -168,6 +181,7 @@ impl RingPoller {
                 out.push(cqe);
             }
         }
+        self.entered_with_more = entered && (woken || out.len() > before);
         self.look_for_overflow();
         // Completions freed room: entries that waited for it go in now.
         self.flush_waiting();
@@ -314,5 +328,92 @@ mod tests {
         }
         let got: Vec<u64> = out.iter().map(|c| c.user_data).collect();
         assert_eq!(got, (0..40).collect::<Vec<_>>());
+    }
+
+    /// A look with nothing to submit that enters the kernel never, as the ring's mode allows, still
+    /// sees a wake and a read's completion that happen after it began: each mode a shard's ring is
+    /// made in.
+    #[test]
+    fn a_look_sees_completions_that_arrive_while_it_only_looks() {
+        use crate::syscore::linux::iouring::ring::taskrun::flag_works;
+        let base = RingConfig::new(8);
+        let modes = [
+            (
+                "deferred",
+                RingConfig {
+                    taskrun_flag: flag_works(),
+                    ..base
+                },
+            ),
+            ("deferred, no flag", base),
+            ("handed over", base.handed_over()),
+            (
+                "kernel thread",
+                RingConfig {
+                    sqpoll_idle_ms: Some(50),
+                    ..base
+                },
+            ),
+        ];
+        for (name, cfg) in modes {
+            let mut p = match RingPoller::new(&cfg, 16) {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("skipping {name}: {err}");
+                    continue;
+                }
+            };
+            p.enable().unwrap();
+            let mut fds = [0; 2];
+            // SAFETY: the kernel fills the two descriptors of our array.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            let mut byte = Box::new(0u8);
+            p.push(Sqe::read(fds[0], core::ptr::from_mut(&mut *byte), 1, u64::MAX).user_data(7));
+            let mut out = Vec::new();
+            // The first wait submits the read and arms the wake; nothing is left to submit after.
+            assert!(!p.wait(Some(Duration::ZERO), &mut out).unwrap());
+            let notifier = p.notifier();
+            notifier.notify();
+            // SAFETY: one byte of our own to our own pipe.
+            assert_eq!(unsafe { libc::write(fds[1], [1u8].as_ptr().cast(), 1) }, 1);
+            let (mut woken, deadline) = (false, Instant::now() + Duration::from_secs(10));
+            while !woken || out.is_empty() {
+                woken |= p.wait(Some(Duration::ZERO), &mut out).unwrap();
+                assert!(
+                    Instant::now() < deadline,
+                    "{name}: woken {woken}, {} completions",
+                    out.len()
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(out[0].user_data, 7, "{name}");
+            // SAFETY: closes our own descriptors.
+            unsafe { (libc::close(fds[0]), libc::close(fds[1])) };
+        }
+    }
+
+    /// An idle ring whose kernel flags its task work is looked at without an enter, and enters
+    /// once the flag is up.
+    #[test]
+    fn an_idle_look_makes_no_enter_where_the_kernel_flags_task_work() {
+        use crate::syscore::linux::iouring::ring::taskrun::flag_works;
+        if !flag_works() {
+            eprintln!("skipping: this kernel does not flag task work");
+            return;
+        }
+        let cfg = RingConfig {
+            taskrun_flag: true,
+            ..RingConfig::new(8)
+        };
+        let Ok(mut p) = RingPoller::new(&cfg, 16) else {
+            return;
+        };
+        p.enable().unwrap();
+        let mut out = Vec::new();
+        p.wait(Some(Duration::ZERO), &mut out).unwrap();
+        assert!(!p.ring.submit_or_look(false).unwrap());
+        p.notifier().notify();
+        assert!(p.ring.taskrun_pending());
+        assert!(p.ring.submit_or_look(false).unwrap());
     }
 }

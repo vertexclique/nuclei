@@ -25,7 +25,7 @@ use std::sync::Arc;
 use super::{Addr, Source, Target};
 use crate::buf::PoolBuf;
 use crate::io::raw::Owned;
-use crate::io::side::After;
+use crate::io::side::{After, Hooks};
 
 /// What a side asks its driver to do next.
 pub(crate) enum Want {
@@ -264,8 +264,16 @@ impl Source {
             self.read.defer(super::read_work::DONE, &mut after, &hooks);
         } else {
             self.write_done.put(done);
-            self.write
-                .defer(super::write_work::DONE, &mut after, &hooks);
+            // The side free: the end is taken now, with no trip through the
+            // deferred bits.
+            if let Some(mut held) = self.write.try_hold() {
+                hooks.taken(held.get(), &mut after);
+                hooks.deferred(held.get(), super::write_work::DONE, &mut after);
+                held.release(&mut after, &hooks);
+            } else {
+                self.write
+                    .defer(super::write_work::DONE, &mut after, &hooks);
+            }
         }
         #[cfg(port)]
         if idle && self.reg.awaits_idle.swap(false, Ordering::SeqCst) {

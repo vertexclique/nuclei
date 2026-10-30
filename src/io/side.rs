@@ -124,7 +124,7 @@ impl<S> Side<S> {
     }
 
     /// The side, if it is free.
-    #[cfg(any(test, ring))]
+    #[cfg(any(test, completion))]
     pub(crate) fn try_hold(&self) -> Option<Held<'_, S>> {
         self.take(0)
     }
@@ -541,6 +541,18 @@ impl Drop for After {
 }
 
 impl After {
+    /// Consumes a step that left nothing to do, without the work of settling it: `Err` gives
+    /// back one that did.
+    pub(crate) fn forget_if_nothing(self) -> Result<(), Self> {
+        if self.is_empty() && !self.starved && !self.register {
+            // Nothing is owned: no waker, no buffer, no allocation, so there is nothing to drop.
+            core::mem::forget(self);
+            Ok(())
+        } else {
+            Err(self)
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.wake.is_none() && self.drop_one.is_none() && self.more.is_none() && !self.has_kick()
     }

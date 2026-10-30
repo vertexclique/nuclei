@@ -85,7 +85,7 @@ pub(crate) struct Pool {
     idle: AtomicUsize,
     /// Jobs submitted and not yet run to their end: a paused clock does not
     /// move by itself while one is in flight.
-    jobs: AtomicUsize,
+    jobs: Arc<AtomicUsize>,
     /// The runtime the pool belongs to, told when its last job ends.
     owner: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
     config: PoolConfig,
@@ -119,7 +119,7 @@ impl Pool {
             hint: AtomicUsize::new(0),
             threads: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),
-            jobs: AtomicUsize::new(0),
+            jobs: Arc::new(AtomicUsize::new(0)),
             owner: std::sync::OnceLock::new(),
             config,
         })
@@ -145,6 +145,11 @@ impl Pool {
     /// Makes `owner` the runtime told when the pool's last job ends.
     pub(crate) fn set_owner(&self, owner: std::sync::Weak<super::runtime::Inner>) {
         let _ = self.owner.set(owner);
+    }
+
+    /// The count of [`jobs`](Self::jobs), for a shard that spins while one may wake it.
+    pub(crate) fn jobs_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.jobs)
     }
 
     /// Jobs submitted and not yet run to their end.

@@ -332,10 +332,33 @@ impl ReadState {
             #[cfg(readiness)]
             Via::Fd(fd) => self.complete_fd(fd, kind, len, after),
             #[cfg(completion)]
-            Via::Ops(route) => self.submit_ops(route, kind, len, after),
+            Via::Ops(route) => {
+                if !self.armed_and_quiet() {
+                    self.submit_ops(route, kind, len, after);
+                }
+            }
             #[cfg(not(completion))]
             Via::None(never, _) => match never {},
         }
+    }
+
+    /// A multishot receive is out and stays: no lent buffer waits for the next bytes (which would
+    /// stop it) and the caller makes no calls of its own, so `submit_ops` would find it out and
+    /// do nothing.
+    #[cfg(completion)]
+    fn armed_and_quiet(&self) -> bool {
+        #[cfg(ring)]
+        return self.out.is_some()
+            && self.multi
+            && !self.multi_stopping
+            && !self.user_fd
+            && !(self.ahead.is_empty()
+                && self
+                    .lent
+                    .as_ref()
+                    .is_some_and(|l| !l.out && l.done.is_none()));
+        #[cfg(not(ring))]
+        false
     }
 
     #[cfg(readiness)]

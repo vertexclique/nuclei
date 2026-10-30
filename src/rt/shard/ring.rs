@@ -40,6 +40,7 @@ use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::Shard;
@@ -97,7 +98,13 @@ impl ShardRing {
     /// A ring as `cfg` describes with a table of `files` fixed files,
     /// disabled until its first wait or submission.
     pub(crate) fn new(cfg: &RingConfig, files: u32) -> io::Result<Self> {
-        let poller = RingPoller::new(cfg, files)?;
+        let poller = RingPoller::new(
+            &RingConfig {
+                taskrun_flag: crate::syscore::linux::iouring::ring::taskrun::flag_works(),
+                ..*cfg
+            },
+            files,
+        )?;
         let recv = match group_entries(cfg.recv_buffers, poller.cq_entries()) {
             0 => None,
             entries => match RecvGroup::new(poller.ring(), entries, cfg.recv_buffer_size) {
@@ -164,6 +171,21 @@ impl ShardRing {
     /// or submission does.
     pub(crate) fn enable(&self) -> io::Result<()> {
         self.poller.borrow_mut().enable()
+    }
+
+    /// Whether finite operations are out (in the kernel or waiting for room): their completions
+    /// come within a moment. A multishot receive or accept waits on a peer for as long as it
+    /// lives, so it is no sign of one.
+    pub(crate) fn expects_completions(&self) -> bool {
+        self.in_kernel.get() > 0 || !self.room.borrow().is_empty()
+    }
+
+    /// Keeps the buffer `bid` of the group `back` for the next take-in, if the ring's group is
+    /// that; `false` when it is not or the group is borrowed (the buffer then goes the long way).
+    pub(crate) fn keep_local(&self, back: &Arc<super::recv::Returns>, bid: u16) -> bool {
+        self.recv
+            .try_borrow_mut()
+            .is_ok_and(|mut group| group.as_mut().is_some_and(|g| g.keep_local(back, bid)))
     }
 
     /// The group id multishot receives draw from, if the ring has a group.
@@ -781,15 +803,34 @@ const MAX_TABLE: u32 = 1 << 14;
 /// The fewest submission entries a ring short of memory is made with.
 const MIN_RING_ENTRIES: u32 = crate::config::MIN_QUEUE_LEN;
 
+/// The fixed files, and buffers of a receive group, [`check`] makes: the
+/// features are the kernel's to give, whatever the sizes.
+const CHECK_TABLE: u32 = 64;
+const CHECK_BUFFERS: u16 = 2;
+
 /// Whether the kernel gives a shard of `cfg` everything its ring needs: the
-/// ring, its disabled start, the table of fixed files, the group of buffers
-/// for multishot receives, and the enabling by the thread that runs it. It
-/// makes the ring through [`ShardRing::for_shard`] and enables it here, then
-/// drops it (nothing is in flight in a ring that never waited), so the
-/// backend choice sees every feature a shard needs and never disagrees with
-/// the shard.
+/// ring with its setup flags and disabled start, a table of fixed files, a
+/// group of buffers for multishot receives, and the enabling by the thread
+/// that runs it. It makes the ring as a shard does ([`ShardRing::new`]) but
+/// at the smallest sizes that prove each feature, then drops it (nothing is
+/// in flight in a ring that never waited), so the backend choice sees every
+/// feature a shard needs and never disagrees with the shard, at the cost of
+/// a small ring instead of a shard's.
 pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
-    ShardRing::for_shard(cfg)?.enable()
+    let group = cfg.recv_buffers != 0;
+    let small = RingConfig {
+        entries: MIN_RING_ENTRIES,
+        cq_entries: None,
+        recv_buffers: cfg.recv_buffers.min(CHECK_BUFFERS),
+        recv_buffer_size: if group {
+            crate::config::MIN_RECV_BUFFER_SIZE
+        } else {
+            cfg.recv_buffer_size
+        },
+        ..cfg
+    };
+    let files = if table_len() == 0 { 0 } else { CHECK_TABLE };
+    ShardRing::new(&small, files)?.enable()
 }
 
 pub(crate) mod exits;

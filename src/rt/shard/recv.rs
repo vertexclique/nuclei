@@ -5,7 +5,9 @@
 //! The ring's thread owns the group and re-adds its buffers. A completion
 //! hands a buffer out as a [`RingChunk`], which the source's reader may take
 //! on any thread; dropped, the chunk puts its buffer on the group's return
-//! queue, and the ring's thread takes the queue in before it next waits.
+//! queue, and the ring's thread takes the queue in before it next waits. A
+//! chunk dropped on the ring's own thread skips the queue: it goes onto the
+//! group's local list, taken in with it.
 //! The buffers stay mapped while any chunk lives (see `BufMem`), so a chunk
 //! that outlives its shard still reads memory that is there.
 //!
@@ -41,6 +43,8 @@ pub(crate) struct RecvGroup {
     /// For each buffer handed out: the receive it went to and its bytes,
     /// counted off that receive when it comes back.
     owners: Vec<(u64, u32)>,
+    /// Buffers given back on the ring's own thread, one slot per buffer.
+    local: Vec<u16>,
     cap: usize,
 }
 
@@ -87,6 +91,7 @@ impl RecvGroup {
             ring: buffers,
             back,
             owners: vec![(NOT_AN_OP, 0); usize::from(entries)],
+            local: Vec::with_capacity(usize::from(entries)),
             cap: (total / CAP_SHARE).max(size as usize),
         })
     }
@@ -145,7 +150,7 @@ impl RecvGroup {
     /// len)`.
     pub(crate) fn take_back(&mut self, mut release: impl FnMut(u64, u32)) {
         let mut any = false;
-        while let Some(bid) = self.back.queue.pop() {
+        while let Some(bid) = self.local.pop().or_else(|| self.back.queue.pop()) {
             if let Some(owner) = self.owners.get_mut(usize::from(bid)) {
                 let (user_data, len) = core::mem::replace(owner, (NOT_AN_OP, 0));
                 if user_data != NOT_AN_OP {
@@ -161,6 +166,16 @@ impl RecvGroup {
         if any {
             self.ring.commit();
         }
+    }
+
+    /// Keeps the chunk `bid` of `back` to take in with the rest, if `back` is this group's:
+    /// for a chunk dropped on the ring's own thread.
+    pub(crate) fn keep_local(&mut self, back: &Arc<Returns>, bid: u16) -> bool {
+        let mine = Arc::ptr_eq(&self.back, back) && self.local.len() < self.local.capacity();
+        if mine {
+            self.local.push(bid);
+        }
+        mine
     }
 }
 
@@ -208,6 +223,14 @@ impl RingChunk {
 
 impl Drop for RingChunk {
     fn drop(&mut self) {
+        let kept = crate::rt::context::current(|shard| {
+            shard
+                .and_then(crate::rt::shard::Shard::ring)
+                .is_some_and(|ring| ring.keep_local(&self.back, self.bid))
+        });
+        if kept {
+            return;
+        }
         let given_back = self.back.queue.push(self.bid);
         // One slot per buffer, and this buffer out once: always room.
         debug_assert!(given_back.is_ok(), "buffer {} came back twice", self.bid);
