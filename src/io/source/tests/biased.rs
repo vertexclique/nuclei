@@ -4,7 +4,15 @@
 //! moves to another thread mid-read and mid-write, and when an owner and
 //! two foreign threads poll one socket at once.
 
+use std::sync::atomic::AtomicU64;
+
 use super::*;
+
+/// "No buffer space", which a datagram socket answers a send with under pressure.
+#[cfg(unix)]
+const ENOBUFS: i32 = libc::ENOBUFS;
+#[cfg(windows)]
+const ENOBUFS: i32 = 10055;
 
 fn fenced() -> bool {
     crate::rt::handoff::fence::available()
@@ -244,6 +252,10 @@ fn a_handoff_of_the_shard_during_a_read_and_a_write_loses_nothing() {
 }
 
 const DATAGRAMS: u64 = 20_000;
+/// Datagrams in flight at most: a datagram socket may drop or refuse under
+/// pressure (UDP on Windows and macOS does), so the sender waits for the
+/// receivers to catch up.
+const WINDOW: u64 = 128;
 const END: u64 = u64::MAX;
 
 fn record(seq: u64) -> [u8; 16] {
@@ -255,7 +267,7 @@ fn record(seq: u64) -> [u8; 16] {
 
 /// Receives on `src` until an end record, checking each datagram whole and
 /// seen once.
-async fn receive_all(src: Arc<Source>, seen: Arc<Vec<AtomicBool>>) -> u64 {
+async fn receive_all(src: Arc<Source>, seen: Arc<Vec<AtomicBool>>, counts: Arc<Counts>) -> u64 {
     let mut count = 0;
     let mut buf = [0u8; 64];
     loop {
@@ -265,6 +277,7 @@ async fn receive_all(src: Arc<Source>, seen: Arc<Vec<AtomicBool>>) -> u64 {
         assert_eq!(n, 16, "a datagram came torn");
         let seq = u64::from_le_bytes(buf[..8].try_into().unwrap());
         if seq == END {
+            counts.finished.fetch_add(1, Ordering::SeqCst);
             return count;
         }
         assert_eq!(buf[..16], record(seq), "datagram {seq} was damaged");
@@ -273,7 +286,15 @@ async fn receive_all(src: Arc<Source>, seen: Arc<Vec<AtomicBool>>) -> u64 {
             "datagram {seq} arrived twice"
         );
         count += 1;
+        counts.received.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+/// What the receivers report to the sender.
+#[derive(Default)]
+struct Counts {
+    received: AtomicU64,
+    finished: AtomicU64,
 }
 
 /// An owner on the worker and two foreign threads receive from one socket
@@ -293,31 +314,75 @@ fn an_owner_and_two_foreign_threads_polling_one_socket_lose_no_datagram() {
     }
     let seen: Arc<Vec<AtomicBool>> =
         Arc::new((0..DATAGRAMS).map(|_| AtomicBool::new(false)).collect());
+    let counts = Arc::new(Counts::default());
     let owner = {
-        let (src, seen) = (Arc::clone(&b.src), Arc::clone(&seen));
-        rt.spawn(receive_all(src, seen))
+        let (src, seen, counts) = (Arc::clone(&b.src), Arc::clone(&seen), Arc::clone(&counts));
+        rt.spawn(receive_all(src, seen, counts))
     };
     let foreign = || {
-        let (src, seen, handle) = (Arc::clone(&b.src), Arc::clone(&seen), rt.handle());
-        std::thread::spawn(move || handle.block_on(receive_all(src, seen)))
+        let (src, seen, counts, handle) = (
+            Arc::clone(&b.src),
+            Arc::clone(&seen),
+            Arc::clone(&counts),
+            rt.handle(),
+        );
+        std::thread::spawn(move || handle.block_on(receive_all(src, seen, counts)))
     };
     let (x, y) = (foreign(), foreign());
     let peer = a.io().try_clone().unwrap();
-    let sender = std::thread::spawn(move || {
-        let push = |bytes: [u8; 16]| loop {
-            match peer.send(&bytes) {
-                Ok(_) => return,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
-                Err(e) => panic!("{e}"),
+    let sender = {
+        let counts = Arc::clone(&counts);
+        std::thread::spawn(move || {
+            // A send the socket refuses for the moment is tried again.
+            let push = |bytes: [u8; 16]| loop {
+                match peer.send(&bytes) {
+                    Ok(_) => return,
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.raw_os_error() == Some(ENOBUFS) =>
+                    {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            // The datagrams the sender gave up on after the receivers made
+            // no progress for a second: the kernel dropped them.
+            let mut lost = 0;
+            for seq in 0..DATAGRAMS {
+                let mut at = (counts.received.load(Ordering::SeqCst), Instant::now());
+                while seq - lost - at.0 >= WINDOW {
+                    std::thread::sleep(Duration::from_micros(100));
+                    let now = counts.received.load(Ordering::SeqCst);
+                    if now != at.0 {
+                        at = (now, Instant::now());
+                    } else if at.1.elapsed() > Duration::from_secs(1) {
+                        lost = seq - now;
+                    }
+                }
+                push(record(seq));
             }
-        };
-        (0..DATAGRAMS).for_each(|seq| push(record(seq)));
-        (0..3).for_each(|_| push(record(END)));
-    });
-    sender.join().unwrap();
+            // An end record may be dropped too: they go until all three came.
+            while counts.finished.load(Ordering::SeqCst) < 3 {
+                push(record(END));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            lost
+        })
+    };
     let got = rt.block_on(owner) + x.join().unwrap() + y.join().unwrap();
-    assert_eq!(got, DATAGRAMS, "a datagram was lost");
-    assert!(seen.iter().all(|s| s.load(Ordering::SeqCst)));
+    let lost = sender.join().unwrap();
+    assert_eq!(got, counts.received.load(Ordering::SeqCst));
+    let missing = seen.iter().filter(|s| !s.load(Ordering::SeqCst)).count() as u64;
+    assert_eq!(
+        missing,
+        DATAGRAMS - got,
+        "a datagram was counted but not seen"
+    );
+    assert!(
+        missing <= lost,
+        "{missing} datagrams never arrived, the sender gave up on {lost}"
+    );
     if fenced() {
         assert!(b.src.shared().0, "foreign threads left the side biased");
     }
