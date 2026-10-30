@@ -952,8 +952,11 @@ compare-and-swap on the count), and the sender it makes sends and goes as any do
 receiver looks at its next position's slot: its own position is a value taken, a later one is
 a lag (it goes on from the tail, read then, less the ring's size, counting what it skipped),
 anything else is nothing yet, unless the channel is closed and its next position is the tail.
-10 configurations: 2 that must pass, with a weak sender upgrading at any point (what was taken
-plus what was reported lost is every value sent; the receiver reaches the close), 4 mutations
+11 configurations: 3 that must pass, with a weak sender upgrading at any point (two senders and
+the weak one, three values each: what was taken plus what was reported lost is every value sent,
+each state checked once up to the two senders' names; the receiver reaches the close, checked
+over every behaviour in two smaller races, the three senders with one value each, and one sender
+and the weak one with three values each), 4 mutations
 (a send publishing over a later position leaves the receiver waiting for good, `Finishes`;
 stopping at the close with values in the ring, an uncounted lag, and an upgrade that makes a
 sender after the last one went, whose values come after the receiver saw the close, break
