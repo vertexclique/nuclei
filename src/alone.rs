@@ -48,3 +48,39 @@ pub(crate) fn alone(name: &str) -> bool {
     );
     false
 }
+
+/// The descriptors this process has open. Listed from the directory the
+/// system keeps for it (Linux, macOS); elsewhere (FreeBSD's `/dev/fd` is
+/// only there with `fdescfs`, and then lists but three) each number up to the
+/// soft limit is asked of the kernel.
+#[cfg(unix)]
+pub(crate) fn open_descriptors() -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    const LISTING: Option<&str> = Some("/proc/self/fd");
+    #[cfg(target_os = "macos")]
+    const LISTING: Option<&str> = Some("/dev/fd");
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const LISTING: Option<&str> = None;
+    if let Some(dir) = LISTING {
+        let listed = std::fs::read_dir(dir).map(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+                .collect::<Vec<_>>()
+        });
+        if let Ok(fds) = listed {
+            return fds;
+        }
+    }
+    // SAFETY: plain data, all zeroes valid; the kernel fills it.
+    let mut limit: libc::rlimit = unsafe { core::mem::zeroed() };
+    // SAFETY: a plain call with a valid struct.
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        limit.rlim_cur.min(1 << 20) as i32
+    } else {
+        1024
+    };
+    // SAFETY: F_GETFD only reads the descriptor's flags.
+    (0..soft)
+        .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+        .collect()
+}

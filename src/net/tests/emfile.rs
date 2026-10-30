@@ -10,14 +10,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
 use super::{next, runtime, within};
-use crate::alone::alone;
+use crate::alone::{alone, open_descriptors};
 use crate::io::Handle;
 
 const CLIENTS: usize = 4;
-
-fn open_descriptors() -> usize {
-    std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
-}
 
 /// Lowers the limit to what is open plus a few and uses those up; dropping
 /// the guard gives the descriptors back.
@@ -27,9 +23,11 @@ struct Starved {
 
 impl Starved {
     fn new() -> Self {
+        // A limit is a descriptor number: the room is above the highest open.
+        let room = open_descriptors().into_iter().max().unwrap_or(0) as libc::rlim_t + 8;
         let limit = libc::rlimit {
-            rlim_cur: (open_descriptors() + 8) as libc::rlim_t,
-            rlim_max: (open_descriptors() + 8) as libc::rlim_t,
+            rlim_cur: room,
+            rlim_max: room,
         };
         // SAFETY: lowers this process's own limit with a valid struct.
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
@@ -79,7 +77,12 @@ fn tcp_case(multi: bool) {
         let mut starved = Starved::new();
         if multi {
             let first = crate::time::timeout(Duration::from_millis(300), next(&mut stream)).await;
-            assert!(first.is_err(), "no descriptor left, yet the stream moved");
+            assert!(
+                first.is_err(),
+                "no descriptor left, yet the stream moved: {:?}, {:?}",
+                first.as_ref().map(|c| c.is_some()),
+                stream.take_error()
+            );
             starved.free();
             for _ in 0..CLIENTS {
                 within(next(&mut stream)).await.expect("the stream ended");

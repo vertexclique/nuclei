@@ -957,12 +957,17 @@ fn dropped_handles_with_unsent_bytes_leave_no_descriptor_open() {
     if !alone("net::tests::dropped_handles_with_unsent_bytes_leave_no_descriptor_open") {
         return;
     }
-    let open = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let open = || crate::alone::open_descriptors().len();
     let rt = runtime();
     let before = open();
+    // A limit is a descriptor number: the room is above the highest open.
+    let top = crate::alone::open_descriptors()
+        .into_iter()
+        .max()
+        .unwrap_or(0);
     let limit = libc::rlimit {
-        rlim_cur: before as libc::rlim_t + 64,
-        rlim_max: before as libc::rlim_t + 64,
+        rlim_cur: top as libc::rlim_t + 64,
+        rlim_max: top as libc::rlim_t + 64,
     };
     // SAFETY: lowers this process's own limit with a valid struct.
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
