@@ -591,9 +591,10 @@ takes them.
 
 `lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`, `tla/lent/LentFile.tla`,
 `tla/lent/LentZc.tla`) checks `read_owned`, `write_owned` and `write_zero_copy` on streams
-(`src/io/source/read.rs`, `src/io/source/write.rs`), where the task hands the side its own buffer
-and the driver reads into it or writes from it with no copy, and on files (`src/fs/file.rs`),
-where the buffer goes to a job of the blocking pool. The guards are abstract here (a step under one runs whole; `side` checks the side's).
+(`src/io/source/read.rs`, `src/io/source/write/lent.rs`), where the task hands the side its own
+buffer and the driver reads into it or writes from it with no copy, and on files
+(`src/fs/file.rs`), where the buffer goes to a job of the blocking pool. The guards are abstract
+here (a step under one runs whole; `side` checks the side's).
 
 The read: bytes arrive in order, each with an edge, and then the stream ends. The lending task
 takes what another read left first (bytes, or the end); otherwise it lends its buffer, which
