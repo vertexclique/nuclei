@@ -381,11 +381,14 @@ it, at most 16 KiB; the model counts blocks against an abstract bound). A freein
 up at the bound, reads the head, gives up if the list is closed, and swaps its block in only if
 the head is still the one it read. The owner takes the whole list when its cache has no block,
 and as its thread ends swaps the list out and the head to closed in one step, frees all it
-holds, then lets the record go; the next thread to claim the record opens it again. 10
-configurations: 3 that must pass (three blocks, two owners one after the other and two freeing
+holds, then lets the record go; the next thread to claim the record opens it again. 11
+configurations: 4 that must pass (three blocks, two owners one after the other and two freeing
 threads, with `ListConsistent`, `ClosedEmpty`, `BoundedList`, `OpenWhileOwned`, `CountOK` and
-`AllFreed`, every block back with the system once every thread is done; the same with a bound of
-one; and `Terminates`), 4 mutations (a push that swaps its block in whatever the head is, and a
+`AllFreed`, every block back with the system once every thread is done, each state checked once
+up to the names of the blocks and of the freeing threads; the same with a bound of one; and
+`Terminates`, every thread ending, with two blocks under a bound of two and under a bound of one,
+which between them still lose a compare-and-swap to another push, find the list full and find it
+closed), 4 mutations (a push that swaps its block in whatever the head is, and a
 close in two steps, each break `ListConsistent`; a record let go before its list is closed breaks
 `OpenWhileOwned`; a push that ignores the count breaks `BoundedList`), and 3 witnesses (a push
 that finds the list closed, one that finds it full, the next owner taking back a block the first
