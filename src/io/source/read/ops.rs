@@ -126,10 +126,16 @@ impl ReadState {
             let multi = !self.dry && issuer.multishot_datagrams(kind);
             #[cfg(not(ring))]
             let multi = false;
-            let Some(want) = self.datagram_want(multi, len, after) else {
-                return;
-            };
-            want
+            match self.datagram_want(multi, len, after) {
+                Some(want) => want,
+                // No buffer of the pool: a poll that holds none, and the task
+                // receives into its own buffer (`task_receives`).
+                #[cfg(ring)]
+                None if self.starved && !self.readable && self.error.is_none() => {
+                    Want::Ready { read: true }
+                }
+                None => return,
+            }
         } else {
             match self.lent.as_mut().filter(|l| !l.out) {
                 Some(lent) => {
@@ -141,12 +147,16 @@ impl ReadState {
                     self.multi = true;
                     Want::RecvMulti
                 }
-                None => {
-                    let Some(buf) = self.buffer(len, false, after) else {
-                        return;
-                    };
-                    Want::Recv(buf)
-                }
+                None => match self.buffer(len, false, after) {
+                    Some(buf) => Want::Recv(buf),
+                    // No buffer of the pool: rather than wait for one that a
+                    // receive of another connection may hold for good, a poll
+                    // that holds none, and the task reads into its own buffer
+                    // (`reads_itself`).
+                    #[cfg(ring)]
+                    None if self.starved && !self.readable => Want::Ready { read: true },
+                    None => return,
+                },
             }
         };
         self.out = Some(issuer.issue(want, kind, self.epoch, after));
@@ -221,7 +231,8 @@ impl ReadState {
                     if let Err(err) = result {
                         self.error = Some(err);
                     }
-                    if core::mem::take(&mut self.task_polls) {
+                    self.readable = self.starved;
+                    if core::mem::take(&mut self.task_polls) || self.starved {
                         after.wake(&mut self.waiters);
                     }
                     if self.user_fd {

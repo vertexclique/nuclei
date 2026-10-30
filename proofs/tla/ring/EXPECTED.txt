@@ -75,3 +75,11 @@ MRR_no_wake_ring               MC_RingRecv          violated:Termination
 MRR_no_wake_edge               MC_RingRecv          violated:Termination
 WRR_wait                       MC_RingRecv          violated:NoWait
 WRR_ahead                      MC_RingRecv          violated:NoAheadTaken
+RV_safe                        MC_RingStarve        pass
+RV_live                        MC_RingStarve        pass
+RV_all_live                    MC_RingStarve        pass
+MRV_park                       MC_RingStarve        violated:Served
+MRV_park_write                 MC_RingStarve        violated:Served
+MRV_no_wake                    MC_RingStarve        violated:Served
+WRV_starve                     MC_RingStarve        violated:NoStarve
+WRV_direct                     MC_RingStarve        violated:NoDirect

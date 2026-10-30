@@ -195,6 +195,11 @@ pub(super) struct ReadState {
     /// came (see `receive_now`): its end wakes the tasks.
     #[cfg(ring)]
     task_polls: bool,
+    /// The poll of a side the pool had no buffer for said bytes came: its
+    /// task reads them into its own buffer, and the ring asks for nothing
+    /// more until it has (proofs/tla/ring/RingStarve.tla).
+    #[cfg(ring)]
+    readable: bool,
     /// The operation out is a multishot receive, and whether it is being
     /// stopped (for a lent buffer, which takes the next bytes itself).
     #[cfg(ring)]
@@ -269,6 +274,11 @@ impl ReadState {
             && let Some(fd) = self.task_receives(io, fd, kind)
         {
             return self.datagram_ready(io, fd, kind, waker, after);
+        }
+        // Bytes came for a starved side: its task's read takes them.
+        #[cfg(ring)]
+        if self.starved && self.readable {
+            return Poll::Ready(self.eof);
         }
         // A datagram read ahead (on a completion driver, of UDP) is read
         // whole: the receive that takes it may ask for any size, and one read
@@ -595,6 +605,20 @@ impl ReadState {
         theirs && self.lent.is_none() && !self.eof && self.error.is_none()
     }
 
+    /// Whether a stream read (or `peek`) of `len` bytes goes straight into
+    /// the task's buffer: a read big enough (see `direct`), or on a ring any
+    /// while the pool has no buffer for the side, so a reader never waits on
+    /// buffers that receives of other connections hold
+    /// (proofs/tla/ring/RingStarve.tla).
+    #[cfg(unix)]
+    pub(super) fn reads_itself(&self, io: Io<'_>, len: usize, peek: bool) -> bool {
+        #[cfg(ring)]
+        if self.starved && matches!(io.via, Via::Ops(_)) {
+            return true;
+        }
+        !peek && super::direct::worth(io, len, false)
+    }
+
     /// A stream read of `len` bytes made by `call` straight on the
     /// descriptor `fd`, into the caller's memory, if the side holds nothing
     /// that comes first. `None` leaves the read to the normal path, which
@@ -613,7 +637,7 @@ impl ReadState {
         let fd = fd?;
         if !kind.streams()
             || len == 0
-            || !super::direct::worth(io, len, false)
+            || !self.reads_itself(io, len, false)
             || !self.ahead.is_empty()
             || self.lent.is_some()
             || self.eof
@@ -640,6 +664,10 @@ impl ReadState {
         }
         #[cfg(not(ring))]
         let _ = waker;
+        #[cfg(ring)]
+        {
+            self.readable = false;
+        }
         match sys::ready(call(fd)) {
             None => {
                 match io.via {
@@ -1091,6 +1119,10 @@ impl ReadState {
     pub(super) fn unstarve(&mut self, after: &mut After) {
         if self.starved {
             self.starved = false;
+            #[cfg(ring)]
+            {
+                self.readable = false;
+            }
             after.wake(&mut self.waiters);
         }
     }
@@ -1156,6 +1188,7 @@ impl ReadState {
         {
             self.poll_first = false;
             self.task_polls = false;
+            self.readable = false;
         }
     }
 }

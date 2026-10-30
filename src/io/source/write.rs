@@ -314,6 +314,19 @@ impl WriteState {
         Poll::Pending
     }
 
+    /// Whether a stream write of `len` bytes goes straight from the task's
+    /// buffer: one big enough (see `direct`), or on a ring any while the pool
+    /// has no buffer for the write-behind, so a writer never waits on buffers
+    /// that receives of other connections hold (proofs/tla/ring/RingStarve.tla).
+    #[cfg(unix)]
+    pub(super) fn writes_itself(&self, io: Io<'_>, len: usize) -> bool {
+        #[cfg(ring)]
+        if self.starved && matches!(io.via, Via::Ops(_)) {
+            return true;
+        }
+        super::direct::worth(io, len, true)
+    }
+
     /// A stream write of the bytes of `bufs` made straight on the
     /// descriptor `fd`, from the caller's memory, if the side holds nothing
     /// that goes first. The kernel may take part of it, as of any write.
@@ -332,7 +345,7 @@ impl WriteState {
         let waits = matches!(io.via, Via::Fd(_)) && self.blocked;
         if !kind.streams()
             || len == 0
-            || !super::direct::worth(io, len, true)
+            || !self.writes_itself(io, len)
             || waits
             || self.failed.is_some()
             || self.error.is_some()
@@ -703,7 +716,15 @@ impl WriteState {
         };
         if n == 0 {
             // No room (the write-behind is full, or the pool has nothing):
-            // the write waits for the driver to make some.
+            // the write waits for the driver to make some. On a ring a write
+            // the pool has nothing for waits instead for a poll that says the
+            // socket takes bytes, and then writes them itself
+            // (`writes_itself`).
+            #[cfg(ring)]
+            if self.starved && self.behind.is_none() && matches!(io.via, Via::Ops(_)) {
+                self.poll_first = true;
+                self.push(io, kind, after);
+            }
             self.waiters.register(waker);
             return Poll::Pending;
         }

@@ -77,6 +77,12 @@ pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     retry(|| cvt(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }))
 }
 
+/// `recv(2)` with `MSG_PEEK`: a stream's bytes, left on the socket.
+pub(crate) fn peek(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: writes at most `buf.len()` bytes into `buf`.
+    retry(|| cvt(unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_PEEK) }))
+}
+
 /// `write(2)`.
 pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     // SAFETY: reads at most `buf.len()` bytes from `buf`.

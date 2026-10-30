@@ -800,6 +800,23 @@ and a ring that receives a Unix datagram ahead for a task that receives it itsel
 a poll, and an edge, that wake nobody break `Termination`), and 2 witnesses (a call that waits
 for the poll, a datagram received ahead and taken).
 
+`tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
+buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
+`reads_itself` in `src/io/source/read.rs`, `write`, `write_direct` and `writes_itself` in
+`src/io/source/write.rs`). Three connections over a pool of two buffers, two of whose peers never
+send: with no receive group to draw from (none configured, or the group dry) a read takes a buffer
+of the pool for a receive that waits in the kernel, and holds it while its peer stays idle. Before,
+a reader or a writer that found the pool empty waited for a buffer to come back and armed nothing,
+so a request that came was never read, or its reply never sent, while both buffers waited for
+peers that never send. Now it asks for a poll that holds no buffer, and once the socket has bytes,
+or room, it reads them into its own buffer or writes from its own. 8 configurations: 3 that must
+pass (`Buffers`, every buffer free, held by a receive out, a request read ahead or a reply not sent
+yet; and `Served`, every request sent is read and answered, with two idle peers and with none), 3
+mutations (a starved reader that waits for a buffer to come back, a starved writer that does, and a
+poll whose end wakes nobody break `Served`), and 2 witnesses (a reader finds the pool empty; a
+starved side uses its own buffer). `tests/idle_peers.rs` fills the pool of a 1 MiB cap with
+receives of idle peers and checks every other peer is answered.
+
 `lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
 every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
 table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its

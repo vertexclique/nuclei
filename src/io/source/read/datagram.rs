@@ -1,5 +1,6 @@
 //! A datagram socket's receives that the task makes itself, on unix: on
-//! epoll and kqueue every one, on a ring a Unix datagram's. The datagram
+//! epoll and kqueue every one, on a ring a Unix datagram's, and a UDP one's
+//! while the pool has no buffer for the side. The datagram
 //! goes from the kernel straight into the task's buffer, whole whenever the
 //! buffer holds it, so no buffer of the pool cuts it or refuses it for its
 //! size; a look at readability looks and takes nothing. With no datagram
@@ -19,7 +20,9 @@ impl ReadState {
     /// The descriptor a datagram's task receives on itself: on epoll and
     /// kqueue every socket's, on a ring a Unix datagram socket's (a UDP
     /// datagram fits a buffer of the pool's largest class, which the ring
-    /// receives into ahead). `None` leaves it to the driver.
+    /// receives into ahead, unless the pool has none for the side: then the
+    /// task receives too, proofs/tla/ring/RingStarve.tla). `None` leaves it
+    /// to the driver.
     #[cfg_attr(
         not(ring),
         expect(
@@ -32,7 +35,7 @@ impl ReadState {
             #[cfg(readiness)]
             Via::Fd(fd) => Some(fd),
             #[cfg(ring)]
-            Via::Ops(_) if kind == Kind::UnixDatagram && !self.user_fd => fd,
+            Via::Ops(_) if (kind == Kind::UnixDatagram || self.starved) && !self.user_fd => fd,
             #[cfg(ring)]
             Via::Ops(_) => None,
             #[cfg(not(completion))]
@@ -97,6 +100,10 @@ impl ReadState {
             return None;
         }
         if !self.waits_for_datagram(io) {
+            #[cfg(ring)]
+            {
+                self.readable = false;
+            }
             match sys::ready(receive_into(fd, kind, out, peek)) {
                 Some(result) => return Some(Poll::Ready(result)),
                 None => {
@@ -124,6 +131,10 @@ impl ReadState {
             return Poll::Ready(self.eof);
         }
         if !self.waits_for_datagram(io) {
+            #[cfg(ring)]
+            {
+                self.readable = false;
+            }
             match sys::ready(receive_into(fd, kind, &mut [0; 1], true)) {
                 Some(Ok(_)) => return Poll::Ready(false),
                 Some(Err(err)) => {

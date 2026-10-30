@@ -60,7 +60,7 @@ impl Source {
         crate::coop::poll_budget(cx, |cx| {
             self.poll_writing(cx, |st, io, waker, after| {
                 #[cfg(unix)]
-                if super::super::direct::worth(io, bufs.iter().map(|b| b.len()).sum(), true)
+                if st.writes_itself(io, bufs.iter().map(|b| b.len()).sum())
                     && let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs)
                 {
                     return Poll::Ready(result);
