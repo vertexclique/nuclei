@@ -143,7 +143,12 @@ impl AtomicWaker {
             if let Some(taken) = taken {
                 taken.wake();
             }
-            drop(displaced);
+            // A different waker this registration replaced belongs to a task
+            // that still waits: the wake that met the registration did not
+            // take it, so it is woken here rather than lost.
+            if let Some(displaced) = displaced {
+                displaced.wake();
+            }
             return Registered::WokenNow;
         }
         Registered::Kept(displaced)

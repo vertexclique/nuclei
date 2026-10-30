@@ -305,6 +305,9 @@ pub(crate) struct Source {
     kind: Kind,
     read: Side<ReadState>,
     write: Side<WriteState>,
+    /// The shards that claimed the sides as their owner.
+    read_owner: crate::sync::OnceCell<Arc<Shared>>,
+    write_owner: crate::sync::OnceCell<Arc<Shared>>,
     reg: Registration,
     /// Work that needs both sides, and what it carries (see `requests`).
     requests: AtomicU8,
@@ -344,11 +347,9 @@ unsafe impl Sync for Source {}
 struct SourceHooks<'a> {
     src: &'a Arc<Source>,
     /// The shard this thread runs, when the caller already looked it up.
-    #[cfg_attr(
-        not(completion),
-        expect(dead_code, reason = "only a completion driver routes")
-    )]
     shard: Option<&'a crate::rt::shard::Shard>,
+    /// The shard a registration under way is made for by its own thread.
+    claim: Option<&'a Arc<Shared>>,
     /// For the driver's own edge: the registration the event came for.
     #[cfg(readiness)]
     token: Option<u64>,
@@ -359,6 +360,49 @@ impl SourceHooks<'_> {
     /// [`Source::with_route`], with the shard the step knew, if it did.
     fn with_route(&self, f: impl FnOnce(Io<'_>)) {
         self.src.with_route(self.shard, f);
+    }
+}
+
+impl SourceHooks<'_> {
+    /// The owner of a biased side: the address of the shard this thread
+    /// runs, inside it, when the source is homed there or not homed yet, or
+    /// of the shard it is being registered with by that shard's thread; else
+    /// 0. A side keeps the first shard that claims it (see `Side::role`).
+    fn owner(&self) -> usize {
+        if let Some(claim) = self.claim {
+            return Arc::as_ptr(claim) as usize;
+        }
+        match self.shard {
+            Some(shard) => match self.src.reg.home.load(Ordering::Relaxed) {
+                0 => shard.shared_addr(),
+                home if home == shard.shared_addr() => home,
+                _ => 0,
+            },
+            None => 0,
+        }
+    }
+
+    /// Keeps the shard that claimed a side, for a nudge to reach.
+    fn claimed(&self, cell: &crate::sync::OnceCell<Arc<Shared>>) {
+        let shard = self
+            .claim
+            .cloned()
+            .or_else(|| self.shard.map(|s| Arc::clone(&s.shared)));
+        if let Some(shard) = shard {
+            let _ = cell.set(shard);
+        }
+    }
+
+    /// Asks the shard that owns a side to take and let go of the source's
+    /// sides (a ring source's kick, else a touch), serving what a thread
+    /// whose heavy fence failed left there.
+    fn nudge(&self, cell: &crate::sync::OnceCell<Arc<Shared>>) {
+        if let Some(owner) = cell.get() {
+            #[cfg(ring)]
+            owner.post_io(IoOp::RingKick(Arc::clone(self.src)));
+            #[cfg(not(ring))]
+            owner.post_io(IoOp::Touch(Arc::clone(self.src)));
+        }
     }
 }
 
@@ -417,7 +461,19 @@ impl Hooks<ReadState> for SourceHooks<'_> {
     }
 
     fn requests(&self, st: &mut ReadState, after: &mut After) {
-        self.src.requests_holding_read(st, after);
+        self.src.requests_holding_read(self, st, after);
+    }
+
+    fn owner(&self) -> usize {
+        SourceHooks::owner(self)
+    }
+
+    fn claimed(&self) {
+        SourceHooks::claimed(self, &self.src.read_owner);
+    }
+
+    fn nudge(&self) {
+        SourceHooks::nudge(self, &self.src.read_owner);
     }
 }
 
@@ -468,13 +524,25 @@ impl Hooks<WriteState> for SourceHooks<'_> {
 
     fn released(&self, saw_requests: bool, after: &mut After) {
         if saw_requests {
-            self.src.requests_after_write(after);
+            self.src.requests_after_write(self, after);
         }
     }
 
     fn releasing(&self, st: &mut WriteState) {
         // Release: a drop on another thread reads it.
         self.src.unsent.store(st.has_unsent(), Ordering::Release);
+    }
+
+    fn owner(&self) -> usize {
+        SourceHooks::owner(self)
+    }
+
+    fn claimed(&self) {
+        SourceHooks::claimed(self, &self.src.write_owner);
+    }
+
+    fn nudge(&self) {
+        SourceHooks::nudge(self, &self.src.write_owner);
     }
 }
 
@@ -488,8 +556,10 @@ impl Source {
             epoch: AtomicU32::new(0),
             retired_epoch: AtomicU32::new(0),
             kind,
-            read: Side::new(ReadState::default()),
-            write: Side::new(WriteState::default()),
+            read: Side::biased(ReadState::default()),
+            write: Side::biased(WriteState::default()),
+            read_owner: Default::default(),
+            write_owner: Default::default(),
             reg: Registration {
                 state: AtomicU8::new(UNREGISTERED),
                 token: AtomicU64::new(NO_TOKEN),
@@ -536,6 +606,7 @@ impl Source {
         SourceHooks {
             src: self,
             shard,
+            claim: None,
             #[cfg(readiness)]
             token: None,
         }
@@ -833,11 +904,17 @@ impl Source {
 
     /// The driver saw readiness for `token`.
     #[cfg(readiness)]
-    pub(crate) fn on_event(self: &Arc<Self>, token: u64, readiness: Readiness) {
+    pub(crate) fn on_event(
+        self: &Arc<Self>,
+        token: u64,
+        readiness: Readiness,
+        shard: &crate::rt::shard::Shard,
+    ) {
         let mut after = After::default();
         let hooks = SourceHooks {
             src: self,
-            shard: None,
+            shard: Some(shard),
+            claim: None,
             token: Some(token),
         };
         if readiness.readable {
@@ -859,6 +936,11 @@ impl Source {
 
 #[cfg(test)]
 impl Source {
+    /// Whether the read side and the write side went to shared mode.
+    pub(crate) fn shared(&self) -> (bool, bool) {
+        (self.read.is_shared(), self.write.is_shared())
+    }
+
     /// The registration in place: its shard's address and its token.
     pub(crate) fn registration(&self) -> (usize, u64) {
         (
@@ -932,6 +1014,19 @@ impl Source {
             held.release(&mut after, &hooks);
             found
         })
+    }
+}
+
+impl Source {
+    /// A thread whose heavy fence failed left work on the sides: this shard's
+    /// thread takes and lets go of each, as their owner, which serves it.
+    #[cfg(not(ring))]
+    pub(crate) fn touch(self: &Arc<Self>, shard: &crate::rt::shard::Shard) {
+        let mut after = After::default();
+        let hooks = self.hooks_in(Some(shard));
+        self.read.defer(0, &mut after, &hooks);
+        self.write.defer(0, &mut after, &hooks);
+        self.settle(after);
     }
 }
 

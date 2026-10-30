@@ -266,7 +266,7 @@ impl Source {
             self.write_done.put(done);
             // The side free: the end is taken now, with no trip through the
             // deferred bits.
-            if let Some(mut held) = self.write.try_hold() {
+            if let Some(mut held) = self.write.try_hold_for(&hooks) {
                 hooks.taken(held.get(), &mut after);
                 hooks.deferred(held.get(), super::write_work::DONE, &mut after);
                 held.release(&mut after, &hooks);
