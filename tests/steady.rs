@@ -1,13 +1,15 @@
 //! Nothing leaks: each subsystem's workload, run again and again after a
 //! warm-up, leaves the process with no more open descriptors (handles on
 //! Windows) and no more live heap bytes than after the warm-up, but for a
-//! fixed slack: what other threads retired and have not reclaimed yet (a
-//! bounded batch each). A leak of 8 bytes a round passes the slack, since
-//! the rounds outnumber it. One test runs every workload in turn, so no
-//! other test moves the counts meanwhile.
+//! fixed slack. Every worker submits what it retired to reclamation before a
+//! count, since each holds up to a batch of retired nodes (a queue's
+//! segments) until it fills, and where a batch stands is no round's growth.
+//! One test runs every workload in turn, so no other test moves the counts
+//! meanwhile.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Duration;
 
 use nuclei::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,8 +68,8 @@ unsafe impl GlobalAlloc for Live {
 static ALLOCATOR: Live = Live;
 
 /// What may be live more after the rounds than after the warm-up: nodes
-/// other threads retired and have not reclaimed yet. Measured at zero on
-/// both Linux backends, with this thread's retired nodes flushed.
+/// retired and not reclaimed yet, with every thread's flushed. Measured at
+/// zero on both Linux backends.
 const SLACK: isize = 16 * 1024;
 
 /// The descriptors this process holds open.
@@ -94,30 +96,80 @@ fn open_handles() -> usize {
     count as usize
 }
 
-/// Runs `round` `warm` times, then `rounds` more, and checks that the open
-/// handles and live bytes came back to where they stood after the warm-up.
-fn steady(name: &str, warm: usize, rounds: usize, mut round: impl FnMut()) {
-    for _ in 0..warm {
-        round();
+/// The runtime whose workers hold retired nodes, if any, and how many.
+struct Watch<'a> {
+    rt: Option<&'a nuclei::Runtime>,
+    workers: usize,
+}
+
+impl Watch<'_> {
+    /// Submits what every worker and this thread retired to reclamation.
+    /// kovan batches 64 retired nodes a thread, and a worker that popped a
+    /// queue's segments keeps them until its batch fills, 100 KB of
+    /// 1600-byte segments, so the live bytes swing with where the batch
+    /// stands. Tasks flush the workers they land on until every worker has.
+    fn reclaim(&self) {
+        if let Some(rt) = self.rt {
+            let mut seen = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while seen.len() < self.workers {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{} of {} workers took a task to flush",
+                    seen.len(),
+                    self.workers
+                );
+                // Live together, so that placement spreads them over the workers.
+                let release = Arc::new(AtomicBool::new(false));
+                let tasks: Vec<_> = (0..self.workers * 64)
+                    .map(|_| {
+                        let release = Arc::clone(&release);
+                        rt.spawn(async move {
+                            kovan::flush();
+                            let id = std::thread::current().id();
+                            while !release.load(Ordering::Acquire) {
+                                nuclei::task::yield_now().await;
+                            }
+                            id
+                        })
+                    })
+                    .collect();
+                release.store(true, Ordering::Release);
+                for task in tasks {
+                    let id = rt.block_on(task);
+                    if !seen.contains(&id) {
+                        seen.push(id);
+                    }
+                }
+            }
+        }
+        kovan::flush();
     }
-    // What this thread retired is freed now, not at the next wave of its
-    // reclamation; other threads hold a bounded batch each.
-    kovan::flush();
-    let (handles, bytes) = (open_handles(), LIVE.load(Ordering::Relaxed));
-    for _ in 0..rounds {
-        round();
+
+    /// Runs `round` `warm` times, then `rounds` more, and checks that the
+    /// open handles and live bytes came back to where they stood after the
+    /// warm-up.
+    fn steady(&self, name: &str, warm: usize, rounds: usize, mut round: impl FnMut()) {
+        for _ in 0..warm {
+            round();
+        }
+        self.reclaim();
+        let (handles, bytes) = (open_handles(), LIVE.load(Ordering::Relaxed));
+        for _ in 0..rounds {
+            round();
+        }
+        self.reclaim();
+        let (handles_after, bytes_after) = (open_handles(), LIVE.load(Ordering::Relaxed));
+        assert!(
+            handles_after <= handles,
+            "{name}: {handles} open handles after the warm-up, {handles_after} after {rounds} more rounds"
+        );
+        let grew = bytes_after - bytes;
+        assert!(
+            grew <= SLACK,
+            "{name}: {grew} live bytes more after {rounds} rounds than after the warm-up"
+        );
     }
-    kovan::flush();
-    let (handles_after, bytes_after) = (open_handles(), LIVE.load(Ordering::Relaxed));
-    assert!(
-        handles_after <= handles,
-        "{name}: {handles} open handles after the warm-up, {handles_after} after {rounds} more rounds"
-    );
-    let grew = bytes_after - bytes;
-    assert!(
-        grew <= SLACK,
-        "{name}: {grew} live bytes more after {rounds} rounds than after the warm-up"
-    );
 }
 
 async fn tcp_pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
@@ -139,7 +191,11 @@ fn every_subsystem_holds_steady() {
         .handoff_after(None)
         .build()
         .unwrap();
-    steady("spawns", 200, 5000, || {
+    let watch = Watch {
+        rt: Some(&rt),
+        workers: 2,
+    };
+    watch.steady("spawns", 200, 5000, || {
         rt.block_on(async {
             let local = nuclei::spawn_local(async { 1u8 });
             let remote = nuclei::spawn(async { 2u8 });
@@ -149,7 +205,7 @@ fn every_subsystem_holds_steady() {
         });
     });
 
-    steady("join sets", 100, 2000, || {
+    watch.steady("join sets", 100, 2000, || {
         rt.block_on(async {
             let mut set = nuclei::task::JoinSet::new();
             for i in 0..8u32 {
@@ -168,7 +224,7 @@ fn every_subsystem_holds_steady() {
     });
 
     let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
-    steady("tcp", 100, 2000, || {
+    watch.steady("tcp", 100, 2000, || {
         rt.block_on(async {
             let (mut client, mut server) = tcp_pair(&listener).await;
             client.write_all(&[1u8; 1024]).await.unwrap();
@@ -181,7 +237,7 @@ fn every_subsystem_holds_steady() {
         });
     });
 
-    steady("udp", 100, 2000, || {
+    watch.steady("udp", 100, 2000, || {
         rt.block_on(async {
             let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -195,7 +251,7 @@ fn every_subsystem_holds_steady() {
     });
 
     #[cfg(unix)]
-    steady("unix streams and pipes", 100, 2000, || {
+    watch.steady("unix streams and pipes", 100, 2000, || {
         rt.block_on(async {
             let (mut a, mut b) = nuclei::net::UnixStream::pair().unwrap();
             a.write_all(b"unix").await.unwrap();
@@ -210,7 +266,7 @@ fn every_subsystem_holds_steady() {
     });
 
     let path = std::env::temp_dir().join(format!("nuclei-steady-{}", std::process::id()));
-    steady("files", 100, 2000, || {
+    watch.steady("files", 100, 2000, || {
         rt.block_on(async {
             nuclei::fs::write(&path, [7u8; 4096]).await.unwrap();
             assert_eq!(nuclei::fs::read(&path).await.unwrap().len(), 4096);
@@ -226,7 +282,7 @@ fn every_subsystem_holds_steady() {
     });
     let _ = std::fs::remove_file(&path);
 
-    steady("timers", 100, 2000, || {
+    watch.steady("timers", 100, 2000, || {
         rt.block_on(async {
             nuclei::time::sleep(Duration::from_micros(10)).await;
             let pending = nuclei::time::timeout(Duration::ZERO, core::future::pending::<()>());
@@ -237,7 +293,7 @@ fn every_subsystem_holds_steady() {
         });
     });
 
-    steady("channels", 200, 5000, || {
+    watch.steady("channels", 200, 5000, || {
         rt.block_on(async {
             let (tx, mut rx) = nuclei::sync::mpsc::channel(4);
             let (utx, mut urx) = nuclei::sync::mpsc::unbounded_channel();
@@ -258,7 +314,7 @@ fn every_subsystem_holds_steady() {
         });
     });
 
-    steady("child processes", 20, 200, || {
+    watch.steady("child processes", 20, 200, || {
         rt.block_on(async {
             #[cfg(unix)]
             let mut command = nuclei::process::Command::new("true");
@@ -273,7 +329,7 @@ fn every_subsystem_holds_steady() {
     });
 
     #[cfg(unix)]
-    steady("signal streams", 100, 2000, || {
+    watch.steady("signal streams", 100, 2000, || {
         rt.block_on(async {
             let signal =
                 nuclei::signal::unix::signal(nuclei::signal::unix::SignalKind::user_defined1());
@@ -281,7 +337,7 @@ fn every_subsystem_holds_steady() {
         });
     });
 
-    steady("cancelled operations", 100, 2000, || {
+    watch.steady("cancelled operations", 100, 2000, || {
         rt.block_on(async {
             let (client, mut server) = tcp_pair(&listener).await;
             let mut buf = [0u8; 64];
@@ -297,7 +353,7 @@ fn every_subsystem_holds_steady() {
     });
 
     #[cfg(unix)]
-    steady("caller's own descriptors", 100, 2000, || {
+    watch.steady("caller's own descriptors", 100, 2000, || {
         use std::io::{Read, Write};
         rt.block_on(async {
             let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -320,7 +376,11 @@ fn every_subsystem_holds_steady() {
         .handoff_after(Some(std::time::Duration::from_millis(5)))
         .build()
         .unwrap();
-    steady("handoffs", 10, 100, || {
+    let watch = Watch {
+        rt: Some(&rt),
+        workers: 1,
+    };
+    watch.steady("handoffs", 10, 100, || {
         rt.block_on(rt.spawn(async {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }));
@@ -329,7 +389,11 @@ fn every_subsystem_holds_steady() {
     });
     drop(rt);
 
-    steady("runtimes started and stopped", 10, 100, || {
+    let watch = Watch {
+        rt: None,
+        workers: 0,
+    };
+    watch.steady("runtimes started and stopped", 10, 100, || {
         let rt = nuclei::Runtime::builder()
             .worker_threads(2)
             .build()
