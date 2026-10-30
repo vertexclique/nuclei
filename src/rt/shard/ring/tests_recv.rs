@@ -529,9 +529,15 @@ fn an_accept_after_a_multishot_one_gets_its_peer_from_the_kernel() {
 
 /// Connections that come while no task takes them: past its cap the accept
 /// is stopped, none is lost, and once they are taken the accept is armed
-/// again.
+/// again. Alone in a process of its own: its clients and the connections it
+/// holds take more descriptors than the tests running beside it leave.
 #[test]
 fn past_its_cap_a_multishot_accept_is_stopped_and_loses_no_connection() {
+    if !crate::alone::alone(
+        "rt::shard::ring::tests_recv::past_its_cap_a_multishot_accept_is_stopped_and_loses_no_connection",
+    ) {
+        return;
+    }
     // A completion queue with room for every connection: only the cap stops
     // the accept.
     let Some(shard) = ring_shard_of(1024, 16, 4096) else {
