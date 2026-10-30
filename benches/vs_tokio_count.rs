@@ -1,6 +1,6 @@
 //! A fixed amount of work on one runtime, for counting instructions and cycles:
 //! `perf stat -e instructions:u,cycles:u target/release/examples/vs_tokio_count
-//! <nuclei|tokio> <block_on|mpsc|timeout|tcp>`. Prints the iteration count so
+//! <nuclei|tokio> <block_on|mpsc|timeout|tcp|unix_dgram>`. Prints the iteration count so
 //! the caller divides. Shapes match `vs_tokio`: one worker, unpinned, no handoff
 //! on nuclei; a current-thread runtime on tokio.
 
@@ -12,6 +12,18 @@ const BLOCK_ON: u64 = 200_000;
 const MPSC_ROUNDS: u64 = 200_000;
 const TIMEOUTS: u64 = 200_000;
 const TCP_ROUNDS: u64 = 50_000;
+#[cfg(unix)]
+const DGRAM_ROUNDS: u64 = 50_000;
+
+#[cfg(unix)]
+fn dgram_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let a = dir.join(format!("vs-tokio-count-{pid}-a"));
+    let b = dir.join(format!("vs-tokio-count-{pid}-b"));
+    let _ = (std::fs::remove_file(&a), std::fs::remove_file(&b));
+    (a, b)
+}
 
 fn nuclei_run(row: &str) -> u64 {
     let rt = nuclei::runtime::Builder::new()
@@ -90,6 +102,30 @@ fn nuclei_run(row: &str) -> u64 {
             }));
             TCP_ROUNDS
         }
+        #[cfg(unix)]
+        "unix_dgram" => {
+            let (a_path, b_path) = dgram_paths();
+            let (a_to, b_to) = (a_path.clone(), b_path.clone());
+            rt.block_on(rt.spawn(async move {
+                let a = nuclei::net::UnixDatagram::bind(&a_path).unwrap();
+                let echo = nuclei::net::UnixDatagram::bind(&b_path).unwrap();
+                nuclei::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok((n @ 1.., _)) = echo.recv_from(&mut buf).await {
+                        echo.send_to(&buf[..n], &a_to).await.unwrap();
+                    }
+                })
+                .detach();
+                let request = [7u8; 64];
+                let mut reply = [0u8; 64];
+                for _ in 0..DGRAM_ROUNDS {
+                    a.send_to(&request, &b_to).await.unwrap();
+                    a.recv_from(&mut reply).await.unwrap();
+                }
+                let _ = (std::fs::remove_file(&a_path), std::fs::remove_file(&b_path));
+            }));
+            DGRAM_ROUNDS
+        }
         _ => usage(),
     }
 }
@@ -161,12 +197,36 @@ fn tokio_run(row: &str) -> u64 {
             .unwrap();
             TCP_ROUNDS
         }
+        #[cfg(unix)]
+        "unix_dgram" => {
+            let (a_path, b_path) = dgram_paths();
+            let (a_to, b_to) = (a_path.clone(), b_path.clone());
+            rt.block_on(rt.spawn(async move {
+                let a = tokio::net::UnixDatagram::bind(&a_path).unwrap();
+                let echo = tokio::net::UnixDatagram::bind(&b_path).unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok((n @ 1.., _)) = echo.recv_from(&mut buf).await {
+                        echo.send_to(&buf[..n], &a_to).await.unwrap();
+                    }
+                });
+                let request = [7u8; 64];
+                let mut reply = [0u8; 64];
+                for _ in 0..DGRAM_ROUNDS {
+                    a.send_to(&request, &b_to).await.unwrap();
+                    a.recv_from(&mut reply).await.unwrap();
+                }
+                let _ = (std::fs::remove_file(&a_path), std::fs::remove_file(&b_path));
+            }))
+            .unwrap();
+            DGRAM_ROUNDS
+        }
         _ => usage(),
     }
 }
 
 fn usage() -> ! {
-    eprintln!("usage: vs_tokio_count <nuclei|tokio> <block_on|mpsc|timeout|tcp>");
+    eprintln!("usage: vs_tokio_count <nuclei|tokio> <block_on|mpsc|timeout|tcp|unix_dgram>");
     std::process::exit(2)
 }
 
