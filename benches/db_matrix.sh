@@ -191,7 +191,8 @@ net_run() {
     next_port
     scmd="taskset -c $smask $(server_cmd "$rt" "$bin" "$port" "$scpus" "$req" "$resp")"
     ccmd="taskset -c $cmask $bin/client port=$port conns=$conns req=$req resp=$resp load=$load $largs warm=$net_warm dur=$net_dur pid=PID cpus=$ccpus spin=$spin"
-    $scmd >"$log" 2>&1 &
+    : >"$log"
+    $scmd >>"$log" 2>&1 &
     srv_pid=$!
     deadline=$((SECONDS + 30))
     until grep -q '^ready' "$log"; do
