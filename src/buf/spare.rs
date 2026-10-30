@@ -57,6 +57,25 @@ impl<T: Reused> Spare<T> {
     }
 }
 
+impl<T: Reused + Clone> Spare<T> {
+    /// The value, its box going back to the spares.
+    pub(crate) fn into_inner(self) -> T {
+        T::clone(&self)
+    }
+}
+
+impl<T: Reused + Clone> Clone for Spare<T> {
+    fn clone(&self) -> Self {
+        Self::new(T::clone(self))
+    }
+}
+
+impl<T: Reused + core::fmt::Debug> core::fmt::Debug for Spare<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        T::fmt(self, f)
+    }
+}
+
 impl<T: Reused> Deref for Spare<T> {
     type Target = T;
 
@@ -91,7 +110,7 @@ impl<T: Reused> Drop for Spare<T> {
 mod tests {
     use super::*;
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     struct Probe(u64);
     reused!(Probe);
 
@@ -114,6 +133,13 @@ mod tests {
         );
         assert_eq!(*second, Probe(2));
         assert_eq!(spares(), 0);
+    }
+
+    #[test]
+    fn into_inner_gives_the_value_and_keeps_the_box() {
+        Probe::with_spares(Vec::clear);
+        assert_eq!(Spare::new(Probe(7)).into_inner(), Probe(7));
+        assert_eq!(spares(), 1);
     }
 
     #[test]

@@ -427,11 +427,11 @@ pub(crate) fn whole_too_large(len: usize) -> Option<std::io::Error> {
 /// the source must do next.
 #[derive(Default)]
 pub(crate) struct After {
-    wake: Wakers,
-    forget: Wakers,
-    /// Buffers to drop: almost every step drops one at most.
+    /// The first waker to wake: almost every step wakes one task at most.
+    wake: Option<Waker>,
+    /// The first buffer to drop: almost every step drops one at most.
     drop_one: Option<PoolBuf>,
-    drop_more: Vec<PoolBuf>,
+    more: Option<Box<More>>,
     /// A side found the pool empty and must hear when a buffer comes back.
     pub(crate) starved: bool,
     /// Work was left to the driver: the source must be registered.
@@ -442,49 +442,86 @@ pub(crate) struct After {
     pub(crate) kick: Option<std::sync::Arc<crate::rt::shard::Shared>>,
 }
 
+/// What a step leaves beyond one waker and one buffer, allocated only when
+/// a step has more.
+#[derive(Default)]
+struct More {
+    wake: Vec<Waker>,
+    forget: Wakers,
+    bufs: Vec<PoolBuf>,
+}
+
 impl After {
+    fn more(&mut self) -> &mut More {
+        self.more.get_or_insert_default()
+    }
+
     pub(crate) fn wake(&mut self, wakers: &mut Wakers) {
-        self.wake.append(wakers);
+        if let Some(w) = wakers.first.take() {
+            self.wake_one(w);
+        }
+        if !wakers.rest.is_empty() {
+            self.more().wake.append(&mut wakers.rest);
+        }
     }
 
     /// Drops `wakers` without waking them.
     pub(crate) fn forget(&mut self, wakers: &mut Wakers) {
-        self.forget.append(wakers);
+        if !wakers.is_empty() {
+            self.more().forget.append(wakers);
+        }
     }
 
     /// Wakes the one task of `waker`.
     pub(crate) fn wake_one(&mut self, waker: Waker) {
-        self.wake.push(waker);
+        match self.wake {
+            None => self.wake = Some(waker),
+            Some(_) => self.more().wake.push(waker),
+        }
     }
 
     /// Drops `waker` without waking it.
     pub(crate) fn forget_one(&mut self, waker: Waker) {
-        self.forget.push(waker);
+        self.more().forget.push(waker);
     }
 
     pub(crate) fn drop_buf(&mut self, buf: PoolBuf) {
         match self.drop_one {
             None => self.drop_one = Some(buf),
-            Some(_) => self.drop_more.push(buf),
+            Some(_) => self.more().bufs.push(buf),
         }
     }
 
-    /// Wakes and drops; call with no guard held.
-    pub(crate) fn run(&mut self) {
+    /// Wakes and drops; call with no guard held. Once: it consumes the step,
+    /// so its drop finds nothing left to do.
+    pub(crate) fn run(mut self) {
+        self.flush();
+        #[cfg(ring)]
+        drop(self.kick.take());
+        core::mem::forget(self);
+    }
+
+    fn flush(&mut self) {
         drop(self.drop_one.take());
-        if !self.drop_more.is_empty() {
-            self.drop_more.clear();
+        let Some(more) = self.more.take() else {
+            if let Some(w) = self.wake.take() {
+                w.wake();
+            }
+            return;
+        };
+        let More { wake, forget, bufs } = *more;
+        drop(bufs);
+        drop(forget);
+        if let Some(w) = self.wake.take() {
+            w.wake();
         }
-        if !self.forget.is_empty() {
-            self.forget = Wakers::default();
-        }
-        self.wake.wake_all();
+        wake.into_iter().for_each(Waker::wake);
     }
 }
 
 impl Drop for After {
     fn drop(&mut self) {
-        self.run();
+        self.flush();
     }
 }
 
@@ -534,17 +571,6 @@ impl Wakers {
             self.push(w);
         }
         self.rest.append(&mut other.rest);
-    }
-
-    fn wake_all(&mut self) {
-        if let Some(w) = self.first.take() {
-            w.wake();
-        }
-        if !self.rest.is_empty() {
-            for w in self.rest.drain(..) {
-                w.wake();
-            }
-        }
     }
 }
 

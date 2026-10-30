@@ -101,7 +101,7 @@ fn peer_cred(fd: std::os::fd::RawFd) -> io::Result<UCred> {
 
 fn unix(addr: Addr) -> io::Result<UnixSocketAddr> {
     match addr {
-        Addr::Unix(addr) => Ok(addr),
+        Addr::Unix(addr) => Ok(addr.into_inner()),
         Addr::Inet(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "a Unix socket's peer has an internet address",

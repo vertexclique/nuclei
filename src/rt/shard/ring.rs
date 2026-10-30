@@ -389,15 +389,20 @@ impl ShardRing {
                 return;
             };
             let mut ops = self.ops.borrow_mut();
-            let held = ops.get_mut(user_data).and_then(|op| match &mut op.mem {
-                RingMem::RecvMulti { held, stopping } => Some((op.epoch, held, stopping, false)),
-                RingMem::RecvFromMulti { held, stopping, .. } => {
-                    Some((op.epoch, held, stopping, true))
+            let held = ops.get_mut(user_data).and_then(|op| {
+                let source = std::sync::Arc::as_ptr(&op.source);
+                match &mut op.mem {
+                    RingMem::RecvMulti { held, stopping } => {
+                        Some((op.epoch, held, stopping, false, source))
+                    }
+                    RingMem::RecvFromMulti { held, stopping, .. } => {
+                        Some((op.epoch, held, stopping, true, source))
+                    }
+                    _ => None,
                 }
-                _ => None,
             });
             match (u32::try_from(res), held) {
-                (Ok(len @ 1..), Some((epoch, held, stopping, datagram))) => {
+                (Ok(len @ 1..), Some((epoch, held, stopping, datagram, source))) => {
                     match group.hand_out(user_data, bid, len) {
                         Some(chunk) => {
                             *held += len as usize;
@@ -405,9 +410,7 @@ impl ShardRing {
                                 *stopping = true;
                                 stop = true;
                             }
-                            ops.get_mut(user_data).map(|op| {
-                                (std::sync::Arc::clone(&op.source), chunk, epoch, datagram)
-                            })
+                            Some((source, chunk, epoch, datagram))
                         }
                         None => None,
                     }
@@ -425,21 +428,40 @@ impl ShardRing {
         }
         // Handed over with nothing borrowed: the source may submit at once.
         if let Some((source, chunk, epoch, datagram)) = delivery {
-            #[cfg(test)]
-            {
-                let (armed, arrived, dry) = self.counts.get();
-                self.counts.set((armed, arrived + 1, dry));
-            }
-            let arrival = if datagram {
-                // A buffer not laid out as the kernel says is only given back.
-                match crate::io::source::ring::datagram_of(chunk, source.kind()) {
-                    Some((payload, from)) => Arrival::Datagram(payload, from),
-                    None => return,
+            let (after, starved) = {
+                // SAFETY: the op's slab entry owns a strong count of the
+                // source until its final completion, which this thread
+                // processes only after this call returns. Until the view is
+                // dropped below nothing runs foreign code or removes the
+                // entry: a cancel only queues a cancel entry (a multishot
+                // receive never waits for room), and the shard's shutdown
+                // runs on this thread outside any source code. The wakes
+                // run after the view is gone. The view is never dropped as
+                // an `Arc`.
+                let source =
+                    core::mem::ManuallyDrop::new(unsafe { std::sync::Arc::from_raw(source) });
+                #[cfg(test)]
+                {
+                    let (armed, arrived, dry) = self.counts.get();
+                    self.counts.set((armed, arrived + 1, dry));
                 }
-            } else {
-                Arrival::Chunk(chunk)
+                let arrival = if datagram {
+                    // A buffer not laid out as the kernel says is only given back.
+                    match crate::io::source::ring::datagram_of(chunk, source.kind()) {
+                        Some((payload, from)) => Arrival::Datagram(payload, from),
+                        None => return,
+                    }
+                } else {
+                    Arrival::Chunk(chunk)
+                };
+                let after = source.ring_arrival(arrival, epoch);
+                let starved = after.starved.then(|| std::sync::Arc::clone(&source));
+                (after, starved)
             };
-            source.ring_arrival(arrival, epoch);
+            if let Some(source) = starved {
+                source.wait_for_buffer();
+            }
+            after.run();
         }
     }
 
@@ -471,7 +493,11 @@ impl ShardRing {
         if stop {
             self.cancel(user_data);
         }
-        source.ring_arrival(Arrival::Conn(conn), epoch);
+        let after = source.ring_arrival(Arrival::Conn(conn), epoch);
+        if after.starved {
+            std::sync::Arc::clone(&source).wait_for_buffer();
+        }
+        after.run();
     }
 
     /// Takes in the buffers chunks gave back and gives them to the kernel

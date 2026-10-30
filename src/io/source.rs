@@ -200,12 +200,15 @@ impl Kind {
     }
 }
 
+#[cfg(unix)]
+crate::buf::spare::reused!(unix::SocketAddr, crate::io::sys::UnixAddr);
+
 /// A peer's address.
 #[derive(Clone, Debug)]
 pub(crate) enum Addr {
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(unix::SocketAddr),
+    Unix(crate::buf::spare::Spare<unix::SocketAddr>),
 }
 
 /// Where a datagram goes.
@@ -215,7 +218,7 @@ pub(crate) enum Target {
     Connected,
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(crate::io::sys::UnixAddr),
+    Unix(crate::buf::spare::Spare<crate::io::sys::UnixAddr>),
 }
 
 /// An error kept to be reported again: the kernel's code, or its kind.
@@ -589,18 +592,33 @@ impl Source {
     /// of buffers waits for one of this thread's pool, then the wakes and
     /// drops.
     fn settle(self: &Arc<Self>, mut after: After) {
+        self.kick(&mut after);
+        if after.starved {
+            Arc::clone(self).wait_for_buffer();
+        }
+        after.run();
+    }
+
+    /// Posts the ring thread the submit a side of a ring source asked for.
+    #[cfg_attr(
+        not(ring),
+        expect(unused_variables, reason = "only a ring source kicks")
+    )]
+    fn kick(self: &Arc<Self>, after: &mut After) {
         #[cfg(ring)]
         if let Some(home) = after.kick.take() {
             home.post_io(crate::rt::shard::IoOp::RingKick(Arc::clone(self)));
         }
-        if after.starved {
-            crate::buf::with_pool(|pool| {
-                if let Some(pool) = pool {
-                    pool.wait_for_return(Arc::clone(self).into());
-                }
-            });
-        }
-        after.run();
+    }
+
+    /// Has this thread's pool wake the source when a buffer comes back. May
+    /// wake at once, so no borrowed view of the source may be live.
+    pub(crate) fn wait_for_buffer(self: Arc<Self>) {
+        crate::buf::with_pool(|pool| {
+            if let Some(pool) = pool {
+                pool.wait_for_return(self.into());
+            }
+        });
     }
 
     /// The end of a poll: settles, and makes sure a driver watches the

@@ -905,7 +905,9 @@ const REPORTS_URGENT: bool = cfg!(any(
 /// Accepts a connection, non-blocking, with its peer's address.
 fn accept(fd: RawFd, kind: Kind) -> io::Result<(Owned, Addr)> {
     match kind {
-        Kind::UnixListener => sys::accept_unix(fd).map(|(s, a)| (s, Addr::Unix(a))),
+        Kind::UnixListener => {
+            sys::accept_unix(fd).map(|(s, a)| (s, Addr::Unix(crate::buf::spare::Spare::new(a))))
+        }
         _ => sys::accept_inet(fd).map(|(s, a)| (s, Addr::Inet(a))),
     }
 }
@@ -914,7 +916,8 @@ fn accept(fd: RawFd, kind: Kind) -> io::Result<(Owned, Addr)> {
 /// Receives a datagram with its sender's address.
 fn receive(fd: RawFd, kind: Kind, out: &mut [u8]) -> io::Result<(usize, Addr)> {
     match kind {
-        Kind::UnixDatagram => sys::recv_from_unix(fd, out).map(|(n, a)| (n, Addr::Unix(a))),
+        Kind::UnixDatagram => sys::recv_from_unix(fd, out)
+            .map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)))),
         _ => sys::recv_from_udp(fd, out).map(|(n, a)| (n, Addr::Inet(a))),
     }
 }

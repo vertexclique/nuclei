@@ -66,7 +66,7 @@ impl Dest<'_> {
             Dest::Connected => Target::Connected,
             Dest::Inet(addr) => Target::Inet(addr),
             #[cfg(unix)]
-            Dest::Unix(addr) => Target::Unix(*addr),
+            Dest::Unix(addr) => Target::Unix(crate::buf::spare::Spare::new(*addr)),
             #[cfg(windows)]
             Dest::Unix((never, _)) => match never {},
         }
@@ -790,7 +790,9 @@ impl WriteState {
                     self.dial = Some(match peer {
                         Peer::Inet(addr) => super::ops::Dial::Inet(addr),
                         #[cfg(unix)]
-                        Peer::Unix(addr) => super::ops::Dial::Unix(*addr),
+                        Peer::Unix(addr) => {
+                            super::ops::Dial::Unix(crate::buf::spare::Spare::new(*addr))
+                        }
                         #[cfg(windows)]
                         Peer::Unix((never, _)) => match never {},
                     });

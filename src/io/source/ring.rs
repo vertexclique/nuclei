@@ -245,7 +245,7 @@ impl RawAddr {
                 let un = unsafe {
                     &*(&self.storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_un>()
                 };
-                Ok(Addr::Unix(sys::unix_addr(un, self.len)?))
+                Ok(Addr::Unix(Spare::new(sys::unix_addr(un, self.len)?)))
             }
             _ => Ok(Addr::Inet(sys::inet_addr(&self.storage, self.len)?)),
         }
@@ -633,8 +633,9 @@ fn stream_write(kind: Kind, slot: RawFd, bytes: &[u8]) -> Sqe {
 impl Source {
     /// On the ring's thread: an arrival of the read side's multishot
     /// receive or accept, submitted in `epoch`. The side takes it at once if
-    /// free, else its holder does as it lets go.
-    pub(crate) fn ring_arrival(self: &Arc<Self>, arrival: Arrival, epoch: u32) {
+    /// free, else its holder does as it lets go. The wakes and drops come
+    /// back to be run once the caller no longer borrows the source.
+    pub(crate) fn ring_arrival(self: &Arc<Self>, arrival: Arrival, epoch: u32) -> After {
         let mut after = After::default();
         let hooks = self.hooks();
         // The side free: the arrival goes in now, with no trip through the
@@ -653,7 +654,8 @@ impl Source {
             self.read
                 .defer(super::read_work::ARRIVALS, &mut after, &hooks);
         }
-        self.settle(after);
+        self.kick(&mut after);
+        after
     }
 
     /// Cancels the side's operation of `user_data`, on its ring's thread;
