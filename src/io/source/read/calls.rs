@@ -55,6 +55,16 @@ impl Source {
         let kind = self.kind;
         crate::coop::poll_budget(cx, |cx| {
             self.poll_reading(cx, |st, io, waker, after| {
+                #[cfg(unix)]
+                if !peek
+                    && super::super::direct::worth(io, out.len(), false)
+                    && let Some(poll) =
+                        st.read_direct(io, self.serving_fd(None), kind, out.len(), waker, |fd| {
+                            sys::read(fd, out)
+                        })
+                {
+                    return poll;
+                }
                 st.read(io, kind, out, peek, waker, after)
             })
         })
@@ -160,6 +170,18 @@ impl Source {
         let kind = self.kind;
         crate::coop::poll_budget(cx, |cx| {
             self.poll_reading(cx, |st, io, waker, after| {
+                #[cfg(unix)]
+                {
+                    let len = bufs.iter().map(|b| b.len()).sum();
+                    if super::super::direct::worth(io, len, false)
+                        && let Some(poll) =
+                            st.read_direct(io, self.serving_fd(None), kind, len, waker, |fd| {
+                                sys::read_bufs(fd, bufs)
+                            })
+                    {
+                        return poll;
+                    }
+                }
                 st.read_vectored(io, kind, bufs, waker, after)
             })
         })

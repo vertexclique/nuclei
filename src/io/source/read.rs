@@ -2,15 +2,17 @@
 //!
 //! Every call on the descriptor is the driver's ([`ReadState::complete`]),
 //! into buffers of the pool: on an edge, for the tasks that wait, or at
-//! once when a task asks and the socket may hold something. A task never
-//! makes the call itself: it takes what the driver completed, copying it
-//! into its own buffer. What no task took yet waits here: a stream's
-//! read-ahead (in the order it came: a buffer of the pool, a lent buffer's
-//! leftover, or on a ring the buffers of the shard's receive group that a
-//! multishot receive handed out), its end or its error, a listener's
-//! accepted connections, a datagram socket's datagrams (as many as tasks
-//! wait, at most [`BATCH`]). A task whose future went away leaves it for the
-//! next operation, so nothing the kernel handed over is lost.
+//! once when a task asks and the socket may hold something. A task takes
+//! what the driver completed, copying it into its own buffer; only a
+//! stream read into a buffer big enough (see `direct`) makes the call
+//! itself, into that buffer, when the read-ahead holds nothing. What no
+//! task took yet waits here: a stream's read-ahead (in the order it came: a
+//! buffer of the pool, a lent buffer's leftover, or on a ring the buffers of
+//! the shard's receive group that a multishot receive handed out), its end
+//! or its error, a listener's accepted connections, a datagram socket's
+//! datagrams (as many as tasks wait, at most [`BATCH`]). A task whose future
+//! went away leaves it for the next operation, so nothing the kernel handed
+//! over is lost.
 //!
 //! A stream read may also lend the side a buffer of its own
 //! ([`Source::read_owned`]): the driver reads into that buffer, with no copy,
@@ -315,6 +317,12 @@ impl ReadState {
         if self.waiters.is_empty() && !self.lent_waits() {
             return;
         }
+        if self.leaves_to_tasks(kind) {
+            // The task reads into its own buffer when it polls.
+            self.want = 0;
+            after.wake(&mut self.waiters);
+            return;
+        }
         self.complete_fd(fd, kind, self.want, after);
         if self.has_result() {
             self.want = 0;
@@ -504,6 +512,84 @@ impl ReadState {
                     return;
                 }
             }
+        }
+    }
+
+    /// The tasks waiting asked for buffers big enough to read into directly,
+    /// and nothing is held that must come first.
+    #[cfg(readiness)]
+    fn leaves_to_tasks(&self, kind: Kind) -> bool {
+        kind.streams()
+            && self.want >= super::direct::READ_READINESS
+            && self.ahead.is_empty()
+            && self.lent.is_none()
+            && !self.eof
+            && self.error.is_none()
+    }
+
+    /// A stream read of `len` bytes made by `call` straight on the
+    /// descriptor `fd`, into the caller's memory, if the side holds nothing
+    /// that comes first. `None` leaves the read to the normal path, which
+    /// waits for readiness when the socket had nothing; `Pending` is a
+    /// multishot receive being stopped so the next poll can call.
+    #[cfg(unix)]
+    pub(super) fn read_direct(
+        &mut self,
+        io: Io<'_>,
+        fd: Option<RawFd>,
+        kind: Kind,
+        len: usize,
+        waker: &Waker,
+        call: impl FnOnce(RawFd) -> io::Result<usize>,
+    ) -> Option<Poll<io::Result<usize>>> {
+        let fd = fd?;
+        if !kind.streams()
+            || len == 0
+            || !super::direct::worth(io, len, false)
+            || !self.ahead.is_empty()
+            || self.lent.is_some()
+            || self.eof
+            || self.error.is_some()
+        {
+            return None;
+        }
+        match io.via {
+            Via::Fd(_) if self.blocked => return None,
+            Via::Fd(_) => {}
+            #[cfg(ring)]
+            Via::Ops(route) => {
+                if self.out.is_some() {
+                    if !self.multi {
+                        return None;
+                    }
+                    self.stop_multi(route);
+                    self.wait(waker, len);
+                    return Some(Poll::Pending);
+                }
+            }
+            #[cfg(not(completion))]
+            Via::None(never, _) => match never {},
+        }
+        #[cfg(not(ring))]
+        let _ = waker;
+        match sys::ready(call(fd)) {
+            None => {
+                match io.via {
+                    Via::Fd(_) => self.blocked = true,
+                    #[cfg(ring)]
+                    Via::Ops(_) => self.poll_first = true,
+                    #[cfg(not(completion))]
+                    Via::None(never, _) => match never {},
+                }
+                None
+            }
+            Some(Ok(n)) => {
+                if matches!(io.via, Via::Fd(_)) {
+                    self.blocked = drained(kind, self.unsure, n, len);
+                }
+                Some(Poll::Ready(Ok(n)))
+            }
+            Some(Err(err)) => Some(Poll::Ready(Err(err))),
         }
     }
 

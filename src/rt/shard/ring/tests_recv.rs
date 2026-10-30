@@ -148,8 +148,12 @@ fn a_long_stream_arrives_whole_and_in_order_across_the_buffers() {
         peer
     });
     shard.block_on(async {
+        // Reads under the size a buffer is read into directly, so the
+        // group serves them.
         let mut got = vec![0u8; expected.len()];
-        read_exact(&src, &mut got).await;
+        for piece in got.chunks_mut(4096) {
+            read_exact(&src, piece).await;
+        }
         assert!(got == expected, "the bytes arrived changed or out of order");
     });
     // Some reads may go through the pool when a burst outruns the group.

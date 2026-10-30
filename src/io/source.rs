@@ -34,6 +34,8 @@
 //! index and generation, never a pointer) against the registration in
 //! place, so an event for one that is gone does nothing.
 
+#[cfg(unix)]
+mod direct;
 #[cfg(completion)]
 pub(crate) mod ops;
 #[cfg(port)]

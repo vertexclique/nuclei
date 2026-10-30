@@ -59,6 +59,12 @@ impl Source {
         let kind = self.kind;
         crate::coop::poll_budget(cx, |cx| {
             self.poll_writing(cx, |st, io, waker, after| {
+                #[cfg(unix)]
+                if super::super::direct::worth(io, bufs.iter().map(|b| b.len()).sum(), true)
+                    && let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs)
+                {
+                    return Poll::Ready(result);
+                }
                 st.write(io, kind, bufs, waker, after)
             })
         })

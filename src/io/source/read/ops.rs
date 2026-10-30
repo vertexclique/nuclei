@@ -26,6 +26,19 @@ impl ReadState {
         }
     }
 
+    /// Stops the multishot receive out, once: a task takes the next bytes
+    /// itself, and its end wakes the tasks.
+    #[cfg(ring)]
+    pub(super) fn stop_multi(&mut self, route: Route<'_>) {
+        if let Some(id) = self.out
+            && self.multi
+            && !self.multi_stopping
+        {
+            self.multi_stopping = true;
+            route.cancel(id);
+        }
+    }
+
     /// The driver's part on a completion driver: issues the read the
     /// waiting tasks need (`len` asked), unless one is out or a result waits
     /// to be taken. A route that cannot issue here leaves it to the thread
@@ -40,17 +53,13 @@ impl ReadState {
         // A lent buffer that waits with nothing read ahead takes the next
         // bytes itself: a multishot receive out is stopped for it.
         #[cfg(ring)]
-        if let Some(id) = self.out
-            && self.multi
-            && !self.multi_stopping
-            && self.ahead.is_empty()
+        if self.ahead.is_empty()
             && self
                 .lent
                 .as_ref()
                 .is_some_and(|l| !l.out && l.done.is_none())
         {
-            self.multi_stopping = true;
-            route.cancel(id);
+            self.stop_multi(route);
         }
         // The caller's own calls: only a poll, while the side is not ready
         // and a task waits. A receive of the driver's still out is stopped

@@ -110,6 +110,37 @@ pub(crate) fn send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     retry(|| cvt(unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), SEND_FLAGS) }))
 }
 
+/// The most slices one vectored call takes.
+const IOV_MAX: usize = 1024;
+
+/// `send(2)` of the bytes of `bufs` in order (one call, the first
+/// `IOV_MAX` slices at most), as [`send`] with no `SIGPIPE`.
+pub(crate) fn send_bufs(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    if let [one] = bufs {
+        return send(fd, one);
+    }
+    // SAFETY: an all-zero `msghdr` is valid (no name, no control data).
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    let bufs = bufs.get(..IOV_MAX).unwrap_or(bufs);
+    msg.msg_iov = bufs.as_ptr().cast_mut().cast();
+    msg.msg_iovlen = bufs.len() as _;
+    // SAFETY: `IoSlice` is `iovec` on unix; the kernel reads at most the
+    // lengths of `bufs` from them and writes nothing to them.
+    retry(|| cvt(unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) }))
+}
+
+/// `readv(2)` into `bufs` in order (one call, the first `IOV_MAX` slices at
+/// most).
+pub(crate) fn read_bufs(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+    if let [one] = bufs {
+        return read(fd, one);
+    }
+    let count = bufs.len().min(IOV_MAX) as libc::c_int;
+    // SAFETY: `IoSliceMut` is `iovec` on unix; the kernel writes at most the
+    // lengths of the first `count` slices.
+    retry(|| cvt(unsafe { libc::readv(fd, bufs.as_ptr().cast(), count) }))
+}
+
 /// `shutdown(2)` of the writing half.
 pub(crate) fn shutdown_write(fd: RawFd) -> io::Result<()> {
     // SAFETY: a plain syscall on a socket the caller holds.

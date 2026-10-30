@@ -3,11 +3,12 @@
 //!
 //! Every call on the descriptor is the driver's ([`WriteState::push`]): on
 //! an edge, or at once after a task handed it work while the socket may
-//! take it. A task never makes the call itself. A write copies its bytes
-//! into a buffer of the pool (the write-behind, one per source) and is
-//! accepted; the driver writes them out as the socket takes them. Later
-//! writes add to that buffer while it has room and wait while it is full,
-//! so bytes go out in the order they were written. A write-behind that fails
+//! take it. A task makes the call itself only for a stream write of a
+//! buffer big enough (see `direct`) when the side holds nothing. Otherwise
+//! a write copies its bytes into a buffer of the pool (the write-behind, one
+//! per source) and is accepted; the driver writes them out as the socket
+//! takes them. Later writes add to that buffer while it has room and wait
+//! while it is full, so bytes go out in the order they were written. A write-behind that fails
 //! keeps its error: every write fails with it until a flush reports it,
 //! except that a write whose own bytes were the first to fail gets the error
 //! itself. A datagram is copied and queued the same way, one at a time, and
@@ -26,7 +27,7 @@ use core::future::poll_fn;
 use core::task::{Poll, Waker};
 use std::io;
 use std::net::SocketAddr;
-#[cfg(readiness)]
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::task::Context;
@@ -264,6 +265,48 @@ impl WriteState {
         }
         self.waiters.register(waker);
         Poll::Pending
+    }
+
+    /// A stream write of the bytes of `bufs` made straight on the
+    /// descriptor `fd`, from the caller's memory, if the side holds nothing
+    /// that goes first. The kernel may take part of it, as of any write.
+    /// `None` leaves it to the normal path, which writes behind and waits
+    /// for readiness when the socket took nothing.
+    #[cfg(unix)]
+    pub(super) fn write_direct(
+        &mut self,
+        io: Io<'_>,
+        fd: Option<RawFd>,
+        kind: Kind,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Option<io::Result<usize>> {
+        let fd = fd?;
+        let len: usize = bufs.iter().map(|b| b.len()).sum();
+        let waits = matches!(io.via, Via::Fd(_)) && self.blocked;
+        if !kind.streams()
+            || len == 0
+            || !super::direct::worth(io, len, true)
+            || waits
+            || self.failed.is_some()
+            || self.error.is_some()
+            || self.connecting
+            || self.behind.is_some()
+            || self.lent.is_some()
+            || self.queued.is_some()
+            || self.ring_holds()
+        {
+            return None;
+        }
+        match sys::ready(sys::send_bufs(fd, bufs)) {
+            None => {
+                if matches!(io.via, Via::Fd(_)) {
+                    self.blocked = true;
+                }
+                None
+            }
+            Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
+            Some(result) => Some(result),
+        }
     }
 
     /// A buffer from this thread's pool, or the side starves until one
