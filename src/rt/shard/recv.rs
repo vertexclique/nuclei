@@ -115,6 +115,16 @@ pub(crate) struct RingChunk {
     len: u32,
 }
 
+/// The error of a group of `buffers` of `size` bytes the system had no memory for.
+pub(crate) fn no_memory(buffers: u16, size: u32, err: &io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "no memory for the io_uring receive buffers, {buffers} of {size} bytes ({err}): lower recv_buffers or recv_buffer_size"
+        ),
+    )
+}
+
 impl RecvGroup {
     /// A group of `entries` buffers (a power of two up to 32768) of `size`
     /// bytes each, registered on `ring`, every buffer given to the kernel.

@@ -35,6 +35,14 @@ use super::{
 
 /// Largest number of descriptors the kernel accepts in one buffer ring.
 const MAX_ENTRIES: u16 = 1 << 15;
+
+#[cfg(test)]
+thread_local! {
+    /// The buffers of a ring made on this thread find no memory, as a mapping the system refuses
+    /// does, for a test.
+    pub(crate) static NO_MEMORY_FOR_TEST: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
 /// Byte offset of the tail inside descriptor 0 (the `resv` field).
 const TAIL_OFFSET: usize = 14;
 
@@ -132,6 +140,10 @@ impl BufRing {
                 io::Error::new(io::ErrorKind::InvalidInput, "the buffer pool is too large")
             })?;
         let ring_map = Mapping::anon(usize::from(entries) * size_of::<IoUringBuf>())?;
+        #[cfg(test)]
+        if NO_MEMORY_FOR_TEST.with(core::cell::Cell::get) {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
         let buf_map = Mapping::anon(buf_bytes)?;
         let ring_fd = ring.fd.try_clone()?;
         let reg = IoUringBufReg {

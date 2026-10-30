@@ -88,7 +88,7 @@ pub(crate) struct ShardRing {
     /// Completions of the last wait, reused.
     cqes: RefCell<Vec<IoUringCqe>>,
     /// The buffers multishot receives draw from; `None` when the
-    /// configuration asks for none or the kernel could not make them.
+    /// configuration asks for none.
     recv: RefCell<Option<RecvGroup>>,
     /// Multishot receives and accepts submitted, the receives' arrivals,
     /// and the receives that ended as the group ran dry, for a test.
@@ -126,8 +126,12 @@ impl ShardRing {
                         format!("io_uring recv_buffers and recv_buffer_size: {err}"),
                     ));
                 }
-                // Short of memory: each read takes a buffer of the pool.
-                Err(err) if err.raw_os_error() == Some(libc::ENOMEM) => None,
+                // No memory for the group is said as the group's, apart
+                // from the ring's own shortage, which the ring answers by
+                // shrinking (`with_room`) or `auto` with the poller.
+                Err(err) if err.kind() == io::ErrorKind::OutOfMemory => {
+                    return Err(super::recv::no_memory(entries, cfg.recv_buffer_size, &err));
+                }
                 // Anything else, a kernel's refusal included, is
                 // the ring's failure: a shard never runs without the group
                 // its configuration asked for, unseen.
@@ -946,5 +950,7 @@ mod tests_cap;
 mod tests_inc;
 #[cfg(test)]
 mod tests_recv;
+#[cfg(test)]
+mod tests_reserve;
 #[cfg(test)]
 mod tests_zc;

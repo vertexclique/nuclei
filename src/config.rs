@@ -82,6 +82,9 @@ pub struct IoUringConfiguration {
     /// stays armed for every arrival and a receive that waits holds no buffer
     /// of its own.
     ///
+    /// A group the system has no memory for fails the shard's start with
+    /// `OutOfMemory`.
+    ///
     /// 0 turns multishot receives off, and each read then takes a buffer of
     /// the shard's own pool for its receive. Otherwise a power of two from 1 to
     /// 32768 and below twice `queue_len`, so the group never takes more than
