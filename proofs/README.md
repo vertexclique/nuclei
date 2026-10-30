@@ -611,6 +611,20 @@ while the side still counts it lent breaks `NoScribble`; a fill that wakes nobod
 deadlock), and 3 witnesses (the driver fills the buffer on an edge, the lender's own poll fills
 it at once, a lender that went away leaves its bytes to the read-ahead).
 
+`LentReadRing.tla` checks the same read on a ring (`read_owned` and `lent_idle` in
+`src/io/source/read.rs`, `submit_ops` and `op_done` in `src/io/source/read/ops.rs`), where a
+read is an operation the kernel completes later and a side has one out at a time. A plain read
+asks for one into a buffer of the pool and its task goes away while it is out; then a task reads
+with its own buffer until the stream ends. Its first lend finds the operation out, so none goes
+out for the buffer, and the operation completes into the read-ahead: the completion wakes the
+lender, whose buffer comes back to take those bytes before it is lent again. 6 configurations: 3
+that must pass (three bytes through a buffer of two and two through a buffer of one, with
+`Conservation`, `Order`, `NoScribble` and `AllTaken`, the lender takes every byte; and
+`Termination`), 2 mutations (a waiting buffer that stays lent while bytes wait in the read-ahead,
+and a completion that wakes only the plain readers, both leave the lender waiting forever: a
+deadlock), and 1 witness (the buffer comes back for the bytes the dropped read's operation
+brought).
+
 The write: the socket is full and a byte waits in the write-behind. The lending task lends a
 buffer of three bytes, which the driver writes after the write-behind as the peer makes room,
 and a later copied write waits until it is out. A lender that goes away has its write withdrawn
