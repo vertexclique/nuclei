@@ -1,22 +1,23 @@
-TLC run of every configuration in proofs/tla/semaphore, 2026-10-25 20:43 UTC.
+TLC run of every configuration in proofs/tla/semaphore, 2026-10-30 20:26 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-L_barge                         426063     232297     17  pass                                  pass                                  yes
-L_pair                         2314039    1270065     85  pass                                  pass                                  yes
-L_cancel                      34929041   13175268    160  pass                                  pass                                  yes
-L_cancel_live                    10939       6119      2  pass                                  pass                                  yes
-L_weighted                      134215      73932      7  pass                                  pass                                  yes
-L_close                         214224      87231     10  pass                                  pass                                  yes
-M_release_no_pass                  952        536      1  violated:AllTasksEnd                  violated:AllTasksEnd                  yes
-M_exit_ignores_dirty             38018      16740      2  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
-M_owe_without_handoff           158997      89493      4  violated:BypassBounded                violated:BypassBounded                yes
-M_try_ignores_handoff            32416      18751      2  violated:NoBargePastOwed              violated:NoBargePastOwed              yes
-M_keep_grant                   3071884    1235419     44  violated:PermitsBackAtEnd             violated:PermitsBackAtEnd             yes
-M_close_admits                      20         16      1  violated:NoAdmitAfterClose            violated:NoAdmitAfterClose            yes
-W_handoff                        15334       8985      1  violated:NoHandoff                    violated:NoHandoff                    yes
-W_grant_given_back              695886     286503     12  violated:NoGrantGivenBack             violated:NoGrantGivenBack             yes
-W_nudge_pending                   4063       2312      1  violated:NoNudgePending               violated:NoNudgePending               yes
+L_barge                         165221      89292     29  pass                                  pass                                  yes
+L_pair                          240935     130104      8  pass                                  pass                                  yes
+L_pair_live                      55068      30102     14  pass                                  pass                                  yes
+L_cancel                       4166124    1558985     53  pass                                  pass                                  yes
+L_cancel_live                     8492       4719      7  pass                                  pass                                  yes
+L_weighted                       57253      31276     14  pass                                  pass                                  yes
+L_close                         160738      65612     25  pass                                  pass                                  yes
+M_release_no_pass                  952        536      5  violated:AllTasksEnd                  violated:AllTasksEnd                  yes
+M_exit_ignores_dirty             37847      16610      8  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
+M_owe_without_handoff           101078      55985     11  violated:BypassBounded                violated:BypassBounded                yes
+M_try_ignores_handoff            28344      16170      7  violated:NoBargePastOwed              violated:NoBargePastOwed              yes
+M_keep_grant                     31983      17697      6  violated:PermitsBackAtEnd             violated:PermitsBackAtEnd             yes
+M_close_admits                      20         16      4  violated:NoAdmitAfterClose            violated:NoAdmitAfterClose            yes
+W_handoff                        14448       8379      5  violated:NoHandoff                    violated:NoHandoff                    yes
+W_grant_given_back              585091     238486     31  violated:NoGrantGivenBack             violated:NoGrantGivenBack             yes
+W_nudge_pending                   3981       2257      3  violated:NoNudgePending               violated:NoNudgePending               yes
 
-results matching EXPECTED.txt: 15 of 15
+results matching EXPECTED.txt: 16 of 16

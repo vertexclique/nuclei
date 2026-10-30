@@ -31,6 +31,15 @@
 (* level (`<<level, index>>`, a leaf at level 0), which the swaps keep      *)
 (* unique; a node a push made and could not link is freed unseen and not    *)
 (* modelled.                                                                *)
+(*                                                                          *)
+(* What is forgotten: a register no step reads again before it is next      *)
+(* written goes back to its start value at its last use (a push's position  *)
+(* and step count when the push ends, the root it saw once its descent      *)
+(* starts, the receiver's scan, find and take once used, a taken position's *)
+(* push and place): there the code's locals go out of scope, and the        *)
+(* model's own bookkeeping is done with. Two states that differ only in a   *)
+(* forgotten value have the same futures, so TLC walks one of them; every   *)
+(* check sees what it saw before.                                           *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -122,6 +131,9 @@ P_grow:
         end if;
 P_start:
         level := seen;
+        \* The root seen is not read again before the next load: forgotten, so two
+        \* states that differ only in it are one.
+        seen := 0;
 P_descend:
         while level > 0 do
             \* Read the child slot of the node on the path; make it if missing.
@@ -143,6 +155,10 @@ P_write:
         steps[self] := steps[self] + 1;
 P_unpin:
         prot[self] := {};
+        \* The push is over: its position and its step count are not read again (the
+        \* step bound was checked at every step of it), so both are forgotten.
+        pos := 0;
+        steps[self] := 0;
         n := n + 1;
     end while;
 end process;
@@ -172,12 +188,14 @@ R_scan:
         if at < tail /\ at < head + Window then
             if taken[at] = 0 /\ NodeOf(0, at) \in made /\ ready[at] then
                 found := at;
+                at := 0;    \* the scan is over: where it was is not read again
                 goto R_recheck;
             else
                 at := at + 1;
                 goto R_scan;
             end if;
         else
+            at := 0;        \* the scan is over: where it was is not read again
             goto R_retire;
         end if;
 R_recheck:
@@ -190,6 +208,7 @@ R_recheck:
                 (x = found \/ (taken[x] = 0 /\ ready[x]))
                 /\ \A y \in head .. x - 1 : ~(taken[y] = 0 /\ ready[y]);
         end if;
+        found := 0;         \* the one found is not read again
 R_take:
         touchedFreed := Touch(NodeOf(0, take));
         if seqOf[take] < lastSeq[owner[take]] then
@@ -198,7 +217,11 @@ R_take:
         lastSeq[owner[take]] := seqOf[take];
         past := past \/ take > head;
         taken[take] := 1;
+        \* A taken position's push and place are not read again (it is taken once).
+        owner[take] := "none";
+        seqOf[take] := 0;
         head := NextHead(head, [taken EXCEPT ![take] = 1]);
+        take := 0;          \* the position taken is not read again
 R_retire:
         \* Every leaf the head passed goes, with the inner nodes it ended, once
         \* the next leaf exists.

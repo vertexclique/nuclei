@@ -18,7 +18,8 @@ checks every case the description allows. Two tools do the checking here, and th
 together:
 
 - **TLA+** (checked by TLC) looks at several threads at once, every order of their steps, but
-  only for small sizes: two slots, two senders with two operations each, and a receiver.
+  only for small sizes: two slots, one or two senders with one to three operations each, and a
+  receiver.
 - **Lean** looks at one thread doing one whole operation at a time, but for every size and
   every sequence of operations.
 
@@ -113,9 +114,9 @@ for, with two exceptions the spec's header explains: the pass's look past withdr
 the head of the line is one step, and so is the receiver's look at the queue and the sender
 count. The message queue is a sequence of cells in the order sends claimed them: a send claims
 its cell in one step and writes its value in a later one, as in kovan's segment queue, so the
-receiver can find the oldest cell claimed and not written yet. It then takes nothing, does not
-read the sender count, and waits for that send's wake, which comes after the write. Every
-line carries a comment.
+receiver can find the oldest cell claimed and not written yet. It then takes nothing, reads the
+sender count, which that send keeps above zero, and waits for that send's wake, which comes
+after the write. Every line carries a comment.
 
 The properties:
 
@@ -131,32 +132,40 @@ The properties:
 | `Termination` (under weak fairness of every thread) | every thread finishes: no waiter whose request can be served sleeps forever, so no wakeup is lost; checked with the waiter's park and the grant's wake modelled step by step |
 | deadlock freedom (TLC's own check, on every configuration that must pass) | no state where some thread is stuck while every other one is done |
 
-The 45 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
-`.cfg` file says in its first lines what it checks):
+The 48 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
+`.cfg` file says in its first lines what it checks, and why its size is enough):
 
-- **14 that must pass.** Ten check every safety property and deadlock freedom: three sends on
-  one slot; a request for both slots among single sends; a request for both slots that gives
-  them back unused; a request for both slots that is dropped after one poll; a single send that
-  is dropped; a `try_` racing waiting sends; one sender's two values; the receiver closing in
-  the middle, with and without a dropped request; the receiver dropped while sends wait. Four
-  check `Termination` under weak fairness: plain sends, a dropped send, a request for both
-  slots, and a close.
-- **18 mutations that must fail.** Each takes one rule out of the algorithm and must break the
-  property that rule protects: `try_ignores_queue` and `skip_unfit_front` (an attempt, or a
-  pass, that serves a later request first) break `FifoFair`; `drop_pass_on` (a leaving
-  waiter's share is dropped) breaks `Conservation`; `park_no_look`, `grant_no_wake`,
-  `release_no_pass`, `exit_ignores_release` and `rx_no_recheck` (a wakeup or a hand-over that
-  never comes) end in a deadlock, and `park_no_look` and `grant_no_wake` also break
-  `Termination`; `close_keeps_set_aside` (the close keeps what was set aside for the front
-  waiter, so the channel can never go idle) breaks `CloseReturnsShare`;
-  `try_ignores_close` and `take_after_close` break
-  `CloseSemantics`; `finish_early` breaks `EndMeansDrained`; `queue_lifo` breaks
-  `PerSenderOrder`, and so does `skip_busy` (the receiver passes over a cell still being
-  written and takes a written one behind it, as the queue of kovan before 0.2 did: a sender's
-  second value comes out first); `wake_before_write` (a send wakes the receiver before it
-  writes, so a receiver that looked in between sleeps through the value) ends in a deadlock;
-  `double_delivery` breaks `ExactlyOnce`.
-- **13 witnesses that must fail.** Each claims an interesting case never happens, and must be
+- **14 that must pass.** Ten check every safety property and deadlock freedom: three sends from
+  two senders on one slot; a request for both slots racing the other sender's two sends; the
+  same request putting nothing in, so both slots go on to the sends behind it; a request for
+  both slots that is dropped after one poll, racing two sends; a single send that is dropped,
+  racing two sends on one slot; a `try_` racing waiting sends; one sender's two values; the
+  receiver closing in the middle, racing a request for both slots that gives them back unused
+  and two sends, or a dropped request for both slots, a send after it and one more send; the
+  receiver dropped while sends wait. Where a run is about one request, one sender makes it and
+  the other only sends, once or twice; each `.cfg` says why that is enough for the bugs the
+  run guards against. Four check `Termination` under weak fairness, on smaller programs, as a
+  liveness check costs far more per state: one sender's three sends on one slot; one sender's
+  send, dropped send and send; a request for both slots racing one send; one sender's send and
+  request for both slots, with the receiver closing.
+- **20 mutation runs that must fail.** Each of 18 mutations takes one rule out of the
+  algorithm and must break the property that rule protects: `try_ignores_queue` and
+  `skip_unfit_front` (an attempt, or a pass, that serves a later request first) break
+  `FifoFair`; `drop_pass_on` (a leaving waiter's share is dropped) breaks `Conservation`;
+  `park_no_look`, `grant_no_wake`, `release_no_pass`, `exit_ignores_release` and
+  `rx_no_recheck` (a wakeup or a hand-over that never comes) end in a deadlock, and
+  `park_no_look` and `grant_no_wake` run a second time, against `Termination`, which they
+  break; `close_keeps_set_aside` (the close keeps what was set aside for the front waiter, so
+  the channel can never go idle) breaks `CloseReturnsShare`; `try_ignores_close` and
+  `take_after_close` break `CloseSemantics`; `finish_early` breaks `EndMeansDrained`;
+  `queue_lifo` breaks `PerSenderOrder`, and so does `skip_busy` (the receiver passes over a
+  cell still being written and takes a written one behind it, as the queue of kovan before 0.2
+  did: a sender's second value comes out first); `wake_before_write` (a send wakes the
+  receiver before it writes, so a receiver that looked in between sleeps through the value),
+  `flag_before_write` (a send looks at the receiver's flag before it writes) and
+  `raise_after_look` (the receiver says it waits only after its look again) end in a
+  deadlock; `double_delivery` breaks `ExactlyOnce`.
+- **14 witnesses that must fail.** Each claims an interesting case never happens, and must be
   proved wrong, which shows the search really reaches it: a share held between passes; a
   waiter that withdraws at the very moment a pass grants it; a grant that its future never
   looks at before the drop; the front waiter dropped while it holds a share; an attempt
@@ -164,8 +173,9 @@ The 45 configurations, listed with their expected result in `tla/mpsc/EXPECTED.t
   again because something changed while it worked; the close giving a share back; a waiter
   failed by the close; a value sent after the close through a slot reserved before it; the
   receiver ending a closed channel because it went idle; a grant that lands between a
-  waiter's arrival and its park; and the receiver parking while the oldest cell is still being
-  written.
+  waiter's arrival and its park; the receiver parking while the oldest cell is still being
+  written; and a send that leaves the receiver's waker in its cell, because the receiver has
+  not said it waits yet.
 
 ## What the Lean proofs check
 
@@ -303,12 +313,15 @@ is in the queue at most once and is pushed again as soon as it was taken. The sh
 its own end past a stub node, hands a task out only once it read the task's link, and pushes
 the stub behind the last task before handing it out; between a push's swap and its link the
 queue is busy. Empty is the head on the stub, which the shard looks at once more after it says
-it parks. 9 configurations: 3 that must pass (two pushers three rounds each, three pushers two
+it parks. 11 configurations: 3 that must pass (two pushers three rounds each, three pushers two
 rounds each, liveness), with `NoDuplicate` (no task handed out that is not queued), `Counted`,
 `EmptyAtSleep` (a shard asleep with the head on the stub has no task queued) and no deadlock;
-3 mutations (a pusher that leaves its task's old link, and a last task handed out with the
-shard's end left on it, break `NoDuplicate`; sleeping without the look again deadlocks); and 3
-witnesses (a busy queue, the stub pushed behind the last task, a sleep a push ends). TLA+ is
+the three-pusher one checks each state once up to the pushers' names (a symmetry set), as the
+pushers run the same code; 4 mutations (a pusher that leaves its task's old link, and a last
+task handed out with the shard's end left on it, break `NoDuplicate`; a park whose look is at
+the head alone breaks `EmptyAtSleep`; sleeping without the look again deadlocks); and 4
+witnesses (a busy queue, the stub pushed behind the last task, tasks behind the shard's end with
+the head on the stub, a sleep a push ends). TLA+ is
 sequentially consistent: the unit tests in `src/rt/inbox.rs` run four pushing threads against
 the taker. The same queue holds a `JoinSet`'s woken members (`src/join_set.rs`), linked through
 each slot's waker: its `queued` flag keeps a waker in the queue at most once, as the scheduled
@@ -368,11 +381,14 @@ it, at most 16 KiB; the model counts blocks against an abstract bound). A freein
 up at the bound, reads the head, gives up if the list is closed, and swaps its block in only if
 the head is still the one it read. The owner takes the whole list when its cache has no block,
 and as its thread ends swaps the list out and the head to closed in one step, frees all it
-holds, then lets the record go; the next thread to claim the record opens it again. 10
-configurations: 3 that must pass (three blocks, two owners one after the other and two freeing
+holds, then lets the record go; the next thread to claim the record opens it again. 11
+configurations: 4 that must pass (three blocks, two owners one after the other and two freeing
 threads, with `ListConsistent`, `ClosedEmpty`, `BoundedList`, `OpenWhileOwned`, `CountOK` and
-`AllFreed`, every block back with the system once every thread is done; the same with a bound of
-one; and `Terminates`), 4 mutations (a push that swaps its block in whatever the head is, and a
+`AllFreed`, every block back with the system once every thread is done, each state checked once
+up to the names of the blocks and of the freeing threads; the same with a bound of one; and
+`Terminates`, every thread ending, with two blocks under a bound of two and under a bound of one,
+which between them still lose a compare-and-swap to another push, find the list full and find it
+closed), 4 mutations (a push that swaps its block in whatever the head is, and a
 close in two steps, each break `ListConsistent`; a record let go before its list is closed breaks
 `OpenWhileOwned`; a push that ignores the count breaks `BoundedList`), and 3 witnesses (a push
 that finds the list closed, one that finds it full, the next owner taking back a block the first
@@ -425,13 +441,19 @@ and counts a park before it says it parks; parked, it claims the advance, looks 
 unchanged), moves the clock to the earliest deadline and wakes the shards whose timers came
 due. A shard that wakes, or that finds work as it is about to sleep, waits for an advance in
 progress before it reads the clock. A blocking job wakes its task before it counts itself out
-of the jobs in flight, then tries the advance too. The family checks configurations that must
-pass (two shards with a pusher and a blocking job; two shards with a timer each, the scenario the
-races below need; three shards; timers armed again by the tasks they wake), each with
-`ClockNeverPassesArmed` (no jump leaves an armed timer behind),
+of the jobs in flight, then tries the advance too. The family checks five configurations that
+must pass. Three check `ClockNeverPassesArmed` (no jump leaves an armed timer behind) and
 `NoBadJump` (every jump comes over a moment, between its two looks, at which every shard was
-idle, with no job in flight) and the liveness property `TimersFire` (every armed timer fires:
-no runtime hangs with its shards asleep and a timer armed); one mutation per rule (a deadline
+idle, with no job in flight) at full size: two shards with a pusher and a blocking job; two
+shards with a timer each, the scenario the races below need; three shards. With no blocking job
+the shards are alike, so those two (and the races' own runs) check each state once up to the
+shards' names (a symmetry set), and every run forgets a value nobody reads again (whether a
+shard's own timer came due, the shard a push went to) once it was read. Two smaller ones
+check both and, over every behaviour, the liveness property `TimersFire` (every armed timer
+fires: no runtime hangs with its shards asleep and a timer armed): two shards with the blocking
+job alone, and two shards with the pusher alone, whose timers the tasks they wake arm again. A
+timer on each of two shards, or three shards, are too many states to check every behaviour, so
+`TimersFire` is checked where one shard arms its timers. Then one mutation per rule (a deadline
 published after the park, a busy path that does not wait for the advance, one look instead of
 two, a woken shard that does not wait, no look at the jobs, no attempt at the park); and a
 witness that the clock jumps at all. Writing the model found the first two of those races in the
@@ -1011,8 +1033,11 @@ compare-and-swap on the count), and the sender it makes sends and goes as any do
 receiver looks at its next position's slot: its own position is a value taken, a later one is
 a lag (it goes on from the tail, read then, less the ring's size, counting what it skipped),
 anything else is nothing yet, unless the channel is closed and its next position is the tail.
-10 configurations: 2 that must pass, with a weak sender upgrading at any point (what was taken
-plus what was reported lost is every value sent; the receiver reaches the close), 4 mutations
+11 configurations: 3 that must pass, with a weak sender upgrading at any point (two senders and
+the weak one, three values each: what was taken plus what was reported lost is every value sent,
+each state checked once up to the two senders' names; the receiver reaches the close, checked
+over every behaviour in two smaller races, the three senders with one value each, and one sender
+and the weak one with three values each), 4 mutations
 (a send publishing over a later position leaves the receiver waiting for good, `Finishes`;
 stopping at the close with values in the ring, an uncounted lag, and an upgrade that makes a
 sender after the last one went, whose values come after the receiver saw the close, break
@@ -1030,9 +1055,11 @@ its atomic steps: a send's store of the value, its version bump and its wake; a 
 load, its compare-and-swap and its retry; the last sender's close and wake; `changed` making its
 `Notified`, reading the state word and deciding; a borrow's read of the version and of the value;
 the receivers' count and its wake; and a sender's `closed` waiting for the receivers to go. A
-`Notified` is abstracted to what `Notify` promises: it hears every wake made after it was made. 12
-configurations: 4 that must pass (sends; modifying sends, where no change is lost; the two mixed;
-a sender waiting for the receivers to go, which ends), with `changed` never answering closed
+`Notified` is abstracted to what `Notify` promises: it hears every wake made after it was made. 14
+configurations: 6 that must pass (sends, and sends mixed with modifying sends, each run once with
+the receiver that waits for changes and once with the borrower, as the two decide nothing by each
+other; modifying sends, where no change is lost; a sender waiting for the receivers to go, which
+ends), with `changed` never answering closed
 while a version it has not seen is there (`ErrOnlyWhenSeen`), a borrow never pairing a version
 with an older value (`PairedNoOlder`), the version counting every publication, the receiver
 seeing the last version and ending; 5 mutations (a modifying send that stores without comparing
@@ -1086,15 +1113,20 @@ it); each compare-and-swap of an attempt, an enqueue, a release, the owe-or-take
 settling, a withdrawal and the close; and the drain's passes, each grant and each nudge. The
 spin before queueing is abstract (more attempts of the kind other callers' barging already
 makes), so is the node's waker handshake (the waiter machinery's part), and so is the list's
-sweep of withdrawn waiters (one step). 15 configurations: 6 that must
-pass (a mutex locked three times past one wait; two tasks locking twice each; a wait given up
+sweep of withdrawn waiters (one step). States that differ only in what nobody reads again are one
+state: a pass's working values start over once read for the last time, and a node its future and
+the queue are both done with is forgotten. 16 configurations: 7 that must
+pass (a mutex locked three times past one wait; two tasks locking twice each, and one task locking
+twice beside one locking once, where every task's ending is checked too; a wait given up
 between two locks, with a handoff owed from the first loss; the same with two tasks, where every
 task's ending is checked too; two permits with a request for both behind requests for one; a close
 while two tasks lock), with the permits always adding up (`Conservation`) and all back at the end,
 one holder at a time for a mutex, no waiter passed over more than `MAX_BYPASS` times while it
 waits (`BypassBounded`), nobody barging while the handoff bit is up, nothing admitted after the
 close, no waiter left on the arrival stack once the drain role is free (`NoStrandedArrival`), and
-every task ending; 6 mutations (a release that never asks for a pass leaves a waiter for good,
+every task ending; the two tasks locking twice each and the wait given up between two locks check
+each state once up to the names of the tasks that run the same program (a symmetry set,
+`MC_SemaphoreSym.tla`); 6 mutations (a release that never asks for a pass leaves a waiter for good,
 `AllTasksEnd`; a drain that gives up its role over a change made during its pass strands a
 waiter that queued meanwhile, `NoStrandedArrival`; the last allowed loss raising no handoff lets
 the waiter be passed over again, `BypassBounded`; an attempt that ignores the handoff bit barges
@@ -1207,17 +1239,24 @@ enqueue, each kind's release, a downgrade, an upgrade (the upgrading bit, the wr
 no reader inside, or the wait in its slot and the finish) and the owe-or-take, and each pass with
 its upgrade grant, its handoffs in order (stopping after a writer) and its nudges (the front, and
 the readers behind a sharing front). The spin, the node's waker handshake and the list's sweep
-are abstract, as in the semaphore model. 14 configurations: 8 that must pass (reads beside a write;
+are abstract, as in the semaphore model, and so are the values nobody reads again (a pass's
+working values start over once read for the last time, and a node its future and the queue are
+both done with is forgotten). 15 configurations: 8 that must pass (reads beside a write;
 writers; an upgrade beside a read; a downgrade beside a read; two upgradable reads; reads barging
 past a waiting writer, which is owed a handoff in the end; a write dropped beside readers, with
 three tasks for safety and with two for the ending too), with the state word matching exactly
 who holds what (`StateMatches`), a writer alone and one upgradable read at most (`Exclusion`), no
 read entering while an upgrade is under way, no upgrade finishing over a reader, the bypass bound,
 no barging while a handoff is owed, no waiter left on the arrival stack, the lock free at the end,
-and every task ending; 4 mutations (a read that ignores the upgrading bit,
+no waiter still counted owed once every task ended (`OwedSettled`: the queue settles a node's
+owed mark as it lets the node go, a withdrawn one included, as `release_queued` in
+`src/sync/waiter/node.rs` does), and every task ending; the three-task drop checks each state once up to the two readers' names (a
+symmetry set, `MC_RwLockSym.tla`); 5 mutations (a read that ignores the upgrading bit,
 `NoReaderWhileUpgrading`; a pass that grants the upgrade with a reader inside,
 `NoUpgradeOverReaders`; a release that never asks for a pass, `AllTasksEnd`; a drain giving up
-its role over a change, `NoStrandedArrival`); and 2 witnesses (an upgrade that waits in its slot;
+its role over a change, `NoStrandedArrival`; a pass that counts the owed marks of the withdrawn
+nodes it lets go after it swept the list, so an owed write withdrawn on the list stays counted,
+`OwedSettled`); and 2 witnesses (an upgrade that waits in its slot;
 a downgrade). `lean/Nuclei/RwLock.lean` proves the state word's rules for every state: each
 admitted entry, each release, a downgrade and an upgrade's finish keep a writer alone with
 upgrading tied to the upgradable read; an upgrade holds reads back; and a write needs the lock

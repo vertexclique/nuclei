@@ -1,6 +1,7 @@
 # configuration                spec                 expected
 RF_safe                        MC_RemoteFree        pass
 RF_live                        MC_RemoteFree        pass
+RF_live_tight                  MC_RemoteFree        pass
 RF_tight                       MC_RemoteFree        pass
 MRF_blind_push                 MC_RemoteFree        violated:ListConsistent
 MRF_store_close                MC_RemoteFree        violated:ListConsistent

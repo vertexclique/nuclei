@@ -1,23 +1,23 @@
-TLC run of every configuration in proofs/tla/waiter, 2026-10-25 23:58 UTC.
+TLC run of every configuration in proofs/tla/waiter, 2026-10-30 20:22 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-L_spin                           17987       6348      2  pass                                  pass                                  yes
-L_cancel                         33525      11497      2  pass                                  pass                                  yes
-L_nudges                        404088     115667      8  pass                                  pass                                  yes
-L_reuse                       14451756    3264709    272  pass                                  pass                                  yes
-M_claim_registering                224        131      1  violated:SlotExclusive                violated:SlotExclusive                yes
-M_park_ignores_taking              685        341      1  violated:SlotExclusive                violated:SlotExclusive                yes
-M_no_again                       11877       4203      1  violated:AllEnd                       violated:AllEnd                       yes
-M_arm_without_look                3094       1128      2  violated:AllEnd                       violated:AllEnd                       yes
-M_spin_keeps_armed                 144         89      1  violated:NoClaimWhileSpinning         violated:NoClaimWhileSpinning         yes
-M_free_on_queue_release             57         39      1  violated:NoStaleAccess                violated:NoStaleAccess                yes
-M_release_forgets_owed            3077       1136      1  violated:OwedSettled                  violated:OwedSettled                  yes
-W_again                           4776       1814      1  violated:NoAgain                      violated:NoAgain                      yes
-W_spin_mark                        144         89      1  violated:NoSpinMark                   violated:NoSpinMark                   yes
-W_reuse                             82         52      0  violated:NoReuse                      violated:NoReuse                      yes
-W_forgive                           69         47      0  violated:NoForgive                    violated:NoForgive                    yes
-W_cancel_take                       76         51      1  violated:NoCancelTake                 violated:NoCancelTake                 yes
+L_spin                            7376       3172      6  pass                                  pass                                  yes
+L_cancel                         14104       5567      6  pass                                  pass                                  yes
+L_nudges                         90702      32923     11  pass                                  pass                                  yes
+L_reuse                         385593     114357     32  pass                                  pass                                  yes
+M_claim_registering                183        112      5  violated:SlotExclusive                violated:SlotExclusive                yes
+M_park_ignores_taking              482        262      4  violated:SlotExclusive                violated:SlotExclusive                yes
+M_no_again                        5357       2237      6  violated:AllEnd                       violated:AllEnd                       yes
+M_arm_without_look                1300        602      5  violated:AllEnd                       violated:AllEnd                       yes
+M_spin_keeps_armed                 109         72      3  violated:NoClaimWhileSpinning         violated:NoClaimWhileSpinning         yes
+M_free_on_queue_release             52         36      3  violated:NoStaleAccess                violated:NoStaleAccess                yes
+M_release_forgets_owed            1273        614      3  violated:OwedSettled                  violated:OwedSettled                  yes
+W_again                           2510       1132      3  violated:NoAgain                      violated:NoAgain                      yes
+W_spin_mark                        109         72      2  violated:NoSpinMark                   violated:NoSpinMark                   yes
+W_reuse                             70         46      3  violated:NoReuse                      violated:NoReuse                      yes
+W_forgive                           64         44      3  violated:NoForgive                    violated:NoForgive                    yes
+W_cancel_take                       71         48      3  violated:NoCancelTake                 violated:NoCancelTake                 yes
 
 results matching EXPECTED.txt: 16 of 16

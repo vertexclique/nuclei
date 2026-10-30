@@ -1,18 +1,18 @@
-TLC run of every configuration in proofs/tla/radix, 2026-10-27 23:28 UTC.
+TLC run of every configuration in proofs/tla/radix, 2026-10-30 20:15 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-X_safe                         2600437     746244      5  pass                                  pass                                  yes
-X_deep                       251003535   48585490    176  pass                                  pass                                  yes
-X_three                        2515345     707952      6  pass                                  pass                                  yes
-X_live                         2600437     746244     19  pass                                  pass                                  yes
-MX_leave_early                   17934       6913      2  violated:RootLive                     violated:RootLive                     yes
-MX_retire_parent_early           25046       9839      1  violated:NoFreedTouch                 violated:NoFreedTouch                 yes
-MX_no_recheck                   394799     137754      3  violated:PerSenderOrder               violated:PerSenderOrder               yes
-WX_grow                           2338        964      1  violated:NoGrow                       violated:NoGrow                       yes
-WX_race                           5461       2262      1  violated:NoRace                       violated:NoRace                       yes
-WX_free                           4767       1966      1  violated:NoFree                       violated:NoFree                       yes
-WX_past                           1760        725      1  violated:NoPast                       violated:NoPast                       yes
+X_safe                          562527     172420      8  pass                                  pass                                  yes
+X_deep                         9483810    2205307     63  pass                                  pass                                  yes
+X_three                        1122123     309070     16  pass                                  pass                                  yes
+X_live                          562527     172420     44  pass                                  pass                                  yes
+MX_leave_early                   17620       6741      6  violated:RootLive                     violated:RootLive                     yes
+MX_retire_parent_early           24201       9421      6  violated:NoFreedTouch                 violated:NoFreedTouch                 yes
+MX_no_recheck                   298774     101882      9  violated:PerSenderOrder               violated:PerSenderOrder               yes
+WX_grow                           2338        964      3  violated:NoGrow                       violated:NoGrow                       yes
+WX_race                           5461       2260      4  violated:NoRace                       violated:NoRace                       yes
+WX_free                           4767       1966      3  violated:NoFree                       violated:NoFree                       yes
+WX_past                           1760        725      4  violated:NoPast                       violated:NoPast                       yes
 
 results matching EXPECTED.txt: 11 of 11
