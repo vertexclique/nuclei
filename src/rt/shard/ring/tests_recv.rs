@@ -400,8 +400,33 @@ fn listener_source() -> (std::net::TcpListener, Arc<Source>, std::net::SocketAdd
     (listener, src, addr)
 }
 
+/// The next connection; a process short of descriptors (other tests run in
+/// parallel) is waited out.
 async fn accept_stream(src: &Arc<Source>) -> crate::io::raw::Owned {
-    poll_fn(|cx| src.poll_accept_stream(cx)).await.unwrap()
+    loop {
+        match poll_fn(|cx| src.poll_accept_stream(cx)).await {
+            Ok(conn) => return conn,
+            Err(err) if crate::rt::counters::out_of_descriptors(&err) => {
+                crate::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
+}
+
+/// A client connection, made again while the process has no descriptor for
+/// it: a client that died of that would leave the accepting side waiting for
+/// good.
+fn connect_patiently(addr: std::net::SocketAddr) -> std::net::TcpStream {
+    loop {
+        match std::net::TcpStream::connect(addr) {
+            Ok(c) => return c,
+            Err(err) if crate::rt::counters::out_of_descriptors(&err) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
 }
 
 /// Connections taken without their addresses are all served by the one
@@ -416,7 +441,7 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
     let clients = std::thread::spawn(move || {
         (0..16)
             .map(|i| {
-                let mut c = std::net::TcpStream::connect(addr).unwrap();
+                let mut c = connect_patiently(addr);
                 c.write_all(&[i]).unwrap();
                 std::thread::sleep(Duration::from_millis(1));
                 c
@@ -424,7 +449,7 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
             .collect::<Vec<_>>()
     });
     let mut seen = Vec::new();
-    shard.block_on(async {
+    let served = shard.block_on(crate::time::timeout(Duration::from_secs(30), async {
         for _ in 0..16 {
             let conn = std::net::TcpStream::from(accept_stream(&src).await);
             // An accepted connection is non-blocking; its byte may still be
@@ -436,7 +461,8 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
             assert_eq!(n, 1);
             seen.push(b[0]);
         }
-    });
+    }));
+    served.expect("a connection never came");
     seen.sort_unstable();
     assert_eq!(
         seen,
