@@ -1158,17 +1158,24 @@ enqueue, each kind's release, a downgrade, an upgrade (the upgrading bit, the wr
 no reader inside, or the wait in its slot and the finish) and the owe-or-take, and each pass with
 its upgrade grant, its handoffs in order (stopping after a writer) and its nudges (the front, and
 the readers behind a sharing front). The spin, the node's waker handshake and the list's sweep
-are abstract, as in the semaphore model. 14 configurations: 8 that must pass (reads beside a write;
+are abstract, as in the semaphore model, and so are the values nobody reads again (a pass's
+working values start over once read for the last time, and a node its future and the queue are
+both done with is forgotten). 15 configurations: 8 that must pass (reads beside a write;
 writers; an upgrade beside a read; a downgrade beside a read; two upgradable reads; reads barging
 past a waiting writer, which is owed a handoff in the end; a write dropped beside readers, with
 three tasks for safety and with two for the ending too), with the state word matching exactly
 who holds what (`StateMatches`), a writer alone and one upgradable read at most (`Exclusion`), no
 read entering while an upgrade is under way, no upgrade finishing over a reader, the bypass bound,
 no barging while a handoff is owed, no waiter left on the arrival stack, the lock free at the end,
-and every task ending; 4 mutations (a read that ignores the upgrading bit,
+no waiter still counted owed once every task ended (`OwedSettled`: the queue settles a node's
+owed mark as it lets the node go, a withdrawn one included, as `release_queued` in
+`src/sync/waiter/node.rs` does), and every task ending; the three-task drop checks each state once up to the two readers' names (a
+symmetry set, `MC_RwLockSym.tla`); 5 mutations (a read that ignores the upgrading bit,
 `NoReaderWhileUpgrading`; a pass that grants the upgrade with a reader inside,
 `NoUpgradeOverReaders`; a release that never asks for a pass, `AllTasksEnd`; a drain giving up
-its role over a change, `NoStrandedArrival`); and 2 witnesses (an upgrade that waits in its slot;
+its role over a change, `NoStrandedArrival`; a pass that counts the owed marks of the withdrawn
+nodes it lets go after it swept the list, so an owed write withdrawn on the list stays counted,
+`OwedSettled`); and 2 witnesses (an upgrade that waits in its slot;
 a downgrade). `lean/Nuclei/RwLock.lean` proves the state word's rules for every state: each
 admitted entry, each release, a downgrade and an upgrade's finish keep a writer alone with
 upgrading tied to the upgradable read; an upgrade holds reads back; and a write needs the lock
