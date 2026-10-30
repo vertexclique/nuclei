@@ -107,10 +107,9 @@ variables
     rxRegistered = FALSE,               \* the receiver's waker cell holds its waker
     rxWoken = FALSE,                    \* the receiver's waker was called
     rxWaiting = FALSE,                  \* the receiver says it waits: a send then wakes it
-    skippedRegistered = FALSE,          \* (record) a send left the waker cell alone while it held the waker
     \* ---- records the properties read; the code has no such variables ----
     status = [r \in Reqs |-> "new"],    \* how far each request got (see Status below)
-    ahead = [r \in Reqs |-> {}],        \* the requests already waiting when this one began
+    ahead = [r \in Reqs |-> {}],        \* the requests waiting when this one began, until each leaves the line
     lateStart = [r \in Reqs |-> FALSE], \* this request began after the close
     admittedAfterClose = FALSE,         \* slots left the word after the close
     pushed = {},                        \* every value ever put into the queue
@@ -169,8 +168,6 @@ macro send_wake() begin
             rxRegistered := FALSE;
             rxWoken := TRUE;
         end if;
-    else
-        skippedRegistered := skippedRegistered \/ rxRegistered;
     end if;
 end macro;
 
@@ -207,6 +204,8 @@ D_fail:
             nodeState[front] := "granted";      \* the grant ...
             closedG[front] := TRUE;         \* ... is the close
             status[front] := "failed";      \* this request ends in an error
+            \* (record) it left the line: no request that began behind it counts it as ahead now
+            ahead := [x \in Reqs |-> ahead[x] \ {front}];
             \* MUTATION grant_no_wake: the grant leaves the armed waker where it is.
             if armed[front] /\ Mutation # "grant_no_wake" then   \* an armed waker is claimed
                 armed[front] := FALSE;      \* taken off the node ...
@@ -271,6 +270,8 @@ D_grant:
         owned[front] := need[front];        \* ... and carries its slots to its future
         setAside := setAside - need[front]; \* which leave the set-aside
         status[front] := "granted";         \* (record) this request has its slots
+        \* (record) it left the line: no request that began behind it counts it as ahead now
+        ahead := [x \in Reqs |-> ahead[x] \ {front}];
         \* MUTATION grant_no_wake: the grant leaves the armed waker where it is.
         if armed[front] /\ Mutation # "grant_no_wake" then   \* an armed waker is claimed
             armed[front] := FALSE;          \* taken off the node ...
@@ -479,6 +480,8 @@ S_cancel:
         nodeState[req] := "cancelled";      \* withdrawn: no pass grants it from now on
         armed[req] := FALSE;                \* and its waker is dropped with it
         status[req] := "cancelled";         \* (record) it left the line
+        \* (record) so no request that began behind it counts it as ahead now
+        ahead := [x \in Reqs |-> ahead[x] \ {req}];
     end if;
 S_cancel_on:
     \* Pass on what the request held: granted slots through a release, a withdrawal
@@ -506,6 +509,7 @@ S_cancel_on:
 S_cancel_wake:
     \* The cancelled wait's drop wakes a receiver whose closed channel just went idle.
     left := 0;                              \* nothing left to give back
+    wasGranted := FALSE;                    \* and whether a grant came first is no longer asked
     if Finished then wake_rx(); end if;
     goto S_op_done;
 S_use:
@@ -708,6 +712,9 @@ Conservation ==
 
 \* First come, first served: a request that was already in line when another began is never
 \* still waiting once that other one has its slots, a `try_` that took slots included.
+\* `ahead` forgets a request once it leaves the line. That changes no answer: a request that
+\* left the line never waits again, so it could never break this check. It only lets two runs
+\* that differ in nothing but who has left the line count as one state.
 FifoFair ==
     \A r \in Reqs : status[r] \in {"granted", "done", "returned"} =>
         \A q \in ahead[r] : status[q] # "waiting"
@@ -779,9 +786,16 @@ NoFailByClose == \A r \in Reqs : ~closedG[r]
 NoValueAfterClose == \A p \in Senders : pc[p] = "S_send_wake" => ~closedBit
 \* The receiver parks while the oldest cell is claimed and not written yet.
 NoParkOnBusy == pc[Rx] = "R_sleep" => ~FrontBusy
+\* The sender's next step is a send's wake (`send_wake`): where it runs depends on the mutation.
+AboutToWake(p) ==
+    \/ pc[p] = "S_send_wake" /\ Mutation # "flag_before_write"    \* after the write, as in the code
+    \/ pc[p] = "S_early_wake"                                     \* wake_before_write: before it
+    \/ pc[p] = "S_send" /\ left[p] > 0 /\ Mutation = "flag_before_write"   \* in the claim's step
 \* A send leaves the waker cell alone while the receiver's waker is in it (it had not said
-\* it waits yet, or a send before already woke it).
-NoSkipRegistered == ~skippedRegistered
+\* it waits yet, or a send before already woke it): the wake is about to run, finds the
+\* flag down, and the waker is in the cell. That step has no condition, so it runs from
+\* here and leaves the waker where it is.
+NoSkipRegistered == \A p \in Senders : AboutToWake(p) => (rxWaiting \/ ~rxRegistered)
 \* The receiver ends a closed channel by finding it idle while a sender still lives.
 NoEndByIdle == rxEnded => txCount = 0
 \* A grant reaches a node between its push and its park, so the future sees it without

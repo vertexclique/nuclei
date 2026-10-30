@@ -18,7 +18,8 @@ checks every case the description allows. Two tools do the checking here, and th
 together:
 
 - **TLA+** (checked by TLC) looks at several threads at once, every order of their steps, but
-  only for small sizes: two slots, two senders with two operations each, and a receiver.
+  only for small sizes: two slots, one or two senders with one to three operations each, and a
+  receiver.
 - **Lean** looks at one thread doing one whole operation at a time, but for every size and
   every sequence of operations.
 
@@ -113,9 +114,9 @@ for, with two exceptions the spec's header explains: the pass's look past withdr
 the head of the line is one step, and so is the receiver's look at the queue and the sender
 count. The message queue is a sequence of cells in the order sends claimed them: a send claims
 its cell in one step and writes its value in a later one, as in kovan's segment queue, so the
-receiver can find the oldest cell claimed and not written yet. It then takes nothing, does not
-read the sender count, and waits for that send's wake, which comes after the write. Every
-line carries a comment.
+receiver can find the oldest cell claimed and not written yet. It then takes nothing, reads the
+sender count, which that send keeps above zero, and waits for that send's wake, which comes
+after the write. Every line carries a comment.
 
 The properties:
 
@@ -131,32 +132,40 @@ The properties:
 | `Termination` (under weak fairness of every thread) | every thread finishes: no waiter whose request can be served sleeps forever, so no wakeup is lost; checked with the waiter's park and the grant's wake modelled step by step |
 | deadlock freedom (TLC's own check, on every configuration that must pass) | no state where some thread is stuck while every other one is done |
 
-The 45 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
-`.cfg` file says in its first lines what it checks):
+The 48 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
+`.cfg` file says in its first lines what it checks, and why its size is enough):
 
-- **14 that must pass.** Ten check every safety property and deadlock freedom: three sends on
-  one slot; a request for both slots among single sends; a request for both slots that gives
-  them back unused; a request for both slots that is dropped after one poll; a single send that
-  is dropped; a `try_` racing waiting sends; one sender's two values; the receiver closing in
-  the middle, with and without a dropped request; the receiver dropped while sends wait. Four
-  check `Termination` under weak fairness: plain sends, a dropped send, a request for both
-  slots, and a close.
-- **18 mutations that must fail.** Each takes one rule out of the algorithm and must break the
-  property that rule protects: `try_ignores_queue` and `skip_unfit_front` (an attempt, or a
-  pass, that serves a later request first) break `FifoFair`; `drop_pass_on` (a leaving
-  waiter's share is dropped) breaks `Conservation`; `park_no_look`, `grant_no_wake`,
-  `release_no_pass`, `exit_ignores_release` and `rx_no_recheck` (a wakeup or a hand-over that
-  never comes) end in a deadlock, and `park_no_look` and `grant_no_wake` also break
-  `Termination`; `close_keeps_set_aside` (the close keeps what was set aside for the front
-  waiter, so the channel can never go idle) breaks `CloseReturnsShare`;
-  `try_ignores_close` and `take_after_close` break
-  `CloseSemantics`; `finish_early` breaks `EndMeansDrained`; `queue_lifo` breaks
-  `PerSenderOrder`, and so does `skip_busy` (the receiver passes over a cell still being
-  written and takes a written one behind it, as the queue of kovan before 0.2 did: a sender's
-  second value comes out first); `wake_before_write` (a send wakes the receiver before it
-  writes, so a receiver that looked in between sleeps through the value) ends in a deadlock;
-  `double_delivery` breaks `ExactlyOnce`.
-- **13 witnesses that must fail.** Each claims an interesting case never happens, and must be
+- **14 that must pass.** Ten check every safety property and deadlock freedom: three sends from
+  two senders on one slot; a request for both slots racing the other sender's two sends; the
+  same request putting nothing in, so both slots go on to the sends behind it; a request for
+  both slots that is dropped after one poll, racing two sends; a single send that is dropped,
+  racing two sends on one slot; a `try_` racing waiting sends; one sender's two values; the
+  receiver closing in the middle, racing a request for both slots that gives them back unused
+  and two sends, or a dropped request for both slots, a send after it and one more send; the
+  receiver dropped while sends wait. Where a run is about one request, one sender makes it and
+  the other only sends, once or twice; each `.cfg` says why that is enough for the bugs the
+  run guards against. Four check `Termination` under weak fairness, on smaller programs, as a
+  liveness check costs far more per state: one sender's three sends on one slot; one sender's
+  send, dropped send and send; a request for both slots racing one send; one sender's send and
+  request for both slots, with the receiver closing.
+- **20 mutation runs that must fail.** Each of 18 mutations takes one rule out of the
+  algorithm and must break the property that rule protects: `try_ignores_queue` and
+  `skip_unfit_front` (an attempt, or a pass, that serves a later request first) break
+  `FifoFair`; `drop_pass_on` (a leaving waiter's share is dropped) breaks `Conservation`;
+  `park_no_look`, `grant_no_wake`, `release_no_pass`, `exit_ignores_release` and
+  `rx_no_recheck` (a wakeup or a hand-over that never comes) end in a deadlock, and
+  `park_no_look` and `grant_no_wake` run a second time, against `Termination`, which they
+  break; `close_keeps_set_aside` (the close keeps what was set aside for the front waiter, so
+  the channel can never go idle) breaks `CloseReturnsShare`; `try_ignores_close` and
+  `take_after_close` break `CloseSemantics`; `finish_early` breaks `EndMeansDrained`;
+  `queue_lifo` breaks `PerSenderOrder`, and so does `skip_busy` (the receiver passes over a
+  cell still being written and takes a written one behind it, as the queue of kovan before 0.2
+  did: a sender's second value comes out first); `wake_before_write` (a send wakes the
+  receiver before it writes, so a receiver that looked in between sleeps through the value),
+  `flag_before_write` (a send looks at the receiver's flag before it writes) and
+  `raise_after_look` (the receiver says it waits only after its look again) end in a
+  deadlock; `double_delivery` breaks `ExactlyOnce`.
+- **14 witnesses that must fail.** Each claims an interesting case never happens, and must be
   proved wrong, which shows the search really reaches it: a share held between passes; a
   waiter that withdraws at the very moment a pass grants it; a grant that its future never
   looks at before the drop; the front waiter dropped while it holds a share; an attempt
@@ -164,8 +173,9 @@ The 45 configurations, listed with their expected result in `tla/mpsc/EXPECTED.t
   again because something changed while it worked; the close giving a share back; a waiter
   failed by the close; a value sent after the close through a slot reserved before it; the
   receiver ending a closed channel because it went idle; a grant that lands between a
-  waiter's arrival and its park; and the receiver parking while the oldest cell is still being
-  written.
+  waiter's arrival and its park; the receiver parking while the oldest cell is still being
+  written; and a send that leaves the receiver's waker in its cell, because the receiver has
+  not said it waits yet.
 
 ## What the Lean proofs check
 
