@@ -592,8 +592,9 @@ takes them.
 `lent` (`tla/lent/LentRead.tla`, `tla/lent/LentWrite.tla`, `tla/lent/LentFile.tla`) checks
 `read_owned` and `write_owned` on streams (`src/io/source/read.rs`, `src/io/source/write.rs`),
 where the task hands the side its own buffer and the driver reads into it or writes from it
-with no copy, and on files (`src/fs/file.rs`), where the buffer goes to a job of the blocking
-pool. The guards are abstract here (a step under one runs whole; `side` checks the side's).
+with no copy, and on files (`src/fs/file/`), where the buffer goes to a job of the blocking
+pool or the ring, beside the file's positional calls, syncs and direct IO. The guards are
+abstract here (a step under one runs whole; `side` checks the side's).
 
 The read: bytes arrive in order, each with an edge, and then the stream ends. The lending task
 takes what another read left first (bytes, or the end); otherwise it lends its buffer, which
@@ -624,35 +625,96 @@ it went out breaks `NoScribble`; an end that wakes nobody deadlocks), and 3 witn
 that goes out over several calls, the driver finishing the write of a task that went away, a
 withdrawn write).
 
-The file (`LentFile.tla`): the file has a cursor and an epoch, which every write and seek
-moves on, and its jobs run on the blocking pool or the ring of the task's shard, in any order;
-a write on the ring may land in two parts, and a shard that goes has its ring's calls made on
-the pool, from where they stopped. Two tasks each read one cell at the cursor into their own
-buffers: a read waits for the write in flight, its job reads at the cursor, and its result
-counts only if the cursor and the epoch are still those it read at, else it reads again. A
-third task writes a cell from the pool, then one from its own buffer (which waits for the write
-in flight and then is that write), then seeks back to the start. Any task may go away while its
-job is out: a read job is cancelled or its result dropped, and a lent write still lands. A file
-opened to append makes its writes on the pool at its end, wherever the cursor was; once one
-landed the cursor is the end of it; and its writer appends once more after the seek. 18
-configurations: 5 that must pass (tasks that may go away and tasks that stay, and a file opened
-to append, with `NoStaleRead`, a read counts only a value its cell still holds; `NoTornRead`,
-no read counts a cell a write landed only part of; `AllLanded`, every accepted write is in the
-file at the end; for the append, `NoOverwrite`, no append writes over what the file holds, and
-`CursorAtEnd`, the cursor is the file's end once an append landed; and liveness, twice), 7
-mutations (a result that counts on the cursor alone breaks `NoStaleRead`, through the seek back;
-a lent write that goes in flight over the one there, a lent write cancelled when its task goes
-away, a write cut short on the ring that counts as done, and a write on the ring cancelled with
-its shard that ends there break `AllLanded`; an append that lands where the cursor was breaks
-`NoOverwrite`; a cursor that stays where an append was made breaks `CursorAtEnd`), and 6
-witnesses (a read that reads again, the write of a task that went away landing, a read after the
-seek that counts the lent write's value, a write on the ring landing in two parts, one cut short
-whose shard went finished on the pool, an append after the seek landing at the end). In Rust a
-seek needs the handle exclusively, so it cannot overlap a read; the model lets it, so the epoch
-rule is checked for any path that moves the cursor back.
+The file (`LentFile.tla`) checks a file handle's reads, writes, syncs and seeks
+(`src/fs/file/`: `mod.rs`, `positional.rs`, `orphans.rs`, `durable.rs`, `work.rs`) in five
+scenarios, which a constant picks so that each configuration holds only the tasks its rules need.
+In all of them the file has a cursor and an epoch, which every write and seek at the cursor moves
+on, and its jobs run on the blocking pool or the ring of the task's shard, in any order; a write
+on the ring may land in two parts, and a shard that goes has its ring's calls made on the pool,
+from where they stopped.
 
-The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
-rules on real sockets and files, each with a mutation of the code that makes one of them fail.
+- **cursor** (the first one checked): two tasks each read one cell at the cursor into their own
+  buffers: a read waits for the write in flight, its job reads at the cursor, and its result
+  counts only if the cursor and the epoch are still those it read at, else it reads again. A
+  third task writes a cell from the pool, then one from its own buffer (which waits for the write
+  in flight and then is that write), then seeks back to the start. Any task may go away while its
+  job is out: a read job is cancelled or its result dropped, and a lent write still lands. A file
+  opened to append makes its writes on the pool at its end, wherever the cursor was; once one
+  landed the cursor is the end of it; and its writer appends once more after the seek. In Rust a
+  seek needs the handle exclusively, so it cannot overlap a read; the model lets it, so the epoch
+  rule is checked for any path that moves the cursor back.
+- **positional**: a task writes cell 0 at an offset of its own (`write_at`) and another reads it
+  (`read_at`), while the cursor writer writes cell 0 once, before, while or after the positional
+  write is out. Neither positional call reads or moves the cursor or the epoch; each waits first
+  for the cursor writes accepted before it. The positional writer may go away while its write is
+  out: the write still lands, the file keeps it (`orphans`), and a cursor write after that waits
+  for it.
+- **generation**: a cursor reader reads two cells through the read-ahead (a job reads ahead two
+  cells), another one cell into its own buffer, while a task writes cell 1 at an offset of its
+  own. When a positional write's task takes its end (or the file takes the end of one whose task
+  went away), the file's generation moves on, and a cursor read counts a job's result, or hands
+  out cells read ahead, only of the generation it began in.
+- **sync**: the cursor writer's second copied write waits in the write-behind while the first is
+  in flight, and a task syncs twice once both were accepted. A sync waits until the write-behind
+  went out and every write in flight landed, then its job makes what the file holds durable, or
+  fails (the device may fail it); a failed sync makes every later one fail, with no call.
+- **direct**: the file is opened for direct IO: a read job reads exactly the cell asked for, and
+  each copied write is one kernel write of exactly its bytes, which waits for the write in
+  flight instead of joining the write-behind.
+
+The properties: `NoStaleRead` and `NoTornRead`, no read counts a value its cell no longer holds,
+or a cell a write landed only part of, unless a positional write was out when it was taken (the
+caller's own race, as with `pread` and `pwrite` from two threads); `AllLanded`, every cursor
+write accepted is in the file at the end; for the append, `NoOverwrite`, no append writes over
+what the file holds, and `CursorAtEnd`, the cursor is the file's end once an append landed;
+`PositionalOrder`, each cell a positional write reached holds the write that came last in the
+order the file keeps (a cursor write accepted after the positional one ended, else the positional
+one, unless a cursor write raced it); `PositionalKeepsCursor`, an action property: no step of a
+positional call moves the cursor or the epoch; `PosReadSees`, a positional read made after a
+cursor write to its cell was accepted never reads what the cell held before it; `SyncCovers`,
+every write a good sync covers (accepted, or returned for a positional one, before it was called)
+is durable; `NoSyncAfterFailure`, no sync succeeds after one failed; `DirectExact`, on a direct
+file every kernel read and write is exactly one a caller made; and liveness (`Termination`).
+
+42 configurations. 13 must pass: tasks that may go away and tasks that stay, a file opened to
+append, positional calls, the generation, syncs that may fail and a direct file, each with its
+safety properties, and liveness for the cursor, append, positional, generation, sync and direct
+scenarios. 19 mutations must break the property their rule protects: a result that counts on
+the cursor alone breaks `NoStaleRead`, through the seek back; a lent write that goes in flight
+over the one there, a lent write cancelled when its task goes away, a write cut short on the ring
+that counts as done, and a write on the ring cancelled with its shard that ends there break
+`AllLanded`; an append that lands where the cursor was breaks `NoOverwrite`; a cursor that stays
+where an append was made breaks `CursorAtEnd`; a positional write that goes while the cursor
+write before it is out (`pos_skips_wait`) and a cursor write that goes while a positional write
+left by its task is out (`orphan_unordered`) break `PositionalOrder`; a positional write that
+moves the epoch on breaks `PositionalKeepsCursor`; a read job's result counted whatever
+positional write ended meanwhile (`no_gen_check`), cells read ahead before a positional write
+ended handed out after it (`ahead_no_gen`), and a positional write left by its task taken with
+the generation where it was (`orphan_no_gen`) break `NoStaleRead`; a positional read that goes
+while the cursor write before it is out breaks `PosReadSees`; a sync made with a write still in
+the write-behind or in flight (`sync_no_flush`), and one made once the write-behind went out but
+ordered after the writes only by the ring's drain (`sync_drain`: a write the shard handed to the
+blocking pool is not the ring's, so the drain does not order it) break `SyncCovers`; a failed
+sync forgotten once reported breaks `NoSyncAfterFailure`; a direct read through the read-ahead
+and a direct write that joins the write-behind break `DirectExact`. 10 witnesses must be proved
+wrong: a read that reads again, the lent write of a task that went away landing, a read after
+the seek that counts the lent write's value, a write on the ring landing in two parts, one cut
+short whose shard went finished on the pool, an append after the seek landing at the end, a read
+that reads again only because a positional write ended, a buffered read asking the kernel for
+more than its caller (the read-ahead the direct rule takes away), the positional write of a task
+that went away landing, and a sync that fails.
+
+The model shows why a sync waits for the writes before it rather than relying on io_uring's
+`IOSQE_IO_DRAIN` (`MF_sync_drain`): the drain orders an entry after the ring's earlier entries
+only, and a write may be on the blocking pool (its shard went, or the handle's calls run there);
+in Rust the drain would also hold the sync behind every other operation of the shard's ring, a
+multishot receive among them, which may never end. Waiting costs nothing the drain would not:
+the writes it waits for are the ones the sync must cover.
+
+The Rust tests in `src/io/source/tests/owned.rs`, `src/fs/tests/owned.rs`,
+`src/fs/tests/positional.rs`, `src/fs/tests/durable.rs` and `src/fs/tests/direct.rs` check the
+same rules on real sockets and files, each with a mutation of the code that makes one of them
+fail.
 
 ## A caller's own descriptor
 
