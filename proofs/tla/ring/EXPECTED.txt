@@ -37,3 +37,16 @@ MMU_rearm_stopping             MC_RingMulti         violated:OneOut
 WMU_direct                     MC_RingMulti         violated:NoDirectGot
 WMU_direct_stop                MC_RingMulti         violated:NoDirectStop
 WMU_rearm                      MC_RingMulti         violated:NoRearm
+RI_safe                        MC_RingInc           pass
+RI_batch                       MC_RingInc           pass
+RI_live                        MC_RingInc           pass
+RI_live_batch                  MC_RingInc           pass
+RI_dgram                       MC_RingInc           pass
+RI_dgram_live                  MC_RingInc           pass
+MI_readd_with_more             MC_RingInc           violated:NoReuse
+MI_readd_with_more_order       MC_RingInc           violated:InOrder
+MI_readd_on_done               MC_RingInc           violated:NoReuse
+MI_charge_len                  MC_RingInc           violated:CapHeld
+MI_dgram_multishot             MC_RingInc           violated:NoCut
+WI_pieces                      MC_RingInc           violated:NoPieces
+WI_readd                       MC_RingInc           violated:NoReAdd

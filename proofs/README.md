@@ -739,6 +739,27 @@ socket while the receive is out, or with chunks read ahead, breaks `InOrder`), a
 socket, a big read's stop, and a receive armed again after it). The reader makes at most two
 big reads, so a reader that keeps switching between sizes cannot spin the model.
 
+`tla/ring/RingInc.tla` checks the same receives on a group filled in pieces (`IOU_PBUF_RING_INC`;
+`RecvGroup::hand_out`, `settle`, `take_back` and `charge` in `src/rt/shard/recv.rs`, `arrived` in
+`src/rt/shard/ring.rs`). The kernel keeps a buffer while it has room: each message goes after the
+bytes already there, and its completion carries BUF_MORE until the one that fills the buffer; a
+receive that ends leaves the buffer partly filled for the next. For each buffer the ring's thread
+counts where the next piece starts, the chunks of it out and whether the kernel is done with it,
+and gives it back to the kernel only when the kernel is done and no chunk of it is out. A chunk
+counts at least a minimum against its receive's cap, and a datagram socket takes pool buffers
+while the group is filled in pieces. The model keeps the message each unit of a buffer holds, so
+a buffer filled again under a live chunk shows as a wrong message read. 13 configurations: 6 that
+must pass (four and five messages, with one and two completions posted ahead of the ring, and a
+datagram socket, with `InOrder`, `NoReuse`, no buffer back under the kernel or a live chunk and
+never twice in the kernel's ring, `BuffersBack`, `CapHeld`, the chunks of a receive within its cap
+at the minimum charge plus the batch the kernel posted when the ring passed it and the cancel's
+burst, and `NoCut`, no datagram cut; and `Termination` for each), 5 mutations (a buffer back on
+its last chunk while the kernel still holds it, and back on the kernel's last piece while chunks
+are out, break `NoReuse`, and with six messages the first loses a message, breaking `InOrder`; a
+chunk that counts its length only lets a peer sending a unit at a time past the cap, breaking
+`CapHeld`; a datagram socket arming a multishot receive on the group gets a datagram cut, breaking
+`NoCut`), and 2 witnesses (a buffer handed out in two pieces, a buffer given back).
+
 `lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
 every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
 table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its
