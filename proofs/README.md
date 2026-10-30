@@ -668,6 +668,22 @@ rule is checked for any path that moves the cursor back.
 The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
 rules on real sockets and files, each with a mutation of the code that makes one of them fail.
 
+## A datagram's sender
+
+`sender` (`tla/sender/Sender.tla`) checks that a receive on a Unix datagram socket names its
+sender without a descriptor (`unix_addr` and `unnamed` in `src/io/sys/unix.rs`, used by the
+receives of `src/io/source/read.rs` and `src/io/source/ring.rs`). A peer sends datagrams over a
+socket pair, whose ends have no name; a receive takes one from the kernel and then makes the
+sender's address for the task, while other code takes the process's last descriptors and gives
+them back. Once the kernel handed a datagram over it is the receive's, so naming its sender must
+not fail: the unnamed address is made from an empty path, with no socket. 4 configurations: 2
+that must pass (`Conservation`, no datagram lost, and `Order`; and `Termination`), 1 mutation
+(naming the sender by opening a socket, which fails with no descriptor free and loses the
+datagram the kernel handed over, breaks `Conservation`), and 1 witness (a receive names an
+unnamed sender while no descriptor is free). The Rust test
+`emfile::datagram_sockets_open_before_send_and_receive_with_no_descriptor_left` in
+`tests/faults/emfile.rs` receives on a real pair with no descriptor left.
+
 ## A caller's own descriptor
 
 `asyncfd` (`tla/asyncfd/AsyncFd.tla`) checks `AsyncFd` (`src/io/async_fd.rs`) and the side's
