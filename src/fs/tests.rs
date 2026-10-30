@@ -337,5 +337,6 @@ fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
 
 mod durable;
 mod owned;
+mod positional;
 #[cfg(windows)]
 mod windows;

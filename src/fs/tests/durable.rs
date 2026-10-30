@@ -21,7 +21,6 @@ fn one_blocking_thread_kept() -> Runtime {
 }
 
 /// A file's call on the ring: its opcode, length, offset and flags.
-#[cfg(target_os = "linux")]
 pub(super) type Entry = (u8, u32, u64, u32);
 
 /// The ring of this thread's shard: its file calls so far, and the
@@ -35,7 +34,7 @@ pub(super) fn ring_calls() -> Option<(usize, Vec<Entry>)> {
     })
 }
 
-#[cfg(all(not(ring), target_os = "linux"))]
+#[cfg(not(ring))]
 pub(super) fn ring_calls() -> Option<(usize, Vec<Entry>)> {
     None
 }
@@ -93,6 +92,7 @@ fn a_sync_covers_the_writes_accepted_before_it() {
     rt.block_on(async {
         let mut file = Handle::new(read_write(&path)).unwrap();
         within(write_all(&mut file, &data)).await.unwrap();
+        within(file.write_at(b"positional", 5)).await.unwrap();
         within(file.sync_data()).await.unwrap();
         assert!(
             !file.file().unwrap().has_unsent(),
@@ -100,6 +100,8 @@ fn a_sync_covers_the_writes_accepted_before_it() {
         );
         within(file.sync_all()).await.unwrap();
     });
+    let mut expected = expected;
+    expected[5..15].copy_from_slice(b"positional");
     assert!(std::fs::read(&path).unwrap() == expected);
 }
 

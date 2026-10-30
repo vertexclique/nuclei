@@ -25,8 +25,12 @@ use crate::syscore::linux::iouring::ring::Sqe;
 
 /// What a file's operation reads into or writes from.
 pub(crate) enum FileMem {
-    /// A read into the spare room of a buffer of the pool.
-    Read(PoolBuf),
+    /// A read into `len` bytes of a buffer of the pool from `from`.
+    Read {
+        buf: PoolBuf,
+        from: usize,
+        len: usize,
+    },
     /// A read into the spare capacity of a task's buffer.
     ReadLent(Vec<u8>),
     /// A write of a buffer of the pool, `done` of its bytes landed.
@@ -206,13 +210,23 @@ fn submit<B, T>(
     })
 }
 
-/// A read at `at` into the spare room of `buf`, on this thread's ring.
+/// A read at `at` into `len` bytes of `buf` from `from`, on this thread's
+/// ring.
 pub(crate) fn read(
     fd: &Arc<OwnedFile>,
     at: u64,
     buf: PoolBuf,
+    from: usize,
+    len: usize,
 ) -> Result<RingJob<io::Result<PoolBuf>>, PoolBuf> {
-    submit(fd, at, buf, FileMem::Read, as_read)
+    submit(
+        fd,
+        at,
+        (buf, from, len),
+        |(buf, from, len)| FileMem::Read { buf, from, len },
+        as_read,
+    )
+    .map_err(|(buf, _, _)| buf)
 }
 
 /// A sync of the file's data (`data_only`) or of all of it, on this
@@ -271,9 +285,11 @@ impl FileOp {
     pub(crate) fn entry(&mut self) -> Sqe {
         let fd = file_raw(&self.fd);
         match &mut self.mem {
-            FileMem::Read(buf) => {
+            FileMem::Read { buf, from, len } => {
                 let spare = buf.spare();
-                Sqe::read(fd, spare.as_mut_ptr(), len32(spare.len()), self.at)
+                let room = spare.get_mut(*from..).unwrap_or_default();
+                let len = (*len).min(room.len());
+                Sqe::read(fd, room.as_mut_ptr(), len32(len), self.at)
             }
             FileMem::ReadLent(buf) => {
                 let spare = buf.spare_capacity_mut();
@@ -328,8 +344,8 @@ impl FileOp {
             r => Ok(r as usize),
         };
         let outcome = match self.mem {
-            FileMem::Read(mut buf) => FileOutcome::Read(result.map(|n| {
-                buf.set_filled(n);
+            FileMem::Read { mut buf, from, .. } => FileOutcome::Read(result.map(|n| {
+                buf.set_filled_at(from, n);
                 buf
             })),
             FileMem::ReadLent(mut buf) => {
@@ -355,9 +371,12 @@ impl FileOp {
         let job = crate::runtime::spawn_blocking(move || {
             let raw = file_raw(&fd);
             let outcome = match mem {
-                FileMem::Read(mut buf) => {
-                    FileOutcome::Read(sys::pread(raw, buf.spare(), at).map(|n| {
-                        buf.set_filled(n);
+                FileMem::Read { mut buf, from, len } => {
+                    let spare = buf.spare();
+                    let end = from.saturating_add(len).min(spare.len());
+                    let room = spare.get_mut(from..end).unwrap_or_default();
+                    FileOutcome::Read(sys::pread(raw, room, at).map(|n| {
+                        buf.set_filled_at(from, n);
                         buf
                     }))
                 }

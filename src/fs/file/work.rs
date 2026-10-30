@@ -1,6 +1,9 @@
 //! A file's calls in flight and how they are made: a job of the blocking
 //! pool, or an operation on the ring of the shard whose thread asks; and the
 //! buffers of the pool they read into and write from.
+//!
+//! Every call names exactly the bytes it moves: a read the range of its
+//! buffer it fills, a write the bytes its buffer holds.
 
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -9,7 +12,7 @@ use std::io;
 use std::sync::Arc;
 
 use super::FileIo;
-use crate::buf::{PoolBuf, with_pool};
+use crate::buf::{LARGEST, PoolBuf, with_pool};
 use crate::io::raw::file_raw;
 use crate::io::side::After;
 use crate::io::sys;
@@ -40,6 +43,19 @@ impl<T: Ended> Work<T> {
     }
 }
 
+impl<T> Work<T> {
+    /// Lets the call run to its end with nobody to take it: a job of the
+    /// pool is detached (dropped, one not started would be cancelled), an
+    /// operation of the ring goes on by itself.
+    pub(super) fn let_go(self) {
+        match self {
+            Work::Pool(task) => task.detach(),
+            #[cfg(ring)]
+            Work::Ring(job) => drop(job),
+        }
+    }
+}
+
 /// The end of a file's call: its result, alone or with the task's buffer.
 pub(super) trait Ended {
     fn error(&self) -> Option<&io::Error>;
@@ -57,23 +73,27 @@ impl<T> Ended for (io::Result<T>, Vec<u8>) {
     }
 }
 
+/// A read job at the cursor, into a buffer of the pool.
 pub(super) struct Job<T> {
     pub(super) task: Work<io::Result<T>>,
-    /// Where it reads, and the epoch it read in.
+    /// Where it reads, the epoch and the generation it read in.
     pub(super) at: u64,
     pub(super) epoch: u64,
+    pub(super) generation: u64,
 }
 
-/// A read job into a task's own buffer, which comes back with the result.
+/// A read job at the cursor into a task's own buffer, which comes back
+/// with the result.
 pub(super) struct LentRead {
     pub(super) task: Work<(io::Result<usize>, Vec<u8>)>,
     pub(super) at: u64,
     pub(super) epoch: u64,
+    pub(super) generation: u64,
     /// What the buffer held before: the read's bytes come after.
     pub(super) from: usize,
 }
 
-/// The write in flight.
+/// The cursor write in flight.
 pub(super) enum Writing {
     /// From a buffer of the pool.
     Pool(Work<io::Result<()>>),
@@ -104,13 +124,36 @@ pub(super) fn poll_task<T>(task: &mut Task<T>, waker: &Waker) -> Poll<T> {
     Pin::new(task).poll(&mut Context::from_waker(waker))
 }
 
-/// A buffer of this thread's pool, or the file waits for one.
+/// A buffer of this thread's pool of at least `len` bytes (or of its largest
+/// class), or the file waits for one.
 pub(super) fn buffer(len: usize, after: &mut After) -> Option<PoolBuf> {
     let buf = with_pool(|pool| pool.and_then(|p| p.get(len)));
     if buf.is_none() {
         after.starved = true;
     }
     buf
+}
+
+/// A buffer of this thread's pool for a call of up to `len` bytes of a
+/// task's memory, and how many of them the call moves: up to a buffer of the
+/// pool's largest class. `None` while the pool has no room: `waker` is woken
+/// once a buffer comes back.
+pub(super) fn bounce(len: usize, waker: &Waker) -> Option<(PoolBuf, usize)> {
+    with_pool(|pool| {
+        let pool = pool?;
+        let want = len.min(LARGEST);
+        let buf = if pool.could_hold_whole(want) {
+            pool.get_whole(want)
+        } else {
+            pool.get(want)
+        };
+        let Some(buf) = buf else {
+            pool.wait_for_return(waker.clone());
+            return None;
+        };
+        let n = want.min(buf.capacity());
+        Some((buf, n))
+    })
 }
 
 impl FileIo {
@@ -124,35 +167,51 @@ impl FileIo {
         true
     }
 
-    pub(super) fn submit_read(&self, buf: PoolBuf, at: u64, epoch: u64) -> Job<PoolBuf> {
+    /// A read at `at` into `len` bytes of `buf` from `from`.
+    pub(super) fn submit_read(
+        &self,
+        buf: PoolBuf,
+        from: usize,
+        len: usize,
+        at: u64,
+    ) -> Work<io::Result<PoolBuf>> {
         #[cfg(ring)]
         let buf = match self.on_ring() {
-            true => match crate::fs::ring::read(&self.fd, at, buf) {
-                Ok(job) => {
-                    return Job {
-                        task: Work::Ring(job),
-                        at,
-                        epoch,
-                    };
-                }
+            true => match crate::fs::ring::read(&self.fd, at, buf, from, len) {
+                Ok(job) => return Work::Ring(job),
                 Err(buf) => buf,
             },
             false => buf,
         };
         let fd = Arc::clone(&self.fd);
         let mut buf = buf;
-        let task = crate::runtime::spawn_blocking(move || {
-            let n = sys::pread(file_raw(&fd), buf.spare(), at)?;
-            buf.set_filled(n);
+        Work::Pool(crate::runtime::spawn_blocking(move || {
+            let end = (from + len).min(buf.capacity());
+            let n = sys::pread(file_raw(&fd), &mut buf.spare()[from..end], at)?;
+            buf.set_filled_at(from, n);
             Ok(buf)
-        });
-        Job {
-            task: Work::Pool(task),
-            at,
-            epoch,
-        }
+        }))
     }
 
+    /// A write of the bytes `buf` holds at `at`, whole: for a positional
+    /// write, and the cursor's on a file not opened to append.
+    pub(super) fn submit_pwrite(&self, buf: PoolBuf, at: u64) -> Work<io::Result<()>> {
+        #[cfg(ring)]
+        let buf = match self.on_ring() {
+            true => match crate::fs::ring::write(&self.fd, at, buf) {
+                Ok(job) => return Work::Ring(job),
+                Err(buf) => buf,
+            },
+            false => buf,
+        };
+        let fd = Arc::clone(&self.fd);
+        Work::Pool(crate::runtime::spawn_blocking(move || {
+            sys::pwrite_all(file_raw(&fd), buf.filled(), at)
+        }))
+    }
+
+    /// The cursor's write of `buf` at `at`, or at the end of a file opened
+    /// to append.
     pub(super) fn submit_write(&self, buf: PoolBuf, at: u64) -> Writing {
         if self.append {
             let fd = Arc::clone(&self.fd);
@@ -160,40 +219,27 @@ impl FileIo {
                 sys::append_all(file_raw(&fd), buf.filled())
             })));
         }
-        #[cfg(ring)]
-        let buf = match self.on_ring() {
-            true => match crate::fs::ring::write(&self.fd, at, buf) {
-                Ok(job) => return Writing::Pool(Work::Ring(job)),
-                Err(buf) => buf,
-            },
-            false => buf,
-        };
-        let fd = Arc::clone(&self.fd);
-        Writing::Pool(Work::Pool(crate::runtime::spawn_blocking(move || {
-            sys::pwrite_all(file_raw(&fd), buf.filled(), at)
-        })))
+        Writing::Pool(self.submit_pwrite(buf, at))
     }
 
-    pub(super) fn submit_read_owned(&self, buf: Vec<u8>, at: u64, epoch: u64) -> LentRead {
-        let from = buf.len();
+    /// A read at `at` into the spare capacity of a task's `buf`, after the
+    /// bytes it holds.
+    pub(super) fn submit_read_owned(
+        &self,
+        buf: Vec<u8>,
+        at: u64,
+    ) -> Work<(io::Result<usize>, Vec<u8>)> {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::read_lent(&self.fd, at, buf) {
-                Ok(job) => {
-                    return LentRead {
-                        task: Work::Ring(job),
-                        at,
-                        epoch,
-                        from,
-                    };
-                }
+                Ok(job) => return Work::Ring(job),
                 Err(buf) => buf,
             },
             false => buf,
         };
         let fd = Arc::clone(&self.fd);
         let mut buf = buf;
-        let task = crate::runtime::spawn_blocking(move || {
+        Work::Pool(crate::runtime::spawn_blocking(move || {
             let result = sys::pread_uninit(file_raw(&fd), buf.spare_capacity_mut(), at);
             if let Ok(n) = result {
                 // SAFETY: the kernel wrote the first `n` bytes of the spare
@@ -201,15 +247,32 @@ impl FileIo {
                 unsafe { buf.set_len(buf.len() + n) };
             }
             (result, buf)
-        });
-        LentRead {
-            task: Work::Pool(task),
-            at,
-            epoch,
-            from,
-        }
+        }))
     }
 
+    /// A write of all of a task's `buf` at `at`: for a positional write, and
+    /// the cursor's on a file not opened to append.
+    pub(super) fn submit_pwrite_owned(
+        &self,
+        buf: Vec<u8>,
+        at: u64,
+    ) -> Work<(io::Result<()>, Vec<u8>)> {
+        #[cfg(ring)]
+        let buf = match self.on_ring() {
+            true => match crate::fs::ring::write_lent(&self.fd, at, buf) {
+                Ok(job) => return Work::Ring(job),
+                Err(buf) => buf,
+            },
+            false => buf,
+        };
+        let fd = Arc::clone(&self.fd);
+        Work::Pool(crate::runtime::spawn_blocking(move || {
+            (sys::pwrite_all(file_raw(&fd), &buf, at), buf)
+        }))
+    }
+
+    /// The cursor's write of all of a task's `buf` at `at`, or at the end of
+    /// a file opened to append.
     pub(super) fn submit_write_owned(&self, buf: Vec<u8>, at: u64) -> Writing {
         if self.append {
             let fd = Arc::clone(&self.fd);
@@ -217,17 +280,6 @@ impl FileIo {
                 (sys::append_all(file_raw(&fd), &buf), buf)
             })));
         }
-        #[cfg(ring)]
-        let buf = match self.on_ring() {
-            true => match crate::fs::ring::write_lent(&self.fd, at, buf) {
-                Ok(job) => return Writing::Lent(Work::Ring(job)),
-                Err(buf) => buf,
-            },
-            false => buf,
-        };
-        let fd = Arc::clone(&self.fd);
-        Writing::Lent(Work::Pool(crate::runtime::spawn_blocking(move || {
-            (sys::pwrite_all(file_raw(&fd), &buf, at), buf)
-        })))
+        Writing::Lent(self.submit_pwrite_owned(buf, at))
     }
 }

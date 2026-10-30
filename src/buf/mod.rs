@@ -538,6 +538,24 @@ impl PoolBuf {
         self.end = n.min(self.capacity()) as u32;
     }
 
+    /// The `n` bytes from `from` were written: they are the filled ones.
+    pub(crate) fn set_filled_at(&mut self, from: usize, n: usize) {
+        let from = from.min(self.capacity());
+        self.start = from as u32;
+        self.end = (from + n).min(self.capacity()) as u32;
+    }
+
+    /// Fills the buffer from `from` with `bytes` (as many as fit); returns
+    /// how many.
+    pub(crate) fn fill_at(&mut self, from: usize, bytes: &[u8]) -> usize {
+        let n = bytes.len().min(self.capacity().saturating_sub(from));
+        if let Some(room) = self.spare().get_mut(from..from + n) {
+            room.copy_from_slice(&bytes[..n]);
+        }
+        self.set_filled_at(from, n);
+        n
+    }
+
     /// Fills the buffer with `bytes` (as many as fit); returns how many.
     pub(crate) fn fill_from(&mut self, bytes: &[u8]) -> usize {
         let n = bytes.len().min(self.capacity());

@@ -5,17 +5,18 @@
 //! pool, `pread` or `pwrite` at the handle's own cursor, on a copy of the
 //! descriptor that every job keeps open until it ends (so a handle dropped
 //! while a job runs closes only its own descriptor, and the job never meets
-//! a reused number).
+//! a reused number); on io_uring an operation of the shard's ring instead
+//! (see `fs::ring`).
 //!
-//! One read and one write are in flight at most. A read fills a read-ahead
-//! buffer of the pool, at least [`READ_MIN`] bytes, that the next reads copy
-//! from. A write is copied into a buffer and accepted at once; while it is
-//! in flight, later writes go into one more buffer (the write-behind), which
-//! starts when the first ends, so a run of writes keeps one job going. A
-//! read waits for the writes before it, so it sees them; a write or a seek
-//! moves the epoch on, and a read job of an older epoch is thrown away. A
-//! write that fails keeps its error: every later write fails with it until a
-//! flush reports it.
+//! One read and one write at the cursor are in flight at most. A read fills
+//! a read-ahead buffer of the pool, at least [`READ_MIN`] bytes, that the
+//! next reads copy from. A write is copied into a buffer and accepted at
+//! once; while it is in flight, later writes go into one more buffer (the
+//! write-behind), which starts when the first ends, so a run of writes keeps
+//! one job going. A read waits for the writes before it, so it sees them; a
+//! write or a seek moves the epoch on, and a read job of an older epoch is
+//! thrown away. A write that fails keeps its error: every later write fails
+//! with it until a flush reports it.
 //!
 //! A file opened to append writes at its end whatever its cursor says: its
 //! write jobs call `write(2)` (on Windows, a write at the end), since
@@ -33,11 +34,19 @@
 //! any other, so whatever comes after it waits for it; dropped, it still
 //! lands, and its buffer goes with the job.
 //!
-//! A sync (`durable`) waits for every write it covers, then is an operation
-//! of the shard's ring where it runs one; a failed sync fails every later
-//! one.
+//! Reads and writes at offsets of the caller's own (`positional`) never read
+//! or move the cursor or the epoch, and run any number at once; each waits
+//! for the cursor writes accepted before it. When a positional write ends
+//! for its task, the file's generation moves on, and a cursor read counts a
+//! job's bytes, or hands out bytes read ahead, only of the generation it
+//! began in. A positional write whose task went away is kept in the state
+//! (`orphans`) until it landed, and everything after it waits for it.
+//!
+//! `proofs/tla/lent/LentFile.tla` checks these rules.
 
 mod durable;
+mod orphans;
+mod positional;
 mod work;
 
 use core::future::poll_fn;
@@ -48,6 +57,7 @@ use std::task::Wake;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use self::orphans::{Orphan, Orphans};
 use self::work::{Job, Lent, LentRead, Writing, buffer, poll_task};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::raw::{OwnedFile, Raw, file_raw};
@@ -72,6 +82,8 @@ mod deferred {
     pub(super) const CONSUME: u8 = 1;
     /// The future of a lent write went away.
     pub(super) const ABANDON: u8 = 2;
+    /// A positional write was left by its task (see `orphans`).
+    pub(super) const ORPHAN: u8 = 4;
 }
 
 /// The IO state of a file handle, shared with the waker its jobs wake.
@@ -87,6 +99,11 @@ pub(crate) struct FileIo {
     /// as the state's last holder left them.
     unsent: AtomicBool,
     cursor: AtomicU64,
+    /// Positional writes whose end their task took (or the state took, for
+    /// one its task left): the generation of what the file holds.
+    generation: AtomicU64,
+    /// Positional writes left by their tasks, for the state to take.
+    orphans: Orphans,
     /// The first sync that failed: every later sync fails with it.
     sync_failed: OnceLock<Failure>,
     /// The file was opened to append.
@@ -119,12 +136,15 @@ impl Hooks<FileState> for FileHooks<'_> {
         if bits & deferred::ABANDON != 0 {
             st.abandon_lent(&Waker::from(Arc::clone(self.io)), after);
         }
+        if bits & deferred::ORPHAN != 0 {
+            self.io.orphans.take(&mut st.orphans);
+        }
     }
 
     fn releasing(&self, st: &mut FileState) {
         // Release: read without the guard, on any thread.
         self.io.unsent.store(
-            st.writing.is_some() || st.behind.is_some(),
+            st.writing.is_some() || st.behind.is_some() || !st.orphans.is_empty(),
             Ordering::Release,
         );
         self.io.cursor.store(st.cursor, Ordering::Release);
@@ -137,8 +157,9 @@ struct FileState {
     cursor: u64,
     /// Moves on with every write and seek.
     epoch: u64,
-    /// Bytes at the cursor, read ahead.
+    /// Bytes at the cursor, read ahead, and the generation they were read in.
     ahead: Option<PoolBuf>,
+    ahead_gen: u64,
     reading: Option<Job<PoolBuf>>,
     writing: Option<Writing>,
     lent: Lent,
@@ -147,6 +168,8 @@ struct FileState {
     behind_at: u64,
     failed: Option<Failure>,
     sizing: Option<crate::rt::task::Task<io::Result<u64>>>,
+    /// Positional writes left by their tasks, out until they land.
+    orphans: Vec<Orphan>,
 }
 
 impl FileIo {
@@ -165,6 +188,8 @@ impl FileIo {
             consumed: AtomicUsize::new(0),
             unsent: AtomicBool::new(false),
             cursor: AtomicU64::new(cursor),
+            generation: AtomicU64::new(0),
+            orphans: Orphans::new(),
             sync_failed: OnceLock::new(),
             append,
             #[cfg(test)]
@@ -176,6 +201,19 @@ impl FileIo {
     #[cfg(test)]
     pub(crate) fn keep_on_pool(&self) {
         self.on_pool.store(true, Ordering::Relaxed);
+    }
+
+    /// Sends this file's calls to the shard's ring again, where it runs one.
+    #[cfg(test)]
+    pub(crate) fn back_to_ring(&self) {
+        self.on_pool.store(false, Ordering::Relaxed);
+    }
+
+    /// The file's generation now.
+    fn generation(&self) -> u64 {
+        // Acquire: pairs with the Release of a positional write's end, so a
+        // read made after it sees what it wrote.
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Runs `step` on the state for a task polling with `cx`: the task is
@@ -317,11 +355,13 @@ impl FileIo {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(out) => out,
                     };
-                    let (at, epoch, from) = (lent.at, lent.epoch, lent.from);
+                    let (at, epoch, generation, from) =
+                        (lent.at, lent.epoch, lent.generation, lent.from);
                     *job = None;
-                    if at != st.cursor || epoch != st.epoch {
-                        // Another read, a write or a seek moved on meanwhile:
-                        // read again where the cursor is.
+                    if !st.counts(io, at, epoch, generation) {
+                        // Another read, a write, a seek or a positional
+                        // write's end moved on meanwhile: read again where
+                        // the cursor is.
                         buf.truncate(from);
                         *held = Some(buf);
                         continue;
@@ -343,6 +383,7 @@ impl FileIo {
                 let Some(buf) = held.as_mut() else {
                     return Poll::Ready(Err(io::Error::other("the read lost its buffer")));
                 };
+                st.drop_stale_ahead(io, after);
                 if let Some(ahead) = st.ahead.as_mut().filter(|a| !a.is_empty()) {
                     let n = crate::buf::append_spare(ahead.filled(), buf);
                     ahead.consume(n);
@@ -350,7 +391,17 @@ impl FileIo {
                     return Poll::Ready(Ok(n));
                 }
                 if let Some(buf) = held.take() {
-                    *job = Some(io.submit_read_owned(buf, st.cursor, st.epoch));
+                    let (at, from) = (st.cursor, buf.len());
+                    // Read before the call, so a positional write that ends
+                    // while it runs is seen to have.
+                    let generation = io.generation();
+                    *job = Some(LentRead {
+                        task: io.submit_read_owned(buf, at),
+                        at,
+                        epoch: st.epoch,
+                        generation,
+                        from,
+                    });
                 }
             }
         })
@@ -452,8 +503,26 @@ impl FileState {
         }
     }
 
-    /// Drives the writes: takes the end of the one in flight, then starts
-    /// the write-behind. Ready once none is in flight.
+    /// Whether the bytes of a read at `at` in `epoch` and `generation` are the
+    /// file's at the cursor now: no read, write or seek moved the cursor or
+    /// the epoch on, and no positional write ended, since.
+    fn counts(&self, io: &FileIo, at: u64, epoch: u64, generation: u64) -> bool {
+        at == self.cursor && epoch == self.epoch && generation == io.generation()
+    }
+
+    /// Bytes read ahead before a positional write ended are not the file's.
+    fn drop_stale_ahead(&mut self, io: &FileIo, after: &mut After) {
+        if self.ahead.is_some()
+            && self.ahead_gen != io.generation()
+            && let Some(stale) = self.ahead.take()
+        {
+            after.drop_buf(stale);
+        }
+    }
+
+    /// Drives the writes: takes the end of the one in flight, then of the
+    /// positional writes left by their tasks, then starts the write-behind.
+    /// Ready once none is in flight.
     fn poll_writes(&mut self, io: &FileIo, waker: &Waker, after: &mut After) -> Poll<()> {
         loop {
             if let Some(writing) = self.writing.as_mut() {
@@ -492,10 +561,44 @@ impl FileState {
                     }
                 }
             }
+            if self.poll_orphans(io, waker).is_pending() {
+                return Poll::Pending;
+            }
             match self.behind.take() {
                 Some(behind) => self.writing = Some(io.submit_write(behind, self.behind_at)),
                 None => return Poll::Ready(()),
             }
+        }
+    }
+
+    /// Takes the ends of the positional writes left by their tasks: Ready
+    /// once every one landed. Each that landed moves the generation on, and
+    /// one that failed is the file's failure, as a lent write's nobody took.
+    fn poll_orphans(&mut self, io: &FileIo, waker: &Waker) -> Poll<()> {
+        io.orphans.take(&mut self.orphans);
+        if self.orphans.is_empty() {
+            return Poll::Ready(());
+        }
+        let before = self.orphans.len();
+        let failed = &mut self.failed;
+        self.orphans.retain_mut(|orphan| match orphan.poll(waker) {
+            Poll::Pending => true,
+            Poll::Ready(err) => {
+                if let Some(err) = err {
+                    *failed = Some(Failure::of(&err));
+                }
+                false
+            }
+        });
+        let landed = before - self.orphans.len();
+        if landed > 0 {
+            // Release: pairs with the Acquire of `FileIo::generation`.
+            io.generation.fetch_add(landed as u64, Ordering::Release);
+        }
+        if self.orphans.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 
@@ -512,7 +615,8 @@ impl FileState {
     }
 
     /// Makes sure bytes at the cursor are read ahead: `true`, or `false` at
-    /// the end of the file.
+    /// the end of the file. A read job asks for `want` bytes, at least
+    /// [`READ_MIN`].
     fn fill(
         &mut self,
         io: &FileIo,
@@ -525,6 +629,7 @@ impl FileState {
             return Poll::Pending;
         }
         loop {
+            self.drop_stale_ahead(io, after);
             if self.ahead.as_ref().is_some_and(|ahead| !ahead.is_empty()) {
                 return Poll::Ready(Ok(true));
             }
@@ -533,12 +638,13 @@ impl FileState {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => result,
                 };
-                let (at, epoch) = (job.at, job.epoch);
+                let (at, epoch, generation) = (job.at, job.epoch, job.generation);
                 self.reading = None;
                 match result {
                     Err(err) => return Poll::Ready(Err(err)),
-                    // Read before a write or a seek: not the file as it is.
-                    Ok(buf) if at != self.cursor || epoch != self.epoch => after.drop_buf(buf),
+                    // Read before a write, a seek or a positional write's
+                    // end: not the file as it is.
+                    Ok(buf) if !self.counts(io, at, epoch, generation) => after.drop_buf(buf),
                     Ok(buf) if buf.is_empty() => {
                         after.drop_buf(buf);
                         return Poll::Ready(Ok(false));
@@ -547,6 +653,7 @@ impl FileState {
                         if let Some(old) = self.ahead.replace(buf) {
                             after.drop_buf(old);
                         }
+                        self.ahead_gen = generation;
                     }
                 }
                 continue;
@@ -554,7 +661,16 @@ impl FileState {
             let Some(buf) = buffer(want.max(READ_MIN), after) else {
                 return Poll::Pending;
             };
-            self.reading = Some(io.submit_read(buf, self.cursor, self.epoch));
+            let len = buf.capacity();
+            // Read before the call, so a positional write that ends while it
+            // runs is seen to have.
+            let generation = io.generation();
+            self.reading = Some(Job {
+                task: io.submit_read(buf, 0, len, self.cursor),
+                at: self.cursor,
+                epoch: self.epoch,
+                generation,
+            });
         }
     }
 
@@ -636,7 +752,7 @@ impl FileState {
             return Poll::Ready(Ok(0));
         }
         self.invalidate(after);
-        let n = if self.writing.is_none() {
+        let n = if self.writing.is_none() && self.orphans.is_empty() {
             // Nothing in flight: these bytes go now.
             let Some(mut buf) = buffer(len.max(WRITE_MIN), after) else {
                 return Poll::Pending;

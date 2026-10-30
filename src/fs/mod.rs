@@ -5,18 +5,21 @@
 //! page at a time) and links. Calls by path, and a regular file's calls
 //! beside its reads, writes and syncs, run on the blocking pool.
 //!
-//! A regular file's reads and writes, at the handle's own cursor, and its
-//! syncs ([`Handle::sync_all`], [`Handle::sync_data`]) are operations of the
-//! shard's ring on io_uring and jobs of the blocking pool on the other
-//! backends (see `file`); a `File` that is not a regular file
-//! (a FIFO, a terminal, a pipe) is a byte stream the shard's driver serves
-//! like a socket (on Windows, through the completion port, or through jobs
-//! of the blocking pool for a handle opened for synchronous IO). Reads
-//! and writes are `AsyncRead` and `AsyncWrite` on the handle and on a shared
+//! A regular file's reads and writes, at the handle's own cursor or at an
+//! offset of the caller's ([`Handle::read_at`], [`Handle::write_at`] and
+//! their forms, which many tasks may make at once on one handle), and its
+//! syncs ([`Handle::sync_all`], [`Handle::sync_data`]), are operations of
+//! the shard's ring on io_uring and jobs of the blocking pool on the other
+//! backends (see `file`). A `File` that is not a regular file (a FIFO, a terminal, a
+//! pipe) is a byte stream the shard's driver serves like a socket (on
+//! Windows, through the completion port, or through jobs of the blocking
+//! pool for a handle opened for synchronous IO). Reads and writes at the
+//! cursor are `AsyncRead` and `AsyncWrite` on the handle and on a shared
 //! reference to it (both share the cursor, as `&File` shares its offset);
-//! `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned` and
-//! `write_owned` take the caller's buffer and give it back, so the bytes are
-//! read into it and written from it with no copy.
+//! `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned`,
+//! `write_owned`, `read_at_owned` and `write_at_owned` take the caller's
+//! buffer and give it back, so the bytes are read into it and written from
+//! it with no copy.
 
 pub(crate) mod file;
 mod file_ops;
