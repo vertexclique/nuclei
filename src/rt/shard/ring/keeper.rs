@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::super::{IoOp, Shared};
-use super::{EXIT_TAG, ExitOp, FILE_TAG, FileOp, IGNORED, RecvGroup, RingOp, ShardRing, Sqe};
+use super::{ExitOp, FILE_TAG, FileOp, IGNORED, RecvGroup, RingOp, ShardRing, Sqe};
 use crate::sync::oneshot;
 
 /// How long a shard that goes waits for its ring's cancelled operations, when it keeps them.
@@ -37,25 +37,15 @@ pub(crate) fn leaked() -> usize {
 }
 
 impl ShardRing {
-    /// The shard is going, its sources detached: what waits for room ends here, never submitted,
-    /// and the kernel is asked to cancel every operation it holds.
+    /// The shard is going, its sources detached: a file's call that waits for room ends here,
+    /// never submitted, and the kernel is asked to cancel every operation it holds.
     pub(crate) fn cancel_all(&self) {
         let waiting: Vec<u64> = self.room.borrow_mut().drain(..).map(|(u, _)| u).collect();
         for user_data in waiting {
-            // Never submitted: nothing points at its memory. A file's call
-            // goes to the pool; a child goes to be watched elsewhere.
-            if user_data & (FILE_TAG | EXIT_TAG) == FILE_TAG | EXIT_TAG {
-                self.drop_waiting_exit(user_data);
-            } else if user_data & FILE_TAG != 0 {
-                let op = self.file_ops.borrow_mut().remove(user_data & !FILE_TAG);
-                if let Some(op) = op {
-                    drop(op.complete(-libc::ECANCELED));
-                }
-            } else {
-                let op = self.ops.borrow_mut().remove(user_data);
-                if let Some(op) = op {
-                    self.end(None, op, -libc::ECANCELED);
-                }
+            // Never submitted: nothing points at its memory, and it goes to the pool.
+            let op = self.file_ops.borrow_mut().remove(user_data & !FILE_TAG);
+            if let Some(op) = op {
+                drop(op.complete(-libc::ECANCELED));
             }
         }
         if self.in_flight() > 0 {
