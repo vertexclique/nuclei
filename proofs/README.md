@@ -332,6 +332,32 @@ that finds a job, a time-out, a job taken back). The unit tests in `src/rt/block
 submit landing as the only thread goes idle (the first mutation fails it) and submitters on
 threads against threads that keep timing out.
 
+`tla/pool/PoolIndex.tla`, in the same family, checks the index of idle slots the network-path
+work plans for the pool (`Pool::submit`, `Pool::wake_one` and `Pool::work`, not changed yet):
+a bitmap beside the slots, one bit per slot, so a submitter finds a candidate with loads of the
+bitmap and tries the compare-and-swap (idle to woken) on that slot only, instead of on every
+slot from a hint. A bitmap rather than a queue of idle slots: finding a candidate takes loads
+only, a bit set twice is still one bit, and its size is fixed. A thread sets its bit after it
+marks its slot idle and before its look at the queue; only a slot's own thread writes its bit,
+and it clears it after taking its slot back at its look, and before its slot's compare-and-swap
+at the end of its wait, since a slot freed first may be another thread's at once. A set bit that
+is stale sends the submitter on to the next candidate; with none left it starts a thread while
+there is room. 20 configurations: 10 that must pass (two submitters with a pool of two threads,
+and of three, with `RunOnce`, `Bounded`, `OneOwner`, `IdleCounted`, `IndexComplete`, the bitmap
+misses no waiting thread, and `IndexTight`, a set bit names an idle or claimed slot or one whose
+thread is about to clear it; `AllRan` with and without the keep-alive exit and at the cap of one
+thread; the same with loads of the bitmap that may read any value and today's full scan as the
+fallback; and two mutations that lose no job: a woken slot's bit never cleared, and, with
+sequentially consistent loads, a submitter that gives up when it finds no candidate), 7
+mutations (a bit set after the look, a submitter's claim followed by its own clear of the bit,
+and, with loads that may read stale values, a submitter that gives up or only starts a thread at
+the cap, each lose a job, breaking `AllRan`; a submitter that trusts the bit and stores woken
+without the compare-and-swap breaks `IdleCounted`; a bit never cleared breaks `IndexTight`; a
+bit cleared after the slot is freed erases another thread's bit, breaking `IndexComplete`), and
+3 witnesses (a submitter sent to start a thread by a thread idle before its bit, a stale bit
+whose compare-and-swap loses, a wake through the bitmap). The model reads the bitmap one slot's
+bit per step, which covers a scan over several words, each word with its own load.
+
 ## Task blocks given back to their thread
 
 `remote` (`tla/remote/RemoteFree.tla`) checks how a task's block freed on another thread than
