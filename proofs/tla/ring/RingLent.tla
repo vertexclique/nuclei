@@ -1,7 +1,7 @@
 ----------------------------- MODULE RingLent -----------------------------
 (***************************************************************************)
 (* A task's own buffer written through the ring (`write_owned`, in        *)
-(* src/io/source/write/ring.rs), whose task may go away while the buffer  *)
+(* src/io/source/write/ops.rs), whose task may go away while the buffer   *)
 (* is out with the kernel.                                                 *)
 (*                                                                          *)
 (* In plain words: the buffer is out with a send. The kernel takes some of *)

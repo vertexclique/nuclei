@@ -723,7 +723,7 @@ each case on both Linux backends, and the three code mutations fail it.
 ## A source's operations on its shard's ring
 
 `ring` (`tla/ring/RingOp.tla`) checks how a side of a source works on an io_uring ring
-(`src/io/source/ring.rs`, `src/io/source/write/ring.rs`, `src/rt/shard/ring.rs`) when the
+(`src/io/source/ring.rs`, `src/io/source/write/ops.rs`, `src/rt/shard/ring.rs`) when the
 side is held from another thread than the ring's. A task there writes twice; each write is
 accepted into the side, and the side's operation goes to the ring one at a time. Only the
 ring's own thread submits: a task elsewhere posts a kick once it has let go of the side, and
