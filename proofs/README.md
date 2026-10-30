@@ -865,6 +865,21 @@ shard, `AllEnd`; no wait, which lands the holder's cancel after the shard has go
 `NoStrandedOp`); and 2 witnesses (the other shard's registration under the same number while
 the shard waits; a holder's eviction).
 
+`Behind` (`tla/going/Behind.tla`) checks the bytes a source's writes took into its write-behind
+when the shard that drove them goes (`Shard::leave` and `drain_unsent` in
+`src/rt/shard/going.rs`, `Source::poll_drain`, `WriteState::submit_ops` and `op_done`,
+`attach_port` and `waits_for_ops`): no task of the handle's may poll that side again, so the
+shard hands a source that still holds bytes to a drain task on a worker. The task looks each
+time it is woken: with nothing left it ends; registered nowhere with nothing out, it registers
+the source with its worker, whose driver writes the bytes out; with an operation still out (a
+port's TCP send, which the eviction never cancels, or a ring's send it cancels, which may come
+back undone) it waits for that operation's end, which wakes it. 7 configurations: 3 that must
+pass (a readiness poller with every byte behind, a port with a send out, a ring with a send
+cancelled), with `Conserved`, no byte lost or sent twice, `AllSent`, every byte reaches the
+kernel, and `DrainEnds`; 3 mutations (no drain task, as before, which left the peer waiting for
+good, `AllSent`; a drain task that does not register the source, `AllSent`; an operation's end
+that wakes nobody, `AllSent`); and 1 witness (the drain task moves the source to the worker).
+
 ## A blocking job of a Windows handle
 
 `job` (`tla/job/Job.tla`) checks the cancel of a pool thread's call on a Windows handle opened

@@ -629,15 +629,38 @@ pub(crate) fn with_clock<R>(f: impl FnOnce(Option<&crate::time::clock::Clock>) -
     }
 }
 
+/// The runtime this thread is inside, or the default one if it runs: never
+/// started here (a thread on its way out may ask).
+fn running() -> Option<Arc<Inner>> {
+    context::runtime().or_else(|| DEFAULT.get().map(|rt| Arc::clone(&rt.inner)))
+}
+
 /// A shard to serve a thread that runs none, of the runtime this thread is
 /// inside or of the default one, if one runs: it never starts one (a thread
 /// on its way out may ask).
 pub(crate) fn running_service_shard() -> Option<Arc<Shared>> {
-    let inner = context::runtime().or_else(|| DEFAULT.get().map(|rt| Arc::clone(&rt.inner)))?;
+    let inner = running()?;
     inner
         .workers
         .place(inner.id, inner.local_margin)
         .map(Arc::clone)
+}
+
+/// Spawns `future`, detached, on a worker that takes tasks, of the runtime
+/// this thread is inside or of the default one if it runs; never starts one
+/// (a shard on its way out calls it). False when no worker took it.
+pub(crate) fn spawn_on_worker<F>(future: F) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let Some(inner) = running() else {
+        return false;
+    };
+    let Some(shard) = inner.workers.place(inner.id, inner.local_margin) else {
+        return false;
+    };
+    spawn_on(&inner, shard, future).detach();
+    true
 }
 
 /// Whether the shard [`service_shard`] hands out runs a ring: the current
@@ -686,6 +709,15 @@ where
         // No worker takes tasks: the spawning thread's own shard runs it.
         return spawn_here(future, false);
     };
+    spawn_on(inner, shard, future)
+}
+
+/// Spawns `future` on `inner`'s worker `shard`.
+fn spawn_on<F>(inner: &Inner, shard: &Arc<Shared>, future: F) -> Task<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     let hooks = inner.task_hooks.clone();
     let (runnable, task) = task::spawn(
         Counted::new(future, shard),
