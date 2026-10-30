@@ -25,9 +25,11 @@ use nuclei::runtime::Builder;
 /// The server's ring, the least a ring may have: 128 completions.
 const QUEUE: u32 = 64;
 const COMPLETIONS: usize = 128;
-/// Connections, and receives, that all end at once: three times the queue each, over listeners
-/// that each hold fewer than 128 in their backlog.
-const PEERS: usize = 3 * COMPLETIONS;
+/// Connections whose accepts and receives all end at once, twice the queue of each: four times
+/// its entries in all, over listeners that each hold fewer than 128 in their backlog. Each takes
+/// three descriptors at most (the peer's, the server's, and on a kernel before 6.13 the ring's own
+/// copy of it), well within the 1024 every process may have.
+const PEERS: usize = 2 * COMPLETIONS;
 const LISTENERS: usize = 4;
 const REQUEST: usize = 64;
 /// The server's buffers, a cap no other shard of the process has.
