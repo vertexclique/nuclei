@@ -55,7 +55,7 @@ use crate::rt::park::ring::RingPoller;
 use crate::syscore::linux::iouring::files::Files;
 use crate::syscore::linux::iouring::ops::Ops;
 use crate::syscore::linux::iouring::ring::sys::{
-    IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IOSQE_FIXED_FILE, cqe_buffer_id,
+    IORING_CQE_F_BUF_MORE, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IOSQE_FIXED_FILE, cqe_buffer_id,
 };
 use crate::syscore::linux::iouring::ring::{IoUringCqe, RingConfig, Sqe};
 use exits::ExitOp;
@@ -195,10 +195,14 @@ impl ShardRing {
 
     /// Keeps the buffer `bid` of the group `back` for the next take-in, if the ring's group is
     /// that; `false` when it is not or the group is borrowed (the buffer then goes the long way).
-    pub(crate) fn keep_local(&self, back: &Arc<super::recv::Returns>, bid: u16) -> bool {
+    pub(crate) fn keep_local(
+        &self,
+        back: &Arc<super::recv::Returns>,
+        item: super::recv::Back,
+    ) -> bool {
         self.recv
             .try_borrow_mut()
-            .is_ok_and(|mut group| group.as_mut().is_some_and(|g| g.keep_local(back, bid)))
+            .is_ok_and(|mut group| group.as_mut().is_some_and(|g| g.keep_local(back, item)))
     }
 
     /// The group id multishot receives draw from, if the ring has a group.
@@ -209,6 +213,15 @@ impl ShardRing {
     /// Whether a stream send may go out zero-copy on this ring.
     pub(crate) fn zc_stream(&self) -> bool {
         self.send_zc && !self.zc_denied.get()
+    }
+
+    /// Whether the ring's group is filled in pieces, which a datagram cannot share: the kernel
+    /// would cut it to the room left in a buffer.
+    pub(crate) fn recv_group_incremental(&self) -> bool {
+        self.recv
+            .borrow()
+            .as_ref()
+            .is_some_and(RecvGroup::incremental)
     }
 
     /// The size of the group's buffers, if the ring has a group.
@@ -410,7 +423,13 @@ impl ShardRing {
             return;
         }
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
-            self.arrived(shard, cqe.user_data, bid, cqe.res);
+            self.arrived(
+                shard,
+                cqe.user_data,
+                bid,
+                cqe.res,
+                cqe.flags & IORING_CQE_F_BUF_MORE != 0,
+            );
         } else if cqe.res >= 0 {
             self.accepted(shard, cqe.user_data, cqe.res);
         }
@@ -466,7 +485,7 @@ impl ShardRing {
     /// multishot receive of `user_data`: its source gets them as a chunk.
     /// Past the cap of bytes it holds, the receive is stopped; its source
     /// asks for another once its reader took them.
-    fn arrived(&self, shard: Option<&Shard>, user_data: u64, bid: u16, res: i32) {
+    fn arrived(&self, shard: Option<&Shard>, user_data: u64, bid: u16, res: i32, more: bool) {
         let mut stop = false;
         let delivery = {
             let mut recv = self.recv.borrow_mut();
@@ -488,9 +507,9 @@ impl ShardRing {
             });
             match (u32::try_from(res), held) {
                 (Ok(len @ 1..), Some((epoch, held, stopping, datagram, source))) => {
-                    match group.hand_out(user_data, bid, len) {
+                    match group.hand_out(user_data, bid, len, more) {
                         Some(chunk) => {
-                            *held += len as usize;
+                            *held += chunk.charged(group);
                             if *held > group.cap() && !*stopping {
                                 *stopping = true;
                                 stop = true;
@@ -503,7 +522,7 @@ impl ShardRing {
                 // No bytes, or no receive to give them to: the buffer goes
                 // back at once.
                 _ => {
-                    group.give_back(bid);
+                    group.give_back(bid, u32::try_from(res).unwrap_or(0), more);
                     None
                 }
             }
@@ -595,11 +614,11 @@ impl ShardRing {
             return;
         };
         let mut ops = self.ops.borrow_mut();
-        group.take_back(|user_data, len| {
+        group.take_back(|user_data, charged| {
             if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
                 ops.get_mut(user_data).map(|op| &mut op.mem)
             {
-                *held = held.saturating_sub(len as usize);
+                *held = held.saturating_sub(charged);
             }
         });
     }
@@ -711,7 +730,13 @@ impl ShardRing {
 
 /// Whether the kernel refused a zero-copy send: no memory it may pin, or a socket that has none.
 fn zc_refused(res: i32) -> bool {
-    [-libc::ENOBUFS, -libc::ENOMEM, -libc::EPERM, -libc::EOPNOTSUPP].contains(&res)
+    [
+        -libc::ENOBUFS,
+        -libc::ENOMEM,
+        -libc::EPERM,
+        -libc::EOPNOTSUPP,
+    ]
+    .contains(&res)
 }
 
 /// How many buffers the receive group of a ring with `cq_entries`
@@ -791,6 +816,16 @@ impl ShardRing {
     pub(crate) fn held(&self) -> usize {
         self.take_back();
         self.recv.borrow().as_ref().map_or(0, RecvGroup::out)
+    }
+
+    /// Chunks of the group handed out and not given back yet, and whether the group is filled in
+    /// pieces.
+    pub(crate) fn live_chunks(&self) -> (u32, bool) {
+        self.take_back();
+        self.recv
+            .borrow()
+            .as_ref()
+            .map_or((0, false), |g| (g.live(), g.incremental()))
     }
 
     /// Zero-copy sends' first completions and notifications seen so far.
@@ -903,6 +938,8 @@ pub(crate) mod exits;
 mod tests;
 #[cfg(test)]
 mod tests_cap;
+#[cfg(test)]
+mod tests_inc;
 #[cfg(test)]
 mod tests_recv;
 #[cfg(test)]

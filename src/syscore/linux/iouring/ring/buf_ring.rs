@@ -28,8 +28,8 @@ use std::{
 use super::{
     Ring, refused,
     sys::{
-        IORING_REGISTER_PBUF_RING, IORING_UNREGISTER_PBUF_RING, IoUringBuf, IoUringBufReg, Mapping,
-        cqe_buffer_id, io_uring_register,
+        IORING_REGISTER_PBUF_RING, IORING_UNREGISTER_PBUF_RING, IOU_PBUF_RING_INC, IoUringBuf,
+        IoUringBufReg, Mapping, cqe_buffer_id, io_uring_register,
     },
 };
 
@@ -92,6 +92,28 @@ impl BufRing {
     /// registers them as group `bgid` on `ring` and returns the empty-looking ring: call
     /// [`BufRing::add`] for each buffer id, then [`BufRing::commit`], before arming a receive.
     pub(crate) fn new(ring: &Ring, bgid: u16, entries: u16, buf_size: u32) -> io::Result<BufRing> {
+        Self::registered(ring, bgid, entries, buf_size, 0)
+    }
+
+    /// As [`BufRing::new`], with incremental buffers: the kernel fills a buffer in pieces, one
+    /// completion each (`IORING_CQE_F_BUF_MORE` while room is left), and the application tracks
+    /// where the next piece starts. The kernel refuses it before Linux 6.12.
+    pub(crate) fn incremental(
+        ring: &Ring,
+        bgid: u16,
+        entries: u16,
+        buf_size: u32,
+    ) -> io::Result<BufRing> {
+        Self::registered(ring, bgid, entries, buf_size, IOU_PBUF_RING_INC)
+    }
+
+    fn registered(
+        ring: &Ring,
+        bgid: u16,
+        entries: u16,
+        buf_size: u32,
+        flags: u16,
+    ) -> io::Result<BufRing> {
         if !entries.is_power_of_two() || entries > MAX_ENTRIES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -116,6 +138,7 @@ impl BufRing {
             ring_addr: ring_map.as_ptr().expose_provenance() as u64,
             ring_entries: u32::from(entries),
             bgid,
+            flags,
             ..IoUringBufReg::default()
         };
         // SAFETY: `reg` is a valid `io_uring_buf_reg` and `ring_map` is the page-aligned,

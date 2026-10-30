@@ -464,10 +464,12 @@ impl RingIssuer<'_> {
     }
 
     /// Whether a datagram receive of a source of `kind` goes out as a
-    /// multishot one: a UDP socket's, on a ring whose group's buffers hold
-    /// any datagram whole (a Unix datagram may be larger than any buffer).
+    /// multishot one: a UDP socket's, on a ring whose group's whole buffers
+    /// hold any datagram (a Unix datagram may be larger than any buffer, and
+    /// a buffer filled in pieces may have less room left than a datagram).
     pub(crate) fn multishot_datagrams(&self, kind: Kind) -> bool {
         kind == Kind::Udp
+            && !self.ring.recv_group_incremental()
             && self
                 .ring
                 .recv_buf_size()
@@ -669,10 +671,7 @@ fn entry(
         }
         Want::SendLent(buf, from) => {
             let rest = buf.get(from..).unwrap_or_default();
-            if kind == Kind::Tcp
-                && rest.len() >= SEND_ZC_MIN
-                && ring.zc_stream()
-            {
+            if kind == Kind::Tcp && rest.len() >= SEND_ZC_MIN && ring.zc_stream() {
                 let len = rest.len().min(SEND_ZC_CHUNK) as u32;
                 let sqe = Sqe::send_zc(slot, rest.as_ptr(), len, sys::SEND_FLAGS);
                 (RingMem::SendLentZc { buf, first: None }, sqe)

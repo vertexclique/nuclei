@@ -23,7 +23,7 @@
 use std::io;
 use std::sync::Arc;
 
-use kovan_queue::array_queue::ArrayQueue;
+use kovan_queue::seg_queue::SegQueue;
 
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::Ring;
@@ -35,17 +35,51 @@ const GROUP: u16 = 0;
 /// The share of the group one receive may hold before the ring stops it.
 const CAP_SHARE: usize = 8;
 
+/// The least a chunk of an incremental buffer counts against its receive's cap, so a peer that
+/// sends a byte at a time is stopped after a bounded number of chunks, as one that fills buffers is.
+const MIN_CHARGE: u32 = 256;
+
+#[cfg(test)]
+thread_local! {
+    /// Whether a group made on this thread asks for incremental buffers: `None` asks and takes
+    /// what the kernel gives, `Some(false)` never asks, for a test.
+    pub(crate) static INCREMENTAL_FOR_TEST: core::cell::Cell<Option<bool>> =
+        const { core::cell::Cell::new(None) };
+}
+
 /// A shard's buffer group: the ring of buffers, who holds each one handed
 /// out, and the queue they come back on.
 pub(crate) struct RecvGroup {
     ring: BufRing,
     back: Arc<Returns>,
-    /// For each buffer handed out: the receive it went to and its bytes,
-    /// counted off that receive when it comes back.
-    owners: Vec<(u64, u32)>,
-    /// Buffers given back on the ring's own thread, one slot per buffer.
-    local: Vec<u16>,
+    /// For each buffer: where the next piece of it starts, how many chunks of it are out, and
+    /// whether the kernel is done filling it. Whole buffers (the plain group) are done at their
+    /// one hand-out.
+    fills: Vec<Fill>,
+    /// Chunks given back on the ring's own thread, taken in with the rest.
+    local: Vec<Back>,
     cap: usize,
+    /// The buffers are filled in pieces (`IOU_PBUF_RING_INC`).
+    incremental: bool,
+    /// Bytes handed out in chunks not given back yet.
+    #[cfg(test)]
+    out: usize,
+}
+
+/// One buffer of the group.
+#[derive(Clone, Copy, Default)]
+struct Fill {
+    used: u32,
+    live: u32,
+    done: bool,
+}
+
+/// What a chunk puts on the return queue: its buffer, the receive it counted against and its bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct Back {
+    bid: u16,
+    owner: u64,
+    len: u32,
 }
 
 // SAFETY: the group is used by its ring's thread only. A shard is built on
@@ -56,44 +90,68 @@ pub(crate) struct RecvGroup {
 unsafe impl Send for RecvGroup {}
 
 /// What chunks share with their group: the buffers, and the queue of
-/// buffers given back, one slot per buffer of the group: a buffer is out at
-/// most once, so the queue never fills and never allocates after it is
-/// made.
+/// chunks given back. A buffer filled in pieces has many chunks out, so the
+/// queue grows with them (a segment at a time), bounded by the bytes of the
+/// group, each chunk holding at least one of them.
+// vertexia: the queue is unbounded in chunks; a group-wide cap on live chunks that copies past it
+// is the upgrade path if a peer sending single bytes across many connections shows up in a profile.
 pub(crate) struct Returns {
     mem: Arc<BufMem>,
-    queue: ArrayQueue<u16>,
+    queue: SegQueue<Back>,
 }
 
 /// Bytes `start..end` of a buffer a receive's completion handed out, read
-/// on any thread; its buffer goes back to the group when it drops.
+/// on any thread; its buffer goes back to the group when the last of its
+/// chunks drops and the kernel is done with it.
 pub(crate) struct RingChunk {
     back: Arc<Returns>,
     bid: u16,
     start: u32,
     end: u32,
+    owner: u64,
+    len: u32,
 }
 
 impl RecvGroup {
     /// A group of `entries` buffers (a power of two up to 32768) of `size`
     /// bytes each, registered on `ring`, every buffer given to the kernel.
+    /// The kernel fills them in pieces where it can (Linux 6.12), else
+    /// whole.
     pub(crate) fn new(ring: &Ring, entries: u16, size: u32) -> io::Result<Self> {
-        let mut buffers = BufRing::new(ring, GROUP, entries, size)?;
+        #[cfg(test)]
+        let ask = INCREMENTAL_FOR_TEST.with(core::cell::Cell::get) != Some(false);
+        #[cfg(not(test))]
+        let ask = true;
+        let (mut buffers, incremental) =
+            match ask.then(|| BufRing::incremental(ring, GROUP, entries, size)) {
+                Some(Ok(buffers)) => (buffers, true),
+                // Refused (an older kernel) or not asked: the plain group.
+                _ => (BufRing::new(ring, GROUP, entries, size)?, false),
+            };
         for bid in 0..entries {
             buffers.add(bid)?;
         }
         buffers.commit();
         let back = Arc::new(Returns {
             mem: Arc::clone(buffers.memory()),
-            queue: ArrayQueue::new(usize::from(entries)),
+            queue: SegQueue::new(),
         });
         let total = usize::from(entries) * size as usize;
         Ok(Self {
             ring: buffers,
             back,
-            owners: vec![(NOT_AN_OP, 0); usize::from(entries)],
+            fills: vec![Fill::default(); usize::from(entries)],
             local: Vec::with_capacity(usize::from(entries)),
             cap: (total / CAP_SHARE).max(size as usize),
+            incremental,
+            #[cfg(test)]
+            out: 0,
         })
+    }
+
+    /// Whether the buffers are filled in pieces.
+    pub(crate) fn incremental(&self) -> bool {
+        self.incremental
     }
 
     /// The group id receives name.
@@ -117,63 +175,108 @@ impl RecvGroup {
         self.ring.buf_size()
     }
 
+    /// What `len` bytes of a chunk count against the cap of the receive that brought them.
+    pub(crate) fn charge(&self, len: u32) -> usize {
+        (if self.incremental {
+            len.max(MIN_CHARGE)
+        } else {
+            len
+        }) as usize
+    }
+
     /// The chunk of buffer `bid` that a completion of receive `user_data`
-    /// filled with `len` bytes; `None` for an id or a length outside the
-    /// group (the buffer then goes back at once).
-    pub(crate) fn hand_out(&mut self, user_data: u64, bid: u16, len: u32) -> Option<RingChunk> {
-        let owner = self.owners.get_mut(usize::from(bid))?;
-        if len > self.ring.buf_size() {
-            return None;
+    /// filled with `len` bytes (`more`: the buffer has room left, and the
+    /// next completion on it continues after these); `None` for an id or a
+    /// length outside the group (the buffer then goes back with
+    /// [`give_back`](Self::give_back)).
+    pub(crate) fn hand_out(
+        &mut self,
+        user_data: u64,
+        bid: u16,
+        len: u32,
+        more: bool,
+    ) -> Option<RingChunk> {
+        let size = self.ring.buf_size();
+        let fill = self.fills.get_mut(usize::from(bid))?;
+        let start = if self.incremental { fill.used } else { 0 };
+        let end = start.checked_add(len).filter(|&end| end <= size)?;
+        fill.used = end;
+        fill.live += 1;
+        fill.done = !more;
+        #[cfg(test)]
+        {
+            self.out += len as usize;
         }
-        *owner = (user_data, len);
         Some(RingChunk {
             back: Arc::clone(&self.back),
             bid,
-            start: 0,
-            end: len,
+            start,
+            end,
+            owner: user_data,
+            len,
         })
     }
 
-    /// Gives buffer `bid` to the kernel again at once: a completion handed
-    /// it out with nothing for anyone.
-    pub(crate) fn give_back(&mut self, bid: u16) {
-        if let Some(owner) = self.owners.get_mut(usize::from(bid)) {
-            *owner = (NOT_AN_OP, 0);
-        }
-        if self.ring.add(bid).is_ok() {
+    /// Gives buffer `bid` back at once for a completion that handed `len` bytes of it to nobody
+    /// (`more` as for [`hand_out`](Self::hand_out)).
+    pub(crate) fn give_back(&mut self, bid: u16, len: u32, more: bool) {
+        let size = self.ring.buf_size();
+        let Some(fill) = self.fills.get_mut(usize::from(bid)) else {
+            return;
+        };
+        fill.used = fill.used.saturating_add(len).min(size);
+        fill.done = !more;
+        if self.settle(bid) {
             self.ring.commit();
         }
     }
 
-    /// Takes in the buffers given back, gives them to the kernel again, and
-    /// counts each off the receive it went to with `release(user_data,
-    /// len)`.
-    pub(crate) fn take_back(&mut self, mut release: impl FnMut(u64, u32)) {
+    /// Gives buffer `bid` to the kernel again if it is done and no chunk of it is out. Returns
+    /// whether it did, for the caller to commit.
+    fn settle(&mut self, bid: u16) -> bool {
+        let Some(fill) = self.fills.get_mut(usize::from(bid)) else {
+            return false;
+        };
+        if fill.live > 0 || !fill.done {
+            return false;
+        }
+        *fill = Fill::default();
+        // A full ring cannot happen: a buffer comes back once per
+        // fill, so at most `entries` are added since the last commit.
+        self.ring.add(bid).is_ok()
+    }
+
+    /// Takes in the chunks given back, gives their buffers to the kernel again once the kernel is
+    /// done with them and no chunk of them is out, and counts each chunk off the receive it went
+    /// to with `release(user_data, charged)`.
+    pub(crate) fn take_back(&mut self, mut release: impl FnMut(u64, usize)) {
         let mut any = false;
-        while let Some(bid) = self.local.pop().or_else(|| self.back.queue.pop()) {
-            if let Some(owner) = self.owners.get_mut(usize::from(bid)) {
-                let (user_data, len) = core::mem::replace(owner, (NOT_AN_OP, 0));
-                if user_data != NOT_AN_OP {
-                    release(user_data, len);
-                }
+        while let Some(Back { bid, owner, len }) =
+            self.local.pop().or_else(|| self.back.queue.try_pop().ok())
+        {
+            if owner != NOT_AN_OP {
+                release(owner, self.charge(len));
             }
-            // A full ring cannot happen: a buffer comes back once per
-            // hand-out, so at most `entries` are added since the last commit.
-            if self.ring.add(bid).is_ok() {
-                any = true;
+            #[cfg(test)]
+            {
+                self.out -= len as usize;
             }
+            if let Some(fill) = self.fills.get_mut(usize::from(bid)) {
+                fill.live = fill.live.saturating_sub(1);
+            }
+            any |= self.settle(bid);
         }
         if any {
             self.ring.commit();
         }
     }
 
-    /// Keeps the chunk `bid` of `back` to take in with the rest, if `back` is this group's:
+    /// Keeps the chunk `item` of `back` to take in with the rest, if `back` is this group's:
     /// for a chunk dropped on the ring's own thread.
-    pub(crate) fn keep_local(&mut self, back: &Arc<Returns>, bid: u16) -> bool {
+    pub(crate) fn keep_local(&mut self, back: &Arc<Returns>, item: Back) -> bool {
         let mine = Arc::ptr_eq(&self.back, back) && self.local.len() < self.local.capacity();
         if mine {
-            self.local.push(bid);
+            self.local.push(item);
         }
         mine
     }
@@ -181,13 +284,14 @@ impl RecvGroup {
 
 #[cfg(test)]
 impl RecvGroup {
-    /// The bytes of the buffers handed out and not given back yet.
+    /// The bytes of the chunks handed out and not given back yet.
     pub(crate) fn out(&self) -> usize {
-        self.owners
-            .iter()
-            .filter(|(user_data, _)| *user_data != NOT_AN_OP)
-            .map(|(_, len)| *len as usize)
-            .sum()
+        self.out
+    }
+
+    /// Chunks handed out and not given back yet, over all buffers.
+    pub(crate) fn live(&self) -> u32 {
+        self.fills.iter().map(|f| f.live).sum()
     }
 }
 
@@ -221,19 +325,28 @@ impl RingChunk {
     }
 }
 
+impl RingChunk {
+    /// What the chunk counted against its receive's cap when it was handed out.
+    pub(crate) fn charged(&self, group: &RecvGroup) -> usize {
+        group.charge(self.len)
+    }
+}
+
 impl Drop for RingChunk {
     fn drop(&mut self) {
+        let item = Back {
+            bid: self.bid,
+            owner: self.owner,
+            len: self.len,
+        };
         let kept = crate::rt::context::current(|shard| {
             shard
                 .and_then(crate::rt::shard::Shard::ring)
-                .is_some_and(|ring| ring.keep_local(&self.back, self.bid))
+                .is_some_and(|ring| ring.keep_local(&self.back, item))
         });
-        if kept {
-            return;
+        if !kept {
+            self.back.queue.push(item);
         }
-        let given_back = self.back.queue.push(self.bid);
-        // One slot per buffer, and this buffer out once: always room.
-        debug_assert!(given_back.is_ok(), "buffer {} came back twice", self.bid);
     }
 }
 
