@@ -1,11 +1,12 @@
-//! A listener whose process runs out of descriptors: the accept says so, and
-//! the connections that waited in the backlog are served once descriptors are
-//! free again, with nothing spinning in between. Each case runs alone in its
-//! process, for it lowers the descriptor limit.
+//! A listener whose process runs out of descriptors: the accept says so, as
+//! often as it is retried, and the connections that waited in the backlog are
+//! served once descriptors are free again, with nothing spinning in between.
+//! Each case runs alone in its process, for it lowers the descriptor limit.
 
 use std::fs::File;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
@@ -14,6 +15,37 @@ use crate::alone::{alone, open_descriptors};
 use crate::io::Handle;
 
 const CLIENTS: usize = 4;
+
+/// Accepts tried while no descriptor is free.
+const RETRIES: usize = 3;
+
+/// The connections of the backlog the first accept to find no descriptor
+/// closes: on macOS it takes one and drops it (XNU's `accept_nocancel`,
+/// bsd/kern/uipc_syscalls.c), elsewhere it leaves the backlog whole. The
+/// retries after it take none.
+const CLOSED: usize = if cfg!(target_vendor = "apple") { 1 } else { 0 };
+
+/// How many of `clients` the listener's side closed: a closed one reads the
+/// end or a reset, a served one has nothing to read yet.
+fn closed(clients: &[impl AsRawFd]) -> usize {
+    clients
+        .iter()
+        .filter(|client| {
+            let mut byte = 0u8;
+            // SAFETY: a peek of at most one byte into our own byte, on a
+            // descriptor the caller keeps open.
+            let n = unsafe {
+                libc::recv(
+                    client.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            n == 0 || (n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock)
+        })
+        .count()
+}
 
 /// Lowers the limit to what is open plus a few and uses those up; dropping
 /// the guard gives the descriptors back.
@@ -75,6 +107,7 @@ fn tcp_case(multi: bool) {
             .map(|_| TcpStream::connect(addr).unwrap())
             .collect();
         let mut starved = Starved::new();
+        let mut served = Vec::new();
         if multi {
             let first = crate::time::timeout(Duration::from_millis(300), next(&mut stream)).await;
             assert!(
@@ -84,20 +117,22 @@ fn tcp_case(multi: bool) {
                 stream.take_error()
             );
             starved.free();
-            for _ in 0..CLIENTS {
-                within(next(&mut stream)).await.expect("the stream ended");
+            for _ in 0..CLIENTS - CLOSED {
+                served.push(within(next(&mut stream)).await.expect("the stream ended"));
             }
             assert!(stream.take_error().is_none());
-            return;
+        } else {
+            for _ in 0..RETRIES {
+                let err = within(listener.accept()).await.unwrap_err();
+                assert!(is_out_of_descriptors(&err), "{err}");
+            }
+            idles().await;
+            starved.free();
+            for _ in 0..CLIENTS - CLOSED {
+                served.push(within(listener.accept()).await.unwrap().0);
+            }
         }
-        let err = within(listener.accept()).await.unwrap_err();
-        assert!(is_out_of_descriptors(&err), "{err}");
-        idles().await;
-        starved.free();
-        for _ in 0..CLIENTS {
-            within(listener.accept()).await.unwrap();
-        }
-        drop(clients);
+        assert_eq!(closed(&clients), CLOSED);
     });
 }
 
@@ -110,14 +145,17 @@ fn unix_case() {
             .map(|_| UnixStream::connect(&path).unwrap())
             .collect();
         let mut starved = Starved::new();
-        let err = within(listener.accept()).await.unwrap_err();
-        assert!(is_out_of_descriptors(&err), "{err}");
+        for _ in 0..RETRIES {
+            let err = within(listener.accept()).await.unwrap_err();
+            assert!(is_out_of_descriptors(&err), "{err}");
+        }
         idles().await;
         starved.free();
-        for _ in 0..CLIENTS {
-            within(listener.accept()).await.unwrap();
+        let mut served = Vec::new();
+        for _ in 0..CLIENTS - CLOSED {
+            served.push(within(listener.accept()).await.unwrap().0);
         }
-        drop(clients);
+        assert_eq!(closed(&clients), CLOSED);
     });
     let _ = std::fs::remove_file(&path);
 }

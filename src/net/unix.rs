@@ -129,7 +129,10 @@ impl Handle<UnixListener> {
         Handle::adopt(UnixListener::bind_addr(addr)?, Kind::UnixListener)
     }
 
-    /// The next connection, with its peer's address.
+    /// The next connection, with its peer's address. On macOS an accept
+    /// that finds the process out of descriptors closes the connection it
+    /// took, and the next ones take none until a descriptor is free, as a
+    /// TCP listener's do.
     ///
     /// # Errors
     ///
