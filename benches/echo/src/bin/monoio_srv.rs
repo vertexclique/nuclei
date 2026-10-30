@@ -17,8 +17,8 @@ async fn echo(mut stream: TcpStream, buf_len: usize) {
     }
 }
 
-async fn serve(port: u16, buf_len: usize) {
-    let l = TcpListener::from_std(reuseport_listener(port, false).unwrap()).unwrap();
+async fn serve(port: u16, buf_len: usize, nonblocking: bool) {
+    let l = TcpListener::from_std(reuseport_listener(port, nonblocking).unwrap()).unwrap();
     loop {
         let Ok((stream, _)) = l.accept().await else {
             continue;
@@ -42,7 +42,7 @@ fn main() {
                         .build()
                         .unwrap();
                     b.wait();
-                    rt.block_on(serve(port, buf_len));
+                    rt.block_on(serve(port, buf_len, true));
                 } else {
                     let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
                         .with_entries(4096)
@@ -50,7 +50,7 @@ fn main() {
                         .build()
                         .unwrap();
                     b.wait();
-                    rt.block_on(serve(port, buf_len));
+                    rt.block_on(serve(port, buf_len, false));
                 }
             })
         })

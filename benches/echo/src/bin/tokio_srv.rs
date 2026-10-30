@@ -23,7 +23,7 @@ async fn echo(mut stream: TcpStream, buf_len: usize) {
 fn main() {
     let a = Args::parse();
     let buf_len = a.buf_len();
-    let barrier = ready(if a.mode == "ct" { a.cores } else { 1 });
+    let barrier = ready(if a.mode == "ct" { a.cores } else { 0 });
     if a.mode == "ct" {
         let handles: Vec<_> = (0..a.cores)
             .map(|i| {
