@@ -1,49 +1,70 @@
-TLC run of every configuration in proofs/tla/lent, 2026-10-26 19:54 UTC.
+TLC run of every configuration in proofs/tla/lent, 2026-10-30 15:06 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
 PR_three                         42726      18149      1  pass                                  pass                                  yes
-PR_one                           34644      14629      1  pass                                  pass                                  yes
-PR_stays                         29391      12942      1  pass                                  pass                                  yes
+PR_one                           34644      14629      2  pass                                  pass                                  yes
+PR_stays                         29391      12942      2  pass                                  pass                                  yes
 PR_live                          42726      18149      2  pass                                  pass                                  yes
 PR_live_stays                    29391      12942      2  pass                                  pass                                  yes
-MR_abandon_drops                  2873       1309      1  violated:Conservation                 violated:Conservation                 yes
+MR_abandon_drops                  2873       1309      2  violated:Conservation                 violated:Conservation                 yes
 MR_read_past_lent                23429       9855      1  violated:Order                        violated:Order                        yes
 MR_take_keeps_slot                 863        424      1  violated:NoScribble                   violated:NoScribble                   yes
-MR_no_wake                       19873       8820      1  deadlock                              deadlock                              yes
+MR_no_wake                       19873       8820      2  deadlock                              deadlock                              yes
 WR_driver_fill                     654        327      1  violated:NoDriverFill                 violated:NoDriverFill                 yes
-WR_submit_fill                      66         40      1  violated:NoSubmitFill                 violated:NoSubmitFill                 yes
+WR_submit_fill                      66         40      2  violated:NoSubmitFill                 violated:NoSubmitFill                 yes
 WR_left_bytes                     2873       1309      1  violated:NoLeftBytes                  violated:NoLeftBytes                  yes
 PW_two                           11486       4577      1  pass                                  pass                                  yes
-PW_one                            4189       1898      1  pass                                  pass                                  yes
+PW_one                            4189       1898      2  pass                                  pass                                  yes
 PW_stays                          4714       1962      1  pass                                  pass                                  yes
-PW_live                          11486       4577      2  pass                                  pass                                  yes
-PW_live_stays                     4714       1962      1  pass                                  pass                                  yes
+PW_live                          11486       4577      3  pass                                  pass                                  yes
+PW_live_stays                     4714       1962      2  pass                                  pass                                  yes
 MW_withdraw_started               3961       1669      1  violated:WireOrder                    violated:WireOrder                    yes
-MW_copy_passes_lent               2275       1005      1  violated:WireOrder                    violated:WireOrder                    yes
+MW_copy_passes_lent               2275       1005      2  violated:WireOrder                    violated:WireOrder                    yes
 MW_take_early                      484        256      1  violated:NoScribble                   violated:NoScribble                   yes
 MW_no_wake                        2095        982      1  deadlock                              deadlock                              yes
 WW_partial                         188         97      1  violated:NoPartial                    violated:NoPartial                    yes
-WW_orphan_done                    2192        965      1  violated:NoOrphanDone                 violated:NoOrphanDone                 yes
+WW_orphan_done                    2192        965      2  violated:NoOrphanDone                 violated:NoOrphanDone                 yes
 WW_withdraw                        117         63      1  violated:NoWithdraw                   violated:NoWithdraw                   yes
-PF_leave                       1052603     297755      2  pass                                  pass                                  yes
+PF_leave                       1052603     297755      3  pass                                  pass                                  yes
 PF_stay                         620908     222070      3  pass                                  pass                                  yes
-PF_live                        1052603     297755      8  pass                                  pass                                  yes
-MF_no_epoch_check               237173      89003      2  violated:NoStaleRead                  violated:NoStaleRead                  yes
-MF_lent_skips_wait              603717     223001      4  violated:AllLanded                    violated:AllLanded                    yes
-MF_orphan_cancelled              47604      17333      1  violated:AllLanded                    violated:AllLanded                    yes
-MF_no_continuation              535685     192064      4  violated:AllLanded                    violated:AllLanded                    yes
-MF_cancel_ends                  583788     219935      3  violated:AllLanded                    violated:AllLanded                    yes
+PF_live                        1052603     297755     16  pass                                  pass                                  yes
+MF_no_epoch_check               237173      89003      4  violated:NoStaleRead                  violated:NoStaleRead                  yes
+MF_lent_skips_wait              603717     223001      6  violated:AllLanded                    violated:AllLanded                    yes
+MF_orphan_cancelled              47604      17333      2  violated:AllLanded                    violated:AllLanded                    yes
+MF_no_continuation              535685     192064      5  violated:AllLanded                    violated:AllLanded                    yes
+MF_cancel_ends                  583788     219935      7  violated:AllLanded                    violated:AllLanded                    yes
 WF_redo                           1921       1019      1  violated:NoRedo                       violated:NoRedo                       yes
-WF_orphan_landed                  8303       3525      1  violated:NoOrphanLanded               violated:NoOrphanLanded               yes
-WF_read_of_lent                 484141     176772      3  violated:NoReadOfLent                 violated:NoReadOfLent                 yes
-WF_short_write                      17         15      1  violated:NoShortWrite                 violated:NoShortWrite                 yes
+WF_orphan_landed                  8303       3525      3  violated:NoOrphanLanded               violated:NoOrphanLanded               yes
+WF_read_of_lent                 484141     176772      5  violated:NoReadOfLent                 violated:NoReadOfLent                 yes
+WF_short_write                      17         15      2  violated:NoShortWrite                 violated:NoShortWrite                 yes
 WF_moved_mid                        55         40      1  violated:NoMovedMid                   violated:NoMovedMid                   yes
 PF_append                       414710     115846      2  pass                                  pass                                  yes
-PF_append_live                  414710     115846      4  pass                                  pass                                  yes
-MF_append_at_cursor              31016      12364      1  violated:NoOverwrite                  violated:NoOverwrite                  yes
-MF_cursor_stays                   5626       2561      1  violated:CursorAtEnd                  violated:CursorAtEnd                  yes
+PF_append_live                  414710     115846      7  pass                                  pass                                  yes
+MF_append_at_cursor              31016      12364      2  violated:NoOverwrite                  violated:NoOverwrite                  yes
+MF_cursor_stays                   5626       2561      3  violated:CursorAtEnd                  violated:CursorAtEnd                  yes
 WF_append_past_cursor             1922        953      1  violated:NoAppendPastCursor           violated:NoAppendPastCursor           yes
+PZ_exchange                      29148       7460      2  pass                                  pass                                  yes
+PZ_exchange_live                 29148       7460      3  pass                                  pass                                  yes
+PZ_short                         22201       6201      2  pass                                  pass                                  yes
+PZ_short_live                    22201       6201      3  pass                                  pass                                  yes
+PZ_leave                         20022       5442      3  pass                                  pass                                  yes
+PZ_leave_live                    20022       5442      3  pass                                  pass                                  yes
+PZ_teardown                      46066      12502      3  pass                                  pass                                  yes
+MZ_wait_notif                      520        285      1  violated:Finishes                     violated:Finishes                     yes
+MZ_hand_at_first                   267        132      1  violated:NoScribble                   violated:NoScribble                   yes
+MZ_drop_frees                     2973       1026      1  violated:NoScribble                   violated:NoScribble                   yes
+MZ_resend_start                     45         29      2  violated:WireOrder                    violated:WireOrder                    yes
+MZ_chunk_early                       7          7      1  violated:WireOrder                    violated:WireOrder                    yes
+MZ_withdraw_started                 72         41      1  violated:WireOrder                    violated:WireOrder                    yes
+MZ_teardown_frees                  902        373      2  violated:NoScribble                   violated:NoScribble                   yes
+WZ_pipeline                        617        266      1  violated:NoPipeline                   violated:NoPipeline                   yes
+WZ_short                             5          5      1  violated:NoShort                      violated:NoShort                      yes
+WZ_late_free                      6401       2007      2  violated:NoLateFree                   violated:NoLateFree                   yes
+WZ_withdraw                          3          3      1  violated:NoWithdraw                   violated:NoWithdraw                   yes
+WZ_orphan_done                     794        341      1  violated:NoOrphanDone                 violated:NoOrphanDone                 yes
+WZ_kept                             64         38      1  violated:NoKept                       violated:NoKept                       yes
+WZ_failed                           10         10      2  violated:NoFailed                     violated:NoFailed                     yes
 
-results matching EXPECTED.txt: 42 of 42
+results matching EXPECTED.txt: 63 of 63
