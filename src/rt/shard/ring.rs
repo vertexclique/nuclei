@@ -23,8 +23,9 @@
 //! comes once the peer acknowledged the bytes: the side goes on meanwhile, so
 //! one side may leave several. Each holds at most a chunk the socket's send
 //! buffer took, and none names its slot or counts against the cap once it
-//! only waits. One still waiting as the shard goes keeps its buffer for good,
-//! as any operation the kernel did not finish does.
+//! only waits. Only a ring a keeper can take sends zero-copy: as its shard
+//! goes, what is still out goes to the keeper with the ring (see `keeper`),
+//! so a buffer is kept until its notification and no longer.
 //!
 //! A multishot receive stays in flight across its arrivals: each completion
 //! that says more come (`IORING_CQE_F_MORE`) hands its buffer of the
@@ -86,6 +87,9 @@ pub(crate) struct ShardRing {
     /// A zero-copy send was refused for lack of lockable memory: the ring sends with copies from
     /// then on.
     zc_denied: Cell<bool>,
+    /// Any thread may submit to the ring and its completions are posted without its thread (it
+    /// is not single-issuer with deferred task work), so a keeper can take it as its shard goes.
+    reapable: bool,
     files: RefCell<Files>,
     /// Operations submitted but not in the kernel yet, by user data, with
     /// their entries, in order.
@@ -164,6 +168,7 @@ impl ShardRing {
             waitid,
             send_zc,
             zc_denied: Cell::new(false),
+            reapable: cfg.multi_issuer,
             files: RefCell::new(Files::new(files)),
             room: RefCell::new(VecDeque::new()),
             in_kernel: Cell::new(0),
@@ -219,9 +224,16 @@ impl ShardRing {
         self.recv.borrow().as_ref().map(RecvGroup::bgid)
     }
 
-    /// Whether a stream send may go out zero-copy on this ring.
+    /// Whether a stream send may go out zero-copy on this ring: one a keeper can take, so a
+    /// buffer the kernel still holds as the shard goes comes back once it let go of it.
     pub(crate) fn zc_stream(&self) -> bool {
-        self.send_zc && !self.zc_denied.get()
+        self.send_zc && self.reapable && !self.zc_denied.get()
+    }
+
+    /// Whether another thread can submit to the ring and reap its completions: a keeper can take
+    /// it as its shard goes (see `keeper`).
+    pub(crate) fn reapable(&self) -> bool {
+        self.reapable
     }
 
     /// Whether the ring's group is filled in pieces, which a datagram cannot share: the kernel
@@ -698,54 +710,6 @@ impl ShardRing {
             shard,
         );
     }
-
-    /// The shard is going, its sources detached: every operation still out
-    /// is cancelled and its completion waited for, for at most
-    /// [`SHUTDOWN_WAIT`]. One that never completes keeps its memory for
-    /// good (the kernel may still write it), and is counted (`leaked`).
-    pub(crate) fn shut_down(&self) {
-        let waiting: Vec<u64> = self.room.borrow_mut().drain(..).map(|(u, _)| u).collect();
-        for user_data in waiting {
-            // Never submitted: nothing points at its memory. A file's call
-            // goes to the pool; a child goes to be watched elsewhere.
-            if user_data & (FILE_TAG | EXIT_TAG) == FILE_TAG | EXIT_TAG {
-                self.drop_waiting_exit(user_data);
-            } else if user_data & FILE_TAG != 0 {
-                let op = self.file_ops.borrow_mut().remove(user_data & !FILE_TAG);
-                if let Some(op) = op {
-                    drop(op.complete(-libc::ECANCELED));
-                }
-            } else {
-                let op = self.ops.borrow_mut().remove(user_data);
-                if let Some(op) = op {
-                    self.end(None, op, -libc::ECANCELED);
-                }
-            }
-        }
-        if self.in_flight() > 0 {
-            self.poller
-                .borrow_mut()
-                .push(Sqe::async_cancel_any(true).user_data(IGNORED));
-        }
-        self.settle(|| {});
-        let stuck: Vec<RingOp> = self.ops.borrow_mut().drain().collect();
-        let stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
-        let stuck_exits: Vec<ExitOp> = self.exit_ops.borrow_mut().drain().collect();
-        LEAKED.fetch_add(
-            stuck.len() + stuck_files.len() + stuck_exits.len(),
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        // A file's call still in the kernel keeps its buffer and its
-        // descriptor for good, a child's wait its info and its pidfd.
-        core::mem::forget(stuck_files);
-        core::mem::forget(stuck_exits);
-        if !stuck.is_empty() {
-            // A receive still in the kernel may write the group's buffers:
-            // they stay registered and mapped for good.
-            core::mem::forget(self.recv.borrow_mut().take());
-        }
-        core::mem::forget(stuck);
-    }
 }
 
 impl ShardRing {
@@ -758,28 +722,6 @@ impl ShardRing {
     /// room for.
     pub(crate) fn overflows(&self) -> u64 {
         self.poller.borrow().overflows()
-    }
-
-    /// Submits what is queued and waits until no operation is out, for at
-    /// most [`SHUTDOWN_WAIT`]: what its sources cancelled as they went.
-    /// `between` runs before each wait (the shard's mailbox, where a
-    /// source's holder on another thread leaves its cancel).
-    pub(crate) fn settle(&self, mut between: impl FnMut()) {
-        let deadline = std::time::Instant::now() + SHUTDOWN_WAIT;
-        loop {
-            between();
-            if self.in_flight() == 0 {
-                return;
-            }
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero()
-                || self
-                    .wait(None, Some(left.min(Duration::from_millis(10))))
-                    .is_err()
-            {
-                return;
-            }
-        }
     }
 }
 
@@ -843,18 +785,6 @@ const ACCEPT_CAP: usize = 256;
 /// to anyone: no operation of the slab has it (its index is the one the
 /// slab never hands out), and it is not the wake's.
 const IGNORED: u64 = u32::MAX as u64;
-
-/// How long a shard that goes waits for its ring's cancelled operations.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
-
-static LEAKED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Operations whose completion never came as their shard went: their memory
-/// is kept for good.
-#[cfg(test)]
-pub(crate) fn leaked() -> usize {
-    LEAKED.load(core::sync::atomic::Ordering::Relaxed)
-}
 
 #[cfg(test)]
 impl ShardRing {
@@ -993,6 +923,9 @@ pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
 }
 
 pub(crate) mod exits;
+pub(crate) mod keeper;
+#[cfg(test)]
+pub(crate) use keeper::leaked;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

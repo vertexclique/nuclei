@@ -97,8 +97,9 @@ pub(crate) enum RingMem {
     ZcHeld(#[expect(dead_code, reason = "the kernel may read it until the notification")] Pinned),
 }
 
-/// The least a `write_zero_copy` must have left to send for its next chunk to go out zero-copy;
-/// a smaller write is copied whole, and its buffer handed back at once. Below it, pinning the
+/// The least a `write_zero_copy` must have left to send for its next chunk to go out zero-copy
+/// (on a ring that allows it at all: `ShardRing::zc_stream`); a smaller write is copied whole,
+/// and its buffer handed back at once. Below it, pinning the
 /// pages costs more than the copy it saves: on the development host's loopback (where the receive
 /// path copies what a send pinned), the `owned_size_*` modes of benches/vs_tokio_count.rs
 /// measured total cycles per write above the copy's from 16 KiB to 512 KiB, level with it at

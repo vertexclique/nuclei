@@ -1,7 +1,8 @@
 //! Zero-copy sends on a shard's ring: an owned write is copied whatever its size; a zero-copy
 //! write arrives whole, ends at its first completions, and hands its buffer back only after the
 //! kernel's notifications; a dropped `Released` or write leaves the buffer to the notifications;
-//! a send that fails still ends; and a shard that goes waits for the notifications.
+//! a send that fails still ends; a shard that goes hands its ring to a keeper, and the buffer
+//! comes back once the peer read it; and a ring no keeper can take copies.
 
 use core::future::{Future, poll_fn};
 use core::pin::Pin;
@@ -23,12 +24,17 @@ use crate::rt::context;
 use crate::rt::shard::Limits;
 use crate::syscore::linux::iouring::ring::RingConfig;
 
+/// A shard on a ring a keeper can take, which sends zero-copy.
 fn ring_shard() -> Option<Shard> {
+    shard_of(RingConfig::new(64).handed_over())
+}
+
+fn shard_of(cfg: RingConfig) -> Option<Shard> {
     TABLE_FOR_TEST.with(|t| t.set(Some(8)));
     let shard = Shard::new(Limits {
         max_nesting: 8,
         buffer_cap: crate::buf::DEFAULT_CAP,
-        backend: Backend::Ring(RingConfig::new(64)),
+        backend: Backend::Ring(cfg),
     });
     TABLE_FOR_TEST.with(|t| t.set(None));
     match shard {
@@ -41,7 +47,29 @@ fn ring_shard() -> Option<Shard> {
 }
 
 fn tcp_source() -> (TcpStream, Arc<Source>, TcpStream) {
+    tcp_source_into(TcpListener::bind("127.0.0.1:0").unwrap())
+}
+
+/// As [`tcp_source`], with a peer whose receive buffer holds 64 KiB: what a write sends past that
+/// waits, unacknowledged, until the peer reads.
+fn held_back_source() -> (TcpStream, Arc<Source>, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let small: libc::c_int = 64 * 1024;
+    // SAFETY: a plain setsockopt with a pointer to our own int; accepted sockets inherit it.
+    let set = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&small as *const libc::c_int).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0);
+    tcp_source_into(listener)
+}
+
+fn tcp_source_into(listener: TcpListener) -> (TcpStream, Arc<Source>, TcpStream) {
     let mine = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (peer, _) = listener.accept().unwrap();
     sys::set_nonblocking(mine.as_raw_fd()).unwrap();
@@ -327,31 +355,78 @@ fn a_zero_copy_write_that_fails_gives_the_buffer_back_and_leaves_nothing_out() {
     assert_eq!(ring.in_flight(), 0, "a send is still out");
 }
 
-/// A shard that goes with a send waiting for its notification waits for it, so the buffer comes
-/// back rather than being kept for good.
+/// Waits on this thread, which runs no shard, for `released`, within a deadline.
+fn wait_released(mut released: Released) -> Vec<u8> {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Poll::Ready(back) = Pin::new(&mut released).poll(&mut cx) {
+            return back;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "the buffer never came back");
+        std::thread::park_timeout(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// A shard that goes while a send waits for its notification, the peer reading only after: the
+/// shard hands its ring to a keeper and does not wait, and the buffer comes back once the peer
+/// read it. Nothing is kept for good.
 #[test]
-fn a_shard_that_goes_waits_for_the_notifications() {
+fn a_shard_that_goes_leaves_its_notifications_to_a_keeper() {
     let Some(shard) = ring_shard() else { return };
     if !zc_available(&shard) {
         return;
     }
-    let (_mine, src, peer) = tcp_source();
+    let (_mine, src, peer) = held_back_source();
     let data = pattern(SEND_ZC_MIN);
+    let sent = data.clone();
+    let at = sent.as_ptr().addr();
     let before = super::leaked();
     let mut released = {
         let _current = context::enter(&shard);
-        let (result, released) = shard.block_on(src.write_zero_copy(data.clone()));
+        let (result, released) = shard.block_on(src.write_zero_copy(sent));
         assert_eq!(result.unwrap(), data.len());
         released
     };
-    let read = reader(peer, data.len());
+    assert!(
+        poll_once(&mut released).is_pending(),
+        "the buffer came back before the peer read it"
+    );
     drop(shard);
     assert_eq!(super::leaked(), before, "a send was left with its buffer");
-    let Poll::Ready(back) = poll_once(&mut released) else {
-        panic!("the buffer did not come back as the shard went");
-    };
+    let read = reader(peer, data.len());
+    let back = wait_released(released);
+    assert_eq!(back.as_ptr().addr(), at, "another buffer came back");
     assert!(back == data);
     assert!(read.join().unwrap() == data);
+}
+
+/// A ring only its own thread may reap copies a zero-copy write: no keeper could take its
+/// notifications, so the buffer is back at once.
+#[test]
+fn a_ring_no_keeper_can_take_copies_a_zero_copy_write() {
+    let Some(shard) = shard_of(RingConfig::new(64)) else {
+        return;
+    };
+    let _current = context::enter(&shard);
+    let (_mine, src, peer) = held_back_source();
+    let data = pattern(SEND_ZC_MIN);
+    let (result, mut released) = shard.block_on(src.write_zero_copy(data.clone()));
+    assert_eq!(result.unwrap(), data.len());
+    let Poll::Ready(back) = poll_once(&mut released) else {
+        panic!("the copied write's buffer did not come back at once");
+    };
+    assert!(back == data);
+    assert_eq!(shard.ring().expect("a ring").zc_seen(), (0, 0));
+    assert!(reader(peer, data.len()).join().unwrap() == data);
 }
 
 #[test]

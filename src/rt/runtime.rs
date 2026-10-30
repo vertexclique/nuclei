@@ -900,13 +900,20 @@ where
 /// its way out could not): whether `f` went.
 #[cfg(port)]
 pub(crate) fn spawn_blocking_inside(f: impl FnOnce() + Send + 'static) -> bool {
-    match context::runtime() {
-        Some(inner) => {
-            inner.pool.spawn(f).detach();
+    match blocking_pool_inside() {
+        Some(pool) => {
+            pool.spawn(f).detach();
             true
         }
         None => false,
     }
+}
+
+/// The blocking pool of the runtime this thread is inside, if it is inside one; never the
+/// default runtime's, which it does not start.
+#[cfg(completion)]
+pub(crate) fn blocking_pool_inside() -> Option<Arc<super::blocking::Pool>> {
+    context::runtime().map(|inner| Arc::clone(&inner.pool))
 }
 
 /// The cores this process may run on, in order (Linux; Windows, in the

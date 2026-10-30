@@ -280,7 +280,11 @@ impl Handle<TcpStream> {
     /// A write of less than 1 MiB, where copying costs less, and every write on epoll, kqueue,
     /// I/O completion ports or an io_uring kernel without zero-copy sends (or without memory it
     /// may lock for them), is copied by the kernel as `write_owned`'s is, and its `Released` is
-    /// ready at once.
+    /// ready at once. So is a write served by a ring only its own thread may reap: a thread's own
+    /// shard (a stream polled by `block_on` outside the runtime's workers), or the workers of a
+    /// runtime built with [`handoff_after(None)`](crate::runtime::Builder::handoff_after). Their
+    /// rings could not be handed to another thread, which a buffer still out when the thread
+    /// stops would need.
     ///
     /// If the future is dropped before it completes, the stream gets `buf` whole or not at all,
     /// as with `write_owned`. Either way `buf` is dropped only once the kernel let go of it.

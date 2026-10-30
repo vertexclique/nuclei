@@ -11,10 +11,9 @@ use core::task::{Context, Poll};
 /// It may be polled from any thread, or dropped: the buffer is then dropped once the kernel let go
 /// of it, never before. A write the kernel copied gives one that is ready at once.
 ///
-/// The buffer comes back as the runtime thread that sent it handles its completions. If that
-/// thread's IO stops for good (its runtime shut down) while the kernel still holds part of the
-/// buffer, the buffer is kept for good, since the kernel may still read it, and this never
-/// resolves.
+/// The buffer comes back even after the runtime that sent it shut down: a keeper on the blocking
+/// pool takes over the completions of its worker's ring then, and lets go of the ring once the
+/// kernel let go of every buffer.
 pub struct Released(Inner);
 
 enum Inner {

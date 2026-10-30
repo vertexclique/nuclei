@@ -133,3 +133,99 @@ fn released_buffers_come_back_on_any_thread() {
         std::thread::spawn(move || released.into_iter().map(plain_block_on).collect::<Vec<_>>());
     assert!(back.join().unwrap() == sent);
 }
+
+/// A listener whose connections hold 64 KiB of what they receive: what a write sends past that
+/// waits, unacknowledged, until the peer reads.
+#[cfg(unix)]
+fn held_back_listener() -> TcpListener {
+    use std::os::fd::AsRawFd;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let small: libc::c_int = 64 * 1024;
+    // SAFETY: a plain setsockopt with a pointer to our own int; accepted sockets inherit it.
+    let set = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&small as *const libc::c_int).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0);
+    listener
+}
+
+/// A runtime shut down while a worker's send waits for its notification, the peer reading only
+/// after: the shutdown does not wait for the peer, and the buffer comes back once it read.
+#[cfg(unix)]
+#[test]
+fn a_buffer_comes_back_after_its_runtime_shut_down() {
+    let listener = held_back_listener();
+    let addr = listener.local_addr().unwrap();
+    let data = pattern(MIB);
+    let sent = data.clone();
+    let rt = runtime();
+    let (stream, mut released, zero_copy) = rt.block_on(async move {
+        within(spawn(async move {
+            let s = Handle::<TcpStream>::connect(addr).await.unwrap();
+            #[cfg(ring)]
+            let zero_copy = crate::rt::context::current(|shard| {
+                shard
+                    .and_then(|s| s.ring())
+                    .is_some_and(crate::rt::shard::ring::ShardRing::zc_stream)
+            });
+            #[cfg(not(ring))]
+            let zero_copy = false;
+            let (n, released) = s.write_zero_copy(sent).await;
+            assert_eq!(n.unwrap(), MIB);
+            (s, released, zero_copy)
+        }))
+        .await
+    });
+    let (mut peer, _) = listener.accept().unwrap();
+    let early = match Pin::new(&mut released).poll(&mut core::task::Context::from_waker(
+        core::task::Waker::noop(),
+    )) {
+        Poll::Ready(back) => Some(back),
+        Poll::Pending => None,
+    };
+    assert!(
+        early.is_none() || !zero_copy,
+        "the buffer came back before the peer read it"
+    );
+    drop(rt);
+    let mut got = vec![0u8; MIB];
+    peer.read_exact(&mut got).unwrap();
+    assert!(got == data, "the bytes changed on the way");
+    let back = early.unwrap_or_else(|| plain_block_on(released));
+    assert!(back == data, "the buffer changed");
+    drop(stream);
+}
+
+/// A thread's own shard runs a ring only that thread may reap: its zero-copy write is copied,
+/// so `block_on` has nothing to wait for and the buffer is back at once.
+#[cfg(unix)]
+#[test]
+fn a_zero_copy_write_on_a_threads_own_shard_is_copied() {
+    let listener = held_back_listener();
+    let addr = listener.local_addr().unwrap();
+    let data = pattern(MIB);
+    let sent = data.clone();
+    let (stream, mut released) = crate::block_on(async move {
+        let s = within(Handle::<TcpStream>::connect(addr)).await.unwrap();
+        let (n, released) = within(s.write_zero_copy(sent)).await;
+        assert_eq!(n.unwrap(), MIB);
+        (s, released)
+    });
+    let Poll::Ready(back) = Pin::new(&mut released).poll(&mut core::task::Context::from_waker(
+        core::task::Waker::noop(),
+    )) else {
+        panic!("the copied write's buffer did not come back at once");
+    };
+    assert!(back == data);
+    let (mut peer, _) = listener.accept().unwrap();
+    let mut got = vec![0u8; MIB];
+    peer.read_exact(&mut got).unwrap();
+    assert!(got == data);
+    drop(stream);
+}
