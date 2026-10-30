@@ -12,8 +12,8 @@
 use core::pin::Pin;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use nuclei::config::{IoUringConfiguration, NucleiConfig};
@@ -104,14 +104,22 @@ fn completions_past_the_queue_all_come_with_their_bytes() {
     let addr = socket.local_addr().unwrap();
     // A backlog that holds every peer while the shard's thread is held.
     let listener = socket.listen(2 * PEERS as u32).unwrap();
+    let ended = Arc::new(OnceLock::new());
+    let end = Arc::clone(&ended);
     rt.spawn(async move {
         let mut conns = listener.accept_multi().await.unwrap();
+        let mut accepted = 0;
         while let Some(stream) =
             core::future::poll_fn(|cx| futures_core::Stream::poll_next(Pin::new(&mut conns), cx))
                 .await
         {
+            accepted += 1;
             nuclei::runtime::spawn(echo(stream)).detach();
         }
+        let _ = end.set(format!(
+            "ended after {accepted} connections: {:?}",
+            conns.take_error()
+        ));
     })
     .detach();
     let ring = nuclei::Proactor::backend() == nuclei::IoBackend::IoUring;
@@ -143,7 +151,10 @@ fn completions_past_the_queue_all_come_with_their_bytes() {
     for (peer, stream) in peers.iter_mut().enumerate() {
         let mut back = [0u8; REQUEST];
         if let Err(err) = stream.read_exact(&mut back) {
-            panic!("peer {peer} of {PEERS} got no reply within {DEADLINE:?}: {err}");
+            panic!(
+                "peer {peer} of {PEERS} got no reply within {DEADLINE:?}: {err}; the accept stream {}",
+                ended.get().map_or("still open", String::as_str)
+            );
         }
         assert_eq!(back, request(peer), "peer {peer} got another's bytes");
     }
