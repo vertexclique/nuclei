@@ -26,7 +26,7 @@ still waits, with nothing free.
 
 One whole operation at a time: the code runs on one thread, and every operation is one step of
 it, as here. Wakers, the slab the line lives in and the close (which ends every waiter at once
-and serves nobody) are not in this model; the TLA+ model in `proofs/tla/shardlocal/` checks the
+and serves nobody) are not in this model; the TLA+ model in `proofs/tla/localsemaphore/` checks the
 same rules with the tasks' polls interleaved, and the waiters' drops at any point.
 -/
 

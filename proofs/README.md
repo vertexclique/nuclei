@@ -1253,8 +1253,8 @@ good, `AllSent`; a drain task that does not register the source, `AllSent`; an o
 that wakes nobody, `AllSent`); and 1 witness (the drain task moves the source to the worker).
 
 `Linger` (`tla/going/Linger.tla`) checks what a dropped handle leaves when its runtime drops
-(`src/rt/linger.rs`, `Runtime::drop` and `finish_lingering` in `src/rt/runtime.rs`, `Counted`'s
-drop in `src/rt/sched.rs`, `Shared::settled` and `drop_stopped` in `src/rt/shard.rs`, the file
+(`src/rt/linger.rs`, `Runtime::drop` and `finish_lingering` in `src/rt/runtime.rs`,
+`Sched::drop_future` in `src/rt/sched.rs`, `Shared::settled` and `drop_stopped` in `src/rt/shard.rs`, the file
 write's count in `src/fs/call.rs`, the handle's drop, a gone shard's sources): a worker's task
 holds a handle whose write-behind holds bytes, and whose file has one write out. A handle dropped
 while the runtime runs hands its linger to a worker; once the runtime's drop began, to the
@@ -1813,7 +1813,7 @@ poll, where the counter starts at `2^64 - 1`, nothing ever yields.
 
 ## The single-shard semaphore
 
-`shardlocal` (`tla/shardlocal/Local.tla`, `lean/Nuclei/LocalSemaphore.lean`) checks `sync::local::Semaphore`
+`localsemaphore` (`tla/localsemaphore/Local.tla`, `lean/Nuclei/LocalSemaphore.lean`) checks `sync::local::Semaphore`
 (`src/sync/local/semaphore.rs`, its line in `src/sync/local/waiters.rs`), which the local `Mutex`
 and the local bounded channel's slots are built on: a strictly first-come, first-served semaphore
 for the tasks of one shard. A request takes its permits at once when nobody waits and they are
@@ -1850,6 +1850,250 @@ witnesses (a sleep a send ends, a flooded value taken while the quiet one waits)
 counts; their own steps are the `mpsc` models'. The Lean file proves the layout `mesh` builds: the
 channel made at outer step `from` and inner step `to` is the one party `from` sends to `to` on and
 the one party `to` receives from `from` on, and no two pairs share a channel.
+
+## A task placed on a worker
+
+`placement` (`tla/placement/Placement.tla`) checks a task placed on a worker the caller names
+(`spawn_on_worker` and `worker_shard` in `src/rt/runtime/placement.rs`) while that worker is
+drained (`Shared::drain`, `may_exit`, `stopped` and `push_remote` in `src/rt/shard.rs`, the
+shard's drop in `src/rt/shard/going.rs`, `Sched::counted` and `Sched::drop_future` in
+`src/rt/sched.rs`) and while its shard is
+handed to another thread (`take` in `src/rt/handoff/monitor.rs`). A spawn looks at the shard's
+`draining` flag, makes the task (`Sched::counted` counts it in the shard's `load`), runs a
+sequentially consistent fence and looks at `draining` again, dropping the task unrun and refusing
+with `InvalidInput` if it is up now; only then does it push the task to the shard's inbox, look at
+`stopped` (`push_remote`) and answer Ok. The worker's loop polls what its shard queues, or looks
+whether it may exit: `draining` first, then `load` in a second load; up and zero, it stops and
+drops whatever it still queues. A task's count goes when it completes or is dropped. The monitor
+may hand the shard to the spare while its runner is in a task's poll: that poll ends on the old
+thread, and a Pending task's wake goes back to the shard's inbox, which moved with the shard.
+
+| property | what it says |
+|----------|--------------|
+| `NoSilentLoss` | a task whose spawn answered Ok is never dropped unrun: it ran, is in a poll, or still waits on the shard |
+| `RefusedNeverRuns` | a task whose spawn was refused is never polled |
+| `RunsOnItsWorker` | every poll of a placed task begins on worker k's shard, by the thread that runs that shard at the moment: a handoff never takes the placement away |
+| `StoppedQueuesNothing` | a stopped shard queues nothing: no task is pushed to it once it stopped |
+| `EveryOkRuns` (under fairness) | every task whose spawn answered Ok runs to its end |
+
+The 13 configurations, listed with their expected result in `tla/placement/EXPECTED.txt` (each
+`.cfg` says in its first lines what it checks, and why its size is enough):
+
+- **4 that must pass.** Two tasks of two polls each, a drain and one handoff, with every safety
+  property (`P_safe`); the same with the first look at `draining` taken away
+  (`P_no_first_look`): the first look is no guard, as the second, after the count, refuses
+  every spawn the first would have, so it has no mutation of its own; and `EveryOkRuns` under
+  weak fairness of the spawners, the loop and the old runner and strong fairness of the loop's
+  take, for two tasks of one poll each (`P_live`) and for one task whose poll ends Pending on the
+  old thread (`P_live_repush`).
+- **6 mutations that must fail.** No second look (`M_no_second_look`), the second look before
+  the count (`M_look_before_count`), `may_exit` reading `load` before `draining`
+  (`M_load_first`) and a count that goes at the task's first poll instead of its end
+  (`M_uncount_at_poll`) each let the loop exit between a spawn's looks and its push, or with a
+  woken task still queued, and break `NoSilentLoss`; the second look after the push
+  (`M_refuse_after_push`) refuses a task already polled and breaks `RefusedNeverRuns`; a placed
+  task bound to the thread that ran the shard when it was made, as a `spawn_local` task is
+  (`M_bound`), runs on that thread after the handoff, off the worker, and breaks
+  `RunsOnItsWorker`.
+- **3 witnesses that must fail.** A spawn refused at its second look, after its count; a handoff
+  while a placed task waits in the queue; a drain that runs a placed task to its end before the
+  worker exits.
+
+What the model leaves out. Every step is sequentially consistent, as the code's fences make
+it: the fence of `spawn_on_worker` pairs with the fence of `drain` (before its look at `load`)
+and with the fence `may_exit` makes between its look at `draining` and its look at `load`, so a
+worker that sees the drain sees a count made before a second look that found no drain. The
+weaker orders those fences stand for are not checked here. The stop waker is not
+modelled: the loop may look whether it may exit whenever it is not in a poll, which covers every
+look the code makes, so a drained worker that is never woken to exit is not checked either.
+`push_remote`'s look at `stopped` drops nothing on this path (`StoppedQueuesNothing`); the model
+keeps it, as it is what drops a mutation's task. `Shared::stop`, the runtime's shutdown, which
+drops every task by design, is not modelled.
+A handoff is one step (its claim, fence and take are `handoff`'s), and the spawners run on
+threads that run no shard.
+
+## A shard-local value across a handoff
+
+`shardlocal` (`tla/shardlocal/ShardLocal.tla`) checks a shard-local value
+(`ShardLocal::try_with` in `src/shard_local.rs`, kept in the shard's `Locals` in
+`src/rt/shard/locals.rs`) while the monitor may hand its shard to another thread
+(`current_pinned`, `current` and `poll` in `src/rt/context.rs`; the slot's `pin`, `unpin`,
+`is_pinned`, `go_out`, `come_back`, `claim`, `take` and `cancel` in `src/rt/handoff/slot.rs`; the
+monitor's `take` in `src/rt/handoff/monitor.rs`). A task's `with` comes back into the shard as
+any call into the runtime does (the word inside, then a look at the claim: a taken claim detaches
+the thread, and `with` answers its access error), pins the slot and lends the value to its
+closure, which may run a nested `block_on` whose poll goes outside the shard again; then it
+unpins and goes outside. The monitor claims, fences, reads the word again and then the pins, and
+takes only if the word is unchanged and nothing is pinned, so a value lent across a nested poll
+keeps the shard where it is. It hands the shard to the spare with a fresh slot, and the value
+goes with the shard.
+
+| property | what it says |
+|----------|--------------|
+| `ExclusiveValue` | at most one thread holds the value at any time |
+| `OneValuePerShard` | every `with` on the shard, by whichever thread runs it, gets the same value, before and after the handoff |
+| `DetachedNeverHolds` | a thread whose shard was taken never holds the value from then on |
+
+The 8 configurations, listed with their expected result in `tla/shardlocal/EXPECTED.txt`:
+
+- **1 that must pass** (`SL_safe`): thread A's two polls and two calls of `with`, one of which
+  may nest a `block_on`, while the monitor watches A's slot and may hand the shard to B, whose
+  task calls `with` too, with every property.
+- **4 mutations that must fail.** A monitor that does not look at the pins
+  (`M_no_pin_check`) takes the shard while A's nested poll is outside with the value lent, and
+  B's `with` gets it too: `ExclusiveValue`; one that looks at the pins but does not read the word
+  again (`M_no_recheck`) takes the shard from a `with` that came back in and has not pinned yet:
+  `ExclusiveValue`, so the pin does not replace the second read; a `with` that takes the value
+  without coming back into the shard (`M_no_bracket`) holds it on a thread the shard was taken
+  from: `DetachedNeverHolds`; the value kept per thread instead of in the shard
+  (`M_per_thread`) gives B's `with` another value than A's: `OneValuePerShard`.
+- **3 witnesses that must fail.** A take after a `with` let go of the value; a take cancelled
+  because the slot was pinned; B holding the value after the handoff.
+
+What the model leaves out. Every step is sequentially consistent, so the store buffer the heavy
+fence exists for is `handoff`'s; the pins are stored inside the shard before the release store of
+the word that goes outside, and the monitor reads them after its acquire load of that word, an
+order the model takes as given. The monitor takes after one look at an outside word, where the
+code waits for a streak of them, so every take the code makes is one the model makes. The shard is
+handed on once; B's task makes one poll with one `with` and no nested `block_on`, as nobody
+watches B's fresh slot. The making of the value on its first use, and its initializer using it
+(`Missing::Making`), are not modelled.
+
+## The task a long poll is reported for
+
+`longpoll` (`tla/longpoll/LongPoll.tla`) checks the task the monitor names when a poll runs past
+the handoff threshold (`Builder::on_long_poll`): the notes a runtime with the hook set wraps
+around its poll hooks (`compose`, `begin` and `end` in `src/rt/notes.rs`), the slot's task
+(`Slot::note_task` and `Slot::task` in `src/rt/handoff/slot.rs`), the monitor's tick loop and
+`report_long` (`run` in `src/rt/handoff/monitor.rs`), and the runner's polls and calls into the
+runtime (`poll` and `current` in `src/rt/context.rs`, `Shard::block_on` in `src/rt/shard/run.rs`,
+the order of a task's run in `src/rt/task/raw.rs`). A poll goes out of the shard with a new epoch;
+a task's poll then notes its task in the slot, keeping the one it replaced on the thread's stack,
+and puts that one back at its end, before it comes back in; a `block_on` future's poll notes
+nothing. Polls nest: a task's code may call `block_on`, whose loop polls its future first and then
+other tasks and the future again, and a call into the runtime goes out again with the poll's own
+word when it returns. The monitor reads the word each tick, and for a word read `Streak` times in a
+row while outside, other than the last one it reported, it reads the slot's task, reads the word
+again, and calls the hook with the task unless it is 0 or the word changed meanwhile (the long
+poll ended).
+
+| property | what it says |
+|----------|--------------|
+| `ReportedIsOnStack` | the hook is called only with a task whose poll is on the runner's stack when the monitor reads it, never one whose poll ended |
+| `NamesInnermostNoted` | the task read for a report is the innermost one whose begin ran and whose end has not: the poll the runner is in, or, for a `block_on` future, the task whose poll encloses it; 0 only when no task is noted |
+| `OncePerPoll` | the hook is called at most once for a poll (checked where polls do not nest; see below) |
+| `NoNewerName` | the hook never names the task of a poll that began after the long one (checked where polls do not nest; see below) |
+| `SlotTracksStack` | the lemma under the first two: the slot names the innermost noted task at every moment |
+
+The 13 configurations, listed with their expected result in `tla/longpoll/EXPECTED.txt` (each
+`.cfg` says in its first lines what it checks, and why its size is enough):
+
+- **3 that must pass.** Three polls one after the other, each calling into the runtime at will,
+  with every property (`G_flat`); a task's poll calling `block_on`, whose loop polls its future
+  and a task, four polls with calls into the runtime (`G_nested`); three levels in five polls, a
+  `block_on` in a task polled by a `block_on`'s loop or in a `block_on` future (`G_deep`). The last
+  two check every property but `OncePerPoll` and `NoNewerName`.
+- **6 mutations that must fail.** An `end` that leaves the slot naming its task (`M_end_keeps`)
+  gets the ended poll reported for the next one, breaking `ReportedIsOnStack`; a `begin` that keeps
+  no stack, so every `end` puts 0 back (`M_no_stack`, which stands for an `end` that writes 0 too),
+  loses the enclosing task once a nested task's poll ended, breaking `NamesInnermostNoted`; one
+  saved task instead of a stack (`M_one_cell`) makes the outer `end` put the outer task itself
+  back, reported once its poll ended, breaking `ReportedIsOnStack`; a monitor that does not
+  remember the word it reported (`M_no_memory`) reports a long poll at every streak, breaking
+  `OncePerPoll`; a hook called with 0 (`M_report_zero`) breaks `ReportedIsOnStack`; a monitor that
+  does not read the word again after the task (`M_no_reread`) names the next poll's task when the
+  long poll ends between its two reads, breaking `NoNewerName`.
+- **4 witnesses that must fail.** A report naming a task polled by a `block_on`'s loop inside
+  another task's poll; one naming the enclosing task while its `block_on` future is polled; one
+  naming a task whose poll began and ended inside the long one between the monitor's two reads of
+  the word (`W_newer_nested`); and one poll reported twice (`W_twice_after_nesting`).
+
+The last two are what the code allows, as the docs of `on_long_poll` say. The second read of the
+word sees a long poll that ended, but not a nested poll that began and ended within it, whose
+task the slot named for a moment. And the monitor remembers only the last word it reported: a task's poll is reported long, then a `block_on`
+future inside it is reported too (naming the same task), and once the `block_on` returns the
+task's own word comes back, no longer the last one reported, so the poll is reported a second
+time. That needs the takes at both stretches to fail (the runner coming back just as the monitor
+takes, or the heavy fence failing; a take that succeeds ends the watch of the slot), but it means
+`OncePerPoll` holds only while no poll nested in a long one is reported.
+
+What the model leaves out. A task's id is its poll's epoch, so a note left from an ended poll is
+caught even where the same task polled again would make it look right. The worker loop's own
+future (which notes nothing and returns at once) and the user's own poll hooks (which run outside
+the notes) are not modelled. The take attempt between the read of the task and the call is left
+out: the hook gets the task read whatever the take does, and a take that succeeds only ends the
+watch of the slot (the next runner's fresh slot, with the reported word forgotten, is the same
+story from the start), so letting
+every take fail sees every read a slot can see. Every step is sequentially consistent: the read of
+the word is an acquire paired with the release of `go_out`, so the read of the task after it sees
+no value older than the one the slot had when that word was written, which the interleavings
+cover. A word whose poll came back is never written again, and the model forgets the monitor's
+memory of it, which merges states that behave alike.
+
+## A runtime's settings and the default runtime
+
+`builder` (`tla/builder/Builder.tla`) checks how a runtime's settings are checked and how the
+process default runtime is started: the setters, which only record their value
+(`src/rt/runtime/builder.rs`, `knobs.rs`, `cores.rs`); `Builder::validate`, which checks every
+setting in one place in a fixed order and refuses the first that does not fit with `InvalidInput`
+naming it, `IoUringConfiguration::validate` (`src/config.rs`) and the check of a list of cores
+among its checks; `Builder::worker_count` and the capacity `build` gives the workers;
+`build_global`, which looks at the default first, builds, then sets it; `init_with_config` and
+`GlobalExecutorConfig::builder` (`src/compat.rs`); and `try_default`
+(`src/rt/runtime/fallible.rs`), which starts the default for the free functions. Each setting
+takes a few values, each standing for every value on its side of the setting's bounds. Each
+setter's documentation is written down as the spec (which settings are out of range, which do not
+fit together, the workers a runtime starts with), and the code's checks are held to it. Two
+callers may race for the default, and the machine may refuse a build whose settings fit.
+
+| property | what it says |
+|----------|--------------|
+| `SettersNeverPanic` | no setter call panics |
+| `BuildOkIffValid` | a build answers Ok exactly when every setting is in range and they fit together (`max_worker_threads` not below an explicit `worker_threads`, `on_long_poll` not with `handoff_after(None)`): `InvalidInput` when one does not, and with every one fine Ok, or the machine's refusal |
+| `ErrorNamesFailingSetting` | an `InvalidInput` names a setting that is in fact out of range or does not fit |
+| `WorkerCount` | an Ok runtime starts with `worker_threads`, else the length of `worker_cores`, else the machine's count, either of the last two held to `max_worker_threads`; it may run `max_worker_threads` workers at most, four times its start when that is unset |
+| `SecondGlobalIsAlreadyExists` | a `build_global` that finds the default running answers `AlreadyExists` and builds nothing; one that loses the race to set it answers `AlreadyExists`, its runtime dropped |
+| `OneDefault` | the default, once set, is never replaced |
+| `InitReportsFailure` | an `init_with_config` whose build failed for another reason than `AlreadyExists` leaves an error-level record and no default; Ok and `AlreadyExists` log nothing |
+| `InitConfigFits` | the builder an executor configuration describes always fits |
+| deadlock freedom (TLC's own check, on every configuration that must pass) | every call ends |
+
+The 40 configurations, listed with their expected result in `tla/builder/EXPECTED.txt` (each
+`.cfg` says in its first lines what it checks, and why its size is enough):
+
+- **7 that must pass**, with every property and every order of setter calls, the last call
+  winning: eight settings with a range or a partner (`G_ranges`); the ring settings beside a
+  handoff, `on_long_poll` and the counts (`G_io`); the counts and both lists of cores
+  (`G_workers`); two `build_global` calls racing (`G_global`); `init_with_config`, with every
+  executor configuration, racing a `build_global` (`G_init`) or a free function's start
+  (`G_init_default`); a `build_global` racing a free function's start (`G_global_default`). The
+  machine may refuse in all but the first.
+- **27 mutations that must fail**, one per guard. Each range check taken away (the stack size,
+  nesting, blocking threads, `handoff_after`, the three knobs, the ring's queue, receive-buffer and
+  buffer-size rules, an empty list of cores or one naming a core outside, `blocking_cores` not
+  checked at all), `on_long_poll` accepted with `handoff_after(None)`, an unset `handoff_after`
+  read as None, and the early return for receive buffers off taken away (which refuses a ring that
+  fits) break `BuildOkIffValid`; the old behaviour of raising `max_worker_threads` to an explicit
+  count silently, a count that ignores `worker_cores`, and one not held to `max_worker_threads`
+  break `WorkerCount`; a refused `blocking_cores` named `worker_cores` breaks
+  `ErrorNamesFailingSetting`; a knob setter that asserts, as they did, breaks `SettersNeverPanic`;
+  `build_global` answering another error than `AlreadyExists`, building before it looks, or
+  keeping the runtime that lost the race breaks `SecondGlobalIsAlreadyExists`; a set that replaces
+  the default breaks `OneDefault`; `init_with_config` discarding the error, as it did, or logging
+  `AlreadyExists` breaks `InitReportsFailure`.
+- **6 witnesses that must fail.** Two `build_global` calls that both build, the second one
+  dropped; a count held to `max_worker_threads`; a runtime with no worker; an init that logs; a
+  refusal while two settings fail at once; a buffer size out of range accepted with receive buffers
+  off.
+
+What the model leaves out. Settings whose every value is accepted (names, keep-alive, pinning, the
+spawn margin, the seed, the hooks other than `on_long_poll`, the backend, which only the machine
+may refuse); `io_buffer_cap`, which a worker checks against its ring's buffers when it starts; and
+the environment variables (`NUCLEI_BACKEND`, the executor configuration's own). The process may
+run on every core of the machine. The lock that lets one free function start the default at a
+time is not modelled (one caller makes that start here). The spec is written from each setter's
+documentation, and most of the code's checks agree with it by construction: the mutations are what
+shows each check is needed and in its place.
 
 ## What is not checked
 

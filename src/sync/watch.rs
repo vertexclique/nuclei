@@ -507,7 +507,7 @@ impl<T: Send + Sync + 'static> Receiver<T> {
             // A value that fits at once spends one operation of the poll's
             // budget, as `changed` does.
             if !crate::coop::has_budget_remaining() {
-                crate::task::yield_now().await;
+                crate::coop::yield_spent().await;
             }
             {
                 let (guard, new_version) = self.shared.snapshot();
@@ -586,7 +586,7 @@ async fn changed_impl<T: Send + Sync + 'static>(
         // (see `coop`): with the budget spent, the look waits for the next
         // poll, after the shard's other tasks.
         if !crate::coop::has_budget_remaining() {
-            crate::task::yield_now().await;
+            crate::coop::yield_spent().await;
         }
         let notified = shared.notify_rx.notified();
         if let Some(ret) = maybe_changed(shared, version) {

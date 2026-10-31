@@ -103,6 +103,8 @@ pub(crate) struct Pool {
     /// Jobs submitted and not yet run to their end: a paused clock does not
     /// move by itself while one is in flight.
     jobs: Arc<AtomicUsize>,
+    /// Jobs in the queue, not taken by a thread yet, for `stats`.
+    queued: AtomicUsize,
     /// The runtime the pool belongs to, told when its last job ends.
     owner: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
     config: PoolConfig,
@@ -132,7 +134,7 @@ impl Pool {
             })
             .collect();
         let index = (0..n.div_ceil(WORD)).map(|_| AtomicU64::new(0)).collect();
-        Arc::new(Self {
+        let pool = Arc::new(Self {
             queue,
             slots,
             index,
@@ -140,9 +142,23 @@ impl Pool {
             threads: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),
             jobs: Arc::new(AtomicUsize::new(0)),
+            queued: AtomicUsize::new(0),
             owner: std::sync::OnceLock::new(),
             config,
-        })
+        });
+        take_out_gone();
+        pools().insert(Arc::as_ptr(&pool) as usize, Arc::downgrade(&pool));
+        pool
+    }
+
+    /// Jobs waiting in the queue for a thread to take them.
+    pub(crate) fn queued(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// Threads of this pool alive now.
+    pub(crate) fn threads_now(&self) -> usize {
+        self.threads.load(Ordering::Relaxed)
     }
 
     /// Runs `f` on a pool thread.
@@ -191,6 +207,7 @@ impl Pool {
 
     fn submit(self: &Arc<Self>, runnable: Runnable) {
         self.jobs.fetch_add(1, Ordering::SeqCst);
+        self.queued.fetch_add(1, Ordering::Relaxed);
         self.queue.push(runnable);
         if self.idle.load(Ordering::SeqCst) > 0 && self.wake_one() {
             return;
@@ -270,7 +287,10 @@ impl Pool {
                     popped
                 };
                 match popped {
-                    Pop::Item(runnable) => return Some(runnable),
+                    Pop::Item(runnable) => {
+                        self.queued.fetch_sub(1, Ordering::Relaxed);
+                        return Some(runnable);
+                    }
                     Pop::Empty => return None,
                     Pop::Busy => {}
                 }
@@ -457,6 +477,38 @@ impl Drop for Pool {
 
 /// Threads of every blocking pool alive now.
 static ALIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Every pool made, by address (which the entry's allocation keeps from
+/// reuse), for `stats`. A pool that went is taken out at the next pool's
+/// making or the next snapshot, on a thread that runs, as the shards'
+/// registry does (`rt::counters`): a pool may go in a thread's exit.
+fn pools() -> &'static kovan_map::HashMap<usize, std::sync::Weak<Pool>> {
+    static POOLS: std::sync::OnceLock<kovan_map::HashMap<usize, std::sync::Weak<Pool>>> =
+        std::sync::OnceLock::new();
+    POOLS.get_or_init(|| kovan_map::HashMap::with_capacity(64))
+}
+
+/// Takes out the entries of pools that went.
+fn take_out_gone() {
+    let gone: Vec<usize> = pools()
+        .iter()
+        .filter(|(_, pool)| pool.strong_count() == 0)
+        .map(|(key, _)| key)
+        .collect();
+    for key in gone {
+        drop(pools().remove(&key));
+    }
+}
+
+/// Jobs waiting in the queues of every pool alive, for `stats`.
+pub(crate) fn queued_everywhere() -> usize {
+    take_out_gone();
+    pools()
+        .values()
+        .filter_map(|pool| pool.upgrade())
+        .map(|pool| pool.queued())
+        .sum()
+}
 
 /// Runs `call` on the blocking pool and answers its result; a call whose task
 /// was lost (its runtime shut down) is an error, not a panic.

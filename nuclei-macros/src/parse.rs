@@ -119,18 +119,22 @@ pub(crate) struct Options {
     /// `crate = "path"`: the path the expansion names nuclei by, its
     /// segments; `None` is `::nuclei`.
     pub(crate) krate: Option<Vec<String>>,
+    /// `builder = "path"`: the function, called with no argument, whose
+    /// `nuclei::Builder` the runtime is built from, its segments as written.
+    pub(crate) builder: Option<Vec<String>>,
 }
 
 impl Options {
     /// Whether the expansion builds a runtime of its own rather than use the
     /// process default.
     pub(crate) fn own_runtime(&self) -> bool {
-        self.threads.is_some() || self.start_paused
+        self.threads.is_some() || self.start_paused || self.builder.is_some()
     }
 }
 
 /// What the options accept, for the messages that name them.
-const ACCEPTED: &str = "`threads = <number>`, `start_paused = true` or `crate = \"<path>\"`";
+const ACCEPTED: &str =
+    "`threads = <number>`, `start_paused = true`, `builder = \"<path>\"` or `crate = \"<path>\"`";
 
 /// The parsed shape of the function a macro is applied to.
 #[derive(Clone, Debug)]
@@ -151,8 +155,8 @@ pub(crate) struct FnItem {
 }
 
 /// Parses the attribute arguments: empty, or a comma-separated list of
-/// `threads = <number>`, `start_paused = <bool>` and `crate = "<path>"`, each
-/// at most once, with an optional trailing comma.
+/// `threads = <number>`, `start_paused = <bool>`, `builder = "<path>"` and
+/// `crate = "<path>"`, each at most once, with an optional trailing comma.
 pub(crate) fn parse_options(toks: &[Tok], mac: Macro) -> Result<Options, Error> {
     let mut toks = toks;
     // Tolerate the arguments arriving wrapped in one empty parenthesis group.
@@ -177,6 +181,7 @@ pub(crate) fn parse_options(toks: &[Tok], mac: Macro) -> Result<Options, Error> 
         let key = match name {
             "threads" => "threads",
             "start_paused" => "start_paused",
+            "builder" => "builder",
             "crate" => "crate",
             _ => {
                 return Err(Error::at(
@@ -215,6 +220,7 @@ pub(crate) fn parse_options(toks: &[Tok], mac: Macro) -> Result<Options, Error> 
                     _ => return Err(Error::at("give start_paused `true` or `false`", value_span)),
                 }
             }
+            "builder" => opts.builder = Some(builder_path(value, value_span)?),
             _ => opts.krate = Some(crate_path(value, value_span)?),
         }
         toks = &toks[3.min(toks.len())..];
@@ -254,11 +260,28 @@ fn thread_count(value: Option<&Tok>, span: Option<Span>) -> Result<u32, Error> {
 fn crate_path(value: Option<&Tok>, span: Option<Span>) -> Result<Vec<String>, Error> {
     const MESSAGE: &str =
         "give crate the path nuclei is reached by, as a string: `crate = \"my_crate::nuclei\"`";
+    string_path(value, span, MESSAGE)
+}
+
+/// The value of `builder`: a string literal holding the path of a function
+/// (`"runtime::builder"`), its segments.
+fn builder_path(value: Option<&Tok>, span: Option<Span>) -> Result<Vec<String>, Error> {
+    const MESSAGE: &str = "give builder the path of a function that returns a nuclei::Builder, as a string: `builder = \"runtime::builder\"`";
+    string_path(value, span, MESSAGE)
+}
+
+/// A string literal holding a path of identifiers, its segments; `message`
+/// for anything else.
+fn string_path(
+    value: Option<&Tok>,
+    span: Option<Span>,
+    message: &str,
+) -> Result<Vec<String>, Error> {
     let Some(Tok::Literal(text, _)) = value else {
-        return Err(Error::at(MESSAGE, span));
+        return Err(Error::at(message, span));
     };
     let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) else {
-        return Err(Error::at(MESSAGE, span));
+        return Err(Error::at(message, span));
     };
     let inner = inner.strip_prefix("::").unwrap_or(inner);
     let segments: Vec<String> = inner.split("::").map(str::to_string).collect();
@@ -270,7 +293,7 @@ fn crate_path(value: Option<&Tok>, span: Option<Span>) -> Result<Vec<String>, Er
             && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
     });
     if !valid {
-        return Err(Error::at(MESSAGE, span));
+        return Err(Error::at(message, span));
     }
     Ok(segments)
 }

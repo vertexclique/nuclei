@@ -14,10 +14,20 @@
 //! claim. Where the monitor has a heavy fence (one that orders every thread
 //! of the process, [`super::fence`]), the runner's fence is the compiler's
 //! only; elsewhere it is a full one.
+//!
+//! Two more words, each written by the runner alone. The pins, written
+//! inside the shard, are held while a shard-local value is lent to the
+//! runner's code, during which the monitor takes nothing even when a nested
+//! `block_on` in that code goes outside (proofs/tla/shardlocal); the monitor
+//! reads them after an outside word, whose release store came after them.
+//! The id of the task whose poll is innermost on the runner's stack is noted
+//! as each poll begins and ends, only while the runtime has a long-poll hook
+//! (proofs/tla/longpoll); the monitor reads it once a poll has run four of
+//! its ticks.
 
 use core::sync::atomic::compiler_fence;
 
-use crate::sync::internal::{AtomicU8, AtomicU64, Ordering, fence};
+use crate::sync::internal::{AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
 
 /// No claim: the shard is its runner's.
 pub(crate) const NONE: u8 = 0;
@@ -63,6 +73,10 @@ pub(crate) struct Slot {
     claim: AtomicU8,
     /// The monitor has no heavy fence: the runner's fence is a full one.
     full_fence: bool,
+    /// Shard-local values lent to the runner's code now.
+    pins: AtomicU32,
+    /// The id of the task polled innermost, 0 for none.
+    task: AtomicU64,
 }
 
 impl Slot {
@@ -73,7 +87,41 @@ impl Slot {
             word: AtomicU64::new(inside(0)),
             claim: AtomicU8::new(NONE),
             full_fence,
+            pins: AtomicU32::new(0),
+            task: AtomicU64::new(0),
         }
+    }
+
+    /// The runner, inside, lends a shard-local value to its code. Only the
+    /// runner writes the pins: a load and a store.
+    pub(crate) fn pin(&self) {
+        let pins = self.pins.load(Ordering::Relaxed);
+        self.pins.store(pins + 1, Ordering::Relaxed);
+    }
+
+    /// The runner, inside again, got the value back.
+    pub(crate) fn unpin(&self) {
+        let pins = self.pins.load(Ordering::Relaxed);
+        self.pins.store(pins.saturating_sub(1), Ordering::Relaxed);
+    }
+
+    /// Whether a shard-local value is lent out, as the monitor reads it once
+    /// it read an outside word (which pairs with the store of the pins).
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pins.load(Ordering::Relaxed) != 0
+    }
+
+    /// The runner polls the task `id` (0: none) from now on; answers the one
+    /// it polled before, which encloses this poll.
+    pub(crate) fn note_task(&self, id: u64) -> u64 {
+        let previous = self.task.load(Ordering::Relaxed);
+        self.task.store(id, Ordering::Relaxed);
+        previous
+    }
+
+    /// The task polled innermost, as the monitor reads it.
+    pub(crate) fn task(&self) -> u64 {
+        self.task.load(Ordering::Relaxed)
     }
 
     /// The runner leaves the shard for a task's code, in the poll of

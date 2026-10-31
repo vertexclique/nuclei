@@ -1,0 +1,12 @@
+# configuration                spec                 expected
+L_safe                         MC_Local             pass
+L_mixed                        MC_Local             pass
+L_try                          MC_Local             pass
+L_live                         MC_Local             pass
+M_try_barges                   MC_Local             violated:FifoFair
+M_cancel_front_no_serve        MC_Local             violated:NoIdleFront
+M_cancel_granted_keeps         MC_Local             violated:Conservation
+M_release_no_serve             MC_Local             violated:NoIdleFront
+W_pass_on                      MC_Local             violated:NoPassOn
+W_front_served                 MC_Local             violated:NoFrontServed
+W_set_aside                    MC_Local             violated:NoSetAside

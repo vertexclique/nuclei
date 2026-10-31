@@ -15,6 +15,8 @@ use crate::io::source::Via;
 use crate::io::source::{Io, Kind};
 #[cfg(unix)]
 use crate::io::sys;
+#[cfg(unix)]
+use crate::rt::counters::tally;
 
 impl WriteState {
     /// A datagram handed to the kernel by the polling task once nothing of
@@ -47,7 +49,7 @@ impl WriteState {
             Via::None(never, _) => match never {},
         };
         if !ahead {
-            match sys::ready(super::send_datagram(fd, bytes, dest)) {
+            match sys::ready(super::send_datagram(fd, bytes, dest)).inspect(tally::writing) {
                 Some(result) => return Poll::Ready(result),
                 None => match io.via {
                     Via::Fd(_) => self.blocked = true,
