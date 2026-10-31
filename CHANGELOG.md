@@ -20,9 +20,9 @@
   for a thread that runs no shard could stop first; either failed the registration, so the
   source's next operation returned "the shard stopped before the registration", and a dropped
   stream's drain (a runtime dropping with bytes behind) took that for its end and gave the bytes
-  up (on macOS, about one run in twenty of the drop test). A stopped shard now registers nothing:
-  the source stays unregistered and its waiting tasks look again, to register it where they poll
-  next, as `proofs/tla/attach` has it.
+  up (on macOS, about one run in seven of the drop test). A stopped shard now registers nothing:
+  the source stays unregistered, and is registered where its tasks are polled next, as
+  `proofs/tla/attach` has it.
 - **A dropped TCP stream whose linger ran out resets its connection.** The bytes still behind were
   given up and the stream closed with a FIN, so the peer read a cut stream as a whole one; it now
   reads `ConnectionReset` (`proofs/tla/close`).
