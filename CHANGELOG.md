@@ -55,6 +55,13 @@
 
 ### Added
 
+- **`shut` and `abort` on streams.** `TcpStream::shut(how)` and `UnixStream::shut(how)` make std's
+  shutdown once the bytes written behind reached the kernel (`Write`, `Both`), and the reading
+  half's through the ring's `SHUTDOWN` where the calling thread runs a ring; reads after it answer
+  as std's on each system (macOS and Windows drop what was read ahead). It is not named `shutdown`,
+  so `stream.shutdown(how)` still reaches std's through `Deref`. `TcpStream::abort()` sets
+  `SO_LINGER` to zero, drops the bytes behind and closes now: the peer reads a reset
+  (`proofs/tla/close`).
 - **IO settings on the builder**: `write_behind_linger` (how long a dropped handle's bytes may
   take, 60 s by default, more than zero), `zero_copy_threshold` (the least a `write_zero_copy`
   must have left for a zero-copy send, 1 MiB by default) and `send_file_chunk` (the most one call

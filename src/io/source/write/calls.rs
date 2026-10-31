@@ -246,13 +246,23 @@ impl Source {
 
     /// Flushes, then shuts a stream socket's writing half down.
     pub(crate) fn poll_close(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_shutdown(cx, std::net::Shutdown::Write)
+    }
+
+    /// Flushes, then shuts the halves `how` names of a stream socket down:
+    /// the writing half, or both.
+    pub(crate) fn poll_shutdown(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        how: std::net::Shutdown,
+    ) -> Poll<io::Result<()>> {
         let fd = match self.fd() {
             Ok(fd) => fd,
             Err(err) => return Poll::Ready(Err(err)),
         };
         let kind = self.kind;
         self.poll_writing(cx, |st, io, waker, after| {
-            st.close(io, fd, kind, waker, after)
+            st.close(io, fd, kind, how, waker, after)
         })
     }
 

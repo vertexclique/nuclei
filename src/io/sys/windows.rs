@@ -19,12 +19,12 @@ use crate::syscore::windows::{
     FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT,
     FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType,
     HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK,
-    NtQueryInformationFile, OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN,
-    SO_MAX_MSG_SIZE, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM,
-    SOCK_RAW, SOCK_RDM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET,
-    SOCKET_ERROR, SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
-    WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile, bind, getsockname,
-    getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, shutdown, wsa_error,
+    NtQueryInformationFile, OVERLAPPED, ReadFile, SD_BOTH, SD_RECEIVE, SD_SEND, SIO_UDP_CONNRESET,
+    SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
+    SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile,
+    bind, getsockname, getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, wsa_error,
 };
 
 fn socket_of(raw: Raw) -> SOCKET {
@@ -124,22 +124,32 @@ fn file_information(raw: Raw, class: u32) -> io::Result<ULONG> {
     Ok(value)
 }
 
-/// Shuts the writing half of a stream socket down.
-pub(crate) fn shutdown_write(raw: Raw) -> io::Result<()> {
+/// Shuts the halves `how` names of a stream socket down.
+pub(crate) fn shutdown(raw: Raw, how: std::net::Shutdown) -> io::Result<()> {
+    let how = match how {
+        std::net::Shutdown::Read => SD_RECEIVE,
+        std::net::Shutdown::Write => SD_SEND,
+        std::net::Shutdown::Both => SD_BOTH,
+    };
     // SAFETY: a plain call on a socket the caller holds.
-    check(unsafe { shutdown(socket_of(raw), SD_SEND) })
+    check(unsafe { crate::syscore::windows::shutdown(socket_of(raw), how) })
 }
 
 /// A `recv` (with `peek`, a look that leaves the bytes) on the stream socket
 /// `raw` into `buf`, made only once a zero-byte receive said bytes, the end
 /// or an error came: the socket blocks, and holding them it answers at once.
+/// A reading half shut answers the end, as std's read does.
 pub(crate) fn recv_ready(raw: Raw, buf: &mut [u8], peek: bool) -> io::Result<usize> {
     let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
     let flags = if peek { MSG_PEEK } else { 0 };
     // SAFETY: the kernel writes at most `len` bytes into `buf`.
     let n = unsafe { recv(socket_of(raw), buf.as_mut_ptr(), len, flags) };
     if n == SOCKET_ERROR {
-        return Err(wsa_error());
+        let err = wsa_error();
+        if err.raw_os_error() == Some(crate::syscore::windows::WSAESHUTDOWN) {
+            return Ok(0);
+        }
+        return Err(err);
     }
     Ok(n as usize)
 }

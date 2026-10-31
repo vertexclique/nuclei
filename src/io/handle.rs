@@ -275,6 +275,23 @@ impl<T> Handle<T> {
             ));
         }
     }
+
+    /// Closes the object now, whatever the write-behind holds: the source's
+    /// close, with no linger (`Source::close`).
+    pub(crate) fn close_now(self) {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: `this` is never used or dropped again; each field is moved
+        // out once.
+        let (io, source, file) = unsafe {
+            (
+                ManuallyDrop::take(&mut this.io),
+                core::ptr::read(&this.source),
+                core::ptr::read(&this.file),
+            )
+        };
+        drop(file);
+        source.close(io);
+    }
 }
 
 impl<T> Drop for Handle<T> {

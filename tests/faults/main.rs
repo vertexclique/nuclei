@@ -1,8 +1,8 @@
 //! Faults: what every byte API answers when its peer resets or half-closes,
-//! a datagram flood fills the buffers, the process has no descriptor or no
-//! memory left, the socket buffers are as small as they go, a future is
-//! dropped at any of its awaits, and a handle, a runtime or a shard goes with
-//! operations out. The answer is the one std gives for the same call on the
+//! what the peer sees of our shut and abort, a datagram flood fills the
+//! buffers, the process has no descriptor or no memory left, the socket
+//! buffers are as small as they go, a future is dropped at any of its awaits,
+//! and a handle, a runtime or a shard goes with operations out. The answer is the one std gives for the same call on the
 //! same kind of socket in the same situation, and where the kernel may give
 //! either of two, one std can give; every case has a deadline, and the cases
 //! that count what the process holds run alone in a process of their own.
@@ -18,6 +18,7 @@ mod emfile;
 mod half_close;
 mod reset;
 mod short_io;
+mod shut;
 mod support;
 
 struct Live;

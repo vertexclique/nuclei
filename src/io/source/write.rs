@@ -611,15 +611,17 @@ impl WriteState {
         Poll::Ready(Ok(()))
     }
 
-    /// Flushes, then shuts a stream's writing half of `fd` down (with
-    /// nothing out on the ring by then, the driver's call on it at once).
-    /// Every close asks the kernel, so one after the first answers what the
-    /// system answers to a second shutdown (macOS: `ENOTCONN`), as std's.
+    /// Flushes, then shuts the halves `how` names (the writing half, or
+    /// both) of a stream's `fd` down (with nothing out on the ring by then,
+    /// the driver's call on it at once). Every close asks the kernel, so one
+    /// after the first answers what the system answers to a second shutdown
+    /// (macOS: `ENOTCONN`), as std's.
     fn close(
         &mut self,
         io: Io<'_>,
         fd: crate::io::raw::Raw,
         kind: Kind,
+        how: std::net::Shutdown,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<()>> {
@@ -628,7 +630,7 @@ impl WriteState {
             other => return other,
         }
         if kind.streams() {
-            return Poll::Ready(sys::shutdown_write(fd).inspect_err(crate::rt::counters::io_error));
+            return Poll::Ready(sys::shutdown(fd, how).inspect_err(crate::rt::counters::io_error));
         }
         Poll::Ready(Ok(()))
     }

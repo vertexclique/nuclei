@@ -158,10 +158,24 @@ pub(crate) fn read_bufs(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Resul
     retry(|| cvt(unsafe { libc::readv(fd, bufs.as_ptr().cast(), count) }))
 }
 
-/// `shutdown(2)` of the writing half.
-pub(crate) fn shutdown_write(fd: RawFd) -> io::Result<()> {
+/// `shutdown(2)` of the halves `how` names.
+pub(crate) fn shutdown(fd: RawFd, how: std::net::Shutdown) -> io::Result<()> {
+    shutdown_raw(fd, shut_how(how))
+}
+
+/// `shutdown(2)` of the halves its own `how` names.
+pub(crate) fn shutdown_raw(fd: RawFd, how: libc::c_int) -> io::Result<()> {
     // SAFETY: a plain syscall on a socket the caller holds.
-    cvt_int(unsafe { libc::shutdown(fd, libc::SHUT_WR) }).map(drop)
+    cvt_int(unsafe { libc::shutdown(fd, how) }).map(drop)
+}
+
+/// `shutdown(2)`'s name for the halves `how` names.
+fn shut_how(how: std::net::Shutdown) -> libc::c_int {
+    match how {
+        std::net::Shutdown::Read => libc::SHUT_RD,
+        std::net::Shutdown::Write => libc::SHUT_WR,
+        std::net::Shutdown::Both => libc::SHUT_RDWR,
+    }
 }
 
 /// The pending error of a socket (`SO_ERROR`): how a non-blocking connect

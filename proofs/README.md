@@ -1050,7 +1050,7 @@ and an accept that still closed a connection, the race the check cannot close).
 ## A stream's close
 
 `shutdown` (`tla/shutdown/Shutdown.tla`) checks a stream's close (`WriteState::close` in
-`src/io/source/write.rs`, which flushes and then calls `shutdown_write` of `src/io/sys/`; the
+`src/io/source/write.rs`, which flushes and then calls `shutdown` of `src/io/sys/`; the
 driver's writes of the write-behind are `WriteState::push_fd`). A task writes bytes, which wait in
 the write-behind until the driver hands them to the kernel, one per call; then it closes the
 writing half again and again. A close waits until the write-behind is out, then asks the kernel to

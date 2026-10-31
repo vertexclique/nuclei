@@ -211,7 +211,9 @@ pub(crate) struct LINGER {
     pub(crate) l_onoff: u16,
     pub(crate) l_linger: u16,
 }
+pub(crate) const SD_RECEIVE: i32 = 0;
 pub(crate) const SD_SEND: i32 = 1;
+pub(crate) const SD_BOTH: i32 = 2;
 pub(crate) const WSA_FLAG_OVERLAPPED: DWORD = 0x01;
 pub(crate) const WSA_FLAG_NO_HANDLE_INHERIT: DWORD = 0x80;
 pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC800_0006;
@@ -260,6 +262,7 @@ pub(crate) const WSAECONNABORTED: i32 = 10053;
 pub(crate) const WSAECONNRESET: i32 = 10054;
 pub(crate) const WSAENOBUFS: i32 = 10055;
 pub(crate) const WSAENOTCONN: i32 = 10057;
+pub(crate) const WSAESHUTDOWN: i32 = 10058;
 pub(crate) const WSAETIMEDOUT: i32 = 10060;
 pub(crate) const WSAECONNREFUSED: i32 = 10061;
 pub(crate) const WSAEHOSTUNREACH: i32 = 10065;

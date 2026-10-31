@@ -30,7 +30,8 @@
 //! ```
 
 mod addr;
-mod opt;
+mod close;
+pub(crate) mod opt;
 mod released;
 pub(crate) mod send_file;
 mod socket;
