@@ -149,8 +149,14 @@ async fn flood(send: Send, recv: Recv, count: u32) {
         set_tiny_datagram(rx.get_ref(), LARGEST);
     }
     let (tx_addr, rx_addr) = (tx.local_addr().unwrap(), rx.local_addr().unwrap());
-    tx.get_ref().connect(rx_addr).unwrap();
+    // The sender is connected for the connected sends only: macOS refuses an addressed send on
+    // a connected socket (`EISCONN`), std's as well.
+    let connected = matches!(send, Send::Connected | Send::Owned);
+    if connected {
+        tx.get_ref().connect(rx_addr).unwrap();
+    }
     rx.get_ref().connect(tx_addr).unwrap();
+    let plain = if connected { Send::Connected } else { Send::To };
     let ended = Arc::new(AtomicBool::new(false));
     let receiver = {
         let ended = Arc::clone(&ended);
@@ -186,7 +192,7 @@ async fn flood(send: Send, recv: Recv, count: u32) {
     let mut pause = Duration::from_millis(1);
     within(&what, async {
         while !ended.load(Ordering::Acquire) {
-            let _ = send_one(&tx, Send::To, datagram(END, HEADER), rx_addr).await;
+            let _ = send_one(&tx, plain, datagram(END, HEADER), rx_addr).await;
             nuclei::time::sleep(pause).await;
             pause = (pause * 2).min(Duration::from_millis(50));
         }
@@ -198,7 +204,9 @@ async fn flood(send: Send, recv: Recv, count: u32) {
     // Both sockets still work.
     while rx.try_recv(&mut [0u8; 16]).is_ok() {}
     let after = datagram(0, 100);
-    within(&what, tx.send(&after)).await.unwrap();
+    within(&what, send_one(&tx, plain, after.clone(), rx_addr))
+        .await
+        .unwrap();
     let back = within(&what, recv_one(&rx, Recv::From)).await.unwrap();
     assert!(
         back == after || check(&what, &back) == END,

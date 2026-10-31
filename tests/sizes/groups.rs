@@ -1,7 +1,7 @@
 //! The io_uring receive group's buffer size, each in a process of its own.
 
 use super::datagrams::{
-    datagram_row, datagram_sizes, largest_into, one_into, recv_connected, recv_owned,
+    To, datagram_row, datagram_sizes, largest_into, one_into, recv_connected, recv_owned,
     send_connected, send_owned, short, whole,
 };
 use super::streams::{
@@ -128,6 +128,7 @@ fn group_child() {
     datagram_row::<UdpSocket, _, _>(
         &format!("group {group} udp"),
         &datagrams,
+        To::Connected,
         send_connected,
         recv_connected,
         whole,
@@ -135,6 +136,7 @@ fn group_child() {
     datagram_row::<UdpSocket, _, _>(
         &format!("group {group} udp cut"),
         &datagrams,
+        To::Connected,
         send_connected,
         recv_connected,
         short,
@@ -142,6 +144,7 @@ fn group_child() {
     datagram_row::<UdpSocket, _, _>(
         &format!("group {group} udp owned"),
         &datagrams,
+        To::Connected,
         send_owned,
         recv_owned,
         whole,
@@ -149,6 +152,7 @@ fn group_child() {
     datagram_row::<UdpSocket, _, _>(
         &format!("group {group} udp one into"),
         &datagrams,
+        To::Connected,
         send_connected,
         recv_connected,
         one_into,
@@ -156,6 +160,7 @@ fn group_child() {
     datagram_row::<UdpSocket, _, _>(
         &format!("group {group} udp largest into"),
         &datagrams,
+        To::Connected,
         send_connected,
         recv_connected,
         largest_into,

@@ -2,14 +2,24 @@
 
 use super::*;
 
-/// A datagram socket's calls, on UDP and Unix datagram sockets alike, each socket connected to
-/// its peer and named, so both the connected and the addressed calls reach it.
+/// How a row's datagrams go: on a socket connected to its peer, or addressed to the peer from a
+/// socket connected to nothing. macOS refuses an addressed send on a connected socket
+/// (`EISCONN`), std's as well, where Linux sends it; so the addressed calls are made where every
+/// system sends them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum To {
+    Connected,
+    Addressed,
+}
+
+/// A datagram socket's calls, on UDP and Unix datagram sockets alike, each socket named, the
+/// receiver connected to the sender, and the sender to the receiver for the connected calls.
 pub(crate) trait Dgram: Sized + 'static {
     type Addr: Clone + PartialEq + std::fmt::Debug;
-    /// Two sockets connected to each other, and their addresses.
-    fn pair() -> ((Self, Self::Addr), (Self, Self::Addr));
-    /// What std's own send of `len` bytes gives on a pair like this one.
-    fn std_send(len: usize) -> io::Result<usize>;
+    /// The sender and the receiver, and their addresses.
+    fn pair(to: To) -> ((Self, Self::Addr), (Self, Self::Addr));
+    /// What std's own send of `len` bytes, made as `to` says, gives on a pair like this one.
+    fn std_send(len: usize, to: To) -> io::Result<usize>;
     fn send(&self, buf: &[u8]) -> impl Future<Output = io::Result<usize>>;
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>>;
     fn readable(&self) -> impl Future<Output = io::Result<()>>;
@@ -28,27 +38,36 @@ pub(crate) trait Dgram: Sized + 'static {
     ) -> impl Future<Output = (io::Result<(usize, Self::Addr)>, Vec<u8>)>;
 }
 
-/// What std's blocking send of `len` bytes on `a` gives, the datagram taken off `b` again.
+/// What std's blocking send of `len` bytes from `a` gives, made as `to` says, the datagram
+/// taken off `b` again; `$pair` makes the sockets and the receiver's address for a `To`.
 macro_rules! std_send {
-    ($pair:expr, $len:expr) => {{
+    ($pair:expr, $len:expr, $to:expr) => {{
         thread_local! {
-            static PAIR: (StdDgram, StdDgram) = $pair;
+            static CONNECTED: (StdDgram, StdDgram, StdAddr) = $pair(To::Connected);
+            static ADDRESSED: (StdDgram, StdDgram, StdAddr) = $pair(To::Addressed);
         }
-        PAIR.with(|(a, b)| {
-            let sent = a.send(pattern($len));
+        let send = |(a, b, b_at): &(StdDgram, StdDgram, StdAddr)| {
+            let sent = match $to {
+                To::Connected => a.send(pattern($len)),
+                To::Addressed => a.send_to(pattern($len), b_at),
+            };
             if sent.is_ok() {
                 b.recv(&mut vec![0; $len + 1]).unwrap();
             }
             sent
-        })
+        };
+        match $to {
+            To::Connected => CONNECTED.with(send),
+            To::Addressed => ADDRESSED.with(send),
+        }
     }};
 }
 
 impl Dgram for UdpSocket {
     type Addr = std::net::SocketAddr;
 
-    fn pair() -> ((Self, Self::Addr), (Self, Self::Addr)) {
-        let (a, b) = std_udp_pair();
+    fn pair(to: To) -> ((Self, Self::Addr), (Self, Self::Addr)) {
+        let (a, b) = std_udp_pair(to);
         let (a_at, b_at) = (a.local_addr().unwrap(), b.local_addr().unwrap());
         (
             (Handle::new(a).unwrap(), a_at),
@@ -56,9 +75,18 @@ impl Dgram for UdpSocket {
         )
     }
 
-    fn std_send(len: usize) -> io::Result<usize> {
+    fn std_send(len: usize, to: To) -> io::Result<usize> {
         type StdDgram = std::net::UdpSocket;
-        std_send!(std_udp_pair(), len)
+        type StdAddr = std::net::SocketAddr;
+        std_send!(
+            |to| {
+                let (a, b) = std_udp_pair(to);
+                let b_at = b.local_addr().unwrap();
+                (a, b, b_at)
+            },
+            len,
+            to
+        )
     }
 
     fn send(&self, buf: &[u8]) -> impl Future<Output = io::Result<usize>> {
@@ -97,10 +125,14 @@ impl Dgram for UdpSocket {
     }
 }
 
-fn std_udp_pair() -> (std::net::UdpSocket, std::net::UdpSocket) {
+/// The sender and the receiver: the receiver connected to the sender, and the sender to the
+/// receiver for the connected calls.
+fn std_udp_pair(to: To) -> (std::net::UdpSocket, std::net::UdpSocket) {
     let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    a.connect(b.local_addr().unwrap()).unwrap();
+    if matches!(to, To::Connected) {
+        a.connect(b.local_addr().unwrap()).unwrap();
+    }
     b.connect(a.local_addr().unwrap()).unwrap();
     (a, b)
 }
@@ -109,22 +141,24 @@ fn std_udp_pair() -> (std::net::UdpSocket, std::net::UdpSocket) {
 impl Dgram for UnixDatagram {
     type Addr = std::path::PathBuf;
 
-    fn pair() -> ((Self, Self::Addr), (Self, Self::Addr)) {
-        let (a, a_at, b, b_at) = std_unix_pair();
+    fn pair(to: To) -> ((Self, Self::Addr), (Self, Self::Addr)) {
+        let (a, a_at, b, b_at) = std_unix_pair(to);
         (
             (Handle::new(a).unwrap(), a_at),
             (Handle::new(b).unwrap(), b_at),
         )
     }
 
-    fn std_send(len: usize) -> io::Result<usize> {
+    fn std_send(len: usize, to: To) -> io::Result<usize> {
         type StdDgram = std::os::unix::net::UnixDatagram;
+        type StdAddr = std::path::PathBuf;
         std_send!(
-            {
-                let (a, _, b, _) = std_unix_pair();
-                (a, b)
+            |to| {
+                let (a, _, b, b_at) = std_unix_pair(to);
+                (a, b, b_at)
             },
-            len
+            len,
+            to
         )
     }
 
@@ -176,9 +210,12 @@ impl Dgram for UnixDatagram {
     }
 }
 
-/// Two Unix datagram sockets bound in a directory of their own and connected to each other.
+/// Two Unix datagram sockets bound in a directory of their own: the receiver connected to the
+/// sender, and the sender to the receiver for the connected calls.
 #[cfg(unix)]
-fn std_unix_pair() -> (
+fn std_unix_pair(
+    to: To,
+) -> (
     std::os::unix::net::UnixDatagram,
     std::path::PathBuf,
     std::os::unix::net::UnixDatagram,
@@ -188,7 +225,9 @@ fn std_unix_pair() -> (
     let dir = temp_dir();
     let (a_at, b_at) = (dir.join("a"), dir.join("b"));
     let (a, b) = (Std::bind(&a_at).unwrap(), Std::bind(&b_at).unwrap());
-    a.connect(&b_at).unwrap();
+    if matches!(to, To::Connected) {
+        a.connect(&b_at).unwrap();
+    }
     b.connect(&a_at).unwrap();
     (a, a_at, b, b_at)
 }
@@ -198,7 +237,7 @@ fn largest_datagram<D: Dgram>() -> usize {
     let (mut fits, mut fails) = (0, 2 << 20);
     while fails - fits > 1 {
         let mid = fits + (fails - fits) / 2;
-        if D::std_send(mid).is_ok() {
+        if D::std_send(mid, To::Connected).is_ok() {
             fits = mid;
         } else {
             fails = mid;
@@ -223,15 +262,15 @@ pub(crate) fn datagram_sizes<D: Dgram>(sizes: &[usize]) -> Vec<usize> {
 /// the buffer. What std refuses must fail with std's error; what it sends must come whole, or
 /// cut to the buffer as std cuts it.
 macro_rules! datagram_rows {
-    ($($name:ident: $send:ident, $recv:ident, $shape:expr;)*) => {$(
+    ($($name:ident: $to:ident, $send:ident, $recv:ident, $shape:expr;)*) => {$(
         #[test]
         fn $name() {
             let udp = datagram_sizes::<UdpSocket>(sizes());
-            datagram_row::<UdpSocket, _, _>(concat!(stringify!($name), " udp"), &udp, $send, $recv, $shape);
+            datagram_row::<UdpSocket, _, _>(concat!(stringify!($name), " udp"), &udp, To::$to, $send, $recv, $shape);
             #[cfg(unix)]
             {
                 let unix = datagram_sizes::<UnixDatagram>(sizes());
-                datagram_row::<UnixDatagram, _, _>(concat!(stringify!($name), " unix"), &unix, $send, $recv, $shape);
+                datagram_row::<UnixDatagram, _, _>(concat!(stringify!($name), " unix"), &unix, To::$to, $send, $recv, $shape);
             }
         }
     )*};
@@ -240,8 +279,14 @@ macro_rules! datagram_rows {
 /// A datagram's length and the buffer it is received into, from a size and the largest datagram.
 pub(crate) type Shape = fn(usize, usize) -> (usize, usize);
 
-pub(crate) fn datagram_row<D, S, R>(row: &str, sizes: &[usize], send: S, recv: R, shape: Shape)
-where
+pub(crate) fn datagram_row<D, S, R>(
+    row: &str,
+    sizes: &[usize],
+    to: To,
+    send: S,
+    recv: R,
+    shape: Shape,
+) where
     D: Dgram,
     S: AsyncFn(&D, &D::Addr, &'static [u8]) -> io::Result<usize>,
     R: AsyncFn(&D, Vec<u8>) -> Received<D::Addr>,
@@ -250,9 +295,9 @@ where
     for &size in sizes {
         let (n, room) = shape(size, max);
         let what = format!("{row} at {size}: {n} bytes into {room}");
-        let expected = D::std_send(n);
+        let expected = D::std_send(n, to);
         within(&what, async {
-            let ((a, a_at), (b, b_at)) = D::pair();
+            let ((a, a_at), (b, b_at)) = D::pair(to);
             let data = pattern(n);
             let sent = send(&a, &b_at, data).await;
             match (&expected, sent) {
@@ -298,17 +343,17 @@ pub(crate) fn largest_into(n: usize, max: usize) -> (usize, usize) {
 }
 
 datagram_rows! {
-    datagrams_connected: send_connected, recv_connected, whole;
-    datagrams_connected_cut: send_connected, recv_connected, short;
-    datagrams_addressed: send_addressed, recv_addressed, whole;
-    datagrams_owned: send_owned, recv_owned, whole;
-    datagrams_owned_cut: send_owned, recv_owned, short;
-    datagrams_owned_addressed: send_owned_addressed, recv_owned_addressed, whole;
-    buffers_connected: send_connected, recv_connected, one_into;
-    buffers_connected_largest: send_connected, recv_connected, largest_into;
-    buffers_owned: send_owned, recv_owned, one_into;
-    buffers_owned_largest: send_owned, recv_owned, largest_into;
-    datagrams_after_readable: send_connected, recv_after_readable, whole;
+    datagrams_connected: Connected, send_connected, recv_connected, whole;
+    datagrams_connected_cut: Connected, send_connected, recv_connected, short;
+    datagrams_addressed: Addressed, send_addressed, recv_addressed, whole;
+    datagrams_owned: Connected, send_owned, recv_owned, whole;
+    datagrams_owned_cut: Connected, send_owned, recv_owned, short;
+    datagrams_owned_addressed: Addressed, send_owned_addressed, recv_owned_addressed, whole;
+    buffers_connected: Connected, send_connected, recv_connected, one_into;
+    buffers_connected_largest: Connected, send_connected, recv_connected, largest_into;
+    buffers_owned: Connected, send_owned, recv_owned, one_into;
+    buffers_owned_largest: Connected, send_owned, recv_owned, largest_into;
+    datagrams_after_readable: Connected, send_connected, recv_after_readable, whole;
 }
 
 pub(crate) async fn send_connected<D: Dgram>(d: &D, _: &D::Addr, data: &[u8]) -> io::Result<usize> {
