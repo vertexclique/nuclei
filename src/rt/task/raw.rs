@@ -272,9 +272,11 @@ where
         // SAFETY: the caller owns the live future.
         unsafe {
             let cell = Self::cell(ptr);
-            abort_on_panic(|| {
-                cell.core
-                    .with_mut(|core| ManuallyDrop::drop(&mut (*core).future))
+            cell.schedule.drop_future(|| {
+                abort_on_panic(|| {
+                    cell.core
+                        .with_mut(|core| ManuallyDrop::drop(&mut (*core).future))
+                })
             });
             cell.schedule.terminated(cell.header.id);
         }

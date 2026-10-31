@@ -29,7 +29,7 @@ use kovan_channel::flavors::RecvDeadline;
 
 use super::blocking::{Pool, PoolConfig};
 use super::context;
-use super::sched::{AtHome, Counted, Sched};
+use super::sched::Sched;
 use super::shard::{Limits, Shard, Shared};
 use super::task::{self, ScheduleInfo, Task};
 use super::workers::{Start, Workers};
@@ -779,12 +779,8 @@ where
 {
     let hooks = inner.task_hooks.clone();
     let (runnable, task) = task::spawn(
-        Counted::new(future, shard),
-        Sched {
-            shard: Arc::clone(shard),
-            home: None,
-            hooks: hooks.clone(),
-        },
+        future,
+        Sched::counted(Arc::clone(shard), None, hooks.clone()),
     );
     spawned(hooks.as_deref(), &task);
     // As its schedule would, without the turn through the task's table.
@@ -830,30 +826,12 @@ where
         // SAFETY: the task's schedule sends a woken bound task only to its
         // home's thread (leaked rather than dropped if that thread is gone);
         // the future is 'static.
-        unsafe {
-            task::spawn_unchecked(
-                Counted::new(AtHome::new(future, &home), &shared),
-                Sched {
-                    shard: shared,
-                    home: Some(home),
-                    hooks: hooks.clone(),
-                },
-            )
-        }
+        unsafe { task::spawn_unchecked(future, Sched::counted(shared, Some(home), hooks.clone())) }
     } else {
         // SAFETY: the task's schedule sends a woken task of this shard back
         // to it; the future is 'static, and `Send` (a caller with `bound`
         // false is `spawn`'s, whose future is).
-        unsafe {
-            task::spawn_unchecked(
-                Counted::new(future, &shared),
-                Sched {
-                    shard: shared,
-                    home: None,
-                    hooks: hooks.clone(),
-                },
-            )
-        }
+        unsafe { task::spawn_unchecked(future, Sched::counted(shared, None, hooks.clone())) }
     };
     spawned(hooks.as_deref(), &task);
     runnable.schedule();
@@ -982,15 +960,8 @@ where
     // SAFETY: as in `spawn_here`: the schedule sends a woken task back to
     // its shard; the future is `Send` and 'static.
     let (runnable, task) = unsafe {
-        task::spawn_unchecked(
-            future,
-            Sched {
-                shard: shared,
-                home: None,
-                // The runtime's own service task: not a task of its user's.
-                hooks: None,
-            },
-        )
+        // The runtime's own service task: not a task of its user's.
+        task::spawn_unchecked(future, Sched::uncounted(shared))
     };
     runnable.schedule();
     task.detach();

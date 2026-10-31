@@ -92,6 +92,12 @@ impl ScheduleInfo {
 pub(crate) unsafe trait Schedule {
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo);
 
+    /// Drops the task's future (`drop` does), where and as the schedule
+    /// wants it dropped.
+    fn drop_future(&self, drop: impl FnOnce()) {
+        drop();
+    }
+
     /// Just before each poll of the task's future.
     fn before_poll(&self, _id: Id) {}
 

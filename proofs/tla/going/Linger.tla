@@ -4,7 +4,7 @@
 (* (src/rt/linger.rs: `hand`, `Inner::linger`, `Guarded`, `Lingering`,      *)
 (* `Inner::lingers_done`; src/rt/runtime.rs: `Runtime::drop`,               *)
 (* `finish_lingering`, `spawn_linger`; src/rt/runtime/enter.rs:             *)
-(* `shutdown_background`; src/rt/sched.rs: `Counted`'s drop;                *)
+(* `shutdown_background`; src/rt/sched.rs: `Sched::drop_future`;          *)
 (* src/rt/shard.rs: `Shared::settled`, `write_ended`, `drop_stopped`,       *)
 (* `release_inbox`;                                                         *)
 (* src/fs/call.rs: `WriteCall`, `write_on_pool`; src/fs/ring.rs:            *)
@@ -112,7 +112,7 @@ define                                                                       \* 
 end define;                                                                  \* end of the names
 
 \* The held task drops where its wake was drained: its handle hands its linger.
-macro DropHeld() begin                                                       \* `Counted`'s drop, the handle's drop
+macro DropHeld() begin                                                       \* `Sched::drop_future`, the handle's drop
     dropped := TRUE;                                                         \* the handle goes
     taskHeld := FALSE;                                                       \* the task is gone
     inbox := "empty";                                                        \* its wake was taken out
