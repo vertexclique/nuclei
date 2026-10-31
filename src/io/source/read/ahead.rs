@@ -54,6 +54,7 @@ impl Piece {
         }
     }
 
+    #[inline]
     fn release(self, after: &mut After) {
         if let Piece::Pool(buf) = self {
             after.drop_buf(buf);
@@ -70,17 +71,20 @@ pub(super) struct Ahead {
 }
 
 impl Ahead {
+    #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.pieces.is_empty()
     }
 
     /// The bytes held.
     #[cfg(test)]
+    #[inline]
     pub(super) fn len(&self) -> usize {
         self.pieces.iter().map(|p| p.filled().len()).sum()
     }
 
     /// Adds bytes that came after those held.
+    #[inline]
     pub(super) fn push(&mut self, piece: Piece, after: &mut After) {
         if piece.filled().is_empty() {
             piece.release(after);
@@ -90,6 +94,7 @@ impl Ahead {
     }
 
     /// Takes `n` bytes off the front, letting go of the pieces emptied.
+    #[inline]
     pub(super) fn consume(&mut self, mut n: usize, after: &mut After) {
         while n > 0 {
             let Some(front) = self.pieces.front_mut() else {
@@ -108,6 +113,7 @@ impl Ahead {
 
     /// Copies bytes into `out`, in order, consumed unless `peek`; returns
     /// how many.
+    #[inline]
     pub(super) fn copy_into(&mut self, out: &mut [u8], peek: bool, after: &mut After) -> usize {
         let mut n = 0;
         for piece in &self.pieces {
@@ -160,6 +166,7 @@ impl Ahead {
     }
 
     /// Lets go of every byte held.
+    #[inline]
     pub(super) fn release(&mut self, after: &mut After) {
         for piece in self.pieces.drain(..) {
             piece.release(after);
