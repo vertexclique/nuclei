@@ -125,6 +125,7 @@ pub(crate) fn zc_outcome(res: i32) -> Outcome {
 
 /// The kernel's answer `res` (a count, or a negated errno) to an operation
 /// that takes bytes or gives a descriptor.
+#[inline]
 fn answer(res: i32) -> Answer<usize> {
     match res {
         r if r == -libc::ECANCELED => Answer::Undone { not_ready: false },
@@ -153,8 +154,34 @@ impl RingMem {
     }
 
     /// The completion of an operation of a source of `kind`, whose kernel
-    /// answer is `res`.
+    /// answer is `res`. The streams' hot ends are inline here; the rest is
+    /// [`complete_rest`](Self::complete_rest).
+    #[inline]
     pub(crate) fn complete(self, res: i32, kind: Kind) -> Outcome {
+        match self {
+            RingMem::Recv(mut buf) => {
+                let answer = answer(res);
+                if let Answer::Done(Ok(n)) = answer {
+                    buf.set_filled(n);
+                }
+                Outcome::Recv(buf, answer)
+            }
+            RingMem::Send(buf) => Outcome::Send(buf, answer(res)),
+            RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
+            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => Outcome::RecvMultiEnd {
+                // A group with no buffer left gives the receive back undone.
+                answer: match res {
+                    r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
+                    r => answer(r),
+                },
+                dry: res == -libc::ENOBUFS,
+            },
+            rest => rest.complete_rest(res, kind),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_rest(self, res: i32, kind: Kind) -> Outcome {
         match self {
             RingMem::Ready => Outcome::Ready(match answer(res) {
                 Answer::Done(result) => Answer::Done(result.map(drop)),
@@ -172,13 +199,6 @@ impl RingMem {
                 }
                 Answer::Undone { not_ready } => Answer::Undone { not_ready },
             }),
-            RingMem::Recv(mut buf) => {
-                let answer = answer(res);
-                if let Answer::Done(Ok(n)) = answer {
-                    buf.set_filled(n);
-                }
-                Outcome::Recv(buf, answer)
-            }
             RingMem::AcceptMulti { .. } => Outcome::AcceptMultiEnd(match res {
                 // Its last connection came as an arrival.
                 r if r >= 0 => Answer::Done(Ok(())),
@@ -191,14 +211,6 @@ impl RingMem {
                     Answer::Undone { not_ready } => Answer::Undone { not_ready },
                 },
             }),
-            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => Outcome::RecvMultiEnd {
-                // A group with no buffer left gives the receive back undone.
-                answer: match res {
-                    r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
-                    r => answer(r),
-                },
-                dry: res == -libc::ENOBUFS,
-            },
             RingMem::RecvLent(mut buf) => {
                 let answer = answer(res);
                 if let Answer::Done(Ok(n)) = answer {
@@ -243,13 +255,16 @@ impl RingMem {
                     _ => Answer::Done(Ok(())),
                 },
             ),
-            RingMem::Send(buf) => Outcome::Send(buf, answer(res)),
-            RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
             RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, answer(res)),
             RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, answer(res)),
             RingMem::SendPinned(_) | RingMem::SendZc { .. } | RingMem::ZcHeld(_) => {
                 Outcome::SendPinned(answer(res))
             }
+            RingMem::Recv(_)
+            | RingMem::Send(_)
+            | RingMem::SendLent(_)
+            | RingMem::RecvMulti { .. }
+            | RingMem::RecvFromMulti { .. } => self.complete(res, kind),
         }
     }
 }
@@ -434,6 +449,7 @@ impl RingIssuer<'_> {
     /// Submits `want` for a side of a source of `kind` in `epoch`, and
     /// returns the operation's user data. A want no entry can carry (an
     /// address no socket can have) completes at once with the reason.
+    #[inline]
     pub(crate) fn issue(&self, want: Want, kind: Kind, epoch: u32, _after: &mut After) -> u64 {
         let read = want.of_read();
         match entry(want, kind, self.file as RawFd, self.ring) {
@@ -751,33 +767,31 @@ impl Source {
     /// On the ring's thread: an arrival of the read side's multishot
     /// receive or accept, submitted in `epoch`. The side takes it at once if
     /// free, else its holder does as it lets go. The wakes and drops come
-    /// back to be run once the caller no longer borrows the source.
+    /// into `after`, for the caller to run once it no longer borrows the source.
     pub(crate) fn ring_arrival(
         self: &Arc<Self>,
         arrival: Arrival,
         epoch: u32,
         shard: Option<&crate::rt::shard::Shard>,
-    ) -> After {
-        let mut after = After::default();
+        after: &mut After,
+    ) {
         let hooks = self.hooks_in(shard);
         // The side free: the arrival goes in now, with no trip through the
         // queue (whose segments would be allocated as it grows). Only this
         // thread pushes to the queue, so what waits there came before this
         // arrival and goes in first: the order holds.
         if let Some(mut held) = self.read.try_hold_for(&hooks) {
-            hooks.taken(held.get(), &mut after);
+            hooks.taken(held.get(), after);
             while let Ok((queued, at)) = self.read_arrivals.try_pop() {
-                held.get().take_arrival(queued, at, &mut after);
+                held.get().take_arrival(queued, at, after);
             }
-            held.get().take_arrival(arrival, epoch, &mut after);
-            held.release(&mut after, &hooks);
+            held.get().take_arrival(arrival, epoch, after);
+            held.release(after, &hooks);
         } else {
             self.read_arrivals.push((arrival, epoch));
-            self.read
-                .defer(super::read_work::ARRIVALS, &mut after, &hooks);
+            self.read.defer(super::read_work::ARRIVALS, after, &hooks);
         }
-        self.kick(&mut after);
-        after
+        self.kick(after);
     }
 
     /// Cancels the side's operation of `user_data`, on its ring's thread;

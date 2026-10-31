@@ -275,7 +275,7 @@ analysis.
 
 `park` (`tla/park/Park.tla`) checks how a shard goes to sleep without losing a wake
 (`src/rt/handshake.rs`, `src/rt/shard.rs`). A shard with nothing to run (after a short spin that
-only looks at its inbox) publishes that it parks, looks at its inbox once more, and only then
+only looks at its inbox, first look before its clock starts: `Spin::run`, `src/rt/shard/spin.rs`) publishes that it parks, looks at its inbox once more, and only then
 sleeps until its poller is notified. A
 thread that gives it work pushes the work, then looks whether the shard parks; if it does, it
 swaps the flag back and notifies, so only the first of a burst of wakes notifies. Every access
@@ -831,7 +831,10 @@ the ring's thread submits what the side wants. Submitting raises the side's flag
 is out) and the source's count of operations in the kernel. When the kernel completes one, the
 ring's thread lowers the count, leaves the completion in the side's one-slot mailbox and
 defers it to the side: applied at once if the side is free, else by its holder as it lets go,
-which then asks for the next operation. A retire deregisters the source, cancels what is out
+which then asks for the next operation. (`Source::op_done` in `src/io/source/ops.rs` tries the
+write side's hold first and applies a completion to a free side with no trip through the
+mailbox, which is the model's put and apply with nothing between them; a held side takes the
+mailbox and the deferred bit, as modelled.) A retire deregisters the source, cancels what is out
 and waits until the count is zero: it puts its waker in, raises a flag, and only then looks at
 the count, while the ring's thread lowers the count and then looks at the flag. 11
 configurations: 3 that must pass (`OneOut` and `NoOverwrite`, one operation out and one

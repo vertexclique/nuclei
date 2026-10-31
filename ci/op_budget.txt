@@ -7,9 +7,9 @@ timeout io_uring 108 1
 timeout epoll 108 1
 tcp io_uring 7400 1
 tcp epoll 6541 1
-unix_dgram io_uring 10835 1
+unix_dgram io_uring 10483 1
 unix_dgram epoll 8532 1
-udp io_uring 10556 1
+udp io_uring 10168 1
 udp epoll 7995 1
 unix_stream io_uring 7400 1
 unix_stream epoll 8277 1
@@ -23,12 +23,12 @@ tcp_2w io_uring 7399 1
 tcp_2w epoll 6541 1
 bulk io_uring 72891 1
 bulk epoll 2233 1
-file_read io_uring 3150 1
+file_read io_uring 2953 1
 file_read epoll 4744 9
 spawn_join io_uring 1438 1
 spawn_join epoll 1435 1
 spawn_blocking io_uring 3701 6
-spawn_blocking epoll 2709 5
+spawn_blocking epoll 3432 5
 sleep io_uring 1185 1
 sleep epoll 1186 1
 oneshot io_uring 1651 1

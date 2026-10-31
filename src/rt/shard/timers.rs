@@ -101,7 +101,15 @@ impl Shard {
         crate::rt::context::with_in_task(false, || self.fire_timers());
     }
 
+    #[inline]
     pub(super) fn fire_timers(&self) {
+        if self.shared.timer_ops.is_empty() && self.wheel.borrow().armed() == 0 {
+            return;
+        }
+        self.fire_armed_timers();
+    }
+
+    fn fire_armed_timers(&self) {
         if !self.shared.timer_ops.is_empty() {
             let mut wheel = self.wheel.borrow_mut();
             while let Ok(op) = self.shared.timer_ops.try_pop() {
