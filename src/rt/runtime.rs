@@ -364,9 +364,6 @@ impl Builder {
             .max(workers);
         let shutdown_on_panic = self.unhandled_panic == UnhandledPanic::ShutdownRuntime;
         let mut task_hooks = self.task_hooks;
-        if task_hooks.before_poll.is_some() || task_hooks.after_poll.is_some() {
-            super::tuning::ANY_POLL_HOOKS.store(true, std::sync::atomic::Ordering::Release);
-        }
         let inner = Arc::new_cyclic(|this| {
             if shutdown_on_panic {
                 task_hooks.shutdown = Some(this.clone());

@@ -144,11 +144,6 @@ impl TaskHooks {
 pub(crate) static ANY_TASK_HOOKS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Whether any runtime of the process has a hook around each poll: while
-/// none does, a poll calls none.
-pub(crate) static ANY_POLL_HOOKS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 /// What a runtime does when one of its tasks panics
 /// ([`Builder::unhandled_panic`](crate::runtime::Builder::unhandled_panic)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

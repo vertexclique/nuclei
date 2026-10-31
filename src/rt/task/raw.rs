@@ -370,20 +370,13 @@ where
             let here = crate::rt::context::local();
             let previous = here.task.replace(Some(header.id));
             let budget = here.budget.replace(crate::coop::Left::FULL);
-            // Read once: while no runtime of the process has task hooks, the
-            // poll costs one predictable branch more, not two calls.
-            let hooked =
-                crate::rt::tuning::ANY_POLL_HOOKS.load(core::sync::atomic::Ordering::Relaxed);
-            if hooked {
-                cell.schedule.before_poll(header.id);
-            }
+            // Each schedule's hooks are a check of its own, inline.
+            cell.schedule.before_poll(header.id);
             let poll = catch_unwind(AssertUnwindSafe(|| {
                 cell.core
                     .with_mut(|core| F::poll(Pin::new_unchecked(&mut *(*core).future), cx))
             }));
-            if hooked {
-                cell.schedule.after_poll(header.id);
-            }
+            cell.schedule.after_poll(header.id);
             here.budget.set(budget);
             here.task.set(previous);
             // The poll may have woken the task, cloned its waker, or a handle
