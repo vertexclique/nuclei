@@ -175,12 +175,15 @@ async fn file_round(file: &mut nuclei::fs::File, buf: &mut [u8; 4096]) {
 
 /// File writes, flushes, seeks and reads through a handle: on the ring, a
 /// call's slot is a spare once the ring let go of it; on the pool, a job is
-/// a task of the cache in the pool's linked queue.
+/// a task of the cache in the pool's linked queue. On the pool a round's
+/// write and read are jobs of one task class, so a round can find two of that
+/// class's blocks still on their way back from the pool thread: the burst runs
+/// three rounds at once, which leaves the third block such a round takes.
 #[test]
 fn file_reads_and_writes_allocate_nothing() {
     let dir = std::env::temp_dir();
     let paths =
-        ["a", "b"].map(|n| dir.join(format!("nuclei-zero-alloc-{}-{n}", std::process::id())));
+        ["a", "b", "c"].map(|n| dir.join(format!("nuclei-zero-alloc-{}-{n}", std::process::id())));
     let open = async |path| {
         nuclei::fs::OpenOptions::new()
             .read(true)
@@ -191,19 +194,21 @@ fn file_reads_and_writes_allocate_nothing() {
             .await
             .unwrap()
     };
-    let (mut file, other) = burst(async {
+    let (mut file, others) = burst(async {
         let mut file = open(&paths[0]).await;
         let mut other = open(&paths[1]).await;
-        let (mut a, mut b) = ([0u8; 4096], [0u8; 4096]);
+        let mut third = open(&paths[2]).await;
+        let (mut a, mut b, mut c) = ([0u8; 4096], [0u8; 4096], [0u8; 4096]);
         nuclei::join!(
             file_round(&mut file, &mut a),
-            file_round(&mut other, &mut b)
+            file_round(&mut other, &mut b),
+            file_round(&mut third, &mut c)
         );
-        (file, other)
+        (file, (other, third))
     });
     let mut buf = [0u8; 4096];
     let made = steady(async || file_round(&mut file, &mut buf).await);
-    drop(other);
+    drop(others);
     for path in &paths {
         let _ = std::fs::remove_file(path);
     }
