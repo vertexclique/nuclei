@@ -31,6 +31,10 @@
   128 entries or fewer and the default 256-buffer group had a cap of 1: the multishot receive armed
   for an HTTP client's reply held it, and the request's send waited for the receive to end.
 
+- **A file cut by `set_len` no longer hands out bytes read ahead past its new end.** A cut, a range
+  call (`allocate`) and a copy into the file move its generation on, so a cursor read made after them
+  reads the file as it is.
+
 ### Changed
 
 - **Sizes are validated where they take effect**, and a value outside what the runtime can work
@@ -55,6 +59,34 @@
 
 ### Added
 
+- **Owned calls take any buffer type.** `read_owned`, `write_owned`, `write_zero_copy`, the datagram
+  owned calls and the file owned calls take any `IoBuf` (writes) or `IoBufMut` (reads) and give the
+  same type back; a caller passing a `Vec<u8>` gets a `Vec<u8>` back as before (the
+  runtime holds the buffer in a vector's size, and boxes any other type once). `Released` is
+  `Released<B = Vec<u8>>`. A caller's own type implements the two unsafe traits.
+- **`AlignedBuf`**, a buffer of a fixed capacity at an address of a chosen alignment, made by a safe
+  constructor: the buffer for a file opened for direct IO. Its memory is the caller's, not charged to
+  the IO buffer cap.
+- **Owned vectored IO**: `write_vectored_owned` writes every buffer of an `IoVecBuf` (`Vec<B>`,
+  `[B; N]`) in order as one write, with no other write of the handle between them, and
+  `read_vectored_owned` reads into the first buffer of an `IoVecBufMut` with room, on TCP and Unix
+  streams, pipes and files. Each buffer goes to the kernel in calls of its own.
+- **Positional file IO on a shared handle**: `read_at`, `write_at`, `read_exact_at`, `write_all_at`,
+  `read_at_owned`, `write_at_owned` and `read_many_at` (many reads in one call, at most 64 out at
+  once, together on the shard's ring), ordered after the writes accepted at the cursor before them.
+- **More file calls**: `allocate` (`Allocate::{Extend, KeepSize, PunchHole, ZeroRange}`, on the ring
+  as `IORING_OP_FALLOCATE`; a mode the system has not answers `Unsupported`), `sync_range`
+  (`IORING_OP_SYNC_FILE_RANGE` on Linux, a data sync elsewhere), `fs::sync_dir` with the
+  rename-then-sync recipe, `copy_range_to` (`copy_file_range` in bounded chunks, read and write
+  where the kernel cannot), and advisory `lock`, `try_lock` and `unlock` (the blocking lock on the
+  pool, never left held by a dropped future). `sync_all` and `sync_data` are operations of the ring,
+  and a failed sync makes every later one of the handle fail. A file opened for direct IO is read and
+  written with exactly the caller's lengths and offsets.
+- **The names shadow std's through `Deref`**: `lock`, `try_lock`, `unlock`, `read_at` and `write_at`
+  on `Handle<File>` are the async calls; std's blocking ones stay reachable as `(*file).lock()`.
+- **TLA+ models** of a file's positional calls, syncs, direct IO and descriptor leases
+  (`proofs/tla/lent/LentFile.tla`), of a file lock's cancellation (`proofs/tla/flock`) and of many
+  reads in one call (`proofs/tla/many`), each with mutations that break their rules.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.
