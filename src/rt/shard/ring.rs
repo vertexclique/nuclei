@@ -543,6 +543,7 @@ impl ShardRing {
         Ok((handled, woken?))
     }
 
+    #[inline(never)]
     fn complete(&self, shard: Option<&Shard>, cqe: IoUringCqe) {
         if cqe.user_data & FILE_TAG != 0 {
             if cqe.user_data & EXIT_TAG != 0 {
