@@ -1,9 +1,11 @@
 //! A fixed amount of work on one runtime, for counting instructions and cycles:
 //! `perf stat -e instructions:u,cycles:u target/release/examples/vs_tokio_count
-//! <nuclei|tokio> <mode>`. Prints the iteration count so the caller divides.
-//! Shapes match `vs_tokio`: one worker, unpinned, no handoff on nuclei; a
-//! current-thread runtime on tokio. `tcp_2w` uses two workers on nuclei and a
-//! two-worker multi-thread runtime on tokio.
+//! <nuclei|tokio|monoio|monoio-legacy> <mode>`. Prints the iteration count so
+//! the caller divides. Shapes match `vs_tokio`: one worker, unpinned, no
+//! handoff on nuclei; a current-thread runtime on tokio; one thread on monoio,
+//! on its io_uring driver (`monoio`) or its epoll driver (`monoio-legacy`),
+//! Linux only. `tcp_2w` uses two workers on nuclei, a two-worker multi-thread
+//! runtime on tokio, and a server thread plus a client thread on monoio.
 
 use std::time::Duration;
 
@@ -760,8 +762,431 @@ fn tokio_run(row: &str) -> u64 {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod monoio_side {
+    use std::time::Duration;
+
+    use monoio::{
+        BufResult, Driver, Runtime,
+        io::{
+            AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, IntoPollIo,
+            Splitable,
+        },
+        net::{
+            ListenerOpts, TcpListener, TcpStream, UnixDatagram, UnixListener, UnixStream,
+            udp::UdpSocket,
+        },
+        time::TimeDriver,
+    };
+
+    use super::*;
+
+    type Rt<D> = Runtime<TimeDriver<D>>;
+
+    macro_rules! monoio_runtime {
+        ($name:ident, $driver:ty) => {
+            pub fn $name(blocking: bool) -> Rt<$driver> {
+                let mut builder = monoio::RuntimeBuilder::<$driver>::new().enable_timer();
+                if blocking {
+                    builder = builder
+                        .attach_thread_pool(Box::new(monoio::blocking::DefaultThreadPool::new(1)));
+                }
+                builder.build().expect("the runtime starts")
+            }
+        };
+    }
+    monoio_runtime!(uring_runtime, monoio::IoUringDriver);
+    monoio_runtime!(legacy_runtime, monoio::LegacyDriver);
+
+    // monoio's own bind leaves the socket blocking, which stalls its epoll driver
+    fn bind_dgram(path: &std::path::Path) -> UnixDatagram {
+        let socket = std::os::unix::net::UnixDatagram::bind(path).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        UnixDatagram::from_std(socket).unwrap()
+    }
+
+    async fn echo<S>(mut conn: S)
+    where
+        S: AsyncReadRent + AsyncWriteRent,
+    {
+        let mut buf = Vec::with_capacity(4096);
+        while let (Ok(1..), back) = conn.read(buf).await {
+            buf = back;
+            let (sent, back) = conn.write_all(buf).await;
+            if sent.is_err() {
+                return;
+            }
+            buf = back;
+            buf.clear();
+        }
+    }
+
+    async fn rounds<S>(conn: &mut S, rounds: u64)
+    where
+        S: AsyncReadRent + AsyncWriteRent,
+    {
+        let mut request = vec![7u8; 64];
+        let mut reply = Vec::with_capacity(64);
+        for _ in 0..rounds {
+            let (sent, back) = conn.write_all(request).await;
+            sent.unwrap();
+            request = back;
+            let (got, back) = conn.read_exact(reply).await;
+            got.unwrap();
+            reply = back;
+            reply.clear();
+        }
+    }
+
+    fn listen_echo(accepts: u64) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        monoio::spawn(async move {
+            for _ in 0..accepts {
+                let (conn, _) = listener.accept().await.unwrap();
+                monoio::spawn(echo(conn));
+            }
+        });
+        addr
+    }
+
+    async fn split_client(addr: std::net::SocketAddr) {
+        let (mut read, mut write) = TcpStream::connect(addr).await.unwrap().into_split();
+        let writer = monoio::spawn(async move {
+            let mut request = vec![7u8; 64];
+            for _ in 0..TCP_ROUNDS {
+                let (sent, back) = write.write_all(request).await;
+                sent.unwrap();
+                request = back;
+            }
+        });
+        let reader = monoio::spawn(async move {
+            let mut reply = Vec::with_capacity(64);
+            for _ in 0..TCP_ROUNDS {
+                let (got, back) = read.read_exact(reply).await;
+                got.unwrap();
+                reply = back;
+                reply.clear();
+            }
+        });
+        writer.await;
+        reader.await;
+    }
+
+    async fn asyncrw_echo(listener: TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (conn, _) = listener.accept().await.unwrap();
+        let mut conn = conn.into_poll_io().unwrap();
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = conn.read(&mut buf).await {
+            conn.write_all(&buf[..n]).await.unwrap();
+        }
+    }
+
+    async fn asyncrw_client(addr: std::net::SocketAddr) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut conn = TcpStream::connect(addr)
+            .await
+            .unwrap()
+            .into_poll_io()
+            .unwrap();
+        let request = [7u8; 64];
+        let mut reply = [0u8; 64];
+        for _ in 0..TCP_ROUNDS {
+            conn.write_all(&request).await.unwrap();
+            conn.read_exact(&mut reply).await.unwrap();
+        }
+    }
+
+    async fn bulk_receiver(listener: TcpListener) -> usize {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::with_capacity(BULK_CHUNK);
+        let mut total = 0;
+        while total < BULK {
+            let (got, back): BufResult<usize, Vec<u8>> = conn.read(buf).await;
+            total += got.unwrap();
+            buf = back;
+            buf.clear();
+        }
+        total
+    }
+
+    pub fn monoio_run<D>(row: &str, runtime: fn(bool) -> Rt<D>) -> u64
+    where
+        D: Driver + 'static,
+    {
+        let mut rt = runtime(row == "spawn_blocking");
+        match row {
+            "block_on" => {
+                for _ in 0..BLOCK_ON {
+                    std::hint::black_box(rt.block_on(async { 1u8 }));
+                }
+                BLOCK_ON
+            }
+            "mpsc" => {
+                // local_sync channels are !Send and single-thread, monoio's own companion crate
+                rt.block_on(async {
+                    let (to_b, mut from_a) = local_sync::mpsc::bounded::channel::<u64>(1);
+                    let (to_a, mut from_b) = local_sync::mpsc::bounded::channel::<u64>(1);
+                    let a = monoio::spawn(async move {
+                        for i in 0..MPSC_ROUNDS {
+                            to_b.send(i).await.unwrap();
+                            from_b.recv().await.unwrap();
+                        }
+                    });
+                    let echo = monoio::spawn(async move {
+                        while let Some(i) = from_a.recv().await {
+                            if to_a.send(i).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    a.await;
+                    echo.await;
+                });
+                MPSC_ROUNDS * 2
+            }
+            "timeout" => {
+                rt.block_on(async {
+                    for _ in 0..TIMEOUTS {
+                        monoio::time::timeout(Duration::from_secs(1), async {})
+                            .await
+                            .unwrap();
+                    }
+                });
+                TIMEOUTS
+            }
+            "tcp" => {
+                rt.block_on(async {
+                    let addr = listen_echo(1);
+                    let mut conn = TcpStream::connect(addr).await.unwrap();
+                    rounds(&mut conn, TCP_ROUNDS).await;
+                });
+                TCP_ROUNDS
+            }
+            "tcp_2w" => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let server = std::thread::spawn(move || {
+                    runtime(false).block_on(async move {
+                        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                        tx.send(listener.local_addr().unwrap()).unwrap();
+                        let (conn, _) = listener.accept().await.unwrap();
+                        echo(conn).await;
+                    });
+                });
+                let addr = rx.recv().unwrap();
+                rt.block_on(async move {
+                    let mut conn = TcpStream::connect(addr).await.unwrap();
+                    rounds(&mut conn, TCP_ROUNDS).await;
+                });
+                // the uring close of the client socket completes when the ring drops
+                drop(rt);
+                server.join().unwrap();
+                TCP_ROUNDS
+            }
+            "unix_dgram" => {
+                let (a_path, b_path) = dgram_paths();
+                let (a_to, b_to) = (a_path.clone(), b_path.clone());
+                rt.block_on(async move {
+                    let a = bind_dgram(&a_path);
+                    let echo = bind_dgram(&b_path);
+                    monoio::spawn(async move {
+                        let mut buf = Vec::with_capacity(4096);
+                        while let (Ok((1.., _)), back) = echo.recv_from(buf).await {
+                            let (sent, back) = echo.send_to(back, &a_to).await;
+                            sent.unwrap();
+                            buf = back;
+                            buf.clear();
+                        }
+                    });
+                    let mut request = vec![7u8; 64];
+                    let mut reply = Vec::with_capacity(64);
+                    for _ in 0..DGRAM_ROUNDS {
+                        let (sent, back) = a.send_to(request, &b_to).await;
+                        sent.unwrap();
+                        request = back;
+                        let (got, back) = a.recv_from(reply).await;
+                        got.unwrap();
+                        reply = back;
+                        reply.clear();
+                    }
+                    let _ = (std::fs::remove_file(&a_path), std::fs::remove_file(&b_path));
+                });
+                DGRAM_ROUNDS
+            }
+            "udp" => {
+                rt.block_on(async {
+                    let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let (a_addr, echo_addr) = (a.local_addr().unwrap(), echo.local_addr().unwrap());
+                    let server = monoio::spawn(async move {
+                        let mut buf = Vec::with_capacity(256);
+                        for _ in 0..UDP_ROUNDS {
+                            let (got, back) = echo.recv_from(buf).await;
+                            got.unwrap();
+                            let (sent, back) = echo.send_to(back, a_addr).await;
+                            sent.unwrap();
+                            buf = back;
+                            buf.clear();
+                        }
+                    });
+                    let mut request = vec![3u8; 64];
+                    let mut reply = Vec::with_capacity(256);
+                    for _ in 0..UDP_ROUNDS {
+                        let (sent, back) = a.send_to(request, echo_addr).await;
+                        sent.unwrap();
+                        request = back;
+                        let (got, back) = a.recv_from(reply).await;
+                        got.unwrap();
+                        reply = back;
+                        reply.clear();
+                    }
+                    server.await;
+                });
+                UDP_ROUNDS
+            }
+            "unix_stream" => {
+                let path = tmp_path("us");
+                let _ = std::fs::remove_file(&path);
+                let at = path.clone();
+                rt.block_on(async move {
+                    let listener =
+                        UnixListener::bind_with_config(&at, &ListenerOpts::new().reuse_port(false))
+                            .unwrap();
+                    monoio::spawn(async move {
+                        let (conn, _) = listener.accept().await.unwrap();
+                        echo(conn).await;
+                    });
+                    let mut conn = UnixStream::connect(&at).await.unwrap();
+                    rounds(&mut conn, UNIX_ROUNDS).await;
+                });
+                let _ = std::fs::remove_file(&path);
+                UNIX_ROUNDS
+            }
+            "tcp_split" => {
+                rt.block_on(async {
+                    let addr = listen_echo(1);
+                    split_client(addr).await;
+                });
+                TCP_ROUNDS
+            }
+            "tcp_asyncrw" => {
+                rt.block_on(async {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    monoio::spawn(asyncrw_echo(listener));
+                    asyncrw_client(addr).await;
+                });
+                TCP_ROUNDS
+            }
+            "tcp_many" => {
+                rt.block_on(async {
+                    let addr = listen_echo(MANY_CONNS);
+                    let tasks: Vec<_> = (0..MANY_CONNS)
+                        .map(|_| {
+                            monoio::spawn(async move {
+                                let mut conn = TcpStream::connect(addr).await.unwrap();
+                                rounds(&mut conn, MANY_ROUNDS).await;
+                            })
+                        })
+                        .collect();
+                    for task in tasks {
+                        task.await;
+                    }
+                });
+                MANY_CONNS * MANY_ROUNDS
+            }
+            "bulk" => {
+                let total = rt.block_on(async {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let receiver = monoio::spawn(bulk_receiver(listener));
+                    let mut conn = TcpStream::connect(addr).await.unwrap();
+                    let mut chunk = vec![1u8; BULK_CHUNK];
+                    for _ in 0..BULK / BULK_CHUNK {
+                        let (sent, back) = conn.write_all(chunk).await;
+                        sent.unwrap();
+                        chunk = back;
+                    }
+                    receiver.await
+                });
+                assert_eq!(total, BULK);
+                (BULK / BULK_CHUNK) as u64
+            }
+            "file_read" => {
+                let path = bench_file();
+                let total = rt.block_on(async move {
+                    let file = monoio::fs::File::open(&path).await.unwrap();
+                    let mut buf = Vec::with_capacity(FILE_CHUNK);
+                    let mut total = 0;
+                    loop {
+                        let (read, back) = file.read_at(buf, total as u64).await;
+                        buf = back;
+                        buf.clear();
+                        match read.unwrap() {
+                            0 => break total,
+                            n => total += n,
+                        }
+                    }
+                });
+                assert_eq!(total, FILE_SIZE);
+                (FILE_SIZE / FILE_CHUNK) as u64
+            }
+            "spawn_join" => {
+                rt.block_on(async {
+                    for i in 0..SPAWNS {
+                        std::hint::black_box(monoio::spawn(async move { i }).await);
+                    }
+                });
+                SPAWNS
+            }
+            "spawn_blocking" => {
+                rt.block_on(async {
+                    for i in 0..BLOCKING {
+                        std::hint::black_box(monoio::spawn_blocking(move || i).await.unwrap());
+                    }
+                });
+                BLOCKING
+            }
+            "sleep" => {
+                rt.block_on(async {
+                    let tasks: Vec<_> = (0..SLEEP_TASKS)
+                        .map(|_| {
+                            monoio::spawn(async {
+                                for _ in 0..SLEEPS_PER_TASK {
+                                    monoio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                            })
+                        })
+                        .collect();
+                    for task in tasks {
+                        task.await;
+                    }
+                });
+                SLEEP_TASKS * SLEEPS_PER_TASK
+            }
+            "oneshot" => {
+                rt.block_on(async {
+                    for i in 0..ONESHOTS {
+                        let (tx, rx) = local_sync::oneshot::channel::<u64>();
+                        monoio::spawn(async move {
+                            let _ = tx.send(i);
+                        });
+                        std::hint::black_box(rx.await.unwrap());
+                    }
+                });
+                ONESHOTS
+            }
+            _ => usage(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+use monoio_side::{legacy_runtime, monoio_run, uring_runtime};
+
 fn usage() -> ! {
-    eprintln!("usage: vs_tokio_count <nuclei|tokio> <{MODES}>");
+    eprintln!("usage: vs_tokio_count <nuclei|tokio|monoio|monoio-legacy> <{MODES}>");
     std::process::exit(2)
 }
 
@@ -773,6 +1198,10 @@ fn main() {
     let iterations = match side.as_str() {
         "nuclei" => nuclei_run(&row),
         "tokio" => tokio_run(&row),
+        #[cfg(target_os = "linux")]
+        "monoio" => monoio_run(&row, uring_runtime),
+        #[cfg(target_os = "linux")]
+        "monoio-legacy" => monoio_run(&row, legacy_runtime),
         _ => usage(),
     };
     println!("{side} {row} iterations={iterations}");
