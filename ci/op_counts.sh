@@ -81,7 +81,7 @@ while read -r row n1 n2; do
       continue
     fi
     read -r min med max < <(printf '%s\n' "${vals[@]}" | sort -n | awk '{ v[NR] = $1 } END { print v[1], v[int((NR + 1) / 2)], v[NR] }')
-    spread=$(awk -v lo="$min" -v hi="$max" -v m="$med" 'BEGIN { printf "%.2f%%", m > 0 ? (hi - lo) * 100 / m : 0 }')
+    spread=$(awk -v lo="$min" -v hi="$max" -v m="$med" 'BEGIN { printf "%.2f%%", (m > 0) ? (hi - lo) * 100 / m : 0 }')
     printf '%-15s %-9s %10s %10s %10s %10s\n' "$row" "$backend" "$med" "$min" "$max" "$spread"
     read -r budget tol < <(budget_of "$row" "$backend") || true
     if [[ -z ${budget:-} ]]; then
