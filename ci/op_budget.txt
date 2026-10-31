@@ -33,3 +33,7 @@ sleep io_uring 1185 1
 sleep epoll 1161 1
 oneshot io_uring 1651 1
 oneshot epoll 1648 1
+local_mpsc io_uring 714 1
+local_mpsc epoll 713 1
+local_oneshot io_uring 1518 1
+local_oneshot epoll 1514 1
