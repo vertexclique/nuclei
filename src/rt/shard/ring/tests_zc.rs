@@ -157,9 +157,11 @@ fn a_zero_copy_write_arrives_whole_and_its_buffer_comes_back_after_the_notificat
         let before = ring.zc_seen().0;
         let (result, released) = shard.block_on(src.write_zero_copy(data));
         assert_eq!(result.unwrap(), len);
+        // A kernel with no more memory it may pin refuses a zero-copy send, and the ring
+        // copies from then on.
         assert!(
-            ring.zc_seen().0 > before,
-            "the write never went out zero-copy"
+            ring.zc_seen().0 > before || !ring.zc_stream(),
+            "a write went out copied though the kernel never refused zero-copy"
         );
         let back = await_released(&shard, released);
         assert_eq!(back.as_ptr(), at, "another buffer came back");
@@ -201,13 +203,21 @@ fn a_zero_copy_write_ends_before_the_peer_reads() {
     let (result, mut released) = shard.block_on(src.write_zero_copy(data.clone()));
     assert_eq!(result.unwrap(), data.len());
     let ring = shard.ring().expect("a ring shard");
-    let (firsts, notifs) = ring.zc_seen();
-    assert!(firsts > 0, "the write never went out zero-copy");
-    if poll_once(&mut released).is_ready() {
-        assert_eq!(firsts, notifs, "the buffer came back before a notification");
-    }
+    assert!(
+        ring.zc_seen().0 > 0 || !ring.zc_stream(),
+        "a write went out copied though the kernel never refused zero-copy"
+    );
+    // The buffer may be back already: the peer's window took the whole write.
+    let early = match poll_once(&mut released) {
+        Poll::Ready(back) => {
+            let (firsts, notifs) = ring.zc_seen();
+            assert_eq!(firsts, notifs, "the buffer came back before a notification");
+            Some(back)
+        }
+        Poll::Pending => None,
+    };
     let read = reader(peer, data.len());
-    let back = await_released(&shard, released);
+    let back = early.unwrap_or_else(|| await_released(&shard, released));
     assert!(back == data);
     assert!(read.join().unwrap() == data);
 }
