@@ -217,3 +217,12 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Coop.nothing_yields_unbudgeted
 #print axioms Nuclei.Coop.example_budget_two
 #print axioms Nuclei.Coop.example_budget_128
+
+-- The precise sleep's rounding: never early, on either wheel; at most a microsecond late; exact
+-- on the microsecond grid; the published time within a microsecond of the deadline.
+#print axioms Nuclei.Precise.never_early
+#print axioms Nuclei.Precise.never_early_on_the_tick
+#print axioms Nuclei.Precise.at_most_a_microsecond_late
+#print axioms Nuclei.Precise.on_the_grid_exactly
+#print axioms Nuclei.Precise.published_within_a_microsecond
+#print axioms Nuclei.Precise.example_rounding

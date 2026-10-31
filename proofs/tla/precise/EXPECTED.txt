@@ -1,0 +1,14 @@
+# configuration                spec                 expected
+G_fine                         MC_Precise           pass
+G_coarse                       MC_Precise           pass
+G_paused                       MC_Precise           pass
+G_live_coarse                  MC_Precise           pass
+G_live_paused                  MC_Precise           pass
+M_no_arm                       MC_Precise           violated:OnTime
+M_stale_arm                    MC_Precise           violated:OnTime
+M_wait_tick_only               MC_Precise           violated:OnTime
+M_fire_tick_only               MC_Precise           violated:Termination
+M_publish_tick_only            MC_Precise           violated:OnTime
+W_kernel_end                   MC_Precise           violated:NoKernelEnd
+W_move                         MC_Precise           violated:NoMove
+W_jump_precise                 MC_Precise           violated:NoJumpToPrecise

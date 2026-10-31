@@ -438,7 +438,39 @@ armed again on the second shard after the first went). A dropped sleep's deadlin
 never come within a run, so a cancel that did not remove its entry shows as a leak, as it would
 be for a far deadline. The waker slot's register-then-look-again handshake guards a waker that
 changed between polls; one task cannot show that, and it is checked by the loom models of the
-sync module's waker cell.
+sync module's waker cell. A precise sleep polled off a shard goes through the same cell and the
+same mailbox (`TimerOp::Insert`, `Remove` and `Cancel` carry which wheel the timer is in, the
+cell's `precise` flag), so the protocol checked here is its protocol too.
+
+## Precise sleeps
+
+`precise` (`tla/precise/Precise.tla`, `lean/Nuclei/Precise.lean`) checks `time::sleep_precise`
+(`src/time/precise.rs`, the shard's timers in `src/rt/shard/timers.rs`, the pollers' own timers in
+`src/rt/park/linux.rs` and `src/rt/park/kqueue.rs`). A shard keeps two wheels, one in milliseconds
+and one in microseconds; a precise sleep is armed in the second. With nothing to run the shard
+waits until the earliest deadline of either wheel. On io_uring the ring's own wait timeout is a
+high-resolution timer with no slack, and on Windows the port's wait arms a high-resolution
+waitable timer for every timed wait, so the wait ends at a precise deadline by itself; epoll's
+timeout counts milliseconds, so there the poller arms a timerfd for the precise deadline, moved
+whenever the earliest one changes, and kqueue adds a one-shot `EVFILT_TIMER` in nanoseconds
+(critical on Apple's systems, so it is not coalesced) to the wait itself. A precise sleep may
+come while the shard waits: another thread wakes it, its task arms the sleep. A paused clock
+publishes the earliest deadline of either wheel before the shard parks, and jumps there. The
+family checks 13 configurations: 5 that must pass (a backend whose wait is precise, one that
+counts ticks, a paused clock, and liveness for the last two), with `NeverEarly` (no sleep ends
+before its deadline) and `OnTime` (a precise sleep ends at its deadline, a sleep of the
+millisecond wheel at its tick), every choice of the deadlines from 1 to 9 and of when the second
+precise sleep comes; 5 mutations (the poller's own timer never armed, armed once and never moved,
+a wait that looks at the millisecond wheel alone, and a paused shard that publishes the
+millisecond wheel alone each break `OnTime`; a shard that never fires its microsecond wheel
+breaks `Termination`), and 3 witnesses (the poller's timer ends a park, it is moved to an earlier
+deadline, a paused clock jumps to a precise deadline). The model has a tick of four units and no
+wake latency, and its "coarse" backend stands for both pollers that arm a timer. The Lean file
+proves the rounding the wheels rest on, for every deadline and clock reading: a deadline armed
+rounded up and a clock read rounded down never fire a timer early, on either wheel; a precise
+timer is due at most a microsecond after its deadline, exactly at it on the microsecond grid; and
+what a paused shard publishes is within a microsecond of the deadline. The microsecond wheel is
+the millisecond one with another unit, so `Wheel.lean` covers its placement and cascade.
 
 ## A paused clock that moves by itself
 
