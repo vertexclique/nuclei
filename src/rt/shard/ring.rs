@@ -370,15 +370,21 @@ impl ShardRing {
         let user_data = match inserted {
             Ok(user_data) => user_data | FILE_TAG,
             // Past 2^30 file calls at once: the call goes to the pool.
-            Err(op) => {
-                drop(op.complete(-libc::ECANCELED));
-                return;
-            }
+            Err(op) => return Self::file_to_pool(op),
         };
         if self.times.get().is_some() {
             self.stamp(user_data);
         }
         self.enter(user_data, sqe, true);
+    }
+
+    /// A file call the ring has no room for, made on the blocking pool
+    /// instead: out of line, as `FileOp::complete` is inlined where the
+    /// ring's completions take it.
+    #[cold]
+    #[inline(never)]
+    fn file_to_pool(op: FileOp) {
+        drop(op.complete(-libc::ECANCELED));
     }
 
     /// A file's call completed: the rest of a write goes on, else its end
