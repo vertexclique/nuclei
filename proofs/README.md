@@ -1681,6 +1681,35 @@ mean the poll has run at least four ticks, and a read that missed the poll just 
 saw it means the poll began after it. The model takes a bound task's home as its creator thread
 and a hand-over to a spare as one step.
 
+## The cooperative budget in channels and locks
+
+`coop` (`tla/coop/Coop.tla`, `lean/Nuclei/Coop.lean`, the loom models in
+`src/sync/loom_tests/coop.rs`) checks the budget the receives, acquires and locks of
+`nuclei::sync` spend (`src/coop.rs`, `Chan::poll_recv` in `src/sync/mpsc/chan.rs`,
+`taken_at_once` and `admitted` in `src/sync/contend.rs`, `FairWait::poll_admitted` in
+`src/sync/fair_semaphore.rs`). Each poll of a task starts with a budget; every receive or acquire
+that completes spends one, and one that finds the budget spent completes nothing, wakes its task
+behind the shard's other tasks and returns `Pending`. A receive looks at the budget before it
+takes a value. An acquire takes first and looks after, so a refused one gives the lock back
+through the release's pass, which hands it to a thread that queued for it in between. The TLA+
+family runs a hot task whose channel always has a value and whose lock is free whenever it asks,
+the other task of its shard, and a thread on another core that takes the lock once, and checks 13
+configurations: 5 that must pass (three receives, three acquires, both kinds in one poll, and
+liveness for the first two), with `NoValueLost`, `Conservation` (the lock's permit is free, held
+or handed over), `BoundedPoll` (a poll completes at most its budget), `OtherWaitsOneBudget` (the
+other task waits for at most one budget of the hot task's operations) and `NoIdleWhileQueued`; 5
+mutations (a receive that takes its value before it looks at the budget breaks `NoValueLost`; an
+operation that spends nothing breaks `BoundedPoll`; a refusal that does not wake its task breaks
+`Termination`; a refused acquire that keeps the lock breaks `Conservation`; a give back that
+serves nobody breaks `NoIdleWhileQueued`), and 3 witnesses (a refusal, the other task running
+between two polls of the hot task, the give back serving the queued thread). The loom models run
+the real `RawSemaphore` and `FairSemaphore` with a refusal handed in at the place the budget's
+answer lands, against a thread that queues for the permit, and count the runs where it had queued
+by the refusal; a calibration that drops the give back must deadlock. The Lean file proves the
+counter: a spend refuses only at zero and takes one unit; a poll completes at most its budget, a
+program within it completes whole, a longer one yields with nothing left; and outside a budgeted
+poll, where the counter starts at `2^64 - 1`, nothing ever yields.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the

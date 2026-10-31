@@ -204,3 +204,16 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Handshake.one_side_sees
 #print axioms Nuclei.Handshake.later_swaps_read_down
 #print axioms Nuclei.Handshake.a_burst_notifies_once
+
+-- The cooperative budget: a spend refuses only when the budget is spent and takes one unit; a
+-- poll completes at most its budget and its program, a program within the budget completes
+-- whole, a longer one yields with nothing left, and outside a budgeted poll nothing yields.
+#print axioms Nuclei.Coop.spend_refuses_only_when_spent
+#print axioms Nuclei.Coop.spend_takes_one
+#print axioms Nuclei.Coop.completes_at_most_the_budget
+#print axioms Nuclei.Coop.completes_at_most_the_program
+#print axioms Nuclei.Coop.a_program_within_the_budget_completes
+#print axioms Nuclei.Coop.a_longer_program_yields_after_the_budget
+#print axioms Nuclei.Coop.nothing_yields_unbudgeted
+#print axioms Nuclei.Coop.example_budget_two
+#print axioms Nuclei.Coop.example_budget_128

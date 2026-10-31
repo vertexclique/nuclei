@@ -1,6 +1,7 @@
 import Nuclei.Barrier
 import Nuclei.Broadcast
 import Nuclei.Cancel
+import Nuclei.Coop
 import Nuclei.FairSemaphore.Model
 import Nuclei.FairSemaphore.Invariant
 import Nuclei.FairSemaphore.Theorems

@@ -78,7 +78,7 @@ use crate::sync::mpsc::{
 /// Runs `model` under loom with at most `preemptions` preemptions per
 /// schedule (`LOOM_MAX_PREEMPTIONS` overrides it) and fails it if the search
 /// was implausibly small.
-fn explore(
+pub(super) fn explore(
     name: &str,
     preemptions: usize,
     min_interleavings: usize,
@@ -142,7 +142,7 @@ impl std::task::Wake for Unpark {
 /// at once, and a thread that polls again and again without ever blocking
 /// would keep the thread that is mid-wake from running, which loom reports as
 /// a model that never ends.
-fn block_on<F: Future>(future: F) -> F::Output {
+pub(super) fn block_on<F: Future>(future: F) -> F::Output {
     let park = std::sync::Arc::new(Unpark(Park::new()));
     let waker = std::task::Waker::from(std::sync::Arc::clone(&park));
     let mut cx = Context::from_waker(&waker);

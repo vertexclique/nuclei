@@ -193,7 +193,19 @@ pub(super) fn taken_at_once<L: Lock + ?Sized>(
     need: usize,
     waker: &Waker,
 ) -> Poll<Result<(), Closed>> {
-    if crate::coop::spend(waker) {
+    admitted(lock, need, crate::coop::spend(waker))
+}
+
+/// What a first attempt that took `need` comes to once the budget answered:
+/// complete when `admit`, else `need` goes back (serving whoever queued for it
+/// meanwhile) and the caller yields.
+#[inline]
+pub(super) fn admitted<L: Lock + ?Sized>(
+    lock: &L,
+    need: usize,
+    admit: bool,
+) -> Poll<Result<(), Closed>> {
+    if admit {
         Poll::Ready(Ok(()))
     } else {
         lock.give_back(need);
