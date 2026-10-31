@@ -943,6 +943,7 @@ impl Shard {
     /// [`Shared::has_remote_work`], a look from any thread, misses the tasks
     /// this shard's last pop left behind its end as it put an inbox's stub
     /// back ([`Inbox::is_drained`]).
+    #[inline]
     fn has_remote_work(&self) -> bool {
         let shared = &self.shared;
         // SAFETY: the shard holds the inbox's taker's role until it goes
