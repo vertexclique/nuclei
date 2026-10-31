@@ -295,6 +295,7 @@ impl WriteState {
     /// buffer: one big enough (see `direct`), or on a ring any while the pool
     /// has no buffer for the write-behind, so a writer never waits on buffers
     /// that receives of other connections hold (proofs/tla/ring/RingStarve.tla).
+    /// A pipe's goes too, while the pool has no buffer for it (`writes_bytes`).
     #[cfg(unix)]
     pub(super) fn writes_itself(&self, io: Io<'_>, len: usize) -> bool {
         #[cfg(ring)]
@@ -320,7 +321,7 @@ impl WriteState {
         let fd = fd?;
         let len: usize = bufs.iter().map(|b| b.len()).sum();
         let waits = matches!(io.via, Via::Fd(_)) && self.blocked;
-        if !kind.streams()
+        if !self.writes_bytes(kind)
             || len == 0
             || !self.writes_itself(io, len)
             || waits
@@ -334,7 +335,12 @@ impl WriteState {
         {
             return None;
         }
-        match sys::ready(sys::send_bufs(fd, bufs)) {
+        let call = if kind.streams() {
+            sys::send_bufs(fd, bufs)
+        } else {
+            sys::write_bufs(fd, bufs)
+        };
+        match sys::ready(call) {
             None => {
                 if matches!(io.via, Via::Fd(_)) {
                     self.blocked = true;
@@ -344,6 +350,15 @@ impl WriteState {
             Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
             Some(result) => Some(result),
         }
+    }
+
+    /// Whether a write of `kind` may go straight from the task's buffer: a
+    /// socket's, and while the pool has no buffer for the side a pipe's or a
+    /// terminal's, as the read side's `reads_bytes` (so no writer waits on
+    /// buffers that receives or reads ahead of others hold).
+    #[cfg(unix)]
+    fn writes_bytes(&self, kind: Kind) -> bool {
+        kind.streams() || (self.starved && kind == Kind::Bytes)
     }
 
     /// A buffer from this thread's pool, or the side starves until one
@@ -524,6 +539,16 @@ impl WriteState {
             if self.starved && self.behind.is_none() && matches!(io.via, Via::Ops(_)) {
                 self.poll_first = true;
                 self.push(io, kind, after);
+            }
+            // On epoll and kqueue a pipe's write the pool has nothing for is
+            // the task's own call now (`writes_bytes`); one the pipe cannot
+            // take waits for its edge.
+            #[cfg(readiness)]
+            if let Via::Fd(fd) = io.via
+                && self.behind.is_none()
+                && let Some(result) = self.write_direct(io, Some(fd), kind, bufs)
+            {
+                return Poll::Ready(result);
             }
             // On a port such a write sends from the write slot's own room
             // instead, a few hundred bytes at a time

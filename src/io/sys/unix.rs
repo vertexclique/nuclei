@@ -89,6 +89,17 @@ pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     retry(|| cvt(unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) }))
 }
 
+/// `writev(2)` of `bufs` in order (one call, the first `IOV_MAX` slices).
+pub(crate) fn write_bufs(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    if let [one] = bufs {
+        return write(fd, one);
+    }
+    let count = bufs.len().min(IOV_MAX) as libc::c_int;
+    // SAFETY: `IoSlice` is `iovec` on unix; the kernel reads at most the
+    // lengths of the first `count` slices.
+    retry(|| cvt(unsafe { libc::writev(fd, bufs.as_ptr().cast(), count) }))
+}
+
 #[cfg(any(
     target_os = "linux",
     target_os = "android",

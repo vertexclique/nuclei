@@ -11,8 +11,8 @@
 //! kqueue no receive waits in the kernel, and every request is answered the same way. On a
 //! completion port a read the pool has no buffer for waits in a zero-byte receive, which holds
 //! none, and a reader or a writer it has no buffer for uses its own memory
-//! (proofs/tla/port/PortStarve.tla). The same holds for datagram sockets nobody sends to, on every
-//! backend.
+//! (proofs/tla/port/PortStarve.tla). The same holds for datagram sockets nobody sends to and for
+//! pipes nobody writes to, on every backend.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdStream};
@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use nuclei::config::{IoUringConfiguration, NucleiConfig};
+use nuclei::io::{AsyncReadExt, AsyncWriteExt};
 use nuclei::net::{TcpListener, TcpStream, UdpSocket};
 use nuclei::runtime::Builder;
 
@@ -41,8 +42,8 @@ const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The first byte of a request whose task peeks at it and then never reads it.
 const HOLD: u8 = 1;
-/// The cap of the buffers such tasks (and idle datagram sockets) hold, a few of each read's size,
-/// and more of them.
+/// The cap of the buffers such tasks (and idle datagram sockets and pipes) hold, a few of each
+/// read's size, and more of them.
 const HELD_CAP: usize = 64 << 10;
 const HOLDERS: usize = HELD_CAP / READ + 4;
 
@@ -249,4 +250,75 @@ fn idle_datagram_sockets_holding_the_cap_keep_no_datagram_from_its_reply() {
             Err(err) => panic!("reply {i} of {ACTIVE} not within {DEADLINE:?}: {err}"),
         }
     }
+}
+
+/// A pipe's end as a file nuclei reads or writes as the byte stream it is.
+#[cfg(unix)]
+fn pipe_file(end: impl Into<std::os::fd::OwnedFd>) -> nuclei::fs::File {
+    nuclei::fs::File::new(std::fs::File::from(end.into())).unwrap()
+}
+
+#[cfg(windows)]
+fn pipe_file(end: impl Into<std::os::windows::io::OwnedHandle>) -> nuclei::fs::File {
+    nuclei::fs::File::new(std::fs::File::from(end.into())).unwrap()
+}
+
+/// Pipes nobody writes to, each with a read the pool holds a buffer for, keep no request sent down
+/// another pipe from its reply: a read or a write the pool has no buffer for uses memory of its own
+/// (on a completion port its slot's own room, proofs/tla/port/PortStarve.tla; elsewhere the task's
+/// own buffer).
+#[test]
+fn idle_pipes_holding_the_cap_keep_no_request_from_its_reply() {
+    let _alone = one_at_a_time();
+    let rt = runtime(HELD_CAP);
+    let mut idle = Vec::new();
+    for _ in 0..HOLDERS {
+        let (r, w) = std::io::pipe().unwrap();
+        rt.spawn(async move {
+            let reader = pipe_file(r);
+            let mut buf = vec![0u8; READ];
+            let _ = (&reader).read(&mut buf).await;
+        })
+        .detach();
+        idle.push(w);
+    }
+    if nuclei::Proactor::backend() == nuclei::IoBackend::Iocp {
+        until("the pool full of reads of idle pipes", || {
+            exhausted(HELD_CAP)
+        });
+    }
+    let mut replies = Vec::new();
+    for _ in 0..ACTIVE {
+        let (request, mut send) = std::io::pipe().unwrap();
+        let (mut answer, reply) = std::io::pipe().unwrap();
+        rt.spawn(async move {
+            let (reader, writer) = (pipe_file(request), pipe_file(reply));
+            let mut buf = vec![0u8; READ];
+            let mut got = 0;
+            while got < READ {
+                match (&reader).read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => got += n,
+                }
+            }
+            let _ = (&writer).write_all(&[7u8; REPLY]).await;
+            let _ = (&writer).flush().await;
+        })
+        .detach();
+        send.write_all(&[3u8; READ]).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reply = [0u8; REPLY];
+            let _ = tx.send(answer.read_exact(&mut reply).map(|()| reply));
+        });
+        replies.push((send, rx));
+    }
+    for (i, (_, rx)) in replies.iter().enumerate() {
+        match rx.recv_timeout(DEADLINE) {
+            Ok(Ok(reply)) => assert_eq!(reply, [7u8; REPLY]),
+            Ok(Err(err)) => panic!("pipe {i} of {ACTIVE}: {err}"),
+            Err(_) => panic!("pipe {i} of {ACTIVE} got no reply within {DEADLINE:?}"),
+        }
+    }
+    drop(idle);
 }
