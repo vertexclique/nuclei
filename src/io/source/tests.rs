@@ -32,6 +32,14 @@ const STREAM: Kind = Kind::Stream;
 #[cfg(windows)]
 const STREAM: Kind = Kind::Tcp;
 
+/// The kind of a stream whose driver reads ahead on every backend, for the tests of what the
+/// read-ahead keeps: a Unix stream instead reads straight into the caller's buffer on epoll where
+/// the kernel counts what a read leaves (`SO_INQ`), as TCP does on Linux.
+#[cfg(unix)]
+const READS_AHEAD: Kind = Kind::Bytes;
+#[cfg(windows)]
+const READS_AHEAD: Kind = Kind::Tcp;
+
 /// The connected datagram sockets the tests pair, likewise.
 #[cfg(unix)]
 type Datagram = UnixDatagram;
@@ -607,7 +615,7 @@ fn a_revival_with_another_descriptor_discards_the_old_ones_results() {
     let (a2, b2) = stream_pair();
     adopt(&b1);
     adopt(&b2);
-    let src = Source::new(b1.raw(), STREAM);
+    let src = Source::new(b1.raw(), READS_AHEAD);
     rt.block_on(async {
         let mut buf = [0u8; 8];
         let mut waiting = Box::pin(read(&src, &mut buf));
@@ -639,7 +647,8 @@ fn a_revival_with_another_descriptor_discards_the_old_ones_results() {
 #[test]
 fn a_revival_with_the_same_descriptor_keeps_the_read_ahead() {
     let rt = runtime(None);
-    let (a, b) = pair();
+    let (a, b) = stream_pair();
+    let (a, b) = (Owned::new(a, READS_AHEAD), Owned::new(b, READS_AHEAD));
     rt.block_on(async {
         let mut buf = [0u8; 8];
         let mut waiting = Box::pin(read(&b.src, &mut buf));
