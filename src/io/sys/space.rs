@@ -137,3 +137,16 @@ fn unsupported_mode() -> io::Error {
         "this system cannot change the space of a file in this way",
     )
 }
+
+/// Writes the dirty pages of the `len` bytes of the file `fd` from `offset`
+/// back and waits for them (`sync_file_range(2)`, before, writing and
+/// after); a `len` of zero is to the end of the file.
+#[cfg(target_os = "linux")]
+pub(crate) fn sync_file_range(fd: RawFd, offset: u64, len: u64) -> io::Result<()> {
+    let (offset, len) = (file_offset(offset)?, file_offset(len)?);
+    let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+        | libc::SYNC_FILE_RANGE_WRITE
+        | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+    // SAFETY: a plain syscall on the caller's descriptor.
+    retry(|| cvt_int(unsafe { libc::sync_file_range(fd, offset, len, flags) })).map(drop)
+}

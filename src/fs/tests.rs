@@ -341,5 +341,6 @@ mod direct;
 mod durable;
 mod owned;
 mod positional;
+mod sync_range;
 #[cfg(windows)]
 mod windows;

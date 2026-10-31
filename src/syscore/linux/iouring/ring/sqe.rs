@@ -169,6 +169,16 @@ impl Sqe {
         })
     }
 
+    /// `sync_file_range(2)` of the `len` bytes of the file from `offset` (zero: to the end), with
+    /// the `SYNC_FILE_RANGE_*` `flags`; completes with 0.
+    pub(crate) fn sync_file_range(fd: RawFd, offset: u64, len: u32, flags: u32) -> Self {
+        Self::new(Opcode::SyncFileRange, fd).with(|s| {
+            s.off = offset;
+            s.len = len;
+            s.op_flags = flags;
+        })
+    }
+
     /// `accept4(2)`; completes with the new fd. `peer` and `peer_len` may be null.
     /// Every pointer argument must stay valid and unmoved until the final completion.
     pub(crate) fn accept(

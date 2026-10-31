@@ -17,6 +17,7 @@ use std::time::SystemTime;
 use futures_io::AsyncWrite;
 
 use super::Allocate;
+use super::file::{SyncKind, sync_file};
 use super::ops::{OpenOptions, blocking};
 use crate::io::Handle;
 use crate::io::raw::Raw;
@@ -79,7 +80,7 @@ impl Handle<File> {
         if !self.is_regular() {
             return self.on_pool(File::sync_all).await;
         }
-        self.file()?.sync(false).await
+        self.file()?.sync(SyncKind::All).await
     }
 
     /// Writes the file's data through to the device, and the metadata a
@@ -93,7 +94,33 @@ impl Handle<File> {
         if !self.is_regular() {
             return self.on_pool(File::sync_data).await;
         }
-        self.file()?.sync(true).await
+        self.file()?.sync(SyncKind::Data).await
+    }
+
+    /// Writes back the dirty data of the `len` bytes of the file from
+    /// `offset` and waits for it (`len` of zero: to the end of the file), as
+    /// Linux's `sync_file_range` does, once every write accepted before the
+    /// call landed. On io_uring this is an operation of the shard's ring
+    /// (`IORING_OP_SYNC_FILE_RANGE`, for a range its length field holds, else
+    /// a job of the blocking pool).
+    ///
+    /// This is not a durability guarantee: it writes no metadata and flushes
+    /// no cache of the device, so a crash may still lose the data. Use
+    /// [`sync_data`](Self::sync_data) for that. On the systems that have no
+    /// such call (macOS, Windows, other unix) it does what `sync_data` does
+    /// for the whole file, which is stronger and covers the range.
+    ///
+    /// # Errors
+    ///
+    /// As [`sync_all`](Self::sync_all): a write that failed, or the call's
+    /// own failure, which every later sync of the handle then repeats (the
+    /// system reports a write-back error to one call only).
+    pub async fn sync_range(&self, offset: u64, len: u64) -> io::Result<()> {
+        let kind = SyncKind::Range { offset, len };
+        if !self.is_regular() {
+            return self.on_pool(move |file| sync_file(file, kind)).await;
+        }
+        self.file()?.sync(kind).await
     }
 
     /// Changes the space the `len` bytes of the file from `offset` use, as

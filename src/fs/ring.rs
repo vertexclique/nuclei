@@ -22,6 +22,7 @@ use super::call::{
     FileOutcome, LentReadEnd, LentWriteEnd, Slot, SlotJob, WriteCall, as_read, as_read_lent,
     as_sync, as_write, as_write_lent,
 };
+use super::file::{SyncKind, sync_on};
 use crate::buf::PoolBuf;
 use crate::buf::owned::OwnedBuf;
 use crate::io::source::requests::Lease;
@@ -46,7 +47,14 @@ pub(crate) enum FileMem {
     Sync { data_only: bool },
     /// A change of the space `len` bytes from `at` use, as `mode` says.
     Allocate { len: u64, mode: Allocate },
+    /// A write-back of `len` bytes from `at` (zero: to the file's end).
+    SyncRange { len: u32 },
 }
+
+/// The flags of a range write-back: wait before, write, and wait after
+/// (`SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+/// SYNC_FILE_RANGE_WAIT_AFTER`, the kernel's own numbers).
+const SYNC_RANGE_FLAGS: u32 = 1 | 2 | 4;
 
 /// A file's operation on a ring.
 pub(crate) struct FileOp {
@@ -142,6 +150,12 @@ pub(crate) fn allocate(
     .map_err(drop)
 }
 
+/// A write-back of the `len` bytes from `offset` (zero: to the end), on this
+/// thread's ring; `Err` when the thread runs none.
+pub(crate) fn sync_range(fd: &Lease, offset: u64, len: u32) -> Result<SlotJob<io::Result<()>>, ()> {
+    submit(fd, offset, len, |len| FileMem::SyncRange { len }, as_sync).map_err(drop)
+}
+
 /// A read at `at` into the spare capacity of a task's `buf`.
 pub(crate) fn read_lent(
     fd: &Lease,
@@ -213,6 +227,7 @@ impl FileOp {
             FileMem::Allocate { len, mode } => {
                 Sqe::fallocate(fd, self.at, *len, sys::fallocate_mode(*mode) as u32)
             }
+            FileMem::SyncRange { len } => Sqe::sync_file_range(fd, self.at, *len, SYNC_RANGE_FLAGS),
         }
     }
 
@@ -257,7 +272,7 @@ impl FileOp {
             }
             FileMem::Write { .. } => FileOutcome::Write(written(result)),
             FileMem::WriteLent { buf, .. } => FileOutcome::WriteLent(written(result), buf),
-            FileMem::Sync { .. } => FileOutcome::Sync(result.map(drop)),
+            FileMem::Sync { .. } | FileMem::SyncRange { .. } => FileOutcome::Sync(result.map(drop)),
             FileMem::Allocate { .. } => FileOutcome::Write(result.map(drop)),
         };
         self.slot.put(outcome);
@@ -314,9 +329,21 @@ impl FileOp {
                     let result = crate::fs::file::pwrite_owned(raw, &buf, done, at + done as u64);
                     FileOutcome::WriteLent(result, buf)
                 }
-                FileMem::Sync { data_only } => {
-                    FileOutcome::Sync(crate::fs::file::sync_on(&fd, data_only))
-                }
+                FileMem::Sync { data_only } => FileOutcome::Sync(sync_on(
+                    &fd,
+                    if data_only {
+                        SyncKind::Data
+                    } else {
+                        SyncKind::All
+                    },
+                )),
+                FileMem::SyncRange { len } => FileOutcome::Sync(sync_on(
+                    &fd,
+                    SyncKind::Range {
+                        offset: at,
+                        len: u64::from(len),
+                    },
+                )),
                 FileMem::Allocate { len, mode } => {
                     FileOutcome::Write(sys::allocate(raw, at, len, mode))
                 }

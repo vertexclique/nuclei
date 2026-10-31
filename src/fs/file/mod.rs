@@ -80,6 +80,7 @@ use crate::io::sys;
 
 #[cfg(ring)]
 pub(crate) use self::durable::sync_on;
+pub(crate) use self::durable::{SyncKind, sync_file};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::work::bounce as bounce_for_test;
 #[cfg(ring)]
