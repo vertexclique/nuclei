@@ -603,6 +603,9 @@ impl ReadState {
 
     #[cfg(readiness)]
     /// Reads into the spare capacity of the lent buffer, and wakes its task.
+    /// Out of line: its caller checks for a lent buffer, and the read-ahead's
+    /// own path stays small without it.
+    #[inline(never)]
     fn read_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) {
         let Some(lent) = self.lent.as_mut() else {
             return;
@@ -634,6 +637,7 @@ impl ReadState {
     #[cfg(readiness)]
     /// Receives one datagram into the spare capacity of the lent buffer, and
     /// wakes its task.
+    #[inline(never)]
     fn receive_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) {
         let Some(lent) = self.lent.as_mut() else {
             return;

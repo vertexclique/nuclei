@@ -128,7 +128,9 @@ impl Lent {
 impl WriteState {
     #[cfg(readiness)]
     /// Writes the lent buffer out, after the write-behind. Returns whether
-    /// anything changed.
+    /// anything changed. Out of line: its caller checks for a lent buffer,
+    /// and the write-behind's own path stays small without it.
+    #[inline(never)]
     pub(super) fn push_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
         let Some(lent) = self.lent.as_mut() else {
             return false;
