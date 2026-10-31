@@ -40,6 +40,7 @@ use std::sync::Arc;
 use super::ops::{Answer, Dial, Done, Outcome, Want};
 use super::{Addr, Kind, Source, Target};
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::sys;
@@ -84,14 +85,14 @@ enum PortMem {
         to: usize,
     },
     Recv(PoolBuf),
-    RecvLent(Vec<u8>),
+    RecvLent(OwnedBuf),
     RecvFrom(PoolBuf),
-    RecvLentFrom(Vec<u8>),
+    RecvLentFrom(OwnedBuf),
     Connect(Dial),
     Send(PoolBuf),
-    SendLent(Vec<u8>),
+    SendLent(OwnedBuf),
     SendTo(PoolBuf, Target),
-    SendLentTo(Vec<u8>),
+    SendLentTo(OwnedBuf),
     /// The file a `TransmitFile` reads, kept open until its packet.
     SendFile(#[expect(dead_code, reason = "kept open until the packet")] Arc<OwnedHandle>),
 }
@@ -483,13 +484,14 @@ fn start(
             // libuv's zero reads of UDP do (src/win/udp.c).
             let looks = datagrams && matches!(inner.mem, Some(PortMem::Ready));
             inner.flags = if looks { MSG_PEEK as DWORD } else { 0 };
-            // SAFETY: the buffer and the flags live in the slot until the
-            // packet; the kernel writes the buffer's spare room.
+            let (bufs, count) = stream_bufs(inner);
+            // SAFETY: the buffers and the flags live in the slot until the
+            // packet; the kernel writes the buffers' spare room.
             return queued(unsafe {
                 WSARecv(
                     socket,
-                    &mut inner.buf,
-                    1,
+                    bufs,
+                    count,
                     core::ptr::null_mut(),
                     &mut inner.flags,
                     ov,
@@ -498,10 +500,11 @@ fn start(
             });
         }
         Ok(false) => {
-            // SAFETY: the buffer lives in the slot until the packet; the
-            // kernel only reads it.
+            let (bufs, count) = stream_bufs(inner);
+            // SAFETY: the buffers live in the slot until the packet; the
+            // kernel only reads them.
             return queued(unsafe {
-                WSASend(socket, &inner.buf, 1, core::ptr::null_mut(), 0, ov, null)
+                WSASend(socket, bufs, count, core::ptr::null_mut(), 0, ov, null)
             });
         }
         Err(other) => other,
@@ -714,10 +717,10 @@ fn start(
 enum NotStream {
     Accept,
     RecvFrom(PoolBuf),
-    RecvLentFrom(Vec<u8>),
+    RecvLentFrom(OwnedBuf),
     Connect(Dial),
     SendTo(PoolBuf, Target),
-    SendLentTo(Vec<u8>, Target),
+    SendLentTo(OwnedBuf, Target),
     SendFile(super::write::FileRange),
 }
 
@@ -734,6 +737,22 @@ impl NotStream {
             NotStream::Connect(dial) => PortMem::Connect(dial),
             NotStream::SendTo(buf, target) => PortMem::SendTo(buf, target),
         });
+    }
+}
+
+/// The buffer descriptors of the socket call `stream_memory` set up: a
+/// vectored buffer's own, all of them in one call, else the slot's one.
+fn stream_bufs(inner: &mut Inner) -> (*mut WSABUF, DWORD) {
+    let vectored = match &mut inner.mem {
+        Some(PortMem::RecvLent(buf) | PortMem::SendLent(buf)) => buf.vectored_mut(),
+        _ => None,
+    };
+    match vectored.map(|bufs| bufs.built()) {
+        Some(iov) if !iov.is_empty() => (
+            iov.as_mut_ptr(),
+            DWORD::try_from(iov.len()).unwrap_or(DWORD::MAX),
+        ),
+        _ => (&raw mut inner.buf, 1),
     }
 }
 
@@ -770,8 +789,16 @@ fn stream_memory(inner: &mut Inner, want: Want) -> Result<bool, NotStream> {
             Ok(true)
         }
         Want::RecvLent(mut buf) => {
-            let spare = buf.spare_capacity_mut();
-            inner.buf = wsabuf(spare.as_mut_ptr().cast(), spare.len());
+            inner.buf = match buf.vectored_mut() {
+                // The socket's receive takes every room (`stream_bufs`); a
+                // handle's read, which has no vectored form, the first.
+                Some(bufs) => bufs.read_iovecs().first().copied(),
+                None => None,
+            }
+            .unwrap_or_else(|| {
+                let spare = buf.spare_capacity_mut();
+                wsabuf(spare.as_mut_ptr().cast(), spare.len())
+            });
             inner.mem = Some(PortMem::RecvLent(buf));
             Ok(true)
         }
@@ -781,8 +808,12 @@ fn stream_memory(inner: &mut Inner, want: Want) -> Result<bool, NotStream> {
             inner.mem = Some(PortMem::Send(buf));
             Ok(false)
         }
-        Want::SendLent(buf, from) => {
-            let bytes = buf.get(from..).unwrap_or_default();
+        Want::SendLent(mut buf, from) => {
+            if let Some(bufs) = buf.vectored_mut() {
+                // Built for the socket's send of them all (`stream_bufs`).
+                bufs.write_iovecs(from);
+            }
+            let bytes = buf.rest_from(from);
             inner.buf = wsabuf(bytes.as_ptr().cast_mut(), bytes.len());
             inner.mem = Some(PortMem::SendLent(buf));
             Ok(false)
@@ -1075,7 +1106,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         PortMem::SendTo(buf, target) => Outcome::SendTo(buf, target, answer),
         PortMem::SendLentTo(buf) => Outcome::SendLentTo(buf, answer),
         // The lent write's end, with no buffer to give back.
-        PortMem::SendFile(_) => Outcome::SendLent(Vec::new(), answer),
+        PortMem::SendFile(_) => Outcome::SendLent(OwnedBuf::default(), answer),
     }
 }
 

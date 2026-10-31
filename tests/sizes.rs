@@ -79,12 +79,12 @@ const THRESHOLDS: &[Threshold] = &[
         16 << 10
     ),
     threshold!(
-        "src/fs/file.rs",
+        "src/fs/file/mod.rs",
         "pub(crate) const READ_MIN: usize = 64 * 1024;",
         64 << 10
     ),
     threshold!(
-        "src/fs/file.rs",
+        "src/fs/file/mod.rs",
         "const WRITE_MIN: usize = 64 * 1024;",
         64 << 10
     ),

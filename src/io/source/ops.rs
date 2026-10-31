@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use super::{Addr, Source, Target};
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Owned;
 use crate::io::side::{After, Hooks};
 
@@ -52,12 +53,12 @@ pub(crate) enum Want {
     #[cfg(ring)]
     RecvMulti,
     /// Read a stream's bytes into the spare capacity of a task's buffer.
-    RecvLent(Vec<u8>),
+    RecvLent(OwnedBuf),
     /// Receive a datagram into a buffer of the pool, with its sender.
     RecvFrom(PoolBuf),
     /// Receive a datagram into the spare capacity of a task's buffer, with
     /// its sender.
-    RecvLentFrom(Vec<u8>),
+    RecvLentFrom(OwnedBuf),
     /// Receive datagrams as they come, each into a buffer of the shard's
     /// receive group with its sender, until the receive is stopped (its end
     /// as [`Outcome::RecvMultiEnd`]).
@@ -68,7 +69,7 @@ pub(crate) enum Want {
     /// Send a stream the bytes a buffer of the pool holds.
     Send(PoolBuf),
     /// Send a stream a task's buffer, from `.1` on.
-    SendLent(Vec<u8>, usize),
+    SendLent(OwnedBuf, usize),
     /// Send a stream the buffer of a zero-copy write, from `.1` on: zero-copy when `.2`, the send
     /// then keeping its hold until the kernel's notification.
     #[cfg(ring)]
@@ -76,7 +77,7 @@ pub(crate) enum Want {
     /// Send a datagram from a buffer of the pool.
     SendTo(PoolBuf, Target),
     /// Send a datagram from a task's buffer.
-    SendLentTo(Vec<u8>, Target),
+    SendLentTo(OwnedBuf, Target),
     /// Send a range of a file to a stream, in the kernel.
     #[cfg(windows)]
     SendFile(crate::io::source::write::FileRange),
@@ -207,17 +208,17 @@ pub(crate) enum Outcome {
         answer: Answer<usize>,
         dry: bool,
     },
-    RecvLent(Vec<u8>, Answer<usize>),
+    RecvLent(OwnedBuf, Answer<usize>),
     RecvFrom(PoolBuf, Answer<(usize, Addr)>),
-    RecvLentFrom(Vec<u8>, Answer<(usize, Addr)>),
+    RecvLentFrom(OwnedBuf, Answer<(usize, Addr)>),
     Connect(Dial, Answer<()>),
     Send(PoolBuf, Answer<usize>),
-    SendLent(Vec<u8>, Answer<usize>),
+    SendLent(OwnedBuf, Answer<usize>),
     /// A send of a zero-copy write's buffer ended for its side; the side holds the buffer.
     #[cfg(ring)]
     SendPinned(Answer<usize>),
     SendTo(PoolBuf, Target, Answer<usize>),
-    SendLentTo(Vec<u8>, Answer<usize>),
+    SendLentTo(OwnedBuf, Answer<usize>),
     /// A read into the read slot's room ended, with the bytes it left there.
     #[cfg(port)]
     RecvRoom(Answer<Room>),

@@ -9,10 +9,11 @@
 //! last byte, and the task gets the receiver the last hold hands the buffer back through.
 
 use super::*;
+use crate::buf::owned::OwnedBuf;
 
 /// A task's own buffer, lent to the side for the driver to write out.
 pub(super) struct Lent {
-    pub(super) buf: Vec<u8>,
+    pub(super) buf: OwnedBuf,
     /// Bytes the kernel took.
     pub(super) sent: usize,
     /// The write's result, once all of it went out or it failed.
@@ -39,20 +40,20 @@ pub(super) struct Lent {
     /// Once a send of it went out zero-copy: the buffer, shared with the sends the kernel may
     /// still read it for (`buf` is empty), and the receiver that hands it back to the task.
     #[cfg(ring)]
-    pub(super) pinned: Option<(Pinned, oneshot::Receiver<Vec<u8>>)>,
+    pub(super) pinned: Option<(Pinned, oneshot::Receiver<OwnedBuf>)>,
 }
 
 /// A lent write's buffer on its task's side: the buffer while the task has it, and once a
 /// zero-copy send shares it, the receiver it comes back through.
 #[derive(Default)]
 pub(crate) struct Held {
-    pub(crate) buf: Option<Vec<u8>>,
+    pub(crate) buf: Option<OwnedBuf>,
     #[cfg(ring)]
-    back: Option<oneshot::Receiver<Vec<u8>>>,
+    back: Option<oneshot::Receiver<OwnedBuf>>,
 }
 
 impl Held {
-    pub(crate) fn of(buf: Vec<u8>) -> Self {
+    pub(crate) fn of(buf: OwnedBuf) -> Self {
         Self {
             buf: Some(buf),
             #[cfg(ring)]
@@ -71,7 +72,7 @@ impl Held {
 
     /// What a zero-copy write gives its task once it ended: the buffer, or what hands it back.
     #[cfg(ring)]
-    pub(crate) fn released(&mut self) -> crate::net::Released {
+    pub(crate) fn released<B>(&mut self) -> crate::net::Released<B> {
         if let Some(back) = self.back.take() {
             return crate::net::Released::waiting(back);
         }
@@ -87,16 +88,27 @@ impl Lent {
         if let Some(file) = &self.file {
             return file.len as usize;
         }
-        self.bytes().len()
+        self.len()
     }
 
-    /// The buffer's bytes, wherever the buffer is.
-    pub(super) fn bytes(&self) -> &[u8] {
+    /// How many bytes the buffer holds, wherever it is.
+    pub(super) fn len(&self) -> usize {
         #[cfg(ring)]
         if let Some((pinned, _)) = &self.pinned {
-            return pinned.bytes();
+            return pinned.bytes().len();
         }
-        &self.buf
+        self.buf.len()
+    }
+
+    /// The buffer's bytes not sent yet, wherever the buffer is: for a
+    /// vectored write, the rest of the buffer the next byte is in.
+    #[cfg(readiness)]
+    fn rest(&self) -> &[u8] {
+        #[cfg(ring)]
+        if let Some((pinned, _)) = &self.pinned {
+            return pinned.bytes().get(self.sent..).unwrap_or_default();
+        }
+        self.buf.rest_from(self.sent)
     }
 
     /// The task's side of it, as the write ends or the task takes it back: the buffer, or once a
@@ -116,7 +128,9 @@ impl Lent {
 impl WriteState {
     #[cfg(readiness)]
     /// Writes the lent buffer out, after the write-behind. Returns whether
-    /// anything changed.
+    /// anything changed. Out of line: its caller checks for a lent buffer,
+    /// and the write-behind's own path stays small without it.
+    #[inline(never)]
     pub(super) fn push_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
         let Some(lent) = self.lent.as_mut() else {
             return false;
@@ -140,14 +154,17 @@ impl WriteState {
             }
         }
         while lent.done.is_none() && !self.blocked {
-            let rest = lent.bytes().get(lent.sent..).unwrap_or_default();
-            match sys::ready(write_bytes(fd, kind, rest)).inspect(tally::writing) {
+            let written = match lent.buf.vectored_mut() {
+                Some(bufs) => write_iov(fd, kind, bufs.write_iovecs(lent.sent)),
+                None => write_bytes(fd, kind, lent.rest()),
+            };
+            match sys::ready(written).inspect(tally::writing) {
                 None => self.blocked = true,
                 Some(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
                 Some(Ok(n)) => {
                     lent.sent += n;
                     progress = true;
-                    let len = lent.bytes().len();
+                    let len = lent.len();
                     if lent.sent >= len {
                         lent.done = Some(Ok(len));
                     }

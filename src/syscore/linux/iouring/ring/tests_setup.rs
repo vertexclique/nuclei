@@ -234,6 +234,8 @@ fn probe_reports_every_opcode_the_builders_use() {
         Close,
         Statx,
         Fsync,
+        Fallocate,
+        SyncFileRange,
         Accept,
         Connect,
         Send,

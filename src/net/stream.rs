@@ -22,6 +22,8 @@ use futures_io::{AsyncRead, AsyncWrite};
 
 use super::Released;
 use super::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
+use crate::buf::owned::{IoBuf, IoBufMut, OwnedBuf};
+use crate::buf::vectored::{self, IoVecBuf, IoVecBufMut};
 use crate::io::{Handle, Interest, Ready};
 
 /// The read side of a byte stream handle.
@@ -36,9 +38,31 @@ macro_rules! read_side {
             ///
             /// If the future is dropped before it completes, bytes the
             /// driver read into `buf` stay with the handle for its next
-            /// read, so none is lost.
-            pub async fn read_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+            /// read, so none is lost. `buf` is any
+            /// [`IoBufMut`](crate::io::IoBufMut).
+            pub async fn read_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+            where
+                B: IoBufMut,
+            {
                 self.source().read_owned(buf).await
+            }
+
+            /// Reads into the spare capacity of `bufs`, after the bytes each
+            /// holds, filling each buffer's room before the next one's, and
+            /// gives `bufs` back with how many bytes came: zero at the end of
+            /// the stream, or when no buffer has spare capacity. One read of
+            /// the kernel takes every room at once (`readv`, a `recvmsg` of
+            /// several buffers, a `WSARecv` of several `WSABUF`s), as
+            /// [`read_owned`](Self::read_owned) lends one buffer: the bytes
+            /// land in the buffers themselves, never copied. Bytes another
+            /// read left behind are copied in instead, in the same order.
+            pub async fn read_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
+            where
+                V: IoVecBufMut,
+            {
+                let bufs = OwnedBuf::vectored_read(vectored::filled(bufs));
+                let (result, bufs) = self.source().read_owned(bufs).await;
+                (result, vectored::into_filled(bufs.into_segments()))
             }
 
             /// Waits until a read would end at once.
@@ -133,9 +157,31 @@ macro_rules! write_side {
             /// out is withdrawn, and one that started is finished by the
             /// driver. On Windows a TCP write is always finished: there a
             /// cancelled send may have handed bytes to the stack while it
-            /// says it took none.
-            pub async fn write_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+            /// says it took none. `buf` is any [`IoBuf`](crate::io::IoBuf).
+            pub async fn write_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+            where
+                B: IoBuf,
+            {
                 self.source().write_owned(buf).await
+            }
+
+            /// Writes all of the bytes of `bufs`, each buffer's in order, as
+            /// one write, and gives `bufs` back with how many bytes that was.
+            /// No other write of the stream comes between two of them. Each
+            /// call of the kernel takes every buffer left at once (`writev`,
+            /// a `sendmsg` of several buffers, a `WSASend` of several
+            /// `WSABUF`s), from the buffers themselves, never copied; a call
+            /// the kernel takes part of goes on from the first byte it did
+            /// not take. If the future is dropped, as with
+            /// [`write_owned`](Self::write_owned): the stream gets all of the
+            /// bytes or none of them.
+            pub async fn write_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
+            where
+                V: IoVecBuf,
+            {
+                let bufs = OwnedBuf::vectored(vectored::written(bufs));
+                let (result, bufs) = self.source().write_owned(bufs).await;
+                (result, vectored::into_written(bufs.into_segments()))
             }
 
             /// Waits until a write would be taken at once.
@@ -289,8 +335,12 @@ impl Handle<TcpStream> {
     /// stops would need.
     ///
     /// If the future is dropped before it completes, the stream gets `buf` whole or not at all,
-    /// as with `write_owned`. Either way `buf` is dropped only once the kernel let go of it.
-    pub async fn write_zero_copy(&self, buf: Vec<u8>) -> (io::Result<usize>, Released) {
+    /// as with `write_owned`. Either way `buf` is dropped only once the kernel let go of it. `buf`
+    /// is any [`IoBuf`](crate::io::IoBuf).
+    pub async fn write_zero_copy<B>(&self, buf: B) -> (io::Result<usize>, Released<B>)
+    where
+        B: IoBuf,
+    {
         self.source().write_zero_copy(buf).await
     }
 }

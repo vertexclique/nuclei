@@ -660,8 +660,9 @@ takes them.
 `tla/lent/LentZc.tla`) checks `read_owned`, `write_owned` and `write_zero_copy` on streams
 (`src/io/source/read.rs`, `src/io/source/write/lent.rs`), where the task hands the side its own
 buffer and the driver reads into it or writes from it with no copy, and on files
-(`src/fs/file.rs`), where the buffer goes to a job of the blocking pool. The guards are abstract
-here (a step under one runs whole; `side` checks the side's).
+(`src/fs/file/`), where the buffer goes to a job of the blocking pool or the ring, beside the
+file's positional calls, syncs and direct IO. The guards are abstract here (a step under one runs
+whole; `side` checks the side's).
 
 The read: bytes arrive in order, each with an edge, and then the stream ends. The lending task
 takes what another read left first (bytes, or the end); otherwise it lends its buffer, which
@@ -715,40 +716,116 @@ order and the buffer whole or not at all; `Delivered`, everything written reache
 that passes the lent buffer break `WireOrder`; a task that takes its buffer back once some of
 it went out breaks `NoScribble`; an end that wakes nobody deadlocks), and 3 witnesses (a buffer
 that goes out over several calls, the driver finishing the write of a task that went away, a
-withdrawn write).
+withdrawn write). A vectored write (`write_vectored_owned`) is this write: its buffers are lent
+as one, and each call hands the kernel every byte not sent yet at once, so the model's rules are
+its rules. On a file a vectored write is the lent write at the cursor of `LentFile.tla`, and a
+vectored read on either is the lent read, filling each buffer's room before the next one's (an
+order the property test `buf::tests::vectored::a_read_fills_rooms_in_order` checks).
 
-The file (`LentFile.tla`): the file has a cursor and an epoch, which every write and seek
-moves on, and its jobs run on the blocking pool or the ring of the task's shard, in any order;
-a write on the ring may land in two parts, and a shard that goes has its ring's calls made on
-the pool, from where they stopped. Two tasks each read one cell at the cursor into their own
-buffers: a read waits for the write in flight, its job reads at the cursor, and its result
-counts only if the cursor and the epoch are still those it read at, else it reads again. A
-third task writes a cell from the pool, then one from its own buffer (which waits for the write
-in flight and then is that write), then seeks back to the start. Any task may go away while its
-job is out: a read job is cancelled or its result dropped, and a lent write still lands. A file
-opened to append makes its writes on the pool at its end, wherever the cursor was; once one
-landed the cursor is the end of it; and its writer appends once more after the seek. Every job
-runs on the handle's own descriptor, holding a lease on its object until it ran: once no task
-borrows the handle it is dropped, and the last lease out closes the object, or handed back by
-`into_inner`, which waits until no lease is out. 23 configurations: 7 that must pass (tasks that
-may go away and tasks that stay, a file opened to append, and a handle dropped or handed back with
-jobs still out, with `NoStaleRead`, a read counts only a value its cell still holds;
-`NoTornRead`, no read counts a cell a write landed only part of; `AllLanded`, every accepted write
-is in the file at the end; for the append, `NoOverwrite`, no append writes over what the file
-holds, and `CursorAtEnd`, the cursor is the file's end once an append landed; for the handle's
-end, `NoCallOnClosed`, no job's call runs on a descriptor that closed; and liveness, twice), 9
-mutations (a result that counts on the cursor alone breaks `NoStaleRead`, through the seek back;
-a lent write that goes in flight over the one there, a lent write cancelled when its task goes
-away, a write cut short on the ring that counts as done, and a write on the ring cancelled with
-its shard that ends there break `AllLanded`; an append that lands where the cursor was breaks
-`NoOverwrite`; a cursor that stays where an append was made breaks `CursorAtEnd`; a descriptor
-closed at the drop with a job out, and an `into_inner` that does not wait for the jobs, break
-`NoCallOnClosed`), and 7 witnesses (a read that reads again, the write of a task that went away
-landing, a read after the seek that counts the lent write's value, a write on the ring landing in
-two parts, one cut short whose shard went finished on the pool, an append after the seek landing
-at the end, a job still out as its handle drops). In Rust a
-seek needs the handle exclusively, so it cannot overlap a read; the model lets it, so the epoch
-rule is checked for any path that moves the cursor back.
+The file (`LentFile.tla`) checks a file handle's reads, writes, syncs and seeks
+(`src/fs/file/`: `mod.rs`, `positional.rs`, `orphans.rs`, `durable.rs`, `work.rs`) in five
+scenarios, which a constant picks so that each configuration holds only the tasks its rules need.
+In all of them the file has a cursor and an epoch, which every write and seek at the cursor moves
+on, and its jobs run on the blocking pool or the ring of the task's shard, in any order; a write
+on the ring may land in two parts, and a shard that goes has its ring's calls made on the pool,
+from where they stopped.
+
+- **cursor** (the first one checked): two tasks each read one cell at the cursor into their own
+  buffers: a read waits for the write in flight, its job reads at the cursor, and its result
+  counts only if the cursor and the epoch are still those it read at, else it reads again. A
+  third task writes a cell from the pool, then one from its own buffer (which waits for the write
+  in flight and then is that write), then seeks back to the start. Any task may go away while its
+  job is out: a read job is cancelled or its result dropped, and a lent write still lands. A file
+  opened to append makes its writes on the pool at its end, wherever the cursor was; once one
+  landed the cursor is the end of it; and its writer appends once more after the seek. In Rust a
+  seek needs the handle exclusively, so it cannot overlap a read; the model lets it, so the epoch
+  rule is checked for any path that moves the cursor back.
+- **positional**: a task writes cell 0 at an offset of its own (`write_at`) and another reads it
+  (`read_at`), while the cursor writer writes cell 0 once, before, while or after the positional
+  write is out. Neither positional call reads or moves the cursor or the epoch; each waits first
+  for the cursor writes accepted before it. The positional writer may go away while its write is
+  out: the write still lands, the file keeps it (`orphans`), and a cursor write after that waits
+  for it. A change of a range of the file (`allocate`: reserve, punch a hole, zero) and each chunk
+  of a copy into the file (`copy_range_to`) are positional writes in this scenario: both go
+  through `Out` and `poll_ordered`, the file keeps one whose future went away, and the cut of
+  `set_len` moves the generation on as a positional write's end does.
+- **generation**: a cursor reader reads two cells through the read-ahead (a job reads ahead two
+  cells), another one cell into its own buffer, while a task writes cell 1 at an offset of its
+  own. When a positional write's task takes its end (or the file takes the end of one whose task
+  went away), the file's generation moves on, and a cursor read counts a job's result, or hands
+  out cells read ahead, only of the generation it began in.
+- **sync**: the cursor writer's second copied write waits in the write-behind while the first is
+  in flight, and a task syncs twice once both were accepted. A sync waits until the write-behind
+  went out and every write in flight landed, then its job makes what the file holds durable, or
+  fails (the device may fail it); a failed sync makes every later one fail, with no call. The
+  sync of a range (`sync_range`) is such a sync with another call.
+- **direct**: the file is opened for direct IO: a read job reads exactly the cell asked for, and
+  each copied write is one kernel write of exactly its bytes, which waits for the write in
+  flight instead of joining the write-behind.
+
+In every scenario each job runs on the handle's own descriptor, holding a lease on its object
+until it ran (a cursor write, a read job, a positional call, a sync): once no task borrows the
+handle it is dropped, and the last lease out closes the object, or handed back by `into_inner`,
+which waits until no lease is out (a constant picks which, or neither).
+
+The properties: `NoStaleRead` and `NoTornRead`, no read counts a value its cell no longer holds,
+or a cell a write landed only part of, unless a positional write was out when it was taken (the
+caller's own race, as with `pread` and `pwrite` from two threads); `AllLanded`, every cursor
+write accepted is in the file at the end; for the append, `NoOverwrite`, no append writes over
+what the file holds, and `CursorAtEnd`, the cursor is the file's end once an append landed;
+`PositionalOrder`, each cell a positional write reached holds the write that came last in the
+order the file keeps (a cursor write accepted after the positional one ended, else the positional
+one, unless a cursor write raced it); `PositionalKeepsCursor`, an action property: no step of a
+positional call moves the cursor or the epoch; `PosReadSees`, a positional read made after a
+cursor write to its cell was accepted never reads what the cell held before it; `SyncCovers`,
+every write a good sync covers (accepted, or returned for a positional one, before it was called)
+is durable; `NoSyncAfterFailure`, no sync succeeds after one failed; `DirectExact`, on a direct
+file every kernel read and write is exactly one a caller made; `NoCallOnClosed`, no job's call
+runs on a descriptor that closed; and liveness (`Termination`).
+
+52 configurations. 17 must pass: tasks that may go away and tasks that stay, a file opened to
+append, positional calls, the generation, syncs that may fail and a direct file, each with its
+safety properties; a handle dropped or handed back with cursor jobs, and with a positional write
+left by its task, still out, with `NoCallOnClosed` beside them; and liveness for the cursor,
+append, positional, generation, sync and direct scenarios. 23 mutations must break the property
+their rule protects: a result that counts on the cursor alone breaks `NoStaleRead`, through the
+seek back; a lent write that goes in flight over the one there, a lent write cancelled when its
+task goes away, a write cut short on the ring that counts as done, and a write on the ring
+cancelled with its shard that ends there break `AllLanded`; an append that lands where the cursor
+was breaks `NoOverwrite`; a cursor that stays where an append was made breaks `CursorAtEnd`; a
+positional write that goes while the cursor write before it is out (`pos_skips_wait`) and a
+cursor write that goes while a positional write left by its task is out (`orphan_unordered`)
+break `PositionalOrder`; a positional write that moves the epoch on breaks
+`PositionalKeepsCursor`; a read job's result counted whatever positional write ended meanwhile
+(`no_gen_check`), cells read ahead before a positional write ended handed out after it
+(`ahead_no_gen`), and a positional write left by its task taken with the generation where it was
+(`orphan_no_gen`) break `NoStaleRead`; a positional read that goes while the cursor write before
+it is out breaks `PosReadSees`; a sync made with a write still in the write-behind or in flight
+(`sync_no_flush`), and one made once the write-behind went out but ordered after the writes only
+by the ring's drain (`sync_drain`: a write the shard handed to the blocking pool is not the
+ring's, so the drain does not order it) break `SyncCovers`; a failed sync forgotten once reported
+breaks `NoSyncAfterFailure`; a direct read through the read-ahead and a direct write that joins
+the write-behind break `DirectExact`; a descriptor closed at the drop with a job out, and an
+`into_inner` that does not wait for the jobs, each with a cursor job and with a positional write
+left by its task, break `NoCallOnClosed`. 12 witnesses must be proved wrong: a read that reads
+again, the lent write of a task that went away landing, a read after the seek that counts the
+lent write's value, a write on the ring landing in two parts, one cut short whose shard went
+finished on the pool, an append after the seek landing at the end, a read that reads again only
+because a positional write ended, a buffered read asking the kernel for more than its caller (the
+read-ahead the direct rule takes away), the positional write of a task that went away landing, a
+sync that fails, and a cursor job and a positional write still out as their handle drops.
+
+The model shows why a sync waits for the writes before it rather than relying on io_uring's
+`IOSQE_IO_DRAIN` (`MF_sync_drain`): the drain orders an entry after the ring's earlier entries
+only, and a write may be on the blocking pool (its shard went, or the handle's calls run there);
+in Rust the drain would also hold the sync behind every other operation of the shard's ring, a
+multishot receive among them, which may never end. Waiting costs nothing the drain would not:
+the writes it waits for are the ones the sync must cover.
+
+The Rust tests in `src/io/source/tests/owned.rs`, `src/fs/tests/owned.rs`,
+`src/fs/tests/positional.rs`, `src/fs/tests/durable.rs` and `src/fs/tests/direct.rs` check the
+same rules on real sockets and files, each with a mutation of the code that makes one of them
+fail.
 
 The zero-copy write (`LentZc.tla`): `TcpStream::write_zero_copy` (`src/net/stream.rs`,
 `src/io/source/write/calls.rs`), its chunks (`lent_want`, `submit_ops` and `lent_back` in
@@ -789,8 +866,6 @@ notification after its `Released` was dropped, a withdrawn write, an abandoned w
 send still holding its buffer as the shard went, a notification the keeper applied, a failed send
 whose buffer waits for its notification).
 
-The Rust tests in `src/io/source/tests/owned.rs` and `src/fs/tests/owned.rs` check the same
-rules on real sockets and files, each with a mutation of the code that makes one of them fail.
 `src/net/tests/zero_copy.rs` and `src/rt/shard/ring/tests_zc.rs` check the zero-copy write on real
 sockets: both ends that write before they read finish, the buffer comes back whole only after the
 notifications, a dropped `Released` and a dropped write, pipelined writes, a shard and a runtime
@@ -1737,6 +1812,19 @@ holds them (`IORING_FEAT_NODROP`) until the shard takes them. `tests/idle_peers.
 of the smallest ring with receives of idle peers, and then with sends to peers that never read, and
 checks every other peer is still accepted and answered.
 
+## A vectored read's fill
+
+`lean/Nuclei/Fill.lean` checks how a vectored read's count is shared out among its buffers
+(`src/buf/vectored.rs`, `Vectored::set_len`): the kernel writes one read's bytes into the
+buffers' rooms in order, and each room, in order, takes what is left of the count up to its
+size. For every list of rooms and every count it proves that each room takes at most its size
+(`fill_fits`), that the rooms take the whole count or all their room (`fill_total`), and that a
+room not filled is the last that takes anything (`fill_in_order`), with `fill_length` and
+`fill_zero` beside them. Its mutation, every room taking the whole count, makes up bytes. The
+bytes themselves, and the kernel's rule that a vectored read fills its descriptors in order, are
+left out. The property test `buf::tests::vectored::a_read_fills_rooms_in_order` checks the Rust
+code against the same rules.
+
 ## A ring's overflow count
 
 `lean/Nuclei/Overflow.lean` checks how a ring's poller counts completion-queue overflows for
@@ -1781,6 +1869,45 @@ the monitor's streak of four is five equal reads outside the shard, which a tick
 mean the poll has run at least four ticks, and a read that missed the poll just before one that
 saw it means the poll began after it. The model takes a bound task's home as its creator thread
 and a hand-over to a spare as one step.
+
+## A file's blocking lock
+
+`flock` (`tla/flock/FileLock.tla`) checks the cancellation of `Handle<File>::lock_file`
+(`src/fs/lock.rs`: `lock_file` and its `LockCall`) at the grain of its atomic steps. `lock_file`
+waits in the kernel until the file is free, so it is a job of the blocking pool; a future dropped while the job
+waits must not leave the file locked with nobody to give it back. The future and the job share one
+word, WAITING, HELD or GONE. The job locks the file and then does one compare-and-swap from
+WAITING to HELD, and unlocks the file itself if it finds GONE; a future dropped before it took the
+result swaps GONE in, and unlocks the file itself if the word was HELD; a job that has not started
+when the future is dropped is cancelled. The model has each step: the word and its swap and
+compare-and-swap, the job's claim, the kernel's lock and each unlock, the drop at any point and
+its three steps, and the future taking the result. The kernel's lock is one flag: other holders
+of the file, and how long the blocking lock waits, are the kernel's. 7 configurations: 2 that
+must pass (a lock that always succeeds, and one that may fail, each with the future dropped at any
+point), with the file locked, once both are done, only if the caller holds the lock
+(`NoOwnerlessLock`), a lock handed to the caller held, and both parties always ending; 3
+mutations (a job that writes HELD without looking for GONE, a drop that finds HELD and does not
+unlock, a drop that reads the word and writes GONE in two steps, each `NoOwnerlessLock`); and 2
+witnesses (the job gets the lock after its future was dropped, and a dropped future finds the
+lock held and gives it back itself).
+
+## Many reads in one call
+
+`many` (`tla/many/ReadMany.tla`) checks `Handle<File>::read_many_at` (`src/fs/file/many.rs`:
+`FileIo::read_many_at`, with `poll_ordered` of `src/fs/file/positional.rs`): a call of N reads at
+offsets of the task's own, with a cursor write accepted before it and not landed yet. The call
+waits until that write landed, then sends reads out in the order the task named them, at most
+`Cap` at once (`MANY_AT_ONCE`); the kernel makes them in any order, and each time one ends the call
+takes its result into that read's place and sends the next. A read moves one cell; the ring's own
+room only delays a read and is the kernel's. 8 configurations: 3 that must pass (four reads
+through a window of two, three through a window of one, three through a window wider than the
+call), with `WithinCap`, never more reads out than the window holds; `ResultInPlace`, each place
+holds its own read's result, which saw the write before the call; `EachOnce`, no read goes out
+twice; `AllAnswered`, a call that is done answered every read; and `Termination`; 4 mutations (a
+call that sends every read out whatever the window holds breaks `WithinCap`; one that gives
+results back in the order reads end, and one that sends reads before the write before it landed,
+break `ResultInPlace`; one that does not move on to the next read breaks `EachOnce`); and 1 witness
+(a read ends before one named before it).
 
 ## The cooperative budget in channels and locks
 

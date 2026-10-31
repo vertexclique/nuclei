@@ -38,8 +38,11 @@
 //! whoever waits for one; nothing that drops a buffer may hold a source's
 //! guard (see `io::source`), since the wake reaches into sources.
 
+pub(crate) mod aligned;
+pub(crate) mod owned;
 #[cfg(any(ring, unix))]
 pub(crate) mod spare;
+pub(crate) mod vectored;
 
 use core::cell::{Cell, RefCell};
 use core::ptr::NonNull;
@@ -547,10 +550,8 @@ pub(crate) fn copy_vectored(src: &[u8], bufs: &mut [std::io::IoSliceMut<'_>]) ->
 
 /// Copies the front of `src` onto the end of `buf`, as much as its spare
 /// capacity holds; returns how many bytes.
-pub(crate) fn append_spare(src: &[u8], buf: &mut Vec<u8>) -> usize {
-    let n = src.len().min(buf.capacity() - buf.len());
-    buf.extend_from_slice(&src[..n]);
-    n
+pub(crate) fn append_spare(src: &[u8], buf: &mut owned::OwnedBuf) -> usize {
+    buf.append(src)
 }
 
 /// A buffer of a shard's pool, with the bytes `start..end` filled and not
@@ -608,6 +609,24 @@ impl PoolBuf {
         debug_assert!(n <= self.capacity());
         self.start = 0;
         self.end = n.min(self.capacity()) as u32;
+    }
+
+    /// The `n` bytes from `from` were written: they are the filled ones.
+    pub(crate) fn set_filled_at(&mut self, from: usize, n: usize) {
+        let from = from.min(self.capacity());
+        self.start = from as u32;
+        self.end = (from + n).min(self.capacity()) as u32;
+    }
+
+    /// Fills the buffer from `from` with `bytes` (as many as fit); returns
+    /// how many.
+    pub(crate) fn fill_at(&mut self, from: usize, bytes: &[u8]) -> usize {
+        let n = bytes.len().min(self.capacity().saturating_sub(from));
+        if let Some(room) = self.spare().get_mut(from..from + n) {
+            room.copy_from_slice(&bytes[..n]);
+        }
+        self.set_filled_at(from, n);
+        n
     }
 
     /// Fills the buffer with `bytes` (as many as fit); returns how many.

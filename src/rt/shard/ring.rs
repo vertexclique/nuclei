@@ -132,9 +132,12 @@ pub(crate) struct ShardRing {
     /// and the receives that ended as the group ran dry, for a test.
     #[cfg(test)]
     counts: Cell<(usize, usize, usize)>,
-    /// Files' calls submitted, for a test.
+    /// Files' calls submitted, and each one's opcode, length and offset, for
+    /// a test.
     #[cfg(test)]
     file_calls: Cell<usize>,
+    #[cfg(test)]
+    file_entries: RefCell<Vec<FileEntry>>,
     /// Zero-copy sends' first completions and notifications, for a test.
     #[cfg(test)]
     zc_seen: Cell<(usize, usize)>,
@@ -213,6 +216,8 @@ impl ShardRing {
             counts: Cell::new((0, 0, 0)),
             #[cfg(test)]
             file_calls: Cell::new(0),
+            #[cfg(test)]
+            file_entries: RefCell::new(Vec::new()),
             #[cfg(test)]
             zc_seen: Cell::new((0, 0)),
         })
@@ -368,6 +373,13 @@ impl ShardRing {
         #[cfg(test)]
         self.file_calls.set(self.file_calls.get() + 1);
         let sqe = op.entry();
+        #[cfg(test)]
+        self.file_entries.borrow_mut().push((
+            sqe.raw().opcode,
+            sqe.raw().len,
+            sqe.raw().off,
+            sqe.raw().op_flags,
+        ));
         let inserted = self.file_ops.borrow_mut().insert(op);
         let user_data = match inserted {
             Ok(user_data) => user_data | FILE_TAG,
@@ -989,6 +1001,10 @@ fn counts_as_write(op: &RingOp) -> bool {
     !op.read && !matches!(op.mem, RingMem::ZcHeld(_))
 }
 
+/// A file's call as a test sees it: its opcode, length, offset and flags.
+#[cfg(test)]
+pub(crate) type FileEntry = (u8, u32, u64, u32);
+
 /// The bit of the user data of a file's call (in the slot index, which the
 /// sources' operations never reach).
 const FILE_TAG: u64 = 1 << 31;
@@ -1045,6 +1061,12 @@ impl ShardRing {
     /// Files' calls submitted so far.
     pub(crate) fn file_calls(&self) -> usize {
         self.file_calls.get()
+    }
+
+    /// The opcode, length, offset and flags of each file's call submitted
+    /// since the last look.
+    pub(crate) fn take_file_entries(&self) -> Vec<FileEntry> {
+        core::mem::take(&mut *self.file_entries.borrow_mut())
     }
 
     /// Multishot receives and accepts in flight.

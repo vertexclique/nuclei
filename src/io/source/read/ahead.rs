@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::io;
 
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::io::side::After;
 use crate::rt::shard::Shard;
 
@@ -18,7 +19,7 @@ pub(super) enum Piece {
     // vertexia: the caller's allocation, kept uncharged by the pool (one per
     // source at most, freed by the next reads); copy it into pool buffers if
     // kept buffers must count against the cap.
-    Left { buf: Vec<u8>, start: usize },
+    Left { buf: OwnedBuf, start: usize },
     /// A buffer of the shard's receive group a multishot receive filled;
     /// it goes back to the group once taken.
     #[cfg(ring)]
@@ -30,6 +31,7 @@ pub(super) enum Piece {
 }
 
 impl Piece {
+    #[inline]
     fn filled(&self) -> &[u8] {
         match self {
             Piece::Pool(buf) => buf.filled(),
@@ -41,6 +43,7 @@ impl Piece {
         }
     }
 
+    #[inline]
     fn consume(&mut self, n: usize) {
         match self {
             Piece::Pool(buf) => buf.consume(n),
@@ -54,6 +57,7 @@ impl Piece {
 
     /// Lets go of the piece; a chunk of the receive group goes back through
     /// `shard`, the shard the caller runs, if it knows it.
+    #[inline]
     fn release(self, after: &mut After, shard: Option<&Shard>) {
         match self {
             Piece::Pool(buf) => after.drop_buf(buf),
@@ -75,17 +79,20 @@ pub(super) struct Ahead {
 }
 
 impl Ahead {
+    #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.pieces.is_empty()
     }
 
     /// The bytes held.
     #[cfg(test)]
+    #[inline]
     pub(super) fn len(&self) -> usize {
         self.pieces.iter().map(|p| p.filled().len()).sum()
     }
 
     /// Adds bytes that came after those held.
+    #[inline]
     pub(super) fn push(&mut self, piece: Piece, after: &mut After) {
         if piece.filled().is_empty() {
             piece.release(after, None);
@@ -95,6 +102,7 @@ impl Ahead {
     }
 
     /// Takes `n` bytes off the front, letting go of the pieces emptied.
+    #[inline]
     pub(super) fn consume(&mut self, mut n: usize, after: &mut After, shard: Option<&Shard>) {
         while n > 0 {
             let Some(front) = self.pieces.front_mut() else {
@@ -113,6 +121,7 @@ impl Ahead {
 
     /// Copies bytes into `out`, in order, consumed unless `peek`; returns
     /// how many.
+    #[inline]
     pub(super) fn copy_into(
         &mut self,
         out: &mut [u8],
@@ -177,7 +186,7 @@ impl Ahead {
     /// holds.
     pub(super) fn append_to(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut OwnedBuf,
         after: &mut After,
         shard: Option<&Shard>,
     ) -> usize {
@@ -195,6 +204,7 @@ impl Ahead {
     }
 
     /// Lets go of every byte held.
+    #[inline]
     pub(super) fn release(&mut self, after: &mut After) {
         for piece in self.pieces.drain(..) {
             piece.release(after, None);
