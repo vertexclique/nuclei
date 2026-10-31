@@ -1129,3 +1129,5 @@ impl Shard {
 mod tests;
 #[cfg(all(test, not(loom)))]
 mod tests_pool;
+#[cfg(all(test, not(loom)))]
+mod tests_signal;
