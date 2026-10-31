@@ -193,25 +193,76 @@ impl Drop for Bracket<'_> {
 /// Runs `f` with the shard this thread is running, if any. Called from a
 /// task's code, it comes back into the shard first (a bracket), and finds
 /// none if the shard was taken.
-#[inline]
+#[inline(always)]
 pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
     let here = local();
     let shard = here.current.get();
     if shard.is_null() {
         return f(None);
     }
-    let _bracket = if here.inside.get() || here.slot.get().is_null() {
-        None
+    let _bracket = match bracket(here) {
+        Some(bracket) => bracket,
+        None => return f(None),
+    };
+    // SAFETY: as in `Current::shard`.
+    f(unsafe { shard.as_ref() })
+}
+
+/// The bracket a call into the current shard from here needs (`None` inside, or with no
+/// monitor), or `None` when the shard was taken and this thread is detached from it. The one
+/// rule [`current`] and [`current_held`] share.
+#[inline(always)]
+fn bracket(here: &'static Here) -> Option<Option<Bracket<'static>>> {
+    if here.inside.get() || here.slot.get().is_null() {
+        Some(None)
     } else if here.come_back(here.epoch.get()) {
         here.inside.set(true);
-        Some(Bracket(here))
+        Some(Some(Bracket(here)))
     } else {
-        return f(None);
-    };
-    // SAFETY: `current` points at a shard only while an `Entered` guard
-    // for it lives, and the guard borrows the shard; a taken shard is
-    // current no more.
-    f(unsafe { shard.as_ref() })
+        None
+    }
+}
+
+/// The shard this thread is running, as [`current`] finds it, held for as long as the result
+/// lives (its bracket, if it made one, ends as it drops). One call of a caller's closure
+/// follows, so a step that runs in it is inlined there.
+#[inline(always)]
+pub(crate) fn current_held() -> Current {
+    let here = local();
+    let shard = here.current.get();
+    if shard.is_null() {
+        return Current {
+            shard,
+            _bracket: None,
+        };
+    }
+    match bracket(here) {
+        Some(bracket) => Current {
+            shard,
+            _bracket: bracket,
+        },
+        None => Current {
+            shard: core::ptr::null(),
+            _bracket: None,
+        },
+    }
+}
+
+/// What [`current_held`] found: the shard, while it lives.
+pub(crate) struct Current {
+    shard: *const Shard,
+    _bracket: Option<Bracket<'static>>,
+}
+
+impl Current {
+    /// The shard this thread is running, if any.
+    #[inline(always)]
+    pub(crate) fn shard(&self) -> Option<&Shard> {
+        // SAFETY: `current` points at a shard only while an `Entered` guard
+        // for it lives, and the guard borrows the shard; a taken shard is
+        // current no more. The borrow ends with `self`, inside the call that made it.
+        unsafe { self.shard.as_ref() }
+    }
 }
 
 /// The shard this thread runs, when a call into it from here needs no

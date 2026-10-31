@@ -17,6 +17,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net as unix;
 use std::path::Path;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod linux;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use self::linux::{UNIX_INQ, enable_inq, read_inq, syscall};
+
 /// A std socket of type `S` over `fd` for one call, never closed by it.
 ///
 /// # Safety
@@ -31,21 +36,28 @@ unsafe fn borrow<S: FromRawFd>(fd: RawFd) -> ManuallyDrop<S> {
 /// The answer of a call that may have to wait: `None` for "not now"
 /// (`EAGAIN`, `EWOULDBLOCK`), or the call's result (an error counted for
 /// `stats`).
+#[inline]
 pub(crate) fn ready<T>(result: io::Result<T>) -> Option<io::Result<T>> {
     match result {
         // The code itself, not std's kind (which is decoded from it).
         Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK) => {
             None
         }
-        Err(e) => {
-            crate::rt::counters::io_error(&e);
-            Some(Err(e))
-        }
+        Err(e) => Some(Err(counted(e))),
         ok => Some(ok),
     }
 }
 
+/// Counts a call's failure `e` for `stats`, and hands it back.
+#[cold]
+#[inline(never)]
+fn counted(e: io::Error) -> io::Error {
+    crate::rt::counters::io_error(&e);
+    e
+}
+
 /// Makes `call` again while a signal cuts it short.
+#[inline(always)]
 pub(super) fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         match call() {
@@ -71,27 +83,25 @@ pub(super) fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
-/// `read(2)` of up to `len` bytes into `buf`. On Linux the system call is
-/// made directly: glibc's wrapper adds a cancellation-point check (about 40
-/// instructions) to every call, and nothing here is cancelled by
-/// `pthread_cancel`.
+/// `read(2)` of up to `len` bytes into `buf`, made as a system call on Linux
+/// (see [`syscall`]).
 ///
 /// # Safety
 /// `buf` must be valid for writes of `len` bytes.
 #[inline]
-unsafe fn read_raw(fd: RawFd, buf: *mut u8, len: usize) -> isize {
+unsafe fn read_raw(fd: RawFd, buf: *mut u8, len: usize) -> io::Result<usize> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: as the caller's.
-    return unsafe { libc::syscall(libc::SYS_read, libc::c_long::from(fd), buf, len) as isize };
+    return unsafe { syscall(libc::SYS_read, [fd as usize, buf as usize, len, 0, 0, 0]) };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     // SAFETY: as the caller's.
-    return unsafe { libc::read(fd, buf.cast(), len) };
+    return cvt(unsafe { libc::read(fd, buf.cast(), len) });
 }
 
 /// `read(2)` (also a stream socket's receive).
 pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
-    retry(|| cvt(unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) }))
+    retry(|| unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) })
 }
 
 /// `recv(2)` with `MSG_PEEK`: a stream's bytes, left on the socket.
@@ -139,36 +149,32 @@ pub(crate) const SEND_FLAGS: libc::c_int = 0;
 
 /// `send(2)`, never raising `SIGPIPE` for a closed peer (the error comes
 /// back as `BrokenPipe` instead).
+#[inline]
 pub(crate) fn send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     retry(|| {
         // SAFETY: reads at most `buf.len()` bytes from `buf`; no address is given.
-        cvt(unsafe { send_raw(fd, buf.as_ptr(), buf.len()) })
+        unsafe { send_raw(fd, buf.as_ptr(), buf.len()) }
     })
 }
 
-/// `send(2)` of up to `len` bytes of `buf` with `SEND_FLAGS`. On Linux the
-/// system call is made directly, as in `read_raw`.
+/// `send(2)` of up to `len` bytes of `buf` with `SEND_FLAGS`, made as a
+/// system call on Linux (see [`syscall`]).
 ///
 /// # Safety
 /// `buf` must be valid for reads of `len` bytes.
 #[inline]
-unsafe fn send_raw(fd: RawFd, buf: *const u8, len: usize) -> isize {
+unsafe fn send_raw(fd: RawFd, buf: *const u8, len: usize) -> io::Result<usize> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: as the caller's.
     return unsafe {
-        libc::syscall(
+        syscall(
             libc::SYS_sendto,
-            libc::c_long::from(fd),
-            buf,
-            len,
-            libc::c_long::from(SEND_FLAGS),
-            0 as libc::c_long,
-            0 as libc::c_long,
-        ) as isize
+            [fd as usize, buf as usize, len, SEND_FLAGS as usize, 0, 0],
+        )
     };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     // SAFETY: as the caller's.
-    return unsafe { libc::send(fd, buf.cast(), len, SEND_FLAGS) };
+    return cvt(unsafe { libc::send(fd, buf.cast(), len, SEND_FLAGS) });
 }
 
 /// The most slices one vectored call takes.
@@ -176,10 +182,17 @@ const IOV_MAX: usize = 1024;
 
 /// `send(2)` of the bytes of `bufs` in order (one call, the first
 /// `IOV_MAX` slices at most), as [`send`] with no `SIGPIPE`.
+#[inline]
 pub(crate) fn send_bufs(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
     if let [one] = bufs {
         return send(fd, one);
     }
+    send_msg(fd, bufs)
+}
+
+/// [`send_bufs`] of more than one slice, in one `sendmsg(2)`.
+#[inline(never)]
+fn send_msg(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
     // SAFETY: an all-zero `msghdr` is valid (no name, no control data).
     let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
     let bufs = bufs.get(..IOV_MAX).unwrap_or(bufs);
@@ -200,67 +213,6 @@ pub(crate) fn read_bufs(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Resul
     // SAFETY: `IoSliceMut` is `iovec` on unix; the kernel writes at most the
     // lengths of the first `count` slices.
     retry(|| cvt(unsafe { libc::readv(fd, bufs.as_ptr().cast(), count) }))
-}
-
-/// Asks a TCP socket to report, with every receive, how many bytes its
-/// receive queue still holds (`TCP_INQ`, Linux 4.18). False where the kernel
-/// does not know the option.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn enable_inq(fd: RawFd) -> bool {
-    let one: libc::c_int = 1;
-    // SAFETY: a plain setsockopt with a pointer to our own int.
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_INQ,
-            (&one as *const libc::c_int).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    ret == 0
-}
-
-/// `recvmsg(2)` on a TCP socket whose `TCP_INQ` is on: reads into `buf` and
-/// answers how many bytes, and how many the receive queue still holds after
-/// them (a pending end of stream counts as one). The second is `None` when
-/// the kernel gave no count.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<usize>)> {
-    // Room for one `int` of control data, aligned for a `cmsghdr`.
-    // SAFETY: `CMSG_SPACE` is arithmetic on its argument.
-    const CONTROL: usize =
-        unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as libc::c_uint) } as usize;
-    let mut control = [0u64; CONTROL.div_ceil(size_of::<u64>())];
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    // SAFETY: an all-zero `msghdr` is valid (no name, no control data).
-    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
-    let n = retry(|| {
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = CONTROL as _;
-        // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
-        // `CONTROL` into `control`, both of which `msg` points at. Made as a
-        // system call, as in `read_raw`.
-        cvt(
-            unsafe { libc::syscall(libc::SYS_recvmsg, libc::c_long::from(fd), &mut msg, 0) }
-                as isize,
-        )
-    })?;
-    // SAFETY: the kernel filled `msg`'s control data; the header is read
-    // only if it fits, and its data is one `int`.
-    let left = unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (!cmsg.is_null()
-            && (*cmsg).cmsg_level == libc::IPPROTO_TCP
-            && (*cmsg).cmsg_type == libc::TCP_CM_INQ)
-            .then(|| libc::CMSG_DATA(cmsg).cast::<u32>().read_unaligned() as usize)
-    };
-    Ok((n, left))
 }
 
 /// `shutdown(2)` of the halves `how` names.
@@ -709,21 +661,69 @@ fn recv_from_raw(
     // SAFETY: plain data; all zeroes is a valid value.
     let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
     let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let flags = if peek { libc::MSG_PEEK } else { 0 };
     let n = retry(|| {
         // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
         // `len` bytes into the storage; nothing is read from either.
-        cvt(unsafe {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return unsafe {
+            syscall(
+                libc::SYS_recvfrom,
+                [
+                    fd as usize,
+                    buf.as_mut_ptr() as usize,
+                    buf.len(),
+                    flags as usize,
+                    (&raw mut storage) as usize,
+                    (&raw mut len) as usize,
+                ],
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        return cvt(unsafe {
             libc::recvfrom(
                 fd,
                 buf.as_mut_ptr().cast(),
                 buf.len(),
-                if peek { libc::MSG_PEEK } else { 0 },
+                flags,
                 (&raw mut storage).cast(),
                 &mut len,
             )
-        })
+        });
     })?;
     Ok((n, storage, len))
+}
+
+/// `sendto(2)` of `buf` to the `len` bytes of address at `addr`, with `SEND_FLAGS`; made as a
+/// system call on Linux (see [`syscall`]).
+///
+/// # Safety
+/// `addr` must be valid for reads of `len` bytes.
+unsafe fn send_to_raw(
+    fd: RawFd,
+    buf: &[u8],
+    addr: *const libc::sockaddr,
+    len: libc::socklen_t,
+) -> io::Result<usize> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: reads at most `buf.len()` bytes of `buf`, and the caller's address.
+    return unsafe {
+        syscall(
+            libc::SYS_sendto,
+            [
+                fd as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+                SEND_FLAGS as usize,
+                addr as usize,
+                len as usize,
+            ],
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: as above.
+    return cvt(unsafe { libc::sendto(fd, buf.as_ptr().cast(), buf.len(), SEND_FLAGS, addr, len) });
 }
 
 /// A datagram from a UDP socket into memory not written yet, with its
@@ -767,27 +767,15 @@ pub(crate) fn recv_from_unix_uninit(
 
 /// A datagram to `addr` on a UDP socket.
 pub(crate) fn send_to_udp(fd: RawFd, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-    // SAFETY: see `borrow`; the fd is a UDP socket.
-    let socket = unsafe { borrow::<UdpSocket>(fd) };
-    retry(|| socket.send_to(buf, addr))
+    let (raw, len) = raw_inet(&addr);
+    // SAFETY: the address is `len` bytes of `raw`.
+    retry(|| unsafe { send_to_raw(fd, buf, (&raw const raw).cast(), len) })
 }
 
 /// A datagram to `addr` on a Unix datagram socket.
 pub(crate) fn send_to_unix(fd: RawFd, buf: &[u8], addr: &UnixAddr) -> io::Result<usize> {
-    retry(|| {
-        // SAFETY: reads at most `buf.len()` bytes; the address is `len`
-        // bytes of the caller's `sockaddr_un`.
-        cvt(unsafe {
-            libc::sendto(
-                fd,
-                buf.as_ptr().cast(),
-                buf.len(),
-                SEND_FLAGS,
-                addr.as_ptr(),
-                addr.len,
-            )
-        })
-    })
+    // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
+    retry(|| unsafe { send_to_raw(fd, buf, addr.as_ptr(), addr.len) })
 }
 
 /// A Unix socket address from its raw form: a path, an abstract name
@@ -1027,7 +1015,7 @@ pub(crate) fn poll_writable(fd: RawFd) -> io::Result<()> {
 pub(crate) fn read_uninit(fd: RawFd, buf: &mut [core::mem::MaybeUninit<u8>]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`; nothing is read
     // from it.
-    retry(|| cvt(unsafe { read_raw(fd, buf.as_mut_ptr().cast(), buf.len()) }))
+    retry(|| unsafe { read_raw(fd, buf.as_mut_ptr().cast(), buf.len()) })
 }
 
 /// `pread(2)` into memory not written yet, as [`read_uninit`] at `offset`.

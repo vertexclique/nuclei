@@ -566,7 +566,7 @@ each with a mutation of the code that makes one of them fail.
 
 `side_biased` (`tla/side_biased/SideBiased.tla`) checks the owner-biased guard (`Side::try_hold`,
 `Side::poll`, `Side::contend`, `Side::defer`, `Side::take_for_request` and
-`Held::release_with` in `src/io/side.rs`; the heavy fence is `heavy` and `heavy_retried` in
+`Held::release_or_again` in `src/io/side.rs`; the heavy fence is `heavy` and `heavy_retried` in
 `src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
 x86's do. A socket's side has an owner, the thread running its home shard, which serves the
 driver's edges. The owner takes the side with a plain store of its word `own`, a compiler fence
@@ -1120,7 +1120,10 @@ report again looks at once. A peek leaves the bytes in the socket, so it never m
 drained. A TCP read on Linux goes straight into the task's buffer at every size (`inq_wanted`,
 `read_direct`, `sys::read_inq`): it can fill its buffer exactly, so the kernel's count of what a
 read leaves (`TCP_INQ`, which counts a pending end of stream as one) says whether the socket is
-empty, and a count of none lets the next read wait for the edge. The model's `Exact` runs it on a
+empty, and a count of none lets the next read wait for the edge. A Unix stream's read does the
+same where the kernel counts for it (`SO_INQ`, Linux 6.17), whose count leaves a pending end out:
+the hangup's edge, which marks the side unsure as it does for TCP's `drained`, has the next read
+find the end. The model's `Exact` runs it on a
 request of two pieces, one read each. 11 configurations: 4 that must pass (`Buffers`, every buffer free or holding a request
 read ahead; and `Read`, every task that reads gets its request, with a task that stops, with
 none, and with exact reads), 5 mutations (a starved reader that waits for a buffer to come back, an edge that starves
@@ -1279,8 +1282,9 @@ ring's look and its install, which puts a closed number's file into the table,
 `NoClosedInstall`), and 4 witnesses.
 
 `tla/attach/Route.tla`, in the same family, checks a read of a ring source from a thread that
-runs no shard while the source's registration finishes (`Source::with_io`, `ensure_registered`,
-`ops_registered`, the side's `submit_wanted`). `with_io` reads the route before the side is
+runs no shard while the source's registration finishes (`Source::with_io` with `Source::via`
+and `Source::submit_if_registered`, `ensure_registered`, `ops_registered`, the side's
+`submit_wanted`). `with_io` reads the route before the side is
 taken: NotYet while the registration is under way, which issues nothing, Elsewhere once it is in
 place, which kicks the ring's thread. The registration is done with the sides held on the ring's
 thread, where `ops_registered` submits for a waiter it finds, or by the side's holder as it lets

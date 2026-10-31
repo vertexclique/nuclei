@@ -321,6 +321,7 @@ impl WriteState {
     /// `None` leaves it to the normal path, which writes behind and waits
     /// for readiness when the socket took nothing.
     #[cfg(unix)]
+    #[inline]
     pub(super) fn write_direct(
         &mut self,
         io: Io<'_>,
@@ -403,6 +404,7 @@ impl WriteState {
     #[cfg(readiness)]
     /// The driver's part: on readiness, does what the side holds and wakes
     /// the tasks that wait on any of it.
+    #[inline]
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         // An edge that finds the side idle only counts: the cheap and usual
         // case (a socket is writable with every readable edge on epoll).
@@ -416,6 +418,13 @@ impl WriteState {
             self.edges = self.edges.wrapping_add(1);
             return;
         }
+        self.serve_held(fd, kind, edge, after);
+    }
+
+    /// [`serve`](Self::serve) of a side that holds or waits for something.
+    #[cfg(readiness)]
+    #[inline(never)]
+    fn serve_held(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         // A call that found the socket full waits for the edge itself (a
         // datagram's, see `send_now`): it is woken even if nothing else moves.
         let unblocked = edge && self.blocked;

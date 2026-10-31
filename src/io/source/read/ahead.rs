@@ -57,7 +57,7 @@ impl Piece {
 
     /// Lets go of the piece; a chunk of the receive group goes back through
     /// `shard`, the shard the caller runs, if it knows it.
-    #[inline]
+    #[inline(always)]
     fn release(self, after: &mut After, shard: Option<&Shard>) {
         match self {
             Piece::Pool(buf) => after.drop_buf(buf),
@@ -92,7 +92,7 @@ impl Ahead {
     }
 
     /// Adds bytes that came after those held.
-    #[inline]
+    #[inline(always)]
     pub(super) fn push(&mut self, piece: Piece, after: &mut After) {
         if piece.filled().is_empty() {
             piece.release(after, None);
@@ -147,6 +147,18 @@ impl Ahead {
             }
             return n;
         }
+        self.copy_pieces(out, peek, after, shard)
+    }
+
+    /// [`copy_into`](Self::copy_into) from any number of pieces.
+    #[inline(never)]
+    fn copy_pieces(
+        &mut self,
+        out: &mut [u8],
+        peek: bool,
+        after: &mut After,
+        shard: Option<&Shard>,
+    ) -> usize {
         let mut n = 0;
         for piece in &self.pieces {
             let src = piece.filled();

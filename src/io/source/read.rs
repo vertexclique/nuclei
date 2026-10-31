@@ -47,6 +47,8 @@ mod ahead;
 mod calls;
 #[cfg(unix)]
 mod datagram;
+#[cfg(unix)]
+mod direct;
 #[cfg(completion)]
 mod ops;
 
@@ -146,7 +148,8 @@ struct Lent {
 #[cfg(completion)]
 const UDP_MAX: usize = u16::MAX as usize;
 
-/// Whether `TCP_INQ` is on for a socket (see `ReadState::inq_wanted`).
+/// Whether the kernel's count of what a read leaves (`TCP_INQ`, or a Unix
+/// stream's `SO_INQ`) is on for a socket (see `ReadState::inq_wanted`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Inq {
@@ -277,6 +280,7 @@ impl ReadState {
         self.lent.as_ref().is_some_and(|l| l.done.is_none())
     }
 
+    #[inline(always)]
     fn wait(&mut self, waker: &Waker, len: usize) {
         self.waiters.register(waker);
         self.want = self.want.max(len);
@@ -379,6 +383,7 @@ impl ReadState {
         not(readiness),
         expect(unused_variables, reason = "only a readiness driver looks again")
     )]
+    #[inline(always)]
     fn look_again(&mut self, io: Io<'_>, after: &mut After) {
         #[cfg(readiness)]
         if self.starved && !self.blocked && matches!(io.via, Via::Fd(_)) {
@@ -460,6 +465,7 @@ impl ReadState {
     #[cfg(readiness)]
     /// The driver's part: on readiness, completes what the waiting tasks
     /// asked for, into the pool's buffers, and wakes them.
+    #[inline]
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         if edge {
             self.blocked = false;
@@ -491,6 +497,7 @@ impl ReadState {
     /// listener's connections; a socket's datagrams (`len` each). Nothing
     /// while the last call would have blocked and no edge came since, or
     /// while a result waits to be taken.
+    #[inline]
     fn complete(&mut self, io: Io<'_>, kind: Kind, len: usize, after: &mut After) {
         match io.via {
             #[cfg(readiness)]
@@ -527,10 +534,18 @@ impl ReadState {
 
     #[cfg(readiness)]
     /// The driver's call on the descriptor, as [`complete`](Self::complete).
+    #[inline(always)]
     fn complete_fd(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
         if self.blocked || self.has_result() || self.lent_done() {
             return;
         }
+        self.call_fd(fd, kind, len, after);
+    }
+
+    /// [`complete_fd`](Self::complete_fd) once the call may find something.
+    #[cfg(readiness)]
+    #[inline(never)]
+    fn call_fd(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
         match kind {
             Kind::Stream | Kind::Tcp | Kind::Bytes | Kind::File => {
                 if self.lent.is_some() {
@@ -560,6 +575,7 @@ impl ReadState {
 
     /// A stream's completed read, copied out by `copy` (which peeks when
     /// `peek`); `None` when nothing is completed.
+    #[inline(always)]
     fn take_stream(
         &mut self,
         peek: bool,
@@ -726,155 +742,9 @@ impl ReadState {
         theirs && self.lent.is_none() && !self.eof && self.error.is_none()
     }
 
-    /// Whether a stream read (or `peek`) of `len` bytes goes straight into
-    /// the task's buffer: a read big enough (see `direct`), or any while the
-    /// pool has no buffer for the side, so a reader never waits on buffers
-    /// that receives or reads ahead of other connections hold
-    /// (proofs/tla/ring/RingStarve.tla, proofs/tla/starve/FdStarve.tla).
-    #[cfg(unix)]
-    pub(super) fn reads_itself(&self, io: Io<'_>, kind: Kind, len: usize, peek: bool) -> bool {
-        self.starved
-            || (!peek
-                && ((matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind))
-                    || super::direct::worth(io, len, false)))
-    }
-
-    /// Whether a TCP read on a readiness driver goes straight into the
-    /// task's buffer at every size: the kernel counts what a read leaves
-    /// (`TCP_INQ`), so even a read that filled its buffer knows whether the
-    /// socket is empty, and the next one waits for an edge instead of
-    /// finding nothing (proofs/tla/starve/FdStarve.tla). Not once the kernel
-    /// refused the option, and not off Linux.
-    #[cfg(unix)]
-    pub(super) fn inq_wanted(&self, kind: Kind) -> bool {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        return kind == Kind::Tcp && self.inq != Inq::Off;
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            let _ = kind;
-            false
-        }
-    }
-
-    /// Whether the receives of `fd` report what they leave: asks the kernel
-    /// the first time.
-    #[cfg(unix)]
-    pub(super) fn inq_on(&mut self, fd: RawFd) -> bool {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            if self.inq == Inq::Unknown {
-                self.inq = if sys::enable_inq(fd) {
-                    Inq::On
-                } else {
-                    Inq::Off
-                };
-            }
-            self.inq == Inq::On
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            let _ = fd;
-            false
-        }
-    }
-
-    /// Whether a read of `kind` may go straight into the task's buffer: a
-    /// socket's, and while the pool has no buffer for the side any byte
-    /// stream's (a pipe's, a terminal's).
-    #[cfg(unix)]
-    fn reads_bytes(&self, kind: Kind) -> bool {
-        kind.streams() || (self.starved && kind == Kind::Bytes)
-    }
-
-    /// A stream read (or `peek`) of `len` bytes made by `call` straight on
-    /// the descriptor `fd`, into the caller's memory, if the side holds
-    /// nothing that comes first. `None` leaves the read to the normal path,
-    /// which waits for readiness when the socket had nothing; `Pending` is a
-    /// multishot receive being stopped so the next poll can call.
-    #[cfg(unix)]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the step's context, as every step's"
-    )]
-    pub(super) fn read_direct(
-        &mut self,
-        io: Io<'_>,
-        fd: Option<RawFd>,
-        kind: Kind,
-        len: usize,
-        peek: bool,
-        waker: &Waker,
-        call: impl FnOnce(RawFd, bool) -> io::Result<(usize, Option<usize>)>,
-    ) -> Option<Poll<io::Result<usize>>> {
-        let fd = fd?;
-        if !self.reads_bytes(kind)
-            || len == 0
-            || !self.ahead.is_empty()
-            || self.lent.is_some()
-            || self.eof
-            || self.error.is_some()
-        {
-            return None;
-        }
-        // `call` is told to count what the socket keeps, when it can.
-        let inq = !peek && matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind) && self.inq_on(fd);
-        if !inq && !self.reads_itself(io, kind, len, peek) {
-            return None;
-        }
-        match io.via {
-            Via::Fd(_) if self.blocked => return None,
-            Via::Fd(_) => {}
-            #[cfg(ring)]
-            Via::Ops(route) => {
-                if self.out.is_some() {
-                    if !self.multi {
-                        return None;
-                    }
-                    self.stop_multi(route);
-                    self.wait(waker, len);
-                    return Some(Poll::Pending);
-                }
-            }
-            #[cfg(not(completion))]
-            Via::None(never, _) => match never {},
-        }
-        #[cfg(not(ring))]
-        let _ = waker;
-        #[cfg(ring)]
-        {
-            self.readable = false;
-        }
-        match sys::ready(call(fd, inq)) {
-            None => {
-                match io.via {
-                    Via::Fd(_) => self.blocked = true,
-                    #[cfg(ring)]
-                    Via::Ops(_) => self.poll_first = true,
-                    #[cfg(not(completion))]
-                    Via::None(never, _) => match never {},
-                }
-                None
-            }
-            Some(Ok((n, left))) => {
-                if !peek {
-                    tally::read(n);
-                }
-                // A peek leaves the bytes in the socket, which no edge reports again.
-                if matches!(io.via, Via::Fd(_)) && !peek {
-                    self.blocked = match left {
-                        // The kernel counted what is left: none, and nothing is.
-                        Some(left) => n > 0 && !self.unsure && left == 0,
-                        None => drained(kind, self.unsure, n, len),
-                    };
-                }
-                Some(Poll::Ready(Ok(n)))
-            }
-            Some(Err(err)) => Some(Poll::Ready(Err(err))),
-        }
-    }
-
     /// A stream read (or peek) into `out`: the driver reads into the pool
     /// first if the socket may hold bytes, and the task copies them out.
+    #[inline]
     fn read(
         &mut self,
         io: Io<'_>,
@@ -1422,6 +1292,7 @@ impl ReadState {
     /// `epoch`: the tasks waiting take it. One of an older descriptor only
     /// goes.
     #[cfg(ring)]
+    #[inline(always)]
     pub(super) fn take_arrival(
         &mut self,
         arrival: super::ring::Arrival,

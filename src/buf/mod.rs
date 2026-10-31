@@ -512,7 +512,9 @@ thread_local! {
 /// or its own if it runs none. `None` only while the thread exits, after its
 /// pool is gone.
 pub(crate) fn with_pool<R>(f: impl FnOnce(Option<&Pool>) -> R) -> R {
-    crate::rt::context::current(|shard| match shard {
+    // The held form: one call of `f`, which is inlined into the IO steps that ask.
+    let current = crate::rt::context::current_held();
+    match current.shard() {
         Some(shard) => f(Some(shard.pool())),
         None => {
             let fallback = FALLBACK
@@ -522,7 +524,7 @@ pub(crate) fn with_pool<R>(f: impl FnOnce(Option<&Pool>) -> R) -> R {
             // which `try_with` would have reported.
             f(unsafe { fallback.as_ref() })
         }
-    })
+    }
 }
 
 /// [`with_pool`], unless the caller already holds this thread's pool.
@@ -708,13 +710,15 @@ impl PoolBuf {
 
 impl Drop for PoolBuf {
     fn drop(&mut self) {
-        let returned = crate::rt::context::current(|shard| match shard {
+        let current = crate::rt::context::current_held();
+        let returned = match current.shard() {
             Some(shard) if shard.pool().is_home(&self.home) => {
                 shard.pool().take_back(self.ptr, self.class, self.cap);
                 false
             }
             _ => true,
-        });
+        };
+        drop(current);
         if returned {
             self.home.give_back(Returned {
                 raw: Raw(self.ptr),
