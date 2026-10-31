@@ -39,16 +39,24 @@ pub(crate) enum FileMem {
     Write { buf: PoolBuf, done: usize },
     /// A write of a task's buffer, `done` of its bytes landed.
     WriteLent { buf: OwnedBuf, done: usize },
+    /// A call that moves no bytes: a sync, a range's space or write-back.
+    Call(Call),
+    /// A socket's shutdown of the halves `shutdown(2)`'s `how` names, the
+    /// one call of a socket's that goes this way: its lease keeps the
+    /// descriptor's number the socket's until the call ran.
+    Shutdown(libc::c_int),
+}
+
+/// A file's call that moves no bytes, apart from the reads and writes: a
+/// narrow field of its own by the operation's tag would keep the tag a byte,
+/// and every move of a read or a write would copy the bytes around it.
+pub(crate) enum Call {
     /// A sync of the file's data (`data_only`) or of all of it.
     Sync { data_only: bool },
     /// A change of the space `len` bytes from `at` use, as `mode` says.
     Allocate { len: u64, mode: Allocate },
     /// A write-back of `len` bytes from `at` (zero: to the file's end).
     SyncRange { len: u32 },
-    /// A socket's shutdown of the halves `shutdown(2)`'s `how` names, the
-    /// one call of a socket's that goes this way: its lease keeps the
-    /// descriptor's number the socket's until the call ran.
-    Shutdown(libc::c_int),
 }
 
 /// The flags of a range write-back: wait before, write, and wait after
@@ -85,7 +93,9 @@ where
         let mem = mem(buf);
         let write = matches!(
             mem,
-            FileMem::Write { .. } | FileMem::WriteLent { .. } | FileMem::Allocate { .. }
+            FileMem::Write { .. }
+                | FileMem::WriteLent { .. }
+                | FileMem::Call(Call::Allocate { .. })
         )
         .then(|| WriteCall::on(&shard.shared));
         ring.submit_file(FileOp {
@@ -120,7 +130,10 @@ pub(crate) fn read(
 /// A sync of the file's data (`data_only`) or of all of it, on this
 /// thread's ring; `Err` when the thread runs none.
 pub(crate) fn sync(fd: &Lease, data_only: bool) -> Result<SlotJob<io::Result<()>>, ()> {
-    submit(fd, 0, data_only, |data_only| FileMem::Sync { data_only }).map_err(drop)
+    submit(fd, 0, data_only, |data_only| {
+        FileMem::Call(Call::Sync { data_only })
+    })
+    .map_err(drop)
 }
 
 /// A change of the space the `len` bytes from `offset` use, as `mode` says,
@@ -131,9 +144,8 @@ pub(crate) fn allocate(
     len: u64,
     mode: Allocate,
 ) -> Result<SlotJob<io::Result<()>>, ()> {
-    submit(fd, offset, (len, mode), |(len, mode)| FileMem::Allocate {
-        len,
-        mode,
+    submit(fd, offset, (len, mode), |(len, mode)| {
+        FileMem::Call(Call::Allocate { len, mode })
     })
     .map_err(drop)
 }
@@ -141,7 +153,10 @@ pub(crate) fn allocate(
 /// A write-back of the `len` bytes from `offset` (zero: to the end), on this
 /// thread's ring; `Err` when the thread runs none.
 pub(crate) fn sync_range(fd: &Lease, offset: u64, len: u32) -> Result<SlotJob<io::Result<()>>, ()> {
-    submit(fd, offset, len, |len| FileMem::SyncRange { len }).map_err(drop)
+    submit(fd, offset, len, |len| {
+        FileMem::Call(Call::SyncRange { len })
+    })
+    .map_err(drop)
 }
 
 /// A read at `at` into the spare capacity of a task's `buf`.
@@ -223,10 +238,7 @@ impl FileOp {
                     self.at + *done as u64,
                 )
             }
-            FileMem::Sync { .. }
-            | FileMem::Allocate { .. }
-            | FileMem::SyncRange { .. }
-            | FileMem::Shutdown(_) => self.call_entry(fd),
+            FileMem::Call(_) | FileMem::Shutdown(_) => self.call_entry(fd),
         }
     }
 
@@ -236,11 +248,13 @@ impl FileOp {
     #[inline(never)]
     fn call_entry(&self, fd: std::os::fd::RawFd) -> Sqe {
         match &self.mem {
-            FileMem::Sync { data_only } => Sqe::fsync(fd, *data_only),
-            FileMem::Allocate { len, mode } => {
+            FileMem::Call(Call::Sync { data_only }) => Sqe::fsync(fd, *data_only),
+            FileMem::Call(Call::Allocate { len, mode }) => {
                 Sqe::fallocate(fd, self.at, *len, sys::fallocate_mode(*mode) as u32)
             }
-            FileMem::SyncRange { len } => Sqe::sync_file_range(fd, self.at, *len, SYNC_RANGE_FLAGS),
+            FileMem::Call(Call::SyncRange { len }) => {
+                Sqe::sync_file_range(fd, self.at, *len, SYNC_RANGE_FLAGS)
+            }
             FileMem::Shutdown(how) => Sqe::shutdown(fd, *how),
             _ => Sqe::nop(),
         }
@@ -291,8 +305,10 @@ impl FileOp {
             }
             FileMem::Write { .. } => FileOutcome::Write(written(result)),
             FileMem::WriteLent { buf, .. } => FileOutcome::WriteLent(written(result), buf),
-            FileMem::Sync { .. } | FileMem::SyncRange { .. } => FileOutcome::Sync(result.map(drop)),
-            FileMem::Allocate { .. } => FileOutcome::Write(result.map(drop)),
+            FileMem::Call(Call::Sync { .. } | Call::SyncRange { .. }) => {
+                FileOutcome::Sync(result.map(drop))
+            }
+            FileMem::Call(Call::Allocate { .. }) => FileOutcome::Write(result.map(drop)),
             FileMem::Shutdown(_) => FileOutcome::Write(result.map(drop)),
         };
         self.slot.put(outcome);
@@ -363,7 +379,7 @@ impl FileOp {
                         crate::fs::file::pwrite_owned(raw, &mut buf, done, at + done as u64);
                     FileOutcome::WriteLent(result, buf)
                 }
-                FileMem::Sync { data_only } => FileOutcome::Sync(sync_on(
+                FileMem::Call(Call::Sync { data_only }) => FileOutcome::Sync(sync_on(
                     &fd,
                     if data_only {
                         SyncKind::Data
@@ -371,14 +387,14 @@ impl FileOp {
                         SyncKind::All
                     },
                 )),
-                FileMem::SyncRange { len } => FileOutcome::Sync(sync_on(
+                FileMem::Call(Call::SyncRange { len }) => FileOutcome::Sync(sync_on(
                     &fd,
                     SyncKind::Range {
                         offset: at,
                         len: u64::from(len),
                     },
                 )),
-                FileMem::Allocate { len, mode } => {
+                FileMem::Call(Call::Allocate { len, mode }) => {
                     FileOutcome::Write(sys::allocate(raw, at, len, mode))
                 }
                 FileMem::Shutdown(how) => FileOutcome::Write(sys::shutdown_raw(raw, how)),
