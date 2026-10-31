@@ -436,29 +436,28 @@ impl FileIo {
                 if st.poll_writes(io, waker, after).is_pending() {
                     return Poll::Pending;
                 }
-                let Some(buf) = held.as_mut() else {
+                let Some(mut buf) = held.take() else {
                     return Poll::Ready(Err(io::Error::other("the read lost its buffer")));
                 };
                 st.drop_stale_ahead(io, after);
                 if let Some(ahead) = st.ahead.as_mut().filter(|a| !a.is_empty()) {
-                    let n = crate::buf::append_spare(ahead.filled(), buf);
+                    let n = crate::buf::append_spare(ahead.filled(), &mut buf);
+                    *held = Some(buf);
                     ahead.consume(n);
                     st.consumed(n, after);
                     return Poll::Ready(Ok(n));
                 }
-                if let Some(buf) = held.take() {
-                    let (at, from) = (st.cursor, buf.len());
-                    // Read before the call, so a positional write that ends
-                    // while it runs is seen to have.
-                    let generation = io.generation();
-                    *job = Some(LentRead {
-                        task: io.submit_read_owned(buf, at),
-                        at,
-                        epoch: st.epoch,
-                        generation,
-                        from,
-                    });
-                }
+                let (at, from) = (st.cursor, buf.len());
+                // Read before the call, so a positional write that ends
+                // while it runs is seen to have.
+                let generation = io.generation();
+                *job = Some(LentRead {
+                    task: io.submit_read_owned(buf, at),
+                    at,
+                    epoch: st.epoch,
+                    generation,
+                    from,
+                });
             }
         })
     }
