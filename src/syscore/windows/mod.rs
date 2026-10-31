@@ -283,6 +283,7 @@ pub(crate) const STATUS_HOST_UNREACHABLE: NTSTATUS = 0xC000_023Du32 as i32;
 pub(crate) const STATUS_PORT_UNREACHABLE: NTSTATUS = 0xC000_023Fu32 as i32;
 pub(crate) const STATUS_CONNECTION_ABORTED: NTSTATUS = 0xC000_0241u32 as i32;
 pub(crate) const STATUS_INVALID_DEVICE_STATE: NTSTATUS = 0xC000_0184u32 as i32;
+pub(crate) const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206u32 as i32;
 
 pub(crate) type LPWSAOVERLAPPED_COMPLETION_ROUTINE = *const c_void;
 pub(crate) type PTIMERAPCROUTINE = *const c_void;
@@ -570,6 +571,9 @@ pub(crate) fn status_error(status: NTSTATUS) -> Option<i32> {
         STATUS_HOST_UNREACHABLE => WSAEHOSTUNREACH,
         STATUS_CONNECTION_ABORTED => WSAECONNABORTED,
         STATUS_INVALID_DEVICE_STATE => WSAEINVAL,
+        // A datagram longer than the socket sends: Winsock's own answer is
+        // WSAEMSGSIZE, where the status table's is ERROR_INVALID_USER_BUFFER.
+        STATUS_INVALID_BUFFER_SIZE => WSAEMSGSIZE,
         // SAFETY: a pure lookup of the status table.
         other => (unsafe { RtlNtStatusToDosError(other) }) as i32,
     };
