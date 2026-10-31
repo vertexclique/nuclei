@@ -115,13 +115,18 @@ impl Poller {
             }
         };
         let capacity = self.events.capacity().min(max).max(1) as libc::c_int;
-        // `epoll_pwait` with no mask is `epoll_wait`, made as a system call (see
-        // `io::sys::syscall`), which every architecture has.
+        // Made as a system call (see `io::sys::syscall`): `epoll_wait` where the architecture
+        // has it, which the kernel serves with less than `epoll_pwait`, else `epoll_pwait` with
+        // no mask, which is the same wait.
+        #[cfg(target_arch = "x86_64")]
+        let call = libc::SYS_epoll_wait;
+        #[cfg(not(target_arch = "x86_64"))]
+        let call = libc::SYS_epoll_pwait;
         // SAFETY: the buffer has room for `capacity` events; the kernel says
         // how many it wrote.
         let n = match unsafe {
             crate::io::sys::syscall(
-                libc::SYS_epoll_pwait,
+                call,
                 [
                     self.epoll.as_raw_fd() as usize,
                     self.events.as_mut_ptr() as usize,
