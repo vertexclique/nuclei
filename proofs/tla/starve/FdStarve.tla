@@ -4,7 +4,10 @@
 (* shard's pool of IO buffers (src/io/source/read.rs: the driver's `serve` *)
 (* and `leaves_to_tasks`, `complete_fd` and `read_ahead`; the task's       *)
 (* `read`, `reads_itself`, `read_direct` and `look_again`; `buffer` and    *)
-(* `unstarve`), at the grain of a step under the side's guard.             *)
+(* `unstarve`), at the grain of a step under the side's guard. With       *)
+(* `Exact` set the model also covers a TCP read into the task's own       *)
+(* buffer at every size (`reads_itself`, `read_direct` and `drained`,     *)
+(* with `TCP_INQ` on Linux), described below.                              *)
 (*                                                                         *)
 (* In plain words: several connections each have a task that peeks at one *)
 (* request and then reads it. A read too small to go straight into the     *)
@@ -25,21 +28,34 @@
 (* the fix a starved reader on epoll waited for a buffer to come back, and *)
 (* none ever did.                                                          *)
 (*                                                                         *)
+(* With `Exact` set, a task reads a socket straight into its own buffer   *)
+(* whether or not the pool has a buffer, and the driver, on an edge, only  *)
+(* wakes the task (`leaves_to_tasks`). Such a read can be exactly the size *)
+(* of the buffer, so it cannot tell by its length whether the socket is    *)
+(* empty. The kernel says how many bytes are left (`TCP_INQ`): none, and   *)
+(* the next read waits for the next edge; some, and the task reads again. *)
+(* A request here is two pieces, and one read takes one. The reader that   *)
+(* treats an exact read as having emptied the socket would wait for an     *)
+(* edge that never comes.                                                  *)
+(*                                                                         *)
 (* What is abstract: the guards (each step runs whole under its side's),   *)
 (* the driver's thread (each edge is served as one step), and the bytes:   *)
-(* one request per connection, read whole.                                 *)
+(* one request per connection, read whole (in two pieces with `Exact`).     *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS
     Holders,   \* how many of the connections have tasks that peek and then never read
-    Mutation   \* "none", or the name of the one rule this run takes away
+    Mutation,  \* "none", or the name of the one rule this run takes away
+    Exact      \* TRUE: tasks read straight into their own buffers, in pieces of a request
 
 \* The connections, and the buffers the pool holds: fewer than the connections.
 Conns == 1..2
 Pool == 1
 \* The connections whose tasks read their request; the first `Holders` only peek at theirs.
 Active == {c \in Conns : c > Holders}
+\* The pieces a request comes in: a read into the task's own buffer takes one.
+Pieces == IF Exact THEN 2 ELSE 1
 \* Where a task goes after its peek: an active one on to its read, a holder nowhere.
 AfterPeek(c) == IF c \in Active THEN "read" ELSE "hold"
 
@@ -65,7 +81,7 @@ P_send:
     while left # {} do
         with c \in left do
             \* The request is in the socket, and the poller reports it.
-            sock[c] := 1;
+            sock[c] := Pieces;
             edge[c] := TRUE;
             left := left \ {c};
         end with;
@@ -81,12 +97,12 @@ D_loop:
             \* The edge is taken: the socket may hold bytes again.
             edge[c] := FALSE;
             if waits[c] /\ ~woken[c] then
-                if starved[c] then
-                    \* A starved side's bytes are its tasks' to read (`leaves_to_tasks`): they are woken.
+                if starved[c] \/ Exact then
+                    \* A starved side's bytes (or any, with `Exact`) are its tasks' to read (`leaves_to_tasks`): they are woken.
                     blocked[c] := FALSE;
                     woken[c] := TRUE;
                 elsif free > 0 then
-                    if sock[c] = 1 then
+                    if sock[c] > 0 then
                         \* The driver reads the request ahead into a buffer of the pool, and wakes the task.
                         free := free - 1;
                         ahead[c] := TRUE;
@@ -120,9 +136,9 @@ R_loop:
     while phase[self] \in {"peek", "read"} do
 R_poll:
         \* MUTATION park: a starved reader waits for a buffer to come back, and calls nothing itself.
-        if starved[self] /\ Mutation # "park" /\ ~ahead[self] /\ ~blocked[self] then
-            \* The starved reader calls on the socket itself, into its own buffer (`read_direct`).
-            if sock[self] = 1 then
+        if (starved[self] \/ Exact) /\ Mutation # "park" /\ ~ahead[self] /\ ~blocked[self] then
+            \* The reader calls on the socket itself, into its own buffer (`read_direct`).
+            if sock[self] > 0 then
                 direct := TRUE;
                 if phase[self] = "peek" then
                     \* The peek copies the request and leaves it in the socket.
@@ -131,11 +147,17 @@ R_poll:
                     if Mutation = "peek_drains" then
                         blocked[self] := TRUE;
                     end if;
-                else
+                elsif sock[self] = 1 then
                     \* The read takes the request, and empties the socket.
                     phase[self] := "done";
                     sock[self] := 0;
                     blocked[self] := TRUE;
+                else
+                    \* The read takes one piece and the kernel says more is left (`TCP_INQ`): the
+                    \* task reads again at once.
+                    \* MUTATION inq_ignored: an exact read is taken as having emptied the socket.
+                    sock[self] := sock[self] - 1;
+                    blocked[self] := (Mutation = "inq_ignored");
                 end if;
             else
                 \* The socket is empty: the task waits for the next edge.
@@ -158,7 +180,7 @@ R_poll:
             end if;
         elsif ~blocked[self] then
             if free > 0 then
-                if sock[self] = 1 then
+                if sock[self] > 0 then
                     \* The driver reads the request ahead for the task, into a buffer of the pool;
                     \* the task takes it on its next step.
                     free := free - 1;

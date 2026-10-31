@@ -877,5 +877,7 @@ fn tempdir() -> std::path::PathBuf {
 }
 
 mod biased;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod inq;
 mod owned;
 mod requests;

@@ -202,6 +202,67 @@ pub(crate) fn read_bufs(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Resul
     retry(|| cvt(unsafe { libc::readv(fd, bufs.as_ptr().cast(), count) }))
 }
 
+/// Asks a TCP socket to report, with every receive, how many bytes its
+/// receive queue still holds (`TCP_INQ`, Linux 4.18). False where the kernel
+/// does not know the option.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn enable_inq(fd: RawFd) -> bool {
+    let one: libc::c_int = 1;
+    // SAFETY: a plain setsockopt with a pointer to our own int.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INQ,
+            (&one as *const libc::c_int).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    ret == 0
+}
+
+/// `recvmsg(2)` on a TCP socket whose `TCP_INQ` is on: reads into `buf` and
+/// answers how many bytes, and how many the receive queue still holds after
+/// them (a pending end of stream counts as one). The second is `None` when
+/// the kernel gave no count.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<usize>)> {
+    // Room for one `int` of control data, aligned for a `cmsghdr`.
+    // SAFETY: `CMSG_SPACE` is arithmetic on its argument.
+    const CONTROL: usize =
+        unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as libc::c_uint) } as usize;
+    let mut control = [0u64; CONTROL.div_ceil(size_of::<u64>())];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: an all-zero `msghdr` is valid (no name, no control data).
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    let n = retry(|| {
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = CONTROL as _;
+        // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
+        // `CONTROL` into `control`, both of which `msg` points at. Made as a
+        // system call, as in `read_raw`.
+        cvt(
+            unsafe { libc::syscall(libc::SYS_recvmsg, libc::c_long::from(fd), &mut msg, 0) }
+                as isize,
+        )
+    })?;
+    // SAFETY: the kernel filled `msg`'s control data; the header is read
+    // only if it fits, and its data is one `int`.
+    let left = unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (!cmsg.is_null()
+            && (*cmsg).cmsg_level == libc::IPPROTO_TCP
+            && (*cmsg).cmsg_type == libc::TCP_CM_INQ)
+            .then(|| libc::CMSG_DATA(cmsg).cast::<u32>().read_unaligned() as usize)
+    };
+    Ok((n, left))
+}
+
 /// `shutdown(2)` of the writing half.
 pub(crate) fn shutdown_write(fd: RawFd) -> io::Result<()> {
     // SAFETY: a plain syscall on a socket the caller holds.

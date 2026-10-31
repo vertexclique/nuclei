@@ -1007,11 +1007,16 @@ back, and none ever did. Now a starved reader reads, or peeks, straight from the
 own buffer; one that finds the socket empty waits for the next edge, which wakes it to read
 itself, and one that just found the pool empty while the socket may hold bytes no edge will
 report again looks at once. A peek leaves the bytes in the socket, so it never marks the socket
-drained. 9 configurations: 3 that must pass (`Buffers`, every buffer free or holding a request
-read ahead; and `Read`, every task that reads gets its request, with a task that stops and with
-none), 4 mutations (a starved reader that waits for a buffer to come back, an edge that starves
+drained. A TCP read on Linux goes straight into the task's buffer at every size (`inq_wanted`,
+`read_direct`, `sys::read_inq`): it can fill its buffer exactly, so the kernel's count of what a
+read leaves (`TCP_INQ`, which counts a pending end of stream as one) says whether the socket is
+empty, and a count of none lets the next read wait for the edge. The model's `Exact` runs it on a
+request of two pieces, one read each. 11 configurations: 4 that must pass (`Buffers`, every buffer free or holding a request
+read ahead; and `Read`, every task that reads gets its request, with a task that stops, with
+none, and with exact reads), 5 mutations (a starved reader that waits for a buffer to come back, an edge that starves
 the side and wakes nobody, a reader that waits for the next edge after the pool turned it away,
-and a peek taken as having emptied the socket break `Read`), and 2 witnesses (a reader finds the
+a peek taken as having emptied the socket, and an exact read taken as having emptied it whatever
+the kernel counts, break `Read`), and 2 witnesses (a reader finds the
 pool empty; a starved reader calls on the socket itself). The second test of
 `tests/idle_peers.rs` fills a pool of a 64 KiB cap with bytes read ahead for tasks that peeked
 and stopped, on every backend, and checks every other peer is answered. A pipe's write the pool
