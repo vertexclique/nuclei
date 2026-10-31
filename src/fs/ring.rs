@@ -291,7 +291,6 @@ impl FileOp {
     /// The operation's call answered `res` (a count, or a negated errno):
     /// the operation again, for the rest of a write; or its end, left for
     /// its task.
-    #[inline]
     pub(crate) fn complete(mut self, res: i32) -> Option<FileOp> {
         if tally::counting() {
             self.tally(res);
@@ -370,7 +369,6 @@ impl FileOp {
     /// this thread is inside, and leaves its end in the slot. With none (a
     /// ring's keeper, itself a blocking job or a thread of its own), it is
     /// made here: no runtime is started for it.
-    #[inline(never)]
     fn finish_on_pool(self) {
         let FileOp {
             fd,
