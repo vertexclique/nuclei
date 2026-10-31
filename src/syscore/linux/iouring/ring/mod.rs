@@ -390,6 +390,11 @@ impl Ring {
         self.sq.space()
     }
 
+    /// Entries queued that the kernel has not consumed yet.
+    pub(crate) fn sq_ready(&self) -> u32 {
+        self.sq.ready()
+    }
+
     /// Queues `sqe`; nothing reaches the kernel until [`Ring::submit`] or [`Ring::submit_and_wait`].
     pub(crate) fn push(&mut self, sqe: &Sqe) -> Result<(), SqFull> {
         self.sq.push(sqe)

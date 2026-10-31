@@ -838,11 +838,13 @@ impl Source {
     }
 
     /// Registers the source with ring shard `shard` under `token`, with both
-    /// sides held. On the ring's thread its file goes into the table now;
-    /// elsewhere a copy of the descriptor goes to the ring's thread, which
-    /// puts it there (only that thread may change the ring's table).
+    /// sides held. On the ring's thread its file goes into the table (or a
+    /// slot naming its descriptor) now; elsewhere a lease on the handle's
+    /// object goes to the ring's thread, which does it there (only that
+    /// thread may change the ring's table), the number the handle's until
+    /// then.
     pub(super) fn attach_ring(
-        &self,
+        self: &Arc<Self>,
         shard: Arc<crate::rt::shard::Shared>,
         token: u64,
         fd: RawFd,
@@ -865,15 +867,12 @@ impl Source {
                 Ok(())
             }
             Some(Err(err)) => self.ring_attach_failed(&shard, token, err),
-            None => match sys::duplicate(fd) {
-                Ok(copy) => {
-                    // SAFETY: both sides are held.
-                    unsafe { *self.reg.shard.get() = Some(Arc::clone(&shard)) };
-                    shard.post_io(crate::rt::shard::IoOp::RingAttach(token, copy));
-                    Ok(())
-                }
-                Err(err) => self.ring_attach_failed(&shard, token, err),
-            },
+            None => {
+                // SAFETY: both sides are held.
+                unsafe { *self.reg.shard.get() = Some(Arc::clone(&shard)) };
+                shard.post_io(crate::rt::shard::IoOp::RingAttach(token, self.hold(fd)));
+                Ok(())
+            }
         }
     }
 
@@ -891,46 +890,54 @@ impl Source {
         Err(err)
     }
 
-    /// On the ring's thread: puts the file of `copy` (a copy of the
-    /// source's descriptor made while the source could not close) into the
-    /// table, and hands the slot to the source, whose registration takes it
-    /// with both sides held (see `ring_installed`).
+    /// On the ring's thread: puts the file of the descriptor `lease` keeps
+    /// open (the source's own, leased while the source could not close)
+    /// into the table, or a slot naming it, and hands the slot to the
+    /// source, whose registration takes it with both sides held (see
+    /// `ring_installed`). The lease goes once the caller is done.
     pub(crate) fn ring_attached(
         self: &Arc<Self>,
         ring: &ShardRing,
         shard: &Arc<crate::rt::shard::Shared>,
-        copy: &OwnedFd,
+        lease: &super::requests::Lease,
         token: u64,
     ) {
-        use std::os::fd::AsRawFd;
         // A source that closed or moved on meanwhile: its registration was
-        // undone, and the copy only goes. One under way with another shard
+        // undone, and the lease only goes. One under way with another shard
         // may carry a token of the same number.
         if self.reg.state.load(Ordering::Acquire) != super::REGISTERING
             || !self.registered_with(Arc::as_ptr(shard) as usize, token)
         {
             return;
         }
-        self.ring_installed(shard, token, ring.attach(copy.as_raw_fd()));
+        self.ring_installed(shard, token, ring.attach(lease.raw()));
     }
 
     /// The source's registration with ring shard `shard` goes: its ring
-    /// cancels the sides' operations `out` and lets go of `slot` once they
-    /// are done, at once on the ring's thread, else from its mailbox.
+    /// cancels the sides' operations `out`, hands every entry naming `slot`
+    /// to the kernel and takes the file out of the slot, at once on the
+    /// ring's thread, else from its mailbox; the slot is free again once
+    /// those entries completed. A lease keeps the handle's object open until
+    /// none of its entries waits to reach the kernel, so a slot naming the
+    /// descriptor never reaches a number that went to another file.
     pub(super) fn detach_ring(
-        &self,
+        self: &Arc<Self>,
         shard: &Arc<crate::rt::shard::Shared>,
         slot: u32,
         out: [Option<u64>; 2],
     ) {
-        let done = crate::rt::context::here(|here| {
-            here.filter(|s| s.is(shard))
-                .and_then(|s| s.ring())
-                .map(|ring| ring.detach(slot, out))
-                .is_some()
+        let lease = self.hold(self.fd.load(Ordering::Acquire));
+        let lease = crate::rt::context::here(|here| {
+            match here.filter(|s| s.is(shard)).and_then(|s| s.ring()) {
+                Some(ring) => {
+                    ring.detach(slot, out, Some(lease));
+                    None
+                }
+                None => Some(lease),
+            }
         });
-        if !done {
-            shard.post_io(crate::rt::shard::IoOp::RingDetach(slot, out));
+        if let Some(lease) = lease {
+            shard.post_io(crate::rt::shard::IoOp::RingDetach(slot, out, Some(lease)));
         }
     }
 }

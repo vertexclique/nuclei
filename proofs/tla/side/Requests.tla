@@ -17,20 +17,25 @@
 (* taken in one order only, the read side first: a holder of the read side *)
 (* tries the write side, with one fetch_or, and performs if it gets it;   *)
 (* a holder of the write side lets go first, then tries the read side once *)
-(* (getting it, it acts as a read-side holder). Whoever performs the close *)
-(* marks it done; the object is dropped by whichever of the dropper's     *)
-(* hand-over and the performer's mark comes second.                        *)
+(* (getting it, it acts as a read-side holder). The dropper hands its     *)
+(* object to the source first (`Keep::hand_over`), the close's own hold    *)
+(* still up; whoever performs the close lets that hold go. A job of the   *)
+(* blocking pool (a file's call, a `send_file` chunk; or a ring's attach   *)
+(* or detach in its mailbox) takes a lease on the object while the handle *)
+(* lives, uses the descriptor, maybe after the drop, and lets its lease    *)
+(* go: the last of the holds drops the object, so its descriptor closes   *)
+(* only once no call can use it.                                           *)
 (*                                                                          *)
 (* The close lingers: once the handle is gone, a task drains what it wrote *)
-(* through a copy of the descriptor (or, with none to spare for a copy,   *)
-(* through the handle's own object, kept open until it is done), as a     *)
-(* holder of the write side. If it                                        *)
+(* through the handle's own object, kept open until it is done (no copy of *)
+(* the descriptor is made), as a holder of the write side. If it          *)
 (* finds the close not performed yet, it waits on the write side for a    *)
 (* wake; the performer wakes the write side's waiters (the handle's other *)
 (* waiters are of operations that are gone, and are forgotten instead).   *)
 (*                                                                          *)
 (* What is abstract: the other flags of a side's word (Side.tla checks    *)
-(* them), and the descriptor (open until its object is dropped).           *)
+(* them), the descriptor (open until its object is dropped), and the hold  *)
+(* count (the leases out, beside the close's own hold).                    *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, TLC
 
@@ -48,28 +53,29 @@ variables
     req = [s \in Sides |-> FALSE],
     pending = FALSE,          \* the source's request word holds the close
     performed = 0,            \* how many times the close was performed
-    doomed = "empty",         \* the hand-over: "empty", "stored" or "closed"
+    stored = FALSE,           \* the dropper handed its object to the source
+    leases = 0,               \* the leases out on the object
     objectDropped = FALSE,    \* the handle's object, and so the descriptor, is closed
     loaded = [h \in Holders |-> FALSE],  \* a holder loaded the descriptor and will use it
-    usedClosed = FALSE,       \* (record) a holder used a descriptor that was closed
+    usedClosed = FALSE,       \* (record) a holder or a job used a descriptor that was closed
     byHolder = FALSE,         \* (record) a holder performed the close
-    handedOver = FALSE,       \* (record) the dropper handed its object over
+    byLease = FALSE,          \* (record) the last lease, not the close, dropped the object
     lingerWaits = FALSE,      \* the lingering drain waits on the write side for a wake
     lingerWaited = FALSE;     \* (record) it waited, before the close was performed
 
 define
     \* The close, done with both sides held: deregistration and the descriptor out of the source.
     \* Nothing is left to happen but the lingering drain's wait for its wake.
-    Settled == /\ \A p \in Holders \cup {"drop"} : pc[p] = "Done"
+    Settled == /\ \A p \in Holders \cup {"drop", "job"} : pc[p] = "Done"
                /\ pc["linger"] \in {"L_wait", "Done"}
 end define;
 
 macro Perform() begin
     pending := FALSE;
     performed := performed + 1;
-    \* The performer marks the close done; it drops the object if it was handed over.
-    if doomed = "stored" then objectDropped := TRUE; end if;
-    doomed := "closed";
+    \* The close's own hold goes: the object is dropped if it was handed over and no lease is out.
+    \* MUTATION ignore_leases: it is dropped though a lease is out.
+    if stored /\ (leases = 0 \/ Mutation = "ignore_leases") then objectDropped := TRUE; end if;
     \* The write side's waiters are woken: a waiting drain goes on.
     \* MUTATION linger_forgets: they are forgotten, as the handle's others are.
     if Mutation # "linger_forgets" then lingerWaits := FALSE; end if;
@@ -123,8 +129,7 @@ Rel_req:
             busy["read"] := TRUE || req["read"] := TRUE;
             pending := FALSE;
             performed := performed + 1;
-            if doomed = "stored" then objectDropped := TRUE; end if;
-            doomed := "closed";
+            if stored /\ leases = 0 then objectDropped := TRUE; end if;
 Rel_mut_release:
             call Release("read");
         else
@@ -153,6 +158,14 @@ end procedure;
 
 fair process dropper = "drop"
 begin
+D_hand:
+    \* The object goes to the source first, the close's own hold still up.
+    \* MUTATION drop_closes_at_once: the dropper drops its object at once instead.
+    if Mutation = "drop_closes_at_once" then
+        objectDropped := TRUE;
+    else
+        stored := TRUE;
+    end if;
 D_pend:
     pending := TRUE;
 D_take_read:
@@ -163,7 +176,7 @@ D_take_read:
             Perform();
 D_rel_mut:
             call Release("read");
-            goto D_own;
+            goto Done;
         end if;
 D_try_write:
         call TryWrite();
@@ -172,23 +185,27 @@ D_rel_read:
     else
         req["read"] := TRUE;
     end if;
-D_check:
-    if doomed = "closed" /\ ~handedOver then
-        \* Performed by the dropper itself (nothing handed over yet): it drops its own object.
-        goto D_own;
-    end if;
-D_hand:
-    \* MUTATION drop_closes_at_once: the object is dropped even though the close is not done.
-    if Mutation = "drop_closes_at_once" then
-        objectDropped := TRUE;
+end process;
+
+\* A job of the blocking pool: a lease taken while the handle lives, the descriptor used, maybe
+\* after the drop, and the lease let go; the last hold drops the object.
+fair process job = "job"
+begin
+J_lease:
+    \* Only a holder of the handle takes a lease: none once it was dropped.
+    if stored \/ objectDropped then
+        goto Done;
     else
-        handedOver := TRUE;
-        if doomed = "closed" then objectDropped := TRUE; end if;
-        doomed := IF doomed = "closed" THEN "closed" ELSE "stored";
+        leases := leases + 1;
     end if;
-    goto Done;
-D_own:
-    objectDropped := TRUE;
+J_use:
+    if objectDropped then usedClosed := TRUE; end if;
+J_release:
+    leases := leases - 1;
+    if leases = 0 /\ performed > 0 /\ stored /\ ~objectDropped then
+        objectDropped := TRUE;
+        byLease := TRUE;
+    end if;
 end process;
 
 \* The lingering drain, spawned once the dropper is done: a holder of the write side that waits for a
@@ -218,7 +235,7 @@ H_take:
     busy[SideOf(self)] := TRUE;
 H_load:
     \* The driver's part loads the descriptor; a closed source has none to load.
-    loaded[self] := doomed # "closed";
+    loaded[self] := performed = 0;
 H_use:
     if loaded[self] /\ objectDropped then usedClosed := TRUE; end if;
     loaded[self] := FALSE;
@@ -236,7 +253,7 @@ end algorithm; *)
 (* The properties.                                                         *)
 (***************************************************************************)
 
-\* No holder uses a descriptor that was closed under it.
+\* No holder, and no job holding a lease, uses a descriptor that was closed under it.
 NoUseOfClosed == ~usedClosed
 
 \* The close is performed once at most.
@@ -254,8 +271,8 @@ Closed == Settled => (performed = 1 /\ objectDropped)
 
 \* A holder, not the dropper, performs the close.
 NoHolderClose == ~byHolder
-\* The dropper hands its object over instead of dropping it.
-NoHandOver == ~handedOver
+\* The last lease out, not the close, drops the object.
+NoLeaseDrop == ~byLease
 \* The lingering drain waits before the close is performed (and so needs the performer's wake).
 NoLingerWait == ~lingerWaited
 =============================================================================

@@ -74,3 +74,13 @@ WZ_orphan_done                 MC_LentZc            violated:NoOrphanDone
 WZ_kept                        MC_LentZc            violated:NoKept
 WZ_keeper_notif                MC_LentZc            violated:NoKeeperNotif
 WZ_failed                      MC_LentZc            violated:NoFailed
+PD_ahead                       MC_LentDatagram      pass
+PD_lent                        MC_LentDatagram      pass
+PD_ahead_live                  MC_LentDatagram      pass
+MD_no_held_check               MC_LentDatagram      violated:OwnBuffer
+WD_ahead_while_lent            MC_LentDatagram      violated:NoAheadWhileLent
+PF_drop                        MC_LentFile          pass
+PF_into_inner                  MC_LentFile          pass
+MF_close_at_drop               MC_LentFile          violated:NoCallOnClosed
+MF_into_inner_early            MC_LentFile          violated:NoCallOnClosed
+WF_job_outlives_drop           MC_LentFile          violated:NoJobAfterDrop

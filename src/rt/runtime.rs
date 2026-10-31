@@ -68,6 +68,8 @@ pub(crate) struct Inner {
     on_panic: crate::sync::Notify,
     /// Seeds the generator of a thread in this runtime's `block_on`.
     rng_seed: Option<RngSeed>,
+    /// What dropped handles left to finish, once no worker takes it.
+    lingering: super::linger::Lingering,
 }
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
@@ -402,6 +404,7 @@ impl Builder {
                 on_panic: crate::sync::Notify::new(),
                 rng_seed: self.rng_seed,
                 guests: kovan_map::HashMap::with_capacity(GUESTS_CAPACITY),
+                lingering: super::linger::Lingering::new(),
             }
         });
         inner.pool.set_owner(Arc::downgrade(&inner));
@@ -447,7 +450,9 @@ impl fmt::Debug for Builder {
 
 /// A runtime: worker shards and a blocking pool. Dropping it stops the
 /// workers, drops the tasks they still hold, and waits for the threads to
-/// exit.
+/// exit; then, on the dropping thread, for what the handles those tasks held
+/// left behind (the bytes a socket's write-behind holds, a file's writes) to
+/// land, each for at most a minute, so nothing they accepted is lost.
 pub struct Runtime {
     inner: Arc<Inner>,
     /// One message per worker that exited.
@@ -507,12 +512,42 @@ impl Runtime {
     }
 
     /// Stops the workers and waits for them up to `timeout`; workers still
-    /// running a task then are left to exit on their own.
+    /// running a task then are left to exit on their own. What the handles
+    /// of the tasks dropped left behind gets the rest of `timeout` to land,
+    /// on this thread; what has not by then is given up.
     pub fn shutdown_timeout(mut self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
         self.stop_and_join(Some(timeout));
+        self.finish_lingering(Some(deadline));
+    }
+
+    /// Runs what dropped handles left behind until every part handed to the
+    /// runtime ended and nothing more can come (no file write the workers
+    /// issued is still to wake its task, no task woken on a stopped worker
+    /// is still to be dropped), for at most a linger's time (each part is
+    /// bounded by its own) or until `deadline`; on this thread, its runtime
+    /// set to this one, so a file's calls run on this blocking pool. Then
+    /// what is left, and the lingers handed later, run on threads of their
+    /// own.
+    fn finish_lingering(&self, deadline: Option<std::time::Instant>) {
+        // Once: a shutdown that ran it (or gave it up) leaves its drop none.
+        if self.inner.lingering.is_over() {
+            return;
+        }
+        if !self.inner.lingers_done() {
+            let linger = std::time::Instant::now() + crate::io::handle::LINGER;
+            let deadline = deadline.map_or(linger, |d| d.min(linger));
+            let _ = block_on_here(
+                &self.inner,
+                crate::time::timeout_at(deadline, self.inner.run_lingers()),
+            );
+        }
+        self.inner.lingering.end();
     }
 
     fn stop_and_join(&mut self, timeout: Option<Duration>) {
+        // Lingers handed from now on wait for this drop, never for a worker.
+        self.inner.lingering.close();
         self.inner.workers.stop_all();
         let threads = self.inner.workers.take_threads();
         if let Some(timeout) = timeout {
@@ -550,6 +585,7 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.stop_and_join(None);
+        self.finish_lingering(None);
     }
 }
 
@@ -607,6 +643,11 @@ impl Inner {
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
+
+    /// What dropped handles left this runtime to finish.
+    pub(crate) fn lingering(&self) -> &super::linger::Lingering {
+        &self.lingering
+    }
 }
 
 /// The process default runtime, started now if it is not running.
@@ -642,6 +683,34 @@ fn running() -> Option<Arc<Inner>> {
     context::runtime().or_else(|| DEFAULT.get().map(|rt| Arc::clone(&rt.inner)))
 }
 
+/// [`running`], for a linger's hand-off.
+pub(crate) fn running_inner() -> Option<Arc<Inner>> {
+    running()
+}
+
+/// Spawns a linger on `inner`: on a worker that takes tasks, else (with
+/// `here`) on the shard of this thread (which runs it at its next
+/// `block_on`); the linger back where neither can take it.
+pub(crate) fn spawn_linger(
+    inner: &Arc<Inner>,
+    linger: super::linger::Guarded,
+    here: bool,
+) -> Result<(), super::linger::Guarded> {
+    if let Some(shard) = inner.workers.place(inner.id, inner.local_margin) {
+        spawn_on(inner, shard, linger).detach();
+        return Ok(());
+    }
+    // With no workers, the thread's own shard, if it has one: one is never
+    // made here (a thread on its way out may hand a linger).
+    let running = context::current(|current| current.is_some());
+    if here && (running || context::own_shard_if_made().is_some()) {
+        let _runtime = context::set_runtime(inner);
+        spawn_here(linger, false).detach();
+        return Ok(());
+    }
+    Err(linger)
+}
+
 /// A shard to serve a thread that runs none, of the runtime this thread is
 /// inside or of the default one, if one runs: it never starts one (a thread
 /// on its way out may ask).
@@ -651,23 +720,6 @@ pub(crate) fn running_service_shard() -> Option<Arc<Shared>> {
         .workers
         .place(inner.id, inner.local_margin)
         .map(Arc::clone)
-}
-
-/// Spawns `future`, detached, on a worker that takes tasks, of the runtime
-/// this thread is inside or of the default one if it runs; never starts one
-/// (a shard on its way out calls it). False when no worker took it.
-pub(crate) fn spawn_on_worker<F>(future: F) -> bool
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let Some(inner) = running() else {
-        return false;
-    };
-    let Some(shard) = inner.workers.place(inner.id, inner.local_margin) else {
-        return false;
-    };
-    spawn_on(&inner, shard, future).detach();
-    true
 }
 
 /// Whether the shard [`service_shard`] hands out runs a ring: the current

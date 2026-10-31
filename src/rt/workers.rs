@@ -223,6 +223,7 @@ impl Workers {
             workers.monitor.clone(),
         )?);
         let shared = Arc::clone(&shard.shared);
+        shared.set_runtime(Arc::downgrade(inner));
         let _ = workers.slots[index].set(Arc::clone(&shared));
         workers.running.fetch_add(1, Ordering::AcqRel);
         let life = Arc::new(Life::new());

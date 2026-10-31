@@ -189,20 +189,15 @@ fn new_sockets_and_connects_fail_as_std_and_work_once_descriptors_are_free() {
 /// Streams open before the limit fell read and write every way, as std's
 /// do with no descriptor to spare.
 async fn streams_open_before<S: Stream>() {
-    // send_file needs descriptors of its own: open::send_file_with_no_descriptor_left_sends_the_range.
     for how in READERS {
-        for writer in WRITERS
-            .into_iter()
-            .filter(|w| !matches!(w, crate::reset::Writer::SendFile))
-        {
+        for writer in WRITERS {
             // The send_file case opens the file first.
             let bytes = pattern(21, 100_000);
             let file = TempFile::with("emfile-send", &bytes);
             let opened = nuclei::fs::File::open(&file.0).await.unwrap();
             let (ours, mut peer) = S::pair(false);
-            // The first call registers the stream, which on a ring without a
-            // table of files takes a copy of its descriptor: that one is
-            // open::a_sockets_first_call_with_no_descriptor_left_works_as_std.
+            // A first call made before the limit falls; one made after it is
+            // `a_sockets_first_call_with_no_descriptor_left_works_as_std`.
             within("a first write", write_all(&ours, b"ping"))
                 .await
                 .unwrap();
@@ -328,50 +323,14 @@ fn datagram_sockets_open_before_send_and_receive_with_no_descriptor_left() {
     );
 }
 
-/// Whether registering a source takes no new descriptor here: on epoll, and
-/// on a ring with a table of fixed files (Linux 6.13 on). A ring without one
-/// registers each source on a copy of its descriptor, which a process with
-/// none to spare cannot make:
-/// open::a_sockets_first_call_with_no_descriptor_left_works_as_std.
-fn registers_without_a_descriptor() -> bool {
-    let ring = nuclei::stats()
-        .shards
-        .iter()
-        .any(|s| s.backend == nuclei::IoBackend::IoUring);
-    if !ring {
-        return true;
-    }
-    // SAFETY: plain data, all zeroes valid; the kernel fills it.
-    let mut name: libc::utsname = unsafe { core::mem::zeroed() };
-    // SAFETY: a plain call with a valid struct.
-    assert_eq!(unsafe { libc::uname(&mut name) }, 0);
-    // SAFETY: the kernel ends the release with a nul.
-    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
-    let mut numbers = release
-        .to_str()
-        .unwrap_or("")
-        .split(|c: char| !c.is_ascii_digit())
-        .filter_map(|n| n.parse::<u32>().ok());
-    let version = (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0));
-    version >= (6, 13)
-}
-
 /// A handle dropped with bytes still to send: they reach the peer, as std's
 /// do when its socket closes with bytes in the kernel's buffer. The drain
-/// registers the handle's object again, so the case runs where that takes no
-/// descriptor (see `registers_without_a_descriptor`).
+/// goes on with the handle's own object, which takes no descriptor.
 #[test]
 fn a_handle_dropped_with_bytes_to_send_delivers_them_with_no_descriptor_left() {
     run(
         "emfile::a_handle_dropped_with_bytes_to_send_delivers_them_with_no_descriptor_left",
         async || {
-            if !registers_without_a_descriptor() {
-                println!(
-                    "not run: a ring without a table of fixed files registers on a copy of the \
-                     descriptor (open::a_sockets_first_call_with_no_descriptor_left_works_as_std)"
-                );
-                return;
-            }
             for tiny in [false, true] {
                 let bytes = pattern(41, 2 << 20);
                 let (ours, mut peer) = TcpStream::pair(tiny);
@@ -491,4 +450,137 @@ fn a_runtime_built_with_no_descriptor_left_fails_and_one_after_runs() {
         .unwrap();
     other.block_on(round_trip());
     rt.block_on(round_trip());
+}
+
+/// A file opened before the process ran out of descriptors reads, writes
+/// and appends as std's does: its calls run on its own descriptor, and none
+/// needs a new one.
+#[test]
+fn a_file_open_before_reads_writes_and_appends_with_no_descriptor_left() {
+    run(
+        "emfile::a_file_open_before_reads_writes_and_appends_with_no_descriptor_left",
+        async || {
+            use nuclei::io::{AsyncReadExt, AsyncWriteExt};
+            let bytes = pattern(31, 200_000);
+            let file = TempFile::with("emfile-file", &bytes);
+            let log = TempFile::with("emfile-log", b"");
+            let mut reading = nuclei::fs::File::open(&file.0).await.unwrap();
+            let owned = nuclei::fs::File::open(&file.0).await.unwrap();
+            let mut writing = nuclei::fs::OpenOptions::new()
+                .write(true)
+                .open(&file.0)
+                .await
+                .unwrap();
+            let mut appending = nuclei::fs::OpenOptions::new()
+                .append(true)
+                .open(&log.0)
+                .await
+                .unwrap();
+            let mut starved = Starved::new();
+            starved.settle().await;
+            assert!(
+                File::open(&file.0).is_err_and(|e| out_of_descriptors(&e)),
+                "the limit left a descriptor to open with"
+            );
+            let mut got = Vec::new();
+            let read = within("a read", reading.read_to_end(&mut got)).await;
+            assert!(read.is_ok(), "a read with no descriptor left: {read:?}");
+            same_bytes("a read with no descriptor left", &got, &bytes);
+            let (n, buf) =
+                within("an owned read", owned.read_owned(Vec::with_capacity(1000))).await;
+            assert!(n.is_ok(), "an owned read with no descriptor left: {n:?}");
+            same_bytes("an owned read", &buf, &bytes[..1000]);
+            let wrote = within("a write", async {
+                writing.write_all(&bytes[..5000]).await?;
+                writing.flush().await
+            })
+            .await;
+            assert!(wrote.is_ok(), "a write with no descriptor left: {wrote:?}");
+            let (n, _) = within(
+                "an owned write",
+                writing.write_owned(bytes[..7000].to_vec()),
+            )
+            .await;
+            assert!(n.is_ok(), "an owned write with no descriptor left: {n:?}");
+            let synced = within("a sync", writing.sync_all()).await;
+            assert!(synced.is_ok(), "a sync with no descriptor left: {synced:?}");
+            let appended = within("an append", async {
+                appending.write_all(b"appended").await?;
+                appending.flush().await
+            })
+            .await;
+            assert!(
+                appended.is_ok(),
+                "an append with no descriptor left: {appended:?}"
+            );
+            starved.free();
+            assert_eq!(std::fs::read(&log.0).unwrap(), b"appended");
+        },
+    );
+}
+
+/// `send_file` with no descriptor left sends the range, as `sendfile(2)` on
+/// the same socket and file does.
+#[test]
+fn send_file_with_no_descriptor_left_sends_the_range() {
+    run(
+        "emfile::send_file_with_no_descriptor_left_sends_the_range",
+        async || {
+            let bytes = pattern(32, 100_000);
+            let file = TempFile::with("emfile-send-file", &bytes);
+            let opened = nuclei::fs::File::open(&file.0).await.unwrap();
+            let (ours, peer) = <TcpStream as Stream>::pair(false);
+            let reader = std::thread::spawn(move || {
+                let mut peer = peer;
+                let mut got = vec![0u8; 100_000];
+                peer.read_exact(&mut got).map(|()| got)
+            });
+            let mut starved = Starved::new();
+            starved.settle().await;
+            let sent = within("send_file", ours.send_file(&opened, 0, bytes.len() as u64)).await;
+            starved.free();
+            assert_eq!(
+                Answer::of(&sent, |n| *n as usize),
+                Answer::Ok(bytes.len()),
+                "send_file"
+            );
+            same_bytes("send_file", &joined(reader).await.unwrap(), &bytes);
+        },
+    );
+}
+
+/// A socket's first call with no descriptor left (made before the limit
+/// fell, never used since) works as std's does: registering it with a
+/// shard's driver takes no descriptor, whatever the kernel's ring offers.
+#[test]
+fn a_sockets_first_call_with_no_descriptor_left_works_as_std() {
+    run(
+        "emfile::a_sockets_first_call_with_no_descriptor_left_works_as_std",
+        async || {
+            let (tcp, mut tcp_peer) = <TcpStream as Stream>::pair(false);
+            let (unix, mut unix_peer) = <UnixStream as Stream>::pair(false);
+            let (ua, ub) = UnixDatagram::pair().unwrap();
+            let mut starved = Starved::new();
+            starved.settle().await;
+            let wrote = within("a TCP write", write_all(&tcp, b"tcp")).await;
+            let unix_wrote = within("a Unix write", write_all(&unix, b"unix")).await;
+            let sent = within("a Unix datagram", ua.send(b"dgram")).await;
+            let mut buf = [0u8; 8];
+            let got = within("a Unix datagram", ub.recv(&mut buf)).await;
+            starved.free();
+            assert!(wrote.is_ok(), "a TCP stream's first write: {wrote:?}");
+            assert!(
+                unix_wrote.is_ok(),
+                "a Unix stream's first write: {unix_wrote:?}"
+            );
+            assert!(sent.is_ok(), "a Unix datagram's first send: {sent:?}");
+            assert_eq!(got.ok(), Some(5), "a Unix datagram's first receive");
+            let mut three = [0u8; 3];
+            tcp_peer.read_exact(&mut three).unwrap();
+            assert_eq!(&three, b"tcp");
+            let mut four = [0u8; 4];
+            unix_peer.read_exact(&mut four).unwrap();
+            assert_eq!(&four, b"unix");
+        },
+    );
 }

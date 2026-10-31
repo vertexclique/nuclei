@@ -101,6 +101,14 @@ impl Spare {
     }
 }
 
+impl Drop for Spare {
+    /// A gift handed to a spare that had seen the close and gone: its shard
+    /// goes with the spare, never kept for good.
+    fn drop(&mut self) {
+        drop(self.take_gift());
+    }
+}
+
 /// A runtime's watch over its workers.
 pub(crate) struct Monitor {
     /// A poll this long is a blocked one.
@@ -301,6 +309,13 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
                 waiting = deliver(&mut watches, gift);
             }
         }
+    }
+    // A shard that waited for a thread goes here, inside its runtime: what
+    // the handles of its tasks leave goes to that runtime's drop.
+    if let Some(gift) = waiting.take() {
+        let inner = runtime.upgrade();
+        let _runtime = inner.as_ref().map(crate::rt::context::set_runtime);
+        drop(gift);
     }
 }
 

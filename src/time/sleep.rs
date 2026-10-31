@@ -170,6 +170,7 @@ impl Sleep {
         let cell = Arc::new(RemoteTimer {
             fired: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            orphaned: AtomicBool::new(false),
             waker: AtomicWaker::new(),
             key: UnsafeCell::new(None),
         });
@@ -204,6 +205,13 @@ impl Future for Sleep {
         if let State::Done = this.state {
             return Poll::Ready(());
         }
+        if let State::Remote { cell, .. } = &this.state
+            && cell.orphaned.load(Ordering::Acquire)
+        {
+            // The shard that held the timer went without firing it, and holds
+            // it no more: it is armed again where this poll runs.
+            this.state = State::Idle;
+        }
         context::current(|current| match current {
             Some(shard) => this.poll_local(shard, cx),
             None => this.poll_remote(cx),
@@ -230,6 +238,9 @@ impl fmt::Debug for Sleep {
 pub(crate) struct RemoteTimer {
     fired: AtomicBool,
     cancelled: AtomicBool,
+    /// The shard let go of the timer without firing it, as it went: the
+    /// sleep arms it again where it is polled next.
+    orphaned: AtomicBool,
     waker: AtomicWaker,
     /// Where the timer is in the firing shard's wheel. Read and written by
     /// that shard's thread only (arming, cancelling and firing all run there).
@@ -242,14 +253,10 @@ unsafe impl Send for RemoteTimer {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for RemoteTimer {}
 
-impl Wake for RemoteTimer {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        // Called by the firing shard once the wheel let go of the timer: the
-        // fired entry is removed here, as nobody else holds its key.
+impl RemoteTimer {
+    /// Fires the timer: called by the firing shard once the wheel let go of
+    /// it. The fired entry is removed here, as nobody else holds its key.
+    fn fire(&self) {
         // SAFETY: on the firing shard's thread (see `key`).
         if let Some(key) = unsafe { (*self.key.get()).take() } {
             context::current(|current| {
@@ -260,6 +267,40 @@ impl Wake for RemoteTimer {
         }
         self.fired.store(true, Ordering::Release);
         self.waker.wake();
+    }
+
+    /// The shard that was to fire the timer let go of it unfired, as it went:
+    /// unless it fired or was cancelled, the sleep's task is woken, to arm it
+    /// again where it is polled (or be dropped, its own shard gone too). The
+    /// cell keeps the task's waker no longer, so the task, which holds the
+    /// cell, is not kept by it for good (proofs/tla/timer, `NoStrandedWaker`).
+    pub(crate) fn orphan(&self) {
+        if self.fired.load(Ordering::Acquire) || self.cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        self.orphaned.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
+/// A remote timer as its shard's wheel holds it: fired when the wheel wakes
+/// it, orphaned when the wheel drops it unfired (the shard went).
+struct Armed(Arc<RemoteTimer>);
+
+impl Wake for Armed {
+    fn wake(self: Arc<Self>) {
+        self.0.fire();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fire();
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        // A fire or a cancel came first: nothing to do.
+        self.0.orphan();
     }
 }
 
@@ -281,6 +322,14 @@ impl TimerOp {
         matches!(self, Self::Insert { .. })
     }
 
+    /// The op's shard went and applies it never: an arm request orphans its
+    /// timer; a removal or a cancel had nothing left to do.
+    pub(crate) fn orphan(self) {
+        if let Self::Insert { cell, .. } = self {
+            cell.orphan();
+        }
+    }
+
     /// Applies the op on its shard's thread.
     pub(crate) fn apply(self, shard: &Shard, wheel: &mut Wheel) {
         match self {
@@ -288,7 +337,7 @@ impl TimerOp {
                 if cell.cancelled.load(Ordering::SeqCst) {
                     return;
                 }
-                let waker = Waker::from(Arc::clone(&cell));
+                let waker = Waker::from(Arc::new(Armed(Arc::clone(&cell))));
                 let key = wheel.insert(shard.wheel_time(at.into_std()), &waker);
                 if wheel.is_fired(key) {
                     wheel.remove(key);

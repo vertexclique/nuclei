@@ -110,6 +110,33 @@ impl RingPoller {
         }
     }
 
+    /// Hands the kernel every entry queued here, those waiting for room in
+    /// the submission queue too, and has the kernel run the completion work
+    /// it holds for this thread: what a source that goes asked of it (its
+    /// cancels) is done before this returns. False when the kernel took not
+    /// all of them (it holds completions it has no room for, or a kernel
+    /// thread takes them later), which a later call tries again.
+    pub(crate) fn submit_now(&mut self) -> io::Result<bool> {
+        self.enable()?;
+        loop {
+            self.flush_waiting();
+            match self.ring.submit() {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) if matches!(err.raw_os_error(), Some(libc::EBUSY | libc::EAGAIN)) => {
+                    return Ok(false);
+                }
+                Err(err) => return Err(err),
+            }
+            if self.ring.sq_ready() > 0 {
+                return Ok(false);
+            }
+            if self.waiting.is_empty() {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Moves waiting entries into the submission queue while it has room.
     fn flush_waiting(&mut self) {
         while let Some(sqe) = self.waiting.front() {

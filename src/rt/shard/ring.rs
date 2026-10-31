@@ -3,11 +3,15 @@
 //!
 //! Every entry for a source names the source's file by its slot (see
 //! `syscore::linux::iouring::files`): a fixed file of the ring's table
-//! (`IOSQE_FIXED_FILE`), or past the table the ring's own copy of the
-//! descriptor. Either way the ring holds its own reference to the file, so
-//! a handle that closes its descriptor on any thread never changes what an
-//! entry reaches, queued or submitted. A slot, and the file it holds, is let
-//! go only once no entry names it.
+//! (`IOSQE_FIXED_FILE`), or past the table the source's own descriptor,
+//! which the ring never copies. A source that goes ([`ShardRing::detach`])
+//! has its operations cancelled and every entry naming its slot handed to
+//! the kernel at once, which holds each request's file from then on, and its
+//! file taken out of the table at once: so the kernel closes the file as the
+//! handle's drop returns (once its requests let go of it), and the handle's
+//! object, which a lease keeps open until then, closes only once no entry
+//! that names its number waits to reach the kernel. The slot is handed out
+//! again only once no entry names it.
 //!
 //! An operation gets its user data as it is submitted, and keeps it until
 //! its completion: one can be cancelled by it at any time. A side has one
@@ -58,8 +62,8 @@ use super::Shard;
 use super::recv::RecvGroup;
 use crate::fs::ring::FileOp;
 use crate::io::source::ops::Done;
+use crate::io::source::requests::Lease;
 use crate::io::source::ring::{Arrival, RingMem, RingOp};
-use crate::io::sys;
 use crate::rt::backend::with_room;
 use crate::rt::park::Notifier;
 use crate::rt::park::ring::RingPoller;
@@ -92,6 +96,10 @@ pub(crate) struct ShardRing {
     /// is not single-issuer with deferred task work), so a keeper can take it as its shard goes.
     reapable: bool,
     files: RefCell<Files>,
+    /// Slots of sources that went whose entries did not all reach the
+    /// kernel yet (it held completions it had no room for), with the leases
+    /// that keep the sources' objects open until they do.
+    leaving: RefCell<Vec<(u32, Option<Lease>)>>,
     /// Files' calls submitted but not in the kernel yet, by user data, with
     /// their entries, in order.
     room: RefCell<VecDeque<(u64, Sqe)>>,
@@ -179,6 +187,7 @@ impl ShardRing {
             zc_denied: Cell::new(false),
             reapable: cfg.multi_issuer,
             files: RefCell::new(Files::new(files)),
+            leaving: RefCell::new(Vec::new()),
             room: RefCell::new(VecDeque::new()),
             in_kernel: Cell::new(0),
             cap,
@@ -278,8 +287,8 @@ impl ShardRing {
     /// once, never counted against the cap; its slot is named from now on.
     pub(crate) fn submit(&self, op: RingOp, sqe: Sqe) -> u64 {
         self.files.borrow_mut().named(op.file);
-        let sqe = match self.files.borrow().copy_of(op.file) {
-            Some(copy) => sqe.fd(copy),
+        let sqe = match self.files.borrow().number_of(op.file) {
+            Some(own) => sqe.fd(own),
             None => sqe.flags(IOSQE_FIXED_FILE),
         };
         op.source.op_out();
@@ -324,8 +333,8 @@ impl ShardRing {
     }
 
     /// Submits a file's read or write, on its own file (no slot of the
-    /// table): the operation holds a copy of the descriptor until it ends.
-    /// With the kernel full it waits for room.
+    /// table): the operation's lease keeps the descriptor open until it
+    /// ends. With the kernel full it waits for room.
     pub(crate) fn submit_file(&self, mut op: FileOp) {
         #[cfg(test)]
         self.file_calls.set(self.file_calls.get() + 1);
@@ -367,18 +376,23 @@ impl ShardRing {
     }
 
     /// Cancels the source's operation of `user_data`, which is in the kernel:
-    /// its completion says what it did.
-    pub(crate) fn cancel(&self, user_data: u64) {
+    /// its completion says what it did. Returns whether a cancel went to the
+    /// kernel's queue.
+    pub(crate) fn cancel(&self, user_data: u64) -> bool {
         if self.ops.borrow_mut().get_mut(user_data).is_some() {
             self.poller
                 .borrow_mut()
                 .push(Sqe::async_cancel(user_data).user_data(IGNORED));
+            return true;
         }
+        false
     }
 
     /// A slot holding the file of `fd`, which the caller keeps open for
-    /// the call: one of the ring's table, or past a full table, the ring's
-    /// own copy of `fd`.
+    /// the call: one of the ring's table, or past a full table, one naming
+    /// `fd` itself, which its source keeps open for as long as an entry
+    /// waits to name it (no copy is made: a process with no descriptor to
+    /// spare registers all the same).
     pub(crate) fn attach(&self, fd: RawFd) -> io::Result<u32> {
         let fixed = self.files.borrow_mut().take();
         match fixed {
@@ -389,32 +403,62 @@ impl ShardRing {
                     Err(err)
                 }
             },
-            None => {
-                let copy = sys::duplicate(fd)?;
-                Ok(self.files.borrow_mut().take_copy(copy))
-            }
+            None => Ok(self.files.borrow_mut().take_own(fd)),
         }
     }
 
-    /// The source of `slot` went: its sides' operations `out` are
-    /// cancelled, and the slot, with its file, is let go once no entry
-    /// names it (at once if none is out). A cancel by user data needs no
-    /// file, so nothing else keeps the slot.
-    pub(crate) fn detach(&self, slot: u32, out: [Option<u64>; 2]) {
+    /// The source of `slot` went (closed, retired, evicted or lingering
+    /// on): its sides' operations `out` are cancelled, and with every entry
+    /// naming the slot handed to the kernel now, the file is taken out of
+    /// the slot now (a fixed file out of the table; `lease`, which keeps the
+    /// source's object open, let go), so the kernel closes it as soon as its
+    /// requests let go of it, which the cancels see to before this returns
+    /// (proofs/tla/ring/RingClose.tla). The slot stays reserved until no
+    /// entry names it. Where the kernel took not every entry (it held
+    /// completions it had no room for), this is finished after the shard's
+    /// next wait.
+    pub(crate) fn detach(&self, slot: u32, out: [Option<u64>; 2], lease: Option<Lease>) {
+        let mut cancelled = false;
         for user_data in out.into_iter().flatten() {
-            self.cancel(user_data);
+            cancelled |= self.cancel(user_data);
         }
-        let freed = self.files.borrow_mut().release(slot);
-        self.freed(slot, freed);
+        // Entries naming the slot, or cancels of them, may still wait in
+        // the submission queue: they go to the kernel now, and the work the
+        // kernel holds for this thread runs, so the cancelled requests let
+        // go of their files before this returns.
+        let named = cancelled || self.files.borrow().is_named(slot);
+        if named && !self.poller.borrow_mut().submit_now().unwrap_or(false) {
+            // Still held, so the slot is not handed out meanwhile.
+            self.leaving.borrow_mut().push((slot, lease));
+            return;
+        }
+        self.take_out(slot, lease);
     }
 
-    /// A slot that came free: its fixed file is let go (a copy closed as
-    /// it was freed).
-    fn freed(&self, slot: u32, freed: bool) {
-        if freed && self.files.borrow().is_fixed(slot) {
-            // A failure leaves the file in the free slot until the slot's
-            // next source replaces it.
+    /// The source of `slot` went and no entry naming the slot waits to reach
+    /// the kernel: a fixed file leaves the table, the slot is released (free
+    /// once its entries completed), and the source's object may close.
+    fn take_out(&self, slot: u32, lease: Option<Lease>) {
+        if self.files.borrow().is_fixed(slot) {
+            // A failure leaves the file in the slot, reserved, until its next
+            // source replaces it.
             let _ = self.poller.borrow().update_file(slot, -1);
+        }
+        self.files.borrow_mut().release(slot);
+        drop(lease);
+    }
+
+    /// Slots of sources that went, waiting for their entries to reach the
+    /// kernel: once every queued entry did, they are taken out.
+    fn finish_leaving(&self) {
+        if self.leaving.borrow().is_empty()
+            || !self.poller.borrow_mut().submit_now().unwrap_or(false)
+        {
+            return;
+        }
+        let leaving = core::mem::take(&mut *self.leaving.borrow_mut());
+        for (slot, lease) in leaving {
+            self.take_out(slot, lease);
         }
     }
 
@@ -437,6 +481,7 @@ impl ShardRing {
             self.complete(shard, cqe);
         }
         *self.cqes.borrow_mut() = cqes;
+        self.finish_leaving();
         Ok((handled, woken?))
     }
 
@@ -706,8 +751,9 @@ impl ShardRing {
         read: bool,
         outcome: crate::io::source::ops::Outcome,
     ) {
-        let freed = self.files.borrow_mut().done(file);
-        self.freed(file, freed);
+        // The slot's file left the table as its source went: a slot that
+        // comes free only goes back to its list.
+        self.files.borrow_mut().done(file);
         source.op_done(
             Done {
                 outcome,
@@ -786,10 +832,11 @@ const IGNORED: u64 = u32::MAX as u64;
 
 #[cfg(test)]
 impl ShardRing {
-    /// Slots held or still named, and of them the ones past the table.
+    /// Slots held or still named, and of them the ones past the table (which
+    /// name their sources' own descriptors).
     pub(crate) fn files_in_use(&self) -> (usize, usize) {
         let files = self.files.borrow();
-        (files.in_use(), files.copies_in_use())
+        (files.in_use(), files.own_in_use())
     }
 
     /// Multishot receives submitted so far, the arrivals they handed out,
@@ -861,8 +908,8 @@ thread_local! {
 /// The fixed-file table of a ring: the process's descriptor limit (no more
 /// sources can be open while it holds, and the kernel refuses a larger table
 /// with `EMFILE`), at most [`MAX_TABLE`], whose slots cost kernel memory per
-/// ring. Sources past it run on copies; every source does where the kernel
-/// lets go of a file out of the table only late (see
+/// ring. Sources past it run on their own descriptors; every source does
+/// where the kernel lets go of a file out of the table only late (see
 /// `files::release_at_once`).
 pub(crate) fn table_len() -> u32 {
     #[cfg(test)]

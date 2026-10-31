@@ -107,8 +107,8 @@ fn a_retire_waits_for_the_holder_that_performs_it() {
 }
 
 /// A handle dropped with bytes behind while a side is held: the hand-off to
-/// the copy of the descriptor is done by the holder, and the bytes still
-/// reach the peer before it sees the end.
+/// the linger, on the handle's own object, is done by the holder, and the
+/// bytes still reach the peer before it sees the end.
 #[test]
 fn a_dropped_handle_lingers_through_a_held_side() {
     let rt = runtime(None);
@@ -146,13 +146,12 @@ fn a_dropped_handle_lingers_through_a_held_side() {
     (&peer).read_to_end(&mut got).unwrap();
     assert!(got == sent, "{} of {} bytes arrived", got.len(), sent.len());
     drop(rt);
-    assert!(src.is_retired(), "the copy was never closed");
+    assert!(src.is_retired(), "the lingering object was never closed");
 }
 
 /// The drain of a lingering close may wait on the write side before the
-/// close runs: the close wakes it, and it goes on through the copy (a
-/// descriptor's; on Windows the handle keeps its object instead, see
-/// `a_dropped_handle_lingers_through_a_held_side`).
+/// close runs: the close wakes it, and it goes on through the handle's own
+/// descriptor, whose object the drain keeps.
 #[cfg(unix)]
 #[test]
 fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
@@ -208,8 +207,7 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
     // drain task may hold a side for a moment, and then performs the close
     // as it lets go.
     let held = until_some("the read side never came free", || src.read.try_hold());
-    let copy = src.duplicate().expect("a copy of the descriptor");
-    src.close(mine, Some(copy.as_raw_fd()));
+    src.linger(mine.raw());
     let waker = Waker::from(Arc::clone(&woken));
     assert!(
         src.poll_drain(&mut Context::from_waker(&waker))
@@ -225,15 +223,16 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
     });
     phase.store(3, Ordering::SeqCst);
     drop(peer);
-    src.close(copy, None);
+    src.close(mine);
     phase.store(4, Ordering::SeqCst);
     drop(rt);
 }
 
-/// An attach performed off the ring's thread hands the ring a copy of the
-/// descriptor to put into its table. The handle closes before the ring
-/// gets to it: the ring must not keep the file, or the peer never sees the
-/// end. The ring's thread is held in a task meanwhile, so the order is
+/// An attach performed off the ring's thread hands the ring a lease on the
+/// handle's object, whose descriptor it puts into its table. The handle
+/// closes before the ring gets to it: the lease keeps the object open until
+/// then, and the ring must not keep the file after, or the peer never sees
+/// the end. The ring's thread is held in a task meanwhile, so the order is
 /// certain.
 #[cfg(ring)]
 #[test]
@@ -268,7 +267,7 @@ fn a_close_before_the_ring_installs_an_attach_leaves_it_no_file() {
     has_polled
         .recv_timeout(Duration::from_secs(10))
         .expect("the worker's read never ran");
-    // Letting go performs the attach here, which posts the copy to the ring.
+    // Letting go performs the attach here, which posts a lease to the ring.
     let mut after = After::default();
     held.release(&mut after, &src.hooks());
     after.run();
@@ -309,7 +308,7 @@ fn a_stale_attach_is_not_taken_for_one_to_another_ring_under_the_same_token() {
     let src = Arc::clone(handle.source());
     // A read polled on `rt`'s worker registers the source there, the attach
     // left to this thread (it holds the write side), which then performs it
-    // and posts the copy to the ring; the worker's thread waits for `go`.
+    // and posts a lease to the ring; the worker's thread waits for `go`.
     let attach_held = |rt: &Runtime| {
         let held = src.write.try_hold().expect("the write side is free");
         let (polled, has_polled) = channel();

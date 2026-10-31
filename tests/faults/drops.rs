@@ -101,7 +101,7 @@ async fn dropped_with_a_read_out<S: Stream>() {
 
 /// A listener and datagram sockets dropped with calls out hold nothing. That
 /// the listener is closed when its drop returns is
-/// `open::a_listener_dropped_with_an_accept_out_is_closed_at_once`.
+/// `a_listener_dropped_with_an_accept_out_is_closed_at_once`.
 async fn listener_and_datagrams_dropped_with_calls_out() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     poll_times("an accept", listener.accept(), 1, DropAt::Poll).await;
@@ -238,7 +238,7 @@ fn a_file_dropped_with_writes_behind_lands_them() {
 /// owned buffers a peer never takes, accepting, receiving, sleeping, waiting
 /// on the blocking pool. Once it is gone the process holds no more than
 /// before it was built, and a runtime after it works. A file with writes
-/// behind is open::a_file_dropped_with_its_runtime_lands_its_writes.
+/// behind is `a_file_dropped_with_its_runtime_lands_its_writes`.
 #[test]
 fn a_runtime_dropped_with_everything_out_holds_nothing() {
     if !alone("drops::a_runtime_dropped_with_everything_out_holds_nothing") {
@@ -251,14 +251,13 @@ fn a_runtime_dropped_with_everything_out_holds_nothing() {
     };
     warm();
     drop(<TcpStream as Stream>::pair(true));
-    // A handle dropped with its runtime, with bytes or file writes behind,
-    // hands them to a task of the process default runtime, which starts if
-    // it is not running: it runs from before the count, for good.
-    nuclei::block_on(nuclei::spawn(async {}));
     let mut peers = Vec::new();
+    // Returns the peer of the owned write, which never reads: the bytes its
+    // handle left behind go out as the runtime drops, for a minute at most
+    // (`a_runtime_dropped_with_bytes_behind_delivers_them`), so it resets
+    // just before, and they end there.
     let busy = |rt: &nuclei::Runtime, peers: &mut Vec<Box<dyn Send>>| {
-        let (ours, peer) = <TcpStream as Stream>::pair(true);
-        peers.push(Box::new(peer));
+        let (ours, writes_to) = <TcpStream as Stream>::pair(true);
         // Below the zero-copy size: a zero-copy send out when its runtime
         // drops is open::a_runtime_dropped_with_a_zero_copy_send_out_leaves_no_descriptor_open.
         rt.spawn(async move {
@@ -290,21 +289,14 @@ fn a_runtime_dropped_with_everything_out_holds_nothing() {
         })
         .detach();
         rt.block_on(nuclei::task::yield_now());
+        writes_to
     };
     let before = Held::now();
     for _ in 0..3 {
-        // No handoff: a worker the busy host stops past the threshold would
-        // be handed off, and a runtime dropped after a handoff leaks its
-        // pollers (open::a_runtime_dropped_after_a_handoff_leaves_no_descriptor_open).
-        let rt = nuclei::Runtime::builder()
-            .worker_threads(2)
-            .pin_workers(false)
-            .thread_keep_alive(Duration::from_millis(100))
-            .handoff_after(None)
-            .build()
-            .unwrap();
-        busy(&rt, &mut peers);
+        let rt = runtime();
+        let writes_to = busy(&rt, &mut peers);
         rt.block_on(round_trip());
+        <TcpStream as Stream>::reset(writes_to);
         drop(rt);
         peers.clear();
     }
@@ -404,4 +396,317 @@ fn a_shard_that_goes_hands_its_streams_on_with_every_byte() {
         }
     });
     rt.block_on(round_trip());
+}
+
+/// A listener dropped with an accept out is closed when the drop returns, as
+/// std's is: a connect to its port is refused.
+#[test]
+fn a_listener_dropped_with_an_accept_out_is_closed_at_once() {
+    if !alone("drops::a_listener_dropped_with_an_accept_out_is_closed_at_once") {
+        return;
+    }
+    let rt = runtime();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        poll_times("an accept", listener.accept(), 1, DropAt::Poll).await;
+        // The accept reaches the kernel before the drop.
+        nuclei::time::sleep(Duration::from_millis(20)).await;
+        drop(listener);
+        let refused = std::net::TcpStream::connect(addr);
+        assert!(
+            refused.is_err(),
+            "a connect to a listener dropped with an accept out"
+        );
+    });
+}
+
+/// A stream dropped with a read out, by a thread that then blocks and runs
+/// its shard no more, is closed all the same, as std's is: its peer reads
+/// the end at once.
+#[test]
+fn a_stream_dropped_by_a_thread_that_then_blocks_is_closed() {
+    if !alone("drops::a_stream_dropped_by_a_thread_that_then_blocks_is_closed") {
+        return;
+    }
+    let rt = runtime();
+    rt.block_on(async {
+        let (ours, mut peer) = <TcpStream as Stream>::pair(false);
+        let mut buf = [0u8; 64];
+        poll_times("a read", read_some(&ours, &mut buf), 1, DropAt::Poll).await;
+        // The read reaches the kernel before the drop.
+        nuclei::time::sleep(Duration::from_millis(20)).await;
+        drop(ours);
+        // This thread blocks in the peer's read, its shard with it.
+        let mut end = [0u8; 8];
+        let got = peer.read(&mut end);
+        assert_eq!(
+            Answer::of(&got, |n| *n),
+            Answer::Ok(0),
+            "the peer of a stream dropped by a thread that then blocked"
+        );
+    });
+}
+
+/// A runtime dropped after one of its workers was handed off (blocked past
+/// `handoff_after`), with tasks waiting on timers, leaves no descriptor open:
+/// every shard's poller goes with it.
+#[test]
+fn a_runtime_dropped_after_a_handoff_leaves_no_descriptor_open() {
+    if !alone("drops::a_runtime_dropped_after_a_handoff_leaves_no_descriptor_open") {
+        return;
+    }
+    let warm = runtime();
+    warm.block_on(round_trip());
+    drop(warm);
+    let before = Held::now();
+    for _ in 0..4 {
+        let rt = nuclei::Runtime::builder()
+            .worker_threads(2)
+            .pin_workers(false)
+            .handoff_after(Some(Duration::from_millis(5)))
+            .build()
+            .unwrap();
+        for _ in 0..4 {
+            rt.spawn(async {
+                std::thread::sleep(Duration::from_millis(30));
+                nuclei::time::sleep(Duration::from_secs(3600)).await;
+            })
+            .detach();
+        }
+        rt.block_on(nuclei::time::sleep(Duration::from_millis(50)));
+        drop(rt);
+    }
+    eventually("the dropped runtimes' descriptors to close", || {
+        Held::now().handles <= before.handles
+    });
+}
+
+/// What a case whose runtime's drop writes a file on this thread holds
+/// before it: this thread's shard, and on io_uring the worker the kernel
+/// keeps for its ring once a file's write went to it.
+fn warm_up_with_a_write() {
+    use nuclei::io::AsyncWriteExt;
+    let warm = runtime();
+    warm.block_on(round_trip());
+    let ahead = TempFile::new("drop-runtime-ahead");
+    warm.block_on(async {
+        let mut handle = nuclei::fs::File::create(&ahead.0).await.unwrap();
+        handle.write_all(&pattern(8, 64 * 1024)).await.unwrap();
+        handle.flush().await.unwrap();
+    });
+    drop(warm);
+}
+
+/// A file whose task drops with its runtime, with writes accepted behind,
+/// lands them before the drop returns, as std's writes land once they
+/// returned, and leaves no descriptor open.
+#[test]
+fn a_file_dropped_with_its_runtime_lands_its_writes() {
+    if !alone("drops::a_file_dropped_with_its_runtime_lands_its_writes") {
+        return;
+    }
+    use nuclei::io::AsyncWriteExt;
+    let file = TempFile::new("drop-runtime");
+    warm_up_with_a_write();
+    let before = Held::now();
+    let bytes = pattern(9, 300_000);
+    let rt = runtime();
+    let (taken, held) = std::sync::mpsc::channel();
+    let path = file.0.clone();
+    let written = bytes.clone();
+    rt.spawn(async move {
+        let mut handle = nuclei::fs::File::create(&path).await.unwrap();
+        handle.write_all(&written).await.unwrap();
+        taken.send(()).unwrap();
+        core::future::pending::<()>().await;
+        drop(handle);
+    })
+    .detach();
+    held.recv_timeout(DEADLINE).unwrap();
+    drop(rt);
+    same_bytes(
+        "a file's writes when its runtime dropped",
+        &std::fs::read(&file.0).unwrap(),
+        &bytes,
+    );
+    eventually(
+        "the file's descriptors and the runtime's threads to go",
+        || {
+            let now = Held::now();
+            now.handles <= before.handles && now.threads <= before.threads
+        },
+    );
+}
+
+/// A task whose file holds a write behind one the blocking pool has not
+/// made yet as its runtime drops is dropped only where that write ends, on
+/// the pool's thread: the drop waits for it, and lands what the task's file
+/// held, before it returns.
+#[test]
+fn a_file_whose_write_waits_for_the_pool_as_its_runtime_drops_lands_its_writes() {
+    if !alone("drops::a_file_whose_write_waits_for_the_pool_as_its_runtime_drops_lands_its_writes")
+    {
+        return;
+    }
+    use nuclei::io::AsyncWriteExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let file = TempFile::new("drop-runtime-pool");
+    warm_up_with_a_write();
+    let before = Held::now();
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let rt = nuclei::Runtime::builder()
+        .worker_threads(2)
+        .pin_workers(false)
+        .max_blocking_threads(1)
+        .thread_keep_alive(Duration::from_millis(100))
+        .on_thread_stop({
+            let stopped = Arc::clone(&stopped);
+            move || {
+                stopped.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .build()
+        .unwrap();
+    // The pool's one thread is held until both workers stopped: a write on
+    // the pool waits for it meanwhile.
+    let (running, holds) = std::sync::mpsc::channel();
+    let held_pool = {
+        let stopped = Arc::clone(&stopped);
+        rt.spawn_blocking(move || {
+            running.send(()).unwrap();
+            eventually("both workers to stop", || {
+                stopped.load(Ordering::SeqCst) >= 2
+            });
+        })
+    };
+    held_pool.detach();
+    holds.recv_timeout(DEADLINE).unwrap();
+    let bytes = pattern(11, 200_000);
+    let opened = std::fs::File::create(&file.0).unwrap();
+    let (taken, accepted) = std::sync::mpsc::channel();
+    let written = bytes.clone();
+    rt.spawn(async move {
+        let mut handle = nuclei::Handle::new(opened).unwrap();
+        // One write out (on the ring, or waiting for the pool) and one
+        // behind it.
+        let mut at = 0;
+        for _ in 0..2 {
+            at += handle.write(&written[at..]).await.unwrap();
+        }
+        taken.send(at).unwrap();
+        core::future::pending::<()>().await;
+        drop(handle);
+    })
+    .detach();
+    let at = accepted.recv_timeout(DEADLINE).unwrap();
+    drop(rt);
+    same_bytes(
+        "a file's writes when its runtime dropped with one waiting for the pool",
+        &std::fs::read(&file.0).unwrap(),
+        &bytes[..at],
+    );
+    eventually(
+        "the file's descriptors and the runtime's threads to go",
+        || {
+            let now = Held::now();
+            now.handles <= before.handles && now.threads <= before.threads
+        },
+    );
+}
+
+/// Signals as it drops: what holds it went.
+struct Gone(std::sync::mpsc::Sender<()>);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// A task that parks for good holding a file whose write is still out is
+/// dropped once that write ends, file and all: its own registration on the
+/// file keeps nothing alive.
+#[test]
+fn a_task_parked_holding_a_file_whose_write_is_out_goes_once_it_ends() {
+    use nuclei::io::AsyncWriteExt;
+    let file = TempFile::new("parked-holder");
+    let rt = runtime();
+    let (gone, dropped) = std::sync::mpsc::channel();
+    let path = file.0.clone();
+    let bytes = pattern(12, 4096);
+    let written = bytes.clone();
+    rt.spawn(async move {
+        let _gone = Gone(gone);
+        let mut handle = nuclei::fs::File::create(&path).await.unwrap();
+        // Accepted at once, and still out as the task parks.
+        assert_eq!(handle.write(&written).await.unwrap(), written.len());
+        core::future::pending::<()>().await;
+        drop(handle);
+    })
+    .detach();
+    assert!(
+        dropped.recv_timeout(DEADLINE).is_ok(),
+        "a task parked holding a file outlived its write"
+    );
+    same_bytes(
+        "the parked task's write",
+        &std::fs::read(&file.0).unwrap(),
+        &bytes,
+    );
+    drop(rt);
+}
+
+/// A stream whose task drops with its runtime, with bytes in its
+/// write-behind, delivers them before its end, as std's do when the process
+/// lets go of a socket with bytes unsent; no other runtime is started for
+/// them, and nothing is left open or running after.
+#[test]
+fn a_stream_dropped_with_its_runtime_delivers_its_bytes_and_starts_no_runtime() {
+    if !alone("drops::a_stream_dropped_with_its_runtime_delivers_its_bytes_and_starts_no_runtime") {
+        return;
+    }
+    let warm = runtime();
+    warm.block_on(round_trip());
+    drop(warm);
+    let before = Held::now();
+    let bytes = pattern(10, 300_000);
+    let rt = runtime();
+    // Inside the runtime: on Windows the pair's small-buffered socket
+    // connects through nuclei, which outside one would start the default.
+    let (ours, peer) = rt.block_on(async { <TcpStream as Stream>::pair(true) });
+    let reader = drain::<TcpStream>(peer);
+    let (taken, held) = std::sync::mpsc::channel();
+    let written = bytes.clone();
+    rt.spawn(async move {
+        let mut at = 0;
+        while at < written.len() {
+            match ours.try_write(&written[at..]) {
+                Ok(n) => at += n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("a write: {err}"),
+            }
+        }
+        taken.send(at).unwrap();
+        core::future::pending::<()>().await;
+        drop(ours);
+    })
+    .detach();
+    let at = held.recv_timeout(DEADLINE).unwrap();
+    drop(rt);
+    let (got, end) = reader.join().unwrap();
+    assert!(end.is_ok(), "the peer's end: {end:?}");
+    same_bytes(
+        "bytes behind when their task's runtime dropped",
+        &got,
+        &bytes[..at],
+    );
+    eventually(
+        "the stream's descriptors and the runtime's threads to go",
+        || {
+            let now = Held::now();
+            now.handles <= before.handles && now.threads <= before.threads
+        },
+    );
 }

@@ -120,8 +120,20 @@ pub(crate) struct Shared {
     /// Registrations other threads ask of the shard, applied before it
     /// polls.
     io_ops: SegQueue<IoOp>,
+    /// Nothing will apply `io_ops` again (the shard went, and its ring's
+    /// keeper too): what reaches it then is let go of by its poster.
+    io_closed: AtomicBool,
     /// What the shard counts, for `stats`.
     pub(crate) counters: Counters,
+    /// A worker's shard: its runtime, inside which a task of the shard woken
+    /// on another thread after the shard stopped is dropped.
+    runtime: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
+    /// File writes issued on the shard whose end's wake has not gone yet.
+    writes: AtomicUsize,
+    /// The shard drained its inbox for the last time as it was dropped, and
+    /// let go of its taker's role: a task woken here from now on is dropped
+    /// by the thread that pushed it, or one that drains for it.
+    released: AtomicBool,
     /// While its runtime's clock is paused: the deadline of the shard's
     /// earliest timer when it last parked (nanoseconds after the clock's
     /// origin, `u64::MAX` for none).
@@ -138,15 +150,21 @@ pub(crate) enum IoOp {
     /// A source went (its kernel registration is already gone): free its
     /// slot.
     Release(u64),
-    /// Put the file of a source into the ring's table: a copy of its
-    /// descriptor, made while the source could not close, which the ring
-    /// closes once the table holds the file.
+    /// Put the file of a source into the ring's table (or a slot naming its
+    /// descriptor): a lease on the handle's object, taken while the source
+    /// could not close, which keeps the number the handle's until the ring
+    /// took it.
     #[cfg(ring)]
-    RingAttach(u64, std::os::fd::OwnedFd),
-    /// A ring source went: cancel its sides' operations (by user data)
-    /// and let go of its slot.
+    RingAttach(u64, crate::io::source::requests::Lease),
+    /// A ring source went: cancel its sides' operations (by user data),
+    /// hand every entry naming its slot to the kernel and take its file out
+    /// of it, then let go of the lease that kept the object open meanwhile.
     #[cfg(ring)]
-    RingDetach(u32, [Option<u64>; 2]),
+    RingDetach(
+        u32,
+        [Option<u64>; 2],
+        Option<crate::io::source::requests::Lease>,
+    ),
     /// A ring source's side wants an operation submitted.
     #[cfg(ring)]
     RingKick(Arc<Source>),
@@ -159,6 +177,25 @@ pub(crate) enum IoOp {
     Touch(Arc<Source>),
     /// Watch a child's exit for a thread that runs no shard.
     Watch(Arc<crate::process::exit::Exit>),
+}
+
+impl IoOp {
+    /// The op's shard went and applies it never: a registration asked of it
+    /// fails, for the next wait to make it elsewhere, and a child it was to
+    /// watch is watched where its user polls next; the rest only goes.
+    fn gone(self) {
+        match self {
+            IoOp::Register(source) => source.registration_failed(&io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the shard stopped before the registration",
+            )),
+            IoOp::Watch(exit) => {
+                let orphan = Arc::strong_count(&exit) == 1;
+                exit.unwatched(orphan);
+            }
+            other => drop(other),
+        }
+    }
 }
 
 impl Shared {
@@ -194,12 +231,30 @@ impl Shared {
     }
 
     /// Hands work on the timer wheel to the shard. An arm request wakes the
-    /// shard, which may sleep past the new deadline otherwise.
+    /// shard, which may sleep past the new deadline otherwise. A shard that
+    /// stopped applies nothing more: what reaches it then is drained here.
     pub(crate) fn post_timer(&self, op: TimerOp) {
         let wake = op.needs_wake();
         self.timer_ops.push(op);
+        // Pairs with the fence of `drain_timer_ops`: either this sees the
+        // stop, or the shard's last drain finds the op.
+        crate::sync::internal::fence(Ordering::SeqCst);
+        if self.stopped.load(Ordering::SeqCst) {
+            self.drain_timer_ops();
+            return;
+        }
         if wake {
             self.unpark();
+        }
+    }
+
+    /// Drains the timer work of a shard that stopped and fires no timer
+    /// again: an arm request's timer is orphaned, and its sleep arms it again
+    /// where it is polled (proofs/tla/timer, `S_go`); the rest only goes.
+    pub(crate) fn drain_timer_ops(&self) {
+        crate::sync::internal::fence(Ordering::SeqCst);
+        while let Ok(op) = self.timer_ops.try_pop() {
+            op.orphan();
         }
     }
 
@@ -241,10 +296,34 @@ impl Shared {
         )
     }
 
-    /// Hands a registration change to the shard and wakes it.
+    /// Hands a registration change to the shard and wakes it. One that
+    /// nothing will apply (the shard and its ring's keeper went) is let go
+    /// of here, as the shard's last look does.
     pub(crate) fn post_io(&self, op: IoOp) {
         self.io_ops.push(op);
+        // Pairs with the fence of `close_io`: either this sees the mailbox
+        // closed, or its last drain finds the op.
+        crate::sync::internal::fence(Ordering::SeqCst);
+        if self.io_closed.load(Ordering::SeqCst) {
+            self.drain_io_ops();
+            return;
+        }
         self.unpark();
+    }
+
+    /// Nothing applies the mailbox from now on: what it holds is let go of,
+    /// and so is what reaches it later. The ring it was for is gone, with
+    /// every entry it had, so a lease a detach carries may close its object.
+    pub(crate) fn close_io(&self) {
+        self.io_closed.store(true, Ordering::SeqCst);
+        self.drain_io_ops();
+    }
+
+    fn drain_io_ops(&self) {
+        crate::sync::internal::fence(Ordering::SeqCst);
+        while let Ok(op) = self.io_ops.try_pop() {
+            op.gone();
+        }
     }
 
     /// Frees the slot of a source whose kernel registration is gone: at once
@@ -266,6 +345,64 @@ impl Shared {
     /// Whether the shard stopped.
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Makes `runtime` the one this worker's shard belongs to.
+    pub(crate) fn set_runtime(&self, runtime: std::sync::Weak<super::runtime::Inner>) {
+        let _ = self.runtime.set(runtime);
+    }
+
+    /// Sets the shard's runtime on this thread, unless it is set already:
+    /// for a task of the shard dropped where its waker ran (on another
+    /// thread, the shard stopped), so what its drop hands on (a dropped
+    /// handle's bytes) goes to its runtime (`rt::linger`).
+    pub(crate) fn enter_runtime(&self) -> Option<super::context::RuntimeSet> {
+        let runtime = self.runtime.get()?;
+        if super::context::runtime_is(runtime.as_ptr()) {
+            return None;
+        }
+        runtime
+            .upgrade()
+            .and_then(|inner| super::context::try_set_runtime(&inner))
+    }
+
+    /// A file write was issued on the shard.
+    pub(crate) fn write_began(&self) {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A file write issued here ended and its wake went: a runtime's drop
+    /// that waits for the stopped shard looks again.
+    pub(crate) fn write_ended(&self) {
+        if self.writes.fetch_sub(1, Ordering::SeqCst) == 1 && self.stopped.load(Ordering::SeqCst) {
+            self.nudge_runtime();
+        }
+    }
+
+    /// What a runtime's drop waits for of its worker's shard: every file
+    /// write issued here ended with its wake gone, and, once the shard let
+    /// go of its inbox, every task woken since was dropped (the inbox is
+    /// empty and nobody drains it). Read in this order, the inbox after the
+    /// writes, so a task a write's wake left to another thread's drain is
+    /// seen. A shard not let go of yet (its thread blocked in a task's poll,
+    /// the shard handed on) drops what its inbox holds when that thread
+    /// lets go of it, which the drop does not wait for.
+    pub(crate) fn settled(&self) -> bool {
+        self.writes.load(Ordering::SeqCst) == 0
+            && (!self.released.load(Ordering::SeqCst) || self.inbox.is_idle())
+    }
+
+    /// The shard let go of its inbox for good (see [`settled`](Self::settled)).
+    pub(crate) fn release_inbox(&self) {
+        self.drop_stopped(true);
+        self.released.store(true, Ordering::SeqCst);
+    }
+
+    /// Wakes the drop of the shard's runtime, if it waits.
+    fn nudge_runtime(&self) {
+        if let Some(inner) = self.runtime.get().and_then(std::sync::Weak::upgrade) {
+            inner.lingering().nudge();
+        }
     }
 
     /// Stops the shard: a worker's loop ends at its next look.
@@ -358,9 +495,11 @@ impl Shared {
             }
             holding = false;
             if self.inbox.is_empty() {
-                return;
+                break;
             }
         }
+        // A runtime's drop waits until no task woken here is left to drop.
+        self.nudge_runtime();
     }
 
     /// Whether work was handed to the shard, as any thread sees it (for a
@@ -610,7 +749,11 @@ impl Shard {
             #[cfg(port)]
             port: kernel,
             io_ops: SegQueue::new(),
+            io_closed: AtomicBool::new(false),
             counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
+            runtime: std::sync::OnceLock::new(),
+            writes: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
             timer_at: AtomicU64::new(u64::MAX),
             parks: AtomicU64::new(0),
         });
@@ -692,17 +835,17 @@ impl Shard {
                 }
                 IoOp::Watch(exit) => self.watch(exit),
                 #[cfg(ring)]
-                IoOp::RingAttach(token, copy) => {
+                IoOp::RingAttach(token, lease) => {
                     let source = self.sources.borrow().get(token).cloned();
                     if let (Some(ring), Some(source)) = (self.ring(), source) {
-                        source.ring_attached(ring, &self.shared, &copy, token);
+                        source.ring_attached(ring, &self.shared, &lease, token);
                     }
-                    drop(copy);
+                    drop(lease);
                 }
                 #[cfg(ring)]
-                IoOp::RingDetach(slot, out) => {
+                IoOp::RingDetach(slot, out, lease) => {
                     if let Some(ring) = self.ring() {
-                        ring.detach(slot, out);
+                        ring.detach(slot, out, lease);
                     }
                 }
                 #[cfg(ring)]
