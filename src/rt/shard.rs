@@ -422,6 +422,7 @@ impl Shared {
     }
 
     /// Whether placement may give the shard a new task.
+    #[inline]
     pub(crate) fn takes_tasks(&self) -> bool {
         !self.draining.load(Ordering::Relaxed)
     }
@@ -912,6 +913,7 @@ impl Shard {
     }
 
     /// The next runnable, in the loop's order.
+    #[inline]
     fn next(&self) -> Option<Runnable> {
         let left = self.until_inbox.get().wrapping_sub(1);
         if left == 0 {
