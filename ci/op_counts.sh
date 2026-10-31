@@ -26,10 +26,10 @@ tcp_split 2000 6000
 tcp_asyncrw 2000 6000
 tcp_many 4 12
 tcp_2w 2000 6000
-bulk 64 192
-file_read 64 192
+bulk 128 512
+file_read 256 1024
 spawn_join 10000 30000
-spawn_blocking 1000 3000
+spawn_blocking 2000 8000
 sleep 5 15
 oneshot 10000 30000
 "
