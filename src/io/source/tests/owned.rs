@@ -503,7 +503,8 @@ fn a_lent_write_to_a_gone_peer_fails_and_gives_the_buffer_back() {
 }
 
 /// A handle dropped while the driver still writes a lent buffer whose
-/// future went away: the rest goes out through its copy of the descriptor.
+/// future went away: the rest goes out through the handle's own object,
+/// which the linger keeps open meanwhile.
 #[test]
 fn a_dropped_handle_delivers_the_rest_of_a_started_lent_write() {
     let rt = runtime(None);

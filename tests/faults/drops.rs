@@ -101,7 +101,7 @@ async fn dropped_with_a_read_out<S: Stream>() {
 
 /// A listener and datagram sockets dropped with calls out hold nothing. That
 /// the listener is closed when its drop returns is
-/// `open::a_listener_dropped_with_an_accept_out_is_closed_at_once`.
+/// `a_listener_dropped_with_an_accept_out_is_closed_at_once`.
 async fn listener_and_datagrams_dropped_with_calls_out() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     poll_times("an accept", listener.accept(), 1, DropAt::Poll).await;
@@ -406,6 +406,55 @@ fn a_shard_that_goes_hands_its_streams_on_with_every_byte() {
     rt.block_on(round_trip());
 }
 
+/// A listener dropped with an accept out is closed when the drop returns, as
+/// std's is: a connect to its port is refused.
+#[test]
+fn a_listener_dropped_with_an_accept_out_is_closed_at_once() {
+    if !alone("drops::a_listener_dropped_with_an_accept_out_is_closed_at_once") {
+        return;
+    }
+    let rt = runtime();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        poll_times("an accept", listener.accept(), 1, DropAt::Poll).await;
+        // The accept reaches the kernel before the drop.
+        nuclei::time::sleep(Duration::from_millis(20)).await;
+        drop(listener);
+        let refused = std::net::TcpStream::connect(addr);
+        assert!(
+            refused.is_err(),
+            "a connect to a listener dropped with an accept out"
+        );
+    });
+}
+
+/// A stream dropped with a read out, by a thread that then blocks and runs
+/// its shard no more, is closed all the same, as std's is: its peer reads
+/// the end at once.
+#[test]
+fn a_stream_dropped_by_a_thread_that_then_blocks_is_closed() {
+    if !alone("drops::a_stream_dropped_by_a_thread_that_then_blocks_is_closed") {
+        return;
+    }
+    let rt = runtime();
+    rt.block_on(async {
+        let (ours, mut peer) = <TcpStream as Stream>::pair(false);
+        let mut buf = [0u8; 64];
+        poll_times("a read", read_some(&ours, &mut buf), 1, DropAt::Poll).await;
+        // The read reaches the kernel before the drop.
+        nuclei::time::sleep(Duration::from_millis(20)).await;
+        drop(ours);
+        // This thread blocks in the peer's read, its shard with it.
+        let mut end = [0u8; 8];
+        let got = peer.read(&mut end);
+        assert_eq!(
+            Answer::of(&got, |n| *n),
+            Answer::Ok(0),
+            "the peer of a stream dropped by a thread that then blocked"
+        );
+    });
+}
 
 /// A runtime dropped after one of its workers was handed off (blocked past
 /// `handoff_after`), with tasks waiting on timers, leaves no descriptor open:

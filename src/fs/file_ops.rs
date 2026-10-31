@@ -2,8 +2,9 @@
 //! its length, metadata, permissions and times, and a second handle to it.
 //!
 //! Each runs on the blocking pool after the handle's writes in flight landed
-//! (so a sync or a length sees them), on a duplicate of the file's
-//! descriptor, so the call never runs on a descriptor the handle closed.
+//! (so a sync or a length sees them), on the handle's own descriptor, which a
+//! lease keeps open for the call: one dropped meanwhile leaves its object to
+//! the call, and none needs a descriptor of its own.
 
 use core::pin::Pin;
 use std::fs::{File, FileTimes, Metadata, Permissions};
@@ -89,7 +90,7 @@ impl Handle<File> {
     }
 
     /// Runs `call` on the blocking pool once the writes in flight landed, on
-    /// a duplicate of the file's descriptor.
+    /// the handle's own descriptor, leased for the call.
     async fn on_pool<T, F>(&self, call: F) -> io::Result<T>
     where
         T: Send + 'static,
@@ -97,7 +98,7 @@ impl Handle<File> {
     {
         let mut this = self;
         core::future::poll_fn(|cx| Pin::new(&mut this).poll_flush(cx)).await?;
-        let file = self.get_ref().try_clone()?;
-        blocking(move || call(&file)).await
+        let lease = self.source().lease()?;
+        blocking(move || call(&lease.file())).await
     }
 }

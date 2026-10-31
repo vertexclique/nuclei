@@ -1,24 +1,30 @@
-//! A ring's files, as the ring's own thread sees it: which slots hold a
-//! file, which are free, and how many entries still name each slot.
+//! A ring's files, as the ring's own thread sees it: which slots a source
+//! holds, which are free, and how many entries still name each slot.
 //!
 //! A slot is handed to a source at its first operation on the ring and
-//! released when the source closes. It is not given to another source, and
-//! the file it holds is not let go, until no entry names it any more,
-//! submitted or still queued: an entry queued before the release and
-//! submitted after it would otherwise reach the next source's file.
+//! released when the source goes. It is not given to another source until no
+//! entry names it any more, submitted or still queued: an entry queued before
+//! the release and submitted after it would otherwise reach the next source's
+//! file.
 //!
 //! The first slots are the kernel's fixed-file table, which entries name by
-//! index. Past it, a slot holds the ring's own copy of the source's
-//! descriptor, which entries name by number: the number stays the copy's
-//! for as long as an entry names it, so it never reaches another file
-//! either. A full table never turns a source away.
+//! index. Past it, a slot names the source's own descriptor, which entries
+//! name by number: the ring makes no copy of it, so a process with no
+//! descriptor to spare registers its sources all the same. The number stays
+//! the source's while an entry that names it is queued: the source's object
+//! closes only once its entries reached the kernel (which holds the file of
+//! each from then on), as the ring's detach sees to (`ShardRing::detach`).
+//!
+//! A source that goes is taken out of the table at once (the kernel then
+//! closes the file once its last request let go of it), while the slot stays
+//! reserved until its entries completed.
 //!
 //! Before Linux 6.13 a file taken out of the kernel's table is let go only
 //! once every request issued while it was in the table completed, those on
 //! other files too, so one idle receive anywhere on the ring keeps a closed
 //! socket open: its peer never sees the end. Where [`release_at_once`] says
-//! the kernel behaves so, rings get no table, and every source runs on a
-//! copy, whose requests each hold the file themselves.
+//! the kernel behaves so, rings get no table, and every source's entries name
+//! its own descriptor, each request holding the file itself.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
@@ -29,8 +35,9 @@ struct Slot {
     held: bool,
     /// Entries that name it and have not completed.
     entries: u32,
-    /// Past the kernel's table: the ring's copy of the source's descriptor.
-    copy: Option<OwnedFd>,
+    /// Past the kernel's table: the source's own descriptor, which entries
+    /// name by number.
+    own: Option<RawFd>,
 }
 
 /// A ring's file slots.
@@ -88,15 +95,16 @@ impl Files {
         Some(slot)
     }
 
-    /// A slot past the kernel's table, holding `copy`.
-    pub(crate) fn take_copy(&mut self, copy: OwnedFd) -> u32 {
+    /// A slot past the kernel's table, naming the source's own descriptor
+    /// `fd`.
+    pub(crate) fn take_own(&mut self, fd: RawFd) -> u32 {
         let slot = self.spare.pop().unwrap_or_else(|| {
             self.copies.push(Slot::default());
             self.fixed + (self.copies.len() - 1) as u32
         });
         if let Some(s) = self.slot_mut(slot) {
             s.held = true;
-            s.copy = Some(copy);
+            s.own = Some(fd);
         }
         slot
     }
@@ -108,10 +116,13 @@ impl Files {
 
     /// The descriptor entries name `slot` by: `None` for the kernel's
     /// table, whose entries name the index.
-    pub(crate) fn copy_of(&self, slot: u32) -> Option<RawFd> {
-        self.slot(slot)
-            .and_then(|s| s.copy.as_ref())
-            .map(AsRawFd::as_raw_fd)
+    pub(crate) fn number_of(&self, slot: u32) -> Option<RawFd> {
+        self.slot(slot).and_then(|s| s.own)
+    }
+
+    /// Whether an entry still names `slot`.
+    pub(crate) fn is_named(&self, slot: u32) -> bool {
+        self.slot(slot).is_some_and(|s| s.entries > 0)
     }
 
     /// An entry naming `slot` was queued.
@@ -122,8 +133,8 @@ impl Files {
     }
 
     /// An entry naming `slot` completed. Returns whether the slot is free
-    /// now: a slot of the kernel's table then still holds its file, which
-    /// the caller lets go.
+    /// now: it can be handed out again (its file left the table as its source
+    /// went).
     pub(crate) fn done(&mut self, slot: u32) -> bool {
         match self.slot_mut(slot) {
             // A slot no entry names is never freed by one (it would go back
@@ -136,8 +147,10 @@ impl Files {
         }
     }
 
-    /// The source of `slot` closed: the slot is free once no entry names
-    /// it. Returns whether it is free now, as [`done`](Self::done).
+    /// The source of `slot` went: the slot is free once no entry names it,
+    /// and reserved until then. Returns whether it is free now, as
+    /// [`done`](Self::done). The caller takes a file of the kernel's table
+    /// out of it now, whatever entries still name the slot.
     pub(crate) fn release(&mut self, slot: u32) -> bool {
         match self.slot_mut(slot) {
             Some(s) if s.held => {
@@ -148,13 +161,13 @@ impl Files {
         }
     }
 
-    /// Frees `slot`, neither held nor named: a copy closes here.
+    /// Frees `slot`, neither held nor named: it names no descriptor now.
     fn free_slot(&mut self, slot: u32) -> bool {
         if self.is_fixed(slot) {
             self.free.push(slot);
         } else {
             if let Some(s) = self.slot_mut(slot) {
-                s.copy = None;
+                s.own = None;
             }
             self.spare.push(slot);
         }
@@ -169,7 +182,7 @@ impl Files {
 
     /// Slots past the kernel's table held or still named.
     #[cfg(test)]
-    pub(crate) fn copies_in_use(&self) -> usize {
+    pub(crate) fn own_in_use(&self) -> usize {
         self.copies.len() - self.spare.len()
     }
 }
@@ -305,30 +318,34 @@ mod tests {
         assert_eq!(files.take(), Some(a));
     }
 
-    /// Past a full table a source gets a slot holding a copy, which entries
-    /// name by number and which closes only once no entry names it.
+    /// Past a full table a source gets a slot naming its own descriptor,
+    /// which entries name by number, reserved until its last entry.
     #[test]
-    fn past_a_full_table_a_copy_is_named_until_its_last_entry() {
+    fn past_a_full_table_a_slot_names_the_sources_own_descriptor_until_its_last_entry() {
         let mut files = Files::new(1);
         let fixed = files.take().unwrap();
         assert!(files.take().is_none());
-        assert_eq!(files.copy_of(fixed), None);
-        let copy = descriptor();
-        let number = copy.as_raw_fd();
-        let a = files.take_copy(copy);
+        assert_eq!(files.number_of(fixed), None);
+        let own = descriptor();
+        let number = own.as_raw_fd();
+        let a = files.take_own(number);
         assert!(!files.is_fixed(a));
-        assert_eq!(files.copy_of(a), Some(number));
+        assert_eq!(files.number_of(a), Some(number));
         files.named(a);
         assert!(!files.release(a));
-        // Still named: the copy stays open, so its number is still its own.
-        // SAFETY: a plain fcntl that only asks whether `number` is open.
-        assert!(unsafe { libc::fcntl(number, libc::F_GETFD) } >= 0);
+        assert!(files.is_named(a));
+        // Reserved while named: a new source gets another slot.
+        let other = descriptor();
+        let b = files.take_own(other.as_raw_fd());
+        assert_ne!(a, b);
         assert!(files.done(a));
-        assert_eq!(files.copy_of(a), None);
-        assert_eq!(files.in_use(), 1);
-        // The freed slot past the table is the next copy's.
-        let b = files.take_copy(descriptor());
-        assert_eq!(a, b);
+        assert_eq!(files.number_of(a), None);
+        assert_eq!(files.in_use(), 2);
+        // The freed slot past the table is the next source's.
+        let c = files.take_own(number);
+        assert_eq!(a, c);
+        assert!(files.release(c));
         assert!(files.release(b));
+        drop((own, other));
     }
 }

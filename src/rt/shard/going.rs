@@ -218,8 +218,15 @@ impl Drop for Shard {
         // pusher that saw the flag while the role was held left its
         // runnable to this drain.
         self.shared.drop_stopped(true);
+        // The mailbox closes, unless a keeper applies it from now on (and
+        // closes it once it is done).
         #[cfg(ring)]
-        self.keep_ring();
+        let kept = self.keep_ring();
+        #[cfg(not(ring))]
+        let kept = false;
+        if !kept {
+            self.shared.close_io();
+        }
     }
 }
 
@@ -227,24 +234,27 @@ impl Shard {
     /// The shard is dropped: a ring another thread can reap goes to a keeper with what is still
     /// out once the ready completions are applied. Where no keeper can be had, the shard waits
     /// for them a bounded time, and what is still out keeps its memory for good.
+    /// Whether the ring went to a keeper, which applies the shard's mailbox
+    /// from then on.
     #[cfg(ring)]
-    fn keep_ring(&mut self) {
+    fn keep_ring(&mut self) -> bool {
         // A ring no keeper can reap was shut down as the shard went.
         let Driver::Ring(ring) = &self.driver else {
-            return;
+            return false;
         };
         if !ring.reapable() {
-            return;
+            return false;
         }
         // A look that fails leaves the ready completions to the keeper, whose wait meets the
         // same failure and keeps what is out for good.
         let looked = ring.wait(None, Some(std::time::Duration::ZERO)).is_ok();
         if looked && ring.in_flight() == 0 {
-            return;
+            return false;
         }
         let Driver::Ring(ring) = core::mem::replace(&mut self.driver, Driver::Gone) else {
-            return;
+            return false;
         };
         super::ring::keeper::hand_off(ring, Arc::clone(&self.shared));
+        true
     }
 }

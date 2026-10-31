@@ -12,13 +12,17 @@
 //! Why the blocking pool rather than the nonblocking flags: `sendfile(2)`
 //! takes no flag that keeps it off the disk, and a nonblocking socket only
 //! stops it at the socket.
+//!
+//! The calls run on the stream's and the file's own descriptors, each job
+//! holding a lease on both for as long as it runs: a chunk still on its way
+//! when the future is dropped keeps them open until it ends, and no call
+//! needs a descriptor of its own.
 
 use std::io;
 use std::net::TcpStream;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(windows)]
 use std::sync::Arc;
 
 use crate::fs::File;
@@ -98,24 +102,24 @@ macro_rules! send_file {
 
             #[cfg(unix)]
             async fn send_file_in_kernel(&self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
-                let sock = Arc::new(crate::io::sys::duplicate(self.get_ref().as_raw_fd())?);
-                let from = Arc::new(crate::io::sys::duplicate(file.get_ref().as_raw_fd())?);
+                let sock = self.source().lease()?;
+                let from = file.source().lease()?;
                 let mut sent = 0u64;
                 while sent < len {
                     let want = (len - sent).min(SEND_FILE_CHUNK) as usize;
                     let at = offset + sent;
-                    let (out, src) = (Arc::clone(&sock), Arc::clone(&from));
+                    let (out, src) = (sock.clone(), from.clone());
                     // The socket's `WouldBlock` is an answer, not a failure
                     // to count: it rides out inside the `Ok`.
                     let step = crate::rt::blocking::call(move || {
-                        Ok(crate::io::sys::send_file(out.as_raw_fd(), src.as_raw_fd(), at, want))
+                        Ok(crate::io::sys::send_file(out.raw(), src.raw(), at, want))
                     })
                     .await?;
                     match step {
                         Ok(0) => break,
                         Ok(n) => sent += n as u64,
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                            let raw = sock.as_raw_fd();
+                            let raw = sock.raw();
                             self.async_io(Interest::WRITABLE, || crate::io::sys::poll_writable(raw))
                                 .await?;
                         }
@@ -154,15 +158,15 @@ macro_rules! send_file {
             }
 
             async fn send_file_by_copy(&self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
-                let from = Arc::new(file.get_ref().try_clone()?);
+                let from = file.source().lease()?;
                 let mut buf = vec![0u8; SEND_FILE_CHUNK.min(len) as usize];
                 let mut sent = 0u64;
                 while sent < len {
                     let want = (len - sent).min(buf.len() as u64) as usize;
                     let at = offset + sent;
-                    let from = Arc::clone(&from);
+                    let from = from.clone();
                     let (read, back) = crate::rt::blocking::call(move || {
-                        let read = read_at(&from, &mut buf[..want], at);
+                        let read = read_at(&from.file(), &mut buf[..want], at);
                         Ok((read, buf))
                     })
                     .await?;

@@ -120,6 +120,9 @@ pub(crate) struct Shared {
     /// Registrations other threads ask of the shard, applied before it
     /// polls.
     io_ops: SegQueue<IoOp>,
+    /// Nothing will apply `io_ops` again (the shard went, and its ring's
+    /// keeper too): what reaches it then is let go of by its poster.
+    io_closed: AtomicBool,
     /// What the shard counts, for `stats`.
     pub(crate) counters: Counters,
     /// While its runtime's clock is paused: the deadline of the shard's
@@ -138,15 +141,21 @@ pub(crate) enum IoOp {
     /// A source went (its kernel registration is already gone): free its
     /// slot.
     Release(u64),
-    /// Put the file of a source into the ring's table: a copy of its
-    /// descriptor, made while the source could not close, which the ring
-    /// closes once the table holds the file.
+    /// Put the file of a source into the ring's table (or a slot naming its
+    /// descriptor): a lease on the handle's object, taken while the source
+    /// could not close, which keeps the number the handle's until the ring
+    /// took it.
     #[cfg(ring)]
-    RingAttach(u64, std::os::fd::OwnedFd),
-    /// A ring source went: cancel its sides' operations (by user data)
-    /// and let go of its slot.
+    RingAttach(u64, crate::io::source::requests::Lease),
+    /// A ring source went: cancel its sides' operations (by user data),
+    /// hand every entry naming its slot to the kernel and take its file out
+    /// of it, then let go of the lease that kept the object open meanwhile.
     #[cfg(ring)]
-    RingDetach(u32, [Option<u64>; 2]),
+    RingDetach(
+        u32,
+        [Option<u64>; 2],
+        Option<crate::io::source::requests::Lease>,
+    ),
     /// A ring source's side wants an operation submitted.
     #[cfg(ring)]
     RingKick(Arc<Source>),
@@ -159,6 +168,25 @@ pub(crate) enum IoOp {
     Touch(Arc<Source>),
     /// Watch a child's exit for a thread that runs no shard.
     Watch(Arc<crate::process::exit::Exit>),
+}
+
+impl IoOp {
+    /// The op's shard went and applies it never: a registration asked of it
+    /// fails, for the next wait to make it elsewhere, and a child it was to
+    /// watch is watched where its user polls next; the rest only goes.
+    fn gone(self) {
+        match self {
+            IoOp::Register(source) => source.registration_failed(&io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the shard stopped before the registration",
+            )),
+            IoOp::Watch(exit) => {
+                let orphan = Arc::strong_count(&exit) == 1;
+                exit.unwatched(orphan);
+            }
+            other => drop(other),
+        }
+    }
 }
 
 impl Shared {
@@ -259,10 +287,34 @@ impl Shared {
         )
     }
 
-    /// Hands a registration change to the shard and wakes it.
+    /// Hands a registration change to the shard and wakes it. One that
+    /// nothing will apply (the shard and its ring's keeper went) is let go
+    /// of here, as the shard's last look does.
     pub(crate) fn post_io(&self, op: IoOp) {
         self.io_ops.push(op);
+        // Pairs with the fence of `close_io`: either this sees the mailbox
+        // closed, or its last drain finds the op.
+        crate::sync::internal::fence(Ordering::SeqCst);
+        if self.io_closed.load(Ordering::SeqCst) {
+            self.drain_io_ops();
+            return;
+        }
         self.unpark();
+    }
+
+    /// Nothing applies the mailbox from now on: what it holds is let go of,
+    /// and so is what reaches it later. The ring it was for is gone, with
+    /// every entry it had, so a lease a detach carries may close its object.
+    pub(crate) fn close_io(&self) {
+        self.io_closed.store(true, Ordering::SeqCst);
+        self.drain_io_ops();
+    }
+
+    fn drain_io_ops(&self) {
+        crate::sync::internal::fence(Ordering::SeqCst);
+        while let Ok(op) = self.io_ops.try_pop() {
+            op.gone();
+        }
     }
 
     /// Frees the slot of a source whose kernel registration is gone: at once
@@ -628,6 +680,7 @@ impl Shard {
             #[cfg(port)]
             port: kernel,
             io_ops: SegQueue::new(),
+            io_closed: AtomicBool::new(false),
             counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
             timer_at: AtomicU64::new(u64::MAX),
             parks: AtomicU64::new(0),
@@ -710,17 +763,17 @@ impl Shard {
                 }
                 IoOp::Watch(exit) => self.watch(exit),
                 #[cfg(ring)]
-                IoOp::RingAttach(token, copy) => {
+                IoOp::RingAttach(token, lease) => {
                     let source = self.sources.borrow().get(token).cloned();
                     if let (Some(ring), Some(source)) = (self.ring(), source) {
-                        source.ring_attached(ring, &self.shared, &copy, token);
+                        source.ring_attached(ring, &self.shared, &lease, token);
                     }
-                    drop(copy);
+                    drop(lease);
                 }
                 #[cfg(ring)]
-                IoOp::RingDetach(slot, out) => {
+                IoOp::RingDetach(slot, out, lease) => {
                     if let Some(ring) = self.ring() {
-                        ring.detach(slot, out);
+                        ring.detach(slot, out, lease);
                     }
                 }
                 #[cfg(ring)]

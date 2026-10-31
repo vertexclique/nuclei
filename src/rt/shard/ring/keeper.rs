@@ -145,6 +145,7 @@ unsafe impl Send for Kept {}
 pub(crate) fn hand_off(ring: ShardRing, shared: Arc<Shared>) {
     if !ring.reapable() {
         ring.shut_down();
+        shared.close_io();
         return;
     }
     let kept = Kept { ring, shared };
@@ -169,6 +170,7 @@ pub(crate) fn hand_off(ring: ShardRing, shared: Arc<Shared>) {
     };
     if let Some(kept) = unkept {
         kept.ring.shut_down();
+        kept.shared.close_io();
     }
 }
 
@@ -182,9 +184,13 @@ impl Kept {
             if ring.wait(None, None).is_err() {
                 // A ring that cannot be waited on: what is still out keeps its memory for good.
                 ring.forget_stuck();
-                return;
+                break;
             }
         }
+        // The ring goes with nothing queued: what the mailbox holds, and gets
+        // from now on, is let go of.
+        drop(ring);
+        shared.close_io();
     }
 }
 
@@ -194,8 +200,10 @@ impl Kept {
 fn apply_mailbox(ring: &ShardRing, shared: &Shared) {
     while let Ok(op) = shared.io_ops.try_pop() {
         match op {
-            IoOp::RingDetach(slot, out) => ring.detach(slot, out),
-            IoOp::RingCancel(user_data) => ring.cancel(user_data),
+            IoOp::RingDetach(slot, out, lease) => ring.detach(slot, out, lease),
+            IoOp::RingCancel(user_data) => {
+                ring.cancel(user_data);
+            }
             other => drop(other),
         }
     }

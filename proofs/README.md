@@ -506,25 +506,27 @@ the reader's wake, and a contended poll that is never woken).
 dropped handle's close in particular (`src/io/source/requests.rs`), against a holder on each
 side that loads the descriptor and uses it. The dropper raises the close in the source's request
 word and takes the read side with one fetch-or that also raises the side's request bit; holding
-it, it tries the write side the same way, and with both it performs the close and drops its
-object. Taking fewer, it lets go and hands its object to the source, never waiting. Sides are
-taken in one order: a holder of the read side that sees the request bit tries the write side; a
-holder of the write side lets go first, then tries the read side once. Whoever performs the
-close marks it done, and whichever of the dropper's hand-over and that mark comes second drops
-the object. The close lingers: once the dropper is done, a task drains what the handle wrote
-through a copy of the descriptor (or, where the process has no descriptor to spare for one, and
-on Windows, through the handle's own object, which the task keeps open until then), holding the
-write side; finding the close not performed yet,
+it, it tries the write side the same way, and with both it performs the close. Taking fewer, it
+lets go, never waiting. Sides are taken in one order: a holder of the read side that sees the
+request bit tries the write side; a holder of the write side lets go first, then tries the read
+side once. The dropper hands its object to the source before it raises the close, the close's own
+hold still up; a job of the blocking pool (a file's call, a `send_file` chunk, a ring's attach or
+detach in its mailbox) takes a lease on the object while the handle lives and may use the
+descriptor after the drop; the last of the close's hold and the leases drops the object, so no
+descriptor of nuclei's own is ever made for a call. The close lingers: once the dropper is done, a
+task drains what the handle wrote through the handle's own object, which it keeps open until
+then, holding the write side; finding the close not performed yet,
 it waits on the write side, and the performer wakes the write side's waiters rather than
-forget them as it does the handle's others. 11 configurations: 2 that must pass
-(`NoUseOfClosed`, no holder uses a descriptor closed under it; `PerformedOnce`; `Closed`, once
-everything else is done the close was performed and the object dropped; and liveness), 6
-mutations (a holder that ignores the request bit, or takes a raised bit for its own, breaks
-`Closed`; a dropper that performs holding one side, or drops its object before the close is
-done, breaks `NoUseOfClosed`; a holder of the write side that tries the read side while still
-holding its own livelocks, and a close that forgets the lingering drain's wake strands it, both
-breaking `Termination`), and 3 witnesses (a holder performs the close; the dropper hands its
-object over; the lingering drain waits before the close is performed). The Rust tests in
+forget them as it does the handle's others. 12 configurations: 2 that must pass
+(`NoUseOfClosed`, no holder and no job with a lease uses a descriptor closed under it;
+`PerformedOnce`; `Closed`, once everything else is done the close was performed and the object
+dropped; and liveness), 7 mutations (a holder that ignores the request bit, or takes a raised bit
+for its own, breaks `Closed`; a dropper that performs holding one side, a dropper that drops its
+object before the close is done, and a close that drops it with a lease out break
+`NoUseOfClosed`; a holder of the write side that tries the read side while still holding its own
+livelocks, and a close that forgets the lingering drain's wake strands it, both breaking
+`Termination`), and 3 witnesses (a holder performs the close; the last lease, not the close, drops
+the object; the lingering drain waits before the close is performed). The Rust tests in
 `src/io/source/tests/requests.rs` hold a side from the test and check the same on real sockets,
 each with a mutation of the code that makes one of them fail.
 
@@ -693,20 +695,26 @@ third task writes a cell from the pool, then one from its own buffer (which wait
 in flight and then is that write), then seeks back to the start. Any task may go away while its
 job is out: a read job is cancelled or its result dropped, and a lent write still lands. A file
 opened to append makes its writes on the pool at its end, wherever the cursor was; once one
-landed the cursor is the end of it; and its writer appends once more after the seek. 18
-configurations: 5 that must pass (tasks that may go away and tasks that stay, and a file opened
-to append, with `NoStaleRead`, a read counts only a value its cell still holds; `NoTornRead`,
-no read counts a cell a write landed only part of; `AllLanded`, every accepted write is in the
-file at the end; for the append, `NoOverwrite`, no append writes over what the file holds, and
-`CursorAtEnd`, the cursor is the file's end once an append landed; and liveness, twice), 7
+landed the cursor is the end of it; and its writer appends once more after the seek. Every job
+runs on the handle's own descriptor, holding a lease on its object until it ran: once no task
+borrows the handle it is dropped, and the last lease out closes the object, or handed back by
+`into_inner`, which waits until no lease is out. 23 configurations: 7 that must pass (tasks that
+may go away and tasks that stay, a file opened to append, and a handle dropped or handed back with
+jobs still out, with `NoStaleRead`, a read counts only a value its cell still holds;
+`NoTornRead`, no read counts a cell a write landed only part of; `AllLanded`, every accepted write
+is in the file at the end; for the append, `NoOverwrite`, no append writes over what the file
+holds, and `CursorAtEnd`, the cursor is the file's end once an append landed; for the handle's
+end, `NoCallOnClosed`, no job's call runs on a descriptor that closed; and liveness, twice), 9
 mutations (a result that counts on the cursor alone breaks `NoStaleRead`, through the seek back;
 a lent write that goes in flight over the one there, a lent write cancelled when its task goes
 away, a write cut short on the ring that counts as done, and a write on the ring cancelled with
 its shard that ends there break `AllLanded`; an append that lands where the cursor was breaks
-`NoOverwrite`; a cursor that stays where an append was made breaks `CursorAtEnd`), and 6
-witnesses (a read that reads again, the write of a task that went away landing, a read after the
-seek that counts the lent write's value, a write on the ring landing in two parts, one cut short
-whose shard went finished on the pool, an append after the seek landing at the end). In Rust a
+`NoOverwrite`; a cursor that stays where an append was made breaks `CursorAtEnd`; a descriptor
+closed at the drop with a job out, and an `into_inner` that does not wait for the jobs, break
+`NoCallOnClosed`), and 7 witnesses (a read that reads again, the write of a task that went away
+landing, a read after the seek that counts the lent write's value, a write on the ring landing in
+two parts, one cut short whose shard went finished on the pool, an append after the seek landing
+at the end, a job still out as its handle drops). In Rust a
 seek needs the handle exclusively, so it cannot overlap a read; the model lets it, so the epoch
 rule is checked for any path that moves the cursor back.
 
@@ -879,6 +887,30 @@ chunk that counts its length only lets a peer sending a unit at a time past the 
 `CapHeld`; a datagram socket arming a multishot receive on the group gets a datagram cut, breaking
 `NoCut`), and 2 witnesses (a buffer handed out in two pieces, a buffer given back).
 
+`tla/ring/RingClose.tla` checks a ring source dropped with an operation out
+(`Source::detach_ring` in `src/io/source/ring.rs`, `ShardRing::detach`, `take_out` and
+`finish_leaving` in `src/rt/shard/ring.rs`, `RingPoller::submit_now`, the close's lease in
+`src/io/source/requests.rs`): a listener with an accept out, its slot a fixed file of the ring's
+table or one naming its own descriptor, which the ring never copies. The detach cancels what is
+out, hands every entry naming the slot to the kernel at once (the cancel ending the accept in the
+same call, the kernel's task work run), takes the file out of the table and releases the slot,
+which stays reserved until the accept's end is taken; a lease keeps the handle's object open
+until no entry naming its number waits to reach the kernel: where the kernel holds completions it
+has no room for, until the ring's next wait, and for a drop on another thread, until the ring's
+thread applies the detach from its mailbox. Someone opening a file meanwhile gets the number once
+the object closed. 14 configurations: 8 that must pass (each kind of slot, dropped on the ring's
+thread or another, with the kernel taking everything or busy, with `NoStray`, no entry reaches
+the kernel on a number another file took; `SlotReserved`, a slot is free only once no entry names
+it; `ClosedAtDrop`, dropped on the ring's thread with the kernel taking everything, nothing holds
+the file when the drop returns; and liveness, `AllClosed` and `Termination`), 4 mutations (no
+lease, so the object closes with an entry naming its number still queued, breaks `NoStray`; the
+cancel left to the ring's next wait, and the file kept in the table until the slot frees, the two
+halves of the bug a listener dropped with an accept out still accepting after, break
+`ClosedAtDrop`; a slot free at its release breaks `SlotReserved`), and 2 witnesses (a detach left
+to the next wait; the number taken by another file). `tests/faults/drops.rs` drops a listener
+with an accept out and checks a connect is refused when the drop returns, and drops a stream with
+a read out from a thread that then blocks and checks its peer reads the end.
+
 `tla/ring/RingSend.tla` checks a datagram socket's sends (`WriteState::send_now` in
 `src/io/source/write.rs`, the poll it waits on in `submit_ops` and its end in `op_done`,
 `src/io/source/write/ops.rs`; on epoll and kqueue the socket's edge in `serve` stands where the
@@ -936,17 +968,19 @@ poll whose end wakes nobody break `Served`), and 2 witnesses (a reader finds the
 starved side uses its own buffer). `tests/idle_peers.rs` fills the pool of a 1 MiB cap with
 receives of idle peers and checks every other peer is answered.
 
-`lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
-every entry names its source's file by a slot of the kernel's fixed-file table, or past a full
-table by a slot holding the ring's own copy of the descriptor, and counts on that slot from its
-submission to its completion. For every sequence of operations from a fresh table it proves
-that a free slot is held by nobody, named by no entry and holds no open copy (`inv_run`, for a
-table of any size, as the process's descriptor limit sizes it); that
-a slot a source takes has no entry naming it, so an entry on its way never reaches the next
-source's file (`taken_slot_is_unnamed`); that a free slot is never freed again
-(`no_double_free`); and that a copy closes only once no source holds it and no entry names it
-(`copy_closes_unnamed`); and it computes the worked example of a slot released with a read out
-and handed out again only once the read completed (`example_reuse_waits`). The Rust tests in
+`lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`,
+`take_out` in `src/rt/shard/ring.rs`): every entry names its source's file by a slot of the
+kernel's fixed-file table, or past a full table by a slot naming the source's own descriptor (the
+ring makes no copy), and counts on that slot from its submission to its completion; a source that
+goes takes its file out of the table at once. For every sequence of operations from a fresh table
+it proves that a free slot is held by nobody, named by no entry and holds no file (`inv_run`, for
+a table of any size, as the process's descriptor limit sizes it); that a slot a source takes has
+no entry naming it, so an entry on its way never reaches the next source's file
+(`taken_slot_is_unnamed`); that a free slot is never freed again (`no_double_free`); that a slot an
+entry names is never free, so it stays reserved after its source went (`named_slot_is_not_free`);
+and that a release takes the file out of the table whatever entries still name the slot
+(`release_takes_the_file_out`); and it computes the worked example of a slot released with a read
+out and handed out again only once the read completed (`example_reuse_waits`). The Rust tests in
 `src/rt/shard/ring/tests.rs` run sources past a full table, a retire with a read out and a
 shard that goes with one, each with a mutation of the code that makes one of them fail.
 
@@ -1029,15 +1063,18 @@ The wheel has no unsafe code and runs on one thread, so it has no TLA+ model and
 `attach` (`tla/attach/Attach.tla`) checks the attach of a source to a ring performed off the
 ring's thread, racing a close or an evict (`src/io/source/requests.rs`,
 `src/io/source/ring.rs`). The performing thread marks the registration under way and posts the
-ring a copy of the descriptor; the ring's thread puts the file into its table and hands the
-slot back as a request, which whoever performs it (both sides held) keeps if the attach is
-still wanted, or lets go. After the evict the source may attach to another shard under a token
-of the same number (every shard numbers its own), so the ring's look and the install's taking
-check the registration's shard with its token. 12 configurations: 5 that must pass (a close, an
-evict, both, liveness, and an evict followed by an attach to another shard), 3 mutations (2
-that leak the file into the table of a closed source, `NoLeak`; a look and a taking by the
-token alone, which hand the source registered with the other shard a slot of this ring's table,
-`NoForeignSlot`), and 4 witnesses.
+ring a lease on the handle's object, which keeps the descriptor open and its number the
+handle's until the ring's thread is done with the attach (no copy of it is made); the ring's
+thread puts the file into its table and hands the slot back as a request, which whoever performs
+it (both sides held) keeps if the attach is still wanted, or lets go. After the evict the source
+may attach to another shard under a token of the same number (every shard numbers its own), so
+the ring's look and the install's taking check the registration's shard with its token. 13
+configurations: 5 that must pass (a close, an evict, both, liveness, and an evict followed by an
+attach to another shard), 4 mutations (2 that leak the file into the table of a closed source,
+`NoLeak`; a look and a taking by the token alone, which hand the source registered with the other
+shard a slot of this ring's table, `NoForeignSlot`; an attach with no lease, closed between the
+ring's look and its install, which puts a closed number's file into the table,
+`NoClosedInstall`), and 4 witnesses.
 
 `tla/attach/Route.tla`, in the same family, checks a read of a ring source from a thread that
 runs no shard while the source's registration finishes (`Source::with_io`, `ensure_registered`,

@@ -2,9 +2,10 @@
 //! the ring of the shard whose thread asks for it, instead of a job of the
 //! blocking pool.
 //!
-//! The operation keeps a copy of the file's descriptor and the buffer it
+//! The operation keeps a lease on the handle's descriptor and the buffer it
 //! reads into or writes from until its last completion, so neither goes
-//! while the kernel may use them. A write the kernel took only part of goes
+//! while the kernel may use them (and the number reaches no other file while
+//! the entry waits for room). A write the kernel took only part of goes
 //! on with the rest from the ring's thread. Its end is left in a slot the
 //! task that waits for it polls ([`RingJob`]); a task that went away leaves
 //! the end to nobody, and the buffer goes with the operation. An operation
@@ -18,7 +19,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::buf::PoolBuf;
-use crate::io::raw::{OwnedFile, file_raw};
+use crate::io::source::requests::Lease;
 use crate::io::sys;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::syscore::linux::iouring::ring::Sqe;
@@ -45,7 +46,7 @@ pub(crate) enum FileOutcome {
 
 /// A file's operation on a ring.
 pub(crate) struct FileOp {
-    fd: Arc<OwnedFile>,
+    fd: Lease,
     /// Where the call reads or writes.
     at: u64,
     mem: FileMem,
@@ -179,7 +180,7 @@ impl<T> Drop for RingJob<T> {
 /// this thread's shard, if it runs one; else gives `buf` back for the
 /// blocking pool.
 fn submit<B, T>(
-    fd: &Arc<OwnedFile>,
+    fd: &Lease,
     at: u64,
     buf: B,
     mem: fn(B) -> FileMem,
@@ -191,7 +192,7 @@ fn submit<B, T>(
         };
         let slot = Slot::new();
         ring.submit_file(FileOp {
-            fd: Arc::clone(fd),
+            fd: fd.clone(),
             at,
             mem: mem(buf),
             slot: Arc::clone(&slot),
@@ -205,7 +206,7 @@ fn submit<B, T>(
 
 /// A read at `at` into the spare room of `buf`, on this thread's ring.
 pub(crate) fn read(
-    fd: &Arc<OwnedFile>,
+    fd: &Lease,
     at: u64,
     buf: PoolBuf,
 ) -> Result<RingJob<io::Result<PoolBuf>>, PoolBuf> {
@@ -214,7 +215,7 @@ pub(crate) fn read(
 
 /// A read at `at` into the spare capacity of a task's `buf`.
 pub(crate) fn read_lent(
-    fd: &Arc<OwnedFile>,
+    fd: &Lease,
     at: u64,
     buf: Vec<u8>,
 ) -> Result<RingJob<LentReadEnd>, Vec<u8>> {
@@ -222,17 +223,13 @@ pub(crate) fn read_lent(
 }
 
 /// A write of all of `buf` at `at`.
-pub(crate) fn write(
-    fd: &Arc<OwnedFile>,
-    at: u64,
-    buf: PoolBuf,
-) -> Result<RingJob<io::Result<()>>, PoolBuf> {
+pub(crate) fn write(fd: &Lease, at: u64, buf: PoolBuf) -> Result<RingJob<io::Result<()>>, PoolBuf> {
     submit(fd, at, buf, |buf| FileMem::Write { buf, done: 0 }, as_write)
 }
 
 /// A write of all of a task's `buf` at `at`.
 pub(crate) fn write_lent(
-    fd: &Arc<OwnedFile>,
+    fd: &Lease,
     at: u64,
     buf: Vec<u8>,
 ) -> Result<RingJob<LentWriteEnd>, Vec<u8>> {
@@ -253,7 +250,7 @@ impl FileOp {
     /// The entry for the operation's next call. Its pointers point into the
     /// operation's buffer, whose memory does not move with the operation.
     pub(crate) fn entry(&mut self) -> Sqe {
-        let fd = file_raw(&self.fd);
+        let fd = self.fd.raw();
         match &mut self.mem {
             FileMem::Read(buf) => {
                 let spare = buf.spare();
@@ -335,7 +332,7 @@ impl FileOp {
     fn finish_on_pool(self) {
         let FileOp { fd, at, mem, slot } = self;
         let job = crate::runtime::spawn_blocking(move || {
-            let raw = file_raw(&fd);
+            let raw = fd.raw();
             let outcome = match mem {
                 FileMem::Read(mut buf) => {
                     FileOutcome::Read(sys::pread(raw, buf.spare(), at).map(|n| {
@@ -417,7 +414,6 @@ fn as_write_lent(outcome: FileOutcome) -> LentWriteEnd {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::OwnedFd;
     use std::time::Duration;
 
     use super::*;
@@ -441,12 +437,15 @@ mod tests {
         (file, path)
     }
 
+    /// An operation on `file`, through a lease of a source over its own
+    /// descriptor (the file outlives the operation).
     fn op_of(file: &std::fs::File, at: u64, mem: FileMem) -> (FileOp, Arc<Slot>) {
+        use std::os::fd::AsRawFd;
         let slot = Slot::new();
-        let fd: OwnedFd = file.try_clone().unwrap().into();
+        let source = crate::io::Source::new(file.as_raw_fd(), crate::io::source::Kind::File);
         (
             FileOp {
-                fd: Arc::new(fd),
+                fd: source.lease().unwrap(),
                 at,
                 mem,
                 slot: Arc::clone(&slot),

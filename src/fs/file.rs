@@ -2,10 +2,11 @@
 //!
 //! A regular file is always ready to the kernel, so no poller can say when
 //! its IO would not block: each read and write is a job on the blocking
-//! pool, `pread` or `pwrite` at the handle's own cursor, on a copy of the
-//! descriptor that every job keeps open until it ends (so a handle dropped
-//! while a job runs closes only its own descriptor, and the job never meets
-//! a reused number).
+//! pool, `pread` or `pwrite` at the handle's own cursor, on the handle's own
+//! descriptor, of which every job holds a lease until it ends (so a handle
+//! dropped while a job runs leaves its object to the job, which closes it,
+//! the job never meets a reused number, and no call needs a descriptor of
+//! its own: proofs/tla/lent/LentFile.tla).
 //!
 //! One read and one write are in flight at most. A read fills a read-ahead
 //! buffer of the pool, at least [`READ_MIN`] bytes, that the next reads copy
@@ -44,9 +45,9 @@ use std::task::Wake;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::buf::{PoolBuf, with_pool};
-use crate::io::raw::{OwnedFile, Raw, file_raw};
 use crate::io::side::{After, Hooks, Side, WakerSet};
 use crate::io::source::Failure;
+use crate::io::source::requests::Lease;
 use crate::io::sys;
 use crate::rt::task::Task;
 
@@ -68,8 +69,8 @@ mod work {
 
 /// The IO state of a file handle, shared with the waker its jobs wake.
 pub(crate) struct FileIo {
-    /// The jobs' copy of the descriptor.
-    fd: Arc<OwnedFile>,
+    /// The lease on the handle's descriptor its jobs share.
+    fd: Lease,
     state: Side<FileState>,
     /// Tasks waiting for a job: all woken when any job ends.
     waiters: WakerSet<FILE_SLOTS>,
@@ -240,11 +241,11 @@ fn buffer(len: usize, after: &mut After) -> Option<PoolBuf> {
 impl FileIo {
     /// The IO state of the file `fd`, starting at its own offset (a file
     /// opened by std and read some way already goes on from there).
-    pub(crate) fn new(fd: Raw) -> io::Result<Arc<Self>> {
-        let cursor = sys::seek(fd, None)?;
-        let append = sys::appends(fd)?;
+    pub(crate) fn new(fd: Lease) -> io::Result<Arc<Self>> {
+        let cursor = sys::seek(fd.raw(), None)?;
+        let append = sys::appends(fd.raw())?;
         Ok(Arc::new(Self {
-            fd: Arc::new(sys::duplicate_file(fd)?),
+            fd,
             state: Side::new(FileState {
                 cursor,
                 ..FileState::default()
@@ -290,10 +291,10 @@ impl FileIo {
             },
             false => buf,
         };
-        let fd = Arc::clone(&self.fd);
+        let fd = self.fd.clone();
         let mut buf = buf;
         let task = crate::runtime::spawn_blocking(move || {
-            let n = sys::pread(file_raw(&fd), buf.spare(), at)?;
+            let n = sys::pread(fd.raw(), buf.spare(), at)?;
             buf.set_filled(n);
             Ok(buf)
         });
@@ -306,9 +307,9 @@ impl FileIo {
 
     fn submit_write(&self, buf: PoolBuf, at: u64) -> Writing {
         if self.append {
-            let fd = Arc::clone(&self.fd);
+            let fd = self.fd.clone();
             return Writing::Append(Work::Pool(crate::runtime::spawn_blocking(move || {
-                sys::append_all(file_raw(&fd), buf.filled())
+                sys::append_all(fd.raw(), buf.filled())
             })));
         }
         #[cfg(ring)]
@@ -319,9 +320,9 @@ impl FileIo {
             },
             false => buf,
         };
-        let fd = Arc::clone(&self.fd);
+        let fd = self.fd.clone();
         Writing::Pool(Work::Pool(crate::runtime::spawn_blocking(move || {
-            sys::pwrite_all(file_raw(&fd), buf.filled(), at)
+            sys::pwrite_all(fd.raw(), buf.filled(), at)
         })))
     }
 
@@ -342,10 +343,10 @@ impl FileIo {
             },
             false => buf,
         };
-        let fd = Arc::clone(&self.fd);
+        let fd = self.fd.clone();
         let mut buf = buf;
         let task = crate::runtime::spawn_blocking(move || {
-            let result = sys::pread_uninit(file_raw(&fd), buf.spare_capacity_mut(), at);
+            let result = sys::pread_uninit(fd.raw(), buf.spare_capacity_mut(), at);
             if let Ok(n) = result {
                 // SAFETY: the kernel wrote the first `n` bytes of the spare
                 // capacity.
@@ -363,9 +364,9 @@ impl FileIo {
 
     fn submit_write_owned(&self, buf: Vec<u8>, at: u64) -> Writing {
         if self.append {
-            let fd = Arc::clone(&self.fd);
+            let fd = self.fd.clone();
             return Writing::AppendLent(Work::Pool(crate::runtime::spawn_blocking(move || {
-                (sys::append_all(file_raw(&fd), &buf), buf)
+                (sys::append_all(fd.raw(), &buf), buf)
             })));
         }
         #[cfg(ring)]
@@ -376,9 +377,9 @@ impl FileIo {
             },
             false => buf,
         };
-        let fd = Arc::clone(&self.fd);
+        let fd = self.fd.clone();
         Writing::Lent(Work::Pool(crate::runtime::spawn_blocking(move || {
-            (sys::pwrite_all(file_raw(&fd), &buf, at), buf)
+            (sys::pwrite_all(fd.raw(), &buf, at), buf)
         })))
     }
 
@@ -883,8 +884,8 @@ impl FileState {
             SeekFrom::Current(d) => self.cursor.checked_add_signed(d),
             SeekFrom::End(d) => {
                 let task = self.sizing.get_or_insert_with(|| {
-                    let fd = Arc::clone(&io.fd);
-                    crate::runtime::spawn_blocking(move || sys::file_size(file_raw(&fd)))
+                    let fd = io.fd.clone();
+                    crate::runtime::spawn_blocking(move || sys::file_size(fd.raw()))
                 });
                 let size = match poll_task(task, waker) {
                     Poll::Pending => return Poll::Pending,
