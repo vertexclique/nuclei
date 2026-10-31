@@ -71,27 +71,86 @@ fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
-/// `read(2)` of up to `len` bytes into `buf`. On Linux the system call is
-/// made directly: glibc's wrapper adds a cancellation-point check (about 40
-/// instructions) to every call, and nothing here is cancelled by
-/// `pthread_cancel`.
+/// The Linux system call `nr` with `args`, made directly where the architecture's call is
+/// written out (x86-64, AArch64), else through libc's `syscall`: a count, or the error of the
+/// negated errno the kernel answered. glibc's wrappers add a cancellation-point check (about 40
+/// instructions) to every call, and its `syscall` a variadic call and the `errno` round trip;
+/// nothing here is cancelled by `pthread_cancel`.
+///
+/// # Safety
+/// `args` must be what the call `nr` takes, each pointer among them valid for what the kernel
+/// reads and writes through it for the length of the call.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[inline(always)]
+pub(crate) unsafe fn syscall(nr: libc::c_long, args: [usize; 6]) -> io::Result<usize> {
+    let [a0, a1, a2, a3, a4, a5] = args;
+    let ret: isize;
+    // SAFETY: the caller vouches for the arguments; the kernel answers in the result register
+    // and clobbers only the registers named.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr as isize => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            in("r9") a5,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    // SAFETY: as above.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc 0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+            in("x2") a2,
+            in("x3") a3,
+            in("x4") a4,
+            in("x5") a5,
+            options(nostack),
+        );
+    }
+    // SAFETY: as above, through libc, which answers -1 and sets `errno` for an error.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        ret = unsafe { libc::syscall(nr, a0, a1, a2, a3, a4, a5) } as isize;
+        if ret == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if (-4095..0).contains(&ret) {
+        return Err(io::Error::from_raw_os_error(-ret as i32));
+    }
+    Ok(ret as usize)
+}
+
+/// `read(2)` of up to `len` bytes into `buf`, made as a system call on Linux
+/// (see [`syscall`]).
 ///
 /// # Safety
 /// `buf` must be valid for writes of `len` bytes.
 #[inline]
-unsafe fn read_raw(fd: RawFd, buf: *mut u8, len: usize) -> isize {
+unsafe fn read_raw(fd: RawFd, buf: *mut u8, len: usize) -> io::Result<usize> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: as the caller's.
-    return unsafe { libc::syscall(libc::SYS_read, libc::c_long::from(fd), buf, len) as isize };
+    return unsafe { syscall(libc::SYS_read, [fd as usize, buf as usize, len, 0, 0, 0]) };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     // SAFETY: as the caller's.
-    return unsafe { libc::read(fd, buf.cast(), len) };
+    return cvt(unsafe { libc::read(fd, buf.cast(), len) });
 }
 
 /// `read(2)` (also a stream socket's receive).
 pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
-    retry(|| cvt(unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) }))
+    retry(|| unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) })
 }
 
 /// `recv(2)` with `MSG_PEEK`: a stream's bytes, left on the socket.
@@ -139,36 +198,32 @@ const SEND_FLAGS: libc::c_int = 0;
 
 /// `send(2)`, never raising `SIGPIPE` for a closed peer (the error comes
 /// back as `BrokenPipe` instead).
+#[inline]
 pub(crate) fn send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     retry(|| {
         // SAFETY: reads at most `buf.len()` bytes from `buf`; no address is given.
-        cvt(unsafe { send_raw(fd, buf.as_ptr(), buf.len()) })
+        unsafe { send_raw(fd, buf.as_ptr(), buf.len()) }
     })
 }
 
-/// `send(2)` of up to `len` bytes of `buf` with `SEND_FLAGS`. On Linux the
-/// system call is made directly, as in `read_raw`.
+/// `send(2)` of up to `len` bytes of `buf` with `SEND_FLAGS`, made as a
+/// system call on Linux (see [`syscall`]).
 ///
 /// # Safety
 /// `buf` must be valid for reads of `len` bytes.
 #[inline]
-unsafe fn send_raw(fd: RawFd, buf: *const u8, len: usize) -> isize {
+unsafe fn send_raw(fd: RawFd, buf: *const u8, len: usize) -> io::Result<usize> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: as the caller's.
     return unsafe {
-        libc::syscall(
+        syscall(
             libc::SYS_sendto,
-            libc::c_long::from(fd),
-            buf,
-            len,
-            libc::c_long::from(SEND_FLAGS),
-            0 as libc::c_long,
-            0 as libc::c_long,
-        ) as isize
+            [fd as usize, buf as usize, len, SEND_FLAGS as usize, 0, 0],
+        )
     };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     // SAFETY: as the caller's.
-    return unsafe { libc::send(fd, buf.cast(), len, SEND_FLAGS) };
+    return cvt(unsafe { libc::send(fd, buf.cast(), len, SEND_FLAGS) });
 }
 
 /// The most slices one vectored call takes.
@@ -176,10 +231,17 @@ const IOV_MAX: usize = 1024;
 
 /// `send(2)` of the bytes of `bufs` in order (one call, the first
 /// `IOV_MAX` slices at most), as [`send`] with no `SIGPIPE`.
+#[inline]
 pub(crate) fn send_bufs(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
     if let [one] = bufs {
         return send(fd, one);
     }
+    send_msg(fd, bufs)
+}
+
+/// [`send_bufs`] of more than one slice, in one `sendmsg(2)`.
+#[inline(never)]
+fn send_msg(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
     // SAFETY: an all-zero `msghdr` is valid (no name, no control data).
     let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
     let bufs = bufs.get(..IOV_MAX).unwrap_or(bufs);
@@ -245,11 +307,13 @@ pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<u
         msg.msg_controllen = CONTROL as _;
         // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
         // `CONTROL` into `control`, both of which `msg` points at. Made as a
-        // system call, as in `read_raw`.
-        cvt(
-            unsafe { libc::syscall(libc::SYS_recvmsg, libc::c_long::from(fd), &mut msg, 0) }
-                as isize,
-        )
+        // system call (see `syscall`).
+        unsafe {
+            syscall(
+                libc::SYS_recvmsg,
+                [fd as usize, (&raw mut msg) as usize, 0, 0, 0, 0],
+            )
+        }
     })?;
     // SAFETY: the kernel filled `msg`'s control data; the header is read
     // only if it fits, and its data is one `int`.
@@ -1009,7 +1073,7 @@ pub(crate) fn poll_writable(fd: RawFd) -> io::Result<()> {
 pub(crate) fn read_uninit(fd: RawFd, buf: &mut [core::mem::MaybeUninit<u8>]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`; nothing is read
     // from it.
-    retry(|| cvt(unsafe { read_raw(fd, buf.as_mut_ptr().cast(), buf.len()) }))
+    retry(|| unsafe { read_raw(fd, buf.as_mut_ptr().cast(), buf.len()) })
 }
 
 /// `pread(2)` into memory not written yet, as [`read_uninit`] at `offset`.

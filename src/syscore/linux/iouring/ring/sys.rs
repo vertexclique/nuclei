@@ -604,12 +604,11 @@ pub(crate) unsafe fn io_uring_enter(
     unsafe { enter_syscall(fd, to_submit, min_complete, flags, arg, argsz) }
 }
 
-/// The `io_uring_enter` system call, issued directly where the architecture is known (the libc
-/// wrapper's variadic call and errno round trip cost a few dozen instructions in every wait).
+/// The `io_uring_enter` system call, issued directly (see `io::sys::syscall`: the libc wrapper's
+/// variadic call and errno round trip cost a few dozen instructions in every wait).
 ///
 /// # Safety
 /// As for [`io_uring_enter`].
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 unsafe fn enter_syscall(
     fd: RawFd,
@@ -619,82 +618,21 @@ unsafe fn enter_syscall(
     arg: *const c_void,
     argsz: usize,
 ) -> io::Result<u32> {
-    let nr = libc::SYS_io_uring_enter as usize;
-    let (a0, a1, a2, a3) = (
-        fd as isize as usize,
-        to_submit as usize,
-        min_complete as usize,
-        flags as usize,
-    );
-    let ret: isize;
-    // SAFETY: the system call reads only what its arguments name, which the caller vouches for;
-    // it returns a count or a negated errno in the result register.
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r10") a3,
-            in("r8") arg,
-            in("r9") argsz,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    // SAFETY: as above.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("x8") nr,
-            inlateout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") arg,
-            in("x5") argsz,
-            options(nostack),
-        );
-    }
-    if (-4095..0).contains(&ret) {
-        return Err(io::Error::from_raw_os_error(-ret as i32));
-    }
-    Ok(ret as u32)
-}
-
-/// As above, through the libc wrapper, where the architecture's call is not written out.
-///
-/// # Safety
-/// As for [`io_uring_enter`].
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-unsafe fn enter_syscall(
-    fd: RawFd,
-    to_submit: u32,
-    min_complete: u32,
-    flags: u32,
-    arg: *const c_void,
-    argsz: usize,
-) -> io::Result<u32> {
     // SAFETY: the caller upholds the contract on `arg` and `argsz`.
-    let r = unsafe {
-        libc::syscall(
+    unsafe {
+        crate::io::sys::syscall(
             libc::SYS_io_uring_enter,
-            fd as libc::c_long,
-            to_submit as libc::c_long,
-            min_complete as libc::c_long,
-            flags as libc::c_long,
-            arg,
-            argsz,
+            [
+                fd as usize,
+                to_submit as usize,
+                min_complete as usize,
+                flags as usize,
+                arg as usize,
+                argsz,
+            ],
         )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
     }
-    Ok(r as u32)
+    .map(|n| n as u32)
 }
 
 /// `io_uring_register(2)`; returns what the kernel returned.
