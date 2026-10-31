@@ -205,8 +205,7 @@ impl FileOp {
             }
             FileMem::ReadLent(buf) => {
                 if let Some(bufs) = buf.vectored_mut() {
-                    let iov = bufs.read_iovecs();
-                    return Sqe::readv(fd, iov.as_ptr(), len32(iov.len()), self.at);
+                    return vectored_entry(fd, bufs, None, self.at);
                 }
                 let spare = buf.spare_capacity_mut();
                 Sqe::read(fd, spare.as_mut_ptr().cast(), len32(spare.len()), self.at)
@@ -222,9 +221,7 @@ impl FileOp {
             }
             FileMem::WriteLent { buf, done } => {
                 if let Some(bufs) = buf.vectored_mut() {
-                    let iov = bufs.write_iovecs(*done);
-                    let count = len32(iov.len());
-                    return Sqe::writev(fd, iov.as_ptr(), count, self.at + *done as u64);
+                    return vectored_entry(fd, bufs, Some(*done), self.at);
                 }
                 let bytes = buf.rest_from(*done);
                 Sqe::write(
@@ -376,6 +373,28 @@ impl FileOp {
         match crate::rt::runtime::blocking_pool_inside() {
             Some(pool) => pool.spawn(call).detach(),
             None => call(),
+        }
+    }
+}
+
+/// The entry of a vectored call at `at`: a read into every room, or with
+/// `Some(done)` a write of every byte from the `done`th on. Out of line, as
+/// the one-buffer calls are the common ones.
+#[inline(never)]
+fn vectored_entry(
+    fd: std::os::fd::RawFd,
+    bufs: &mut crate::buf::vectored::Vectored,
+    done: Option<usize>,
+    at: u64,
+) -> Sqe {
+    match done {
+        None => {
+            let iov = bufs.read_iovecs();
+            Sqe::readv(fd, iov.as_ptr(), len32(iov.len()), at)
+        }
+        Some(done) => {
+            let iov = bufs.write_iovecs(done);
+            Sqe::writev(fd, iov.as_ptr(), len32(iov.len()), at + done as u64)
         }
     }
 }
