@@ -384,6 +384,12 @@ impl FileIo {
         // result thrown away: the cursor moves only when a result is taken.
         let mut job = None;
         let result = poll_fn(|cx| self.poll_read_owned(cx, &mut held, &mut job)).await;
+        // Its read ended, so no job is left: the empty one is not dropped,
+        // and its drop's call is not made on every read.
+        if let Some(left) = job.take() {
+            drop_cold(left);
+        }
+        core::mem::forget(job);
         (result, held.unwrap_or_default().into_filled())
     }
 
@@ -520,6 +526,13 @@ impl FileIo {
     pub(crate) fn cursor(&self) -> u64 {
         self.cursor.load(Ordering::Acquire)
     }
+}
+
+/// Drops `value` out of line, on a path that is never taken in practice.
+#[cold]
+#[inline(never)]
+fn drop_cold<T>(value: T) {
+    drop(value);
 }
 
 /// A job ended (or a buffer came back): every task waiting on the file
