@@ -25,6 +25,8 @@ pub struct Stats {
     pub shards: Vec<ShardStats>,
     /// Threads of the blocking pools alive now, at work or idle.
     pub blocking_threads: usize,
+    /// Jobs waiting in the blocking pools' queues for a thread to take them.
+    pub blocking_queue_depth: usize,
     /// Errors of IO run on threads that run no shard: a handle polled
     /// outside nuclei's `block_on` and its tasks, or a completion delivered
     /// while its shard was not running.
@@ -44,6 +46,10 @@ pub struct ShardStats {
     /// The shard's place among its runtime's workers; `None` for the shard
     /// of a thread that runs `block_on`.
     pub worker: Option<usize>,
+    /// The runtime the shard is a worker of; `None` for the shard of a
+    /// thread that runs `block_on`, which serves every runtime the thread
+    /// enters.
+    pub runtime: Option<crate::runtime::RuntimeId>,
     /// The kernel interface the shard's IO runs on.
     pub backend: IoBackend,
     /// Tasks placed on the shard and not done yet.
@@ -92,8 +98,127 @@ pub struct ShardStats {
     /// its watch (a quarter of the handoff threshold); zero when no poll
     /// lasted that long, or with the handoff off.
     pub longest_poll: std::time::Duration,
+    /// Times a task's poll on the shard spent its budget of operations and
+    /// yielded to the shard's other tasks (see
+    /// [`task::coop`](crate::task::coop)).
+    pub budget_yields: u64,
+    /// How long each task poll on the shard ran, while its runtime records
+    /// it ([`Builder::record_latencies`](crate::Builder::record_latencies));
+    /// `None` when it does not, which is not a shard with no polls.
+    pub poll_times: Option<Histogram>,
+    /// How long the shard's IO operations took from their submission to the
+    /// kernel to their completion, by kind, while its runtime records
+    /// latencies ([`Builder::record_latencies`](crate::Builder::record_latencies));
+    /// `None` when it does not, and `None` on a readiness backend (epoll,
+    /// kqueue), whose calls are made once the kernel reports the descriptor
+    /// ready, so there is no wait in the kernel per operation to time.
+    pub io_latencies: Option<IoLatencies>,
+    /// The IO operations the shard's thread completed, while its runtime
+    /// counts them ([`Builder::count_io`](crate::Builder::count_io));
+    /// `None` when it does not, which is not a shard that did no IO
+    /// (published). With the `io-stats` feature only.
+    #[cfg(feature = "io-stats")]
+    pub io: Option<IoCounts>,
     /// Errors of IO run on the shard.
     pub errors: ErrorCounts,
+}
+
+/// The IO operations a shard's thread completed: see [`ShardStats::io`].
+/// With the `io-stats` feature only.
+///
+/// An operation is counted when the kernel completes it: a read or receive
+/// that returned bytes or the end of the stream, a write or send that took
+/// bytes, a connection accepted. A read served from the read-ahead is
+/// counted when the read-ahead's own read completed, and a write taken into
+/// the write-behind when the write-behind's own write did. Peeks and
+/// readiness probes are not counted. IO completed on a thread that runs no
+/// shard (the blocking pool's own calls, a thread outside the runtime) is
+/// counted by no shard.
+#[cfg(feature = "io-stats")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IoCounts {
+    /// Reads and receives.
+    pub reads: u64,
+    /// Writes and sends.
+    pub writes: u64,
+    /// Bytes the counted reads returned.
+    pub bytes_read: u64,
+    /// Bytes the counted writes took.
+    pub bytes_written: u64,
+    /// Connections accepted.
+    pub accepts: u64,
+}
+
+/// How long each kind of a shard's IO operations took, from their
+/// submission to the kernel to their completion: see
+/// [`ShardStats::io_latencies`].
+///
+/// A multishot receive or accept is one operation for many arrivals and is
+/// not timed; nor is a cancelled operation or a readiness probe. File calls
+/// are timed on the ring, not the ones the blocking pool makes.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct IoLatencies {
+    /// Reads and receives.
+    pub reads: Histogram,
+    /// Writes and sends.
+    pub writes: Histogram,
+    /// Accepts, one connection each.
+    pub accepts: Histogram,
+    /// Connects.
+    pub connects: Histogram,
+    /// Reads and writes of files.
+    pub files: Histogram,
+}
+
+/// Buckets of a [`Histogram`].
+pub(crate) const BUCKETS: usize = 64;
+
+/// The bucket of a sample of `nanos` nanoseconds.
+pub(crate) fn bucket_of(nanos: u64) -> usize {
+    (u64::BITS - 1 - (nanos | 1).leading_zeros()) as usize
+}
+
+/// A log2 histogram of durations: bucket `i` counts the samples from `2^i`
+/// nanoseconds up to (and not including) `2^(i+1)`; the first bucket also
+/// counts samples under a nanosecond.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Histogram {
+    pub(crate) buckets: [u64; BUCKETS],
+}
+
+impl Histogram {
+    /// The samples counted.
+    pub fn count(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+
+    /// Each bucket that holds samples: its lowest duration, the duration it
+    /// ends before, and its count, from the shortest up.
+    pub fn buckets(
+        &self,
+    ) -> impl Iterator<Item = (std::time::Duration, std::time::Duration, u64)> + '_ {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(i, &n)| {
+                let low = if i == 0 { 0 } else { 1u64 << i };
+                let high = 1u64.checked_shl(i as u32 + 1).unwrap_or(u64::MAX);
+                (
+                    std::time::Duration::from_nanos(low),
+                    std::time::Duration::from_nanos(high),
+                    n,
+                )
+            })
+    }
+}
+
+impl core::fmt::Debug for Histogram {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.buckets()).finish()
+    }
 }
 
 /// IO errors counted by [`io::ErrorKind`], and two kinds of failure

@@ -124,8 +124,16 @@ pub(crate) fn spend(waker: &Waker) -> bool {
 #[cold]
 #[inline(never)]
 fn refused(waker: &Waker) -> bool {
+    crate::rt::counters::budget_yield();
     waker.wake_by_ref();
     false
+}
+
+/// Yields for a spent budget, as an operation [`spend`] refuses does: the task
+/// runs again after the shard's other tasks.
+pub(crate) async fn yield_spent() {
+    crate::rt::counters::budget_yield();
+    crate::task::yield_now().await;
 }
 
 /// Whether the budget is spent, for an operation that cannot undo what it
@@ -158,7 +166,8 @@ fn refund() {
 
 /// Spends one operation of the budget for `poll`, or yields when it is spent:
 /// `Pending`, with the task woken to run again after the others. A `poll`
-/// that answers `Pending` gets its operation back.
+/// that answers `Pending` gets its operation back. Always inlined: it wraps
+/// every IO operation's poll, and its spent branch is a call out of line.
 #[inline(always)]
 pub(crate) fn poll_budget<T>(
     cx: &mut Context<'_>,

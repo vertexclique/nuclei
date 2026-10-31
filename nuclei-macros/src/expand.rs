@@ -120,16 +120,33 @@ fn enter(body: &[Tok], opts: &Options) -> Vec<Tok> {
 /// `::nuclei::Runtime::builder().worker_threads(N).build().expect("...")`,
 /// with `.start_paused(true)` before `build` when asked. A paused runtime
 /// with no `threads` given has no workers: every task runs on the thread
-/// that runs the body.
+/// that runs the body. With `builder = "path"` the builder is `path()`, as
+/// written, and `threads` and `start_paused` apply on top of it only when
+/// given.
 fn builder(opts: &Options) -> Vec<Tok> {
-    let mut out = nuclei_path(opts, &["Runtime", "builder"]);
+    let mut out = match &opts.builder {
+        Some(segments) => {
+            let mut call = Vec::new();
+            for (i, segment) in segments.iter().enumerate() {
+                if i > 0 {
+                    call.push(joint(':'));
+                    call.push(joint(':'));
+                }
+                call.push(id(segment));
+            }
+            call
+        }
+        None => nuclei_path(opts, &["Runtime", "builder"]),
+    };
     out.push(group(Delimiter::Parenthesis, Vec::new()));
-    out.push(punct('.'));
-    out.push(id("worker_threads"));
-    out.push(group(
-        Delimiter::Parenthesis,
-        vec![num(&opts.threads.unwrap_or(0).to_string())],
-    ));
+    if opts.builder.is_none() || opts.threads.is_some() {
+        out.push(punct('.'));
+        out.push(id("worker_threads"));
+        out.push(group(
+            Delimiter::Parenthesis,
+            vec![num(&opts.threads.unwrap_or(0).to_string())],
+        ));
+    }
     if opts.start_paused {
         out.push(punct('.'));
         out.push(id("start_paused"));

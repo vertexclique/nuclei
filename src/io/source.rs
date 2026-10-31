@@ -653,7 +653,8 @@ impl Source {
         self.register()
     }
 
-    /// [`ensure_registered`](Self::ensure_registered) for a source no registration holds.
+    /// [`ensure_registered`](Self::ensure_registered) for a source no shard
+    /// watches.
     #[inline(never)]
     fn register(self: &Arc<Self>) -> io::Result<()> {
         if self
@@ -669,7 +670,30 @@ impl Source {
         {
             return Ok(());
         }
-        match context::current(|current| current.map(|shard| shard.register_source(self))) {
+        // A shard that stopped (a worker going, its thread finishing what
+        // the stop left) registers nothing, as `proofs/tla/attach` has it:
+        // the source stays unregistered, and the tasks waiting on it are
+        // woken, so the stopping shard hands them on (a dropped task hands
+        // its linger to the runtime's drop, `rt::linger`) and they register
+        // it where they are polled next. Waiting unwoken, they would wait
+        // out their deadline.
+        let registered = context::current(|current| {
+            current.map(|shard| {
+                if shard.shared.is_stopped() {
+                    self.registration_abandoned();
+                    Err(requests::stopped_shard())
+                } else {
+                    shard.register_source(self)
+                }
+            })
+        });
+        match registered {
+            // Refused for its stop, here or by the attach (which set the
+            // registration back to none): the tasks look again.
+            Some(Err(err)) if requests::is_stopped_shard(&err) => {
+                self.look_again();
+                Ok(())
+            }
             Some(result) => result,
             None => {
                 crate::rt::runtime::service_shard().post_io(IoOp::Register(Arc::clone(self)));

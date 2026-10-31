@@ -227,9 +227,17 @@ pub mod futures {
     pub use super::notify::{Notified, OwnedNotified};
 }
 
+// These four are the kovan crates' own types, re-exported as they are: their
+// API and its changes are kovan's, and code that names them through this
+// module follows kovan's versions, which nuclei's own semver does not cover.
+/// An atomically swapped value, from the kovan crate: see its docs.
 pub use kovan::Atom;
+/// A concurrent hash map, from the kovan-map crate: see its docs.
 pub use kovan_map::HopscotchMap;
+/// A bounded lock-free queue, from the kovan-queue crate: see its docs.
 pub use kovan_queue::array_queue::ArrayQueue;
+/// An unbounded lock-free queue and its pop error, from the kovan-queue
+/// crate: see its docs.
 pub use kovan_queue::seg_queue::{SegQueue, TryPopError};
 
 #[cfg(all(test, not(loom)))]

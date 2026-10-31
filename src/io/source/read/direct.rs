@@ -9,6 +9,7 @@ use std::os::fd::RawFd;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use super::Inq;
 use super::{Io, Kind, ReadState, Via, drained, sys};
+use crate::rt::counters::tally;
 
 impl ReadState {
     /// Whether a stream read (or `peek`) of `len` bytes goes straight into
@@ -157,6 +158,9 @@ impl ReadState {
                 None
             }
             Some(Ok((n, left))) => {
+                if !peek {
+                    tally::read(n);
+                }
                 // A peek leaves the bytes in the socket, which no edge reports again.
                 if matches!(io.via, Via::Fd(_)) && !peek {
                     self.blocked = match left {

@@ -724,7 +724,7 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
                 Err(Look::Lagged(missed)) => return Err(RecvError::Lagged(missed)),
                 Err(Look::Closed) => return Err(RecvError::Closed),
                 Err(Look::Empty) => notified.await,
-                Err(Look::Refused) => crate::task::yield_now().await,
+                Err(Look::Refused) => crate::coop::yield_spent().await,
             }
         }
     }

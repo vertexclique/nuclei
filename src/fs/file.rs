@@ -52,6 +52,7 @@ use crate::io::side::{After, Hooks, Side, WakerSet};
 use crate::io::source::Failure;
 use crate::io::source::requests::Lease;
 use crate::io::sys;
+use crate::rt::counters::tally;
 use crate::rt::task::Task;
 
 /// The least a read job asks for, so a run of small reads takes one job.
@@ -128,6 +129,10 @@ impl Hooks<FileState> for FileHooks<'_> {
 /// A file's call in flight: a job of the blocking pool, or a call that ends
 /// in a slot (an operation on the ring of the shard whose thread issued it,
 /// or a write the pool makes).
+///
+/// Its IO is counted for `stats` where its end is taken: a read the pool made
+/// by its job's poll, a write the pool made by the write's own count (see
+/// [`Writing`]), and a ring's call as the kernel completes it.
 enum Work<T> {
     Pool(Task<T>),
     Slot(SlotJob<T>),
@@ -147,6 +152,44 @@ impl<T: Ended> Work<T> {
         }
         end
     }
+
+    /// Whether the blocking pool makes the call, whose bytes its poll counts.
+    #[inline(always)]
+    fn pooled(&self) -> bool {
+        matches!(self, Work::Pool(_))
+    }
+}
+
+/// The bytes a write the pool makes takes, kept for `stats`: none, and no
+/// room, without the `io-stats` feature.
+#[cfg(feature = "io-stats")]
+type Counted = usize;
+#[cfg(not(feature = "io-stats"))]
+#[derive(Clone, Copy)]
+struct Counted;
+
+/// What a write of `bytes` keeps for `stats`: 0 for a ring's, whose bytes are
+/// counted as the kernel completes it.
+#[inline(always)]
+fn counted(bytes: usize) -> Counted {
+    #[cfg(feature = "io-stats")]
+    return bytes;
+    #[cfg(not(feature = "io-stats"))]
+    {
+        let _ = bytes;
+        Counted
+    }
+}
+
+/// A write the pool made ended, `bytes` its count: counted, unless it failed.
+#[inline(always)]
+fn tally_write(bytes: Counted, ok: bool) {
+    #[cfg(feature = "io-stats")]
+    if bytes > 0 && ok && tally::counting() {
+        tally::add_write(bytes);
+    }
+    #[cfg(not(feature = "io-stats"))]
+    let _ = (bytes, ok);
 }
 
 /// The end of a file's call: its result, alone or with the task's buffer.
@@ -183,16 +226,19 @@ struct LentRead {
 }
 
 /// The write in flight.
+///
+/// Each carries the bytes it writes when the blocking pool makes the call, 0
+/// for a ring's, whose bytes are counted as the kernel completes it.
 enum Writing {
     /// From a buffer of the pool.
-    Pool(Work<io::Result<()>>),
+    Pool(Work<io::Result<()>>, Counted),
     /// From a task's own buffer, which comes back with the result.
-    Lent(Work<(io::Result<()>, Vec<u8>)>),
+    Lent(Work<(io::Result<()>, Vec<u8>)>, Counted),
     /// At the end of a file opened to append, ending with the file's offset
     /// after it.
-    Append(Work<io::Result<u64>>),
+    Append(Work<io::Result<u64>>, Counted),
     /// As `Append`, from a task's own buffer.
-    AppendLent(Work<(io::Result<u64>, Vec<u8>)>),
+    AppendLent(Work<(io::Result<u64>, Vec<u8>)>, Counted),
 }
 
 /// A write from a task's own buffer, from its submission until its task
@@ -310,26 +356,33 @@ impl FileIo {
     /// A write of `buf` at `at`; a pool's wakes `waker` when it ends.
     fn submit_write(&self, buf: PoolBuf, at: u64, waker: &Waker) -> Writing {
         let fd = self.fd.clone();
+        let bytes = counted(buf.filled().len());
         if self.append {
-            return Writing::Append(Work::Slot(call::write_on_pool(
-                move || FileOutcome::Append(sys::append_all(fd.raw(), buf.filled())),
-                call::as_append,
-                waker,
-            )));
+            return Writing::Append(
+                Work::Slot(call::write_on_pool(
+                    move || FileOutcome::Append(sys::append_all(fd.raw(), buf.filled())),
+                    call::as_append,
+                    waker,
+                )),
+                bytes,
+            );
         }
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match super::ring::write(&self.fd, at, buf) {
-                Ok(job) => return Writing::Pool(Work::Slot(job)),
+                Ok(job) => return Writing::Pool(Work::Slot(job), counted(0)),
                 Err(buf) => buf,
             },
             false => buf,
         };
-        Writing::Pool(Work::Slot(call::write_on_pool(
-            move || FileOutcome::Write(sys::pwrite_all(fd.raw(), buf.filled(), at)),
-            call::as_write,
-            waker,
-        )))
+        Writing::Pool(
+            Work::Slot(call::write_on_pool(
+                move || FileOutcome::Write(sys::pwrite_all(fd.raw(), buf.filled(), at)),
+                call::as_write,
+                waker,
+            )),
+            bytes,
+        )
     }
 
     fn submit_read_owned(&self, buf: Vec<u8>, at: u64, epoch: u64) -> LentRead {
@@ -372,32 +425,39 @@ impl FileIo {
     /// ends.
     fn submit_write_owned(&self, buf: Vec<u8>, at: u64, waker: &Waker) -> Writing {
         let fd = self.fd.clone();
+        let bytes = counted(buf.len());
         if self.append {
-            return Writing::AppendLent(Work::Slot(call::write_on_pool(
-                move || {
-                    let result = sys::append_all(fd.raw(), &buf);
-                    FileOutcome::AppendLent(result, buf)
-                },
-                call::as_append_lent,
-                waker,
-            )));
+            return Writing::AppendLent(
+                Work::Slot(call::write_on_pool(
+                    move || {
+                        let result = sys::append_all(fd.raw(), &buf);
+                        FileOutcome::AppendLent(result, buf)
+                    },
+                    call::as_append_lent,
+                    waker,
+                )),
+                bytes,
+            );
         }
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match super::ring::write_lent(&self.fd, at, buf) {
-                Ok(job) => return Writing::Lent(Work::Slot(job)),
+                Ok(job) => return Writing::Lent(Work::Slot(job), counted(0)),
                 Err(buf) => buf,
             },
             false => buf,
         };
-        Writing::Lent(Work::Slot(call::write_on_pool(
-            move || {
-                let result = sys::pwrite_all(fd.raw(), &buf, at);
-                FileOutcome::WriteLent(result, buf)
-            },
-            call::as_write_lent,
-            waker,
-        )))
+        Writing::Lent(
+            Work::Slot(call::write_on_pool(
+                move || {
+                    let result = sys::pwrite_all(fd.raw(), &buf, at);
+                    FileOutcome::WriteLent(result, buf)
+                },
+                call::as_write_lent,
+                waker,
+            )),
+            bytes,
+        )
     }
 
     /// Runs `step` on the state for a task polling with `cx`: the task is
@@ -535,10 +595,17 @@ impl FileIo {
         self.with_state(cx, |st, io, waker, after| {
             loop {
                 if let Some(lent) = job.as_mut() {
+                    let pooled = lent.task.pooled();
                     let (result, mut buf) = match lent.task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(out) => out,
                     };
+                    if pooled
+                        && tally::counting()
+                        && let Ok(n) = &result
+                    {
+                        tally::add_read(*n);
+                    }
                     let (at, epoch, from) = (lent.at, lent.epoch, lent.from);
                     *job = None;
                     if at != st.cursor || epoch != st.epoch {
@@ -681,23 +748,31 @@ impl FileState {
             if let Some(writing) = self.writing.as_mut() {
                 // Where an append left the file's offset: the cursor.
                 let (failure, end) = match writing {
-                    Writing::Pool(task) => match task.poll(waker) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(result) => (result.as_ref().err().map(Failure::of), None),
-                    },
-                    Writing::Append(task) => match task.poll(waker) {
+                    Writing::Pool(task, bytes) => match task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(result) => {
+                            tally_write(*bytes, result.is_ok());
+                            (result.as_ref().err().map(Failure::of), None)
+                        }
+                    },
+                    Writing::Append(task, bytes) => match task.poll(waker) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => {
+                            tally_write(*bytes, result.is_ok());
                             (result.as_ref().err().map(Failure::of), result.ok())
                         }
                     },
-                    Writing::Lent(task) => match task.poll(waker) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready((result, buf)) => (self.lent_back(result, buf), None),
-                    },
-                    Writing::AppendLent(task) => match task.poll(waker) {
+                    Writing::Lent(task, bytes) => match task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready((result, buf)) => {
+                            tally_write(*bytes, result.is_ok());
+                            (self.lent_back(result, buf), None)
+                        }
+                    },
+                    Writing::AppendLent(task, bytes) => match task.poll(waker) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready((result, buf)) => {
+                            tally_write(*bytes, result.is_ok());
                             let end = result.as_ref().ok().copied();
                             (self.lent_back(result.map(drop), buf), end)
                         }
@@ -751,10 +826,17 @@ impl FileState {
                 return Poll::Ready(Ok(true));
             }
             if let Some(job) = self.reading.as_mut() {
+                let pooled = job.task.pooled();
                 let result = match job.task.poll(waker) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => result,
                 };
+                if pooled
+                    && tally::counting()
+                    && let Ok(buf) = &result
+                {
+                    tally::add_read(buf.filled().len());
+                }
                 let (at, epoch) = (job.at, job.epoch);
                 self.reading = None;
                 match result {

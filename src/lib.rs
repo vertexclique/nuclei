@@ -93,6 +93,7 @@ pub mod process;
 mod rt;
 /// nuclei's own runtime: shards, tasks, `block_on`, `spawn` and the blocking pool.
 pub mod runtime;
+mod shard_local;
 /// Signals (unix) and console control events (Windows), as streams.
 pub mod signal;
 pub mod stats;

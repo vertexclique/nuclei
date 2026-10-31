@@ -15,6 +15,14 @@
   dropped with its run, closing the stream with the bytes behind never sent. It now goes on on a
   thread of its own, to its own deadline, as the ones the run never took do
   (`proofs/tla/going/Linger.tla`).
+- **A registration a stopping shard never made no longer fails the source's IO.** A worker whose
+  shard had stopped still registered sources its thread polled, and one asked to register a source
+  for a thread that runs no shard could stop first; either failed the registration, so the
+  source's next operation returned "the shard stopped before the registration", and a dropped
+  stream's drain (a runtime dropping with bytes behind) took that for its end and gave the bytes
+  up (on macOS, about one run in seven of the drop test). A stopped shard now registers nothing:
+  the source stays unregistered, and is registered where its tasks are polled next, as
+  `proofs/tla/attach` has it.
 - **A dropped TCP stream whose linger ran out resets its connection.** The bytes still behind were
   given up and the stream closed with a FIN, so the peer read a cut stream as a whole one; it now
   reads `ConnectionReset` (`proofs/tla/close`).
@@ -93,6 +101,10 @@
 - **What std's calls through `Deref` do**, on `Handle`: `shutdown`, `set_nonblocking(false)`,
   `take_error`, `Read` and `Write` go around the bytes read ahead and written behind, or block the
   shard; `UdpSocket::connect` is a constructor where `socket.connect(addr)` is std's.
+- **Counts of each worker's IO in `stats`, behind the `io-stats` feature** (off by default):
+  `Builder::count_io` and `ShardStats::io` (`IoCounts`: reads, writes, the bytes of each,
+  accepts). The feature costs every IO call a few instructions, counted or not; without it no IO
+  path carries counting code, and the counting items do not exist.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.

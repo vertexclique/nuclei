@@ -24,6 +24,7 @@ use super::call::{
 use crate::buf::PoolBuf;
 use crate::io::source::requests::Lease;
 use crate::io::sys;
+use crate::rt::counters::tally;
 use crate::syscore::linux::iouring::ring::Sqe;
 
 /// What a file's operation reads into or writes from.
@@ -174,6 +175,9 @@ impl FileOp {
     /// the operation again, for the rest of a write; or its end, left for
     /// its task.
     pub(crate) fn complete(mut self, res: i32) -> Option<FileOp> {
+        if tally::counting() {
+            self.tally(res);
+        }
         if res == -libc::ECANCELED {
             // Its shard went: the call is made on the blocking pool.
             self.finish_on_pool();
@@ -219,6 +223,21 @@ impl FileOp {
         None
     }
 
+    /// The call's `res` bytes are counted, if it read or wrote any; for a
+    /// caller that found [`tally::counting`].
+    #[cold]
+    #[inline(never)]
+    fn tally(&self, res: i32) {
+        let Ok(n) = usize::try_from(res) else {
+            return;
+        };
+        match self.mem {
+            FileMem::Read(_) | FileMem::ReadLent(_) => tally::add_read(n),
+            FileMem::Write { .. } | FileMem::WriteLent { .. } if n > 0 => tally::add_write(n),
+            _ => {}
+        }
+    }
+
     /// The operation is kept for good, its completion never to come: a
     /// runtime's drop does not wait for it.
     pub(crate) fn give_up(&mut self) {
@@ -236,6 +255,7 @@ impl FileOp {
             mem,
             slot,
             write,
+            ..
         } = self;
         let call = move || {
             let raw = fd.raw();

@@ -11,11 +11,15 @@
 //! - `start_paused = true`: a runtime of its own whose clock starts paused
 //!   (see `nuclei::time::pause`), with no workers unless `threads` says
 //!   otherwise, so every task runs on the thread that runs the body.
+//! - `builder = "path"`: a runtime of its own, built from the
+//!   `nuclei::Builder` the function at `path` returns (called with no
+//!   argument, the path written as it resolves where the macro is used);
+//!   `threads` and `start_paused`, when given, apply on top of it.
 //! - `crate = "path"`: the path nuclei is reached by, for code that
 //!   re-exports it (`crate = "my_crate::nuclei"`); `::nuclei` otherwise.
 //!
-//! Without `threads` or `start_paused` the process default runtime starts
-//! with zero configuration. The expansions call the runtime entry points of
+//! Without `threads`, `start_paused` or `builder` the process default
+//! runtime starts with zero configuration. The expansions call the runtime entry points of
 //! the nuclei crate: `block_on` on the default runtime, or
 //! `Runtime::builder().worker_threads(N)` (and `.start_paused(true)`)
 //! `.build()` finished with `block_on`.
@@ -49,6 +53,21 @@
 //! #[nuclei::main(threads = 2)]
 //! async fn main() {
 //!     println!("two worker threads");
+//! }
+//! ```
+//!
+//! With every setting from a function of the program's own:
+//!
+//! ```
+//! fn runtime() -> nuclei::Builder {
+//!     nuclei::Builder::new()
+//!         .worker_threads(2)
+//!         .thread_name("server")
+//! }
+//!
+//! #[nuclei::main(builder = "runtime")]
+//! async fn main() {
+//!     println!("two workers named server");
 //! }
 //! ```
 //!

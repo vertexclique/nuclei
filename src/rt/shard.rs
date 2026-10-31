@@ -66,6 +66,7 @@ use spin::Spin;
 
 mod children;
 mod going;
+pub(crate) mod locals;
 #[cfg(port)]
 mod port;
 mod run;
@@ -183,14 +184,12 @@ pub(crate) enum IoOp {
 
 impl IoOp {
     /// The op's shard went and applies it never: a registration asked of it
-    /// fails, for the next wait to make it elsewhere, and a child it was to
-    /// watch is watched where its user polls next; the rest only goes.
+    /// is made elsewhere, by the next poll of a task waiting on the source,
+    /// and a child it was to watch is watched where its user polls next; the
+    /// rest only goes.
     fn gone(self) {
         match self {
-            IoOp::Register(source) => source.registration_failed(&io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the shard stopped before the registration",
-            )),
+            IoOp::Register(source) => source.registration_orphaned(),
             IoOp::Watch(exit) => {
                 let orphan = Arc::strong_count(&exit) == 1;
                 exit.unwatched(orphan);
@@ -454,8 +453,17 @@ impl Shared {
     }
 
     fn may_exit(&self) -> bool {
-        self.is_stopped()
-            || (self.draining.load(Ordering::Acquire) && self.load.load(Ordering::Acquire) == 0)
+        if self.is_stopped() {
+            return true;
+        }
+        if !self.draining.load(Ordering::Acquire) {
+            return false;
+        }
+        // Pairs with the fence of a placement's second look
+        // (`runtime::placement`): either it sees the drain, or this sees its
+        // task counted (proofs/tla/placement).
+        crate::sync::internal::fence(Ordering::SeqCst);
+        self.load.load(Ordering::Acquire) == 0
     }
 
     /// Completes once the shard is stopped, or drained of its tasks: the
@@ -641,6 +649,8 @@ pub(crate) struct Shard {
     children: RefCell<children::Children>,
     /// Where the shard's reads land and its writes wait.
     pool: Pool,
+    /// The values of the `shard_local!` statics, on a worker's shard.
+    locals: locals::Locals,
     /// The keeper of the shard's port while the shard does not run.
     #[cfg(port)]
     keeper: RefCell<Option<Arc<port::Keeper>>>,
@@ -661,6 +671,15 @@ impl Shard {
         monitor: Option<Arc<super::handoff::Monitor>>,
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
+        #[cfg(feature = "io-stats")]
+        if tuning.count_io {
+            shard.shared.counters.count_io();
+        }
+        if tuning.record_latencies {
+            shard.shared.counters.record_latencies();
+            #[cfg(completion)]
+            shard.time_io();
+        }
         shard.until_inbox.set(tuning.inbox_interval);
         #[cfg(ring)]
         if let Some(ring) = shard.ring() {
@@ -774,7 +793,7 @@ impl Shard {
             port: kernel,
             io_ops: SegQueue::new(),
             io_closed: AtomicBool::new(false),
-            counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
+            counters: Counters::new(driver.backend(), pool.cap(), owner),
             runtime: std::sync::OnceLock::new(),
             runtime_addr: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
@@ -811,9 +830,15 @@ impl Shard {
             sources: RefCell::new(Sources::default()),
             children: RefCell::new(children::Children::default()),
             pool,
+            locals: locals::Locals::default(),
             #[cfg(port)]
             keeper: RefCell::new(None),
         })
+    }
+
+    /// The values of the `shard_local!` statics: a worker's alone.
+    pub(crate) fn locals(&self) -> Option<&locals::Locals> {
+        self.owner.get().is_some().then_some(&self.locals)
     }
 
     /// Watches `source` from now on, under a new token. The caller moved
@@ -851,11 +876,15 @@ impl Shard {
     fn apply_io_ops(&self) {
         while let Ok(op) = self.shared.io_ops.try_pop() {
             match op {
-                IoOp::Register(source) => {
-                    if let Err(err) = self.register_source(&source) {
-                        source.registration_failed(&err);
+                IoOp::Register(source) => match self.register_source(&source) {
+                    Ok(()) => {}
+                    // The shard stopped: no failure, the attach set the
+                    // registration back to none, and its tasks look again.
+                    Err(err) if crate::io::source::requests::is_stopped_shard(&err) => {
+                        source.look_again();
                     }
-                }
+                    Err(err) => source.registration_failed(&err),
+                },
                 IoOp::Release(token) => {
                     let gone = self.sources.borrow_mut().remove(token);
                     drop(gone);

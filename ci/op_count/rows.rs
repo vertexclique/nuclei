@@ -7,6 +7,8 @@ use std::time::Duration;
 
 const MANY_CONNS: u64 = 256;
 const BULK_CHUNK: usize = 64 << 10;
+/// The bulk row's socket buffers, each way, as asked of the system.
+const BULK_BUFFER: u32 = 4 << 20;
 const FILE_CHUNK: usize = 64 << 10;
 const SLEEP_TASKS: u64 = 1_000;
 
@@ -348,7 +350,16 @@ pub fn run(rt: &nuclei::runtime::Runtime, row: &str, n: u64) -> Option<u64> {
         "bulk" => {
             let bulk = n as usize * BULK_CHUNK;
             let sink = rt.spawn(async move {
-                let listener = nuclei::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                // Buffers set on both ends, which stops the kernel's autotuning of them (the
+                // size is held to the system's maximum): autotuned, they grow by the round trips
+                // the kernel measures, so whether a chunk goes straight to the kernel or into the
+                // write-behind (a copy of 64 KiB) followed the timing of the run, and the row
+                // came out in one of two modes.
+                let listening = nuclei::net::TcpSocket::new_v4().unwrap();
+                listening.set_send_buffer_size(BULK_BUFFER).unwrap();
+                listening.set_recv_buffer_size(BULK_BUFFER).unwrap();
+                listening.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let listener = listening.listen(16).unwrap();
                 let addr = listener.local_addr().unwrap();
                 let receiver = nuclei::spawn(async move {
                     let (conn, _) = listener.accept().await.unwrap();
@@ -359,7 +370,10 @@ pub fn run(rt: &nuclei::runtime::Runtime, row: &str, n: u64) -> Option<u64> {
                     }
                     total
                 });
-                let conn = NTcp::connect(addr).await.unwrap();
+                let connecting = nuclei::net::TcpSocket::new_v4().unwrap();
+                connecting.set_send_buffer_size(BULK_BUFFER).unwrap();
+                connecting.set_recv_buffer_size(BULK_BUFFER).unwrap();
+                let conn = connecting.connect(addr).await.unwrap();
                 let chunk = vec![1u8; BULK_CHUNK];
                 let mut sent = 0;
                 while sent < bulk {

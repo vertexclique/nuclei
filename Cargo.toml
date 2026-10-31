@@ -48,6 +48,11 @@ attributes = ["nuclei-macros"]
 # of a crate in the build, so a library that enabled it would enable it for all of them.
 recycle = ["kovan/recycle", "kovan-channel/recycle", "kovan-map/recycle", "kovan-queue/recycle"]
 
+# Counts of each worker's IO operations and their bytes in `stats` (`Builder::count_io`,
+# `ShardStats::io`). Off by default: built in, every IO call costs a few instructions more, counted
+# or not; left out, no IO path carries counting code, and the counting items do not exist.
+io-stats = []
+
 [dependencies]
 nuclei-macros = { version = "0.5.0", path = "nuclei-macros", optional = true }
 futures-io = "0.3"

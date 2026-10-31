@@ -17,7 +17,7 @@
 //! that waits on a completion as its shard goes (a file's write a ring's
 //! keeper or the blocking pool finishes) is dropped only once that
 //! completion wakes it, on the completing thread, inside its runtime still
-//! (`sched::Counted`): the linger's task hands its work back then, and the
+//! (`Sched::drop_future`): the linger's task hands its work back then, and the
 //! task that holds a handle hands that handle's linger. So the runtime
 //! counts every linger handed to it until it ended, and its drop waits,
 //! running its list meanwhile and bounded by the linger's time, until none

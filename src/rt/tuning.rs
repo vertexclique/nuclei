@@ -36,6 +36,11 @@ pub(crate) struct Tuning {
     /// zero-copy on the worker's ring.
     #[cfg(ring)]
     pub(crate) zero_copy_min: usize,
+    /// The shard times its IO operations, by kind (`Builder::record_latencies`).
+    pub(crate) record_latencies: bool,
+    /// The shard counts its IO operations (`Builder::count_io`).
+    #[cfg(feature = "io-stats")]
+    pub(crate) count_io: bool,
 }
 
 impl Default for Tuning {
@@ -50,6 +55,9 @@ impl Default for Tuning {
             blocking: None,
             #[cfg(ring)]
             zero_copy_min: crate::io::source::ring::SEND_ZC_MIN,
+            record_latencies: false,
+            #[cfg(feature = "io-stats")]
+            count_io: false,
         }
     }
 }
@@ -103,6 +111,7 @@ impl core::fmt::Debug for ThreadHooks {
 #[derive(Debug)]
 pub struct TaskMeta<'a> {
     id: crate::task::Id,
+    name: Option<Arc<str>>,
     _task: core::marker::PhantomData<&'a ()>,
 }
 
@@ -110,6 +119,7 @@ impl TaskMeta<'_> {
     pub(crate) fn new(id: crate::task::Id) -> Self {
         Self {
             id,
+            name: super::task::names::get(id),
             _task: core::marker::PhantomData,
         }
     }
@@ -117,6 +127,12 @@ impl TaskMeta<'_> {
     /// The task's id.
     pub fn id(&self) -> crate::task::Id {
         self.id
+    }
+
+    /// The task's name, as [`task::Builder::name`](crate::task::Builder::name)
+    /// gave it; `None` for a task spawned without one.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
 

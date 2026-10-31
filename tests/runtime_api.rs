@@ -179,9 +179,10 @@ fn the_scheduler_knobs_keep_the_runtime_working() {
 }
 
 #[test]
-#[should_panic(expected = "event_interval must be at least 1")]
-fn a_zero_event_interval_is_refused() {
-    let _ = Runtime::builder().event_interval(0);
+fn a_zero_event_interval_is_refused_by_build() {
+    let err = Runtime::builder().event_interval(0).build().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("event_interval"), "{err}");
 }
 
 #[test]
