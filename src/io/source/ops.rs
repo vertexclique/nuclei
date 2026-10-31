@@ -309,7 +309,7 @@ impl Source {
     ) {
         match known {
             Some(shard) => self.route_with(Some(shard), f),
-            None => crate::rt::context::current(|current| self.route_with(current, f)),
+            None => self.route_with(crate::rt::context::current_held().shard(), f),
         }
     }
 

@@ -211,26 +211,32 @@ impl Poller {
             }
         };
         let capacity = self.events.capacity().min(max).max(1) as libc::c_int;
+        // Made as a system call (see `io::sys::syscall`): `epoll_wait` where the architecture
+        // has it, which the kernel serves with less than `epoll_pwait`, else `epoll_pwait` with
+        // no mask, which is the same wait.
+        #[cfg(target_arch = "x86_64")]
+        let call = libc::SYS_epoll_wait;
+        #[cfg(not(target_arch = "x86_64"))]
+        let call = libc::SYS_epoll_pwait;
         // SAFETY: the buffer has room for `capacity` events; the kernel says
         // how many it wrote.
-        let n = unsafe {
-            let n = libc::epoll_wait(
-                self.epoll.as_raw_fd(),
-                self.events.as_mut_ptr(),
-                capacity,
-                ms,
-            );
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                // A signal ended the wait: it returns like a timeout.
-                if err.kind() == io::ErrorKind::Interrupted {
-                    0
-                } else {
-                    return Err(err);
-                }
-            } else {
-                n as usize
-            }
+        let n = match unsafe {
+            crate::io::sys::syscall(
+                call,
+                [
+                    self.epoll.as_raw_fd() as usize,
+                    self.events.as_mut_ptr() as usize,
+                    capacity as usize,
+                    ms as isize as usize,
+                    0,
+                    0,
+                ],
+            )
+        } {
+            Ok(n) => n,
+            // A signal ended the wait: it returns like a timeout.
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => 0,
+            Err(err) => return Err(err),
         };
         // SAFETY: the kernel wrote `n` events.
         unsafe { self.events.set_len(n) };
