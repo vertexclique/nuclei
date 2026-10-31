@@ -361,8 +361,7 @@ where
                 }
             }
 
-            let previous = super::enter(header.id);
-            let budget = crate::coop::enter();
+            let entered = crate::coop::enter_task(header.id);
             // Read once: while no runtime of the process has task hooks, the
             // poll costs one predictable branch more, not two calls.
             let hooked =
@@ -377,8 +376,7 @@ where
             if hooked {
                 cell.schedule.after_poll(header.id);
             }
-            crate::coop::leave(budget);
-            super::leave(previous);
+            crate::coop::leave_task(entered);
             // The poll may have woken the task, cloned its waker, or a handle
             // may have registered meanwhile: the word is read again rather
             // than fed stale into the exchanges below, which would fail once.
