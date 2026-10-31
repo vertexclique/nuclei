@@ -91,7 +91,9 @@ fn an_aligned_buffer_goes_through_as_it_is() {
     buf.extend_from_slice(b"aligned");
     let ptr = buf.as_ptr();
     let owned = OwnedBuf::filled(buf);
-    assert!(matches!(owned, OwnedBuf::Aligned(_)));
+    assert!(
+        matches!(&owned, OwnedBuf::Boxed(b) if matches!(**b, crate::buf::owned::Boxed::Aligned(_)))
+    );
     let back: AlignedBuf = owned.into_filled();
     assert_eq!(
         (back.as_ptr(), &back[..], back.alignment()),
@@ -106,7 +108,9 @@ fn a_callers_type_reads_into_its_spare_room_and_comes_back_with_its_count() {
     let mine = Mine::new(8, b"ab");
     let ptr = mine.mem.as_ptr();
     let mut owned = OwnedBuf::filled(mine);
-    assert!(matches!(owned, OwnedBuf::Other(_)));
+    assert!(
+        matches!(&owned, OwnedBuf::Boxed(b) if matches!(**b, crate::buf::owned::Boxed::Kept(_)))
+    );
     assert_eq!(
         (owned.len(), owned.capacity(), &owned[..]),
         (2, 8, &b"ab"[..])
@@ -261,7 +265,9 @@ fn the_runtimes_own_form_passes_through_unchanged() {
     let again: OwnedBuf = owned.into_filled();
     assert_eq!(again.as_ptr(), ptr);
     let vectored = OwnedBuf::written(OwnedBuf::vectored(vec![again]));
-    assert!(matches!(vectored, OwnedBuf::Vectored(_)));
+    assert!(
+        matches!(&vectored, OwnedBuf::Boxed(b) if matches!(**b, crate::buf::owned::Boxed::Vectored(_)))
+    );
     let back: Vec<u8> = vectored.into_written();
     assert!(back.is_empty(), "a vectored write is no one buffer");
 }

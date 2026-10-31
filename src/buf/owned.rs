@@ -185,15 +185,25 @@ where
 /// A caller's buffer while an owned call holds it: what the call reads into
 /// or writes from, in one type wherever the call goes. It reads as a `Vec<u8>`
 /// does: its bytes, its spare capacity, and the count of bytes it holds.
+///
+/// It is as large as a `Vec<u8>`, so the operations that carry it are no
+/// larger than they were for a vector: any other buffer is boxed.
 pub(crate) enum OwnedBuf {
     Vec(Vec<u8>),
+    Boxed(Box<Boxed>),
+}
+
+const _: () = assert!(size_of::<OwnedBuf>() == size_of::<Vec<u8>>());
+
+/// A buffer of another type than `Vec<u8>`.
+pub(crate) enum Boxed {
     Aligned(AlignedBuf),
-    /// Boxed: unwind safe as a `Vec<u8>` is, since a panic leaves no
-    /// invariant of the caller's buffer half made that the runtime relies on.
-    Other(AssertUnwindSafe<Box<dyn Kept>>),
+    /// Unwind safe as a `Vec<u8>` is, since a panic leaves no invariant of
+    /// the caller's buffer half made that the runtime relies on.
+    Kept(AssertUnwindSafe<Box<dyn Kept>>),
     /// The buffers of a vectored write, written one after the other: their
     /// bytes are not one slice, so its `Deref` is empty and its users read
-    /// it through [`rest_from`](Self::rest_from) and [`len`](Self::len).
+    /// it through [`OwnedBuf::rest_from`] and [`OwnedBuf::len`].
     Vectored(Vec<OwnedBuf>),
 }
 
@@ -204,39 +214,45 @@ impl Default for OwnedBuf {
 }
 
 impl OwnedBuf {
-    /// The buffer of a write; a `Vec<u8>` or an [`AlignedBuf`] as it is.
+    fn boxed(boxed: Boxed) -> Self {
+        OwnedBuf::Boxed(Box::new(boxed))
+    }
+
+    /// The buffer of a write; a `Vec<u8>` as it is.
     pub(crate) fn written<B>(buf: B) -> Self
     where
         B: IoBuf,
     {
+        let buf = match cast::<B, Vec<u8>>(buf) {
+            Ok(vec) => return OwnedBuf::Vec(vec),
+            Err(buf) => buf,
+        };
         let buf = match cast::<B, OwnedBuf>(buf) {
             Ok(owned) => return owned,
             Err(buf) => buf,
         };
-        match cast::<B, Vec<u8>>(buf) {
-            Ok(vec) => OwnedBuf::Vec(vec),
-            Err(buf) => match cast::<B, AlignedBuf>(buf) {
-                Ok(aligned) => OwnedBuf::Aligned(aligned),
-                Err(buf) => OwnedBuf::Other(AssertUnwindSafe(Box::new(Written(buf)))),
-            },
+        match cast::<B, AlignedBuf>(buf) {
+            Ok(aligned) => Self::boxed(Boxed::Aligned(aligned)),
+            Err(buf) => Self::boxed(Boxed::Kept(AssertUnwindSafe(Box::new(Written(buf))))),
         }
     }
 
-    /// The buffer of a read; a `Vec<u8>` or an [`AlignedBuf`] as it is.
+    /// The buffer of a read; a `Vec<u8>` as it is.
     pub(crate) fn filled<B>(buf: B) -> Self
     where
         B: IoBufMut,
     {
+        let buf = match cast::<B, Vec<u8>>(buf) {
+            Ok(vec) => return OwnedBuf::Vec(vec),
+            Err(buf) => buf,
+        };
         let buf = match cast::<B, OwnedBuf>(buf) {
             Ok(owned) => return owned,
             Err(buf) => buf,
         };
-        match cast::<B, Vec<u8>>(buf) {
-            Ok(vec) => OwnedBuf::Vec(vec),
-            Err(buf) => match cast::<B, AlignedBuf>(buf) {
-                Ok(aligned) => OwnedBuf::Aligned(aligned),
-                Err(buf) => OwnedBuf::Other(AssertUnwindSafe(Box::new(Filled(buf)))),
-            },
+        match cast::<B, AlignedBuf>(buf) {
+            Ok(aligned) => Self::boxed(Boxed::Aligned(aligned)),
+            Err(buf) => Self::boxed(Boxed::Kept(AssertUnwindSafe(Box::new(Filled(buf))))),
         }
     }
 
@@ -266,27 +282,33 @@ impl OwnedBuf {
             Ok(same) => return same,
             Err(this) => this,
         };
-        match this {
-            OwnedBuf::Vec(vec) => cast::<Vec<u8>, B>(vec).unwrap_or_default(),
-            OwnedBuf::Aligned(aligned) => cast::<AlignedBuf, B>(aligned).unwrap_or_default(),
-            OwnedBuf::Other(AssertUnwindSafe(kept)) => {
+        let boxed = match this {
+            OwnedBuf::Vec(vec) => return cast::<Vec<u8>, B>(vec).unwrap_or_default(),
+            OwnedBuf::Boxed(boxed) => boxed,
+        };
+        match *boxed {
+            Boxed::Aligned(aligned) => cast::<AlignedBuf, B>(aligned).unwrap_or_default(),
+            Boxed::Kept(AssertUnwindSafe(kept)) => {
                 let kept: Box<dyn Any> = kept;
                 kept.downcast::<K>()
                     .map_or_else(|_| B::default(), |k| unwrap(*k))
             }
-            OwnedBuf::Vectored(_) => B::default(),
+            Boxed::Vectored(_) => B::default(),
         }
     }
 
     /// The buffers of a vectored write, held as one.
     pub(crate) fn vectored(bufs: Vec<OwnedBuf>) -> Self {
-        OwnedBuf::Vectored(bufs)
+        Self::boxed(Boxed::Vectored(bufs))
     }
 
     /// The buffers of a vectored write back; a buffer of one is its own.
     pub(crate) fn into_segments(self) -> Vec<OwnedBuf> {
         match self {
-            OwnedBuf::Vectored(bufs) => bufs,
+            OwnedBuf::Boxed(boxed) => match *boxed {
+                Boxed::Vectored(bufs) => bufs,
+                one => vec![OwnedBuf::Boxed(Box::new(one))],
+            },
             one => vec![one],
         }
     }
@@ -295,7 +317,10 @@ impl OwnedBuf {
     /// that byte is in: all the rest for one buffer, the rest of the buffer
     /// it falls in for a vectored write. Empty past its end.
     pub(crate) fn rest_from(&self, from: usize) -> &[u8] {
-        let OwnedBuf::Vectored(bufs) = self else {
+        let OwnedBuf::Boxed(boxed) = self else {
+            return self.get(from..).unwrap_or_default();
+        };
+        let Boxed::Vectored(bufs) = &**boxed else {
             return self.get(from..).unwrap_or_default();
         };
         let mut from = from;
@@ -312,9 +337,11 @@ impl OwnedBuf {
     pub(crate) fn len(&self) -> usize {
         match self {
             OwnedBuf::Vec(vec) => vec.len(),
-            OwnedBuf::Aligned(aligned) => aligned.len(),
-            OwnedBuf::Other(kept) => kept.init(),
-            OwnedBuf::Vectored(bufs) => bufs.iter().map(OwnedBuf::len).sum(),
+            OwnedBuf::Boxed(boxed) => match &**boxed {
+                Boxed::Aligned(aligned) => aligned.len(),
+                Boxed::Kept(kept) => kept.init(),
+                Boxed::Vectored(bufs) => bufs.iter().map(OwnedBuf::len).sum(),
+            },
         }
     }
 
@@ -327,27 +354,34 @@ impl OwnedBuf {
     pub(crate) fn capacity(&self) -> usize {
         match self {
             OwnedBuf::Vec(vec) => vec.capacity(),
-            OwnedBuf::Aligned(aligned) => aligned.capacity(),
-            OwnedBuf::Other(kept) => kept.total(),
-            OwnedBuf::Vectored(_) => self.len(),
+            OwnedBuf::Boxed(boxed) => match &**boxed {
+                Boxed::Aligned(aligned) => aligned.capacity(),
+                Boxed::Kept(kept) => kept.total(),
+                Boxed::Vectored(_) => self.len(),
+            },
         }
     }
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
             OwnedBuf::Vec(vec) => vec.as_mut_ptr(),
-            OwnedBuf::Aligned(aligned) => aligned.as_mut_ptr(),
-            OwnedBuf::Other(kept) => kept.mut_ptr(),
-            OwnedBuf::Vectored(_) => core::ptr::NonNull::dangling().as_ptr(),
+            OwnedBuf::Boxed(boxed) => match &mut **boxed {
+                Boxed::Aligned(aligned) => aligned.as_mut_ptr(),
+                Boxed::Kept(kept) => kept.mut_ptr(),
+                Boxed::Vectored(_) => core::ptr::NonNull::dangling().as_ptr(),
+            },
         }
     }
 
     /// Its memory past the bytes it holds.
     pub(crate) fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        match self {
-            OwnedBuf::Vec(vec) => vec.spare_capacity_mut(),
-            OwnedBuf::Aligned(aligned) => aligned.spare_capacity_mut(),
-            OwnedBuf::Other(kept) => {
+        let boxed = match self {
+            OwnedBuf::Vec(vec) => return vec.spare_capacity_mut(),
+            OwnedBuf::Boxed(boxed) => boxed,
+        };
+        match &mut **boxed {
+            Boxed::Aligned(aligned) => aligned.spare_capacity_mut(),
+            Boxed::Kept(kept) => {
                 let (len, total) = (kept.init(), kept.total());
                 if len >= total {
                     return &mut [];
@@ -361,7 +395,7 @@ impl OwnedBuf {
                     )
                 }
             }
-            OwnedBuf::Vectored(_) => &mut [],
+            Boxed::Vectored(_) => &mut [],
         }
     }
 
@@ -371,15 +405,18 @@ impl OwnedBuf {
     ///
     /// `len <= capacity()`, and the first `len` bytes are initialized.
     pub(crate) unsafe fn set_len(&mut self, len: usize) {
-        match self {
+        let boxed = match self {
             // SAFETY: the caller's.
-            OwnedBuf::Vec(vec) => unsafe { vec.set_len(len) },
+            OwnedBuf::Vec(vec) => return unsafe { vec.set_len(len) },
+            OwnedBuf::Boxed(boxed) => boxed,
+        };
+        match &mut **boxed {
             // SAFETY: the caller's.
-            OwnedBuf::Aligned(aligned) => unsafe { aligned.set_len(len) },
+            Boxed::Aligned(aligned) => unsafe { aligned.set_len(len) },
             // SAFETY: the caller's.
-            OwnedBuf::Other(kept) => unsafe { kept.set_init(len) },
+            Boxed::Kept(kept) => unsafe { kept.set_init(len) },
             // A write's: nothing is read into it.
-            OwnedBuf::Vectored(_) => {}
+            Boxed::Vectored(_) => {}
         }
     }
 
@@ -427,16 +464,17 @@ impl core::ops::Deref for OwnedBuf {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        match self {
-            OwnedBuf::Vec(vec) => vec,
-            OwnedBuf::Aligned(aligned) => aligned,
-            OwnedBuf::Other(kept) if kept.init() == 0 => &[],
+        let boxed = match self {
+            OwnedBuf::Vec(vec) => return vec,
+            OwnedBuf::Boxed(boxed) => boxed,
+        };
+        match &**boxed {
+            Boxed::Aligned(aligned) => aligned,
+            Boxed::Kept(kept) if kept.init() == 0 => &[],
             // SAFETY: the first `init` bytes of the buffer's memory hold
             // data.
-            OwnedBuf::Other(kept) => unsafe {
-                core::slice::from_raw_parts(kept.ptr(), kept.init())
-            },
-            OwnedBuf::Vectored(_) => &[],
+            Boxed::Kept(kept) => unsafe { core::slice::from_raw_parts(kept.ptr(), kept.init()) },
+            Boxed::Vectored(_) => &[],
         }
     }
 }
