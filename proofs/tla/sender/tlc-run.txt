@@ -1,11 +1,14 @@
-TLC run of every configuration in proofs/tla/sender, 2026-10-30 20:25 UTC.
+TLC run of every configuration in proofs/tla/sender, 2026-10-31 00:38 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-PN_safe                            224        107      2  pass                                  pass                                  yes
-PN_live                            224        107      2  pass                                  pass                                  yes
-MN_name_opens_socket                32         21      3  violated:Conservation                 violated:Conservation                 yes
+PN_safe                            224        107      1  pass                                  pass                                  yes
+PN_live                            224        107      1  pass                                  pass                                  yes
+PN_empty                           224        107      1  pass                                  pass                                  yes
+MN_name_opens_socket                32         21      0  violated:Conservation                 violated:Conservation                 yes
+MN_no_peer                          17         13      0  violated:Conservation                 violated:Conservation                 yes
+MN_empty_peek                        6          6      1  violated:PeeksName                    violated:PeeksName                    yes
 WN_starved_take                     32         21      1  violated:NoStarvedTake                violated:NoStarvedTake                yes
 
-results matching EXPECTED.txt: 4 of 4
+results matching EXPECTED.txt: 7 of 7

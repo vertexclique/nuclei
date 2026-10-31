@@ -621,6 +621,20 @@ pub(crate) fn recv_from_udp_uninit(
     peek: bool,
 ) -> io::Result<(usize, SocketAddr)> {
     let (n, storage, len) = recv_from_raw(fd, buf, peek)?;
+    if len == 0 || libc::c_int::from(storage.ss_family) == libc::AF_UNSPEC {
+        // macOS names no sender for a receive into an empty buffer. A connected socket takes
+        // datagrams from its peer alone, whom the kernel names; one connected to nothing has
+        // no sender to give, as std's receive has none.
+        // SAFETY: see `borrow`; the fd is a UDP socket.
+        let socket = unsafe { borrow::<UdpSocket>(fd) };
+        return match socket.peer_addr() {
+            Ok(peer) => Ok((n, peer)),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the system named no sender for a datagram received into an empty buffer",
+            )),
+        };
+    }
     Ok((n, inet_addr(&storage, len)?))
 }
 

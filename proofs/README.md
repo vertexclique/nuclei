@@ -739,19 +739,28 @@ read, and nothing waits for it), and a ring only its own thread may reap copying
 
 ## A datagram's sender
 
-`sender` (`tla/sender/Sender.tla`) checks that a receive on a Unix datagram socket names its
-sender without a descriptor (`unix_addr` and `unnamed` in `src/io/sys/unix.rs`, used by the
-receives of `src/io/source/read.rs` and `src/io/source/ring.rs`). A peer sends datagrams over a
-socket pair, whose ends have no name; a receive takes one from the kernel and then makes the
+`sender` (`tla/sender/Sender.tla`) checks that a datagram receive names its sender
+(`unix_addr`, `unnamed` and `recv_from_udp_uninit` in `src/io/sys/unix.rs`, used by the
+receives of `src/io/source/read.rs` and `src/io/source/ring.rs`, and `poll_peek_sender` in
+`src/net/udp.rs`). A peer sends datagrams; a receive takes one from the kernel and then makes the
 sender's address for the task, while other code takes the process's last descriptors and gives
 them back. Once the kernel handed a datagram over it is the receive's, so naming its sender must
-not fail: the unnamed address is made from an empty path, with no socket. 4 configurations: 2
-that must pass (`Conservation`, no datagram lost, and `Order`; and `Termination`), 1 mutation
-(naming the sender by opening a socket, which fails with no descriptor free and loses the
-datagram the kernel handed over, breaks `Conservation`), and 1 witness (a receive names an
-unnamed sender while no descriptor is free). The Rust test
+not fail: the unnamed address of a socket pair's end is made from an empty path, with no socket;
+and where macOS's kernel names no sender, for a receive into an empty buffer, a connected
+socket's sender is its peer, whom the kernel names. A look at the next datagram's sender peeks
+one byte, so the kernel names it on a socket connected to nothing too. 7 configurations: 3 that
+must pass (`Conservation`, no datagram lost, `Order`, and `PeeksName`, every look at a sender
+names one, with buffers that have room and with empty ones on a connected socket; and
+`Termination`), 3 mutations (naming the sender by opening a socket, which fails with no
+descriptor free, and answering an error for a receive into an empty buffer whose sender the kernel
+did not name, both as the code once did, lose the datagram the kernel handed over and break
+`Conservation`; a look that peeks into an empty buffer, as it once did, names no sender on a
+socket connected to nothing and breaks `PeeksName`), and 1 witness (a receive names an unnamed
+sender while no descriptor is free). The Rust test
 `emfile::datagram_sockets_open_before_send_and_receive_with_no_descriptor_left` in
-`tests/faults/emfile.rs` receives on a real pair with no descriptor left.
+`tests/faults/emfile.rs` receives on a real pair with no descriptor left;
+`a_datagrams_sender_is_peeked_and_it_stays_to_be_received` in `tests/net_api.rs` and the
+`buffers_*` rows of `tests/sizes/datagrams.rs` peek a sender and receive into an empty buffer.
 
 ## A caller's own descriptor
 

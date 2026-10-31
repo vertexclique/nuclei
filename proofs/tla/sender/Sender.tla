@@ -1,8 +1,9 @@
 ------------------------------- MODULE Sender -------------------------------
 (***************************************************************************)
 (* A datagram receive that names its sender (src/io/sys/unix.rs:          *)
-(* `unix_addr`, `unnamed`; src/io/source/read.rs: `receive_ahead`,         *)
-(* `receive_lent`; src/io/source/ring.rs for the ring's receives).         *)
+(* `unix_addr`, `unnamed`, `recv_from_udp_uninit`; src/io/source/read.rs:  *)
+(* `receive_ahead`, `receive_lent`; src/io/source/ring.rs for the ring's   *)
+(* receives; src/net/udp.rs: `poll_peek_sender`).                          *)
 (*                                                                          *)
 (* In plain words: a peer sends datagrams over a Unix socket pair, whose   *)
 (* ends have no name. A receive takes one from the kernel, and then turns  *)
@@ -12,12 +13,22 @@
 (* is the receive's: it must reach the task, so naming its sender must    *)
 (* never fail. Making the unnamed address by opening a socket (as the     *)
 (* code once did) fails with no descriptor free, and the datagram is gone. *)
+(*                                                                          *)
+(* macOS's kernel names no sender for a receive into an empty buffer. A    *)
+(* connected socket takes datagrams from its peer alone, whom the kernel   *)
+(* names on its own (getpeername), so such a receive still names it; the  *)
+(* code once answered it an error, and the datagram was gone. A look at   *)
+(* the next datagram's sender (a peek, which leaves it on the socket)     *)
+(* peeks one byte, so the kernel names the sender of any socket; one that *)
+(* peeked into an empty buffer, as the code once did, got no name.        *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, TLC
 
 CONSTANTS
     Total,     \* the datagrams the peer sends, numbered 1..Total
-    Mutation   \* "none", or "name_opens_socket": naming the unnamed sender opens a socket
+    Empty,     \* TRUE: the receives are into an empty buffer, for which macOS's kernel names no sender
+    Connected, \* TRUE: the socket is connected to the peer
+    Mutation   \* "none", or the one rule taken away: "name_opens_socket", "no_peer" or "empty_peek"
 
 (* --algorithm Sender
 variables
@@ -27,11 +38,16 @@ variables
     taken = <<>>,      \* the datagram the receive took from the kernel, if any
     got = <<>>,        \* the datagrams the task received, in order
     failed = 0,        \* receives that answered an error
+    peekFailed = FALSE, \* (record) a look at a datagram's sender named none
     starvedTake = FALSE; \* (record) a datagram was named while no descriptor was free
 
 define
     \* Whether naming the sender works now: with no socket to open, always.
     NameWorks == Mutation # "name_opens_socket" \/ free
+    \* Whether the kernel named the receive's sender: not for an empty buffer.
+    KernelNamed == ~Empty
+    \* Whether the code names the sender the kernel did not: a connected socket's peer, unless the no_peer mutation drops that.
+    PeerNames == Connected /\ Mutation # "no_peer"
 end define;
 
 \* The peer: sends its datagrams one by one.
@@ -66,6 +82,11 @@ R_loop:
     while Len(got) + failed < Total do
         \* A receive waits for a datagram in the kernel.
         await kernel # <<>>;
+        \* First a look at its sender: a peek of one byte, which the kernel names (MUTATION empty_peek: of none, which it does not).
+        if Mutation = "empty_peek" /\ ~Connected then
+            \* No name came back, and none can be had from a socket connected to nothing.
+            peekFailed := TRUE;
+        end if;
         \* The kernel hands the oldest over: it is no longer the socket's.
         taken := <<Head(kernel)>>;
         \* The kernel's queue loses it.
@@ -73,12 +94,12 @@ R_loop:
 R_name:
         \* Record a receive that names its sender while no descriptor is free.
         if ~free then starvedTake := TRUE; end if;
-        \* The sender's address is made for the task.
-        if NameWorks then
+        \* The sender's address is made for the task: the kernel's, or the connected peer's.
+        if NameWorks /\ (KernelNamed \/ PeerNames) then
             \* The task gets the datagram.
             got := got \o taken;
         else
-            \* MUTATION name_opens_socket: no socket to open; the receive answers the error.
+            \* MUTATION name_opens_socket: no socket to open; MUTATION no_peer: no name at all; the receive answers the error.
             failed := failed + 1;
         end if;
         \* The receive holds nothing now.
@@ -101,6 +122,9 @@ Conservation == Len(got) + Len(taken) + Len(kernel) = sent
 
 \* The task gets the datagrams in the order they were sent, as a Unix socket keeps them.
 Order == \A i \in 1..(Len(got) - 1) : got[i] < got[i + 1]
+
+\* Every look at a datagram's sender names one.
+PeeksName == ~peekFailed
 
 (***************************************************************************)
 (* Witness: claims an interesting case never happens and must be proved    *)

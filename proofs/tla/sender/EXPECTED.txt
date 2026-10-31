@@ -1,5 +1,8 @@
 # configuration                spec                 expected
 PN_safe                        MC_Sender            pass
 PN_live                        MC_Sender            pass
+PN_empty                       MC_Sender            pass
 MN_name_opens_socket           MC_Sender            violated:Conservation
+MN_no_peer                     MC_Sender            violated:Conservation
+MN_empty_peek                  MC_Sender            violated:PeeksName
 WN_starved_take                MC_Sender            violated:NoStarvedTake
