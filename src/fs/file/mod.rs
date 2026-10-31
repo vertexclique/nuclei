@@ -451,13 +451,20 @@ impl FileIo {
                 // Read before the call, so a positional write that ends
                 // while it runs is seen to have.
                 let generation = io.generation();
+                let task = io.submit_read_owned(buf, at, waker);
+                let pooled = task.pooled();
                 *job = Some(LentRead {
-                    task: io.submit_read_owned(buf, at),
+                    task,
                     at,
                     epoch: st.epoch,
                     generation,
                     from,
                 });
+                // A ring's call has its waker already, which its end wakes
+                // however soon it comes: only the pool's job is polled now.
+                if !pooled {
+                    return Poll::Pending;
+                }
             }
         })
     }

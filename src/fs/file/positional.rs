@@ -104,7 +104,7 @@ impl FileIo {
             return (Ok(0), buf.into_filled());
         }
         poll_fn(|cx| self.poll_ordered(cx)).await;
-        let mut job = self.submit_read_owned(buf, at);
+        let mut job = self.submit_read_owned(buf, at, Waker::noop());
         let pooled = job.pooled();
         let (result, buf) = poll_fn(|cx| job.poll(cx.waker())).await;
         tally_read(pooled, &result, |n| *n);

@@ -14,6 +14,7 @@
 //! (or, on a thread inside no runtime, there), so a write that started still
 //! lands.
 
+use core::task::Waker;
 use std::io;
 use std::sync::Arc;
 
@@ -78,9 +79,15 @@ pub(crate) struct FileOp {
 
 /// Issues the call of `buf` (made into `mem`) on `fd` at `at` on the ring of
 /// this thread's shard, if it runs one; else gives `buf` back for the
-/// blocking pool.
+/// blocking pool. With `waker`, its end wakes `waker` however soon it comes.
 #[inline]
-fn submit<B, T, M>(fd: &Lease, at: u64, buf: B, mem: M) -> Result<SlotJob<T>, B>
+fn submit<B, T, M>(
+    fd: &Lease,
+    at: u64,
+    buf: B,
+    mem: M,
+    waker: Option<&Waker>,
+) -> Result<SlotJob<T>, B>
 where
     T: End,
     M: FnOnce(B) -> FileMem,
@@ -90,6 +97,9 @@ where
             return Err(buf);
         };
         let slot = Slot::new();
+        if let Some(waker) = waker {
+            slot.register(waker);
+        }
         let mem = mem(buf);
         let write = matches!(
             mem,
@@ -119,20 +129,30 @@ pub(crate) fn read(
     from: usize,
     len: usize,
 ) -> Result<SlotJob<io::Result<PoolBuf>>, PoolBuf> {
-    submit(fd, at, (buf, from, len), |(buf, from, len)| FileMem::Read {
-        buf,
-        from: u32::try_from(from).unwrap_or(u32::MAX),
-        len: u32::try_from(len).unwrap_or(u32::MAX),
-    })
+    submit(
+        fd,
+        at,
+        (buf, from, len),
+        |(buf, from, len)| FileMem::Read {
+            buf,
+            from: u32::try_from(from).unwrap_or(u32::MAX),
+            len: u32::try_from(len).unwrap_or(u32::MAX),
+        },
+        None,
+    )
     .map_err(|(buf, _, _)| buf)
 }
 
 /// A sync of the file's data (`data_only`) or of all of it, on this
 /// thread's ring; `Err` when the thread runs none.
 pub(crate) fn sync(fd: &Lease, data_only: bool) -> Result<SlotJob<io::Result<()>>, ()> {
-    submit(fd, 0, data_only, |data_only| {
-        FileMem::Call(Call::Sync { data_only })
-    })
+    submit(
+        fd,
+        0,
+        data_only,
+        |data_only| FileMem::Call(Call::Sync { data_only }),
+        None,
+    )
     .map_err(drop)
 }
 
@@ -144,35 +164,45 @@ pub(crate) fn allocate(
     len: u64,
     mode: Allocate,
 ) -> Result<SlotJob<io::Result<()>>, ()> {
-    submit(fd, offset, (len, mode), |(len, mode)| {
-        FileMem::Call(Call::Allocate { len, mode })
-    })
+    submit(
+        fd,
+        offset,
+        (len, mode),
+        |(len, mode)| FileMem::Call(Call::Allocate { len, mode }),
+        None,
+    )
     .map_err(drop)
 }
 
 /// A write-back of the `len` bytes from `offset` (zero: to the end), on this
 /// thread's ring; `Err` when the thread runs none.
 pub(crate) fn sync_range(fd: &Lease, offset: u64, len: u32) -> Result<SlotJob<io::Result<()>>, ()> {
-    submit(fd, offset, len, |len| {
-        FileMem::Call(Call::SyncRange { len })
-    })
+    submit(
+        fd,
+        offset,
+        len,
+        |len| FileMem::Call(Call::SyncRange { len }),
+        None,
+    )
     .map_err(drop)
 }
 
-/// A read at `at` into the spare capacity of a task's `buf`.
+/// A read at `at` into the spare capacity of a task's `buf`, whose end wakes
+/// `waker`.
 #[inline]
 pub(crate) fn read_lent(
     fd: &Lease,
     at: u64,
     buf: OwnedBuf,
+    waker: &Waker,
 ) -> Result<SlotJob<LentReadEnd>, OwnedBuf> {
-    submit(fd, at, buf, FileMem::ReadLent)
+    submit(fd, at, buf, FileMem::ReadLent, Some(waker))
 }
 
 /// A write of all of `buf` at `at`.
 #[inline]
 pub(crate) fn write(fd: &Lease, at: u64, buf: PoolBuf) -> Result<SlotJob<io::Result<()>>, PoolBuf> {
-    submit(fd, at, buf, |buf| FileMem::Write { buf, done: 0 })
+    submit(fd, at, buf, |buf| FileMem::Write { buf, done: 0 }, None)
 }
 
 /// A shutdown of the socket `fd`'s halves `how` (as `shutdown(2)` names
@@ -181,7 +211,7 @@ pub(crate) fn shutdown(
     fd: &Lease,
     how: libc::c_int,
 ) -> Result<SlotJob<io::Result<()>>, libc::c_int> {
-    submit(fd, 0, how, FileMem::Shutdown)
+    submit(fd, 0, how, FileMem::Shutdown, None)
 }
 
 /// A write of all of a task's `buf` at `at`.
@@ -191,7 +221,7 @@ pub(crate) fn write_lent(
     at: u64,
     buf: OwnedBuf,
 ) -> Result<SlotJob<LentWriteEnd>, OwnedBuf> {
-    submit(fd, at, buf, |buf| FileMem::WriteLent { buf, done: 0 })
+    submit(fd, at, buf, |buf| FileMem::WriteLent { buf, done: 0 }, None)
 }
 
 fn len32(len: usize) -> u32 {

@@ -111,6 +111,12 @@ impl Slot {
         });
     }
 
+    /// Wakes `waker` when the call's end is left.
+    #[cfg(ring)]
+    pub(crate) fn register(&self, waker: &Waker) {
+        self.waker.register(waker);
+    }
+
     /// Leaves the call's end and wakes its task.
     pub(crate) fn put(&self, outcome: FileOutcome) {
         // SAFETY: written once, before `full` is raised.
