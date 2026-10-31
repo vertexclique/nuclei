@@ -1091,7 +1091,7 @@ and an accept that still closed a connection, the race the check cannot close).
 ## A stream's close
 
 `shutdown` (`tla/shutdown/Shutdown.tla`) checks a stream's close (`WriteState::close` in
-`src/io/source/write.rs`, which flushes and then calls `shutdown_write` of `src/io/sys/`; the
+`src/io/source/write.rs`, which flushes and then calls `shutdown` of `src/io/sys/`; the
 driver's writes of the write-behind are `WriteState::push_fd`). A task writes bytes, which wait in
 the write-behind until the driver hands them to the kernel, one per call; then it closes the
 writing half again and again. A close waits until the write-behind is out, then asks the kernel to
@@ -1106,6 +1106,61 @@ after the first that answers Ok from the side's own note that it shut, as the co
 witness (a second close on macOS answered ENOTCONN). The Rust test
 `half_close::*::our_shutdown_delivers_every_byte_and_reads_go_on` in `tests/faults/half_close.rs`
 compares a second close with std's on a real stream.
+
+## A stream's shut and abort
+
+`close` (`tla/close/Close.tla`) checks a TCP stream's ends (`Handle::shut` and `Handle::abort` in
+`src/net/close.rs`; `Source::poll_shutdown` and `WriteState::close`, which flushes and then calls
+`sys::shutdown`; the handle's drop, `Handle::close_now` and `linger` in `src/io/handle.rs`;
+`Source::close`). A task writes two bytes, which wait in the write-behind until the driver hands
+them to the kernel, whose send queue holds one until the peer takes it; then it ends the stream
+one of five ways: a shut of the writing half, of both halves or of the reading half, each
+followed by the handle's drop, an abort, or a drop at once. A handle dropped with bytes behind
+hands them to a linger task, which drains them for at most the runtime's linger time; the close is
+performed by the driver. The peer reads, or never reads. 10 configurations: 2 that must pass (a
+peer that reads, with every end; a peer that never reads, with an abort or a drop whose linger
+runs out), with `FinMeansWhole`, a FIN reaches the peer only after every byte the task wrote;
+`AbortResets`, an abort's stream ends with a reset; `AbortDoesNotDrain`, an abort never hands the
+bytes behind to a linger; `Conserved`; and `Termination`; 5 mutations (a shut of the writing half
+or of both that does not wait for the write-behind, an abort that closes without `SO_LINGER` 0,
+and a linger whose time ran out that closes plainly, as the code did, each break
+`FinMeansWhole`; an abort that drops the handle as a drop does breaks `AbortDoesNotDrain`); and 3
+witnesses (an abort's reset reaches the peer; a linger runs out of time; a shut waits for bytes
+behind).
+
+`ShutRead` (`tla/close/ShutRead.tla`) checks a shut of the reading half (`Handle::shut` with `Read`
+or `Both`, then `Source::poll_drop_ahead` and `ReadState::drop_ahead` where the kernel drops its
+receive queue; the ring's shutdown entry in `src/fs/ring.rs`): two bytes the peer sent are unread,
+one read ahead, one in the kernel's queue; the task shuts the half and reads to the end while the
+driver reads ahead. 6 configurations: 2 that must pass (Linux, which keeps its queue readable, and
+a kernel that drops it), with `AsStd`, the reads after the shut answer exactly what std's reads
+answer after its shutdown, and `Termination`; 3 mutations (keeping the read-ahead where the kernel
+drops its queue, dropping it on Linux, and dropping it before the kernel's shutdown, which lets
+the driver read the queued byte ahead in between: all break `AsStd`); and 1 witness (the drop of
+the read-ahead drops a byte).
+
+The Rust tests `shut::*` in `tests/faults/shut.rs` hold a real stream to the same rules: the peer
+reads every byte behind before the end, reads after a shut answer as std's, writes go on after a
+shut of the reading half, and an abort and an expired linger reset the connection.
+
+## A Unix connect to a full backlog
+
+`connect` (`tla/connect/Connect.tla`) checks a Unix stream's connect to a listener whose backlog
+is full (`connect` in `src/net/unix.rs`; `WriteState::connect`, which forgets a connect that
+failed so the next poll makes another). Linux answers it `EAGAIN` and nothing tells the socket
+when a place frees: the connect pauses on a timer and connects again on the same socket until the
+listener takes it. Its caller may drop it at any await; the listener accepts the connection that
+took its place, or never accepts. 7 configurations: 2 that must pass (a listener that accepts, with
+`Termination`; one that never does), with `NoWouldBlock`, the caller never hears `EAGAIN`;
+`OwnSocket`, the stream is the socket its caller set up; `OkMeansQueued`, a connect that answered
+Ok has its socket in the backlog; and `FreedOnDrop`, a dropped connect holds no thread of the
+blocking pool; 4 mutations (the old way, a blocking connect of a new socket on a pool thread,
+breaks `FreedOnDrop`; `EAGAIN` handed to the caller breaks `NoWouldBlock`; a retry on a new
+socket breaks `OwnSocket`; a side that keeps its note of a started connect answers Ok without a
+connect and breaks `OkMeansQueued`); and 1 witness (a connect that met the full backlog connects
+once a place frees). The Rust tests in `tests/net_unix_connect.rs` check the same on a real
+listener: the connect waits, connects its own socket, and a dropped one leaves the pool's one
+thread free and no connection behind.
 
 ## The timer wheel
 
@@ -1214,19 +1269,24 @@ no write is counted on a worker and no worker's stopped inbox is still to be dra
 returns; one handed after runs on a thread of its own, with a runtime of its own. A background
 shutdown waits for nothing, and its lingers all run on threads of their own. A shard whose thread
 is blocked in a task's poll after the shard was handed on drops what its inbox holds only once
-that poll returns, which the drop does not wait for. 17 configurations: 3 that must pass
+that poll returns, which the drop does not wait for. The drop's run has a bound of its own (the
+runtime's linger time): once it runs out, a linger the run was still running goes on on a thread
+of its own (`RunAll`'s drop). 20 configurations: 4 that must pass
 (`DropWaits`, the drop returns only once every byte reached the peer, `NoDefault`, no runtime is
-started for a linger, and `TypeOK`; liveness, `AllSent` and `Termination`; and a background
-shutdown, with `NoDefault`, `AllSent` and `Termination`), 9 mutations (a drop that does not run its list; one that runs only what its list
+started for a linger, and `TypeOK`; liveness, `AllSent` and `Termination`; a background
+shutdown, with `NoDefault`, `AllSent` and `Termination`; and a drop whose bound runs out, with the
+same), 10 mutations (a drop whose bound drops the linger it was running, as `RunAll` did, breaks
+`AllSent`; a drop that does not run its list; one that runs only what its list
 holds as it looks (the fix's first form, which left a file's last writes unlanded); a linger's
 task lost as its worker stops; a linger handed to the stopping shard of its thread, which never
 runs it; the held task dropped outside its runtime, its linger to a thread of its own; a write
 counted out before its wake went; a drop that does not wait for its workers' writes; and one that
 does not wait for a stopped inbox to be drained: all break `DropWaits`; a linger handed to the
-process default runtime, which starts for it, breaks `NoDefault`), and 5 witnesses (a linger's
+process default runtime, which starts for it, breaks `NoDefault`), and 6 witnesses (a linger's
 task handed back as its worker stops; one held by the write and handed back later; the drop
 running a linger of its list; the task with the handle held by the write as its worker stops;
-another thread draining its wake after the write counted itself out).
+another thread draining its wake after the write counted itself out; the drop's bound running
+out before every byte went).
 
 ## A blocking job of a Windows handle
 
@@ -1814,7 +1874,10 @@ the one party `to` receives from `from` on, and no two pairs share a channel.
   models abstract the kernel's reap to one step; the port model abstracts Windows'
   refusal to rebind a handle with operations out to a bind that fails while any are; the
   broadcast model leaves the wake to `Notify` (checked with the sync primitives) and the
-  reclamation of nodes to kovan.
+  reclamation of nodes to kovan; the close models take a linger's time and a connect's pause
+  as steps that may come at any moment, and leave out a receive a completion port filled
+  before a shutdown of the reading half, whose bytes a read after the shut may still return
+  on Windows.
 - **How soon.** `Termination` says every waiter is eventually served under weak fairness; it
   says nothing about how long that takes, and nothing about a thread the scheduler stops for
   good.

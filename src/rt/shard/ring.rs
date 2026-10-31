@@ -94,6 +94,9 @@ pub(crate) struct ShardRing {
     /// A zero-copy send was refused for lack of lockable memory: the ring sends with copies from
     /// then on.
     zc_denied: Cell<bool>,
+    /// The least a zero-copy write must have left for its next send to go zero-copy: the
+    /// runtime's `zero_copy_threshold`, set as the worker's shard is made.
+    zero_copy_min: Cell<usize>,
     /// Any thread may submit to the ring and its completions are posted without its thread (it
     /// is not single-issuer with deferred task work), so a keeper can take it as its shard goes.
     reapable: bool,
@@ -185,6 +188,7 @@ impl ShardRing {
             waitid,
             send_zc,
             zc_denied: Cell::new(false),
+            zero_copy_min: Cell::new(crate::io::source::ring::SEND_ZC_MIN),
             reapable: cfg.multi_issuer,
             files: RefCell::new(Files::new(files)),
             leaving: RefCell::new(Vec::new()),
@@ -246,6 +250,16 @@ impl ShardRing {
     /// buffer the kernel still holds as the shard goes comes back once it let go of it.
     pub(crate) fn zc_stream(&self) -> bool {
         self.send_zc && self.reapable && !self.zc_denied.get()
+    }
+
+    /// The least a zero-copy write must have left for its next send to go zero-copy here.
+    pub(crate) fn zero_copy_min(&self) -> usize {
+        self.zero_copy_min.get()
+    }
+
+    /// Sets [`zero_copy_min`](Self::zero_copy_min), once, as the worker's shard is made.
+    pub(crate) fn set_zero_copy_min(&self, bytes: usize) {
+        self.zero_copy_min.set(bytes);
     }
 
     /// Whether another thread can submit to the ring and reap its completions: a keeper can take

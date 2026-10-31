@@ -4,6 +4,21 @@
 
 ### Fixed
 
+- **A Unix connect to a full backlog no longer holds a thread of the blocking pool.** Linux answers
+  it `EAGAIN`, and the connect went to a blocking connect of a new socket on the pool, which a
+  dropped future never stopped, and which lost the options set on the caller's socket. It now
+  connects again on its own socket after a pause on a timer (1 ms, doubled up to 64 ms), until the
+  listener takes it, as std's blocking connect waits; a drop frees everything
+  (`proofs/tla/connect`).
+- **A runtime's drop whose bound runs out no longer drops a linger it was running.** The drop
+  runs what dropped handles left for at most the linger time, and a linger it had started then was
+  dropped with its run, closing the stream with the bytes behind never sent. It now goes on on a
+  thread of its own, to its own deadline, as the ones the run never took do
+  (`proofs/tla/going/Linger.tla`).
+- **A dropped TCP stream whose linger ran out resets its connection.** The bytes still behind were
+  given up and the stream closed with a FIN, so the peer read a cut stream as a whole one; it now
+  reads `ConnectionReset` (`proofs/tla/close`).
+
 - **IO of a shard handed over repeatedly no longer waits for 61 task runs.** When a task blocks its
   thread past the handoff threshold the shard goes to another thread, and the count of runs before
   the next look at the driver went with it. If the first task of every new runner blocked as well,
@@ -55,6 +70,29 @@
 
 ### Added
 
+- **`shut` and `abort` on streams.** `TcpStream::shut(how)` and `UnixStream::shut(how)` make std's
+  shutdown once the bytes written behind reached the kernel (`Write`, `Both`), and the reading
+  half's through the ring's `SHUTDOWN` where the calling thread runs a ring; reads after it answer
+  as std's on each system (macOS and Windows drop what was read ahead). It is not named `shutdown`,
+  so `stream.shutdown(how)` still reaches std's through `Deref`. `TcpStream::abort()` sets
+  `SO_LINGER` to zero, drops the bytes behind and closes now: the peer reads a reset
+  (`proofs/tla/close`).
+- **IO settings on the builder**: `write_behind_linger` (how long a dropped handle's bytes may
+  take, 60 s by default, more than zero), `zero_copy_threshold` (the least a `write_zero_copy`
+  must have left for a zero-copy send, 1 MiB by default) and `send_file_chunk` (the most one call
+  of a `send_file` sends, 1 MiB by default, from 1 to `0x7ffff000` bytes). Each is read once, as
+  the runtime builds.
+- **TCP options**: `TcpKeepalive { time, interval, retries }` with `set_keepalive_timing` and
+  `keepalive_timing` on `TcpSocket` and `TcpStream`; `TcpSocket::set_incoming_cpu`,
+  `set_user_timeout`, `set_only_v6`, `set_fastopen` and `set_defer_accept`, and
+  `TcpStream::set_quickack` and `set_user_timeout`, each with its getter. An option the system
+  does not have answers `Unsupported`.
+- **`UdpSocketBuilder`**, a UDP socket set up before it binds (`SO_REUSEADDR`, `SO_REUSEPORT`,
+  buffer sizes, `IP_TOS`, `IPV6_TCLASS`, `IPV6_V6ONLY`, `SO_BINDTODEVICE`), and
+  `UdpSocket::poll_recv_from` and `poll_send_to`.
+- **What std's calls through `Deref` do**, on `Handle`: `shutdown`, `set_nonblocking(false)`,
+  `take_error`, `Read` and `Write` go around the bytes read ahead and written behind, or block the
+  shard; `UdpSocket::connect` is a constructor where `socket.connect(addr)` is std's.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.

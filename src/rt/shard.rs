@@ -662,6 +662,10 @@ impl Shard {
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
         shard.until_inbox.set(tuning.inbox_interval);
+        #[cfg(ring)]
+        if let Some(ring) = shard.ring() {
+            ring.set_zero_copy_min(tuning.zero_copy_min);
+        }
         shard.tuning = tuning;
         shard.monitor = monitor;
         Ok(shard)
@@ -955,7 +959,9 @@ impl Shard {
         local.or_else(|| self.pop_inbox())
     }
 
-    #[inline(never)]
+    // Inlined into the run loop's `next`: it is looked at on every run that
+    // finds the local queue empty.
+    #[inline]
     fn pop_inbox(&self) -> Option<Runnable> {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).

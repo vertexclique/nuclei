@@ -30,14 +30,18 @@
 //! ```
 
 mod addr;
-mod opt;
+mod close;
+pub(crate) mod opt;
 mod released;
-mod send_file;
+pub(crate) mod send_file;
 mod socket;
+mod sockopt;
 mod split;
 mod stream;
 mod tcp;
+mod tcp_options;
 mod udp;
+mod udp_socket;
 #[cfg(unix)]
 pub mod unix;
 #[cfg(unix)]
@@ -45,11 +49,13 @@ mod unix_socket;
 
 pub use self::addr::{ToSocketAddrs, lookup_host};
 pub use self::released::Released;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use self::socket::DeviceName;
 pub use self::socket::TcpSocket;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use self::sockopt::DeviceName;
 pub use self::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};
 pub use self::tcp::TcpStreamGenerator;
+pub use self::tcp_options::TcpKeepalive;
+pub use self::udp_socket::UdpSocketBuilder;
 #[cfg(unix)]
 pub use self::unix_socket::UnixSocket;
 
@@ -59,14 +65,20 @@ use crate::io::Handle;
 
 /// A TCP listener: std's, with an async `accept`.
 pub type TcpListener = Handle<std::net::TcpListener>;
-/// A TCP stream: std's, with async reads and writes.
+/// A TCP stream: std's, with async reads and writes. A few of std's calls
+/// reached through `Deref` go around the handle (`shutdown` among them): see
+/// [`Handle`].
 pub type TcpStream = Handle<std::net::TcpStream>;
-/// A UDP socket: std's, with async sends and receives.
+/// A UDP socket: std's, with async sends and receives. Its
+/// [`connect`](UdpSocket::connect) makes a socket;
+/// `socket.connect(addr)` on one is std's own (see there).
 pub type UdpSocket = Handle<std::net::UdpSocket>;
 /// A Unix stream listener: std's, with an async `accept`.
 #[cfg(unix)]
 pub type UnixListener = Handle<std::os::unix::net::UnixListener>;
-/// A Unix stream: std's, with async reads and writes.
+/// A Unix stream: std's, with async reads and writes. A few of std's calls
+/// reached through `Deref` go around the handle (`shutdown` among them): see
+/// [`Handle`].
 #[cfg(unix)]
 pub type UnixStream = Handle<std::os::unix::net::UnixStream>;
 /// A Unix datagram socket: std's, with async sends and receives.

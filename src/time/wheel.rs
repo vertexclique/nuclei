@@ -321,6 +321,8 @@ impl Wheel {
     }
 
     /// Links an entry into the slot its deadline belongs to now.
+    // Always inlined into `insert` and the cascade: a call costs every armed
+    // timer its arguments and its return.
     #[inline(always)]
     fn link(&mut self, index: usize) {
         let when = self.entries[index].when;

@@ -263,10 +263,24 @@ pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<u
     Ok((n, left))
 }
 
-/// `shutdown(2)` of the writing half.
-pub(crate) fn shutdown_write(fd: RawFd) -> io::Result<()> {
+/// `shutdown(2)` of the halves `how` names.
+pub(crate) fn shutdown(fd: RawFd, how: std::net::Shutdown) -> io::Result<()> {
+    shutdown_raw(fd, shut_how(how))
+}
+
+/// `shutdown(2)` of the halves its own `how` names.
+pub(crate) fn shutdown_raw(fd: RawFd, how: libc::c_int) -> io::Result<()> {
     // SAFETY: a plain syscall on a socket the caller holds.
-    cvt_int(unsafe { libc::shutdown(fd, libc::SHUT_WR) }).map(drop)
+    cvt_int(unsafe { libc::shutdown(fd, how) }).map(drop)
+}
+
+/// `shutdown(2)`'s name for the halves `how` names.
+fn shut_how(how: std::net::Shutdown) -> libc::c_int {
+    match how {
+        std::net::Shutdown::Read => libc::SHUT_RD,
+        std::net::Shutdown::Write => libc::SHUT_WR,
+        std::net::Shutdown::Both => libc::SHUT_RDWR,
+    }
 }
 
 /// The pending error of a socket (`SO_ERROR`): how a non-blocking connect
@@ -573,23 +587,6 @@ pub(crate) fn connect_inet(fd: RawFd, addr: &SocketAddr) -> io::Result<bool> {
 /// [`connect_inet`]. A listener whose backlog is full answers `WouldBlock`.
 pub(crate) fn connect_unix(fd: RawFd, addr: &UnixAddr) -> io::Result<bool> {
     connect_raw(fd, addr.as_ptr(), addr.len)
-}
-
-/// A Unix stream connected to `addr` by a connect that waits: what a full
-/// backlog leaves, made on the blocking pool.
-pub(crate) fn connect_unix_waiting(addr: &UnixAddr) -> io::Result<OwnedFd> {
-    use std::os::fd::AsRawFd;
-    let socket = socket(libc::AF_UNIX, libc::SOCK_STREAM)?;
-    let fd = socket.as_raw_fd();
-    // SAFETY: plain fcntl calls on our own descriptor.
-    unsafe {
-        let flags = cvt_int(libc::fcntl(fd, libc::F_GETFL))?;
-        cvt_int(libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK))?;
-        // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
-        retry(|| cvt_int(libc::connect(fd, addr.as_ptr(), addr.len)))?;
-        cvt_int(libc::fcntl(fd, libc::F_SETFL, flags))?;
-    }
-    Ok(socket)
 }
 
 /// A Unix socket address in its raw form: a path, or on Linux an

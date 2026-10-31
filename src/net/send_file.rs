@@ -30,10 +30,11 @@ use crate::io::Handle;
 #[cfg(unix)]
 use crate::io::Interest;
 
-/// The most one call of the blocking pool sends: what a stall on a cold
-/// page holds a pool thread for is bounded, and so is a cancelled call's
-/// bytes that still land.
-const SEND_FILE_CHUNK: u64 = 1 << 20;
+/// The most one call of the blocking pool sends, by default (see
+/// [`Builder::send_file_chunk`](crate::runtime::Builder::send_file_chunk)):
+/// what a stall on a cold page holds a pool thread for is bounded, and so is
+/// a cancelled call's bytes that still land.
+pub(crate) const SEND_FILE_CHUNK: u64 = 1 << 20;
 
 /// A range of `file` that `len` bytes from `offset` name, or the error of a
 /// range no file can have.
@@ -75,7 +76,9 @@ macro_rules! send_file {
             ///
             /// If the future is dropped before it completes, the stream has
             /// got a prefix of the range, in order and whole, and a chunk of
-            /// at most one MiB may still be on its way.
+            /// at most the runtime's
+            /// [`send_file_chunk`](crate::runtime::Builder::send_file_chunk)
+            /// (one MiB by default) may still be on its way.
             ///
             /// # Errors
             ///
@@ -89,24 +92,31 @@ macro_rules! send_file {
                 if len == 0 {
                     return Ok(0);
                 }
+                let chunk = crate::rt::runtime::io_knobs::current().send_file_chunk;
                 #[cfg(unix)]
                 if crate::io::sys::SENDS_FILES {
-                    return self.send_file_in_kernel(file, offset, len).await;
+                    return self.send_file_in_kernel(file, offset, len, chunk).await;
                 }
                 #[cfg(windows)]
                 if crate::io::sys::transmit_file_available() {
-                    return self.send_file_transmitted(file, offset, len).await;
+                    return self.send_file_transmitted(file, offset, len, chunk).await;
                 }
-                self.send_file_by_copy(file, offset, len).await
+                self.send_file_by_copy(file, offset, len, chunk).await
             }
 
             #[cfg(unix)]
-            async fn send_file_in_kernel(&self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
+            async fn send_file_in_kernel(
+                &self,
+                file: &File,
+                offset: u64,
+                len: u64,
+                chunk: u64,
+            ) -> io::Result<u64> {
                 let sock = self.source().lease()?;
                 let from = file.source().lease()?;
                 let mut sent = 0u64;
                 while sent < len {
-                    let want = (len - sent).min(SEND_FILE_CHUNK) as usize;
+                    let want = (len - sent).min(chunk) as usize;
                     let at = offset + sent;
                     let (out, src) = (sock.clone(), from.clone());
                     // The socket's `WouldBlock` is an answer, not a failure
@@ -135,19 +145,25 @@ macro_rules! send_file {
             /// `TransmitFile` on the completion port, a chunk at a time. The range is cut to
             /// the file first, as the call sends exactly what it is asked for or fails.
             #[cfg(windows)]
-            async fn send_file_transmitted(&self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
+            async fn send_file_transmitted(
+                &self,
+                file: &File,
+                offset: u64,
+                len: u64,
+                chunk: u64,
+            ) -> io::Result<u64> {
                 use std::os::windows::io::AsRawHandle;
                 let raw = file.get_ref().as_raw_handle() as usize as crate::io::raw::Raw;
                 // A file whose sharing forbids another reader is sent by copy, which reads at
                 // the offsets through the handle itself.
                 let Ok(handle) = crate::io::sys::reopen_overlapped(raw) else {
-                    return self.send_file_by_copy(file, offset, len).await;
+                    return self.send_file_by_copy(file, offset, len, chunk).await;
                 };
                 let handle = Arc::new(handle);
                 let len = len.min(file.get_ref().metadata()?.len().saturating_sub(offset));
                 let mut sent = 0u64;
                 while sent < len {
-                    let want = (len - sent).min(SEND_FILE_CHUNK) as u32;
+                    let want = (len - sent).min(chunk) as u32;
                     let wrote = self
                         .source()
                         .send_file_range(Arc::clone(&handle), offset + sent, want)
@@ -157,9 +173,15 @@ macro_rules! send_file {
                 Ok(sent)
             }
 
-            async fn send_file_by_copy(&self, file: &File, offset: u64, len: u64) -> io::Result<u64> {
+            async fn send_file_by_copy(
+                &self,
+                file: &File,
+                offset: u64,
+                len: u64,
+                chunk: u64,
+            ) -> io::Result<u64> {
                 let from = file.source().lease()?;
-                let mut buf = vec![0u8; SEND_FILE_CHUNK.min(len) as usize];
+                let mut buf = vec![0u8; chunk.min(len) as usize];
                 let mut sent = 0u64;
                 while sent < len {
                     let want = (len - sent).min(buf.len() as u64) as usize;
@@ -179,7 +201,7 @@ macro_rules! send_file {
                     let (wrote, back) = self.write_owned(buf).await;
                     buf = back;
                     wrote?;
-                    buf.resize(SEND_FILE_CHUNK.min(len) as usize, 0);
+                    buf.resize(chunk.min(len) as usize, 0);
                     sent += n as u64;
                 }
                 Ok(sent)

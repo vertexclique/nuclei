@@ -1,9 +1,10 @@
 //! Lingers: the work a handle leaves as it drops, which must be done whatever
 //! happens to the handle and to the runtime it ran on: the bytes a socket's
 //! write-behind holds, a file's writes behind, a gone shard's sources that
-//! still hold bytes. Each is bounded by its own deadline
-//! ([`LINGER`](crate::io::handle::LINGER)) and done by the runtime the thread
-//! that hands it is inside (or the process default runtime, if it runs):
+//! still hold bytes. Each is bounded by its own deadline (the runtime's
+//! [`write_behind_linger`](crate::runtime::Builder::write_behind_linger), see
+//! [`time`]) and done by the runtime the thread that hands it is inside (or
+//! the process default runtime, if it runs):
 //!
 //! - while one of its workers takes tasks, as a task there;
 //! - with none, on the shard of the thread that hands it, which runs it at
@@ -37,6 +38,12 @@ use kovan_queue::seg_queue::SegQueue;
 use super::runtime::Inner;
 use crate::sync::atomic_waker::AtomicWaker;
 use crate::sync::internal::{AtomicBool, AtomicUsize, Ordering, fence};
+
+/// How long a linger may take: the `write_behind_linger` of the runtime this
+/// thread is inside (where the linger runs), or the default.
+pub(crate) fn time() -> std::time::Duration {
+    super::runtime::io_knobs::current().linger
+}
 
 /// A linger's work, boxed so it moves between threads and runtimes.
 pub(crate) type Work = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -173,6 +180,19 @@ impl Future for RunAll<'_> {
             Poll::Ready(())
         } else {
             Poll::Pending
+        }
+    }
+}
+
+impl Drop for RunAll<'_> {
+    /// The drop's own bound ran out with lingers still running: each goes on
+    /// on a thread of its own, to its own deadline, as the ones the run never
+    /// took do (`Lingering::end`).
+    fn drop(&mut self) {
+        let lingering = self.inner.lingering();
+        for work in self.running.drain(..) {
+            lingering.ended();
+            alone(work);
         }
     }
 }

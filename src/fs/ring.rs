@@ -36,6 +36,10 @@ pub(crate) enum FileMem {
     Write { buf: PoolBuf, done: usize },
     /// A write of a task's buffer, `done` of its bytes landed.
     WriteLent { buf: Vec<u8>, done: usize },
+    /// A socket's shutdown of the halves `shutdown(2)`'s `how` names, the
+    /// one call of a socket's that goes this way: its lease keeps the
+    /// descriptor's number the socket's until the call ran.
+    Shutdown(libc::c_int),
 }
 
 /// A file's operation on a ring.
@@ -102,6 +106,15 @@ pub(crate) fn write(fd: &Lease, at: u64, buf: PoolBuf) -> Result<SlotJob<io::Res
     submit(fd, at, buf, |buf| FileMem::Write { buf, done: 0 }, as_write)
 }
 
+/// A shutdown of the socket `fd`'s halves `how` (as `shutdown(2)` names
+/// them), on this thread's ring; `how` back where this thread runs none.
+pub(crate) fn shutdown(
+    fd: &Lease,
+    how: libc::c_int,
+) -> Result<SlotJob<io::Result<()>>, libc::c_int> {
+    submit(fd, 0, how, FileMem::Shutdown, as_write)
+}
+
 /// A write of all of a task's `buf` at `at`.
 pub(crate) fn write_lent(
     fd: &Lease,
@@ -153,6 +166,7 @@ impl FileOp {
                     self.at + *done as u64,
                 )
             }
+            FileMem::Shutdown(how) => Sqe::shutdown(fd, *how),
         }
     }
 
@@ -197,6 +211,7 @@ impl FileOp {
             }
             FileMem::Write { .. } => FileOutcome::Write(written(result)),
             FileMem::WriteLent { buf, .. } => FileOutcome::WriteLent(written(result), buf),
+            FileMem::Shutdown(_) => FileOutcome::Write(result.map(drop)),
         };
         self.slot.put(outcome);
         // Once the wake went: a task it dropped handed what it left first.
@@ -250,6 +265,7 @@ impl FileOp {
                         sys::pwrite_all(raw, buf.get(done..).unwrap_or_default(), at + done as u64);
                     FileOutcome::WriteLent(result, buf)
                 }
+                FileMem::Shutdown(how) => FileOutcome::Write(sys::shutdown_raw(raw, how)),
             };
             slot.put(outcome);
             // Once the wake went: a task it dropped handed what it left first.

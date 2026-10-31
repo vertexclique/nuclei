@@ -439,6 +439,10 @@ impl<S> Side<S> {
     /// set for the holder to wake, or, if the side came free meanwhile, the
     /// side is taken after all. `left`: the poll found a biased owner
     /// holding, so the side is free only if `own` says so on a second look.
+    // Always inlined into `poll`: called, it hands its `Held` back through
+    // memory, and every poll's own take then goes through that memory too,
+    // as a codegen unit that holds both may decide.
+    #[inline(always)]
     fn contend(&self, waker: &Waker, left: bool) -> Option<Held<'_, S>> {
         if !self.contended().register(waker) {
             // The holder is taking the contended wakers right now, so it is

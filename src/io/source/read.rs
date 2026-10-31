@@ -1417,6 +1417,13 @@ impl ReadState {
         after.wake(&mut self.waiters);
     }
 
+    /// Drops the bytes read ahead and not read yet, once the kernel shut
+    /// the reading half and dropped what its own queue held: a read after
+    /// it answers as the kernel does, as std's would.
+    pub(super) fn drop_ahead(&mut self, after: &mut After) {
+        self.ahead.release(after);
+    }
+
     /// Drops what the side holds: the descriptor it came from is gone.
     pub(super) fn discard(&mut self, after: &mut After) {
         self.ahead.release(after);

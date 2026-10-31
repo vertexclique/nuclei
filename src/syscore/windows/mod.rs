@@ -190,6 +190,14 @@ pub(crate) const SOCK_DGRAM: i32 = 2;
 pub(crate) const SOCK_RAW: i32 = 3;
 pub(crate) const SOCK_RDM: i32 = 4;
 pub(crate) const IPPROTO_TCP: i32 = 6;
+pub(crate) const IPPROTO_UDP: i32 = 17;
+pub(crate) const IPPROTO_IPV6: i32 = 41;
+pub(crate) const IPV6_V6ONLY: i32 = 27;
+/// Seconds idle before the first keepalive probe (Windows 10 1709 on).
+pub(crate) const TCP_KEEPALIVE: i32 = 3;
+pub(crate) const TCP_FASTOPEN: i32 = 15;
+pub(crate) const TCP_KEEPCNT: i32 = 16;
+pub(crate) const TCP_KEEPINTVL: i32 = 17;
 pub(crate) const SOL_SOCKET: i32 = 0xFFFF;
 pub(crate) const SO_TYPE: i32 = 0x1008;
 pub(crate) const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
@@ -211,7 +219,9 @@ pub(crate) struct LINGER {
     pub(crate) l_onoff: u16,
     pub(crate) l_linger: u16,
 }
+pub(crate) const SD_RECEIVE: i32 = 0;
 pub(crate) const SD_SEND: i32 = 1;
+pub(crate) const SD_BOTH: i32 = 2;
 pub(crate) const WSA_FLAG_OVERLAPPED: DWORD = 0x01;
 pub(crate) const WSA_FLAG_NO_HANDLE_INHERIT: DWORD = 0x80;
 pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC800_0006;
@@ -260,6 +270,7 @@ pub(crate) const WSAECONNABORTED: i32 = 10053;
 pub(crate) const WSAECONNRESET: i32 = 10054;
 pub(crate) const WSAENOBUFS: i32 = 10055;
 pub(crate) const WSAENOTCONN: i32 = 10057;
+pub(crate) const WSAESHUTDOWN: i32 = 10058;
 pub(crate) const WSAETIMEDOUT: i32 = 10060;
 pub(crate) const WSAECONNREFUSED: i32 = 10061;
 pub(crate) const WSAEHOSTUNREACH: i32 = 10065;
