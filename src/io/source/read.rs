@@ -805,7 +805,7 @@ impl ReadState {
     ) -> Poll<io::Result<usize>> {
         self.complete(io, kind, out.len(), after);
         match self.take_stream(peek, after, |ahead, after| {
-            ahead.copy_into(out, peek, after)
+            ahead.copy_into(out, peek, after, io.shard)
         }) {
             Some(result) => {
                 self.pass_on(after);
@@ -864,7 +864,7 @@ impl ReadState {
         let len = bufs.iter().map(|b| b.len()).sum();
         self.complete(io, kind, len, after);
         match self.take_stream(false, after, |ahead, after| {
-            ahead.copy_vectored(bufs, after)
+            ahead.copy_vectored(bufs, after, io.shard)
         }) {
             Some(result) => {
                 self.pass_on(after);
@@ -904,9 +904,9 @@ impl ReadState {
             *held = self.reclaim(after);
         }
         if let Some(buf) = held.as_mut() {
-            if let Some(result) =
-                self.take_stream(false, after, |ahead, after| ahead.append_to(buf, after))
-            {
+            if let Some(result) = self.take_stream(false, after, |ahead, after| {
+                ahead.append_to(buf, after, io.shard)
+            }) {
                 self.pass_on(after);
                 return Poll::Ready(result);
             }
