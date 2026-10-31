@@ -428,6 +428,125 @@ fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
     drop(handle);
 }
 
+/// A shard that leaves while another thread holds a side of a source registered to it: the holder
+/// evicts the source as it lets go, and the shard applies that eviction's detach before it leaves,
+/// which takes the source's file out of the ring and lets go of the lease that keeps the handle's
+/// object open. Before, the registration read as gone before its detach reached the shard's
+/// mailbox: the shard's wait could end in between and the shard leave, and a thread's own shard
+/// runs again only at its next `block_on`, so the detach waited there with its lease, and the
+/// handle, dropped, never closed (a dropped stream's linger delivered every byte and its peer
+/// never saw the end: `drops::a_runtime_dropped_with_bytes_behind_delivers_them`). The holder's
+/// post waits here, should the registration read as gone by then, until the shard left, which
+/// makes that order certain.
+#[cfg(ring)]
+#[test]
+fn a_shard_that_leaves_applies_the_detach_of_a_holders_eviction() {
+    use std::sync::mpsc::channel;
+    let (mine, peer) = stream_pair();
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let handle = Handle::new(mine).unwrap();
+    let src = Arc::clone(handle.source());
+    let (registered, has_registered) = channel::<Option<(usize, u64)>>();
+    let (release, released) = channel::<()>();
+    let (give, taken) = channel();
+    let (exit, exits) = channel::<()>();
+    let left = Arc::new(AtomicBool::new(false));
+    let ended_first = Arc::new(AtomicBool::new(false));
+    let shard = {
+        let (src, left, ended_first) = (
+            Arc::clone(&src),
+            Arc::clone(&left),
+            Arc::clone(&ended_first),
+        );
+        std::thread::spawn(move || {
+            let holder = crate::block_on(async {
+                if crate::proactor::Proactor::backend() != crate::IoBackend::IoUring {
+                    registered.send(None).unwrap();
+                    return None;
+                }
+                // One read polled here registers the source with this thread's own shard.
+                let mut buf = [0u8; 1];
+                {
+                    let mut read = Box::pin(handle.recv(&mut buf));
+                    let polled = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+                    assert!(polled.is_pending());
+                }
+                let (home, token) = src.registration();
+                registered.send(Some((home, token))).unwrap();
+                let (held_tx, held_rx) = channel::<()>();
+                let holder = {
+                    let (src, left) = (Arc::clone(&src), Arc::clone(&left));
+                    std::thread::spawn(move || {
+                        let held = src.read.try_hold().expect("the side is free");
+                        held_tx.send(()).unwrap();
+                        released.recv().unwrap();
+                        let looked = Arc::clone(&src);
+                        super::super::ring::BEFORE_DETACH_POST.with(|look| {
+                            *look.borrow_mut() = Some(Box::new(move || {
+                                if !looked.registered_with(home, token) {
+                                    ended_first.store(true, Ordering::SeqCst);
+                                    until_some("the shard never left", || {
+                                        left.load(Ordering::SeqCst).then_some(())
+                                    });
+                                }
+                            }));
+                        });
+                        let mut after = After::default();
+                        held.release(&mut after, &src.hooks());
+                        after.run();
+                        super::super::ring::BEFORE_DETACH_POST
+                            .with(|look| *look.borrow_mut() = None);
+                    })
+                };
+                held_rx.recv().unwrap();
+                Some(holder)
+            });
+            left.store(true, Ordering::SeqCst);
+            if let Some(holder) = holder {
+                holder.join().unwrap();
+            }
+            give.send(handle).unwrap();
+            // The shard stays as it left, not dropped, until the test looked.
+            exits.recv().unwrap();
+        })
+    };
+    let Some((home, token)) = has_registered.recv().unwrap() else {
+        eprintln!("skipping: this thread's shard runs no ring here");
+        drop(release);
+        drop(taken.recv().unwrap());
+        exit.send(()).unwrap();
+        shard.join().unwrap();
+        return;
+    };
+    assert_ne!(home, 0, "the read did not register the source");
+    // The shard's leave asked for the eviction, which waits for the holder.
+    until_some("the shard never asked for the eviction", || {
+        (src.requests.load(Ordering::SeqCst) != 0).then_some(())
+    });
+    release.send(()).unwrap();
+    let handle = taken
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the shard never left");
+    assert!(!src.registered_with(home, token), "the eviction never ran");
+    drop(handle);
+    let mut buf = [0u8; 1];
+    let end = (&peer).read(&mut buf);
+    assert!(
+        matches!(end, Ok(0)),
+        "the peer never saw the end ({end:?}): the shard left with the eviction's detach still to \
+         come, its ring holding the file and its mailbox the lease (the registration read as gone \
+         before the detach was posted: {})",
+        ended_first.load(Ordering::SeqCst)
+    );
+    assert!(
+        !ended_first.load(Ordering::SeqCst),
+        "the registration read as gone before its detach reached the shard"
+    );
+    exit.send(()).unwrap();
+    shard.join().unwrap();
+}
+
 /// A registration posted to a shard that stops before it makes it fails no IO of the source: the
 /// source is unregistered again (`proofs/tla/attach`: an attach refused leaves it so), and its
 /// next write and read go through where they are polled. Before, the source kept the failure

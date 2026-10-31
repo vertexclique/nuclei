@@ -1059,7 +1059,21 @@ impl Source {
             }
         });
         if let Some(lease) = lease {
+            #[cfg(test)]
+            BEFORE_DETACH_POST.with(|look| {
+                if let Some(look) = look.borrow_mut().as_mut() {
+                    look();
+                }
+            });
             shard.post_io(crate::rt::shard::IoOp::RingDetach(slot, out, Some(lease)));
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's look at what the ring's thread may see, run on this thread
+    /// just before a detach goes to that ring's mailbox.
+    pub(crate) static BEFORE_DETACH_POST: core::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { core::cell::RefCell::new(None) };
 }

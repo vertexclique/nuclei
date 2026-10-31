@@ -862,7 +862,6 @@ impl Source {
 
     /// Deregisters the source; both sides are held by the caller, who
     /// hands their states in.
-    #[cfg_attr(not(ring), expect(unused_variables))]
     fn detach(self: &Arc<Self>, read: &ReadState, write: &WriteState) {
         // An attach still under way on a ring's thread is undone: the ring's
         // install of the file then finds it unwanted and lets it go.
@@ -876,30 +875,36 @@ impl Source {
         }
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
-        let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
-        self.reg.home.store(0, Ordering::Release);
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
-            #[cfg(ring)]
-            if self.reg.ops.swap(false, Ordering::AcqRel) {
-                // The ring holds the file: the descriptor may close at once,
-                // and the ring cancels what the sides have out.
-                let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
-                self.detach_ring(&shard, slot, [read.out(), write.out()]);
-                shard.release_source(token);
-                return;
-            }
-            #[cfg(port)]
-            if self.reg.ops.swap(false, Ordering::AcqRel) {
-                // What the sides have out is cancelled; its packets still
-                // come, to whichever port the socket goes to next.
-                self.detach_port();
-                shard.release_source(token);
-                return;
-            }
-            #[cfg(readiness)]
+            self.undo_with(&shard, read, write);
+            shard.release_source(self.reg.token.load(Ordering::Acquire));
+        }
+        self.registration_gone();
+    }
+
+    /// What `detach` undoes on `shard`'s driver, the registration's state
+    /// gone already; both sides are held.
+    #[cfg_attr(not(ring), expect(unused_variables))]
+    fn undo_with(self: &Arc<Self>, shard: &Arc<Shared>, read: &ReadState, write: &WriteState) {
+        #[cfg(ring)]
+        if self.reg.ops.swap(false, Ordering::AcqRel) {
+            // The ring holds the file: the descriptor may close at once,
+            // and the ring cancels what the sides have out.
+            let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
+            self.detach_ring(shard, slot, [read.out(), write.out()]);
+            return;
+        }
+        #[cfg(port)]
+        if self.reg.ops.swap(false, Ordering::AcqRel) {
+            // What the sides have out is cancelled; its packets still
+            // come, to whichever port the socket goes to next. A port is
+            // the only driver there.
+            self.detach_port();
+        }
+        #[cfg(readiness)]
+        {
             let fd = self.fd.load(Ordering::Acquire);
-            #[cfg(readiness)]
             if fd != NO_FD
                 && let Some(registrar) = shard.registrar()
             {
@@ -908,8 +913,21 @@ impl Source {
                 // kernel's registration.
                 let _ = registrar.delete(fd, self.kind == Kind::Tcp);
             }
-            shard.release_source(token);
         }
+    }
+
+    /// The last step of every end of a registration, with both sides held:
+    /// its token and its home go. Its state went first, so no poll routes
+    /// through it meanwhile, and what its shard must undo (a ring's detach
+    /// with its lease, a slot to release) is in that shard's mailbox by now:
+    /// the shard's wait for the end ([`registered_with`](Self::registered_with),
+    /// `rt::shard::going`) sees it end only then, and finds that work there
+    /// when it looks. A thread's own shard that left runs again only at its
+    /// next `block_on`, so work posted to it after its look would wait there,
+    /// a ring's detach holding the handle's object open.
+    fn registration_gone(&self) {
+        self.reg.token.store(NO_TOKEN, Ordering::Release);
+        self.reg.home.store(0, Ordering::Release);
     }
 
     /// Gives a retired source its descriptor again (the handle's IO object,
@@ -947,10 +965,11 @@ impl Source {
     /// another thread's holder performs, say) has not happened yet. A
     /// registration with another shard since is not it, whatever its token.
     pub(crate) fn registered_with(&self, home: usize, token: u64) -> bool {
-        // The token first. Every end of a registration clears `home` before
-        // the state, and a registration elsewhere stores its token after it
-        // took the state: a token seen from it comes with `home` cleared or
-        // moved on. A failed attach leaves its token, never its `home`.
+        // The token first. Every end of a registration clears `home` last
+        // (`registration_gone`), with both sides held, and a registration
+        // elsewhere stores its token only with both sides held, after that:
+        // a token seen from it comes with `home` cleared or moved on. A
+        // failed attach leaves its token, never its `home`.
         self.reg.token.load(Ordering::Acquire) == token
             && self.reg.home.load(Ordering::Acquire) == home
     }

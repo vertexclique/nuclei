@@ -23,6 +23,15 @@
   up (on macOS, about one run in seven of the drop test). A stopped shard now registers nothing:
   the source stays unregistered, and is registered where its tasks are polled next, as
   `proofs/tla/attach` has it.
+- **A stream dropped after its runtime's drop delivered its bytes closes.** A thread's own shard
+  that leaves (its outermost `block_on` returned, the runtime's drop among them) evicts its sources
+  and waits for each eviction; one a thread holding a side performs, as a dropped stream's linger
+  does, showed the source unregistered before it posted the ring's detach, so the shard could
+  look at its mailbox in between and leave, and the detach waited there until the thread's next
+  `block_on`, with the ring's file and the lease that keeps the stream open. Every byte reached
+  the peer, which then waited for the end that never came (on io_uring, one to six runs in four
+  hundred of the drop test). The end of a registration now shows only once what its shard must undo is in
+  that shard's mailbox (`proofs/tla/going/Going.tla`).
 - **A dropped TCP stream whose linger ran out resets its connection.** The bytes still behind were
   given up and the stream closed with a FIN, so the peer read a cut stream as a whole one; it now
   reads `ConnectionReset` (`proofs/tla/close`).
