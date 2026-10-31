@@ -41,6 +41,7 @@ mod stream;
 mod tcp;
 mod tcp_options;
 mod udp;
+mod udp_socket;
 #[cfg(unix)]
 pub mod unix;
 #[cfg(unix)]
@@ -54,6 +55,7 @@ pub use self::sockopt::DeviceName;
 pub use self::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};
 pub use self::tcp::TcpStreamGenerator;
 pub use self::tcp_options::TcpKeepalive;
+pub use self::udp_socket::UdpSocketBuilder;
 #[cfg(unix)]
 pub use self::unix_socket::UnixSocket;
 

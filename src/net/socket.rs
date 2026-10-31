@@ -187,39 +187,45 @@ impl core::fmt::Debug for TcpSocket {
 }
 
 #[cfg(unix)]
-fn raw_of(socket: &Owned) -> Raw {
+pub(super) fn raw_of(socket: &Owned) -> Raw {
     use std::os::fd::AsRawFd;
     socket.as_raw_fd()
 }
 
 #[cfg(windows)]
-fn raw_of(socket: &Owned) -> Raw {
+pub(super) fn raw_of(socket: &Owned) -> Raw {
     use std::os::windows::io::AsRawSocket;
     socket.as_raw_socket()
 }
 
-/// std's stream over the socket `raw`.
+/// std's socket `T` over the socket `raw`.
 ///
 /// # Safety
 ///
-/// `raw` is an open socket, which the caller keeps from being closed twice.
+/// `raw` is an open socket of `T`'s kind, which the caller keeps from being
+/// closed twice.
 #[cfg(unix)]
-unsafe fn std_from_raw(raw: Raw) -> std::net::TcpStream {
-    use std::os::fd::FromRawFd;
+pub(super) unsafe fn std_from_raw<T>(raw: Raw) -> T
+where
+    T: std::os::fd::FromRawFd,
+{
     // SAFETY: the caller's contract.
-    unsafe { std::net::TcpStream::from_raw_fd(raw) }
+    unsafe { T::from_raw_fd(raw) }
 }
 
-/// std's stream over the socket `raw`.
+/// std's socket `T` over the socket `raw`.
 ///
 /// # Safety
 ///
-/// `raw` is an open socket, which the caller keeps from being closed twice.
+/// `raw` is an open socket of `T`'s kind, which the caller keeps from being
+/// closed twice.
 #[cfg(windows)]
-unsafe fn std_from_raw(raw: Raw) -> std::net::TcpStream {
-    use std::os::windows::io::FromRawSocket;
+pub(super) unsafe fn std_from_raw<T>(raw: Raw) -> T
+where
+    T: std::os::windows::io::FromRawSocket,
+{
     // SAFETY: the caller's contract.
-    unsafe { std::net::TcpStream::from_raw_socket(raw) }
+    unsafe { T::from_raw_socket(raw) }
 }
 
 #[cfg(unix)]

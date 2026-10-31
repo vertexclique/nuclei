@@ -190,6 +190,7 @@ pub(crate) const SOCK_DGRAM: i32 = 2;
 pub(crate) const SOCK_RAW: i32 = 3;
 pub(crate) const SOCK_RDM: i32 = 4;
 pub(crate) const IPPROTO_TCP: i32 = 6;
+pub(crate) const IPPROTO_UDP: i32 = 17;
 pub(crate) const IPPROTO_IPV6: i32 = 41;
 pub(crate) const IPV6_V6ONLY: i32 = 27;
 /// Seconds idle before the first keepalive probe (Windows 10 1709 on).

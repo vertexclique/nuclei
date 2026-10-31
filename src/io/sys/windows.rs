@@ -261,13 +261,24 @@ pub(crate) fn adopt_connected(raw: Raw) -> io::Result<()> {
 
 /// A new overlapped TCP socket of address family `family`, not inherited.
 pub(crate) fn tcp_socket(family: u16) -> io::Result<OwnedSocket> {
+    socket(family, SOCK_STREAM, IPPROTO_TCP)
+}
+
+/// A new overlapped UDP socket of address family `family`, not inherited.
+pub(crate) fn udp_socket(family: u16) -> io::Result<OwnedSocket> {
+    socket(family, SOCK_DGRAM, crate::syscore::windows::IPPROTO_UDP)
+}
+
+/// A new overlapped socket of `family`, type `ty` and protocol `protocol`,
+/// not inherited, as std makes its own.
+fn socket(family: u16, ty: i32, protocol: i32) -> io::Result<OwnedSocket> {
     crate::syscore::windows::winsock::start()?;
     // SAFETY: plain arguments; the socket is owned at once.
     let socket = unsafe {
         WSASocketW(
             i32::from(family),
-            SOCK_STREAM,
-            IPPROTO_TCP,
+            ty,
+            protocol,
             core::ptr::null_mut(),
             0,
             WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,

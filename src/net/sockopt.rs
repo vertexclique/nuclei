@@ -1,6 +1,6 @@
-//! The options a socket takes before it binds, which a TCP socket to set up
-//! ([`TcpSocket`](super::TcpSocket)) takes from one macro, for every builder of a socket to
-//! share them, so no two disagree.
+//! The options a socket takes before it binds, the same for a TCP socket to set up
+//! ([`TcpSocket`](super::TcpSocket)) and a UDP one ([`UdpSocketBuilder`](super::UdpSocketBuilder)):
+//! one macro writes them for both, so the two never disagree.
 
 /// A network interface's name, as `bind_device` takes it: up to 16 bytes,
 /// held in place.

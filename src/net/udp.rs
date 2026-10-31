@@ -171,6 +171,40 @@ impl Handle<UdpSocket> {
         self.receive(buf, true).await
     }
 
+    /// Polls for a datagram and its sender, received into the unfilled part
+    /// of `buf`, which advances by its length; what does not fit is cut.
+    /// `Pending` with `cx`'s waker kept until one comes.
+    ///
+    /// # Errors
+    ///
+    /// As `recvfrom(2)`.
+    pub fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<SocketAddr>> {
+        let (n, addr) =
+            core::task::ready!(self.poll_receive(cx, buf.initialize_unfilled(), false))?;
+        buf.advance(n);
+        Poll::Ready(Ok(addr))
+    }
+
+    /// Polls to send a datagram to `target`, `Pending` with `cx`'s waker kept
+    /// while one is still queued.
+    ///
+    /// # Errors
+    ///
+    /// As `sendto(2)` of this datagram (on Windows, as for
+    /// [`send`](Self::send)).
+    pub fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.source().poll_send(cx, buf, Dest::Inet(target))
+    }
+
     /// Waits until a receive would end at once: a datagram came, or an
     /// error (which the receive reports).
     ///

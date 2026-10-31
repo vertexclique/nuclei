@@ -81,6 +81,9 @@
   `set_user_timeout`, `set_only_v6`, `set_fastopen` and `set_defer_accept`, and
   `TcpStream::set_quickack` and `set_user_timeout`, each with its getter. An option the system
   does not have answers `Unsupported`.
+- **`UdpSocketBuilder`**, a UDP socket set up before it binds (`SO_REUSEADDR`, `SO_REUSEPORT`,
+  buffer sizes, `IP_TOS`, `IPV6_TCLASS`, `IPV6_V6ONLY`, `SO_BINDTODEVICE`), and
+  `UdpSocket::poll_recv_from` and `poll_send_to`.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.
