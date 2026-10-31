@@ -91,7 +91,15 @@ impl Sleep {
     }
 
     /// Lets go of the timer, wherever it is armed.
+    #[inline]
     fn release(&mut self) {
+        if !matches!(self.state, State::Idle | State::Done) {
+            self.release_armed();
+        }
+    }
+
+    #[inline(never)]
+    fn release_armed(&mut self) {
         match core::mem::replace(&mut self.state, State::Idle) {
             State::Local { owner, key } => {
                 let here = context::current(|current| match current {
