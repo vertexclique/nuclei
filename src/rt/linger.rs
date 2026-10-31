@@ -184,6 +184,19 @@ impl Future for RunAll<'_> {
     }
 }
 
+impl Drop for RunAll<'_> {
+    /// The drop's own bound ran out with lingers still running: each goes on
+    /// on a thread of its own, to its own deadline, as the ones the run never
+    /// took do (`Lingering::end`).
+    fn drop(&mut self) {
+        let lingering = self.inner.lingering();
+        for work in self.running.drain(..) {
+            lingering.ended();
+            alone(work);
+        }
+    }
+}
+
 impl Inner {
     /// Whether nothing is left that may hand the runtime a linger, nor a
     /// linger it took not ended: each worker's shard settled (looked at

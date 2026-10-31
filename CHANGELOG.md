@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **A runtime's drop whose bound runs out no longer drops a linger it was running.** The drop
+  runs what dropped handles left for at most the linger time, and a linger it had started then was
+  dropped with its run, closing the stream with the bytes behind never sent. It now goes on on a
+  thread of its own, to its own deadline, as the ones the run never took do
+  (`proofs/tla/going/Linger.tla`).
 - **IO of a shard handed over repeatedly no longer waits for 61 task runs.** When a task blocks its
   thread past the handoff threshold the shard goes to another thread, and the count of runs before
   the next look at the driver went with it. If the first task of every new runner blocked as well,
