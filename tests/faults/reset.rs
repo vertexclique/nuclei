@@ -231,12 +231,14 @@ pub async fn reset_after_a_read<S: Stream>() {
 }
 
 /// The reset is seen first by a read, as std's: a write then answers what
-/// std's write answers on a stream whose reset was read.
+/// std's write answers on a stream whose reset was read, and a file sent what
+/// the system's own call for it answers there where that differs (macOS).
 pub async fn reset_then_a_write<S: Stream>() {
     let (mut std_ours, std_peer) = S::std_pair(false);
     std_ours.write_all(UNREAD).unwrap();
     S::reset(std_peer);
     let _ = std_read_until_end(&mut std_ours, 4096);
+    let want_file = S::std_send_file(&std_ours);
     let want = std_ours.write_all(&pattern(1, 100_000));
     let want = Answer::of(&want, |_| 0);
     for how in WRITERS {
@@ -246,7 +248,11 @@ pub async fn reset_then_a_write<S: Stream>() {
         let what = format!("{}: a reset read, then a {how:?} write", S::NAME);
         let _ = within(&what, read_to_end_as(&ours, Reader::Borrowed, 4096)).await;
         let wrote = within(&what, write_as(&ours, how, &pattern(1, 100_000))).await;
-        assert_eq!(Answer::of(&wrote, |_| 0), want, "{what}");
+        let expected = match (how, &want_file) {
+            (Writer::SendFile, Some(file)) => file,
+            _ => &want,
+        };
+        assert_eq!(Answer::of(&wrote, |_| 0), *expected, "{what}");
         let again = within(&what, write_as(&ours, Writer::Plain, b"more")).await;
         assert_eq!(
             Answer::of(&again, |_| 0),

@@ -122,7 +122,19 @@ impl Answer {
     }
 }
 
-/// What a write to a stream whose peer reset may answer, as std's does.
+/// What a write to a stream whose peer reset may answer, as std's does. On
+/// macOS also `NotConnected`: its `sendfile(2)` checks the connection before
+/// it sends, and a Unix stream's send does too (bsd/kern/uipc_usrreq.c,
+/// `uipc_send`), so either answers `ENOTCONN` once the reset disconnected the
+/// socket, where a write that saw it first answers `EPIPE`.
+#[cfg(target_vendor = "apple")]
+pub const RESET_WRITE: &[io::ErrorKind] = &[
+    io::ErrorKind::ConnectionReset,
+    io::ErrorKind::BrokenPipe,
+    io::ErrorKind::ConnectionAborted,
+    io::ErrorKind::NotConnected,
+];
+#[cfg(not(target_vendor = "apple"))]
 pub const RESET_WRITE: &[io::ErrorKind] = &[
     io::ErrorKind::ConnectionReset,
     io::ErrorKind::BrokenPipe,
@@ -159,6 +171,10 @@ pub trait Stream: Sized + Send + Sync + 'static {
     fn set_std_timeouts(s: &Self::Std);
     /// Whether closing with unread bytes resets the stream on this system.
     fn resets() -> bool;
+    /// What the system's own call that sends a file answers on `s` (a byte
+    /// of one), where it may answer otherwise than a write: macOS's
+    /// `sendfile(2)`. `None` where a write is the oracle of a file sent.
+    fn std_send_file(s: &Self::Std) -> Option<Answer>;
 
     fn poll_read(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>>;
     fn poll_read_vectored(
@@ -416,6 +432,16 @@ impl Stream for TcpStream {
         true
     }
 
+    fn std_send_file(s: &Self::Std) -> Option<Answer> {
+        #[cfg(target_vendor = "apple")]
+        return Some(send_file_oracle(std::os::fd::AsRawFd::as_raw_fd(s)));
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = s;
+            None
+        }
+    }
+
     stream_calls!();
 }
 
@@ -466,7 +492,45 @@ impl Stream for nuclei::net::UnixStream {
         cfg!(any(target_os = "linux", target_os = "android"))
     }
 
+    fn std_send_file(s: &Self::Std) -> Option<Answer> {
+        #[cfg(target_vendor = "apple")]
+        return Some(send_file_oracle(std::os::fd::AsRawFd::as_raw_fd(s)));
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = s;
+            None
+        }
+    }
+
     stream_calls!();
+}
+
+/// What macOS's `sendfile(2)` answers sending one byte of a file to the
+/// socket `fd`, as a write's answer is compared (a count is 0).
+#[cfg(target_vendor = "apple")]
+fn send_file_oracle(fd: std::os::fd::RawFd) -> Answer {
+    use std::os::fd::AsRawFd;
+    let file = TempFile::with("send-file-oracle", b"x");
+    let opened = std::fs::File::open(&file.0).unwrap();
+    let mut len: libc::off_t = 1;
+    // SAFETY: the kernel reads one byte of our open file and writes the
+    // socket the caller holds; `len` is ours, and there is no header.
+    let rc = unsafe {
+        libc::sendfile(
+            opened.as_raw_fd(),
+            fd,
+            0,
+            &mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    let result = if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    Answer::of(&result, |_| 0)
 }
 
 pub async fn read_some<S: Stream>(s: &S, buf: &mut [u8]) -> io::Result<usize> {
