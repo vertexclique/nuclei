@@ -925,13 +925,11 @@ impl ReadState {
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
-        if !self.datagrams.is_empty()
-            && self
-                .lent
-                .as_ref()
-                .is_some_and(|l| !l.out && l.done.is_none())
-        {
-            // One came while the buffer waited: it goes first.
+        if held.is_none() && !self.datagrams.is_empty() && self.lent_idle() {
+            // One came while this task's buffer waited: it goes first. Only
+            // the task whose buffer is lent (it holds none) takes it back
+            // (proofs/tla/lent/LentDatagram.tla); another task's receive
+            // takes the datagram into its own.
             *held = self.reclaim(after);
         }
         if let Some(buf) = held.as_mut() {

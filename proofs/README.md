@@ -650,6 +650,17 @@ and a completion that wakes only the plain readers, both leave the lender waitin
 deadlock), and 1 witness (the buffer comes back for the bytes the dropped read's operation
 brought).
 
+`LentDatagram.tla` checks two tasks' owned datagram receives on one socket (`read_owned_from` and
+`reclaim` in `src/io/source/read.rs`, `op_done` in `src/io/source/read/ops.rs`). One task's buffer
+waits lent while the driver brings a datagram into a buffer of its own, through an operation it
+had out before the lend (a ring, a completion port): only the task whose buffer is lent, which
+holds none, takes it back to copy that datagram in; a task holding its own buffer copies the
+datagram into it. 5 configurations: 3 that must pass (with datagrams ahead and with every datagram
+received into the lent buffer, with `OwnBuffer`, each task gets its own buffer back,
+`NoLostBuffer` and `Conserved`, every datagram in one place; and `Termination`), 1 mutation (a
+reclaim by a task holding its own buffer, the bug that gave a second task the first one's buffer,
+breaks `OwnBuffer`), and 1 witness (a datagram ahead while a buffer waits lent and empty).
+
 The write: the socket is full and a byte waits in the write-behind. The lending task lends a
 buffer of three bytes, which the driver writes after the write-behind as the peer makes room,
 and a later copied write waits until it is out. A lender that goes away has its write withdrawn
