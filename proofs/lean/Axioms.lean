@@ -90,6 +90,14 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Files.release_takes_the_file_out
 #print axioms Nuclei.Files.example_reuse_waits
 
+-- A vectored read's fill: each room takes at most its size, the rooms take the whole count (or
+-- all their room), and a room that is not filled is the last that takes anything.
+#print axioms Nuclei.Fill.fill_length
+#print axioms Nuclei.Fill.fill_total
+#print axioms Nuclei.Fill.fill_fits
+#print axioms Nuclei.Fill.fill_zero
+#print axioms Nuclei.Fill.fill_in_order
+
 -- A ring's overflow count: an overflow counts once however many waits it lasts, never more than
 -- the looks that saw it, a set look after a clear one counts, and stretches split at a clear
 -- look add up.

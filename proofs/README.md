@@ -1720,6 +1720,19 @@ holds them (`IORING_FEAT_NODROP`) until the shard takes them. `tests/idle_peers.
 of the smallest ring with receives of idle peers, and then with sends to peers that never read, and
 checks every other peer is still accepted and answered.
 
+## A vectored read's fill
+
+`lean/Nuclei/Fill.lean` checks how a vectored read's count is shared out among its buffers
+(`src/buf/vectored.rs`, `Vectored::set_len`): the kernel writes one read's bytes into the
+buffers' rooms in order, and each room, in order, takes what is left of the count up to its
+size. For every list of rooms and every count it proves that each room takes at most its size
+(`fill_fits`), that the rooms take the whole count or all their room (`fill_total`), and that a
+room not filled is the last that takes anything (`fill_in_order`), with `fill_length` and
+`fill_zero` beside them. Its mutation, every room taking the whole count, makes up bytes. The
+bytes themselves, and the kernel's rule that a vectored read fills its descriptors in order, are
+left out. The property test `buf::tests::vectored::a_read_fills_rooms_in_order` checks the Rust
+code against the same rules.
+
 ## A ring's overflow count
 
 `lean/Nuclei/Overflow.lean` checks how a ring's poller counts completion-queue overflows for
