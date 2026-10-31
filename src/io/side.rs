@@ -231,6 +231,7 @@ impl<S> Side<S> {
     }
 
     /// How the caller, whose [`Hooks::owner`] is `who`, takes the side.
+    #[inline]
     fn role(&self, hooks: &impl Hooks<S>) -> Role {
         // Acquire: a side the owner switched shows its `own := 0` first.
         if self.shared.load(Ordering::Acquire) {
@@ -260,6 +261,7 @@ impl<S> Side<S> {
     /// The owner's take: `own := 1`, the compiler's fence, then `intent` and
     /// the mode with plain loads. Held if no foreign thread came; else
     /// `own := 0` and the caller takes through the word.
+    #[inline]
     fn try_biased(&self) -> Option<Held<'_, S>> {
         self.own.store(1, Ordering::Relaxed);
         compiler_fence(Ordering::SeqCst);
@@ -346,6 +348,7 @@ impl<S> Side<S> {
 
     /// The side, taken as `role` does, raising `extra` as the word's take
     /// does.
+    #[inline]
     fn take_as(&self, role: Role, extra: u8, hooks: &impl Hooks<S>) -> Take<'_, S> {
         match role {
             Role::Shared => self.take_word(extra),
@@ -357,6 +360,7 @@ impl<S> Side<S> {
         }
     }
 
+    #[inline]
     fn take(&self, extra: u8, hooks: &impl Hooks<S>) -> Option<Held<'_, S>> {
         match self.take_as(self.role(hooks), extra, hooks) {
             Take::Held(held) => Some(held),
@@ -372,6 +376,7 @@ impl<S> Side<S> {
 
     /// The side, if it is free, taken as `hooks`' thread takes it.
     #[cfg(completion)]
+    #[inline]
     pub(crate) fn try_hold_for(&self, hooks: &impl Hooks<S>) -> Option<Held<'_, S>> {
         self.take(0, hooks)
     }
@@ -550,6 +555,7 @@ impl<S> Side<S> {
     /// locked instruction, which puts `own := 0` ahead of the read. True when
     /// work was left there and the side was free: the caller holds it through
     /// the word then, and does that work.
+    #[inline]
     fn release_biased(&self) -> bool {
         // Release: the next holder sees what this one did.
         self.own.store(0, Ordering::Release);
@@ -635,19 +641,21 @@ impl<S> Held<'_, S> {
     }
 
     /// Lets go of the side, first doing what others left for its holder.
+    #[inline]
     pub(crate) fn release(self, after: &mut After, hooks: &impl Hooks<S>) {
         self.release_with(after, hooks, |_, _| {});
     }
 
     /// As [`release`](Self::release); `again` runs after each driver's part
-    /// (a poll's step, while it waits).
+    /// (a poll's step, while it waits). The owner's biased release, which
+    /// finds nothing left, is the inlined part.
+    #[inline]
     fn release_with(
         mut self,
         after: &mut After,
         hooks: &impl Hooks<S>,
-        mut again: impl FnMut(&mut S, &mut After),
+        again: impl FnMut(&mut S, &mut After),
     ) {
-        let mut saw_requests = false;
         if self.biased {
             hooks.releasing(self.get());
             if !self.side.release_biased() {
@@ -660,6 +668,17 @@ impl<S> Held<'_, S> {
             self.biased = false;
             self.expect = BUSY;
         }
+        self.release_word(after, hooks, again);
+    }
+
+    /// The release of a side held through the word.
+    fn release_word(
+        mut self,
+        after: &mut After,
+        hooks: &impl Hooks<S>,
+        mut again: impl FnMut(&mut S, &mut After),
+    ) {
+        let mut saw_requests = false;
         loop {
             hooks.releasing(self.get());
             // Release: publishes the contents to the next holder.
