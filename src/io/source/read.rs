@@ -380,6 +380,7 @@ impl ReadState {
         not(readiness),
         expect(unused_variables, reason = "only a readiness driver looks again")
     )]
+    #[inline(always)]
     fn look_again(&mut self, io: Io<'_>, after: &mut After) {
         #[cfg(readiness)]
         if self.starved && !self.blocked && matches!(io.via, Via::Fd(_)) {

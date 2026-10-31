@@ -151,17 +151,20 @@ pub(crate) trait Hooks<S> {
 /// others left; a drop (a panic under the guard) only wakes the contended.
 pub(crate) struct Held<'a, S> {
     side: &'a Side<S>,
-    /// The word the holder took: what letting go swaps back to zero.
-    expect: u8,
-    /// The driver took the side with its own `READY`.
-    own_ready: bool,
-    /// The owner holds it biased: `own` is up, the word is not.
-    biased: bool,
-    /// Flags of the last take of the word still to be done (see `Held::release_word`).
-    rest: u8,
-    /// The holder saw `REQ` as it let go.
-    saw_requests: bool,
+    /// The holder's state, in one word so a hold moves as two: the word it took, what letting
+    /// go swaps back to zero (`EXPECT`); the driver took the side with its own `READY`
+    /// (`OWN_READY`); the owner holds it biased, `own` up and the word not (`BIASED`); it saw
+    /// `REQ` as it let go (`SAW_REQUESTS`); and the flags of its last take of the word still to
+    /// be done (`REST`, see `Held::release_word`).
+    bits: u32,
 }
+
+/// The fields of [`Held::bits`].
+const EXPECT: u32 = 0xff;
+const OWN_READY: u32 = 1 << 8;
+const BIASED: u32 = 1 << 9;
+const SAW_REQUESTS: u32 = 1 << 10;
+const REST_SHIFT: u32 = 16;
 
 /// The hooks of a caller that is nobody's owner and asks for nothing.
 #[cfg(test)]
@@ -279,11 +282,7 @@ impl<S> Side<S> {
         if self.intent.load(Ordering::Relaxed) == 0 && !self.shared.load(Ordering::Relaxed) {
             return Some(Held {
                 side: self,
-                expect: BUSY,
-                own_ready: false,
-                biased: true,
-                rest: 0,
-                saw_requests: false,
+                bits: u32::from(BUSY) | BIASED,
             });
         }
         self.biased_refused();
@@ -312,11 +311,8 @@ impl<S> Side<S> {
         if prev & BUSY == 0 {
             Take::Held(Held {
                 side: self,
-                expect: BUSY | (extra & READY),
-                own_ready: extra & READY != 0,
-                biased: false,
-                rest: 0,
-                saw_requests: false,
+                bits: u32::from(BUSY | (extra & READY))
+                    | if extra & READY != 0 { OWN_READY } else { 0 },
             })
         } else {
             Take::Busy
@@ -705,7 +701,7 @@ impl<S> Held<'_, S> {
     /// owner's biased release, which finds nothing left, is the inlined part.
     #[inline(always)]
     fn release_or_again(mut self, after: &mut After, hooks: &impl Hooks<S>) -> Result<(), Self> {
-        if self.biased {
+        if self.biased() {
             hooks.releasing(self.get());
             if !self.side.release_biased() {
                 core::mem::forget(self);
@@ -714,10 +710,21 @@ impl<S> Held<'_, S> {
             }
             // Work was left: the side is held through the word now, and
             // done as a holder of the word does it.
-            self.biased = false;
-            self.expect = BUSY;
+            self.bits = (self.bits & !(BIASED | EXPECT)) | u32::from(BUSY);
         }
         self.release_word(after, hooks)
+    }
+
+    /// The owner holds the side biased.
+    #[inline(always)]
+    fn biased(&self) -> bool {
+        self.bits & BIASED != 0
+    }
+
+    /// The word the holder took, what letting go swaps back to zero.
+    #[inline(always)]
+    fn expect(&self) -> u8 {
+        (self.bits & EXPECT) as u8
     }
 
     /// The release of a side held through the word. An edge's driver's part gives the side
@@ -732,29 +739,30 @@ impl<S> Held<'_, S> {
             if self
                 .side
                 .state
-                .compare_exchange(self.expect, 0, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(self.expect(), 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
             }
             // Flags others left meanwhile: taken, the side still held.
             let mut flags = self.side.state.swap(BUSY, Ordering::AcqRel) & !BUSY;
-            if core::mem::take(&mut self.own_ready) {
+            if self.bits & OWN_READY != 0 {
                 // Only the driver raises READY, and it is the holder.
                 flags &= !READY;
             }
-            self.expect = BUSY;
+            self.bits = (self.bits & SAW_REQUESTS)
+                | u32::from(BUSY)
+                | (u32::from(flags & (WAITING | REQ)) << REST_SHIFT);
             if flags & DEFER != 0 {
                 self.run_deferred(0, hooks, after);
             }
-            self.rest = flags & (WAITING | REQ);
             if flags & READY != 0 {
                 hooks.serve(self.get(), after);
                 return Err(self);
             }
             self.finish_flags(after, hooks);
         }
-        let saw_requests = self.saw_requests;
+        let saw_requests = self.bits & SAW_REQUESTS != 0;
         core::mem::forget(self);
         hooks.released(saw_requests, after);
         Ok(())
@@ -763,12 +771,13 @@ impl<S> Held<'_, S> {
     /// The flags of the last take of the word that come after the driver's part: the contended
     /// polls are woken, and the source's requests looked at.
     fn finish_flags(&mut self, after: &mut After, hooks: &impl Hooks<S>) {
-        let flags = core::mem::take(&mut self.rest);
+        let flags = (self.bits >> REST_SHIFT) as u8;
+        self.bits &= !(0xff << REST_SHIFT);
         if flags & WAITING != 0 {
             self.side.wake_contended(after);
         }
         if flags & REQ != 0 {
-            self.saw_requests = true;
+            self.bits |= SAW_REQUESTS;
             hooks.requests(self.get(), after);
         }
     }
@@ -778,7 +787,7 @@ impl<S> Drop for Held<'_, S> {
     /// Only a panic under the guard gets here: the side goes free, and the
     /// polls waiting on it are woken to look again.
     fn drop(&mut self) {
-        if self.biased {
+        if self.biased() {
             // Own goes down; work others left stays in the word for the next
             // holder, and the polls waiting are woken to look again.
             self.side.own.store(0, Ordering::Relaxed);
