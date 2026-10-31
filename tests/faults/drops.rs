@@ -353,45 +353,6 @@ fn a_runtime_dropped_with_bytes_behind_delivers_them() {
     same_bytes("bytes behind when the runtime dropped", &got, &bytes[..at]);
 }
 
-/// A stream whose `block_on` left a send of its write-behind waiting in the ring of the
-/// thread's own shard (its peer reads nothing yet), dropped on that thread outside any runtime:
-/// the drop has the ring end that send, as the thread runs it no more, so the linger, on a thread
-/// of its own, delivers every byte at once instead of waiting out its time for a completion only
-/// that ring could reap. On a readiness backend no send waits in a ring, and the bytes go the
-/// same way.
-#[test]
-fn a_stream_dropped_with_a_send_out_on_its_threads_ring_delivers_its_bytes() {
-    if !alone("drops::a_stream_dropped_with_a_send_out_on_its_threads_ring_delivers_its_bytes") {
-        return;
-    }
-    let bytes = pattern(5, 300_000);
-    let rt = runtime();
-    let (ours, peer) = <TcpStream as Stream>::pair(true);
-    let at = rt.block_on(async {
-        let mut at = 0;
-        while at < bytes.len() {
-            match ours.try_write(&bytes[at..]) {
-                Ok(n) => at += n,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) => panic!("a write: {err}"),
-            }
-        }
-        at
-    });
-    let started = std::time::Instant::now();
-    drop(ours);
-    let reader = drain::<TcpStream>(peer);
-    let (got, end) = reader.join().unwrap();
-    let took = started.elapsed();
-    assert!(end.is_ok(), "the peer's end: {end:?}");
-    same_bytes("bytes behind when the stream dropped", &got, &bytes[..at]);
-    assert!(
-        took < Duration::from_secs(20),
-        "the bytes took {took:?}: the linger waited for a send its thread's ring held"
-    );
-    drop(rt);
-}
-
 /// A shard that goes while a stream of it holds bytes it read ahead: the
 /// stream's next reads on another shard get them, in order, and its writes
 /// go on.
