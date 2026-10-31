@@ -44,6 +44,7 @@ use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::sys;
+use crate::rt::counters::{IoKind, tally};
 use crate::rt::park::iocp::{JOB, Port};
 use crate::syscore::windows::{
     CancelIoEx, CancelSynchronousIo, DUPLICATE_SAME_ACCESS, DWORD, DuplicateHandle,
@@ -124,6 +125,8 @@ struct Inner {
     read: bool,
     epoch: u32,
     mem: Option<PortMem>,
+    /// When the operation was issued, while the port times them.
+    issued_at: Option<std::time::Instant>,
     buf: WSABUF,
     flags: DWORD,
     addr: SOCKADDR_STORAGE,
@@ -158,6 +161,7 @@ impl Default for Slot {
                 read: false,
                 epoch: 0,
                 mem: None,
+                issued_at: None,
                 buf: WSABUF {
                     len: 0,
                     buf: core::ptr::null_mut(),
@@ -426,6 +430,7 @@ impl PortIssuer<'_> {
         self.source.op_out();
         self.port.issued();
         inner.issued_on = Some(Arc::clone(&self.port));
+        inner.issued_at = self.port.stamp();
         inner.owner = Arc::into_raw(Arc::clone(self.source));
         let started = if kind != Kind::Bytes {
             start(inner, slot.ov.get(), socket_of(fd), want, kind.datagrams())
@@ -437,6 +442,7 @@ impl PortIssuer<'_> {
         };
         if let Err(code) = started {
             // No packet comes: the operation ends here, with the error.
+            inner.issued_at = None;
             // SAFETY: the call did not take the slot.
             unsafe { finish(slot, Some(code), 0, None) };
         }
@@ -959,13 +965,19 @@ unsafe fn finish(
     // SAFETY: the reference the issuer leaked for the kernel.
     let source = unsafe { Arc::from_raw(inner.owner) };
     inner.owner = core::ptr::null();
-    if let Some(port) = inner.issued_on.take() {
+    let port = inner.issued_on.take();
+    if let Some(port) = &port {
         port.completed();
     }
     // Every call sets the memory before it can end (see `start`).
     let Some(mem) = inner.mem.take() else {
         return;
     };
+    if let (Some(port), Some(at), Some(kind)) = (&port, inner.issued_at.take(), io_kind(&mem))
+        && code != Some(WSA_OPERATION_ABORTED)
+    {
+        port.time(kind, at);
+    }
     let outcome = outcome(inner, mem, code, bytes);
     source.op_done(
         Done {
@@ -987,6 +999,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         }
         _ => answer(code, bytes),
     };
+    tally_of(&mem, &answer);
     match mem {
         PortMem::Ready => Outcome::Ready(match answer {
             Answer::Done(result) => Answer::Done(result.map(drop)),
@@ -1083,6 +1096,40 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         PortMem::SendLentTo(buf) => Outcome::SendLentTo(buf, answer),
         // The lent write's end, with no buffer to give back.
         PortMem::SendFile(_) => Outcome::SendLent(OwnedBuf::default(), answer),
+    }
+}
+
+/// The kind of latency an operation on `mem` counts as: none for a
+/// zero-byte receive that only waits for data.
+fn io_kind(mem: &PortMem) -> Option<IoKind> {
+    match mem {
+        PortMem::Ready => None,
+        PortMem::RecvRoom
+        | PortMem::Recv(_)
+        | PortMem::RecvLent(_)
+        | PortMem::RecvFrom(_)
+        | PortMem::RecvLentFrom(_) => Some(IoKind::Read),
+        PortMem::NoAccept | PortMem::Accept(_) => Some(IoKind::Accept),
+        PortMem::Connect(_) => Some(IoKind::Connect),
+        PortMem::SendRoom { .. }
+        | PortMem::Send(_)
+        | PortMem::SendLent(_)
+        | PortMem::SendTo(..)
+        | PortMem::SendLentTo(_)
+        | PortMem::SendFile(_) => Some(IoKind::Write),
+    }
+}
+
+/// Counts the completed operation on `mem` that ended with `answer`.
+fn tally_of(mem: &PortMem, answer: &Answer<usize>) {
+    let Answer::Done(Ok(n)) = answer else {
+        return;
+    };
+    match io_kind(mem) {
+        Some(IoKind::Read) => tally::read(*n),
+        Some(IoKind::Write) if *n > 0 => tally::wrote(*n),
+        Some(IoKind::Accept) if matches!(mem, PortMem::Accept(_)) => tally::accepted(1),
+        _ => {}
     }
 }
 

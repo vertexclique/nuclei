@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdStream};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use nuclei::config::{IoUringConfiguration, NucleiConfig};
@@ -127,7 +127,13 @@ fn runtime(cap: usize) -> nuclei::runtime::Runtime {
         .unwrap()
 }
 
+/// The errors the servers' accepts met, for a failure to name.
+static ACCEPT_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// A server of one worker whose buffers may hold `cap` bytes, serving each connection with `serve`.
+/// An accept that fails (a connection its peer gave up on before it was taken, no descriptor or
+/// buffer for it for now) leaves the listener, and the rest of its backlog, as they were: the
+/// server goes on accepting, as a server does, and the error is kept for the failure's message.
 fn server<F>(cap: usize, serve: fn(TcpStream) -> F) -> (nuclei::runtime::Runtime, SocketAddr)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -137,12 +143,29 @@ where
     let addr = listener.local_addr().unwrap();
     rt.spawn(async move {
         let listener = TcpListener::new(listener).unwrap();
-        while let Ok((stream, _)) = listener.accept().await {
-            nuclei::runtime::spawn(serve(stream)).detach();
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => nuclei::runtime::spawn(serve(stream)).detach(),
+                Err(err) => {
+                    ACCEPT_ERRORS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(err.to_string());
+                    nuclei::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
         }
     })
     .detach();
     (rt, addr)
+}
+
+/// The accept errors met so far, for a failure's message.
+fn accept_errors() -> Vec<String> {
+    ACCEPT_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Holds the binary's other tests off while one runs, so the descriptors its peers hold (the
@@ -172,7 +195,10 @@ fn answered(addr: SocketAddr) {
     for (i, stream) in active.iter_mut().enumerate() {
         let mut reply = [0u8; REPLY];
         if let Err(err) = stream.read_exact(&mut reply) {
-            panic!("peer {i} of {ACTIVE} got no reply within {DEADLINE:?}: {err}");
+            panic!(
+                "peer {i} of {ACTIVE} got no reply within {DEADLINE:?}: {err} (accept errors: {:?})",
+                accept_errors()
+            );
         }
         assert_eq!(reply, [7u8; REPLY]);
     }

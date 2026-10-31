@@ -14,6 +14,12 @@ use crate::rt::context;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuntimeId(u64);
 
+impl RuntimeId {
+    pub(crate) fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 impl fmt::Display for RuntimeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)

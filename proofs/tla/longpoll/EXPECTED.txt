@@ -1,0 +1,14 @@
+# configuration                spec                 expected
+G_flat                         LongPoll             pass
+G_nested                       LongPoll             pass
+G_deep                         LongPoll             pass
+M_end_keeps                    LongPoll             violated:ReportedIsOnStack
+M_no_stack                     LongPoll             violated:NamesInnermostNoted
+M_one_cell                     LongPoll             violated:ReportedIsOnStack
+M_no_memory                    LongPoll             violated:OncePerPoll
+M_report_zero                  LongPoll             violated:ReportedIsOnStack
+W_nested_report                LongPoll             violated:NoNestedReport
+W_enclosing_report             LongPoll             violated:NoEnclosingReport
+M_no_reread                    LongPoll             violated:NoNewerName
+W_newer_nested                 LongPoll             violated:NoNewerName
+W_twice_after_nesting          LongPoll             violated:OncePerPoll

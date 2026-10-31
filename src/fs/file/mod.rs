@@ -73,7 +73,9 @@ use std::task::Wake;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use self::orphans::{Orphan, Orphans};
-use self::work::{Job, Lent, LentRead, Writing, bounce, buffer, poll_task};
+use self::work::{
+    Job, Lent, LentRead, Writing, bounce, buffer, poll_task, tally_read, tally_write,
+};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Hooks, Side, WakerSet};
 use crate::io::source::Failure;
@@ -397,10 +399,12 @@ impl FileIo {
         self.with_state(cx, |st, io, waker, after| {
             loop {
                 if let Some(lent) = job.as_mut() {
+                    let pooled = lent.task.pooled();
                     let (result, mut buf) = match lent.task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(out) => out,
                     };
+                    tally_read(pooled, &result, |n| *n);
                     let (at, epoch, generation, from) =
                         (lent.at, lent.epoch, lent.generation, lent.from);
                     *job = None;
@@ -575,23 +579,31 @@ impl FileState {
             if let Some(writing) = self.writing.as_mut() {
                 // Where an append left the file's offset: the cursor.
                 let (failure, end) = match writing {
-                    Writing::Pool(task) => match task.poll(waker) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(result) => (result.as_ref().err().map(Failure::of), None),
-                    },
-                    Writing::Append(task) => match task.poll(waker) {
+                    Writing::Pool(task, bytes) => match task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(result) => {
+                            tally_write(*bytes, result.is_ok());
+                            (result.as_ref().err().map(Failure::of), None)
+                        }
+                    },
+                    Writing::Append(task, bytes) => match task.poll(waker) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => {
+                            tally_write(*bytes, result.is_ok());
                             (result.as_ref().err().map(Failure::of), result.ok())
                         }
                     },
-                    Writing::Lent(task) => match task.poll(waker) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready((result, buf)) => (self.lent_back(result, buf), None),
-                    },
-                    Writing::AppendLent(task) => match task.poll(waker) {
+                    Writing::Lent(task, bytes) => match task.poll(waker) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready((result, buf)) => {
+                            tally_write(*bytes, result.is_ok());
+                            (self.lent_back(result, buf), None)
+                        }
+                    },
+                    Writing::AppendLent(task, bytes) => match task.poll(waker) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready((result, buf)) => {
+                            tally_write(*bytes, result.is_ok());
                             let end = result.as_ref().ok().copied();
                             (self.lent_back(result.map(drop), buf), end)
                         }
@@ -696,10 +708,12 @@ impl FileState {
                 return Poll::Ready(Ok(true));
             }
             if let Some(job) = self.reading.as_mut() {
+                let pooled = job.task.pooled();
                 let result = match job.task.poll(waker) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => result,
                 };
+                tally_read(pooled, &result, |buf| buf.filled().len());
                 let (at, epoch, generation) = (job.at, job.epoch, job.generation);
                 self.reading = None;
                 match result {

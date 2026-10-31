@@ -78,12 +78,17 @@ impl Proactor {
         })
     }
 
-    /// Sets the proactor's configuration, and returns the proactor.
+    /// Sets the proactor's configuration, and returns the proactor. It is
+    /// the default every runtime starts from;
+    /// [`Builder::io_uring`](crate::Builder::io_uring) gives one runtime
+    /// ring settings of its own, checked when it is built.
     ///
     /// # Panics
     ///
     /// When the proactor was configured already, or used (which configures
     /// it with the defaults): a configuration is set once, before any IO.
+    /// The signature returns the proactor itself, so it has no error to
+    /// answer; `Builder::io_uring` answers its error instead.
     pub fn with_config(config: NucleiConfig) -> &'static Proactor {
         let mut config = Some(config);
         let proactor = PROACTOR.get_or_init(|| Proactor {

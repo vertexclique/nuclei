@@ -24,9 +24,10 @@ use crate::sync::internal::Ordering;
 ///
 /// # Panics
 ///
-/// Awaiting a task that its runtime dropped before it completed (the
-/// runtime shut down) panics; [`fallible`](Self::fallible) gives a handle
-/// that returns `None` instead.
+/// Awaiting a task that was cancelled before it completed (through an
+/// [`AbortHandle`], or by its runtime's shutdown) panics;
+/// [`join`](Self::join) answers a [`JoinError`] instead, and
+/// [`fallible`](Self::fallible) gives a handle that returns `None`.
 #[must_use = "dropping a task cancels it; call `detach` to let it run"]
 pub struct Task<T> {
     ptr: NonNull<()>,

@@ -56,7 +56,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::Shard;
 use super::recv::RecvGroup;
@@ -66,6 +66,8 @@ use crate::io::source::ops::Done;
 use crate::io::source::requests::Lease;
 use crate::io::source::ring::{Arrival, RingMem, RingOp};
 use crate::rt::backend::with_room;
+use crate::rt::counters::tally;
+use crate::rt::counters::{IoKind, IoTimes};
 use crate::rt::park::Notifier;
 use crate::rt::park::ring::{CqeBatch, RingPoller};
 use crate::syscore::linux::iouring::files::Files;
@@ -118,6 +120,13 @@ pub(crate) struct ShardRing {
     /// The buffers multishot receives draw from; `None` when the
     /// configuration asks for none, or once the ring is shut down.
     recv: RefCell<Option<RecvGroup>>,
+    /// Where the latencies of the operations go, when the runtime records
+    /// them: operations are stamped as they are submitted.
+    times: std::cell::OnceCell<Arc<IoTimes>>,
+    /// When each operation in flight was submitted, by its user data, while
+    /// latencies are recorded: kept beside the operations, so an operation's
+    /// record stays its size whether or not they are.
+    stamps: RefCell<std::collections::HashMap<u64, Instant>>,
     /// Multishot receives and accepts submitted, the receives' arrivals,
     /// and the receives that ended as the group ran dry, for a test.
     #[cfg(test)]
@@ -200,6 +209,8 @@ impl ShardRing {
             cap,
             writes: Cell::new(0),
             recv: RefCell::new(recv),
+            times: std::cell::OnceCell::new(),
+            stamps: RefCell::new(std::collections::HashMap::new()),
             #[cfg(test)]
             counts: Cell::new((0, 0, 0)),
             #[cfg(test)]
@@ -328,6 +339,9 @@ impl ShardRing {
                 return IGNORED;
             }
         };
+        if self.times.get().is_some() {
+            self.stamp(user_data);
+        }
         if write {
             self.writes.set(self.writes.get() + 1);
         }
@@ -373,6 +387,9 @@ impl ShardRing {
                 return;
             }
         };
+        if self.times.get().is_some() {
+            self.stamp(user_data);
+        }
         self.enter(user_data, sqe, true);
     }
 
@@ -384,6 +401,9 @@ impl ShardRing {
         };
         self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
         self.admit_waiting();
+        if self.times.get().is_some() {
+            self.timed(user_data, Some(IoKind::File), res);
+        }
         if let Some(rest) = op.complete(res) {
             self.submit_file(rest);
         }
@@ -539,6 +559,9 @@ impl ShardRing {
             if counts_as_write(&op) {
                 self.writes.set(self.writes.get().saturating_sub(1));
             }
+            if self.times.get().is_some() {
+                self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
+            }
             self.end(shard, op, cqe.res);
             return;
         }
@@ -564,6 +587,9 @@ impl ShardRing {
         };
         if counts_as_write(&op) {
             self.writes.set(self.writes.get().saturating_sub(1));
+        }
+        if self.times.get().is_some() {
+            self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
         }
         self.end(shard, op, cqe.res);
     }
@@ -621,6 +647,9 @@ impl ShardRing {
             self.zc_denied.set(true);
             res = -libc::ECANCELED;
         }
+        if self.times.get().is_some() {
+            self.timed(cqe.user_data, Some(IoKind::Write), res);
+        }
         let outcome = crate::io::source::ring::zc_outcome(res);
         self.hand_over(shard, &source, file, epoch, false, outcome);
         drop(ended);
@@ -655,6 +684,9 @@ impl ShardRing {
                 (Ok(len @ 1..), Some((epoch, held, stopping, datagram, source))) => {
                     match group.hand_out(user_data, bid, len, more) {
                         Some(chunk) => {
+                            if !datagram {
+                                tally::read(len as usize);
+                            }
                             *held += chunk.charged(group);
                             if *held > group.cap() && !*stopping {
                                 *stopping = true;
@@ -705,7 +737,10 @@ impl ShardRing {
                 let arrival = if datagram {
                     // A buffer not laid out as the kernel says is only given back.
                     match crate::io::source::ring::datagram_of(chunk, source.kind()) {
-                        Some((payload, from)) => Arrival::Datagram(payload, from),
+                        Some((payload, from)) => {
+                            tally::read(payload.len());
+                            Arrival::Datagram(payload, from)
+                        }
                         None => return,
                     }
                 } else {
@@ -746,6 +781,7 @@ impl ShardRing {
             (std::sync::Arc::clone(&op.source), conn, op.epoch, stop)
         };
         let (source, conn, epoch, stop) = delivery;
+        tally::accepted(1);
         if stop {
             self.cancel(user_data);
         }
@@ -772,6 +808,43 @@ impl ShardRing {
                 *held = held.saturating_sub(charged);
             }
         });
+    }
+
+    /// Starts timing the operations submitted from now on into `times`.
+    pub(super) fn time_with(&self, times: Arc<IoTimes>) {
+        let _ = self.times.set(times);
+    }
+
+    /// The operation of `user_data` was submitted now, while latencies are
+    /// recorded.
+    #[cold]
+    #[inline(never)]
+    fn stamp(&self, user_data: u64) {
+        self.stamps.borrow_mut().insert(user_data, Instant::now());
+    }
+
+    /// The operation of `user_data` ended with `res`, while latencies are
+    /// recorded: its stamp goes, and its latency is counted under `kind` (an
+    /// operation of no timed kind, a multishot one, is only let go of).
+    #[cold]
+    #[inline(never)]
+    fn timed(&self, user_data: u64, kind: Option<IoKind>, res: i32) {
+        let stamp = self.stamps.borrow_mut().remove(&user_data);
+        if let (Some(at), Some(kind)) = (stamp, kind) {
+            self.time(kind, res, at);
+        }
+    }
+
+    /// An operation of `kind` stamped `issued` ended with `res`: its latency
+    /// is counted, unless it was cancelled or told to try again.
+    fn time(&self, kind: IoKind, res: i32, issued: Instant) {
+        if let Some(times) = self.times.get()
+            && res != -libc::ECANCELED
+            && res != -libc::EAGAIN
+            && !(matches!(kind, IoKind::Connect) && res == -libc::EALREADY)
+        {
+            times.add(kind, issued.elapsed());
+        }
     }
 
     /// `op` ended with `res`: its slot is named once less, and its source
@@ -817,6 +890,25 @@ impl ShardRing {
             },
             shard,
         );
+    }
+}
+
+/// The kind of latency an operation's end counts as, if it is timed: not a
+/// readiness probe, nor a multishot operation (many arrivals for one).
+fn io_kind(mem: &RingMem) -> Option<IoKind> {
+    match mem {
+        RingMem::Recv(_)
+        | RingMem::RecvLent(_)
+        | RingMem::RecvFrom(..)
+        | RingMem::RecvLentFrom(..) => Some(IoKind::Read),
+        RingMem::Send(_)
+        | RingMem::SendLent(_)
+        | RingMem::SendTo(..)
+        | RingMem::SendLentTo(..)
+        | RingMem::SendPinned(_) => Some(IoKind::Write),
+        RingMem::Accept(_) => Some(IoKind::Accept),
+        RingMem::Connect(..) => Some(IoKind::Connect),
+        _ => None,
     }
 }
 

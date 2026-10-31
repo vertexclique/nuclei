@@ -103,6 +103,7 @@ impl FileIo {
         Out {
             io: to,
             work: Some(work),
+            bytes: 0,
         }
         .finish()
         .await
@@ -135,6 +136,7 @@ impl FileIo {
         Out {
             io: to,
             work: Some(work),
+            bytes: 0,
         }
         .finish()
         .await

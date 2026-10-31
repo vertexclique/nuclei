@@ -49,6 +49,7 @@ impl FileIo {
         Out {
             io: self,
             work: Some(self.submit_allocate(offset, len, mode, Waker::noop())),
+            bytes: 0,
         }
         .finish()
         .await

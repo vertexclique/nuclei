@@ -16,32 +16,34 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use core::task::{Poll, Waker};
 use std::io;
 
-use super::work::Work;
+use super::work::{Work, tally_write};
 use crate::buf::owned::OwnedBuf;
 
 /// A positional write left by its task: from a buffer of the pool, or from
-/// the task's own buffer, which goes with the call; or a change of a range
-/// of the file, or a chunk of a copy into it (which ends with its count).
+/// the task's own buffer, which goes with the call, with the bytes to count
+/// when it lands (see [`Out`](super::positional::Out)); or a change of a
+/// range of the file, or a chunk of a copy into it (which ends with its
+/// count).
 pub(super) enum Orphan {
-    Pool(Work<io::Result<()>>),
-    Lent(Work<(io::Result<()>, OwnedBuf)>),
+    Pool(Work<io::Result<()>>, usize),
+    Lent(Work<(io::Result<()>, OwnedBuf)>, usize),
     Count(Work<io::Result<u64>>),
 }
 
-impl From<Work<io::Result<()>>> for Orphan {
-    fn from(work: Work<io::Result<()>>) -> Self {
-        Orphan::Pool(work)
+impl From<(Work<io::Result<()>>, usize)> for Orphan {
+    fn from((work, bytes): (Work<io::Result<()>>, usize)) -> Self {
+        Orphan::Pool(work, bytes)
     }
 }
 
-impl From<Work<(io::Result<()>, OwnedBuf)>> for Orphan {
-    fn from(work: Work<(io::Result<()>, OwnedBuf)>) -> Self {
-        Orphan::Lent(work)
+impl From<(Work<(io::Result<()>, OwnedBuf)>, usize)> for Orphan {
+    fn from((work, bytes): (Work<(io::Result<()>, OwnedBuf)>, usize)) -> Self {
+        Orphan::Lent(work, bytes)
     }
 }
 
-impl From<Work<io::Result<u64>>> for Orphan {
-    fn from(work: Work<io::Result<u64>>) -> Self {
+impl From<(Work<io::Result<u64>>, usize)> for Orphan {
+    fn from((work, _): (Work<io::Result<u64>>, usize)) -> Self {
         Orphan::Count(work)
     }
 }
@@ -50,18 +52,20 @@ impl Orphan {
     /// Ready once the write landed, with its error if it failed; else
     /// `waker` is woken when it does.
     pub(super) fn poll(&mut self, waker: &Waker) -> Poll<Option<io::Error>> {
-        match self {
-            Orphan::Pool(work) => work.poll(waker).map(Result::err),
-            Orphan::Lent(work) => work.poll(waker).map(|(result, _)| result.err()),
-            Orphan::Count(work) => work.poll(waker).map(Result::err),
-        }
+        let (err, bytes) = match self {
+            Orphan::Pool(work, bytes) => (core::task::ready!(work.poll(waker)).err(), *bytes),
+            Orphan::Lent(work, bytes) => (core::task::ready!(work.poll(waker)).0.err(), *bytes),
+            Orphan::Count(work) => (core::task::ready!(work.poll(waker)).err(), 0),
+        };
+        tally_write(bytes, err.is_none());
+        Poll::Ready(err)
     }
 
     /// Lets the write run to its end with nobody to take it.
     pub(super) fn let_go(self) {
         match self {
-            Orphan::Pool(work) => work.let_go(),
-            Orphan::Lent(work) => work.let_go(),
+            Orphan::Pool(work, _) => work.let_go(),
+            Orphan::Lent(work, _) => work.let_go(),
             Orphan::Count(work) => work.let_go(),
         }
     }

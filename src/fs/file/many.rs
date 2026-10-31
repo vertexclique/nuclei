@@ -15,7 +15,7 @@ use std::io;
 use std::sync::Arc;
 
 use super::FileIo;
-use super::work::Work;
+use super::work::{Work, tally_read};
 use crate::buf::owned::{IoBufMut, OwnedBuf};
 use crate::io::Handle;
 use crate::io::source::Failure;
@@ -52,12 +52,13 @@ impl FileIo {
                     out.push((i, self.submit_read_owned(buf, at)));
                 }
                 let before = out.len();
-                out.retain_mut(|(i, work)| match work.poll(cx.waker()) {
-                    Poll::Ready(end) => {
+                out.retain_mut(|(i, work)| match (work.pooled(), work.poll(cx.waker())) {
+                    (pooled, Poll::Ready(end)) => {
+                        tally_read(pooled, &end.0, |n| *n);
                         ends[*i] = Some(end);
                         false
                     }
-                    Poll::Pending => true,
+                    (_, Poll::Pending) => true,
                 });
                 if out.is_empty() && waiting.len() == 0 {
                     return Poll::Ready(());

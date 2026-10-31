@@ -814,7 +814,21 @@ impl Source {
         {
             return Ok(());
         }
-        match context::current(|current| current.map(|shard| shard.register_source(self))) {
+        // A shard that stopped (a worker going, its thread still running
+        // what the stop left) makes no registration: one of the runtime's
+        // shards that runs, or this thread's own, does.
+        let registered = context::current(|current| {
+            current
+                .filter(|shard| !shard.shared.is_stopped())
+                .map(|shard| shard.register_source(self))
+        });
+        match registered {
+            Some(Err(err)) if requests::is_stopped_shard(&err) => {
+                // It stopped since the look, and the attach it refused set
+                // the registration back to none: the tasks look again.
+                self.look_again();
+                Ok(())
+            }
             Some(result) => result,
             None => {
                 crate::rt::runtime::service_shard().post_io(IoOp::Register(Arc::clone(self)));

@@ -40,6 +40,8 @@ use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
 #[cfg(readiness)]
 use crate::io::sys;
+#[cfg(any(readiness, port))]
+use crate::rt::counters::tally;
 
 mod ahead;
 mod calls;
@@ -586,10 +588,12 @@ impl ReadState {
                 after.drop_buf(buf);
             }
             Some(Ok(0)) => {
+                tally::read(0);
                 self.eof = true;
                 after.drop_buf(buf);
             }
             Some(Ok(n)) => {
+                tally::read(n);
                 self.blocked = drained(kind, self.unsure, n, buf.capacity());
                 buf.set_filled(n);
                 self.ahead.push(Piece::Pool(buf), after);
@@ -615,7 +619,7 @@ impl ReadState {
             Some(bufs) => sys::readv(fd, bufs.read_iovecs()),
             None => sys::read_uninit(fd, lent.buf.spare_capacity_mut()),
         };
-        let result = match sys::ready(read) {
+        let result = match sys::ready(read).inspect(tally::reading) {
             None => {
                 self.blocked = true;
                 return;
@@ -645,8 +649,10 @@ impl ReadState {
         let spare = lent.buf.spare_capacity_mut();
         let result = match kind {
             Kind::UnixDatagram => sys::ready(sys::recv_from_unix_uninit(fd, spare, false))
+                .inspect(tally::received)
                 .map(|r| r.map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a))))),
             _ => sys::ready(sys::recv_from_udp_uninit(fd, spare, false))
+                .inspect(tally::received)
                 .map(|r| r.map(|(n, a)| (n, Addr::Inet(a)))),
         };
         let Some(result) = result else {
@@ -669,7 +675,7 @@ impl ReadState {
     fn accept_ahead(&mut self, fd: RawFd, kind: Kind) {
         let limit = self.waiters.len().clamp(1, BATCH);
         while self.accepted.len() < limit {
-            match sys::ready(self.accept_checked(fd, kind)) {
+            match sys::ready(self.accept_checked(fd, kind)).inspect(tally::accepting) {
                 None => {
                     self.blocked = true;
                     break;
@@ -850,6 +856,9 @@ impl ReadState {
                 None
             }
             Some(Ok((n, left))) => {
+                if !peek {
+                    tally::read(n);
+                }
                 // A peek leaves the bytes in the socket, which no edge reports again.
                 if matches!(io.via, Via::Fd(_)) && !peek {
                     self.blocked = match left {
@@ -918,6 +927,9 @@ impl ReadState {
         }
         let Via::Ops(route) = io.via;
         let result = crate::io::sys::recv_ready(route.socket()?, out, peek);
+        if !peek {
+            tally::reading(&result);
+        }
         // A look leaves the bytes; a read may take them all, and the next
         // waits for more in a zero-byte receive.
         self.readable = peek && matches!(result, Ok(1..));
@@ -1324,6 +1336,9 @@ impl ReadState {
         }
         let Via::Ops(route) = io.via;
         let result = crate::io::sys::recv_from_ready(route.socket()?, out, peek);
+        if !peek {
+            tally::received(&result);
+        }
         self.readable = peek && result.is_ok();
         Some(result.map(|(n, from)| (n, Addr::Inet(from))))
     }

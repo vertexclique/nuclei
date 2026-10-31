@@ -145,7 +145,7 @@ impl WriteState {
             .as_ref()
             .filter(|_| lent.done.is_none() && !self.blocked)
         {
-            match sys::ready(send_datagram(fd, &lent.buf, to.as_dest())) {
+            match sys::ready(send_datagram(fd, &lent.buf, to.as_dest())).inspect(tally::writing) {
                 None => self.blocked = true,
                 Some(result) => {
                     lent.done = Some(result);
@@ -158,7 +158,7 @@ impl WriteState {
                 Some(bufs) => write_iov(fd, kind, bufs.write_iovecs(lent.sent)),
                 None => write_bytes(fd, kind, lent.rest()),
             };
-            match sys::ready(written) {
+            match sys::ready(written).inspect(tally::writing) {
                 None => self.blocked = true,
                 Some(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
                 Some(Ok(n)) => {

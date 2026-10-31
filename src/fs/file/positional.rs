@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use super::FileIo;
 use super::orphans::Orphan;
-use super::work::{Ended, Work, bounce};
+use super::work::{Ended, Work, bounce, tally_read, tally_write};
 use crate::io::Handle;
 use crate::io::side::After;
 
@@ -68,8 +68,10 @@ impl FileIo {
         poll_fn(|cx| self.poll_ordered(cx)).await;
         let (buf, from, n) = self.bounce_for(out.len(), out.as_ptr() as usize).await;
         let mut job = self.submit_read(buf, from, n, at);
-        let buf = poll_fn(|cx| job.poll(cx.waker())).await?;
-        Ok(buf.peek_into(out))
+        let pooled = job.pooled();
+        let result = poll_fn(|cx| job.poll(cx.waker())).await;
+        tally_read(pooled, &result, |buf| buf.filled().len());
+        Ok(result?.peek_into(out))
     }
 
     pub(crate) async fn write_at(self: &Arc<Self>, bytes: &[u8], at: u64) -> io::Result<usize> {
@@ -79,9 +81,11 @@ impl FileIo {
         poll_fn(|cx| self.poll_ordered(cx)).await;
         let (mut buf, from, n) = self.bounce_for(bytes.len(), bytes.as_ptr() as usize).await;
         buf.fill_at(from, &bytes[..n]);
+        let (work, bytes) = self.submit_pwrite(buf, at, Waker::noop());
         let mut out = Out {
             io: self,
-            work: Some(self.submit_pwrite(buf, at, Waker::noop())),
+            work: Some(work),
+            bytes,
         };
         poll_fn(|cx| out.poll(cx)).await.map(|()| n)
     }
@@ -100,7 +104,9 @@ impl FileIo {
         }
         poll_fn(|cx| self.poll_ordered(cx)).await;
         let mut job = self.submit_read_owned(buf, at);
+        let pooled = job.pooled();
         let (result, buf) = poll_fn(|cx| job.poll(cx.waker())).await;
+        tally_read(pooled, &result, |n| *n);
         (result, buf.into_filled())
     }
 
@@ -118,9 +124,11 @@ impl FileIo {
         }
         poll_fn(|cx| self.poll_ordered(cx)).await;
         let len = buf.len();
+        let (work, bytes) = self.submit_pwrite_owned(buf, at, Waker::noop());
         let mut out = Out {
             io: self,
-            work: Some(self.submit_pwrite_owned(buf, at, Waker::noop())),
+            work: Some(work),
+            bytes,
         };
         let (result, buf) = poll_fn(|cx| out.poll(cx)).await;
         (result.map(|()| len), buf.into_written())
@@ -154,19 +162,22 @@ impl FileIo {
 }
 
 /// A positional write out, whose task takes its end. Dropped first, the
-/// write is left to the file.
+/// write is left to the file. `bytes` are counted when it ends, as for a
+/// cursor write (see [`Writing`](super::work::Writing)): 0 for a ring's, or
+/// for a change of a range.
 pub(super) struct Out<'a, T>
 where
-    Work<T>: Into<Orphan>,
+    (Work<T>, usize): Into<Orphan>,
 {
     pub(super) io: &'a Arc<FileIo>,
     pub(super) work: Option<Work<T>>,
+    pub(super) bytes: usize,
 }
 
 impl<T> Out<'_, T>
 where
     T: Ended,
-    Work<T>: Into<Orphan>,
+    (Work<T>, usize): Into<Orphan>,
 {
     /// The call's end, once it came.
     pub(super) async fn finish(mut self) -> T {
@@ -179,6 +190,7 @@ where
         };
         let end = core::task::ready!(work.poll(cx.waker()));
         self.work = None;
+        tally_write(self.bytes, end.error().is_none());
         self.io.moved_on();
         Poll::Ready(end)
     }
@@ -186,11 +198,11 @@ where
 
 impl<T> Drop for Out<'_, T>
 where
-    Work<T>: Into<Orphan>,
+    (Work<T>, usize): Into<Orphan>,
 {
     fn drop(&mut self) {
         if let Some(work) = self.work.take() {
-            self.io.orphan(work.into());
+            self.io.orphan((work, self.bytes).into());
         }
     }
 }

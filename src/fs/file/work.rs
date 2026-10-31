@@ -20,6 +20,7 @@ use crate::fs::call::{self, FileOutcome, SlotJob};
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::sys;
+use crate::rt::counters::tally;
 use crate::rt::task::Task;
 
 /// The page a task's memory is mirrored within, for the kernel's alignment
@@ -29,6 +30,10 @@ pub(super) const PAGE: usize = 4096;
 /// A file's call in flight: a job of the blocking pool, or a call that ends
 /// in a slot (an operation on the ring of the shard whose thread issued it,
 /// or a write the pool makes).
+///
+/// Its IO is counted for `stats` where its end is taken: a read the pool made
+/// by its job's poll, a write the pool made by the write's own count (see
+/// [`Writing`]), and a ring's call as the kernel completes it.
 pub(super) enum Work<T> {
     Pool(Task<T>),
     Slot(SlotJob<T>),
@@ -48,6 +53,33 @@ impl<T: Ended> Work<T> {
             crate::rt::counters::io_error(err);
         }
         end
+    }
+
+    /// Whether the blocking pool makes the call, whose bytes its poll counts.
+    #[inline(always)]
+    pub(super) fn pooled(&self) -> bool {
+        matches!(self, Work::Pool(_))
+    }
+}
+
+/// A write of `bytes` the pool made ended: counted, unless it failed. A ring's
+/// write passes 0, its bytes counted as the kernel completed it.
+#[inline(always)]
+pub(super) fn tally_write(bytes: usize, ok: bool) {
+    if bytes > 0 && ok && tally::counting() {
+        tally::add_write(bytes);
+    }
+}
+
+/// A read the pool made (`pooled`) ended with `result`, of the `bytes` it
+/// holds: counted. A ring's read is counted as the kernel completed it.
+#[inline(always)]
+pub(super) fn tally_read<T>(pooled: bool, result: &io::Result<T>, bytes: fn(&T) -> usize) {
+    if pooled
+        && tally::counting()
+        && let Ok(read) = result
+    {
+        tally::add_read(bytes(read));
     }
 }
 
@@ -101,16 +133,19 @@ pub(super) struct LentRead {
 }
 
 /// The cursor write in flight.
+///
+/// Each carries the bytes it writes when the blocking pool makes the call, 0
+/// for a ring's, whose bytes are counted as the kernel completes it.
 pub(super) enum Writing {
     /// From a buffer of the pool.
-    Pool(Work<io::Result<()>>),
+    Pool(Work<io::Result<()>>, usize),
     /// From a task's own buffer, which comes back with the result.
-    Lent(Work<(io::Result<()>, OwnedBuf)>),
+    Lent(Work<(io::Result<()>, OwnedBuf)>, usize),
     /// At the end of a file opened to append, ending with the file's offset
     /// after it.
-    Append(Work<io::Result<u64>>),
+    Append(Work<io::Result<u64>>, usize),
     /// As `Append`, from a task's own buffer.
-    AppendLent(Work<(io::Result<u64>, OwnedBuf)>),
+    AppendLent(Work<(io::Result<u64>, OwnedBuf)>, usize),
 }
 
 /// A write from a task's own buffer, from its submission until its task
@@ -319,28 +354,31 @@ impl FileIo {
 
     /// A write of the bytes `buf` holds at `at`, whole: for a positional
     /// write, and the cursor's on a file not opened to append. A write the
-    /// pool makes wakes `waker` when it ends.
+    /// pool makes wakes `waker` when it ends, and comes with its bytes to
+    /// count (see [`Writing`]).
     #[inline]
     pub(super) fn submit_pwrite(
         &self,
         buf: PoolBuf,
         at: u64,
         waker: &Waker,
-    ) -> Work<io::Result<()>> {
+    ) -> (Work<io::Result<()>>, usize) {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::write(&self.fd, at, buf) {
-                Ok(job) => return Work::Slot(job),
+                Ok(job) => return (Work::Slot(job), 0),
                 Err(buf) => buf,
             },
             false => buf,
         };
         let fd = self.fd.clone();
-        Work::Slot(call::write_on_pool(
+        let bytes = buf.filled().len();
+        let work = Work::Slot(call::write_on_pool(
             move || FileOutcome::Write(sys::pwrite_all(fd.raw(), buf.filled(), at)),
             call::as_write,
             waker,
-        ))
+        ));
+        (work, bytes)
     }
 
     /// The cursor's write of `buf` at `at`, or at the end of a file opened
@@ -349,13 +387,16 @@ impl FileIo {
     pub(super) fn submit_write(&self, buf: PoolBuf, at: u64, waker: &Waker) -> Writing {
         if self.append {
             let fd = self.fd.clone();
-            return Writing::Append(Work::Slot(call::write_on_pool(
+            let bytes = buf.filled().len();
+            let work = Work::Slot(call::write_on_pool(
                 move || FileOutcome::Append(sys::append_all(fd.raw(), buf.filled())),
                 call::as_append,
                 waker,
-            )));
+            ));
+            return Writing::Append(work, bytes);
         }
-        Writing::Pool(self.submit_pwrite(buf, at, waker))
+        let (work, bytes) = self.submit_pwrite(buf, at, waker);
+        Writing::Pool(work, bytes)
     }
 
     /// A read at `at` into the spare capacity of a task's `buf`, after the
@@ -384,24 +425,26 @@ impl FileIo {
 
     /// A write of all of a task's `buf` at `at`: for a positional write, and
     /// the cursor's on a file not opened to append. A write the pool makes
-    /// wakes `waker` when it ends.
+    /// wakes `waker` when it ends, and comes with its bytes to count (see
+    /// [`Writing`]).
     #[inline]
     pub(super) fn submit_pwrite_owned(
         &self,
         buf: OwnedBuf,
         at: u64,
         waker: &Waker,
-    ) -> Work<(io::Result<()>, OwnedBuf)> {
+    ) -> (Work<(io::Result<()>, OwnedBuf)>, usize) {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::write_lent(&self.fd, at, buf) {
-                Ok(job) => return Work::Slot(job),
+                Ok(job) => return (Work::Slot(job), 0),
                 Err(buf) => buf,
             },
             false => buf,
         };
         let fd = self.fd.clone();
-        Work::Slot(call::write_on_pool(
+        let bytes = buf.len();
+        let work = Work::Slot(call::write_on_pool(
             move || {
                 let mut buf = buf;
                 let result = pwrite_owned(fd.raw(), &mut buf, 0, at);
@@ -409,7 +452,8 @@ impl FileIo {
             },
             call::as_write_lent,
             waker,
-        ))
+        ));
+        (work, bytes)
     }
 
     /// The cursor's write of all of a task's `buf` at `at`, or at the end of
@@ -419,7 +463,8 @@ impl FileIo {
     pub(super) fn submit_write_owned(&self, buf: OwnedBuf, at: u64, waker: &Waker) -> Writing {
         if self.append {
             let fd = self.fd.clone();
-            return Writing::AppendLent(Work::Slot(call::write_on_pool(
+            let bytes = buf.len();
+            let work = Work::Slot(call::write_on_pool(
                 move || {
                     let mut buf = buf;
                     let result = append_owned(fd.raw(), &mut buf);
@@ -427,8 +472,10 @@ impl FileIo {
                 },
                 call::as_append_lent,
                 waker,
-            )));
+            ));
+            return Writing::AppendLent(work, bytes);
         }
-        Writing::Lent(self.submit_pwrite_owned(buf, at, waker))
+        let (work, bytes) = self.submit_pwrite_owned(buf, at, waker);
+        Writing::Lent(work, bytes)
     }
 }
