@@ -246,11 +246,25 @@ macro_rules! stream_calls {
 }
 
 /// The socket buffers a case of small buffers asks for: for a Unix socket
-/// the least the system allows (it rounds 1 up); for TCP a few pages, since
-/// at its least the kernel moves a MiB in a minute on loopback, std's sockets
-/// as much as nuclei's.
-pub const TINY: u32 = 1;
+/// the least the system allows, which Linux rounds 1 up to a few KiB; for
+/// TCP a few pages, since at its least the kernel moves a MiB in a minute on
+/// loopback, std's sockets as much as nuclei's. macOS keeps a Unix stream's
+/// 1 as it is, so each call moves one byte, and a case that polls a transfer
+/// once per byte it moves would run for hours: there it is a page, about
+/// Linux's least.
+pub const TINY: u32 = if cfg!(target_vendor = "apple") {
+    4096
+} else {
+    1
+};
 pub const TINY_TCP: u32 = 8192;
+
+/// The buffers a Unix stream of the system's own size gets on macOS, which
+/// gives it 8 KiB each way (`net.local.stream.sendspace` and `recvspace`)
+/// where a case's peer writes up to 100 000 bytes before anyone reads: about
+/// the 208 KiB Linux's default holds. Elsewhere the system's sizing stays.
+#[cfg(unix)]
+pub const UNIX_ROOM: u32 = 256 * 1024;
 
 /// A connected TCP pair of std's, both ends' buffers tiny with `tiny`.
 fn std_tcp(tiny: bool) -> (std::net::TcpStream, std::net::TcpStream) {
@@ -379,6 +393,9 @@ impl Stream for nuclei::net::UnixStream {
         if tiny {
             set_tiny(&a);
             set_tiny(&b);
+        } else if cfg!(target_vendor = "apple") {
+            set_buffers(&a, UNIX_ROOM);
+            set_buffers(&b, UNIX_ROOM);
         }
         Self::set_std_timeouts(&a);
         Self::set_std_timeouts(&b);
