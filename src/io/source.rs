@@ -654,59 +654,94 @@ impl Source {
     /// register with a ring (this thread's shard runs one, or the
     /// process's shards do) registers before its first operation, which
     /// waits until the registration is in place.
+    #[inline(always)]
     fn with_io<R>(self: &Arc<Self>, f: impl FnOnce(Io<'_>) -> R) -> io::Result<R> {
         let fd = self.fd()?;
+        // Every source but a regular file is reached from the shard this thread runs, as long
+        // as `held` lives. One call of `f`, so it is inlined here.
         #[cfg(completion)]
-        if self.kind != Kind::File {
-            return context::current(|current| {
-                if !self.reg.ops.load(Ordering::Acquire) {
-                    // Registered with a poller, or about to register where
-                    // no ring runs: the driver's calls.
-                    #[cfg(readiness)]
-                    {
-                        let rings = current
-                            .map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
-                        if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
-                            return Ok(f(Io {
-                                via: Via::Fd(fd),
-                                shard: current,
-                            }));
-                        }
-                    }
-                    self.ensure_registered()?;
-                }
-                let route = self.route(current).unwrap_or(route::Route::NotYet);
-                let not_yet = matches!(route, route::Route::NotYet);
-                let out = f(Io {
-                    via: Via::Ops(route),
-                    shard: current,
-                });
-                // The route was read before the sides were taken: a
-                // registration that finished meanwhile submitted nothing for
-                // what this step left, so the sides are asked to submit.
-                if not_yet && self.reg.state.load(Ordering::Acquire) == REGISTERED {
-                    let mut after = After::default();
-                    let hooks = self.hooks_in(current);
-                    self.read.defer(read_work::SUBMIT, &mut after, &hooks);
-                    self.write.defer(write_work::SUBMIT, &mut after, &hooks);
-                    self.settle(after);
-                }
-                Ok(out)
-            });
+        let held = (self.kind != Kind::File).then(context::current_held);
+        #[cfg(completion)]
+        let io = match &held {
+            Some(held) => Io {
+                via: self.via(fd, held.shard())?,
+                shard: held.shard(),
+            },
+            None => Self::file_io(fd)?,
+        };
+        #[cfg(not(completion))]
+        let io = Self::file_io(fd)?;
+        #[cfg(completion)]
+        let not_yet = matches!(io.via, Via::Ops(route::Route::NotYet));
+        let out = f(io);
+        #[cfg(completion)]
+        if not_yet {
+            self.submit_if_registered(io.shard);
         }
+        Ok(out)
+    }
+
+    /// The way a regular file's step reaches its descriptor `fd` (and, where no completion
+    /// driver is built, every source's): calls on it, from no shard.
+    #[inline(always)]
+    fn file_io(fd: Raw) -> io::Result<Io<'static>> {
         #[cfg(readiness)]
-        return Ok(f(Io {
+        return Ok(Io {
             via: Via::Fd(fd),
             shard: None,
-        }));
+        });
         // A regular file's IO goes through the file's jobs, never here.
         #[cfg(not(readiness))]
         {
-            let _ = (fd, f);
+            let _ = fd;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "a regular file is read and written through its handle",
             ))
+        }
+    }
+
+    /// How this thread's step reaches the descriptor `fd` (see [`with_io`](Self::with_io)).
+    #[cfg(completion)]
+    #[inline(always)]
+    fn via<'a>(
+        self: &'a Arc<Self>,
+        fd: Raw,
+        current: Option<&'a crate::rt::shard::Shard>,
+    ) -> io::Result<Via<'a>> {
+        if !self.reg.ops.load(Ordering::Acquire) {
+            // Registered with a poller, or about to register where no ring
+            // runs: the driver's calls.
+            #[cfg(readiness)]
+            {
+                let rings =
+                    current.map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
+                if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
+                    return Ok(Via::Fd(fd));
+                }
+            }
+            #[cfg(not(readiness))]
+            let _ = fd;
+            self.ensure_registered()?;
+        }
+        Ok(Via::Ops(
+            self.route(current).unwrap_or(route::Route::NotYet),
+        ))
+    }
+
+    /// The route was read before the sides were taken: a registration that
+    /// finished meanwhile submitted nothing for what the step left, so the
+    /// sides are asked to submit.
+    #[cfg(completion)]
+    #[cold]
+    #[inline(never)]
+    fn submit_if_registered(self: &Arc<Self>, current: Option<&crate::rt::shard::Shard>) {
+        if self.reg.state.load(Ordering::Acquire) == REGISTERED {
+            let mut after = After::default();
+            let hooks = self.hooks_in(current);
+            self.read.defer(read_work::SUBMIT, &mut after, &hooks);
+            self.write.defer(write_work::SUBMIT, &mut after, &hooks);
+            self.settle(after);
         }
     }
 
@@ -742,11 +777,16 @@ impl Source {
     /// What every step leaves for once no guard is held: a side that ran out
     /// of buffers waits for one of this thread's pool, then the wakes and
     /// drops.
-    #[inline]
+    #[inline(always)]
     fn settle(self: &Arc<Self>, after: After) {
-        let Err(mut after) = after.forget_if_nothing() else {
-            return;
-        };
+        if let Err(after) = after.forget_if_nothing() {
+            self.settle_rest(after);
+        }
+    }
+
+    /// [`settle`](Self::settle) for a step that left something.
+    #[inline(never)]
+    fn settle_rest(self: &Arc<Self>, mut after: After) {
         self.kick(&mut after);
         if after.starved {
             Arc::clone(self).wait_for_buffer();
@@ -778,7 +818,7 @@ impl Source {
 
     /// The end of a poll: settles, and makes sure a driver watches the
     /// source when the poll waits or left work to it.
-    #[inline]
+    #[inline(always)]
     fn finish_poll<R>(
         self: &Arc<Self>,
         after: After,
@@ -794,6 +834,7 @@ impl Source {
 
     /// Makes sure the driver of some shard watches the source: the current
     /// shard's, or (on a thread that runs none) one of the runtime's.
+    #[inline(always)]
     fn ensure_registered(self: &Arc<Self>) -> io::Result<()> {
         // Registered, or being registered by another poll (readiness is
         // reported once the registration is in place). A shard that goes
@@ -801,6 +842,12 @@ impl Source {
         if self.reg.state.load(Ordering::Acquire) != UNREGISTERED {
             return Ok(());
         }
+        self.register()
+    }
+
+    /// [`ensure_registered`](Self::ensure_registered) for a source no registration holds.
+    #[inline(never)]
+    fn register(self: &Arc<Self>) -> io::Result<()> {
         if self
             .reg
             .state

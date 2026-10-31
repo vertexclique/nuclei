@@ -90,6 +90,7 @@ impl Source {
 
     /// Polls the read side with `step` for the handle's own reads, given
     /// the way this thread reaches the descriptor.
+    #[inline(always)]
     fn poll_reading<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -100,6 +101,7 @@ impl Source {
 
     /// Polls the read side with `step`: for the handle's own reads when
     /// `drive`, else for its caller's calls.
+    #[inline(always)]
     fn poll_read_side<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -107,22 +109,26 @@ impl Source {
         mut step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
         let mut after = After::default();
-        let polled = self.with_io(|io| {
-            self.read.poll(
-                &mut after,
-                cx.waker(),
-                &self.hooks_in(io.shard),
-                |st, after| {
-                    #[cfg(unix)]
-                    if drive {
-                        st.drive();
-                    }
-                    #[cfg(not(unix))]
-                    let _ = drive;
-                    step(st, io, cx.waker(), after)
-                },
-            )
-        });
+        let polled = self.with_io(
+            #[inline(always)]
+            |io| {
+                self.read.poll(
+                    &mut after,
+                    cx.waker(),
+                    &self.hooks_in(io.shard),
+                    #[inline(always)]
+                    |st, after| {
+                        #[cfg(unix)]
+                        if drive {
+                            st.drive();
+                        }
+                        #[cfg(not(unix))]
+                        let _ = drive;
+                        step(st, io, cx.waker(), after)
+                    },
+                )
+            },
+        );
         match polled {
             Ok(poll) => self.finish_poll(after, poll),
             Err(err) => {

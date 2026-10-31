@@ -157,6 +157,10 @@ pub(crate) struct Held<'a, S> {
     own_ready: bool,
     /// The owner holds it biased: `own` is up, the word is not.
     biased: bool,
+    /// Flags of the last take of the word still to be done (see `Held::release_word`).
+    rest: u8,
+    /// The holder saw `REQ` as it let go.
+    saw_requests: bool,
 }
 
 /// The hooks of a caller that is nobody's owner and asks for nothing.
@@ -231,24 +235,15 @@ impl<S> Side<S> {
     }
 
     /// How the caller, whose [`Hooks::owner`] is `who`, takes the side.
-    #[inline]
+    #[inline(always)]
     fn role(&self, hooks: &impl Hooks<S>) -> Role {
         // Acquire: a side the owner switched shows its `own := 0` first.
         if self.shared.load(Ordering::Acquire) {
             return Role::Shared;
         }
         let who = hooks.owner();
-        let owner = self.owner.load(Ordering::Relaxed);
-        let owns = who != 0
-            && (owner == who
-                || (owner == 0
-                    && self
-                        .owner
-                        .compare_exchange(0, who, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()));
-        if owns && owner == 0 {
-            hooks.claimed();
-        }
+        let owns =
+            who != 0 && (self.owner.load(Ordering::Relaxed) == who || self.claim(who, hooks));
         // Own is up only under the owner's own hold: a call under it is
         // foreign to itself, and leaves its work for the hold's release.
         if owns && self.own.load(Ordering::Relaxed) == 0 {
@@ -258,10 +253,26 @@ impl<S> Side<S> {
         }
     }
 
+    /// Whether `who`, which is not the side's owner, claims the side as its owner now: only
+    /// while no shard has.
+    #[cold]
+    #[inline(never)]
+    fn claim(&self, who: usize, hooks: &impl Hooks<S>) -> bool {
+        let claimed = self.owner.load(Ordering::Relaxed) == 0
+            && self
+                .owner
+                .compare_exchange(0, who, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok();
+        if claimed {
+            hooks.claimed();
+        }
+        claimed
+    }
+
     /// The owner's take: `own := 1`, the compiler's fence, then `intent` and
     /// the mode with plain loads. Held if no foreign thread came; else
     /// `own := 0` and the caller takes through the word.
-    #[inline]
+    #[inline(always)]
     fn try_biased(&self) -> Option<Held<'_, S>> {
         self.own.store(1, Ordering::Relaxed);
         compiler_fence(Ordering::SeqCst);
@@ -271,13 +282,22 @@ impl<S> Side<S> {
                 expect: BUSY,
                 own_ready: false,
                 biased: true,
+                rest: 0,
+                saw_requests: false,
             });
         }
+        self.biased_refused();
+        None
+    }
+
+    /// The owner's biased take found a foreign thread came: `own := 0`.
+    #[cold]
+    #[inline(never)]
+    fn biased_refused(&self) {
         self.own.store(0, Ordering::Relaxed);
         self.switch_if_unfenced();
         #[cfg(test)]
         witness(2);
-        None
     }
 
     /// The side, if it was free, taken with one `fetch_or` that also raises
@@ -295,6 +315,8 @@ impl<S> Side<S> {
                 expect: BUSY | (extra & READY),
                 own_ready: extra & READY != 0,
                 biased: false,
+                rest: 0,
+                saw_requests: false,
             })
         } else {
             Take::Busy
@@ -348,7 +370,7 @@ impl<S> Side<S> {
 
     /// The side, taken as `role` does, raising `extra` as the word's take
     /// does.
-    #[inline]
+    #[inline(always)]
     fn take_as(&self, role: Role, extra: u8, hooks: &impl Hooks<S>) -> Take<'_, S> {
         match role {
             Role::Shared => self.take_word(extra),
@@ -406,6 +428,7 @@ impl<S> Side<S> {
     /// held registers `waker` and returns `Pending`: the holder wakes it as
     /// it lets go. When an edge came while the step ran, the driver's part
     /// runs here, then the step again if it was pending.
+    #[inline(always)]
     pub(crate) fn poll<R>(
         &self,
         after: &mut After,
@@ -413,7 +436,39 @@ impl<S> Side<S> {
         hooks: &impl Hooks<S>,
         mut step: impl FnMut(&mut S, &mut After) -> Poll<R>,
     ) -> Poll<R> {
-        let taken = match self.take_as(self.role(hooks), 0, hooks) {
+        let mut held = match self.take_as(self.role(hooks), 0, hooks) {
+            Take::Held(held) => held,
+            missed => match self.poll_missed(missed, waker, hooks) {
+                Some(held) => held,
+                None => return Poll::Pending,
+            },
+        };
+        hooks.taken(held.get(), after);
+        // One call of `step`, so it is inlined here: it runs first, and again after each
+        // driver's part while it is pending.
+        let mut out = Poll::Pending;
+        loop {
+            if out.is_pending() {
+                out = step(held.get(), after);
+            }
+            match held.release_or_again(after, hooks) {
+                Ok(()) => return out,
+                Err(again) => held = again,
+            }
+        }
+    }
+
+    /// A poll's take that did not hold the side: its waker is left as `take` asks, or the side
+    /// is taken after all.
+    #[cold]
+    #[inline(never)]
+    fn poll_missed<'a>(
+        &'a self,
+        take: Take<'a, S>,
+        waker: &Waker,
+        hooks: &impl Hooks<S>,
+    ) -> Option<Held<'a, S>> {
+        match take {
             Take::Held(held) => Some(held),
             Take::Busy => self.contend(waker, false),
             Take::Left => self.contend(waker, true),
@@ -421,18 +476,7 @@ impl<S> Side<S> {
                 self.leave_waker(waker, hooks);
                 None
             }
-        };
-        let Some(mut held) = taken else {
-            return Poll::Pending;
-        };
-        hooks.taken(held.get(), after);
-        let mut out = step(held.get(), after);
-        held.release_with(after, hooks, |st, after| {
-            if out.is_pending() {
-                out = step(st, after);
-            }
-        });
-        out
+        }
     }
 
     /// For a poll that found the side held: its waker goes to the contended
@@ -556,15 +600,21 @@ impl<S> Side<S> {
     /// locked instruction, which puts `own := 0` ahead of the read. True when
     /// work was left there and the side was free: the caller holds it through
     /// the word then, and does that work.
-    #[inline]
+    #[inline(always)]
     fn release_biased(&self) -> bool {
         // Release: the next holder sees what this one did.
         self.own.store(0, Ordering::Release);
         compiler_fence(Ordering::SeqCst);
-        let intent = self.intent.load(Ordering::Relaxed);
-        if intent == 0 {
+        if self.intent.load(Ordering::Relaxed) == 0 {
             return false;
         }
+        self.release_biased_came()
+    }
+
+    /// [`release_biased`](Self::release_biased) once a foreign thread came.
+    #[cold]
+    #[inline(never)]
+    fn release_biased_came(&self) -> bool {
         self.switch_if_unfenced();
         let left = self.state.fetch_or(0, Ordering::SeqCst);
         if left & (WAITING | READY | DEFER | REQ) == 0 {
@@ -643,43 +693,39 @@ impl<S> Held<'_, S> {
 
     /// Lets go of the side, first doing what others left for its holder.
     #[inline]
-    pub(crate) fn release(self, after: &mut After, hooks: &impl Hooks<S>) {
-        self.release_with(after, hooks, |_, _| {});
+    pub(crate) fn release(mut self, after: &mut After, hooks: &impl Hooks<S>) {
+        while let Err(again) = self.release_or_again(after, hooks) {
+            self = again;
+        }
     }
 
-    /// As [`release`](Self::release); `again` runs after each driver's part
-    /// (a poll's step, while it waits). The owner's biased release, which
-    /// finds nothing left, is the inlined part.
-    #[inline]
-    fn release_with(
-        mut self,
-        after: &mut After,
-        hooks: &impl Hooks<S>,
-        again: impl FnMut(&mut S, &mut After),
-    ) {
+    /// Lets go of the side, first doing what others left for its holder; `Err` gives the side
+    /// back, still held, just after the driver's part ran for an edge that came meanwhile, for
+    /// the caller to run its step again (a poll's, while it waits) before it lets go again. The
+    /// owner's biased release, which finds nothing left, is the inlined part.
+    #[inline(always)]
+    fn release_or_again(mut self, after: &mut After, hooks: &impl Hooks<S>) -> Result<(), Self> {
         if self.biased {
             hooks.releasing(self.get());
             if !self.side.release_biased() {
                 core::mem::forget(self);
                 hooks.released(false, after);
-                return;
+                return Ok(());
             }
             // Work was left: the side is held through the word now, and
             // done as a holder of the word does it.
             self.biased = false;
             self.expect = BUSY;
         }
-        self.release_word(after, hooks, again);
+        self.release_word(after, hooks)
     }
 
-    /// The release of a side held through the word.
-    fn release_word(
-        mut self,
-        after: &mut After,
-        hooks: &impl Hooks<S>,
-        mut again: impl FnMut(&mut S, &mut After),
-    ) {
-        let mut saw_requests = false;
+    /// The release of a side held through the word. An edge's driver's part gives the side
+    /// back to the caller at once (see [`release_or_again`](Self::release_or_again)); the rest
+    /// of the flags taken with it are done as the release goes on.
+    #[inline(never)]
+    fn release_word(mut self, after: &mut After, hooks: &impl Hooks<S>) -> Result<(), Self> {
+        self.finish_flags(after, hooks);
         loop {
             hooks.releasing(self.get());
             // Release: publishes the contents to the next holder.
@@ -701,20 +747,30 @@ impl<S> Held<'_, S> {
             if flags & DEFER != 0 {
                 self.run_deferred(0, hooks, after);
             }
+            self.rest = flags & (WAITING | REQ);
             if flags & READY != 0 {
                 hooks.serve(self.get(), after);
-                again(self.get(), after);
+                return Err(self);
             }
-            if flags & WAITING != 0 {
-                self.side.wake_contended(after);
-            }
-            if flags & REQ != 0 {
-                saw_requests = true;
-                hooks.requests(self.get(), after);
-            }
+            self.finish_flags(after, hooks);
         }
+        let saw_requests = self.saw_requests;
         core::mem::forget(self);
         hooks.released(saw_requests, after);
+        Ok(())
+    }
+
+    /// The flags of the last take of the word that come after the driver's part: the contended
+    /// polls are woken, and the source's requests looked at.
+    fn finish_flags(&mut self, after: &mut After, hooks: &impl Hooks<S>) {
+        let flags = core::mem::take(&mut self.rest);
+        if flags & WAITING != 0 {
+            self.side.wake_contended(after);
+        }
+        if flags & REQ != 0 {
+            self.saw_requests = true;
+            hooks.requests(self.get(), after);
+        }
     }
 }
 
@@ -938,6 +994,7 @@ impl Drop for After {
 impl After {
     /// Consumes a step that left nothing to do, without the work of settling it: `Err` gives
     /// back one that did.
+    #[inline(always)]
     pub(crate) fn forget_if_nothing(self) -> Result<(), Self> {
         if self.is_empty() && !self.starved && !self.register {
             // Nothing is owned: no waker, no buffer, no allocation, so there is nothing to drop.
@@ -948,6 +1005,7 @@ impl After {
         }
     }
 
+    #[inline(always)]
     fn is_empty(&self) -> bool {
         self.wake.is_none() && self.drop_one.is_none() && self.more.is_none() && !self.has_kick()
     }
@@ -1051,6 +1109,7 @@ pub(crate) struct Wakers {
 }
 
 impl Wakers {
+    #[inline]
     pub(crate) fn register(&mut self, waker: &Waker) {
         let known = self
             .first

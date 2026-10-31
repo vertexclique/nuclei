@@ -5,7 +5,7 @@
 (* is written yet; the planned code is src/io/side.rs: `Side::try_hold`    *)
 (* and `Side::poll` (the takes), `Side::contend` (the poll that finds the  *)
 (* side held), `Side::defer` and `Side::take_for_request` (the calls that  *)
-(* leave DEFER and REQ), `Held::release_with` (the release); the heavy     *)
+(* leave DEFER and REQ), `Held::release_or_again` (the release); the     *)
 (* fence is `heavy` in src/rt/handoff/fence.rs; the shard's move is        *)
 (* `Slot::claim`, `Slot::take` and `Slot::come_back` in                    *)
 (* src/rt/handoff/slot.rs, driven by src/rt/handoff/monitor.rs.            *)
@@ -296,7 +296,7 @@ O_serve:                                                                     \* 
         Store("mode", "shared");                                             \* mode := shared, while own is still 1
     end if;                                                                  \* else nothing here
 O_rel:                                                                       \* the owner's release: own := 0
-    \* The owner's release (`Held::release_with`): a plain store of own := 0.
+    \* The owner's release (`Held::release_or_again`): a plain store of own := 0.
     Store("own", 0);                                                         \* own := 0 joins the buffer
     \* MUTATION release_no_look: the release does not look for work a foreign thread left.
     if Mutation = "release_no_look" then goto O_out; end if;                 \* (mutated) straight back to the task

@@ -113,6 +113,7 @@ impl Ahead {
 
     /// Copies bytes into `out`, in order, consumed unless `peek`; returns
     /// how many.
+    #[inline]
     pub(super) fn copy_into(
         &mut self,
         out: &mut [u8],
@@ -138,6 +139,18 @@ impl Ahead {
             }
             return n;
         }
+        self.copy_pieces(out, peek, after, shard)
+    }
+
+    /// [`copy_into`](Self::copy_into) from any number of pieces.
+    #[inline(never)]
+    fn copy_pieces(
+        &mut self,
+        out: &mut [u8],
+        peek: bool,
+        after: &mut After,
+        shard: Option<&Shard>,
+    ) -> usize {
         let mut n = 0;
         for piece in &self.pieces {
             let src = piece.filled();

@@ -47,6 +47,7 @@ pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
 /// Spends one operation of the budget for `poll`, or yields when it is spent:
 /// `Pending`, with the task woken to run again after the others. A `poll`
 /// that answers `Pending` gets its operation back.
+#[inline(always)]
 pub(crate) fn poll_budget<T>(
     cx: &mut Context<'_>,
     poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
@@ -55,20 +56,21 @@ pub(crate) fn poll_budget<T>(
     match left {
         Some(0) => {
             cx.waker().wake_by_ref();
-            Poll::Pending
+            return Poll::Pending;
         }
         Some(n) => {
             let _ = LEFT.try_with(|cell| cell.set(Some(n - 1)));
-            let result = poll(cx);
-            if result.is_pending() {
-                // No progress, nothing spent; read again, as `poll` may have
-                // run a nested poll with a budget of its own.
-                let _ = LEFT.try_with(|cell| cell.set(cell.get().map(|m| m.saturating_add(1))));
-            }
-            result
         }
-        None => poll(cx),
+        None => {}
     }
+    // One call of `poll`, so it is inlined here.
+    let result = poll(cx);
+    if left.is_some() && result.is_pending() {
+        // No progress, nothing spent; read again, as `poll` may have run a
+        // nested poll with a budget of its own.
+        let _ = LEFT.try_with(|cell| cell.set(cell.get().map(|m| m.saturating_add(1))));
+    }
+    result
 }
 
 /// Whether the current poll has budget left (always `true` outside a poll

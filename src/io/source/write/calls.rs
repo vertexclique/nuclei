@@ -72,6 +72,7 @@ impl Source {
 
     /// Polls the write side with `step` for the handle's own writes, given
     /// the way this thread reaches the descriptor.
+    #[inline(always)]
     fn poll_writing<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -82,6 +83,7 @@ impl Source {
 
     /// Polls the write side with `step`: for the handle's own writes when
     /// `drive`, else for its caller's calls.
+    #[inline(always)]
     fn poll_write_side<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -89,22 +91,26 @@ impl Source {
         mut step: impl FnMut(&mut WriteState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
         let mut after = After::default();
-        let polled = self.with_io(|io| {
-            self.write.poll(
-                &mut after,
-                cx.waker(),
-                &self.hooks_in(io.shard),
-                |st, after| {
-                    #[cfg(unix)]
-                    if drive {
-                        st.drive();
-                    }
-                    #[cfg(not(unix))]
-                    let _ = drive;
-                    step(st, io, cx.waker(), after)
-                },
-            )
-        });
+        let polled = self.with_io(
+            #[inline(always)]
+            |io| {
+                self.write.poll(
+                    &mut after,
+                    cx.waker(),
+                    &self.hooks_in(io.shard),
+                    #[inline(always)]
+                    |st, after| {
+                        #[cfg(unix)]
+                        if drive {
+                            st.drive();
+                        }
+                        #[cfg(not(unix))]
+                        let _ = drive;
+                        step(st, io, cx.waker(), after)
+                    },
+                )
+            },
+        );
         match polled {
             Ok(poll) => self.finish_poll(after, poll),
             Err(err) => {

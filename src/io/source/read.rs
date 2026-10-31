@@ -277,6 +277,7 @@ impl ReadState {
         self.lent.as_ref().is_some_and(|l| l.done.is_none())
     }
 
+    #[inline(always)]
     fn wait(&mut self, waker: &Waker, len: usize) {
         self.waiters.register(waker);
         self.want = self.want.max(len);
@@ -491,6 +492,7 @@ impl ReadState {
     /// listener's connections; a socket's datagrams (`len` each). Nothing
     /// while the last call would have blocked and no edge came since, or
     /// while a result waits to be taken.
+    #[inline]
     fn complete(&mut self, io: Io<'_>, kind: Kind, len: usize, after: &mut After) {
         match io.via {
             #[cfg(readiness)]
@@ -560,6 +562,7 @@ impl ReadState {
 
     /// A stream's completed read, copied out by `copy` (which peeks when
     /// `peek`); `None` when nothing is completed.
+    #[inline(always)]
     fn take_stream(
         &mut self,
         peek: bool,
@@ -861,6 +864,7 @@ impl ReadState {
 
     /// A stream read (or peek) into `out`: the driver reads into the pool
     /// first if the socket may hold bytes, and the task copies them out.
+    #[inline]
     fn read(
         &mut self,
         io: Io<'_>,
