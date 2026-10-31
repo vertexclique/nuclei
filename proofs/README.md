@@ -713,7 +713,10 @@ from where they stopped.
   write is out. Neither positional call reads or moves the cursor or the epoch; each waits first
   for the cursor writes accepted before it. The positional writer may go away while its write is
   out: the write still lands, the file keeps it (`orphans`), and a cursor write after that waits
-  for it.
+  for it. A change of a range of the file (`allocate`: reserve, punch a hole, zero) and each chunk
+  of a copy into the file (`copy_range_to`) are positional writes in this scenario: both go
+  through `Out` and `poll_ordered`, the file keeps one whose future went away, and the cut of
+  `set_len` moves the generation on as a positional write's end does.
 - **generation**: a cursor reader reads two cells through the read-ahead (a job reads ahead two
   cells), another one cell into its own buffer, while a task writes cell 1 at an offset of its
   own. When a positional write's task takes its end (or the file takes the end of one whose task
@@ -722,7 +725,8 @@ from where they stopped.
 - **sync**: the cursor writer's second copied write waits in the write-behind while the first is
   in flight, and a task syncs twice once both were accepted. A sync waits until the write-behind
   went out and every write in flight landed, then its job makes what the file holds durable, or
-  fails (the device may fail it); a failed sync makes every later one fail, with no call.
+  fails (the device may fail it); a failed sync makes every later one fail, with no call. The
+  sync of a range (`sync_range`) is such a sync with another call.
 - **direct**: the file is opened for direct IO: a read job reads exactly the cell asked for, and
   each copied write is one kernel write of exactly its bytes, which waits for the write in
   flight instead of joining the write-behind.
