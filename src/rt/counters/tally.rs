@@ -118,16 +118,20 @@ pub(crate) fn accepting<A>(result: &io::Result<A>) {
     }
 }
 
+/// [`read`] for a caller that found [`counting`] already.
+#[cold]
 #[inline(never)]
-fn add_read(bytes: usize) {
+pub(crate) fn add_read(bytes: usize) {
     CELLS.with(|c| {
         c.reads.set(c.reads.get() + 1);
         c.bytes_read.set(c.bytes_read.get() + bytes as u64);
     });
 }
 
+/// [`wrote`] for a caller that found [`counting`] already.
+#[cold]
 #[inline(never)]
-fn add_write(bytes: usize) {
+pub(crate) fn add_write(bytes: usize) {
     CELLS.with(|c| {
         c.writes.set(c.writes.get() + 1);
         c.bytes_written.set(c.bytes_written.get() + bytes as u64);

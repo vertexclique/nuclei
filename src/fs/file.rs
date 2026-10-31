@@ -152,8 +152,8 @@ impl<T: Ended> Work<T> {
             match end.error() {
                 Some(err) => crate::rt::counters::io_error(err),
                 None if tally::counting() => match self {
-                    Work::Pool(_, bytes) => tally::read(bytes(end)),
-                    Work::Written(_, bytes @ 1..) => tally::wrote(*bytes),
+                    Work::Pool(_, bytes) => tally::add_read(bytes(end)),
+                    Work::Written(_, bytes @ 1..) => tally::add_write(*bytes),
                     Work::Written(..) => {}
                     #[cfg(ring)]
                     Work::Slot(_) => {}
