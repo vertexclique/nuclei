@@ -26,7 +26,61 @@ pub(crate) struct Sched {
 // SAFETY: the remote path holds a waker of the task across the push, so
 // `self` (in the task's memory) stays alive until it is done with it.
 unsafe impl Schedule for Sched {
+    #[inline(always)]
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo) {
+        // A task woken on its own shard's thread, the common case, goes to its
+        // queue with no bracket to take: what the general path below does then.
+        if self.home.is_none() {
+            let here = context::local();
+            if let Some(shard) = context::running_inside(here)
+                && shard.is(&self.shard)
+            {
+                shard.push_local_from(runnable, info, here.in_task());
+                return;
+            }
+        }
+        self.schedule_elsewhere(runnable, info);
+    }
+
+    #[inline]
+    fn before_poll(&self, id: super::task::Id) {
+        if let Some(hooks) = &self.hooks {
+            super::tuning::call(hooks.before_poll.as_ref(), id);
+        }
+    }
+
+    #[inline]
+    fn after_poll(&self, id: super::task::Id) {
+        if let Some(hooks) = &self.hooks {
+            super::tuning::call(hooks.after_poll.as_ref(), id);
+        }
+    }
+
+    #[inline]
+    fn terminated(&self, id: super::task::Id) {
+        if let Some(hooks) = &self.hooks {
+            super::tuning::call(hooks.terminate.as_ref(), id);
+        }
+    }
+
+    fn panicked(&self, _id: super::task::Id) {
+        let runtime = self
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.shutdown.as_ref());
+        if let Some(runtime) = runtime.and_then(std::sync::Weak::upgrade) {
+            // In the middle of the task's change of state: nothing here may
+            // unwind.
+            super::task::abort_on_panic(|| runtime.shut_down_on_panic());
+        }
+    }
+}
+
+impl Sched {
+    /// [`Schedule::schedule`] for a bound task, or one woken anywhere but
+    /// inside its own shard.
+    #[inline(never)]
+    fn schedule_elsewhere(&self, runnable: Runnable, info: ScheduleInfo) {
         if let Some(home) = &self.home {
             let remote = context::current(|current| match current {
                 Some(shard) if context::is_home(home) || shard.owns_home(home) => {
@@ -57,36 +111,6 @@ unsafe impl Schedule for Sched {
             let keep = runnable.waker();
             self.shard.push_remote(runnable);
             drop(keep);
-        }
-    }
-
-    fn before_poll(&self, id: super::task::Id) {
-        if let Some(hooks) = &self.hooks {
-            super::tuning::call(hooks.before_poll.as_ref(), id);
-        }
-    }
-
-    fn after_poll(&self, id: super::task::Id) {
-        if let Some(hooks) = &self.hooks {
-            super::tuning::call(hooks.after_poll.as_ref(), id);
-        }
-    }
-
-    fn terminated(&self, id: super::task::Id) {
-        if let Some(hooks) = &self.hooks {
-            super::tuning::call(hooks.terminate.as_ref(), id);
-        }
-    }
-
-    fn panicked(&self, _id: super::task::Id) {
-        let runtime = self
-            .hooks
-            .as_ref()
-            .and_then(|hooks| hooks.shutdown.as_ref());
-        if let Some(runtime) = runtime.and_then(std::sync::Weak::upgrade) {
-            // In the middle of the task's change of state: nothing here may
-            // unwind.
-            super::task::abort_on_panic(|| runtime.shut_down_on_panic());
         }
     }
 }

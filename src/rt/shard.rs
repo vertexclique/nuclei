@@ -895,7 +895,14 @@ impl Shard {
     /// task being polled runs next (the LIFO slot), unless it is that task
     /// itself yielding.
     pub(crate) fn push_local(&self, runnable: Runnable, info: ScheduleInfo) {
-        if self.tuning.lifo && !info.woken_while_running && super::context::in_task() {
+        self.push_local_from(runnable, info, super::context::in_task());
+    }
+
+    /// [`push_local`](Self::push_local) from a caller that read
+    /// [`in_task`](super::context::in_task) already.
+    #[inline]
+    pub(crate) fn push_local_from(&self, runnable: Runnable, info: ScheduleInfo, in_task: bool) {
+        if self.tuning.lifo && !info.woken_while_running && in_task {
             if let Some(previous) = self.lifo.replace(Some(runnable)) {
                 self.queue.borrow_mut().push_back(previous);
             }

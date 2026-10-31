@@ -201,6 +201,29 @@ pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
     f(unsafe { shard.as_ref() })
 }
 
+/// The shard this thread runs, when a call into it from here needs no
+/// bracket (the thread is inside it, or no monitor watches it): what
+/// [`current`] would hand its closure, without the closure. `None` where
+/// [`current`] has to be asked.
+#[inline(always)]
+pub(crate) fn running_inside(here: &Here) -> Option<&Shard> {
+    if here.inside.get() || here.slot.get().is_null() {
+        // SAFETY: as in `current`.
+        unsafe { here.current.get().as_ref() }
+    } else {
+        None
+    }
+}
+
+impl Here {
+    /// Whether a task's poll (or a `block_on` future's) is on this thread's
+    /// stack ([`in_task`]).
+    #[inline(always)]
+    pub(crate) fn in_task(&self) -> bool {
+        self.in_task.get()
+    }
+}
+
 /// Runs `f` with the shard whose driver this thread may use now: the one
 /// it runs, or else its own, which no other thread ever runs.
 #[cfg(ring)]
