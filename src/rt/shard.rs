@@ -904,7 +904,7 @@ impl Shard {
 
     /// [`push_local`](Self::push_local) from a caller that read
     /// [`in_task`](super::context::in_task) already.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn push_local_from(&self, runnable: Runnable, info: ScheduleInfo, in_task: bool) {
         if self.tuning.lifo && !info.woken_while_running && in_task {
             if let Some(previous) = self.lifo.replace(Some(runnable)) {
@@ -916,7 +916,7 @@ impl Shard {
     }
 
     /// The next runnable, in the loop's order.
-    #[inline]
+    #[inline(always)]
     fn next(&self) -> Option<Runnable> {
         let left = self.until_inbox.get().wrapping_sub(1);
         if left == 0 {
@@ -940,6 +940,7 @@ impl Shard {
         local.or_else(|| self.pop_inbox())
     }
 
+    #[inline(never)]
     fn pop_inbox(&self) -> Option<Runnable> {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
