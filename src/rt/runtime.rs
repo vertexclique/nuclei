@@ -31,7 +31,7 @@ use super::blocking::{Pool, PoolConfig};
 use super::context;
 use super::sched::{AtHome, Counted, Sched};
 use super::shard::{Limits, Shard, Shared};
-use super::task::{self, Task};
+use super::task::{self, ScheduleInfo, Task};
 use super::workers::{Start, Workers};
 
 mod enter;
@@ -787,7 +787,10 @@ where
         },
     );
     spawned(hooks.as_deref(), &task);
-    runnable.schedule();
+    // As its schedule would, without the turn through the task's table.
+    if let Some(runnable) = super::sched::queue_here(shard, runnable, ScheduleInfo::new(false)) {
+        runnable.schedule();
+    }
     task
 }
 

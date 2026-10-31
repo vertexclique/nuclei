@@ -28,17 +28,14 @@ pub(crate) struct Sched {
 unsafe impl Schedule for Sched {
     #[inline(always)]
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo) {
-        // A task woken on its own shard's thread, the common case, goes to its
-        // queue with no bracket to take: what the general path below does then.
-        if self.home.is_none() {
-            let here = context::local();
-            if let Some(shard) = context::running_inside(here)
-                && shard.is(&self.shard)
-            {
-                shard.push_local_from(runnable, info, here.in_task());
-                return;
+        let runnable = if self.home.is_none() {
+            match queue_here(&self.shard, runnable, info) {
+                Some(runnable) => runnable,
+                None => return,
             }
-        }
+        } else {
+            runnable
+        };
         self.schedule_elsewhere(runnable, info);
     }
 
@@ -73,6 +70,26 @@ unsafe impl Schedule for Sched {
             // unwind.
             super::task::abort_on_panic(|| runtime.shut_down_on_panic());
         }
+    }
+}
+
+/// Queues `runnable`, of a task of `shard` that is not bound to a thread, on
+/// that shard if this thread runs it and needs no bracket to reach it (the
+/// common case, a task woken or spawned on its own shard's thread): what
+/// [`Sched::schedule`]'s general path does then. Hands it back otherwise.
+#[inline(always)]
+pub(crate) fn queue_here(
+    shard: &Arc<Shared>,
+    runnable: Runnable,
+    info: ScheduleInfo,
+) -> Option<Runnable> {
+    let here = context::local();
+    match context::running_inside(here) {
+        Some(current) if current.is(shard) => {
+            current.push_local_from(runnable, info, here.in_task());
+            None
+        }
+        _ => Some(runnable),
     }
 }
 
