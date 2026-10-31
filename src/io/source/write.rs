@@ -772,6 +772,9 @@ impl WriteState {
         after: &mut After,
     ) -> Poll<io::Result<()>> {
         if let Some(result) = self.connected.take() {
+            // A connect that failed is forgotten, so the next poll makes
+            // another (a Unix connect waits out a full backlog so).
+            self.connect_started &= result.is_ok();
             return Poll::Ready(result);
         }
         if !self.connect_started {
@@ -790,6 +793,7 @@ impl WriteState {
                             after.register = true;
                         }
                         Err(err) => {
+                            self.connect_started = false;
                             crate::rt::counters::io_error(&err);
                             return Poll::Ready(Err(err));
                         }

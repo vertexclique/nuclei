@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **A Unix connect to a full backlog no longer holds a thread of the blocking pool.** Linux answers
+  it `EAGAIN`, and the connect went to a blocking connect of a new socket on the pool, which a
+  dropped future never stopped, and which lost the options set on the caller's socket. It now
+  connects again on its own socket after a pause on a timer (1 ms, doubled up to 64 ms), until the
+  listener takes it, as std's blocking connect waits; a drop frees everything
+  (`proofs/tla/connect`).
 - **A runtime's drop whose bound runs out no longer drops a linger it was running.** The drop
   runs what dropped handles left for at most the linger time, and a linger it had started then was
   dropped with its run, closing the stream with the bytes behind never sent. It now goes on on a

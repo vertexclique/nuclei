@@ -484,23 +484,6 @@ pub(crate) fn connect_unix(fd: RawFd, addr: &UnixAddr) -> io::Result<bool> {
     connect_raw(fd, addr.as_ptr(), addr.len)
 }
 
-/// A Unix stream connected to `addr` by a connect that waits: what a full
-/// backlog leaves, made on the blocking pool.
-pub(crate) fn connect_unix_waiting(addr: &UnixAddr) -> io::Result<OwnedFd> {
-    use std::os::fd::AsRawFd;
-    let socket = socket(libc::AF_UNIX, libc::SOCK_STREAM)?;
-    let fd = socket.as_raw_fd();
-    // SAFETY: plain fcntl calls on our own descriptor.
-    unsafe {
-        let flags = cvt_int(libc::fcntl(fd, libc::F_GETFL))?;
-        cvt_int(libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK))?;
-        // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
-        retry(|| cvt_int(libc::connect(fd, addr.as_ptr(), addr.len)))?;
-        cvt_int(libc::fcntl(fd, libc::F_SETFL, flags))?;
-    }
-    Ok(socket)
-}
-
 /// A Unix socket address in its raw form: a path, or on Linux an
 /// abstract name. Made once on the caller's stack and copied by value, so
 /// no send, connect or bind allocates for its address.
