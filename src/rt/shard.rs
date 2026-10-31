@@ -128,6 +128,8 @@ pub(crate) struct Shared {
     /// A worker's shard: its runtime, inside which a task of the shard woken
     /// on another thread after the shard stopped is dropped.
     runtime: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
+    /// The address of that runtime, 0 for none: compared, never followed.
+    runtime_addr: AtomicUsize,
     /// File writes issued on the shard whose end's wake has not gone yet.
     writes: AtomicUsize,
     /// The shard drained its inbox for the last time as it was dropped, and
@@ -349,7 +351,10 @@ impl Shared {
 
     /// Makes `runtime` the one this worker's shard belongs to.
     pub(crate) fn set_runtime(&self, runtime: std::sync::Weak<super::runtime::Inner>) {
-        let _ = self.runtime.set(runtime);
+        let addr = runtime.as_ptr() as usize;
+        if self.runtime.set(runtime).is_ok() {
+            self.runtime_addr.store(addr, Ordering::Release);
+        }
     }
 
     /// Sets the shard's runtime on this thread, unless it is set already:
@@ -358,11 +363,11 @@ impl Shared {
     /// handle's bytes) goes to its runtime (`rt::linger`).
     #[inline]
     pub(crate) fn enter_runtime(&self) -> Option<super::context::RuntimeSet> {
-        let runtime = self.runtime.get()?;
-        if super::context::runtime_is(runtime.as_ptr()) {
+        let addr = self.runtime_addr.load(Ordering::Acquire);
+        if addr == 0 || super::context::runtime_is(addr as *const super::runtime::Inner) {
             return None;
         }
-        Self::set_runtime_here(runtime)
+        Self::set_runtime_here(self.runtime.get()?)
     }
 
     #[inline(never)]
@@ -765,6 +770,7 @@ impl Shard {
             io_closed: AtomicBool::new(false),
             counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
             runtime: std::sync::OnceLock::new(),
+            runtime_addr: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             released: AtomicBool::new(false),
             timer_at: AtomicU64::new(u64::MAX),
