@@ -9,10 +9,11 @@
 //! last byte, and the task gets the receiver the last hold hands the buffer back through.
 
 use super::*;
+use crate::buf::owned::OwnedBuf;
 
 /// A task's own buffer, lent to the side for the driver to write out.
 pub(super) struct Lent {
-    pub(super) buf: Vec<u8>,
+    pub(super) buf: OwnedBuf,
     /// Bytes the kernel took.
     pub(super) sent: usize,
     /// The write's result, once all of it went out or it failed.
@@ -39,20 +40,20 @@ pub(super) struct Lent {
     /// Once a send of it went out zero-copy: the buffer, shared with the sends the kernel may
     /// still read it for (`buf` is empty), and the receiver that hands it back to the task.
     #[cfg(ring)]
-    pub(super) pinned: Option<(Pinned, oneshot::Receiver<Vec<u8>>)>,
+    pub(super) pinned: Option<(Pinned, oneshot::Receiver<OwnedBuf>)>,
 }
 
 /// A lent write's buffer on its task's side: the buffer while the task has it, and once a
 /// zero-copy send shares it, the receiver it comes back through.
 #[derive(Default)]
 pub(crate) struct Held {
-    pub(crate) buf: Option<Vec<u8>>,
+    pub(crate) buf: Option<OwnedBuf>,
     #[cfg(ring)]
-    back: Option<oneshot::Receiver<Vec<u8>>>,
+    back: Option<oneshot::Receiver<OwnedBuf>>,
 }
 
 impl Held {
-    pub(crate) fn of(buf: Vec<u8>) -> Self {
+    pub(crate) fn of(buf: OwnedBuf) -> Self {
         Self {
             buf: Some(buf),
             #[cfg(ring)]
@@ -71,7 +72,7 @@ impl Held {
 
     /// What a zero-copy write gives its task once it ended: the buffer, or what hands it back.
     #[cfg(ring)]
-    pub(crate) fn released(&mut self) -> crate::net::Released {
+    pub(crate) fn released<B>(&mut self) -> crate::net::Released<B> {
         if let Some(back) = self.back.take() {
             return crate::net::Released::waiting(back);
         }

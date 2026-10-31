@@ -20,6 +20,7 @@
 use std::io;
 
 use super::{Kind, Lent, WriteState};
+use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::ops::{Answer, Done, Outcome, Want};
@@ -291,7 +292,7 @@ impl WriteState {
     /// went out is withdrawn.
     fn lent_back(
         &mut self,
-        buf: Option<Vec<u8>>,
+        buf: Option<OwnedBuf>,
         answer: Answer<usize>,
         stale: bool,
         after: &mut After,

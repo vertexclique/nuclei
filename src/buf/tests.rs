@@ -333,3 +333,6 @@ fn a_waiter_on_a_pool_holding_only_its_reservation_is_woken_at_once() {
     pool.wait_for_return(w);
     assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+mod aligned;
+mod owned;

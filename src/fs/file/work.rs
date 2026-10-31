@@ -14,6 +14,7 @@ use std::future::Future;
 use std::io;
 
 use super::FileIo;
+use crate::buf::owned::OwnedBuf;
 use crate::buf::{LARGEST, PoolBuf, with_pool};
 use crate::fs::call::{self, FileOutcome, SlotJob};
 use crate::io::side::After;
@@ -71,7 +72,7 @@ impl<T> Ended for io::Result<T> {
     }
 }
 
-impl<T> Ended for (io::Result<T>, Vec<u8>) {
+impl<T> Ended for (io::Result<T>, OwnedBuf) {
     fn error(&self) -> Option<&io::Error> {
         self.0.as_ref().err()
     }
@@ -89,7 +90,7 @@ pub(super) struct Job<T> {
 /// A read job at the cursor into a task's own buffer, which comes back
 /// with the result.
 pub(super) struct LentRead {
-    pub(super) task: Work<(io::Result<usize>, Vec<u8>)>,
+    pub(super) task: Work<(io::Result<usize>, OwnedBuf)>,
     pub(super) at: u64,
     pub(super) epoch: u64,
     pub(super) generation: u64,
@@ -102,12 +103,12 @@ pub(super) enum Writing {
     /// From a buffer of the pool.
     Pool(Work<io::Result<()>>),
     /// From a task's own buffer, which comes back with the result.
-    Lent(Work<(io::Result<()>, Vec<u8>)>),
+    Lent(Work<(io::Result<()>, OwnedBuf)>),
     /// At the end of a file opened to append, ending with the file's offset
     /// after it.
     Append(Work<io::Result<u64>>),
     /// As `Append`, from a task's own buffer.
-    AppendLent(Work<(io::Result<u64>, Vec<u8>)>),
+    AppendLent(Work<(io::Result<u64>, OwnedBuf)>),
 }
 
 /// A write from a task's own buffer, from its submission until its task
@@ -119,7 +120,7 @@ pub(super) enum Lent {
     /// In flight, its task waiting.
     Out,
     /// Done, for its task to take.
-    Done(io::Result<()>, Vec<u8>),
+    Done(io::Result<()>, OwnedBuf),
     /// In flight, its task gone: the buffer is dropped when it lands.
     Orphan,
 }
@@ -288,9 +289,9 @@ impl FileIo {
     /// bytes it holds.
     pub(super) fn submit_read_owned(
         &self,
-        buf: Vec<u8>,
+        buf: OwnedBuf,
         at: u64,
-    ) -> Work<(io::Result<usize>, Vec<u8>)> {
+    ) -> Work<(io::Result<usize>, OwnedBuf)> {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::read_lent(&self.fd, at, buf) {
@@ -317,10 +318,10 @@ impl FileIo {
     /// wakes `waker` when it ends.
     pub(super) fn submit_pwrite_owned(
         &self,
-        buf: Vec<u8>,
+        buf: OwnedBuf,
         at: u64,
         waker: &Waker,
-    ) -> Work<(io::Result<()>, Vec<u8>)> {
+    ) -> Work<(io::Result<()>, OwnedBuf)> {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::write_lent(&self.fd, at, buf) {
@@ -343,7 +344,7 @@ impl FileIo {
     /// The cursor's write of all of a task's `buf` at `at`, or at the end of
     /// a file opened to append; a write the pool makes wakes `waker` when it
     /// ends.
-    pub(super) fn submit_write_owned(&self, buf: Vec<u8>, at: u64, waker: &Waker) -> Writing {
+    pub(super) fn submit_write_owned(&self, buf: OwnedBuf, at: u64, waker: &Waker) -> Writing {
         if self.append {
             let fd = self.fd.clone();
             return Writing::AppendLent(Work::Slot(call::write_on_pool(

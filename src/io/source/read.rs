@@ -30,6 +30,7 @@ use std::io;
 #[cfg(readiness)]
 use std::os::fd::RawFd;
 
+use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Owned;
 use std::sync::Arc;
 use std::task::Context;
@@ -63,7 +64,7 @@ enum Datagram {
     #[cfg(ring)]
     Ring(crate::rt::shard::recv::RingChunk),
     Owned {
-        buf: Vec<u8>,
+        buf: OwnedBuf,
         start: usize,
     },
 }
@@ -89,11 +90,8 @@ impl Datagram {
 
     /// Appends the datagram to `out`, cut to its spare capacity as the
     /// kernel cuts it.
-    fn append_to(&self, out: &mut Vec<u8>) -> usize {
-        let src = self.bytes();
-        let n = src.len().min(out.capacity() - out.len());
-        out.extend_from_slice(&src[..n]);
-        n
+    fn append_to(&self, out: &mut OwnedBuf) -> usize {
+        out.append(self.bytes())
     }
 
     #[cfg_attr(
@@ -125,7 +123,7 @@ enum Peer {
 
 /// A task's own buffer, lent to the side for the driver to read into.
 struct Lent {
-    buf: Vec<u8>,
+    buf: OwnedBuf,
     /// What the buffer held before: the read's bytes start here.
     from: usize,
     /// The read's result, once the driver made it.
@@ -893,7 +891,7 @@ impl ReadState {
         &mut self,
         io: Io<'_>,
         kind: Kind,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Option<OwnedBuf>,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -963,7 +961,7 @@ impl ReadState {
         &mut self,
         io: Io<'_>,
         kind: Kind,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Option<OwnedBuf>,
         from: &mut Option<Addr>,
         waker: &Waker,
         after: &mut After,
@@ -1086,7 +1084,7 @@ impl ReadState {
     }
 
     /// The lent buffer back, as it is, for a poll that ends in an error.
-    fn reclaim(&mut self, after: &mut After) -> Option<Vec<u8>> {
+    fn reclaim(&mut self, after: &mut After) -> Option<OwnedBuf> {
         if self.lent.as_ref().is_some_and(|l| l.out) {
             // Out with a ring operation, it cannot come back now: its
             // completion hands what came to the read-ahead.

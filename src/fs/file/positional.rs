@@ -21,6 +21,7 @@
 //! `ReadFile` or `WriteFile` at the offset its `OVERLAPPED` names).
 //! `proofs/tla/lent/LentFile.tla` (scenario "positional") checks the rules.
 
+use crate::buf::owned::{IoBuf, IoBufMut, OwnedBuf};
 use core::future::poll_fn;
 use core::task::{Context, Poll, Waker};
 use std::fs::File as StdFile;
@@ -78,26 +79,35 @@ impl FileIo {
         poll_fn(|cx| out.poll(cx)).await.map(|()| n)
     }
 
-    pub(crate) async fn read_at_owned(
+    pub(crate) async fn read_at_owned<B>(
         self: &Arc<Self>,
-        buf: Vec<u8>,
+        buf: B,
         at: u64,
-    ) -> (io::Result<usize>, Vec<u8>) {
+    ) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
+        let buf = OwnedBuf::filled(buf);
         if buf.len() == buf.capacity() {
-            return (Ok(0), buf);
+            return (Ok(0), buf.into_filled());
         }
         poll_fn(|cx| self.poll_ordered(cx)).await;
         let mut job = self.submit_read_owned(buf, at);
-        poll_fn(|cx| job.poll(cx.waker())).await
+        let (result, buf) = poll_fn(|cx| job.poll(cx.waker())).await;
+        (result, buf.into_filled())
     }
 
-    pub(crate) async fn write_at_owned(
+    pub(crate) async fn write_at_owned<B>(
         self: &Arc<Self>,
-        buf: Vec<u8>,
+        buf: B,
         at: u64,
-    ) -> (io::Result<usize>, Vec<u8>) {
+    ) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
+        let buf = OwnedBuf::written(buf);
         if buf.is_empty() {
-            return (Ok(0), buf);
+            return (Ok(0), buf.into_written());
         }
         poll_fn(|cx| self.poll_ordered(cx)).await;
         let len = buf.len();
@@ -106,7 +116,7 @@ impl FileIo {
             work: Some(self.submit_pwrite_owned(buf, at, Waker::noop())),
         };
         let (result, buf) = poll_fn(|cx| out.poll(cx)).await;
-        (result.map(|()| len), buf)
+        (result.map(|()| len), buf.into_written())
     }
 
     /// Leaves `orphan`, a positional write whose task went away, to the
@@ -282,9 +292,14 @@ impl Handle<StdFile> {
     /// `buf` back with how many bytes came: zero at the end of the file, or
     /// when `buf` has no spare capacity. The bytes are read into `buf`
     /// itself, never copied; on a file opened for direct IO the kernel's
-    /// alignment rules apply to `buf`'s own memory, which is the caller's to
-    /// align. Otherwise as [`read_at`](Self::read_at).
-    pub async fn read_at_owned(&self, buf: Vec<u8>, offset: u64) -> (io::Result<usize>, Vec<u8>) {
+    /// alignment rules apply to `buf`'s own memory, which an
+    /// [`AlignedBuf`](crate::io::AlignedBuf) aligns. `buf` is any
+    /// [`IoBufMut`](crate::io::IoBufMut). Otherwise as
+    /// [`read_at`](Self::read_at).
+    pub async fn read_at_owned<B>(&self, buf: B, offset: u64) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
         match self.file() {
             Ok(file) => file.read_at_owned(buf, offset).await,
             Err(err) => (Err(err), buf),
@@ -294,10 +309,15 @@ impl Handle<StdFile> {
     /// Writes all of `buf` at `offset` and gives it back with its length
     /// once the bytes landed. They are written from `buf` itself, never
     /// copied; on a file opened for direct IO the kernel's alignment rules
-    /// apply to `buf`'s own memory, which is the caller's to align. If the
-    /// future is dropped while the write is out, it still lands, `buf` going
-    /// with it. Otherwise as [`write_at`](Self::write_at).
-    pub async fn write_at_owned(&self, buf: Vec<u8>, offset: u64) -> (io::Result<usize>, Vec<u8>) {
+    /// apply to `buf`'s own memory, which an
+    /// [`AlignedBuf`](crate::io::AlignedBuf) aligns. If the future is dropped
+    /// while the write is out, it still lands, `buf` going with it. `buf` is
+    /// any [`IoBuf`](crate::io::IoBuf). Otherwise as
+    /// [`write_at`](Self::write_at).
+    pub async fn write_at_owned<B>(&self, buf: B, offset: u64) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
         match self.file() {
             Ok(file) => file.write_at_owned(buf, offset).await,
             Err(err) => (Err(err), buf),

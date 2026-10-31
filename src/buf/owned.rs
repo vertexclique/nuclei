@@ -1,0 +1,397 @@
+//! The caller's own buffers that owned calls read into and write from
+//! ([`IoBuf`], [`IoBufMut`]), and the one form the runtime keeps them in
+//! while a call has them ([`OwnedBuf`]).
+//!
+//! An owned call takes the caller's buffer by value and gives it back with
+//! its result, so the kernel reads or writes the caller's memory and no
+//! byte is copied. While the call has the buffer, the runtime holds it as
+//! an [`OwnedBuf`]: a `Vec<u8>` or an [`AlignedBuf`] as it is, any other type
+//! boxed once. The call's code then works on that one type wherever the
+//! buffer goes (a ring operation, a job of the blocking pool, a side's lent
+//! read or write), and the buffer comes back as the caller's own type.
+//!
+//! A buffer that cannot come back (the call failed while the kernel still
+//! held it, so the runtime keeps it until the kernel is done) is answered
+//! with an empty one, its type's [`Default`].
+
+use core::any::{Any, TypeId};
+use core::mem::{ManuallyDrop, MaybeUninit};
+use core::panic::AssertUnwindSafe;
+
+use super::aligned::AlignedBuf;
+
+/// A buffer an owned write takes: memory at an address that does not move
+/// while the runtime holds the buffer, whose first
+/// [`bytes_init`](Self::bytes_init) bytes are written.
+///
+/// Implemented for `Vec<u8>` and [`AlignedBuf`]; a caller's own type (a
+/// shared byte buffer, memory of a registered region) may implement it too.
+/// It is `Send` and `Sync`, since the runtime may hand it to another thread
+/// and several zero-copy sends read it at once, and its [`Default`] is the
+/// empty buffer a call gives back when the caller's own cannot come back.
+///
+/// # Safety
+///
+/// [`stable_ptr`](Self::stable_ptr) is never null and points at
+/// [`bytes_total`](Self::bytes_total) bytes of memory, the first [`bytes_init`](Self::bytes_init) of them
+/// initialized, which stay valid and in place while the value is not used
+/// through `&mut` or dropped, even when the value itself moves: the kernel
+/// may read them after the value moved into the runtime.
+/// `bytes_init() <= bytes_total()`.
+pub unsafe trait IoBuf: Default + Send + Sync + 'static {
+    /// The address of the buffer's first byte.
+    fn stable_ptr(&self) -> *const u8;
+
+    /// How many bytes from the start hold data: what a write sends.
+    fn bytes_init(&self) -> usize;
+
+    /// How many bytes the buffer's memory holds in all.
+    fn bytes_total(&self) -> usize;
+}
+
+/// A buffer an owned read fills: an [`IoBuf`] whose memory past the bytes
+/// it holds may be written, and told how many hold data after a read.
+///
+/// # Safety
+///
+/// As [`IoBuf`]; and [`stable_mut_ptr`](Self::stable_mut_ptr) points at the
+/// same memory, writable for all [`bytes_total`](IoBuf::bytes_total) bytes.
+pub unsafe trait IoBufMut: IoBuf {
+    /// The address of the buffer's first byte, for writing.
+    fn stable_mut_ptr(&mut self) -> *mut u8;
+
+    /// Sets how many bytes from the start hold data to `pos` (the runtime
+    /// calls it with a smaller count too, never below what the caller
+    /// handed in).
+    ///
+    /// # Safety
+    ///
+    /// `pos <= bytes_total()`, and the first `pos` bytes are initialized.
+    unsafe fn set_init(&mut self, pos: usize);
+}
+
+// SAFETY: a vector's heap memory does not move with the vector, and its
+// first `len` bytes of `capacity` are initialized.
+unsafe impl IoBuf for Vec<u8> {
+    fn stable_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len()
+    }
+
+    fn bytes_total(&self) -> usize {
+        self.capacity()
+    }
+}
+
+// SAFETY: as for `IoBuf`; the whole capacity is writable.
+unsafe impl IoBufMut for Vec<u8> {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    unsafe fn set_init(&mut self, pos: usize) {
+        // SAFETY: the caller's: `pos` is within the capacity and initialized.
+        unsafe { self.set_len(pos) }
+    }
+}
+
+/// `value` as a `U`, when `T` is `U`.
+fn cast<T, U>(value: T) -> Result<U, T>
+where
+    T: 'static,
+    U: 'static,
+{
+    if TypeId::of::<T>() != TypeId::of::<U>() {
+        return Err(value);
+    }
+    let value = ManuallyDrop::new(value);
+    // SAFETY: `T` and `U` are one type, and the value is never dropped as a
+    // `T`, so it is moved, not copied.
+    Ok(unsafe { core::ptr::read((&raw const *value).cast::<U>()) })
+}
+
+/// A caller's buffer of a type of its own, boxed while the runtime holds it.
+pub(crate) trait Kept: Any + Send + Sync {
+    fn ptr(&self) -> *const u8;
+    fn mut_ptr(&mut self) -> *mut u8;
+    fn init(&self) -> usize;
+    fn total(&self) -> usize;
+    /// # Safety
+    ///
+    /// As [`IoBufMut::set_init`].
+    unsafe fn set_init(&mut self, pos: usize);
+}
+
+/// The buffer of a write: nothing is ever read into it, so its room past
+/// the bytes it holds is none.
+struct Written<B>(B);
+
+impl<B> Kept for Written<B>
+where
+    B: IoBuf,
+{
+    fn ptr(&self) -> *const u8 {
+        self.0.stable_ptr()
+    }
+
+    fn mut_ptr(&mut self) -> *mut u8 {
+        // Never written through: the buffer has no room past its bytes.
+        self.0.stable_ptr().cast_mut()
+    }
+
+    fn init(&self) -> usize {
+        self.0.bytes_init()
+    }
+
+    fn total(&self) -> usize {
+        self.0.bytes_init()
+    }
+
+    unsafe fn set_init(&mut self, _pos: usize) {}
+}
+
+/// The buffer of a read.
+struct Filled<B>(B);
+
+impl<B> Kept for Filled<B>
+where
+    B: IoBufMut,
+{
+    fn ptr(&self) -> *const u8 {
+        self.0.stable_ptr()
+    }
+
+    fn mut_ptr(&mut self) -> *mut u8 {
+        self.0.stable_mut_ptr()
+    }
+
+    fn init(&self) -> usize {
+        self.0.bytes_init()
+    }
+
+    fn total(&self) -> usize {
+        self.0.bytes_total()
+    }
+
+    unsafe fn set_init(&mut self, pos: usize) {
+        // SAFETY: the caller's.
+        unsafe { self.0.set_init(pos) }
+    }
+}
+
+/// A caller's buffer while an owned call holds it: what the call reads into
+/// or writes from, in one type wherever the call goes. It reads as a `Vec<u8>`
+/// does: its bytes, its spare capacity, and the count of bytes it holds.
+pub(crate) enum OwnedBuf {
+    Vec(Vec<u8>),
+    Aligned(AlignedBuf),
+    /// Boxed: unwind safe as a `Vec<u8>` is, since a panic leaves no
+    /// invariant of the caller's buffer half made that the runtime relies on.
+    Other(AssertUnwindSafe<Box<dyn Kept>>),
+}
+
+impl Default for OwnedBuf {
+    fn default() -> Self {
+        OwnedBuf::Vec(Vec::new())
+    }
+}
+
+impl OwnedBuf {
+    /// The buffer of a write; a `Vec<u8>` or an [`AlignedBuf`] as it is.
+    pub(crate) fn written<B>(buf: B) -> Self
+    where
+        B: IoBuf,
+    {
+        match cast::<B, Vec<u8>>(buf) {
+            Ok(vec) => OwnedBuf::Vec(vec),
+            Err(buf) => match cast::<B, AlignedBuf>(buf) {
+                Ok(aligned) => OwnedBuf::Aligned(aligned),
+                Err(buf) => OwnedBuf::Other(AssertUnwindSafe(Box::new(Written(buf)))),
+            },
+        }
+    }
+
+    /// The buffer of a read; a `Vec<u8>` or an [`AlignedBuf`] as it is.
+    pub(crate) fn filled<B>(buf: B) -> Self
+    where
+        B: IoBufMut,
+    {
+        match cast::<B, Vec<u8>>(buf) {
+            Ok(vec) => OwnedBuf::Vec(vec),
+            Err(buf) => match cast::<B, AlignedBuf>(buf) {
+                Ok(aligned) => OwnedBuf::Aligned(aligned),
+                Err(buf) => OwnedBuf::Other(AssertUnwindSafe(Box::new(Filled(buf)))),
+            },
+        }
+    }
+
+    /// The caller's buffer of a write back, as the type it was handed in
+    /// as; an empty one if the call could not give it back.
+    pub(crate) fn into_written<B>(self) -> B
+    where
+        B: IoBuf,
+    {
+        self.into_caller::<B, Written<B>>(|kept| kept.0)
+    }
+
+    /// The caller's buffer of a read back, holding the bytes read into it.
+    pub(crate) fn into_filled<B>(self) -> B
+    where
+        B: IoBufMut,
+    {
+        self.into_caller::<B, Filled<B>>(|kept| kept.0)
+    }
+
+    fn into_caller<B, K>(self, unwrap: fn(K) -> B) -> B
+    where
+        B: IoBuf,
+        K: Kept,
+    {
+        match self {
+            OwnedBuf::Vec(vec) => cast::<Vec<u8>, B>(vec).unwrap_or_default(),
+            OwnedBuf::Aligned(aligned) => cast::<AlignedBuf, B>(aligned).unwrap_or_default(),
+            OwnedBuf::Other(AssertUnwindSafe(kept)) => {
+                let kept: Box<dyn Any> = kept;
+                kept.downcast::<K>()
+                    .map_or_else(|_| B::default(), |k| unwrap(*k))
+            }
+        }
+    }
+
+    /// How many bytes it holds.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            OwnedBuf::Vec(vec) => vec.len(),
+            OwnedBuf::Aligned(aligned) => aligned.len(),
+            OwnedBuf::Other(kept) => kept.init(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many bytes its memory holds in all (for a write's buffer, the
+    /// bytes it holds).
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            OwnedBuf::Vec(vec) => vec.capacity(),
+            OwnedBuf::Aligned(aligned) => aligned.capacity(),
+            OwnedBuf::Other(kept) => kept.total(),
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            OwnedBuf::Vec(vec) => vec.as_mut_ptr(),
+            OwnedBuf::Aligned(aligned) => aligned.as_mut_ptr(),
+            OwnedBuf::Other(kept) => kept.mut_ptr(),
+        }
+    }
+
+    /// Its memory past the bytes it holds.
+    pub(crate) fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        match self {
+            OwnedBuf::Vec(vec) => vec.spare_capacity_mut(),
+            OwnedBuf::Aligned(aligned) => aligned.spare_capacity_mut(),
+            OwnedBuf::Other(kept) => {
+                let (len, total) = (kept.init(), kept.total());
+                if len >= total {
+                    return &mut [];
+                }
+                // SAFETY: the buffer's memory holds `total` bytes, writable
+                // past the `len` that hold data (a write's has none).
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        kept.mut_ptr().add(len).cast::<MaybeUninit<u8>>(),
+                        total - len,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Sets how many bytes it holds to `len`.
+    ///
+    /// # Safety
+    ///
+    /// `len <= capacity()`, and the first `len` bytes are initialized.
+    pub(crate) unsafe fn set_len(&mut self, len: usize) {
+        match self {
+            // SAFETY: the caller's.
+            OwnedBuf::Vec(vec) => unsafe { vec.set_len(len) },
+            // SAFETY: the caller's.
+            OwnedBuf::Aligned(aligned) => unsafe { aligned.set_len(len) },
+            // SAFETY: the caller's.
+            OwnedBuf::Other(kept) => unsafe { kept.set_init(len) },
+        }
+    }
+
+    /// Keeps only its first `len` bytes.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if len < self.len() {
+            // SAFETY: fewer bytes than it holds, so all initialized.
+            unsafe { self.set_len(len) };
+        }
+    }
+
+    /// Copies as much of `bytes` as its spare capacity holds onto its end;
+    /// returns how many.
+    pub(crate) fn append(&mut self, bytes: &[u8]) -> usize {
+        let len = self.len();
+        let spare = self.spare_capacity_mut();
+        let n = bytes.len().min(spare.len());
+        for (to, from) in spare.iter_mut().zip(&bytes[..n]) {
+            to.write(*from);
+        }
+        // SAFETY: the `n` bytes after the first `len` were just written.
+        unsafe { self.set_len(len + n) };
+        n
+    }
+
+    /// Zeroes its spare capacity and lends it as bytes; how many it holds is
+    /// left as it was.
+    pub(crate) fn spare_zeroed(&mut self) -> &mut [u8] {
+        let len = self.len();
+        let room = self.capacity().saturating_sub(len);
+        if room == 0 {
+            return &mut [];
+        }
+        let ptr = self.as_mut_ptr();
+        // SAFETY: the `room` bytes past the first `len` are the buffer's own
+        // writable memory; zeroed, they are initialized.
+        unsafe {
+            core::ptr::write_bytes(ptr.add(len), 0, room);
+            core::slice::from_raw_parts_mut(ptr.add(len), room)
+        }
+    }
+}
+
+impl core::ops::Deref for OwnedBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            OwnedBuf::Vec(vec) => vec,
+            OwnedBuf::Aligned(aligned) => aligned,
+            OwnedBuf::Other(kept) if kept.init() == 0 => &[],
+            // SAFETY: the first `init` bytes of the buffer's memory hold
+            // data.
+            OwnedBuf::Other(kept) => unsafe {
+                core::slice::from_raw_parts(kept.ptr(), kept.init())
+            },
+        }
+    }
+}
+
+impl core::fmt::Debug for OwnedBuf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OwnedBuf")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}

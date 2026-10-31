@@ -6,8 +6,10 @@
 //! the in-memory pipes [`duplex`] and [`simplex`], [`split`], [`empty`],
 //! [`repeat`] and [`sink`], the process's [`stdin`], [`stdout`] and
 //! [`stderr`], what the sockets' readiness calls take and answer
-//! ([`Interest`], [`Ready`]), and on unix [`AsyncFd`](unix::AsyncFd), a
-//! caller's own descriptor driven by readiness.
+//! ([`Interest`], [`Ready`]), the caller's own buffers the owned calls take
+//! and give back ([`IoBuf`], [`IoBufMut`], [`AlignedBuf`]), and on unix
+//! [`AsyncFd`](unix::AsyncFd), a caller's own descriptor driven by
+//! readiness.
 //!
 //! Inside, the shards' half of IO: sources, the drivers' half of every
 //! handle, and the system calls they make. A handle's IO object stays its own
@@ -32,6 +34,8 @@ pub use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
 
 pub use self::handle::{Handle, IoObject};
 pub use self::ready::{Interest, Ready};
+pub use crate::buf::aligned::AlignedBuf;
+pub use crate::buf::owned::{IoBuf, IoBufMut};
 
 /// Unix's own: [`AsyncFd`](unix::AsyncFd), a caller's descriptor driven by
 /// readiness, and its guards.

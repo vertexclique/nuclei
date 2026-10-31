@@ -16,12 +16,13 @@ use core::task::{Poll, Waker};
 use std::io;
 
 use super::work::Work;
+use crate::buf::owned::OwnedBuf;
 
 /// A positional write left by its task: from a buffer of the pool, or from
 /// the task's own buffer, which goes with the call.
 pub(super) enum Orphan {
     Pool(Work<io::Result<()>>),
-    Lent(Work<(io::Result<()>, Vec<u8>)>),
+    Lent(Work<(io::Result<()>, OwnedBuf)>),
 }
 
 impl From<Work<io::Result<()>>> for Orphan {
@@ -30,8 +31,8 @@ impl From<Work<io::Result<()>>> for Orphan {
     }
 }
 
-impl From<Work<(io::Result<()>, Vec<u8>)>> for Orphan {
-    fn from(work: Work<(io::Result<()>, Vec<u8>)>) -> Self {
+impl From<Work<(io::Result<()>, OwnedBuf)>> for Orphan {
+    fn from(work: Work<(io::Result<()>, OwnedBuf)>) -> Self {
         Orphan::Lent(work)
     }
 }

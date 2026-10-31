@@ -22,6 +22,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 
 use super::Released;
 use super::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
+use crate::buf::owned::{IoBuf, IoBufMut};
 use crate::io::{Handle, Interest, Ready};
 
 /// The read side of a byte stream handle.
@@ -36,8 +37,12 @@ macro_rules! read_side {
             ///
             /// If the future is dropped before it completes, bytes the
             /// driver read into `buf` stay with the handle for its next
-            /// read, so none is lost.
-            pub async fn read_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+            /// read, so none is lost. `buf` is any
+            /// [`IoBufMut`](crate::io::IoBufMut).
+            pub async fn read_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+            where
+                B: IoBufMut,
+            {
                 self.source().read_owned(buf).await
             }
 
@@ -133,8 +138,11 @@ macro_rules! write_side {
             /// out is withdrawn, and one that started is finished by the
             /// driver. On Windows a TCP write is always finished: there a
             /// cancelled send may have handed bytes to the stack while it
-            /// says it took none.
-            pub async fn write_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+            /// says it took none. `buf` is any [`IoBuf`](crate::io::IoBuf).
+            pub async fn write_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+            where
+                B: IoBuf,
+            {
                 self.source().write_owned(buf).await
             }
 
@@ -287,8 +295,12 @@ impl Handle<TcpStream> {
     /// stops would need.
     ///
     /// If the future is dropped before it completes, the stream gets `buf` whole or not at all,
-    /// as with `write_owned`. Either way `buf` is dropped only once the kernel let go of it.
-    pub async fn write_zero_copy(&self, buf: Vec<u8>) -> (io::Result<usize>, Released) {
+    /// as with `write_owned`. Either way `buf` is dropped only once the kernel let go of it. `buf`
+    /// is any [`IoBuf`](crate::io::IoBuf).
+    pub async fn write_zero_copy<B>(&self, buf: B) -> (io::Result<usize>, Released<B>)
+    where
+        B: IoBuf,
+    {
         self.source().write_zero_copy(buf).await
     }
 }

@@ -38,6 +38,8 @@
 //! whoever waits for one; nothing that drops a buffer may hold a source's
 //! guard (see `io::source`), since the wake reaches into sources.
 
+pub(crate) mod aligned;
+pub(crate) mod owned;
 #[cfg(any(ring, unix))]
 pub(crate) mod spare;
 
@@ -547,10 +549,8 @@ pub(crate) fn copy_vectored(src: &[u8], bufs: &mut [std::io::IoSliceMut<'_>]) ->
 
 /// Copies the front of `src` onto the end of `buf`, as much as its spare
 /// capacity holds; returns how many bytes.
-pub(crate) fn append_spare(src: &[u8], buf: &mut Vec<u8>) -> usize {
-    let n = src.len().min(buf.capacity() - buf.len());
-    buf.extend_from_slice(&src[..n]);
-    n
+pub(crate) fn append_spare(src: &[u8], buf: &mut owned::OwnedBuf) -> usize {
+    buf.append(src)
 }
 
 /// A buffer of a shard's pool, with the bytes `start..end` filled and not

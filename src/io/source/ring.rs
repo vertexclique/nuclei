@@ -20,6 +20,7 @@ use super::ops::{Answer, Dial, Done, Outcome, Want};
 use super::write::Pinned;
 use super::{Addr, Kind, Source, Target};
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::buf::spare::Spare;
 use crate::io::side::{After, Hooks};
 use crate::io::sys;
@@ -66,15 +67,15 @@ pub(crate) enum RingMem {
         #[expect(dead_code, reason = "the kernel reads it until the last completion")]
         msg: RecvHdr,
     },
-    RecvLent(Vec<u8>),
+    RecvLent(OwnedBuf),
     RecvFrom(Spare<Msg>, PoolBuf),
-    RecvLentFrom(Spare<Msg>, Vec<u8>),
+    RecvLentFrom(Spare<Msg>, OwnedBuf),
     Connect(
         Dial,
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<RawAddr>,
     ),
     Send(PoolBuf),
-    SendLent(Vec<u8>),
+    SendLent(OwnedBuf),
     SendTo(
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
         PoolBuf,
@@ -82,7 +83,7 @@ pub(crate) enum RingMem {
     ),
     SendLentTo(
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
-        Vec<u8>,
+        OwnedBuf,
     ),
     /// A copied send of a zero-copy write's buffer, which it holds until its completion.
     SendPinned(#[expect(dead_code, reason = "the kernel reads it until the completion")] Pinned),

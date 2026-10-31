@@ -57,6 +57,7 @@ use std::path::Path;
 
 use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
 
+use crate::buf::owned::{IoBuf, IoBufMut};
 use crate::io::Handle;
 use crate::io::source::Kind;
 
@@ -83,8 +84,13 @@ impl Handle<StdFile> {
     /// landed.
     ///
     /// If the future is dropped before it completes, the cursor stays where
-    /// it was.
-    pub async fn read_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// it was. `buf` is any [`IoBufMut`]: a `Vec<u8>`, an
+    /// [`AlignedBuf`](crate::io::AlignedBuf) for a file opened for direct IO,
+    /// or a type of the caller's.
+    pub async fn read_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
         if !self.is_regular() {
             return self.source().read_owned(buf).await;
         }
@@ -101,8 +107,12 @@ impl Handle<StdFile> {
     ///
     /// If the future is dropped before it completes, the write is withdrawn
     /// while it still waits for the writes before it, and lands whole, in
-    /// its place, once it started.
-    pub async fn write_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// its place, once it started. `buf` is any [`IoBuf`], as for
+    /// [`read_owned`](Self::read_owned).
+    pub async fn write_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
         if !self.is_regular() {
             return self.source().write_owned(buf).await;
         }

@@ -40,6 +40,7 @@ use std::sync::Arc;
 use super::ops::{Answer, Dial, Done, Outcome, Want};
 use super::{Addr, Kind, Source, Target};
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::sys;
@@ -82,14 +83,14 @@ enum PortMem {
         to: usize,
     },
     Recv(PoolBuf),
-    RecvLent(Vec<u8>),
+    RecvLent(OwnedBuf),
     RecvFrom(PoolBuf),
-    RecvLentFrom(Vec<u8>),
+    RecvLentFrom(OwnedBuf),
     Connect(Dial),
     Send(PoolBuf),
-    SendLent(Vec<u8>),
+    SendLent(OwnedBuf),
     SendTo(PoolBuf, Target),
-    SendLentTo(Vec<u8>),
+    SendLentTo(OwnedBuf),
     /// The file a `TransmitFile` reads, kept open until its packet.
     SendFile(#[expect(dead_code, reason = "kept open until the packet")] Arc<OwnedHandle>),
 }
@@ -698,10 +699,10 @@ fn start(
 enum NotStream {
     Accept,
     RecvFrom(PoolBuf),
-    RecvLentFrom(Vec<u8>),
+    RecvLentFrom(OwnedBuf),
     Connect(Dial),
     SendTo(PoolBuf, Target),
-    SendLentTo(Vec<u8>, Target),
+    SendLentTo(OwnedBuf, Target),
     SendFile(super::write::FileRange),
 }
 
@@ -1050,7 +1051,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         PortMem::SendTo(buf, target) => Outcome::SendTo(buf, target, answer),
         PortMem::SendLentTo(buf) => Outcome::SendLentTo(buf, answer),
         // The lent write's end, with no buffer to give back.
-        PortMem::SendFile(_) => Outcome::SendLent(Vec::new(), answer),
+        PortMem::SendFile(_) => Outcome::SendLent(OwnedBuf::default(), answer),
     }
 }
 

@@ -22,6 +22,7 @@ use super::call::{
     as_sync, as_write, as_write_lent,
 };
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::io::source::requests::Lease;
 use crate::io::sys;
 use crate::syscore::linux::iouring::ring::Sqe;
@@ -35,11 +36,11 @@ pub(crate) enum FileMem {
         len: usize,
     },
     /// A read into the spare capacity of a task's buffer.
-    ReadLent(Vec<u8>),
+    ReadLent(OwnedBuf),
     /// A write of a buffer of the pool, `done` of its bytes landed.
     Write { buf: PoolBuf, done: usize },
     /// A write of a task's buffer, `done` of its bytes landed.
-    WriteLent { buf: Vec<u8>, done: usize },
+    WriteLent { buf: OwnedBuf, done: usize },
     /// A sync of the file's data (`data_only`) or of all of it.
     Sync { data_only: bool },
 }
@@ -121,8 +122,8 @@ pub(crate) fn sync(fd: &Lease, data_only: bool) -> Result<SlotJob<io::Result<()>
 pub(crate) fn read_lent(
     fd: &Lease,
     at: u64,
-    buf: Vec<u8>,
-) -> Result<SlotJob<LentReadEnd>, Vec<u8>> {
+    buf: OwnedBuf,
+) -> Result<SlotJob<LentReadEnd>, OwnedBuf> {
     submit(fd, at, buf, FileMem::ReadLent, as_read_lent)
 }
 
@@ -135,8 +136,8 @@ pub(crate) fn write(fd: &Lease, at: u64, buf: PoolBuf) -> Result<SlotJob<io::Res
 pub(crate) fn write_lent(
     fd: &Lease,
     at: u64,
-    buf: Vec<u8>,
-) -> Result<SlotJob<LentWriteEnd>, Vec<u8>> {
+    buf: OwnedBuf,
+) -> Result<SlotJob<LentWriteEnd>, OwnedBuf> {
     submit(
         fd,
         at,
@@ -363,7 +364,7 @@ mod tests {
             &file,
             10,
             FileMem::WriteLent {
-                buf: b"0123456789".to_vec(),
+                buf: OwnedBuf::Vec(b"0123456789".to_vec()),
                 done: 0,
             },
         );
@@ -378,7 +379,7 @@ mod tests {
         assert_eq!((entry.raw().off, entry.raw().len), (14, 6));
         assert!(rest.complete(6).is_none(), "the whole write landed");
         match slot.take() {
-            Some(FileOutcome::WriteLent(Ok(()), buf)) => assert_eq!(buf, b"0123456789"),
+            Some(FileOutcome::WriteLent(Ok(()), buf)) => assert_eq!(&*buf, b"0123456789"),
             _ => panic!("the write did not end whole"),
         }
         std::fs::remove_file(path).unwrap();
@@ -394,7 +395,7 @@ mod tests {
             &file,
             0,
             FileMem::WriteLent {
-                buf: b"landed".to_vec(),
+                buf: OwnedBuf::Vec(b"landed".to_vec()),
                 done: 0,
             },
         );

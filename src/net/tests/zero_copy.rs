@@ -94,7 +94,7 @@ fn both_ends_write_owned_and_then_read() {
         exchange(len, |s, buf| async move {
             let (n, back) = s.write_owned(buf).await;
             assert_eq!(n.unwrap(), back.len());
-            (s, Released::ready(back))
+            (s, Released::ready(crate::buf::owned::OwnedBuf::Vec(back)))
         });
     }
 }

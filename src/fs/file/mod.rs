@@ -60,6 +60,7 @@ mod orphans;
 mod positional;
 mod work;
 
+use crate::buf::owned::{IoBuf, IoBufMut, OwnedBuf};
 use core::future::poll_fn;
 use core::task::{Context, Poll, Waker};
 use std::io::{self, SeekFrom};
@@ -362,19 +363,22 @@ impl FileIo {
     /// Reads at the cursor into the spare capacity of `buf`, after the bytes
     /// it holds, and gives it back with the read's result. The job reads
     /// into `buf` itself (bytes read ahead are copied in instead).
-    pub(crate) async fn read_owned(self: &Arc<Self>, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
-        let mut held = Some(buf);
+    pub(crate) async fn read_owned<B>(self: &Arc<Self>, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
+        let mut held = Some(OwnedBuf::filled(buf));
         // Dropped with the future, a job in flight is cancelled, or its
         // result thrown away: the cursor moves only when a result is taken.
         let mut job = None;
         let result = poll_fn(|cx| self.poll_read_owned(cx, &mut held, &mut job)).await;
-        (result, held.unwrap_or_default())
+        (result, held.unwrap_or_default().into_filled())
     }
 
     fn poll_read_owned(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Option<OwnedBuf>,
         job: &mut Option<LentRead>,
     ) -> Poll<io::Result<usize>> {
         if held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
@@ -441,17 +445,17 @@ impl FileIo {
 
     /// Writes all of `buf` at the cursor, after the writes before it, and
     /// gives it back with its length. The job writes from `buf` itself.
-    pub(crate) async fn write_owned(
-        self: &Arc<Self>,
-        buf: Vec<u8>,
-    ) -> (io::Result<usize>, Vec<u8>) {
+    pub(crate) async fn write_owned<B>(self: &Arc<Self>, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
         let mut op = WriteOwned {
             io: self,
-            held: Some(buf),
+            held: Some(OwnedBuf::written(buf)),
             out: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
-        (result, op.held.take().unwrap_or_default())
+        (result, op.held.take().unwrap_or_default().into_written())
     }
 
     pub(crate) fn poll_write(
@@ -637,7 +641,7 @@ impl FileState {
 
     /// The end of a write from a task's buffer: the buffer goes back to its
     /// task, or with the job if the task is gone.
-    fn lent_back(&mut self, result: io::Result<()>, buf: Vec<u8>) -> Option<Failure> {
+    fn lent_back(&mut self, result: io::Result<()>, buf: OwnedBuf) -> Option<Failure> {
         let failure = result.as_ref().err().map(Failure::of);
         if matches!(self.lent, Lent::Out) {
             self.lent = Lent::Done(result, buf);
@@ -724,7 +728,7 @@ impl FileState {
     fn write_owned(
         &mut self,
         io: &FileIo,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Option<OwnedBuf>,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -909,7 +913,7 @@ impl FileState {
 /// write still lands and the buffer goes with the job.
 struct WriteOwned<'a> {
     io: &'a Arc<FileIo>,
-    held: Option<Vec<u8>>,
+    held: Option<OwnedBuf>,
     out: bool,
 }
 

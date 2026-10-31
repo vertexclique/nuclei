@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::io;
 
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::io::side::After;
 
 /// One run of bytes read ahead.
@@ -17,7 +18,7 @@ pub(super) enum Piece {
     // vertexia: the caller's allocation, kept uncharged by the pool (one per
     // source at most, freed by the next reads); copy it into pool buffers if
     // kept buffers must count against the cap.
-    Left { buf: Vec<u8>, start: usize },
+    Left { buf: OwnedBuf, start: usize },
     /// A buffer of the shard's receive group a multishot receive filled;
     /// it goes back to the group once taken.
     #[cfg(ring)]
@@ -142,7 +143,7 @@ impl Ahead {
 
     /// Moves bytes onto the end of `buf`, as many as its spare capacity
     /// holds.
-    pub(super) fn append_to(&mut self, buf: &mut Vec<u8>, after: &mut After) -> usize {
+    pub(super) fn append_to(&mut self, buf: &mut OwnedBuf, after: &mut After) -> usize {
         let mut n = 0;
         for piece in &self.pieces {
             let src = piece.filled();

@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 #[cfg(ring)]
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::rt::shard::Shared;
 use crate::sync::atomic_waker::AtomicWaker;
 
@@ -27,13 +28,13 @@ pub(crate) enum FileOutcome {
     #[cfg(ring)]
     Read(io::Result<PoolBuf>),
     #[cfg(ring)]
-    ReadLent(io::Result<usize>, Vec<u8>),
+    ReadLent(io::Result<usize>, OwnedBuf),
     Write(io::Result<()>),
-    WriteLent(io::Result<()>, Vec<u8>),
+    WriteLent(io::Result<()>, OwnedBuf),
     /// A write at the end of a file opened to append, and where the file's
     /// offset is after it.
     Append(io::Result<u64>),
-    AppendLent(io::Result<u64>, Vec<u8>),
+    AppendLent(io::Result<u64>, OwnedBuf),
     /// A sync ends in a slot only on a ring.
     #[cfg(ring)]
     Sync(io::Result<()>),
@@ -130,12 +131,12 @@ impl Slot {
 
 /// A lent read's end: its result, and the task's buffer back.
 #[cfg(ring)]
-pub(crate) type LentReadEnd = (io::Result<usize>, Vec<u8>);
+pub(crate) type LentReadEnd = (io::Result<usize>, OwnedBuf);
 /// A lent write's end: its result, and the task's buffer back.
-pub(crate) type LentWriteEnd = (io::Result<()>, Vec<u8>);
+pub(crate) type LentWriteEnd = (io::Result<()>, OwnedBuf);
 /// A lent append's end: where the file's offset is after it, and the task's
 /// buffer back.
-pub(crate) type LentAppendEnd = (io::Result<u64>, Vec<u8>);
+pub(crate) type LentAppendEnd = (io::Result<u64>, OwnedBuf);
 
 /// A file's call in flight, as the task that waits for it sees it.
 pub(crate) struct SlotJob<T> {
@@ -237,7 +238,7 @@ pub(crate) fn as_read_lent(outcome: FileOutcome) -> LentReadEnd {
         FileOutcome::ReadLent(result, buf) => (result, buf),
         _ => (
             Err(io::Error::other("a file read ended as another call")),
-            Vec::new(),
+            OwnedBuf::default(),
         ),
     }
 }
@@ -262,7 +263,7 @@ pub(crate) fn as_write_lent(outcome: FileOutcome) -> LentWriteEnd {
         FileOutcome::WriteLent(result, buf) => (result, buf),
         _ => (
             Err(io::Error::other("a file write ended as another call")),
-            Vec::new(),
+            OwnedBuf::default(),
         ),
     }
 }
@@ -279,7 +280,7 @@ pub(crate) fn as_append_lent(outcome: FileOutcome) -> LentAppendEnd {
         FileOutcome::AppendLent(result, buf) => (result, buf),
         _ => (
             Err(io::Error::other("a file write ended as another call")),
-            Vec::new(),
+            OwnedBuf::default(),
         ),
     }
 }

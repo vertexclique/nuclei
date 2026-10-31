@@ -12,6 +12,7 @@ use std::path::Path;
 
 use futures_core::Stream;
 
+use crate::buf::owned::{IoBuf, IoBufMut};
 use crate::io::source::write::{Dest, Peer};
 use crate::io::source::{Addr, Kind};
 use crate::io::sys::UnixAddr;
@@ -350,19 +351,23 @@ impl Handle<UnixDatagram> {
     ///
     /// If the future is dropped before it completes, the datagram is sent
     /// whole or not at all: one the driver has not handed to the kernel is
-    /// withdrawn, and one already handed over goes out.
-    pub async fn send_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// withdrawn, and one already handed over goes out. `buf` is any
+    /// [`IoBuf`](crate::io::IoBuf).
+    pub async fn send_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
         self.source().send_owned(buf, Dest::Connected).await
     }
 
     /// Sends all of `buf` as one datagram to the socket at `path` and gives
     /// it back with its length, as [`send_owned`](Self::send_owned) sends to
     /// the connected peer.
-    pub async fn send_to_owned<P: AsRef<Path>>(
-        &self,
-        buf: Vec<u8>,
-        path: P,
-    ) -> (io::Result<usize>, Vec<u8>) {
+    pub async fn send_to_owned<P, B>(&self, buf: B, path: P) -> (io::Result<usize>, B)
+    where
+        P: AsRef<Path>,
+        B: IoBuf,
+    {
         match UnixAddr::path(path.as_ref()) {
             Ok(addr) => self.source().send_owned(buf, Dest::Unix(&addr)).await,
             Err(err) => (Err(err), buf),
@@ -376,18 +381,21 @@ impl Handle<UnixDatagram> {
     ///
     /// If the future is dropped before it completes, a datagram the driver
     /// received into `buf` stays with the socket for its next receive, so
-    /// none is lost.
-    pub async fn recv_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// none is lost. `buf` is any [`IoBufMut`](crate::io::IoBufMut).
+    pub async fn recv_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
         let (result, buf) = self.recv_from_owned(buf).await;
         (result.map(|(n, _)| n), buf)
     }
 
     /// Receives a datagram with its sender's address into the spare capacity
     /// of `buf`, as [`recv_owned`](Self::recv_owned).
-    pub async fn recv_from_owned(
-        &self,
-        buf: Vec<u8>,
-    ) -> (io::Result<(usize, UnixSocketAddr)>, Vec<u8>) {
+    pub async fn recv_from_owned<B>(&self, buf: B) -> (io::Result<(usize, UnixSocketAddr)>, B)
+    where
+        B: IoBufMut,
+    {
         let (result, buf) = self.source().recv_from_owned(buf).await;
         (
             result.and_then(|(n, addr)| unix(addr).map(|addr| (n, addr))),

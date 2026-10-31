@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::buf::owned::OwnedBuf;
 use crate::sync::oneshot;
 
 /// A hold on a zero-copy write's buffer: the side's lent write keeps one, and each send of it
@@ -13,13 +14,13 @@ use crate::sync::oneshot;
 pub(crate) struct Pinned(Arc<Shared>);
 
 struct Shared {
-    buf: Vec<u8>,
-    back: Option<oneshot::Sender<Vec<u8>>>,
+    buf: OwnedBuf,
+    back: Option<oneshot::Sender<OwnedBuf>>,
 }
 
 impl Pinned {
     /// Shares `buf`, with the receiver it comes back through once every hold let go.
-    pub(crate) fn new(buf: Vec<u8>) -> (Self, oneshot::Receiver<Vec<u8>>) {
+    pub(crate) fn new(buf: OwnedBuf) -> (Self, oneshot::Receiver<OwnedBuf>) {
         let (back, rx) = oneshot::channel();
         let shared = Shared {
             buf,
