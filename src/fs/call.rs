@@ -30,6 +30,8 @@ pub(crate) enum FileOutcome {
     #[cfg(ring)]
     ReadLent(io::Result<usize>, OwnedBuf),
     Write(io::Result<()>),
+    /// A chunk of a copy into the file, and how many bytes it moved.
+    Copied(io::Result<u64>),
     WriteLent(io::Result<()>, OwnedBuf),
     /// A write at the end of a file opened to append, and where the file's
     /// offset is after it.
@@ -255,6 +257,13 @@ pub(crate) fn as_sync(outcome: FileOutcome) -> io::Result<()> {
     match outcome {
         FileOutcome::Sync(result) => result,
         _ => Err(io::Error::other("a file sync ended as another call")),
+    }
+}
+
+pub(crate) fn as_copied(outcome: FileOutcome) -> io::Result<u64> {
+    match outcome {
+        FileOutcome::Copied(result) => result,
+        _ => Err(io::Error::other("a file copy ended as another call")),
     }
 }
 

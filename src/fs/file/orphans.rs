@@ -1,5 +1,5 @@
-//! Positional writes (and the changes of a range, which are writes in this)
-//! whose future was dropped while they were out. Each
+//! Positional writes (and the changes of a range, and the chunks of a copy,
+//! which are writes in this) whose future was dropped while they were out. Each
 //! still lands, and the file keeps it until it did: every later write at the
 //! cursor, cursor read, positional call and sync of the handle waits for it,
 //! so a write that came before them is never reordered with them.
@@ -20,10 +20,12 @@ use super::work::Work;
 use crate::buf::owned::OwnedBuf;
 
 /// A positional write left by its task: from a buffer of the pool, or from
-/// the task's own buffer, which goes with the call.
+/// the task's own buffer, which goes with the call; or a change of a range
+/// of the file, or a chunk of a copy into it (which ends with its count).
 pub(super) enum Orphan {
     Pool(Work<io::Result<()>>),
     Lent(Work<(io::Result<()>, OwnedBuf)>),
+    Count(Work<io::Result<u64>>),
 }
 
 impl From<Work<io::Result<()>>> for Orphan {
@@ -38,6 +40,12 @@ impl From<Work<(io::Result<()>, OwnedBuf)>> for Orphan {
     }
 }
 
+impl From<Work<io::Result<u64>>> for Orphan {
+    fn from(work: Work<io::Result<u64>>) -> Self {
+        Orphan::Count(work)
+    }
+}
+
 impl Orphan {
     /// Ready once the write landed, with its error if it failed; else
     /// `waker` is woken when it does.
@@ -45,6 +53,7 @@ impl Orphan {
         match self {
             Orphan::Pool(work) => work.poll(waker).map(Result::err),
             Orphan::Lent(work) => work.poll(waker).map(|(result, _)| result.err()),
+            Orphan::Count(work) => work.poll(waker).map(Result::err),
         }
     }
 
@@ -53,6 +62,7 @@ impl Orphan {
         match self {
             Orphan::Pool(work) => work.let_go(),
             Orphan::Lent(work) => work.let_go(),
+            Orphan::Count(work) => work.let_go(),
         }
     }
 }

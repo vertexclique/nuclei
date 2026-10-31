@@ -16,12 +16,12 @@ use crate::fs::Allocate;
 use crate::io::raw::Raw;
 use crate::io::source::Kind;
 use crate::syscore::windows::{
-    AF_INET, AF_INET6, DWORD, DeviceIoControl, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF,
-    FILE_ACCESS_INFORMATION, FILE_ALLOCATION_INFO_CLASS, FILE_APPEND_DATA, FILE_BEGIN,
-    FILE_CURRENT, FILE_END_OF_FILE_INFO_CLASS, FILE_MODE_INFORMATION,
+    AF_INET, AF_INET6, BY_HANDLE_FILE_INFORMATION, DWORD, DeviceIoControl, ERROR_BROKEN_PIPE,
+    ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION, FILE_ALLOCATION_INFO_CLASS, FILE_APPEND_DATA,
+    FILE_BEGIN, FILE_CURRENT, FILE_END_OF_FILE_INFO_CLASS, FILE_MODE_INFORMATION,
     FILE_NO_INTERMEDIATE_BUFFERING, FILE_STANDARD_INFO, FILE_STANDARD_INFO_CLASS,
     FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA,
-    FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
+    FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA, GetFileInformationByHandle,
     GetFileInformationByHandleEx, GetFileSizeEx, GetFileType, HANDLE, IN_ADDR, INVALID_SOCKET,
     IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK, NtQueryInformationFile, OVERLAPPED, ReadFile, SD_SEND,
     SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT,
@@ -707,4 +707,46 @@ pub(crate) fn allocate(raw: Raw, offset: u64, len: u64, mode: Allocate) -> io::R
             zero(raw, from, end)
         }
     }
+}
+
+/// The volume and the index of the file `raw` names, which tell it from every other file.
+fn identity(raw: Raw) -> io::Result<(u32, u64)> {
+    let mut info = BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: 0,
+        ftCreationTime: [0; 2],
+        ftLastAccessTime: [0; 2],
+        ftLastWriteTime: [0; 2],
+        dwVolumeSerialNumber: 0,
+        nFileSizeHigh: 0,
+        nFileSizeLow: 0,
+        nNumberOfLinks: 0,
+        nFileIndexHigh: 0,
+        nFileIndexLow: 0,
+    };
+    // SAFETY: the call writes the information into our own.
+    if unsafe { GetFileInformationByHandle(handle_of(raw), &mut info) } == 0 {
+        return Err(last_error());
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+/// Whether the handles `a` and `b` name one file (one volume, one index).
+pub(crate) fn same_file(a: Raw, b: Raw) -> io::Result<bool> {
+    Ok(identity(a)? == identity(b)?)
+}
+
+/// Whether the system copies a range between files in the kernel.
+pub(crate) const COPIES_IN_KERNEL: bool = false;
+
+/// No call here copies a range in the kernel: the caller reads and writes.
+pub(crate) fn copy_file_range(_: Raw, _: u64, _: Raw, _: u64, _: usize) -> io::Result<usize> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Whether `err` says the kernel cannot copy between these two files.
+pub(crate) fn kernel_copy_unavailable(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Unsupported
 }

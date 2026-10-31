@@ -38,6 +38,7 @@
 
 mod allocate;
 pub(crate) mod call;
+mod copy_range;
 pub(crate) mod file;
 mod file_ops;
 mod ops;

@@ -6,6 +6,8 @@
 use std::io;
 use std::os::fd::RawFd;
 
+#[cfg(target_os = "linux")]
+use super::cvt;
 use super::cvt_int;
 #[cfg_attr(
     not(any(
@@ -149,4 +151,62 @@ pub(crate) fn sync_file_range(fd: RawFd, offset: u64, len: u64) -> io::Result<()
         | libc::SYNC_FILE_RANGE_WAIT_AFTER;
     // SAFETY: a plain syscall on the caller's descriptor.
     retry(|| cvt_int(unsafe { libc::sync_file_range(fd, offset, len, flags) })).map(drop)
+}
+
+fn stat(fd: RawFd) -> io::Result<libc::stat> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    // SAFETY: the kernel fills our own `stat`.
+    cvt_int(unsafe { libc::fstat(fd, &mut st) })?;
+    Ok(st)
+}
+
+/// Whether the descriptors `a` and `b` name one file (one device, one inode).
+pub(crate) fn same_file(a: RawFd, b: RawFd) -> io::Result<bool> {
+    let (a, b) = (stat(a)?, stat(b)?);
+    Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
+}
+
+/// Copies up to `len` bytes from `from` at `from_offset` to `to` at
+/// `to_offset` in the kernel (`copy_file_range(2)`), neither file's own
+/// offset used; the count may be short, and is zero at the end of `from`.
+#[cfg(target_os = "linux")]
+pub(crate) fn copy_file_range(
+    from: RawFd,
+    from_offset: u64,
+    to: RawFd,
+    to_offset: u64,
+    len: usize,
+) -> io::Result<usize> {
+    let mut off_in = file_offset(from_offset)? as _;
+    let mut off_out = file_offset(to_offset)? as _;
+    // SAFETY: the kernel reads and advances our own two offsets.
+    retry(|| cvt(unsafe { libc::copy_file_range(from, &mut off_in, to, &mut off_out, len, 0) }))
+}
+
+/// No call here copies a range in the kernel: the caller reads and writes.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn copy_file_range(_: RawFd, _: u64, _: RawFd, _: u64, _: usize) -> io::Result<usize> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Whether the system copies a range between files in the kernel.
+pub(crate) const COPIES_IN_KERNEL: bool = cfg!(target_os = "linux");
+
+/// Whether `err` says the kernel cannot copy between these two files (or at
+/// all), so the bytes are copied through a buffer instead.
+pub(crate) fn kernel_copy_unavailable(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Unsupported
+        || err.raw_os_error().is_some_and(|code| {
+            [
+                libc::ENOSYS,
+                libc::EXDEV,
+                libc::EOPNOTSUPP,
+                libc::ENOTSUP,
+                libc::EPERM,
+                libc::EINVAL,
+                libc::EBADF,
+            ]
+            .contains(&code)
+        })
 }

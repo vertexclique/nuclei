@@ -336,6 +336,7 @@ fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
 }
 
 mod allocate;
+mod copy_range;
 #[cfg(target_os = "linux")]
 mod direct;
 mod durable;

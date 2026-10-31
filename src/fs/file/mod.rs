@@ -55,6 +55,7 @@
 //!
 //! `proofs/tla/lent/LentFile.tla` checks these rules.
 
+mod copy;
 mod durable;
 mod orphans;
 mod positional;
@@ -78,9 +79,11 @@ use crate::io::source::Failure;
 use crate::io::source::requests::Lease;
 use crate::io::sys;
 
+pub(crate) use self::copy::COPY_CHUNK;
 #[cfg(ring)]
 pub(crate) use self::durable::sync_on;
 pub(crate) use self::durable::{SyncKind, sync_file};
+pub(crate) use self::space::range_end;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::work::bounce as bounce_for_test;
 #[cfg(ring)]

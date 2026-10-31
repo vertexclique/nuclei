@@ -70,6 +70,21 @@ pub(crate) struct FILE_ZERO_DATA_INFORMATION {
     pub(crate) BeyondFinalZero: i64,
 }
 
+/// `BY_HANDLE_FILE_INFORMATION`, with the three times as pairs of words.
+#[repr(C)]
+pub(crate) struct BY_HANDLE_FILE_INFORMATION {
+    pub(crate) dwFileAttributes: DWORD,
+    pub(crate) ftCreationTime: [DWORD; 2],
+    pub(crate) ftLastAccessTime: [DWORD; 2],
+    pub(crate) ftLastWriteTime: [DWORD; 2],
+    pub(crate) dwVolumeSerialNumber: DWORD,
+    pub(crate) nFileSizeHigh: DWORD,
+    pub(crate) nFileSizeLow: DWORD,
+    pub(crate) nNumberOfLinks: DWORD,
+    pub(crate) nFileIndexHigh: DWORD,
+    pub(crate) nFileIndexLow: DWORD,
+}
+
 /// One dequeued completion packet.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -193,6 +208,7 @@ const _: () = {
     assert!(size_of::<GUID>() == 16);
     assert!(size_of::<FILE_STANDARD_INFO>() == 24);
     assert!(size_of::<FILE_ZERO_DATA_INFORMATION>() == 16);
+    assert!(size_of::<BY_HANDLE_FILE_INFORMATION>() == 52);
     assert!(size_of::<SOCKADDR>() == 16);
     assert!(size_of::<SOCKADDR_IN>() == 16);
     assert!(size_of::<SOCKADDR_IN6>() == 28);
@@ -441,6 +457,10 @@ unsafe extern "system" {
         lpOverlapped: *mut OVERLAPPED,
     ) -> BOOL;
     pub(crate) fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *mut i64) -> BOOL;
+    pub(crate) fn GetFileInformationByHandle(
+        hFile: HANDLE,
+        lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+    ) -> BOOL;
     pub(crate) fn GetFileInformationByHandleEx(
         hFile: HANDLE,
         FileInformationClass: i32,
