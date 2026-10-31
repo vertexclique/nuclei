@@ -35,9 +35,9 @@ use crate::sync::raw_semaphore::{PermitWait, RawSemaphore};
 /// A lock refused at its first attempt: when the holder thread's take
 /// succeeds and the budget says no, the lock goes back through the release's
 /// pass, which hands it to a waiter that queued in between. With
-/// `until_queued`, the refusal waits until the waiter queued (the waiter's
-/// spin before it queues yields to the holder, so otherwise the search meets
-/// it only mid-spin); without, it lands wherever loom puts it.
+/// `until_queued`, the refusal gives the waiter a few turns to queue first
+/// (its spin before it queues yields to the holder, so otherwise the search
+/// meets it only mid-spin); without, it lands wherever loom puts it.
 fn lock_refusal(give_back: bool, until_queued: bool, witnessed: Arc<AtomicUsize>) {
     let sem = Arc::new(RawSemaphore::new(1));
     let waited = Arc::new(AtomicBool::new(false));
@@ -56,14 +56,17 @@ fn lock_refusal(give_back: bool, until_queued: bool, witnessed: Arc<AtomicUsize>
         })
     };
     if sem.take_one().is_ok() {
+        // A few turns for the waiter's attempt, its one round of spin under
+        // loom and its queueing; bounded, so the search stays finite.
         if until_queued {
-            while sem
-                .queue()
-                .state
-                .load(crate::sync::internal::Ordering::Acquire)
-                & QUEUED
-                == 0
-            {
+            for _ in 0..4 {
+                let state = sem
+                    .queue()
+                    .state
+                    .load(crate::sync::internal::Ordering::Acquire);
+                if state & QUEUED != 0 {
+                    break;
+                }
                 thread::yield_now();
             }
         }
@@ -147,6 +150,10 @@ fn a_send_refused_for_the_budget_hands_its_slot_to_a_queued_send() {
             };
             let mut wait = FairWait::new();
             let refused = wait.poll_admitted(&sem, 1, Waker::noop(), || {
+                // The other thread may run here, between the take and the
+                // budget's answer, as the system's scheduler may stop a thread
+                // anywhere: a point loom can switch at.
+                thread::yield_now();
                 if waited.load(Ordering::SeqCst) {
                     seen.fetch_add(1, Ordering::SeqCst);
                 }
