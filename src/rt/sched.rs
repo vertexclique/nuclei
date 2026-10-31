@@ -47,6 +47,7 @@ impl Sched {
 
     /// The schedule of a task of the runtime's own on `shard`: left out of
     /// the shard's count, it keeps no worker from draining, and has no hooks.
+    #[cfg(unix)]
     pub(crate) fn uncounted(shard: Arc<Shared>) -> Self {
         Self {
             shard,
