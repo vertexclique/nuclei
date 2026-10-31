@@ -835,21 +835,69 @@ fn recv_from_raw(
     // SAFETY: plain data; all zeroes is a valid value.
     let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
     let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let flags = if peek { libc::MSG_PEEK } else { 0 };
     let n = retry(|| {
         // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
         // `len` bytes into the storage; nothing is read from either.
-        cvt(unsafe {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return unsafe {
+            syscall(
+                libc::SYS_recvfrom,
+                [
+                    fd as usize,
+                    buf.as_mut_ptr() as usize,
+                    buf.len(),
+                    flags as usize,
+                    (&raw mut storage) as usize,
+                    (&raw mut len) as usize,
+                ],
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        return cvt(unsafe {
             libc::recvfrom(
                 fd,
                 buf.as_mut_ptr().cast(),
                 buf.len(),
-                if peek { libc::MSG_PEEK } else { 0 },
+                flags,
                 (&raw mut storage).cast(),
                 &mut len,
             )
-        })
+        });
     })?;
     Ok((n, storage, len))
+}
+
+/// `sendto(2)` of `buf` to the `len` bytes of address at `addr`, with `SEND_FLAGS`; made as a
+/// system call on Linux (see [`syscall`]).
+///
+/// # Safety
+/// `addr` must be valid for reads of `len` bytes.
+unsafe fn send_to_raw(
+    fd: RawFd,
+    buf: &[u8],
+    addr: *const libc::sockaddr,
+    len: libc::socklen_t,
+) -> io::Result<usize> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: reads at most `buf.len()` bytes of `buf`, and the caller's address.
+    return unsafe {
+        syscall(
+            libc::SYS_sendto,
+            [
+                fd as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+                SEND_FLAGS as usize,
+                addr as usize,
+                len as usize,
+            ],
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: as above.
+    return cvt(unsafe { libc::sendto(fd, buf.as_ptr().cast(), buf.len(), SEND_FLAGS, addr, len) });
 }
 
 /// A datagram from a UDP socket into memory not written yet, with its
@@ -893,27 +941,15 @@ pub(crate) fn recv_from_unix_uninit(
 
 /// A datagram to `addr` on a UDP socket.
 pub(crate) fn send_to_udp(fd: RawFd, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-    // SAFETY: see `borrow`; the fd is a UDP socket.
-    let socket = unsafe { borrow::<UdpSocket>(fd) };
-    retry(|| socket.send_to(buf, addr))
+    let (raw, len) = raw_inet(&addr);
+    // SAFETY: the address is `len` bytes of `raw`.
+    retry(|| unsafe { send_to_raw(fd, buf, (&raw const raw).cast(), len) })
 }
 
 /// A datagram to `addr` on a Unix datagram socket.
 pub(crate) fn send_to_unix(fd: RawFd, buf: &[u8], addr: &UnixAddr) -> io::Result<usize> {
-    retry(|| {
-        // SAFETY: reads at most `buf.len()` bytes; the address is `len`
-        // bytes of the caller's `sockaddr_un`.
-        cvt(unsafe {
-            libc::sendto(
-                fd,
-                buf.as_ptr().cast(),
-                buf.len(),
-                SEND_FLAGS,
-                addr.as_ptr(),
-                addr.len,
-            )
-        })
-    })
+    // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
+    retry(|| unsafe { send_to_raw(fd, buf, addr.as_ptr(), addr.len) })
 }
 
 /// A Unix socket address from its raw form: a path, an abstract name
