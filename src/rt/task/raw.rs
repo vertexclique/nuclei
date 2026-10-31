@@ -369,7 +369,7 @@ where
             // polls other tasks in between).
             let here = crate::rt::context::local();
             let previous = here.task.replace(Some(header.id));
-            let budget = here.budget.replace(Some(crate::coop::BUDGET));
+            let budget = here.budget.replace(crate::coop::Left::FULL);
             // Read once: while no runtime of the process has task hooks, the
             // poll costs one predictable branch more, not two calls.
             let hooked =

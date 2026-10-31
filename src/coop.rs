@@ -17,22 +17,46 @@ use core::task::{Context, Poll};
 /// Operations one poll of a task may complete before it yields.
 pub const BUDGET: u8 = 128;
 
-/// The budget left in this thread's poll; `None` outside a poll, or in an
-/// [`unconstrained`] one.
+/// The budget a poll has left, in one word so a poll saves and puts it back
+/// in one move: none outside a poll or in an [`unconstrained`] one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Left(u16);
+
+/// The bit of a [`Left`] that holds a budget, its low byte the operations.
+const LIMITED: u16 = 1 << 8;
+
+impl Left {
+    /// No budget.
+    pub(crate) const NONE: Self = Self(0);
+    /// A new poll's budget.
+    pub(crate) const FULL: Self = Self(LIMITED | BUDGET as u16);
+
+    #[inline(always)]
+    fn get(self) -> Option<u8> {
+        (self.0 & LIMITED != 0).then_some(self.0 as u8)
+    }
+
+    #[inline(always)]
+    fn of(left: Option<u8>) -> Self {
+        left.map_or(Self::NONE, |n| Self(LIMITED | u16::from(n)))
+    }
+}
+
+/// The budget left in this thread's poll.
 #[inline(always)]
-fn left() -> &'static Cell<Option<u8>> {
+fn left() -> &'static Cell<Left> {
     &crate::rt::context::local().budget
 }
 
 /// Starts a poll's budget, and answers the budget before it.
 #[inline]
-pub(crate) fn enter() -> Option<u8> {
-    left().replace(Some(BUDGET))
+pub(crate) fn enter() -> Left {
+    left().replace(Left::FULL)
 }
 
 /// Puts back the budget `enter` replaced.
 #[inline]
-pub(crate) fn leave(previous: Option<u8>) {
+pub(crate) fn leave(previous: Left) {
     left().set(previous);
 }
 
@@ -41,7 +65,7 @@ pub(crate) fn leave(previous: Option<u8>) {
 #[inline]
 pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
     let left = left();
-    let saved = left.replace(None);
+    let saved = left.replace(Left::NONE);
     let result = f();
     left.set(saved);
     result
@@ -56,18 +80,18 @@ pub(crate) fn poll_budget<T>(
     poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
 ) -> Poll<T> {
     let cell = left();
-    match cell.get() {
+    match cell.get().get() {
         Some(0) => {
             cx.waker().wake_by_ref();
             Poll::Pending
         }
         Some(n) => {
-            cell.set(Some(n - 1));
+            cell.set(Left::of(Some(n - 1)));
             let result = poll(cx);
             if result.is_pending() {
                 // No progress, nothing spent; read again, as `poll` may have
                 // run a nested poll with a budget of its own.
-                cell.set(cell.get().map(|m| m.saturating_add(1)));
+                cell.set(Left::of(cell.get().get().map(|m| m.saturating_add(1))));
             }
             result
         }
@@ -78,7 +102,7 @@ pub(crate) fn poll_budget<T>(
 /// Whether the current poll has budget left (always `true` outside a poll
 /// and in an [`unconstrained`] one).
 pub fn has_budget_remaining() -> bool {
-    left().get() != Some(0)
+    left().get().get() != Some(0)
 }
 
 /// Spends one operation of the budget, yielding first when it is spent: a
@@ -106,7 +130,7 @@ impl<F: Future> Future for Unconstrained<F> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         // SAFETY: `future` is structurally pinned and never moved.
         let future = unsafe { self.map_unchecked_mut(|this| &mut this.future) };
-        let previous = left().replace(None);
+        let previous = left().replace(Left::NONE);
         let result = future.poll(cx);
         leave(previous);
         result

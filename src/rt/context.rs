@@ -60,7 +60,7 @@ pub(crate) struct Here {
     pub(crate) task: Cell<Option<super::task::Id>>,
     /// The budget left in this thread's poll; `None` outside a poll, or in an
     /// unconstrained one (`coop`).
-    pub(crate) budget: Cell<Option<u8>>,
+    pub(crate) budget: Cell<crate::coop::Left>,
     /// The runtime `RUNTIME` holds, null for none: read in place, never
     /// followed once `RUNTIME` lets go of it.
     runtime: Cell<*const Inner>,
@@ -81,7 +81,7 @@ impl Here {
             detached: Cell::new(0),
             home: Cell::new(core::ptr::null()),
             task: Cell::new(None),
-            budget: Cell::new(None),
+            budget: Cell::new(crate::coop::Left::NONE),
             runtime: Cell::new(core::ptr::null()),
             own: Cell::new(core::ptr::null()),
         }
