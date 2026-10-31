@@ -9,6 +9,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Duration;
 
 use futures_core::Stream;
 
@@ -178,25 +179,32 @@ impl Stream for Incoming<'_> {
     }
 }
 
+/// The first pause of a connect that found the listener's backlog full,
+/// doubled up to [`FULL_BACKLOG_PAUSE_MAX`] while it stays full.
+const FULL_BACKLOG_PAUSE: Duration = Duration::from_millis(1);
+const FULL_BACKLOG_PAUSE_MAX: Duration = Duration::from_millis(64);
+
 /// The connect of the non-blocking Unix stream `socket` to `addr`.
+///
+/// Linux answers a connect to a listener whose backlog is full `EAGAIN`, and
+/// nothing tells a socket when a place frees: the connect is made again on
+/// the same socket (so its options stay) after a pause on a timer, doubled
+/// up to [`FULL_BACKLOG_PAUSE_MAX`], until the listener takes it or answers
+/// otherwise, as std's blocking connect waits. The future holds nothing but
+/// its socket and its timer, so a drop of it frees everything
+/// (`proofs/tla/connect`).
 pub(super) async fn connect(socket: OwnedFd, addr: &UnixAddr) -> io::Result<Handle<UnixStream>> {
     let stream = Handle::from_nonblocking(UnixStream::from(socket), Kind::Stream);
-    match poll_fn(|cx| stream.source().poll_connect(cx, Peer::Unix(addr))).await {
-        Ok(()) => Ok(stream),
-        // The listener's backlog is full: nothing tells a socket when it
-        // has room, so a thread of the blocking pool waits in a blocking
-        // connect instead.
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-            drop(stream);
-            let addr = *addr;
-            let connected =
-                crate::rt::blocking::call(move || sys::connect_unix_waiting(&addr)).await?;
-            Ok(Handle::from_nonblocking(
-                UnixStream::from(connected),
-                Kind::Stream,
-            ))
+    let mut pause = FULL_BACKLOG_PAUSE;
+    loop {
+        match poll_fn(|cx| stream.source().poll_connect(cx, Peer::Unix(addr))).await {
+            Ok(()) => return Ok(stream),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                crate::time::sleep(pause).await;
+                pause = (pause * 2).min(FULL_BACKLOG_PAUSE_MAX);
+            }
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
     }
 }
 

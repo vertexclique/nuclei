@@ -1,7 +1,7 @@
 ------------------------------ MODULE Shutdown ------------------------------
 (***************************************************************************)
 (* A stream's close (src/io/source/write.rs: `WriteState::close`, which    *)
-(* calls `WriteState::flush` and then `sys::shutdown_write`; the driver's  *)
+(* calls `WriteState::flush` and then `sys::shutdown`; the driver's        *)
 (* writes of the write-behind are `WriteState::push_fd`).                  *)
 (*                                                                          *)
 (* Who acts. A task writes bytes to a stream socket: they wait in the      *)

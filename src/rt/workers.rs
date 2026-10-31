@@ -140,14 +140,20 @@ impl Workers {
     /// of two distinct shards picked at random. Tasks spawned together so
     /// stay on one shard, and no shard holds more than `margin` live tasks
     /// beyond another for long.
+    #[inline]
     pub(crate) fn place(&self, runtime: u64, margin: usize) -> Option<&Arc<Shared>> {
         let n = self.claimed.load(Ordering::Acquire).min(self.slots.len());
-        let take = |i: usize| self.slots[i].get().filter(|s| s.takes_tasks());
         match n {
-            0 => return None,
-            1 => return take(0),
-            _ => {}
+            0 => None,
+            1 => self.slots[0].get().filter(|s| s.takes_tasks()),
+            _ => self.place_among(n, runtime, margin),
         }
+    }
+
+    /// [`place`](Self::place) among `n` workers, two or more.
+    #[inline(never)]
+    fn place_among(&self, n: usize, runtime: u64, margin: usize) -> Option<&Arc<Shared>> {
+        let take = |i: usize| self.slots[i].get().filter(|s| s.takes_tasks());
         let load = |s: &Shared| s.load.load(Ordering::Relaxed);
         // Stays on `home` unless a shard picked at random is lighter by more
         // than the margin.

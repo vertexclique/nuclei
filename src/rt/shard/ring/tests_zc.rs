@@ -189,6 +189,81 @@ fn a_zero_copy_write_below_the_threshold_is_copied_and_ready_at_once() {
     assert_eq!(shard.ring().expect("a ring").zc_seen(), (0, 0));
 }
 
+/// A ring whose threshold a runtime lowered sends a write below the default zero-copy, and one
+/// whose threshold it raised copies a write above it: the ring's own threshold decides.
+#[test]
+fn the_rings_threshold_decides_what_goes_zero_copy() {
+    let Some(shard) = ring_shard() else { return };
+    if !zc_available(&shard) {
+        return;
+    }
+    let _current = context::enter(&shard);
+    let ring = shard.ring().expect("a ring shard");
+    let (_mine, src, peer) = tcp_source();
+    let small = pattern(SEND_ZC_MIN / 4);
+    ring.set_zero_copy_min(SEND_ZC_MIN / 8);
+    let read = reader(peer, small.len());
+    let (result, released) = shard.block_on(src.write_zero_copy(small.clone()));
+    assert_eq!(result.unwrap(), small.len());
+    assert!(
+        ring.zc_seen().0 > 0 || !ring.zc_stream(),
+        "a write past the lowered threshold went out copied"
+    );
+    assert!(read.join().unwrap() == small);
+    assert!(await_released(&shard, released) == small);
+    let (_mine, src, peer) = tcp_source();
+    let large = pattern(2 * SEND_ZC_MIN);
+    ring.set_zero_copy_min(usize::MAX);
+    let seen = ring.zc_seen();
+    let read = reader(peer, large.len());
+    let (result, mut released) = shard.block_on(src.write_zero_copy(large.clone()));
+    assert_eq!(result.unwrap(), large.len());
+    assert_eq!(
+        ring.zc_seen(),
+        seen,
+        "a write below the raised threshold went zero-copy"
+    );
+    let Poll::Ready(back) = poll_once(&mut released) else {
+        panic!("the copied write's buffer did not come back at once");
+    };
+    assert!(back == large);
+    assert!(read.join().unwrap() == large);
+}
+
+/// A worker's shard takes its runtime's threshold for its ring.
+#[test]
+fn a_workers_ring_takes_its_runtimes_threshold() {
+    TABLE_FOR_TEST.with(|t| t.set(Some(8)));
+    let shard = Shard::worker(
+        Limits {
+            max_nesting: 8,
+            buffer_cap: crate::buf::DEFAULT_CAP,
+            backend: Backend::Ring(RingConfig::new(64).handed_over()),
+        },
+        crate::rt::tuning::Tuning {
+            zero_copy_min: 4096,
+            ..crate::rt::tuning::Tuning::default()
+        },
+        0,
+        0,
+        None,
+    );
+    TABLE_FOR_TEST.with(|t| t.set(None));
+    let shard = match shard {
+        Ok(shard) => shard,
+        Err(err) => {
+            eprintln!("skipping: io_uring unavailable: {err}");
+            return;
+        }
+    };
+    assert_eq!(shard.ring().expect("a ring shard").zero_copy_min(), 4096);
+    let Some(own) = ring_shard() else { return };
+    assert_eq!(
+        own.ring().expect("a ring shard").zero_copy_min(),
+        SEND_ZC_MIN
+    );
+}
+
 /// The peer reads only after the write ended: the write does not wait for it, and the buffer
 /// comes back only after the notifications, which wait for what the peer's window did not take.
 #[test]

@@ -320,7 +320,16 @@ impl<T> Task<T> {
 }
 
 impl<T> Drop for Task<T> {
+    #[inline]
     fn drop(&mut self) {
+        // The output taken and every reference gone, nothing but the handle
+        // reaches the task and its word cannot change: what the cancel and the
+        // detach below would end in, the free, comes at once.
+        if self.header().state.load(Ordering::Acquire) == COMPLETED | CLOSED | TASK {
+            // SAFETY: the handle is the task's last holder.
+            unsafe { (self.header().vtable.destroy)(self.ptr.as_ptr().cast_const()) };
+            return;
+        }
         self.set_canceled();
         drop(self.set_detached());
     }
@@ -333,6 +342,7 @@ impl<T> Future for Task<T> {
         clippy::panic,
         reason = "documented under `# Panics` of `Task`; `Task::fallible` answers `None` instead"
     )]
+    #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
         match self.poll_task(cx) {
             Poll::Ready(Some(output)) => Poll::Ready(output),

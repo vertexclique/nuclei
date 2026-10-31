@@ -7,10 +7,12 @@
 //! - `completion`: either of the two, the drivers whose IO is operations
 //!   completed by the kernel;
 //! - `readiness`: a readiness poller the driver makes calls on (epoll,
-//!   kqueue: every unix).
+//!   kqueue: every unix);
+//! - `precise_timer`: a kqueue whose `EVFILT_TIMER` counts nanoseconds
+//!   (macOS, iOS, FreeBSD, NetBSD), which ends a wait at a precise deadline.
 
 fn main() {
-    for name in ["ring", "port", "completion", "readiness"] {
+    for name in ["ring", "port", "completion", "readiness", "precise_timer"] {
         println!("cargo::rustc-check-cfg=cfg({name})");
     }
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -27,4 +29,8 @@ fn main() {
     set("port", port);
     set("completion", ring || port);
     set("readiness", unix);
+    set(
+        "precise_timer",
+        matches!(os.as_str(), "macos" | "ios" | "freebsd" | "netbsd"),
+    );
 }

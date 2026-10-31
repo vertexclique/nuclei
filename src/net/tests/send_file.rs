@@ -1,5 +1,6 @@
 //! `send_file`: ranges of a file arrive whole and in order, on TCP and on a
-//! Unix stream, and a dropped call leaves the stream a prefix.
+//! Unix stream, in the runtime's chunks of any size, and a dropped call
+//! leaves the stream a prefix.
 
 use super::*;
 use crate::fs::File;
@@ -38,6 +39,31 @@ fn read_on_thread<R: Read + Send + 'static>(
         peer.read_exact(&mut got).unwrap();
         got
     })
+}
+
+#[test]
+fn a_runtimes_send_file_chunk_sends_every_byte_in_order() {
+    for chunk in [1usize, 1000, 4096] {
+        let rt = Builder::new()
+            .worker_threads(1)
+            .pin_workers(false)
+            .send_file_chunk(chunk)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let len = if chunk == 1 { 3001 } else { 100_003 };
+            let (path, data) = file_of("sf-chunk", len);
+            let file = File::open(&path).await.unwrap();
+            let (tx, rx) = tcp_pair().await;
+            let reader = read_on_thread(rx, len - 7);
+            let sent = within(tx.send_file(&file, 7, len as u64)).await.unwrap();
+            assert_eq!(sent, len as u64 - 7, "chunk {chunk}");
+            assert!(
+                reader.join().unwrap() == data[7..],
+                "the bytes changed, chunk {chunk}"
+            );
+        });
+    }
 }
 
 #[test]

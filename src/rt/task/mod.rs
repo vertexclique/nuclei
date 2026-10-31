@@ -57,27 +57,12 @@ impl core::fmt::Display for Id {
     }
 }
 
-std::thread_local! {
-    /// The id of the task this thread is polling, if any.
-    static CURRENT: core::cell::Cell<Option<Id>> = const { core::cell::Cell::new(None) };
-}
-
 /// The id of the task being polled on this thread, `None` outside a task (in
 /// `block_on`'s own future, on a blocking-pool thread).
 pub(crate) fn current_id() -> Option<Id> {
-    CURRENT.try_with(core::cell::Cell::get).ok().flatten()
+    crate::coop::current_task()
 }
 
-/// Sets the current task while polling it, and answers the one before it
-/// (a `block_on` inside a task polls other tasks in between).
-pub(super) fn enter(id: Id) -> Option<Id> {
-    CURRENT.try_with(|c| c.replace(Some(id))).ok().flatten()
-}
-
-/// Puts back the task `enter` replaced.
-pub(super) fn leave(previous: Option<Id>) {
-    let _ = CURRENT.try_with(|c| c.set(previous));
-}
 use self::raw::RawTask;
 
 /// How a task came to be scheduled.
@@ -107,6 +92,12 @@ impl ScheduleInfo {
 /// reference to the task before the handoff (a [`Runnable::waker`]).
 pub(crate) unsafe trait Schedule {
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo);
+
+    /// Drops the task's future (`drop` does), where and as the schedule
+    /// wants it dropped.
+    fn drop_future(&self, drop: impl FnOnce()) {
+        drop();
+    }
 
     /// Just before each poll of the task's future.
     fn before_poll(&self, _id: Id) {}

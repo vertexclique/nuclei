@@ -29,6 +29,15 @@ impl Source {
         });
     }
 
+    /// Drops what the side read ahead of a stream and holds still
+    /// (`ReadState::drop_ahead`), once the kernel shut the reading half.
+    pub(crate) fn poll_drop_ahead(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_reading(cx, |st, _io, _waker, after| {
+            st.drop_ahead(after);
+            Poll::Ready(Ok(()))
+        })
+    }
+
     /// Ready once a read would end at once (see `ReadState::ready`); `true`
     /// at the end of the stream.
     pub(crate) fn poll_read_ready(

@@ -389,7 +389,14 @@ impl<'a, T: ?Sized> Future for ReentrantRead<'a, T> {
         if !this.wait.is_queued()
             && let Some(record) = this.lock.reenter_read(this.owner)
         {
-            return Poll::Ready(ReentrantReadGuard::new(this.lock, this.owner, record));
+            // Completed at once: it spends one operation of the poll's
+            // budget, or, the budget spent, the read goes and it yields.
+            let guard = ReentrantReadGuard::new(this.lock, this.owner, record);
+            if crate::coop::spend(cx.waker()) {
+                return Poll::Ready(guard);
+            }
+            drop(guard);
+            return Poll::Pending;
         }
         this.wait.poll(&this.lock.raw, READ, cx.waker()).map(|()| {
             let record = this.lock.enter_read(this.owner);
@@ -441,11 +448,22 @@ impl<'a, T: ?Sized> Future for ReentrantWrite<'a, T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if !this.wait.is_queued() {
+            // Either completes at once: it spends one operation of the poll's
+            // budget, or, the budget spent, the level goes and it yields.
             if this.lock.reenter_write(this.owner) {
-                return Poll::Ready(Ok(ReentrantWriteGuard::new(this.lock, this.owner)));
+                let guard = ReentrantWriteGuard::new(this.lock, this.owner);
+                if crate::coop::spend(cx.waker()) {
+                    return Poll::Ready(Ok(guard));
+                }
+                drop(guard);
+                return Poll::Pending;
             }
             if this.lock.readers.find(this.owner.id()).is_some() {
-                return Poll::Ready(Err(ReadHeldByOwner));
+                return if crate::coop::spend(cx.waker()) {
+                    Poll::Ready(Err(ReadHeldByOwner))
+                } else {
+                    Poll::Pending
+                };
             }
         }
         this.wait.poll(&this.lock.raw, WRITE, cx.waker()).map(|()| {

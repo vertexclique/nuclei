@@ -32,3 +32,6 @@ LM_no_inbox_wait  Linger  violated:DropWaits
 LW_task_held      Linger  violated:NoTaskHeld
 LW_late_drain     Linger  violated:NoLateDrain
 L_background      Linger  pass
+L_bound           Linger  pass
+LM_bound_drops    Linger  violated:AllSent
+LW_bound          Linger  violated:NoBoundOut

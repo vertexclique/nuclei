@@ -49,8 +49,8 @@ use crate::syscore::windows::{
     ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, GetCurrentProcess,
     GetCurrentThread, GetLastError, HANDLE, MSG_PEEK, OVERLAPPED, OVERLAPPED_ENTRY,
     PostQueuedCompletionStatus, ReadFile, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-    WSA_OPERATION_ABORTED, WSABUF, WSARecv, WSARecvFrom, WSASend, WSASendTo, WriteFile,
-    status_error, winsock,
+    WSA_OPERATION_ABORTED, WSABUF, WSAESHUTDOWN, WSARecv, WSARecvFrom, WSASend, WSASendTo,
+    WriteFile, status_error, winsock,
 };
 
 /// Room for one address in an `AcceptEx` buffer: the largest address and
@@ -360,10 +360,11 @@ fn answer(code: Option<i32>, bytes: usize) -> Answer<usize> {
     }
 }
 
-/// A read's answer: the end of a pipe or a file is its end of stream.
+/// A read's answer: the end of a pipe or a file is its end of stream, and so
+/// is a socket's reading half shut, as std's read answers it.
 fn read_answer(code: Option<i32>, bytes: usize) -> Answer<usize> {
     match code {
-        Some(ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF) => Answer::Done(Ok(0)),
+        Some(ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF | WSAESHUTDOWN) => Answer::Done(Ok(0)),
         code => answer(code, bytes),
     }
 }

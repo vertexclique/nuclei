@@ -205,6 +205,7 @@ pub trait Stream: Sized + Send + Sync + 'static {
         offset: u64,
         len: u64,
     ) -> impl Future<Output = io::Result<u64>> + Send + 'a;
+    fn shut(&self, how: std::net::Shutdown) -> impl Future<Output = io::Result<()>> + Send + '_;
 }
 
 macro_rules! stream_calls {
@@ -257,6 +258,12 @@ macro_rules! stream_calls {
             len: u64,
         ) -> impl Future<Output = io::Result<u64>> + Send + 'a {
             Self::send_file(self, file, offset, len)
+        }
+        fn shut(
+            &self,
+            how: std::net::Shutdown,
+        ) -> impl Future<Output = io::Result<()>> + Send + '_ {
+            Self::shut(self, how)
         }
     };
 }

@@ -26,11 +26,13 @@ const SPIN_GAP_MAX: u32 = 64;
 /// from the clock after each gap of pauses (never every pause), and is a
 /// hint: it only sizes the next spin.
 ///
-/// A shard spins only while work may come soon: its caller says so (a job of
-/// its runtime's blocking pool, finite operations of its ring out), or the
-/// shard has seen work come from another thread within a spin or soon after
-/// a park (`hot`) and nothing since has said otherwise. Else it parks at
-/// once and the budget stays.
+/// A shard spins only while work may come soon: its caller says so (finite
+/// operations of its ring out), or the shard has seen work come from another
+/// thread within a spin or soon after a park (`hot`) and nothing since has
+/// said otherwise. Else it parks at once and the budget stays. A job of its
+/// runtime's blocking pool is not work that comes soon: it runs for as long
+/// as it blocks, its end wakes the parked shard with one notification, and a
+/// park it cuts short does not make the shard hot.
 pub(crate) struct Spin {
     budget: Cell<u32>,
     hot: Cell<bool>,
@@ -77,6 +79,13 @@ impl Spin {
         self.budget.set(budget / 2);
         self.hot.set(false);
         false
+    }
+
+    /// Whether work came soon after a spin or a park, so the next spin runs
+    /// unasked.
+    #[cfg(test)]
+    pub(super) fn is_hot(&self) -> bool {
+        self.hot.get()
     }
 
     /// The shard slept for `slept`: a short sleep means work came right

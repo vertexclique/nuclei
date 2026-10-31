@@ -98,8 +98,9 @@ pub(crate) enum RingMem {
 }
 
 /// The least a `write_zero_copy` must have left to send for its next chunk to go out zero-copy
-/// (on a ring that allows it at all: `ShardRing::zc_stream`); a smaller write is copied whole,
-/// and its buffer handed back at once. Below it, pinning the
+/// (on a ring that allows it at all: `ShardRing::zc_stream`), by default: a worker's ring takes
+/// its runtime's `Builder::zero_copy_threshold` instead (`ShardRing::zero_copy_min`). A smaller
+/// write is copied whole, and its buffer handed back at once. Below it, pinning the
 /// pages costs more than the copy it saves: on the development host's loopback (where the receive
 /// path copies what a send pinned), the `owned_size_*` modes of benches/vs_tokio_count.rs
 /// measured total cycles per write above the copy's from 16 KiB to 512 KiB, level with it at
@@ -110,13 +111,6 @@ pub(crate) const SEND_ZC_MIN: usize = 1 << 20;
 /// The most one zero-copy entry carries: what the kernel pins at a time is
 /// bounded, and a longer write goes in several.
 const SEND_ZC_CHUNK: usize = 1 << 20;
-
-/// Whether a send of `len` bytes, what is left of a zero-copy write on a source of `kind`, is
-/// worth a zero-copy send: a TCP stream's, of at least [`SEND_ZC_MIN`]. The one place the call
-/// and the ring decide it.
-pub(crate) fn zero_copy_worth(kind: Kind, len: usize) -> bool {
-    kind == Kind::Tcp && len >= SEND_ZC_MIN
-}
 
 /// What a zero-copy send's first completion `res` brings its side, which goes on at once.
 pub(crate) fn zc_outcome(res: i32) -> Outcome {
@@ -481,9 +475,10 @@ impl RingIssuer<'_> {
 
 impl RingIssuer<'_> {
     /// Whether a send of `len` bytes, what is left of a zero-copy write on a source of `kind`,
-    /// goes out zero-copy: one worth it, on a ring whose kernel sends so.
+    /// goes out zero-copy: a TCP stream's, of at least the ring's threshold
+    /// (`ShardRing::zero_copy_min`), on a ring whose kernel sends so. The one place it is decided.
     pub(crate) fn zero_copy(&self, kind: Kind, len: usize) -> bool {
-        zero_copy_worth(kind, len) && self.ring.zc_stream()
+        kind == Kind::Tcp && len >= self.ring.zero_copy_min() && self.ring.zc_stream()
     }
 
     /// Whether a stream read of a source of `kind` goes out as a multishot

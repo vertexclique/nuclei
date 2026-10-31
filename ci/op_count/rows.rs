@@ -31,6 +31,8 @@ pub const ROWS: &[&str] = &[
     "spawn_blocking",
     "sleep",
     "oneshot",
+    "local_mpsc",
+    "local_oneshot",
 ];
 
 #[cfg(unix)]
@@ -434,6 +436,44 @@ pub fn run(rt: &nuclei::runtime::Runtime, row: &str, n: u64) -> Option<u64> {
                     .detach();
                     std::hint::black_box(rx.await.unwrap());
                 }
+            }));
+            n
+        }
+        "local_mpsc" => {
+            rt.block_on(rt.spawn(async move {
+                let (to_b, mut from_a) = nuclei::sync::local::mpsc::channel::<u64>(1);
+                let (to_a, mut from_b) = nuclei::sync::local::mpsc::channel::<u64>(1);
+                let a = nuclei::task::spawn_local(async move {
+                    for i in 0..n {
+                        to_b.send(i).await.unwrap();
+                        from_b.recv().await.unwrap();
+                    }
+                });
+                let echo = nuclei::task::spawn_local(async move {
+                    while let Some(i) = from_a.recv().await {
+                        if to_a.send(i).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                a.await;
+                echo.await;
+            }));
+            n * 2
+        }
+        "local_oneshot" => {
+            rt.block_on(rt.spawn(async move {
+                nuclei::task::spawn_local(async move {
+                    for i in 0..n {
+                        let (tx, rx) = nuclei::sync::local::oneshot::channel::<u64>();
+                        nuclei::task::spawn_local(async move {
+                            let _ = tx.send(i);
+                        })
+                        .detach();
+                        std::hint::black_box(rx.await.unwrap());
+                    }
+                })
+                .await;
             }));
             n
         }
