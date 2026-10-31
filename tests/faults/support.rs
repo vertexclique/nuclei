@@ -303,21 +303,62 @@ pub fn set_tiny<S: std::os::fd::AsRawFd>(s: &S) {
 /// Sets both buffers of an std socket to `size` through its descriptor.
 #[cfg(unix)]
 pub fn set_buffers<S: std::os::fd::AsRawFd>(s: &S, size: u32) {
-    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        let value: libc::c_int = size as libc::c_int;
-        // SAFETY: a plain option set on a descriptor the caller holds, with
-        // a value of the size given.
-        let rc = unsafe {
-            libc::setsockopt(
-                s.as_raw_fd(),
-                libc::SOL_SOCKET,
-                opt,
-                (&value as *const libc::c_int).cast(),
-                size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+    set_buffer(s, libc::SO_SNDBUF, size);
+    set_buffer(s, libc::SO_RCVBUF, size);
+}
+
+/// Sets one buffer (`SO_SNDBUF` or `SO_RCVBUF`) of a socket to `size`.
+#[cfg(unix)]
+fn set_buffer<S: std::os::fd::AsRawFd>(s: &S, opt: libc::c_int, size: u32) {
+    let value: libc::c_int = size as libc::c_int;
+    // SAFETY: a plain option set on a descriptor the caller holds, with a
+    // value of the size given.
+    let rc = unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            opt,
+            (&value as *const libc::c_int).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+}
+
+/// What a macOS receive buffer holds of a datagram's sender with it: an
+/// IPv4 address, or the unnamed address of a socket pair's end, is 16 bytes.
+#[cfg(target_vendor = "apple")]
+const DATAGRAM_ADDRESS: u32 = 16;
+
+/// Shrinks a datagram socket's buffers to the least that passes a datagram
+/// of `largest` bytes. macOS refuses one larger than the send buffer
+/// (`EMSGSIZE`) and drops one the receive buffer has no room for with its
+/// sender's address, so there it is exactly that room; elsewhere an empty
+/// buffer takes a datagram of any size, and it is the least the system
+/// allows.
+#[cfg(unix)]
+pub fn set_tiny_datagram<S: std::os::fd::AsRawFd>(s: &S, largest: usize) {
+    #[cfg(target_vendor = "apple")]
+    {
+        set_buffer(s, libc::SO_SNDBUF, largest as u32);
+        set_buffer(s, libc::SO_RCVBUF, largest as u32 + DATAGRAM_ADDRESS);
     }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = largest;
+        set_tiny(s);
+    }
+}
+
+/// Gives a datagram socket the send buffer a datagram of `largest` bytes
+/// needs on macOS, which refuses one larger than it (`EMSGSIZE`; 9216 bytes
+/// for UDP by default, `net.inet.udp.maxdgram`). Elsewhere the system takes
+/// it as the socket is.
+pub fn room_to_send(s: &nuclei::net::UdpSocket, largest: usize) {
+    #[cfg(target_vendor = "apple")]
+    set_buffer(s.get_ref(), libc::SO_SNDBUF, largest as u32);
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = (s, largest);
 }
 
 #[cfg(windows)]

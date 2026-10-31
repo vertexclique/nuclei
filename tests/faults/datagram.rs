@@ -1,6 +1,6 @@
 //! Datagrams under pressure: a flood from a socket with the smallest send
-//! buffer into one with the smallest receive buffer, through every send and
-//! receive call; a connected socket whose peer is gone. A datagram that
+//! buffer into one with the smallest receive buffer that pass its datagrams,
+//! through every send and receive call; a connected socket whose peer is gone. A datagram that
 //! arrives arrives whole, once; one the kernel dropped is gone as std's
 //! would be; no call answers `WouldBlock` or waits forever; and the sockets
 //! work afterwards.
@@ -18,8 +18,11 @@ use crate::support::*;
 /// The sizes a flood cycles through: around each size class of the pool, the
 /// threshold of owned datagrams, and up to near the largest UDP takes.
 const SIZES: [usize; 14] = [
-    16, 17, 100, 511, 512, 513, 1400, 4096, 12_287, 12_288, 12_289, 16_384, 32_768, 60_000,
+    16, 17, 100, 511, 512, 513, 1400, 4096, 12_287, 12_288, 12_289, 16_384, 32_768, LARGEST,
 ];
+
+/// The largest datagram a UDP flood sends.
+const LARGEST: usize = 60_000;
 
 const HEADER: usize = 16;
 /// The sequence number of the datagram that says the flood is over.
@@ -134,7 +137,7 @@ async fn recv_one(socket: &UdpSocket, how: Recv) -> io::Result<Vec<u8>> {
 }
 
 /// Floods `count` datagrams from a socket with the smallest send buffer to
-/// one with the smallest receive buffer, sent `send`'s way and received
+/// one with the smallest receive buffer that pass them, sent `send`'s way and received
 /// `recv`'s, and checks what came.
 async fn flood(send: Send, recv: Recv, count: u32) {
     let what = format!("a flood of {count} sent {send:?}, received {recv:?}");
@@ -142,8 +145,8 @@ async fn flood(send: Send, recv: Recv, count: u32) {
     let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     #[cfg(unix)]
     {
-        set_tiny(tx.get_ref());
-        set_tiny(rx.get_ref());
+        set_tiny_datagram(tx.get_ref(), LARGEST);
+        set_tiny_datagram(rx.get_ref(), LARGEST);
     }
     let (tx_addr, rx_addr) = (tx.local_addr().unwrap(), rx.local_addr().unwrap());
     tx.get_ref().connect(rx_addr).unwrap();
@@ -341,23 +344,39 @@ fn a_connected_socket_whose_peer_is_gone_answers_as_std() {
 
 #[cfg(unix)]
 mod unix {
+    use std::io;
+    use std::time::Duration;
+
     use nuclei::net::UnixDatagram;
 
-    use super::{SIZES, check, datagram};
+    use super::{END, HEADER, SIZES, check, datagram};
     use crate::support::*;
 
-    /// A Unix datagram socket loses none: a flood into the smallest buffer
-    /// waits for room, and every datagram arrives whole, once, in order.
+    /// The largest datagram a Unix flood sends.
+    const LARGEST: usize = 4096;
+
+    /// A send the system refused because the receiver has no room: macOS's
+    /// answer, which std's send gives too, where Linux holds the send until
+    /// there is room. The refused datagram never arrives.
+    fn refused(err: &io::Error) -> bool {
+        cfg!(target_vendor = "apple") && err.raw_os_error() == Some(libc::ENOBUFS)
+    }
+
+    /// A Unix datagram socket loses none the kernel took: a flood into the
+    /// smallest buffers arrives whole, once and in order, every datagram
+    /// whose send went through and none other, and on Linux every send goes
+    /// through, waiting for room.
     async fn flood(owned: bool, count: u32) {
         let what = format!("a Unix flood of {count}, owned {owned}");
         let (tx, rx) = UnixDatagram::pair().unwrap();
-        set_tiny(tx.get_ref());
-        set_tiny(rx.get_ref());
+        set_tiny_datagram(tx.get_ref(), LARGEST);
+        set_tiny_datagram(rx.get_ref(), LARGEST);
         let receiver = {
             let what = what.clone();
             nuclei::spawn(async move {
-                for want in 0..count {
-                    let got = if owned {
+                let mut got = Vec::new();
+                loop {
+                    let bytes = if owned {
                         let (n, buf) =
                             within(&what, rx.recv_owned(Vec::with_capacity(65_536))).await;
                         assert_eq!(n.unwrap(), buf.len());
@@ -368,28 +387,56 @@ mod unix {
                         buf.truncate(n);
                         buf
                     };
-                    assert_eq!(check(&what, &got), want, "{what}: out of order");
+                    match check(&what, &bytes) {
+                        END => return got,
+                        seq => got.push(seq),
+                    }
                 }
-                rx
             })
         };
+        let mut sent = Vec::new();
         for seq in 0..count {
-            // A Unix datagram must fit the smallest send buffer whole.
-            let bytes = datagram(seq, SIZES[seq as usize % SIZES.len()].min(4096));
+            let bytes = datagram(seq, SIZES[seq as usize % SIZES.len()].min(LARGEST));
             let len = bytes.len();
-            let sent = if owned {
+            let result = if owned {
                 within(&what, tx.send_owned(bytes)).await.0
             } else {
                 within(&what, tx.send(&bytes)).await
             };
-            assert_eq!(sent.unwrap(), len, "{what}: datagram {seq}");
+            match result {
+                Ok(n) => {
+                    assert_eq!(n, len, "{what}: datagram {seq} sent in part");
+                    sent.push(seq);
+                }
+                // The receiver drains while the sender lets it run.
+                Err(err) if refused(&err) => nuclei::task::yield_now().await,
+                Err(err) => panic!("{what}: datagram {seq}: {err}"),
+            }
         }
-        within(&what, receiver).await;
+        let mut pause = Duration::from_millis(1);
+        within(&what, async {
+            loop {
+                match tx.send(&datagram(END, HEADER)).await {
+                    Ok(_) => return,
+                    Err(err) if refused(&err) => {
+                        nuclei::time::sleep(pause).await;
+                        pause = (pause * 2).min(Duration::from_millis(50));
+                    }
+                    Err(err) => panic!("{what}: the end: {err}"),
+                }
+            }
+        })
+        .await;
+        let got = within(&what, receiver).await;
+        assert_eq!(got, sent, "{what}: the datagrams the kernel took, in order");
+        if !cfg!(target_vendor = "apple") {
+            assert_eq!(sent.len(), count as usize, "{what}: a send was refused");
+        }
     }
 
     #[test]
-    fn a_unix_flood_waits_for_room_and_loses_none() {
-        if alone("datagram::unix::a_unix_flood_waits_for_room_and_loses_none") {
+    fn a_unix_flood_loses_none_the_kernel_took() {
+        if alone("datagram::unix::a_unix_flood_loses_none_the_kernel_took") {
             let rt = runtime();
             rt.block_on(async {
                 flood(false, 3000).await;

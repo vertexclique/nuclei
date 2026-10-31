@@ -374,12 +374,14 @@ async fn connects() {
 /// Datagram sends and receives dropped at every point: a datagram arrives
 /// whole or not at all, and none received is lost.
 async fn datagrams() {
+    const LARGEST: usize = 30_000;
     for at in AT {
-        for (size, owned) in [(100, false), (100, true), (30_000, true)] {
+        for (size, owned) in [(100, false), (100, true), (LARGEST, true)] {
             for k in 0..5 {
                 let what =
                     format!("a {size}-byte send, owned {owned}, dropped at {at:?} after {k} polls");
                 let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                room_to_send(&a, LARGEST);
                 let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 let to = b.local_addr().unwrap();
                 let bytes = pattern(size as u64, size);
@@ -394,7 +396,10 @@ async fn datagrams() {
                 let mut buf = vec![0u8; 65_536];
                 let (n, _) = within(&what, b.recv_from(&mut buf)).await.unwrap();
                 if n == TRAILER.len() && &buf[..n] == TRAILER {
-                    assert!(done.is_none(), "{what}: sent, yet only the trailer came");
+                    assert!(
+                        done.is_none(),
+                        "{what}: sent ({done:?}), yet only the trailer came"
+                    );
                 } else {
                     same_bytes(&what, &buf[..n], &bytes);
                     let (n, _) = within(&what, b.recv_from(&mut buf)).await.unwrap();
