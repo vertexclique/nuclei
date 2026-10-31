@@ -13,7 +13,8 @@ udp io_uring 7790 1
 udp epoll 5186 1
 unix_stream io_uring 4770 1
 unix_stream epoll 4049 1
-tcp_split io_uring 976 1
+# tcp_split io_uring: the median of the perfc merge with the files merge in; its target is 976, perfc's own, which files2 brings it to.
+tcp_split io_uring 991 1
 tcp_split epoll 836 1
 tcp_asyncrw io_uring 4795 1
 tcp_asyncrw epoll 4070 1
@@ -22,7 +23,7 @@ tcp_many epoll 3464 1
 tcp_2w io_uring 4763 1
 tcp_2w epoll 4038 1
 bulk io_uring 70306 1
-bulk epoll 1768 1
+bulk epoll 1514 1
 file_read io_uring 2386 1
 file_read epoll 3310 9
 spawn_join io_uring 736 1
