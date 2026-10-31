@@ -60,8 +60,9 @@ impl Handle<UdpSocket> {
     ///
     /// # Errors
     ///
-    /// As `send(2)`, or the error of an earlier datagram sent after its call
-    /// returned.
+    /// As `send(2)` of this datagram. On Windows the completion port sends it
+    /// after the call returns, so a failure the stack finds only then (its
+    /// size is checked first) is the next send's error.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Connected)).await
     }
@@ -142,7 +143,8 @@ impl Handle<UdpSocket> {
     ///
     /// # Errors
     ///
-    /// As `sendto(2)`, the lookup's, or an earlier datagram's.
+    /// As `sendto(2)` of this datagram (on Windows, as for
+    /// [`send`](Self::send)), or the lookup's.
     pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
         let addr = resolve(&addr)
             .await?
@@ -287,13 +289,20 @@ impl Handle<UdpSocket> {
     }
 
     /// Polls for the sender of the next datagram, which stays to be
-    /// received. No byte of it is copied.
+    /// received. At most one byte of it is copied, and dropped.
     ///
     /// # Errors
     ///
     /// As `recvfrom(2)` with `MSG_PEEK`.
     pub fn poll_peek_sender(&self, cx: &mut Context<'_>) -> Poll<io::Result<SocketAddr>> {
-        self.poll_receive(cx, &mut [], true)
+        // macOS names no sender for a receive into an empty buffer: a peek of one byte gets
+        // it named, and leaves the datagram whole on the socket. Windows names it for an
+        // empty one, and answers a peek cut short with an error.
+        #[cfg(unix)]
+        let mut room = [0u8; 1];
+        #[cfg(windows)]
+        let mut room = [0u8; 0];
+        self.poll_receive(cx, &mut room, true)
             .map(|r| r.map(|(_, addr)| addr))
     }
 

@@ -54,14 +54,17 @@ mapfile -t bins < <(cargo test -p nuclei --no-run --message-format=json 2>/dev/n
 runner=$PWD/target/kernels-run.sh
 {
     echo '#!/bin/sh'
-    echo 'set -e'
     echo 'uname -r'
+    # Every binary runs on every pass, and the run fails at the end if any failed, so one
+    # failure never hides the ones after it.
+    echo 'failed=0'
     for bin in "${bins[@]}"; do
         for pass in "${passes[@]}"; do
             echo "echo '== $(basename "$bin") on ${pass%%|*}'"
-            echo "${pass#*|} '$bin' --test-threads=4"
+            echo "${pass#*|} '$bin' --test-threads=4 || { echo 'FAILED: $(basename "$bin") on ${pass%%|*}'; failed=1; }"
         done
     done
+    echo 'exit $failed'
 } >"$runner"
 chmod +x "$runner"
 vng --run "$version" --memory 4G --cpus 4 -- "$runner"

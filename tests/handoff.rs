@@ -7,9 +7,11 @@
 //! off nothing of it runs.
 //!
 //! Each runtime has one worker, so every task spawned on it shares the
-//! blocked task's shard. The bounds are loose: the shard moves within the
-//! threshold and a quarter (12.5 ms at 10 ms), and what is checked is that
-//! the shard's work does not wait out the 300 ms block.
+//! blocked task's shard. Nothing is timed against a bound: a blocked task
+//! holds its thread at a [`Gate`] until the test has seen the shard's other
+//! work done, and only a shard that waited out the block meets the gate's
+//! [`SAFETY`] deadline, which fails the test. A slow machine takes longer and
+//! still passes.
 
 use std::cell::RefCell;
 use std::net::{TcpListener, TcpStream};
@@ -22,11 +24,46 @@ use std::time::{Duration, Instant};
 use nuclei::runtime::{Builder, Runtime};
 use nuclei::sync::mpsc;
 
-/// How long the blocked task blocks.
+/// How long a task blocks where the test does not end the block.
 const BLOCK: Duration = Duration::from_millis(300);
-/// What the shard's other work may take with the handoff on: well under the
-/// block, with room for a loaded machine.
-const WITHIN: Duration = Duration::from_millis(150);
+/// How long a gate holds at most: far past anything a working handoff needs.
+const SAFETY: Duration = Duration::from_secs(10);
+
+/// A block the test ends: a task holds its thread in one poll until the test
+/// opens the gate, or gives up after [`SAFETY`].
+#[derive(Default)]
+struct Gate {
+    open: AtomicBool,
+    gave_up: AtomicBool,
+}
+
+impl Gate {
+    /// Holds the calling thread, asleep or with `spin` spinning, until the
+    /// gate opens.
+    fn hold(&self, spin: bool) {
+        let deadline = Instant::now() + SAFETY;
+        while !self.open.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                self.gave_up.store(true, Ordering::SeqCst);
+                return;
+            }
+            if spin {
+                std::hint::spin_loop();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Opens the gate, once `what` was done while it still held.
+    fn release_after(&self, what: &str) {
+        assert!(
+            !self.gave_up.load(Ordering::SeqCst),
+            "{what} waited out the block"
+        );
+        self.open.store(true, Ordering::SeqCst);
+    }
+}
 
 fn runtime(handoff: Option<Duration>) -> Runtime {
     Builder::new()
@@ -41,9 +78,13 @@ fn on() -> Runtime {
     runtime(Some(Duration::from_millis(10)))
 }
 
-/// Spawns, on `rt`'s one worker, a task that blocks the thread for `BLOCK`
-/// in its first poll, then gives `out`; waits until its poll began.
-fn blocker(rt: &Runtime, how: fn(), out: u32) -> nuclei::Task<(u32, ThreadId)> {
+/// Spawns, on `rt`'s one worker, a task that blocks the thread with `how` in
+/// its first poll, then gives `out`; waits until its poll began.
+fn blocker(
+    rt: &Runtime,
+    how: impl FnOnce() + Send + 'static,
+    out: u32,
+) -> nuclei::Task<(u32, ThreadId)> {
     let started = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&started);
     let task = rt.spawn(async move {
@@ -63,23 +104,19 @@ fn sleep_in_poll() {
     std::thread::sleep(BLOCK);
 }
 
-fn spin_in_poll() {
-    let until = Instant::now() + BLOCK;
-    while Instant::now() < until {
-        std::hint::spin_loop();
-    }
+/// A gate held by a task of `rt`'s one worker, asleep or with `spin` spinning.
+fn gated(rt: &Runtime, spin: bool, out: u32) -> (Arc<Gate>, nuclei::Task<(u32, ThreadId)>) {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    (gate, blocker(rt, move || held.hold(spin), out))
 }
 
 #[test]
 fn a_task_asleep_in_its_poll_holds_up_no_timer_channel_or_socket_of_its_shard() {
     let rt = on();
-    let blocked = blocker(&rt, sleep_in_poll, 7);
-    let start = Instant::now();
+    let (gate, blocked) = gated(&rt, false, 7);
     // A timer.
-    let timer = rt.spawn(async move {
-        nuclei::time::sleep(Duration::from_millis(20)).await;
-        start.elapsed()
-    });
+    let timer = rt.spawn(nuclei::time::sleep(Duration::from_millis(20)));
     // A ping-pong over two channels between two tasks.
     let (to_b, mut at_b) = mpsc::channel::<u32>(1);
     let (to_a, mut at_a) = mpsc::channel::<u32>(1);
@@ -96,7 +133,7 @@ fn a_task_asleep_in_its_poll_holds_up_no_timer_channel_or_socket_of_its_shard() 
             to_b.send(n).await.unwrap();
             n = at_a.recv().await.unwrap();
         }
-        (n, start.elapsed())
+        n
     });
     // A TCP echo on the shard.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -109,7 +146,7 @@ fn a_task_asleep_in_its_poll_holds_up_no_timer_channel_or_socket_of_its_shard() 
         while got < buf.len() {
             got += stream.recv(&mut buf[got..]).await.unwrap();
         }
-        (buf, start.elapsed())
+        buf
     });
     let (mut peer, _) = listener.accept().unwrap();
     std::io::copy(
@@ -117,17 +154,12 @@ fn a_task_asleep_in_its_poll_holds_up_no_timer_channel_or_socket_of_its_shard() 
         &mut peer,
     )
     .unwrap();
-    let fired = rt.block_on(timer);
-    let (n, pinged) = rt.block_on(ping);
-    let (bytes, echoed) = rt.block_on(echo);
-    assert!(fired < WITHIN, "the timer waited out the block: {fired:?}");
+    rt.block_on(timer);
+    let n = rt.block_on(ping);
+    let bytes = rt.block_on(echo);
+    gate.release_after("the timer, the ping-pong or the echo");
     assert_eq!(n, 100);
-    assert!(
-        pinged < WITHIN,
-        "the ping-pong waited out the block: {pinged:?}"
-    );
     assert_eq!(&bytes, b"hello");
-    assert!(echoed < WITHIN, "the echo waited out the block: {echoed:?}");
     assert_eq!(
         rt.block_on(blocked).0,
         7,
@@ -139,13 +171,9 @@ fn a_task_asleep_in_its_poll_holds_up_no_timer_channel_or_socket_of_its_shard() 
 #[test]
 fn a_task_spinning_in_its_poll_holds_up_no_timer_of_its_shard() {
     let rt = on();
-    let blocked = blocker(&rt, spin_in_poll, 9);
-    let start = Instant::now();
-    let fired = rt.block_on(rt.spawn(async move {
-        nuclei::time::sleep(Duration::from_millis(20)).await;
-        start.elapsed()
-    }));
-    assert!(fired < WITHIN, "the timer waited out the spin: {fired:?}");
+    let (gate, blocked) = gated(&rt, true, 9);
+    rt.block_on(rt.spawn(nuclei::time::sleep(Duration::from_millis(20))));
+    gate.release_after("the timer");
     assert_eq!(rt.block_on(blocked).0, 9);
 }
 
@@ -174,12 +202,14 @@ fn a_blocked_task_woken_in_its_poll_runs_again_on_the_shards_new_thread() {
 #[test]
 fn a_nested_block_on_whose_shard_goes_finishes_on_the_blocked_thread() {
     let rt = on();
-    let task = rt.spawn(async {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let task = rt.spawn(async move {
         let outer = std::thread::current().id();
         let (value, inner) = nuclei::block_on(async {
             nuclei::block_on(async {
                 nuclei::block_on(async {
-                    std::thread::sleep(BLOCK);
+                    held.hold(false);
                     // Pending after the shard went: the rest runs on the
                     // thread's own shard.
                     nuclei::time::sleep(Duration::from_millis(5)).await;
@@ -189,15 +219,8 @@ fn a_nested_block_on_whose_shard_goes_finishes_on_the_blocked_thread() {
         });
         (value, outer, inner)
     });
-    let start = Instant::now();
-    let timer = rt.block_on(rt.spawn(async move {
-        nuclei::time::sleep(Duration::from_millis(20)).await;
-        start.elapsed()
-    }));
-    assert!(
-        timer < WITHIN,
-        "the shard waited out the nested block: {timer:?}"
-    );
+    rt.block_on(rt.spawn(nuclei::time::sleep(Duration::from_millis(20))));
+    gate.release_after("the shard's timer, across the nested block,");
     let (value, outer, inner) = rt.block_on(task);
     assert_eq!(value, 5);
     assert_eq!(outer, inner, "the nested future finished on its own thread");
@@ -206,7 +229,9 @@ fn a_nested_block_on_whose_shard_goes_finishes_on_the_blocked_thread() {
 #[test]
 fn local_tasks_of_a_blocked_thread_finish_on_it_never_on_the_new_runner() {
     let rt = on();
-    let task = rt.spawn(async {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let task = rt.spawn(async move {
         let mine = std::thread::current().id();
         let local = nuclei::spawn_local(async move {
             // Not `Send`: the task may run on its thread only.
@@ -219,16 +244,12 @@ fn local_tasks_of_a_blocked_thread_finish_on_it_never_on_the_new_runner() {
         });
         // Let the local task run once, then block the thread.
         nuclei::time::sleep(Duration::from_millis(1)).await;
-        std::thread::sleep(BLOCK);
+        held.hold(false);
         let threads = local.await;
         (mine, threads)
     });
-    let start = Instant::now();
-    let timer = rt.block_on(rt.spawn(async move {
-        nuclei::time::sleep(Duration::from_millis(20)).await;
-        start.elapsed()
-    }));
-    assert!(timer < WITHIN, "the shard waited out the block: {timer:?}");
+    rt.block_on(rt.spawn(nuclei::time::sleep(Duration::from_millis(20))));
+    gate.release_after("the shard's timer");
     let (mine, threads) = rt.block_on(task);
     assert_eq!(threads.len(), 5);
     assert!(
@@ -262,15 +283,14 @@ fn a_receive_in_flight_across_a_handoff_gets_its_bytes_in_order() {
     }
     // The receive is in flight on the shard; its thread blocks now.
     std::thread::sleep(Duration::from_millis(20));
-    let blocked = blocker(&rt, sleep_in_poll, 1);
+    let (gate, blocked) = gated(&rt, false, 1);
     std::thread::sleep(Duration::from_millis(40));
     std::io::Write::write_all(&mut peer, b"abcd").unwrap();
     std::thread::sleep(Duration::from_millis(5));
     std::io::Write::write_all(&mut peer, b"efgh").unwrap();
-    let start = Instant::now();
     let got = rt.block_on(reader);
+    gate.release_after("the receive");
     assert_eq!(got, b"abcdefgh");
-    assert!(start.elapsed() < WITHIN, "the receive waited out the block");
     rt.block_on(blocked);
 }
 
@@ -310,31 +330,31 @@ fn a_storm_of_tasks_blocking_in_turn_keeps_the_threads_bounded() {
 #[test]
 fn a_shutdown_does_not_wait_for_a_thread_still_blocked() {
     let rt = on();
-    let _blocked = blocker(&rt, || std::thread::sleep(Duration::from_secs(3)), 0);
+    let (gate, _blocked) = gated(&rt, false, 0);
     // The shard goes to another thread first: a task of it runs only then.
     rt.block_on(rt.spawn(async {}));
-    let start = Instant::now();
     drop(rt);
-    assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "the shutdown waited for the blocked thread: {:?}",
-        start.elapsed()
-    );
+    gate.release_after("the shutdown");
 }
 
 #[test]
 fn with_the_handoff_off_a_blocked_task_holds_up_its_shard_as_before() {
     let rt = runtime(None);
-    let blocked = blocker(&rt, sleep_in_poll, 3);
-    let start = Instant::now();
-    let fired = rt.block_on(rt.spawn(async move {
-        nuclei::time::sleep(Duration::from_millis(1)).await;
-        start.elapsed()
-    }));
-    assert!(
-        fired >= BLOCK - Duration::from_millis(20),
-        "the timer ran during the block: {fired:?}"
+    let ended = Arc::new(AtomicBool::new(false));
+    let end = Arc::clone(&ended);
+    let blocked = blocker(
+        &rt,
+        move || {
+            std::thread::sleep(BLOCK);
+            end.store(true, Ordering::SeqCst);
+        },
+        3,
     );
+    let after = rt.block_on(rt.spawn(async move {
+        nuclei::time::sleep(Duration::from_millis(1)).await;
+        ended.load(Ordering::SeqCst)
+    }));
+    assert!(after, "the timer ran during the block");
     assert_eq!(rt.block_on(blocked).0, 3);
 }
 
@@ -356,16 +376,20 @@ fn the_stats_count_the_handoff_and_the_long_poll() {
 
 #[test]
 fn a_poll_blocked_past_the_threshold_hands_its_shard_over_before_it_ends() {
-    // The block is long against the threshold so a slow runner still starts
-    // the spare thread within it; the monitor's tick precision is checked by
-    // the bell's own test.
+    // The poll stays blocked until the queued task ran, so a slow runner only
+    // takes longer; the monitor's tick precision is checked by the bell's own
+    // test.
     let rt = on();
     let started = Arc::new(AtomicBool::new(false));
     let ran = Arc::new(AtomicBool::new(false));
     let (up, seen) = (Arc::clone(&started), Arc::clone(&ran));
     let blocked = rt.spawn(async move {
         up.store(true, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(250));
+        // Held until the queued task ran, which only a handoff lets happen.
+        let deadline = Instant::now() + SAFETY;
+        while !seen.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         seen.load(Ordering::SeqCst)
     });
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -376,7 +400,7 @@ fn a_poll_blocked_past_the_threshold_hands_its_shard_over_before_it_ends() {
     let quick = rt.spawn(async move { ran.store(true, Ordering::SeqCst) });
     assert!(
         rt.block_on(blocked),
-        "the queued task waited out the 250 ms poll"
+        "the queued task waited out the blocked poll"
     );
     rt.block_on(quick);
 }

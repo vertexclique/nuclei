@@ -17,6 +17,8 @@ Try(n, u) == [op |-> "try", n |-> n, use |-> u]
 Cancel(n) == [op |-> "cancel", n |-> n, use |-> 0]
 
 \* ---- sender programs: [sender |-> its operations, in order] ----
+\* (P_many, P_cancel_many, P_cancel_one and P_large_small, four operations each, are run
+\* only by mutations and witnesses, which stop at the first state that breaks their check.)
 
 \* Two senders on one slot: three sends, so somebody always waits.
 P_sends == [s \in {1, 2} |-> IF s = 1 THEN <<Send, Send>> ELSE <<Send>>]
@@ -33,12 +35,30 @@ P_pair == [s \in {1} |-> <<Res(2, 2)>>]
 \* A large request behind a small one and in front of another small one.
 P_large_small == [s \in {1, 2} |-> IF s = 1 THEN <<Send, Res(2, 0)>> ELSE <<Send, Send>>]
 
-\* ---- smaller programs for the liveness checks, which cost far more per state ----
+\* ---- smaller programs for the runs that must pass: sender 1 makes the one request the
+\*      run is about, sender 2 only sends, once or twice ----
 
-\* A send polled once and dropped, racing two sends on one slot.
-P_live_cancel == [s \in {1, 2} |-> IF s = 1 THEN <<Cancel(1)>> ELSE <<Send, Send>>]
 \* A request for both slots, putting one value in, racing two single sends.
-P_live_many == [s \in {1, 2} |-> IF s = 1 THEN <<Res(2, 1)>> ELSE <<Send, Send>>]
+P_many_vs2 == [s \in {1, 2} |-> IF s = 1 THEN <<Res(2, 1)>> ELSE <<Send, Send>>]
+\* A request for both slots that puts nothing in, racing two single sends.
+P_unused_vs2 == [s \in {1, 2} |-> IF s = 1 THEN <<Res(2, 0)>> ELSE <<Send, Send>>]
+\* A request for both slots polled once and dropped, racing two single sends.
+P_cancel_many_vs2 == [s \in {1, 2} |-> IF s = 1 THEN <<Cancel(2)>> ELSE <<Send, Send>>]
+\* A send polled once and dropped, racing two single sends.
+P_cancel_one_vs2 == [s \in {1, 2} |-> IF s = 1 THEN <<Cancel(1)>> ELSE <<Send, Send>>]
+\* A request for both slots, putting one value in, racing one single send.
+P_many_vs1 == [s \in {1, 2} |-> IF s = 1 THEN <<Res(2, 1)>> ELSE <<Send>>]
+\* A request for both slots polled once and dropped, then a send, racing one single send.
+P_cancel_send_vs1 == [s \in {1, 2} |-> IF s = 1 THEN <<Cancel(2), Send>> ELSE <<Send>>]
+
+\* ---- one sender alone, for the liveness checks, which cost far more per state ----
+
+\* Three sends on one slot: each send after the first waits for the slot of the value before.
+P_solo_sends == [s \in {1} |-> <<Send, Send, Send>>]
+\* A send, a send polled once and dropped, and a send that needs the slot the drop gives back.
+P_solo_cancel == [s \in {1} |-> <<Send, Cancel(1), Send>>]
+\* A send, then a request for both slots that waits for the slot the value holds.
+P_solo_many == [s \in {1} |-> <<Send, Res(2, 1)>>]
 
 \* ---- receiver programs ----
 

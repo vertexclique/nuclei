@@ -22,6 +22,10 @@ pub(crate) type ULONG_PTR = usize;
 pub(crate) type NTSTATUS = i32;
 
 pub(crate) const INVALID_HANDLE_VALUE: HANDLE = usize::MAX as HANDLE;
+pub(crate) const GENERIC_READ: DWORD = 0x8000_0000;
+pub(crate) const FILE_SHARE_READ: DWORD = 0x1;
+pub(crate) const FILE_SHARE_WRITE: DWORD = 0x2;
+pub(crate) const FILE_SHARE_DELETE: DWORD = 0x4;
 pub(crate) const INVALID_SOCKET: SOCKET = !0;
 pub(crate) const SOCKET_ERROR: i32 = -1;
 pub(crate) const INFINITE: DWORD = 0xFFFF_FFFF;
@@ -196,6 +200,7 @@ pub(crate) const SO_KEEPALIVE: i32 = 0x0008;
 pub(crate) const SO_LINGER: i32 = 0x0080;
 pub(crate) const SO_SNDBUF: i32 = 0x1001;
 pub(crate) const SO_RCVBUF: i32 = 0x1002;
+pub(crate) const SO_MAX_MSG_SIZE: i32 = 0x2003;
 pub(crate) const IPPROTO_IP: i32 = 0;
 pub(crate) const IP_TOS: i32 = 3;
 
@@ -236,7 +241,6 @@ pub(crate) const FILE_TYPE_DISK: DWORD = 1;
 pub(crate) const DUPLICATE_SAME_ACCESS: DWORD = 2;
 #[cfg(test)]
 pub(crate) const PIPE_ACCESS_DUPLEX: DWORD = 0x3;
-#[cfg(test)]
 pub(crate) const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
 pub(crate) const ERROR_MORE_DATA: i32 = 234;
 
@@ -248,6 +252,7 @@ pub(crate) const WAIT_TIMEOUT: i32 = 258;
 pub(crate) const WAIT_OBJECT_0: DWORD = 0;
 pub(crate) const WSAEINVAL: i32 = 10022;
 pub(crate) const WSAEMFILE: i32 = 10024;
+pub(crate) const WSAEMSGSIZE: i32 = 10040;
 pub(crate) const WSAEADDRINUSE: i32 = 10048;
 pub(crate) const WSAENETUNREACH: i32 = 10051;
 pub(crate) const WSAECONNABORTED: i32 = 10053;
@@ -354,6 +359,12 @@ unsafe extern "system" {
         lpSecurityAttributes: *const c_void,
     ) -> HANDLE;
     pub(crate) fn CancelSynchronousIo(hThread: HANDLE) -> BOOL;
+    pub(crate) fn ReOpenFile(
+        hOriginalFile: HANDLE,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        dwFlagsAndAttributes: DWORD,
+    ) -> HANDLE;
     pub(crate) fn DuplicateHandle(
         hSourceProcessHandle: HANDLE,
         hSourceHandle: HANDLE,

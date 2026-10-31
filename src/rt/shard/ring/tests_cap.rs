@@ -1,7 +1,8 @@
 //! The ring's admission cap: a ring shrunk under memory pressure gives its
 //! receive group no more than half its completion queue, and receives that
-//! wait on the network do not count against the cap, so a send is never held
-//! up behind its own reply's receive or behind idle connections.
+//! wait on the network, multishot or one-shot, do not count against the cap,
+//! so a send is never held up behind its own reply's receive or behind idle
+//! connections.
 
 use core::future::poll_fn;
 use core::pin::pin;
@@ -100,6 +101,65 @@ fn idle_connections_beyond_the_cap_hold_up_no_send() {
     assert!(
         arrived.load(Ordering::SeqCst),
         "the send waited behind idle receives"
+    );
+    drop(reader.join().unwrap());
+    for (_, source, _) in &idle {
+        source.retire();
+    }
+    src.retire();
+}
+
+/// One-shot receives (with no receive group, each read is one into a buffer of the pool) that
+/// wait on idle connections count against the cap no more than multishot ones: a send still goes.
+#[test]
+fn idle_one_shot_receives_beyond_the_cap_hold_up_no_send() {
+    use crate::rt::backend::Backend;
+    use crate::rt::shard::{Limits, Shard};
+    use crate::syscore::linux::iouring::ring::RingConfig;
+    let shard = match Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: Backend::Ring(RingConfig::new(64)),
+    }) {
+        Ok(shard) => shard,
+        Err(err) => {
+            eprintln!("skipping: io_uring unavailable: {err}");
+            return;
+        }
+    };
+    let _current = context::enter(&shard);
+    // No group: the cap is the 128 completions of the ring, and more idle reads than that.
+    let idle: Vec<_> = (0..130).map(|_| source_pair()).collect();
+    let (_mine, src, mut peer) = source_pair();
+    let arrived = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&arrived);
+    let reader = std::thread::spawn(move || {
+        let mut got = [0u8; 1];
+        peer.read_exact(&mut got).unwrap();
+        seen.store(true, Ordering::SeqCst);
+        peer
+    });
+    shard.block_on(async {
+        let mut bufs = vec![[0u8; 1]; idle.len()];
+        poll_fn(|cx| {
+            for ((_, source, _), buf) in idle.iter().zip(bufs.iter_mut()) {
+                assert!(source.poll_read(cx, buf, false).is_pending());
+            }
+            Poll::Ready(())
+        })
+        .await;
+        poll_fn(|cx| src.poll_write(cx, b"q")).await.unwrap();
+        // The byte must reach the peer while the shard keeps running.
+        let deadline = Instant::now() + DEADLINE;
+        let mut pause = Duration::from_millis(1);
+        while !arrived.load(Ordering::SeqCst) && Instant::now() < deadline {
+            crate::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_millis(20));
+        }
+    });
+    assert!(
+        arrived.load(Ordering::SeqCst),
+        "the send waited behind idle one-shot receives"
     );
     drop(reader.join().unwrap());
     for (_, source, _) in &idle {

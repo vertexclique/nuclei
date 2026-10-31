@@ -6,7 +6,9 @@
 //! `AsyncWrite` on the handle and on a shared reference to it, so two tasks
 //! can read and write one stream at once. A stream's `read_owned` and
 //! `write_owned` take the caller's buffer and give it back, so the driver
-//! reads into it and writes from it with no copy.
+//! reads into it and writes from it with no copy; a TCP stream's
+//! `write_zero_copy` asks the kernel not to copy it either, and gives it back
+//! through a [`Released`] once the kernel let go of it.
 //!
 //! An address is anything [`ToSocketAddrs`] takes: numbers are used at
 //! once; a name (`"localhost:80"`) is looked up on the blocking pool, so no
@@ -29,6 +31,7 @@
 
 mod addr;
 mod opt;
+mod released;
 mod send_file;
 mod socket;
 mod split;
@@ -41,6 +44,7 @@ pub mod unix;
 mod unix_socket;
 
 pub use self::addr::{ToSocketAddrs, lookup_host};
+pub use self::released::Released;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use self::socket::DeviceName;
 pub use self::socket::TcpSocket;

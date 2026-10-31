@@ -10,12 +10,18 @@
 //! go only once no entry names it.
 //!
 //! An operation gets its user data as it is submitted, and keeps it until
-//! its completion: one can be cancelled by it at any time. At most as many
-//! are in the kernel as the completion queue holds; the rest wait here, in
-//! order, entry and memory together, and go in as completions free room.
-//! One that is cancelled or whose source goes while it waits ends here,
-//! never submitted. A side has one operation out at a time, so the
-//! operations here are bounded by the sources.
+//! its completion: one can be cancelled by it at any time. A side has one
+//! operation out at a time, so the operations in flight are bounded by the
+//! sources, apart from the zero-copy sends below.
+//!
+//! A zero-copy send ends for its side at its first completion, and stays here
+//! only to hold its write's buffer until the kernel's notification, which
+//! comes once the peer acknowledged the bytes: the side goes on meanwhile, so
+//! one side may leave several. Each holds at most a chunk the socket's send
+//! buffer took, and none names its slot once it only waits. Only a ring a
+//! keeper can take sends zero-copy: as its shard goes, what is still out goes
+//! to the keeper with the ring (see `keeper`), so a buffer is kept until its
+//! notification and no longer.
 //!
 //! A multishot receive stays in flight across its arrivals: each completion
 //! that says more come (`IORING_CQE_F_MORE`) hands its buffer of the
@@ -26,15 +32,20 @@
 //!
 //! The group is sized to the ring: at most half its completion queue, so a
 //! small ring (made so under memory pressure) is never filled by arrivals.
-//! Multishot receives and accepts wait on the network for as long as their
-//! connection lives, so they are let into the kernel at once and do not
-//! count against the cap that finite operations wait behind: a sleeping
-//! connection would otherwise hold the room a request's send needs. The
-//! receives' arrivals are bounded by the group's buffers, which the queue
-//! keeps room for. An accept's connections (up to [`ACCEPT_CAP`] each) and
-//! the last completion of each multishot operation have no room kept: past
-//! the queue the kernel holds them (`IORING_FEAT_NODROP`, which the poller
-//! requires) until the poller takes them, and none is lost.
+//! The rest of the queue is the cap on the finite operations in the kernel,
+//! the files' reads and writes: past it they wait here, in order, entry and
+//! memory together, and go in as completions free room. Every operation of a
+//! source waits on its peer for as long as the peer pleases (a receive or an
+//! accept until it sends or connects, a send or a poll for room until it
+//! reads), and a child's exit watch on the child, so they go into the kernel
+//! at once and never count against the cap: idle or slow peers would
+//! otherwise hold the room another connection's reply, the next accept or a
+//! file call needs (proofs/tla/admission). The multishot receives' arrivals
+//! are bounded by the group's buffers, which the queue keeps room for. An
+//! accept's connections (up to [`ACCEPT_CAP`] each) and the completion of
+//! each of these operations have no room kept: past the queue the kernel
+//! holds them (`IORING_FEAT_NODROP`, which the poller requires) until the
+//! poller takes them, and none is lost.
 
 use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -77,18 +88,24 @@ pub(crate) struct ShardRing {
     /// A zero-copy send was refused for lack of lockable memory: the ring sends with copies from
     /// then on.
     zc_denied: Cell<bool>,
+    /// Any thread may submit to the ring and its completions are posted without its thread (it
+    /// is not single-issuer with deferred task work), so a keeper can take it as its shard goes.
+    reapable: bool,
     files: RefCell<Files>,
-    /// Operations submitted but not in the kernel yet, by user data, with
+    /// Files' calls submitted but not in the kernel yet, by user data, with
     /// their entries, in order.
     room: RefCell<VecDeque<(u64, Sqe)>>,
-    /// Finite operations in the kernel (see [`counts_against_cap`]), and the
-    /// most it may hold.
+    /// Files' calls in the kernel, the only operations the cap counts, and
+    /// the most it may hold.
     in_kernel: Cell<usize>,
     cap: usize,
+    /// Write sides' operations in the kernel: no cap holds them back (a peer
+    /// that never reads keeps one for good), but most end within a moment.
+    writes: Cell<usize>,
     /// Completions of the last wait, reused.
     cqes: RefCell<Vec<IoUringCqe>>,
     /// The buffers multishot receives draw from; `None` when the
-    /// configuration asks for none or the kernel could not make them.
+    /// configuration asks for none, or once the ring is shut down.
     recv: RefCell<Option<RecvGroup>>,
     /// Multishot receives and accepts submitted, the receives' arrivals,
     /// and the receives that ended as the group ran dry, for a test.
@@ -126,8 +143,13 @@ impl ShardRing {
                         format!("io_uring recv_buffers and recv_buffer_size: {err}"),
                     ));
                 }
-                // Short of memory: each read takes a buffer of the pool.
-                Err(err) if err.raw_os_error() == Some(libc::ENOMEM) => None,
+                // No memory for the group: the shard starts without it, said
+                // and counted (`went_without`), apart from the ring's own
+                // shortage, which the ring answers by shrinking (`with_room`).
+                Err(err) if err.kind() == io::ErrorKind::OutOfMemory => {
+                    super::recv::went_without(entries, cfg.recv_buffer_size, &err);
+                    None
+                }
                 // Anything else, a kernel's refusal included, is
                 // the ring's failure: a shard never runs without the group
                 // its configuration asked for, unseen.
@@ -155,10 +177,12 @@ impl ShardRing {
             waitid,
             send_zc,
             zc_denied: Cell::new(false),
+            reapable: cfg.multi_issuer,
             files: RefCell::new(Files::new(files)),
             room: RefCell::new(VecDeque::new()),
             in_kernel: Cell::new(0),
             cap,
+            writes: Cell::new(0),
             cqes: RefCell::new(Vec::with_capacity(256)),
             recv: RefCell::new(recv),
             #[cfg(test)]
@@ -186,11 +210,11 @@ impl ShardRing {
         self.poller.borrow_mut().enable()
     }
 
-    /// Whether finite operations are out (in the kernel or waiting for room): their completions
-    /// come within a moment. A multishot receive or accept waits on a peer for as long as it
-    /// lives, so it is no sign of one.
+    /// Whether operations whose completions come within a moment are out: files' calls (in the
+    /// kernel or waiting for room) and a write side's. A read side's waits on a peer for as long
+    /// as the peer is idle, and a child's exit watch on the child, so neither is a sign of one.
     pub(crate) fn expects_completions(&self) -> bool {
-        self.in_kernel.get() > 0 || !self.room.borrow().is_empty()
+        self.in_kernel.get() > 0 || self.writes.get() > 0 || !self.room.borrow().is_empty()
     }
 
     /// Keeps the buffer `bid` of the group `back` for the next take-in, if the ring's group is
@@ -210,9 +234,16 @@ impl ShardRing {
         self.recv.borrow().as_ref().map(RecvGroup::bgid)
     }
 
-    /// Whether a stream send may go out zero-copy on this ring.
+    /// Whether a stream send may go out zero-copy on this ring: one a keeper can take, so a
+    /// buffer the kernel still holds as the shard goes comes back once it let go of it.
     pub(crate) fn zc_stream(&self) -> bool {
-        self.send_zc && !self.zc_denied.get()
+        self.send_zc && self.reapable && !self.zc_denied.get()
+    }
+
+    /// Whether another thread can submit to the ring and reap its completions: a keeper can take
+    /// it as its shard goes (see `keeper`).
+    pub(crate) fn reapable(&self) -> bool {
+        self.reapable
     }
 
     /// Whether the ring's group is filled in pieces, which a datagram cannot share: the kernel
@@ -229,14 +260,22 @@ impl ShardRing {
         self.recv.borrow().as_ref().map(RecvGroup::buf_size)
     }
 
+    /// The memory the ring's group takes (0 without one), charged to the shard's ledger.
+    pub(crate) fn recv_reservation(&self) -> usize {
+        self.recv
+            .borrow()
+            .as_ref()
+            .map_or(0, RecvGroup::reservation)
+    }
+
     pub(crate) fn notifier(&self) -> Notifier {
         self.poller.borrow().notifier()
     }
 
     /// Submits `op` with its entry `sqe` (whose pointers point into `op`'s
     /// memory, which lives on the heap and does not move with it), on the
-    /// slot `op.file`, and returns its user data. With the kernel full it
-    /// waits for room; its slot is named from now on either way.
+    /// slot `op.file`, and returns its user data. It goes into the kernel at
+    /// once, never counted against the cap; its slot is named from now on.
     pub(crate) fn submit(&self, op: RingOp, sqe: Sqe) -> u64 {
         self.files.borrow_mut().named(op.file);
         let sqe = match self.files.borrow().copy_of(op.file) {
@@ -252,7 +291,7 @@ impl ShardRing {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed + 1, arrived, dry));
         }
-        let counted = counts_against_cap(&op.mem);
+        let write = counts_as_write(&op);
         let inserted = self.ops.borrow_mut().insert(op);
         let user_data = match inserted {
             Ok(user_data) => user_data,
@@ -262,13 +301,16 @@ impl ShardRing {
                 return IGNORED;
             }
         };
-        self.enter(user_data, sqe, counted);
+        if write {
+            self.writes.set(self.writes.get() + 1);
+        }
+        self.enter(user_data, sqe, false);
         user_data
     }
 
     /// Puts the entry of the operation of `user_data` into the kernel, or
-    /// behind the ones waiting for room. A long-lived operation (`counted`
-    /// false) goes in at once and is not counted.
+    /// behind the ones waiting for room. One that waits on a peer or a child
+    /// (`counted` false) goes in at once and is not counted.
     pub(super) fn enter(&self, user_data: u64, sqe: Sqe, counted: bool) {
         let sqe = sqe.user_data(user_data);
         if !counted {
@@ -324,21 +366,9 @@ impl ShardRing {
         }
     }
 
-    /// Cancels the operation of `user_data`: at once if it waits for room,
-    /// else by the kernel (its completion says what it did).
+    /// Cancels the source's operation of `user_data`, which is in the kernel:
+    /// its completion says what it did.
     pub(crate) fn cancel(&self, user_data: u64) {
-        let waiting = {
-            let mut room = self.room.borrow_mut();
-            room.iter()
-                .position(|(u, _)| *u == user_data)
-                .and_then(|at| room.remove(at))
-        };
-        if waiting.is_some() {
-            if let Some(op) = self.ops.borrow_mut().remove(user_data) {
-                self.end(None, op, -libc::ECANCELED);
-            }
-            return;
-        }
         if self.ops.borrow_mut().get_mut(user_data).is_some() {
             self.poller
                 .borrow_mut()
@@ -410,7 +440,7 @@ impl ShardRing {
         Ok((handled, woken?))
     }
 
-    fn complete(&self, shard: Option<&Shard>, mut cqe: IoUringCqe) {
+    fn complete(&self, shard: Option<&Shard>, cqe: IoUringCqe) {
         if cqe.user_data & FILE_TAG != 0 {
             if cqe.user_data & EXIT_TAG != 0 {
                 self.complete_exit(cqe.user_data, cqe.res);
@@ -419,7 +449,7 @@ impl ShardRing {
             }
             return;
         }
-        if self.zc_first(&cqe) {
+        if self.zero_copy(shard, &cqe) {
             return;
         }
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
@@ -440,45 +470,69 @@ impl ShardRing {
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
             return;
         };
-        if op.mem.is_zc() {
-            #[cfg(test)]
-            self.zc_seen
-                .set((self.zc_seen.get().0, self.zc_seen.get().1 + 1));
-            // The notification: the memory is free, and the send ended as its
-            // first completion said (a send refused before it ran has no
-            // notification, and says it at once).
-            cqe.res = op.mem.zc_result().unwrap_or(cqe.res);
-            if zc_refused(cqe.res) {
-                // No memory to pin: nothing was sent, and the send goes again with a copy.
-                self.zc_denied.set(true);
-                cqe.res = -libc::ECANCELED;
-            }
-        }
-        if counts_against_cap(&op.mem) {
-            self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
-            self.admit_waiting();
+        if counts_as_write(&op) {
+            self.writes.set(self.writes.get().saturating_sub(1));
         }
         self.end(shard, op, cqe.res);
     }
 
-    /// The first completion of a zero-copy send, which says how many bytes went and that a
-    /// notification follows (`IORING_CQE_F_MORE`): kept for the notification, which ends the
-    /// send once the kernel is done with its memory. True when `cqe` was such a first completion.
-    fn zc_first(&self, cqe: &IoUringCqe) -> bool {
-        if cqe.flags & IORING_CQE_F_MORE == 0 || cqe.flags & IORING_CQE_F_NOTIF != 0 {
+    /// A completion of a zero-copy send, handled here; false for any other. The first completion,
+    /// with the bytes the kernel took, ends the send for its side at once, which goes on to its
+    /// next chunk or write; the send then stays in the ring only to hold the buffer the kernel may
+    /// still read, until its notification (`IORING_CQE_F_NOTIF`), and no longer names its slot or
+    /// counts among the write sides' operations, since it waits on the network. A first
+    /// completion without `IORING_CQE_F_MORE` (a send refused before it ran) has no notification
+    /// after it. The kernel posts the notification after the first completion; one that comes
+    /// before it is kept for it. `proofs/tla/lent/LentZc.tla` checks the rule.
+    fn zero_copy(&self, shard: Option<&Shard>, cqe: &IoUringCqe) -> bool {
+        let notif = cqe.flags & IORING_CQE_F_NOTIF != 0;
+        let mut ops = self.ops.borrow_mut();
+        let Some(op) = ops.get_mut(cqe.user_data) else {
             return false;
-        }
-        let kept = self
-            .ops
-            .borrow_mut()
-            .get_mut(cqe.user_data)
-            .is_some_and(|op| op.mem.zc_first(cqe.res));
+        };
+        let waits = match &mut op.mem {
+            RingMem::SendZc { notified, .. } if notif => {
+                *notified = true;
+                return true;
+            }
+            RingMem::SendZc { notified, .. } => cqe.flags & IORING_CQE_F_MORE != 0 && !*notified,
+            RingMem::ZcHeld(_) if notif => {
+                // The kernel let go of what the send took: so does the send, and the last hold
+                // hands the buffer back.
+                let held = ops.remove(cqe.user_data);
+                drop(ops);
+                #[cfg(test)]
+                self.zc_seen
+                    .set((self.zc_seen.get().0, self.zc_seen.get().1 + 1));
+                drop(held);
+                return true;
+            }
+            _ => return false,
+        };
+        let (source, file, epoch) = (Arc::clone(&op.source), op.file, op.epoch);
+        let ended = if waits {
+            op.mem.hold_for_notification();
+            None
+        } else {
+            ops.remove(cqe.user_data)
+        };
+        drop(ops);
         #[cfg(test)]
-        if kept {
+        if waits {
             self.zc_seen
                 .set((self.zc_seen.get().0 + 1, self.zc_seen.get().1));
         }
-        kept
+        self.writes.set(self.writes.get().saturating_sub(1));
+        let mut res = cqe.res;
+        if zc_refused(res) {
+            // No memory to pin: nothing was sent, and the chunk goes again with a copy.
+            self.zc_denied.set(true);
+            res = -libc::ECANCELED;
+        }
+        let outcome = crate::io::source::ring::zc_outcome(res);
+        self.hand_over(shard, &source, file, epoch, false, outcome);
+        drop(ended);
+        true
     }
 
     /// Buffer `bid` of the receive group came with `res` bytes for the
@@ -635,65 +689,33 @@ impl ShardRing {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed, arrived, dry + 1));
         }
-        let freed = self.files.borrow_mut().done(op.file);
-        self.freed(op.file, freed);
         let kind = op.source.kind();
-        op.source.op_done(
+        let outcome = op.mem.complete(res, kind);
+        self.hand_over(shard, &op.source, op.file, op.epoch, op.read, outcome);
+    }
+
+    /// An operation of `source` on slot `file`, issued in `epoch` for its read side (`read`) or
+    /// its write side, ended for that side with `outcome`: the slot is named once less, and the
+    /// side gets the completion.
+    fn hand_over(
+        &self,
+        shard: Option<&Shard>,
+        source: &Arc<crate::io::source::Source>,
+        file: u32,
+        epoch: u32,
+        read: bool,
+        outcome: crate::io::source::ops::Outcome,
+    ) {
+        let freed = self.files.borrow_mut().done(file);
+        self.freed(file, freed);
+        source.op_done(
             Done {
-                outcome: op.mem.complete(res, kind),
-                epoch: op.epoch,
-                read: op.read,
+                outcome,
+                epoch,
+                read,
             },
             shard,
         );
-    }
-
-    /// The shard is going, its sources detached: every operation still out
-    /// is cancelled and its completion waited for, for at most
-    /// [`SHUTDOWN_WAIT`]. One that never completes keeps its memory for
-    /// good (the kernel may still write it), and is counted (`leaked`).
-    pub(crate) fn shut_down(&self) {
-        let waiting: Vec<u64> = self.room.borrow_mut().drain(..).map(|(u, _)| u).collect();
-        for user_data in waiting {
-            // Never submitted: nothing points at its memory. A file's call
-            // goes to the pool; a child goes to be watched elsewhere.
-            if user_data & (FILE_TAG | EXIT_TAG) == FILE_TAG | EXIT_TAG {
-                self.drop_waiting_exit(user_data);
-            } else if user_data & FILE_TAG != 0 {
-                let op = self.file_ops.borrow_mut().remove(user_data & !FILE_TAG);
-                if let Some(op) = op {
-                    drop(op.complete(-libc::ECANCELED));
-                }
-            } else {
-                let op = self.ops.borrow_mut().remove(user_data);
-                if let Some(op) = op {
-                    self.end(None, op, -libc::ECANCELED);
-                }
-            }
-        }
-        if self.in_flight() > 0 {
-            self.poller
-                .borrow_mut()
-                .push(Sqe::async_cancel_any(true).user_data(IGNORED));
-        }
-        self.settle(|| {});
-        let stuck: Vec<RingOp> = self.ops.borrow_mut().drain().collect();
-        let stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
-        let stuck_exits: Vec<ExitOp> = self.exit_ops.borrow_mut().drain().collect();
-        LEAKED.fetch_add(
-            stuck.len() + stuck_files.len() + stuck_exits.len(),
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        // A file's call still in the kernel keeps its buffer and its
-        // descriptor for good, a child's wait its info and its pidfd.
-        core::mem::forget(stuck_files);
-        core::mem::forget(stuck_exits);
-        if !stuck.is_empty() {
-            // A receive still in the kernel may write the group's buffers:
-            // they stay registered and mapped for good.
-            core::mem::forget(self.recv.borrow_mut().take());
-        }
-        core::mem::forget(stuck);
     }
 }
 
@@ -707,28 +729,6 @@ impl ShardRing {
     /// room for.
     pub(crate) fn overflows(&self) -> u64 {
         self.poller.borrow().overflows()
-    }
-
-    /// Submits what is queued and waits until no operation is out, for at
-    /// most [`SHUTDOWN_WAIT`]: what its sources cancelled as they went.
-    /// `between` runs before each wait (the shard's mailbox, where a
-    /// source's holder on another thread leaves its cancel).
-    pub(crate) fn settle(&self, mut between: impl FnMut()) {
-        let deadline = std::time::Instant::now() + SHUTDOWN_WAIT;
-        loop {
-            between();
-            if self.in_flight() == 0 {
-                return;
-            }
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero()
-                || self
-                    .wait(None, Some(left.min(Duration::from_millis(10))))
-                    .is_err()
-            {
-                return;
-            }
-        }
     }
 }
 
@@ -761,16 +761,11 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
     configured.min(u16::try_from(fit.min(1 << 15)).unwrap_or(1 << 15))
 }
 
-/// Whether the operation of `mem` counts against the cap on operations in
-/// the kernel. A multishot receive or accept waits on the network for as long
-/// as its connection lives, so counting it would let idle connections fill
-/// the cap and starve the sends that wake them. The one place both the
-/// submission and the end of an operation decide it.
-fn counts_against_cap(mem: &RingMem) -> bool {
-    !matches!(
-        mem,
-        RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } | RingMem::AcceptMulti { .. }
-    )
+/// Whether `op` is one of the write sides' operations counted in `writes`: a
+/// write side's, until a zero-copy send only waits for its notification. The
+/// one place both the submission and the end of an operation decide it.
+fn counts_as_write(op: &RingOp) -> bool {
+    !op.read && !matches!(op.mem, RingMem::ZcHeld(_))
 }
 
 /// The bit of the user data of a file's call (in the slot index, which the
@@ -788,18 +783,6 @@ const ACCEPT_CAP: usize = 256;
 /// to anyone: no operation of the slab has it (its index is the one the
 /// slab never hands out), and it is not the wake's.
 const IGNORED: u64 = u32::MAX as u64;
-
-/// How long a shard that goes waits for its ring's cancelled operations.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
-
-static LEAKED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Operations whose completion never came as their shard went: their memory
-/// is kept for good.
-#[cfg(test)]
-pub(crate) fn leaked() -> usize {
-    LEAKED.load(core::sync::atomic::Ordering::Relaxed)
-}
 
 #[cfg(test)]
 impl ShardRing {
@@ -876,9 +859,10 @@ thread_local! {
 }
 
 /// The fixed-file table of a ring: the process's descriptor limit (no more
-/// sources can be open while it holds), at most [`MAX_TABLE`], whose slots
-/// cost kernel memory per ring. Sources past it run on copies; every source
-/// does where the kernel lets go of a file out of the table only late (see
+/// sources can be open while it holds, and the kernel refuses a larger table
+/// with `EMFILE`), at most [`MAX_TABLE`], whose slots cost kernel memory per
+/// ring. Sources past it run on copies; every source does where the kernel
+/// lets go of a file out of the table only late (see
 /// `files::release_at_once`).
 pub(crate) fn table_len() -> u32 {
     #[cfg(test)]
@@ -896,9 +880,7 @@ pub(crate) fn table_len() -> u32 {
     } else {
         1024
     };
-    u32::try_from(soft)
-        .unwrap_or(MAX_TABLE)
-        .clamp(64, MAX_TABLE)
+    u32::try_from(soft).unwrap_or(MAX_TABLE).min(MAX_TABLE)
 }
 
 /// The most fixed files a ring's table holds.
@@ -933,11 +915,14 @@ pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
         },
         ..cfg
     };
-    let files = if table_len() == 0 { 0 } else { CHECK_TABLE };
+    let files = table_len().min(CHECK_TABLE);
     ShardRing::new(&small, files)?.enable()
 }
 
 pub(crate) mod exits;
+pub(crate) mod keeper;
+#[cfg(test)]
+pub(crate) use keeper::leaked;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -946,5 +931,7 @@ mod tests_cap;
 mod tests_inc;
 #[cfg(test)]
 mod tests_recv;
+#[cfg(test)]
+mod tests_reserve;
 #[cfg(test)]
 mod tests_zc;

@@ -255,9 +255,15 @@ impl Builder {
     /// The most bytes each worker's IO buffers hold (default 64 MiB). Reads
     /// that had to wait land in these buffers, and writes that had to wait
     /// are copied into them; at the cap, IO waits for buffers to come back,
-    /// so a worker's IO memory never grows past it. Any value is accepted; a
-    /// request that cannot fit under a cap too small for it fails with an error
-    /// that names this setting.
+    /// so a worker's IO memory never grows past it. On io_uring the worker's
+    /// receive buffers count against the cap too
+    /// ([`recv_buffers`](crate::config::IoUringConfiguration::recv_buffers) of
+    /// [`recv_buffer_size`](crate::config::IoUringConfiguration::recv_buffer_size)
+    /// bytes, 4 MiB by default, with their descriptors), and the rest is
+    /// left for the others. A cap that leaves less than 512 bytes beside the
+    /// receive buffers is refused with `InvalidInput` when the worker starts;
+    /// otherwise any value is accepted, and a request that cannot fit under a
+    /// cap too small for it fails with an error that names this setting.
     pub fn io_buffer_cap(mut self, bytes: usize) -> Self {
         self.io_buffer_cap = Some(bytes);
         self
@@ -341,6 +347,7 @@ impl Builder {
             keep_alive: self.blocking_keep_alive.unwrap_or(DEFAULT_KEEP_ALIVE),
             stack_size: self.thread_stack_size,
             name: blocking_name,
+            cpu_mask: current_mask(),
         });
         static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (exit_tx, exits) = kovan_channel::unbounded();
@@ -629,15 +636,38 @@ pub(crate) fn with_clock<R>(f: impl FnOnce(Option<&crate::time::clock::Clock>) -
     }
 }
 
+/// The runtime this thread is inside, or the default one if it runs: never
+/// started here (a thread on its way out may ask).
+fn running() -> Option<Arc<Inner>> {
+    context::runtime().or_else(|| DEFAULT.get().map(|rt| Arc::clone(&rt.inner)))
+}
+
 /// A shard to serve a thread that runs none, of the runtime this thread is
 /// inside or of the default one, if one runs: it never starts one (a thread
 /// on its way out may ask).
 pub(crate) fn running_service_shard() -> Option<Arc<Shared>> {
-    let inner = context::runtime().or_else(|| DEFAULT.get().map(|rt| Arc::clone(&rt.inner)))?;
+    let inner = running()?;
     inner
         .workers
         .place(inner.id, inner.local_margin)
         .map(Arc::clone)
+}
+
+/// Spawns `future`, detached, on a worker that takes tasks, of the runtime
+/// this thread is inside or of the default one if it runs; never starts one
+/// (a shard on its way out calls it). False when no worker took it.
+pub(crate) fn spawn_on_worker<F>(future: F) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let Some(inner) = running() else {
+        return false;
+    };
+    let Some(shard) = inner.workers.place(inner.id, inner.local_margin) else {
+        return false;
+    };
+    spawn_on(&inner, shard, future).detach();
+    true
 }
 
 /// Whether the shard [`service_shard`] hands out runs a ring: the current
@@ -686,6 +716,15 @@ where
         // No worker takes tasks: the spawning thread's own shard runs it.
         return spawn_here(future, false);
     };
+    spawn_on(inner, shard, future)
+}
+
+/// Spawns `future` on `inner`'s worker `shard`.
+fn spawn_on<F>(inner: &Inner, shard: &Arc<Shared>, future: F) -> Task<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     let hooks = inner.task_hooks.clone();
     let (runnable, task) = task::spawn(
         Counted::new(future, shard),
@@ -900,13 +939,20 @@ where
 /// its way out could not): whether `f` went.
 #[cfg(port)]
 pub(crate) fn spawn_blocking_inside(f: impl FnOnce() + Send + 'static) -> bool {
-    match context::runtime() {
-        Some(inner) => {
-            inner.pool.spawn(f).detach();
+    match blocking_pool_inside() {
+        Some(pool) => {
+            pool.spawn(f).detach();
             true
         }
         None => false,
     }
+}
+
+/// The blocking pool of the runtime this thread is inside, if it is inside one; never the
+/// default runtime's, which it does not start.
+#[cfg(completion)]
+pub(crate) fn blocking_pool_inside() -> Option<Arc<super::blocking::Pool>> {
+    context::runtime().map(|inner| Arc::clone(&inner.pool))
 }
 
 /// The cores this process may run on, in order (Linux; Windows, in the
@@ -915,16 +961,12 @@ pub(crate) fn spawn_blocking_inside(f: impl FnOnce() + Send + 'static) -> bool {
 pub(crate) fn allowed_cores() -> Vec<usize> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: a plain syscall into a zeroed set of our own.
-        unsafe {
-            let mut set: libc::cpu_set_t = core::mem::zeroed();
-            if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-                return (0..libc::CPU_SETSIZE as usize)
-                    .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
-                    .collect();
-            }
-        }
-        Vec::new()
+        current_mask().map_or_else(Vec::new, |set| {
+            (0..libc::CPU_SETSIZE as usize)
+                // SAFETY: a plain read of a set of our own.
+                .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+                .collect()
+        })
     }
     #[cfg(windows)]
     {
@@ -942,6 +984,37 @@ pub(crate) fn allowed_cores() -> Vec<usize> {
     {
         Vec::new()
     }
+}
+
+/// A thread's CPU affinity mask.
+#[cfg(target_os = "linux")]
+pub(crate) type CpuMask = libc::cpu_set_t;
+/// A thread's CPU affinity mask; none is kept where threads are not pinned.
+#[cfg(not(target_os = "linux"))]
+pub(crate) type CpuMask = ();
+
+/// The calling thread's affinity mask, `None` where it is not known.
+pub(crate) fn current_mask() -> Option<CpuMask> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain syscall into a zeroed set of our own.
+        unsafe {
+            let mut set: libc::cpu_set_t = core::mem::zeroed();
+            (libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) == 0).then_some(set)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// Runs the calling thread on `mask`. A failure leaves the mask it had,
+/// which costs locality and nothing else.
+pub(crate) fn apply_mask(mask: &CpuMask) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: a plain syscall with a set of our own.
+    let _ = unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), mask) };
+    #[cfg(not(target_os = "linux"))]
+    let _ = mask;
 }
 
 /// Pins the calling thread to `core` (Linux, Windows). A failure leaves it

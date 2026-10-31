@@ -5,9 +5,10 @@
 use super::*;
 use crate::io::Handle;
 
-/// What this thread's pool took from the allocator.
+/// What this thread's pool took from the allocator for its own buffers,
+/// beside the receive group charged to it.
 fn pool_charged() -> usize {
-    crate::buf::with_pool(|p| p.map_or(0, |p| p.charged()))
+    crate::buf::with_pool(|p| p.map_or(0, |p| p.charged() - p.reserved()))
 }
 
 /// Runs `fut` as a task on the runtime's worker, whose driver serves the
@@ -503,6 +504,8 @@ fn a_lent_write_to_a_gone_peer_fails_and_gives_the_buffer_back() {
 
 /// A handle dropped while the driver still writes a lent buffer whose
 /// future went away: the rest goes out through its copy of the descriptor.
+/// Some of it is read first, so the write has started for sure (one none of
+/// which went out is withdrawn, as the task's going away asks).
 #[test]
 fn a_dropped_handle_delivers_the_rest_of_a_started_lent_write() {
     let rt = runtime(None);
@@ -514,14 +517,25 @@ fn a_dropped_handle_delivers_the_rest_of_a_started_lent_write() {
         let b = Handle::new(b).unwrap();
         let mut owned = Box::pin(a.write_owned(data));
         pends(&mut owned).await;
+        let reader = Arc::clone(b.source());
+        let (n, mut got) = reader.read_owned(Vec::with_capacity(64 * 1024)).await;
+        assert!(n.unwrap() > 0, "the stream ended before the write started");
         drop(owned);
         drop(a);
-        let reader = Arc::clone(b.source());
-        let got = read_to_end(&reader).await;
+        got.extend(read_to_end(&reader).await);
         drop(b);
         got
     });
-    assert!(got == expected, "the bytes after the drop were lost");
+    assert!(
+        got == expected,
+        "the bytes after the drop were lost: {} of {} came, the first {} in order",
+        got.len(),
+        expected.len(),
+        got.iter()
+            .zip(&expected)
+            .take_while(|(a, b)| a == b)
+            .count()
+    );
 }
 
 #[test]

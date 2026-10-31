@@ -61,6 +61,8 @@ pub(crate) struct PoolConfig {
     pub(crate) keep_alive: Duration,
     pub(crate) stack_size: Option<usize>,
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
+    /// The mask the runtime was built with; a pool thread runs on it.
+    pub(crate) cpu_mask: Option<super::runtime::CpuMask>,
 }
 
 /// A slot's states.
@@ -373,6 +375,11 @@ impl Pool {
     /// A pool thread's life.
     fn work(self: Arc<Self>) {
         let _alive = Alive::new();
+        // A thread inherits its creator's mask, and a pinned worker often
+        // creates pool threads.
+        if let Some(mask) = &self.config.cpu_mask {
+            super::runtime::apply_mask(mask);
+        }
         let _stopping = self.config.hooks.started();
         let mut me = self.claim_slot();
         loop {
@@ -499,6 +506,7 @@ mod tests {
             keep_alive,
             stack_size: None,
             name: Arc::new(|| "test-blocking".to_string()),
+            cpu_mask: None,
         })
     }
 

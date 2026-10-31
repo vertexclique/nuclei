@@ -156,12 +156,13 @@ fn usable_here(cfg: crate::syscore::linux::iouring::ring::RingConfig) -> Result<
     for cfg in [cfg, cfg.handed_over()] {
         match check(cfg) {
             Ok(()) => {}
-            // Short of memory is no missing feature, and a shard makes its
-            // ring with less memory on its own (`with_room`). A configuration
-            // mistake is the shard's to report when it starts, not a reason
-            // to run another backend unseen.
+            // Short of memory is no missing feature: a shard makes its ring
+            // with less memory on its own (`with_room`), and starts without a
+            // receive group it has no memory for (`recv::went_without`). A
+            // configuration mistake is the shard's to report too, not a
+            // reason to run another backend unseen.
             Err(err)
-                if err.raw_os_error() == Some(libc::ENOMEM)
+                if err.kind() == io::ErrorKind::OutOfMemory
                     || err.kind() == io::ErrorKind::InvalidInput => {}
             Err(err) => return Err(err.to_string()),
         }

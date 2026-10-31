@@ -32,6 +32,13 @@
 (* handshake (a nudge or a grant reaches a waiting future: the waiter       *)
 (* family's part); the list's sweep of withdrawn waiters, one step that    *)
 (* takes them all (a waiter never comes back from withdrawn).              *)
+(*                                                                          *)
+(* States that differ only in what nobody reads again are kept as one: a   *)
+(* step's own working values go back to where they started once read for   *)
+(* the last time, and a node is forgotten (its marks go back to where they *)
+(* started) once its future and the queue are both done with it: as a      *)
+(* pass lets a withdrawn node go, and as a future takes or gives back its  *)
+(* grant.                                                                  *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -42,7 +49,9 @@ CONSTANTS
     MaxBypass,  \* MAX_BYPASS (2 under loom; 16 in a build)
     Mutation    \* "none", or the name of the one rule this run takes away
 
-Tasks == 1..Len(Prog)
+\* The tasks are the names Prog gives programs to: 1, 2, ... for a sequence, or
+\* model values (MC_SemaphoreSym), which a symmetry set can swap.
+Tasks == DOMAIN Prog
 CloserT == 100
 Reqs == UNION {{<<t, j>> : j \in 1..Len(Prog[t])} : t \in Tasks}
 NoReq == <<0, 0>>
@@ -99,12 +108,31 @@ define
     NoStrandedArrival == \A r \in Range(arrivals) : enqueued[r] => draining
     AllDone == \A t \in Tasks : pc[t] = "Done"
     PermitsBackAtEnd == AllDone => free = Permits
-    AllTasksEnd == <>AllDone
+    \* Every task ends. Once every task is at its end it stays there (an ended
+    \* task takes no step, under every mutation too), so "in the end, all are
+    \* ended" is the same as "all are ended again and again", which TLC checks
+    \* directly, without the extra machinery an "in the end" needs.
+    AllTasksEnd == []<>AllDone
     \* Witnesses.
     NoHandoff == ~raisedHandoff
     NoNudgePending == ~nudgePending
     NoGrantGivenBack == ~gaveBackGrant
 end define;
+
+\* `forget`: the nodes in S are done with. Their futures will not look at them
+\* again (a future looks at its node only while it asks), and the queue let
+\* them go (it looks only at the nodes on its stack and list), so their marks go
+\* back to where they started: two states that differ only in what a finished
+\* node carried are one state.
+macro forget(S) begin
+    phase := [x \in Reqs |-> IF x \in S THEN "none" ELSE phase[x]];   \* as if never queued
+    nudged := [x \in Reqs |-> nudged[x] /\ x \notin S];              \* no nudge left on it
+    owed := [x \in Reqs |-> owed[x] /\ x \notin S];                  \* no owed mark left on it
+    need := [x \in Reqs |-> IF x \in S THEN 0 ELSE need[x]];          \* asks for nothing
+    closedG := [x \in Reqs |-> closedG[x] /\ x \notin S];            \* no close grant on it
+    woken := [x \in Reqs |-> woken[x] /\ x \notin S];                \* no wake on its way
+    enqueued := [x \in Reqs |-> enqueued[x] /\ x \notin S];          \* no enqueue recorded
+end macro;
 
 macro claimOrDirty(claimed) begin
     if draining then
@@ -120,8 +148,10 @@ end macro;
 (* The drain role's work (`WaitQueue::drain` and `RawSemaphore::pass`).   *)
 (***************************************************************************)
 procedure Drain()
+\* (The withdrawn nodes a sweep takes, and the front a handoff looks at, are
+\* named within their one step, so they are not kept between steps.)
 variables wfBefore = FALSE, wl = {}, at = 1, budget = 0, raised = FALSE, sent = FALSE,
-          front = NoReq, gone = {}, noneLeft = FALSE;
+          noneLeft = FALSE;
 begin
 D_clear:
     wfBefore := wakeFront;
@@ -129,15 +159,19 @@ D_clear:
     wakeFront := FALSE;
 D_absorb:
     \* The arrival stack, oldest first; withdrawn nodes are let go (settling an owed one).
-    gone := {r \in Range(arrivals) : phase[r] = "cancelled"};
-    list := list \o Without(arrivals, gone);
-    arrivals := <<>>;
-    owedCount := owedCount - Cardinality({r \in gone : owed[r]});
+    with gone = {r \in Range(arrivals) : phase[r] = "cancelled"} do   \* the withdrawn ones
+        list := list \o Without(arrivals, gone);
+        arrivals := <<>>;
+        owedCount := owedCount - Cardinality({r \in gone : owed[r]});
+        forget(gone);    \* their futures left them, and now the queue lets them go
+    end with;
 D_tidy:
     \* The sweep: every withdrawn waiter on the list goes.
-    gone := {r \in Range(list) : phase[r] = "cancelled"};
-    list := Without(list, gone);
-    owedCount := owedCount - Cardinality({r \in gone : owed[r]});
+    with gone = {r \in Range(list) : phase[r] = "cancelled"} do   \* the withdrawn ones
+        list := Without(list, gone);
+        owedCount := owedCount - Cardinality({r \in gone : owed[r]});
+        forget(gone);    \* their futures left them, and now the queue lets them go
+    end with;
 D_closed:
     if closedBit then
         \* Closed: every waiter is granted the close; the queue lets go of each.
@@ -151,7 +185,7 @@ D_closed:
 D_handoff:
     \* While a handoff is owed, permits go to the waiters in order.
     if handoffBit /\ list # <<>> then
-        front := Head(list);
+      with front = Head(list) do    \* the front waiter, named for this step only
         if free >= need[front] /\ ~closedBit then
             \* `take_for_waiter`, past the bit, then the grant.
             free := free - need[front];
@@ -166,10 +200,12 @@ D_handoff:
                 goto D_handoff;
             else
                 inPass := need[front];
+                forget({front});    \* withdrawn: its future left it, the queue lets it go
             end if;
         else
             goto D_nudgeStart;
         end if;
+      end with;
     else
         goto D_nudgeStart;
     end if;
@@ -214,9 +250,12 @@ D_nudgeEnd:
     end if;
 D_end:
     noneLeft := \A k \in 1..Len(list) : phase[list[k]] = "cancelled";
+    \* The nudge walk's values are read for the last time: back to their start.
+    wfBefore := FALSE; at := 1; budget := 0; raised := FALSE; sent := FALSE;
 D_exit:
     \* The compare-and-swap that gives the role up, or another pass.
     if dirty /\ Mutation # "exit_ignores_dirty" then
+        noneLeft := FALSE;    \* read: the next pass computes it again
         goto D_clear;
     elsif ~noneLeft /\ wakeFront then
         goto D_clear;
@@ -229,9 +268,11 @@ D_exit:
             queuedBit := FALSE;
             wakeFront := FALSE;
         end if;
+        noneLeft := FALSE;    \* read for the last time
     end if;
 D_wake:
-    woken := [r \in Reqs |-> woken[r] \/ r \in wl];
+    \* A wake reaches the futures still asking; a forgotten node's wakes nobody.
+    woken := [r \in Reqs |-> woken[r] \/ (r \in wl /\ phase[r] # "none")];
     return;
 end procedure;
 
@@ -251,6 +292,7 @@ R_add:
         heldBy[self] := heldBy[self] - back;
     else
         owned[fromReq] := owned[fromReq] - back;
+        forget({fromReq});    \* given back: its future is done with it, the queue let it go
     end if;
 R_ask:
     if wants /\ Mutation # "release_no_pass" then
@@ -299,6 +341,7 @@ Q_enqTr:
     claimOrDirty(claimed);
 Q_enqDrain:
     if claimed then
+        claimed := FALSE;    \* read: back to its start
         call Drain();
     end if;
 Q_park:
@@ -308,6 +351,7 @@ Q_park:
             heldBy[self] := heldBy[self] + owned[ar];
             owned[ar] := 0;
         end if;
+        forget({ar});    \* granted: the queue let it go at the grant, its future is done
         return;
     elsif nudged[ar] then
         nudged[ar] := FALSE;
@@ -381,10 +425,12 @@ Q_settleTr:
     end if;
 Q_settleDrain:
     if claimed then
+        claimed := FALSE;    \* read: back to its start
         call Drain();
     end if;
 Q_after:
     if took then
+        took := FALSE; marked := FALSE; seenHandoff := FALSE;    \* read for the last time
         goto Q_won;
     end if;
 Q_lost:
@@ -396,6 +442,7 @@ Q_lost:
             counted[ar] := counted[ar] + 1;
         end if;
     end if;
+    marked := FALSE; took := FALSE; seenHandoff := FALSE;    \* read for the last time
     goto Q_park;
 Q_won:
     \* Took on its own: leave the queue (`Contend::cancel`).
@@ -423,6 +470,7 @@ Q_withdraw:
         goto Q_giveBack;
     elsif phase[ar] = "granted" then
         nudgeOut := FALSE;
+        forget({ar});    \* granted the close: the queue let it go at the grant
         return;
     else
         return;
@@ -441,6 +489,7 @@ Q_wdTr:
     if wasNudged then
         wakeFront := TRUE;
     end if;
+    wasNudged := FALSE;    \* read for the last time
     claimOrDirty(claimed);
 Q_wdDrain:
     if claimed then

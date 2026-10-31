@@ -1,14 +1,18 @@
-TLC run of every configuration in proofs/tla/accept, 2026-10-30 10:38 UTC.
+TLC run of every configuration in proofs/tla/accept, 2026-10-30 17:29 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers 2, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-A_serve                           1306        556      1  pass                                  pass                                  yes
-A_long                            3948       1618      1  pass                                  pass                                  yes
-A_other                            904        416      1  pass                                  pass                                  yes
-M_end_on_emfile                    393        170      1  violated:AllServed                    violated:AllServed                    yes
-M_no_backoff                       114         62      1  violated:NoBusyLoop                   violated:NoBusyLoop                   yes
-M_no_reset                         566        269      1  violated:FirstWaitLeast               violated:FirstWaitLeast               yes
-W_retry_serves                     213        107      1  violated:NoRetryServed                violated:NoRetryServed                yes
+A_serve                           1671        706      2  pass                                  pass                                  yes
+A_long                            4746       1941      2  pass                                  pass                                  yes
+A_other                           1117        506      1  pass                                  pass                                  yes
+M_end_on_emfile                    504        215      3  violated:AllServed                    violated:AllServed                    yes
+M_no_backoff                       165         83      2  violated:NoBusyLoop                   violated:NoBusyLoop                   yes
+M_no_reset                         916        419      3  violated:FirstWaitLeast               violated:FirstWaitLeast               yes
+W_retry_serves                     330        157      3  violated:NoRetryServed                violated:NoRetryServed                yes
+A_drops                           3000       1264      3  pass                                  pass                                  yes
+M_no_probe                         383        177      2  violated:LostPerOutage                violated:LostPerOutage                yes
+M_no_mark                          383        177      2  violated:LostPerOutage                violated:LostPerOutage                yes
+W_race_lost                        556        261      1  violated:NoRaceLoss                   violated:NoRaceLoss                   yes
 
-results matching EXPECTED.txt: 7 of 7
+results matching EXPECTED.txt: 11 of 11

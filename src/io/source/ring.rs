@@ -7,7 +7,9 @@
 //! the source's file by the ring's slot, never by the descriptor (see
 //! `rt::shard::ring`). Everything the entry points at (the buffer, the
 //! address, the message header) lives in the operation's [`RingMem`] until
-//! its completion; a lent buffer moves into it and back.
+//! its completion; a lent buffer moves into it and back. A zero-copy write's
+//! buffer is shared instead: each send of it holds it until its completion,
+//! a zero-copy one until the kernel's notification after that.
 
 use core::sync::atomic::Ordering;
 use std::io;
@@ -15,6 +17,7 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use super::ops::{Answer, Dial, Done, Outcome, Want};
+use super::write::Pinned;
 use super::{Addr, Kind, Source, Target};
 use crate::buf::PoolBuf;
 use crate::buf::spare::Spare;
@@ -81,26 +84,44 @@ pub(crate) enum RingMem {
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
         Vec<u8>,
     ),
-    /// A zero-copy send of a lent buffer: the buffer stays until the
-    /// notification, `first` the byte count its first completion brought.
-    SendLentZc {
-        buf: Vec<u8>,
-        first: Option<i32>,
+    /// A copied send of a zero-copy write's buffer, which it holds until its completion.
+    SendPinned(#[expect(dead_code, reason = "the kernel reads it until the completion")] Pinned),
+    /// A zero-copy send of a zero-copy write's buffer, before its first completion. `notified`:
+    /// its notification came first, so the first completion ends it.
+    SendZc {
+        buf: Pinned,
+        notified: bool,
     },
+    /// A zero-copy send whose first completion came: it only holds the buffer, which the kernel
+    /// may still read, until its notification.
+    ZcHeld(#[expect(dead_code, reason = "the kernel may read it until the notification")] Pinned),
 }
 
-/// The least a stream send must carry to go out zero-copy: below it, pinning
-/// the pages costs more than the copy it saves. From the `owned_size_*` modes
-/// of benches/vs_tokio_count.rs on the development host (loopback, where the
-/// receive path copies what a send pinned): total cycles per write were above
-/// the copy's from 16 KiB to 512 KiB and level with it at 1 MiB, so no
-/// smaller write is sent zero-copy. A datagram never is: the same sweep from
-/// 16 KiB to 60 KiB, all UDP carries, cost 30 to 50 percent more kernel cycles.
+/// The least a `write_zero_copy` must have left to send for its next chunk to go out zero-copy
+/// (on a ring that allows it at all: `ShardRing::zc_stream`); a smaller write is copied whole,
+/// and its buffer handed back at once. Below it, pinning the
+/// pages costs more than the copy it saves: on the development host's loopback (where the receive
+/// path copies what a send pinned), the `owned_size_*` modes of benches/vs_tokio_count.rs
+/// measured total cycles per write above the copy's from 16 KiB to 512 KiB, level with it at
+/// 1 MiB. A datagram never goes zero-copy: the same sweep from 16 KiB to 60 KiB, all UDP carries,
+/// cost 30 to 50 percent more kernel cycles.
 pub(crate) const SEND_ZC_MIN: usize = 1 << 20;
 
 /// The most one zero-copy entry carries: what the kernel pins at a time is
 /// bounded, and a longer write goes in several.
 const SEND_ZC_CHUNK: usize = 1 << 20;
+
+/// Whether a send of `len` bytes, what is left of a zero-copy write on a source of `kind`, is
+/// worth a zero-copy send: a TCP stream's, of at least [`SEND_ZC_MIN`]. The one place the call
+/// and the ring decide it.
+pub(crate) fn zero_copy_worth(kind: Kind, len: usize) -> bool {
+    kind == Kind::Tcp && len >= SEND_ZC_MIN
+}
+
+/// What a zero-copy send's first completion `res` brings its side, which goes on at once.
+pub(crate) fn zc_outcome(res: i32) -> Outcome {
+    Outcome::SendPinned(answer(res))
+}
 
 /// The kernel's answer `res` (a count, or a negated errno) to an operation
 /// that takes bytes or gives a descriptor.
@@ -121,29 +142,13 @@ fn failed(code: i32) -> io::Error {
 }
 
 impl RingMem {
-    /// Whether the operation is a zero-copy send, which ends on a
-    /// notification.
-    pub(crate) fn is_zc(&self) -> bool {
-        matches!(self, RingMem::SendLentZc { .. })
-    }
-
-    /// Keeps the first completion's `res` of a zero-copy send, whose
-    /// notification ends it. False for an operation that is not one.
-    pub(crate) fn zc_first(&mut self, res: i32) -> bool {
-        match self {
-            RingMem::SendLentZc { first, .. } => {
-                *first = Some(res);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// The first completion's result of a zero-copy send that got one.
-    pub(crate) fn zc_result(&self) -> Option<i32> {
-        match self {
-            RingMem::SendLentZc { first, .. } => *first,
-            _ => None,
+    /// A zero-copy send's first completion came, and a notification follows: from now on the
+    /// send only holds its buffer.
+    pub(crate) fn hold_for_notification(&mut self) {
+        if matches!(self, RingMem::SendZc { .. })
+            && let RingMem::SendZc { buf, .. } = core::mem::replace(self, RingMem::Ready)
+        {
+            *self = RingMem::ZcHeld(buf);
         }
     }
 
@@ -242,7 +247,9 @@ impl RingMem {
             RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
             RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, answer(res)),
             RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, answer(res)),
-            RingMem::SendLentZc { buf, .. } => Outcome::SendLent(buf, answer(res)),
+            RingMem::SendPinned(_) | RingMem::SendZc { .. } | RingMem::ZcHeld(_) => {
+                Outcome::SendPinned(answer(res))
+            }
         }
     }
 }
@@ -457,6 +464,12 @@ impl RingIssuer<'_> {
 }
 
 impl RingIssuer<'_> {
+    /// Whether a send of `len` bytes, what is left of a zero-copy write on a source of `kind`,
+    /// goes out zero-copy: one worth it, on a ring whose kernel sends so.
+    pub(crate) fn zero_copy(&self, kind: Kind, len: usize) -> bool {
+        zero_copy_worth(kind, len) && self.ring.zc_stream()
+    }
+
     /// Whether a stream read of a source of `kind` goes out as a multishot
     /// receive: a socket's, on a ring with a receive group.
     pub(crate) fn multishot(&self, kind: Kind) -> bool {
@@ -670,14 +683,24 @@ fn entry(
             (RingMem::Send(buf), sqe)
         }
         Want::SendLent(buf, from) => {
-            let rest = buf.get(from..).unwrap_or_default();
-            if kind == Kind::Tcp && rest.len() >= SEND_ZC_MIN && ring.zc_stream() {
+            let sqe = stream_write(kind, slot, buf.get(from..).unwrap_or_default());
+            (RingMem::SendLent(buf), sqe)
+        }
+        Want::SendPinned(buf, from, zero_copy) => {
+            let rest = buf.bytes().get(from..).unwrap_or_default();
+            if zero_copy {
                 let len = rest.len().min(SEND_ZC_CHUNK) as u32;
                 let sqe = Sqe::send_zc(slot, rest.as_ptr(), len, sys::SEND_FLAGS);
-                (RingMem::SendLentZc { buf, first: None }, sqe)
+                (
+                    RingMem::SendZc {
+                        buf,
+                        notified: false,
+                    },
+                    sqe,
+                )
             } else {
                 let sqe = stream_write(kind, slot, rest);
-                (RingMem::SendLent(buf), sqe)
+                (RingMem::SendPinned(buf), sqe)
             }
         }
         Want::SendTo(buf, target) => {

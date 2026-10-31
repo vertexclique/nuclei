@@ -129,7 +129,10 @@ impl Handle<UnixListener> {
         Handle::adopt(UnixListener::bind_addr(addr)?, Kind::UnixListener)
     }
 
-    /// The next connection, with its peer's address.
+    /// The next connection, with its peer's address. On macOS an accept
+    /// that finds the process out of descriptors closes the connection it
+    /// took, and the next ones take none until a descriptor is free, as a
+    /// TCP listener's do.
     ///
     /// # Errors
     ///
@@ -326,7 +329,7 @@ impl Handle<UnixDatagram> {
     ///
     /// # Errors
     ///
-    /// As `send(2)`, or an earlier datagram's.
+    /// As `send(2)` of this datagram.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Connected)).await
     }
@@ -405,7 +408,7 @@ impl Handle<UnixDatagram> {
     ///
     /// # Errors
     ///
-    /// As `sendto(2)`, or an earlier datagram's.
+    /// As `sendto(2)` of this datagram.
     pub async fn send_to<P: AsRef<Path>>(&self, buf: &[u8], path: P) -> io::Result<usize> {
         let addr = UnixAddr::path(path.as_ref())?;
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Unix(&addr))).await

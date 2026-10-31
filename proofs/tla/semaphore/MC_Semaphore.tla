@@ -23,4 +23,8 @@ MutexTwo == <<<<L(1)>>, <<L(1)>>>>
 MutexDrop == <<<<L(1)>>, <<C(1)>>>>
 \* A mutex: one task locks four times, another once.
 MutexBarge4 == <<<<L(1), L(1), L(1), L(1)>>, <<L(1)>>>>
+\* A mutex: one task locks twice, another once.
+PairOneTwo == <<<<L(1), L(1)>>, <<L(1)>>>>
+\* A mutex: one task locks twice, another gives up its wait.
+LockTwiceDrop == <<<<L(1), L(1)>>, <<C(1)>>>>
 =============================================================================

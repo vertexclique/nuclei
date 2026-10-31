@@ -5,12 +5,14 @@
 //! once when a task asks and the socket may hold something. A task takes
 //! what the driver completed, copying it into its own buffer; only a
 //! stream read into a buffer big enough (see `direct`) makes the call
-//! itself, into that buffer, when the read-ahead holds nothing. What no
-//! task took yet waits here: a stream's read-ahead (in the order it came: a
-//! buffer of the pool, a lent buffer's leftover, or on a ring the buffers of
-//! the shard's receive group that a multishot receive handed out), its end
-//! or its error, a listener's accepted connections, a datagram socket's
-//! datagrams (as many as tasks wait, at most [`BATCH`]). A task whose future
+//! itself, into that buffer, when the read-ahead holds nothing, and so does
+//! a datagram receive on unix (on a ring, a Unix datagram's: a UDP datagram
+//! fits a buffer of the pool's largest class), so no datagram is cut to a
+//! buffer of the pool. What no task took yet waits here: a stream's
+//! read-ahead (in the order it came: a buffer of the pool, a lent buffer's
+//! leftover, or on a ring the buffers of the shard's receive group that a
+//! multishot receive handed out), its end or its error, a listener's
+//! accepted connections, a completion driver's datagrams. A task whose future
 //! went away leaves it for the next operation, so nothing the kernel handed
 //! over is lost.
 //!
@@ -40,19 +42,23 @@ use crate::io::sys;
 
 mod ahead;
 mod calls;
+#[cfg(unix)]
+mod datagram;
 #[cfg(completion)]
 mod ops;
 
 use ahead::{Ahead, Piece};
 
-/// The most connections or datagrams the driver takes ahead on one edge.
+/// The most connections the driver takes ahead on one edge.
 #[cfg(readiness)]
 const BATCH: usize = 32;
 
-/// A datagram received ahead: in a buffer of the pool, on a ring in a
-/// buffer of the receive group a multishot receive filled, or in a task's
-/// own buffer whose task went away after the driver read into it.
+/// A datagram received ahead: by a completion driver in a buffer of the
+/// pool, on a ring in a buffer of the receive group a multishot receive
+/// filled, or in a task's own buffer whose task went away after the driver
+/// read into it.
 enum Datagram {
+    #[cfg(completion)]
     Pool(PoolBuf),
     #[cfg(ring)]
     Ring(crate::rt::shard::recv::RingChunk),
@@ -65,6 +71,7 @@ enum Datagram {
 impl Datagram {
     fn bytes(&self) -> &[u8] {
         match self {
+            #[cfg(completion)]
             Datagram::Pool(buf) => buf.filled(),
             #[cfg(ring)]
             Datagram::Ring(chunk) => chunk.bytes(),
@@ -89,8 +96,16 @@ impl Datagram {
         n
     }
 
+    #[cfg_attr(
+        not(completion),
+        expect(
+            unused_variables,
+            reason = "only a pool's buffer goes back through `after`"
+        )
+    )]
     fn release(self, after: &mut After) {
         match self {
+            #[cfg(completion)]
             Datagram::Pool(buf) => after.drop_buf(buf),
             // Goes back to its group as it drops.
             #[cfg(ring)]
@@ -126,6 +141,11 @@ struct Lent {
     peer: Option<Addr>,
 }
 
+/// The longest datagram UDP carries, by its length field: what a datagram
+/// received ahead needs room for whole.
+#[cfg(completion)]
+const UDP_MAX: usize = u16::MAX as usize;
+
 #[derive(Default)]
 pub(super) struct ReadState {
     /// The last call would have blocked, and no edge came since.
@@ -144,6 +164,10 @@ pub(super) struct ReadState {
     /// Urgent data or a hangup was reported: a short read may leave bytes
     /// behind it from now on (see [`drained`]).
     unsure: bool,
+    /// The last accept failed for want of a descriptor: the next one looks
+    /// for a free one first (see [`ReadState::accept_checked`]).
+    #[cfg(readiness)]
+    short_of_fds: bool,
     /// The source's epoch this state is of.
     epoch: u32,
     /// Edges (and, on a ring, polls that completed) since the source was
@@ -171,6 +195,15 @@ pub(super) struct ReadState {
     /// the next one waits for it to be.
     #[cfg(ring)]
     poll_first: bool,
+    /// A task that receives a datagram itself waits for the poll to say one
+    /// came (see `receive_now`): its end wakes the tasks.
+    #[cfg(ring)]
+    task_polls: bool,
+    /// The poll of a side the pool had no buffer for said bytes came: its
+    /// task reads them into its own buffer, and the ring asks for nothing
+    /// more until it has (proofs/tla/ring/RingStarve.tla).
+    #[cfg(ring)]
+    readable: bool,
     /// The operation out is a multishot receive, and whether it is being
     /// stopped (for a lent buffer, which takes the next bytes itself).
     #[cfg(ring)]
@@ -212,6 +245,14 @@ impl ReadState {
         self.lent.as_ref().is_some_and(|l| l.done.is_some())
     }
 
+    /// A lent buffer waits for the driver, and no operation has it: its
+    /// task may take it back.
+    fn lent_idle(&self) -> bool {
+        self.lent
+            .as_ref()
+            .is_some_and(|l| !l.out && l.done.is_none())
+    }
+
     /// A lent buffer waits for the driver.
     fn lent_waits(&self) -> bool {
         self.lent.as_ref().is_some_and(|l| l.done.is_none())
@@ -225,17 +266,37 @@ impl ReadState {
     /// Whether a read, receive or accept would end now, taking nothing:
     /// what came ahead, the end, or an error, which stays for it. `Ready`
     /// with `true` at the end of the stream.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            unused_variables,
+            reason = "only unix tasks receive datagrams themselves"
+        )
+    )]
     pub(super) fn ready(
         &mut self,
         io: Io<'_>,
+        fd: Option<crate::io::raw::Raw>,
         kind: Kind,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<bool> {
-        // A datagram read ahead is read whole: the receive that takes it may
-        // ask for any size, and one read into less would be cut. The pool's
-        // largest buffer holds any datagram UDP carries; a pool too small
-        // for one reads into what it has, as a receive would.
+        #[cfg(unix)]
+        if kind.datagrams()
+            && let Some(fd) = self.task_receives(io, fd, kind)
+        {
+            return self.datagram_ready(io, fd, kind, waker, after);
+        }
+        // Bytes came for a starved side: its task's read takes them.
+        #[cfg(ring)]
+        if self.starved && self.readable {
+            return Poll::Ready(self.eof);
+        }
+        // A datagram read ahead (on a completion driver, of UDP) is read
+        // whole: the receive that takes it may ask for any size, and one read
+        // into less would be cut. The pool's largest buffer holds any
+        // datagram UDP carries; a pool too small for one reads into what it
+        // has, as a receive would.
         let len = if kind.datagrams() {
             let largest = crate::buf::LARGEST;
             let room = with_pool(|pool| pool.is_some_and(|p| p.could_hold_whole(largest)));
@@ -247,8 +308,63 @@ impl ReadState {
         if self.has_result() {
             return Poll::Ready(self.eof);
         }
+        #[cfg(readiness)]
+        if let Some(ready) = self.starved_look(io, kind) {
+            return ready;
+        }
         self.wait(waker, len);
         Poll::Pending
+    }
+
+    /// On a readiness driver, whether a stream socket the pool has no buffer
+    /// for may be read now, by a peek at one byte straight from it that takes
+    /// nothing: its task's read goes straight into its own buffer
+    /// (`reads_itself`). `None` once the socket is found empty, which waits
+    /// for the next edge, and for a side that is not starved
+    /// (proofs/tla/starve/FdStarve.tla).
+    #[cfg(readiness)]
+    fn starved_look(&mut self, io: Io<'_>, kind: Kind) -> Option<Poll<bool>> {
+        let fd = match io.via {
+            Via::Fd(fd) => fd,
+            #[cfg(completion)]
+            Via::Ops(_) => return None,
+            #[cfg(not(completion))]
+            Via::None(never, _) => match never {},
+        };
+        if !self.starved || self.blocked || !kind.streams() {
+            return None;
+        }
+        match sys::ready(sys::peek(fd, &mut [0; 1])) {
+            None => {
+                self.blocked = true;
+                None
+            }
+            Some(Ok(0)) => {
+                self.eof = true;
+                Some(Poll::Ready(true))
+            }
+            Some(Ok(_)) => Some(Poll::Ready(false)),
+            Some(Err(err)) => {
+                self.error = Some(err);
+                Some(Poll::Ready(false))
+            }
+        }
+    }
+
+    /// On a readiness driver, a side the pool just had no buffer for whose
+    /// socket may hold bytes no edge will report again: its waiting tasks are
+    /// woken to read them into their own buffers (`reads_itself`), and one
+    /// that finds the socket empty waits for the next edge
+    /// (proofs/tla/starve/FdStarve.tla).
+    #[cfg_attr(
+        not(readiness),
+        expect(unused_variables, reason = "only a readiness driver looks again")
+    )]
+    fn look_again(&mut self, io: Io<'_>, after: &mut After) {
+        #[cfg(readiness)]
+        if self.starved && !self.blocked && matches!(io.via, Via::Fd(_)) {
+            after.wake(&mut self.waiters);
+        }
     }
 
     /// The caller's own calls: `Ready` with the edge count while the side
@@ -344,7 +460,8 @@ impl ReadState {
             return;
         }
         self.complete_fd(fd, kind, self.want, after);
-        if self.has_result() {
+        // A side the pool had no buffer for reads its bytes itself.
+        if self.has_result() || self.starved {
             self.want = 0;
             after.wake(&mut self.waiters);
         }
@@ -407,7 +524,8 @@ impl ReadState {
             Kind::Udp | Kind::UnixDatagram if self.lent.is_some() => {
                 self.receive_lent(fd, kind, after);
             }
-            Kind::Udp | Kind::UnixDatagram => self.receive_ahead(fd, kind, len, after),
+            // The task receives a datagram itself (`receive_now`).
+            Kind::Udp | Kind::UnixDatagram => {}
             // The caller makes its own calls.
             Kind::Fd => {}
         }
@@ -502,9 +620,9 @@ impl ReadState {
         };
         let spare = lent.buf.spare_capacity_mut();
         let result = match kind {
-            Kind::UnixDatagram => sys::ready(sys::recv_from_unix_uninit(fd, spare))
+            Kind::UnixDatagram => sys::ready(sys::recv_from_unix_uninit(fd, spare, false))
                 .map(|r| r.map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a))))),
-            _ => sys::ready(sys::recv_from_udp_uninit(fd, spare))
+            _ => sys::ready(sys::recv_from_udp_uninit(fd, spare, false))
                 .map(|r| r.map(|(n, a)| (n, Addr::Inet(a)))),
         };
         let Some(result) = result else {
@@ -527,14 +645,18 @@ impl ReadState {
     fn accept_ahead(&mut self, fd: RawFd, kind: Kind) {
         let limit = self.waiters.len().clamp(1, BATCH);
         while self.accepted.len() < limit {
-            match sys::ready(accept(fd, kind)) {
+            match sys::ready(self.accept_checked(fd, kind)) {
                 None => {
                     self.blocked = true;
                     break;
                 }
-                Some(Ok((conn, peer))) => self.accepted.push_back((conn, Peer::Known(peer))),
+                Some(Ok((conn, peer))) => {
+                    self.short_of_fds = false;
+                    self.accepted.push_back((conn, Peer::Known(peer)));
+                }
                 Some(Err(err)) => {
                     crate::rt::counters::accept_error(&err);
+                    self.short_of_fds = crate::rt::counters::out_of_descriptors(&err);
                     self.error = Some(err);
                     break;
                 }
@@ -542,63 +664,78 @@ impl ReadState {
         }
     }
 
+    /// An accept from the listener `fd`; after one that failed for want of a
+    /// descriptor, only once a copy of `fd` (closed at once) says one is free.
+    /// On macOS an accept that finds none closes the connection it took off
+    /// the backlog (XNU's `accept_nocancel`, bsd/kern/uipc_syscalls.c), so a
+    /// retry while none is free would close one connection each; the copy's
+    /// EMFILE leaves the backlog whole (proofs/tla/accept).
     #[cfg(readiness)]
-    fn receive_ahead(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
-        let limit = self.waiters.len().clamp(1, BATCH);
-        while self.datagrams.len() < limit {
-            let Some(mut buf) = self.buffer(len, true, after) else {
-                return;
-            };
-            match sys::ready(receive(fd, kind, buf.spare())) {
-                None => {
-                    self.blocked = true;
-                    after.drop_buf(buf);
-                    return;
-                }
-                Some(Ok((n, addr))) => {
-                    buf.set_filled(n);
-                    self.datagrams.push_back((Datagram::Pool(buf), addr));
-                }
-                Some(Err(err)) => {
-                    self.error = Some(err);
-                    after.drop_buf(buf);
-                    return;
-                }
-            }
+    fn accept_checked(&self, fd: RawFd, kind: Kind) -> io::Result<(Owned, Addr)> {
+        if self.short_of_fds {
+            drop(sys::duplicate(fd)?);
         }
+        accept(fd, kind)
     }
 
     /// The tasks waiting asked for buffers big enough to read into directly,
-    /// and nothing is held that must come first.
+    /// or the pool had no buffer for the side (`reads_itself`), and nothing is
+    /// held that must come first.
     #[cfg(readiness)]
     fn leaves_to_tasks(&self, kind: Kind) -> bool {
-        kind.streams()
-            && self.want >= super::direct::READ_READINESS
-            && self.ahead.is_empty()
-            && self.lent.is_none()
-            && !self.eof
-            && self.error.is_none()
+        let theirs = if kind.datagrams() {
+            // A datagram is always the task's to receive (`receive_now`).
+            self.datagrams.is_empty()
+        } else {
+            self.reads_bytes(kind)
+                && (self.want >= super::direct::READ_READINESS || self.starved)
+                && self.ahead.is_empty()
+        };
+        theirs && self.lent.is_none() && !self.eof && self.error.is_none()
     }
 
-    /// A stream read of `len` bytes made by `call` straight on the
-    /// descriptor `fd`, into the caller's memory, if the side holds nothing
-    /// that comes first. `None` leaves the read to the normal path, which
-    /// waits for readiness when the socket had nothing; `Pending` is a
+    /// Whether a stream read (or `peek`) of `len` bytes goes straight into
+    /// the task's buffer: a read big enough (see `direct`), or any while the
+    /// pool has no buffer for the side, so a reader never waits on buffers
+    /// that receives or reads ahead of other connections hold
+    /// (proofs/tla/ring/RingStarve.tla, proofs/tla/starve/FdStarve.tla).
+    #[cfg(unix)]
+    pub(super) fn reads_itself(&self, io: Io<'_>, len: usize, peek: bool) -> bool {
+        self.starved || (!peek && super::direct::worth(io, len, false))
+    }
+
+    /// Whether a read of `kind` may go straight into the task's buffer: a
+    /// socket's, and while the pool has no buffer for the side any byte
+    /// stream's (a pipe's, a terminal's).
+    #[cfg(unix)]
+    fn reads_bytes(&self, kind: Kind) -> bool {
+        kind.streams() || (self.starved && kind == Kind::Bytes)
+    }
+
+    /// A stream read (or `peek`) of `len` bytes made by `call` straight on
+    /// the descriptor `fd`, into the caller's memory, if the side holds
+    /// nothing that comes first. `None` leaves the read to the normal path,
+    /// which waits for readiness when the socket had nothing; `Pending` is a
     /// multishot receive being stopped so the next poll can call.
     #[cfg(unix)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's context, as every step's"
+    )]
     pub(super) fn read_direct(
         &mut self,
         io: Io<'_>,
         fd: Option<RawFd>,
         kind: Kind,
         len: usize,
+        peek: bool,
         waker: &Waker,
         call: impl FnOnce(RawFd) -> io::Result<usize>,
     ) -> Option<Poll<io::Result<usize>>> {
         let fd = fd?;
-        if !kind.streams()
+        if !self.reads_bytes(kind)
             || len == 0
-            || !super::direct::worth(io, len, false)
+            || !self.reads_itself(io, len, peek)
             || !self.ahead.is_empty()
             || self.lent.is_some()
             || self.eof
@@ -625,6 +762,10 @@ impl ReadState {
         }
         #[cfg(not(ring))]
         let _ = waker;
+        #[cfg(ring)]
+        {
+            self.readable = false;
+        }
         match sys::ready(call(fd)) {
             None => {
                 match io.via {
@@ -637,7 +778,8 @@ impl ReadState {
                 None
             }
             Some(Ok(n)) => {
-                if matches!(io.via, Via::Fd(_)) {
+                // A peek leaves the bytes in the socket, which no edge reports again.
+                if matches!(io.via, Via::Fd(_)) && !peek {
                     self.blocked = drained(kind, self.unsure, n, len);
                 }
                 Some(Poll::Ready(Ok(n)))
@@ -667,6 +809,7 @@ impl ReadState {
             }
             None => {
                 self.wait(waker, out.len());
+                self.look_again(io, after);
                 Poll::Pending
             }
         }
@@ -692,6 +835,7 @@ impl ReadState {
             }
             None => {
                 self.wait(waker, len);
+                self.look_again(io, after);
                 Poll::Pending
             }
         }
@@ -710,6 +854,12 @@ impl ReadState {
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
+        if held.is_none() && self.has_result() && self.lent_idle() {
+            // An operation out before the buffer was lent brought bytes, the
+            // end or an error to the read-ahead: they go first, taken into
+            // the buffer.
+            *held = self.reclaim(after);
+        }
         if let Some(buf) = held.as_mut() {
             if let Some(result) =
                 self.take_stream(false, after, |ahead, after| ahead.append_to(buf, after))
@@ -974,18 +1124,35 @@ impl ReadState {
         }
     }
 
-    /// A datagram receive (or peek) into `out`: the driver receives into the
-    /// pool first if the socket may hold one, and the task copies it out
+    /// A datagram receive (or peek) into `out`: on unix the task's own (see
+    /// [`receive_now`](Self::receive_now)); else the driver receives into
+    /// the pool first if the socket may hold one, and the task copies it out
     /// (what does not fit `out` is cut, as the kernel cuts it).
+    #[cfg_attr(
+        not(unix),
+        expect(
+            unused_variables,
+            reason = "only unix tasks receive datagrams themselves"
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's context, as every step's"
+    )]
     fn receive(
         &mut self,
         io: Io<'_>,
+        fd: Option<crate::io::raw::Raw>,
         kind: Kind,
         out: &mut [u8],
         peek: bool,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<(usize, Addr)>> {
+        #[cfg(unix)]
+        if let Some(poll) = self.receive_now(io, fd, kind, out, peek, waker, after) {
+            return poll;
+        }
         self.complete(io, kind, out.len(), after);
         let taken = match self.datagrams.front() {
             Some((datagram, addr)) => {
@@ -1059,6 +1226,10 @@ impl ReadState {
     pub(super) fn unstarve(&mut self, after: &mut After) {
         if self.starved {
             self.starved = false;
+            #[cfg(ring)]
+            {
+                self.readable = false;
+            }
             after.wake(&mut self.waiters);
         }
     }
@@ -1123,6 +1294,8 @@ impl ReadState {
         #[cfg(ring)]
         {
             self.poll_first = false;
+            self.task_polls = false;
+            self.readable = false;
         }
     }
 }
@@ -1164,15 +1337,5 @@ fn accept(fd: RawFd, kind: Kind) -> io::Result<(Owned, Addr)> {
             sys::accept_unix(fd).map(|(s, a)| (s, Addr::Unix(crate::buf::spare::Spare::new(a))))
         }
         _ => sys::accept_inet(fd).map(|(s, a)| (s, Addr::Inet(a))),
-    }
-}
-
-#[cfg(readiness)]
-/// Receives a datagram with its sender's address.
-fn receive(fd: RawFd, kind: Kind, out: &mut [u8]) -> io::Result<(usize, Addr)> {
-    match kind {
-        Kind::UnixDatagram => sys::recv_from_unix(fd, out)
-            .map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)))),
-        _ => sys::recv_from_udp(fd, out).map(|(n, a)| (n, Addr::Inet(a))),
     }
 }

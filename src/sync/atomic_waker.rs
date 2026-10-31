@@ -377,13 +377,19 @@ mod tests {
         assert!(cell.take().is_none(), "the slot was emptied");
     }
 
+    /// How long one round may wait for its waking thread to run, or its wake
+    /// to come, on a loaded host.
+    const ROUND: Duration = Duration::from_secs(30);
+
     /// A wake racing a registration is delivered or the registrant sees what
-    /// the waker set: the lost-wakeup check, many rounds on two threads.
+    /// the waker set: the lost-wakeup check, many rounds on two threads. Each
+    /// round has its own deadline, so a slow host spreads no wait over the
+    /// rounds after it.
     #[test]
     fn no_wakeup_is_lost_between_a_register_and_a_wake() {
         let rounds = if cfg!(miri) { 20 } else { 20_000 };
-        let deadline = Instant::now() + Duration::from_secs(60);
         for _ in 0..rounds {
+            let deadline = Instant::now() + ROUND;
             let cell = Arc::new(AtomicWaker::new());
             let ready = Arc::new(AtomicBool::new(false));
             let (counter, waker) = counting();
@@ -406,8 +412,8 @@ mod tests {
     #[test]
     fn repeated_registration_from_one_thread_against_a_waking_thread_never_loses_the_last_wake() {
         let rounds = if cfg!(miri) { 20 } else { 5_000 };
-        let deadline = Instant::now() + Duration::from_secs(60);
         for _ in 0..rounds {
+            let deadline = Instant::now() + ROUND;
             let cell = Arc::new(AtomicWaker::new());
             let ready = Arc::new(AtomicBool::new(false));
             let (counter, waker) = counting();
