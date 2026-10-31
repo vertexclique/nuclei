@@ -82,7 +82,7 @@ impl Header {
 
     /// Stores `waker` as the awaiter. A notification that raced the store is
     /// handled here: the waker is woken at once instead of being left behind.
-    #[inline]
+    #[inline(always)]
     pub(super) fn register(&self, waker: &Waker) {
         let mut state = self.state.fetch_or(0, Ordering::Acquire);
         loop {
