@@ -228,11 +228,13 @@ fn a_cursor_read_after_a_positional_write_sees_it() {
 
 /// A read into a task's buffer whose job read before a positional write
 /// landed, and is taken after that write returned, reads again: its bytes
-/// are of an older generation. On a ring the read's call goes first and is
-/// served at once; on the pool either order ends the same.
+/// are of an older generation. The pool's one thread is held while the
+/// read is made, so its job is out for certain (on the pool it then runs
+/// before the write's, in their queue's order); on a ring the read's call
+/// goes first and is served at once. Either order ends the same.
 #[test]
 fn a_lent_read_taken_after_a_positional_write_reads_again() {
-    let rt = runtime();
+    let rt = one_blocking_thread();
     let tmp = Temp::new("pos-lent-gen");
     let path = tmp.file("data");
     std::fs::write(&path, b"old!old!").unwrap();
@@ -244,8 +246,11 @@ fn a_lent_read_taken_after_a_positional_write_reads_again() {
                 .open(&path)
                 .unwrap();
             let file = Handle::new(open).unwrap();
+            let (hold, busy) = hold_the_pool();
             let mut read = Box::pin(file.read_owned(Vec::with_capacity(8)));
             pends(&mut read).await;
+            hold.send(()).unwrap();
+            within(busy).await;
             within(file.write_all_at(b"NEW!", 0)).await.unwrap();
             let (n, got) = within(read).await;
             assert_eq!(n.unwrap(), 8);
