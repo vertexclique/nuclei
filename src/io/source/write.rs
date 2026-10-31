@@ -546,10 +546,10 @@ impl WriteState {
         Poll::Ready(Ok(n))
     }
 
-    /// On a port, a stream write the pool had no buffer for: the front of
-    /// `bufs` is copied into the write slot's own room and sent from there,
-    /// so no writer waits on buffers that reads ahead or receives of other
-    /// connections hold. `None` while the side holds bytes that go first.
+    /// On a port, a write of a stream or a pipe the pool had no buffer for:
+    /// the front of `bufs` is copied into the write slot's own room and sent
+    /// from there, so no writer waits on buffers that reads ahead or receives
+    /// of others hold. `None` while the side holds bytes that go first.
     #[cfg(port)]
     fn write_room(
         &mut self,
@@ -558,7 +558,8 @@ impl WriteState {
         bufs: &[io::IoSlice<'_>],
         after: &mut After,
     ) -> Option<usize> {
-        if !self.starved || !kind.streams() || self.behind.is_some() || self.ring_holds() {
+        let bytes = kind.streams() || kind == Kind::Bytes;
+        if !self.starved || !bytes || self.behind.is_some() || self.ring_holds() {
             return None;
         }
         let Via::Ops(route) = io.via;
@@ -656,7 +657,23 @@ impl WriteState {
                 {
                     return Poll::Ready(Err(err));
                 }
-                self.send_queued(io, kind, bytes, dest, waker, after)
+                let queued = self.send_queued(io, kind, bytes, dest, waker, after);
+                // The pool had no buffer for it: with nothing of the socket's
+                // in the kernel, the task hands it over itself
+                // (proofs/tla/port/PortStarve.tla).
+                if queued.is_pending()
+                    && self.starved
+                    && !self.ring_holds()
+                    && let Some(fd) = fd
+                {
+                    let to = match dest {
+                        Dest::Connected => None,
+                        Dest::Inet(addr) => Some(addr),
+                        Dest::Unix((never, _)) => match never {},
+                    };
+                    return Poll::Ready(sys::send_datagram_now(fd, bytes, to.as_ref()));
+                }
+                queued
             }
             #[cfg(not(completion))]
             Via::None(never, _) => match never {},

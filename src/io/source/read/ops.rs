@@ -146,6 +146,13 @@ impl ReadState {
                 None if self.starved && !self.readable && self.error.is_none() => {
                     Want::Ready { read: true }
                 }
+                // On a port a zero-byte receive that looks, leaving the
+                // datagram queued, and once it says one came the task
+                // receives it into its own buffer (`receive_starved`).
+                #[cfg(port)]
+                None if self.starved && !self.readable && self.error.is_none() => {
+                    Want::Ready { read: true }
+                }
                 None => return,
             }
         } else {
@@ -172,13 +179,20 @@ impl ReadState {
                     // (`read_starved`, proofs/tla/port/PortStarve.tla).
                     #[cfg(port)]
                     None if kind == Kind::Tcp && !self.readable => Want::Ready { read: true },
+                    // A pipe's read goes into the slot's own room, which holds
+                    // no buffer of the pool.
+                    #[cfg(port)]
+                    None if kind == Kind::Bytes => Want::RecvRoom,
                     None => return,
                 },
             }
         };
         // The bytes the zero-byte receive said came are this receive's.
         #[cfg(port)]
-        if matches!(want, Want::Recv(_) | Want::RecvLent(_)) {
+        if matches!(
+            want,
+            Want::Recv(_) | Want::RecvLent(_) | Want::RecvFrom(_) | Want::RecvLentFrom(_)
+        ) {
             self.readable = false;
         }
         self.out = Some(issuer.issue(want, kind, self.epoch, after));
@@ -264,17 +278,29 @@ impl ReadState {
                     }
                 }
             }
-            // Bytes or the end came: the receive into a buffer of the pool goes
-            // out at once (`submit_wanted`), and its end wakes the tasks.
+            // Bytes, the end or an error came: the receive into a buffer of the
+            // pool goes out at once (`submit_wanted`), and its end wakes the
+            // tasks.
             #[cfg(port)]
             Outcome::Ready(answer) => {
-                if !stale && let Answer::Done(result) = answer {
-                    match result {
-                        Ok(()) => {
-                            self.readable = true;
-                            return;
-                        }
-                        Err(err) => self.error = Some(err),
+                // Its error, if any, is the receive's after it to report and
+                // clear: a look clears none (a UDP socket's report of a
+                // port unreachable stays queued under MSG_PEEK).
+                if !stale && let Answer::Done(_) = answer {
+                    self.readable = true;
+                    return;
+                }
+            }
+            // A pipe's bytes read into the slot's room are read ahead from
+            // there.
+            #[cfg(port)]
+            Outcome::RecvRoom(answer) => {
+                if !stale {
+                    match answer {
+                        Answer::Undone { .. } => {}
+                        Answer::Done(Ok(room)) if room.bytes().is_empty() => self.eof = true,
+                        Answer::Done(Ok(room)) => self.ahead.push(Piece::Room(room), after),
+                        Answer::Done(Err(err)) => self.error = Some(err),
                     }
                 }
             }

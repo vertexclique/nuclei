@@ -505,8 +505,23 @@ unsafe extern "system" {
     pub(crate) fn closesocket(s: SOCKET) -> i32;
     pub(crate) fn shutdown(s: SOCKET, how: i32) -> i32;
     pub(crate) fn recv(s: SOCKET, buf: *mut u8, len: i32, flags: i32) -> i32;
-    #[cfg(test)]
+    pub(crate) fn recvfrom(
+        s: SOCKET,
+        buf: *mut u8,
+        len: i32,
+        flags: i32,
+        from: *mut SOCKADDR,
+        fromlen: *mut i32,
+    ) -> i32;
     pub(crate) fn send(s: SOCKET, buf: *const u8, len: i32, flags: i32) -> i32;
+    pub(crate) fn sendto(
+        s: SOCKET,
+        buf: *const u8,
+        len: i32,
+        flags: i32,
+        to: *const SOCKADDR,
+        tolen: i32,
+    ) -> i32;
 }
 
 #[link(name = "ntdll")]

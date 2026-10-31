@@ -11,7 +11,8 @@
 //! kqueue no receive waits in the kernel, and every request is answered the same way. On a
 //! completion port a read the pool has no buffer for waits in a zero-byte receive, which holds
 //! none, and a reader or a writer it has no buffer for uses its own memory
-//! (proofs/tla/port/PortStarve.tla).
+//! (proofs/tla/port/PortStarve.tla). The same holds for datagram sockets nobody sends to, on every
+//! backend.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdStream};
@@ -19,7 +20,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use nuclei::config::{IoUringConfiguration, NucleiConfig};
-use nuclei::net::{TcpListener, TcpStream};
+use nuclei::net::{TcpListener, TcpStream, UdpSocket};
 use nuclei::runtime::Builder;
 
 /// The server's ring, the least a ring may have: 128 completions, the cap on operations in the
@@ -40,7 +41,8 @@ const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The first byte of a request whose task peeks at it and then never reads it.
 const HOLD: u8 = 1;
-/// The cap of the buffers such tasks hold, a few of each read's size, and more of them.
+/// The cap of the buffers such tasks (and idle datagram sockets) hold, a few of each read's size,
+/// and more of them.
 const HELD_CAP: usize = 64 << 10;
 const HOLDERS: usize = HELD_CAP / READ + 4;
 
@@ -91,18 +93,23 @@ fn configure() {
     });
 }
 
+/// A runtime of one worker whose buffers may hold `cap` bytes.
+fn runtime(cap: usize) -> nuclei::runtime::Runtime {
+    configure();
+    Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .io_buffer_cap(cap)
+        .build()
+        .unwrap()
+}
+
 /// A server of one worker whose buffers may hold `cap` bytes, serving each connection with `serve`.
 fn server<F>(cap: usize, serve: fn(TcpStream) -> F) -> (nuclei::runtime::Runtime, SocketAddr)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    configure();
-    let rt = Builder::new()
-        .worker_threads(1)
-        .pin_workers(false)
-        .io_buffer_cap(cap)
-        .build()
-        .unwrap();
+    let rt = runtime(cap);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     rt.spawn(async move {
@@ -113,6 +120,16 @@ where
     })
     .detach();
     (rt, addr)
+}
+
+/// Holds the binary's other tests off while one runs, so the descriptors its peers hold (the
+/// first test's more than 500) stay within a 1024-descriptor limit, as a virtual machine of the
+/// kernel matrix sets, however many tests run at once.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that failed holding it leaves it poisoned, and the next still runs alone.
+    ONE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether a shard of the buffer cap `cap` found every byte under it in use.
@@ -157,6 +174,7 @@ fn connect(addr: SocketAddr) -> StdStream {
 
 #[test]
 fn idle_peers_holding_the_cap_and_the_pool_keep_no_request_from_its_reply() {
+    let _alone = one_at_a_time();
     let (_rt, addr) = server(CAP, serve);
     let idle: Vec<StdStream> = (0..IDLE).map(|_| connect(addr)).collect();
     if nuclei::Proactor::backend() == nuclei::IoBackend::IoUring {
@@ -172,6 +190,7 @@ fn idle_peers_holding_the_cap_and_the_pool_keep_no_request_from_its_reply() {
 /// it has no buffer for reads, and peeks, into its own.
 #[test]
 fn tasks_that_stop_reading_with_the_pool_full_keep_no_request_from_its_reply() {
+    let _alone = one_at_a_time();
     let (_rt, addr) = server(HELD_CAP, serve_or_hold);
     let mut held: Vec<StdStream> = (0..HOLDERS).map(|_| connect(addr)).collect();
     for stream in &mut held {
@@ -182,4 +201,52 @@ fn tasks_that_stop_reading_with_the_pool_full_keep_no_request_from_its_reply() {
     });
     answered(addr);
     drop(held);
+}
+
+/// Datagram sockets nobody sends to, each with a receive the pool holds a buffer for, keep no
+/// datagram from its reply: on a completion port a receive the pool has no buffer for looks with a
+/// zero-byte receive that leaves the datagram queued, then takes it into its task's own buffer and
+/// sends the reply from there (proofs/tla/port/PortStarve.tla). Elsewhere a datagram is its task's
+/// own to receive and send, or the ring's starved rule applies.
+#[test]
+fn idle_datagram_sockets_holding_the_cap_keep_no_datagram_from_its_reply() {
+    let _alone = one_at_a_time();
+    let rt = runtime(HELD_CAP);
+    for _ in 0..HOLDERS {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        rt.spawn(async move {
+            let socket = UdpSocket::new(socket).unwrap();
+            let mut buf = vec![0u8; READ];
+            let _ = socket.recv_from(&mut buf).await;
+        })
+        .detach();
+    }
+    if nuclei::Proactor::backend() == nuclei::IoBackend::Iocp {
+        until("the pool full of datagram receives", || exhausted(HELD_CAP));
+    }
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_read_timeout(Some(DEADLINE)).unwrap();
+    let mut servers = Vec::new();
+    for _ in 0..ACTIVE {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        servers.push(socket.local_addr().unwrap());
+        rt.spawn(async move {
+            let socket = UdpSocket::new(socket).unwrap();
+            let mut buf = vec![0u8; READ];
+            if let Ok((_, from)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&[7u8; REPLY], from).await;
+            }
+        })
+        .detach();
+    }
+    for addr in &servers {
+        client.send_to(&[3u8; READ], addr).unwrap();
+    }
+    for i in 0..ACTIVE {
+        let mut reply = [0u8; READ];
+        match client.recv_from(&mut reply) {
+            Ok((n, _)) => assert_eq!(&reply[..n], &[7u8; REPLY]),
+            Err(err) => panic!("reply {i} of {ACTIVE} not within {DEADLINE:?}: {err}"),
+        }
+    }
 }

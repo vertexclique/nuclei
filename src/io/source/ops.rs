@@ -84,6 +84,10 @@ pub(crate) enum Want {
     /// a write the pool had no buffer for copied them.
     #[cfg(port)]
     SendRoom { from: usize, to: usize },
+    /// Read a byte stream that is not a socket into the read slot's own
+    /// room, for a read the pool had no buffer for.
+    #[cfg(port)]
+    RecvRoom,
 }
 
 impl Want {
@@ -110,6 +114,8 @@ impl Want {
             Want::SendFile(_) => false,
             #[cfg(port)]
             Want::SendRoom { .. } => false,
+            #[cfg(port)]
+            Want::RecvRoom => true,
         }
     }
 
@@ -121,6 +127,44 @@ impl Want {
             }
             _ => {}
         }
+    }
+}
+
+/// Bytes a read left in its slot's own room, which its task takes from there.
+/// No operation of the read side goes out while the side holds them (it
+/// asks for none while bytes read ahead wait), so nothing writes the room
+/// meanwhile, and the slot is the source's, which outlives the side.
+#[cfg(port)]
+pub(crate) struct Room {
+    at: core::ptr::NonNull<u8>,
+    len: usize,
+    start: usize,
+}
+
+// SAFETY: the room is memory of the source's slot, read only by the side's
+// holder, and nothing writes it while a `Room` names it (as above).
+#[cfg(port)]
+unsafe impl Send for Room {}
+
+#[cfg(port)]
+impl Room {
+    /// The first `len` bytes of the room at `at`.
+    pub(crate) fn new(at: core::ptr::NonNull<u8>, len: usize) -> Self {
+        Self { at, len, start: 0 }
+    }
+
+    /// The bytes not taken yet.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: the read wrote `len` bytes from `at`, which stay put (as
+        // above); `start` never passes `len`.
+        unsafe {
+            core::slice::from_raw_parts(self.at.as_ptr().add(self.start), self.len - self.start)
+        }
+    }
+
+    /// Takes `n` bytes off the front.
+    pub(crate) fn consume(&mut self, n: usize) {
+        self.start = (self.start + n).min(self.len);
     }
 }
 
@@ -174,6 +218,9 @@ pub(crate) enum Outcome {
     SendPinned(Answer<usize>),
     SendTo(PoolBuf, Target, Answer<usize>),
     SendLentTo(Vec<u8>, Answer<usize>),
+    /// A read into the read slot's room ended, with the bytes it left there.
+    #[cfg(port)]
+    RecvRoom(Answer<Room>),
     /// A send of the bytes `from..to` of the write slot's room ended.
     #[cfg(port)]
     SendRoom {

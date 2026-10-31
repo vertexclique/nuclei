@@ -1,13 +1,14 @@
 ----------------------------- MODULE PortStarve -----------------------------
 (***************************************************************************)
 (* Stream reads and replies on a completion port that share one shard's    *)
-(* pool of IO buffers (src/io/source/read/ops.rs `submit_ops`,             *)
-(* `submit_wanted` and `op_done`; the zero-byte receive in                 *)
-(* src/io/source/port.rs `stream_memory` and `outcome`; `buffer`,          *)
-(* `unstarve` and the starved reader's own call `read_starved` in          *)
-(* src/io/source/read.rs; `write`, `write_room` and `buffer` in            *)
-(* src/io/source/write.rs, and the room send's end in                      *)
-(* src/io/source/write/ops.rs `op_done`), at the grain of a step under     *)
+(* pool of IO buffers, over TCP, over UDP, or over pipes                   *)
+(* (src/io/source/read/ops.rs `submit_ops`, `submit_wanted` and `op_done`; *)
+(* the zero-byte receive, its look on a datagram socket, and the room read *)
+(* in src/io/source/port.rs `start`, `stream_memory` and `outcome`;        *)
+(* `buffer`, `unstarve` and the starved side's own calls `read_starved`    *)
+(* and `receive_starved` in src/io/source/read.rs; `write`, `write_room`,  *)
+(* `send` and `buffer` in src/io/source/write.rs, and the room send's end  *)
+(* in src/io/source/write/ops.rs `op_done`), at the grain of a step under  *)
 (* each side's guard.                                                      *)
 (*                                                                         *)
 (* In plain words: several connections each have a task that reads one     *)
@@ -16,17 +17,20 @@
 (* their request and then never read it, so its buffer stays read ahead. A *)
 (* receive into a buffer of the pool waits in the kernel until its peer    *)
 (* sends, holding that buffer all the while, so idle peers and stopped     *)
-(* tasks may hold every buffer. A read the pool has no buffer for sends a  *)
-(* zero-byte receive, which holds nothing; once that ends (the request is  *)
-(* in the socket) a receive takes a buffer, which ends at once since the   *)
-(* bytes are there, sent out at once on the thread that took the end. If   *)
-(* the pool still has no buffer, the reader is starved, is woken, and      *)
-(* reads the request straight from the socket into its own buffer: the     *)
-(* zero-byte receive said it is there, so that call never waits. A reply   *)
-(* is copied into a buffer of the pool that the kernel sends out and gives *)
-(* back; a writer the pool has none for copies it into its slot's own room *)
-(* and sends it from there. A buffer that comes back wakes every starved   *)
-(* side to try the pool again.                                             *)
+(* tasks may hold every buffer. On a socket, a read the pool has no buffer *)
+(* for sends a zero-byte receive, which holds nothing (on UDP it looks, so *)
+(* the datagram it saw stays queued); once that ends a receive takes a     *)
+(* buffer, which ends at once since the bytes are there, sent out at once  *)
+(* on the thread that took the end. If the pool still has no buffer, the   *)
+(* reader is starved, is woken, and reads the request straight from the    *)
+(* socket into its own buffer: the zero-byte receive said it is there, so  *)
+(* that call never waits. On a pipe, a read the pool has no buffer for     *)
+(* reads into its slot's own room, which holds no buffer of the pool, and  *)
+(* its task takes the bytes from there. A reply is copied into a buffer of *)
+(* the pool that the kernel sends out and gives back; a writer the pool    *)
+(* has none for sends it from memory of its own (its slot's room, or a     *)
+(* datagram straight from its buffer). A buffer that comes back wakes      *)
+(* every starved side to try the pool again.                               *)
 (*                                                                         *)
 (* What must never happen: a reader's own call on a socket that has        *)
 (* nothing for it, which would block its thread; or a peer's request that  *)
@@ -37,14 +41,15 @@
 (*                                                                         *)
 (* What is abstract: the guards (each step runs whole under its side's),   *)
 (* the port's thread (each end is applied as the kernel makes it), the     *)
-(* sizes (every buffer one class, a reply fits the room), and the bytes:   *)
-(* one request and one reply per connection, each whole.                   *)
+(* sizes (every buffer one class, a request and a reply fit the room), and *)
+(* the bytes: one request and one reply per connection, each whole.        *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS
     Idle,      \* how many of the connections have peers that never send
     Held,      \* how many of the next connections have tasks that peek and stop
+    Path,      \* what the connections are: "tcp", "udp" or "pipe"
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The connections, and the buffers the pool holds: fewer than the connections.
@@ -62,6 +67,7 @@ variables
     op = [c \in Conns |-> "none"],      \* the read's operation: "none", "zero" (holds nothing), "recv" (holds a buffer)
     readable = [c \in Conns |-> FALSE], \* a zero-byte receive said the request is in the socket
     ahead = [c \in Conns |-> FALSE],    \* a request received into a buffer of the pool
+    inroom = [c \in Conns |-> FALSE],   \* a pipe's request read into its slot's own room
     starved = [c \in Conns |-> FALSE],  \* the pool had no buffer for the read
     woken = [c \in Conns |-> FALSE],    \* the waiting task was woken
     got = [c \in Conns |-> FALSE],      \* the task has its request
@@ -98,6 +104,16 @@ macro read(c) begin
         free := free - 1;
         \* The receive is out.
         op[c] := "recv";
+    elsif Path = "pipe" then
+        \* The pool is empty: a pipe's read is starved...
+        starved[c] := TRUE;
+        \* (record) a side found the pool empty.
+        starvedOnce := TRUE;
+        \* MUTATION pipe_park: a starved pipe read waits for a buffer to come back, as before.
+        if Mutation # "pipe_park" then
+            \* ...and reads into its slot's own room, which holds no buffer of the pool.
+            op[c] := "room";
+        end if;
     else
         \* The pool is empty: a zero-byte receive, which holds no buffer.
         op[c] := "zero";
@@ -175,6 +191,18 @@ K_loop:
                 replied[c] := TRUE;
             end with;
         or
+            \* A pipe's read into its slot's room takes the request: no buffer of the pool.
+            with c \in {d \in Conns : op[d] = "room" /\ sock[d] = 1} do
+                \* The request is in the room now, for the task to take.
+                inroom[c] := TRUE;
+                \* The pipe is empty again.
+                sock[c] := 0;
+                \* The read is over.
+                op[c] := "none";
+                \* The task is woken to take the request.
+                woken[c] := TRUE;
+            end with;
+        or
             \* A receive into a buffer of the pool takes the request that is in its socket.
             with c \in {d \in Conns : op[d] = "recv" /\ sock[d] = 1} do
                 \* The request is in the buffer now, for the task to take.
@@ -189,6 +217,12 @@ K_loop:
         or
             \* A zero-byte receive ends: the request is in the socket, and stays there.
             with c \in {d \in Conns : op[d] = "zero" /\ sock[d] = 1} do
+                \* MUTATION peek_off: on UDP the zero-byte receive does not look, so it takes the
+                \* datagram into no room: cut to nothing, and the rest of it lost.
+                if Path = "udp" /\ Mutation = "peek_off" then
+                    \* The datagram is gone from the socket, and nobody has it.
+                    sock[c] := 0;
+                end if;
                 \* MUTATION no_resubmit: its end sends nothing out and wakes nobody.
                 if Mutation = "no_resubmit" then
                     \* The side knows the request came...
@@ -229,9 +263,16 @@ begin
 R_loop:
     while ~got[self] do
 R_poll:
-        if ahead[self] /\ self \in Holders then
+        if (ahead[self] \/ inroom[self]) /\ self \in Holders then
             \* A task that peeked: it never takes the request, which stays read ahead.
             woken[self] := FALSE;
+        elsif inroom[self] then
+            \* A pipe's request in its slot's room: the task takes it from there.
+            got[self] := TRUE;
+            \* The room is free again.
+            inroom[self] := FALSE;
+            \* (record) a starved side used its own memory.
+            direct := TRUE;
         elsif ahead[self] then
             \* The request came into a buffer of the pool: the task takes it.
             got[self] := TRUE;
@@ -286,7 +327,8 @@ W_poll:
                 starvedOnce := TRUE;
                 \* MUTATION park_write: a starved writer waits for a buffer to come back.
                 if Mutation # "park_write" then
-                    \* The reply goes into the slot's own room, sent from there.
+                    \* The reply goes from memory of its own: the slot's room, or (a datagram)
+                    \* straight from the task's buffer, which nothing of the socket's is ahead of.
                     room[self] := TRUE;
                     \* (record) a starved side used its own memory.
                     direct := TRUE;
@@ -344,4 +386,6 @@ NoStarve == ~starvedOnce
 NoZero == \A c \in Conns : op[c] # "zero"
 \* A starved reader read straight from its socket, or a starved writer sent from its room.
 NoDirect == ~direct
+\* A pipe's read waits in its slot's own room.
+NoRoom == \A c \in Conns : op[c] # "room"
 =============================================================================

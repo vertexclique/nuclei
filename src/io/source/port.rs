@@ -47,7 +47,7 @@ use crate::rt::park::iocp::{JOB, Port};
 use crate::syscore::windows::{
     CancelIoEx, CancelSynchronousIo, DUPLICATE_SAME_ACCESS, DWORD, DuplicateHandle,
     ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, GetCurrentProcess,
-    GetCurrentThread, GetLastError, HANDLE, OVERLAPPED, OVERLAPPED_ENTRY,
+    GetCurrentThread, GetLastError, HANDLE, MSG_PEEK, OVERLAPPED, OVERLAPPED_ENTRY,
     PostQueuedCompletionStatus, ReadFile, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
     WSA_OPERATION_ABORTED, WSABUF, WSARecv, WSARecvFrom, WSASend, WSASendTo, WriteFile,
     status_error, winsock,
@@ -57,8 +57,8 @@ use crate::syscore::windows::{
 /// the 16 bytes the call asks for beside it.
 const ACCEPT_ADDR: usize = size_of::<SOCKADDR_STORAGE>() + 16;
 
-/// The bytes a write the pool had no buffer for sends from its slot's own
-/// room, the address room a stream's slot never uses otherwise.
+/// The bytes a read or a write the pool had no buffer for moves through its
+/// slot's own room, the address room a stream's slot never uses otherwise.
 const ROOM: usize = 2 * ACCEPT_ADDR;
 
 /// The id of the read side's operation (the write side's is 1): what a
@@ -74,6 +74,8 @@ enum PortMem {
     /// A zero-byte receive: it ends once bytes or the end came, and holds
     /// nothing.
     Ready,
+    /// A read into the slot's own room.
+    RecvRoom,
     /// A send of the bytes `from..to` of the slot's own room.
     SendRoom {
         from: usize,
@@ -424,7 +426,7 @@ impl PortIssuer<'_> {
         inner.issued_on = Some(Arc::clone(&self.port));
         inner.owner = Arc::into_raw(Arc::clone(self.source));
         let started = if kind != Kind::Bytes {
-            start(inner, slot.ov.get(), socket_of(fd), want)
+            start(inner, slot.ov.get(), socket_of(fd), want, kind.datagrams())
         // SAFETY: a side is held, so the copy is not being written.
         } else if let Some(handle) = unsafe { (*self.source.port.sync.get()).clone() } {
             start_job(slot, inner, handle, Arc::clone(&self.port), want)
@@ -441,8 +443,15 @@ impl PortIssuer<'_> {
 }
 
 /// Makes the overlapped call for `want` on `socket` with `ov`, the memory
-/// in `inner`. `Ok`: a packet will come.
-fn start(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET, want: Want) -> Result<(), i32> {
+/// in `inner`; `datagrams` for a socket of datagrams. `Ok`: a packet will
+/// come.
+fn start(
+    inner: &mut Inner,
+    ov: *mut OVERLAPPED,
+    socket: SOCKET,
+    want: Want,
+    datagrams: bool,
+) -> Result<(), i32> {
     let null = core::ptr::null();
     let fail = |inner: &mut Inner, mem: PortMem, err: io::Error| -> Result<(), i32> {
         inner.mem = Some(mem);
@@ -452,7 +461,12 @@ fn start(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET, want: Want) -> 
     };
     let want = match stream_memory(inner, want) {
         Ok(true) => {
-            inner.flags = 0;
+            // A zero-byte receive of a datagram socket looks: one taken into
+            // no room is cut to nothing and the rest of it lost (UDP's own
+            // rule, WSARecvFrom's remarks), so MSG_PEEK leaves it queued, as
+            // libuv's zero reads of UDP do (src/win/udp.c).
+            let looks = datagrams && matches!(inner.mem, Some(PortMem::Ready));
+            inner.flags = if looks { MSG_PEEK as DWORD } else { 0 };
             // SAFETY: the buffer and the flags live in the slot until the
             // packet; the kernel writes the buffer's spare room.
             return queued(unsafe {
@@ -722,6 +736,11 @@ fn stream_memory(inner: &mut Inner, want: Want) -> Result<bool, NotStream> {
             inner.mem = Some(PortMem::Ready);
             Ok(read)
         }
+        Want::RecvRoom => {
+            inner.buf = wsabuf(inner.accept.as_mut_ptr(), ROOM);
+            inner.mem = Some(PortMem::RecvRoom);
+            Ok(true)
+        }
         Want::SendRoom { from, to } => {
             let bytes = inner.accept.get_mut(from..to).unwrap_or_default();
             inner.buf = wsabuf(bytes.as_mut_ptr(), bytes.len());
@@ -931,12 +950,21 @@ unsafe fn finish(
 fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> Outcome {
     // Made once: an error is counted as it is made.
     let answer = match mem {
-        PortMem::Ready | PortMem::Recv(_) | PortMem::RecvLent(_) => read_answer(code, bytes),
+        PortMem::Ready | PortMem::RecvRoom | PortMem::Recv(_) | PortMem::RecvLent(_) => {
+            read_answer(code, bytes)
+        }
         _ => answer(code, bytes),
     };
     match mem {
         PortMem::Ready => Outcome::Ready(match answer {
             Answer::Done(result) => Answer::Done(result.map(drop)),
+            Answer::Undone { not_ready } => Answer::Undone { not_ready },
+        }),
+        PortMem::RecvRoom => Outcome::RecvRoom(match answer {
+            Answer::Done(result) => Answer::Done(result.map(|n| {
+                let at = core::ptr::NonNull::from(&mut inner.accept).cast::<u8>();
+                super::ops::Room::new(at, n.min(ROOM))
+            })),
             Answer::Undone { not_ready } => Answer::Undone { not_ready },
         }),
         PortMem::SendRoom { from, to } => Outcome::SendRoom { from, to, answer },

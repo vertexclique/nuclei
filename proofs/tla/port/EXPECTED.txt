@@ -29,3 +29,13 @@ MPV_own_early                  MC_PortStarve        violated:NeverBlocks
 WPV_starve                     MC_PortStarve        violated:NoStarve
 WPV_zero                       MC_PortStarve        violated:NoZero
 WPV_direct                     MC_PortStarve        violated:NoDirect
+PV_udp_safe                    MC_PortStarve        pass
+PV_udp_live                    MC_PortStarve        pass
+PV_udp_held_live               MC_PortStarve        pass
+PV_pipe_safe                   MC_PortStarve        pass
+PV_pipe_live                   MC_PortStarve        pass
+PV_pipe_held_live              MC_PortStarve        pass
+MPV_peek_off                   MC_PortStarve        violated:NeverBlocks
+MPV_pipe_park                  MC_PortStarve        violated:Served
+MPV_pipe_park_write            MC_PortStarve        violated:Served
+WPV_room                       MC_PortStarve        violated:NoRoom
