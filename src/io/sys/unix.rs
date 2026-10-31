@@ -31,18 +31,24 @@ unsafe fn borrow<S: FromRawFd>(fd: RawFd) -> ManuallyDrop<S> {
 /// The answer of a call that may have to wait: `None` for "not now"
 /// (`EAGAIN`, `EWOULDBLOCK`), or the call's result (an error counted for
 /// `stats`).
+#[inline]
 pub(crate) fn ready<T>(result: io::Result<T>) -> Option<io::Result<T>> {
     match result {
         // The code itself, not std's kind (which is decoded from it).
         Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK) => {
             None
         }
-        Err(e) => {
-            crate::rt::counters::io_error(&e);
-            Some(Err(e))
-        }
+        Err(e) => Some(Err(counted(e))),
         ok => Some(ok),
     }
+}
+
+/// Counts a call's failure `e` for `stats`, and hands it back.
+#[cold]
+#[inline(never)]
+fn counted(e: io::Error) -> io::Error {
+    crate::rt::counters::io_error(&e);
+    e
 }
 
 /// Makes `call` again while a signal cuts it short.

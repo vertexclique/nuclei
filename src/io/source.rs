@@ -420,6 +420,7 @@ impl Hooks<ReadState> for SourceHooks<'_> {
         }
     }
 
+    #[inline]
     fn serve(&self, st: &mut ReadState, after: &mut After) {
         // Only a readiness driver serves edges.
         #[cfg(readiness)]
@@ -491,6 +492,7 @@ impl Hooks<WriteState> for SourceHooks<'_> {
         }
     }
 
+    #[inline]
     fn serve(&self, st: &mut WriteState, after: &mut After) {
         // Only a readiness driver serves edges.
         #[cfg(readiness)]

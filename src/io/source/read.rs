@@ -531,10 +531,18 @@ impl ReadState {
 
     #[cfg(readiness)]
     /// The driver's call on the descriptor, as [`complete`](Self::complete).
+    #[inline(always)]
     fn complete_fd(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
         if self.blocked || self.has_result() || self.lent_done() {
             return;
         }
+        self.call_fd(fd, kind, len, after);
+    }
+
+    /// [`complete_fd`](Self::complete_fd) once the call may find something.
+    #[cfg(readiness)]
+    #[inline(never)]
+    fn call_fd(&mut self, fd: RawFd, kind: Kind, len: usize, after: &mut After) {
         match kind {
             Kind::Stream | Kind::Tcp | Kind::Bytes | Kind::File => {
                 if self.lent.is_some() {
@@ -753,6 +761,7 @@ impl ReadState {
     /// Whether the receives of `fd` report what they leave: asks the kernel
     /// the first time.
     #[cfg(unix)]
+    #[inline]
     pub(super) fn inq_on(&mut self, fd: RawFd) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
