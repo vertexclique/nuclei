@@ -70,6 +70,14 @@ impl Piece {
     }
 }
 
+/// Lets go of a piece that came empty, out of the way of the pushes of the
+/// pieces that hold bytes, which are the common ones.
+#[cold]
+#[inline(never)]
+fn release_empty(piece: Piece, after: &mut After) {
+    piece.release(after, None);
+}
+
 /// Bytes read ahead that no task took yet, in the order they came: what
 /// the driver read into the pool, what a lent buffer whose task went away
 /// holds, what multishot receives handed out.
@@ -95,7 +103,7 @@ impl Ahead {
     #[inline]
     pub(super) fn push(&mut self, piece: Piece, after: &mut After) {
         if piece.filled().is_empty() {
-            piece.release(after, None);
+            release_empty(piece, after);
         } else {
             self.pieces.push_back(piece);
         }
