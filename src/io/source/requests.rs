@@ -698,11 +698,23 @@ impl Source {
     /// `fd`, the handle's own descriptor, its object kept open meanwhile: the
     /// registration goes now (cancelling what is out, for the drain to
     /// register again where it runs), and the source goes on with `fd`.
+    ///
+    /// Operations out on the ring of this thread's own shard, which the
+    /// thread runs no more (it drops the handle outside any runtime), are
+    /// waited for here, the detach having cancelled them: only this thread
+    /// reaps that ring, so the drain, elsewhere, would wait for their ends
+    /// until its time ran out.
     pub(crate) fn linger(self: &Arc<Self>, fd: Raw) {
+        #[cfg(ring)]
+        let settle = self.ops_out_on_idle_own_ring();
         self.ask.linger_fd.store(fd, Ordering::Release);
         let mut after = After::default();
         self.request(LINGER, &mut after);
         after.run();
+        #[cfg(ring)]
+        if settle {
+            self.settle_ops_here();
+        }
     }
 
     /// A lease on the handle's object, which keeps its descriptor open until

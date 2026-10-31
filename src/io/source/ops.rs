@@ -336,6 +336,40 @@ impl Source {
         self.ops_out.load(Ordering::SeqCst) == 0
     }
 
+    /// Whether operations of the source are out on the ring of this thread's
+    /// own shard while the thread runs no shard: their completions, and the
+    /// cancels a detach submits for them, are reaped only if this thread runs
+    /// that ring.
+    #[cfg(ring)]
+    pub(super) fn ops_out_on_idle_own_ring(&self) -> bool {
+        !self.ops_idle()
+            && crate::rt::context::current(|current| current.is_none())
+            && crate::rt::context::own_shard_if_made().is_some_and(|own| {
+                self.reg.home.load(Ordering::Acquire) == Arc::as_ptr(&own.shared) as usize
+            })
+    }
+
+    /// Runs this thread's own shard until the source's operations have ended
+    /// (a detach cancelled them), for at most the linger's time: as `retire`
+    /// waits, so their ends reach the sides before the work goes elsewhere.
+    #[cfg(ring)]
+    pub(super) fn settle_ops_here(self: &Arc<Self>) {
+        let ask = &self.ask;
+        let ended = core::future::poll_fn(|cx| {
+            ask.retire_waker.register(cx.waker());
+            // SeqCst, after the waker is in: as in `retire`.
+            ask.awaits_ops.store(true, Ordering::SeqCst);
+            if self.ops_idle() {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        });
+        let _ =
+            crate::sync::internal::blocking(crate::time::timeout(crate::rt::linger::time(), ended));
+        ask.awaits_ops.store(false, Ordering::SeqCst);
+    }
+
     /// The kernel completed one of the source's operations: its side takes
     /// the completion at once if free, else its holder does as it lets go.
     pub(crate) fn op_done(self: &Arc<Self>, done: Done, shard: Option<&crate::rt::shard::Shard>) {
