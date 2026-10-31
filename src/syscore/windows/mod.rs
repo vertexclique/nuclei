@@ -53,6 +53,38 @@ impl OVERLAPPED {
     }
 }
 
+/// `FILE_STANDARD_INFO`: a file's allocation and end.
+#[repr(C)]
+pub(crate) struct FILE_STANDARD_INFO {
+    pub(crate) AllocationSize: i64,
+    pub(crate) EndOfFile: i64,
+    pub(crate) NumberOfLinks: DWORD,
+    pub(crate) DeletePending: u8,
+    pub(crate) Directory: u8,
+}
+
+/// `FILE_ZERO_DATA_INFORMATION`: the range `FSCTL_SET_ZERO_DATA` zeroes.
+#[repr(C)]
+pub(crate) struct FILE_ZERO_DATA_INFORMATION {
+    pub(crate) FileOffset: i64,
+    pub(crate) BeyondFinalZero: i64,
+}
+
+/// `BY_HANDLE_FILE_INFORMATION`, with the three times as pairs of words.
+#[repr(C)]
+pub(crate) struct BY_HANDLE_FILE_INFORMATION {
+    pub(crate) dwFileAttributes: DWORD,
+    pub(crate) ftCreationTime: [DWORD; 2],
+    pub(crate) ftLastAccessTime: [DWORD; 2],
+    pub(crate) ftLastWriteTime: [DWORD; 2],
+    pub(crate) dwVolumeSerialNumber: DWORD,
+    pub(crate) nFileSizeHigh: DWORD,
+    pub(crate) nFileSizeLow: DWORD,
+    pub(crate) nNumberOfLinks: DWORD,
+    pub(crate) nFileIndexHigh: DWORD,
+    pub(crate) nFileIndexLow: DWORD,
+}
+
 /// One dequeued completion packet.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -174,6 +206,9 @@ const _: () = {
     assert!(size_of::<OVERLAPPED_ENTRY>() == if p == 8 { 32 } else { 16 });
     assert!(size_of::<WSABUF>() == if p == 8 { 16 } else { 8 });
     assert!(size_of::<GUID>() == 16);
+    assert!(size_of::<FILE_STANDARD_INFO>() == 24);
+    assert!(size_of::<FILE_ZERO_DATA_INFORMATION>() == 16);
+    assert!(size_of::<BY_HANDLE_FILE_INFORMATION>() == 52);
     assert!(size_of::<SOCKADDR>() == 16);
     assert!(size_of::<SOCKADDR_IN>() == 16);
     assert!(size_of::<SOCKADDR_IN6>() == 28);
@@ -190,6 +225,14 @@ pub(crate) const SOCK_DGRAM: i32 = 2;
 pub(crate) const SOCK_RAW: i32 = 3;
 pub(crate) const SOCK_RDM: i32 = 4;
 pub(crate) const IPPROTO_TCP: i32 = 6;
+pub(crate) const IPPROTO_UDP: i32 = 17;
+pub(crate) const IPPROTO_IPV6: i32 = 41;
+pub(crate) const IPV6_V6ONLY: i32 = 27;
+/// Seconds idle before the first keepalive probe (Windows 10 1709 on).
+pub(crate) const TCP_KEEPALIVE: i32 = 3;
+pub(crate) const TCP_FASTOPEN: i32 = 15;
+pub(crate) const TCP_KEEPCNT: i32 = 16;
+pub(crate) const TCP_KEEPINTVL: i32 = 17;
 pub(crate) const SOL_SOCKET: i32 = 0xFFFF;
 pub(crate) const SO_TYPE: i32 = 0x1008;
 pub(crate) const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
@@ -211,7 +254,9 @@ pub(crate) struct LINGER {
     pub(crate) l_onoff: u16,
     pub(crate) l_linger: u16,
 }
+pub(crate) const SD_RECEIVE: i32 = 0;
 pub(crate) const SD_SEND: i32 = 1;
+pub(crate) const SD_BOTH: i32 = 2;
 pub(crate) const WSA_FLAG_OVERLAPPED: DWORD = 0x01;
 pub(crate) const WSA_FLAG_NO_HANDLE_INHERIT: DWORD = 0x80;
 pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC800_0006;
@@ -220,6 +265,7 @@ pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC800_0006;
 pub(crate) const SIO_UDP_CONNRESET: DWORD = 0x9800_000C;
 #[cfg(test)]
 pub(crate) const MSG_OOB: i32 = 0x1;
+pub(crate) const MSG_PEEK: i32 = 0x2;
 pub(crate) const FILE_BEGIN: DWORD = 0;
 pub(crate) const FILE_CURRENT: DWORD = 1;
 
@@ -235,6 +281,7 @@ pub(crate) const FILE_MODE_INFORMATION: u32 = 16;
 pub(crate) const FILE_ACCESS_INFORMATION: u32 = 8;
 pub(crate) const FILE_WRITE_DATA: ULONG = 0x2;
 pub(crate) const FILE_APPEND_DATA: ULONG = 0x4;
+pub(crate) const FILE_NO_INTERMEDIATE_BUFFERING: ULONG = 0x8;
 pub(crate) const FILE_SYNCHRONOUS_IO_ALERT: ULONG = 0x10;
 pub(crate) const FILE_SYNCHRONOUS_IO_NONALERT: ULONG = 0x20;
 pub(crate) const FILE_TYPE_DISK: DWORD = 1;
@@ -243,6 +290,15 @@ pub(crate) const DUPLICATE_SAME_ACCESS: DWORD = 2;
 pub(crate) const PIPE_ACCESS_DUPLEX: DWORD = 0x3;
 pub(crate) const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
 pub(crate) const ERROR_MORE_DATA: i32 = 234;
+
+/// `FILE_INFO_BY_HANDLE_CLASS` values: the file's sizes, its allocation, its end.
+pub(crate) const FILE_STANDARD_INFO_CLASS: i32 = 1;
+pub(crate) const FILE_ALLOCATION_INFO_CLASS: i32 = 5;
+pub(crate) const FILE_END_OF_FILE_INFO_CLASS: i32 = 6;
+/// `DeviceIoControl` codes: mark a file sparse, and zero a range of it.
+pub(crate) const FSCTL_SET_SPARSE: DWORD = 0x0009_00C4;
+pub(crate) const FSCTL_SET_ZERO_DATA: DWORD = 0x0009_80C8;
+pub(crate) const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x0200_0000;
 
 pub(crate) const ERROR_IO_PENDING: i32 = 997;
 pub(crate) const ERROR_HANDLE_EOF: i32 = 38;
@@ -259,6 +315,7 @@ pub(crate) const WSAECONNABORTED: i32 = 10053;
 pub(crate) const WSAECONNRESET: i32 = 10054;
 pub(crate) const WSAENOBUFS: i32 = 10055;
 pub(crate) const WSAENOTCONN: i32 = 10057;
+pub(crate) const WSAESHUTDOWN: i32 = 10058;
 pub(crate) const WSAETIMEDOUT: i32 = 10060;
 pub(crate) const WSAECONNREFUSED: i32 = 10061;
 pub(crate) const WSAEHOSTUNREACH: i32 = 10065;
@@ -282,6 +339,7 @@ pub(crate) const STATUS_HOST_UNREACHABLE: NTSTATUS = 0xC000_023Du32 as i32;
 pub(crate) const STATUS_PORT_UNREACHABLE: NTSTATUS = 0xC000_023Fu32 as i32;
 pub(crate) const STATUS_CONNECTION_ABORTED: NTSTATUS = 0xC000_0241u32 as i32;
 pub(crate) const STATUS_INVALID_DEVICE_STATE: NTSTATUS = 0xC000_0184u32 as i32;
+pub(crate) const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206u32 as i32;
 
 pub(crate) type LPWSAOVERLAPPED_COMPLETION_ROUTINE = *const c_void;
 pub(crate) type PTIMERAPCROUTINE = *const c_void;
@@ -411,6 +469,32 @@ unsafe extern "system" {
         lpOverlapped: *mut OVERLAPPED,
     ) -> BOOL;
     pub(crate) fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *mut i64) -> BOOL;
+    pub(crate) fn GetFileInformationByHandle(
+        hFile: HANDLE,
+        lpFileInformation: *mut BY_HANDLE_FILE_INFORMATION,
+    ) -> BOOL;
+    pub(crate) fn GetFileInformationByHandleEx(
+        hFile: HANDLE,
+        FileInformationClass: i32,
+        lpFileInformation: *mut c_void,
+        dwBufferSize: DWORD,
+    ) -> BOOL;
+    pub(crate) fn SetFileInformationByHandle(
+        hFile: HANDLE,
+        FileInformationClass: i32,
+        lpFileInformation: *const c_void,
+        dwBufferSize: DWORD,
+    ) -> BOOL;
+    pub(crate) fn DeviceIoControl(
+        hDevice: HANDLE,
+        dwIoControlCode: DWORD,
+        lpInBuffer: *const c_void,
+        nInBufferSize: DWORD,
+        lpOutBuffer: *mut c_void,
+        nOutBufferSize: DWORD,
+        lpBytesReturned: *mut DWORD,
+        lpOverlapped: *mut OVERLAPPED,
+    ) -> BOOL;
     pub(crate) fn SetFilePointerEx(
         hFile: HANDLE,
         liDistanceToMove: i64,
@@ -502,8 +586,24 @@ unsafe extern "system" {
     pub(crate) fn listen(s: SOCKET, backlog: i32) -> i32;
     pub(crate) fn closesocket(s: SOCKET) -> i32;
     pub(crate) fn shutdown(s: SOCKET, how: i32) -> i32;
-    #[cfg(test)]
+    pub(crate) fn recv(s: SOCKET, buf: *mut u8, len: i32, flags: i32) -> i32;
+    pub(crate) fn recvfrom(
+        s: SOCKET,
+        buf: *mut u8,
+        len: i32,
+        flags: i32,
+        from: *mut SOCKADDR,
+        fromlen: *mut i32,
+    ) -> i32;
     pub(crate) fn send(s: SOCKET, buf: *const u8, len: i32, flags: i32) -> i32;
+    pub(crate) fn sendto(
+        s: SOCKET,
+        buf: *const u8,
+        len: i32,
+        flags: i32,
+        to: *const SOCKADDR,
+        tolen: i32,
+    ) -> i32;
 }
 
 #[link(name = "ntdll")]
@@ -568,6 +668,9 @@ pub(crate) fn status_error(status: NTSTATUS) -> Option<i32> {
         STATUS_HOST_UNREACHABLE => WSAEHOSTUNREACH,
         STATUS_CONNECTION_ABORTED => WSAECONNABORTED,
         STATUS_INVALID_DEVICE_STATE => WSAEINVAL,
+        // A datagram longer than the socket sends: Winsock's own answer is
+        // WSAEMSGSIZE, where the status table's is ERROR_INVALID_USER_BUFFER.
+        STATUS_INVALID_BUFFER_SIZE => WSAEMSGSIZE,
         // SAFETY: a pure lookup of the status table.
         other => (unsafe { RtlNtStatusToDosError(other) }) as i32,
     };

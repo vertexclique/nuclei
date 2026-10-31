@@ -335,6 +335,18 @@ fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
     });
 }
 
+mod allocate;
+mod copy_range;
+#[cfg(target_os = "linux")]
+mod direct;
+mod durable;
+mod lock;
+mod many;
 mod owned;
+mod positional;
+mod sync_dir;
+mod sync_range;
+#[cfg(ring)]
+mod vectored;
 #[cfg(windows)]
 mod windows;

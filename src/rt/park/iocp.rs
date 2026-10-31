@@ -20,7 +20,14 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::io;
 use std::sync::Arc;
+#[cfg(feature = "io-stats")]
+use std::sync::OnceLock;
 use std::time::Duration;
+#[cfg(feature = "io-stats")]
+use std::time::Instant;
+
+#[cfg(feature = "io-stats")]
+use crate::rt::counters::{IoKind, IoTimes};
 
 use crate::syscore::windows::{
     BOOLEAN, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CloseHandle,
@@ -53,6 +60,10 @@ pub(crate) struct Port {
     handle: HANDLE,
     /// Operations issued to this port whose packets were not dequeued yet.
     out: AtomicUsize,
+    /// Where the latencies of the operations go, when the runtime records
+    /// them.
+    #[cfg(feature = "io-stats")]
+    times: OnceLock<Arc<IoTimes>>,
 }
 
 // SAFETY: a port handle is used from any thread by design of the API.
@@ -82,6 +93,26 @@ impl Port {
     /// port or on another the handle was moved to.
     pub(crate) fn completed(&self) {
         self.out.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Starts timing the operations issued from now on into `times`.
+    #[cfg(feature = "io-stats")]
+    pub(crate) fn time_with(&self, times: Arc<IoTimes>) {
+        let _ = self.times.set(times);
+    }
+
+    /// The stamp of an operation issued now, if the port times them.
+    #[cfg(feature = "io-stats")]
+    pub(crate) fn stamp(&self) -> Option<Instant> {
+        self.times.get().map(|_| Instant::now())
+    }
+
+    /// An operation of `kind` stamped `issued` completed.
+    #[cfg(feature = "io-stats")]
+    pub(crate) fn time(&self, kind: IoKind, issued: Instant) {
+        if let Some(times) = self.times.get() {
+            times.add(kind, issued.elapsed());
+        }
     }
 
     /// Operations issued to this port and not completed.
@@ -281,6 +312,8 @@ impl Poller {
             port: Arc::new(Port {
                 handle,
                 out: AtomicUsize::new(0),
+                #[cfg(feature = "io-stats")]
+                times: OnceLock::new(),
             }),
             timer: Timer::new(),
             entries: vec![OVERLAPPED_ENTRY::zeroed(); 256],

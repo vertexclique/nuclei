@@ -15,6 +15,7 @@ use super::ReadState;
 use crate::io::side::After;
 use crate::io::source::{Addr, Io, Kind, Via};
 use crate::io::sys;
+use crate::rt::counters::tally;
 
 impl ReadState {
     /// The descriptor a datagram's task receives on itself: on epoll and
@@ -104,7 +105,11 @@ impl ReadState {
             {
                 self.readable = false;
             }
-            match sys::ready(receive_into(fd, kind, out, peek)) {
+            match sys::ready(receive_into(fd, kind, out, peek)).inspect(|r| {
+                if !peek {
+                    tally::received(r);
+                }
+            }) {
                 Some(result) => return Some(Poll::Ready(result)),
                 None => {
                     if matches!(io.via, Via::Fd(_)) {

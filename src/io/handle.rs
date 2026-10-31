@@ -40,13 +40,15 @@
 //! accepts bytes into a socket's buffer, and the driver writes it out. Those
 //! bytes go out whatever happens to the handle, as std's do: `get_mut` and
 //! `into_inner` wait until the kernel took them, and a handle dropped before
-//! that leaves its object to a task, which delivers them (for at most
-//! [`LINGER`]) and then closes it. A runtime that drops waits for those tasks
-//! (see `rt::linger`), and none starts a runtime to run them.
+//! that leaves its object to a task, which delivers them (for at most the
+//! runtime's [`write_behind_linger`](crate::runtime::Builder::write_behind_linger))
+//! and then closes it. One whose time ran out gives the rest up, and a TCP
+//! stream's then resets its connection, so the peer never reads a cut stream
+//! as a whole one (`proofs/tla/close`). A runtime that drops waits for those
+//! tasks (see `rt::linger`), and none starts a runtime to run them.
 
-/// How long a dropped handle's unsent bytes may take to reach the kernel.
-// vertexia: one constant for every handle; a builder setting if a peer that
-// never reads must be given up on sooner or later.
+/// How long a dropped handle's unsent bytes may take to reach the kernel, by
+/// default (see [`Builder::write_behind_linger`](crate::runtime::Builder::write_behind_linger)).
 pub(crate) const LINGER: Duration = Duration::from_secs(60);
 
 use core::fmt;
@@ -138,6 +140,28 @@ windows_handles!(
 /// shards.
 ///
 /// `Send` and `Sync` exactly when the object is.
+///
+/// # std's calls through `Deref`
+///
+/// `Deref` hands the object out for its own methods (socket options,
+/// addresses), and the handle's methods of the same name take their place
+/// where it has them (`connect`, `send`, `linger`, ...). A few of std's
+/// calls reached through it go around the handle, so around the bytes it
+/// read ahead and the ones it wrote behind, or block its shard:
+///
+/// - `shutdown` shuts the halves at once, ahead of the bytes still behind,
+///   which then never reach the peer;
+///   [`shut`](crate::net::TcpStream::shut) waits for them first.
+/// - `set_nonblocking(false)` makes the driver's own calls on the object
+///   block the shard's thread, and every task of the shard with them.
+/// - `take_error` takes the error the socket holds, which the handle's
+///   connect in progress or its next operation would have answered.
+/// - `Read` and `Write` on a shared reference to the object (`&TcpStream`,
+///   `&UnixStream`) read past the bytes read ahead and write ahead of the
+///   bytes written behind, and answer `WouldBlock` where the handle's own
+///   reads and writes wait. Called on the handle with std's traits in scope
+///   (`stream.read(&mut buf)`), they reach the object through `DerefMut`,
+///   after the wait of [`get_mut`](Handle::get_mut).
 ///
 /// ```
 /// use std::net::TcpListener;
@@ -258,22 +282,39 @@ impl<T> Handle<T> {
 }
 
 impl<T> Handle<T> {
-    /// Waits until the kernel took what the write-behind holds (or
-    /// [`LINGER`] passed): on a shard, its other tasks run meanwhile.
+    /// Waits until the kernel took what the write-behind holds (or the
+    /// runtime's linger passed): on a shard, its other tasks run meanwhile.
     fn deliver_unsent(&self) {
         if self.source.has_unsent() {
             let source = &self.source;
             let _ = crate::sync::internal::blocking(crate::time::timeout(
-                LINGER,
+                crate::rt::linger::time(),
                 core::future::poll_fn(|cx| source.poll_drain(cx)),
             ));
         }
         if let Some(file) = self.file.get().filter(|f| f.has_unsent()) {
             let _ = crate::sync::internal::blocking(crate::time::timeout(
-                LINGER,
+                crate::rt::linger::time(),
                 core::future::poll_fn(|cx| file.poll_flush(cx)),
             ));
         }
+    }
+
+    /// Closes the object now, whatever the write-behind holds: the source's
+    /// close, with no linger (`Source::close`).
+    pub(crate) fn close_now(self) {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: `this` is never used or dropped again; each field is moved
+        // out once.
+        let (io, source, file) = unsafe {
+            (
+                ManuallyDrop::take(&mut this.io),
+                core::ptr::read(&this.source),
+                core::ptr::read(&this.file),
+            )
+        };
+        drop(file);
+        source.close(io);
     }
 }
 
@@ -286,9 +327,11 @@ impl<T> Drop for Handle<T> {
         // behind them is handed to a task, the file's state with its lease.
         if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
             crate::rt::linger::hand(async move {
-                let _ =
-                    crate::time::timeout(LINGER, core::future::poll_fn(|cx| file.poll_flush(cx)))
-                        .await;
+                let _ = crate::time::timeout(
+                    crate::rt::linger::time(),
+                    core::future::poll_fn(|cx| file.poll_flush(cx)),
+                )
+                .await;
             });
         }
         // SAFETY: taken once, here; the field is never used again.
@@ -307,14 +350,27 @@ impl<T> Drop for Handle<T> {
         // out, and closes then: the drain needs no descriptor of its own
         // (and on Windows, closing a socket would cancel its sends).
         self.source.linger(own);
-        crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io)));
+        crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io), own));
     }
 }
 
 /// Delivers what a dropped handle's write-behind holds through `kept`, its
-/// object itself, then closes it.
-async fn linger(source: Arc<Source>, kept: Kept) {
-    let _ = crate::time::timeout(LINGER, core::future::poll_fn(|cx| source.poll_drain(cx))).await;
+/// object itself (whose descriptor is `own`), then closes it. Bytes still
+/// behind as the drain ends (its time ran out, or it failed) are given up,
+/// and a TCP stream resets: its peer must not read the end of the stream
+/// after a cut one.
+async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
+    let drain = core::future::poll_fn(|cx| source.poll_drain(cx));
+    let _ = crate::time::timeout(crate::rt::linger::time(), drain).await;
+    if source.has_unsent()
+        && source.kind() == Kind::Tcp
+        && let Err(err) = crate::net::opt::set_linger_time(own, Some(Duration::ZERO))
+    {
+        log::warn!(
+            "a dropped stream's unsent bytes were given up, and its peer is not told: \
+             the stream could not be reset ({err})"
+        );
+    }
     source.close(kept);
 }
 

@@ -33,6 +33,8 @@ mod imp {
     pub(crate) const IP_TOS: Int = libc::IP_TOS;
     pub(crate) const IPPROTO_IPV6: Int = libc::IPPROTO_IPV6;
     pub(crate) const IPV6_TCLASS: Int = libc::IPV6_TCLASS;
+    pub(crate) const IPV6_V6ONLY: Int = libc::IPV6_V6ONLY;
+    pub(crate) const IPPROTO_TCP: Int = libc::IPPROTO_TCP;
 
     pub(crate) fn linger(on: bool, secs: u64) -> Linger {
         libc::linger {
@@ -91,7 +93,8 @@ mod imp {
     impl Plain for Linger {}
 
     pub(crate) use win::{
-        IP_TOS, IPPROTO_IP, SO_KEEPALIVE, SO_LINGER, SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF, SOL_SOCKET,
+        IP_TOS, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, SO_KEEPALIVE, SO_LINGER,
+        SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF, SOL_SOCKET,
     };
 
     pub(crate) fn linger(on: bool, secs: u64) -> Linger {
@@ -182,6 +185,41 @@ pub(crate) fn size(raw: Raw, level: Int, name: Int) -> io::Result<u32> {
 /// Sets a size option, in bytes.
 pub(crate) fn set_size(raw: Raw, level: Int, name: Int, bytes: u32) -> io::Result<()> {
     set(raw, level, name, Int::try_from(bytes).unwrap_or(Int::MAX))
+}
+
+/// A count option.
+pub(crate) fn count(raw: Raw, level: Int, name: Int) -> io::Result<u32> {
+    size(raw, level, name)
+}
+
+/// Sets a count option; a count past what the option holds is the caller's
+/// mistake, named `what`.
+pub(crate) fn set_count(raw: Raw, level: Int, name: Int, n: u32, what: &str) -> io::Result<()> {
+    set(raw, level, name, int(u64::from(n), what)?)
+}
+
+/// `n` as the option's integer, or `InvalidInput` naming `what`.
+pub(crate) fn int(n: u64, what: &str) -> io::Result<Int> {
+    Int::try_from(n).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the {what} is more than this system takes"),
+        )
+    })
+}
+
+/// `time` in whole units of `unit`, a part of one counting as one more.
+pub(crate) fn whole(time: Duration, unit: Duration) -> u64 {
+    let units = time.as_nanos().div_ceil(unit.as_nanos());
+    u64::try_from(units).unwrap_or(u64::MAX)
+}
+
+/// The error of an option the system does not have, named `name`.
+pub(crate) fn unsupported(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("this system has no {name} option"),
+    )
 }
 
 /// `SO_LINGER`: how long a close waits for unsent data, `None` if it does

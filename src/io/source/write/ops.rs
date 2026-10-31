@@ -20,6 +20,7 @@
 use std::io;
 
 use super::{Kind, Lent, WriteState};
+use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::ops::{Answer, Done, Outcome, Want};
@@ -68,6 +69,16 @@ impl WriteState {
             || self.queued.is_some()
     }
 
+    /// Whether `submit_wanted` has anything to do after a completion.
+    pub(crate) fn wants_ops(&self) -> bool {
+        #[cfg(port)]
+        return true;
+        #[cfg(not(port))]
+        {
+            self.out.is_none() && (self.op_work() || self.not_ready_first() || self.user_fd)
+        }
+    }
+
     /// Issues what the side holds, if this thread reaches a completion
     /// driver.
     #[cfg_attr(
@@ -77,6 +88,12 @@ impl WriteState {
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
         if let Via::Ops(route) = io.via {
             self.submit_ops(route, kind, after);
+        }
+        // A write the pool had no buffer for that found the source between
+        // ports sends from its slot's room now (`write_room`).
+        #[cfg(port)]
+        if self.starved && self.behind.is_none() && !self.ring_holds() {
+            after.wake(&mut self.waiters);
         }
     }
 
@@ -197,6 +214,29 @@ impl WriteState {
                     }
                 }
             },
+            // The rest of the room's bytes goes out next, ahead of anything
+            // written after them.
+            #[cfg(port)]
+            Outcome::SendRoom { .. } if stale => {}
+            #[cfg(port)]
+            Outcome::SendRoom { from, to, answer } => match answer {
+                Answer::Undone { .. } => self.again = Some(Want::SendRoom { from, to }),
+                Answer::Done(Ok(n)) if n > 0 => {
+                    if from + n < to {
+                        self.again = Some(Want::SendRoom { from: from + n, to });
+                    }
+                }
+                other => {
+                    let err = match other {
+                        Answer::Done(Err(err)) => err,
+                        _ => io::ErrorKind::WriteZero.into(),
+                    };
+                    self.failed = Some(Failure::of(&err));
+                    if let Some(behind) = self.behind.take() {
+                        after.drop_buf(behind);
+                    }
+                }
+            },
             Outcome::SendTo(buf, _, Answer::Done(result)) => {
                 if let Err(err) = result {
                     self.error = Some(err);
@@ -262,7 +302,7 @@ impl WriteState {
     /// went out is withdrawn.
     fn lent_back(
         &mut self,
-        buf: Option<Vec<u8>>,
+        buf: Option<OwnedBuf>,
         answer: Answer<usize>,
         stale: bool,
         after: &mut After,

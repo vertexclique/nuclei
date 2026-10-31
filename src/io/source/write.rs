@@ -41,6 +41,8 @@ use super::{Failure, Io, Kind, Source, Target, Via};
 use crate::buf::{Pool, PoolBuf, with_pool_or};
 use crate::io::side::{After, Wakers};
 use crate::io::sys;
+#[cfg(any(readiness, port))]
+use crate::rt::counters::tally;
 
 mod calls;
 mod datagram;
@@ -190,6 +192,15 @@ fn write_bytes(fd: RawFd, kind: Kind, bytes: &[u8]) -> io::Result<usize> {
 }
 
 #[cfg(readiness)]
+/// Writes the bytes the descriptors name, in order, in one call.
+fn write_iov(fd: RawFd, kind: Kind, iov: &[crate::buf::vectored::IoVec]) -> io::Result<usize> {
+    match kind {
+        Kind::Bytes | Kind::File => sys::writev(fd, iov),
+        _ => sys::sendv(fd, iov),
+    }
+}
+
+#[cfg(readiness)]
 /// Sends a datagram.
 fn send_datagram(fd: RawFd, bytes: &[u8], dest: Dest<'_>) -> io::Result<usize> {
     match dest {
@@ -291,9 +302,10 @@ impl WriteState {
     }
 
     /// Whether a stream write of `len` bytes goes straight from the task's
-    /// buffer: one big enough (see `direct`), or on a ring any while the pool
-    /// has no buffer for the write-behind, so a writer never waits on buffers
-    /// that receives of other connections hold (proofs/tla/ring/RingStarve.tla).
+    /// buffer: one big enough (see `direct`; on a ring any), so a writer never
+    /// waits on buffers that receives of other connections hold
+    /// (proofs/tla/ring/RingStarve.tla).
+    /// A pipe's goes too, while the pool has no buffer for it (`writes_bytes`).
     #[cfg(unix)]
     pub(super) fn writes_itself(&self, io: Io<'_>, len: usize) -> bool {
         #[cfg(ring)]
@@ -309,6 +321,7 @@ impl WriteState {
     /// `None` leaves it to the normal path, which writes behind and waits
     /// for readiness when the socket took nothing.
     #[cfg(unix)]
+    #[inline]
     pub(super) fn write_direct(
         &mut self,
         io: Io<'_>,
@@ -319,7 +332,7 @@ impl WriteState {
         let fd = fd?;
         let len: usize = bufs.iter().map(|b| b.len()).sum();
         let waits = matches!(io.via, Via::Fd(_)) && self.blocked;
-        if !kind.streams()
+        if !self.writes_bytes(kind)
             || len == 0
             || !self.writes_itself(io, len)
             || waits
@@ -333,7 +346,12 @@ impl WriteState {
         {
             return None;
         }
-        match sys::ready(sys::send_bufs(fd, bufs)) {
+        let call = if kind.streams() {
+            sys::send_bufs(fd, bufs)
+        } else {
+            sys::write_bufs(fd, bufs)
+        };
+        match sys::ready(call) {
             None => {
                 if matches!(io.via, Via::Fd(_)) {
                     self.blocked = true;
@@ -341,8 +359,22 @@ impl WriteState {
                 None
             }
             Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
-            Some(result) => Some(result),
+            // Moved through as it is, counted by reference: taken apart and
+            // made again, the result cost the call a drop of its own.
+            Some(result) => {
+                tally::writing(&result);
+                Some(result)
+            }
         }
+    }
+
+    /// Whether a write of `kind` may go straight from the task's buffer: a
+    /// socket's, and while the pool has no buffer for the side a pipe's or a
+    /// terminal's, as the read side's `reads_bytes` (so no writer waits on
+    /// buffers that receives or reads ahead of others hold).
+    #[cfg(unix)]
+    fn writes_bytes(&self, kind: Kind) -> bool {
+        kind.streams() || (self.starved && kind == Kind::Bytes)
     }
 
     /// A buffer from this thread's pool, or the side starves until one
@@ -372,7 +404,27 @@ impl WriteState {
     #[cfg(readiness)]
     /// The driver's part: on readiness, does what the side holds and wakes
     /// the tasks that wait on any of it.
+    #[inline]
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
+        // An edge that finds the side idle only counts: the cheap and usual
+        // case (a socket is writable with every readable edge on epoll).
+        if edge
+            && !self.user_fd
+            && !self.blocked
+            && !self.connecting
+            && self.behind.is_none()
+            && !self.lent_waits()
+        {
+            self.edges = self.edges.wrapping_add(1);
+            return;
+        }
+        self.serve_held(fd, kind, edge, after);
+    }
+
+    /// [`serve`](Self::serve) of a side that holds or waits for something.
+    #[cfg(readiness)]
+    #[inline(never)]
+    fn serve_held(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         // A call that found the socket full waits for the edge itself (a
         // datagram's, see `send_now`): it is woken even if nothing else moves.
         let unblocked = edge && self.blocked;
@@ -450,6 +502,7 @@ impl WriteState {
                         break;
                     }
                     Some(Ok(n)) => {
+                        tally::wrote(n);
                         behind.consume(n);
                         progress = true;
                         if behind.is_empty() {
@@ -524,6 +577,23 @@ impl WriteState {
                 self.poll_first = true;
                 self.push(io, kind, after);
             }
+            // On epoll and kqueue a pipe's write the pool has nothing for is
+            // the task's own call now (`writes_bytes`); one the pipe cannot
+            // take waits for its edge.
+            #[cfg(readiness)]
+            if let Via::Fd(fd) = io.via
+                && self.behind.is_none()
+                && let Some(result) = self.write_direct(io, Some(fd), kind, bufs)
+            {
+                return Poll::Ready(result);
+            }
+            // On a port such a write sends from the write slot's own room
+            // instead, a few hundred bytes at a time
+            // (proofs/tla/port/PortStarve.tla).
+            #[cfg(port)]
+            if let Some(n) = self.write_room(io, kind, bufs, after) {
+                return Poll::Ready(Ok(n));
+            }
             self.waiters.register(waker);
             return Poll::Pending;
         }
@@ -536,6 +606,29 @@ impl WriteState {
             after.register = true;
         }
         Poll::Ready(Ok(n))
+    }
+
+    /// On a port, a write of a stream or a pipe the pool had no buffer for:
+    /// the front of `bufs` is copied into the write slot's own room and sent
+    /// from there, so no writer waits on buffers that reads ahead or receives
+    /// of others hold. `None` while the side holds bytes that go first.
+    #[cfg(port)]
+    fn write_room(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        bufs: &[io::IoSlice<'_>],
+        after: &mut After,
+    ) -> Option<usize> {
+        let bytes = kind.streams() || kind == Kind::Bytes;
+        if !self.starved || !bytes || self.behind.is_some() || self.ring_holds() {
+            return None;
+        }
+        let Via::Ops(route) = io.via;
+        let n = route.issuer(after)?.fill_room(bufs);
+        self.again = Some(super::ops::Want::SendRoom { from: 0, to: n });
+        self.push(io, kind, after);
+        Some(n)
     }
 
     fn flush(
@@ -556,15 +649,17 @@ impl WriteState {
         Poll::Ready(Ok(()))
     }
 
-    /// Flushes, then shuts a stream's writing half of `fd` down (with
-    /// nothing out on the ring by then, the driver's call on it at once).
-    /// Every close asks the kernel, so one after the first answers what the
-    /// system answers to a second shutdown (macOS: `ENOTCONN`), as std's.
+    /// Flushes, then shuts the halves `how` names (the writing half, or
+    /// both) of a stream's `fd` down (with nothing out on the ring by then,
+    /// the driver's call on it at once). Every close asks the kernel, so one
+    /// after the first answers what the system answers to a second shutdown
+    /// (macOS: `ENOTCONN`), as std's.
     fn close(
         &mut self,
         io: Io<'_>,
         fd: crate::io::raw::Raw,
         kind: Kind,
+        how: std::net::Shutdown,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<()>> {
@@ -573,7 +668,7 @@ impl WriteState {
             other => return other,
         }
         if kind.streams() {
-            return Poll::Ready(sys::shutdown_write(fd).inspect_err(crate::rt::counters::io_error));
+            return Poll::Ready(sys::shutdown(fd, how).inspect_err(crate::rt::counters::io_error));
         }
         Poll::Ready(Ok(()))
     }
@@ -627,7 +722,25 @@ impl WriteState {
                 {
                     return Poll::Ready(Err(err));
                 }
-                self.send_queued(io, kind, bytes, dest, waker, after)
+                let queued = self.send_queued(io, kind, bytes, dest, waker, after);
+                // The pool had no buffer for it: with nothing of the socket's
+                // in the kernel, the task hands it over itself
+                // (proofs/tla/port/PortStarve.tla).
+                if queued.is_pending()
+                    && self.starved
+                    && !self.ring_holds()
+                    && let Some(fd) = fd
+                {
+                    let to = match dest {
+                        Dest::Connected => None,
+                        Dest::Inet(addr) => Some(addr),
+                        Dest::Unix((never, _)) => match never {},
+                    };
+                    let sent = sys::send_datagram_now(fd, bytes, to.as_ref());
+                    tally::writing(&sent);
+                    return Poll::Ready(sent);
+                }
+                queued
             }
             #[cfg(not(completion))]
             Via::None(never, _) => match never {},
@@ -699,6 +812,9 @@ impl WriteState {
         after: &mut After,
     ) -> Poll<io::Result<()>> {
         if let Some(result) = self.connected.take() {
+            // A connect that failed is forgotten, so the next poll makes
+            // another (a Unix connect waits out a full backlog so).
+            self.connect_started &= result.is_ok();
             return Poll::Ready(result);
         }
         if !self.connect_started {
@@ -717,6 +833,7 @@ impl WriteState {
                             after.register = true;
                         }
                         Err(err) => {
+                            self.connect_started = false;
                             crate::rt::counters::io_error(&err);
                             return Poll::Ready(Err(err));
                         }

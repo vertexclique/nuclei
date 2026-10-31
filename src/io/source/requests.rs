@@ -18,7 +18,7 @@
 //! while it holds its own can livelock.
 //!
 //! The requests: attaching the source to a shard's poller, a shard's evict,
-//! a failed registration, a retire (`get_mut`, `into_inner`), and a dropped
+//! a failed registration, one a shard stopped before it made it, a retire (`get_mut`, `into_inner`), and a dropped
 //! handle's close, with or without a linger (the drain of bytes written
 //! behind, on the handle's own object). A dropped handle hands its IO object
 //! to the source ([`Keep`]): it is dropped once the close was performed,
@@ -39,7 +39,7 @@ use std::sync::Arc;
 use super::Kind;
 use super::read::ReadState;
 use super::write::WriteState;
-use super::{Failure, NO_FD, NO_TOKEN, REGISTERED, Source, SourceHooks, UNREGISTERED};
+use super::{Failure, NO_FD, REGISTERED, Source, SourceHooks, UNREGISTERED};
 use crate::io::side::After;
 use crate::rt::shard::Shared;
 use crate::sync::atomic_waker::AtomicWaker;
@@ -63,6 +63,33 @@ const LINGER: u8 = 32;
 /// it, else the ring lets it go.
 #[cfg(ring)]
 const INSTALLED: u8 = 64;
+/// A shard stopped before it made the source's registration: no failure, as
+/// `proofs/tla/attach` has it (an attach refused leaves the source
+/// unregistered); every task waiting on the source looks again, to register
+/// it where it polls next.
+const ORPHANED: u8 = 128;
+
+/// What an attach to a shard that stopped first answers.
+#[derive(Debug)]
+struct StoppedShard;
+
+impl core::fmt::Display for StoppedShard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the shard stopped before the registration")
+    }
+}
+
+impl std::error::Error for StoppedShard {}
+
+pub(super) fn stopped_shard() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, StoppedShard)
+}
+
+/// Whether `err` is an attach refused because its shard stopped first.
+pub(crate) fn is_stopped_shard(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<StoppedShard>())
+}
 
 /// What pending requests carry. Each field is written by its requester
 /// before the request's bit is raised (Release) and read by the performer
@@ -324,12 +351,21 @@ impl Source {
             self.ops_registered(read, write, after);
         }
         if !here && let Some(Err(err)) = &attached {
-            let failure = Failure::of(err);
-            read.fail(failure, after);
-            write.fail(failure, after);
+            if is_stopped_shard(err) {
+                read.wake_all(after);
+                write.wake_all(after);
+            } else {
+                let failure = Failure::of(err);
+                read.fail(failure, after);
+                write.fail(failure, after);
+            }
         }
         if bits & EVICT != 0 {
             self.evict_now(read, write, after);
+        }
+        if bits & ORPHANED != 0 {
+            read.wake_all(after);
+            write.wake_all(after);
         }
         attached
     }
@@ -425,13 +461,12 @@ impl Source {
     pub(super) fn abandon_ring_attach(&self) {
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
-        let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
-        self.reg.home.store(0, Ordering::Release);
         self.reg.ops.store(false, Ordering::Release);
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
-            shard.release_source(token);
+            shard.release_source(self.reg.token.load(Ordering::Acquire));
         }
+        self.registration_gone();
     }
 
     /// Whether an attach to a ring is under way on the ring's thread: its
@@ -471,10 +506,7 @@ impl Source {
                 io::ErrorKind::NotConnected,
                 "the handle closed before its registration",
             )),
-            _ if shard.is_stopped() => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the shard stopped before the registration",
-            )),
+            _ if shard.is_stopped() => Err(stopped_shard()),
             #[cfg(ring)]
             fd if shard.is_ring() => return self.attach_ring(shard, token, fd),
             #[cfg(port)]
@@ -520,8 +552,6 @@ impl Source {
         if self.reg.state.load(Ordering::Acquire) == REGISTERED {
             // SAFETY: both sides are held.
             let shard = unsafe { (*self.reg.shard.get()).take() };
-            self.reg.token.store(NO_TOKEN, Ordering::Release);
-            self.reg.home.store(0, Ordering::Release);
             self.reg.state.store(UNREGISTERED, Ordering::Release);
             #[cfg(ring)]
             if self.reg.ops.swap(false, Ordering::AcqRel) {
@@ -546,6 +576,7 @@ impl Source {
             }
             #[cfg(not(readiness))]
             drop(shard);
+            self.registration_gone();
         }
         read.wake_all(after);
         write.wake_all(after);
@@ -577,6 +608,22 @@ impl Source {
         let done = self.request_with(ATTACH, &mut after, &hooks);
         after.run();
         done.attached.filter(|_| done.here)
+    }
+
+    /// A registration posted to a shard that stopped before it made it: the
+    /// source is unregistered, and the tasks waiting on it look again, to
+    /// register it where they poll next (no failure of its IO).
+    pub(crate) fn registration_orphaned(self: &Arc<Self>) {
+        self.registration_abandoned();
+        self.look_again();
+    }
+
+    /// Every task waiting on the source looks again, to register it where it
+    /// polls next: its registration went back to none.
+    pub(crate) fn look_again(self: &Arc<Self>) {
+        let mut after = After::default();
+        self.request(ORPHANED, &mut after);
+        after.run();
     }
 
     /// A registration the shard made for a thread that runs none failed:

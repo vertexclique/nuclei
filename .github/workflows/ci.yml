@@ -47,6 +47,18 @@ jobs:
         env:
           NUCLEI_BACKEND: epoll
 
+      # The IO counts of `stats` are built only with the `io-stats` feature: the suite with it
+      # on, on Linux's two backends and on macOS.
+      - name: tests with io-stats
+        if: runner.os != 'Windows'
+        run: cargo test --all --features nuclei/io-stats --no-fail-fast
+
+      - name: tests with io-stats on epoll
+        if: runner.os == 'Linux'
+        run: cargo test --all --features nuclei/io-stats --no-fail-fast
+        env:
+          NUCLEI_BACKEND: epoll
+
   # `#[nuclei::bench]` expands to a benchmark, which only nightly's test
   # harness takes: built and run here, each benchmark's body once.
   bench_macro_on_nightly:
@@ -129,6 +141,29 @@ jobs:
           PROBE_SYSTEMD_RUN: sudo systemd-run
           PROBE_SYSCTL: "1"
 
+  # Instructions per operation of each runtime row (ci/op_count), counted under cachegrind
+  # because the runners have no hardware counters, against ci/op_budget.txt: a change that
+  # makes an operation cost more user-space instructions fails here. The budgets are this
+  # runner's counts (the C library picks its copy routines per CPU model).
+  op_counts:
+    name: Op counts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      # The budgets hold for one compiler: its inlining moves rows. This is the latest stable.
+      - name: compiler
+        run: rustc -Vv
+
+      - name: op counts
+        run: bash ci/op_counts.sh
+
   check_fmt_and_docs:
     name: Checking fmt and docs
     runs-on: ubuntu-latest
@@ -137,10 +172,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: fmt
         run: cargo fmt --all -- --check
+
+      # Every feature on, `io-stats` and `recycle` included.
+      - name: clippy
+        run: cargo clippy --all --all-targets --all-features -- -D warnings
 
       # Doc warnings stay visible but not fatal while the legacy runtime is
       # in the tree; it is on its way out and its doc nits go with it.

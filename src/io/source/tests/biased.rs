@@ -18,6 +18,21 @@ fn fenced() -> bool {
     crate::rt::handoff::fence::available()
 }
 
+/// Polls from this thread, which is not the owner, until one poll finds the side free and switches
+/// it: a poll that meets the owner holding the side leaves its work there and keeps the bias.
+fn until_shared(mut poll: impl FnMut(), shared: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    poll();
+    while fenced() && !shared() {
+        assert!(
+            Instant::now() < deadline,
+            "no foreign poll switched the side to shared"
+        );
+        std::thread::yield_now();
+        poll();
+    }
+}
+
 /// One round trip through both sockets' sources on the runtime's worker,
 /// which homes them: the worker is their owner from now on.
 fn home_on_worker(rt: &Runtime, a: &Owned<Stream>, b: &Owned<Stream>) {
@@ -103,10 +118,11 @@ fn a_foreign_poll_during_the_owners_read_leaves_the_read_whole() {
     let waker = Waker::from(Arc::clone(&woke));
     let mut cx = Context::from_waker(&waker);
     let mut spare = [0u8; 8];
-    let first = b.src.poll_read(&mut cx, &mut spare, true);
-    if fenced() {
-        assert!(b.src.shared().0, "the foreign poll left the side biased");
-    }
+    let mut first = None;
+    until_shared(
+        || first = Some(b.src.poll_read(&mut cx, &mut spare, true)),
+        || b.src.shared().0,
+    );
     send(a.io(), &data);
     let got = rt.block_on(reader);
     assert!(got == data, "the read lost or reordered bytes");
@@ -160,10 +176,10 @@ fn a_foreign_poll_during_the_owners_write_leaves_the_write_whole() {
     let woke = Arc::new(Flag(AtomicBool::new(false)));
     let waker = Waker::from(Arc::clone(&woke));
     let mut cx = Context::from_waker(&waker);
-    assert!(a.src.poll_flush(&mut cx).is_pending());
-    if fenced() {
-        assert!(a.src.shared().1, "the foreign flush left the side biased");
-    }
+    until_shared(
+        || assert!(a.src.poll_flush(&mut cx).is_pending()),
+        || a.src.shared().1,
+    );
     // Read through the source: its driver reads ahead on the socket.
     let got = rt.block_on(async {
         let mut got = vec![0u8; filled.len() + data.len()];

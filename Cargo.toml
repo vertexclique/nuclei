@@ -20,7 +20,6 @@ exclude = [
 	"art/*",
 	"proofs/*",
 	"proptest-regressions/*",
-	"ci/*",
 	"benches/*",
 	"doc/*",
 	"docs/*",
@@ -49,14 +48,21 @@ attributes = ["nuclei-macros"]
 # of a crate in the build, so a library that enabled it would enable it for all of them.
 recycle = ["kovan/recycle", "kovan-channel/recycle", "kovan-map/recycle", "kovan-queue/recycle"]
 
+# Each worker's IO in `stats`: the counts of its operations and their bytes (`Builder::count_io`,
+# `ShardStats::io`) and the latencies of its IO operations (`ShardStats::io_latencies`, recorded
+# with `Builder::record_latencies`). Off by default: built in, every IO call costs a few
+# instructions more, counted and timed or not; left out, no IO path carries counting or timing
+# code, and those items do not exist. The poll-time histograms need no feature.
+io-stats = []
+
 [dependencies]
 nuclei-macros = { version = "0.5.0", path = "nuclei-macros", optional = true }
 futures-io = "0.3"
 futures-core = { version = "0.3", default-features = false }
-kovan = "0.2.2"
-kovan-channel = "0.2.2"
-kovan-map = "0.2.2"
-kovan-queue = "0.2.2"
+kovan = "0.2.3"
+kovan-channel = "0.2.3"
+kovan-map = "0.2.3"
+kovan-queue = "0.2.3"
 log = "0.4"
 
 [target.'cfg(target_family = "unix")'.dependencies]
@@ -71,7 +77,7 @@ loom = "0.7"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 # tests/steady.rs reclaims what the test thread retired before it measures.
-kovan = "0.2.2"
+kovan = "0.2.3"
 proptest = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "fs", "io-util", "macros"] }
 
@@ -83,6 +89,11 @@ local-sync = "0.1"
 [[test]]
 name = "macros_main"
 harness = false
+
+# The op-count gate's program (ci/op_counts.sh), outside the directories cargo discovers.
+[[example]]
+name = "op_count"
+path = "ci/op_count/main.rs"
 
 [[bench]]
 name = "sync"

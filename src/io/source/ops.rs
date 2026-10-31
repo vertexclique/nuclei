@@ -24,15 +24,18 @@ use std::sync::Arc;
 
 use super::{Addr, Source, Target};
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Owned;
 use crate::io::side::{After, Hooks};
 
 /// What a side asks its driver to do next.
 pub(crate) enum Want {
-    /// Wait until the socket may be read (`read`) or written: after a kernel
-    /// gave an operation back because it was not, or for a connect under
-    /// way.
-    #[cfg(ring)]
+    /// Wait until the socket may be read (`read`) or written: on a ring after
+    /// a kernel gave an operation back because it was not, or for a connect
+    /// under way; on a port a zero-byte receive, which holds no buffer, for a
+    /// TCP stream's read the pool has no buffer for (a port's sends wait in
+    /// the kernel, so a write side's ends at once).
+    #[cfg(completion)]
     Ready { read: bool },
     /// Accept a connection.
     Accept,
@@ -50,12 +53,12 @@ pub(crate) enum Want {
     #[cfg(ring)]
     RecvMulti,
     /// Read a stream's bytes into the spare capacity of a task's buffer.
-    RecvLent(Vec<u8>),
+    RecvLent(OwnedBuf),
     /// Receive a datagram into a buffer of the pool, with its sender.
     RecvFrom(PoolBuf),
     /// Receive a datagram into the spare capacity of a task's buffer, with
     /// its sender.
-    RecvLentFrom(Vec<u8>),
+    RecvLentFrom(OwnedBuf),
     /// Receive datagrams as they come, each into a buffer of the shard's
     /// receive group with its sender, until the receive is stopped (its end
     /// as [`Outcome::RecvMultiEnd`]).
@@ -66,7 +69,7 @@ pub(crate) enum Want {
     /// Send a stream the bytes a buffer of the pool holds.
     Send(PoolBuf),
     /// Send a stream a task's buffer, from `.1` on.
-    SendLent(Vec<u8>, usize),
+    SendLent(OwnedBuf, usize),
     /// Send a stream the buffer of a zero-copy write, from `.1` on: zero-copy when `.2`, the send
     /// then keeping its hold until the kernel's notification.
     #[cfg(ring)]
@@ -74,17 +77,25 @@ pub(crate) enum Want {
     /// Send a datagram from a buffer of the pool.
     SendTo(PoolBuf, Target),
     /// Send a datagram from a task's buffer.
-    SendLentTo(Vec<u8>, Target),
+    SendLentTo(OwnedBuf, Target),
     /// Send a range of a file to a stream, in the kernel.
     #[cfg(windows)]
     SendFile(crate::io::source::write::FileRange),
+    /// Send a stream the bytes `from..to` of the write slot's own room, where
+    /// a write the pool had no buffer for copied them.
+    #[cfg(port)]
+    SendRoom { from: usize, to: usize },
+    /// Read a byte stream that is not a socket into the read slot's own
+    /// room, for a read the pool had no buffer for.
+    #[cfg(port)]
+    RecvRoom,
 }
 
 impl Want {
     /// Whether the read side asked.
     pub(crate) fn of_read(&self) -> bool {
         match self {
-            #[cfg(ring)]
+            #[cfg(completion)]
             Want::Ready { read } => *read,
             Want::Accept
             | Want::Recv(_)
@@ -102,6 +113,10 @@ impl Want {
             Want::SendPinned(..) => false,
             #[cfg(windows)]
             Want::SendFile(_) => false,
+            #[cfg(port)]
+            Want::SendRoom { .. } => false,
+            #[cfg(port)]
+            Want::RecvRoom => true,
         }
     }
 
@@ -113,6 +128,44 @@ impl Want {
             }
             _ => {}
         }
+    }
+}
+
+/// Bytes a read left in its slot's own room, which its task takes from there.
+/// No operation of the read side goes out while the side holds them (it
+/// asks for none while bytes read ahead wait), so nothing writes the room
+/// meanwhile, and the slot is the source's, which outlives the side.
+#[cfg(port)]
+pub(crate) struct Room {
+    at: core::ptr::NonNull<u8>,
+    len: usize,
+    start: usize,
+}
+
+// SAFETY: the room is memory of the source's slot, read only by the side's
+// holder, and nothing writes it while a `Room` names it (as above).
+#[cfg(port)]
+unsafe impl Send for Room {}
+
+#[cfg(port)]
+impl Room {
+    /// The first `len` bytes of the room at `at`.
+    pub(crate) fn new(at: core::ptr::NonNull<u8>, len: usize) -> Self {
+        Self { at, len, start: 0 }
+    }
+
+    /// The bytes not taken yet.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: the read wrote `len` bytes from `at`, which stay put (as
+        // above); `start` never passes `len`.
+        unsafe {
+            core::slice::from_raw_parts(self.at.as_ptr().add(self.start), self.len - self.start)
+        }
+    }
+
+    /// Takes `n` bytes off the front.
+    pub(crate) fn consume(&mut self, n: usize) {
+        self.start = (self.start + n).min(self.len);
     }
 }
 
@@ -138,7 +191,7 @@ pub(crate) enum Answer<T> {
 /// What came back from an operation: the memory its `Want` gave the driver
 /// (its bytes counted in), and the kernel's answer.
 pub(crate) enum Outcome {
-    #[cfg(ring)]
+    #[cfg(completion)]
     Ready(Answer<()>),
     Accept(Answer<(Owned, Addr)>),
     /// A multishot accept ended: after its last connection (`Done(Ok(()))`,
@@ -155,17 +208,27 @@ pub(crate) enum Outcome {
         answer: Answer<usize>,
         dry: bool,
     },
-    RecvLent(Vec<u8>, Answer<usize>),
+    RecvLent(OwnedBuf, Answer<usize>),
     RecvFrom(PoolBuf, Answer<(usize, Addr)>),
-    RecvLentFrom(Vec<u8>, Answer<(usize, Addr)>),
+    RecvLentFrom(OwnedBuf, Answer<(usize, Addr)>),
     Connect(Dial, Answer<()>),
     Send(PoolBuf, Answer<usize>),
-    SendLent(Vec<u8>, Answer<usize>),
+    SendLent(OwnedBuf, Answer<usize>),
     /// A send of a zero-copy write's buffer ended for its side; the side holds the buffer.
     #[cfg(ring)]
     SendPinned(Answer<usize>),
     SendTo(PoolBuf, Target, Answer<usize>),
-    SendLentTo(Vec<u8>, Answer<usize>),
+    SendLentTo(OwnedBuf, Answer<usize>),
+    /// A read into the read slot's room ended, with the bytes it left there.
+    #[cfg(port)]
+    RecvRoom(Answer<Room>),
+    /// A send of the bytes `from..to` of the write slot's room ended.
+    #[cfg(port)]
+    SendRoom {
+        from: usize,
+        to: usize,
+        answer: Answer<usize>,
+    },
 }
 
 impl Outcome {
@@ -246,7 +309,7 @@ impl Source {
     ) {
         match known {
             Some(shard) => self.route_with(Some(shard), f),
-            None => crate::rt::context::current(|current| self.route_with(current, f)),
+            None => self.route_with(crate::rt::context::current_held().shard(), f),
         }
     }
 
@@ -291,18 +354,20 @@ impl Source {
         if done.read {
             self.read_done.put(done);
             self.read.defer(super::read_work::DONE, &mut after, &hooks);
+        } else if let Some(mut held) = self.write.try_hold_for(&hooks) {
+            // The side free: the end is applied now, with no trip through the mailbox or the
+            // deferred bits.
+            hooks.taken(held.get(), &mut after);
+            let st = held.get();
+            st.op_done(done, self.serving_fd(None), &mut after);
+            if st.wants_ops() {
+                self.with_route(shard, |io| st.submit_wanted(io, self.kind, &mut after));
+            }
+            held.release(&mut after, &hooks);
         } else {
             self.write_done.put(done);
-            // The side free: the end is taken now, with no trip through the
-            // deferred bits.
-            if let Some(mut held) = self.write.try_hold_for(&hooks) {
-                hooks.taken(held.get(), &mut after);
-                hooks.deferred(held.get(), super::write_work::DONE, &mut after);
-                held.release(&mut after, &hooks);
-            } else {
-                self.write
-                    .defer(super::write_work::DONE, &mut after, &hooks);
-            }
+            self.write
+                .defer(super::write_work::DONE, &mut after, &hooks);
         }
         #[cfg(port)]
         if idle && self.reg.awaits_idle.swap(false, Ordering::SeqCst) {

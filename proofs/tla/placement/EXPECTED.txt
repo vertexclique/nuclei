@@ -1,0 +1,14 @@
+# configuration       spec        expected
+P_safe                Placement   pass
+P_no_first_look       Placement   pass
+P_live                Placement   pass
+P_live_repush         Placement   pass
+M_no_second_look      Placement   violated:NoSilentLoss
+M_look_before_count   Placement   violated:NoSilentLoss
+M_load_first          Placement   violated:NoSilentLoss
+M_uncount_at_poll     Placement   violated:NoSilentLoss
+M_refuse_after_push   Placement   violated:RefusedNeverRuns
+M_bound               Placement   violated:RunsOnItsWorker
+W_late_refusal        Placement   violated:NoLateRefusal
+W_handoff_waiting     Placement   violated:NoHandoffWhileWaiting
+W_drain_runs          Placement   violated:NoDrainedRun

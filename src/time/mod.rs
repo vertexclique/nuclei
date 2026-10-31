@@ -9,6 +9,10 @@
 //! code that sleeps runs at once in tests. Timers fire on the wheel's
 //! millisecond: a timer waits at least its duration, rounded up to the next
 //! millisecond, and a shard busy with a task fires it once that task yields.
+//! [`sleep_precise`](crate::time::sleep_precise) waits to the microsecond
+//! instead, off the millisecond wheel: its deadline ends the shard's wait
+//! through the backend's high-resolution timer, and a paused clock moves to
+//! it exactly; `sleep` and `timeout` on the wheel pay nothing for it.
 //! Arming and cancelling a timer on its shard costs no allocation once the
 //! shard's wheel has grown to the most timers alive at once; a timer polled on
 //! a thread that is not a shard (another runtime's) is fired for it by a
@@ -18,12 +22,14 @@ pub(crate) mod clock;
 pub mod error;
 mod instant;
 mod interval;
+mod precise;
 mod sleep;
 mod timeout;
 pub(crate) mod wheel;
 
 pub use self::instant::Instant;
 pub use self::interval::{Interval, MissedTickBehavior, interval, interval_at};
+pub use self::precise::{SleepPrecise, sleep_precise, sleep_until_precise};
 pub(crate) use self::sleep::TimerOp;
 pub use self::sleep::{Sleep, sleep, sleep_until};
 pub use self::timeout::{Timeout, timeout, timeout_at};

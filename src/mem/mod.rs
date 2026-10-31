@@ -72,7 +72,7 @@ impl Owner {
 
 #[cfg(not(all(loom, test)))]
 mod cache {
-    use core::cell::RefCell;
+    use core::cell::{Cell, UnsafeCell};
     use core::ptr::{self, NonNull};
     use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
@@ -187,13 +187,19 @@ mod cache {
 
     /// This thread's free blocks, by class, and its record once it
     /// allocated.
-    pub(super) struct Cache {
+    pub(super) struct Lists {
         lists: [Vec<NonNull<u8>>; CLASSES],
         record: Option<&'static Record>,
     }
 
-    impl Cache {
+    /// The thread's [`Lists`], reached through `FAST` once made: the calls
+    /// below take them one at a time and call none of each other meanwhile,
+    /// so a reference to them is the only one live.
+    pub(super) struct Cache(UnsafeCell<Lists>);
+
+    impl Lists {
         /// Keeps `ptr`, a block of `class`; `false` if the list is full.
+        #[inline]
         fn keep(&mut self, class: usize, ptr: NonNull<u8>) -> bool {
             let blocks = &mut self.lists[class];
             if blocks.len() >= kept(class) {
@@ -233,9 +239,11 @@ mod cache {
 
     impl Drop for Cache {
         fn drop(&mut self) {
+            FAST.with(|fast| fast.set(ptr::null_mut()));
+            let this = self.0.get_mut();
             // The list is closed and emptied before the record goes, so no
             // block is left in it (`OpenWhileOwned`, `AllFreed`).
-            if let Some(record) = self.record {
+            if let Some(record) = this.record {
                 let mut list = record.head.swap(CLOSED, Ordering::Acquire);
                 let mut taken = 0;
                 while !list.is_null() {
@@ -248,68 +256,111 @@ mod cache {
                 }
                 record.bytes.fetch_sub(taken, Ordering::Relaxed);
             }
-            for (class, blocks) in self.lists.iter_mut().enumerate() {
+            for (class, blocks) in this.lists.iter_mut().enumerate() {
                 for ptr in blocks.drain(..) {
                     // SAFETY: each block was allocated with its class's layout
                     // and is no task's.
                     unsafe { std::alloc::dealloc(ptr.as_ptr(), block(class)) };
                 }
             }
-            if let Some(record) = self.record {
+            if let Some(record) = this.record {
                 record.claimed.store(false, Ordering::Release);
             }
         }
     }
 
     thread_local! {
-        static CACHE: RefCell<Cache> = const {
-            RefCell::new(Cache {
+        static CACHE: Cache = const {
+            Cache(UnsafeCell::new(Lists {
                 lists: [const { Vec::new() }; CLASSES],
                 record: None,
-            })
+            }))
         };
+        /// `CACHE`'s lists once this thread made them, null before and once
+        /// they went: what the calls look at first, a read with no check of
+        /// the thread-local's life.
+        static FAST: Cell<*mut Lists> = const { Cell::new(ptr::null_mut()) };
+    }
+
+    /// This thread's lists, if it made them and they have not gone, with its
+    /// record.
+    #[inline(always)]
+    fn fast() -> Option<(&'static mut Lists, &'static Record)> {
+        // SAFETY: `FAST` points at the lists while `CACHE` holds them, on this
+        // thread only, and no other reference to them is live (see `Cache`).
+        let lists = unsafe { FAST.with(Cell::get).as_mut()? };
+        let record = lists.record?;
+        Some((lists, record))
+    }
+
+    /// This thread's lists, made now if they were not (with its record
+    /// claimed), for `f`; `None` once they went (the thread is ending).
+    fn with_lists<R>(f: impl FnOnce(&mut Lists, &'static Record) -> R) -> Option<R> {
+        CACHE
+            .try_with(|cache| {
+                let lists = cache.0.get();
+                FAST.with(|fast| fast.set(lists));
+                // SAFETY: the only reference to the lists while `f` runs (see
+                // `Cache`).
+                let lists = unsafe { &mut *lists };
+                let record = *lists.record.get_or_insert_with(claim);
+                f(lists, record)
+            })
+            .ok()
     }
 
     /// A free block of `class`, if this thread keeps one or was given one
     /// back, and the owner of the block allocated for it either way.
+    #[inline]
     pub(super) fn take(class: usize) -> (Option<NonNull<u8>>, Owner) {
-        CACHE
-            .try_with(|cache| {
-                let Ok(mut cache) = cache.try_borrow_mut() else {
-                    return (None, Owner::NONE);
-                };
-                let record = *cache.record.get_or_insert_with(claim);
-                if cache.lists[class].is_empty() {
-                    cache.take_back(record);
-                }
-                (cache.lists[class].pop(), Owner(record))
-            })
-            .unwrap_or((None, Owner::NONE))
+        if let Some((lists, record)) = fast()
+            && let Some(ptr) = lists.lists[class].pop()
+        {
+            return (Some(ptr), Owner(record));
+        }
+        take_slow(class)
+    }
+
+    #[inline(never)]
+    fn take_slow(class: usize) -> (Option<NonNull<u8>>, Owner) {
+        with_lists(|lists, record| {
+            if lists.lists[class].is_empty() {
+                lists.take_back(record);
+            }
+            (lists.lists[class].pop(), Owner(record))
+        })
+        .unwrap_or((None, Owner::NONE))
     }
 
     /// Keeps `ptr`, a block of `class` from `owner`: back to its owner if
     /// that is another thread, else (or if the owner's list refuses it) in
     /// this thread's cache; `false` if neither takes it.
+    #[inline]
     pub(super) fn keep(class: usize, ptr: NonNull<u8>, owner: Owner) -> bool {
+        if let Some((lists, record)) = fast()
+            && ptr::eq(owner.0, record)
+        {
+            return lists.keep(class, ptr);
+        }
+        keep_slow(class, ptr, owner)
+    }
+
+    #[inline(never)]
+    fn keep_slow(class: usize, ptr: NonNull<u8>, owner: Owner) -> bool {
         // SAFETY: records are never freed.
         let owner = unsafe { owner.0.as_ref() };
-        CACHE
-            .try_with(|cache| {
-                let mut cache = cache.try_borrow_mut().ok();
-                let mine = cache
-                    .as_ref()
-                    .and_then(|cache| cache.record)
-                    .is_some_and(|record| owner.is_some_and(|o| ptr::eq(o, record)));
-                if !mine
-                    && let Some(owner) = owner
-                    && give_back(owner, ptr, class)
-                {
-                    return true;
-                }
-                cache.as_mut().is_some_and(|cache| cache.keep(class, ptr))
-            })
-            // This thread's cache is gone (it is ending).
-            .unwrap_or_else(|_| owner.is_some_and(|o| give_back(o, ptr, class)))
+        with_lists(|lists, record| {
+            let mine = owner.is_some_and(|o| ptr::eq(o, record));
+            if !mine
+                && let Some(owner) = owner
+                && give_back(owner, ptr, class)
+            {
+                return true;
+            }
+            lists.keep(class, ptr)
+        })
+        // This thread's cache is gone (it is ending).
+        .unwrap_or_else(|| owner.is_some_and(|o| give_back(o, ptr, class)))
     }
 }
 
@@ -331,6 +382,7 @@ mod cache {
 }
 
 /// Memory for a task of `layout`, and the owner to free it with.
+#[inline]
 pub(crate) fn alloc(layout: Layout) -> (NonNull<u8>, Owner) {
     let (layout, owner) = match class_of(layout) {
         Some(class) => match cache::take(class) {
@@ -352,6 +404,7 @@ pub(crate) fn alloc(layout: Layout) -> (NonNull<u8>, Owner) {
 ///
 /// `ptr` and `owner` came from `alloc(layout)`, and nothing uses `ptr` any
 /// more.
+#[inline]
 pub(crate) unsafe fn free(ptr: NonNull<u8>, layout: Layout, owner: Owner) {
     match class_of(layout) {
         Some(class) => {

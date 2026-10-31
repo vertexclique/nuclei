@@ -2,6 +2,7 @@
 //! write side.
 
 use super::*;
+use crate::buf::owned::{IoBuf, OwnedBuf};
 
 impl Source {
     /// A caller's descriptor: `Ready` with the write side's edge count while
@@ -50,7 +51,9 @@ impl Source {
     }
 
     /// Writes the bytes of `bufs`, gathered in order, as
-    /// [`poll_write`](Self::poll_write) writes one slice.
+    /// [`poll_write`](Self::poll_write) writes one slice. Inlined, so a single slice's
+    /// length is known where the call is made.
+    #[inline(always)]
     pub(crate) fn poll_write_vectored(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -60,9 +63,7 @@ impl Source {
         crate::coop::poll_budget(cx, |cx| {
             self.poll_writing(cx, |st, io, waker, after| {
                 #[cfg(unix)]
-                if st.writes_itself(io, bufs.iter().map(|b| b.len()).sum())
-                    && let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs)
-                {
+                if let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs) {
                     return Poll::Ready(result);
                 }
                 st.write(io, kind, bufs, waker, after)
@@ -72,6 +73,7 @@ impl Source {
 
     /// Polls the write side with `step` for the handle's own writes, given
     /// the way this thread reaches the descriptor.
+    #[inline(always)]
     fn poll_writing<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -82,6 +84,7 @@ impl Source {
 
     /// Polls the write side with `step`: for the handle's own writes when
     /// `drive`, else for its caller's calls.
+    #[inline(always)]
     fn poll_write_side<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -89,22 +92,26 @@ impl Source {
         mut step: impl FnMut(&mut WriteState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
         let mut after = After::default();
-        let polled = self.with_io(|io| {
-            self.write.poll(
-                &mut after,
-                cx.waker(),
-                &self.hooks_in(io.shard),
-                |st, after| {
-                    #[cfg(unix)]
-                    if drive {
-                        st.drive();
-                    }
-                    #[cfg(not(unix))]
-                    let _ = drive;
-                    step(st, io, cx.waker(), after)
-                },
-            )
-        });
+        let polled = self.with_io(
+            #[inline(always)]
+            |io| {
+                self.write.poll(
+                    &mut after,
+                    cx.waker(),
+                    &self.hooks_in(io.shard),
+                    #[inline(always)]
+                    |st, after| {
+                        #[cfg(unix)]
+                        if drive {
+                            st.drive();
+                        }
+                        #[cfg(not(unix))]
+                        let _ = drive;
+                        step(st, io, cx.waker(), after)
+                    },
+                )
+            },
+        );
         match polled {
             Ok(poll) => self.finish_poll(after, poll),
             Err(err) => {
@@ -117,71 +124,85 @@ impl Source {
     /// Writes all of `buf` and gives it back with the write's result. The
     /// buffer is lent to the side until the kernel took the last byte, so
     /// the bytes go out from it with no copy.
-    pub(crate) async fn write_owned(
-        self: &Arc<Self>,
-        buf: Vec<u8>,
-    ) -> (io::Result<usize>, Vec<u8>) {
-        let mut op = WriteOwned {
-            source: self,
-            held: Held::of(buf),
-            lending: Lending::default(),
-            lent: false,
-        };
-        let result = poll_fn(|cx| op.poll(cx)).await;
-        (result, op.held.buf.take().unwrap_or_default())
+    pub(crate) async fn write_owned<B>(self: &Arc<Self>, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
+        let (result, mut held) = self
+            .lend_write(OwnedBuf::written(buf), Lending::default())
+            .await;
+        (result, held.buf.take().unwrap_or_default().into_written())
     }
 
     /// Writes all of `buf` as [`write_owned`](Self::write_owned) does, the ring sending its large
-    /// chunks zero-copy (see `ring::zero_copy_worth`): the write ends once the kernel took the
+    /// chunks zero-copy (see `RingIssuer::zero_copy`): the write ends once the kernel took the
     /// last byte, and the buffer comes back through the [`Released`](crate::net::Released) once
     /// the kernel let go of every byte. A write the kernel copies has its buffer back at once.
-    pub(crate) async fn write_zero_copy(
+    pub(crate) async fn write_zero_copy<B>(
         self: &Arc<Self>,
-        buf: Vec<u8>,
-    ) -> (io::Result<usize>, crate::net::Released) {
+        buf: B,
+    ) -> (io::Result<usize>, crate::net::Released<B>)
+    where
+        B: IoBuf,
+    {
+        let buf = OwnedBuf::written(buf);
         #[cfg(ring)]
-        if super::super::ring::zero_copy_worth(self.kind, buf.len()) {
-            let mut op = WriteOwned {
-                source: self,
-                held: Held::of(buf),
-                lending: Lending {
-                    zero_copy: true,
-                    ..Lending::default()
-                },
-                lent: false,
+        if self.kind == Kind::Tcp {
+            let lending = Lending {
+                zero_copy: true,
+                ..Lending::default()
             };
-            let result = poll_fn(|cx| op.poll(cx)).await;
-            return (result, op.held.released());
+            let (result, mut held) = self.lend_write(buf, lending).await;
+            return (result, held.released());
         }
-        let (result, buf) = self.write_owned(buf).await;
-        (result, crate::net::Released::ready(buf))
+        let (result, mut held) = self.lend_write(buf, Lending::default()).await;
+        (
+            result,
+            crate::net::Released::ready(held.buf.take().unwrap_or_default()),
+        )
     }
 
     /// Sends all of `buf` as one datagram to `to` and gives it back with the
     /// send's result. The buffer is lent to the side until the kernel took
     /// the datagram, so the bytes go out from it with no copy.
-    pub(crate) async fn send_owned(
+    pub(crate) async fn send_owned<B>(
         self: &Arc<Self>,
-        buf: Vec<u8>,
+        buf: B,
         to: Dest<'_>,
-    ) -> (io::Result<usize>, Vec<u8>) {
+    ) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
+        let buf = OwnedBuf::written(buf);
         if buf.len() < super::super::OWNED_DATAGRAM_MIN && self.on_ring() {
             // A small datagram is cheaper sent by the call itself, which ends at once, than
             // lent to the ring and waited for.
             let result = poll_fn(|cx| self.poll_send(cx, &buf, to)).await;
-            return (result, buf);
+            return (result, buf.into_written());
         }
+        let lending = Lending {
+            to: Some(to),
+            ..Lending::default()
+        };
+        let (result, mut held) = self.lend_write(buf, lending).await;
+        (result, held.buf.take().unwrap_or_default().into_written())
+    }
+
+    /// Lends `buf` to the side for a write as `lending` says, and gives back
+    /// the write's result with what the task holds of the buffer then.
+    async fn lend_write(
+        self: &Arc<Self>,
+        buf: OwnedBuf,
+        lending: Lending<'_>,
+    ) -> (io::Result<usize>, Held) {
         let mut op = WriteOwned {
             source: self,
             held: Held::of(buf),
-            lending: Lending {
-                to: Some(to),
-                ..Lending::default()
-            },
+            lending,
             lent: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
-        (result, op.held.buf.take().unwrap_or_default())
+        (result, core::mem::take(&mut op.held))
     }
 
     fn poll_write_owned(
@@ -224,7 +245,7 @@ impl Source {
     ) -> io::Result<usize> {
         let mut op = WriteOwned {
             source: self,
-            held: Held::of(Vec::new()),
+            held: Held::of(OwnedBuf::default()),
             lending: Lending {
                 file: Some(FileRange {
                     handle,
@@ -246,13 +267,23 @@ impl Source {
 
     /// Flushes, then shuts a stream socket's writing half down.
     pub(crate) fn poll_close(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_shutdown(cx, std::net::Shutdown::Write)
+    }
+
+    /// Flushes, then shuts the halves `how` names of a stream socket down:
+    /// the writing half, or both.
+    pub(crate) fn poll_shutdown(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        how: std::net::Shutdown,
+    ) -> Poll<io::Result<()>> {
         let fd = match self.fd() {
             Ok(fd) => fd,
             Err(err) => return Poll::Ready(Err(err)),
         };
         let kind = self.kind;
         self.poll_writing(cx, |st, io, waker, after| {
-            st.close(io, fd, kind, waker, after)
+            st.close(io, fd, kind, how, waker, after)
         })
     }
 

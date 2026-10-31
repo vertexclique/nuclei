@@ -8,6 +8,7 @@
 //! the submission queue full wait here, in order, and go in as room frees;
 //! nothing is dropped and nothing blocks.
 
+use core::mem::MaybeUninit;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -18,6 +19,74 @@ use super::Notifier;
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::sys::IORING_SETUP_SINGLE_ISSUER;
 use crate::syscore::linux::iouring::ring::{IoUringCqe, Ring, RingConfig, SqFull, Sqe};
+
+/// Where a wait puts the completions it reaps, and how many it may.
+pub(crate) trait CqeSink {
+    fn room(&self) -> usize;
+    fn put(&mut self, cqe: IoUringCqe);
+}
+
+impl CqeSink for Vec<IoUringCqe> {
+    fn room(&self) -> usize {
+        usize::MAX
+    }
+
+    fn put(&mut self, cqe: IoUringCqe) {
+        self.push(cqe);
+    }
+}
+
+/// The most completions a [`CqeBatch`] holds: what one reap of a busy shard brings, on the stack.
+pub(crate) const CQE_BATCH: usize = 32;
+
+/// A fixed batch of completions, reaped in one go and handled after the ring is let go.
+pub(crate) struct CqeBatch {
+    cqes: [MaybeUninit<IoUringCqe>; CQE_BATCH],
+    len: usize,
+}
+
+impl CqeBatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            cqes: [MaybeUninit::uninit(); CQE_BATCH],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the batch took all it can, so more may wait in the ring.
+    pub(crate) fn is_full(&self) -> bool {
+        self.len == CQE_BATCH
+    }
+
+    /// The completion at `at`, which is below [`len`](Self::len).
+    pub(crate) fn get(&self, at: usize) -> IoUringCqe {
+        debug_assert!(at < self.len);
+        // SAFETY: `put` initialized every slot below `len`.
+        unsafe { self.cqes[at].assume_init() }
+    }
+
+    /// Empties the batch, its completions handled.
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl CqeSink for CqeBatch {
+    fn room(&self) -> usize {
+        CQE_BATCH - self.len
+    }
+
+    fn put(&mut self, cqe: IoUringCqe) {
+        if let Some(slot) = self.cqes.get_mut(self.len) {
+            slot.write(cqe);
+            self.len += 1;
+        }
+    }
+}
 
 /// A shard's ring.
 pub(crate) struct RingPoller {
@@ -172,9 +241,11 @@ impl RingPoller {
     pub(crate) fn wait(
         &mut self,
         timeout: Option<Duration>,
-        out: &mut Vec<IoUringCqe>,
+        out: &mut impl CqeSink,
     ) -> io::Result<bool> {
-        self.enable()?;
+        if !self.enabled {
+            self.enable()?;
+        }
         self.arm_wake();
         self.flush_waiting();
         // The enter below flushes what the kernel holds into the queue as
@@ -198,21 +269,30 @@ impl RingPoller {
                 ) => {}
             Err(err) => return Err(err),
         }
-        let mut woken = false;
-        let before = out.len();
-        for cqe in self.ring.completions() {
-            if cqe.user_data == NOT_AN_OP {
-                woken = true;
-                self.wake_armed = false;
-            } else {
-                out.push(cqe);
-            }
-        }
-        self.entered_with_more = entered && (woken || out.len() > before);
+        let (woken, got) = self.reap(out);
+        self.entered_with_more = entered && (woken || got > 0);
         self.look_for_overflow();
         // Completions freed room: entries that waited for it go in now.
         self.flush_waiting();
         Ok(woken)
+    }
+
+    /// Takes the completions that have arrived into `out`, as many as it has room for, without
+    /// entering the kernel. Returns whether a wake came and how many completions it took
+    /// (the wake not counted).
+    pub(crate) fn reap(&mut self, out: &mut impl CqeSink) -> (bool, usize) {
+        let mut woken = false;
+        let mut got = 0;
+        for cqe in self.ring.completions().take(out.room()) {
+            if cqe.user_data == NOT_AN_OP {
+                woken = true;
+                self.wake_armed = false;
+            } else {
+                out.put(cqe);
+                got += 1;
+            }
+        }
+        (woken, got)
     }
 
     /// Counts an overflow the first time a look finds the kernel holding

@@ -26,11 +26,13 @@ const SPIN_GAP_MAX: u32 = 64;
 /// from the clock after each gap of pauses (never every pause), and is a
 /// hint: it only sizes the next spin.
 ///
-/// A shard spins only while work may come soon: its caller says so (a job of
-/// its runtime's blocking pool, finite operations of its ring out), or the
-/// shard has seen work come from another thread within a spin or soon after
-/// a park (`hot`) and nothing since has said otherwise. Else it parks at
-/// once and the budget stays.
+/// A shard spins only while work may come soon: its caller says so (finite
+/// operations of its ring out), or the shard has seen work come from another
+/// thread within a spin or soon after a park (`hot`) and nothing since has
+/// said otherwise. Else it parks at once and the budget stays. A job of its
+/// runtime's blocking pool is not work that comes soon: it runs for as long
+/// as it blocks, its end wakes the parked shard with one notification, and a
+/// park it cuts short does not make the shard hot.
 pub(crate) struct Spin {
     budget: Cell<u32>,
     hot: Cell<bool>,
@@ -51,26 +53,39 @@ impl Spin {
         if !(expecting || self.hot.get()) || budget == 0 {
             return false;
         }
-        let limit = Duration::from_nanos(u64::from(budget));
-        let start = Instant::now();
-        let mut gap = 1;
-        loop {
-            for _ in 0..gap {
-                core::hint::spin_loop();
+        // The first look comes before the clock and the first pause: work already there costs
+        // neither, and the budget runs from a failed look.
+        let mut hit = found();
+        if !hit {
+            let limit = Duration::from_nanos(u64::from(budget));
+            let start = Instant::now();
+            let mut gap = 1;
+            loop {
+                for _ in 0..gap {
+                    core::hint::spin_loop();
+                }
+                gap = (gap * 2).min(SPIN_GAP_MAX);
+                hit = found();
+                if hit || start.elapsed() >= limit {
+                    break;
+                }
             }
-            gap = (gap * 2).min(SPIN_GAP_MAX);
-            if found() {
-                self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
-                self.hot.set(true);
-                return true;
-            }
-            if start.elapsed() >= limit {
-                break;
-            }
+        }
+        if hit {
+            self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
+            self.hot.set(true);
+            return true;
         }
         self.budget.set(budget / 2);
         self.hot.set(false);
         false
+    }
+
+    /// Whether work came soon after a spin or a park, so the next spin runs
+    /// unasked.
+    #[cfg(test)]
+    pub(super) fn is_hot(&self) -> bool {
+        self.hot.get()
     }
 
     /// The shard slept for `slept`: a short sleep means work came right

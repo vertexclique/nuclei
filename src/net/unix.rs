@@ -9,9 +9,11 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixDatagram, UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Duration;
 
 use futures_core::Stream;
 
+use crate::buf::owned::{IoBuf, IoBufMut};
 use crate::io::source::write::{Dest, Peer};
 use crate::io::source::{Addr, Kind};
 use crate::io::sys::UnixAddr;
@@ -178,25 +180,32 @@ impl Stream for Incoming<'_> {
     }
 }
 
+/// The first pause of a connect that found the listener's backlog full,
+/// doubled up to [`FULL_BACKLOG_PAUSE_MAX`] while it stays full.
+const FULL_BACKLOG_PAUSE: Duration = Duration::from_millis(1);
+const FULL_BACKLOG_PAUSE_MAX: Duration = Duration::from_millis(64);
+
 /// The connect of the non-blocking Unix stream `socket` to `addr`.
+///
+/// Linux answers a connect to a listener whose backlog is full `EAGAIN`, and
+/// nothing tells a socket when a place frees: the connect is made again on
+/// the same socket (so its options stay) after a pause on a timer, doubled
+/// up to [`FULL_BACKLOG_PAUSE_MAX`], until the listener takes it or answers
+/// otherwise, as std's blocking connect waits. The future holds nothing but
+/// its socket and its timer, so a drop of it frees everything
+/// (`proofs/tla/connect`).
 pub(super) async fn connect(socket: OwnedFd, addr: &UnixAddr) -> io::Result<Handle<UnixStream>> {
     let stream = Handle::from_nonblocking(UnixStream::from(socket), Kind::Stream);
-    match poll_fn(|cx| stream.source().poll_connect(cx, Peer::Unix(addr))).await {
-        Ok(()) => Ok(stream),
-        // The listener's backlog is full: nothing tells a socket when it
-        // has room, so a thread of the blocking pool waits in a blocking
-        // connect instead.
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-            drop(stream);
-            let addr = *addr;
-            let connected =
-                crate::rt::blocking::call(move || sys::connect_unix_waiting(&addr)).await?;
-            Ok(Handle::from_nonblocking(
-                UnixStream::from(connected),
-                Kind::Stream,
-            ))
+    let mut pause = FULL_BACKLOG_PAUSE;
+    loop {
+        match poll_fn(|cx| stream.source().poll_connect(cx, Peer::Unix(addr))).await {
+            Ok(()) => return Ok(stream),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                crate::time::sleep(pause).await;
+                pause = (pause * 2).min(FULL_BACKLOG_PAUSE_MAX);
+            }
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -350,19 +359,23 @@ impl Handle<UnixDatagram> {
     ///
     /// If the future is dropped before it completes, the datagram is sent
     /// whole or not at all: one the driver has not handed to the kernel is
-    /// withdrawn, and one already handed over goes out.
-    pub async fn send_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// withdrawn, and one already handed over goes out. `buf` is any
+    /// [`IoBuf`](crate::io::IoBuf).
+    pub async fn send_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
         self.source().send_owned(buf, Dest::Connected).await
     }
 
     /// Sends all of `buf` as one datagram to the socket at `path` and gives
     /// it back with its length, as [`send_owned`](Self::send_owned) sends to
     /// the connected peer.
-    pub async fn send_to_owned<P: AsRef<Path>>(
-        &self,
-        buf: Vec<u8>,
-        path: P,
-    ) -> (io::Result<usize>, Vec<u8>) {
+    pub async fn send_to_owned<P, B>(&self, buf: B, path: P) -> (io::Result<usize>, B)
+    where
+        P: AsRef<Path>,
+        B: IoBuf,
+    {
         match UnixAddr::path(path.as_ref()) {
             Ok(addr) => self.source().send_owned(buf, Dest::Unix(&addr)).await,
             Err(err) => (Err(err), buf),
@@ -376,18 +389,21 @@ impl Handle<UnixDatagram> {
     ///
     /// If the future is dropped before it completes, a datagram the driver
     /// received into `buf` stays with the socket for its next receive, so
-    /// none is lost.
-    pub async fn recv_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// none is lost. `buf` is any [`IoBufMut`](crate::io::IoBufMut).
+    pub async fn recv_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
         let (result, buf) = self.recv_from_owned(buf).await;
         (result.map(|(n, _)| n), buf)
     }
 
     /// Receives a datagram with its sender's address into the spare capacity
     /// of `buf`, as [`recv_owned`](Self::recv_owned).
-    pub async fn recv_from_owned(
-        &self,
-        buf: Vec<u8>,
-    ) -> (io::Result<(usize, UnixSocketAddr)>, Vec<u8>) {
+    pub async fn recv_from_owned<B>(&self, buf: B) -> (io::Result<(usize, UnixSocketAddr)>, B)
+    where
+        B: IoBufMut,
+    {
         let (result, buf) = self.source().recv_from_owned(buf).await;
         (
             result.and_then(|(n, addr)| unix(addr).map(|addr| (n, addr))),

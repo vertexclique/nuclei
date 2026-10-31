@@ -9,15 +9,20 @@
 //! the whole pool too, and a reader the pool has no buffer for still reads into its own. A binary
 //! of its own, since the configuration is the process's: the smallest ring, with the receive group
 //! off, so every read below 16 KiB is a receive into a buffer of the pool that waits. On epoll and
-//! kqueue no receive waits in the kernel, and every request is answered the same way.
+//! kqueue no receive waits in the kernel, and every request is answered the same way. On a
+//! completion port a read the pool has no buffer for waits in a zero-byte receive, which holds
+//! none, and a reader or a writer it has no buffer for uses its own memory
+//! (proofs/tla/port/PortStarve.tla). The same holds for datagram sockets nobody sends to and for
+//! pipes nobody writes to, on every backend.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdStream};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use nuclei::config::{IoUringConfiguration, NucleiConfig};
-use nuclei::net::{TcpListener, TcpStream};
+use nuclei::io::{AsyncReadExt, AsyncWriteExt};
+use nuclei::net::{TcpListener, TcpStream, UdpSocket};
 use nuclei::runtime::Builder;
 
 /// The server's ring, the least a ring may have: 128 completions, the cap on operations in the
@@ -38,7 +43,8 @@ const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The first byte of a request whose task peeks at it and then never reads it.
 const HOLD: u8 = 1;
-/// The cap of the buffers such tasks hold, a few of each read's size, and more of them.
+/// The cap of the buffers such tasks (and idle datagram sockets and pipes) hold, a few of each
+/// read's size, and more of them.
 const HELD_CAP: usize = 64 << 10;
 const HOLDERS: usize = HELD_CAP / READ + 4;
 
@@ -110,28 +116,66 @@ fn configure() {
     });
 }
 
-/// A server of one worker whose buffers may hold `cap` bytes, serving each connection with `serve`.
-fn server<F>(cap: usize, serve: fn(TcpStream) -> F) -> (nuclei::runtime::Runtime, SocketAddr)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
+/// A runtime of one worker whose buffers may hold `cap` bytes.
+fn runtime(cap: usize) -> nuclei::runtime::Runtime {
     configure();
-    let rt = Builder::new()
+    Builder::new()
         .worker_threads(1)
         .pin_workers(false)
         .io_buffer_cap(cap)
         .build()
-        .unwrap();
+        .unwrap()
+}
+
+/// The errors the servers' accepts met, for a failure to name.
+static ACCEPT_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A server of one worker whose buffers may hold `cap` bytes, serving each connection with `serve`.
+/// An accept that fails (a connection its peer gave up on before it was taken, no descriptor or
+/// buffer for it for now) leaves the listener, and the rest of its backlog, as they were: the
+/// server goes on accepting, as a server does, and the error is kept for the failure's message.
+fn server<F>(cap: usize, serve: fn(TcpStream) -> F) -> (nuclei::runtime::Runtime, SocketAddr)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let rt = runtime(cap);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     rt.spawn(async move {
         let listener = TcpListener::new(listener).unwrap();
-        while let Ok((stream, _)) = listener.accept().await {
-            nuclei::runtime::spawn(serve(stream)).detach();
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => nuclei::runtime::spawn(serve(stream)).detach(),
+                Err(err) => {
+                    ACCEPT_ERRORS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(err.to_string());
+                    nuclei::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
         }
     })
     .detach();
     (rt, addr)
+}
+
+/// The accept errors met so far, for a failure's message.
+fn accept_errors() -> Vec<String> {
+    ACCEPT_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Holds the binary's other tests off while one runs, so the descriptors its peers hold (the
+/// first test's more than 500) stay within a 1024-descriptor limit, as a virtual machine of the
+/// kernel matrix sets, however many tests run at once.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that failed holding it leaves it poisoned, and the next still runs alone.
+    ONE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether a shard of the buffer cap `cap` found every byte under it in use.
@@ -151,7 +195,10 @@ fn answered(addr: SocketAddr) {
     for (i, stream) in active.iter_mut().enumerate() {
         let mut reply = [0u8; REPLY];
         if let Err(err) = stream.read_exact(&mut reply) {
-            panic!("peer {i} of {ACTIVE} got no reply within {DEADLINE:?}: {err}");
+            panic!(
+                "peer {i} of {ACTIVE} got no reply within {DEADLINE:?}: {err} (accept errors: {:?})",
+                accept_errors()
+            );
         }
         assert_eq!(reply, [7u8; REPLY]);
     }
@@ -176,6 +223,7 @@ fn connect(addr: SocketAddr) -> StdStream {
 
 #[test]
 fn idle_peers_holding_the_cap_and_the_pool_keep_no_request_from_its_reply() {
+    let _alone = one_at_a_time();
     let (_rt, addr) = server(CAP, serve);
     let idle: Vec<StdStream> = (0..IDLE).map(|_| connect(addr)).collect();
     if nuclei::Proactor::backend() == nuclei::IoBackend::IoUring {
@@ -191,6 +239,7 @@ fn idle_peers_holding_the_cap_and_the_pool_keep_no_request_from_its_reply() {
 /// it has no buffer for reads, and peeks, into its own.
 #[test]
 fn tasks_that_stop_reading_with_the_pool_full_keep_no_request_from_its_reply() {
+    let _alone = one_at_a_time();
     let (_rt, addr) = server(HELD_CAP, serve_or_hold);
     let mut held: Vec<StdStream> = (0..HOLDERS).map(|_| connect(addr)).collect();
     for stream in &mut held {
@@ -207,6 +256,7 @@ fn tasks_that_stop_reading_with_the_pool_full_keep_no_request_from_its_reply() {
 /// other connection's reply from going out.
 #[test]
 fn sends_waiting_for_peers_that_never_read_keep_no_request_from_its_reply() {
+    let _alone = one_at_a_time();
     let (_rt, addr) = server(DEAF_CAP, serve_or_flood);
     let mut deaf: Vec<StdStream> = (0..DEAF).map(|_| connect(addr)).collect();
     for stream in &mut deaf {
@@ -223,4 +273,123 @@ fn sends_waiting_for_peers_that_never_read_keep_no_request_from_its_reply() {
     }
     answered(addr);
     drop(deaf);
+}
+
+/// Datagram sockets nobody sends to, each with a receive the pool holds a buffer for, keep no
+/// datagram from its reply: on a completion port a receive the pool has no buffer for looks with a
+/// zero-byte receive that leaves the datagram queued, then takes it into its task's own buffer and
+/// sends the reply from there (proofs/tla/port/PortStarve.tla). Elsewhere a datagram is its task's
+/// own to receive and send, or the ring's starved rule applies.
+#[test]
+fn idle_datagram_sockets_holding_the_cap_keep_no_datagram_from_its_reply() {
+    let _alone = one_at_a_time();
+    let rt = runtime(HELD_CAP);
+    for _ in 0..HOLDERS {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        rt.spawn(async move {
+            let socket = UdpSocket::new(socket).unwrap();
+            let mut buf = vec![0u8; READ];
+            let _ = socket.recv_from(&mut buf).await;
+        })
+        .detach();
+    }
+    if nuclei::Proactor::backend() == nuclei::IoBackend::Iocp {
+        until("the pool full of datagram receives", || exhausted(HELD_CAP));
+    }
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_read_timeout(Some(DEADLINE)).unwrap();
+    let mut servers = Vec::new();
+    for _ in 0..ACTIVE {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        servers.push(socket.local_addr().unwrap());
+        rt.spawn(async move {
+            let socket = UdpSocket::new(socket).unwrap();
+            let mut buf = vec![0u8; READ];
+            if let Ok((_, from)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&[7u8; REPLY], from).await;
+            }
+        })
+        .detach();
+    }
+    for addr in &servers {
+        client.send_to(&[3u8; READ], addr).unwrap();
+    }
+    for i in 0..ACTIVE {
+        let mut reply = [0u8; READ];
+        match client.recv_from(&mut reply) {
+            Ok((n, _)) => assert_eq!(&reply[..n], &[7u8; REPLY]),
+            Err(err) => panic!("reply {i} of {ACTIVE} not within {DEADLINE:?}: {err}"),
+        }
+    }
+}
+
+/// A pipe's end as a file nuclei reads or writes as the byte stream it is.
+#[cfg(unix)]
+fn pipe_file(end: impl Into<std::os::fd::OwnedFd>) -> nuclei::fs::File {
+    nuclei::fs::File::new(std::fs::File::from(end.into())).unwrap()
+}
+
+#[cfg(windows)]
+fn pipe_file(end: impl Into<std::os::windows::io::OwnedHandle>) -> nuclei::fs::File {
+    nuclei::fs::File::new(std::fs::File::from(end.into())).unwrap()
+}
+
+/// Pipes nobody writes to, each with a read the pool holds a buffer for, keep no request sent down
+/// another pipe from its reply: a read or a write the pool has no buffer for uses memory of its own
+/// (on a completion port its slot's own room, proofs/tla/port/PortStarve.tla; elsewhere the task's
+/// own buffer).
+#[test]
+fn idle_pipes_holding_the_cap_keep_no_request_from_its_reply() {
+    let _alone = one_at_a_time();
+    let rt = runtime(HELD_CAP);
+    let mut idle = Vec::new();
+    for _ in 0..HOLDERS {
+        let (r, w) = std::io::pipe().unwrap();
+        rt.spawn(async move {
+            let reader = pipe_file(r);
+            let mut buf = vec![0u8; READ];
+            let _ = (&reader).read(&mut buf).await;
+        })
+        .detach();
+        idle.push(w);
+    }
+    if nuclei::Proactor::backend() == nuclei::IoBackend::Iocp {
+        until("the pool full of reads of idle pipes", || {
+            exhausted(HELD_CAP)
+        });
+    }
+    let mut replies = Vec::new();
+    for _ in 0..ACTIVE {
+        let (request, mut send) = std::io::pipe().unwrap();
+        let (mut answer, reply) = std::io::pipe().unwrap();
+        rt.spawn(async move {
+            let (reader, writer) = (pipe_file(request), pipe_file(reply));
+            let mut buf = vec![0u8; READ];
+            let mut got = 0;
+            while got < READ {
+                match (&reader).read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => got += n,
+                }
+            }
+            let _ = (&writer).write_all(&[7u8; REPLY]).await;
+            let _ = (&writer).flush().await;
+        })
+        .detach();
+        send.write_all(&[3u8; READ]).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reply = [0u8; REPLY];
+            let _ = tx.send(answer.read_exact(&mut reply).map(|()| reply));
+        });
+        replies.push((send, rx));
+    }
+    for (i, (_, rx)) in replies.iter().enumerate() {
+        match rx.recv_timeout(DEADLINE) {
+            Ok(Ok(reply)) => assert_eq!(reply, [7u8; REPLY]),
+            Ok(Err(err)) => panic!("pipe {i} of {ACTIVE}: {err}"),
+            Err(_) => panic!("pipe {i} of {ACTIVE} got no reply within {DEADLINE:?}"),
+        }
+    }
+    drop(idle);
 }

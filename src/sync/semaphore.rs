@@ -20,7 +20,7 @@ use super::raw_semaphore::{MAX, PermitWait, RawSemaphore, observed_closed};
 pub struct AcquireError(());
 
 impl AcquireError {
-    fn closed() -> Self {
+    pub(crate) fn closed() -> Self {
         Self(())
     }
 }

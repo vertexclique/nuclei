@@ -20,9 +20,11 @@ use super::ops::{Answer, Dial, Done, Outcome, Want};
 use super::write::Pinned;
 use super::{Addr, Kind, Source, Target};
 use crate::buf::PoolBuf;
+use crate::buf::owned::OwnedBuf;
 use crate::buf::spare::Spare;
 use crate::io::side::{After, Hooks};
 use crate::io::sys;
+use crate::rt::counters::tally;
 use crate::rt::shard::ring::ShardRing;
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::Sqe;
@@ -66,15 +68,15 @@ pub(crate) enum RingMem {
         #[expect(dead_code, reason = "the kernel reads it until the last completion")]
         msg: RecvHdr,
     },
-    RecvLent(Vec<u8>),
+    RecvLent(OwnedBuf),
     RecvFrom(Spare<Msg>, PoolBuf),
-    RecvLentFrom(Spare<Msg>, Vec<u8>),
+    RecvLentFrom(Spare<Msg>, OwnedBuf),
     Connect(
         Dial,
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<RawAddr>,
     ),
     Send(PoolBuf),
-    SendLent(Vec<u8>),
+    SendLent(OwnedBuf),
     SendTo(
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
         PoolBuf,
@@ -82,7 +84,7 @@ pub(crate) enum RingMem {
     ),
     SendLentTo(
         #[expect(dead_code, reason = "the kernel reads it until the completion")] Spare<Msg>,
-        Vec<u8>,
+        OwnedBuf,
     ),
     /// A copied send of a zero-copy write's buffer, which it holds until its completion.
     SendPinned(#[expect(dead_code, reason = "the kernel reads it until the completion")] Pinned),
@@ -98,8 +100,9 @@ pub(crate) enum RingMem {
 }
 
 /// The least a `write_zero_copy` must have left to send for its next chunk to go out zero-copy
-/// (on a ring that allows it at all: `ShardRing::zc_stream`); a smaller write is copied whole,
-/// and its buffer handed back at once. Below it, pinning the
+/// (on a ring that allows it at all: `ShardRing::zc_stream`), by default: a worker's ring takes
+/// its runtime's `Builder::zero_copy_threshold` instead (`ShardRing::zero_copy_min`). A smaller
+/// write is copied whole, and its buffer handed back at once. Below it, pinning the
 /// pages costs more than the copy it saves: on the development host's loopback (where the receive
 /// path copies what a send pinned), the `owned_size_*` modes of benches/vs_tokio_count.rs
 /// measured total cycles per write above the copy's from 16 KiB to 512 KiB, level with it at
@@ -111,20 +114,14 @@ pub(crate) const SEND_ZC_MIN: usize = 1 << 20;
 /// bounded, and a longer write goes in several.
 const SEND_ZC_CHUNK: usize = 1 << 20;
 
-/// Whether a send of `len` bytes, what is left of a zero-copy write on a source of `kind`, is
-/// worth a zero-copy send: a TCP stream's, of at least [`SEND_ZC_MIN`]. The one place the call
-/// and the ring decide it.
-pub(crate) fn zero_copy_worth(kind: Kind, len: usize) -> bool {
-    kind == Kind::Tcp && len >= SEND_ZC_MIN
-}
-
 /// What a zero-copy send's first completion `res` brings its side, which goes on at once.
 pub(crate) fn zc_outcome(res: i32) -> Outcome {
-    Outcome::SendPinned(answer(res))
+    Outcome::SendPinned(wrote_of(res))
 }
 
 /// The kernel's answer `res` (a count, or a negated errno) to an operation
 /// that takes bytes or gives a descriptor.
+#[inline]
 fn answer(res: i32) -> Answer<usize> {
     match res {
         r if r == -libc::ECANCELED => Answer::Undone { not_ready: false },
@@ -132,6 +129,25 @@ fn answer(res: i32) -> Answer<usize> {
         r if r < 0 => Answer::Done(Err(failed(-r))),
         r => Answer::Done(Ok(r as usize)),
     }
+}
+
+/// The [`answer`] `res` is, counted as a read when it brought bytes or the end
+/// (a count, which is no error): one look at the flag, on the kernel's word.
+#[inline(always)]
+fn read_of(res: i32) -> Answer<usize> {
+    if tally::counting() && res >= 0 {
+        tally::add_read(res as usize);
+    }
+    answer(res)
+}
+
+/// The [`answer`] `res` is, counted as a write when it took bytes.
+#[inline(always)]
+fn wrote_of(res: i32) -> Answer<usize> {
+    if tally::counting() && res > 0 {
+        tally::add_write(res as usize);
+    }
+    answer(res)
 }
 
 /// The error of an operation that failed with errno `code`, counted.
@@ -153,8 +169,40 @@ impl RingMem {
     }
 
     /// The completion of an operation of a source of `kind`, whose kernel
-    /// answer is `res`.
+    /// answer is `res`. The streams' hot ends are inline here; the rest is
+    /// [`complete_rest`](Self::complete_rest).
+    #[inline]
     pub(crate) fn complete(self, res: i32, kind: Kind) -> Outcome {
+        match self {
+            RingMem::Recv(mut buf) => {
+                let answer = read_of(res);
+                if let Answer::Done(Ok(n)) = answer {
+                    buf.set_filled(n);
+                }
+                Outcome::Recv(buf, answer)
+            }
+            RingMem::Send(buf) => Outcome::Send(buf, wrote_of(res)),
+            RingMem::SendLent(buf) => Outcome::SendLent(buf, wrote_of(res)),
+            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => {
+                // Arrivals were counted as they came: only the end of the stream is none.
+                if res == 0 {
+                    tally::read(0);
+                }
+                Outcome::RecvMultiEnd {
+                    // A group with no buffer left gives the receive back undone.
+                    answer: match res {
+                        r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
+                        r => answer(r),
+                    },
+                    dry: res == -libc::ENOBUFS,
+                }
+            }
+            rest => rest.complete_rest(res, kind),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_rest(self, res: i32, kind: Kind) -> Outcome {
         match self {
             RingMem::Ready => Outcome::Ready(match answer(res) {
                 Answer::Done(result) => Answer::Done(result.map(drop)),
@@ -162,6 +210,7 @@ impl RingMem {
             }),
             RingMem::Accept(addr) => Outcome::Accept(match answer(res) {
                 Answer::Done(Ok(fd)) => {
+                    tally::accepted(1);
                     // SAFETY: the kernel made this descriptor for us.
                     let conn = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
                     Answer::Done(addr.decode(kind).map(|peer| (conn, peer)))
@@ -172,13 +221,6 @@ impl RingMem {
                 }
                 Answer::Undone { not_ready } => Answer::Undone { not_ready },
             }),
-            RingMem::Recv(mut buf) => {
-                let answer = answer(res);
-                if let Answer::Done(Ok(n)) = answer {
-                    buf.set_filled(n);
-                }
-                Outcome::Recv(buf, answer)
-            }
             RingMem::AcceptMulti { .. } => Outcome::AcceptMultiEnd(match res {
                 // Its last connection came as an arrival.
                 r if r >= 0 => Answer::Done(Ok(())),
@@ -191,16 +233,8 @@ impl RingMem {
                     Answer::Undone { not_ready } => Answer::Undone { not_ready },
                 },
             }),
-            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => Outcome::RecvMultiEnd {
-                // A group with no buffer left gives the receive back undone.
-                answer: match res {
-                    r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
-                    r => answer(r),
-                },
-                dry: res == -libc::ENOBUFS,
-            },
             RingMem::RecvLent(mut buf) => {
-                let answer = answer(res);
+                let answer = read_of(res);
                 if let Answer::Done(Ok(n)) = answer {
                     // SAFETY: the kernel wrote the first `n` bytes of the
                     // buffer's spare capacity.
@@ -209,7 +243,7 @@ impl RingMem {
                 Outcome::RecvLent(buf, answer)
             }
             RingMem::RecvFrom(mut msg, mut buf) => {
-                let answer = match answer(res) {
+                let answer = match read_of(res) {
                     Answer::Done(Ok(n)) => {
                         buf.set_filled(n);
                         Answer::Done(msg.sender(kind).map(|from| (n, from)))
@@ -220,7 +254,7 @@ impl RingMem {
                 Outcome::RecvFrom(buf, answer)
             }
             RingMem::RecvLentFrom(mut msg, mut buf) => {
-                let answer = match answer(res) {
+                let answer = match read_of(res) {
                     Answer::Done(Ok(n)) => {
                         // SAFETY: the kernel wrote the first `n` bytes of the
                         // buffer's spare capacity.
@@ -243,13 +277,16 @@ impl RingMem {
                     _ => Answer::Done(Ok(())),
                 },
             ),
-            RingMem::Send(buf) => Outcome::Send(buf, answer(res)),
-            RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
-            RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, answer(res)),
-            RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, answer(res)),
-            RingMem::SendPinned(_) | RingMem::SendZc { .. } | RingMem::ZcHeld(_) => {
-                Outcome::SendPinned(answer(res))
-            }
+            RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, wrote_of(res)),
+            RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, wrote_of(res)),
+            RingMem::SendPinned(_) => Outcome::SendPinned(wrote_of(res)),
+            // A zero-copy send was counted at its first completion.
+            RingMem::SendZc { .. } | RingMem::ZcHeld(_) => Outcome::SendPinned(answer(res)),
+            RingMem::Recv(_)
+            | RingMem::Send(_)
+            | RingMem::SendLent(_)
+            | RingMem::RecvMulti { .. }
+            | RingMem::RecvFromMulti { .. } => self.complete(res, kind),
         }
     }
 }
@@ -434,6 +471,7 @@ impl RingIssuer<'_> {
     /// Submits `want` for a side of a source of `kind` in `epoch`, and
     /// returns the operation's user data. A want no entry can carry (an
     /// address no socket can have) completes at once with the reason.
+    #[inline]
     pub(crate) fn issue(&self, want: Want, kind: Kind, epoch: u32, _after: &mut After) -> u64 {
         let read = want.of_read();
         match entry(want, kind, self.file as RawFd, self.ring) {
@@ -465,9 +503,10 @@ impl RingIssuer<'_> {
 
 impl RingIssuer<'_> {
     /// Whether a send of `len` bytes, what is left of a zero-copy write on a source of `kind`,
-    /// goes out zero-copy: one worth it, on a ring whose kernel sends so.
+    /// goes out zero-copy: a TCP stream's, of at least the ring's threshold
+    /// (`ShardRing::zero_copy_min`), on a ring whose kernel sends so. The one place it is decided.
     pub(crate) fn zero_copy(&self, kind: Kind, len: usize) -> bool {
-        zero_copy_worth(kind, len) && self.ring.zc_stream()
+        kind == Kind::Tcp && len >= self.ring.zero_copy_min() && self.ring.zc_stream()
     }
 
     /// Whether a stream read of a source of `kind` goes out as a multishot
@@ -657,8 +696,13 @@ fn entry(
             }
         },
         Want::RecvLent(mut buf) => {
-            let spare = buf.spare_capacity_mut();
-            let sqe = stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len());
+            let sqe = match buf.vectored_mut() {
+                Some(bufs) => stream_readv(kind, slot, bufs),
+                None => {
+                    let spare = buf.spare_capacity_mut();
+                    stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len())
+                }
+            };
             (RingMem::RecvLent(buf), sqe)
         }
         Want::RecvFrom(mut buf) => {
@@ -682,8 +726,11 @@ fn entry(
             let sqe = stream_write(kind, slot, buf.filled());
             (RingMem::Send(buf), sqe)
         }
-        Want::SendLent(buf, from) => {
-            let sqe = stream_write(kind, slot, buf.get(from..).unwrap_or_default());
+        Want::SendLent(mut buf, from) => {
+            let sqe = match buf.vectored_mut() {
+                Some(bufs) => stream_writev(kind, slot, bufs, from),
+                None => stream_write(kind, slot, buf.rest_from(from)),
+            };
             (RingMem::SendLent(buf), sqe)
         }
         Want::SendPinned(buf, from, zero_copy) => {
@@ -737,6 +784,40 @@ fn stream_read(kind: Kind, slot: RawFd, buf: *mut u8, len: usize) -> Sqe {
     }
 }
 
+/// A stream read into the rooms of the buffers of a vectored read, in order:
+/// `recvmsg` on a socket, `readv` at the current position on a pipe or a
+/// terminal. The descriptors and the message stay in the buffers, which the
+/// operation holds until its last completion.
+fn stream_readv(kind: Kind, slot: RawFd, bufs: &mut crate::buf::vectored::Vectored) -> Sqe {
+    match kind {
+        Kind::Bytes => {
+            let iov = bufs.read_iovecs();
+            let count = u32::try_from(iov.len()).unwrap_or(u32::MAX);
+            Sqe::readv(slot, iov.as_ptr(), count, u64::MAX)
+        }
+        _ => Sqe::recvmsg(slot, bufs.recv_msg(), 0),
+    }
+}
+
+/// A stream write of the bytes of a vectored write's buffers from the
+/// `from`th on: `sendmsg` on a socket, `writev` at the current position on a
+/// pipe or a terminal.
+fn stream_writev(
+    kind: Kind,
+    slot: RawFd,
+    bufs: &mut crate::buf::vectored::Vectored,
+    from: usize,
+) -> Sqe {
+    match kind {
+        Kind::Bytes | Kind::File => {
+            let iov = bufs.write_iovecs(from);
+            let count = u32::try_from(iov.len()).unwrap_or(u32::MAX);
+            Sqe::writev(slot, iov.as_ptr(), count, u64::MAX)
+        }
+        _ => Sqe::sendmsg(slot, bufs.send_msg(from), sys::SEND_FLAGS as u32),
+    }
+}
+
 /// A stream write of `bytes` on slot `slot`: `send` on a socket, `write` at
 /// the current position on a pipe or a terminal.
 fn stream_write(kind: Kind, slot: RawFd, bytes: &[u8]) -> Sqe {
@@ -751,33 +832,31 @@ impl Source {
     /// On the ring's thread: an arrival of the read side's multishot
     /// receive or accept, submitted in `epoch`. The side takes it at once if
     /// free, else its holder does as it lets go. The wakes and drops come
-    /// back to be run once the caller no longer borrows the source.
+    /// into `after`, for the caller to run once it no longer borrows the source.
     pub(crate) fn ring_arrival(
         self: &Arc<Self>,
         arrival: Arrival,
         epoch: u32,
         shard: Option<&crate::rt::shard::Shard>,
-    ) -> After {
-        let mut after = After::default();
+        after: &mut After,
+    ) {
         let hooks = self.hooks_in(shard);
         // The side free: the arrival goes in now, with no trip through the
         // queue (whose segments would be allocated as it grows). Only this
         // thread pushes to the queue, so what waits there came before this
         // arrival and goes in first: the order holds.
         if let Some(mut held) = self.read.try_hold_for(&hooks) {
-            hooks.taken(held.get(), &mut after);
+            hooks.taken(held.get(), after);
             while let Ok((queued, at)) = self.read_arrivals.try_pop() {
-                held.get().take_arrival(queued, at, &mut after);
+                held.get().take_arrival(queued, at, after);
             }
-            held.get().take_arrival(arrival, epoch, &mut after);
-            held.release(&mut after, &hooks);
+            held.get().take_arrival(arrival, epoch, after);
+            held.release(after, &hooks);
         } else {
             self.read_arrivals.push((arrival, epoch));
-            self.read
-                .defer(super::read_work::ARRIVALS, &mut after, &hooks);
+            self.read.defer(super::read_work::ARRIVALS, after, &hooks);
         }
-        self.kick(&mut after);
-        after
+        self.kick(after);
     }
 
     /// Cancels the side's operation of `user_data`, on its ring's thread;
@@ -937,7 +1016,21 @@ impl Source {
             }
         });
         if let Some(lease) = lease {
+            #[cfg(test)]
+            BEFORE_DETACH_POST.with(|look| {
+                if let Some(look) = look.borrow_mut().as_mut() {
+                    look();
+                }
+            });
             shard.post_io(crate::rt::shard::IoOp::RingDetach(slot, out, Some(lease)));
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's look at what the ring's thread may see, run on this thread
+    /// just before a detach goes to that ring's mailbox.
+    pub(crate) static BEFORE_DETACH_POST: core::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { core::cell::RefCell::new(None) };
 }

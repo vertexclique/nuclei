@@ -48,8 +48,13 @@ pub(crate) struct Start {
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
     /// The cores workers are pinned to, in turn; empty for none.
     pub(crate) cores: Vec<usize>,
+    /// The mask every worker runs on when none is pinned to a core of its
+    /// own (`Builder::worker_cores` with `pin_workers(false)`).
+    pub(crate) mask: Option<super::runtime::CpuMask>,
     /// A poll this long hands its shard to another thread; `None` for never.
     pub(crate) handoff_after: Option<Duration>,
+    /// Told of each poll the monitor sees run past `handoff_after`.
+    pub(crate) long_poll: Option<super::tuning::TaskHook>,
 }
 
 /// A runtime's worker shards.
@@ -105,6 +110,7 @@ impl Workers {
                     after,
                     capacity,
                     super::runtime::allowed_cores(),
+                    start.long_poll.clone(),
                 ))
             });
         Self {
@@ -125,6 +131,17 @@ impl Workers {
         self.running.load(Ordering::Relaxed)
     }
 
+    /// The places workers have started in so far, stopped ones included:
+    /// the indices of [`get`](Self::get).
+    pub(crate) fn started(&self) -> usize {
+        self.claimed.load(Ordering::Acquire).min(self.slots.len())
+    }
+
+    /// The shard of worker `index`, if it started and its shard was made.
+    pub(crate) fn get(&self, index: usize) -> Option<&Arc<Shared>> {
+        self.slots[..self.started()].get(index)?.get()
+    }
+
     /// The shards of every slot filled so far.
     pub(crate) fn shards(&self) -> impl Iterator<Item = &Arc<Shared>> {
         let claimed = self.claimed.load(Ordering::Acquire).min(self.slots.len());
@@ -140,14 +157,20 @@ impl Workers {
     /// of two distinct shards picked at random. Tasks spawned together so
     /// stay on one shard, and no shard holds more than `margin` live tasks
     /// beyond another for long.
+    #[inline]
     pub(crate) fn place(&self, runtime: u64, margin: usize) -> Option<&Arc<Shared>> {
         let n = self.claimed.load(Ordering::Acquire).min(self.slots.len());
-        let take = |i: usize| self.slots[i].get().filter(|s| s.takes_tasks());
         match n {
-            0 => return None,
-            1 => return take(0),
-            _ => {}
+            0 => None,
+            1 => self.slots[0].get().filter(|s| s.takes_tasks()),
+            _ => self.place_among(n, runtime, margin),
         }
+    }
+
+    /// [`place`](Self::place) among `n` workers, two or more.
+    #[inline(never)]
+    fn place_among(&self, n: usize, runtime: u64, margin: usize) -> Option<&Arc<Shared>> {
+        let take = |i: usize| self.slots[i].get().filter(|s| s.takes_tasks());
         let load = |s: &Shared| s.load.load(Ordering::Relaxed);
         // Stays on `home` unless a shard picked at random is lighter by more
         // than the margin.
@@ -459,6 +482,8 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
     let cores = &workers.start.cores;
     if !cores.is_empty() {
         super::runtime::pin_to(cores[place % cores.len()]);
+    } else if let Some(mask) = &workers.start.mask {
+        super::runtime::apply_mask(mask);
     }
     let _seeded = workers
         .start

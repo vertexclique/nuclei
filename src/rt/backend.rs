@@ -68,7 +68,7 @@ pub(crate) fn chosen() -> io::Result<Backend> {
     CHOSEN
         .get_or_init(|| {
             let configured = crate::proactor::Proactor::get().config().backend;
-            decide(env_override().as_deref(), configured, usable)
+            decide(env_override().as_deref(), configured, usable, ring)
         })
         .clone()
         .map_err(unsupported)
@@ -76,10 +76,29 @@ pub(crate) fn chosen() -> io::Result<Backend> {
 }
 
 /// The backend of a runtime that names `named`: the process's default if it
-/// names none, or if `NUCLEI_BACKEND` overrides it.
-pub(crate) fn for_runtime(named: Option<IoBackend>) -> io::Result<Backend> {
+/// names none, or if `NUCLEI_BACKEND` overrides it. A runtime with ring
+/// settings of its own (`iouring`, checked by its builder) is decided with
+/// them, and its rings are made with them.
+pub(crate) fn for_runtime(
+    named: Option<IoBackend>,
+    iouring: Option<&crate::config::IoUringConfiguration>,
+) -> io::Result<Backend> {
+    #[cfg(ring)]
+    if let Some(cfg) = iouring {
+        let cfg: crate::syscore::linux::iouring::ring::RingConfig = cfg.into();
+        let configured = named.or(crate::proactor::Proactor::get().config().backend);
+        return decide(
+            env_override().as_deref(),
+            configured,
+            || usable_with(cfg),
+            |auto| ring_of(cfg, auto),
+        )
+        .map_err(unsupported);
+    }
+    #[cfg(not(ring))]
+    let _ = iouring;
     match (env_override(), named) {
-        (None, Some(named)) => decide(None, Some(named), usable)
+        (None, Some(named)) => decide(None, Some(named), usable, ring)
             .map_err(unsupported)
             .and_then(checked),
         _ => chosen(),
@@ -183,11 +202,13 @@ enum Ask {
 }
 
 /// The backend asked for by `env` (`NUCLEI_BACKEND`), else by `configured`
-/// (the program), given whether io_uring is usable here.
+/// (the program), given whether io_uring is usable here; a ring is made by
+/// `ring`, told whether `auto` chose it.
 fn decide(
     env: Option<&str>,
     configured: Option<IoBackend>,
     usable: impl FnOnce() -> Result<(), String>,
+    ring: impl FnOnce(bool) -> Backend,
 ) -> Result<Backend, String> {
     let (ask, named) = match env {
         Some(name) => (ask_by_name(name)?, format!("NUCLEI_BACKEND={name}")),
@@ -262,17 +283,22 @@ fn ring_config() -> crate::syscore::linux::iouring::ring::RingConfig {
 fn ring(auto: bool) -> Backend {
     #[cfg(ring)]
     {
-        let cfg = ring_config();
-        if auto {
-            Backend::RingOrPoll(cfg)
-        } else {
-            Backend::Ring(cfg)
-        }
+        ring_of(ring_config(), auto)
     }
     #[cfg(not(ring))]
     {
         let _ = auto;
         Backend::Poll
+    }
+}
+
+/// A ring made with `cfg`; `auto`: whether `auto` chose it.
+#[cfg(ring)]
+fn ring_of(cfg: crate::syscore::linux::iouring::ring::RingConfig, auto: bool) -> Backend {
+    if auto {
+        Backend::RingOrPoll(cfg)
+    } else {
+        Backend::Ring(cfg)
     }
 }
 
@@ -324,9 +350,13 @@ mod tests {
     #[test]
     fn auto_takes_a_ring_first_and_falls_back_to_the_poller() {
         for env in [None, Some("auto")] {
-            assert_eq!(is_ring(&decide(env, None, usable)), RINGS_BUILT, "{env:?}");
+            assert_eq!(
+                is_ring(&decide(env, None, usable, super::ring)),
+                RINGS_BUILT,
+                "{env:?}"
+            );
             assert!(
-                matches!(decide(env, None, refused), Ok(Backend::Poll)),
+                matches!(decide(env, None, refused, super::ring), Ok(Backend::Poll)),
                 "{env:?}"
             );
         }
@@ -338,15 +368,15 @@ mod tests {
     #[test]
     fn only_autos_ring_may_fall_back() {
         assert!(matches!(
-            decide(None, None, usable),
+            decide(None, None, usable, super::ring),
             Ok(Backend::RingOrPoll(_))
         ));
         assert!(matches!(
-            decide(Some("io_uring"), None, usable),
+            decide(Some("io_uring"), None, usable, super::ring),
             Ok(Backend::Ring(_))
         ));
         assert!(matches!(
-            decide(None, Some(IoBackend::IoUring), usable),
+            decide(None, Some(IoBackend::IoUring), usable, super::ring),
             Ok(Backend::Ring(_))
         ));
     }
@@ -356,7 +386,7 @@ mod tests {
     #[test]
     fn an_explicit_ring_that_cannot_be_had_fails_with_the_reason() {
         for (env, configured) in [(Some("io_uring"), None), (None, Some(IoBackend::IoUring))] {
-            let err = decide(env, configured, refused).unwrap_err();
+            let err = decide(env, configured, refused, super::ring).unwrap_err();
             assert!(err.contains("the system refused io_uring"), "{err}");
             assert!(err.contains("leave it unset"), "{err}");
         }
@@ -367,11 +397,16 @@ mod tests {
     fn the_variable_overrides_the_program() {
         let poller = super::POLLER;
         assert!(matches!(
-            decide(Some(poller.0), Some(IoBackend::IoUring), usable),
+            decide(
+                Some(poller.0),
+                Some(IoBackend::IoUring),
+                usable,
+                super::ring
+            ),
             Ok(Backend::Poll)
         ));
         assert_eq!(
-            is_ring(&decide(Some("auto"), Some(poller.1), usable)),
+            is_ring(&decide(Some("auto"), Some(poller.1), usable, super::ring)),
             RINGS_BUILT
         );
     }
@@ -381,18 +416,18 @@ mod tests {
         let poller = super::POLLER;
         let never = || -> Result<(), String> { panic!("the poller asked about io_uring") };
         assert!(matches!(
-            decide(Some(poller.0), None, never),
+            decide(Some(poller.0), None, never, super::ring),
             Ok(Backend::Poll)
         ));
         assert!(matches!(
-            decide(None, Some(poller.1), never),
+            decide(None, Some(poller.1), never, super::ring),
             Ok(Backend::Poll)
         ));
-        let err = decide(Some("kqueue-ish"), None, usable).unwrap_err();
+        let err = decide(Some("kqueue-ish"), None, usable, super::ring).unwrap_err();
         assert!(err.contains("NUCLEI_BACKEND=kqueue-ish"), "{err}");
         for foreign in [IoBackend::Epoll, IoBackend::Kqueue, IoBackend::Iocp] {
             if foreign != poller.1 {
-                let err = decide(None, Some(foreign), usable).unwrap_err();
+                let err = decide(None, Some(foreign), usable, super::ring).unwrap_err();
                 assert!(err.contains("this platform has no"), "{err}");
             }
         }
@@ -436,7 +471,10 @@ mod tests {
     #[test]
     fn the_probe_decides_auto_on_this_machine() {
         let available = super::usable().is_ok();
-        assert_eq!(is_ring(&decide(None, None, super::usable)), available);
+        assert_eq!(
+            is_ring(&decide(None, None, super::usable, super::ring)),
+            available
+        );
         let named = std::env::var("NUCLEI_BACKEND").unwrap_or_default();
         if (named.is_empty() || named == "auto")
             && crate::proactor::Proactor::get().config().backend.is_none()

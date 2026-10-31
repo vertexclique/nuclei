@@ -2,6 +2,7 @@
 //! read side.
 
 use super::*;
+use crate::buf::owned::{IoBufMut, OwnedBuf};
 
 impl Source {
     /// A caller's descriptor: `Ready` with the read side's edge count while
@@ -27,6 +28,15 @@ impl Source {
             st.fd_clear(tick);
             Poll::Ready(Ok(()))
         });
+    }
+
+    /// Drops what the side read ahead of a stream and holds still
+    /// (`ReadState::drop_ahead`), once the kernel shut the reading half.
+    pub(crate) fn poll_drop_ahead(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_reading(cx, |st, _io, _waker, after| {
+            st.drop_ahead(after);
+            Poll::Ready(Ok(()))
+        })
     }
 
     /// Ready once a read would end at once (see `ReadState::ready`); `true`
@@ -57,7 +67,7 @@ impl Source {
         crate::coop::poll_budget(cx, |cx| {
             self.poll_reading(cx, |st, io, waker, after| {
                 #[cfg(unix)]
-                if st.reads_itself(io, out.len(), peek)
+                if st.reads_itself(io, kind, out.len(), peek)
                     && let Some(poll) = st.read_direct(
                         io,
                         self.serving_fd(None),
@@ -65,12 +75,19 @@ impl Source {
                         out.len(),
                         peek,
                         waker,
-                        |fd| {
-                            if peek {
+                        |fd, inq| {
+                            #[cfg(any(target_os = "linux", target_os = "android"))]
+                            if inq {
+                                return sys::read_inq(fd, out);
+                            }
+                            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                            let _ = inq;
+                            let read = if peek {
                                 sys::peek(fd, out)
                             } else {
                                 sys::read(fd, out)
-                            }
+                            };
+                            read.map(|n| (n, None))
                         },
                     )
                 {
@@ -83,6 +100,7 @@ impl Source {
 
     /// Polls the read side with `step` for the handle's own reads, given
     /// the way this thread reaches the descriptor.
+    #[inline(always)]
     fn poll_reading<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -93,6 +111,7 @@ impl Source {
 
     /// Polls the read side with `step`: for the handle's own reads when
     /// `drive`, else for its caller's calls.
+    #[inline(always)]
     fn poll_read_side<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -100,22 +119,26 @@ impl Source {
         mut step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
         let mut after = After::default();
-        let polled = self.with_io(|io| {
-            self.read.poll(
-                &mut after,
-                cx.waker(),
-                &self.hooks_in(io.shard),
-                |st, after| {
-                    #[cfg(unix)]
-                    if drive {
-                        st.drive();
-                    }
-                    #[cfg(not(unix))]
-                    let _ = drive;
-                    step(st, io, cx.waker(), after)
-                },
-            )
-        });
+        let polled = self.with_io(
+            #[inline(always)]
+            |io| {
+                self.read.poll(
+                    &mut after,
+                    cx.waker(),
+                    &self.hooks_in(io.shard),
+                    #[inline(always)]
+                    |st, after| {
+                        #[cfg(unix)]
+                        if drive {
+                            st.drive();
+                        }
+                        #[cfg(not(unix))]
+                        let _ = drive;
+                        step(st, io, cx.waker(), after)
+                    },
+                )
+            },
+        );
         match polled {
             Ok(poll) => self.finish_poll(after, poll),
             Err(err) => {
@@ -129,15 +152,18 @@ impl Source {
     /// and gives it back with the read's result. The buffer is lent to the
     /// side until the driver read into it, so the bytes land in it with no
     /// copy (bytes another read left behind are copied in instead).
-    pub(crate) async fn read_owned(self: &Arc<Self>, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    pub(crate) async fn read_owned<B>(self: &Arc<Self>, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
         let mut op = ReadOwned {
             source: self,
-            buf: Some(buf),
+            buf: Some(OwnedBuf::filled(buf)),
             from: None,
             lent: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
-        (result, op.buf.take().unwrap_or_default())
+        (result, op.buf.take().unwrap_or_default().into_filled())
     }
 
     /// Receives one datagram into the spare capacity of `buf`, after the
@@ -145,26 +171,36 @@ impl Source {
     /// sender. The buffer is lent to the side until the driver received into
     /// it, so the datagram lands in it with no copy (one that came before is
     /// copied in instead); what does not fit is cut.
-    pub(crate) async fn recv_from_owned(
+    pub(crate) async fn recv_from_owned<B>(
         self: &Arc<Self>,
-        mut buf: Vec<u8>,
-    ) -> (io::Result<(usize, Addr)>, Vec<u8>) {
+        buf: B,
+    ) -> (io::Result<(usize, Addr)>, B)
+    where
+        B: IoBufMut,
+    {
+        let (result, buf) = self.recv_from_buf(OwnedBuf::filled(buf)).await;
+        (result, buf.into_filled())
+    }
+
+    async fn recv_from_buf(
+        self: &Arc<Self>,
+        mut buf: OwnedBuf,
+    ) -> (io::Result<(usize, Addr)>, OwnedBuf) {
         let start = buf.len();
         let room = buf.capacity() - start;
         if room < super::super::OWNED_DATAGRAM_MIN && self.on_ring() {
             // A small datagram is cheaper taken as every other is and copied in than received
             // by an operation of its own.
-            buf.resize(start + room, 0);
-            let received = poll_fn(|cx| self.poll_receive(cx, &mut buf[start..], false)).await;
+            let spare = buf.spare_zeroed();
+            let received = poll_fn(|cx| self.poll_receive(cx, &mut *spare, false)).await;
             return match received {
                 Ok((n, from)) => {
-                    buf.truncate(start + n);
+                    // SAFETY: the spare capacity was zeroed and the datagram's
+                    // `n` bytes received into its start.
+                    unsafe { buf.set_len(start + n.min(room)) };
                     (Ok((n, from)), buf)
                 }
-                Err(err) => {
-                    buf.truncate(start);
-                    (Err(err), buf)
-                }
+                Err(err) => (Err(err), buf),
             };
         }
         let mut op = ReadOwned {
@@ -186,7 +222,7 @@ impl Source {
     fn poll_read_owned(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Option<OwnedBuf>,
         from: &mut Option<Addr>,
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
@@ -233,7 +269,7 @@ impl Source {
                 #[cfg(unix)]
                 {
                     let len = bufs.iter().map(|b| b.len()).sum();
-                    if st.reads_itself(io, len, false)
+                    if st.reads_itself(io, kind, len, false)
                         && let Some(poll) = st.read_direct(
                             io,
                             self.serving_fd(None),
@@ -241,7 +277,7 @@ impl Source {
                             len,
                             false,
                             waker,
-                            |fd| sys::read_bufs(fd, bufs),
+                            |fd, _| sys::read_bufs(fd, bufs).map(|n| (n, None)),
                         )
                     {
                         return poll;
@@ -291,7 +327,7 @@ impl Source {
 /// side keeps what the driver read into it for the next read.
 struct ReadOwned<'a> {
     source: &'a Arc<Source>,
-    buf: Option<Vec<u8>>,
+    buf: Option<OwnedBuf>,
     /// The sender, for a datagram socket's receive.
     from: Option<Addr>,
     lent: bool,

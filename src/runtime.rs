@@ -33,3 +33,4 @@ pub use crate::rt::runtime::{
     UnhandledPanic, block_on, spawn, spawn_blocking, spawn_local, worker_index,
 };
 pub use crate::rt::task::{FallibleTask, Task};
+pub use crate::shard_local::{ShardAccessError, ShardLocal};

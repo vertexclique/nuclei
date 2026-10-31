@@ -29,7 +29,6 @@ pub(crate) fn set(id: Id, name: &str) {
 }
 
 /// The name of the task `id`, if it has one.
-#[allow(dead_code)] // read by the task dump
 pub(crate) fn get(id: Id) -> Option<Arc<str>> {
     if NAMED.load(Ordering::Relaxed) == 0 {
         return None;
@@ -38,8 +37,16 @@ pub(crate) fn get(id: Id) -> Option<Arc<str>> {
 }
 
 /// Drops the name of the task `id`, destroyed now.
+#[inline]
 pub(super) fn forget(id: Id) {
-    if NAMED.load(Ordering::Relaxed) != 0 && table().remove(&id.0.get()).is_some() {
+    if NAMED.load(Ordering::Relaxed) != 0 {
+        forget_named(id);
+    }
+}
+
+#[inline(never)]
+fn forget_named(id: Id) {
+    if table().remove(&id.0.get()).is_some() {
         NAMED.fetch_sub(1, Ordering::Relaxed);
     }
 }

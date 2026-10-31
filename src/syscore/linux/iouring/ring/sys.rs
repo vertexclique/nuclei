@@ -601,21 +601,38 @@ pub(crate) unsafe fn io_uring_enter(
     argsz: usize,
 ) -> io::Result<u32> {
     // SAFETY: the caller upholds the contract on `arg` and `argsz`.
-    let r = unsafe {
-        libc::syscall(
+    unsafe { enter_syscall(fd, to_submit, min_complete, flags, arg, argsz) }
+}
+
+/// The `io_uring_enter` system call, issued directly (see `io::sys::syscall`: the libc wrapper's
+/// variadic call and errno round trip cost a few dozen instructions in every wait).
+///
+/// # Safety
+/// As for [`io_uring_enter`].
+#[inline]
+unsafe fn enter_syscall(
+    fd: RawFd,
+    to_submit: u32,
+    min_complete: u32,
+    flags: u32,
+    arg: *const c_void,
+    argsz: usize,
+) -> io::Result<u32> {
+    // SAFETY: the caller upholds the contract on `arg` and `argsz`.
+    unsafe {
+        crate::io::sys::syscall(
             libc::SYS_io_uring_enter,
-            fd as libc::c_long,
-            to_submit as libc::c_long,
-            min_complete as libc::c_long,
-            flags as libc::c_long,
-            arg,
-            argsz,
+            [
+                fd as usize,
+                to_submit as usize,
+                min_complete as usize,
+                flags as usize,
+                arg as usize,
+                argsz,
+            ],
         )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
     }
-    Ok(r as u32)
+    .map(|n| n as u32)
 }
 
 /// `io_uring_register(2)`; returns what the kernel returned.

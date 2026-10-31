@@ -121,7 +121,13 @@ impl Shard {
     pub(super) fn let_go_of_children(&self) {
         #[cfg(ring)]
         if let Some(ring) = self.ring() {
-            ring.let_go_of_exits();
+            // An exit watched is an operation out: with none, none to cancel.
+            if ring.in_flight() != 0 {
+                ring.let_go_of_exits();
+            }
+            return;
+        }
+        if self.children.borrow().is_untouched() {
             return;
         }
         let gone: Vec<Watched> = self.children.borrow_mut().drain().collect();
