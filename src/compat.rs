@@ -94,8 +94,18 @@ pub fn init() {
 
 /// Starts the process default runtime now, as `config` says, unless it is
 /// running already (then `config` is not used).
+///
+/// A runtime that cannot start is reported at the `error` level of the
+/// [`log`](https://docs.rs/log) facade, and the default runtime stays
+/// unstarted: the next call that needs it starts it with every setting at
+/// its default. [`Builder::build_global`](crate::Builder::build_global)
+/// answers the error instead.
 pub fn init_with_config(config: GlobalExecutorConfig) {
-    let _ = config.builder().build_global();
+    match config.builder().build_global() {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => log::error!("the default runtime could not start as configured: {err}"),
+    }
 }
 
 /// Starts up to `count` more workers on the runtime this thread is inside
