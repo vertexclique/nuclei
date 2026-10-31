@@ -932,8 +932,14 @@ impl Shard {
                 self.lifo_streak.set(self.lifo_streak.get() + 1);
                 return Some(r);
             }
-            // The slot's task ran enough times in a row: to the back.
-            self.queue.borrow_mut().push_back(r);
+            // The slot's task ran enough times in a row: to the back, which
+            // is the front when nothing else is queued.
+            let mut queue = self.queue.borrow_mut();
+            if queue.is_empty() {
+                self.lifo_streak.set(0);
+                return Some(r);
+            }
+            queue.push_back(r);
         }
         self.lifo_streak.set(0);
         let local = self.queue.borrow_mut().pop_front();
