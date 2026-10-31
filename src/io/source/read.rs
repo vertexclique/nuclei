@@ -1030,16 +1030,10 @@ impl ReadState {
                     // Each buffer's bytes read, in order, past what it held.
                     Ok(bufs) => {
                         for (buf, start) in bufs.read_parts() {
-                            self.ahead.push(Piece::Left { buf, start }, after);
+                            self.ahead.push(Piece::left(buf, start), after);
                         }
                     }
-                    Err(buf) => self.ahead.push(
-                        Piece::Left {
-                            buf,
-                            start: lent.from,
-                        },
-                        after,
-                    ),
+                    Err(buf) => self.ahead.push(Piece::left(buf, lent.from), after),
                 }
             }
             Some(Err(err)) => self.error = Some(err),
