@@ -195,7 +195,32 @@ impl Drop for Bracket<'_> {
 /// none if the shard was taken.
 #[inline(always)]
 pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
-    f(current_held().shard())
+    let here = local();
+    let shard = here.current.get();
+    if shard.is_null() {
+        return f(None);
+    }
+    let _bracket = match bracket(here) {
+        Some(bracket) => bracket,
+        None => return f(None),
+    };
+    // SAFETY: as in `Current::shard`.
+    f(unsafe { shard.as_ref() })
+}
+
+/// The bracket a call into the current shard from here needs (`None` inside, or with no
+/// monitor), or `None` when the shard was taken and this thread is detached from it. The one
+/// rule [`current`] and [`current_held`] share.
+#[inline(always)]
+fn bracket(here: &'static Here) -> Option<Option<Bracket<'static>>> {
+    if here.inside.get() || here.slot.get().is_null() {
+        Some(None)
+    } else if here.come_back(here.epoch.get()) {
+        here.inside.set(true);
+        Some(Some(Bracket(here)))
+    } else {
+        None
+    }
 }
 
 /// The shard this thread is running, as [`current`] finds it, held for as long as the result
@@ -205,20 +230,21 @@ pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
 pub(crate) fn current_held() -> Current {
     let here = local();
     let shard = here.current.get();
-    let bracket = if shard.is_null() || here.inside.get() || here.slot.get().is_null() {
-        None
-    } else if here.come_back(here.epoch.get()) {
-        here.inside.set(true);
-        Some(Bracket(here))
-    } else {
+    if shard.is_null() {
         return Current {
-            shard: core::ptr::null(),
+            shard,
             _bracket: None,
         };
-    };
-    Current {
-        shard,
-        _bracket: bracket,
+    }
+    match bracket(here) {
+        Some(bracket) => Current {
+            shard,
+            _bracket: bracket,
+        },
+        None => Current {
+            shard: core::ptr::null(),
+            _bracket: None,
+        },
     }
 }
 

@@ -433,11 +433,10 @@ impl RingChunk {
 impl Drop for RingChunk {
     fn drop(&mut self) {
         let item = self.item();
-        let kept = crate::rt::context::current(|shard| {
-            shard
-                .and_then(crate::rt::shard::Shard::ring)
-                .is_some_and(|ring| ring.keep_local(&self.back, item))
-        });
+        let kept = crate::rt::context::current_held()
+            .shard()
+            .and_then(crate::rt::shard::Shard::ring)
+            .is_some_and(|ring| ring.keep_local(&self.back, item));
         if !kept {
             self.back.queue.push(item);
         }
