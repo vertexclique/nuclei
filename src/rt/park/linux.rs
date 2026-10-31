@@ -107,8 +107,11 @@ impl Poller {
         let ms = match timeout {
             None => -1,
             Some(t) => {
-                let ms = t.as_nanos().div_ceil(1_000_000);
-                ms.min(libc::c_int::MAX as u128) as libc::c_int
+                let ms = t
+                    .as_secs()
+                    .saturating_mul(1000)
+                    .saturating_add(u64::from(t.subsec_nanos()).div_ceil(1_000_000));
+                ms.min(libc::c_int::MAX as u64) as libc::c_int
             }
         };
         let capacity = self.events.capacity().min(max).max(1) as libc::c_int;
