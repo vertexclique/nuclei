@@ -923,6 +923,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// When the default runtime or this thread's shard cannot start (its
 /// poller cannot be made); [`task::Builder::spawn`](crate::task::Builder::spawn)
 /// answers the error instead.
+#[inline]
 pub fn spawn<F>(future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
