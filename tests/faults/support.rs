@@ -154,7 +154,7 @@ pub fn is_one_of(err: &io::Error, kinds: &[io::ErrorKind]) -> bool {
 /// A byte stream of nuclei's, with its std counterpart for the peer and the
 /// oracle: TCP everywhere, Unix streams on unix.
 pub trait Stream: Sized + Send + Sync + 'static {
-    type Std: Read + Write + Send + Sync + 'static;
+    type Std: TimedRead + Write + Send + Sync + 'static;
     const NAME: &'static str;
 
     /// Our end and the peer's, connected; with `tiny`, the peer's buffers
@@ -655,18 +655,70 @@ pub async fn read_exact<S: Stream>(s: &S, len: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Reads an std stream until its end or an error.
-pub fn std_read_until_end<R: Read>(r: &mut R, chunk: usize) -> (Vec<u8>, io::Result<usize>) {
+/// An std stream whose blocking reads wait at most a timeout.
+pub trait TimedRead: Read {
+    fn read_timeout(&self) -> io::Result<Option<Duration>>;
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+macro_rules! timed_read {
+    ($($ty:ty),*) => {$(
+        impl TimedRead for $ty {
+            fn read_timeout(&self) -> io::Result<Option<Duration>> {
+                <$ty>::read_timeout(self)
+            }
+            fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+                <$ty>::set_read_timeout(self, timeout)
+            }
+        }
+    )*};
+}
+
+timed_read!(std::net::TcpStream);
+#[cfg(unix)]
+timed_read!(std::os::unix::net::UnixStream);
+
+/// How long one blocking read of [`std_read_until_end`] waits before it
+/// looks again.
+const LOOK_AGAIN: Duration = Duration::from_secs(1);
+
+/// Reads an std stream until its end or an error; a read that sees nothing
+/// for [`DEADLINE`] answers its timeout. Each blocking read waits at most
+/// [`LOOK_AGAIN`] and the next looks again: macOS's kernel can miss the
+/// wakeup of a blocking read on a Unix stream whose peer shuts its writing
+/// half, which then waits out its timeout with the end already there, and
+/// the next read answers the end at once (std's own writer meets it, a few
+/// times in a thousand transfers of a MiB through buffers set by size).
+pub fn std_read_until_end<R: TimedRead>(r: &mut R, chunk: usize) -> (Vec<u8>, io::Result<usize>) {
     let mut got = Vec::new();
     let mut buf = vec![0u8; chunk.max(1)];
-    loop {
+    // macOS answers `EINVAL` to an option of a socket shut both ways, whose
+    // reads never wait: its timeout stays as it is.
+    let before = r.read_timeout().ok();
+    let looks = before.is_some() && r.set_read_timeout(Some(LOOK_AGAIN)).is_ok();
+    let mut seen = Instant::now();
+    let end = loop {
         match r.read(&mut buf) {
-            Ok(0) => return (got, Ok(0)),
-            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Ok(0) => break Ok(0),
+            Ok(n) => {
+                got.extend_from_slice(&buf[..n]);
+                seen = Instant::now();
+            }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-            Err(err) => return (got, Err(err)),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) && seen.elapsed() < DEADLINE => {}
+            Err(err) => break Err(err),
         }
+    };
+    if let Some(before) = before.filter(|_| looks) {
+        // Refused only once the socket is shut both ways, as above: nothing
+        // waits on it then.
+        let _ = r.set_read_timeout(before);
     }
+    (got, end)
 }
 
 /// A connected TCP pair of nuclei's, through its own connect and accept.
