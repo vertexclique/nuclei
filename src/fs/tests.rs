@@ -341,6 +341,7 @@ mod copy_range;
 mod direct;
 mod durable;
 mod lock;
+mod many;
 mod owned;
 mod positional;
 mod sync_dir;

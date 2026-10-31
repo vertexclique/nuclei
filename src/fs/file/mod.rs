@@ -57,6 +57,7 @@
 
 mod copy;
 mod durable;
+mod many;
 mod orphans;
 mod positional;
 mod space;
@@ -83,6 +84,8 @@ pub(crate) use self::copy::COPY_CHUNK;
 #[cfg(ring)]
 pub(crate) use self::durable::sync_on;
 pub(crate) use self::durable::{SyncKind, sync_file};
+#[cfg(test)]
+pub(crate) use self::many::MANY_AT_ONCE;
 pub(crate) use self::space::range_end;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::work::bounce as bounce_for_test;
