@@ -340,6 +340,7 @@ mod copy_range;
 #[cfg(target_os = "linux")]
 mod direct;
 mod durable;
+mod lock;
 mod owned;
 mod positional;
 mod sync_dir;

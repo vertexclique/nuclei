@@ -29,6 +29,7 @@ pub(crate) mod call;
 mod copy_range;
 pub(crate) mod file;
 mod file_ops;
+mod lock;
 mod ops;
 mod read_dir;
 #[cfg(ring)]
@@ -36,7 +37,7 @@ pub(crate) mod ring;
 mod sync_dir;
 
 pub use self::allocate::Allocate;
-pub use std::fs::{FileTimes, FileType, Metadata, Permissions};
+pub use std::fs::{FileTimes, FileType, Metadata, Permissions, TryLockError};
 
 #[cfg(unix)]
 pub use self::ops::symlink;
