@@ -695,16 +695,12 @@ fn entry(
                 }));
             }
         },
-        Want::RecvLent(mut buf) => {
-            let sqe = match buf.vectored_mut() {
-                Some(bufs) => stream_readv(kind, slot, bufs),
-                None => {
-                    let spare = buf.spare_capacity_mut();
-                    stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len())
-                }
-            };
-            (RingMem::RecvLent(buf), sqe)
+        Want::RecvLent(OwnedBuf::Vec(mut buf)) => {
+            let spare = buf.spare_capacity_mut();
+            let sqe = stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len());
+            (RingMem::RecvLent(OwnedBuf::Vec(buf)), sqe)
         }
+        Want::RecvLent(buf) => other_read_entry(kind, slot, buf),
         Want::RecvFrom(mut buf) => {
             let spare = buf.spare();
             let mut msg = Msg::receiving(spare.as_mut_ptr(), spare.len());
@@ -726,13 +722,11 @@ fn entry(
             let sqe = stream_write(kind, slot, buf.filled());
             (RingMem::Send(buf), sqe)
         }
-        Want::SendLent(mut buf, from) => {
-            let sqe = match buf.vectored_mut() {
-                Some(bufs) => stream_writev(kind, slot, bufs, from),
-                None => stream_write(kind, slot, buf.rest_from(from)),
-            };
-            (RingMem::SendLent(buf), sqe)
+        Want::SendLent(OwnedBuf::Vec(buf), from) => {
+            let sqe = stream_write(kind, slot, buf.get(from..).unwrap_or_default());
+            (RingMem::SendLent(OwnedBuf::Vec(buf)), sqe)
         }
+        Want::SendLent(buf, from) => other_write_entry(kind, slot, buf, from),
         Want::SendPinned(buf, from, zero_copy) => {
             let rest = buf.bytes().get(from..).unwrap_or_default();
             if zero_copy {
@@ -782,6 +776,32 @@ fn stream_read(kind: Kind, slot: RawFd, buf: *mut u8, len: usize) -> Sqe {
         Kind::Bytes => Sqe::read(slot, buf, len, u64::MAX),
         _ => Sqe::recv(slot, buf, len, 0),
     }
+}
+
+/// The entry of a stream read into a task's buffer of another type than a
+/// vector: into the rooms of a vectored read's buffers, or the spare
+/// capacity of one buffer. Out of the hot `entry`, whose vectors' reads it
+/// would otherwise make larger.
+#[inline(never)]
+fn other_read_entry(kind: Kind, slot: RawFd, mut buf: OwnedBuf) -> (RingMem, Sqe) {
+    let sqe = match buf.vectored_mut() {
+        Some(bufs) => stream_readv(kind, slot, bufs),
+        None => {
+            let spare = buf.spare_capacity_mut();
+            stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len())
+        }
+    };
+    (RingMem::RecvLent(buf), sqe)
+}
+
+/// As [`other_read_entry`], for a stream write from the `from`th byte on.
+#[inline(never)]
+fn other_write_entry(kind: Kind, slot: RawFd, mut buf: OwnedBuf, from: usize) -> (RingMem, Sqe) {
+    let sqe = match buf.vectored_mut() {
+        Some(bufs) => stream_writev(kind, slot, bufs, from),
+        None => stream_write(kind, slot, buf.rest_from(from)),
+    };
+    (RingMem::SendLent(buf), sqe)
 }
 
 /// A stream read into the rooms of the buffers of a vectored read, in order:
