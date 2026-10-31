@@ -353,18 +353,20 @@ impl Source {
         if done.read {
             self.read_done.put(done);
             self.read.defer(super::read_work::DONE, &mut after, &hooks);
+        } else if let Some(mut held) = self.write.try_hold_for(&hooks) {
+            // The side free: the end is applied now, with no trip through the mailbox or the
+            // deferred bits.
+            hooks.taken(held.get(), &mut after);
+            let st = held.get();
+            st.op_done(done, self.serving_fd(None), &mut after);
+            if st.wants_ops() {
+                self.with_route(shard, |io| st.submit_wanted(io, self.kind, &mut after));
+            }
+            held.release(&mut after, &hooks);
         } else {
             self.write_done.put(done);
-            // The side free: the end is taken now, with no trip through the
-            // deferred bits.
-            if let Some(mut held) = self.write.try_hold_for(&hooks) {
-                hooks.taken(held.get(), &mut after);
-                hooks.deferred(held.get(), super::write_work::DONE, &mut after);
-                held.release(&mut after, &hooks);
-            } else {
-                self.write
-                    .defer(super::write_work::DONE, &mut after, &hooks);
-            }
+            self.write
+                .defer(super::write_work::DONE, &mut after, &hooks);
         }
         #[cfg(port)]
         if idle && self.reg.awaits_idle.swap(false, Ordering::SeqCst) {
