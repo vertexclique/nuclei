@@ -288,6 +288,7 @@ pub(crate) const FILE_END_OF_FILE_INFO_CLASS: i32 = 6;
 /// `DeviceIoControl` codes: mark a file sparse, and zero a range of it.
 pub(crate) const FSCTL_SET_SPARSE: DWORD = 0x0009_00C4;
 pub(crate) const FSCTL_SET_ZERO_DATA: DWORD = 0x0009_80C8;
+pub(crate) const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x0200_0000;
 
 pub(crate) const ERROR_IO_PENDING: i32 = 997;
 pub(crate) const ERROR_HANDLE_EOF: i32 = 38;
