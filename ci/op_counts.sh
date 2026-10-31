@@ -32,6 +32,8 @@ spawn_join 10000 30000
 spawn_blocking 2000 8000
 sleep 5 15
 oneshot 10000 30000
+local_mpsc 10000 30000
+local_oneshot 10000 30000
 "
 
 cargo build --release -p nuclei --example op_count
