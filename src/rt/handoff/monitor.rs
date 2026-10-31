@@ -101,6 +101,14 @@ impl Spare {
     }
 }
 
+impl Drop for Spare {
+    /// A gift handed to a spare that had seen the close and gone: its shard
+    /// goes with the spare, never kept for good.
+    fn drop(&mut self) {
+        drop(self.take_gift());
+    }
+}
+
 /// A runtime's watch over its workers.
 pub(crate) struct Monitor {
     /// A poll this long is a blocked one.

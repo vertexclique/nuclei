@@ -405,3 +405,38 @@ fn a_shard_that_goes_hands_its_streams_on_with_every_byte() {
     });
     rt.block_on(round_trip());
 }
+
+
+/// A runtime dropped after one of its workers was handed off (blocked past
+/// `handoff_after`), with tasks waiting on timers, leaves no descriptor open:
+/// every shard's poller goes with it.
+#[test]
+fn a_runtime_dropped_after_a_handoff_leaves_no_descriptor_open() {
+    if !alone("drops::a_runtime_dropped_after_a_handoff_leaves_no_descriptor_open") {
+        return;
+    }
+    let warm = runtime();
+    warm.block_on(round_trip());
+    drop(warm);
+    let before = Held::now();
+    for _ in 0..4 {
+        let rt = nuclei::Runtime::builder()
+            .worker_threads(2)
+            .pin_workers(false)
+            .handoff_after(Some(Duration::from_millis(5)))
+            .build()
+            .unwrap();
+        for _ in 0..4 {
+            rt.spawn(async {
+                std::thread::sleep(Duration::from_millis(30));
+                nuclei::time::sleep(Duration::from_secs(3600)).await;
+            })
+            .detach();
+        }
+        rt.block_on(nuclei::time::sleep(Duration::from_millis(50)));
+        drop(rt);
+    }
+    eventually("the dropped runtimes' descriptors to close", || {
+        Held::now().handles <= before.handles
+    });
+}

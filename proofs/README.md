@@ -421,11 +421,20 @@ an arm request into the shard's mailbox and waits on a small shared cell (a fire
 waker slot). The shard applies its mailbox in order, arms the timer, and when the deadline
 passes sets the flag, wakes the waker and removes the entry. Dropping the sleep marks the cell
 cancelled, takes the waker out and posts a cancel; the shard removes the entry if it has it. The
-family checks 10 configurations: 4 that must pass (awaited and dropped, each with every safety
-property and with liveness), 3 mutations (a fire that leaves its entry in the wheel and a
-cancel that does not remove it break `NothingLeft`; a drop that leaves its waker in the cell
-breaks `NoWakeAfterDrop`), and 3 witnesses (a drop after the timer was armed, a drop before
-the shard applied the arm request, a fire that wakes the task). A dropped sleep's deadline may
+shard may go before the deadline (its runtime dropped, a worker stopped): as it goes it drains
+its mailbox and lets go of its wheel, and every timer it held for a cell, armed or only asked
+for, orphans the cell (`RemoteTimer::orphan`, through the wheel's `Armed` hold), whose waker is
+woken, so the cell never keeps the task's waker for good while the task keeps the cell; a request
+posted to a shard that went is drained by its poster the same way. The sleep, polled again, lets
+the orphaned cell go and arms the timer where it is polled, here a second shard. The family
+checks 17 configurations: 8 that must pass (awaited and dropped, with the shard staying and with
+it free to go, each with every safety property and with liveness), 5 mutations (a fire that
+leaves its entry in the wheel and a cancel that does not remove it break `NothingLeft`; a drop
+that leaves its waker in the cell breaks `NoWakeAfterDrop`; a shard that goes and wakes nobody
+breaks `NoStrandedWaker`, the cycle that kept a dropped runtime's shards after a handoff; a sleep
+that waits on its orphaned cell breaks `Termination`), and 4 witnesses (a drop after the timer
+was armed, a drop before the shard applied the arm request, a fire that wakes the task, a timer
+armed again on the second shard after the first went). A dropped sleep's deadline may
 never come within a run, so a cancel that did not remove its entry shows as a leak, as it would
 be for a far deadline. The waker slot's register-then-look-again handshake guards a waker that
 changed between polls; one task cannot show that, and it is checked by the loom models of the

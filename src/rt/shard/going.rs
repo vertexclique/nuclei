@@ -190,6 +190,11 @@ impl Drop for Shard {
         if !self.port_kept() && !self.hand_off_port() {
             self.settle_port();
         }
+        // No timer fires here again: the arm requests never applied orphan
+        // their timers now, and those in the wheel as the loop below lets go
+        // of them (`sleep::Armed`), so each sleep arms again where it is
+        // polled, or its task, woken here, goes too.
+        self.shared.drain_timer_ops();
         // What goes with a task may wake another of the shard's (a timer's
         // waker, a channel its future held): that one comes back through the
         // inbox, and is dropped here too, until none is left.

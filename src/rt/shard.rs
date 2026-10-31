@@ -194,12 +194,30 @@ impl Shared {
     }
 
     /// Hands work on the timer wheel to the shard. An arm request wakes the
-    /// shard, which may sleep past the new deadline otherwise.
+    /// shard, which may sleep past the new deadline otherwise. A shard that
+    /// stopped applies nothing more: what reaches it then is drained here.
     pub(crate) fn post_timer(&self, op: TimerOp) {
         let wake = op.needs_wake();
         self.timer_ops.push(op);
+        // Pairs with the fence of `drain_timer_ops`: either this sees the
+        // stop, or the shard's last drain finds the op.
+        crate::sync::internal::fence(Ordering::SeqCst);
+        if self.stopped.load(Ordering::SeqCst) {
+            self.drain_timer_ops();
+            return;
+        }
         if wake {
             self.unpark();
+        }
+    }
+
+    /// Drains the timer work of a shard that stopped and fires no timer
+    /// again: an arm request's timer is orphaned, and its sleep arms it again
+    /// where it is polled (proofs/tla/timer, `S_go`); the rest only goes.
+    pub(crate) fn drain_timer_ops(&self) {
+        crate::sync::internal::fence(Ordering::SeqCst);
+        while let Ok(op) = self.timer_ops.try_pop() {
+            op.orphan();
         }
     }
 
