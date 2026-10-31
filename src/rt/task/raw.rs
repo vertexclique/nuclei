@@ -272,9 +272,11 @@ where
         // SAFETY: the caller owns the live future.
         unsafe {
             let cell = Self::cell(ptr);
-            abort_on_panic(|| {
-                cell.core
-                    .with_mut(|core| ManuallyDrop::drop(&mut (*core).future))
+            cell.schedule.drop_future(|| {
+                abort_on_panic(|| {
+                    cell.core
+                        .with_mut(|core| ManuallyDrop::drop(&mut (*core).future))
+                })
             });
             cell.schedule.terminated(cell.header.id);
         }
@@ -313,6 +315,7 @@ where
 
     /// Takes the awaiter, drops the run's reference, then wakes the awaiter:
     /// the end of a run that leaves the task completed or closed.
+    #[inline(always)]
     unsafe fn finish(ptr: *const (), state: usize) {
         // SAFETY: the run's reference is live until `drop_ref`, and the
         // awaiter taken first does not need the task.
@@ -361,24 +364,18 @@ where
                 }
             }
 
-            let previous = super::enter(header.id);
-            let budget = crate::coop::enter();
-            // Read once: while no runtime of the process has task hooks, the
-            // poll costs one predictable branch more, not two calls.
-            let hooked =
-                crate::rt::tuning::ANY_POLL_HOOKS.load(core::sync::atomic::Ordering::Relaxed);
-            if hooked {
-                cell.schedule.before_poll(header.id);
-            }
+            // The task and a fresh budget are this thread's for the poll, the
+            // ones before them put back after it (a `block_on` inside a task
+            // polls other tasks in between).
+            let entered = crate::coop::enter_task(header.id);
+            // Each schedule's hooks are a check of its own, inline.
+            cell.schedule.before_poll(header.id);
             let poll = catch_unwind(AssertUnwindSafe(|| {
                 cell.core
                     .with_mut(|core| F::poll(Pin::new_unchecked(&mut *(*core).future), cx))
             }));
-            if hooked {
-                cell.schedule.after_poll(header.id);
-            }
-            crate::coop::leave(budget);
-            super::leave(previous);
+            cell.schedule.after_poll(header.id);
+            crate::coop::leave_task(entered);
             // The poll may have woken the task, cloned its waker, or a handle
             // may have registered meanwhile: the word is read again rather
             // than fed stale into the exchanges below, which would fail once.

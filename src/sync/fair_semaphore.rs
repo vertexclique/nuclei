@@ -268,18 +268,47 @@ impl FairWait {
     /// semaphore closed before they were. A first poll takes them at once if
     /// nobody waits; otherwise it queues, and later polls only look at the
     /// node.
+    ///
+    /// A first poll that completes spends one operation of the poll's budget
+    /// (see `coop`); with the budget spent, permits it took go back and it
+    /// yields. A grant to a queued wait spends nothing: that wait yielded.
     pub(super) fn poll(
         &mut self,
         sem: &FairSemaphore,
         n: usize,
         waker: &Waker,
     ) -> Poll<Result<(), Closed>> {
+        self.poll_admitted(sem, n, waker, || crate::coop::spend(waker))
+    }
+
+    /// [`poll`](Self::poll) with `admit` in place of the budget: asked once
+    /// a first poll would complete, and a `false` undoes it and answers
+    /// `Pending`.
+    pub(super) fn poll_admitted(
+        &mut self,
+        sem: &FairSemaphore,
+        n: usize,
+        waker: &Waker,
+        admit: impl FnOnce() -> bool,
+    ) -> Poll<Result<(), Closed>> {
         let granted = if self.wait.is_queued() {
             self.wait.poll(&sem.queue, Some(waker))
         } else {
             match sem.try_acquire(n) {
-                Ok(()) => return Poll::Ready(Ok(())),
-                Err(seen) if observed_closed(seen) => return Poll::Ready(Err(Closed)),
+                Ok(()) => {
+                    if admit() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    sem.release(n);
+                    return Poll::Pending;
+                }
+                Err(seen) if observed_closed(seen) => {
+                    return if admit() {
+                        Poll::Ready(Err(Closed))
+                    } else {
+                        Poll::Pending
+                    };
+                }
                 Err(_) => {}
             }
             sem.enqueue(&mut self.wait, n, waker);

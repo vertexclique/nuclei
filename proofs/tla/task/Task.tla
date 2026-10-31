@@ -503,7 +503,9 @@ H_park:
     end either;
     goto H_poll;
 H_detach:
-    \* `set_detached`. The common case right after the spawn is one exchange.
+    \* `set_detached`. The common case right after the spawn is one exchange. (`Task::drop`
+    \* that finds the task completed, closed and with no reference left takes the free of
+    \* H_det_loop at once, without the exchange: nothing else can reach the word then.)
     touch();
     if sch /\ tsk /\ refs = 1 /\ ~run /\ ~comp /\ ~clo /\ ~awt /\ ~reg /\ ~ntf then
         tsk := FALSE;

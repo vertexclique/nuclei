@@ -29,6 +29,10 @@
 //! [`RwLock`](crate::sync::RwLock), the reentrant locks and `OnceCell::get_or_init_racy`.
 //! The [`mpsc`](crate::sync::mpsc) channels follow the same rule for the established channel API,
 //! with their own progress notes.
+//! The [`local`](crate::sync::local) module adds single-shard twins of the
+//! channels, the semaphore and the mutex, with no atomic instruction on any
+//! path, and [`mesh`](crate::sync::mesh) a full mesh of bounded channels
+//! between a fixed number of parties.
 //!
 //! # What every primitive guarantees
 //!
@@ -55,6 +59,20 @@
 //!   waiter. If something was handed to it concurrently, the drop passes
 //!   it on. No wakeup is lost. (A [`Barrier`](crate::sync::Barrier) wait is the one exception: an
 //!   arrival that was counted stays counted.)
+//! - **Cooperative on a nuclei shard.** In a task on a nuclei shard (or in
+//!   `block_on`'s own future), a receive of [`mpsc`](crate::sync::mpsc),
+//!   [`oneshot`](crate::sync::oneshot), [`broadcast`](crate::sync::broadcast)
+//!   or [`watch`](crate::sync::watch) that completes spends one operation of
+//!   the task's cooperative budget, as IO does
+//!   ([`task::coop`](crate::task::coop)), and so does an acquire of a
+//!   semaphore, a lock (the reentrant ones too) or a bounded send that
+//!   completes at its first attempt. When the budget is spent the call
+//!   completes nothing, wakes its task and returns `Pending`, so a loop on a
+//!   channel or a lock that is always ready yields to the shard's other
+//!   tasks. A wait that queued and was granted spends nothing: giving the
+//!   grant back would cost it its place. The `try_` forms never spend, and
+//!   off a nuclei shard there is no budget. The events, latches, barriers,
+//!   once-cells and `Notify` keep no budget.
 //! - **Reentrancy by [`Owner`](crate::sync::Owner).** The reentrant locks are keyed by an
 //!   owner token rather than a thread, because a task can move between
 //!   threads and many tasks can share one.
@@ -137,11 +155,13 @@ pub(crate) mod internal;
 mod latch;
 mod lazy;
 mod list;
+pub mod local;
 #[cfg(all(loom, test))]
 #[doc(hidden)]
 pub(crate) mod loom_model;
 #[cfg(all(test, loom))]
 mod loom_tests;
+pub mod mesh;
 pub mod mpsc;
 mod mutex;
 mod notify;

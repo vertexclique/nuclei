@@ -320,12 +320,19 @@ impl<T, L: Limit> Chan<T, L> {
 
     /// The receiver's poll: register, then look again, then decide.
     ///
+    /// A receive that completes spends one operation of the poll's budget;
+    /// with the budget spent, the poll takes nothing and yields (see `coop`).
+    ///
     /// # Safety
     ///
     /// The caller is the channel's one receiver (see the module).
     pub(super) unsafe fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        if crate::coop::exhausted(cx.waker()) {
+            return Poll::Pending;
+        }
         // SAFETY: the caller's contract.
         if let Some(done) = unsafe { self.next() } {
+            crate::coop::spent_one();
             return Poll::Ready(done);
         }
         self.rx_waker.register(cx.waker());
@@ -335,9 +342,11 @@ impl<T, L: Limit> Chan<T, L> {
         // SAFETY: the caller's contract.
         if let Some(done) = unsafe { self.next() } {
             self.rx_does_not_wait();
+            crate::coop::spent_one();
             return Poll::Ready(done);
         }
         if self.finished() {
+            crate::coop::spent_one();
             Poll::Ready(None)
         } else {
             Poll::Pending
@@ -373,7 +382,8 @@ impl<T, L: Limit> Chan<T, L> {
         (taken > 0 || ended).then_some(taken)
     }
 
-    /// The receiver's batch poll; see [`take_many`](Self::take_many).
+    /// The receiver's batch poll; see [`take_many`](Self::take_many). The
+    /// batch spends one operation of the poll's budget, as one receive does.
     ///
     /// # Safety
     ///
@@ -387,8 +397,12 @@ impl<T, L: Limit> Chan<T, L> {
         if limit == 0 {
             return Poll::Ready(0);
         }
+        if crate::coop::exhausted(cx.waker()) {
+            return Poll::Pending;
+        }
         // SAFETY: the caller's contract.
         if let Some(taken) = unsafe { self.take_many(buf, limit) } {
+            crate::coop::spent_one();
             return Poll::Ready(taken);
         }
         self.rx_waker.register(cx.waker());
@@ -396,9 +410,11 @@ impl<T, L: Limit> Chan<T, L> {
         // SAFETY: the caller's contract.
         if let Some(taken) = unsafe { self.take_many(buf, limit) } {
             self.rx_does_not_wait();
+            crate::coop::spent_one();
             return Poll::Ready(taken);
         }
         if self.finished() {
+            crate::coop::spent_one();
             Poll::Ready(0)
         } else {
             Poll::Pending

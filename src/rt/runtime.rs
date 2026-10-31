@@ -29,9 +29,9 @@ use kovan_channel::flavors::RecvDeadline;
 
 use super::blocking::{Pool, PoolConfig};
 use super::context;
-use super::sched::{AtHome, Counted, Sched};
+use super::sched::Sched;
 use super::shard::{Limits, Shard, Shared};
-use super::task::{self, Task};
+use super::task::{self, ScheduleInfo, Task};
 use super::workers::{Start, Workers};
 
 mod enter;
@@ -364,9 +364,6 @@ impl Builder {
             .max(workers);
         let shutdown_on_panic = self.unhandled_panic == UnhandledPanic::ShutdownRuntime;
         let mut task_hooks = self.task_hooks;
-        if task_hooks.before_poll.is_some() || task_hooks.after_poll.is_some() {
-            super::tuning::ANY_POLL_HOOKS.store(true, std::sync::atomic::Ordering::Release);
-        }
         let inner = Arc::new_cyclic(|this| {
             if shutdown_on_panic {
                 task_hooks.shutdown = Some(this.clone());
@@ -759,7 +756,7 @@ fn own_shard() -> std::rc::Rc<Shard> {
 }
 
 /// Spawns `future` on `inner`.
-fn spawn_with<F>(inner: &Arc<Inner>, future: F) -> Task<F::Output>
+fn spawn_with<F>(inner: &Inner, future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -777,17 +774,16 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let hooks = inner.task_hooks.clone();
+    let hooks = inner.task_hooks.as_ref();
     let (runnable, task) = task::spawn(
-        Counted::new(future, shard),
-        Sched {
-            shard: Arc::clone(shard),
-            home: None,
-            hooks: hooks.clone(),
-        },
+        future,
+        Sched::counted(Arc::clone(shard), None, hooks.cloned()),
     );
-    spawned(hooks.as_deref(), &task);
-    runnable.schedule();
+    spawned(hooks.map(|hooks| &**hooks), &task);
+    // As its schedule would, without the turn through the task's table.
+    if let Some(runnable) = super::sched::queue_here(shard, runnable, ScheduleInfo::new(false)) {
+        runnable.schedule();
+    }
     task
 }
 
@@ -827,30 +823,12 @@ where
         // SAFETY: the task's schedule sends a woken bound task only to its
         // home's thread (leaked rather than dropped if that thread is gone);
         // the future is 'static.
-        unsafe {
-            task::spawn_unchecked(
-                Counted::new(AtHome::new(future, &home), &shared),
-                Sched {
-                    shard: shared,
-                    home: Some(home),
-                    hooks: hooks.clone(),
-                },
-            )
-        }
+        unsafe { task::spawn_unchecked(future, Sched::counted(shared, Some(home), hooks.clone())) }
     } else {
         // SAFETY: the task's schedule sends a woken task of this shard back
         // to it; the future is 'static, and `Send` (a caller with `bound`
         // false is `spawn`'s, whose future is).
-        unsafe {
-            task::spawn_unchecked(
-                Counted::new(future, &shared),
-                Sched {
-                    shard: shared,
-                    home: None,
-                    hooks: hooks.clone(),
-                },
-            )
-        }
+        unsafe { task::spawn_unchecked(future, Sched::counted(shared, None, hooks.clone())) }
     };
     spawned(hooks.as_deref(), &task);
     runnable.schedule();
@@ -920,12 +898,19 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// When the default runtime or this thread's shard cannot start (its
 /// poller cannot be made); [`task::Builder::spawn`](crate::task::Builder::spawn)
 /// answers the error instead.
+#[inline]
 pub fn spawn<F>(future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    spawn_with(&current(), future)
+    // With no task hooks nothing the spawn runs is the user's, so nothing
+    // sets or unsets the thread's runtime meanwhile: it is used in place.
+    let spawned = context::with_runtime(|inner| match inner {
+        Some(inner) if inner.task_hooks.is_none() => Ok(spawn_with(inner, future)),
+        _ => Err(future),
+    });
+    spawned.unwrap_or_else(|future| spawn_with(&current(), future))
 }
 
 /// Spawns a task that stays on the calling thread: a worker's shard, or the
@@ -972,15 +957,8 @@ where
     // SAFETY: as in `spawn_here`: the schedule sends a woken task back to
     // its shard; the future is `Send` and 'static.
     let (runnable, task) = unsafe {
-        task::spawn_unchecked(
-            future,
-            Sched {
-                shard: shared,
-                home: None,
-                // The runtime's own service task: not a task of its user's.
-                hooks: None,
-            },
-        )
+        // The runtime's own service task: not a task of its user's.
+        task::spawn_unchecked(future, Sched::uncounted(shared))
     };
     runnable.schedule();
     task.detach();

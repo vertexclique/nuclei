@@ -504,6 +504,11 @@ impl<T: Send + Sync + 'static> Receiver<T> {
     ) -> Result<Ref<'_, T>, RecvError> {
         let mut closed = false;
         loop {
+            // A value that fits at once spends one operation of the poll's
+            // budget, as `changed` does.
+            if !crate::coop::has_budget_remaining() {
+                crate::task::yield_now().await;
+            }
             {
                 let (guard, new_version) = self.shared.snapshot();
                 let has_changed = self.version != new_version;
@@ -511,6 +516,7 @@ impl<T: Send + Sync + 'static> Receiver<T> {
                 // After the channel closed, only a value that changed since
                 // `f` last judged is worth another call.
                 if (!closed || has_changed) && f(&guard) {
+                    crate::coop::try_spend();
                     return Ok(Ref { guard, has_changed });
                 }
             }
@@ -576,8 +582,15 @@ async fn changed_impl<T: Send + Sync + 'static>(
     version: &mut u64,
 ) -> Result<(), RecvError> {
     loop {
+        // A change seen at once spends one operation of the poll's budget
+        // (see `coop`): with the budget spent, the look waits for the next
+        // poll, after the shard's other tasks.
+        if !crate::coop::has_budget_remaining() {
+            crate::task::yield_now().await;
+        }
         let notified = shared.notify_rx.notified();
         if let Some(ret) = maybe_changed(shared, version) {
+            crate::coop::try_spend();
             return ret;
         }
         notified.await;

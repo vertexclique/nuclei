@@ -212,3 +212,43 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Handshake.one_side_sees
 #print axioms Nuclei.Handshake.later_swaps_read_down
 #print axioms Nuclei.Handshake.a_burst_notifies_once
+
+-- The cooperative budget: a spend refuses only when the budget is spent and takes one unit; a
+-- poll completes at most its budget and its program, a program within the budget completes
+-- whole, a longer one yields with nothing left, and outside a budgeted poll nothing yields.
+#print axioms Nuclei.Coop.spend_refuses_only_when_spent
+#print axioms Nuclei.Coop.spend_takes_one
+#print axioms Nuclei.Coop.completes_at_most_the_budget
+#print axioms Nuclei.Coop.completes_at_most_the_program
+#print axioms Nuclei.Coop.a_program_within_the_budget_completes
+#print axioms Nuclei.Coop.a_longer_program_yields_after_the_budget
+#print axioms Nuclei.Coop.nothing_yields_unbudgeted
+#print axioms Nuclei.Coop.example_budget_two
+#print axioms Nuclei.Coop.example_budget_128
+
+-- The precise sleep's rounding: never early, on either wheel; at most a microsecond late; exact
+-- on the microsecond grid; the published time within a microsecond of the deadline.
+#print axioms Nuclei.Precise.never_early
+#print axioms Nuclei.Precise.never_early_on_the_tick
+#print axioms Nuclei.Precise.at_most_a_microsecond_late
+#print axioms Nuclei.Precise.on_the_grid_exactly
+#print axioms Nuclei.Precise.published_within_a_microsecond
+#print axioms Nuclei.Precise.example_rounding
+
+-- The single-shard semaphore: the pass grants the front in order, conserves the permits and
+-- stops at an unfit front; every operation, and every run, keeps the count and leaves no waiter
+-- whose need is free at the front.
+#print axioms Nuclei.LocalSemaphore.serve_grants_the_front
+#print axioms Nuclei.LocalSemaphore.serve_conserves
+#print axioms Nuclei.LocalSemaphore.serve_leaves_an_unfit_front
+#print axioms Nuclei.LocalSemaphore.fresh_good
+#print axioms Nuclei.LocalSemaphore.step_good
+#print axioms Nuclei.LocalSemaphore.run_good
+#print axioms Nuclei.LocalSemaphore.example_front_first
+
+-- The mesh's layout: a party's sender to another and that one's receiver from it are one
+-- channel, and a channel joins exactly one pair.
+#print axioms Nuclei.Mesh.the_ends_meet
+#print axioms Nuclei.Mesh.one_pair_per_channel
+#print axioms Nuclei.Mesh.pairs_do_not_share
+#print axioms Nuclei.Mesh.example_three

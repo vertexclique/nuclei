@@ -438,7 +438,39 @@ armed again on the second shard after the first went). A dropped sleep's deadlin
 never come within a run, so a cancel that did not remove its entry shows as a leak, as it would
 be for a far deadline. The waker slot's register-then-look-again handshake guards a waker that
 changed between polls; one task cannot show that, and it is checked by the loom models of the
-sync module's waker cell.
+sync module's waker cell. A precise sleep polled off a shard goes through the same cell and the
+same mailbox (`TimerOp::Insert`, `Remove` and `Cancel` carry which wheel the timer is in, the
+cell's `precise` flag), so the protocol checked here is its protocol too.
+
+## Precise sleeps
+
+`precise` (`tla/precise/Precise.tla`, `lean/Nuclei/Precise.lean`) checks `time::sleep_precise`
+(`src/time/precise.rs`, the shard's timers in `src/rt/shard/timers.rs`, the pollers' own timers in
+`src/rt/park/linux.rs` and `src/rt/park/kqueue.rs`). A shard keeps two wheels, one in milliseconds
+and one in microseconds; a precise sleep is armed in the second. With nothing to run the shard
+waits until the earliest deadline of either wheel. On io_uring the ring's own wait timeout is a
+high-resolution timer with no slack, and on Windows the port's wait arms a high-resolution
+waitable timer for every timed wait, so the wait ends at a precise deadline by itself; epoll's
+timeout counts milliseconds, so there the poller arms a timerfd for the precise deadline, moved
+whenever the earliest one changes, and kqueue adds a one-shot `EVFILT_TIMER` in nanoseconds
+(critical on Apple's systems, so it is not coalesced) to the wait itself. A precise sleep may
+come while the shard waits: another thread wakes it, its task arms the sleep. A paused clock
+publishes the earliest deadline of either wheel before the shard parks, and jumps there. The
+family checks 13 configurations: 5 that must pass (a backend whose wait is precise, one that
+counts ticks, a paused clock, and liveness for the last two), with `NeverEarly` (no sleep ends
+before its deadline) and `OnTime` (a precise sleep ends at its deadline, a sleep of the
+millisecond wheel at its tick), every choice of the deadlines from 1 to 9 and of when the second
+precise sleep comes; 5 mutations (the poller's own timer never armed, armed once and never moved,
+a wait that looks at the millisecond wheel alone, and a paused shard that publishes the
+millisecond wheel alone each break `OnTime`; a shard that never fires its microsecond wheel
+breaks `Termination`), and 3 witnesses (the poller's timer ends a park, it is moved to an earlier
+deadline, a paused clock jumps to a precise deadline). The model has a tick of four units and no
+wake latency, and its "coarse" backend stands for both pollers that arm a timer. The Lean file
+proves the rounding the wheels rest on, for every deadline and clock reading: a deadline armed
+rounded up and a clock read rounded down never fire a timer early, on either wheel; a precise
+timer is due at most a microsecond after its deadline, exactly at it on the microsecond grid; and
+what a paused shard publishes is within a microsecond of the deadline. The microsecond wheel is
+the millisecond one with another unit, so `Wheel.lean` covers its placement and cascade.
 
 ## A paused clock that moves by itself
 
@@ -1816,6 +1848,75 @@ call that sends every read out whatever the window holds breaks `WithinCap`; one
 results back in the order reads end, and one that sends reads before the write before it landed,
 break `ResultInPlace`; one that does not move on to the next read breaks `EachOnce`); and 1 witness
 (a read ends before one named before it).
+
+## The cooperative budget in channels and locks
+
+`coop` (`tla/coop/Coop.tla`, `lean/Nuclei/Coop.lean`, the loom models in
+`src/sync/loom_tests/coop.rs`) checks the budget the receives, acquires and locks of
+`nuclei::sync` spend (`src/coop.rs`, `Chan::poll_recv` in `src/sync/mpsc/chan.rs`,
+`taken_at_once` and `admitted` in `src/sync/contend.rs`, `FairWait::poll_admitted` in
+`src/sync/fair_semaphore.rs`). Each poll of a task starts with a budget; every receive or acquire
+that completes spends one, and one that finds the budget spent completes nothing, wakes its task
+behind the shard's other tasks and returns `Pending`. A receive looks at the budget before it
+takes a value. An acquire takes first and looks after, so a refused one gives the lock back
+through the release's pass, which hands it to a thread that queued for it in between. The TLA+
+family runs a hot task whose channel always has a value and whose lock is free whenever it asks,
+the other task of its shard, and a thread on another core that takes the lock once, and checks 13
+configurations: 5 that must pass (three receives, three acquires, both kinds in one poll, and
+liveness for the first two), with `NoValueLost`, `Conservation` (the lock's permit is free, held
+or handed over), `BoundedPoll` (a poll completes at most its budget), `OtherWaitsOneBudget` (the
+other task waits for at most one budget of the hot task's operations) and `NoIdleWhileQueued`; 5
+mutations (a receive that takes its value before it looks at the budget breaks `NoValueLost`; an
+operation that spends nothing breaks `BoundedPoll`; a refusal that does not wake its task breaks
+`Termination`; a refused acquire that keeps the lock breaks `Conservation`; a give back that
+serves nobody breaks `NoIdleWhileQueued`), and 3 witnesses (a refusal, the other task running
+between two polls of the hot task, the give back serving the queued thread). The loom models run
+the real `RawSemaphore` and `FairSemaphore` with a refusal handed in at the place the budget's
+answer lands, against a thread that queues for the permit, and count the runs where it had queued
+by the refusal; a calibration that drops the give back must deadlock. The Lean file proves the
+counter: a spend refuses only at zero and takes one unit; a poll completes at most its budget, a
+program within it completes whole, a longer one yields with nothing left; and outside a budgeted
+poll, where the counter starts at `2^64 - 1`, nothing ever yields.
+
+## The single-shard semaphore
+
+`shardlocal` (`tla/shardlocal/Local.tla`, `lean/Nuclei/LocalSemaphore.lean`) checks `sync::local::Semaphore`
+(`src/sync/local/semaphore.rs`, its line in `src/sync/local/waiters.rs`), which the local `Mutex`
+and the local bounded channel's slots are built on: a strictly first-come, first-served semaphore
+for the tasks of one shard. A request takes its permits at once when nobody waits and they are
+free, else joins the back of the line; a release serves the front waiters whose needs fit, one
+after another, stopping at the first that does not; an attempt that never waits takes nothing
+while anybody waits; a dropped request leaves the line (serving it again when it was the front),
+and one dropped after its grant and before it took it passes the permits on. The tasks run on one
+thread, so a poll or a drop is one step, and the model interleaves whole steps in every order. 11
+configurations: 4 that must pass (two big requests and a small one, a big request between two
+small ones, a request that only tries racing a big waiter, liveness), with `Conservation`,
+`FifoFair` (nobody gets permits while one that asked before it still waits) and `NoIdleFront` (no
+waiter sleeps with its whole need free at the front); 4 mutations (a try that barges breaks
+`FifoFair`; a front dropped without serving the line again and a release that serves nobody break
+`NoIdleFront`; a dropped grant that keeps its permits breaks `Conservation`), and 3 witnesses (a
+granted request dropped before it took its grant, the front dropped and the next served, a waiter
+asleep while a permit is kept for the front). The Lean file proves, for every sequence of
+operations from a fresh semaphore of any size, that the pass grants a prefix of the line in its
+order and conserves the permits, that every operation keeps the count and leaves no waiter whose
+need is free at the front, and computes a worked example. What is left out: the wakers (one
+thread, so a wake cannot race its registration) and the close, which ends every waiter at once
+and serves nobody.
+
+## A mesh party's receive
+
+`mesh` (`tla/mesh/Mesh.tla`, `lean/Nuclei/Mesh.lean`) checks `sync::mesh` (`src/sync/mesh.rs`).
+The TLA+ family checks `Party::poll_recv`: the party looks at its channels round robin, starting
+after the one that delivered last, takes the first value it finds, and otherwise sleeps with its
+waker registered in every channel (each channel's own receive does it); one peer floods its
+channel, refilling it whenever there is room, and the other sends one value. 6 configurations: 2
+that must pass, with `QuietServed` (the quiet value waits for at most one flooded value) and
+`NoLostWake`, and liveness; 2 mutations (a receive that always starts at the first channel breaks
+`QuietServed`; one that keeps its waker in one channel only breaks `Termination`), and 2
+witnesses (a sleep a send ends, a flooded value taken while the quiet one waits). The channels are
+counts; their own steps are the `mpsc` models'. The Lean file proves the layout `mesh` builds: the
+channel made at outer step `from` and inner step `to` is the one party `from` sends to `to` on and
+the one party `to` receives from `from` on, and no two pairs share a channel.
 
 ## What is not checked
 

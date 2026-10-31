@@ -6,6 +6,7 @@
 //! RUSTFLAGS="--cfg loom" cargo test --release --lib -- sync::loom_tests
 //! ```
 
+mod coop;
 mod mpsc;
 mod primitives;
 mod signals;

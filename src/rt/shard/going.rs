@@ -25,26 +25,38 @@ impl Shard {
     pub(crate) fn block_on_then_leave<F: core::future::Future>(&self, future: F) -> F::Output {
         let mut future = core::pin::pin!(future);
         crate::rt::context::deeper(self.limits.max_nesting, || {
-            let signal = Arc::new(super::signal::Signal::new(&self.shared));
-            self.run_then_leave(future.as_mut(), &signal)
+            let signal = self.signal();
+            let output = self.run_then_leave(future.as_mut(), &signal);
+            self.keep_signal(signal);
+            output
         })
     }
 
     /// The outermost `block_on` of a thread outside the runtime returned,
     /// and this, its own shard, runs again only at its next one.
     pub(crate) fn leave(&self) {
-        let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
-        evict_all(&gone, self.shared_addr());
-        // On a worker, or with none on this thread's shard, which runs it at
-        // the thread's next `block_on`, as any task spawned here; a runtime
-        // that drops waits for it (`rt::linger`).
-        drain_unsent(&gone, |source| crate::rt::linger::hand(drain(source)));
+        // A shard that never registered a source since it last left has
+        // none to let go of.
+        if !self.sources.borrow().is_untouched() {
+            let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
+            evict_all(&gone, self.shared_addr());
+            // On a worker, or with none on this thread's shard, which runs it at
+            // the thread's next `block_on`, as any task spawned here; a runtime
+            // that drops waits for it (`rt::linger`).
+            drain_unsent(&gone, |source| crate::rt::linger::hand(drain(source)));
+        }
         self.let_go_of_children();
         // Sources that went before (a dropped handle's) may have left a
-        // cancel queued, or their operations still out.
+        // cancel queued, or their operations still out: the settle's first
+        // step applies the one, and with none of the other it is over.
         #[cfg(ring)]
         if let Driver::Ring(ring) = &self.driver {
-            ring.settle(|| self.apply_io_ops());
+            if !self.shared.io_ops.is_empty() {
+                self.apply_io_ops();
+            }
+            if ring.in_flight() != 0 {
+                ring.settle(|| self.apply_io_ops());
+            }
         }
         // The port's go to its keeper.
         #[cfg(port)]
@@ -205,10 +217,14 @@ impl Drop for Shard {
             let lifo = self.lifo.take();
             let queue = core::mem::take(&mut *self.queue.borrow_mut());
             let timers = self.wheel.borrow_mut().take_wakers();
+            let precise = self.precise.borrow_mut().take_wakers();
             let fired = core::mem::take(&mut *self.fired.borrow_mut());
-            let mut quiet =
-                lifo.is_none() && queue.is_empty() && timers.is_empty() && fired.is_empty();
-            drop((lifo, queue, timers, fired));
+            let mut quiet = lifo.is_none()
+                && queue.is_empty()
+                && timers.is_empty()
+                && precise.is_empty()
+                && fired.is_empty();
+            drop((lifo, queue, timers, precise, fired));
             while let Some(runnable) = self.pop_inbox() {
                 drop(runnable);
                 quiet = false;

@@ -639,6 +639,18 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
     /// assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
     /// ```
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        self.try_recv_if(|| true).map_err(|look| match look {
+            Look::Lagged(missed) => TryRecvError::Lagged(missed),
+            Look::Closed => TryRecvError::Closed,
+            // An admit that always says yes never refuses.
+            Look::Empty | Look::Refused => TryRecvError::Empty,
+        })
+    }
+
+    /// [`try_recv`](Self::try_recv) that asks `admit` once the receive would
+    /// complete (a value, a lag, the end) and before it moves on: a `false`
+    /// leaves the receiver where it was.
+    fn try_recv_if(&mut self, admit: impl FnOnce() -> bool) -> Result<T, Look> {
         let shared = &*self.shared;
         let next = self.next();
         let guard = pin();
@@ -646,6 +658,9 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
         // SAFETY: the guard keeps the node alive while it is read.
         match unsafe { slot.load(Ordering::Acquire, &guard).as_ref() } {
             Some(node) if node.pos == next => {
+                if !admit() {
+                    return Err(Look::Refused);
+                }
                 let value = node.value.clone();
                 drop(guard);
                 self.advance(next + 1);
@@ -653,6 +668,9 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
             }
             Some(node) if node.pos > next => {
                 drop(guard);
+                if !admit() {
+                    return Err(Look::Refused);
+                }
                 // A later position took the slot: positions before the oldest
                 // the ring can hold are lost. That one is past `next`, since
                 // the slot's position is at least a ring past it and below
@@ -662,7 +680,7 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
                     .load(Ordering::SeqCst)
                     .saturating_sub(shared.capacity());
                 self.advance(oldest);
-                return Err(TryRecvError::Lagged(oldest - next));
+                return Err(Look::Lagged(oldest - next));
             }
             // Not sent yet, or sent and not published yet.
             _ => {}
@@ -672,9 +690,9 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
         // after every send, so with the flag seen every position below the
         // tail is published, and one at `next` would have been found.
         if shared.closed.load(Ordering::SeqCst) && shared.tail.load(Ordering::SeqCst) <= next {
-            return Err(TryRecvError::Closed);
+            return Err(if admit() { Look::Closed } else { Look::Refused });
         }
-        Err(TryRecvError::Empty)
+        Err(Look::Empty)
     }
 
     /// Waits for the next value and takes it.
@@ -688,6 +706,12 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
     /// # Cancel safety
     ///
     /// Dropping the future takes nothing: the next receive gets the value.
+    ///
+    /// # Cooperative scheduling
+    ///
+    /// On a nuclei shard a receive that completes spends one operation of
+    /// its task's budget; with the budget spent it takes nothing and yields
+    /// to the shard's other tasks first (see `nuclei::task::coop`).
     pub async fn recv(&mut self) -> Result<T, RecvError> {
         let shared = Arc::clone(&self.shared);
         loop {
@@ -695,11 +719,12 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
             // `Notify`: a `Notified` hears every `notify_waiters` made after
             // its creation).
             let notified = shared.notify_rx.notified();
-            match self.try_recv() {
+            match self.try_recv_if(crate::coop::try_spend) {
                 Ok(value) => return Ok(value),
-                Err(TryRecvError::Lagged(missed)) => return Err(RecvError::Lagged(missed)),
-                Err(TryRecvError::Closed) => return Err(RecvError::Closed),
-                Err(TryRecvError::Empty) => notified.await,
+                Err(Look::Lagged(missed)) => return Err(RecvError::Lagged(missed)),
+                Err(Look::Closed) => return Err(RecvError::Closed),
+                Err(Look::Empty) => notified.await,
+                Err(Look::Refused) => crate::task::yield_now().await,
             }
         }
     }
@@ -736,6 +761,15 @@ impl<T: Clone + Send + Sync + 'static> Receiver<T> {
     pub fn blocking_recv(&mut self) -> Result<T, RecvError> {
         super::internal::blocking(self.recv())
     }
+}
+
+/// What a receiver's look came to, short of a value.
+enum Look {
+    Empty,
+    Lagged(u64),
+    Closed,
+    /// The look's `admit` turned the receive down: nothing moved.
+    Refused,
 }
 
 impl<T: Send + Sync + 'static> Drop for Receiver<T> {
