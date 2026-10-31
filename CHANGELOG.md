@@ -75,8 +75,14 @@
   the IO buffer cap.
 - **Owned vectored IO**: `write_vectored_owned` writes every buffer of an `IoVecBuf` (`Vec<B>`,
   `[B; N]`) in order as one write, with no other write of the handle between them, and
-  `read_vectored_owned` reads into the first buffer of an `IoVecBufMut` with room, on TCP and Unix
-  streams, pipes and files. Each buffer goes to the kernel in calls of its own.
+  `read_vectored_owned` fills the rooms of an `IoVecBufMut`'s buffers in order, on TCP and Unix
+  streams, pipes and files. Each kernel call takes every buffer at once: `writev`/`readv` or a
+  `sendmsg`/`recvmsg` of several buffers on epoll and kqueue, `IORING_OP_WRITEV`/`READV` or
+  `SENDMSG`/`RECVMSG` on io_uring, a `WSASend`/`WSARecv` of several `WSABUF`s on I/O completion
+  ports, `pwritev`/`preadv` for files; a call the kernel takes part of goes on from the byte it
+  stopped at. Where the system has no vectored call of the kind, the buffers go one call each, in
+  order: a buffered file on Windows reads and writes so, and a Windows handle that is not a socket
+  writes so and reads into its first room (a short read).
 - **Positional file IO on a shared handle**: `read_at`, `write_at`, `read_exact_at`, `write_all_at`,
   `read_at_owned`, `write_at_owned` and `read_many_at` (many reads in one call, at most 64 out at
   once, together on the shard's ring), ordered after the writes accepted at the cursor before them.

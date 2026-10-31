@@ -346,5 +346,7 @@ mod owned;
 mod positional;
 mod sync_dir;
 mod sync_range;
+#[cfg(ring)]
+mod vectored;
 #[cfg(windows)]
 mod windows;

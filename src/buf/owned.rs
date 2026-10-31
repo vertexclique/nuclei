@@ -19,6 +19,7 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use core::panic::AssertUnwindSafe;
 
 use super::aligned::AlignedBuf;
+use super::vectored::Vectored;
 
 /// A buffer an owned write takes: memory at an address that does not move
 /// while the runtime holds the buffer, whose first
@@ -201,10 +202,10 @@ pub(crate) enum Boxed {
     /// Unwind safe as a `Vec<u8>` is, since a panic leaves no invariant of
     /// the caller's buffer half made that the runtime relies on.
     Kept(AssertUnwindSafe<Box<dyn Kept>>),
-    /// The buffers of a vectored write, written one after the other: their
-    /// bytes are not one slice, so its `Deref` is empty and its users read
-    /// it through [`OwnedBuf::rest_from`] and [`OwnedBuf::len`].
-    Vectored(Vec<OwnedBuf>),
+    /// The buffers of a vectored call, written from or read into one after
+    /// the other: their bytes are not one slice, so its `Deref` is empty and
+    /// its users go through [`OwnedBuf::vectored_mut`].
+    Vectored(Vectored),
 }
 
 impl Default for OwnedBuf {
@@ -316,17 +317,40 @@ impl OwnedBuf {
 
     /// The buffers of a vectored write, held as one.
     pub(crate) fn vectored(bufs: Vec<OwnedBuf>) -> Self {
-        Self::boxed(Boxed::Vectored(bufs))
+        Self::boxed(Boxed::Vectored(Vectored::written(bufs)))
     }
 
-    /// The buffers of a vectored write back; a buffer of one is its own.
+    /// The buffers of a vectored read, held as one.
+    pub(crate) fn vectored_read(bufs: Vec<OwnedBuf>) -> Self {
+        Self::boxed(Boxed::Vectored(Vectored::filled(bufs)))
+    }
+
+    /// The buffers of a vectored call back; a buffer of one is its own.
     pub(crate) fn into_segments(self) -> Vec<OwnedBuf> {
+        match self.into_vectored() {
+            Ok(vectored) => vectored.into_bufs(),
+            Err(one) => vec![one],
+        }
+    }
+
+    /// The buffers of a vectored call, or the buffer itself when it is one.
+    pub(crate) fn into_vectored(self) -> Result<Vectored, OwnedBuf> {
         match self {
             OwnedBuf::Boxed(boxed) => match *boxed {
-                Boxed::Vectored(bufs) => bufs,
-                one => vec![OwnedBuf::Boxed(Box::new(one))],
+                Boxed::Vectored(vectored) => Ok(vectored),
+                one => Err(OwnedBuf::Boxed(Box::new(one))),
             },
-            one => vec![one],
+            one => Err(one),
+        }
+    }
+
+    /// The buffers of a vectored call, for a call that hands the kernel all
+    /// of them at once; `None` for one buffer.
+    #[inline]
+    pub(crate) fn vectored_mut(&mut self) -> Option<&mut Vectored> {
+        match self {
+            OwnedBuf::Vec(_) => None,
+            OwnedBuf::Boxed(boxed) => boxed.vectored_mut(),
         }
     }
 
@@ -410,6 +434,9 @@ impl OwnedBuf {
     /// returns how many.
     #[inline]
     pub(crate) fn append(&mut self, bytes: &[u8]) -> usize {
+        if let Some(vectored) = self.vectored_mut() {
+            return vectored.append(bytes);
+        }
         let len = self.len();
         let spare = self.spare_capacity_mut();
         let n = bytes.len().min(spare.len());
@@ -424,6 +451,9 @@ impl OwnedBuf {
     /// Zeroes its spare capacity and lends it as bytes; how many it holds is
     /// left as it was.
     pub(crate) fn spare_zeroed(&mut self) -> &mut [u8] {
+        if self.vectored_mut().is_some() {
+            return &mut [];
+        }
         let len = self.len();
         let room = self.capacity().saturating_sub(len);
         if room == 0 {
@@ -459,7 +489,7 @@ impl Boxed {
         match self {
             Boxed::Aligned(aligned) => aligned.len(),
             Boxed::Kept(kept) => kept.init(),
-            Boxed::Vectored(bufs) => bufs.iter().map(OwnedBuf::len).sum(),
+            Boxed::Vectored(vectored) => vectored.len(),
         }
     }
 
@@ -468,7 +498,7 @@ impl Boxed {
         match self {
             Boxed::Aligned(aligned) => aligned.capacity(),
             Boxed::Kept(kept) => kept.total(),
-            Boxed::Vectored(_) => self.len(),
+            Boxed::Vectored(vectored) => vectored.capacity(),
         }
     }
 
@@ -499,7 +529,7 @@ impl Boxed {
                     )
                 }
             }
-            Boxed::Vectored(_) => &mut [],
+            Boxed::Vectored(vectored) => vectored.spare_capacity_mut(),
         }
     }
 
@@ -513,8 +543,8 @@ impl Boxed {
             Boxed::Aligned(aligned) => unsafe { aligned.set_len(len) },
             // SAFETY: the caller's.
             Boxed::Kept(kept) => unsafe { kept.set_init(len) },
-            // A write's: nothing is read into it.
-            Boxed::Vectored(_) => {}
+            // SAFETY: the caller's.
+            Boxed::Vectored(vectored) => unsafe { vectored.set_len(len) },
         }
     }
 
@@ -532,17 +562,18 @@ impl Boxed {
 
     #[inline(never)]
     fn rest_from(&self, from: usize) -> &[u8] {
-        let Boxed::Vectored(bufs) = self else {
-            return self.bytes().get(from..).unwrap_or_default();
-        };
-        let mut from = from;
-        for buf in bufs {
-            if from < buf.len() {
-                return buf.rest_from(from);
-            }
-            from -= buf.len();
+        match self {
+            Boxed::Vectored(vectored) => vectored.rest_from(from),
+            other => other.bytes().get(from..).unwrap_or_default(),
         }
-        &[]
+    }
+
+    #[inline(never)]
+    fn vectored_mut(&mut self) -> Option<&mut Vectored> {
+        match self {
+            Boxed::Vectored(vectored) => Some(vectored),
+            _ => None,
+        }
     }
 }
 

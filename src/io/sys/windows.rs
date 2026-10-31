@@ -461,7 +461,7 @@ fn at(offset: u64) -> OVERLAPPED {
 
 /// Reads up to `len` bytes at `offset` of the file into `buf`; zero at the
 /// end of the file.
-fn read_at(raw: Raw, buf: *mut u8, len: usize, offset: u64) -> io::Result<usize> {
+pub(super) fn read_at(raw: Raw, buf: *mut u8, len: usize, offset: u64) -> io::Result<usize> {
     let mut ov = at(offset);
     let mut read: DWORD = 0;
     let len = u32::try_from(len).unwrap_or(u32::MAX);
@@ -504,7 +504,7 @@ pub(crate) fn append_all(raw: Raw, buf: &[u8]) -> io::Result<u64> {
 }
 
 /// Writes all of `buf` at `offset`, or with `None` at the file's end.
-fn write_all_at(raw: Raw, mut buf: &[u8], mut offset: Option<u64>) -> io::Result<()> {
+pub(super) fn write_all_at(raw: Raw, mut buf: &[u8], mut offset: Option<u64>) -> io::Result<()> {
     while !buf.is_empty() {
         // Both halves of the offset all ones: the file's end.
         let mut ov = at(offset.unwrap_or(u64::MAX));

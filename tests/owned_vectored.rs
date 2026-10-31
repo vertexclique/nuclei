@@ -134,20 +134,41 @@ fn two_tasks_vectored_writes_never_interleave() {
 }
 
 #[test]
-fn a_vectored_read_fills_the_first_buffer_with_room() {
+fn a_vectored_read_fills_each_buffer_before_the_next_and_keeps_what_they_held() {
     nuclei::block_on(async {
         let (client, server) = tcp_pair().await;
         let (n, _) = client.write_owned(b"0123456789".to_vec()).await;
         assert_eq!(n.unwrap(), 10);
-        let mut full = Vec::with_capacity(2);
-        full.extend_from_slice(b"ab");
-        let bufs = vec![full, Vec::with_capacity(4), Vec::with_capacity(64)];
-        let (n, back) = server.read_vectored_owned(bufs).await;
-        let n = n.unwrap();
-        assert!(n > 0 && n <= 4);
-        assert_eq!(back[0], b"ab");
-        assert_eq!(back[1], &b"0123"[..n]);
-        assert!(back[2].is_empty());
+        let mut got = Vec::new();
+        let mut held = Vec::with_capacity(4);
+        held.extend_from_slice(b"ab");
+        let mut bufs = vec![
+            held,
+            Vec::with_capacity(0),
+            Vec::with_capacity(3),
+            Vec::with_capacity(64),
+        ];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while got.len() < 10 {
+            assert!(std::time::Instant::now() < deadline, "the bytes never came");
+            let lens: Vec<usize> = bufs.iter().map(Vec::len).collect();
+            let (n, back) = server.read_vectored_owned(bufs).await;
+            let n = n.unwrap();
+            assert_ne!(n, 0);
+            let mut short = false;
+            for (buf, len) in back.iter().zip(&lens) {
+                let gained = buf.len() - len;
+                assert!(
+                    !(short && gained > 0),
+                    "a later buffer filled before an earlier one"
+                );
+                short |= buf.len() < buf.capacity();
+                got.extend_from_slice(&buf[*len..]);
+            }
+            assert_eq!(back[0][..2], *b"ab");
+            bufs = back;
+        }
+        assert_eq!(got, b"0123456789");
         let full = [AlignedBuf::zeroed(8, 8).unwrap()];
         let (n, back) = server.read_vectored_owned(full).await;
         assert_eq!((n.unwrap(), back[0].len()), (0, 8), "no room is no read");
@@ -184,6 +205,19 @@ fn unix_streams_and_pipes_take_vectored_buffers() {
         }
         assert_eq!(got, b"unix stream");
 
+        // Bytes queued before the read: one read fills both buffers.
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::io::Write::write_all(&mut &a, b"queued bytes").unwrap();
+        let b = nuclei::io::Handle::new(b).unwrap();
+        let (n, back) = b
+            .read_vectored_owned([Vec::with_capacity(5), Vec::with_capacity(32)])
+            .await;
+        assert_eq!(n.unwrap(), 12);
+        assert_eq!(
+            (&back[0][..], &back[1][..]),
+            (&b"queue"[..], &b"d bytes"[..])
+        );
+
         let (r, w) = std::io::pipe().unwrap();
         let (r, w) = (
             nuclei::io::Handle::new(r).unwrap(),
@@ -195,10 +229,14 @@ fn unix_streams_and_pipes_take_vectored_buffers() {
         assert_eq!(n.unwrap(), 4);
         drop(w);
         let (n, back) = r
-            .read_vectored_owned(vec![Vec::with_capacity(0), Vec::with_capacity(8)])
+            .read_vectored_owned(vec![
+                Vec::with_capacity(0),
+                Vec::with_capacity(3),
+                Vec::with_capacity(8),
+            ])
             .await;
-        let n = n.unwrap();
-        assert_eq!(&back[1][..], &b"pipe"[..n]);
+        assert_eq!(n.unwrap(), 4, "one read of every room");
+        assert_eq!((&back[1][..], &back[2][..]), (&b"pip"[..], &b"e"[..]));
     });
 }
 
@@ -241,22 +279,89 @@ fn a_files_vectored_write_appends_every_buffer_at_the_end() {
 }
 
 #[test]
-fn a_files_vectored_read_fills_the_first_buffer_with_room_at_the_cursor() {
+fn a_files_vectored_read_fills_its_buffers_in_order_at_the_cursor() {
     nuclei::block_on(async {
         let t = Temp::new();
-        std::fs::write(t.path("r"), b"abcdefgh").unwrap();
+        std::fs::write(t.path("r"), b"abcdefghij").unwrap();
         let file = File::open(t.path("r")).await.unwrap();
+        let mut held = Vec::with_capacity(4);
+        held.extend_from_slice(b">>");
         let (n, back) = file
-            .read_vectored_owned([Vec::with_capacity(3), Vec::with_capacity(16)])
+            .read_vectored_owned([held, Vec::with_capacity(3), Vec::with_capacity(2)])
             .await;
-        assert_eq!((n.unwrap(), &back[0][..]), (3, &b"abc"[..]));
+        assert_eq!(n.unwrap(), 7);
+        assert_eq!(
+            (&back[0][..], &back[1][..], &back[2][..]),
+            (&b">>ab"[..], &b"cde"[..], &b"fg"[..])
+        );
         let (n, back) = file
-            .read_vectored_owned(vec![back[0].clone(), Vec::with_capacity(16)])
+            .read_vectored_owned(vec![Vec::with_capacity(1), Vec::with_capacity(16)])
             .await;
-        assert_eq!(n.unwrap(), 5);
-        assert_eq!((&back[0][..], &back[1][..]), (&b"abc"[..], &b"defgh"[..]));
+        assert_eq!(n.unwrap(), 3);
+        assert_eq!((&back[0][..], &back[1][..]), (&b"h"[..], &b"ij"[..]));
         let (n, _) = file.read_vectored_owned([Vec::with_capacity(4)]).await;
         assert_eq!(n.unwrap(), 0, "the end of the file");
+    });
+}
+
+#[test]
+fn a_files_vectored_read_after_a_buffered_read_and_write_sees_the_write() {
+    nuclei::block_on(async {
+        let t = Temp::new();
+        std::fs::write(t.path("w"), b"0123456789").unwrap();
+        let mut file = nuclei::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t.path("w"))
+            .await
+            .unwrap();
+        let mut one = [0u8; 1];
+        nuclei::io::AsyncReadExt::read_exact(&mut file, &mut one)
+            .await
+            .unwrap();
+        assert_eq!(&one, b"0");
+        file.write_all(b"AB").await.unwrap();
+        let (n, back) = file
+            .read_vectored_owned([
+                Vec::with_capacity(2),
+                Vec::with_capacity(2),
+                Vec::with_capacity(9),
+            ])
+            .await;
+        assert_eq!(n.unwrap(), 7);
+        assert_eq!(
+            (&back[0][..], &back[1][..], &back[2][..]),
+            (&b"34"[..], &b"56"[..], &b"789"[..])
+        );
+    });
+}
+
+#[test]
+fn many_small_buffers_past_one_calls_limit_are_written_whole() {
+    nuclei::block_on(async {
+        let (client, server) = tcp_pair().await;
+        let bufs: Vec<Vec<u8>> = (0..2500).map(|i| pattern(1 + i % 37, i as u8)).collect();
+        let want = bufs.concat();
+        let total = want.len();
+        let reader = nuclei::spawn(async move { read_all(&server, total).await });
+        let (n, back) = client.write_vectored_owned(bufs).await;
+        assert_eq!((n.unwrap(), back.len()), (total, 2500));
+        assert_eq!(reader.await, want);
+
+        let t = Temp::new();
+        let file = File::create_new(t.path("many")).await.unwrap();
+        let bufs: Vec<Vec<u8>> = (0..1500).map(|i| pattern(1 + i % 5, i as u8)).collect();
+        let want = bufs.concat();
+        let (n, _) = file.write_vectored_owned(bufs).await;
+        assert_eq!(n.unwrap(), want.len());
+        file.sync_all().await.unwrap();
+        assert_eq!(std::fs::read(t.path("many")).unwrap(), want);
+        let reader = File::open(t.path("many")).await.unwrap();
+        let rooms: Vec<Vec<u8>> = (0..1200).map(|_| Vec::with_capacity(3)).collect();
+        let (n, back) = reader.read_vectored_owned(rooms).await;
+        let n = n.unwrap();
+        assert!(n > 0 && n <= 3600);
+        assert_eq!(back.concat(), want[..n]);
     });
 }
 

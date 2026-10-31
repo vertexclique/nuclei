@@ -135,7 +135,7 @@ pub(crate) const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
     target_os = "openbsd",
     target_os = "dragonfly"
 )))]
-const SEND_FLAGS: libc::c_int = 0;
+pub(crate) const SEND_FLAGS: libc::c_int = 0;
 
 /// `send(2)`, never raising `SIGPIPE` for a closed peer (the error comes
 /// back as `BrokenPipe` instead).

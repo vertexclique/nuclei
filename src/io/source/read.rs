@@ -607,9 +607,12 @@ impl ReadState {
         let Some(lent) = self.lent.as_mut() else {
             return;
         };
-        let spare = lent.buf.spare_capacity_mut();
-        let asked = spare.len();
-        let result = match sys::ready(sys::read_uninit(fd, spare)) {
+        let asked = lent.buf.capacity() - lent.buf.len();
+        let read = match lent.buf.vectored_mut() {
+            Some(bufs) => sys::readv(fd, bufs.read_iovecs()),
+            None => sys::read_uninit(fd, lent.buf.spare_capacity_mut()),
+        };
+        let result = match sys::ready(read) {
             None => {
                 self.blocked = true;
                 return;
@@ -618,7 +621,7 @@ impl ReadState {
         };
         if let Ok(n) = result {
             // SAFETY: the kernel wrote the first `n` bytes of the spare
-            // capacity.
+            // capacity (of a vectored buffer, its rooms in order).
             unsafe { lent.buf.set_len(lent.buf.len() + n) };
             self.blocked = drained(kind, self.unsure, n, asked);
         }
@@ -1137,13 +1140,21 @@ impl ReadState {
                     self.ahead.is_empty(),
                     "bytes were read past the lent buffer"
                 );
-                self.ahead.push(
-                    Piece::Left {
-                        buf: lent.buf,
-                        start: lent.from,
-                    },
-                    after,
-                );
+                match lent.buf.into_vectored() {
+                    // Each buffer's bytes read, in order, past what it held.
+                    Ok(bufs) => {
+                        for (buf, start) in bufs.read_parts() {
+                            self.ahead.push(Piece::Left { buf, start }, after);
+                        }
+                    }
+                    Err(buf) => self.ahead.push(
+                        Piece::Left {
+                            buf,
+                            start: lent.from,
+                        },
+                        after,
+                    ),
+                }
             }
             Some(Err(err)) => self.error = Some(err),
         }

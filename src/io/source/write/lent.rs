@@ -152,7 +152,11 @@ impl WriteState {
             }
         }
         while lent.done.is_none() && !self.blocked {
-            match sys::ready(write_bytes(fd, kind, lent.rest())) {
+            let written = match lent.buf.vectored_mut() {
+                Some(bufs) => write_iov(fd, kind, bufs.write_iovecs(lent.sent)),
+                None => write_bytes(fd, kind, lent.rest()),
+            };
+            match sys::ready(written) {
                 None => self.blocked = true,
                 Some(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
                 Some(Ok(n)) => {

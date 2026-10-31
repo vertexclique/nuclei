@@ -129,27 +129,66 @@ pub(super) enum Lent {
 
 /// Writes all of a task's `buf` from its `from`th byte at `at` on, every
 /// buffer of a vectored write in turn.
-pub(crate) fn pwrite_owned(fd: Raw, buf: &OwnedBuf, from: usize, at: u64) -> io::Result<()> {
-    let mut done = from;
-    while done < buf.len() {
-        let rest = buf.rest_from(done);
-        sys::pwrite_all(fd, rest, at + (done - from) as u64)?;
-        done += rest.len();
+pub(crate) fn pwrite_owned(fd: Raw, buf: &mut OwnedBuf, from: usize, at: u64) -> io::Result<()> {
+    let Some(bufs) = buf.vectored_mut() else {
+        return sys::pwrite_all(fd, buf.rest_from(from), at);
+    };
+    let (len, mut done) = (bufs.len(), from);
+    while done < len {
+        let n = sys::pwritev(fd, bufs.write_iovecs(done), at + (done - from) as u64)?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        done += n;
     }
     Ok(())
 }
 
+/// Reads at `at` into the spare capacity of a task's `buf`, after the bytes
+/// it holds (of a vectored read, into each buffer's room in order, in one
+/// call), and answers how many bytes came.
+pub(crate) fn pread_owned(fd: Raw, buf: &mut OwnedBuf, at: u64) -> io::Result<usize> {
+    let result = match buf.vectored_mut() {
+        Some(bufs) => sys::preadv(fd, bufs.read_iovecs(), at),
+        None => sys::pread_uninit(fd, buf.spare_capacity_mut(), at),
+    };
+    if let Ok(n) = result {
+        // SAFETY: the kernel wrote the first `n` bytes of the spare capacity
+        // (of a vectored read, its rooms in order).
+        unsafe { buf.set_len(buf.len() + n) };
+    }
+    result
+}
+
 /// Writes all of a task's `buf` at the end of a file opened to append, and
 /// answers where the file's offset is after it.
-fn append_owned(fd: Raw, buf: &OwnedBuf) -> io::Result<u64> {
-    let mut done = 0;
-    loop {
-        let rest = buf.rest_from(done);
-        let end = sys::append_all(fd, rest)?;
-        done += rest.len();
-        if done >= buf.len() {
-            return Ok(end);
+fn append_owned(fd: Raw, buf: &mut OwnedBuf) -> io::Result<u64> {
+    let Some(bufs) = buf.vectored_mut() else {
+        return sys::append_all(fd, buf);
+    };
+    #[cfg(unix)]
+    {
+        // One `writev` a call: each lands whole at the file's end.
+        let (len, mut done) = (bufs.len(), 0);
+        while done < len {
+            let n = sys::writev(fd, bufs.write_iovecs(done))?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            done += n;
         }
+        sys::seek(fd, None)
+    }
+    // A file on Windows has no vectored write: a write each, in order.
+    #[cfg(windows)]
+    {
+        let (len, mut done, mut end) = (bufs.len(), 0, 0);
+        while done < len {
+            let rest = bufs.rest_from(done);
+            end = sys::append_all(fd, rest)?;
+            done += rest.len();
+        }
+        Ok(end)
     }
 }
 
@@ -338,12 +377,7 @@ impl FileIo {
         let fd = self.fd.clone();
         let mut buf = buf;
         Work::Pool(crate::runtime::spawn_blocking(move || {
-            let result = sys::pread_uninit(fd.raw(), buf.spare_capacity_mut(), at);
-            if let Ok(n) = result {
-                // SAFETY: the kernel wrote the first `n` bytes of the spare
-                // capacity.
-                unsafe { buf.set_len(buf.len() + n) };
-            }
+            let result = pread_owned(fd.raw(), &mut buf, at);
             (result, buf)
         }))
     }
@@ -369,7 +403,8 @@ impl FileIo {
         let fd = self.fd.clone();
         Work::Slot(call::write_on_pool(
             move || {
-                let result = pwrite_owned(fd.raw(), &buf, 0, at);
+                let mut buf = buf;
+                let result = pwrite_owned(fd.raw(), &mut buf, 0, at);
                 FileOutcome::WriteLent(result, buf)
             },
             call::as_write_lent,
@@ -386,7 +421,8 @@ impl FileIo {
             let fd = self.fd.clone();
             return Writing::AppendLent(Work::Slot(call::write_on_pool(
                 move || {
-                    let result = append_owned(fd.raw(), &buf);
+                    let mut buf = buf;
+                    let result = append_owned(fd.raw(), &mut buf);
                     FileOutcome::AppendLent(result, buf)
                 },
                 call::as_append_lent,

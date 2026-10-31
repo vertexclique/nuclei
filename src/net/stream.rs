@@ -47,24 +47,22 @@ macro_rules! read_side {
                 self.source().read_owned(buf).await
             }
 
-            /// Reads into the spare capacity of the first of `bufs` that has
-            /// any, after the bytes it holds, as [`read_owned`](Self::read_owned)
-            /// does, and gives `bufs` back with how many bytes came: zero at
-            /// the end of the stream, or when no buffer has spare capacity. It
-            /// is a short read, as std's own `read_vectored` is for a reader
-            /// that reads one buffer at a time: the bytes land in that buffer
-            /// itself, never copied.
+            /// Reads into the spare capacity of `bufs`, after the bytes each
+            /// holds, filling each buffer's room before the next one's, and
+            /// gives `bufs` back with how many bytes came: zero at the end of
+            /// the stream, or when no buffer has spare capacity. One read of
+            /// the kernel takes every room at once (`readv`, a `recvmsg` of
+            /// several buffers, a `WSARecv` of several `WSABUF`s), as
+            /// [`read_owned`](Self::read_owned) lends one buffer: the bytes
+            /// land in the buffers themselves, never copied. Bytes another
+            /// read left behind are copied in instead, in the same order.
             pub async fn read_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
             where
                 V: IoVecBufMut,
             {
-                let mut bufs = vectored::filled(bufs);
-                let Some(room) = bufs.iter_mut().find(|b| b.len() < b.capacity()) else {
-                    return (Ok(0), vectored::into_filled(bufs));
-                };
-                let (result, buf) = self.source().read_owned(core::mem::take(room)).await;
-                *room = buf;
-                (result, vectored::into_filled(bufs))
+                let bufs = OwnedBuf::vectored_read(vectored::filled(bufs));
+                let (result, bufs) = self.source().read_owned(bufs).await;
+                (result, vectored::into_filled(bufs.into_segments()))
             }
 
             /// Waits until a read would end at once.
@@ -169,9 +167,12 @@ macro_rules! write_side {
 
             /// Writes all of the bytes of `bufs`, each buffer's in order, as
             /// one write, and gives `bufs` back with how many bytes that was.
-            /// No other write of the stream comes between two of them. The
-            /// driver writes from the buffers themselves, never copied, each
-            /// buffer in calls of its own. If the future is dropped, as with
+            /// No other write of the stream comes between two of them. Each
+            /// call of the kernel takes every buffer left at once (`writev`,
+            /// a `sendmsg` of several buffers, a `WSASend` of several
+            /// `WSABUF`s), from the buffers themselves, never copied; a call
+            /// the kernel takes part of goes on from the first byte it did
+            /// not take. If the future is dropped, as with
             /// [`write_owned`](Self::write_owned): the stream gets all of the
             /// bytes or none of them.
             pub async fn write_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)

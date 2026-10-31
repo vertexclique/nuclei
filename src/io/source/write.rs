@@ -190,6 +190,15 @@ fn write_bytes(fd: RawFd, kind: Kind, bytes: &[u8]) -> io::Result<usize> {
 }
 
 #[cfg(readiness)]
+/// Writes the bytes the descriptors name, in order, in one call.
+fn write_iov(fd: RawFd, kind: Kind, iov: &[crate::buf::vectored::IoVec]) -> io::Result<usize> {
+    match kind {
+        Kind::Bytes | Kind::File => sys::writev(fd, iov),
+        _ => sys::sendv(fd, iov),
+    }
+}
+
+#[cfg(readiness)]
 /// Sends a datagram.
 fn send_datagram(fd: RawFd, bytes: &[u8], dest: Dest<'_>) -> io::Result<usize> {
     match dest {

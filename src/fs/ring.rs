@@ -204,6 +204,10 @@ impl FileOp {
                 Sqe::read(fd, room.as_mut_ptr(), len32(len), self.at)
             }
             FileMem::ReadLent(buf) => {
+                if let Some(bufs) = buf.vectored_mut() {
+                    let iov = bufs.read_iovecs();
+                    return Sqe::readv(fd, iov.as_ptr(), len32(iov.len()), self.at);
+                }
                 let spare = buf.spare_capacity_mut();
                 Sqe::read(fd, spare.as_mut_ptr().cast(), len32(spare.len()), self.at)
             }
@@ -217,6 +221,11 @@ impl FileOp {
                 )
             }
             FileMem::WriteLent { buf, done } => {
+                if let Some(bufs) = buf.vectored_mut() {
+                    let iov = bufs.write_iovecs(*done);
+                    let count = len32(iov.len());
+                    return Sqe::writev(fd, iov.as_ptr(), count, self.at + *done as u64);
+                }
                 let bytes = buf.rest_from(*done);
                 Sqe::write(
                     fd,
@@ -328,12 +337,7 @@ impl FileOp {
                     }))
                 }
                 FileMem::ReadLent(mut buf) => {
-                    let result = sys::pread_uninit(raw, buf.spare_capacity_mut(), at);
-                    if let Ok(n) = result {
-                        // SAFETY: the call wrote the first `n` bytes of the
-                        // spare capacity.
-                        unsafe { buf.set_len(buf.len() + n) };
-                    }
+                    let result = crate::fs::file::pread_owned(raw, &mut buf, at);
                     FileOutcome::ReadLent(result, buf)
                 }
                 FileMem::Write { buf, done } => FileOutcome::Write(sys::pwrite_all(
@@ -341,8 +345,9 @@ impl FileOp {
                     buf.filled().get(done..).unwrap_or_default(),
                     at + done as u64,
                 )),
-                FileMem::WriteLent { buf, done } => {
-                    let result = crate::fs::file::pwrite_owned(raw, &buf, done, at + done as u64);
+                FileMem::WriteLent { mut buf, done } => {
+                    let result =
+                        crate::fs::file::pwrite_owned(raw, &mut buf, done, at + done as u64);
                     FileOutcome::WriteLent(result, buf)
                 }
                 FileMem::Sync { data_only } => FileOutcome::Sync(sync_on(

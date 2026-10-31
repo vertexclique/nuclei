@@ -674,8 +674,13 @@ fn entry(
             }
         },
         Want::RecvLent(mut buf) => {
-            let spare = buf.spare_capacity_mut();
-            let sqe = stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len());
+            let sqe = match buf.vectored_mut() {
+                Some(bufs) => stream_readv(kind, slot, bufs),
+                None => {
+                    let spare = buf.spare_capacity_mut();
+                    stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len())
+                }
+            };
             (RingMem::RecvLent(buf), sqe)
         }
         Want::RecvFrom(mut buf) => {
@@ -699,8 +704,11 @@ fn entry(
             let sqe = stream_write(kind, slot, buf.filled());
             (RingMem::Send(buf), sqe)
         }
-        Want::SendLent(buf, from) => {
-            let sqe = stream_write(kind, slot, buf.rest_from(from));
+        Want::SendLent(mut buf, from) => {
+            let sqe = match buf.vectored_mut() {
+                Some(bufs) => stream_writev(kind, slot, bufs, from),
+                None => stream_write(kind, slot, buf.rest_from(from)),
+            };
             (RingMem::SendLent(buf), sqe)
         }
         Want::SendPinned(buf, from, zero_copy) => {
@@ -751,6 +759,40 @@ fn stream_read(kind: Kind, slot: RawFd, buf: *mut u8, len: usize) -> Sqe {
     match kind {
         Kind::Bytes => Sqe::read(slot, buf, len, u64::MAX),
         _ => Sqe::recv(slot, buf, len, 0),
+    }
+}
+
+/// A stream read into the rooms of the buffers of a vectored read, in order:
+/// `recvmsg` on a socket, `readv` at the current position on a pipe or a
+/// terminal. The descriptors and the message stay in the buffers, which the
+/// operation holds until its last completion.
+fn stream_readv(kind: Kind, slot: RawFd, bufs: &mut crate::buf::vectored::Vectored) -> Sqe {
+    match kind {
+        Kind::Bytes => {
+            let iov = bufs.read_iovecs();
+            let count = u32::try_from(iov.len()).unwrap_or(u32::MAX);
+            Sqe::readv(slot, iov.as_ptr(), count, u64::MAX)
+        }
+        _ => Sqe::recvmsg(slot, bufs.recv_msg(), 0),
+    }
+}
+
+/// A stream write of the bytes of a vectored write's buffers from the
+/// `from`th on: `sendmsg` on a socket, `writev` at the current position on a
+/// pipe or a terminal.
+fn stream_writev(
+    kind: Kind,
+    slot: RawFd,
+    bufs: &mut crate::buf::vectored::Vectored,
+    from: usize,
+) -> Sqe {
+    match kind {
+        Kind::Bytes | Kind::File => {
+            let iov = bufs.write_iovecs(from);
+            let count = u32::try_from(iov.len()).unwrap_or(u32::MAX);
+            Sqe::writev(slot, iov.as_ptr(), count, u64::MAX)
+        }
+        _ => Sqe::sendmsg(slot, bufs.send_msg(from), sys::SEND_FLAGS as u32),
     }
 }
 

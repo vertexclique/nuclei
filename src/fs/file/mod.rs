@@ -90,7 +90,7 @@ pub(crate) use self::space::range_end;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::work::bounce as bounce_for_test;
 #[cfg(ring)]
-pub(crate) use self::work::pwrite_owned;
+pub(crate) use self::work::{pread_owned, pwrite_owned};
 
 /// The least a read job asks for, so a run of small reads takes one job.
 pub(crate) const READ_MIN: usize = 64 * 1024;
