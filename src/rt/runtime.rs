@@ -774,12 +774,12 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let hooks = inner.task_hooks.clone();
+    let hooks = inner.task_hooks.as_ref();
     let (runnable, task) = task::spawn(
         future,
-        Sched::counted(Arc::clone(shard), None, hooks.clone()),
+        Sched::counted(Arc::clone(shard), None, hooks.cloned()),
     );
-    spawned(hooks.as_deref(), &task);
+    spawned(hooks.map(|hooks| &**hooks), &task);
     // As its schedule would, without the turn through the task's table.
     if let Some(runnable) = super::sched::queue_here(shard, runnable, ScheduleInfo::new(false)) {
         runnable.schedule();
