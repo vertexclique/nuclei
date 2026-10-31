@@ -8,11 +8,12 @@
 //!
 //! The budget is a per-thread counter, saved and restored around each poll,
 //! so a `block_on` nested in a task gives its own polls a budget of their own
-//! and leaves the task's as it was. It shares one thread-local with the id of
-//! the task being polled, so a task's poll saves and restores both with one
-//! lookup. Outside a budgeted poll, and in an [`unconstrained`] one, the
-//! counter holds `UNBUDGETED`, which no thread could spend in its life: an
-//! operation there spends without a branch of its own, and never yields.
+//! and leaves the task's as it was. It lives in the thread's one context
+//! (`rt::context`) next to the id of the task being polled, so a task's poll
+//! saves and restores both through one access. Outside a budgeted poll, and
+//! in an [`unconstrained`] one, the counter holds `UNBUDGETED`, which no
+//! thread could spend in its life: an operation there spends without a branch
+//! of its own, and never yields.
 
 use core::cell::Cell;
 use core::future::Future;
@@ -26,25 +27,12 @@ pub const BUDGET: u8 = 128;
 
 /// The budget outside a budgeted poll: `2^64 - 1` operations, more than a
 /// thread completes at one per nanosecond in 500 years, so it never runs out.
-const UNBUDGETED: u64 = u64::MAX;
+pub(crate) const UNBUDGETED: u64 = u64::MAX;
 
-/// What this thread is polling.
-struct Polling {
-    /// The budget left in the poll; `UNBUDGETED` outside a poll, or in an
-    /// [`unconstrained`] one.
-    left: Cell<u64>,
-    /// The task being polled; `None` outside a task (in `block_on`'s own
-    /// future, on a blocking-pool thread).
-    task: Cell<Option<Id>>,
-}
-
-std::thread_local! {
-    static POLLING: Polling = const {
-        Polling {
-            left: Cell::new(UNBUDGETED),
-            task: Cell::new(None),
-        }
-    };
+/// The budget left in this thread's poll.
+#[inline(always)]
+fn left() -> &'static Cell<u64> {
+    &crate::rt::context::local().budget
 }
 
 /// What [`enter_task`] replaced, for [`leave_task`] to put back.
@@ -57,56 +45,49 @@ pub(crate) struct Entered {
 /// Starts the poll of task `id`: a fresh budget, and `id` as the current
 /// task. Answers what it replaced (a `block_on` inside a task polls other
 /// tasks in between).
-#[inline]
+#[inline(always)]
 pub(crate) fn enter_task(id: Id) -> Entered {
-    POLLING
-        .try_with(|p| Entered {
-            left: p.left.replace(u64::from(BUDGET)),
-            task: p.task.replace(Some(id)),
-        })
-        .unwrap_or(Entered {
-            left: UNBUDGETED,
-            task: None,
-        })
+    let here = crate::rt::context::local();
+    Entered {
+        left: here.budget.replace(u64::from(BUDGET)),
+        task: here.task.replace(Some(id)),
+    }
 }
 
 /// Puts back what [`enter_task`] replaced.
-#[inline]
+#[inline(always)]
 pub(crate) fn leave_task(entered: Entered) {
-    let _ = POLLING.try_with(|p| {
-        p.left.set(entered.left);
-        p.task.set(entered.task);
-    });
+    let here = crate::rt::context::local();
+    here.budget.set(entered.left);
+    here.task.set(entered.task);
 }
 
 /// The task being polled on this thread, if any.
 #[inline]
 pub(crate) fn current_task() -> Option<Id> {
-    POLLING.try_with(|p| p.task.get()).ok().flatten()
+    crate::rt::context::local().task.get()
 }
 
 /// Starts a poll's budget, and answers the budget before it.
 #[inline]
 pub(crate) fn enter() -> u64 {
-    POLLING
-        .try_with(|p| p.left.replace(u64::from(BUDGET)))
-        .unwrap_or(UNBUDGETED)
+    left().replace(u64::from(BUDGET))
 }
 
 /// Puts back the budget `enter` replaced.
 #[inline]
 pub(crate) fn leave(previous: u64) {
-    let _ = POLLING.try_with(|p| p.left.set(previous));
+    left().set(previous);
 }
 
 /// Runs `f` outside the budget, as a call that does not wait (a `try_`
 /// read or write) is: it neither spends nor yields.
+#[inline]
 pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
-    let saved = POLLING
-        .try_with(|p| p.left.replace(UNBUDGETED))
-        .unwrap_or(UNBUDGETED);
+    let left = left();
+    let saved = left.replace(UNBUDGETED);
     let result = f();
-    leave(saved);
+    left.set(saved);
     result
 }
 
@@ -115,24 +96,21 @@ pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
 /// spent, and the operation completes nothing and yields.
 #[inline(always)]
 pub(crate) fn try_spend() -> bool {
-    POLLING
-        .try_with(|p| {
-            // Stored before the branch, so the step is one decrement of the
-            // counter in memory; a spent budget has its zero put back.
-            let (rest, spent) = p.left.get().overflowing_sub(1);
-            p.left.set(rest);
-            if spent {
-                was_spent(p);
-            }
-            !spent
-        })
-        .unwrap_or(true)
+    let left = left();
+    // Stored before the branch, so the step is one decrement of the counter
+    // in memory; a spent budget has its zero put back.
+    let (rest, spent) = left.get().overflowing_sub(1);
+    left.set(rest);
+    if spent {
+        was_spent();
+    }
+    !spent
 }
 
 #[cold]
 #[inline(never)]
-fn was_spent(p: &Polling) {
-    p.left.set(0);
+fn was_spent() {
+    left().set(0);
 }
 
 /// [`try_spend`] for an operation polled with `waker`: when the budget is
@@ -156,18 +134,17 @@ fn refused(waker: &Waker) -> bool {
 /// answers `Pending` without starting.
 #[inline]
 pub(crate) fn exhausted(waker: &Waker) -> bool {
-    POLLING.try_with(|p| p.left.get()).unwrap_or(UNBUDGETED) == 0 && !refused(waker)
+    left().get() == 0 && !refused(waker)
 }
 
 /// Spends one operation of a budget [`exhausted`] just found not spent, for
 /// the operation that then completed.
 #[inline(always)]
 pub(crate) fn spent_one() {
-    let _ = POLLING.try_with(|p| {
-        let left = p.left.get();
-        debug_assert_ne!(left, 0, "spent without a look at the budget");
-        p.left.set(left.wrapping_sub(1));
-    });
+    let left = left();
+    let rest = left.get();
+    debug_assert_ne!(rest, 0, "spent without a look at the budget");
+    left.set(rest.wrapping_sub(1));
 }
 
 /// Gives back the operation [`try_spend`] took, for one that did not
@@ -175,12 +152,14 @@ pub(crate) fn spent_one() {
 /// budget meanwhile.
 #[inline]
 fn refund() {
-    let _ = POLLING.try_with(|p| p.left.set(p.left.get().saturating_add(1)));
+    let left = left();
+    left.set(left.get().saturating_add(1));
 }
 
 /// Spends one operation of the budget for `poll`, or yields when it is spent:
 /// `Pending`, with the task woken to run again after the others. A `poll`
 /// that answers `Pending` gets its operation back.
+#[inline]
 pub(crate) fn poll_budget<T>(
     cx: &mut Context<'_>,
     poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
@@ -198,7 +177,7 @@ pub(crate) fn poll_budget<T>(
 /// Whether the current poll has budget left (always `true` outside a poll
 /// and in an [`unconstrained`] one).
 pub fn has_budget_remaining() -> bool {
-    POLLING.try_with(|p| p.left.get()).unwrap_or(UNBUDGETED) != 0
+    left().get() != 0
 }
 
 /// Spends one operation of the budget, yielding first when it is spent: a

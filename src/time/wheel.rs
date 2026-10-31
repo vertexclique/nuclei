@@ -321,6 +321,7 @@ impl Wheel {
     }
 
     /// Links an entry into the slot its deadline belongs to now.
+    #[inline(always)]
     fn link(&mut self, index: usize) {
         let when = self.entries[index].when;
         // A deadline beyond the span is placed at the span's edge.

@@ -30,7 +30,7 @@ pub(crate) struct Tuning {
     pub(crate) lifo: bool,
     pub(crate) hooks: ThreadHooks,
     /// Jobs in flight on the runtime's blocking pool: while any is, a shard that
-    /// runs dry spins, as one of them may wake it.
+    /// runs dry parks, and a park one of them cuts short does not make it spin.
     pub(crate) blocking: Option<Arc<crate::sync::internal::AtomicUsize>>,
 }
 
@@ -142,11 +142,6 @@ impl TaskHooks {
 /// Whether any runtime of the process has task hooks: while none does, a
 /// spawn that does not know its runtime looks for none.
 pub(crate) static ANY_TASK_HOOKS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Whether any runtime of the process has a hook around each poll: while
-/// none does, a poll calls none.
-pub(crate) static ANY_POLL_HOOKS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// What a runtime does when one of its tasks panics

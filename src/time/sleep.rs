@@ -7,6 +7,7 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::sync::Arc;
@@ -117,7 +118,9 @@ impl Grain for Fine {
 /// shard that polls it. Dropping it cancels it.
 pub(super) struct Timer<G: Grain> {
     pub(super) deadline: Instant,
-    state: State,
+    /// Never dropped as it is: the drop releases what it holds, which leaves
+    /// it holding nothing.
+    state: ManuallyDrop<State>,
     grain: PhantomData<G>,
 }
 
@@ -139,14 +142,14 @@ impl<G: Grain> Timer<G> {
     pub(super) fn new(deadline: Instant) -> Self {
         Self {
             deadline,
-            state: State::Idle,
+            state: ManuallyDrop::new(State::Idle),
             grain: PhantomData,
         }
     }
 
     /// Whether the deadline has passed.
     pub(super) fn is_elapsed(&self) -> bool {
-        matches!(self.state, State::Done) || Instant::now() >= self.deadline
+        matches!(*self.state, State::Done) || Instant::now() >= self.deadline
     }
 
     /// Moves the deadline; the timer is pending again until it.
@@ -155,9 +158,20 @@ impl<G: Grain> Timer<G> {
         self.deadline = deadline;
     }
 
-    /// Lets go of the timer, wherever it is armed.
+    /// Lets go of the timer, wherever it is armed, and leaves the timer idle.
+    #[inline]
     fn release(&mut self) {
-        match core::mem::replace(&mut self.state, State::Idle) {
+        match *self.state {
+            State::Idle => {}
+            // Fired: nothing to let go of, and pending again (a reset).
+            State::Done => *self.state = State::Idle,
+            State::Local { .. } | State::Remote { .. } => self.release_armed(),
+        }
+    }
+
+    #[inline(never)]
+    fn release_armed(&mut self) {
+        match core::mem::replace(&mut *self.state, State::Idle) {
             State::Local { owner, key } => {
                 let here = context::current(|current| match current {
                     Some(shard) if shard.is(&owner) => {
@@ -185,7 +199,7 @@ impl<G: Grain> Timer<G> {
     }
 
     fn poll_local(&mut self, shard: &Shard, cx: &mut Context<'_>) -> Poll<()> {
-        if let State::Local { owner, key } = &self.state
+        if let State::Local { owner, key } = &*self.state
             && shard.is(owner)
         {
             let key = *key;
@@ -193,20 +207,25 @@ impl<G: Grain> Timer<G> {
             if wheel.is_fired(key) {
                 wheel.remove(key);
                 drop(wheel);
-                self.state = State::Done;
+                // The state is `Local`: its owner goes, and nothing else.
+                if let State::Local { owner, .. } =
+                    core::mem::replace(&mut *self.state, State::Done)
+                {
+                    drop(owner);
+                }
                 return Poll::Ready(());
             }
             wheel.set_waker(key, cx.waker());
             return Poll::Pending;
         }
-        if let State::Remote { cell, .. } = &self.state {
-            return poll_cell(cell, cx).map(|()| self.state = State::Done);
+        if let State::Remote { cell, .. } = &*self.state {
+            return poll_cell(cell, cx).map(|()| *self.state = State::Done);
         }
         // Not armed here: armed now (after letting go of an arming on
         // another shard, if it moved).
         self.release();
         if Instant::now() >= self.deadline {
-            self.state = State::Done;
+            *self.state = State::Done;
             return Poll::Ready(());
         }
         let at = shard.time_of(G::PRECISE, self.deadline.into_std());
@@ -215,11 +234,11 @@ impl<G: Grain> Timer<G> {
         if wheel.is_fired(key) {
             wheel.remove(key);
             drop(wheel);
-            self.state = State::Done;
+            *self.state = State::Done;
             return Poll::Ready(());
         }
         drop(wheel);
-        self.state = State::Local {
+        *self.state = State::Local {
             owner: Arc::clone(&shard.shared),
             key,
         };
@@ -227,12 +246,12 @@ impl<G: Grain> Timer<G> {
     }
 
     fn poll_remote(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let State::Remote { cell, .. } = &self.state {
-            return poll_cell(cell, cx).map(|()| self.state = State::Done);
+        if let State::Remote { cell, .. } = &*self.state {
+            return poll_cell(cell, cx).map(|()| *self.state = State::Done);
         }
         self.release();
         if Instant::now() >= self.deadline {
-            self.state = State::Done;
+            *self.state = State::Done;
             return Poll::Ready(());
         }
         let cell = Arc::new(RemoteTimer {
@@ -249,20 +268,25 @@ impl<G: Grain> Timer<G> {
             at: self.deadline,
             cell: Arc::clone(&cell),
         });
-        self.state = State::Remote { shard, cell };
+        *self.state = State::Remote { shard, cell };
         Poll::Pending
     }
 
     pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let State::Done = self.state {
+        if let State::Done = *self.state {
             return Poll::Ready(());
         }
-        if let State::Remote { cell, .. } = &self.state
+        if let State::Remote { cell, .. } = &*self.state
             && cell.orphaned.load(Ordering::Acquire)
         {
             // The shard that held the timer went without firing it, and holds
             // it no more: it is armed again where this poll runs.
-            self.state = State::Idle;
+            *self.state = State::Idle;
+        }
+        // On the shard this thread runs with no bracket to take, as `current`
+        // would hand it over.
+        if let Some(shard) = context::running_inside(context::local()) {
+            return self.poll_local(shard, cx);
         }
         context::current(|current| match current {
             Some(shard) => self.poll_local(shard, cx),
@@ -273,7 +297,10 @@ impl<G: Grain> Timer<G> {
 
 impl<G: Grain> Drop for Timer<G> {
     fn drop(&mut self) {
-        self.release();
+        // What the state holds goes here; idle or done, it holds nothing.
+        if matches!(*self.state, State::Local { .. } | State::Remote { .. }) {
+            self.release_armed();
+        }
     }
 }
 

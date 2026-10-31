@@ -1,8 +1,10 @@
 ------------------------------ MODULE Handoff ------------------------------
 (***************************************************************************)
 (* The shard handoff (src/rt/handoff/, its callers in src/rt/shard.rs and  *)
-(* src/rt/context.rs) on a machine whose stores wait in a store buffer, as *)
-(* x86's do.                                                               *)
+(* src/rt/context.rs: `poll_watched`, the bracket of `current`) on a       *)
+(* machine whose stores wait in a store buffer, as x86's do. A shard no    *)
+(* monitor watches has no slot, and its polls (`poll_unwatched`) take no   *)
+(* part in this protocol.                                                  *)
 (*                                                                          *)
 (* In plain words: one thread at a time runs a shard (its runner). Each    *)
 (* runner has a slot of its own: a word it writes (in the loop, or in a    *)

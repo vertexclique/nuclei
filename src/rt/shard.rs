@@ -128,6 +128,8 @@ pub(crate) struct Shared {
     /// A worker's shard: its runtime, inside which a task of the shard woken
     /// on another thread after the shard stopped is dropped.
     runtime: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
+    /// The address of that runtime, 0 for none: compared, never followed.
+    runtime_addr: AtomicUsize,
     /// File writes issued on the shard whose end's wake has not gone yet.
     writes: AtomicUsize,
     /// The shard drained its inbox for the last time as it was dropped, and
@@ -349,18 +351,29 @@ impl Shared {
 
     /// Makes `runtime` the one this worker's shard belongs to.
     pub(crate) fn set_runtime(&self, runtime: std::sync::Weak<super::runtime::Inner>) {
-        let _ = self.runtime.set(runtime);
+        let addr = runtime.as_ptr() as usize;
+        if self.runtime.set(runtime).is_ok() {
+            self.runtime_addr.store(addr, Ordering::Release);
+        }
     }
 
     /// Sets the shard's runtime on this thread, unless it is set already:
     /// for a task of the shard dropped where its waker ran (on another
     /// thread, the shard stopped), so what its drop hands on (a dropped
     /// handle's bytes) goes to its runtime (`rt::linger`).
+    #[inline]
     pub(crate) fn enter_runtime(&self) -> Option<super::context::RuntimeSet> {
-        let runtime = self.runtime.get()?;
-        if super::context::runtime_is(runtime.as_ptr()) {
+        let addr = self.runtime_addr.load(Ordering::Acquire);
+        if addr == 0 || super::context::runtime_is(addr as *const super::runtime::Inner) {
             return None;
         }
+        Self::set_runtime_here(self.runtime.get()?)
+    }
+
+    #[inline(never)]
+    fn set_runtime_here(
+        runtime: &std::sync::Weak<super::runtime::Inner>,
+    ) -> Option<super::context::RuntimeSet> {
         runtime
             .upgrade()
             .and_then(|inner| super::context::try_set_runtime(&inner))
@@ -414,6 +427,7 @@ impl Shared {
     }
 
     /// Whether placement may give the shard a new task.
+    #[inline]
     pub(crate) fn takes_tasks(&self) -> bool {
         !self.draining.load(Ordering::Relaxed)
     }
@@ -619,6 +633,8 @@ pub(crate) struct Shard {
     epoch: Instant,
     /// Wakers of fired timers, woken once the wheel is let go; reused.
     fired: RefCell<Vec<Waker>>,
+    /// The waker the last `block_on` here left, for the next one's future.
+    signal: Cell<Option<Arc<signal::Signal>>>,
     /// The IO sources the poller watches, by token.
     sources: RefCell<Sources>,
     /// The children whose exits the poller or the port watches, by token.
@@ -756,6 +772,7 @@ impl Shard {
             io_closed: AtomicBool::new(false),
             counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
             runtime: std::sync::OnceLock::new(),
+            runtime_addr: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             released: AtomicBool::new(false),
             timer_at: AtomicU64::new(u64::MAX),
@@ -786,6 +803,7 @@ impl Shard {
             precise: RefCell::new(Wheel::new()),
             epoch: crate::time::clock::origin(),
             fired: RefCell::new(Vec::new()),
+            signal: Cell::new(None),
             sources: RefCell::new(Sources::default()),
             children: RefCell::new(children::Children::default()),
             pool,
@@ -890,7 +908,14 @@ impl Shard {
     /// task being polled runs next (the LIFO slot), unless it is that task
     /// itself yielding.
     pub(crate) fn push_local(&self, runnable: Runnable, info: ScheduleInfo) {
-        if self.tuning.lifo && !info.woken_while_running && super::context::in_task() {
+        self.push_local_from(runnable, info, super::context::in_task());
+    }
+
+    /// [`push_local`](Self::push_local) from a caller that read
+    /// [`in_task`](super::context::in_task) already.
+    #[inline(always)]
+    pub(crate) fn push_local_from(&self, runnable: Runnable, info: ScheduleInfo, in_task: bool) {
+        if self.tuning.lifo && !info.woken_while_running && in_task {
             if let Some(previous) = self.lifo.replace(Some(runnable)) {
                 self.queue.borrow_mut().push_back(previous);
             }
@@ -900,6 +925,7 @@ impl Shard {
     }
 
     /// The next runnable, in the loop's order.
+    #[inline(always)]
     fn next(&self) -> Option<Runnable> {
         let left = self.until_inbox.get().wrapping_sub(1);
         if left == 0 {
@@ -915,14 +941,21 @@ impl Shard {
                 self.lifo_streak.set(self.lifo_streak.get() + 1);
                 return Some(r);
             }
-            // The slot's task ran enough times in a row: to the back.
-            self.queue.borrow_mut().push_back(r);
+            // The slot's task ran enough times in a row: to the back, which
+            // is the front when nothing else is queued.
+            let mut queue = self.queue.borrow_mut();
+            if queue.is_empty() {
+                self.lifo_streak.set(0);
+                return Some(r);
+            }
+            queue.push_back(r);
         }
         self.lifo_streak.set(0);
         let local = self.queue.borrow_mut().pop_front();
         local.or_else(|| self.pop_inbox())
     }
 
+    #[inline(never)]
     fn pop_inbox(&self) -> Option<Runnable> {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
@@ -1057,25 +1090,26 @@ impl Shard {
         self.driver.backend()
     }
 
-    /// Whether something outside this thread can bring it work within a spin's time: a job on
-    /// the runtime's blocking pool (any shard's: the pool does not say whose), or a finite
+    /// Whether something outside this thread can bring it work within a spin's time: a finite
     /// operation of the ring still out. Work posted by other threads is not foreseen, so a shard
-    /// with neither parks at once.
+    /// with none parks at once. A job on the runtime's blocking pool is not such work: it runs
+    /// for as long as it blocks, and its end wakes the shard with one notification.
     fn work_may_come_soon(&self) -> bool {
-        if self
-            .tuning
-            .blocking
-            .as_ref()
-            .is_some_and(|jobs| jobs.load(Ordering::Relaxed) > 0)
-        {
-            return true;
-        }
         #[cfg(ring)]
         return self
             .ring()
             .is_some_and(ring::ShardRing::expects_completions);
         #[cfg(not(ring))]
         false
+    }
+
+    /// Whether a job of the runtime's blocking pool is out (any shard's: the pool does not say
+    /// whose).
+    fn blocking_out(&self) -> bool {
+        self.tuning
+            .blocking
+            .as_ref()
+            .is_some_and(|jobs| jobs.load(Ordering::Relaxed) > 0)
     }
 
     /// The shard's ring, if its IO runs on one.
@@ -1103,3 +1137,7 @@ impl Shard {
 
 #[cfg(all(test, not(loom)))]
 mod tests;
+#[cfg(all(test, not(loom)))]
+mod tests_pool;
+#[cfg(all(test, not(loom)))]
+mod tests_signal;

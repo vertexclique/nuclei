@@ -1,7 +1,7 @@
 ------------------------------ MODULE RunLoop ------------------------------
 (***************************************************************************)
 (* How often a shard's run loop looks at its IO driver                     *)
-(* (src/rt/shard.rs: `Shard::block_on`), one turn of the loop per step.    *)
+(* (src/rt/shard/run.rs: `Shard::run_loop`), one turn of the loop per step. *)
 (*                                                                          *)
 (* In plain words: each turn the loop polls its future if it was woken,     *)
 (* then runs one task if one is ready. Every `N` task runs it looks at the  *)

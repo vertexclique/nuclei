@@ -24,12 +24,14 @@ impl Shard {
         self.publish();
     }
 
-    /// Counts a sleep of `slept` for `stats` and tells the spin how long it
-    /// was.
-    pub(super) fn slept_for(&self, slept: std::time::Duration) {
+    /// Counts a sleep of `slept` for `stats` and, unless a blocking job was out
+    /// (`tells_the_spin` false), tells the spin how long it was.
+    pub(super) fn slept_for(&self, slept: std::time::Duration, tells_the_spin: bool) {
         self.sleeps.set(self.sleeps.get() + 1);
         self.slept.set(self.slept.get() + slept);
-        self.spin.parked_for(slept);
+        if tells_the_spin {
+            self.spin.parked_for(slept);
+        }
     }
 
     /// Publishes the polls, the sleeps, the queue, the remote wakes, the

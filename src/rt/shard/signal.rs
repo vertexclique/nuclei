@@ -24,6 +24,17 @@ impl Signal {
             target: Target::new(Arc::clone(shared)),
         }
     }
+
+    /// Makes the signal, which nothing else holds, a new future's: woken once,
+    /// as [`new`](Self::new) makes it. False for one whose target moved,
+    /// which stays its first shard's no more.
+    pub(super) fn reset(&mut self) -> bool {
+        if self.target.moved() {
+            return false;
+        }
+        self.woken.store(true, Ordering::Relaxed);
+        true
+    }
 }
 
 impl Wake for Signal {
