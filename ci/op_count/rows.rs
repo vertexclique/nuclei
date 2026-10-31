@@ -41,7 +41,8 @@ fn tmp_path(tag: &str) -> std::path::PathBuf {
 fn bench_file(size: usize) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("nuclei-op-count-file-{size}"));
     if std::fs::metadata(&path).map_or(true, |m| m.len() != size as u64) {
-        std::fs::write(&path, vec![5u8; size]).expect("the file is written");
+        let file = std::fs::File::create(&path).expect("the file is made");
+        file.set_len(size as u64).expect("the file is sized");
     }
     path
 }
