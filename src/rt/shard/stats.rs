@@ -24,6 +24,25 @@ impl Shard {
         self.publish();
     }
 
+    #[cfg(completion)]
+    /// Has the shard's ring or port stamp the operations it issues from now
+    /// on, to record their latencies; a readiness poller issues none.
+    pub(super) fn time_io(&self) {
+        let Some(times) = self.shared.counters.io_times() else {
+            return;
+        };
+        match &self.driver {
+            #[cfg(ring)]
+            Driver::Ring(ring) => ring.time_with(std::sync::Arc::clone(times)),
+            #[cfg(ring)]
+            Driver::Gone => {}
+            #[cfg(readiness)]
+            Driver::Poll(_) => {}
+            #[cfg(port)]
+            Driver::Poll(_) => self.shared.port.time_with(std::sync::Arc::clone(times)),
+        }
+    }
+
     /// Counts a sleep of `slept` for `stats` and tells the spin how long it
     /// was.
     pub(super) fn slept_for(&self, slept: std::time::Duration) {

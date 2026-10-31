@@ -655,8 +655,13 @@ impl Shard {
         monitor: Option<Arc<super::handoff::Monitor>>,
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
+        if tuning.count_io {
+            shard.shared.counters.count_io();
+        }
         if tuning.record_latencies {
             shard.shared.counters.record_latencies();
+            #[cfg(completion)]
+            shard.time_io();
         }
         shard.until_inbox.set(tuning.inbox_interval);
         shard.tuning = tuning;

@@ -117,7 +117,10 @@ macro_rules! send_file {
                     .await?;
                     match step {
                         Ok(0) => break,
-                        Ok(n) => sent += n as u64,
+                        Ok(n) => {
+                            crate::rt::counters::tally::wrote(n);
+                            sent += n as u64;
+                        }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             let raw = sock.raw();
                             self.async_io(Interest::WRITABLE, || crate::io::sys::poll_writable(raw))
@@ -172,6 +175,7 @@ macro_rules! send_file {
                     .await?;
                     buf = back;
                     let n = read?;
+                    crate::rt::counters::tally::read(n);
                     if n == 0 {
                         break;
                     }

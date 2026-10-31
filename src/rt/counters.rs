@@ -15,6 +15,9 @@
 //!   busy, which it makes at least once every
 //!   [`DRIVER_INTERVAL`](super::shard::DRIVER_INTERVAL) task runs: a
 //!   snapshot sees them as the shard last published them;
+//! - the IO operations the shard's thread completed, counted in the thread's
+//!   own cells ([`tally`]) and drained into the shard's totals as it
+//!   publishes: IO on a thread that runs no shard is counted by none;
 //! - errors, counted by whichever thread met them, against the shard that
 //!   thread runs, or in one table for the threads that run none: an atomic
 //!   add, on a path that failed already.
@@ -30,6 +33,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::io;
 use std::sync::{Arc, OnceLock, Weak};
+
+pub(crate) mod tally;
 
 use super::shard::Shared;
 use crate::IoBackend;
@@ -117,6 +122,12 @@ pub(crate) struct Counters {
     /// The poll times, while the runtime records them (made once, before the
     /// shard runs anything).
     poll_times: OnceLock<Box<Buckets>>,
+    /// The IO latencies, while the runtime records them (made with
+    /// `poll_times`); shared with the shard's ring or port.
+    io_times: OnceLock<Arc<IoTimes>>,
+    /// The IO operations counted, while the runtime counts them (made once,
+    /// before the shard runs anything).
+    io: OnceLock<Box<IoTotals>>,
     /// The shard's runtime and its place among the runtime's workers.
     owner: Option<(u64, usize)>,
     /// The shard went: its `Shared` may outlive it, held by a waker.
@@ -160,6 +171,8 @@ impl Counters {
             longest_poll_nanos: AtomicU64::new(0),
             budget_yields: AtomicU64::new(0),
             poll_times: OnceLock::new(),
+            io_times: OnceLock::new(),
+            io: OnceLock::new(),
             owner,
             gone: AtomicBool::new(false),
             backend,
@@ -183,6 +196,20 @@ impl Counters {
         self.ops_in_flight
             .store(now.ops_in_flight, Ordering::Relaxed);
         self.cq_overflows.store(now.cq_overflows, Ordering::Relaxed);
+        // The thread's counts go to the shard it runs, or nowhere if that
+        // shard's runtime does not count them.
+        if tally::counting() {
+            let io = tally::take();
+            if let Some(totals) = self.io.get() {
+                totals.add(&io);
+            }
+        }
+    }
+
+    /// The shard counts its IO operations from now on.
+    pub(crate) fn count_io(&self) {
+        tally::start();
+        let _ = self.io.set(Box::default());
     }
 
     /// The shard was handed to another thread, its runner blocked.
@@ -199,6 +226,13 @@ impl Counters {
     /// The shard records the time of each poll from now on.
     pub(crate) fn record_latencies(&self) {
         let _ = self.poll_times.set(Box::new(Buckets::new()));
+        let _ = self.io_times.set(Arc::new(IoTimes::new()));
+    }
+
+    #[cfg(completion)]
+    /// The IO latency buckets, if the shard records them.
+    pub(crate) fn io_times(&self) -> Option<&Arc<IoTimes>> {
+        self.io_times.get()
     }
 
     /// A poll of `length` ran on the shard, which records poll times.
@@ -266,7 +300,47 @@ impl Counters {
             ),
             budget_yields: self.budget_yields.load(Ordering::Relaxed),
             poll_times: self.poll_times.get().map(|buckets| buckets.read()),
+            io_latencies: self
+                .io_times
+                .get()
+                .filter(|_| matches!(self.backend, IoBackend::IoUring | IoBackend::Iocp))
+                .map(|times| times.read()),
+            io: self.io.get().map(|totals| totals.read()),
             errors: self.errors.read(),
+        }
+    }
+}
+
+/// A shard's IO operations, as its own thread adds them: a load and a store.
+#[derive(Default)]
+struct IoTotals {
+    reads: AtomicU64,
+    writes: AtomicU64,
+    bytes_read: AtomicU64,
+    bytes_written: AtomicU64,
+    accepts: AtomicU64,
+}
+
+impl IoTotals {
+    fn add(&self, io: &tally::Taken) {
+        for (total, more) in [
+            (&self.reads, io.reads),
+            (&self.writes, io.writes),
+            (&self.bytes_read, io.bytes_read),
+            (&self.bytes_written, io.bytes_written),
+            (&self.accepts, io.accepts),
+        ] {
+            total.store(total.load(Ordering::Relaxed) + more, Ordering::Relaxed);
+        }
+    }
+
+    fn read(&self) -> crate::stats::IoCounts {
+        crate::stats::IoCounts {
+            reads: self.reads.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            accepts: self.accepts.load(Ordering::Relaxed),
         }
     }
 }
@@ -289,6 +363,64 @@ impl Buckets {
     pub(crate) fn read(&self) -> crate::stats::Histogram {
         crate::stats::Histogram {
             buckets: core::array::from_fn(|i| self.0[i].load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// The latencies of a shard's IO operations by kind, from their submission
+/// to their completion.
+pub(crate) struct IoTimes {
+    reads: Buckets,
+    writes: Buckets,
+    accepts: Buckets,
+    connects: Buckets,
+    files: Buckets,
+}
+
+/// The kind of operation a latency is of.
+#[cfg(completion)]
+#[derive(Clone, Copy)]
+pub(crate) enum IoKind {
+    Read,
+    Write,
+    Accept,
+    Connect,
+    #[cfg(ring)]
+    File,
+}
+
+impl IoTimes {
+    fn new() -> Self {
+        Self {
+            reads: Buckets::new(),
+            writes: Buckets::new(),
+            accepts: Buckets::new(),
+            connects: Buckets::new(),
+            files: Buckets::new(),
+        }
+    }
+
+    /// An operation of `kind` took `length` from submission to completion.
+    #[cfg(completion)]
+    pub(crate) fn add(&self, kind: IoKind, length: std::time::Duration) {
+        match kind {
+            IoKind::Read => &self.reads,
+            IoKind::Write => &self.writes,
+            IoKind::Accept => &self.accepts,
+            IoKind::Connect => &self.connects,
+            #[cfg(ring)]
+            IoKind::File => &self.files,
+        }
+        .add(length);
+    }
+
+    fn read(&self) -> crate::stats::IoLatencies {
+        crate::stats::IoLatencies {
+            reads: self.reads.read(),
+            writes: self.writes.read(),
+            accepts: self.accepts.read(),
+            connects: self.connects.read(),
+            files: self.files.read(),
         }
     }
 }

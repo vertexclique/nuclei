@@ -43,6 +43,7 @@ pub struct Builder {
     pub(super) handoff_after: Option<Option<Duration>>,
     pub(super) start_paused: bool,
     pub(super) record_latencies: bool,
+    pub(super) count_io: bool,
     pub(super) tuning: super::super::tuning::Tuning,
     pub(super) task_hooks: super::super::tuning::TaskHooks,
     pub(super) long_poll: Option<super::super::tuning::TaskHook>,
@@ -172,6 +173,7 @@ impl Builder {
             handoff_after: None,
             start_paused: false,
             record_latencies: false,
+            count_io: false,
             tuning: super::super::tuning::Tuning::default(),
             task_hooks: super::super::tuning::TaskHooks::default(),
             long_poll: None,
@@ -349,6 +351,17 @@ impl Builder {
         self
     }
 
+    /// Counts each worker's IO operations (reads, writes, the bytes of each,
+    /// accepts) in its [`ShardStats::io`](crate::stats::ShardStats::io)
+    /// (default false: `io` is `None`). Off, a count costs one load of a flag
+    /// per operation; on, a few plain thread-local adds per operation and a
+    /// drain each time a shard publishes its counts, on every thread of the
+    /// process while one runtime counts.
+    pub fn count_io(mut self, count: bool) -> Self {
+        self.count_io = count;
+        self
+    }
+
     /// Starts the runtime.
     ///
     /// # Errors
@@ -425,6 +438,7 @@ impl Builder {
                         tuning: super::super::tuning::Tuning {
                             blocking: Some(pool.jobs_counter()),
                             record_latencies: self.record_latencies,
+                            count_io: self.count_io,
                             ..self.tuning.clone()
                         },
                         seed: self.rng_seed,
@@ -506,6 +520,7 @@ impl fmt::Debug for Builder {
             .field("io_uring", &self.io_uring)
             .field("start_paused", &self.start_paused)
             .field("record_latencies", &self.record_latencies)
+            .field("count_io", &self.count_io)
             .finish_non_exhaustive()
     }
 }

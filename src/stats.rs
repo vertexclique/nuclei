@@ -106,8 +106,67 @@ pub struct ShardStats {
     /// it ([`Builder::record_latencies`](crate::Builder::record_latencies));
     /// `None` when it does not, which is not a shard with no polls.
     pub poll_times: Option<Histogram>,
+    /// How long the shard's IO operations took from their submission to the
+    /// kernel to their completion, by kind, while its runtime records
+    /// latencies ([`Builder::record_latencies`](crate::Builder::record_latencies));
+    /// `None` when it does not, and `None` on a readiness backend (epoll,
+    /// kqueue), whose calls are made once the kernel reports the descriptor
+    /// ready, so there is no wait in the kernel per operation to time.
+    pub io_latencies: Option<IoLatencies>,
+    /// The IO operations the shard's thread completed, while its runtime
+    /// counts them ([`Builder::count_io`](crate::Builder::count_io));
+    /// `None` when it does not, which is not a shard that did no IO
+    /// (published).
+    pub io: Option<IoCounts>,
     /// Errors of IO run on the shard.
     pub errors: ErrorCounts,
+}
+
+/// The IO operations a shard's thread completed: see [`ShardStats::io`].
+///
+/// An operation is counted when the kernel completes it: a read or receive
+/// that returned bytes or the end of the stream, a write or send that took
+/// bytes, a connection accepted. A read served from the read-ahead is
+/// counted when the read-ahead's own read completed, and a write taken into
+/// the write-behind when the write-behind's own write did. Peeks and
+/// readiness probes are not counted. IO completed on a thread that runs no
+/// shard (the blocking pool's own calls, a thread outside the runtime) is
+/// counted by no shard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IoCounts {
+    /// Reads and receives.
+    pub reads: u64,
+    /// Writes and sends.
+    pub writes: u64,
+    /// Bytes the counted reads returned.
+    pub bytes_read: u64,
+    /// Bytes the counted writes took.
+    pub bytes_written: u64,
+    /// Connections accepted.
+    pub accepts: u64,
+}
+
+/// How long each kind of a shard's IO operations took, from their
+/// submission to the kernel to their completion: see
+/// [`ShardStats::io_latencies`].
+///
+/// A multishot receive or accept is one operation for many arrivals and is
+/// not timed; nor is a cancelled operation or a readiness probe. File calls
+/// are timed on the ring, not the ones the blocking pool makes.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct IoLatencies {
+    /// Reads and receives.
+    pub reads: Histogram,
+    /// Writes and sends.
+    pub writes: Histogram,
+    /// Accepts, one connection each.
+    pub accepts: Histogram,
+    /// Connects.
+    pub connects: Histogram,
+    /// Reads and writes of files.
+    pub files: Histogram,
 }
 
 /// Buckets of a [`Histogram`].

@@ -23,6 +23,7 @@ use crate::buf::PoolBuf;
 use crate::buf::spare::Spare;
 use crate::io::side::{After, Hooks};
 use crate::io::sys;
+use crate::rt::counters::tally;
 use crate::rt::shard::ring::ShardRing;
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::Sqe;
@@ -120,7 +121,7 @@ pub(crate) fn zero_copy_worth(kind: Kind, len: usize) -> bool {
 
 /// What a zero-copy send's first completion `res` brings its side, which goes on at once.
 pub(crate) fn zc_outcome(res: i32) -> Outcome {
-    Outcome::SendPinned(answer(res))
+    Outcome::SendPinned(wrote_of(answer(res)))
 }
 
 /// The kernel's answer `res` (a count, or a negated errno) to an operation
@@ -133,6 +134,28 @@ fn answer(res: i32) -> Answer<usize> {
         r if r < 0 => Answer::Done(Err(failed(-r))),
         r => Answer::Done(Ok(r as usize)),
     }
+}
+
+/// `answer`, counted as a read when it brought bytes or the end.
+#[inline]
+fn read_of(answer: Answer<usize>) -> Answer<usize> {
+    if tally::counting()
+        && let Answer::Done(Ok(n)) = &answer
+    {
+        tally::read(*n);
+    }
+    answer
+}
+
+/// `answer`, counted as a write when it took bytes.
+#[inline]
+fn wrote_of(answer: Answer<usize>) -> Answer<usize> {
+    if tally::counting()
+        && let Answer::Done(Ok(n @ 1..)) = &answer
+    {
+        tally::wrote(*n);
+    }
+    answer
 }
 
 /// The error of an operation that failed with errno `code`, counted.
@@ -160,22 +183,28 @@ impl RingMem {
     pub(crate) fn complete(self, res: i32, kind: Kind) -> Outcome {
         match self {
             RingMem::Recv(mut buf) => {
-                let answer = answer(res);
+                let answer = read_of(answer(res));
                 if let Answer::Done(Ok(n)) = answer {
                     buf.set_filled(n);
                 }
                 Outcome::Recv(buf, answer)
             }
-            RingMem::Send(buf) => Outcome::Send(buf, answer(res)),
-            RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
-            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => Outcome::RecvMultiEnd {
-                // A group with no buffer left gives the receive back undone.
-                answer: match res {
-                    r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
-                    r => answer(r),
-                },
-                dry: res == -libc::ENOBUFS,
-            },
+            RingMem::Send(buf) => Outcome::Send(buf, wrote_of(answer(res))),
+            RingMem::SendLent(buf) => Outcome::SendLent(buf, wrote_of(answer(res))),
+            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => {
+                // Arrivals were counted as they came: only the end of the stream is none.
+                if res == 0 {
+                    tally::read(0);
+                }
+                Outcome::RecvMultiEnd {
+                    // A group with no buffer left gives the receive back undone.
+                    answer: match res {
+                        r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
+                        r => answer(r),
+                    },
+                    dry: res == -libc::ENOBUFS,
+                }
+            }
             rest => rest.complete_rest(res, kind),
         }
     }
@@ -189,6 +218,7 @@ impl RingMem {
             }),
             RingMem::Accept(addr) => Outcome::Accept(match answer(res) {
                 Answer::Done(Ok(fd)) => {
+                    tally::accepted(1);
                     // SAFETY: the kernel made this descriptor for us.
                     let conn = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
                     Answer::Done(addr.decode(kind).map(|peer| (conn, peer)))
@@ -212,7 +242,7 @@ impl RingMem {
                 },
             }),
             RingMem::RecvLent(mut buf) => {
-                let answer = answer(res);
+                let answer = read_of(answer(res));
                 if let Answer::Done(Ok(n)) = answer {
                     // SAFETY: the kernel wrote the first `n` bytes of the
                     // buffer's spare capacity.
@@ -221,7 +251,7 @@ impl RingMem {
                 Outcome::RecvLent(buf, answer)
             }
             RingMem::RecvFrom(mut msg, mut buf) => {
-                let answer = match answer(res) {
+                let answer = match read_of(answer(res)) {
                     Answer::Done(Ok(n)) => {
                         buf.set_filled(n);
                         Answer::Done(msg.sender(kind).map(|from| (n, from)))
@@ -232,7 +262,7 @@ impl RingMem {
                 Outcome::RecvFrom(buf, answer)
             }
             RingMem::RecvLentFrom(mut msg, mut buf) => {
-                let answer = match answer(res) {
+                let answer = match read_of(answer(res)) {
                     Answer::Done(Ok(n)) => {
                         // SAFETY: the kernel wrote the first `n` bytes of the
                         // buffer's spare capacity.
@@ -255,11 +285,11 @@ impl RingMem {
                     _ => Answer::Done(Ok(())),
                 },
             ),
-            RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, answer(res)),
-            RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, answer(res)),
-            RingMem::SendPinned(_) | RingMem::SendZc { .. } | RingMem::ZcHeld(_) => {
-                Outcome::SendPinned(answer(res))
-            }
+            RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, wrote_of(answer(res))),
+            RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, wrote_of(answer(res))),
+            RingMem::SendPinned(_) => Outcome::SendPinned(wrote_of(answer(res))),
+            // A zero-copy send was counted at its first completion.
+            RingMem::SendZc { .. } | RingMem::ZcHeld(_) => Outcome::SendPinned(answer(res)),
             RingMem::Recv(_)
             | RingMem::Send(_)
             | RingMem::SendLent(_)

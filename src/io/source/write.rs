@@ -41,6 +41,8 @@ use super::{Failure, Io, Kind, Source, Target, Via};
 use crate::buf::{Pool, PoolBuf, with_pool_or};
 use crate::io::side::{After, Wakers};
 use crate::io::sys;
+#[cfg(any(readiness, port))]
+use crate::rt::counters::tally;
 
 mod calls;
 mod datagram;
@@ -347,6 +349,10 @@ impl WriteState {
                 None
             }
             Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
+            Some(Ok(n)) => {
+                tally::wrote(n);
+                Some(Ok(n))
+            }
             Some(result) => Some(result),
         }
     }
@@ -477,6 +483,7 @@ impl WriteState {
                         break;
                     }
                     Some(Ok(n)) => {
+                        tally::wrote(n);
                         behind.consume(n);
                         progress = true;
                         if behind.is_empty() {
@@ -708,7 +715,9 @@ impl WriteState {
                         Dest::Inet(addr) => Some(addr),
                         Dest::Unix((never, _)) => match never {},
                     };
-                    return Poll::Ready(sys::send_datagram_now(fd, bytes, to.as_ref()));
+                    let sent = sys::send_datagram_now(fd, bytes, to.as_ref());
+                    tally::writing(&sent);
+                    return Poll::Ready(sent);
                 }
                 queued
             }

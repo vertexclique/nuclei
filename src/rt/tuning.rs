@@ -34,6 +34,8 @@ pub(crate) struct Tuning {
     pub(crate) blocking: Option<Arc<crate::sync::internal::AtomicUsize>>,
     /// The shard times its IO operations, by kind (`Builder::record_latencies`).
     pub(crate) record_latencies: bool,
+    /// The shard counts its IO operations (`Builder::count_io`).
+    pub(crate) count_io: bool,
 }
 
 impl Default for Tuning {
@@ -47,6 +49,7 @@ impl Default for Tuning {
             hooks: ThreadHooks::default(),
             blocking: None,
             record_latencies: false,
+            count_io: false,
         }
     }
 }
