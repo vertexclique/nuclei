@@ -33,7 +33,7 @@ pub(crate) const DEFAULT_MAX_NESTING: usize = 256;
 
 /// What this thread runs now, as only this thread sees it. No destructor: it
 /// is there for the whole life of the thread.
-struct Here {
+pub(crate) struct Here {
     /// The shard this thread runs: a worker's, or the thread's own while it
     /// runs `block_on`.
     current: Cell<*const Shard>,
@@ -56,6 +56,11 @@ struct Here {
     /// The home of this thread's bound tasks, kept alive by `HOME`; null
     /// for none yet.
     home: Cell<*const Home>,
+    /// The id of the task this thread is polling, if any (`task::current_id`).
+    pub(crate) task: Cell<Option<super::task::Id>>,
+    /// The budget left in this thread's poll; `None` outside a poll, or in an
+    /// unconstrained one (`coop`).
+    pub(crate) budget: Cell<Option<u8>>,
 }
 
 impl Here {
@@ -70,6 +75,8 @@ impl Here {
             epochs: Cell::new(0),
             detached: Cell::new(0),
             home: Cell::new(core::ptr::null()),
+            task: Cell::new(None),
+            budget: Cell::new(None),
         }
     }
 
@@ -116,8 +123,18 @@ struct HomeCell(RefCell<Option<Arc<Home>>>);
 
 impl Drop for HomeCell {
     fn drop(&mut self) {
-        HERE.with(|here| here.home.set(core::ptr::null()));
+        local().home.set(core::ptr::null());
     }
+}
+
+/// This thread's [`Here`]: one access of the thread-local, whose work then
+/// runs in the caller.
+#[inline(always)]
+pub(crate) fn local() -> &'static Here {
+    // SAFETY: `HERE` has a constant initializer and no destructor, so it is
+    // there for the whole life of the thread; `Here` is not `Sync`, so the
+    // reference never leaves it.
+    HERE.with(|here| unsafe { &*core::ptr::from_ref(here) })
 }
 
 /// A call into the runtime from a task's code: inside the shard until it
@@ -141,24 +158,23 @@ impl Drop for Bracket<'_> {
 /// none if the shard was taken.
 #[inline]
 pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
-    HERE.with(|here| {
-        let shard = here.current.get();
-        if shard.is_null() {
-            return f(None);
-        }
-        let _bracket = if here.inside.get() || here.slot.get().is_null() {
-            None
-        } else if here.come_back(here.epoch.get()) {
-            here.inside.set(true);
-            Some(Bracket(here))
-        } else {
-            return f(None);
-        };
-        // SAFETY: `current` points at a shard only while an `Entered` guard
-        // for it lives, and the guard borrows the shard; a taken shard is
-        // current no more.
-        f(unsafe { shard.as_ref() })
-    })
+    let here = local();
+    let shard = here.current.get();
+    if shard.is_null() {
+        return f(None);
+    }
+    let _bracket = if here.inside.get() || here.slot.get().is_null() {
+        None
+    } else if here.come_back(here.epoch.get()) {
+        here.inside.set(true);
+        Some(Bracket(here))
+    } else {
+        return f(None);
+    };
+    // SAFETY: `current` points at a shard only while an `Entered` guard
+    // for it lives, and the guard borrows the shard; a taken shard is
+    // current no more.
+    f(unsafe { shard.as_ref() })
 }
 
 /// Runs `f` with the shard whose driver this thread may use now: the one
@@ -188,12 +204,11 @@ pub(crate) fn enter(shard: &Shard) -> Entered<'_> {
 /// [`enter`] for a worker shard the monitor watches through `slot`. A thread
 /// handed a shard it was once detached from runs it again.
 pub(crate) fn enter_watched<'a>(shard: &'a Shard, slot: Option<&'a Slot>) -> Entered<'a> {
-    HERE.with(|here| {
-        if slot.is_some() {
-            here.detached.set(0);
-        }
-        enter_with(here, shard, slot)
-    })
+    let here = local();
+    if slot.is_some() {
+        here.detached.set(0);
+    }
+    enter_with(here, shard, slot)
 }
 
 fn enter_with<'a>(here: &Here, shard: &'a Shard, slot: Option<&'a Slot>) -> Entered<'a> {
@@ -217,11 +232,10 @@ pub(crate) struct Entered<'a> {
 
 impl Drop for Entered<'_> {
     fn drop(&mut self) {
-        HERE.with(|here| {
-            here.current.set(self.previous);
-            here.slot.set(self.slot);
-            here.inside.set(self.inside);
-        });
+        let here = local();
+        here.current.set(self.previous);
+        here.slot.set(self.slot);
+        here.inside.set(self.inside);
     }
 }
 
@@ -272,31 +286,31 @@ pub(crate) fn poll<R>(shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) 
             }
         }
     }
-    HERE.with(|here| {
-        let mine = here.epochs.get() + 1;
-        here.epochs.set(mine);
-        let mut out = Out {
-            here,
-            shared: core::ptr::from_ref(shared) as usize,
-            in_task: here.in_task.replace(true),
-            epoch: here.epoch.replace(mine),
-            mine,
-            done: false,
-        };
-        here.inside.set(false);
-        // SAFETY: as in `Here::come_back`.
-        if let Some(slot) = unsafe { here.slot.get().as_ref() } {
-            slot.go_out(mine);
-        }
-        let result = poll();
-        (result, out.back())
-    })
+    let here = local();
+    let mine = here.epochs.get() + 1;
+    here.epochs.set(mine);
+    let mut out = Out {
+        here,
+        shared: core::ptr::from_ref(shared) as usize,
+        in_task: here.in_task.replace(true),
+        epoch: here.epoch.replace(mine),
+        mine,
+        done: false,
+    };
+    here.inside.set(false);
+    // SAFETY: as in `Here::come_back`.
+    if let Some(slot) = unsafe { here.slot.get().as_ref() } {
+        slot.go_out(mine);
+    }
+    let result = poll();
+    (result, out.back())
 }
 
 /// Whether a task's poll (or a `block_on` future's) is on this thread's
 /// stack.
+#[inline]
 pub(crate) fn in_task() -> bool {
-    HERE.with(|here| here.in_task.get())
+    local().in_task.get()
 }
 
 /// Runs `f` with [`in_task`] set to `in_task`.
@@ -307,10 +321,9 @@ pub(crate) fn with_in_task<R>(in_task: bool, f: impl FnOnce() -> R) -> R {
             self.0.in_task.set(self.1);
         }
     }
-    HERE.with(|here| {
-        let _restore = Restore(here, here.in_task.replace(in_task));
-        f()
-    })
+    let here = local();
+    let _restore = Restore(here, here.in_task.replace(in_task));
+    f()
 }
 
 /// Runs `f` one `block_on` deeper on this thread.
@@ -329,18 +342,17 @@ pub(crate) fn deeper<R>(max: usize, f: impl FnOnce() -> R) -> R {
             self.0.depth.set(self.0.depth.get() - 1);
         }
     }
-    HERE.with(|here| {
-        let depth = here.depth.get();
-        if depth >= max {
-            panic!(
-                "block_on is nested {max} deep on one thread, the most allowed: each level runs \
-                 on the thread's stack (raise the limit with `Builder::max_nesting`)"
-            );
-        }
-        here.depth.set(depth + 1);
-        let _up = Up(here);
-        f()
-    })
+    let here = local();
+    let depth = here.depth.get();
+    if depth >= max {
+        panic!(
+            "block_on is nested {max} deep on one thread, the most allowed: each level runs \
+             on the thread's stack (raise the limit with `Builder::max_nesting`)"
+        );
+    }
+    here.depth.set(depth + 1);
+    let _up = Up(here);
+    f()
 }
 
 /// This thread's own shard, made now if it has none.
@@ -422,32 +434,29 @@ pub(crate) fn set_home(home: Arc<Home>) {
 }
 
 fn set_home_ptr(home: &Arc<Home>) {
-    HERE.with(|here| here.home.set(Arc::as_ptr(home)));
+    local().home.set(Arc::as_ptr(home));
 }
 
 /// Whether `home` is this thread's.
 pub(crate) fn is_home(home: &Home) -> bool {
-    HERE.with(|here| core::ptr::eq(here.home.get(), home))
+    core::ptr::eq(local().home.get(), home)
 }
 
 /// The next runnable pushed to this thread's home, if any.
 pub(crate) fn pop_home() -> Option<Runnable> {
-    HERE.with(|here| {
-        // SAFETY: `HOME` keeps the home alive while `home` points at it, and
-        // this thread is its thread.
-        unsafe { here.home.get().as_ref().and_then(|home| home.pop()) }
-    })
+    // SAFETY: `HOME` keeps the home alive while `home` points at it, and
+    // this thread is its thread.
+    unsafe { local().home.get().as_ref().and_then(|home| home.pop()) }
 }
 
 /// Whether nothing pushed to this thread's home waits, as its taker sees it.
 pub(crate) fn home_is_drained() -> bool {
-    HERE.with(|here| {
-        // SAFETY: as in `pop_home`.
-        unsafe {
-            here.home
-                .get()
-                .as_ref()
-                .is_none_or(|home| home.is_drained())
-        }
-    })
+    // SAFETY: as in `pop_home`.
+    unsafe {
+        local()
+            .home
+            .get()
+            .as_ref()
+            .is_none_or(|home| home.is_drained())
+    }
 }

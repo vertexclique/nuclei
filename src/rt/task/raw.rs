@@ -361,8 +361,12 @@ where
                 }
             }
 
-            let previous = super::enter(header.id);
-            let budget = crate::coop::enter();
+            // The task and a fresh budget are this thread's for the poll, the
+            // ones before them put back after it (a `block_on` inside a task
+            // polls other tasks in between).
+            let here = crate::rt::context::local();
+            let previous = here.task.replace(Some(header.id));
+            let budget = here.budget.replace(Some(crate::coop::BUDGET));
             // Read once: while no runtime of the process has task hooks, the
             // poll costs one predictable branch more, not two calls.
             let hooked =
@@ -377,8 +381,8 @@ where
             if hooked {
                 cell.schedule.after_poll(header.id);
             }
-            crate::coop::leave(budget);
-            super::leave(previous);
+            here.budget.set(budget);
+            here.task.set(previous);
             // The poll may have woken the task, cloned its waker, or a handle
             // may have registered meanwhile: the word is read again rather
             // than fed stale into the exchanges below, which would fail once.
