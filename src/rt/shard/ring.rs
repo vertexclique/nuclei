@@ -336,7 +336,7 @@ impl ShardRing {
             Ok(user_data) => user_data,
             // Past 2^32 - 2 operations at once (two per source at most).
             Err(op) => {
-                self.end(None, op, -libc::ENOBUFS);
+                self.end(None, op, -libc::ENOBUFS, None);
                 return IGNORED;
             }
         };
@@ -560,14 +560,7 @@ impl ShardRing {
                 None
             };
         if let Some(op) = plain {
-            if counts_as_write(&op) {
-                self.writes.set(self.writes.get().saturating_sub(1));
-            }
-            #[cfg(feature = "io-stats")]
-            if self.timing.get().is_some() {
-                self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
-            }
-            self.end(shard, op, cqe.res);
+            self.end(shard, op, cqe.res, Some(cqe.user_data));
             return;
         }
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
@@ -590,14 +583,7 @@ impl ShardRing {
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
             return;
         };
-        if counts_as_write(&op) {
-            self.writes.set(self.writes.get().saturating_sub(1));
-        }
-        #[cfg(feature = "io-stats")]
-        if self.timing.get().is_some() {
-            self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
-        }
-        self.end(shard, op, cqe.res);
+        self.end(shard, op, cqe.res, Some(cqe.user_data));
     }
 
     /// A completion of a zero-copy send, handled here; false for any other. The first completion,
@@ -867,8 +853,22 @@ impl ShardRing {
     }
 
     /// `op` ended with `res`: its slot is named once less, and its source
-    /// gets the completion.
-    fn end(&self, shard: Option<&Shard>, op: RingOp, res: i32) {
+    /// gets the completion. One the kernel completed (`completed`, its user
+    /// data) is also counted out of the writes in flight, and timed while the
+    /// runtime records latencies; the caller hands `op` over untouched, so it
+    /// is moved here once.
+    fn end(&self, shard: Option<&Shard>, op: RingOp, res: i32, completed: Option<u64>) {
+        if let Some(user_data) = completed {
+            if counts_as_write(&op) {
+                self.writes.set(self.writes.get().saturating_sub(1));
+            }
+            #[cfg(feature = "io-stats")]
+            if self.timing.get().is_some() {
+                self.timed(user_data, io_kind(&op.mem), res);
+            }
+            #[cfg(not(feature = "io-stats"))]
+            let _ = user_data;
+        }
         let RingOp {
             source,
             file,
