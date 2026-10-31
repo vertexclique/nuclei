@@ -440,8 +440,17 @@ impl Shared {
     }
 
     fn may_exit(&self) -> bool {
-        self.is_stopped()
-            || (self.draining.load(Ordering::Acquire) && self.load.load(Ordering::Acquire) == 0)
+        if self.is_stopped() {
+            return true;
+        }
+        if !self.draining.load(Ordering::Acquire) {
+            return false;
+        }
+        // Pairs with the fence of a placement's second look
+        // (`runtime::placement`): either it sees the drain, or this sees its
+        // task counted (proofs/tla/placement).
+        crate::sync::internal::fence(Ordering::SeqCst);
+        self.load.load(Ordering::Acquire) == 0
     }
 
     /// Completes once the shard is stopped, or drained of its tasks: the

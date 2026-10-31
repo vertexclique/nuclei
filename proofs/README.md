@@ -1690,6 +1690,66 @@ mean the poll has run at least four ticks, and a read that missed the poll just 
 saw it means the poll began after it. The model takes a bound task's home as its creator thread
 and a hand-over to a spare as one step.
 
+## A task placed on a worker
+
+`placement` (`tla/placement/Placement.tla`) checks a task placed on a worker the caller names
+(`spawn_on_worker` and `worker_shard` in `src/rt/runtime/placement.rs`) while that worker is
+drained (`Shared::drain`, `may_exit`, `stopped` and `push_remote` in `src/rt/shard.rs`, the
+shard's drop in `src/rt/shard/going.rs`, `Counted` in `src/rt/sched.rs`) and while its shard is
+handed to another thread (`take` in `src/rt/handoff/monitor.rs`). A spawn looks at the shard's
+`draining` flag, makes the task (`Counted::new` counts it in the shard's `load`), runs a
+sequentially consistent fence and looks at `draining` again, dropping the task unrun and refusing
+with `InvalidInput` if it is up now; only then does it push the task to the shard's inbox, look at
+`stopped` (`push_remote`) and answer Ok. The worker's loop polls what its shard queues, or looks
+whether it may exit: `draining` first, then `load` in a second load; up and zero, it stops and
+drops whatever it still queues. A task's count goes when it completes or is dropped. The monitor
+may hand the shard to the spare while its runner is in a task's poll: that poll ends on the old
+thread, and a Pending task's wake goes back to the shard's inbox, which moved with the shard.
+
+| property | what it says |
+|----------|--------------|
+| `NoSilentLoss` | a task whose spawn answered Ok is never dropped unrun: it ran, is in a poll, or still waits on the shard |
+| `RefusedNeverRuns` | a task whose spawn was refused is never polled |
+| `RunsOnItsWorker` | every poll of a placed task begins on worker k's shard, by the thread that runs that shard at the moment: a handoff never takes the placement away |
+| `StoppedQueuesNothing` | a stopped shard queues nothing: no task is pushed to it once it stopped |
+| `EveryOkRuns` (under fairness) | every task whose spawn answered Ok runs to its end |
+
+The 13 configurations, listed with their expected result in `tla/placement/EXPECTED.txt` (each
+`.cfg` says in its first lines what it checks, and why its size is enough):
+
+- **4 that must pass.** Two tasks of two polls each, a drain and one handoff, with every safety
+  property (`P_safe`); the same with the first look at `draining` taken away
+  (`P_no_first_look`): the first look is no guard, as the second, after the count, refuses
+  every spawn the first would have, so it has no mutation of its own; and `EveryOkRuns` under
+  weak fairness of the spawners, the loop and the old runner and strong fairness of the loop's
+  take, for two tasks of one poll each (`P_live`) and for one task whose poll ends Pending on the
+  old thread (`P_live_repush`).
+- **6 mutations that must fail.** No second look (`M_no_second_look`), the second look before
+  the count (`M_look_before_count`), `may_exit` reading `load` before `draining`
+  (`M_load_first`) and a count that goes at the task's first poll instead of its end
+  (`M_uncount_at_poll`) each let the loop exit between a spawn's looks and its push, or with a
+  woken task still queued, and break `NoSilentLoss`; the second look after the push
+  (`M_refuse_after_push`) refuses a task already polled and breaks `RefusedNeverRuns`; a placed
+  task bound to the thread that ran the shard when it was made, as a `spawn_local` task is
+  (`M_bound`), runs on that thread after the handoff, off the worker, and breaks
+  `RunsOnItsWorker`.
+- **3 witnesses that must fail.** A spawn refused at its second look, after its count; a handoff
+  while a placed task waits in the queue; a drain that runs a placed task to its end before the
+  worker exits.
+
+What the model leaves out. Every step is sequentially consistent, as the code's fences make
+it: the fence of `spawn_on_worker` pairs with the fence of `drain` (before its look at `load`)
+and with the fence `may_exit` makes between its look at `draining` and its look at `load`, so a
+worker that sees the drain sees a count made before a second look that found no drain. The
+weaker orders those fences stand for are not checked here. The stop waker is not
+modelled: the loop may look whether it may exit whenever it is not in a poll, which covers every
+look the code makes, so a drained worker that is never woken to exit is not checked either.
+`push_remote`'s look at `stopped` drops nothing on this path (`StoppedQueuesNothing`); the model
+keeps it, as it is what drops a mutation's task. `Shared::stop`, the runtime's shutdown, which
+drops every task by design, is not modelled.
+A handoff is one step (its claim, fence and take are `handoff`'s), and the spawners run on
+threads that run no shard.
+
 ## A runtime's settings and the default runtime
 
 `builder` (`tla/builder/Builder.tla`) checks how a runtime's settings are checked and how the

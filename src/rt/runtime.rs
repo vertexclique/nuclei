@@ -37,10 +37,13 @@ use super::workers::Workers;
 mod builder;
 mod cores;
 mod enter;
+mod fallible;
 mod knobs;
 mod panic;
+mod placement;
 pub use self::builder::Builder;
 pub use self::enter::{EnterGuard, RuntimeId, TryCurrentError, worker_index};
+pub(crate) use self::fallible::{try_current, try_spawn, try_spawn_blocking, try_spawn_local};
 pub use super::rng::RngSeed;
 pub use super::tuning::{TaskMeta, UnhandledPanic};
 
@@ -253,6 +256,10 @@ impl RuntimeHandle {
     pub fn current() -> Self {
         Self { inner: current() }
     }
+
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
+        &self.inner
+    }
 }
 
 impl fmt::Debug for RuntimeHandle {
@@ -283,11 +290,8 @@ impl Inner {
     reason = "no caller to hand the error to; documented under `# Panics`"
 )]
 pub(crate) fn default_runtime() -> &'static Runtime {
-    DEFAULT.get_or_init(|| {
-        Builder::new()
-            .build()
-            .unwrap_or_else(|err| panic!("the default runtime could not start: {err}"))
-    })
+    fallible::try_default()
+        .unwrap_or_else(|err| panic!("the default runtime could not start: {err}"))
 }
 
 /// The runtime this thread is inside, or the default one.

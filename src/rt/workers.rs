@@ -128,6 +128,17 @@ impl Workers {
         self.running.load(Ordering::Relaxed)
     }
 
+    /// The places workers have started in so far, stopped ones included:
+    /// the indices of [`get`](Self::get).
+    pub(crate) fn started(&self) -> usize {
+        self.claimed.load(Ordering::Acquire).min(self.slots.len())
+    }
+
+    /// The shard of worker `index`, if it started and its shard was made.
+    pub(crate) fn get(&self, index: usize) -> Option<&Arc<Shared>> {
+        self.slots[..self.started()].get(index)?.get()
+    }
+
     /// The shards of every slot filled so far.
     pub(crate) fn shards(&self) -> impl Iterator<Item = &Arc<Shared>> {
         let claimed = self.claimed.load(Ordering::Acquire).min(self.slots.len());
