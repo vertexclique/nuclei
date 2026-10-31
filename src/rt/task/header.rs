@@ -60,6 +60,7 @@ impl Header {
     /// Takes the awaiter out, leaving none. Returns nothing when the waker is
     /// `current`'s (it is dropped here) or when a registration is in
     /// progress, which then wakes it itself.
+    #[inline]
     pub(super) fn take(&self, current: Option<&Waker>) -> Option<Waker> {
         let state = self.state.fetch_or(NOTIFYING, Ordering::AcqRel);
         if state & (NOTIFYING | REGISTERING) != 0 {
@@ -81,6 +82,7 @@ impl Header {
 
     /// Stores `waker` as the awaiter. A notification that raced the store is
     /// handled here: the waker is woken at once instead of being left behind.
+    #[inline]
     pub(super) fn register(&self, waker: &Waker) {
         let mut state = self.state.fetch_or(0, Ordering::Acquire);
         loop {
