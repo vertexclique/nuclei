@@ -313,6 +313,7 @@ where
 
     /// Takes the awaiter, drops the run's reference, then wakes the awaiter:
     /// the end of a run that leaves the task completed or closed.
+    #[inline(always)]
     unsafe fn finish(ptr: *const (), state: usize) {
         // SAFETY: the run's reference is live until `drop_ref`, and the
         // awaiter taken first does not need the task.

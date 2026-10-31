@@ -164,6 +164,7 @@ impl<F: Future> Future for Counted<F> {
 }
 
 impl<F> Drop for Counted<F> {
+    #[inline]
     fn drop(&mut self) {
         // SAFETY: see `Send` above: the shard outlives the future.
         let shard = unsafe { &*self.shard };
