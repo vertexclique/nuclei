@@ -1132,13 +1132,10 @@ pub(crate) struct Wakers {
 }
 
 impl Wakers {
-    #[inline]
+    #[inline(always)]
     pub(crate) fn register(&mut self, waker: &Waker) {
-        let known = self
-            .first
-            .iter()
-            .chain(self.rest.iter())
-            .any(|w| w.will_wake(waker));
+        let known = self.first.as_ref().is_some_and(|w| w.will_wake(waker))
+            || self.rest.iter().any(|w| w.will_wake(waker));
         if known {
             return;
         }
@@ -1146,12 +1143,19 @@ impl Wakers {
     }
 
     /// Adds `waker`, known or not.
+    #[inline(always)]
     fn push(&mut self, waker: Waker) {
         if self.first.is_none() {
             self.first = Some(waker);
         } else {
-            self.rest.push(waker);
+            self.push_rest(waker);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_rest(&mut self, waker: Waker) {
+        self.rest.push(waker);
     }
 
     pub(crate) fn is_empty(&self) -> bool {

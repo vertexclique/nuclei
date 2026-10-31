@@ -310,6 +310,7 @@ impl WriteState {
     /// `None` leaves it to the normal path, which writes behind and waits
     /// for readiness when the socket took nothing.
     #[cfg(unix)]
+    #[inline]
     pub(super) fn write_direct(
         &mut self,
         io: Io<'_>,

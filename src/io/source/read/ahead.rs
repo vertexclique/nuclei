@@ -54,6 +54,7 @@ impl Piece {
 
     /// Lets go of the piece; a chunk of the receive group goes back through
     /// `shard`, the shard the caller runs, if it knows it.
+    #[inline(always)]
     fn release(self, after: &mut After, shard: Option<&Shard>) {
         match self {
             Piece::Pool(buf) => after.drop_buf(buf),
@@ -86,7 +87,7 @@ impl Ahead {
     }
 
     /// Adds bytes that came after those held.
-    #[inline]
+    #[inline(always)]
     pub(super) fn push(&mut self, piece: Piece, after: &mut After) {
         if piece.filled().is_empty() {
             piece.release(after, None);

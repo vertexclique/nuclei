@@ -461,6 +461,7 @@ impl ReadState {
     #[cfg(readiness)]
     /// The driver's part: on readiness, completes what the waiting tasks
     /// asked for, into the pool's buffers, and wakes them.
+    #[inline]
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         if edge {
             self.blocked = false;
@@ -788,6 +789,7 @@ impl ReadState {
         clippy::too_many_arguments,
         reason = "the step's context, as every step's"
     )]
+    #[inline(always)]
     pub(super) fn read_direct(
         &mut self,
         io: Io<'_>,
@@ -1398,7 +1400,7 @@ impl ReadState {
     /// `epoch`: the tasks waiting take it. One of an older descriptor only
     /// goes.
     #[cfg(ring)]
-    #[inline]
+    #[inline(always)]
     pub(super) fn take_arrival(
         &mut self,
         arrival: super::ring::Arrival,

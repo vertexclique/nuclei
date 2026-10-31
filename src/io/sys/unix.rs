@@ -46,6 +46,7 @@ pub(crate) fn ready<T>(result: io::Result<T>) -> Option<io::Result<T>> {
 }
 
 /// Makes `call` again while a signal cuts it short.
+#[inline(always)]
 fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         match call() {
