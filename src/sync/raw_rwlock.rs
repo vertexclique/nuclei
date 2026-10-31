@@ -435,11 +435,18 @@ impl UpgradeWait {
         let park = if self.wait.is_queued() {
             self.wait.park(&lock.queue, Some(waker))
         } else {
+            // An upgrade that completes at once spends one operation of the
+            // poll's budget (see `coop`); it cannot be undone, so the budget
+            // is looked at before it starts.
+            if crate::coop::exhausted(waker) {
+                return Poll::Pending;
+            }
             if !self.started {
                 self.started = true;
                 lock.queue.state.fetch_or(UPGRADING, Ordering::AcqRel);
             }
             if lock.try_upgrade() {
+                crate::coop::try_spend();
                 return Poll::Ready(());
             }
             lock.enqueue(&mut self.wait, UPGRADE, waker);

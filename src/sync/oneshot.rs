@@ -212,7 +212,29 @@ impl<T> Inner<T> {
     /// Called by the receiver, once per value: the caller drops its handle
     /// when this returns `Some`.
     unsafe fn resolve(&self, close: RxClose, state: usize) -> Option<Option<T>> {
-        if close == RxClose::Empty {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.resolve_if(close, state, || true) }.ok()?
+    }
+
+    /// [`resolve`](Self::resolve) that asks `admit` once the receive would
+    /// complete and before it reads the value: `Err(())` when `admit` says
+    /// no, the cell untouched.
+    ///
+    /// # Safety
+    ///
+    /// As for [`resolve`](Self::resolve), for an answer that is not `Err`.
+    #[inline]
+    unsafe fn resolve_if(
+        &self,
+        close: RxClose,
+        state: usize,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<Option<Option<T>>, ()> {
+        let completes = close == RxClose::Empty || state & (VALUE_SENT | TX_DROPPED) != 0;
+        if completes && !admit() {
+            return Err(());
+        }
+        Ok(if close == RxClose::Empty {
             Some(None)
         } else if state & VALUE_SENT != 0 {
             // SAFETY: the sender raised VALUE_SENT after writing the value, and
@@ -223,7 +245,7 @@ impl<T> Inner<T> {
             Some(None)
         } else {
             None
-        }
+        })
     }
 }
 
@@ -639,11 +661,18 @@ impl<T> Future for Receiver<T> {
         };
         let mut state = inner.state.load(Ordering::Acquire);
         let mut registered = false;
+        // A receive that completes spends one operation of the poll's budget;
+        // with the budget spent it takes nothing and yields (see `coop`).
+        let admit = || crate::coop::spend(cx.waker());
         loop {
             // SAFETY: the handle is retired just below whenever this returns `Some`.
-            if let Some(done) = unsafe { inner.resolve(this.close, state) } {
-                this.inner = None;
-                return Poll::Ready(done.ok_or(RecvError(())));
+            match unsafe { inner.resolve_if(this.close, state, admit) } {
+                Ok(Some(done)) => {
+                    this.inner = None;
+                    return Poll::Ready(done.ok_or(RecvError(())));
+                }
+                Err(()) => return Poll::Pending,
+                Ok(None) => {}
             }
             if registered {
                 return Poll::Pending;

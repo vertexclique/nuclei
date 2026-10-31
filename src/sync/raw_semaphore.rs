@@ -28,7 +28,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use super::contend::{self, CLOSED_GRANT, Closed, Contend, Lock};
+use super::contend::{self, CLOSED_GRANT, Closed, Contend, Lock, taken_at_once};
 use super::internal::{Ordering, UnsafeCell, fence};
 use super::list::List;
 use super::queue::{
@@ -425,7 +425,10 @@ impl PermitWait {
             None
         } else {
             match sem.take_one() {
-                Ok(()) => return Poll::Ready(()),
+                Ok(()) => {
+                    return taken_at_once(sem, 1, waker)
+                        .map(|taken| debug_assert!(taken.is_ok(), "a taken permit is no close"));
+                }
                 Err(seen) => Some(seen),
             }
         };

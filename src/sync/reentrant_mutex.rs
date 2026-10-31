@@ -209,7 +209,14 @@ impl<'a, T: ?Sized> Future for ReentrantMutexLock<'a, T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReentrantMutexGuard<'a, T>> {
         let this = self.get_mut();
         if !this.wait.is_queued() && this.mutex.reenter(this.owner) {
-            return Poll::Ready(ReentrantMutexGuard::new(this.mutex));
+            // Completed at once: it spends one operation of the poll's
+            // budget, or, the budget spent, the level goes and it yields.
+            let guard = ReentrantMutexGuard::new(this.mutex);
+            if crate::coop::spend(cx.waker()) {
+                return Poll::Ready(guard);
+            }
+            drop(guard);
+            return Poll::Pending;
         }
         this.wait.poll(&this.mutex.sem, 1, cx.waker()).map(|()| {
             this.mutex.enter(this.owner);

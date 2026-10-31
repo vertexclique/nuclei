@@ -9,7 +9,9 @@ use std::io;
 pub use crate::join_set::JoinSet;
 
 /// Cooperative scheduling: the budget of operations each poll of a task may
-/// complete before it yields to the other tasks of its shard.
+/// complete before it yields to the other tasks of its shard. IO that
+/// completes spends one, and so do the receives, acquires and locks of
+/// [`sync`](crate::sync) that complete (see its module docs).
 pub mod coop {
     pub use crate::coop::{
         BUDGET, Cooperative, Unconstrained, consume_budget, cooperative, has_budget_remaining,

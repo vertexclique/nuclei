@@ -1,8 +1,9 @@
 //! Cooperative scheduling: every poll of a task (and of `block_on`'s own
 //! future) gets a budget of [`BUDGET`] operations. IO that completes spends
-//! one; a task whose budget is spent is answered `Pending` and woken at once,
-//! so it goes behind the other tasks of its shard instead of starving them on
-//! IO that is always ready. An IO operation that does
+//! one, and so does every receive, acquire and lock of `nuclei::sync` that
+//! completes; a task whose budget is spent is answered `Pending` and woken at
+//! once, so it goes behind the other tasks of its shard instead of starving
+//! them on IO or a channel that is always ready. An IO operation that does
 //! not complete is refunded: only progress spends budget.
 //!
 //! The budget is a per-thread counter, saved and restored around each poll,
@@ -147,6 +148,26 @@ pub(crate) fn spend(waker: &Waker) -> bool {
 fn refused(waker: &Waker) -> bool {
     waker.wake_by_ref();
     false
+}
+
+/// Whether the budget is spent, for an operation that cannot undo what it
+/// completes: it looks before it starts, and spends with [`try_spend`] once it
+/// completed. When the budget is spent the task is woken and the caller
+/// answers `Pending` without starting.
+#[inline]
+pub(crate) fn exhausted(waker: &Waker) -> bool {
+    POLLING.try_with(|p| p.left.get()).unwrap_or(UNBUDGETED) == 0 && !refused(waker)
+}
+
+/// Spends one operation of a budget [`exhausted`] just found not spent, for
+/// the operation that then completed.
+#[inline(always)]
+pub(crate) fn spent_one() {
+    let _ = POLLING.try_with(|p| {
+        let left = p.left.get();
+        debug_assert_ne!(left, 0, "spent without a look at the budget");
+        p.left.set(left.wrapping_sub(1));
+    });
 }
 
 /// Gives back the operation [`try_spend`] took, for one that did not
