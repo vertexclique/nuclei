@@ -61,6 +61,7 @@ use std::time::Duration;
 use super::Shard;
 use super::recv::RecvGroup;
 use crate::fs::ring::FileOp;
+use crate::io::side::After;
 use crate::io::source::ops::Done;
 use crate::io::source::requests::Lease;
 use crate::io::source::ring::{Arrival, RingMem, RingOp};
@@ -657,7 +658,8 @@ impl ShardRing {
         if let Some((source, chunk, epoch, datagram)) = delivery {
             // Before the view, so it drops after it.
             let _unwound = crate::io::side::Unwound::enter();
-            let (after, starved) = {
+            let mut after = After::default();
+            let starved = {
                 // SAFETY: the op's slab entry owns a strong count of the
                 // source until its final completion, which this thread
                 // processes only after this call returns. Until the view is
@@ -683,9 +685,8 @@ impl ShardRing {
                 } else {
                     Arrival::Chunk(chunk)
                 };
-                let after = source.ring_arrival(arrival, epoch, shard);
-                let starved = after.starved.then(|| std::sync::Arc::clone(&source));
-                (after, starved)
+                source.ring_arrival(arrival, epoch, shard, &mut after);
+                after.starved.then(|| std::sync::Arc::clone(&source))
             };
             if let Some(source) = starved {
                 source.wait_for_buffer();
@@ -722,7 +723,8 @@ impl ShardRing {
         if stop {
             self.cancel(user_data);
         }
-        let after = source.ring_arrival(Arrival::Conn(conn), epoch, shard);
+        let mut after = After::default();
+        source.ring_arrival(Arrival::Conn(conn), epoch, shard, &mut after);
         if after.starved {
             std::sync::Arc::clone(&source).wait_for_buffer();
         }

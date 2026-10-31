@@ -766,33 +766,31 @@ impl Source {
     /// On the ring's thread: an arrival of the read side's multishot
     /// receive or accept, submitted in `epoch`. The side takes it at once if
     /// free, else its holder does as it lets go. The wakes and drops come
-    /// back to be run once the caller no longer borrows the source.
+    /// into `after`, for the caller to run once it no longer borrows the source.
     pub(crate) fn ring_arrival(
         self: &Arc<Self>,
         arrival: Arrival,
         epoch: u32,
         shard: Option<&crate::rt::shard::Shard>,
-    ) -> After {
-        let mut after = After::default();
+        after: &mut After,
+    ) {
         let hooks = self.hooks_in(shard);
         // The side free: the arrival goes in now, with no trip through the
         // queue (whose segments would be allocated as it grows). Only this
         // thread pushes to the queue, so what waits there came before this
         // arrival and goes in first: the order holds.
         if let Some(mut held) = self.read.try_hold_for(&hooks) {
-            hooks.taken(held.get(), &mut after);
+            hooks.taken(held.get(), after);
             while let Ok((queued, at)) = self.read_arrivals.try_pop() {
-                held.get().take_arrival(queued, at, &mut after);
+                held.get().take_arrival(queued, at, after);
             }
-            held.get().take_arrival(arrival, epoch, &mut after);
-            held.release(&mut after, &hooks);
+            held.get().take_arrival(arrival, epoch, after);
+            held.release(after, &hooks);
         } else {
             self.read_arrivals.push((arrival, epoch));
-            self.read
-                .defer(super::read_work::ARRIVALS, &mut after, &hooks);
+            self.read.defer(super::read_work::ARRIVALS, after, &hooks);
         }
-        self.kick(&mut after);
-        after
+        self.kick(after);
     }
 
     /// Cancels the side's operation of `user_data`, on its ring's thread;
