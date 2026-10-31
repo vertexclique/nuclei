@@ -875,11 +875,15 @@ impl Shard {
     fn apply_io_ops(&self) {
         while let Ok(op) = self.shared.io_ops.try_pop() {
             match op {
-                IoOp::Register(source) => {
-                    if let Err(err) = self.register_source(&source) {
-                        source.registration_failed(&err);
+                IoOp::Register(source) => match self.register_source(&source) {
+                    Ok(()) => {}
+                    // The shard stopped: no failure, the attach set the
+                    // registration back to none, and its tasks look again.
+                    Err(err) if crate::io::source::requests::is_stopped_shard(&err) => {
+                        source.look_again();
                     }
-                }
+                    Err(err) => source.registration_failed(&err),
+                },
                 IoOp::Release(token) => {
                     let gone = self.sources.borrow_mut().remove(token);
                     drop(gone);

@@ -86,7 +86,7 @@ fn stopped_shard() -> io::Error {
 }
 
 /// Whether `err` is an attach refused because its shard stopped first.
-fn is_stopped_shard(err: &io::Error) -> bool {
+pub(crate) fn is_stopped_shard(err: &io::Error) -> bool {
     err.get_ref()
         .is_some_and(|inner| inner.is::<StoppedShard>())
 }
@@ -617,6 +617,12 @@ impl Source {
     /// register it where they poll next (no failure of its IO).
     pub(crate) fn registration_orphaned(self: &Arc<Self>) {
         self.registration_abandoned();
+        self.look_again();
+    }
+
+    /// Every task waiting on the source looks again, to register it where it
+    /// polls next: its registration went back to none.
+    pub(crate) fn look_again(self: &Arc<Self>) {
         let mut after = After::default();
         self.request(ORPHANED, &mut after);
         after.run();

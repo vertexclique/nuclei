@@ -15,12 +15,14 @@
   dropped with its run, closing the stream with the bytes behind never sent. It now goes on on a
   thread of its own, to its own deadline, as the ones the run never took do
   (`proofs/tla/going/Linger.tla`).
-- **A registration a stopping shard never made no longer fails the source's IO.** A thread that
-  runs no shard posts its source's registration to a worker; one that stopped first failed it, so
-  the source's next operation returned "the shard stopped before the registration", and a dropped
+- **A registration a stopping shard never made no longer fails the source's IO.** A worker whose
+  shard had stopped still registered sources its thread polled, and one asked to register a source
+  for a thread that runs no shard could stop first; either failed the registration, so the
+  source's next operation returned "the shard stopped before the registration", and a dropped
   stream's drain (a runtime dropping with bytes behind) took that for its end and gave the bytes
-  up. The source now stays unregistered and its waiting tasks look again, to register it where
-  they poll next, as `proofs/tla/attach` has it.
+  up (on macOS, about one run in twenty of the drop test). A stopped shard now registers nothing:
+  the source stays unregistered and its waiting tasks look again, to register it where they poll
+  next, as `proofs/tla/attach` has it.
 - **A dropped TCP stream whose linger ran out resets its connection.** The bytes still behind were
   given up and the stream closed with a FIN, so the peer read a cut stream as a whole one; it now
   reads `ConnectionReset` (`proofs/tla/close`).
