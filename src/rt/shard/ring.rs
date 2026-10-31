@@ -70,7 +70,8 @@ use crate::rt::park::ring::RingPoller;
 use crate::syscore::linux::iouring::files::Files;
 use crate::syscore::linux::iouring::ops::Ops;
 use crate::syscore::linux::iouring::ring::sys::{
-    IORING_CQE_F_BUF_MORE, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IOSQE_FIXED_FILE, cqe_buffer_id,
+    IORING_CQE_F_BUF_MORE, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF,
+    IOSQE_FIXED_FILE, cqe_buffer_id,
 };
 use crate::syscore::linux::iouring::ring::{IoUringCqe, RingConfig, Sqe};
 use exits::ExitOp;
@@ -494,7 +495,18 @@ impl ShardRing {
             }
             return;
         }
-        if self.zero_copy(shard, &cqe) {
+        // The common end, one lookup: a plain operation's only completion.
+        let plain =
+            if cqe.flags & (IORING_CQE_F_MORE | IORING_CQE_F_NOTIF | IORING_CQE_F_BUFFER) == 0 {
+                self.ops.borrow_mut().remove_if(cqe.user_data, ends_plain)
+            } else {
+                None
+            };
+        if let Some(op) = plain {
+            if counts_as_write(&op) {
+                self.writes.set(self.writes.get().saturating_sub(1));
+            }
+            self.end(shard, op, cqe.res);
             return;
         }
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
@@ -505,6 +517,8 @@ impl ShardRing {
                 cqe.res,
                 cqe.flags & IORING_CQE_F_BUF_MORE != 0,
             );
+        } else if self.zero_copy(shard, &cqe) {
+            return;
         } else if cqe.res >= 0 {
             self.accepted(shard, cqe.user_data, cqe.res);
         }
@@ -817,6 +831,18 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
 /// Whether `op` is one of the write sides' operations counted in `writes`: a
 /// write side's, until a zero-copy send only waits for its notification. The
 /// one place both the submission and the end of an operation decide it.
+/// Whether `op` ends at its one completion, with no arrival, notification or follow-up to wait for.
+fn ends_plain(op: &RingOp) -> bool {
+    !matches!(
+        op.mem,
+        RingMem::SendZc { .. }
+            | RingMem::ZcHeld(_)
+            | RingMem::RecvMulti { .. }
+            | RingMem::RecvFromMulti { .. }
+            | RingMem::AcceptMulti { .. }
+    )
+}
+
 fn counts_as_write(op: &RingOp) -> bool {
     !op.read && !matches!(op.mem, RingMem::ZcHeld(_))
 }
