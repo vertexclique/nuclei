@@ -28,7 +28,7 @@ file_read epoll 4744 9
 spawn_join io_uring 1438 1
 spawn_join epoll 1435 1
 spawn_blocking io_uring 3701 6
-spawn_blocking epoll 3432 1
+spawn_blocking epoll 3432 5
 sleep io_uring 1185 1
 sleep epoll 1186 1
 oneshot io_uring 1651 1
