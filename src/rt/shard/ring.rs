@@ -120,13 +120,10 @@ pub(crate) struct ShardRing {
     /// The buffers multishot receives draw from; `None` when the
     /// configuration asks for none, or once the ring is shut down.
     recv: RefCell<Option<RecvGroup>>,
-    /// Where the latencies of the operations go, when the runtime records
-    /// them: operations are stamped as they are submitted.
-    times: std::cell::OnceCell<Arc<IoTimes>>,
-    /// When each operation in flight was submitted, by its user data, while
-    /// latencies are recorded: kept beside the operations, so an operation's
-    /// record stays its size whether or not they are.
-    stamps: RefCell<std::collections::HashMap<u64, Instant>>,
+    /// Where the latencies of the operations go, with their submissions'
+    /// stamps, while the runtime records them: one word, boxed, so a ring
+    /// that records nothing carries none of it in its own layout.
+    timing: std::cell::OnceCell<Box<Timing>>,
     /// Multishot receives and accepts submitted, the receives' arrivals,
     /// and the receives that ended as the group ran dry, for a test.
     #[cfg(test)]
@@ -206,8 +203,7 @@ impl ShardRing {
             cap,
             writes: Cell::new(0),
             recv: RefCell::new(recv),
-            times: std::cell::OnceCell::new(),
-            stamps: RefCell::new(std::collections::HashMap::new()),
+            timing: std::cell::OnceCell::new(),
             #[cfg(test)]
             counts: Cell::new((0, 0, 0)),
             #[cfg(test)]
@@ -334,7 +330,7 @@ impl ShardRing {
                 return IGNORED;
             }
         };
-        if self.times.get().is_some() {
+        if self.timing.get().is_some() {
             self.stamp(user_data);
         }
         if write {
@@ -370,21 +366,15 @@ impl ShardRing {
         let user_data = match inserted {
             Ok(user_data) => user_data | FILE_TAG,
             // Past 2^30 file calls at once: the call goes to the pool.
-            Err(op) => return Self::file_to_pool(op),
+            Err(op) => {
+                drop(op.complete(-libc::ECANCELED));
+                return;
+            }
         };
-        if self.times.get().is_some() {
+        if self.timing.get().is_some() {
             self.stamp(user_data);
         }
         self.enter(user_data, sqe, true);
-    }
-
-    /// A file call the ring has no room for, made on the blocking pool
-    /// instead: out of line, as `FileOp::complete` is inlined where the
-    /// ring's completions take it.
-    #[cold]
-    #[inline(never)]
-    fn file_to_pool(op: FileOp) {
-        drop(op.complete(-libc::ECANCELED));
     }
 
     /// A file's call completed: the rest of a write goes on, else its end
@@ -395,7 +385,7 @@ impl ShardRing {
         };
         self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
         self.admit_waiting();
-        if self.times.get().is_some() {
+        if self.timing.get().is_some() {
             self.timed(user_data, Some(IoKind::File), res);
         }
         if let Some(rest) = op.complete(res) {
@@ -553,7 +543,7 @@ impl ShardRing {
             if counts_as_write(&op) {
                 self.writes.set(self.writes.get().saturating_sub(1));
             }
-            if self.times.get().is_some() {
+            if self.timing.get().is_some() {
                 self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
             }
             self.end(shard, op, cqe.res);
@@ -582,7 +572,7 @@ impl ShardRing {
         if counts_as_write(&op) {
             self.writes.set(self.writes.get().saturating_sub(1));
         }
-        if self.times.get().is_some() {
+        if self.timing.get().is_some() {
             self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
         }
         self.end(shard, op, cqe.res);
@@ -641,7 +631,7 @@ impl ShardRing {
             self.zc_denied.set(true);
             res = -libc::ECANCELED;
         }
-        if self.times.get().is_some() {
+        if self.timing.get().is_some() {
             self.timed(cqe.user_data, Some(IoKind::Write), res);
         }
         let outcome = crate::io::source::ring::zc_outcome(res);
@@ -806,7 +796,10 @@ impl ShardRing {
 
     /// Starts timing the operations submitted from now on into `times`.
     pub(super) fn time_with(&self, times: Arc<IoTimes>) {
-        let _ = self.times.set(times);
+        let _ = self.timing.set(Box::new(Timing {
+            times,
+            stamps: RefCell::new(std::collections::HashMap::new()),
+        }));
     }
 
     /// The operation of `user_data` was submitted now, while latencies are
@@ -814,7 +807,9 @@ impl ShardRing {
     #[cold]
     #[inline(never)]
     fn stamp(&self, user_data: u64) {
-        self.stamps.borrow_mut().insert(user_data, Instant::now());
+        if let Some(timing) = self.timing.get() {
+            timing.stamps.borrow_mut().insert(user_data, Instant::now());
+        }
     }
 
     /// The operation of `user_data` ended with `res`, while latencies are
@@ -823,7 +818,10 @@ impl ShardRing {
     #[cold]
     #[inline(never)]
     fn timed(&self, user_data: u64, kind: Option<IoKind>, res: i32) {
-        let stamp = self.stamps.borrow_mut().remove(&user_data);
+        let stamp = self
+            .timing
+            .get()
+            .and_then(|timing| timing.stamps.borrow_mut().remove(&user_data));
         if let (Some(at), Some(kind)) = (stamp, kind) {
             self.time(kind, res, at);
         }
@@ -832,7 +830,7 @@ impl ShardRing {
     /// An operation of `kind` stamped `issued` ended with `res`: its latency
     /// is counted, unless it was cancelled or told to try again.
     fn time(&self, kind: IoKind, res: i32, issued: Instant) {
-        if let Some(times) = self.times.get()
+        if let Some(times) = self.timing.get().map(|timing| &timing.times)
             && res != -libc::ECANCELED
             && res != -libc::EAGAIN
             && !(matches!(kind, IoKind::Connect) && res == -libc::EALREADY)
@@ -885,6 +883,13 @@ impl ShardRing {
             shard,
         );
     }
+}
+
+/// A ring's latencies while its runtime records them: where they go, and
+/// when each operation in flight was submitted, by its user data.
+struct Timing {
+    times: Arc<IoTimes>,
+    stamps: RefCell<std::collections::HashMap<u64, Instant>>,
 }
 
 /// The kind of latency an operation's end counts as, if it is timed: not a
