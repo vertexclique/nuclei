@@ -547,7 +547,9 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// task stays on its shard.
 ///
 /// Dropping the returned [`Task`] cancels it; call [`Task::detach`] to let
-/// it run on its own.
+/// it run on its own. Awaiting a task that was cancelled (through an
+/// [`AbortHandle`](crate::task::AbortHandle), or by its runtime's shutdown)
+/// panics; [`Task::join`] and [`Task::fallible`] answer it instead.
 ///
 /// # Panics
 ///

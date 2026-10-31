@@ -2,6 +2,16 @@
 //! [`GlobalExecutorConfig`] builder, and growing or shrinking the default
 //! runtime's workers. Each maps onto the process default
 //! [`Runtime`](crate::Runtime).
+//!
+//! It stays at the crate root, with [`Proactor`](crate::Proactor) and
+//! [`drive`](crate::drive), so code written against those versions builds;
+//! new code reaches for [`Builder`](crate::Builder) (with
+//! [`build_global`](crate::Builder::build_global), which answers its
+//! error), [`RuntimeHandle`](crate::RuntimeHandle) and
+//! [`block_on`](crate::block_on). Its shapes are kept as they were:
+//! [`spawn_more_threads`] is async though nothing in it waits, and
+//! [`stop_thread`] answers a [`Task`] that dropping cancels before it stops
+//! anything.
 
 use std::fmt;
 use std::io;

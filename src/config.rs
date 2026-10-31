@@ -69,8 +69,12 @@ pub struct IoUringConfiguration {
     /// process's task limit (`RLIMIT_NPROC`) bounds them.
     pub per_numa_unbounded_worker_count: Option<u32>,
 
-    /// Kept for code written against earlier versions; the ring does not read
-    /// it (default `false`).
+    /// Has no effect, and is kept so code written against earlier versions
+    /// builds (default `false`). Every shard already looks at its ring's
+    /// completions while it spins before it sleeps, and a kernel thread that
+    /// polls the submission queue is
+    /// [`sqpoll_wake_interval`](Self::sqpoll_wake_interval); no third kind of
+    /// polling is left for this flag to turn on.
     pub aggressive_poll: bool,
 
     /// Busy-waits for file completions instead of taking interrupts (default
