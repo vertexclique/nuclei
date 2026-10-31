@@ -10,7 +10,7 @@ use super::*;
 /// worker's ring (handed off, the poll's thread runs no shard, and its calls
 /// go to the blocking pool, as they must).
 #[cfg(target_os = "linux")]
-fn one_blocking_thread_kept() -> Runtime {
+pub(super) fn one_blocking_thread_kept() -> Runtime {
     Builder::new()
         .worker_threads(1)
         .max_blocking_threads(1)

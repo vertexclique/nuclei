@@ -17,6 +17,7 @@
 use std::io;
 use std::sync::Arc;
 
+use super::Allocate;
 use super::call::{
     FileOutcome, LentReadEnd, LentWriteEnd, Slot, SlotJob, WriteCall, as_read, as_read_lent,
     as_sync, as_write, as_write_lent,
@@ -43,6 +44,8 @@ pub(crate) enum FileMem {
     WriteLent { buf: OwnedBuf, done: usize },
     /// A sync of the file's data (`data_only`) or of all of it.
     Sync { data_only: bool },
+    /// A change of the space `len` bytes from `at` use, as `mode` says.
+    Allocate { len: u64, mode: Allocate },
 }
 
 /// A file's operation on a ring.
@@ -73,8 +76,11 @@ fn submit<B, T>(
         };
         let slot = Slot::new();
         let mem = mem(buf);
-        let write = matches!(mem, FileMem::Write { .. } | FileMem::WriteLent { .. })
-            .then(|| WriteCall::on(&shard.shared));
+        let write = matches!(
+            mem,
+            FileMem::Write { .. } | FileMem::WriteLent { .. } | FileMem::Allocate { .. }
+        )
+        .then(|| WriteCall::on(&shard.shared));
         ring.submit_file(FileOp {
             fd: fd.clone(),
             at,
@@ -114,6 +120,24 @@ pub(crate) fn sync(fd: &Lease, data_only: bool) -> Result<SlotJob<io::Result<()>
         data_only,
         |data_only| FileMem::Sync { data_only },
         as_sync,
+    )
+    .map_err(drop)
+}
+
+/// A change of the space the `len` bytes from `offset` use, as `mode` says,
+/// on this thread's ring; `Err` when the thread runs none.
+pub(crate) fn allocate(
+    fd: &Lease,
+    offset: u64,
+    len: u64,
+    mode: Allocate,
+) -> Result<SlotJob<io::Result<()>>, ()> {
+    submit(
+        fd,
+        offset,
+        (len, mode),
+        |(len, mode)| FileMem::Allocate { len, mode },
+        as_write,
     )
     .map_err(drop)
 }
@@ -186,6 +210,9 @@ impl FileOp {
                 )
             }
             FileMem::Sync { data_only } => Sqe::fsync(fd, *data_only),
+            FileMem::Allocate { len, mode } => {
+                Sqe::fallocate(fd, self.at, *len, sys::fallocate_mode(*mode) as u32)
+            }
         }
     }
 
@@ -231,6 +258,7 @@ impl FileOp {
             FileMem::Write { .. } => FileOutcome::Write(written(result)),
             FileMem::WriteLent { buf, .. } => FileOutcome::WriteLent(written(result), buf),
             FileMem::Sync { .. } => FileOutcome::Sync(result.map(drop)),
+            FileMem::Allocate { .. } => FileOutcome::Write(result.map(drop)),
         };
         self.slot.put(outcome);
         // Once the wake went: a task it dropped handed what it left first.
@@ -288,6 +316,9 @@ impl FileOp {
                 }
                 FileMem::Sync { data_only } => {
                     FileOutcome::Sync(crate::fs::file::sync_on(&fd, data_only))
+                }
+                FileMem::Allocate { len, mode } => {
+                    FileOutcome::Write(sys::allocate(raw, at, len, mode))
                 }
             };
             slot.put(outcome);

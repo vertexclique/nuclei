@@ -23,7 +23,20 @@
 //! `write_owned`, `read_at_owned` and `write_at_owned` take the caller's
 //! buffer and give it back, so the bytes are read into it and written from
 //! it with no copy.
+//!
+//! Beside those, a regular file can be asked to change the space a range
+//! uses ([`Handle::allocate`]: reserve, keep the length, punch a hole, zero),
+//! to write a range back ([`Handle::sync_range`]), to copy a range into
+//! another file in the kernel where the system can ([`Handle::copy_range_to`]),
+//! and to take an advisory lock without blocking the worker
+//! ([`Handle::lock`], [`Handle::try_lock`], [`Handle::unlock`]).
+//!
+//! A file's name in its directory needs [`sync_dir`] to survive a crash. To
+//! replace a file atomically: write a temporary file in the same directory,
+//! `sync_all` it, [`rename`] it over the target, then [`sync_dir`] the
+//! directory.
 
+mod allocate;
 pub(crate) mod call;
 pub(crate) mod file;
 mod file_ops;
@@ -32,6 +45,7 @@ mod read_dir;
 #[cfg(ring)]
 pub(crate) mod ring;
 
+pub use self::allocate::Allocate;
 pub use std::fs::{FileTimes, FileType, Metadata, Permissions};
 
 #[cfg(unix)]
@@ -62,6 +76,14 @@ use crate::buf::vectored::{self, IoVecBuf, IoVecBufMut};
 use crate::io::Handle;
 use crate::io::source::Kind;
 
+/// A file's calls. std's own `File::lock`, `FileExt::read_at` and
+/// `FileExt::write_at` (on Windows `seek_read` and `seek_write`), reached
+/// through `Deref`, block the worker thread that makes them. Use the async
+/// calls instead: [`lock`](Handle::lock), [`try_lock`](Handle::try_lock) and
+/// [`unlock`](Handle::unlock), [`read_at`](Handle::read_at) and
+/// [`write_at`](Handle::write_at), and, with no copy of the bytes,
+/// [`read_at_owned`](Handle::read_at_owned) and
+/// [`write_at_owned`](Handle::write_at_owned).
 impl Handle<StdFile> {
     /// Opens the file at `p` for reading, on the blocking pool.
     ///

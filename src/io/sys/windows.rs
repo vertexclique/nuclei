@@ -12,20 +12,24 @@ use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::windows::io::{BorrowedHandle, FromRawSocket, OwnedHandle, OwnedSocket};
 
+use crate::fs::Allocate;
 use crate::io::raw::Raw;
 use crate::io::source::Kind;
 use crate::syscore::windows::{
-    AF_INET, AF_INET6, DWORD, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION,
-    FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION,
-    FILE_NO_INTERMEDIATE_BUFFERING, FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT,
-    FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType, HANDLE, IN_ADDR, INVALID_SOCKET,
+    AF_INET, AF_INET6, DWORD, DeviceIoControl, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF,
+    FILE_ACCESS_INFORMATION, FILE_ALLOCATION_INFO_CLASS, FILE_APPEND_DATA, FILE_BEGIN,
+    FILE_CURRENT, FILE_END_OF_FILE_INFO_CLASS, FILE_MODE_INFORMATION,
+    FILE_NO_INTERMEDIATE_BUFFERING, FILE_STANDARD_INFO, FILE_STANDARD_INFO_CLASS,
+    FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA,
+    FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
+    GetFileInformationByHandleEx, GetFileSizeEx, GetFileType, HANDLE, IN_ADDR, INVALID_SOCKET,
     IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK, NtQueryInformationFile, OVERLAPPED, ReadFile, SD_SEND,
     SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT,
     SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
     SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, STATUS_SUCCESS,
-    SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAEMSGSIZE,
-    WSAIoctl, WSASocketW, WriteFile, bind, getsockname, getsockopt, last_error, recv, recvfrom,
-    send, sendto, setsockopt, shutdown, wsa_error,
+    SetFileInformationByHandle, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
+    WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile, bind, getsockname,
+    getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, shutdown, wsa_error,
 };
 
 fn socket_of(raw: Raw) -> SOCKET {
@@ -591,4 +595,116 @@ pub(crate) fn reopen_overlapped(raw: Raw) -> io::Result<OwnedHandle> {
 /// Whether the provider has `TransmitFile`, which sends a file range in the kernel.
 pub(crate) fn transmit_file_available() -> bool {
     crate::syscore::windows::winsock::ext().is_ok_and(|ext| ext.transmit_file.is_some())
+}
+
+/// Sets one of the file's sizes (`class`) to `value`.
+fn set_size(raw: Raw, class: i32, value: i64) -> io::Result<()> {
+    // SAFETY: the call reads the one `i64` both classes carry.
+    if unsafe {
+        SetFileInformationByHandle(
+            handle_of(raw),
+            class,
+            core::ptr::from_ref(&value).cast(),
+            size_of::<i64>() as DWORD,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// A control code of the file system that takes `input` (or nothing) and answers nothing.
+fn control<T>(raw: Raw, code: DWORD, input: Option<&T>) -> io::Result<()> {
+    let mut returned: DWORD = 0;
+    let (ptr, len) = match input {
+        Some(input) => (core::ptr::from_ref(input).cast(), size_of::<T>() as DWORD),
+        None => (core::ptr::null(), 0),
+    };
+    // SAFETY: the call reads `len` bytes at `ptr`, which is ours or null.
+    if unsafe {
+        DeviceIoControl(
+            handle_of(raw),
+            code,
+            ptr,
+            len,
+            core::ptr::null_mut(),
+            0,
+            &mut returned,
+            core::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// Zeroes the bytes of the file from `from` to `to`.
+fn zero(raw: Raw, from: i64, to: i64) -> io::Result<()> {
+    let range = FILE_ZERO_DATA_INFORMATION {
+        FileOffset: from,
+        BeyondFinalZero: to,
+    };
+    control(raw, FSCTL_SET_ZERO_DATA, Some(&range))
+}
+
+/// Changes the space the `len` bytes of the file from `offset` use, as `mode`
+/// says: the allocation (and, for `Extend`, the size) grown to the range's
+/// end, a range made a hole of a sparse file, or a range zeroed (the file
+/// grown first when the range ends past its end).
+pub(crate) fn allocate(raw: Raw, offset: u64, len: u64, mode: Allocate) -> io::Result<()> {
+    let past = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the range ends past the largest offset a file can have",
+        )
+    };
+    let end = i64::try_from(offset.saturating_add(len)).map_err(|_| past())?;
+    let from = i64::try_from(offset).map_err(|_| past())?;
+    let mut standard = FILE_STANDARD_INFO {
+        AllocationSize: 0,
+        EndOfFile: 0,
+        NumberOfLinks: 0,
+        DeletePending: 0,
+        Directory: 0,
+    };
+    // SAFETY: the call writes a `FILE_STANDARD_INFO` into our own.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle_of(raw),
+            FILE_STANDARD_INFO_CLASS,
+            core::ptr::from_mut(&mut standard).cast(),
+            size_of::<FILE_STANDARD_INFO>() as DWORD,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    match mode {
+        Allocate::Extend | Allocate::KeepSize => {
+            if end > standard.AllocationSize {
+                set_size(raw, FILE_ALLOCATION_INFO_CLASS, end)?;
+            }
+            if mode == Allocate::Extend && end > standard.EndOfFile {
+                set_size(raw, FILE_END_OF_FILE_INFO_CLASS, end)?;
+            }
+            Ok(())
+        }
+        Allocate::PunchHole => {
+            control::<()>(raw, FSCTL_SET_SPARSE, None)?;
+            let to = end.min(standard.EndOfFile);
+            if from < to {
+                zero(raw, from, to)
+            } else {
+                Ok(())
+            }
+        }
+        Allocate::ZeroRange => {
+            if end > standard.EndOfFile {
+                set_size(raw, FILE_END_OF_FILE_INFO_CLASS, end)?;
+            }
+            zero(raw, from, end)
+        }
+    }
 }

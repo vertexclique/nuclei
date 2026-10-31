@@ -1,4 +1,5 @@
-//! Positional writes whose future was dropped while they were out. Each
+//! Positional writes (and the changes of a range, which are writes in this)
+//! whose future was dropped while they were out. Each
 //! still lands, and the file keeps it until it did: every later write at the
 //! cursor, cursor read, positional call and sync of the handle waits for it,
 //! so a write that came before them is never reordered with them.

@@ -46,7 +46,7 @@ pub(crate) fn ready<T>(result: io::Result<T>) -> Option<io::Result<T>> {
 }
 
 /// Makes `call` again while a signal cuts it short.
-fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+pub(super) fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         match call() {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -55,7 +55,7 @@ fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     }
 }
 
-fn cvt(ret: isize) -> io::Result<usize> {
+pub(super) fn cvt(ret: isize) -> io::Result<usize> {
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -63,7 +63,7 @@ fn cvt(ret: isize) -> io::Result<usize> {
     }
 }
 
-fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
+pub(super) fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -727,7 +727,7 @@ fn unnamed() -> io::Result<unix::SocketAddr> {
 }
 
 /// `offset` as the system's file offset.
-fn file_offset(offset: u64) -> io::Result<libc::off_t> {
+pub(super) fn file_offset(offset: u64) -> io::Result<libc::off_t> {
     libc::off_t::try_from(offset).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

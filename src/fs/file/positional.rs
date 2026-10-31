@@ -15,6 +15,9 @@
 //!   `pwrite` and `pread` from two threads race.
 //! - A positional write whose future is dropped while it is out still lands;
 //!   the file keeps it until it did (`orphans`).
+//! - The writes of a range (`space`: `allocate`; `copy`: the write side of
+//!   `copy_range_to`) are positional writes in all this, and so is the cut of
+//!   `set_len`, which moves the generation on when it ran.
 //!
 //! On io_uring each is a read or a write of the shard's ring at its offset;
 //! elsewhere a `pread` or `pwrite` on the blocking pool (on Windows a
@@ -37,7 +40,7 @@ use crate::io::side::After;
 impl FileIo {
     /// Ready once every cursor write accepted before the call, and every
     /// positional write left by its task, landed.
-    fn poll_ordered(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<()> {
+    pub(super) fn poll_ordered(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<()> {
         if !self.has_unsent() {
             return Poll::Ready(());
         }
@@ -46,7 +49,11 @@ impl FileIo {
 
     /// A buffer of the pool for the bytes of a task's memory at `addr`, and
     /// where in it and how many of `len` the call moves (see `work::bounce`).
-    async fn bounce_for(&self, len: usize, addr: usize) -> (crate::buf::PoolBuf, usize, usize) {
+    pub(super) async fn bounce_for(
+        &self,
+        len: usize,
+        addr: usize,
+    ) -> (crate::buf::PoolBuf, usize, usize) {
         poll_fn(|cx| match bounce(len, addr, self.direct, cx.waker()) {
             Some(got) => Poll::Ready(got),
             None => Poll::Pending,
@@ -119,6 +126,15 @@ impl FileIo {
         (result.map(|()| len), buf.into_written())
     }
 
+    /// The file may hold other bytes than before (a write ended, failed or
+    /// not; a cut, a hole): reads of the file before this, read ahead or still
+    /// out, are of an older generation.
+    pub(crate) fn moved_on(&self) {
+        // Release: pairs with the Acquire of `FileIo::generation`.
+        self.generation
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+
     /// Leaves `orphan`, a positional write whose task went away, to the
     /// file state, which keeps everything after it waiting until it landed.
     fn orphan(self: &Arc<Self>, orphan: Orphan) {
@@ -139,12 +155,12 @@ impl FileIo {
 
 /// A positional write out, whose task takes its end. Dropped first, the
 /// write is left to the file.
-struct Out<'a, T>
+pub(super) struct Out<'a, T>
 where
     Work<T>: Into<Orphan>,
 {
-    io: &'a Arc<FileIo>,
-    work: Option<Work<T>>,
+    pub(super) io: &'a Arc<FileIo>,
+    pub(super) work: Option<Work<T>>,
 }
 
 impl<T> Out<'_, T>
@@ -152,18 +168,18 @@ where
     T: Ended,
     Work<T>: Into<Orphan>,
 {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<T> {
+    /// The call's end, once it came.
+    pub(super) async fn finish(mut self) -> T {
+        poll_fn(|cx| self.poll(cx)).await
+    }
+
+    pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<T> {
         let Some(work) = self.work.as_mut() else {
             return Poll::Pending;
         };
         let end = core::task::ready!(work.poll(cx.waker()));
         self.work = None;
-        // The file may hold what it wrote, failed or not: reads of the file
-        // before this, read ahead or still out, are of an older generation.
-        // Release: pairs with the Acquire of `FileIo::generation`.
-        self.io
-            .generation
-            .fetch_add(1, core::sync::atomic::Ordering::Release);
+        self.io.moved_on();
         Poll::Ready(end)
     }
 }

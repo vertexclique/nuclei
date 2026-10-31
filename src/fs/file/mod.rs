@@ -58,6 +58,7 @@
 mod durable;
 mod orphans;
 mod positional;
+mod space;
 mod work;
 
 use crate::buf::owned::{IoBuf, IoBufMut, OwnedBuf};

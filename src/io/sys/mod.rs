@@ -6,6 +6,10 @@
 mod unix;
 #[cfg(unix)]
 pub(crate) use self::unix::*;
+#[cfg(unix)]
+mod space;
+#[cfg(unix)]
+pub(crate) use self::space::*;
 
 #[cfg(windows)]
 mod windows;

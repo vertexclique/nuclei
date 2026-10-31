@@ -16,8 +16,23 @@ use std::time::SystemTime;
 
 use futures_io::AsyncWrite;
 
+use super::Allocate;
 use super::ops::{OpenOptions, blocking};
 use crate::io::Handle;
+use crate::io::raw::Raw;
+use crate::io::sys;
+
+/// The descriptor of `file`, as the system calls take it.
+#[cfg(unix)]
+fn raw_of(file: &File) -> Raw {
+    std::os::fd::AsRawFd::as_raw_fd(file)
+}
+
+/// The handle of `file`, as the system calls take it.
+#[cfg(windows)]
+fn raw_of(file: &File) -> Raw {
+    std::os::windows::io::AsRawHandle::as_raw_handle(file) as usize as Raw
+}
 
 impl Handle<File> {
     /// Opens the file at `path` for writing, creating it or cutting it down
@@ -81,10 +96,44 @@ impl Handle<File> {
         self.file()?.sync(true).await
     }
 
+    /// Changes the space the `len` bytes of the file from `offset` use, as
+    /// `mode` says: reserves it, keeps the length, frees it, or zeroes it.
+    /// The call is a write of the range: it lands after every write accepted
+    /// at the cursor before it and every positional write that returned
+    /// before it, a read at the cursor made after it sees what it did, and a
+    /// future dropped while the call is out leaves it to the file, which
+    /// every later call of the handle waits for. On io_uring it is an
+    /// operation of the shard's ring (`fallocate(2)`); elsewhere a job of the
+    /// blocking pool (`fcntl` on macOS, `DeviceIoControl` and
+    /// `SetFileInformationByHandle` on Windows).
+    ///
+    /// A system that cannot do `mode` answers `Unsupported` (macOS cannot
+    /// zero a range in place), and a file system may refuse a mode as the
+    /// system says.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when the end of the range is past the largest offset a
+    /// file can have; otherwise the system's own answer, among them that of
+    /// an empty range, a handle that cannot be written, and a stream.
+    pub async fn allocate(&self, offset: u64, len: u64, mode: Allocate) -> io::Result<()> {
+        if !self.is_regular() {
+            return self
+                .on_pool(move |file| sys::allocate(raw_of(file), offset, len, mode))
+                .await;
+        }
+        self.file()?.allocate(offset, len, mode).await
+    }
+
     /// Sets the file's length: cut down, or grown with zeros. The cursor
-    /// stays where it is.
+    /// stays where it is. Bytes of the file read ahead before the cut are
+    /// never handed out after it.
     pub async fn set_len(&self, len: u64) -> io::Result<()> {
-        self.on_pool(move |file| file.set_len(len)).await
+        let result = self.on_pool(move |file| file.set_len(len)).await;
+        if let Some(file) = self.file.get() {
+            file.moved_on();
+        }
+        result
     }
 
     /// The file's metadata.
