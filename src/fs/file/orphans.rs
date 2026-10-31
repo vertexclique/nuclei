@@ -92,6 +92,12 @@ impl Orphans {
         }
     }
 
+    /// Whether no write was pushed since the last take.
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Relaxed).is_null()
+    }
+
     pub(super) fn push(&self, orphan: Orphan) {
         let node = Box::into_raw(Box::new(Node {
             orphan,

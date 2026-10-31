@@ -36,6 +36,7 @@ pub(super) enum Work<T> {
 
 impl<T: Ended> Work<T> {
     /// The call's end once it came, its error counted for `stats`.
+    #[inline]
     pub(super) fn poll(&mut self, waker: &Waker) -> Poll<T> {
         let end = match self {
             Work::Pool(task) => poll_task(task, waker),
@@ -152,12 +153,14 @@ fn append_owned(fd: Raw, buf: &OwnedBuf) -> io::Result<u64> {
     }
 }
 
+#[inline]
 pub(super) fn poll_task<T>(task: &mut Task<T>, waker: &Waker) -> Poll<T> {
     Pin::new(task).poll(&mut Context::from_waker(waker))
 }
 
 /// A buffer of this thread's pool of at least `len` bytes (or of its largest
 /// class), or the file waits for one.
+#[inline]
 pub(super) fn buffer(len: usize, after: &mut After) -> Option<PoolBuf> {
     let buf = with_pool(|pool| pool.and_then(|p| p.get(len)));
     if buf.is_none() {
@@ -239,6 +242,7 @@ pub(crate) fn bounce(
 impl FileIo {
     /// Whether this thread's calls go to its shard's ring.
     #[cfg(ring)]
+    #[inline]
     pub(super) fn on_ring(&self) -> bool {
         #[cfg(test)]
         if self.on_pool.load(core::sync::atomic::Ordering::Relaxed) {
@@ -248,6 +252,7 @@ impl FileIo {
     }
 
     /// A read at `at` into `len` bytes of `buf` from `from`.
+    #[inline]
     pub(super) fn submit_read(
         &self,
         buf: PoolBuf,
@@ -276,6 +281,7 @@ impl FileIo {
     /// A write of the bytes `buf` holds at `at`, whole: for a positional
     /// write, and the cursor's on a file not opened to append. A write the
     /// pool makes wakes `waker` when it ends.
+    #[inline]
     pub(super) fn submit_pwrite(
         &self,
         buf: PoolBuf,
@@ -300,6 +306,7 @@ impl FileIo {
 
     /// The cursor's write of `buf` at `at`, or at the end of a file opened
     /// to append; a write the pool makes wakes `waker` when it ends.
+    #[inline]
     pub(super) fn submit_write(&self, buf: PoolBuf, at: u64, waker: &Waker) -> Writing {
         if self.append {
             let fd = self.fd.clone();
@@ -314,6 +321,7 @@ impl FileIo {
 
     /// A read at `at` into the spare capacity of a task's `buf`, after the
     /// bytes it holds.
+    #[inline]
     pub(super) fn submit_read_owned(
         &self,
         buf: OwnedBuf,
@@ -343,6 +351,7 @@ impl FileIo {
     /// A write of all of a task's `buf` at `at`: for a positional write, and
     /// the cursor's on a file not opened to append. A write the pool makes
     /// wakes `waker` when it ends.
+    #[inline]
     pub(super) fn submit_pwrite_owned(
         &self,
         buf: OwnedBuf,
@@ -371,6 +380,7 @@ impl FileIo {
     /// The cursor's write of all of a task's `buf` at `at`, or at the end of
     /// a file opened to append; a write the pool makes wakes `waker` when it
     /// ends.
+    #[inline]
     pub(super) fn submit_write_owned(&self, buf: OwnedBuf, at: u64, waker: &Waker) -> Writing {
         if self.append {
             let fd = self.fd.clone();

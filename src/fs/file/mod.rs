@@ -621,7 +621,18 @@ impl FileState {
     /// Takes the ends of the positional writes left by their tasks: Ready
     /// once every one landed. Each that landed moves the generation on, and
     /// one that failed is the file's failure, as a lent write's nobody took.
+    #[inline]
     fn poll_orphans(&mut self, io: &FileIo, waker: &Waker) -> Poll<()> {
+        // The common case, no write left by its task, costs two loads.
+        if self.orphans.is_empty() && io.orphans.is_empty() {
+            return Poll::Ready(());
+        }
+        self.poll_left(io, waker)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn poll_left(&mut self, io: &FileIo, waker: &Waker) -> Poll<()> {
         io.orphans.take(&mut self.orphans);
         if self.orphans.is_empty() {
             return Poll::Ready(());
