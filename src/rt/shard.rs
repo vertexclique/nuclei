@@ -924,6 +924,9 @@ impl Shard {
         local.or_else(|| self.pop_inbox())
     }
 
+    // Inlined into the run loop's `next` wherever the codegen units put the
+    // two: it is looked at on every run that finds the local queue empty.
+    #[inline]
     fn pop_inbox(&self) -> Option<Runnable> {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
