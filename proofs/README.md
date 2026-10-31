@@ -1013,7 +1013,10 @@ the side and wakes nobody, a reader that waits for the next edge after the pool 
 and a peek taken as having emptied the socket break `Read`), and 2 witnesses (a reader finds the
 pool empty; a starved reader calls on the socket itself). The second test of
 `tests/idle_peers.rs` fills a pool of a 64 KiB cap with bytes read ahead for tasks that peeked
-and stopped, on every backend, and checks every other peer is answered.
+and stopped, on every backend, and checks every other peer is answered. A pipe's write the pool
+has no buffer for goes straight from the task's buffer too (`writes_bytes` in
+`src/io/source/write.rs`), on epoll and kqueue as on a ring, as a socket's always does there; the
+pipe test of `tests/idle_peers.rs` checks it on every backend.
 
 ## A listener's stream of connections
 
@@ -1210,6 +1213,45 @@ whether the shard runs again or not), 6 mutations (no keeper and no wait for the
 strand packets, `AllDelivered`; no wait for the keeper and a keeper that ignores being called
 off break `OneDrainer`; no look at the count after the flag breaks `Registers`; a bind failure
 that fails the registration breaks `NoFailure`), and 4 witnesses.
+
+## Idle peers on a completion port
+
+`tla/port/PortStarve.tla` checks stream reads and replies that share one shard's pool of IO
+buffers on a completion port, over TCP, over UDP and over pipes (`submit_ops`, `submit_wanted`
+and `op_done` in `src/io/source/read/ops.rs`; the zero-byte receive, its look on a datagram
+socket and the room read in `start`, `stream_memory` and `outcome` of `src/io/source/port.rs`;
+`read_starved` and `receive_starved` in `src/io/source/read.rs`; `write_room` and `send` in
+`src/io/source/write.rs` and the room send's end in `src/io/source/write/ops.rs`; and `buffer`
+and `unstarve` of each side). Three connections over a pool of two buffers, each task reading a
+request, writing a reply and asking for a next request its peer never sends; some peers never
+send at all, and some tasks peek at their request and never read it, so its buffer stays read
+ahead. Receives of idle peers and bytes no task reads may hold every buffer. Before, a reader or
+a writer the pool had no buffer for waited for one to come back, which none did, and a request
+that came was never read or answered (`tests/idle_peers.rs` on Windows: 256 receives of idle
+peers held the whole 1 MiB cap, and the reads of the peers that sent never went out). Now a
+socket's read the pool has no buffer for sends a zero-byte receive, which holds none; on UDP it
+looks (`MSG_PEEK`), since a datagram received into no room is cut to nothing and the rest lost
+(WSARecvFrom's remarks), as libuv's zero reads of UDP do (`src/win/udp.c`). Its end sends a
+receive into a buffer at once, which ends at once since the bytes are there, or, with the pool
+still empty, wakes the task, which reads the bytes, or receives the datagram, straight from the
+socket into its own buffer (the zero-byte receive said they are there, so the call on the
+blocking socket never waits). A pipe's read the pool has no buffer for reads into its slot's own
+room, a few hundred bytes, and its task takes them from there. A writer the pool has no buffer
+for sends from its slot's room, or a datagram straight from its own buffer, with nothing of the
+socket's in the kernel ahead of it. A read or a write the pool has a buffer for is as before. 27
+configurations: 12 that must pass (`Buffers`, every buffer free, held by a receive out, a request
+read ahead or a reply not sent yet, and `NeverBlocks`, no reader's own call meets an empty
+socket; and `Served`, every request sent is read and answered but those of tasks that stopped;
+over TCP with two idle peers, with none and with two tasks that stopped, and over UDP and pipes
+with idle peers and with stopped tasks), 11 mutations (a zero-byte receive whose end sends
+nothing and wakes nobody, a buffer that comes back and wakes no starved side, a starved reader
+that waits for a buffer, as before, with idle peers and with stopped tasks, a starved writer that
+does, on TCP and on pipes, a zero-byte receive that ends with the pool empty and wakes nobody,
+and a pipe's read that waits for a buffer, as before, break `Served`; a receive that leaves its
+side marked readable, a starved reader that calls while its zero-byte receive is out, and a
+datagram socket's zero-byte receive that does not look break `NeverBlocks`), and 4 witnesses (a
+side finds the pool empty; a read waits in a zero-byte receive; a starved side uses its own
+memory; a pipe's read waits in its slot's room).
 
 ## Signals
 

@@ -731,16 +731,24 @@ fn a_thread_that_runs_no_shard_is_served_by_the_runtime() {
     assert!(b.src.poll_read(&mut cx, &mut buf, false).is_pending());
     a.io().write_all(b"far").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !woke.0.load(Ordering::SeqCst) {
-        assert!(
-            Instant::now() < deadline,
-            "the runtime never completed the read"
-        );
-        std::thread::yield_now();
-    }
-    match b.src.poll_read(&mut cx, &mut buf, false) {
-        Poll::Ready(Ok(3)) => assert_eq!(&buf[..3], b"far"),
-        other => panic!("{other:?}"),
+    // A poll that finds the side held by the shard is pending, and its holder
+    // wakes it again as it lets go.
+    loop {
+        while !woke.0.swap(false, Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the runtime never completed the read"
+            );
+            std::thread::yield_now();
+        }
+        match b.src.poll_read(&mut cx, &mut buf, false) {
+            Poll::Ready(Ok(3)) => {
+                assert_eq!(&buf[..3], b"far");
+                return;
+            }
+            Poll::Pending => {}
+            other => panic!("{other:?}"),
+        }
     }
 }
 

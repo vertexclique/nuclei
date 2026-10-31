@@ -78,6 +78,12 @@ impl WriteState {
         if let Via::Ops(route) = io.via {
             self.submit_ops(route, kind, after);
         }
+        // A write the pool had no buffer for that found the source between
+        // ports sends from its slot's room now (`write_room`).
+        #[cfg(port)]
+        if self.starved && self.behind.is_none() && !self.ring_holds() {
+            after.wake(&mut self.waiters);
+        }
     }
 
     /// The driver's part on a completion driver: issues the side's next
@@ -192,6 +198,29 @@ impl WriteState {
                     self.failed = Some(Failure::of(&err));
                     after.drop_buf(buf);
                     // What was written behind it never goes out.
+                    if let Some(behind) = self.behind.take() {
+                        after.drop_buf(behind);
+                    }
+                }
+            },
+            // The rest of the room's bytes goes out next, ahead of anything
+            // written after them.
+            #[cfg(port)]
+            Outcome::SendRoom { .. } if stale => {}
+            #[cfg(port)]
+            Outcome::SendRoom { from, to, answer } => match answer {
+                Answer::Undone { .. } => self.again = Some(Want::SendRoom { from, to }),
+                Answer::Done(Ok(n)) if n > 0 => {
+                    if from + n < to {
+                        self.again = Some(Want::SendRoom { from: from + n, to });
+                    }
+                }
+                other => {
+                    let err = match other {
+                        Answer::Done(Err(err)) => err,
+                        _ => io::ErrorKind::WriteZero.into(),
+                    };
+                    self.failed = Some(Failure::of(&err));
                     if let Some(behind) = self.behind.take() {
                         after.drop_buf(behind);
                     }

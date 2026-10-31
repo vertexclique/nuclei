@@ -220,6 +220,7 @@ pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC800_0006;
 pub(crate) const SIO_UDP_CONNRESET: DWORD = 0x9800_000C;
 #[cfg(test)]
 pub(crate) const MSG_OOB: i32 = 0x1;
+pub(crate) const MSG_PEEK: i32 = 0x2;
 pub(crate) const FILE_BEGIN: DWORD = 0;
 pub(crate) const FILE_CURRENT: DWORD = 1;
 
@@ -282,6 +283,7 @@ pub(crate) const STATUS_HOST_UNREACHABLE: NTSTATUS = 0xC000_023Du32 as i32;
 pub(crate) const STATUS_PORT_UNREACHABLE: NTSTATUS = 0xC000_023Fu32 as i32;
 pub(crate) const STATUS_CONNECTION_ABORTED: NTSTATUS = 0xC000_0241u32 as i32;
 pub(crate) const STATUS_INVALID_DEVICE_STATE: NTSTATUS = 0xC000_0184u32 as i32;
+pub(crate) const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206u32 as i32;
 
 pub(crate) type LPWSAOVERLAPPED_COMPLETION_ROUTINE = *const c_void;
 pub(crate) type PTIMERAPCROUTINE = *const c_void;
@@ -502,8 +504,24 @@ unsafe extern "system" {
     pub(crate) fn listen(s: SOCKET, backlog: i32) -> i32;
     pub(crate) fn closesocket(s: SOCKET) -> i32;
     pub(crate) fn shutdown(s: SOCKET, how: i32) -> i32;
-    #[cfg(test)]
+    pub(crate) fn recv(s: SOCKET, buf: *mut u8, len: i32, flags: i32) -> i32;
+    pub(crate) fn recvfrom(
+        s: SOCKET,
+        buf: *mut u8,
+        len: i32,
+        flags: i32,
+        from: *mut SOCKADDR,
+        fromlen: *mut i32,
+    ) -> i32;
     pub(crate) fn send(s: SOCKET, buf: *const u8, len: i32, flags: i32) -> i32;
+    pub(crate) fn sendto(
+        s: SOCKET,
+        buf: *const u8,
+        len: i32,
+        flags: i32,
+        to: *const SOCKADDR,
+        tolen: i32,
+    ) -> i32;
 }
 
 #[link(name = "ntdll")]
@@ -568,6 +586,9 @@ pub(crate) fn status_error(status: NTSTATUS) -> Option<i32> {
         STATUS_HOST_UNREACHABLE => WSAEHOSTUNREACH,
         STATUS_CONNECTION_ABORTED => WSAECONNABORTED,
         STATUS_INVALID_DEVICE_STATE => WSAEINVAL,
+        // A datagram longer than the socket sends: Winsock's own answer is
+        // WSAEMSGSIZE, where the status table's is ERROR_INVALID_USER_BUFFER.
+        STATUS_INVALID_BUFFER_SIZE => WSAEMSGSIZE,
         // SAFETY: a pure lookup of the status table.
         other => (unsafe { RtlNtStatusToDosError(other) }) as i32,
     };

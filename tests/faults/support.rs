@@ -953,6 +953,11 @@ impl Held {
 /// nodes retired and not reclaimed yet.
 pub const SLACK: isize = 64 * 1024;
 
+/// The runs of rounds after one whose counts grew: a leak grows in each, and
+/// a thread's state that a system library made once does not (see
+/// [`holds_steady`]).
+pub const MORE_RUNS: usize = 3;
+
 /// Submits what every worker of `rt`, its blocking pool and this thread
 /// retired to reclamation (see tests/steady.rs, whose count this follows).
 pub fn reclaim(rt: &Runtime, workers: usize) {
@@ -993,7 +998,12 @@ pub fn reclaim(rt: &Runtime, workers: usize) {
 /// times, then `rounds` times more, and checks that the second run of rounds
 /// left the process holding no more descriptors, threads or heap bytes than
 /// the first: a pool that grew to what the case needs stays that size, and a
-/// leak grows every round. A round trip works at the end.
+/// leak grows every round. What grew once may be a system library's state for
+/// a thread that made its first such call in those rounds, kept as long as
+/// the thread runs (on Windows a second handle to a running worker, or an
+/// event, appears once that way and never again): runs of rounds go on, up to
+/// [`MORE_RUNS`], and the case fails only if the counts grew in each. A round
+/// trip works at the end.
 pub fn holds_steady<F, Fut>(name: &str, rounds: usize, mut case: F)
 where
     F: FnMut() -> Fut,
@@ -1029,15 +1039,22 @@ where
             pause = (pause * 2).min(Duration::from_millis(50));
         }
     };
-    let mut held = Vec::new();
-    for _ in 0..2 {
+    let grew = |before: &Held, after: &Held| {
+        after.handles > before.handles
+            || after.bytes - before.bytes > SLACK
+            || after.threads > before.threads
+    };
+    let mut held: Vec<Held> = Vec::new();
+    while held.len() < 2
+        || (held.len() < 2 + MORE_RUNS && grew(&held[held.len() - 2], &held[held.len() - 1]))
+    {
         for _ in 0..rounds {
             rt.block_on(within(name, case()));
         }
         held.push(settle(held.last().copied()));
     }
     rt.block_on(round_trip());
-    let (before, after) = (held[0], held[1]);
+    let (before, after) = (held[held.len() - 2], held[held.len() - 1]);
     assert!(
         after.handles <= before.handles,
         "{name}: {} open descriptors after {rounds} rounds, {} after {rounds} more",

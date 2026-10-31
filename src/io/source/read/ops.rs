@@ -8,6 +8,12 @@
 //! clears that, and wakes the tasks waiting, which take what came or ask
 //! again. Only the operation's own completion clears it, so a side never
 //! has two operations out, and its mailbox never more than one completion.
+//!
+//! On a port a TCP read the pool has no buffer for waits in a zero-byte
+//! receive, which holds none; once that says bytes came, a receive takes a
+//! buffer for them, or, with the pool still empty, the task reads them into
+//! its own (`read_starved`). So no set of idle peers or stopped readers keeps
+//! a read from its bytes (proofs/tla/port/PortStarve.tla).
 
 use super::{Datagram, Kind, Peer, Piece, ReadState, UDP_MAX};
 use crate::io::raw::Raw;
@@ -23,6 +29,12 @@ impl ReadState {
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
         if !self.waiters.is_empty() || self.lent_waits() {
             self.complete(io, kind, self.want, after);
+            // Bytes came and the pool has no buffer for them: the tasks read
+            // them into their own (`read_starved`).
+            #[cfg(port)]
+            if self.starved && self.readable && self.out.is_none() {
+                after.wake(&mut self.waiters);
+            }
         }
     }
 
@@ -134,6 +146,13 @@ impl ReadState {
                 None if self.starved && !self.readable && self.error.is_none() => {
                     Want::Ready { read: true }
                 }
+                // On a port a zero-byte receive that looks, leaving the
+                // datagram queued, and once it says one came the task
+                // receives it into its own buffer (`receive_starved`).
+                #[cfg(port)]
+                None if self.starved && !self.readable && self.error.is_none() => {
+                    Want::Ready { read: true }
+                }
                 None => return,
             }
         } else {
@@ -155,10 +174,27 @@ impl ReadState {
                     // (`reads_itself`).
                     #[cfg(ring)]
                     None if self.starved && !self.readable => Want::Ready { read: true },
+                    // On a port a zero-byte receive, which holds none, and once it
+                    // says bytes came the task reads them into its own buffer
+                    // (`read_starved`, proofs/tla/port/PortStarve.tla).
+                    #[cfg(port)]
+                    None if kind == Kind::Tcp && !self.readable => Want::Ready { read: true },
+                    // A pipe's read goes into the slot's own room, which holds
+                    // no buffer of the pool.
+                    #[cfg(port)]
+                    None if kind == Kind::Bytes => Want::RecvRoom,
                     None => return,
                 },
             }
         };
+        // The bytes the zero-byte receive said came are this receive's.
+        #[cfg(port)]
+        if matches!(
+            want,
+            Want::Recv(_) | Want::RecvLent(_) | Want::RecvFrom(_) | Want::RecvLentFrom(_)
+        ) {
+            self.readable = false;
+        }
         self.out = Some(issuer.issue(want, kind, self.epoch, after));
     }
 
@@ -239,6 +275,32 @@ impl ReadState {
                         self.blocked = false;
                         self.edges = self.edges.wrapping_add(1);
                         after.wake(&mut self.waiters);
+                    }
+                }
+            }
+            // Bytes, the end or an error came: the receive into a buffer of the
+            // pool goes out at once (`submit_wanted`), and its end wakes the
+            // tasks.
+            #[cfg(port)]
+            Outcome::Ready(answer) => {
+                // Its error, if any, is the receive's after it to report and
+                // clear: a look clears none (a UDP socket's report of a
+                // port unreachable stays queued under MSG_PEEK).
+                if !stale && let Answer::Done(_) = answer {
+                    self.readable = true;
+                    return;
+                }
+            }
+            // A pipe's bytes read into the slot's room are read ahead from
+            // there.
+            #[cfg(port)]
+            Outcome::RecvRoom(answer) => {
+                if !stale {
+                    match answer {
+                        Answer::Undone { .. } => {}
+                        Answer::Done(Ok(room)) if room.bytes().is_empty() => self.eof = true,
+                        Answer::Done(Ok(room)) => self.ahead.push(Piece::Room(room), after),
+                        Answer::Done(Err(err)) => self.error = Some(err),
                     }
                 }
             }

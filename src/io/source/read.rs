@@ -199,11 +199,15 @@ pub(super) struct ReadState {
     /// came (see `receive_now`): its end wakes the tasks.
     #[cfg(ring)]
     task_polls: bool,
-    /// The poll of a side the pool had no buffer for said bytes came: its
-    /// task reads them into its own buffer, and the ring asks for nothing
-    /// more until it has (proofs/tla/ring/RingStarve.tla).
-    #[cfg(ring)]
+    /// On a ring, the poll of a side the pool had no buffer for said bytes
+    /// came: its task reads them into its own buffer, and the ring asks for
+    /// nothing more until it has (proofs/tla/ring/RingStarve.tla). On a
+    /// port, a zero-byte receive said bytes or the end came: the next
+    /// receive takes a buffer of the pool and ends at once, or, with none,
+    /// the task reads them itself (proofs/tla/port/PortStarve.tla).
+    #[cfg(completion)]
     readable: bool,
+
     /// The operation out is a multishot receive, and whether it is being
     /// stopped (for a lent buffer, which takes the next bytes itself).
     #[cfg(ring)]
@@ -288,7 +292,7 @@ impl ReadState {
             return self.datagram_ready(io, fd, kind, waker, after);
         }
         // Bytes came for a starved side: its task's read takes them.
-        #[cfg(ring)]
+        #[cfg(completion)]
         if self.starved && self.readable {
             return Poll::Ready(self.eof);
         }
@@ -808,11 +812,44 @@ impl ReadState {
                 Poll::Ready(result)
             }
             None => {
+                #[cfg(port)]
+                if let Some(result) = self.read_starved(io, out, peek) {
+                    return Poll::Ready(result);
+                }
                 self.wait(waker, out.len());
                 self.look_again(io, after);
                 Poll::Pending
             }
         }
+    }
+
+    /// On a port, a stream read (or `peek`) of a side the pool has no
+    /// buffer for, whose bytes a zero-byte receive said came: straight from
+    /// the socket into `out`, which holds them, so the call takes them at
+    /// once (proofs/tla/port/PortStarve.tla). `None` for any other side.
+    #[cfg(port)]
+    fn read_starved(
+        &mut self,
+        io: Io<'_>,
+        out: &mut [u8],
+        peek: bool,
+    ) -> Option<io::Result<usize>> {
+        if !self.starved
+            || !self.readable
+            || self.out.is_some()
+            || !self.ahead.is_empty()
+            || self.lent.is_some()
+            || self.eof
+            || self.error.is_some()
+        {
+            return None;
+        }
+        let Via::Ops(route) = io.via;
+        let result = crate::io::sys::recv_ready(route.socket()?, out, peek);
+        // A look leaves the bytes; a read may take them all, and the next
+        // waits for more in a zero-byte receive.
+        self.readable = peek && matches!(result, Ok(1..));
+        Some(result)
     }
 
     /// A stream read scattered into `bufs`, as [`read`](Self::read).
@@ -834,6 +871,12 @@ impl ReadState {
                 Poll::Ready(result)
             }
             None => {
+                #[cfg(port)]
+                if let Some(first) = bufs.iter_mut().find(|b| !b.is_empty())
+                    && let Some(result) = self.read_starved(io, first, false)
+                {
+                    return Poll::Ready(result);
+                }
                 self.wait(waker, len);
                 self.look_again(io, after);
                 Poll::Pending
@@ -1168,10 +1211,41 @@ impl ReadState {
                 Poll::Ready(result)
             }
             None => {
+                #[cfg(port)]
+                if let Some(result) = self.receive_starved(io, out, peek) {
+                    return Poll::Ready(result);
+                }
                 self.wait(waker, out.len());
                 Poll::Pending
             }
         }
+    }
+
+    /// On a port, a datagram receive (or `peek`) of a side the pool has no
+    /// buffer for, once a zero-byte look said one came: straight from the
+    /// socket into `out`, cut to it as the pool's receive cuts it, so the
+    /// call takes it at once (proofs/tla/port/PortStarve.tla). `None` for any
+    /// other side.
+    #[cfg(port)]
+    fn receive_starved(
+        &mut self,
+        io: Io<'_>,
+        out: &mut [u8],
+        peek: bool,
+    ) -> Option<io::Result<(usize, Addr)>> {
+        if !self.starved
+            || !self.readable
+            || self.out.is_some()
+            || !self.datagrams.is_empty()
+            || self.lent.is_some()
+            || self.error.is_some()
+        {
+            return None;
+        }
+        let Via::Ops(route) = io.via;
+        let result = crate::io::sys::recv_from_ready(route.socket()?, out, peek);
+        self.readable = peek && result.is_ok();
+        Some(result.map(|(n, from)| (n, Addr::Inet(from))))
     }
 
     /// What the side holds, as a line, for a test that failed.
@@ -1293,6 +1367,9 @@ impl ReadState {
         {
             self.poll_first = false;
             self.task_polls = false;
+        }
+        #[cfg(completion)]
+        {
             self.readable = false;
         }
     }

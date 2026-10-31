@@ -18,13 +18,13 @@ use crate::syscore::windows::{
     AF_INET, AF_INET6, DWORD, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION,
     FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT,
     FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType,
-    HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, NtQueryInformationFile,
-    OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE,
-    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
-    SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
-    WSA_FLAG_OVERLAPPED, WSAIoctl, WSASocketW, WriteFile, bind, getsockname, getsockopt,
-    last_error, setsockopt, shutdown, wsa_error,
+    HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK,
+    NtQueryInformationFile, OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN,
+    SO_MAX_MSG_SIZE, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM,
+    SOCK_RAW, SOCK_RDM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET,
+    SOCKET_ERROR, SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
+    WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile, bind, getsockname,
+    getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, shutdown, wsa_error,
 };
 
 fn socket_of(raw: Raw) -> SOCKET {
@@ -128,6 +128,93 @@ fn file_information(raw: Raw, class: u32) -> io::Result<ULONG> {
 pub(crate) fn shutdown_write(raw: Raw) -> io::Result<()> {
     // SAFETY: a plain call on a socket the caller holds.
     check(unsafe { shutdown(socket_of(raw), SD_SEND) })
+}
+
+/// A `recv` (with `peek`, a look that leaves the bytes) on the stream socket
+/// `raw` into `buf`, made only once a zero-byte receive said bytes, the end
+/// or an error came: the socket blocks, and holding them it answers at once.
+pub(crate) fn recv_ready(raw: Raw, buf: &mut [u8], peek: bool) -> io::Result<usize> {
+    let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+    let flags = if peek { MSG_PEEK } else { 0 };
+    // SAFETY: the kernel writes at most `len` bytes into `buf`.
+    let n = unsafe { recv(socket_of(raw), buf.as_mut_ptr(), len, flags) };
+    if n == SOCKET_ERROR {
+        return Err(wsa_error());
+    }
+    Ok(n as usize)
+}
+
+/// A `recvfrom` (with `peek`, a look that leaves the datagram) on the
+/// datagram socket `raw` into `buf`, made only once a zero-byte look said a
+/// datagram (or an error) came: the socket blocks, and holding one it answers
+/// at once. A datagram longer than `buf` is cut to it, as the port's own
+/// receive cuts one.
+pub(crate) fn recv_from_ready(
+    raw: Raw,
+    buf: &mut [u8],
+    peek: bool,
+) -> io::Result<(usize, SocketAddr)> {
+    let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+    let flags = if peek { MSG_PEEK } else { 0 };
+    let mut from = SOCKADDR_STORAGE::zeroed();
+    let mut from_len = size_of::<SOCKADDR_STORAGE>() as i32;
+    // SAFETY: the kernel writes at most `len` bytes into `buf` and at most
+    // `from_len` into our own address storage.
+    let n = unsafe {
+        recvfrom(
+            socket_of(raw),
+            buf.as_mut_ptr(),
+            len,
+            flags,
+            core::ptr::from_mut(&mut from).cast(),
+            &mut from_len,
+        )
+    };
+    let n = if n == SOCKET_ERROR {
+        let err = wsa_error();
+        if err.raw_os_error() != Some(WSAEMSGSIZE) {
+            return Err(err);
+        }
+        buf.len()
+    } else {
+        n as usize
+    };
+    // SAFETY: the kernel wrote the sender's address and its length.
+    let from = unsafe { socket_addr(core::ptr::from_ref(&from).cast(), from_len) }?;
+    Ok((n, from))
+}
+
+/// A datagram handed to the socket `raw` by the calling task itself, to
+/// `to` or else to its connected peer: with nothing of the socket's in the
+/// kernel, the blocking socket takes it at once.
+pub(crate) fn send_datagram_now(
+    raw: Raw,
+    bytes: &[u8],
+    to: Option<&SocketAddr>,
+) -> io::Result<usize> {
+    let len = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
+    let n = match to {
+        // SAFETY: the kernel reads at most `len` bytes of `bytes`.
+        None => unsafe { send(socket_of(raw), bytes.as_ptr(), len, 0) },
+        Some(addr) => {
+            let (storage, to_len) = raw_addr(addr);
+            // SAFETY: as above, and the address is our own storage.
+            unsafe {
+                sendto(
+                    socket_of(raw),
+                    bytes.as_ptr(),
+                    len,
+                    0,
+                    core::ptr::from_ref(&storage).cast(),
+                    to_len,
+                )
+            }
+        }
+    };
+    if n == SOCKET_ERROR {
+        return Err(wsa_error());
+    }
+    Ok(n as usize)
 }
 
 /// Gives a connection `listener` accepted the listener's context, which a
