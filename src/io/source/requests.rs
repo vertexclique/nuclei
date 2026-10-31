@@ -81,7 +81,7 @@ impl core::fmt::Display for StoppedShard {
 
 impl std::error::Error for StoppedShard {}
 
-fn stopped_shard() -> io::Error {
+pub(super) fn stopped_shard() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, StoppedShard)
 }
 
