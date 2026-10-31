@@ -141,6 +141,28 @@ windows_handles!(
 ///
 /// `Send` and `Sync` exactly when the object is.
 ///
+/// # std's calls through `Deref`
+///
+/// `Deref` hands the object out for its own methods (socket options,
+/// addresses), and the handle's methods of the same name take their place
+/// where it has them (`connect`, `send`, `linger`, ...). A few of std's
+/// calls reached through it go around the handle, so around the bytes it
+/// read ahead and the ones it wrote behind, or block its shard:
+///
+/// - `shutdown` shuts the halves at once, ahead of the bytes still behind,
+///   which then never reach the peer;
+///   [`shut`](crate::net::TcpStream::shut) waits for them first.
+/// - `set_nonblocking(false)` makes the driver's own calls on the object
+///   block the shard's thread, and every task of the shard with them.
+/// - `take_error` takes the error the socket holds, which the handle's
+///   connect in progress or its next operation would have answered.
+/// - `Read` and `Write` on a shared reference to the object (`&TcpStream`,
+///   `&UnixStream`) read past the bytes read ahead and write ahead of the
+///   bytes written behind, and answer `WouldBlock` where the handle's own
+///   reads and writes wait. Called on the handle with std's traits in scope
+///   (`stream.read(&mut buf)`), they reach the object through `DerefMut`,
+///   after the wait of [`get_mut`](Handle::get_mut).
+///
 /// ```
 /// use std::net::TcpListener;
 /// use nuclei::Handle;

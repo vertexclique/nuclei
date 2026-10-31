@@ -33,6 +33,14 @@ impl Handle<UdpSocket> {
     /// `sock_addrs` it can connect to: `send` and `recv` then talk to that
     /// peer only.
     ///
+    /// This makes a socket: it is called as `UdpSocket::connect(addr)`.
+    /// Called on a socket, `socket.connect(addr)` is std's own
+    /// `UdpSocket::connect`, reached through `Deref`, which connects that
+    /// socket in place and looks a name up with a blocking call, on the
+    /// calling thread (a shard's, with every task of it). Connect a socket
+    /// in place with a numeric address, or look the name up first with
+    /// [`lookup_host`](super::lookup_host).
+    ///
     /// # Errors
     ///
     /// The last address's error when none worked, or the lookup's.

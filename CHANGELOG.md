@@ -90,6 +90,9 @@
 - **`UdpSocketBuilder`**, a UDP socket set up before it binds (`SO_REUSEADDR`, `SO_REUSEPORT`,
   buffer sizes, `IP_TOS`, `IPV6_TCLASS`, `IPV6_V6ONLY`, `SO_BINDTODEVICE`), and
   `UdpSocket::poll_recv_from` and `poll_send_to`.
+- **What std's calls through `Deref` do**, on `Handle`: `shutdown`, `set_nonblocking(false)`,
+  `take_error`, `Read` and `Write` go around the bytes read ahead and written behind, or block the
+  shard; `UdpSocket::connect` is a constructor where `socket.connect(addr)` is std's.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.

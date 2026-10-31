@@ -65,14 +65,20 @@ use crate::io::Handle;
 
 /// A TCP listener: std's, with an async `accept`.
 pub type TcpListener = Handle<std::net::TcpListener>;
-/// A TCP stream: std's, with async reads and writes.
+/// A TCP stream: std's, with async reads and writes. A few of std's calls
+/// reached through `Deref` go around the handle (`shutdown` among them): see
+/// [`Handle`].
 pub type TcpStream = Handle<std::net::TcpStream>;
-/// A UDP socket: std's, with async sends and receives.
+/// A UDP socket: std's, with async sends and receives. Its
+/// [`connect`](UdpSocket::connect) makes a socket;
+/// `socket.connect(addr)` on one is std's own (see there).
 pub type UdpSocket = Handle<std::net::UdpSocket>;
 /// A Unix stream listener: std's, with an async `accept`.
 #[cfg(unix)]
 pub type UnixListener = Handle<std::os::unix::net::UnixListener>;
-/// A Unix stream: std's, with async reads and writes.
+/// A Unix stream: std's, with async reads and writes. A few of std's calls
+/// reached through `Deref` go around the handle (`shutdown` among them): see
+/// [`Handle`].
 #[cfg(unix)]
 pub type UnixStream = Handle<std::os::unix::net::UnixStream>;
 /// A Unix datagram socket: std's, with async sends and receives.
