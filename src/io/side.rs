@@ -152,6 +152,13 @@ pub(crate) trait Hooks<S> {
     /// Asks the owner's thread to take and let go of the side, so that work
     /// left for it is served.
     fn nudge(&self) {}
+    /// Whether a release of the side held through the word tries its one
+    /// compare-and-swap inline first: for a side every hold of which goes
+    /// through the word (a file's), where the outlined release would be a
+    /// call on every poll.
+    fn releases_inline(&self) -> bool {
+        false
+    }
 }
 
 /// A held side. Let go through [`release`](Held::release), which does what
@@ -722,6 +729,21 @@ impl<S> Held<'_, S> {
             // Work was left: the side is held through the word now, and
             // done as a holder of the word does it.
             self.bits = (self.bits & !(BIASED | EXPECT)) | u32::from(BUSY);
+        } else if hooks.releases_inline() && self.bits >> REST_SHIFT == 0 {
+            // No flag was taken with the hold: what others left meanwhile
+            // fails the swap, and goes the long way.
+            hooks.releasing(self.get());
+            if self
+                .side
+                .state
+                .compare_exchange(self.expect(), 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let saw_requests = self.bits & SAW_REQUESTS != 0;
+                core::mem::forget(self);
+                hooks.released(saw_requests, after);
+                return Ok(());
+            }
         }
         self.release_word(after, hooks)
     }
