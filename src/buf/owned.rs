@@ -266,7 +266,13 @@ impl OwnedBuf {
     where
         B: IoBuf,
     {
-        self.into_caller::<B, Written<B>>(|kept| kept.0)
+        match self {
+            OwnedBuf::Vec(vec) => match cast::<Vec<u8>, B>(vec) {
+                Ok(same) => same,
+                Err(vec) => OwnedBuf::Vec(vec).into_other::<B, Written<B>>(|kept| kept.0),
+            },
+            other => other.into_other::<B, Written<B>>(|kept| kept.0),
+        }
     }
 
     /// The caller's buffer of a read back, holding the bytes read into it.
@@ -275,22 +281,27 @@ impl OwnedBuf {
     where
         B: IoBufMut,
     {
-        self.into_caller::<B, Filled<B>>(|kept| kept.0)
+        match self {
+            OwnedBuf::Vec(vec) => match cast::<Vec<u8>, B>(vec) {
+                Ok(same) => same,
+                Err(vec) => OwnedBuf::Vec(vec).into_other::<B, Filled<B>>(|kept| kept.0),
+            },
+            other => other.into_other::<B, Filled<B>>(|kept| kept.0),
+        }
     }
 
-    #[inline]
-    fn into_caller<B, K>(self, unwrap: fn(K) -> B) -> B
+    /// The caller's buffer back when it is not a `Vec<u8>`: the runtime's own
+    /// form as it is, a boxed one unboxed, or an empty one if it cannot.
+    #[inline(never)]
+    fn into_other<B, K>(self, unwrap: fn(K) -> B) -> B
     where
         B: IoBuf,
         K: Kept,
     {
-        let this = match cast::<OwnedBuf, B>(self) {
+        let boxed = match cast::<OwnedBuf, B>(self) {
             Ok(same) => return same,
-            Err(this) => this,
-        };
-        let boxed = match this {
-            OwnedBuf::Vec(vec) => return cast::<Vec<u8>, B>(vec).unwrap_or_default(),
-            OwnedBuf::Boxed(boxed) => boxed,
+            Err(OwnedBuf::Boxed(boxed)) => boxed,
+            Err(OwnedBuf::Vec(_)) => return B::default(),
         };
         match *boxed {
             Boxed::Aligned(aligned) => cast::<AlignedBuf, B>(aligned).unwrap_or_default(),
@@ -324,20 +335,10 @@ impl OwnedBuf {
     /// it falls in for a vectored write. Empty past its end.
     #[inline]
     pub(crate) fn rest_from(&self, from: usize) -> &[u8] {
-        let OwnedBuf::Boxed(boxed) = self else {
-            return self.get(from..).unwrap_or_default();
-        };
-        let Boxed::Vectored(bufs) = &**boxed else {
-            return self.get(from..).unwrap_or_default();
-        };
-        let mut from = from;
-        for buf in bufs {
-            if from < buf.len() {
-                return buf.rest_from(from);
-            }
-            from -= buf.len();
+        match self {
+            OwnedBuf::Vec(vec) => vec.get(from..).unwrap_or_default(),
+            OwnedBuf::Boxed(boxed) => boxed.rest_from(from),
         }
-        &[]
     }
 
     /// How many bytes it holds.
@@ -345,11 +346,7 @@ impl OwnedBuf {
     pub(crate) fn len(&self) -> usize {
         match self {
             OwnedBuf::Vec(vec) => vec.len(),
-            OwnedBuf::Boxed(boxed) => match &**boxed {
-                Boxed::Aligned(aligned) => aligned.len(),
-                Boxed::Kept(kept) => kept.init(),
-                Boxed::Vectored(bufs) => bufs.iter().map(OwnedBuf::len).sum(),
-            },
+            OwnedBuf::Boxed(boxed) => boxed.len(),
         }
     }
 
@@ -364,11 +361,7 @@ impl OwnedBuf {
     pub(crate) fn capacity(&self) -> usize {
         match self {
             OwnedBuf::Vec(vec) => vec.capacity(),
-            OwnedBuf::Boxed(boxed) => match &**boxed {
-                Boxed::Aligned(aligned) => aligned.capacity(),
-                Boxed::Kept(kept) => kept.total(),
-                Boxed::Vectored(_) => self.len(),
-            },
+            OwnedBuf::Boxed(boxed) => boxed.capacity(),
         }
     }
 
@@ -376,38 +369,16 @@ impl OwnedBuf {
     fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
             OwnedBuf::Vec(vec) => vec.as_mut_ptr(),
-            OwnedBuf::Boxed(boxed) => match &mut **boxed {
-                Boxed::Aligned(aligned) => aligned.as_mut_ptr(),
-                Boxed::Kept(kept) => kept.mut_ptr(),
-                Boxed::Vectored(_) => core::ptr::NonNull::dangling().as_ptr(),
-            },
+            OwnedBuf::Boxed(boxed) => boxed.as_mut_ptr(),
         }
     }
 
     /// Its memory past the bytes it holds.
     #[inline]
     pub(crate) fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        let boxed = match self {
-            OwnedBuf::Vec(vec) => return vec.spare_capacity_mut(),
-            OwnedBuf::Boxed(boxed) => boxed,
-        };
-        match &mut **boxed {
-            Boxed::Aligned(aligned) => aligned.spare_capacity_mut(),
-            Boxed::Kept(kept) => {
-                let (len, total) = (kept.init(), kept.total());
-                if len >= total {
-                    return &mut [];
-                }
-                // SAFETY: the buffer's memory holds `total` bytes, writable
-                // past the `len` that hold data (a write's has none).
-                unsafe {
-                    core::slice::from_raw_parts_mut(
-                        kept.mut_ptr().add(len).cast::<MaybeUninit<u8>>(),
-                        total - len,
-                    )
-                }
-            }
-            Boxed::Vectored(_) => &mut [],
+        match self {
+            OwnedBuf::Vec(vec) => vec.spare_capacity_mut(),
+            OwnedBuf::Boxed(boxed) => boxed.spare_capacity_mut(),
         }
     }
 
@@ -418,18 +389,11 @@ impl OwnedBuf {
     /// `len <= capacity()`, and the first `len` bytes are initialized.
     #[inline]
     pub(crate) unsafe fn set_len(&mut self, len: usize) {
-        let boxed = match self {
+        match self {
             // SAFETY: the caller's.
-            OwnedBuf::Vec(vec) => return unsafe { vec.set_len(len) },
-            OwnedBuf::Boxed(boxed) => boxed,
-        };
-        match &mut **boxed {
+            OwnedBuf::Vec(vec) => unsafe { vec.set_len(len) },
             // SAFETY: the caller's.
-            Boxed::Aligned(aligned) => unsafe { aligned.set_len(len) },
-            // SAFETY: the caller's.
-            Boxed::Kept(kept) => unsafe { kept.set_init(len) },
-            // A write's: nothing is read into it.
-            Boxed::Vectored(_) => {}
+            OwnedBuf::Boxed(boxed) => unsafe { boxed.set_len(len) },
         }
     }
 
@@ -480,11 +444,83 @@ impl core::ops::Deref for OwnedBuf {
 
     #[inline]
     fn deref(&self) -> &[u8] {
-        let boxed = match self {
-            OwnedBuf::Vec(vec) => return vec,
-            OwnedBuf::Boxed(boxed) => boxed,
-        };
-        match &**boxed {
+        match self {
+            OwnedBuf::Vec(vec) => vec,
+            OwnedBuf::Boxed(boxed) => boxed.bytes(),
+        }
+    }
+}
+
+/// The buffers of other types than `Vec<u8>`, kept out of line so that a
+/// vector's accessors stay small enough to inline.
+impl Boxed {
+    #[inline(never)]
+    fn len(&self) -> usize {
+        match self {
+            Boxed::Aligned(aligned) => aligned.len(),
+            Boxed::Kept(kept) => kept.init(),
+            Boxed::Vectored(bufs) => bufs.iter().map(OwnedBuf::len).sum(),
+        }
+    }
+
+    #[inline(never)]
+    fn capacity(&self) -> usize {
+        match self {
+            Boxed::Aligned(aligned) => aligned.capacity(),
+            Boxed::Kept(kept) => kept.total(),
+            Boxed::Vectored(_) => self.len(),
+        }
+    }
+
+    #[inline(never)]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            Boxed::Aligned(aligned) => aligned.as_mut_ptr(),
+            Boxed::Kept(kept) => kept.mut_ptr(),
+            Boxed::Vectored(_) => core::ptr::NonNull::dangling().as_ptr(),
+        }
+    }
+
+    #[inline(never)]
+    fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        match self {
+            Boxed::Aligned(aligned) => aligned.spare_capacity_mut(),
+            Boxed::Kept(kept) => {
+                let (len, total) = (kept.init(), kept.total());
+                if len >= total {
+                    return &mut [];
+                }
+                // SAFETY: the buffer's memory holds `total` bytes, writable
+                // past the `len` that hold data (a write's has none).
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        kept.mut_ptr().add(len).cast::<MaybeUninit<u8>>(),
+                        total - len,
+                    )
+                }
+            }
+            Boxed::Vectored(_) => &mut [],
+        }
+    }
+
+    /// # Safety
+    ///
+    /// As [`OwnedBuf::set_len`].
+    #[inline(never)]
+    unsafe fn set_len(&mut self, len: usize) {
+        match self {
+            // SAFETY: the caller's.
+            Boxed::Aligned(aligned) => unsafe { aligned.set_len(len) },
+            // SAFETY: the caller's.
+            Boxed::Kept(kept) => unsafe { kept.set_init(len) },
+            // A write's: nothing is read into it.
+            Boxed::Vectored(_) => {}
+        }
+    }
+
+    #[inline(never)]
+    fn bytes(&self) -> &[u8] {
+        match self {
             Boxed::Aligned(aligned) => aligned,
             Boxed::Kept(kept) if kept.init() == 0 => &[],
             // SAFETY: the first `init` bytes of the buffer's memory hold
@@ -492,6 +528,21 @@ impl core::ops::Deref for OwnedBuf {
             Boxed::Kept(kept) => unsafe { core::slice::from_raw_parts(kept.ptr(), kept.init()) },
             Boxed::Vectored(_) => &[],
         }
+    }
+
+    #[inline(never)]
+    fn rest_from(&self, from: usize) -> &[u8] {
+        let Boxed::Vectored(bufs) = self else {
+            return self.bytes().get(from..).unwrap_or_default();
+        };
+        let mut from = from;
+        for buf in bufs {
+            if from < buf.len() {
+                return buf.rest_from(from);
+            }
+            from -= buf.len();
+        }
+        &[]
     }
 }
 
