@@ -963,7 +963,8 @@ for the poll, a datagram received ahead and taken).
 `tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
 `reads_itself` in `src/io/source/read.rs`, `write`, `write_direct` and `writes_itself` in
-`src/io/source/write.rs`). Three connections over a pool of two buffers, two of whose peers never
+`src/io/source/write.rs`; a ring write goes direct at every size, `WRITE_RING` of
+`src/io/source/direct.rs` being 0). Three connections over a pool of two buffers, two of whose peers never
 send: with no receive group to draw from (none configured, or the group dry) a read takes a buffer
 of the pool for a receive that waits in the kernel, and holds it while its peer stays idle. Before,
 a reader or a writer that found the pool empty waited for a buffer to come back and armed nothing,

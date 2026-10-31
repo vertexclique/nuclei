@@ -291,9 +291,9 @@ impl WriteState {
     }
 
     /// Whether a stream write of `len` bytes goes straight from the task's
-    /// buffer: one big enough (see `direct`), or on a ring any while the pool
-    /// has no buffer for the write-behind, so a writer never waits on buffers
-    /// that receives of other connections hold (proofs/tla/ring/RingStarve.tla).
+    /// buffer: one big enough (see `direct`; on a ring any), so a writer never
+    /// waits on buffers that receives of other connections hold
+    /// (proofs/tla/ring/RingStarve.tla).
     /// A pipe's goes too, while the pool has no buffer for it (`writes_bytes`).
     #[cfg(unix)]
     pub(super) fn writes_itself(&self, io: Io<'_>, len: usize) -> bool {

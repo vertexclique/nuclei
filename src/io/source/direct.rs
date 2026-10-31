@@ -15,9 +15,13 @@ use super::{Io, Via};
 // Smallest borrowed buffer a stream reads or writes directly, by driver and
 // direction. Measured with `tcp_size_<KiB>` of benches/vs_tokio_count.rs,
 // against the pool path, 5 runs a size over several passes: user
-// instructions fall at every size; cycles fall for epoll writes from 1 KiB,
-// ring writes from 4 KiB and reads from 16 KiB, epoll reads from 16 KiB
-// (below, the read that finds the socket empty costs more than the copy).
+// instructions fall at every size; cycles fall for epoll writes from 1 KiB
+// and reads from 16 KiB (below, the read that finds the socket empty costs
+// more than the copy). Ring writes go direct at every size: a 64-byte TCP
+// ping-pong on Linux 7.3, 5 alternating runs each, falls from 11,077 to 8,061
+// user instructions a round trip (kernel 31,100 to 30,700, user cycles median
+// 11,700 to 9,990), a unix stream from 11,080 to 8,064 (kernel 11,920 to
+// 11,590). Ring reads stay at 16 KiB.
 /// Epoll and kqueue reads.
 pub(super) const READ_READINESS: usize = 16 << 10;
 /// Epoll and kqueue writes.
@@ -27,7 +31,7 @@ const WRITE_READINESS: usize = 0;
 const READ_RING: usize = 16 << 10;
 /// Ring writes.
 #[cfg(ring)]
-const WRITE_RING: usize = 4 << 10;
+const WRITE_RING: usize = 0;
 
 /// Whether a borrowed buffer of `len` bytes is read or written directly.
 #[inline]
