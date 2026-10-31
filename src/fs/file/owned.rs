@@ -3,7 +3,10 @@
 //! reads into or writes from the caller's memory itself; only bytes read
 //! ahead are copied in.
 
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
+use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
 use std::sync::Arc;
@@ -17,22 +20,16 @@ impl FileIo {
     /// Reads at the cursor into the spare capacity of `buf`, after the bytes
     /// it holds, and gives it back with the read's result. The job reads
     /// into `buf` itself (bytes read ahead are copied in instead).
-    pub(crate) async fn read_owned<B>(self: &Arc<Self>, buf: B) -> (io::Result<usize>, B)
+    pub(crate) fn read_owned<B>(self: &Arc<Self>, buf: B) -> ReadOwned<'_, B>
     where
         B: IoBufMut,
     {
-        let mut held = Some(OwnedBuf::filled(buf));
-        // Dropped with the future, a job in flight is cancelled, or its
-        // result thrown away: the cursor moves only when a result is taken.
-        let mut job = None;
-        let result = poll_fn(|cx| self.poll_read_owned(cx, &mut held, &mut job)).await;
-        // Its read ended, so no job is left: the empty one is not dropped,
-        // and its drop's call is not made on every read.
-        if let Some(left) = job.take() {
-            drop_cold(left);
+        ReadOwned {
+            io: self,
+            held: Some(OwnedBuf::filled(buf)),
+            job: ManuallyDrop::new(None),
+            buf: PhantomData,
         }
-        core::mem::forget(job);
-        (result, held.unwrap_or_default().into_filled())
     }
 
     fn poll_read_owned(
@@ -127,7 +124,42 @@ impl FileIo {
     }
 }
 
-/// Drops `value` out of line, on a path that is never taken in practice.
+/// A read into a caller's buffer at the cursor ([`FileIo::read_owned`]).
+/// Dropped with a job in flight, the job is cancelled, or its result thrown
+/// away: the cursor moves only when a result is taken. A read that ended has
+/// no job, and its drop is a look at that and nothing more.
+pub(crate) struct ReadOwned<'a, B> {
+    io: &'a Arc<FileIo>,
+    held: Option<OwnedBuf>,
+    job: ManuallyDrop<Option<LentRead>>,
+    buf: PhantomData<fn() -> B>,
+}
+
+impl<B> Future for ReadOwned<'_, B>
+where
+    B: IoBufMut,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let result = core::task::ready!(this.io.poll_read_owned(cx, &mut this.held, &mut this.job));
+        Poll::Ready((result, this.held.take().unwrap_or_default().into_filled()))
+    }
+}
+
+impl<B> Drop for ReadOwned<'_, B> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.job.is_some() {
+            // SAFETY: taken once, here; the field is never used after.
+            drop_cold(unsafe { ManuallyDrop::take(&mut self.job) });
+        }
+    }
+}
+
+/// Drops `value` out of line: a read's job, when the read is dropped before
+/// it ended.
 #[cold]
 #[inline(never)]
 fn drop_cold<T>(value: T) {
