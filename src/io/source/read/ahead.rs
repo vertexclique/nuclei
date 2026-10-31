@@ -9,6 +9,7 @@ use std::io;
 use crate::buf::PoolBuf;
 use crate::buf::owned::OwnedBuf;
 use crate::io::side::After;
+use crate::rt::shard::Shard;
 
 /// One run of bytes read ahead.
 pub(super) enum Piece {
@@ -54,11 +55,18 @@ impl Piece {
         }
     }
 
+    /// Lets go of the piece; a chunk of the receive group goes back through
+    /// `shard`, the shard the caller runs, if it knows it.
     #[inline]
-    fn release(self, after: &mut After) {
-        if let Piece::Pool(buf) = self {
-            after.drop_buf(buf);
+    fn release(self, after: &mut After, shard: Option<&Shard>) {
+        match self {
+            Piece::Pool(buf) => after.drop_buf(buf),
+            #[cfg(ring)]
+            Piece::Ring(chunk) => chunk.give_back(shard),
+            _ => {}
         }
+        #[cfg(not(ring))]
+        let _ = shard;
     }
 }
 
@@ -87,7 +95,7 @@ impl Ahead {
     #[inline]
     pub(super) fn push(&mut self, piece: Piece, after: &mut After) {
         if piece.filled().is_empty() {
-            piece.release(after);
+            piece.release(after, None);
         } else {
             self.pieces.push_back(piece);
         }
@@ -95,7 +103,7 @@ impl Ahead {
 
     /// Takes `n` bytes off the front, letting go of the pieces emptied.
     #[inline]
-    pub(super) fn consume(&mut self, mut n: usize, after: &mut After) {
+    pub(super) fn consume(&mut self, mut n: usize, after: &mut After, shard: Option<&Shard>) {
         while n > 0 {
             let Some(front) = self.pieces.front_mut() else {
                 return;
@@ -106,7 +114,7 @@ impl Ahead {
             if front.filled().is_empty()
                 && let Some(done) = self.pieces.pop_front()
             {
-                done.release(after);
+                done.release(after, shard);
             }
         }
     }
@@ -114,7 +122,31 @@ impl Ahead {
     /// Copies bytes into `out`, in order, consumed unless `peek`; returns
     /// how many.
     #[inline]
-    pub(super) fn copy_into(&mut self, out: &mut [u8], peek: bool, after: &mut After) -> usize {
+    pub(super) fn copy_into(
+        &mut self,
+        out: &mut [u8],
+        peek: bool,
+        after: &mut After,
+        shard: Option<&Shard>,
+    ) -> usize {
+        // One piece, the usual case: one look at its bytes.
+        if self.pieces.len() == 1
+            && let Some(piece) = self.pieces.front_mut()
+        {
+            let src = piece.filled();
+            let (all, n) = (src.len(), src.len().min(out.len()));
+            out[..n].copy_from_slice(&src[..n]);
+            if !peek {
+                if n == all {
+                    if let Some(done) = self.pieces.pop_front() {
+                        done.release(after, shard);
+                    }
+                } else {
+                    piece.consume(n);
+                }
+            }
+            return n;
+        }
         let mut n = 0;
         for piece in &self.pieces {
             let src = piece.filled();
@@ -126,7 +158,7 @@ impl Ahead {
             }
         }
         if !peek {
-            self.consume(n, after);
+            self.consume(n, after, shard);
         }
         n
     }
@@ -136,6 +168,7 @@ impl Ahead {
         &mut self,
         bufs: &mut [io::IoSliceMut<'_>],
         after: &mut After,
+        shard: Option<&Shard>,
     ) -> usize {
         let mut n = 0;
         for piece in &self.pieces {
@@ -145,13 +178,18 @@ impl Ahead {
                 break;
             }
         }
-        self.consume(n, after);
+        self.consume(n, after, shard);
         n
     }
 
     /// Moves bytes onto the end of `buf`, as many as its spare capacity
     /// holds.
-    pub(super) fn append_to(&mut self, buf: &mut OwnedBuf, after: &mut After) -> usize {
+    pub(super) fn append_to(
+        &mut self,
+        buf: &mut OwnedBuf,
+        after: &mut After,
+        shard: Option<&Shard>,
+    ) -> usize {
         let mut n = 0;
         for piece in &self.pieces {
             let src = piece.filled();
@@ -161,7 +199,7 @@ impl Ahead {
                 break;
             }
         }
-        self.consume(n, after);
+        self.consume(n, after, shard);
         n
     }
 
@@ -169,7 +207,7 @@ impl Ahead {
     #[inline]
     pub(super) fn release(&mut self, after: &mut After) {
         for piece in self.pieces.drain(..) {
-            piece.release(after);
+            piece.release(after, None);
         }
     }
 }

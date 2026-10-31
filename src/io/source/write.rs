@@ -291,9 +291,9 @@ impl WriteState {
     }
 
     /// Whether a stream write of `len` bytes goes straight from the task's
-    /// buffer: one big enough (see `direct`), or on a ring any while the pool
-    /// has no buffer for the write-behind, so a writer never waits on buffers
-    /// that receives of other connections hold (proofs/tla/ring/RingStarve.tla).
+    /// buffer: one big enough (see `direct`; on a ring any), so a writer never
+    /// waits on buffers that receives of other connections hold
+    /// (proofs/tla/ring/RingStarve.tla).
     /// A pipe's goes too, while the pool has no buffer for it (`writes_bytes`).
     #[cfg(unix)]
     pub(super) fn writes_itself(&self, io: Io<'_>, len: usize) -> bool {
@@ -388,6 +388,18 @@ impl WriteState {
     /// The driver's part: on readiness, does what the side holds and wakes
     /// the tasks that wait on any of it.
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
+        // An edge that finds the side idle only counts: the cheap and usual
+        // case (a socket is writable with every readable edge on epoll).
+        if edge
+            && !self.user_fd
+            && !self.blocked
+            && !self.connecting
+            && self.behind.is_none()
+            && !self.lent_waits()
+        {
+            self.edges = self.edges.wrapping_add(1);
+            return;
+        }
         // A call that found the socket full waits for the edge itself (a
         // datagram's, see `send_now`): it is woken even if nothing else moves.
         let unblocked = edge && self.blocked;

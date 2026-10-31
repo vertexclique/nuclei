@@ -144,6 +144,18 @@ struct Lent {
 #[cfg(completion)]
 const UDP_MAX: usize = u16::MAX as usize;
 
+/// Whether `TCP_INQ` is on for a socket (see `ReadState::inq_wanted`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Inq {
+    /// Not asked yet.
+    #[default]
+    Unknown,
+    On,
+    /// The kernel does not know the option.
+    Off,
+}
+
 #[derive(Default)]
 pub(super) struct ReadState {
     /// The last call would have blocked, and no edge came since.
@@ -162,6 +174,9 @@ pub(super) struct ReadState {
     /// Urgent data or a hangup was reported: a short read may leave bytes
     /// behind it from now on (see [`drained`]).
     unsure: bool,
+    /// Whether the kernel counts what a read of this TCP socket leaves.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    inq: Inq,
     /// The last accept failed for want of a descriptor: the next one looks
     /// for a free one first (see [`ReadState::accept_checked`]).
     #[cfg(readiness)]
@@ -690,7 +705,9 @@ impl ReadState {
             self.datagrams.is_empty()
         } else {
             self.reads_bytes(kind)
-                && (self.want >= super::direct::READ_READINESS || self.starved)
+                && (self.want >= super::direct::READ_READINESS
+                    || self.starved
+                    || self.inq_wanted(kind))
                 && self.ahead.is_empty()
         };
         theirs && self.lent.is_none() && !self.eof && self.error.is_none()
@@ -702,8 +719,50 @@ impl ReadState {
     /// that receives or reads ahead of other connections hold
     /// (proofs/tla/ring/RingStarve.tla, proofs/tla/starve/FdStarve.tla).
     #[cfg(unix)]
-    pub(super) fn reads_itself(&self, io: Io<'_>, len: usize, peek: bool) -> bool {
-        self.starved || (!peek && super::direct::worth(io, len, false))
+    pub(super) fn reads_itself(&self, io: Io<'_>, kind: Kind, len: usize, peek: bool) -> bool {
+        self.starved
+            || (!peek
+                && ((matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind))
+                    || super::direct::worth(io, len, false)))
+    }
+
+    /// Whether a TCP read on a readiness driver goes straight into the
+    /// task's buffer at every size: the kernel counts what a read leaves
+    /// (`TCP_INQ`), so even a read that filled its buffer knows whether the
+    /// socket is empty, and the next one waits for an edge instead of
+    /// finding nothing (proofs/tla/starve/FdStarve.tla). Not once the kernel
+    /// refused the option, and not off Linux.
+    #[cfg(unix)]
+    pub(super) fn inq_wanted(&self, kind: Kind) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return kind == Kind::Tcp && self.inq != Inq::Off;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = kind;
+            false
+        }
+    }
+
+    /// Whether the receives of `fd` report what they leave: asks the kernel
+    /// the first time.
+    #[cfg(unix)]
+    pub(super) fn inq_on(&mut self, fd: RawFd) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if self.inq == Inq::Unknown {
+                self.inq = if sys::enable_inq(fd) {
+                    Inq::On
+                } else {
+                    Inq::Off
+                };
+            }
+            self.inq == Inq::On
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = fd;
+            false
+        }
     }
 
     /// Whether a read of `kind` may go straight into the task's buffer: a
@@ -732,17 +791,21 @@ impl ReadState {
         len: usize,
         peek: bool,
         waker: &Waker,
-        call: impl FnOnce(RawFd) -> io::Result<usize>,
+        call: impl FnOnce(RawFd, bool) -> io::Result<(usize, Option<usize>)>,
     ) -> Option<Poll<io::Result<usize>>> {
         let fd = fd?;
         if !self.reads_bytes(kind)
             || len == 0
-            || !self.reads_itself(io, len, peek)
             || !self.ahead.is_empty()
             || self.lent.is_some()
             || self.eof
             || self.error.is_some()
         {
+            return None;
+        }
+        // `call` is told to count what the socket keeps, when it can.
+        let inq = !peek && matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind) && self.inq_on(fd);
+        if !inq && !self.reads_itself(io, kind, len, peek) {
             return None;
         }
         match io.via {
@@ -768,7 +831,7 @@ impl ReadState {
         {
             self.readable = false;
         }
-        match sys::ready(call(fd)) {
+        match sys::ready(call(fd, inq)) {
             None => {
                 match io.via {
                     Via::Fd(_) => self.blocked = true,
@@ -779,10 +842,14 @@ impl ReadState {
                 }
                 None
             }
-            Some(Ok(n)) => {
+            Some(Ok((n, left))) => {
                 // A peek leaves the bytes in the socket, which no edge reports again.
                 if matches!(io.via, Via::Fd(_)) && !peek {
-                    self.blocked = drained(kind, self.unsure, n, len);
+                    self.blocked = match left {
+                        // The kernel counted what is left: none, and nothing is.
+                        Some(left) => n > 0 && !self.unsure && left == 0,
+                        None => drained(kind, self.unsure, n, len),
+                    };
                 }
                 Some(Poll::Ready(Ok(n)))
             }
@@ -803,7 +870,7 @@ impl ReadState {
     ) -> Poll<io::Result<usize>> {
         self.complete(io, kind, out.len(), after);
         match self.take_stream(peek, after, |ahead, after| {
-            ahead.copy_into(out, peek, after)
+            ahead.copy_into(out, peek, after, io.shard)
         }) {
             Some(result) => {
                 self.pass_on(after);
@@ -862,7 +929,7 @@ impl ReadState {
         let len = bufs.iter().map(|b| b.len()).sum();
         self.complete(io, kind, len, after);
         match self.take_stream(false, after, |ahead, after| {
-            ahead.copy_vectored(bufs, after)
+            ahead.copy_vectored(bufs, after, io.shard)
         }) {
             Some(result) => {
                 self.pass_on(after);
@@ -902,9 +969,9 @@ impl ReadState {
             *held = self.reclaim(after);
         }
         if let Some(buf) = held.as_mut() {
-            if let Some(result) =
-                self.take_stream(false, after, |ahead, after| ahead.append_to(buf, after))
-            {
+            if let Some(result) = self.take_stream(false, after, |ahead, after| {
+                ahead.append_to(buf, after, io.shard)
+            }) {
                 self.pass_on(after);
                 return Poll::Ready(result);
             }

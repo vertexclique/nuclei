@@ -48,6 +48,7 @@ impl<T> Ops<T> {
 
     /// Keeps `op` and returns the user data its entry carries, or gives `op`
     /// back when the slab is full.
+    #[inline]
     pub(crate) fn insert(&mut self, op: T) -> Result<u64, T> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
@@ -77,9 +78,18 @@ impl<T> Ops<T> {
     /// Takes the operation of `user_data` out, freeing its slot for another
     /// generation; a stale user data takes nothing.
     pub(crate) fn remove(&mut self, user_data: u64) -> Option<T> {
+        self.remove_if(user_data, |_| true)
+    }
+
+    /// As [`remove`](Self::remove), but only an operation `take` says
+    /// to take: one lookup for the look and the take.
+    #[inline]
+    pub(crate) fn remove_if(&mut self, user_data: u64, take: impl FnOnce(&T) -> bool) -> Option<T> {
         let index = (user_data & INDEX_MASK) as usize;
         let slot = self.slots.get_mut(index)?;
-        if u64::from(slot.generation) != user_data >> INDEX_BITS {
+        if u64::from(slot.generation) != user_data >> INDEX_BITS
+            || !slot.op.as_ref().is_some_and(take)
+        {
             return None;
         }
         let op = slot.op.take()?;

@@ -58,7 +58,7 @@ impl Source {
         crate::coop::poll_budget(cx, |cx| {
             self.poll_reading(cx, |st, io, waker, after| {
                 #[cfg(unix)]
-                if st.reads_itself(io, out.len(), peek)
+                if st.reads_itself(io, kind, out.len(), peek)
                     && let Some(poll) = st.read_direct(
                         io,
                         self.serving_fd(None),
@@ -66,12 +66,19 @@ impl Source {
                         out.len(),
                         peek,
                         waker,
-                        |fd| {
-                            if peek {
+                        |fd, inq| {
+                            #[cfg(any(target_os = "linux", target_os = "android"))]
+                            if inq {
+                                return sys::read_inq(fd, out);
+                            }
+                            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                            let _ = inq;
+                            let read = if peek {
                                 sys::peek(fd, out)
                             } else {
                                 sys::read(fd, out)
-                            }
+                            };
+                            read.map(|n| (n, None))
                         },
                     )
                 {
@@ -247,7 +254,7 @@ impl Source {
                 #[cfg(unix)]
                 {
                     let len = bufs.iter().map(|b| b.len()).sum();
-                    if st.reads_itself(io, len, false)
+                    if st.reads_itself(io, kind, len, false)
                         && let Some(poll) = st.read_direct(
                             io,
                             self.serving_fd(None),
@@ -255,7 +262,7 @@ impl Source {
                             len,
                             false,
                             waker,
-                            |fd| sys::read_bufs(fd, bufs),
+                            |fd, _| sys::read_bufs(fd, bufs).map(|n| (n, None)),
                         )
                     {
                         return poll;
