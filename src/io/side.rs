@@ -774,6 +774,7 @@ impl<const N: usize> WakerSet<N> {
     /// displaces. Returns false when `waker` was woken at once instead of
     /// kept: a take met the registration (the taker is waking this set's
     /// tasks now), or the last slot was in use.
+    #[inline]
     pub(crate) fn register(&self, waker: &Waker) -> bool {
         // Never zero, the empty slot's tag.
         let tag = waker.data() as usize | 1;
@@ -796,6 +797,7 @@ impl<const N: usize> WakerSet<N> {
 
     /// Takes every registered waker, for `after` to wake, and frees the
     /// slots.
+    #[inline]
     pub(crate) fn take_all(&self, after: &mut After) {
         for (tag, waker) in self.tags.iter().zip(&self.wakers) {
             if let Some(w) = waker.take() {
