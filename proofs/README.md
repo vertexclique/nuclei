@@ -1742,6 +1742,46 @@ counter: a spend refuses only at zero and takes one unit; a poll completes at mo
 program within it completes whole, a longer one yields with nothing left; and outside a budgeted
 poll, where the counter starts at `2^64 - 1`, nothing ever yields.
 
+## The single-shard semaphore
+
+`shardlocal` (`tla/shardlocal/Local.tla`, `lean/Nuclei/LocalSemaphore.lean`) checks `sync::local::Semaphore`
+(`src/sync/local/semaphore.rs`, its line in `src/sync/local/waiters.rs`), which the local `Mutex`
+and the local bounded channel's slots are built on: a strictly first-come, first-served semaphore
+for the tasks of one shard. A request takes its permits at once when nobody waits and they are
+free, else joins the back of the line; a release serves the front waiters whose needs fit, one
+after another, stopping at the first that does not; an attempt that never waits takes nothing
+while anybody waits; a dropped request leaves the line (serving it again when it was the front),
+and one dropped after its grant and before it took it passes the permits on. The tasks run on one
+thread, so a poll or a drop is one step, and the model interleaves whole steps in every order. 11
+configurations: 4 that must pass (two big requests and a small one, a big request between two
+small ones, a request that only tries racing a big waiter, liveness), with `Conservation`,
+`FifoFair` (nobody gets permits while one that asked before it still waits) and `NoIdleFront` (no
+waiter sleeps with its whole need free at the front); 4 mutations (a try that barges breaks
+`FifoFair`; a front dropped without serving the line again and a release that serves nobody break
+`NoIdleFront`; a dropped grant that keeps its permits breaks `Conservation`), and 3 witnesses (a
+granted request dropped before it took its grant, the front dropped and the next served, a waiter
+asleep while a permit is kept for the front). The Lean file proves, for every sequence of
+operations from a fresh semaphore of any size, that the pass grants a prefix of the line in its
+order and conserves the permits, that every operation keeps the count and leaves no waiter whose
+need is free at the front, and computes a worked example. What is left out: the wakers (one
+thread, so a wake cannot race its registration) and the close, which ends every waiter at once
+and serves nobody.
+
+## A mesh party's receive
+
+`mesh` (`tla/mesh/Mesh.tla`, `lean/Nuclei/Mesh.lean`) checks `sync::mesh` (`src/sync/mesh.rs`).
+The TLA+ family checks `Party::poll_recv`: the party looks at its channels round robin, starting
+after the one that delivered last, takes the first value it finds, and otherwise sleeps with its
+waker registered in every channel (each channel's own receive does it); one peer floods its
+channel, refilling it whenever there is room, and the other sends one value. 6 configurations: 2
+that must pass, with `QuietServed` (the quiet value waits for at most one flooded value) and
+`NoLostWake`, and liveness; 2 mutations (a receive that always starts at the first channel breaks
+`QuietServed`; one that keeps its waker in one channel only breaks `Termination`), and 2
+witnesses (a sleep a send ends, a flooded value taken while the quiet one waits). The channels are
+counts; their own steps are the `mpsc` models'. The Lean file proves the layout `mesh` builds: the
+channel made at outer step `from` and inner step `to` is the one party `from` sends to `to` on and
+the one party `to` receives from `from` on, and no two pairs share a channel.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the

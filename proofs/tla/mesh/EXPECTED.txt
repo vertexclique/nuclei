@@ -1,0 +1,7 @@
+# configuration                spec                 expected
+R_fair                         MC_Mesh              pass
+R_live                         MC_Mesh              pass
+M_fixed_start                  MC_Mesh              violated:QuietServed
+M_register_first_only          MC_Mesh              violated:Termination
+W_sleep                        MC_Mesh              violated:NoSleep
+W_overtake                     MC_Mesh              violated:NoOvertake

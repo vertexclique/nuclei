@@ -226,3 +226,21 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Precise.on_the_grid_exactly
 #print axioms Nuclei.Precise.published_within_a_microsecond
 #print axioms Nuclei.Precise.example_rounding
+
+-- The single-shard semaphore: the pass grants the front in order, conserves the permits and
+-- stops at an unfit front; every operation, and every run, keeps the count and leaves no waiter
+-- whose need is free at the front.
+#print axioms Nuclei.LocalSemaphore.serve_grants_the_front
+#print axioms Nuclei.LocalSemaphore.serve_conserves
+#print axioms Nuclei.LocalSemaphore.serve_leaves_an_unfit_front
+#print axioms Nuclei.LocalSemaphore.fresh_good
+#print axioms Nuclei.LocalSemaphore.step_good
+#print axioms Nuclei.LocalSemaphore.run_good
+#print axioms Nuclei.LocalSemaphore.example_front_first
+
+-- The mesh's layout: a party's sender to another and that one's receiver from it are one
+-- channel, and a channel joins exactly one pair.
+#print axioms Nuclei.Mesh.the_ends_meet
+#print axioms Nuclei.Mesh.one_pair_per_channel
+#print axioms Nuclei.Mesh.pairs_do_not_share
+#print axioms Nuclei.Mesh.example_three
