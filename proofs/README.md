@@ -1752,6 +1752,27 @@ mean the poll has run at least four ticks, and a read that missed the poll just 
 saw it means the poll began after it. The model takes a bound task's home as its creator thread
 and a hand-over to a spare as one step.
 
+## A file's blocking lock
+
+`flock` (`tla/flock/FileLock.tla`) checks the cancellation of `Handle<File>::lock`
+(`src/fs/lock.rs`: `lock` and its `LockCall`) at the grain of its atomic steps. `lock` waits in the
+kernel until the file is free, so it is a job of the blocking pool; a future dropped while the job
+waits must not leave the file locked with nobody to give it back. The future and the job share one
+word, WAITING, HELD or GONE. The job locks the file and then does one compare-and-swap from
+WAITING to HELD, and unlocks the file itself if it finds GONE; a future dropped before it took the
+result swaps GONE in, and unlocks the file itself if the word was HELD; a job that has not started
+when the future is dropped is cancelled. The model has each step: the word and its swap and
+compare-and-swap, the job's claim, the kernel's lock and each unlock, the drop at any point and
+its three steps, and the future taking the result. The kernel's lock is one flag: other holders
+of the file, and how long the blocking lock waits, are the kernel's. 7 configurations: 2 that
+must pass (a lock that always succeeds, and one that may fail, each with the future dropped at any
+point), with the file locked, once both are done, only if the caller holds the lock
+(`NoOwnerlessLock`), a lock handed to the caller held, and both parties always ending; 3
+mutations (a job that writes HELD without looking for GONE, a drop that finds HELD and does not
+unlock, a drop that reads the word and writes GONE in two steps, each `NoOwnerlessLock`); and 2
+witnesses (the job gets the lock after its future was dropped, and a dropped future finds the
+lock held and gives it back itself).
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the
