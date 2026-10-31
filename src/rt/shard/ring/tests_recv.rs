@@ -361,7 +361,13 @@ fn a_chunk_outlives_its_shard() {
             let mut first = [0u8; 1];
             read_exact(&src, &mut first).await;
             assert_eq!(first[0], expected[0]);
-            pause(Duration::from_millis(50)).await;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut nap = Duration::from_millis(1);
+            while !src.has_read_ahead() {
+                assert!(Instant::now() < deadline, "no chunk was held in time");
+                pause(nap).await;
+                nap = (nap * 2).min(Duration::from_millis(50));
+            }
         });
     }
     drop(shard);

@@ -879,7 +879,7 @@ impl Source {
         )
     }
 
-    fn has_read_ahead(self: &Arc<Self>) -> bool {
+    pub(crate) fn has_read_ahead(self: &Arc<Self>) -> bool {
         let mut after = After::default();
         let hooks = self.hooks();
         self.read.try_hold().is_some_and(|mut held| {
