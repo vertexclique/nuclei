@@ -115,7 +115,7 @@ pub mod error {
     /// The receiver gets it when the sender is dropped without sending, or
     /// when the receiver was closed with nothing sent.
     #[derive(Debug, Eq, PartialEq, Clone)]
-    pub struct RecvError(pub(super) ());
+    pub struct RecvError(pub(crate) ());
 
     /// Error returned by [`Receiver::try_recv`](super::Receiver::try_recv).
     #[derive(Debug, Eq, PartialEq, Clone)]

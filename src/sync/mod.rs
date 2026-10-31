@@ -29,6 +29,9 @@
 //! [`RwLock`](crate::sync::RwLock), the reentrant locks and `OnceCell::get_or_init_racy`.
 //! The [`mpsc`](crate::sync::mpsc) channels follow the same rule for the established channel API,
 //! with their own progress notes.
+//! The [`local`](crate::sync::local) module adds single-shard twins of the
+//! channels, the semaphore and the mutex, with no atomic instruction on any
+//! path.
 //!
 //! # What every primitive guarantees
 //!
@@ -151,6 +154,7 @@ pub(crate) mod internal;
 mod latch;
 mod lazy;
 mod list;
+pub mod local;
 #[cfg(all(loom, test))]
 #[doc(hidden)]
 pub(crate) mod loom_model;

@@ -29,7 +29,7 @@ use super::raw_semaphore::{PermitWait, RawSemaphore};
 /// [`RwLock::try_read`]: super::RwLock::try_read
 /// [`RwLock::try_write`]: super::RwLock::try_write
 #[derive(Debug)]
-pub struct TryLockError(pub(super) ());
+pub struct TryLockError(pub(crate) ());
 
 impl fmt::Display for TryLockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
