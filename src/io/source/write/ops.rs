@@ -68,6 +68,16 @@ impl WriteState {
             || self.queued.is_some()
     }
 
+    /// Whether `submit_wanted` has anything to do after a completion.
+    pub(crate) fn wants_ops(&self) -> bool {
+        #[cfg(port)]
+        return true;
+        #[cfg(not(port))]
+        {
+            self.out.is_none() && (self.op_work() || self.not_ready_first() || self.user_fd)
+        }
+    }
+
     /// Issues what the side holds, if this thread reaches a completion
     /// driver.
     #[cfg_attr(

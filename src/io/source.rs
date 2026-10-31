@@ -529,6 +529,7 @@ impl Hooks<WriteState> for SourceHooks<'_> {
         }
     }
 
+    #[inline]
     fn released(&self, saw_requests: bool, after: &mut After) {
         if saw_requests {
             self.src.requests_after_write(self, after);
@@ -741,6 +742,7 @@ impl Source {
     /// What every step leaves for once no guard is held: a side that ran out
     /// of buffers waits for one of this thread's pool, then the wakes and
     /// drops.
+    #[inline]
     fn settle(self: &Arc<Self>, after: After) {
         let Err(mut after) = after.forget_if_nothing() else {
             return;
@@ -776,6 +778,7 @@ impl Source {
 
     /// The end of a poll: settles, and makes sure a driver watches the
     /// source when the poll waits or left work to it.
+    #[inline]
     fn finish_poll<R>(
         self: &Arc<Self>,
         after: After,
@@ -903,6 +906,7 @@ impl Source {
     }
 
     /// Whether the source is retired: the handle's next poll revives it.
+    #[inline]
     pub(crate) fn is_retired(&self) -> bool {
         self.fd.load(Ordering::Acquire) == NO_FD
     }

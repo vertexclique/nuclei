@@ -51,22 +51,28 @@ impl Spin {
         if !(expecting || self.hot.get()) || budget == 0 {
             return false;
         }
-        let limit = Duration::from_nanos(u64::from(budget));
-        let start = Instant::now();
-        let mut gap = 1;
-        loop {
-            for _ in 0..gap {
-                core::hint::spin_loop();
+        // The first look comes before the clock and the first pause: work already there costs
+        // neither, and the budget runs from a failed look.
+        let mut hit = found();
+        if !hit {
+            let limit = Duration::from_nanos(u64::from(budget));
+            let start = Instant::now();
+            let mut gap = 1;
+            loop {
+                for _ in 0..gap {
+                    core::hint::spin_loop();
+                }
+                gap = (gap * 2).min(SPIN_GAP_MAX);
+                hit = found();
+                if hit || start.elapsed() >= limit {
+                    break;
+                }
             }
-            gap = (gap * 2).min(SPIN_GAP_MAX);
-            if found() {
-                self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
-                self.hot.set(true);
-                return true;
-            }
-            if start.elapsed() >= limit {
-                break;
-            }
+        }
+        if hit {
+            self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
+            self.hot.set(true);
+            return true;
         }
         self.budget.set(budget / 2);
         self.hot.set(false);

@@ -126,10 +126,18 @@ impl Files {
     }
 
     /// An entry naming `slot` was queued.
+    #[cfg(test)]
     pub(crate) fn named(&mut self, slot: u32) {
-        if let Some(s) = self.slot_mut(slot) {
-            s.entries += 1;
-        }
+        self.name(slot);
+    }
+
+    /// An entry naming `slot` was queued: returns [`number_of`](Self::number_of) the slot, in one
+    /// lookup.
+    #[inline]
+    pub(crate) fn name(&mut self, slot: u32) -> Option<RawFd> {
+        let s = self.slot_mut(slot)?;
+        s.entries += 1;
+        s.own
     }
 
     /// An entry naming `slot` completed. Returns whether the slot is free
