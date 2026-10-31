@@ -154,7 +154,6 @@ pub(super) struct WriteState {
     connect_started: bool,
     connecting: bool,
     connected: Option<io::Result<()>>,
-    shut: bool,
     /// The source's epoch this state is of.
     epoch: u32,
     /// Edges (and, on a ring, polls that completed) since the source was
@@ -559,6 +558,8 @@ impl WriteState {
 
     /// Flushes, then shuts a stream's writing half of `fd` down (with
     /// nothing out on the ring by then, the driver's call on it at once).
+    /// Every close asks the kernel, so one after the first answers what the
+    /// system answers to a second shutdown (macOS: `ENOTCONN`), as std's.
     fn close(
         &mut self,
         io: Io<'_>,
@@ -571,8 +572,7 @@ impl WriteState {
             Poll::Ready(Ok(())) => {}
             other => return other,
         }
-        if kind.streams() && !self.shut {
-            self.shut = true;
+        if kind.streams() {
             return Poll::Ready(sys::shutdown_write(fd).inspect_err(crate::rt::counters::io_error));
         }
         Poll::Ready(Ok(()))
@@ -803,7 +803,6 @@ impl WriteState {
         self.connect_started = false;
         self.connecting = false;
         self.connected = None;
-        self.shut = false;
         self.blocked = false;
         #[cfg(ring)]
         {

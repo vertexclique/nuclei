@@ -959,6 +959,25 @@ and a failed accept that does not mark the side for that check, break `LostPerOu
 witnesses (a retry after a pause that accepts a connection; a check that found a descriptor free
 and an accept that still closed a connection, the race the check cannot close).
 
+## A stream's close
+
+`shutdown` (`tla/shutdown/Shutdown.tla`) checks a stream's close (`WriteState::close` in
+`src/io/source/write.rs`, which flushes and then calls `shutdown_write` of `src/io/sys/`; the
+driver's writes of the write-behind are `WriteState::push_fd`). A task writes bytes, which wait in
+the write-behind until the driver hands them to the kernel, one per call; then it closes the
+writing half again and again. A close waits until the write-behind is out, then asks the kernel to
+shut the writing half; the first shutdown puts the end of the stream on the wire. The kernel
+answers a shutdown of a half shut already its own way: Linux says it went, macOS says ENOTCONN. 5
+configurations: 2 that must pass (two bytes and three closes on Linux and on macOS, with
+`AsTheKernel`, every close answers what the kernel answered to that shutdown, which is std's
+answer; `FinLast`, the end of the stream follows every byte written before the close, in order;
+`NoneLost`, no byte is refused by a half shut under it; and `Termination`), 2 mutations (a close
+after the first that answers Ok from the side's own note that it shut, as the code did, breaks
+`AsTheKernel` on macOS; a close that shuts before the write-behind is out breaks `FinLast`), and 1
+witness (a second close on macOS answered ENOTCONN). The Rust test
+`half_close::*::our_shutdown_delivers_every_byte_and_reads_go_on` in `tests/faults/half_close.rs`
+compares a second close with std's on a real stream.
+
 ## The timer wheel
 
 `lean/Nuclei/Wheel.lean` checks the arithmetic of each shard's timing wheel
