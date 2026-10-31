@@ -67,11 +67,7 @@ const THRESHOLDS: &[Threshold] = &[
         "const READ_RING: usize = 16 << 10;",
         16 << 10
     ),
-    threshold!(
-        "src/io/source/direct.rs",
-        "const WRITE_RING: usize = 4 << 10;",
-        4 << 10
-    ),
+    threshold!("src/io/source/direct.rs", "const WRITE_RING: usize = 0;", 0),
     threshold!(
         "src/io/source.rs",
         "pub(crate) const OWNED_DATAGRAM_MIN: usize = 12 * 1024;",
