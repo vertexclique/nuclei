@@ -2,7 +2,8 @@
 (***************************************************************************)
 (* What a dropped handle leaves, when the runtime it ran on drops           *)
 (* (src/rt/linger.rs: `hand`, `Inner::linger`, `Guarded`, `Lingering`,      *)
-(* `Inner::lingers_done`; src/rt/runtime.rs: `Runtime::drop`,               *)
+(* `Inner::lingers_done`, `RunAll` and its drop; src/rt/runtime.rs:         *)
+(* `Runtime::drop`,                                                         *)
 (* `finish_lingering`, `spawn_linger`; src/rt/runtime/enter.rs:             *)
 (* `shutdown_background`; src/rt/sched.rs: `Counted`'s drop;                *)
 (* src/rt/shard.rs: `Shared::settled`, `write_ended`, `drop_stopped`,       *)
@@ -36,20 +37,24 @@
 (* quiet; then it returns. One handed after that runs on a thread of its   *)
 (* own. Each linger sends its bytes, one at a time. A background shutdown  *)
 (* (`Background`) waits for nothing: it stops W and returns, and every     *)
-(* linger runs on a thread of its own.                                     *)
+(* linger runs on a thread of its own. The drop's run has a bound of its   *)
+(* own, the runtime's linger time (`Bound`): once it runs out, a linger    *)
+(* the run was still running goes on on a thread of its own, as one it     *)
+(* never took does (`RunAll`'s drop), and the drop returns.                *)
 (*                                                                          *)
 (* What must never happen. The drop returns before every byte the handle   *)
-(* took reached the peer (a background shutdown does not wait, but the    *)
-(* bytes still reach it); a linger is dropped unfinished; another runtime  *)
-(* (the process default one) is started for a linger.                      *)
+(* took reached the peer (a background shutdown, or a drop whose bound ran *)
+(* out, does not wait, but the bytes still reach it); a linger is dropped  *)
+(* unfinished; another runtime (the process default one) is started for a *)
+(* linger.                                                                 *)
 (*                                                                          *)
 (* What is abstract. One handle and its linger; one write, whose own bytes *)
 (* the handle's count leaves out; the bytes are counted; the peer reads (a *)
 (* linger that meets a peer that never reads gives up at its own deadline, *)
-(* which is one minute, and is not modelled; nor is the drop's own bound   *)
-(* of a minute, but as the end of a wait for a linger nothing will hand    *)
-(* back); W's stop, with the drop of its tasks, is one step; a task held   *)
-(* by something other than the write (a channel another thread keeps) is  *)
+(* which close/Close.tla models); the bound's running out is a step that   *)
+(* may come at any moment of the run; W's stop, with the drop of its      *)
+(* tasks, is one step; a task held by something other than the write (a   *)
+(* channel another thread keeps) is                                        *)
 (* not modelled: it drops, and hands its linger, when that thread lets it; *)
 (* nor is a worker's thread blocked in a task's poll after its shard was   *)
 (* handed on, which drops that shard (and what its inbox holds) only once  *)
@@ -60,6 +65,7 @@ EXTENDS Integers, TLC                                                        \* 
 CONSTANTS                                                                    \* what each configuration sets:
     Total,       \* the bytes in the handle's write-behind
     Background,  \* TRUE: the runtime shuts down in the background, waiting for nothing
+    Bound,       \* TRUE: the drop's own bound may run out while a linger still runs
     Mutation     \* "none", or the name of the one rule this run takes away
 
 (* --algorithm Linger                                                         \* the algorithm, in PlusCal
@@ -81,7 +87,8 @@ variables                                                                    \* 
     heldOnce = FALSE,                                                        \* (record) a linger's task was held by the write as its worker stopped
     taskHeldOnce = FALSE,                                                    \* (record) the task with the handle was held by the write as W stopped
     lateDrain = FALSE,                                                       \* (record) X dropped the held task, after K counted its write out
-    fromList = FALSE;                                                        \* (record) the drop ran a linger of its list
+    fromList = FALSE,                                                        \* (record) the drop ran a linger of its list
+    boundOut = FALSE;                                                        \* (record) the drop's own bound ran out
 
 define                                                                       \* names the steps and properties use:
     \* Where a linger handed now goes: a task on W while the runtime runs; the list once its drop began.
@@ -176,16 +183,26 @@ D_join:                                                                      \* 
     await Background \/ ~wRuns;                                              \* the worker stopped and its thread ended (in the background, not waited for)
 D_run:                                                                       \* `finish_lingering`: the list runs here
     while ~Background /\ Waits do                                            \* something may still hand or end a linger (in the background, never looked at)
-        await linger = "list" \/ ~Waits;                                     \* one to run, or nothing left: a wake comes
-        if linger = "list" then                                              \* one to run:
-            linger := After;                                                 \* one more byte, done at the last
-            sent := sent + 1;                                                \* the peer gets it
-            fromList := TRUE;                                                \* (recorded)
-        end if;                                                              \* the run goes on
+        either                                                               \* the run goes on:
+            await linger = "list" \/ ~Waits;                                 \* one to run, or nothing left: a wake comes
+            if linger = "list" then                                          \* one to run:
+                linger := After;                                             \* one more byte, done at the last
+                sent := sent + 1;                                            \* the peer gets it
+                fromList := TRUE;                                            \* (recorded)
+            end if;                                                          \* the run goes on
+        or                                                                   \* or the drop's own bound runs out:
+            await Bound;                                                     \* (where the run allows it)
+            boundOut := TRUE;                                                \* (recorded)
+            goto D_end;                                                      \* the run stops, a linger maybe running
+        end either;                                                          \* one of the two
     end while;                                                               \* nothing left
-D_end:                                                                       \* `Lingering::end`
+D_end:                                                                       \* `Lingering::end`, after `RunAll`'s drop
     over := TRUE;                                                            \* lingers handed from now go alone
-    if linger = "list" then linger := "alone"; end if;                       \* what is left goes to a thread of its own
+    \* A linger the run took, or left in the list, goes to a thread of its own.
+    \* MUTATION bound_drops: one the run was running is dropped with it, as `RunAll` did.
+    if linger = "list" then                                                  \* one is left:
+        linger := IF Mutation = "bound_drops" THEN "lost" ELSE "alone";      \* to a thread of its own
+    end if;                                                                  \* (or lost)
     dropDone := TRUE;                                                        \* the drop returns
 end process;                                                                 \* end of the drop
 
@@ -280,4 +297,6 @@ NoHeld == ~heldOnce                                                          \* 
 NoTaskHeld == ~taskHeldOnce                                                  \* never held
 \* Another thread drops the held task after the write counted itself out.
 NoLateDrain == ~lateDrain                                                    \* never late
+\* The drop's own bound runs out before every byte reached the peer.
+NoBoundOut == ~(boundOut /\ sent < Total)                                    \* never cut short
 =============================================================================
