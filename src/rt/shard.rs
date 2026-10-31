@@ -580,7 +580,8 @@ pub(crate) struct Shard {
     queue: RefCell<VecDeque<Runnable>>,
     lifo: Cell<Option<Runnable>>,
     lifo_streak: Cell<u32>,
-    tick: Cell<u32>,
+    /// Runs left before the inbox is looked at first (`tuning.inbox_interval` at the start).
+    until_inbox: Cell<u32>,
     /// Runs since timers and the poller were last looked at.
     since_drive: Cell<u32>,
     /// The `Quartz` reading of the last look at timers and the poller.
@@ -642,6 +643,7 @@ impl Shard {
         monitor: Option<Arc<super::handoff::Monitor>>,
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
+        shard.until_inbox.set(tuning.inbox_interval);
         #[cfg(ring)]
         if let Some(ring) = shard.ring() {
             ring.set_zero_copy_min(tuning.zero_copy_min);
@@ -767,7 +769,7 @@ impl Shard {
             queue: RefCell::new(VecDeque::new()),
             lifo: Cell::new(None),
             lifo_streak: Cell::new(0),
-            tick: Cell::new(0),
+            until_inbox: Cell::new(super::tuning::Tuning::default().inbox_interval),
             since_drive: Cell::new(0),
             last_drive: Cell::new(super::quartz::Quartz::now()),
             polls: Cell::new(0),
@@ -900,12 +902,14 @@ impl Shard {
 
     /// The next runnable, in the loop's order.
     fn next(&self) -> Option<Runnable> {
-        let tick = self.tick.get().wrapping_add(1);
-        self.tick.set(tick);
-        if tick.is_multiple_of(self.tuning.inbox_interval)
-            && let Some(r) = self.pop_inbox()
-        {
-            return Some(r);
+        let left = self.until_inbox.get().wrapping_sub(1);
+        if left == 0 {
+            self.until_inbox.set(self.tuning.inbox_interval);
+            if let Some(r) = self.pop_inbox() {
+                return Some(r);
+            }
+        } else {
+            self.until_inbox.set(left);
         }
         if let Some(r) = self.lifo.take() {
             if self.lifo_streak.get() < LIFO_MAX {
@@ -964,11 +968,8 @@ impl Shard {
     }
 
     fn has_local_work(&self) -> bool {
-        // The LIFO slot is looked at by taking it and putting it back.
-        let lifo = self.lifo.take();
-        let busy = lifo.is_some() || !self.queue.borrow().is_empty();
-        self.lifo.set(lifo);
-        busy
+        // SAFETY: a shard's cells are its thread's alone, and no reference into the slot is live.
+        unsafe { (*self.lifo.as_ptr()).is_some() || !self.queue.borrow().is_empty() }
     }
 
     /// Applies registration changes and fires due timers, then looks at the

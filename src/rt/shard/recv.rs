@@ -404,13 +404,35 @@ impl RingChunk {
     }
 }
 
-impl Drop for RingChunk {
-    fn drop(&mut self) {
-        let item = Back {
+impl RingChunk {
+    fn item(&self) -> Back {
+        Back {
             bid: self.bid,
             owner: self.owner,
             len: self.len,
-        };
+        }
+    }
+
+    /// Gives the chunk back as its drop does, through `shard`, the shard the
+    /// caller already knows this thread runs, with no lookup of its own.
+    pub(crate) fn give_back(self, shard: Option<&super::Shard>) {
+        let item = self.item();
+        let kept = shard
+            .and_then(super::Shard::ring)
+            .is_some_and(|ring| ring.keep_local(&self.back, item));
+        if !kept {
+            self.back.queue.push(item);
+        }
+        let chunk = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `chunk` is never dropped, so `back` is read out once, and
+        // the rest of the fields need no drop.
+        drop(unsafe { core::ptr::read(&chunk.back) });
+    }
+}
+
+impl Drop for RingChunk {
+    fn drop(&mut self) {
+        let item = self.item();
         let kept = crate::rt::context::current(|shard| {
             shard
                 .and_then(crate::rt::shard::Shard::ring)

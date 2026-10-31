@@ -61,16 +61,18 @@ use std::time::Duration;
 use super::Shard;
 use super::recv::RecvGroup;
 use crate::fs::ring::FileOp;
+use crate::io::side::After;
 use crate::io::source::ops::Done;
 use crate::io::source::requests::Lease;
 use crate::io::source::ring::{Arrival, RingMem, RingOp};
 use crate::rt::backend::with_room;
 use crate::rt::park::Notifier;
-use crate::rt::park::ring::RingPoller;
+use crate::rt::park::ring::{CqeBatch, RingPoller};
 use crate::syscore::linux::iouring::files::Files;
 use crate::syscore::linux::iouring::ops::Ops;
 use crate::syscore::linux::iouring::ring::sys::{
-    IORING_CQE_F_BUF_MORE, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF, IOSQE_FIXED_FILE, cqe_buffer_id,
+    IORING_CQE_F_BUF_MORE, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF,
+    IOSQE_FIXED_FILE, cqe_buffer_id,
 };
 use crate::syscore::linux::iouring::ring::{IoUringCqe, RingConfig, Sqe};
 use exits::ExitOp;
@@ -113,8 +115,6 @@ pub(crate) struct ShardRing {
     /// Write sides' operations in the kernel: no cap holds them back (a peer
     /// that never reads keeps one for good), but most end within a moment.
     writes: Cell<usize>,
-    /// Completions of the last wait, reused.
-    cqes: RefCell<Vec<IoUringCqe>>,
     /// The buffers multishot receives draw from; `None` when the
     /// configuration asks for none, or once the ring is shut down.
     recv: RefCell<Option<RecvGroup>>,
@@ -196,7 +196,6 @@ impl ShardRing {
             in_kernel: Cell::new(0),
             cap,
             writes: Cell::new(0),
-            cqes: RefCell::new(Vec::with_capacity(256)),
             recv: RefCell::new(recv),
             #[cfg(test)]
             counts: Cell::new((0, 0, 0)),
@@ -299,9 +298,9 @@ impl ShardRing {
     /// memory, which lives on the heap and does not move with it), on the
     /// slot `op.file`, and returns its user data. It goes into the kernel at
     /// once, never counted against the cap; its slot is named from now on.
+    #[inline]
     pub(crate) fn submit(&self, op: RingOp, sqe: Sqe) -> u64 {
-        self.files.borrow_mut().named(op.file);
-        let sqe = match self.files.borrow().number_of(op.file) {
+        let sqe = match self.files.borrow_mut().name(op.file) {
             Some(own) => sqe.fd(own),
             None => sqe.flags(IOSQE_FIXED_FILE),
         };
@@ -488,13 +487,22 @@ impl ShardRing {
         timeout: Option<Duration>,
     ) -> io::Result<(usize, bool)> {
         self.take_back();
-        let mut cqes = core::mem::take(&mut *self.cqes.borrow_mut());
-        let woken = self.poller.borrow_mut().wait(timeout, &mut cqes);
-        let handled = cqes.len();
-        for cqe in cqes.drain(..) {
-            self.complete(shard, cqe);
+        let mut batch = CqeBatch::new();
+        let mut woken = self.poller.borrow_mut().wait(timeout, &mut batch);
+        let mut handled = 0;
+        loop {
+            handled += batch.len();
+            for at in 0..batch.len() {
+                self.complete(shard, batch.get(at));
+            }
+            // A full batch may have left more in the queue.
+            if !batch.is_full() {
+                break;
+            }
+            batch.clear();
+            let (woke_more, _) = self.poller.borrow_mut().reap(&mut batch);
+            woken = woken.map(|w| w || woke_more);
         }
-        *self.cqes.borrow_mut() = cqes;
         self.finish_leaving();
         Ok((handled, woken?))
     }
@@ -508,7 +516,18 @@ impl ShardRing {
             }
             return;
         }
-        if self.zero_copy(shard, &cqe) {
+        // The common end, one lookup: a plain operation's only completion.
+        let plain =
+            if cqe.flags & (IORING_CQE_F_MORE | IORING_CQE_F_NOTIF | IORING_CQE_F_BUFFER) == 0 {
+                self.ops.borrow_mut().remove_if(cqe.user_data, ends_plain)
+            } else {
+                None
+            };
+        if let Some(op) = plain {
+            if counts_as_write(&op) {
+                self.writes.set(self.writes.get().saturating_sub(1));
+            }
+            self.end(shard, op, cqe.res);
             return;
         }
         if let Some(bid) = cqe_buffer_id(cqe.flags) {
@@ -519,6 +538,8 @@ impl ShardRing {
                 cqe.res,
                 cqe.flags & IORING_CQE_F_BUF_MORE != 0,
             );
+        } else if self.zero_copy(shard, &cqe) {
+            return;
         } else if cqe.res >= 0 {
             self.accepted(shard, cqe.user_data, cqe.res);
         }
@@ -651,7 +672,8 @@ impl ShardRing {
         if let Some((source, chunk, epoch, datagram)) = delivery {
             // Before the view, so it drops after it.
             let _unwound = crate::io::side::Unwound::enter();
-            let (after, starved) = {
+            let mut after = After::default();
+            let starved = {
                 // SAFETY: the op's slab entry owns a strong count of the
                 // source until its final completion, which this thread
                 // processes only after this call returns. Until the view is
@@ -677,9 +699,8 @@ impl ShardRing {
                 } else {
                     Arrival::Chunk(chunk)
                 };
-                let after = source.ring_arrival(arrival, epoch, shard);
-                let starved = after.starved.then(|| std::sync::Arc::clone(&source));
-                (after, starved)
+                source.ring_arrival(arrival, epoch, shard, &mut after);
+                after.starved.then(|| std::sync::Arc::clone(&source))
             };
             if let Some(source) = starved {
                 source.wait_for_buffer();
@@ -716,7 +737,8 @@ impl ShardRing {
         if stop {
             self.cancel(user_data);
         }
-        let after = source.ring_arrival(Arrival::Conn(conn), epoch, shard);
+        let mut after = After::default();
+        source.ring_arrival(Arrival::Conn(conn), epoch, shard, &mut after);
         if after.starved {
             std::sync::Arc::clone(&source).wait_for_buffer();
         }
@@ -743,19 +765,26 @@ impl ShardRing {
     /// `op` ended with `res`: its slot is named once less, and its source
     /// gets the completion.
     fn end(&self, shard: Option<&Shard>, op: RingOp, res: i32) {
+        let RingOp {
+            source,
+            file,
+            epoch,
+            read,
+            mem,
+        } = op;
         #[cfg(test)]
-        if res == -libc::ENOBUFS && matches!(op.mem, RingMem::RecvMulti { .. }) {
+        if res == -libc::ENOBUFS && matches!(mem, RingMem::RecvMulti { .. }) {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed, arrived, dry + 1));
         }
-        let kind = op.source.kind();
-        let outcome = op.mem.complete(res, kind);
-        self.hand_over(shard, &op.source, op.file, op.epoch, op.read, outcome);
+        let outcome = mem.complete(res, source.kind());
+        self.hand_over(shard, &source, file, epoch, read, outcome);
     }
 
     /// An operation of `source` on slot `file`, issued in `epoch` for its read side (`read`) or
     /// its write side, ended for that side with `outcome`: the slot is named once less, and the
     /// side gets the completion.
+    #[inline]
     fn hand_over(
         &self,
         shard: Option<&Shard>,
@@ -824,6 +853,18 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
 /// Whether `op` is one of the write sides' operations counted in `writes`: a
 /// write side's, until a zero-copy send only waits for its notification. The
 /// one place both the submission and the end of an operation decide it.
+/// Whether `op` ends at its one completion, with no arrival, notification or follow-up to wait for.
+fn ends_plain(op: &RingOp) -> bool {
+    !matches!(
+        op.mem,
+        RingMem::SendZc { .. }
+            | RingMem::ZcHeld(_)
+            | RingMem::RecvMulti { .. }
+            | RingMem::RecvFromMulti { .. }
+            | RingMem::AcceptMulti { .. }
+    )
+}
+
 fn counts_as_write(op: &RingOp) -> bool {
     !op.read && !matches!(op.mem, RingMem::ZcHeld(_))
 }

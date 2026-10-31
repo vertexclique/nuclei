@@ -275,7 +275,7 @@ analysis.
 
 `park` (`tla/park/Park.tla`) checks how a shard goes to sleep without losing a wake
 (`src/rt/handshake.rs`, `src/rt/shard.rs`). A shard with nothing to run (after a short spin that
-only looks at its inbox) publishes that it parks, looks at its inbox once more, and only then
+only looks at its inbox, first look before its clock starts: `Spin::run`, `src/rt/shard/spin.rs`) publishes that it parks, looks at its inbox once more, and only then
 sleeps until its poller is notified. A
 thread that gives it work pushes the work, then looks whether the shard parks; if it does, it
 swaps the flag back and notifies, so only the first of a burst of wakes notifies. Every access
@@ -831,7 +831,10 @@ the ring's thread submits what the side wants. Submitting raises the side's flag
 is out) and the source's count of operations in the kernel. When the kernel completes one, the
 ring's thread lowers the count, leaves the completion in the side's one-slot mailbox and
 defers it to the side: applied at once if the side is free, else by its holder as it lets go,
-which then asks for the next operation. A retire deregisters the source, cancels what is out
+which then asks for the next operation. (`Source::op_done` in `src/io/source/ops.rs` tries the
+write side's hold first and applies a completion to a free side with no trip through the
+mailbox, which is the model's put and apply with nothing between them; a held side takes the
+mailbox and the deferred bit, as modelled.) A retire deregisters the source, cancels what is out
 and waits until the count is zero: it puts its waker in, raises a flag, and only then looks at
 the count, while the ring's thread lowers the count and then looks at the flag. 11
 configurations: 3 that must pass (`OneOut` and `NoOverwrite`, one operation out and one
@@ -963,7 +966,8 @@ for the poll, a datagram received ahead and taken).
 `tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
 `reads_itself` in `src/io/source/read.rs`, `write`, `write_direct` and `writes_itself` in
-`src/io/source/write.rs`). Three connections over a pool of two buffers, two of whose peers never
+`src/io/source/write.rs`; a ring write goes direct at every size, `WRITE_RING` of
+`src/io/source/direct.rs` being 0). Three connections over a pool of two buffers, two of whose peers never
 send: with no receive group to draw from (none configured, or the group dry) a read takes a buffer
 of the pool for a receive that waits in the kernel, and holds it while its peer stays idle. Before,
 a reader or a writer that found the pool empty waited for a buffer to come back and armed nothing,
@@ -1006,11 +1010,16 @@ back, and none ever did. Now a starved reader reads, or peeks, straight from the
 own buffer; one that finds the socket empty waits for the next edge, which wakes it to read
 itself, and one that just found the pool empty while the socket may hold bytes no edge will
 report again looks at once. A peek leaves the bytes in the socket, so it never marks the socket
-drained. 9 configurations: 3 that must pass (`Buffers`, every buffer free or holding a request
-read ahead; and `Read`, every task that reads gets its request, with a task that stops and with
-none), 4 mutations (a starved reader that waits for a buffer to come back, an edge that starves
+drained. A TCP read on Linux goes straight into the task's buffer at every size (`inq_wanted`,
+`read_direct`, `sys::read_inq`): it can fill its buffer exactly, so the kernel's count of what a
+read leaves (`TCP_INQ`, which counts a pending end of stream as one) says whether the socket is
+empty, and a count of none lets the next read wait for the edge. The model's `Exact` runs it on a
+request of two pieces, one read each. 11 configurations: 4 that must pass (`Buffers`, every buffer free or holding a request
+read ahead; and `Read`, every task that reads gets its request, with a task that stops, with
+none, and with exact reads), 5 mutations (a starved reader that waits for a buffer to come back, an edge that starves
 the side and wakes nobody, a reader that waits for the next edge after the pool turned it away,
-and a peek taken as having emptied the socket break `Read`), and 2 witnesses (a reader finds the
+a peek taken as having emptied the socket, and an exact read taken as having emptied it whatever
+the kernel counts, break `Read`), and 2 witnesses (a reader finds the
 pool empty; a starved reader calls on the socket itself). The second test of
 `tests/idle_peers.rs` fills a pool of a 64 KiB cap with bytes read ahead for tasks that peeked
 and stopped, on every backend, and checks every other peer is answered. A pipe's write the pool
