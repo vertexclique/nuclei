@@ -64,6 +64,8 @@ pub(crate) struct Here {
     /// The runtime `RUNTIME` holds, null for none: read in place, never
     /// followed once `RUNTIME` lets go of it.
     runtime: Cell<*const Inner>,
+    /// The shard `OWN` holds, null for none yet or once it went.
+    own: Cell<*const Shard>,
 }
 
 impl Here {
@@ -81,6 +83,7 @@ impl Here {
             task: Cell::new(None),
             budget: Cell::new(None),
             runtime: Cell::new(core::ptr::null()),
+            own: Cell::new(core::ptr::null()),
         }
     }
 
@@ -114,17 +117,17 @@ thread_local! {
     static HERE: Here = const { Here::new() };
     /// This thread's own shard, made on first need, dropped (with every task
     /// still queued on it) when the thread exits.
-    static OWN: RefCell<Option<Rc<Shard>>> = const { RefCell::new(None) };
+    static OWN: OwnCell = const { OwnCell(RefCell::new(None)) };
     /// The runtime `spawn` uses here: the worker's, or the one whose
     /// `block_on` (or `enter`) this thread is inside.
-    static RUNTIME: RuntimeCell = const { RuntimeCell(RefCell::new(None)) };
+    static RUNTIME: RuntimeCell = const { RuntimeCell(Cell::new(None)) };
     /// The home of this thread's bound tasks (see `Here::home`).
     static HOME: HomeCell = const { HomeCell(RefCell::new(None)) };
 }
 
 /// The thread's runtime, which `Here::runtime` points at; it points at none
 /// once the cell goes.
-struct RuntimeCell(RefCell<Option<Arc<Inner>>>);
+struct RuntimeCell(Cell<Option<Arc<Inner>>>);
 
 impl RuntimeCell {
     /// Sets `runtime`, mirrored in `Here::runtime`, and answers the one before.
@@ -139,6 +142,16 @@ impl RuntimeCell {
 impl Drop for RuntimeCell {
     fn drop(&mut self) {
         local().runtime.set(core::ptr::null());
+    }
+}
+
+/// The thread's own shard, which `Here::own` points at; it points at none
+/// once the cell goes.
+struct OwnCell(RefCell<Option<Rc<Shard>>>);
+
+impl Drop for OwnCell {
+    fn drop(&mut self) {
+        local().own.set(core::ptr::null());
     }
 }
 
@@ -238,8 +251,18 @@ pub(crate) fn here<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
 }
 
 /// This thread's own shard, if it made one.
+#[inline]
 pub(crate) fn own_shard_if_made() -> Option<Rc<Shard>> {
-    OWN.try_with(|own| own.borrow().clone()).ok().flatten()
+    let own = local().own.get();
+    if own.is_null() {
+        return None;
+    }
+    // SAFETY: `OWN` holds the shard `Here` names, and the count taken here is
+    // the clone's.
+    unsafe {
+        Rc::increment_strong_count(own);
+        Some(Rc::from_raw(own))
+    }
 }
 
 /// Marks `shard` as the one this thread runs, its own code running, until
@@ -437,8 +460,18 @@ pub(crate) fn deeper<R>(max: usize, f: impl FnOnce() -> R) -> R {
 }
 
 /// This thread's own shard, made now if it has none.
+#[inline]
 pub(crate) fn own_shard() -> io::Result<Rc<Shard>> {
+    match own_shard_if_made() {
+        Some(own) => Ok(own),
+        None => make_own_shard(),
+    }
+}
+
+#[inline(never)]
+fn make_own_shard() -> io::Result<Rc<Shard>> {
     OWN.with(|own| {
+        let own = &own.0;
         if let Some(shard) = own.borrow().as_ref() {
             return Ok(Rc::clone(shard));
         }
@@ -448,6 +481,7 @@ pub(crate) fn own_shard() -> io::Result<Rc<Shard>> {
             backend: super::backend::chosen()?,
         })?);
         *own.borrow_mut() = Some(Rc::clone(&shard));
+        local().own.set(Rc::as_ptr(&shard));
         Ok(shard)
     })
 }

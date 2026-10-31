@@ -96,11 +96,13 @@ impl Clock {
         }
     }
 
+    #[inline]
     pub(crate) fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
     }
 
     /// Whether the clock was ever paused or advanced.
+    #[inline]
     pub(crate) fn is_altered(&self) -> bool {
         self.altered.load(Ordering::Acquire)
     }
@@ -206,6 +208,7 @@ impl Drop for Clock {
 /// Whether any live runtime's clock was paused or advanced: while none was,
 /// every clock is the system's and the park path skips the paused clock's
 /// work.
+#[inline]
 pub(crate) fn any_altered() -> bool {
     ALTERED.load(Ordering::Relaxed) != 0
 }

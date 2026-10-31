@@ -141,13 +141,19 @@ pub(crate) struct Guest<'a> {
 impl<'a> Guest<'a> {
     /// Counts `shard` in `inner` if its clock is paused (or was ever
     /// altered, so a pause during the call is seen when it ends).
+    #[inline]
     pub(crate) fn enter(inner: &'a Arc<Inner>, shard: &Arc<Shared>) -> Guest<'a> {
         let key = Arc::as_ptr(shard) as usize;
         if inner.clock.is_paused() {
-            inner.guests.insert(key, Arc::clone(shard));
-            inner.clock.member_changed();
+            Self::join(inner, key, shard);
         }
         Guest { inner, key }
+    }
+
+    #[inline(never)]
+    fn join(inner: &Inner, key: usize, shard: &Arc<Shared>) {
+        inner.guests.insert(key, Arc::clone(shard));
+        inner.clock.member_changed();
     }
 
     /// Counts the calling thread's own shard in `inner`, if the thread is
@@ -169,10 +175,17 @@ impl<'a> Guest<'a> {
 }
 
 impl Drop for Guest<'_> {
+    #[inline]
     fn drop(&mut self) {
-        if !self.inner.clock.is_altered() {
-            return;
+        if self.inner.clock.is_altered() {
+            self.leave();
         }
+    }
+}
+
+impl Guest<'_> {
+    #[inline(never)]
+    fn leave(&self) {
         if self.inner.guests.remove(&self.key).is_some() {
             self.inner.clock.member_changed();
             // The shards left may all be idle now.
