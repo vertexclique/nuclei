@@ -214,11 +214,13 @@ impl Default for OwnedBuf {
 }
 
 impl OwnedBuf {
+    #[inline]
     fn boxed(boxed: Boxed) -> Self {
         OwnedBuf::Boxed(Box::new(boxed))
     }
 
     /// The buffer of a write; a `Vec<u8>` as it is.
+    #[inline]
     pub(crate) fn written<B>(buf: B) -> Self
     where
         B: IoBuf,
@@ -238,6 +240,7 @@ impl OwnedBuf {
     }
 
     /// The buffer of a read; a `Vec<u8>` as it is.
+    #[inline]
     pub(crate) fn filled<B>(buf: B) -> Self
     where
         B: IoBufMut,
@@ -258,6 +261,7 @@ impl OwnedBuf {
 
     /// The caller's buffer of a write back, as the type it was handed in
     /// as; an empty one if the call could not give it back.
+    #[inline]
     pub(crate) fn into_written<B>(self) -> B
     where
         B: IoBuf,
@@ -266,6 +270,7 @@ impl OwnedBuf {
     }
 
     /// The caller's buffer of a read back, holding the bytes read into it.
+    #[inline]
     pub(crate) fn into_filled<B>(self) -> B
     where
         B: IoBufMut,
@@ -273,6 +278,7 @@ impl OwnedBuf {
         self.into_caller::<B, Filled<B>>(|kept| kept.0)
     }
 
+    #[inline]
     fn into_caller<B, K>(self, unwrap: fn(K) -> B) -> B
     where
         B: IoBuf,
@@ -316,6 +322,7 @@ impl OwnedBuf {
     /// The bytes from the `from`th of those it holds to the end of the slice
     /// that byte is in: all the rest for one buffer, the rest of the buffer
     /// it falls in for a vectored write. Empty past its end.
+    #[inline]
     pub(crate) fn rest_from(&self, from: usize) -> &[u8] {
         let OwnedBuf::Boxed(boxed) = self else {
             return self.get(from..).unwrap_or_default();
@@ -334,6 +341,7 @@ impl OwnedBuf {
     }
 
     /// How many bytes it holds.
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         match self {
             OwnedBuf::Vec(vec) => vec.len(),
@@ -345,12 +353,14 @@ impl OwnedBuf {
         }
     }
 
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// How many bytes its memory holds in all (for a write's buffer, the
     /// bytes it holds).
+    #[inline]
     pub(crate) fn capacity(&self) -> usize {
         match self {
             OwnedBuf::Vec(vec) => vec.capacity(),
@@ -362,6 +372,7 @@ impl OwnedBuf {
         }
     }
 
+    #[inline]
     fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
             OwnedBuf::Vec(vec) => vec.as_mut_ptr(),
@@ -374,6 +385,7 @@ impl OwnedBuf {
     }
 
     /// Its memory past the bytes it holds.
+    #[inline]
     pub(crate) fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         let boxed = match self {
             OwnedBuf::Vec(vec) => return vec.spare_capacity_mut(),
@@ -404,6 +416,7 @@ impl OwnedBuf {
     /// # Safety
     ///
     /// `len <= capacity()`, and the first `len` bytes are initialized.
+    #[inline]
     pub(crate) unsafe fn set_len(&mut self, len: usize) {
         let boxed = match self {
             // SAFETY: the caller's.
@@ -421,6 +434,7 @@ impl OwnedBuf {
     }
 
     /// Keeps only its first `len` bytes.
+    #[inline]
     pub(crate) fn truncate(&mut self, len: usize) {
         if len < self.len() {
             // SAFETY: fewer bytes than it holds, so all initialized.
@@ -430,6 +444,7 @@ impl OwnedBuf {
 
     /// Copies as much of `bytes` as its spare capacity holds onto its end;
     /// returns how many.
+    #[inline]
     pub(crate) fn append(&mut self, bytes: &[u8]) -> usize {
         let len = self.len();
         let spare = self.spare_capacity_mut();
@@ -463,6 +478,7 @@ impl OwnedBuf {
 impl core::ops::Deref for OwnedBuf {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &[u8] {
         let boxed = match self {
             OwnedBuf::Vec(vec) => return vec,
