@@ -193,7 +193,7 @@ pub(crate) fn pread_owned(fd: Raw, buf: &mut OwnedBuf, at: u64) -> io::Result<us
     if let Ok(n) = result {
         // SAFETY: the kernel wrote the first `n` bytes of the spare capacity
         // (of a vectored read, its rooms in order).
-        unsafe { buf.set_len(buf.len() + n) };
+        unsafe { buf.add_len(n) };
     }
     result
 }

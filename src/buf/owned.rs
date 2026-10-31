@@ -464,6 +464,25 @@ impl OwnedBuf {
         }
     }
 
+    /// Counts the `n` bytes after those it holds as held too.
+    ///
+    /// # Safety
+    ///
+    /// They are within its capacity and initialized (of a vectored read,
+    /// filling its buffers' rooms in order).
+    #[inline]
+    pub(crate) unsafe fn add_len(&mut self, n: usize) {
+        match self {
+            // SAFETY: the caller's.
+            OwnedBuf::Vec(vec) => unsafe { vec.set_len(vec.len() + n) },
+            OwnedBuf::Boxed(boxed) => {
+                let len = boxed.len() + n;
+                // SAFETY: the caller's.
+                unsafe { boxed.set_len(len) }
+            }
+        }
+    }
+
     /// Keeps only its first `len` bytes.
     #[inline]
     pub(crate) fn truncate(&mut self, len: usize) {

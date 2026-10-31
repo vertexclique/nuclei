@@ -210,13 +210,11 @@ impl FileOp {
                 let len = (*len as usize).min(room.len());
                 Sqe::read(fd, room.as_mut_ptr(), len32(len), self.at)
             }
-            FileMem::ReadLent(buf) => {
-                if let Some(bufs) = buf.vectored_mut() {
-                    return vectored_entry(fd, bufs, None, self.at);
-                }
-                let spare = buf.spare_capacity_mut();
+            FileMem::ReadLent(OwnedBuf::Vec(vec)) => {
+                let spare = vec.spare_capacity_mut();
                 Sqe::read(fd, spare.as_mut_ptr().cast(), len32(spare.len()), self.at)
             }
+            FileMem::ReadLent(buf) => other_read_entry(fd, buf, self.at),
             FileMem::Write { buf, done } => {
                 let bytes = buf.filled().get(*done..).unwrap_or_default();
                 Sqe::write(
@@ -298,8 +296,8 @@ impl FileOp {
             FileMem::ReadLent(mut buf) => {
                 if let Ok(n) = result {
                     // SAFETY: the kernel wrote the first `n` bytes of the
-                    // spare capacity.
-                    unsafe { buf.set_len(buf.len() + n) };
+                    // spare capacity (of a vectored read, its rooms in order).
+                    unsafe { buf.add_len(n) };
                 }
                 FileOutcome::ReadLent(result, buf)
             }
@@ -408,6 +406,18 @@ impl FileOp {
             None => call(),
         }
     }
+}
+
+/// The entry of a read at `at` into a task's buffer of another type than a
+/// vector: into every room of a vectored read, or the spare capacity of one
+/// buffer. Out of line, as a vector's is the common one.
+#[inline(never)]
+fn other_read_entry(fd: std::os::fd::RawFd, buf: &mut OwnedBuf, at: u64) -> Sqe {
+    if let Some(bufs) = buf.vectored_mut() {
+        return vectored_entry(fd, bufs, None, at);
+    }
+    let spare = buf.spare_capacity_mut();
+    Sqe::read(fd, spare.as_mut_ptr().cast(), len32(spare.len()), at)
 }
 
 /// The entry of a vectored call at `at`: a read into every room, or with
