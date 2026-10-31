@@ -78,6 +78,34 @@ fn out_of_descriptors(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
+/// The connections of a backlog the first accept to find no descriptor
+/// closes: on macOS it takes one and drops it (XNU's `accept_nocancel`,
+/// bsd/kern/uipc_syscalls.c), elsewhere it leaves the backlog whole; the
+/// accepts after it take none until a descriptor is free.
+const CLOSED: usize = if cfg!(target_vendor = "apple") { 1 } else { 0 };
+
+/// How many of `clients` the listener's side closed: a closed one reads the
+/// end or a reset, a served one has nothing to read yet.
+fn closed(clients: &[impl std::os::fd::AsRawFd]) -> usize {
+    clients
+        .iter()
+        .filter(|client| {
+            let mut byte = 0u8;
+            // SAFETY: a peek of at most one byte into our own byte, on a
+            // descriptor the caller keeps open.
+            let n = unsafe {
+                libc::recv(
+                    client.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            n == 0 || (n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock)
+        })
+        .count()
+}
+
 fn run(name: &str, case: impl AsyncFnOnce()) {
     if alone(name) {
         let rt = runtime();
@@ -379,7 +407,7 @@ fn a_handle_dropped_with_bytes_to_send_delivers_them_with_no_descriptor_left() {
 
 /// A listener's streams of connections with no descriptor left: `incoming`
 /// answers the error and goes on; both serve the backlog once descriptors
-/// are free.
+/// are free, less the connection macOS's accept closed (`CLOSED`).
 #[test]
 fn incoming_connections_answer_the_error_and_serve_the_backlog_after() {
     run(
@@ -392,10 +420,11 @@ fn incoming_connections_answer_the_error_and_serve_the_backlog_after() {
                 std::env::temp_dir().join(format!("nuclei-faults-inc-{}.sock", std::process::id()));
             let _ = std::fs::remove_file(&path);
             let unix = UnixListener::bind(&path).unwrap();
-            let clients: Vec<_> = (0..3)
+            const CLIENTS: usize = 3;
+            let clients: Vec<_> = (0..CLIENTS)
                 .map(|_| std::net::TcpStream::connect(addr).unwrap())
                 .collect();
-            let unix_clients: Vec<_> = (0..3)
+            let unix_clients: Vec<_> = (0..CLIENTS)
                 .map(|_| StdUnixStream::connect(&path).unwrap())
                 .collect();
             let mut starved = Starved::new();
@@ -414,21 +443,24 @@ fn incoming_connections_answer_the_error_and_serve_the_backlog_after() {
             .await;
             assert!(first.unwrap().is_err_and(|e| out_of_descriptors(&e)));
             starved.free();
-            for _ in 0..3 {
+            let mut served = (Vec::new(), Vec::new());
+            for _ in 0..CLIENTS - CLOSED {
                 let next = within(
                     "incoming",
                     core::future::poll_fn(|cx| core::pin::Pin::new(&mut tcp_in).poll_next(cx)),
                 )
                 .await;
-                next.unwrap().unwrap();
+                served.0.push(next.unwrap().unwrap());
                 let next = within(
                     "incoming",
                     core::future::poll_fn(|cx| core::pin::Pin::new(&mut unix_in).poll_next(cx)),
                 )
                 .await;
-                next.unwrap().unwrap();
+                served.1.push(next.unwrap().unwrap());
             }
-            drop((clients, unix_clients));
+            assert_eq!(closed(&clients), CLOSED, "the TCP connections closed");
+            assert_eq!(closed(&unix_clients), CLOSED, "the Unix connections closed");
+            drop((served, clients, unix_clients));
             let _ = std::fs::remove_file(&path);
         },
     );
