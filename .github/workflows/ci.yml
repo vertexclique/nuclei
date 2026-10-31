@@ -145,6 +145,16 @@ jobs:
       - name: valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
 
+      - name: op profile
+        run: bash ci/op_prof.sh
+        env:
+          PROF_BASE: d899e17cf2f3d488e51580a5034be986ed88a949
+
+      - name: op counts A/B
+        run: bash ci/op_ab.sh
+        env:
+          AB_REVS: d899e17cf2f3d488e51580a5034be986ed88a949 HEAD
+
       - name: op counts
         run: bash ci/op_counts.sh
 
