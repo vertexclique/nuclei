@@ -175,6 +175,11 @@ impl Hooks<FileState> for FileHooks<'_> {
         );
         self.io.cursor.store(st.cursor, Ordering::Release);
     }
+
+    // The file's side takes through its word only (`Side::new`).
+    fn releases_inline(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Default)]
