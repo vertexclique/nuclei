@@ -486,6 +486,48 @@ mod unix {
         within(&what, receiver).await;
     }
 
+    /// Sends on a connected Unix datagram socket whose peer closed answer
+    /// each what std's do: the kernel's own error for each datagram, not an
+    /// earlier one's on a later send; a small datagram and one an owned send
+    /// lends its buffer for alike.
+    #[test]
+    fn sends_to_a_closed_unix_datagram_peer_answer_as_std() {
+        if !alone("datagram::unix::sends_to_a_closed_unix_datagram_peer_answer_as_std") {
+            return;
+        }
+        use std::os::unix::net::UnixDatagram as StdDatagram;
+        for len in [1, 16 * 1024] {
+            let bytes = vec![b'x'; len];
+            let (a, b) = StdDatagram::pair().unwrap();
+            drop(b);
+            let want: Vec<Answer> = (0..3)
+                .map(|_| Answer::of(&a.send(&bytes), |n| *n))
+                .collect();
+            let rt = runtime();
+            rt.block_on(async {
+                for owned in [false, true] {
+                    let (a, b) = UnixDatagram::pair().unwrap();
+                    drop(b);
+                    let mut got = Vec::new();
+                    for _ in 0..3 {
+                        let sent = if owned {
+                            within("a send to a closed peer", a.send_owned(bytes.clone()))
+                                .await
+                                .0
+                        } else {
+                            within("a send to a closed peer", a.send(&bytes)).await
+                        };
+                        got.push(Answer::of(&sent, |n| *n));
+                    }
+                    assert_eq!(
+                        got, want,
+                        "sends of {len} bytes to a closed peer, owned {owned}"
+                    );
+                }
+            });
+        }
+    }
+
     #[test]
     fn a_unix_flood_waits_for_room_and_loses_none() {
         if alone("datagram::unix::a_unix_flood_waits_for_room_and_loses_none") {
