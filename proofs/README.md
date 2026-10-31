@@ -1767,9 +1767,9 @@ and a hand-over to a spare as one step.
 
 ## A file's blocking lock
 
-`flock` (`tla/flock/FileLock.tla`) checks the cancellation of `Handle<File>::lock`
-(`src/fs/lock.rs`: `lock` and its `LockCall`) at the grain of its atomic steps. `lock` waits in the
-kernel until the file is free, so it is a job of the blocking pool; a future dropped while the job
+`flock` (`tla/flock/FileLock.tla`) checks the cancellation of `Handle<File>::lock_file`
+(`src/fs/lock.rs`: `lock_file` and its `LockCall`) at the grain of its atomic steps. `lock_file`
+waits in the kernel until the file is free, so it is a job of the blocking pool; a future dropped while the job
 waits must not leave the file locked with nobody to give it back. The future and the job share one
 word, WAITING, HELD or GONE. The job locks the file and then does one compare-and-swap from
 WAITING to HELD, and unlocks the file itself if it finds GONE; a future dropped before it took the

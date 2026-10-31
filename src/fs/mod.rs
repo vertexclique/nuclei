@@ -29,7 +29,7 @@
 //! to write a range back ([`Handle::sync_range`]), to copy a range into
 //! another file in the kernel where the system can ([`Handle::copy_range_to`]),
 //! and to take an advisory lock without blocking the worker
-//! ([`Handle::lock`], [`Handle::try_lock`], [`Handle::unlock`]).
+//! ([`Handle::lock_file`], [`Handle::try_lock_file`], [`Handle::unlock_file`]).
 //!
 //! A file's name in its directory needs [`sync_dir`] to survive a crash. To
 //! replace a file atomically: write a temporary file in the same directory,
@@ -83,8 +83,9 @@ use crate::io::source::Kind;
 /// A file's calls. std's own `File::lock`, `FileExt::read_at` and
 /// `FileExt::write_at` (on Windows `seek_read` and `seek_write`), reached
 /// through `Deref`, block the worker thread that makes them. Use the async
-/// calls instead: [`lock`](Handle::lock), [`try_lock`](Handle::try_lock) and
-/// [`unlock`](Handle::unlock), [`read_at`](Handle::read_at) and
+/// calls instead: [`lock_file`](Handle::lock_file),
+/// [`try_lock_file`](Handle::try_lock_file) and
+/// [`unlock_file`](Handle::unlock_file), [`read_at`](Handle::read_at) and
 /// [`write_at`](Handle::write_at), and, with no copy of the bytes,
 /// [`read_at_owned`](Handle::read_at_owned) and
 /// [`write_at_owned`](Handle::write_at_owned).

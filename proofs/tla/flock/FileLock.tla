@@ -1,7 +1,7 @@
 ------------------------------ MODULE FileLock ------------------------------
 (***************************************************************************)
-(* The cancellation of a file's blocking lock (src/fs/lock.rs: `lock` and  *)
-(* its `LockCall`), at the grain of its atomic steps.                      *)
+(* The cancellation of a file's blocking lock (src/fs/lock.rs: `lock_file` *)
+(* and its `LockCall`), at the grain of its atomic steps.                  *)
 (*                                                                          *)
 (* In plain words: `File::lock` waits in the kernel until the file is      *)
 (* free, so nuclei makes it as a job of the blocking pool. Two parties     *)
@@ -64,7 +64,7 @@ define
     EveryoneEnds == <>AllDone
 end define;
 
-fair process caller = 1                 \* the future of the `lock` call
+fair process caller = 1                 \* the future of the `lock_file` call
 variables old = "WAITING";              \* what the drop's swap found in the word
 begin
 C_poll:

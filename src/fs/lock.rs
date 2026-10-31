@@ -1,6 +1,6 @@
 //! Advisory locks on a whole file, without blocking the worker.
 //!
-//! `lock` waits in the kernel until the file is free, so it is a job of the
+//! `lock_file` waits in the kernel until the file is free, so it is a job of the
 //! blocking pool. A future dropped while the job waits must not leave the file
 //! locked with nobody to give it back, so the future and the job share one
 //! state word per call: WAITING, HELD or GONE. After the job got the lock it
@@ -31,7 +31,7 @@ const HELD: u8 = 1;
 /// The future was dropped before it took the result.
 const GONE: u8 = 2;
 
-/// A `lock` call: the future of the pool's job, and what it must give back.
+/// A `lock_file` call: the future of the pool's job, and what it must give back.
 struct LockCall {
     state: Arc<AtomicU8>,
     lease: Lease,
@@ -63,20 +63,19 @@ impl Handle<File> {
     /// else exclusively for one, as std's `File::lock_shared` and
     /// `File::lock` do, waiting for the lock on the blocking pool so the
     /// worker is free meanwhile. The lock is advisory, and it is released by
-    /// [`unlock`](Self::unlock) or when the file is closed.
+    /// [`unlock_file`](Self::unlock_file) or when the file is closed.
     ///
     /// If the future is dropped while it waits, the lock is never left held
     /// with nobody to release it: a job that had not started is cancelled,
     /// and one that got the lock gives it back.
     ///
-    /// This name shadows std's `File::lock`, which is reached through `Deref`
-    /// and blocks the worker thread; `(*file).lock()` and
-    /// `file.get_ref().lock()` still reach std's.
+    /// std's own `File::lock`, reached through `Deref`, blocks the worker
+    /// thread that makes it.
     ///
     /// # Errors
     ///
     /// The system's own, as std's.
-    pub async fn lock(&self, shared: bool) -> io::Result<()> {
+    pub async fn lock_file(&self, shared: bool) -> io::Result<()> {
         let lease = self.source().lease()?;
         let state = Arc::new(AtomicU8::new(WAITING));
         let (job_lease, job_state) = (lease.clone(), Arc::clone(&state));
@@ -110,14 +109,11 @@ impl Handle<File> {
     /// exclusively, as std's `File::try_lock_shared` and `File::try_lock` do.
     /// The call does not wait, so it is made on the calling thread.
     ///
-    /// This name shadows std's `File::try_lock`, which is reached through
-    /// `Deref`; `(*file).try_lock()` still reaches it.
-    ///
     /// # Errors
     ///
     /// `WouldBlock` when another holder has the lock, else the system's own
     /// error, as std's.
-    pub async fn try_lock(&self, shared: bool) -> Result<(), TryLockError> {
+    pub async fn try_lock_file(&self, shared: bool) -> Result<(), TryLockError> {
         let lease = self.source().lease().map_err(TryLockError::Error)?;
         let file = lease.file();
         if shared {
@@ -132,14 +128,11 @@ impl Handle<File> {
     /// them), so a holder that wrote under the lock lets go only after its
     /// bytes are in the file.
     ///
-    /// This name shadows std's `File::unlock`, which is reached through
-    /// `Deref`; `(*file).unlock()` still reaches it.
-    ///
     /// # Errors
     ///
     /// A write that failed (reported here as by a flush), or the system's own
     /// error. The lock is released even when a write failed.
-    pub async fn unlock(&self) -> io::Result<()> {
+    pub async fn unlock_file(&self) -> io::Result<()> {
         let mut this = self;
         let flushed = poll_fn(|cx| Pin::new(&mut this).poll_flush(cx)).await;
         let unlocked = self
