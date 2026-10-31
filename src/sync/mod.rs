@@ -31,7 +31,8 @@
 //! with their own progress notes.
 //! The [`local`](crate::sync::local) module adds single-shard twins of the
 //! channels, the semaphore and the mutex, with no atomic instruction on any
-//! path.
+//! path, and [`mesh`](crate::sync::mesh) a full mesh of bounded channels
+//! between a fixed number of parties.
 //!
 //! # What every primitive guarantees
 //!
@@ -160,6 +161,7 @@ pub mod local;
 pub(crate) mod loom_model;
 #[cfg(all(test, loom))]
 mod loom_tests;
+pub mod mesh;
 pub mod mpsc;
 mod mutex;
 mod notify;
