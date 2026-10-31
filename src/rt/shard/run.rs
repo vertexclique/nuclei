@@ -52,9 +52,12 @@ impl Shard {
         // Pinned before the nesting's closure, which then holds a reference.
         let mut future = pin!(future);
         context::deeper(self.limits.max_nesting, || {
-            let signal = Arc::new(Signal::new(&self.shared));
+            let signal = self.signal();
             match self.run_loop(future.as_mut(), &signal) {
-                Ok(output) => output,
+                Ok(output) => {
+                    self.keep_signal(signal);
+                    output
+                }
                 Err(Detached) => finish_on_own(future, &signal),
             }
         })
@@ -71,11 +74,27 @@ impl Shard {
         self.count_again(self.since_drive.get());
         self.drive_or_report(Some(Duration::ZERO));
         let stopped = pin!(self.shared.stopped());
-        let signal = Arc::new(Signal::new(&self.shared));
+        let signal = self.signal();
         match self.run_loop(stopped, &signal) {
             Ok(()) => Worked::Stopped,
             Err(Detached) => Worked::Detached,
         }
+    }
+
+    /// The waker of a `block_on` future on this shard: the one the last call
+    /// here left, if nothing else holds it any more, else a new one.
+    pub(super) fn signal(&self) -> Arc<Signal> {
+        if let Some(mut signal) = self.signal.take()
+            && Arc::get_mut(&mut signal).is_some_and(Signal::reset)
+        {
+            return signal;
+        }
+        Arc::new(Signal::new(&self.shared))
+    }
+
+    /// Keeps `signal`, whose future is done, for the next call's.
+    pub(super) fn keep_signal(&self, signal: Arc<Signal>) {
+        self.signal.set(Some(signal));
     }
 
     /// [`block_on`](Self::block_on) for a future already pinned and woken

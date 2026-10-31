@@ -25,8 +25,10 @@ impl Shard {
     pub(crate) fn block_on_then_leave<F: core::future::Future>(&self, future: F) -> F::Output {
         let mut future = core::pin::pin!(future);
         crate::rt::context::deeper(self.limits.max_nesting, || {
-            let signal = Arc::new(super::signal::Signal::new(&self.shared));
-            self.run_then_leave(future.as_mut(), &signal)
+            let signal = self.signal();
+            let output = self.run_then_leave(future.as_mut(), &signal);
+            self.keep_signal(signal);
+            output
         })
     }
 

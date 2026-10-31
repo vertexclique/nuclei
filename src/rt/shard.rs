@@ -626,6 +626,8 @@ pub(crate) struct Shard {
     epoch: Instant,
     /// Wakers of fired timers, woken once the wheel is let go; reused.
     fired: RefCell<Vec<Waker>>,
+    /// The waker the last `block_on` here left, for the next one's future.
+    signal: Cell<Option<Arc<signal::Signal>>>,
     /// The IO sources the poller watches, by token.
     sources: RefCell<Sources>,
     /// The children whose exits the poller or the port watches, by token.
@@ -792,6 +794,7 @@ impl Shard {
             wheel: RefCell::new(Wheel::new()),
             epoch: crate::time::clock::origin(),
             fired: RefCell::new(Vec::new()),
+            signal: Cell::new(None),
             sources: RefCell::new(Sources::default()),
             children: RefCell::new(children::Children::default()),
             pool,
