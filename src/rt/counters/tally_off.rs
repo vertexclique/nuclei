@@ -14,10 +14,11 @@ pub(crate) fn counting() -> bool {
 #[inline(always)]
 pub(crate) fn read(_bytes: usize) {}
 
+#[cfg(unix)]
 #[inline(always)]
 pub(crate) fn wrote(_bytes: usize) {}
 
-#[cfg(any(ring, port))]
+#[cfg(ring)]
 #[inline(always)]
 pub(crate) fn accepted(_count: usize) {}
 

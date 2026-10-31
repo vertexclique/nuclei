@@ -129,6 +129,7 @@ pub(crate) struct Counters {
     poll_times: OnceLock<Box<Buckets>>,
     /// The IO latencies, while the runtime records them (made with
     /// `poll_times`); shared with the shard's ring or port.
+    #[cfg(feature = "io-stats")]
     io_times: OnceLock<Arc<IoTimes>>,
     /// The IO operations counted, while the runtime counts them (made once,
     /// before the shard runs anything).
@@ -177,6 +178,7 @@ impl Counters {
             longest_poll_nanos: AtomicU64::new(0),
             budget_yields: AtomicU64::new(0),
             poll_times: OnceLock::new(),
+            #[cfg(feature = "io-stats")]
             io_times: OnceLock::new(),
             #[cfg(feature = "io-stats")]
             io: OnceLock::new(),
@@ -235,10 +237,11 @@ impl Counters {
     /// The shard records the time of each poll from now on.
     pub(crate) fn record_latencies(&self) {
         let _ = self.poll_times.set(Box::new(Buckets::new()));
+        #[cfg(feature = "io-stats")]
         let _ = self.io_times.set(Arc::new(IoTimes::new()));
     }
 
-    #[cfg(completion)]
+    #[cfg(all(completion, feature = "io-stats"))]
     /// The IO latency buckets, if the shard records them.
     pub(crate) fn io_times(&self) -> Option<&Arc<IoTimes>> {
         self.io_times.get()
@@ -309,6 +312,7 @@ impl Counters {
             ),
             budget_yields: self.budget_yields.load(Ordering::Relaxed),
             poll_times: self.poll_times.get().map(|buckets| buckets.read()),
+            #[cfg(feature = "io-stats")]
             io_latencies: self
                 .io_times
                 .get()
@@ -381,6 +385,7 @@ impl Buckets {
 
 /// The latencies of a shard's IO operations by kind, from their submission
 /// to their completion.
+#[cfg(feature = "io-stats")]
 pub(crate) struct IoTimes {
     reads: Buckets,
     writes: Buckets,
@@ -390,7 +395,7 @@ pub(crate) struct IoTimes {
 }
 
 /// The kind of operation a latency is of.
-#[cfg(completion)]
+#[cfg(all(completion, feature = "io-stats"))]
 #[derive(Clone, Copy)]
 pub(crate) enum IoKind {
     Read,
@@ -401,6 +406,7 @@ pub(crate) enum IoKind {
     File,
 }
 
+#[cfg(feature = "io-stats")]
 impl IoTimes {
     fn new() -> Self {
         Self {

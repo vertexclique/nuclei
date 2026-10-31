@@ -677,7 +677,7 @@ impl Shard {
         }
         if tuning.record_latencies {
             shard.shared.counters.record_latencies();
-            #[cfg(completion)]
+            #[cfg(all(completion, feature = "io-stats"))]
             shard.time_io();
         }
         shard.until_inbox.set(tuning.inbox_interval);

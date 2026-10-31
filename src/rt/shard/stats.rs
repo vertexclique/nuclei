@@ -24,7 +24,7 @@ impl Shard {
         self.publish();
     }
 
-    #[cfg(completion)]
+    #[cfg(all(completion, feature = "io-stats"))]
     /// Has the shard's ring or port stamp the operations it issues from now
     /// on, to record their latencies; a readiness poller issues none.
     pub(super) fn time_io(&self) {

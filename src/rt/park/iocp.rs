@@ -19,9 +19,14 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::io;
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+#[cfg(feature = "io-stats")]
+use std::sync::OnceLock;
+use std::time::Duration;
+#[cfg(feature = "io-stats")]
+use std::time::Instant;
 
+#[cfg(feature = "io-stats")]
 use crate::rt::counters::{IoKind, IoTimes};
 
 use crate::syscore::windows::{
@@ -57,6 +62,7 @@ pub(crate) struct Port {
     out: AtomicUsize,
     /// Where the latencies of the operations go, when the runtime records
     /// them.
+    #[cfg(feature = "io-stats")]
     times: OnceLock<Arc<IoTimes>>,
 }
 
@@ -90,16 +96,19 @@ impl Port {
     }
 
     /// Starts timing the operations issued from now on into `times`.
+    #[cfg(feature = "io-stats")]
     pub(crate) fn time_with(&self, times: Arc<IoTimes>) {
         let _ = self.times.set(times);
     }
 
     /// The stamp of an operation issued now, if the port times them.
+    #[cfg(feature = "io-stats")]
     pub(crate) fn stamp(&self) -> Option<Instant> {
         self.times.get().map(|_| Instant::now())
     }
 
     /// An operation of `kind` stamped `issued` completed.
+    #[cfg(feature = "io-stats")]
     pub(crate) fn time(&self, kind: IoKind, issued: Instant) {
         if let Some(times) = self.times.get() {
             times.add(kind, issued.elapsed());
@@ -303,6 +312,7 @@ impl Poller {
             port: Arc::new(Port {
                 handle,
                 out: AtomicUsize::new(0),
+                #[cfg(feature = "io-stats")]
                 times: OnceLock::new(),
             }),
             timer: Timer::new(),

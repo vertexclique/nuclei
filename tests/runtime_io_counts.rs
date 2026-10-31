@@ -1,37 +1,32 @@
 //! The IO operation counts and latencies a runtime's worker reports in
 //! `Runtime::stats`: a TCP echo and a UDP round trip counted per worker when
 //! the runtime counts, none when it does not, and the latency histograms
-//! only on the completion backends that record them. The counts need the
-//! `io-stats` feature; the latencies are there without it.
+//! only on the completion backends that record them.
+//!
+//! Counts and latencies both need the `io-stats` feature.
+#![cfg(feature = "io-stats")]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nuclei::IoBackend;
-#[cfg(feature = "io-stats")]
-use nuclei::net::UdpSocket;
-use nuclei::net::{TcpListener, TcpStream};
+use nuclei::net::{TcpListener, TcpStream, UdpSocket};
 use nuclei::runtime::Runtime;
-#[cfg(feature = "io-stats")]
-use nuclei::stats::IoCounts;
-use nuclei::stats::{IoLatencies, ShardStats};
+use nuclei::stats::{IoCounts, ShardStats};
 
 const SAFETY: Duration = Duration::from_secs(30);
 const ECHOED: usize = 256 * 1024;
 
 fn runtime(count: bool, record: bool) -> Runtime {
-    let builder = Runtime::builder()
+    Runtime::builder()
         .worker_threads(1)
         .pin_workers(false)
-        .record_latencies(record);
-    #[cfg(feature = "io-stats")]
-    let builder = builder.count_io(count);
-    #[cfg(not(feature = "io-stats"))]
-    let _ = count;
-    builder.build().expect("the runtime starts")
+        .count_io(count)
+        .record_latencies(record)
+        .build()
+        .expect("the runtime starts")
 }
 
-#[cfg(feature = "io-stats")]
 fn io(shard: &ShardStats) -> IoCounts {
     shard
         .io
@@ -95,7 +90,6 @@ async fn echo() {
     server.await;
 }
 
-#[cfg(feature = "io-stats")]
 async fn round_trip() {
     let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -108,7 +102,6 @@ async fn round_trip() {
     assert_eq!(&buf[..n], b"pong");
 }
 
-#[cfg(feature = "io-stats")]
 #[test]
 fn a_tcp_echo_is_counted_on_its_worker() {
     let rt = runtime(true, false);
@@ -123,7 +116,6 @@ fn a_tcp_echo_is_counted_on_its_worker() {
     assert_eq!(io.accepts, 1, "{shard:?}");
 }
 
-#[cfg(feature = "io-stats")]
 #[test]
 fn a_udp_round_trip_is_counted_on_its_worker() {
     let rt = runtime(true, false);
@@ -137,40 +129,31 @@ fn a_udp_round_trip_is_counted_on_its_worker() {
 fn latencies_are_kept_only_on_the_completion_backends_that_record_them() {
     let rt = runtime(true, true);
     rt.block_on(rt.spawn(echo()));
-    // The echo is over: its operations' latencies are published once the
-    // shard looks again.
-    let shard = settled(&rt, |s| match s.backend {
-        IoBackend::IoUring | IoBackend::Iocp => {
-            s.io_latencies.as_ref().is_some_and(|t| timed(t) > 0)
-        }
-        IoBackend::Epoll | IoBackend::Kqueue => true,
-    });
+    let shard = settled(&rt, |s| io(s).bytes_read >= ECHOED as u64);
     match shard.backend {
         IoBackend::IoUring | IoBackend::Iocp => {
             let times = shard
                 .io_latencies
                 .as_ref()
                 .unwrap_or_else(|| panic!("no latencies on a completion backend: {shard:?}"));
-            assert!(timed(times) > 0, "{shard:?}");
+            let timed = times.reads.count()
+                + times.writes.count()
+                + times.accepts.count()
+                + times.connects.count();
+            assert!(timed > 0, "{shard:?}");
         }
         IoBackend::Epoll | IoBackend::Kqueue => assert!(shard.io_latencies.is_none(), "{shard:?}"),
     }
-}
-
-/// The operations the latencies timed.
-fn timed(times: &IoLatencies) -> u64 {
-    times.reads.count() + times.writes.count() + times.accepts.count() + times.connects.count()
 }
 
 #[test]
 fn latencies_are_none_unless_the_runtime_records_them() {
     let rt = runtime(true, false);
     rt.block_on(rt.spawn(echo()));
-    let shard = rt.stats().shards.swap_remove(0);
+    let shard = settled(&rt, |s| io(s).bytes_read >= ECHOED as u64);
     assert!(shard.io_latencies.is_none(), "{shard:?}");
 }
 
-#[cfg(feature = "io-stats")]
 #[test]
 fn a_runtime_that_does_not_count_reports_no_counts() {
     let rt = runtime(false, false);

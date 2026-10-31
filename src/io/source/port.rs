@@ -43,6 +43,7 @@ use crate::buf::PoolBuf;
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::sys;
+#[cfg(feature = "io-stats")]
 use crate::rt::counters::{IoKind, tally};
 use crate::rt::park::iocp::{JOB, Port};
 use crate::syscore::windows::{
@@ -125,6 +126,7 @@ struct Inner {
     epoch: u32,
     mem: Option<PortMem>,
     /// When the operation was issued, while the port times them.
+    #[cfg(feature = "io-stats")]
     issued_at: Option<std::time::Instant>,
     buf: WSABUF,
     flags: DWORD,
@@ -160,6 +162,7 @@ impl Default for Slot {
                 read: false,
                 epoch: 0,
                 mem: None,
+                #[cfg(feature = "io-stats")]
                 issued_at: None,
                 buf: WSABUF {
                     len: 0,
@@ -429,7 +432,10 @@ impl PortIssuer<'_> {
         self.source.op_out();
         self.port.issued();
         inner.issued_on = Some(Arc::clone(&self.port));
-        inner.issued_at = self.port.stamp();
+        #[cfg(feature = "io-stats")]
+        {
+            inner.issued_at = self.port.stamp();
+        }
         inner.owner = Arc::into_raw(Arc::clone(self.source));
         let started = if kind != Kind::Bytes {
             start(inner, slot.ov.get(), socket_of(fd), want, kind.datagrams())
@@ -441,7 +447,10 @@ impl PortIssuer<'_> {
         };
         if let Err(code) = started {
             // No packet comes: the operation ends here, with the error.
-            inner.issued_at = None;
+            #[cfg(feature = "io-stats")]
+            {
+                inner.issued_at = None;
+            }
             // SAFETY: the call did not take the slot.
             unsafe { finish(slot, Some(code), 0, None) };
         }
@@ -942,6 +951,7 @@ unsafe fn finish(
     let Some(mem) = inner.mem.take() else {
         return;
     };
+    #[cfg(feature = "io-stats")]
     if let (Some(port), Some(at), Some(kind)) = (&port, inner.issued_at.take(), io_kind(&mem))
         && code != Some(WSA_OPERATION_ABORTED)
     {
@@ -968,6 +978,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
         }
         _ => answer(code, bytes),
     };
+    #[cfg(feature = "io-stats")]
     tally_of(&mem, &answer);
     match mem {
         PortMem::Ready => Outcome::Ready(match answer {
@@ -1070,6 +1081,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
 
 /// The kind of latency an operation on `mem` counts as: none for a
 /// zero-byte receive that only waits for data.
+#[cfg(feature = "io-stats")]
 fn io_kind(mem: &PortMem) -> Option<IoKind> {
     match mem {
         PortMem::Ready => None,
@@ -1090,6 +1102,7 @@ fn io_kind(mem: &PortMem) -> Option<IoKind> {
 }
 
 /// Counts the completed operation on `mem` that ended with `answer`.
+#[cfg(feature = "io-stats")]
 fn tally_of(mem: &PortMem, answer: &Answer<usize>) {
     let Answer::Done(Ok(n)) = answer else {
         return;
