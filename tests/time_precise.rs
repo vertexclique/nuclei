@@ -165,9 +165,17 @@ fn many_precise_sleeps_at_once_all_end_after_their_deadlines() {
 fn a_dropped_precise_sleep_does_not_wake_its_task() {
     let rt = runtime(1, false);
     rt.block_on(rt.spawn(async {
-        let mut sleep = Box::pin(time::sleep_precise(Duration::from_micros(200)));
-        assert!(poll_now(sleep.as_mut()).is_pending());
-        drop(sleep);
+        // Dropped armed: after a poll that found its deadline still ahead. A machine that
+        // stalls past the deadline before that poll makes a fresh sleep, a bounded number of
+        // times.
+        let armed = (0..100).any(|_| {
+            let mut sleep = Box::pin(time::sleep_precise(Duration::from_micros(200)));
+            poll_now(sleep.as_mut()).is_pending()
+        });
+        assert!(
+            armed,
+            "no precise sleep of 200 microseconds was pending at its first poll"
+        );
         let start = std::time::Instant::now();
         time::sleep_precise(Duration::from_millis(2)).await;
         assert!(start.elapsed() >= Duration::from_millis(2));
