@@ -31,12 +31,10 @@ use crate::syscore::linux::iouring::ring::Sqe;
 
 /// What a file's operation reads into or writes from.
 pub(crate) enum FileMem {
-    /// A read into `len` bytes of a buffer of the pool from `from`.
-    Read {
-        buf: PoolBuf,
-        from: usize,
-        len: usize,
-    },
+    /// A read into `len` bytes of a buffer of the pool from `from` (each
+    /// within the buffer's `u32` capacity, so the variant is no larger than
+    /// a write's).
+    Read { buf: PoolBuf, from: u32, len: u32 },
     /// A read into the spare capacity of a task's buffer.
     ReadLent(OwnedBuf),
     /// A write of a buffer of the pool, `done` of its bytes landed.
@@ -113,7 +111,11 @@ pub(crate) fn read(
         fd,
         at,
         (buf, from, len),
-        |(buf, from, len)| FileMem::Read { buf, from, len },
+        |(buf, from, len)| FileMem::Read {
+            buf,
+            from: u32::try_from(from).unwrap_or(u32::MAX),
+            len: u32::try_from(len).unwrap_or(u32::MAX),
+        },
         as_read,
     )
     .map_err(|(buf, _, _)| buf)
@@ -197,8 +199,8 @@ impl FileOp {
         match &mut self.mem {
             FileMem::Read { buf, from, len } => {
                 let spare = buf.spare();
-                let room = spare.get_mut(*from..).unwrap_or_default();
-                let len = (*len).min(room.len());
+                let room = spare.get_mut(*from as usize..).unwrap_or_default();
+                let len = (*len as usize).min(room.len());
                 Sqe::read(fd, room.as_mut_ptr(), len32(len), self.at)
             }
             FileMem::ReadLent(buf) => {
@@ -259,7 +261,7 @@ impl FileOp {
         };
         let outcome = match self.mem {
             FileMem::Read { mut buf, from, .. } => FileOutcome::Read(result.map(|n| {
-                buf.set_filled_at(from, n);
+                buf.set_filled_at(from as usize, n);
                 buf
             })),
             FileMem::ReadLent(mut buf) => {
@@ -303,6 +305,7 @@ impl FileOp {
             let raw = fd.raw();
             let outcome = match mem {
                 FileMem::Read { mut buf, from, len } => {
+                    let (from, len) = (from as usize, len as usize);
                     let spare = buf.spare();
                     let end = from.saturating_add(len).min(spare.len());
                     let room = spare.get_mut(from..end).unwrap_or_default();
