@@ -93,11 +93,14 @@ impl Sleep {
         this.deadline = deadline;
     }
 
-    /// Lets go of the timer, wherever it is armed.
+    /// Lets go of the timer, wherever it is armed, and leaves the sleep idle.
     #[inline]
     fn release(&mut self) {
-        if !matches!(*self.state, State::Idle | State::Done) {
-            self.release_armed();
+        match *self.state {
+            State::Idle => {}
+            // Fired: nothing to let go of, and pending again (a reset).
+            State::Done => *self.state = State::Idle,
+            State::Local { .. } | State::Remote { .. } => self.release_armed(),
         }
     }
 
@@ -242,8 +245,10 @@ impl Future for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        // What the state held goes here; left idle or done, it holds nothing.
-        self.release();
+        // What the state holds goes here; idle or done, it holds nothing.
+        if matches!(*self.state, State::Local { .. } | State::Remote { .. }) {
+            self.release_armed();
+        }
     }
 }
 
