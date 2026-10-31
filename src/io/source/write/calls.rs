@@ -50,7 +50,9 @@ impl Source {
     }
 
     /// Writes the bytes of `bufs`, gathered in order, as
-    /// [`poll_write`](Self::poll_write) writes one slice.
+    /// [`poll_write`](Self::poll_write) writes one slice. Inlined, so a single slice's
+    /// length is known where the call is made.
+    #[inline(always)]
     pub(crate) fn poll_write_vectored(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
