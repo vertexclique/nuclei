@@ -444,7 +444,20 @@ impl FileIo {
         #[cfg(not(ring))]
         let _ = waker;
         let fd = self.fd.clone();
-        let mut buf = buf;
+        let mut buf = match buf {
+            OwnedBuf::Vec(mut vec) => {
+                return Work::Pool(crate::runtime::spawn_blocking(move || {
+                    let result = sys::pread_uninit(fd.raw(), vec.spare_capacity_mut(), at);
+                    if let Ok(n) = result {
+                        // SAFETY: the kernel wrote the first `n` bytes of the
+                        // spare capacity.
+                        unsafe { vec.set_len(vec.len() + n) };
+                    }
+                    (result, OwnedBuf::Vec(vec))
+                }));
+            }
+            other => other,
+        };
         Work::Pool(crate::runtime::spawn_blocking(move || {
             let result = pread_owned(fd.raw(), &mut buf, at);
             (result, buf)
