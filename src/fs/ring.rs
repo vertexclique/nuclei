@@ -73,13 +73,17 @@ pub(crate) struct FileOp {
 /// Issues the call of `buf` (made into `mem`) on `fd` at `at` on the ring of
 /// this thread's shard, if it runs one; else gives `buf` back for the
 /// blocking pool.
-fn submit<B, T>(
+#[inline]
+fn submit<B, T, M>(
     fd: &Lease,
     at: u64,
     buf: B,
-    mem: fn(B) -> FileMem,
+    mem: M,
     map: fn(FileOutcome) -> T,
-) -> Result<SlotJob<T>, B> {
+) -> Result<SlotJob<T>, B>
+where
+    M: FnOnce(B) -> FileMem,
+{
     crate::rt::context::current(|current| {
         let Some((shard, ring)) = current.and_then(|shard| Some((shard, shard.ring()?))) else {
             return Err(buf);
@@ -104,6 +108,7 @@ fn submit<B, T>(
 
 /// A read at `at` into `len` bytes of `buf` from `from`, on this thread's
 /// ring.
+#[inline]
 pub(crate) fn read(
     fd: &Lease,
     at: u64,
@@ -163,6 +168,7 @@ pub(crate) fn sync_range(fd: &Lease, offset: u64, len: u32) -> Result<SlotJob<io
 }
 
 /// A read at `at` into the spare capacity of a task's `buf`.
+#[inline]
 pub(crate) fn read_lent(
     fd: &Lease,
     at: u64,
@@ -172,6 +178,7 @@ pub(crate) fn read_lent(
 }
 
 /// A write of all of `buf` at `at`.
+#[inline]
 pub(crate) fn write(fd: &Lease, at: u64, buf: PoolBuf) -> Result<SlotJob<io::Result<()>>, PoolBuf> {
     submit(fd, at, buf, |buf| FileMem::Write { buf, done: 0 }, as_write)
 }
@@ -186,6 +193,7 @@ pub(crate) fn shutdown(
 }
 
 /// A write of all of a task's `buf` at `at`.
+#[inline]
 pub(crate) fn write_lent(
     fd: &Lease,
     at: u64,
