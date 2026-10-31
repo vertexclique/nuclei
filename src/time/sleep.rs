@@ -4,6 +4,7 @@
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::future::Future;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::sync::Arc;
@@ -35,7 +36,7 @@ pub fn sleep(duration: Duration) -> Sleep {
 pub fn sleep_until(deadline: impl Into<Instant>) -> Sleep {
     Sleep {
         deadline: deadline.into(),
-        state: State::Idle,
+        state: ManuallyDrop::new(State::Idle),
     }
 }
 
@@ -54,7 +55,9 @@ pub(super) fn far_future() -> Instant {
 #[must_use = "a sleep does nothing unless awaited"]
 pub struct Sleep {
     deadline: Instant,
-    state: State,
+    /// Never dropped as it is: the drop releases what it holds, which leaves
+    /// it holding nothing.
+    state: ManuallyDrop<State>,
 }
 
 enum State {
@@ -79,7 +82,7 @@ impl Sleep {
 
     /// Whether the deadline has passed.
     pub fn is_elapsed(&self) -> bool {
-        matches!(self.state, State::Done) || Instant::now() >= self.deadline
+        matches!(*self.state, State::Done) || Instant::now() >= self.deadline
     }
 
     /// Moves the deadline; the sleep is pending again until it.
@@ -93,14 +96,14 @@ impl Sleep {
     /// Lets go of the timer, wherever it is armed.
     #[inline]
     fn release(&mut self) {
-        if !matches!(self.state, State::Idle | State::Done) {
+        if !matches!(*self.state, State::Idle | State::Done) {
             self.release_armed();
         }
     }
 
     #[inline(never)]
     fn release_armed(&mut self) {
-        match core::mem::replace(&mut self.state, State::Idle) {
+        match core::mem::replace(&mut *self.state, State::Idle) {
             State::Local { owner, key } => {
                 let here = context::current(|current| match current {
                     Some(shard) if shard.is(&owner) => {
@@ -125,7 +128,7 @@ impl Sleep {
     }
 
     fn poll_local(&mut self, shard: &Shard, cx: &mut Context<'_>) -> Poll<()> {
-        if let State::Local { owner, key } = &self.state
+        if let State::Local { owner, key } = &*self.state
             && shard.is(owner)
         {
             let key = *key;
@@ -133,20 +136,25 @@ impl Sleep {
             if wheel.is_fired(key) {
                 wheel.remove(key);
                 drop(wheel);
-                self.state = State::Done;
+                // The state is `Local`: its owner goes, and nothing else.
+                if let State::Local { owner, .. } =
+                    core::mem::replace(&mut *self.state, State::Done)
+                {
+                    drop(owner);
+                }
                 return Poll::Ready(());
             }
             wheel.set_waker(key, cx.waker());
             return Poll::Pending;
         }
-        if let State::Remote { cell, .. } = &self.state {
-            return Self::poll_cell(cell, cx).map(|()| self.state = State::Done);
+        if let State::Remote { cell, .. } = &*self.state {
+            return Self::poll_cell(cell, cx).map(|()| *self.state = State::Done);
         }
         // Not armed here: armed now (after letting go of an arming on
         // another shard, if it moved).
         self.release();
         if Instant::now() >= self.deadline {
-            self.state = State::Done;
+            *self.state = State::Done;
             return Poll::Ready(());
         }
         let at = shard.wheel_time(self.deadline.into_std());
@@ -155,11 +163,11 @@ impl Sleep {
         if wheel.is_fired(key) {
             wheel.remove(key);
             drop(wheel);
-            self.state = State::Done;
+            *self.state = State::Done;
             return Poll::Ready(());
         }
         drop(wheel);
-        self.state = State::Local {
+        *self.state = State::Local {
             owner: Arc::clone(&shard.shared),
             key,
         };
@@ -167,12 +175,12 @@ impl Sleep {
     }
 
     fn poll_remote(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let State::Remote { cell, .. } = &self.state {
-            return Self::poll_cell(cell, cx).map(|()| self.state = State::Done);
+        if let State::Remote { cell, .. } = &*self.state {
+            return Self::poll_cell(cell, cx).map(|()| *self.state = State::Done);
         }
         self.release();
         if Instant::now() >= self.deadline {
-            self.state = State::Done;
+            *self.state = State::Done;
             return Poll::Ready(());
         }
         let cell = Arc::new(RemoteTimer {
@@ -188,7 +196,7 @@ impl Sleep {
             at: self.deadline,
             cell: Arc::clone(&cell),
         });
-        self.state = State::Remote { shard, cell };
+        *self.state = State::Remote { shard, cell };
         Poll::Pending
     }
 
@@ -210,15 +218,20 @@ impl Future for Sleep {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        if let State::Done = this.state {
+        if let State::Done = *this.state {
             return Poll::Ready(());
         }
-        if let State::Remote { cell, .. } = &this.state
+        if let State::Remote { cell, .. } = &*this.state
             && cell.orphaned.load(Ordering::Acquire)
         {
             // The shard that held the timer went without firing it, and holds
             // it no more: it is armed again where this poll runs.
-            this.state = State::Idle;
+            *this.state = State::Idle;
+        }
+        // On the shard this thread runs with no bracket to take, as `current`
+        // would hand it over.
+        if let Some(shard) = context::running_inside(context::local()) {
+            return this.poll_local(shard, cx);
         }
         context::current(|current| match current {
             Some(shard) => this.poll_local(shard, cx),
@@ -229,6 +242,7 @@ impl Future for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
+        // What the state held goes here; left idle or done, it holds nothing.
         self.release();
     }
 }
