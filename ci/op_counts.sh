@@ -3,7 +3,10 @@
 # cachegrind, against the budgets in ci/op_budget.txt. A row costs
 # (I(N2) - I(N1)) / (ops(N2) - ops(N1)) at two iteration counts, so the runtime's start and
 # every other fixed cost cancel. Each measurement is run RUNS times; the median is judged and
-# the min and max are printed. OP_REPORT=1 reports everything and fails nothing.
+# the min and max are printed. OP_REPORT=1 reports everything and fails nothing. The program is
+# built as one codegen unit: with several, adding unrelated code to the crate reshuffles which
+# functions share a unit, which moves what is inlined and so rows by a few percent, and the
+# gate would measure the partitioning instead of the code.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -36,7 +39,7 @@ local_mpsc 10000 30000
 local_oneshot 10000 30000
 "
 
-cargo build --release -p nuclei --example op_count
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release -p nuclei --example op_count
 
 # measure BACKEND ROW ITERATIONS: prints "instructions operations".
 measure() {
