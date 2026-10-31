@@ -6,6 +6,7 @@ G_failed_held     Going   pass
 M_token_only      Going   violated:AllEnd
 M_keep_home       Going   violated:AllEnd
 M_no_wait         Going   violated:NoStrandedOp
+M_end_first       Going   violated:NoStrandedDetach
 W_collision       Going   violated:NoCollision
 W_held            Going   violated:NoHolderEvict
 B_poller          Behind  pass

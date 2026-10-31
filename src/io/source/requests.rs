@@ -39,7 +39,7 @@ use std::sync::Arc;
 use super::Kind;
 use super::read::ReadState;
 use super::write::WriteState;
-use super::{Failure, NO_FD, NO_TOKEN, REGISTERED, Source, SourceHooks, UNREGISTERED};
+use super::{Failure, NO_FD, REGISTERED, Source, SourceHooks, UNREGISTERED};
 use crate::io::side::After;
 use crate::rt::shard::Shared;
 use crate::sync::atomic_waker::AtomicWaker;
@@ -461,13 +461,12 @@ impl Source {
     pub(super) fn abandon_ring_attach(&self) {
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
-        let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
-        self.reg.home.store(0, Ordering::Release);
         self.reg.ops.store(false, Ordering::Release);
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
-            shard.release_source(token);
+            shard.release_source(self.reg.token.load(Ordering::Acquire));
         }
+        self.registration_gone();
     }
 
     /// Whether an attach to a ring is under way on the ring's thread: its
@@ -553,8 +552,6 @@ impl Source {
         if self.reg.state.load(Ordering::Acquire) == REGISTERED {
             // SAFETY: both sides are held.
             let shard = unsafe { (*self.reg.shard.get()).take() };
-            self.reg.token.store(NO_TOKEN, Ordering::Release);
-            self.reg.home.store(0, Ordering::Release);
             self.reg.state.store(UNREGISTERED, Ordering::Release);
             #[cfg(ring)]
             if self.reg.ops.swap(false, Ordering::AcqRel) {
@@ -579,6 +576,7 @@ impl Source {
             }
             #[cfg(not(readiness))]
             drop(shard);
+            self.registration_gone();
         }
         read.wake_all(after);
         write.wake_all(after);

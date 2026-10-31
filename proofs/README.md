@@ -1296,21 +1296,28 @@ submit).
 ## A shard that goes
 
 `going` (`tla/going/Going.tla`) checks how a shard that goes waits for the evictions of its
-sources (`src/rt/shard/going.rs`, `src/io/source.rs`, `src/io/source/requests.rs`) before it
-looks at what its ring has out. The shard evicts a source with a receive out on its ring, at
-once or, while another thread holds a side, by that holder as it lets go, and waits until the
-source is no longer registered with it; then its mailbox, where the eviction left the cancel,
-ends the receive. A task on another shard registers the source as soon as the eviction is done,
-under a token of the same number, and its receive goes out once the old one has ended. The
-wait checks the registration's shard with its token, and every end of a registration (a failed
-ring attach too) clears the shard. 9 configurations: 4 that must pass (the shard's own
-eviction, a holder's, a registration that was a failed attach, and that with a holder and the
-other shard), with nothing left out on the ring once the shard has gone and everything ending;
-3 mutations (a wait by the token alone, which waits for the other shard's registration while
-that one's receive waits for this shard's cancel, `AllEnd`; a failed attach that keeps its
-shard, `AllEnd`; no wait, which lands the holder's cancel after the shard has gone,
-`NoStrandedOp`); and 2 witnesses (the other shard's registration under the same number while
-the shard waits; a holder's eviction).
+sources (`src/rt/shard/going.rs`, `Source::detach` and `registration_gone` in
+`src/io/source.rs`, `evict_now` in `src/io/source/requests.rs`) before it looks at what its ring
+has out and at what its mailbox got. The shard evicts a source with a receive out on its ring,
+at once or, while another thread holds a side, by that holder as it lets go, and waits until the
+source is no longer registered with it; then its mailbox, where the eviction left its detach,
+ends the receive and takes the source's file out of the ring (with the lease that keeps the
+handle's object open). A holder ends the registration in steps: the state, then the detach to
+the shard's mailbox, then the token and the shard, so the wait sees the end only once the
+detach is there; a thread's own shard that left runs again only at its next `block_on`, and a
+detach that came after its look would keep the file and the handle open. A task on another
+shard registers the source as soon as the eviction is done, under a token of the same number,
+and its receive goes out once the old one has ended. The wait checks the registration's shard
+with its token, and every end of a registration (a failed ring attach too) clears the shard.
+10 configurations: 4 that must pass (the shard's own eviction, a holder's, a registration that
+was a failed attach, and that with a holder and the other shard), with nothing left out on the
+ring and no file or detach left to the shard once it has gone, and everything ending; 4
+mutations (a wait by the token alone, which waits for the other shard's registration while that
+one's receive waits for this shard's cancel, `AllEnd`; a failed attach that keeps its shard,
+`AllEnd`; no wait, which lands the holder's cancel after the shard has gone, `NoStrandedOp`; a
+holder that clears the token and the shard with the state, before its detach, which the shard
+then misses, `NoStrandedDetach`); and 2 witnesses (the other shard's registration under the
+same number while the shard waits; a holder's eviction).
 
 `Behind` (`tla/going/Behind.tla`) checks the bytes a source's writes took into its write-behind
 when the shard that drove them goes (`Shard::leave` and `drain_unsent` in
