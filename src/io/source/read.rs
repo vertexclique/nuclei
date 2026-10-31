@@ -308,8 +308,63 @@ impl ReadState {
         if self.has_result() {
             return Poll::Ready(self.eof);
         }
+        #[cfg(readiness)]
+        if let Some(ready) = self.starved_look(io, kind) {
+            return ready;
+        }
         self.wait(waker, len);
         Poll::Pending
+    }
+
+    /// On a readiness driver, whether a stream socket the pool has no buffer
+    /// for may be read now, by a peek at one byte straight from it that takes
+    /// nothing: its task's read goes straight into its own buffer
+    /// (`reads_itself`). `None` once the socket is found empty, which waits
+    /// for the next edge, and for a side that is not starved
+    /// (proofs/tla/starve/FdStarve.tla).
+    #[cfg(readiness)]
+    fn starved_look(&mut self, io: Io<'_>, kind: Kind) -> Option<Poll<bool>> {
+        let fd = match io.via {
+            Via::Fd(fd) => fd,
+            #[cfg(completion)]
+            Via::Ops(_) => return None,
+            #[cfg(not(completion))]
+            Via::None(never, _) => match never {},
+        };
+        if !self.starved || self.blocked || !kind.streams() {
+            return None;
+        }
+        match sys::ready(sys::peek(fd, &mut [0; 1])) {
+            None => {
+                self.blocked = true;
+                None
+            }
+            Some(Ok(0)) => {
+                self.eof = true;
+                Some(Poll::Ready(true))
+            }
+            Some(Ok(_)) => Some(Poll::Ready(false)),
+            Some(Err(err)) => {
+                self.error = Some(err);
+                Some(Poll::Ready(false))
+            }
+        }
+    }
+
+    /// On a readiness driver, a side the pool just had no buffer for whose
+    /// socket may hold bytes no edge will report again: its waiting tasks are
+    /// woken to read them into their own buffers (`reads_itself`), and one
+    /// that finds the socket empty waits for the next edge
+    /// (proofs/tla/starve/FdStarve.tla).
+    #[cfg_attr(
+        not(readiness),
+        expect(unused_variables, reason = "only a readiness driver looks again")
+    )]
+    fn look_again(&mut self, io: Io<'_>, after: &mut After) {
+        #[cfg(readiness)]
+        if self.starved && !self.blocked && matches!(io.via, Via::Fd(_)) {
+            after.wake(&mut self.waiters);
+        }
     }
 
     /// The caller's own calls: `Ready` with the edge count while the side
@@ -405,7 +460,8 @@ impl ReadState {
             return;
         }
         self.complete_fd(fd, kind, self.want, after);
-        if self.has_result() {
+        // A side the pool had no buffer for reads its bytes itself.
+        if self.has_result() || self.starved {
             self.want = 0;
             after.wake(&mut self.waiters);
         }
@@ -623,51 +679,63 @@ impl ReadState {
     }
 
     /// The tasks waiting asked for buffers big enough to read into directly,
-    /// and nothing is held that must come first.
+    /// or the pool had no buffer for the side (`reads_itself`), and nothing is
+    /// held that must come first.
     #[cfg(readiness)]
     fn leaves_to_tasks(&self, kind: Kind) -> bool {
         let theirs = if kind.datagrams() {
             // A datagram is always the task's to receive (`receive_now`).
             self.datagrams.is_empty()
         } else {
-            kind.streams() && self.want >= super::direct::READ_READINESS && self.ahead.is_empty()
+            self.reads_bytes(kind)
+                && (self.want >= super::direct::READ_READINESS || self.starved)
+                && self.ahead.is_empty()
         };
         theirs && self.lent.is_none() && !self.eof && self.error.is_none()
     }
 
     /// Whether a stream read (or `peek`) of `len` bytes goes straight into
-    /// the task's buffer: a read big enough (see `direct`), or on a ring any
-    /// while the pool has no buffer for the side, so a reader never waits on
-    /// buffers that receives of other connections hold
-    /// (proofs/tla/ring/RingStarve.tla).
+    /// the task's buffer: a read big enough (see `direct`), or any while the
+    /// pool has no buffer for the side, so a reader never waits on buffers
+    /// that receives or reads ahead of other connections hold
+    /// (proofs/tla/ring/RingStarve.tla, proofs/tla/starve/FdStarve.tla).
     #[cfg(unix)]
     pub(super) fn reads_itself(&self, io: Io<'_>, len: usize, peek: bool) -> bool {
-        #[cfg(ring)]
-        if self.starved && matches!(io.via, Via::Ops(_)) {
-            return true;
-        }
-        !peek && super::direct::worth(io, len, false)
+        self.starved || (!peek && super::direct::worth(io, len, false))
     }
 
-    /// A stream read of `len` bytes made by `call` straight on the
-    /// descriptor `fd`, into the caller's memory, if the side holds nothing
-    /// that comes first. `None` leaves the read to the normal path, which
-    /// waits for readiness when the socket had nothing; `Pending` is a
+    /// Whether a read of `kind` may go straight into the task's buffer: a
+    /// socket's, and while the pool has no buffer for the side any byte
+    /// stream's (a pipe's, a terminal's).
+    #[cfg(unix)]
+    fn reads_bytes(&self, kind: Kind) -> bool {
+        kind.streams() || (self.starved && kind == Kind::Bytes)
+    }
+
+    /// A stream read (or `peek`) of `len` bytes made by `call` straight on
+    /// the descriptor `fd`, into the caller's memory, if the side holds
+    /// nothing that comes first. `None` leaves the read to the normal path,
+    /// which waits for readiness when the socket had nothing; `Pending` is a
     /// multishot receive being stopped so the next poll can call.
     #[cfg(unix)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's context, as every step's"
+    )]
     pub(super) fn read_direct(
         &mut self,
         io: Io<'_>,
         fd: Option<RawFd>,
         kind: Kind,
         len: usize,
+        peek: bool,
         waker: &Waker,
         call: impl FnOnce(RawFd) -> io::Result<usize>,
     ) -> Option<Poll<io::Result<usize>>> {
         let fd = fd?;
-        if !kind.streams()
+        if !self.reads_bytes(kind)
             || len == 0
-            || !self.reads_itself(io, len, false)
+            || !self.reads_itself(io, len, peek)
             || !self.ahead.is_empty()
             || self.lent.is_some()
             || self.eof
@@ -710,7 +778,8 @@ impl ReadState {
                 None
             }
             Some(Ok(n)) => {
-                if matches!(io.via, Via::Fd(_)) {
+                // A peek leaves the bytes in the socket, which no edge reports again.
+                if matches!(io.via, Via::Fd(_)) && !peek {
                     self.blocked = drained(kind, self.unsure, n, len);
                 }
                 Some(Poll::Ready(Ok(n)))
@@ -740,6 +809,7 @@ impl ReadState {
             }
             None => {
                 self.wait(waker, out.len());
+                self.look_again(io, after);
                 Poll::Pending
             }
         }
@@ -765,6 +835,7 @@ impl ReadState {
             }
             None => {
                 self.wait(waker, len);
+                self.look_again(io, after);
                 Poll::Pending
             }
         }

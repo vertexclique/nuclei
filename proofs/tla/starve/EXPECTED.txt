@@ -1,0 +1,10 @@
+# configuration                spec                 expected
+FS_safe                        MC_FdStarve          pass
+FS_live                        MC_FdStarve          pass
+FS_all_live                    MC_FdStarve          pass
+MFS_park                       MC_FdStarve          violated:Read
+MFS_edge_quiet                 MC_FdStarve          violated:Read
+MFS_no_look                    MC_FdStarve          violated:Read
+MFS_peek_drains                MC_FdStarve          violated:Read
+WFS_starve                     MC_FdStarve          violated:NoStarve
+WFS_direct                     MC_FdStarve          violated:NoDirect

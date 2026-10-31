@@ -1,0 +1,16 @@
+TLC run of every configuration in proofs/tla/starve, 2026-10-30 19:01 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+FS_safe                           9435       3217      4  pass                                  pass                                  yes
+FS_live                           9435       3217      7  pass                                  pass                                  yes
+FS_all_live                      16255       5521      7  pass                                  pass                                  yes
+MFS_park                          6275       2116      7  violated:Read                         violated:Read                         yes
+MFS_edge_quiet                    9567       3293      7  violated:Read                         violated:Read                         yes
+MFS_no_look                       6447       2360      5  violated:Read                         violated:Read                         yes
+MFS_peek_drains                   9759       3385      6  violated:Read                         violated:Read                         yes
+WFS_starve                         193         98      6  violated:NoStarve                     violated:NoStarve                     yes
+WFS_direct                        1315        548      6  violated:NoDirect                     violated:NoDirect                     yes
+
+results matching EXPECTED.txt: 9 of 9

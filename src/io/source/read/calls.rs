@@ -58,14 +58,21 @@ impl Source {
             self.poll_reading(cx, |st, io, waker, after| {
                 #[cfg(unix)]
                 if st.reads_itself(io, out.len(), peek)
-                    && let Some(poll) =
-                        st.read_direct(io, self.serving_fd(None), kind, out.len(), waker, |fd| {
+                    && let Some(poll) = st.read_direct(
+                        io,
+                        self.serving_fd(None),
+                        kind,
+                        out.len(),
+                        peek,
+                        waker,
+                        |fd| {
                             if peek {
                                 sys::peek(fd, out)
                             } else {
                                 sys::read(fd, out)
                             }
-                        })
+                        },
+                    )
                 {
                     return poll;
                 }
@@ -227,10 +234,15 @@ impl Source {
                 {
                     let len = bufs.iter().map(|b| b.len()).sum();
                     if st.reads_itself(io, len, false)
-                        && let Some(poll) =
-                            st.read_direct(io, self.serving_fd(None), kind, len, waker, |fd| {
-                                sys::read_bufs(fd, bufs)
-                            })
+                        && let Some(poll) = st.read_direct(
+                            io,
+                            self.serving_fd(None),
+                            kind,
+                            len,
+                            false,
+                            waker,
+                            |fd| sys::read_bufs(fd, bufs),
+                        )
                     {
                         return poll;
                     }
