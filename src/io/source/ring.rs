@@ -707,12 +707,13 @@ fn entry(
             let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
             (RingMem::RecvFrom(msg, buf), sqe)
         }
-        Want::RecvLentFrom(mut buf) => {
+        Want::RecvLentFrom(OwnedBuf::Vec(mut buf)) => {
             let spare = buf.spare_capacity_mut();
             let mut msg = Msg::receiving(spare.as_mut_ptr().cast(), spare.len());
             let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
-            (RingMem::RecvLentFrom(msg, buf), sqe)
+            (RingMem::RecvLentFrom(msg, OwnedBuf::Vec(buf)), sqe)
         }
+        Want::RecvLentFrom(buf) => other_receive_entry(slot, buf),
         Want::Connect(dial) => {
             let addr = Spare::new(RawAddr::of(&dial));
             let sqe = Sqe::connect(slot, addr.as_ptr(), addr.len);
@@ -745,26 +746,19 @@ fn entry(
             }
         }
         Want::SendTo(buf, target) => {
-            let to = match &target {
-                Target::Connected => None,
-                Target::Inet(addr) => Some(RawAddr::inet(addr)),
-                Target::Unix(addr) => Some(RawAddr::unix(addr)),
-            };
+            let to = raw_target(&target);
             let bytes = buf.filled();
             let msg = Msg::new(bytes.as_ptr().cast_mut(), bytes.len(), to);
             let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
             (RingMem::SendTo(msg, buf, target), sqe)
         }
-        Want::SendLentTo(buf, target) => {
-            let to = match &target {
-                Target::Connected => None,
-                Target::Inet(addr) => Some(RawAddr::inet(addr)),
-                Target::Unix(addr) => Some(RawAddr::unix(addr)),
-            };
+        Want::SendLentTo(OwnedBuf::Vec(buf), target) => {
+            let to = raw_target(&target);
             let msg = Msg::new(buf.as_ptr().cast_mut(), buf.len(), to);
             let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
-            (RingMem::SendLentTo(msg, buf), sqe)
+            (RingMem::SendLentTo(msg, OwnedBuf::Vec(buf)), sqe)
         }
+        Want::SendLentTo(buf, target) => other_send_to_entry(slot, buf, target),
     })
 }
 
@@ -792,6 +786,35 @@ fn other_read_entry(kind: Kind, slot: RawFd, mut buf: OwnedBuf) -> (RingMem, Sqe
         }
     };
     (RingMem::RecvLent(buf), sqe)
+}
+
+/// The raw address a datagram's send names for `target`; `None` for a
+/// connected socket's.
+#[inline]
+fn raw_target(target: &Target) -> Option<RawAddr> {
+    match target {
+        Target::Connected => None,
+        Target::Inet(addr) => Some(RawAddr::inet(addr)),
+        Target::Unix(addr) => Some(RawAddr::unix(addr)),
+    }
+}
+
+/// As [`other_read_entry`], for a datagram's receive with its sender.
+#[inline(never)]
+fn other_receive_entry(slot: RawFd, mut buf: OwnedBuf) -> (RingMem, Sqe) {
+    let spare = buf.spare_capacity_mut();
+    let mut msg = Msg::receiving(spare.as_mut_ptr().cast(), spare.len());
+    let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
+    (RingMem::RecvLentFrom(msg, buf), sqe)
+}
+
+/// As [`other_read_entry`], for a datagram's send to `target`.
+#[inline(never)]
+fn other_send_to_entry(slot: RawFd, buf: OwnedBuf, target: Target) -> (RingMem, Sqe) {
+    let to = raw_target(&target);
+    let msg = Msg::new(buf.as_ptr().cast_mut(), buf.len(), to);
+    let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
+    (RingMem::SendLentTo(msg, buf), sqe)
 }
 
 /// As [`other_read_entry`], for a stream write from the `from`th byte on.
