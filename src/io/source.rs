@@ -794,6 +794,7 @@ impl Source {
 
     /// Makes sure the driver of some shard watches the source: the current
     /// shard's, or (on a thread that runs none) one of the runtime's.
+    #[inline]
     fn ensure_registered(self: &Arc<Self>) -> io::Result<()> {
         // Registered, or being registered by another poll (readiness is
         // reported once the registration is in place). A shard that goes
@@ -801,6 +802,13 @@ impl Source {
         if self.reg.state.load(Ordering::Acquire) != UNREGISTERED {
             return Ok(());
         }
+        self.register()
+    }
+
+    /// [`ensure_registered`](Self::ensure_registered) for a source no shard
+    /// watches.
+    #[inline(never)]
+    fn register(self: &Arc<Self>) -> io::Result<()> {
         if self
             .reg
             .state
