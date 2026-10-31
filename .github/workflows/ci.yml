@@ -147,8 +147,6 @@ jobs:
 
       - name: op counts
         run: bash ci/op_counts.sh
-        env:
-          OP_REPORT: "1"
 
   check_fmt_and_docs:
     name: Checking fmt and docs
