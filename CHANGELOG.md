@@ -148,6 +148,10 @@
 - **What std's calls through `Deref` do**, on `Handle`: `shutdown`, `set_nonblocking(false)`,
   `take_error`, `Read` and `Write` go around the bytes read ahead and written behind, or block the
   shard; `UdpSocket::connect` is a constructor where `socket.connect(addr)` is std's.
+- **Counts of each worker's IO in `stats`, behind the `io-stats` feature** (off by default):
+  `Builder::count_io` and `ShardStats::io` (`IoCounts`: reads, writes, the bytes of each,
+  accepts). The feature costs every IO call a few instructions, counted or not; without it no IO
+  path carries counting code, and the counting items do not exist.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.

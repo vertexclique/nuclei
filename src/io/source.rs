@@ -794,6 +794,7 @@ impl Source {
 
     /// Makes sure the driver of some shard watches the source: the current
     /// shard's, or (on a thread that runs none) one of the runtime's.
+    #[inline]
     fn ensure_registered(self: &Arc<Self>) -> io::Result<()> {
         // Registered, or being registered by another poll (readiness is
         // reported once the registration is in place). A shard that goes
@@ -801,6 +802,13 @@ impl Source {
         if self.reg.state.load(Ordering::Acquire) != UNREGISTERED {
             return Ok(());
         }
+        self.register()
+    }
+
+    /// [`ensure_registered`](Self::ensure_registered) for a source no shard
+    /// watches.
+    #[inline(never)]
+    fn register(self: &Arc<Self>) -> io::Result<()> {
         if self
             .reg
             .state
@@ -816,23 +824,28 @@ impl Source {
         }
         // A shard that stopped (a worker going, its thread finishing what
         // the stop left) registers nothing, as `proofs/tla/attach` has it:
-        // the source stays unregistered, and the task waiting registers it
-        // where it is polled next (a task the stopping shard drops hands its
-        // linger on, `rt::linger`).
+        // the source stays unregistered, and the tasks waiting on it are
+        // woken, so the stopping shard hands them on (a dropped task hands
+        // its linger to the runtime's drop, `rt::linger`) and they register
+        // it where they are polled next. Waiting unwoken, they would wait
+        // out their deadline.
         let registered = context::current(|current| {
             current.map(|shard| {
                 if shard.shared.is_stopped() {
                     self.registration_abandoned();
-                    Ok(())
+                    Err(requests::stopped_shard())
                 } else {
                     shard.register_source(self)
                 }
             })
         });
         match registered {
-            // It stopped since the look: the attach it refused set the
-            // registration back to none.
-            Some(Err(err)) if requests::is_stopped_shard(&err) => Ok(()),
+            // Refused for its stop, here or by the attach (which set the
+            // registration back to none): the tasks look again.
+            Some(Err(err)) if requests::is_stopped_shard(&err) => {
+                self.look_again();
+                Ok(())
+            }
             Some(result) => result,
             None => {
                 crate::rt::runtime::service_shard().post_io(IoOp::Register(Arc::clone(self)));

@@ -358,11 +358,12 @@ impl WriteState {
                 None
             }
             Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
-            Some(Ok(n)) => {
-                tally::wrote(n);
-                Some(Ok(n))
+            // Moved through as it is, counted by reference: taken apart and
+            // made again, the result cost the call a drop of its own.
+            Some(result) => {
+                tally::writing(&result);
+                Some(result)
             }
-            Some(result) => Some(result),
         }
     }
 

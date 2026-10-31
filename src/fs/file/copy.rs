@@ -22,7 +22,7 @@ use std::sync::Arc;
 use super::FileIo;
 use super::positional::Out;
 use super::space::range_end;
-use super::work::Work;
+use super::work::{Work, counted};
 use crate::buf::PoolBuf;
 use crate::fs::call::{self, FileOutcome};
 use crate::io::raw::Raw;
@@ -102,7 +102,7 @@ impl FileIo {
         Out {
             io: to,
             work: Some(work),
-            bytes: 0,
+            bytes: counted(0),
         }
         .finish()
         .await
@@ -134,7 +134,7 @@ impl FileIo {
         Out {
             io: to,
             work: Some(work),
-            bytes: 0,
+            bytes: counted(0),
         }
         .finish()
         .await

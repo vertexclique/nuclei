@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use core::task::{Poll, Waker};
 use std::io;
 
-use super::work::{Work, tally_write};
+use super::work::{Counted, Work, counted, tally_write};
 use crate::buf::owned::OwnedBuf;
 
 /// A positional write left by its task: from a buffer of the pool, or from
@@ -25,25 +25,25 @@ use crate::buf::owned::OwnedBuf;
 /// range of the file, or a chunk of a copy into it (which ends with its
 /// count).
 pub(super) enum Orphan {
-    Pool(Work<io::Result<()>>, usize),
-    Lent(Work<(io::Result<()>, OwnedBuf)>, usize),
+    Pool(Work<io::Result<()>>, Counted),
+    Lent(Work<(io::Result<()>, OwnedBuf)>, Counted),
     Count(Work<io::Result<u64>>),
 }
 
-impl From<(Work<io::Result<()>>, usize)> for Orphan {
-    fn from((work, bytes): (Work<io::Result<()>>, usize)) -> Self {
+impl From<(Work<io::Result<()>>, Counted)> for Orphan {
+    fn from((work, bytes): (Work<io::Result<()>>, Counted)) -> Self {
         Orphan::Pool(work, bytes)
     }
 }
 
-impl From<(Work<(io::Result<()>, OwnedBuf)>, usize)> for Orphan {
-    fn from((work, bytes): (Work<(io::Result<()>, OwnedBuf)>, usize)) -> Self {
+impl From<(Work<(io::Result<()>, OwnedBuf)>, Counted)> for Orphan {
+    fn from((work, bytes): (Work<(io::Result<()>, OwnedBuf)>, Counted)) -> Self {
         Orphan::Lent(work, bytes)
     }
 }
 
-impl From<(Work<io::Result<u64>>, usize)> for Orphan {
-    fn from((work, _): (Work<io::Result<u64>>, usize)) -> Self {
+impl From<(Work<io::Result<u64>>, Counted)> for Orphan {
+    fn from((work, _): (Work<io::Result<u64>>, Counted)) -> Self {
         Orphan::Count(work)
     }
 }
@@ -55,7 +55,7 @@ impl Orphan {
         let (err, bytes) = match self {
             Orphan::Pool(work, bytes) => (core::task::ready!(work.poll(waker)).err(), *bytes),
             Orphan::Lent(work, bytes) => (core::task::ready!(work.poll(waker)).0.err(), *bytes),
-            Orphan::Count(work) => (core::task::ready!(work.poll(waker)).err(), 0),
+            Orphan::Count(work) => (core::task::ready!(work.poll(waker)).err(), counted(0)),
         };
         tally_write(bytes, err.is_none());
         Poll::Ready(err)

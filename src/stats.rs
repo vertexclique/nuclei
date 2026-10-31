@@ -116,13 +116,15 @@ pub struct ShardStats {
     /// The IO operations the shard's thread completed, while its runtime
     /// counts them ([`Builder::count_io`](crate::Builder::count_io));
     /// `None` when it does not, which is not a shard that did no IO
-    /// (published).
+    /// (published). With the `io-stats` feature only.
+    #[cfg(feature = "io-stats")]
     pub io: Option<IoCounts>,
     /// Errors of IO run on the shard.
     pub errors: ErrorCounts,
 }
 
 /// The IO operations a shard's thread completed: see [`ShardStats::io`].
+/// With the `io-stats` feature only.
 ///
 /// An operation is counted when the kernel completes it: a read or receive
 /// that returned bytes or the end of the stream, a write or send that took
@@ -132,6 +134,7 @@ pub struct ShardStats {
 /// readiness probes are not counted. IO completed on a thread that runs no
 /// shard (the blocking pool's own calls, a thread outside the runtime) is
 /// counted by no shard.
+#[cfg(feature = "io-stats")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IoCounts {

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use super::FileIo;
 use super::positional::Out;
-use super::work::Work;
+use super::work::{Work, counted};
 use crate::fs::Allocate;
 use crate::fs::call::{self, FileOutcome};
 use crate::io::sys;
@@ -49,7 +49,7 @@ impl FileIo {
         Out {
             io: self,
             work: Some(self.submit_allocate(offset, len, mode, Waker::noop())),
-            bytes: 0,
+            bytes: counted(0),
         }
         .finish()
         .await

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use super::FileIo;
 use super::orphans::Orphan;
-use super::work::{Ended, Work, bounce, tally_read, tally_write};
+use super::work::{Counted, Ended, Work, bounce, tally_read, tally_write};
 use crate::fs::call::End;
 use crate::io::Handle;
 use crate::io::side::After;
@@ -168,17 +168,17 @@ impl FileIo {
 /// for a change of a range.
 pub(super) struct Out<'a, T>
 where
-    (Work<T>, usize): Into<Orphan>,
+    (Work<T>, Counted): Into<Orphan>,
 {
     pub(super) io: &'a Arc<FileIo>,
     pub(super) work: Option<Work<T>>,
-    pub(super) bytes: usize,
+    pub(super) bytes: Counted,
 }
 
 impl<T> Out<'_, T>
 where
     T: Ended + End,
-    (Work<T>, usize): Into<Orphan>,
+    (Work<T>, Counted): Into<Orphan>,
 {
     /// The call's end, once it came.
     pub(super) async fn finish(mut self) -> T {
@@ -199,7 +199,7 @@ where
 
 impl<T> Drop for Out<'_, T>
 where
-    (Work<T>, usize): Into<Orphan>,
+    (Work<T>, Counted): Into<Orphan>,
 {
     fn drop(&mut self) {
         if let Some(work) = self.work.take() {

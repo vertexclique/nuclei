@@ -43,6 +43,7 @@ pub struct Builder {
     pub(super) handoff_after: Option<Option<Duration>>,
     pub(super) start_paused: bool,
     pub(super) record_latencies: bool,
+    #[cfg(feature = "io-stats")]
     pub(super) count_io: bool,
     pub(super) tuning: super::super::tuning::Tuning,
     pub(super) task_hooks: super::super::tuning::TaskHooks,
@@ -174,6 +175,7 @@ impl Builder {
             handoff_after: None,
             start_paused: false,
             record_latencies: false,
+            #[cfg(feature = "io-stats")]
             count_io: false,
             tuning: super::super::tuning::Tuning::default(),
             task_hooks: super::super::tuning::TaskHooks::default(),
@@ -355,10 +357,13 @@ impl Builder {
 
     /// Counts each worker's IO operations (reads, writes, the bytes of each,
     /// accepts) in its [`ShardStats::io`](crate::stats::ShardStats::io)
-    /// (default false: `io` is `None`). Off, a count costs one load of a flag
-    /// per operation; on, a few plain thread-local adds per operation and a
-    /// drain each time a shard publishes its counts, on every thread of the
-    /// process while one runtime counts.
+    /// (default false: `io` is `None`). With the `io-stats` feature only,
+    /// which costs every IO call a few instructions, counted or not: off, a
+    /// count is one load of a flag per operation; on, a few plain
+    /// thread-local adds per operation and a drain each time a shard
+    /// publishes its counts, on every thread of the process while one
+    /// runtime counts.
+    #[cfg(feature = "io-stats")]
     pub fn count_io(mut self, count: bool) -> Self {
         self.count_io = count;
         self
@@ -437,6 +442,7 @@ impl Builder {
                         tuning: super::super::tuning::Tuning {
                             blocking: Some(pool.jobs_counter()),
                             record_latencies: self.record_latencies,
+                            #[cfg(feature = "io-stats")]
                             count_io: self.count_io,
                             ..self.tuning.clone()
                         },
@@ -506,7 +512,8 @@ fn already_running() -> io::Error {
 
 impl fmt::Debug for Builder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Builder")
+        let mut builder = f.debug_struct("Builder");
+        builder
             .field("worker_threads", &self.worker_threads)
             .field("thread_stack_size", &self.thread_stack_size)
             .field("max_nesting", &self.max_nesting)
@@ -519,8 +526,9 @@ impl fmt::Debug for Builder {
             .field("io_buffer_cap", &self.io_buffer_cap)
             .field("io_uring", &self.io_uring)
             .field("start_paused", &self.start_paused)
-            .field("record_latencies", &self.record_latencies)
-            .field("count_io", &self.count_io)
-            .finish_non_exhaustive()
+            .field("record_latencies", &self.record_latencies);
+        #[cfg(feature = "io-stats")]
+        builder.field("count_io", &self.count_io);
+        builder.finish_non_exhaustive()
     }
 }
