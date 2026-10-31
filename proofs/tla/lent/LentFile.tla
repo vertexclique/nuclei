@@ -123,6 +123,9 @@ Behinds == CASE Scenario = "direct" -> <<6, 8>> [] Scenario = "sync" -> <<6>> []
 ReadAhead == 2
 \* Every task (the pool, which makes the jobs' calls, is not one).
 Tasks == Readers \cup BReaders \cup PWriters \cup PReaders \cup Syncers \cup {"writer"}
+\* The handle's owner, who ends it; a run whose handle outlives it has none (so no step of an owner
+\* that does nothing is interleaved with every other step).
+Owners == IF Ending = "none" THEN {} ELSE {"owner"}
 
 (* --algorithm LentFile
 variables
@@ -796,11 +799,10 @@ W_flush_wait:
 end process;
 
 \* The handle's owner: once no task borrows the handle, it ends as `Ending` says.
-fair process owner = "owner"
+fair process owner \in Owners
 begin
-O_end:
-    if Ending = "none" then goto Done; end if;
 O_wait:
+    \* It waits until every task is done with the handle.
     await AllDone;
     if Ending = "drop" then
         \* Dropped: the object goes to the source; the last lease out closes it.
