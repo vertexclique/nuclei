@@ -1,6 +1,8 @@
 /// Nuclei's proactor configuration: the io_uring settings of every shard, and
 /// the backend of every runtime that names none. It is set once, before any
-/// IO, with [`Proactor::with_config`](crate::Proactor::with_config).
+/// IO, with [`Proactor::with_config`](crate::Proactor::with_config); a
+/// runtime with io_uring settings of its own takes them from
+/// [`Builder::io_uring`](crate::Builder::io_uring) instead.
 #[derive(Clone, Debug, Default)]
 pub struct NucleiConfig {
     /// The settings every shard's io_uring ring is made with.
@@ -126,13 +128,10 @@ pub struct IoUringConfiguration {
 
 /// The fewest entries a ring may be asked for: the floor a ring made short of
 /// memory is shrunk to.
-#[cfg(ring)]
 pub(crate) const MIN_QUEUE_LEN: u32 = 64;
 /// The smallest receive buffer.
-#[cfg(ring)]
 pub(crate) const MIN_RECV_BUFFER_SIZE: u32 = 512;
 /// The largest receive buffer.
-#[cfg(ring)]
 pub(crate) const MAX_RECV_BUFFER_SIZE: u32 = 1 << 30;
 
 /// The error for a setting outside what the runtime can work with: the
@@ -171,7 +170,6 @@ impl IoUringConfiguration {
     /// # Errors
     ///
     /// `InvalidInput` naming the setting, its value and the allowed range.
-    #[cfg(ring)]
     pub(crate) fn validate(&self) -> std::io::Result<()> {
         if self.queue_len < MIN_QUEUE_LEN {
             return Err(refuse(

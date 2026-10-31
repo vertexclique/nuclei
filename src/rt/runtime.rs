@@ -35,6 +35,7 @@ use super::task::{self, Task};
 use super::workers::Workers;
 
 mod builder;
+mod cores;
 mod enter;
 mod knobs;
 mod panic;
@@ -667,8 +668,11 @@ pub(crate) fn allowed_cores() -> Vec<usize> {
 /// A thread's CPU affinity mask.
 #[cfg(target_os = "linux")]
 pub(crate) type CpuMask = libc::cpu_set_t;
+/// A thread's CPU affinity mask: one bit per core of the process's group.
+#[cfg(windows)]
+pub(crate) type CpuMask = usize;
 /// A thread's CPU affinity mask; none is kept where threads are not pinned.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) type CpuMask = ();
 
 /// The calling thread's affinity mask, `None` where it is not known.
@@ -691,7 +695,13 @@ pub(crate) fn apply_mask(mask: &CpuMask) {
     #[cfg(target_os = "linux")]
     // SAFETY: a plain syscall with a set of our own.
     let _ = unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), mask) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use crate::syscore::windows::{GetCurrentThread, SetThreadAffinityMask};
+        // SAFETY: the pseudo-handle of the calling thread, and a mask.
+        unsafe { SetThreadAffinityMask(GetCurrentThread(), *mask) };
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     let _ = mask;
 }
 

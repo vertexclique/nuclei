@@ -1,5 +1,10 @@
-//! The [`Builder`]: every setting of a runtime, and [`build`](Builder::build),
-//! which starts the runtime they describe.
+//! The [`Builder`]: every setting of a runtime, checked once in
+//! [`build`](Builder::build), which starts the runtime they describe.
+//!
+//! A setter only records its value; `build` checks them all, each against
+//! what a runtime can work with and against the others, and refuses the
+//! first one that does not fit with `InvalidInput` naming it. No setter
+//! panics.
 
 use std::fmt;
 use std::io;
@@ -10,9 +15,7 @@ use super::super::blocking::{Pool, PoolConfig};
 use super::super::context;
 use super::super::shard::Limits;
 use super::super::workers::{Start, Workers};
-use super::{
-    DEFAULT, Inner, RngSeed, Runtime, RuntimeHandle, UnhandledPanic, allowed_cores, current_mask,
-};
+use super::{DEFAULT, Inner, RngSeed, Runtime, RuntimeHandle, UnhandledPanic};
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
 /// default, which needs no configuration to work well.
@@ -34,6 +37,9 @@ pub struct Builder {
     pub(super) io_buffer_cap: Option<usize>,
     pub(super) max_worker_threads: Option<usize>,
     pub(super) backend: Option<crate::IoBackend>,
+    pub(super) io_uring: Option<crate::config::IoUringConfiguration>,
+    pub(super) worker_cores: Option<Vec<usize>>,
+    pub(super) blocking_cores: Option<Vec<usize>>,
     pub(super) handoff_after: Option<Option<Duration>>,
     pub(super) start_paused: bool,
     pub(super) tuning: super::super::tuning::Tuning,
@@ -68,7 +74,8 @@ const MIN_HANDOFF: Duration = Duration::from_millis(1);
 const GUESTS_CAPACITY: usize = 64;
 
 impl Builder {
-    /// Refuses a size no runtime can work with, as the configuration's mistake.
+    /// Refuses a setting no runtime can work with, or one that does not fit
+    /// with another, as the configuration's mistake.
     fn validate(&self) -> io::Result<()> {
         use crate::config::refuse;
         if let Some(bytes) = self.thread_stack_size.filter(|&b| b < MIN_STACK) {
@@ -84,17 +91,56 @@ impl Builder {
         if let Some(n) = self.max_blocking_threads.filter(|&n| n < 1) {
             return Err(refuse("max_blocking_threads", n, "at least 1"));
         }
-        if let Some(Some(after)) = self
-            .handoff_after
-            .filter(|a| a.is_some_and(|a| a < MIN_HANDOFF))
+        if let (Some(workers), Some(max)) = (self.worker_threads, self.max_worker_threads)
+            && max < workers
         {
+            return Err(refuse(
+                "max_worker_threads",
+                max,
+                format_args!("at least worker_threads ({workers})"),
+            ));
+        }
+        let handoff = self.handoff_after.unwrap_or(Some(DEFAULT_HANDOFF));
+        if let Some(after) = handoff.filter(|&a| a < MIN_HANDOFF) {
             return Err(refuse(
                 "handoff_after",
                 format_args!("{after:?}"),
                 format_args!("at least {MIN_HANDOFF:?}, or None"),
             ));
         }
+        let tuning = &self.tuning;
+        for (setting, runs) in [
+            ("event_interval", tuning.driver_interval),
+            ("global_queue_interval", tuning.inbox_interval),
+        ] {
+            if runs < 1 {
+                return Err(refuse(setting, runs, "at least 1"));
+            }
+        }
+        if tuning.max_io_events < 1 {
+            return Err(refuse("max_io_events_per_tick", 0, "at least 1"));
+        }
+        if let Some(cfg) = &self.io_uring {
+            cfg.validate()?;
+        }
+        super::cores::validate("worker_cores", self.worker_cores.as_deref())?;
+        super::cores::validate("blocking_cores", self.blocking_cores.as_deref())?;
         Ok(())
+    }
+
+    /// The workers the runtime starts with: `worker_threads`, else one per
+    /// core of `worker_cores`, else one per core the process may run on;
+    /// an unset count is held to `max_worker_threads`.
+    fn worker_count(&self) -> usize {
+        if let Some(n) = self.worker_threads {
+            return n;
+        }
+        let default = self.worker_cores.as_ref().map_or_else(
+            || std::thread::available_parallelism().map_or(1, usize::from),
+            Vec::len,
+        );
+        self.max_worker_threads
+            .map_or(default, |max| default.min(max))
     }
 
     /// A builder with every setting at its default.
@@ -111,6 +157,9 @@ impl Builder {
             io_buffer_cap: None,
             max_worker_threads: None,
             backend: None,
+            io_uring: None,
+            worker_cores: None,
+            blocking_cores: None,
             handoff_after: None,
             start_paused: false,
             tuning: super::super::tuning::Tuning::default(),
@@ -121,8 +170,11 @@ impl Builder {
     }
 
     /// Worker threads, each running one shard. The default is one per core
-    /// the process may run on. Zero runs every task on the thread that
-    /// spawns it, while that thread is inside `block_on`.
+    /// of [`worker_cores`](Self::worker_cores) when it is set, else one per
+    /// core the process may run on, held to
+    /// [`max_worker_threads`](Self::max_worker_threads) when that is set.
+    /// Zero runs every task on the thread that spawns it, while that thread
+    /// is inside `block_on`.
     pub fn worker_threads(mut self, n: usize) -> Self {
         self.worker_threads = Some(n);
         self
@@ -186,11 +238,12 @@ impl Builder {
     }
 
     /// The most worker threads the runtime may start over its life, the
-    /// ones it starts with included (default four times
-    /// [`worker_threads`](Self::worker_threads)): what `spawn_more_threads`
-    /// may add up to. A stopped worker's place is not taken again. A value
-    /// below the worker threads is raised to them, whose count may come from
-    /// the machine.
+    /// ones it starts with included (default four times the workers it
+    /// starts with): what `spawn_more_threads` may add up to. A stopped
+    /// worker's place is not taken again. Below an explicit
+    /// [`worker_threads`](Self::worker_threads), [`build`](Self::build) fails
+    /// with `InvalidInput`; with `worker_threads` unset, the runtime starts
+    /// with at most this many.
     pub fn max_worker_threads(mut self, n: usize) -> Self {
         self.max_worker_threads = Some(n);
         self
@@ -224,6 +277,20 @@ impl Builder {
         self
     }
 
+    /// The settings the workers' io_uring rings are made with, for this
+    /// runtime alone (default: the process's, from
+    /// [`Proactor::with_config`](crate::Proactor::with_config)). Checked in
+    /// [`build`](Self::build), which fails with `InvalidInput` naming the
+    /// setting a ring cannot work with, on every platform; only the workers
+    /// of a runtime whose IO runs on io_uring make rings. Whether io_uring
+    /// is chosen when no backend is named is decided with these settings.
+    /// The shard of a thread inside `block_on` keeps the process's settings:
+    /// it serves every runtime the thread enters.
+    pub fn io_uring(mut self, config: crate::config::IoUringConfiguration) -> Self {
+        self.io_uring = Some(config);
+        self
+    }
+
     /// Whether the runtime's clock starts paused (default false): see
     /// [`time::pause`](crate::time::pause). Its tasks then see time move only
     /// as they [`advance`](crate::time::advance) it, or as it jumps to the
@@ -249,9 +316,11 @@ impl Builder {
         self
     }
 
-    /// Whether each worker thread is pinned to its own core (Linux; default
-    /// true). A pinned shard keeps its cache warm; unpinned, the scheduler may
-    /// move it.
+    /// Whether each worker thread is pinned to its own core (Linux and
+    /// Windows; default true). A pinned shard keeps its cache warm; unpinned,
+    /// the scheduler may move it. With
+    /// [`worker_cores`](Self::worker_cores) set, each worker is pinned to its
+    /// core of that list, or, unpinned, runs on any core of the list.
     pub fn pin_workers(mut self, pin: bool) -> Self {
         self.pin_workers = Some(pin);
         self
@@ -261,17 +330,17 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// When a worker's poller cannot be made or its thread cannot start.
+    /// `InvalidInput` naming a setting that no runtime can work with, or
+    /// that does not fit with another; the reason when the backend cannot
+    /// be had, a worker's poller cannot be made or its thread cannot start.
     pub fn build(self) -> io::Result<Runtime> {
-        let workers = self
-            .worker_threads
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
         self.validate()?;
+        let workers = self.worker_count();
         let stack = self.thread_stack_size.unwrap_or(DEFAULT_STACK);
         let limits = Limits {
             max_nesting: self.max_nesting.unwrap_or(context::DEFAULT_MAX_NESTING),
             buffer_cap: self.io_buffer_cap.unwrap_or(crate::buf::DEFAULT_CAP),
-            backend: super::super::backend::for_runtime(self.backend)?,
+            backend: super::super::backend::for_runtime(self.backend, self.io_uring.as_ref())?,
         };
         #[cfg(ring)]
         let rings = limits.backend.rings();
@@ -291,14 +360,19 @@ impl Builder {
             keep_alive: self.blocking_keep_alive.unwrap_or(DEFAULT_KEEP_ALIVE),
             stack_size: self.thread_stack_size,
             name: blocking_name,
-            cpu_mask: current_mask(),
+            cpu_mask: match &self.blocking_cores {
+                Some(cores) => super::cores::mask_of(cores),
+                None => super::current_mask(),
+            },
         });
         static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (exit_tx, exits) = kovan_channel::unbounded();
-        let cores = if self.pin_workers.unwrap_or(true) {
-            allowed_cores()
-        } else {
-            Vec::new()
+        let pin = self.pin_workers.unwrap_or(true);
+        let (cores, mask) = match &self.worker_cores {
+            Some(list) if pin => (list.clone(), None),
+            Some(list) => (Vec::new(), super::cores::mask_of(list)),
+            None if pin => (super::allowed_cores(), None),
+            None => (Vec::new(), None),
         };
         let capacity = self
             .max_worker_threads
@@ -328,6 +402,7 @@ impl Builder {
                         stack,
                         name: worker_name,
                         cores,
+                        mask,
                         handoff_after: self.handoff_after.unwrap_or(Some(DEFAULT_HANDOFF)),
                     },
                     exit_tx,
@@ -363,16 +438,26 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// As for [`build`](Self::build), and when the default runtime is
-    /// already running (it was built, or a free function started it).
+    /// As for [`build`](Self::build), and `AlreadyExists` when the default
+    /// runtime is already running (it was built, or a free function started
+    /// it).
     pub fn build_global(self) -> io::Result<RuntimeHandle> {
+        if DEFAULT.get().is_some() {
+            return Err(already_running());
+        }
         let runtime = self.build()?;
         let handle = runtime.handle();
-        DEFAULT
-            .set(runtime)
-            .map_err(|_| io::Error::other("the default runtime is already running"))?;
+        DEFAULT.set(runtime).map_err(|_| already_running())?;
         Ok(handle)
     }
+}
+
+/// The error of a second default runtime.
+fn already_running() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "the default runtime is already running",
+    )
 }
 
 impl fmt::Debug for Builder {
@@ -384,8 +469,11 @@ impl fmt::Debug for Builder {
             .field("max_blocking_threads", &self.max_blocking_threads)
             .field("thread_keep_alive", &self.blocking_keep_alive)
             .field("pin_workers", &self.pin_workers)
+            .field("worker_cores", &self.worker_cores)
+            .field("blocking_cores", &self.blocking_cores)
             .field("local_spawn_margin", &self.local_spawn_margin)
             .field("io_buffer_cap", &self.io_buffer_cap)
+            .field("io_uring", &self.io_uring)
             .field("start_paused", &self.start_paused)
             .finish_non_exhaustive()
     }

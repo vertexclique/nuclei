@@ -48,6 +48,9 @@ pub(crate) struct Start {
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
     /// The cores workers are pinned to, in turn; empty for none.
     pub(crate) cores: Vec<usize>,
+    /// The mask every worker runs on when none is pinned to a core of its
+    /// own (`Builder::worker_cores` with `pin_workers(false)`).
+    pub(crate) mask: Option<super::runtime::CpuMask>,
     /// A poll this long hands its shard to another thread; `None` for never.
     pub(crate) handoff_after: Option<Duration>,
 }
@@ -459,6 +462,8 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
     let cores = &workers.start.cores;
     if !cores.is_empty() {
         super::runtime::pin_to(cores[place % cores.len()]);
+    } else if let Some(mask) = &workers.start.mask {
+        super::runtime::apply_mask(mask);
     }
     let _seeded = workers
         .start

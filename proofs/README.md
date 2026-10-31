@@ -1690,6 +1690,71 @@ mean the poll has run at least four ticks, and a read that missed the poll just 
 saw it means the poll began after it. The model takes a bound task's home as its creator thread
 and a hand-over to a spare as one step.
 
+## A runtime's settings and the default runtime
+
+`builder` (`tla/builder/Builder.tla`) checks how a runtime's settings are checked and how the
+process default runtime is started: the setters, which only record their value
+(`src/rt/runtime/builder.rs`, `knobs.rs`, `cores.rs`); `Builder::validate`, which checks every
+setting in one place in a fixed order and refuses the first that does not fit with `InvalidInput`
+naming it, `IoUringConfiguration::validate` (`src/config.rs`) and the check of a list of cores
+among its checks; `Builder::worker_count` and the capacity `build` gives the workers;
+`build_global`, which looks at the default first, builds, then sets it; `init_with_config` and
+`GlobalExecutorConfig::builder` (`src/compat.rs`); and `try_default`
+(`src/rt/runtime/fallible.rs`), which starts the default for the free functions. Each setting
+takes a few values, each standing for every value on its side of the setting's bounds. Each
+setter's documentation is written down as the spec (which settings are out of range, which do not
+fit together, the workers a runtime starts with), and the code's checks are held to it. Two
+callers may race for the default, and the machine may refuse a build whose settings fit.
+
+| property | what it says |
+|----------|--------------|
+| `SettersNeverPanic` | no setter call panics |
+| `BuildOkIffValid` | a build answers Ok exactly when every setting is in range and they fit together (`max_worker_threads` not below an explicit `worker_threads`, `on_long_poll` not with `handoff_after(None)`): `InvalidInput` when one does not, and with every one fine Ok, or the machine's refusal |
+| `ErrorNamesFailingSetting` | an `InvalidInput` names a setting that is in fact out of range or does not fit |
+| `WorkerCount` | an Ok runtime starts with `worker_threads`, else the length of `worker_cores`, else the machine's count, either of the last two held to `max_worker_threads`; it may run `max_worker_threads` workers at most, four times its start when that is unset |
+| `SecondGlobalIsAlreadyExists` | a `build_global` that finds the default running answers `AlreadyExists` and builds nothing; one that loses the race to set it answers `AlreadyExists`, its runtime dropped |
+| `OneDefault` | the default, once set, is never replaced |
+| `InitReportsFailure` | an `init_with_config` whose build failed for another reason than `AlreadyExists` leaves an error-level record and no default; Ok and `AlreadyExists` log nothing |
+| `InitConfigFits` | the builder an executor configuration describes always fits |
+| deadlock freedom (TLC's own check, on every configuration that must pass) | every call ends |
+
+The 40 configurations, listed with their expected result in `tla/builder/EXPECTED.txt` (each
+`.cfg` says in its first lines what it checks, and why its size is enough):
+
+- **7 that must pass**, with every property and every order of setter calls, the last call
+  winning: eight settings with a range or a partner (`G_ranges`); the ring settings beside a
+  handoff, `on_long_poll` and the counts (`G_io`); the counts and both lists of cores
+  (`G_workers`); two `build_global` calls racing (`G_global`); `init_with_config`, with every
+  executor configuration, racing a `build_global` (`G_init`) or a free function's start
+  (`G_init_default`); a `build_global` racing a free function's start (`G_global_default`). The
+  machine may refuse in all but the first.
+- **27 mutations that must fail**, one per guard. Each range check taken away (the stack size,
+  nesting, blocking threads, `handoff_after`, the three knobs, the ring's queue, receive-buffer and
+  buffer-size rules, an empty list of cores or one naming a core outside, `blocking_cores` not
+  checked at all), `on_long_poll` accepted with `handoff_after(None)`, an unset `handoff_after`
+  read as None, and the early return for receive buffers off taken away (which refuses a ring that
+  fits) break `BuildOkIffValid`; the old behaviour of raising `max_worker_threads` to an explicit
+  count silently, a count that ignores `worker_cores`, and one not held to `max_worker_threads`
+  break `WorkerCount`; a refused `blocking_cores` named `worker_cores` breaks
+  `ErrorNamesFailingSetting`; a knob setter that asserts, as they did, breaks `SettersNeverPanic`;
+  `build_global` answering another error than `AlreadyExists`, building before it looks, or
+  keeping the runtime that lost the race breaks `SecondGlobalIsAlreadyExists`; a set that replaces
+  the default breaks `OneDefault`; `init_with_config` discarding the error, as it did, or logging
+  `AlreadyExists` breaks `InitReportsFailure`.
+- **6 witnesses that must fail.** Two `build_global` calls that both build, the second one
+  dropped; a count held to `max_worker_threads`; a runtime with no worker; an init that logs; a
+  refusal while two settings fail at once; a buffer size out of range accepted with receive buffers
+  off.
+
+What the model leaves out. Settings whose every value is accepted (names, keep-alive, pinning, the
+spawn margin, the seed, the hooks other than `on_long_poll`, the backend, which only the machine
+may refuse); `io_buffer_cap`, which a worker checks against its ring's buffers when it starts; and
+the environment variables (`NUCLEI_BACKEND`, the executor configuration's own). The process may
+run on every core of the machine. The lock that lets one free function start the default at a
+time is not modelled (one caller makes that start here). The spec is written from each setter's
+documentation, and most of the code's checks agree with it by construction: the mutations are what
+shows each check is needed and in its place.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the
