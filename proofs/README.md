@@ -1797,6 +1797,77 @@ handed on once; B's task makes one poll with one `with` and no nested `block_on`
 watches B's fresh slot. The making of the value on its first use, and its initializer using it
 (`Missing::Making`), are not modelled.
 
+## The task a long poll is reported for
+
+`longpoll` (`tla/longpoll/LongPoll.tla`) checks the task the monitor names when a poll runs past
+the handoff threshold (`Builder::on_long_poll`): the notes a runtime with the hook set wraps
+around its poll hooks (`compose`, `begin` and `end` in `src/rt/notes.rs`), the slot's task
+(`Slot::note_task` and `Slot::task` in `src/rt/handoff/slot.rs`), the monitor's tick loop and
+`report_long` (`run` in `src/rt/handoff/monitor.rs`), and the runner's polls and calls into the
+runtime (`poll` and `current` in `src/rt/context.rs`, `Shard::block_on` in `src/rt/shard/run.rs`,
+the order of a task's run in `src/rt/task/raw.rs`). A poll goes out of the shard with a new epoch;
+a task's poll then notes its task in the slot, keeping the one it replaced on the thread's stack,
+and puts that one back at its end, before it comes back in; a `block_on` future's poll notes
+nothing. Polls nest: a task's code may call `block_on`, whose loop polls its future first and then
+other tasks and the future again, and a call into the runtime goes out again with the poll's own
+word when it returns. The monitor reads the word each tick, and for a word read `Streak` times in a
+row while outside, other than the last one it reported, it reads the slot's task, reads the word
+again, and calls the hook with the task unless it is 0 or the word changed meanwhile (the long
+poll ended).
+
+| property | what it says |
+|----------|--------------|
+| `ReportedIsOnStack` | the hook is called only with a task whose poll is on the runner's stack when the monitor reads it, never one whose poll ended |
+| `NamesInnermostNoted` | the task read for a report is the innermost one whose begin ran and whose end has not: the poll the runner is in, or, for a `block_on` future, the task whose poll encloses it; 0 only when no task is noted |
+| `OncePerPoll` | the hook is called at most once for a poll (checked where polls do not nest; see below) |
+| `NoNewerName` | the hook never names the task of a poll that began after the long one (checked where polls do not nest; see below) |
+| `SlotTracksStack` | the lemma under the first two: the slot names the innermost noted task at every moment |
+
+The 13 configurations, listed with their expected result in `tla/longpoll/EXPECTED.txt` (each
+`.cfg` says in its first lines what it checks, and why its size is enough):
+
+- **3 that must pass.** Three polls one after the other, each calling into the runtime at will,
+  with every property (`G_flat`); a task's poll calling `block_on`, whose loop polls its future
+  and a task, four polls with calls into the runtime (`G_nested`); three levels in five polls, a
+  `block_on` in a task polled by a `block_on`'s loop or in a `block_on` future (`G_deep`). The last
+  two check every property but `OncePerPoll` and `NoNewerName`.
+- **6 mutations that must fail.** An `end` that leaves the slot naming its task (`M_end_keeps`)
+  gets the ended poll reported for the next one, breaking `ReportedIsOnStack`; a `begin` that keeps
+  no stack, so every `end` puts 0 back (`M_no_stack`, which stands for an `end` that writes 0 too),
+  loses the enclosing task once a nested task's poll ended, breaking `NamesInnermostNoted`; one
+  saved task instead of a stack (`M_one_cell`) makes the outer `end` put the outer task itself
+  back, reported once its poll ended, breaking `ReportedIsOnStack`; a monitor that does not
+  remember the word it reported (`M_no_memory`) reports a long poll at every streak, breaking
+  `OncePerPoll`; a hook called with 0 (`M_report_zero`) breaks `ReportedIsOnStack`; a monitor that
+  does not read the word again after the task (`M_no_reread`) names the next poll's task when the
+  long poll ends between its two reads, breaking `NoNewerName`.
+- **4 witnesses that must fail.** A report naming a task polled by a `block_on`'s loop inside
+  another task's poll; one naming the enclosing task while its `block_on` future is polled; one
+  naming a task whose poll began and ended inside the long one between the monitor's two reads of
+  the word (`W_newer_nested`); and one poll reported twice (`W_twice_after_nesting`).
+
+The last two are what the code allows, as the docs of `on_long_poll` say. The second read of the
+word sees a long poll that ended, but not a nested poll that began and ended within it, whose
+task the slot named for a moment. And the monitor remembers only the last word it reported: a task's poll is reported long, then a `block_on`
+future inside it is reported too (naming the same task), and once the `block_on` returns the
+task's own word comes back, no longer the last one reported, so the poll is reported a second
+time. That needs the takes at both stretches to fail (the runner coming back just as the monitor
+takes, or the heavy fence failing; a take that succeeds ends the watch of the slot), but it means
+`OncePerPoll` holds only while no poll nested in a long one is reported.
+
+What the model leaves out. A task's id is its poll's epoch, so a note left from an ended poll is
+caught even where the same task polled again would make it look right. The worker loop's own
+future (which notes nothing and returns at once) and the user's own poll hooks (which run outside
+the notes) are not modelled. The take attempt between the read of the task and the call is left
+out: the hook gets the task read whatever the take does, and a take that succeeds only ends the
+watch of the slot (the next runner's fresh slot, with the reported word forgotten, is the same
+story from the start), so letting
+every take fail sees every read a slot can see. Every step is sequentially consistent: the read of
+the word is an acquire paired with the release of `go_out`, so the read of the task after it sees
+no value older than the one the slot had when that word was written, which the interleavings
+cover. A word whose poll came back is never written again, and the model forgets the monitor's
+memory of it, which merges states that behave alike.
+
 ## A runtime's settings and the default runtime
 
 `builder` (`tla/builder/Builder.tla`) checks how a runtime's settings are checked and how the

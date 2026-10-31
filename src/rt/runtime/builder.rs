@@ -42,8 +42,10 @@ pub struct Builder {
     pub(super) blocking_cores: Option<Vec<usize>>,
     pub(super) handoff_after: Option<Option<Duration>>,
     pub(super) start_paused: bool,
+    pub(super) record_latencies: bool,
     pub(super) tuning: super::super::tuning::Tuning,
     pub(super) task_hooks: super::super::tuning::TaskHooks,
+    pub(super) long_poll: Option<super::super::tuning::TaskHook>,
     pub(super) unhandled_panic: UnhandledPanic,
     pub(super) rng_seed: Option<RngSeed>,
 }
@@ -108,6 +110,13 @@ impl Builder {
                 format_args!("at least {MIN_HANDOFF:?}, or None"),
             ));
         }
+        if self.long_poll.is_some() && handoff.is_none() {
+            return Err(refuse(
+                "on_long_poll",
+                "set with handoff_after(None)",
+                "used with handoff_after set to a duration, which is what a long poll passes",
+            ));
+        }
         let tuning = &self.tuning;
         for (setting, runs) in [
             ("event_interval", tuning.driver_interval),
@@ -162,8 +171,10 @@ impl Builder {
             blocking_cores: None,
             handoff_after: None,
             start_paused: false,
+            record_latencies: false,
             tuning: super::super::tuning::Tuning::default(),
             task_hooks: super::super::tuning::TaskHooks::default(),
+            long_poll: None,
             unhandled_panic: UnhandledPanic::Ignore,
             rng_seed: None,
         }
@@ -326,6 +337,18 @@ impl Builder {
         self
     }
 
+    /// Counts how long each task poll runs, and how long each IO operation
+    /// waits for the kernel, by kind, in log2 histograms each worker's
+    /// [`ShardStats`](crate::stats::ShardStats) carries (default false: no
+    /// clock is read for it). The poll times cost two clock reads and a call
+    /// around every poll, of every runtime of the process while one records
+    /// them; the IO latencies two clock reads per operation of this
+    /// runtime's workers.
+    pub fn record_latencies(mut self, record: bool) -> Self {
+        self.record_latencies = record;
+        self
+    }
+
     /// Starts the runtime.
     ///
     /// # Errors
@@ -380,6 +403,11 @@ impl Builder {
             .max(workers);
         let shutdown_on_panic = self.unhandled_panic == UnhandledPanic::ShutdownRuntime;
         let mut task_hooks = self.task_hooks;
+        super::super::notes::compose(
+            &mut task_hooks,
+            self.long_poll.is_some(),
+            self.record_latencies,
+        );
         if task_hooks.before_poll.is_some() || task_hooks.after_poll.is_some() {
             super::super::tuning::ANY_POLL_HOOKS.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -396,6 +424,7 @@ impl Builder {
                         limits,
                         tuning: super::super::tuning::Tuning {
                             blocking: Some(pool.jobs_counter()),
+                            record_latencies: self.record_latencies,
                             ..self.tuning.clone()
                         },
                         seed: self.rng_seed,
@@ -404,6 +433,7 @@ impl Builder {
                         cores,
                         mask,
                         handoff_after: self.handoff_after.unwrap_or(Some(DEFAULT_HANDOFF)),
+                        long_poll: self.long_poll,
                     },
                     exit_tx,
                 ),
@@ -475,6 +505,7 @@ impl fmt::Debug for Builder {
             .field("io_buffer_cap", &self.io_buffer_cap)
             .field("io_uring", &self.io_uring)
             .field("start_paused", &self.start_paused)
+            .field("record_latencies", &self.record_latencies)
             .finish_non_exhaustive()
     }
 }

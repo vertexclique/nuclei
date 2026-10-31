@@ -41,6 +41,7 @@ mod fallible;
 mod knobs;
 mod panic;
 mod placement;
+mod stats;
 pub use self::builder::Builder;
 pub use self::enter::{EnterGuard, RuntimeId, TryCurrentError, worker_index};
 pub(crate) use self::fallible::{try_current, try_spawn, try_spawn_blocking, try_spawn_local};
@@ -422,9 +423,11 @@ where
     task
 }
 
-/// Calls the spawn hook, if the task's runtime has one.
+/// Calls the spawn hook, if the task's runtime has one, with the name a
+/// `task::Builder` gives the task in place first, so every hook sees it.
 fn spawned<T>(hooks: Option<&super::tuning::TaskHooks>, task: &Task<T>) {
     if let Some(hooks) = hooks {
+        crate::task::name_now(task.id());
         super::tuning::call(hooks.spawn.as_ref(), task.id());
     }
 }

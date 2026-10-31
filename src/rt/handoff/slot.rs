@@ -20,6 +20,10 @@
 //! runner's code, during which the monitor takes nothing even when a nested
 //! `block_on` in that code goes outside (proofs/tla/shardlocal); the monitor
 //! reads them after an outside word, whose release store came after them.
+//! The id of the task whose poll is innermost on the runner's stack is noted
+//! as each poll begins and ends, only while the runtime has a long-poll hook
+//! (proofs/tla/longpoll); the monitor reads it once a poll has run four of
+//! its ticks.
 
 use core::sync::atomic::compiler_fence;
 
@@ -71,6 +75,8 @@ pub(crate) struct Slot {
     full_fence: bool,
     /// Shard-local values lent to the runner's code now.
     pins: AtomicU32,
+    /// The id of the task polled innermost, 0 for none.
+    task: AtomicU64,
 }
 
 impl Slot {
@@ -82,6 +88,7 @@ impl Slot {
             claim: AtomicU8::new(NONE),
             full_fence,
             pins: AtomicU32::new(0),
+            task: AtomicU64::new(0),
         }
     }
 
@@ -102,6 +109,19 @@ impl Slot {
     /// it read an outside word (which pairs with the store of the pins).
     pub(crate) fn is_pinned(&self) -> bool {
         self.pins.load(Ordering::Relaxed) != 0
+    }
+
+    /// The runner polls the task `id` (0: none) from now on; answers the one
+    /// it polled before, which encloses this poll.
+    pub(crate) fn note_task(&self, id: u64) -> u64 {
+        let previous = self.task.load(Ordering::Relaxed);
+        self.task.store(id, Ordering::Relaxed);
+        previous
+    }
+
+    /// The task polled innermost, as the monitor reads it.
+    pub(crate) fn task(&self) -> u64 {
+        self.task.load(Ordering::Relaxed)
     }
 
     /// The runner leaves the shard for a task's code, in the poll of

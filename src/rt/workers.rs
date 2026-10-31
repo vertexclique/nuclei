@@ -53,6 +53,8 @@ pub(crate) struct Start {
     pub(crate) mask: Option<super::runtime::CpuMask>,
     /// A poll this long hands its shard to another thread; `None` for never.
     pub(crate) handoff_after: Option<Duration>,
+    /// Told of each poll the monitor sees run past `handoff_after`.
+    pub(crate) long_poll: Option<super::tuning::TaskHook>,
 }
 
 /// A runtime's worker shards.
@@ -108,6 +110,7 @@ impl Workers {
                     after,
                     capacity,
                     super::runtime::allowed_cores(),
+                    start.long_poll.clone(),
                 ))
             });
         Self {

@@ -125,12 +125,19 @@ pub(crate) struct Monitor {
     closing: crate::sync::Notify,
     /// The cores of the process, which a blocked thread may run on.
     cores: Vec<usize>,
+    /// Told of each poll seen past the threshold.
+    long_poll: Option<crate::rt::tuning::TaskHook>,
 }
 
 impl Monitor {
     /// The watch of a runtime with room for `places` workers, a poll of
-    /// `after` a blocked one.
-    pub(crate) fn new(after: Duration, places: usize, cores: Vec<usize>) -> Self {
+    /// `after` a blocked one, each told to `long_poll`.
+    pub(crate) fn new(
+        after: Duration,
+        places: usize,
+        cores: Vec<usize>,
+        long_poll: Option<crate::rt::tuning::TaskHook>,
+    ) -> Self {
         Self {
             after,
             full_fence: !super::fence::available(),
@@ -141,7 +148,22 @@ impl Monitor {
             closed: AtomicBool::new(false),
             closing: crate::sync::Notify::new(),
             cores,
+            long_poll,
         }
+    }
+
+    /// Tells the long-poll hook of the poll of task `task` (0: a poll that
+    /// is no task's, which nothing is told of). A hook that panics is let
+    /// go of: the watch goes on.
+    fn report_long(&self, task: u64) {
+        let (Some(hook), Some(id)) = (
+            &self.long_poll,
+            core::num::NonZeroU64::new(task).map(crate::rt::task::Id),
+        ) else {
+            return;
+        };
+        let meta = crate::rt::tuning::TaskMeta::new(id);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(&meta)));
     }
 
     /// A slot for a new runner.
@@ -232,6 +254,8 @@ struct Watch {
     last: u64,
     streak: u32,
     longest: u32,
+    /// The word of the last poll told to the long-poll hook.
+    reported: u64,
 }
 
 /// The monitor's thread: watches the workers of the runtime of `runtime`
@@ -288,6 +312,7 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
                 last: slot::inside(0),
                 streak: 0,
                 longest: 0,
+                reported: slot::inside(0),
             });
             let word = watch.runner.slot.word();
             if slot::is_outside(word) && word == watch.last {
@@ -300,13 +325,31 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
                 watch.streak = 0;
             }
             watch.last = word;
-            if watch.streak < STREAK || waiting.is_some() {
+            if watch.streak < STREAK {
                 continue;
             }
-            watch.streak = 0;
-            if let Some(gift) = take(monitor, place, index, watch, word) {
-                place.shared.counters.longest_poll(tick * STREAK);
-                waiting = deliver(&mut watches, gift);
+            // Once per word: read before the take, which gives the runner a
+            // fresh slot; told after it, so the hook delays no rescue. The
+            // word read again: a poll that ended meanwhile is not told under
+            // the task that came after it (proofs/tla/longpoll).
+            let long = (watch.reported != word).then(|| {
+                watch.reported = word;
+                let task = watch.runner.slot.task();
+                if watch.runner.slot.word() == word {
+                    task
+                } else {
+                    0
+                }
+            });
+            if waiting.is_none() {
+                watch.streak = 0;
+                if let Some(gift) = take(monitor, place, index, watch, word) {
+                    place.shared.counters.longest_poll(tick * STREAK);
+                    waiting = deliver(&mut watches, gift);
+                }
+            }
+            if let Some(task) = long {
+                monitor.report_long(task);
             }
         }
     }
@@ -361,6 +404,8 @@ fn take(
         life: Arc::clone(&old.life),
     };
     watch.last = slot::inside(0);
+    // The new runner's words are its own: none is held back as told.
+    watch.reported = slot::inside(0);
     Some(Gift {
         place: index,
         shard: Owned(shard),

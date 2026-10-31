@@ -64,6 +64,24 @@ impl Builder {
         self
     }
 
+    /// Called with each poll of a task of this runtime that its worker's
+    /// watch sees run past [`handoff_after`](Builder::handoff_after), on the
+    /// watch's own thread: the task's id and name say which one holds its
+    /// worker up. The task is the innermost one whose poll was running when
+    /// the watch looked; the poll may have ended by the time the hook runs.
+    /// A poll is told once, unless a `block_on` inside it ran a long poll of
+    /// its own and the shard stayed on that thread: the outer poll may then
+    /// be told again as it goes on. The shard is handed on first, so a slow
+    /// hook delays no rescue, but every other worker waits for its next look
+    /// while the hook runs: keep it short. A panic in it is caught (after the
+    /// panic hook reported it) and the watch goes on. Only workers are
+    /// watched; with `handoff_after(None)` [`build`](Builder::build) fails
+    /// with `InvalidInput`.
+    pub fn on_long_poll(mut self, f: impl Fn(&TaskMeta<'_>) + Send + Sync + 'static) -> Self {
+        self.long_poll = Some(Arc::new(f));
+        self
+    }
+
     /// Task runs between a worker's looks at its timers and IO when it is
     /// busy (default 61): lower answers IO sooner, higher runs tasks with
     /// fewer interruptions. At least 1; [`build`](Builder::build) fails with

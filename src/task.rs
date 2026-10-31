@@ -67,7 +67,9 @@ impl Future for YieldNow {
 }
 
 /// Spawns tasks with options: a name, kept with the task's id while the
-/// task lives, and the worker to place it on. Every spawn answers an error where the free functions
+/// task lives and shown to the runtime's task hooks
+/// ([`TaskMeta::name`](crate::runtime::TaskMeta::name)), and the worker to
+/// place it on. Every spawn answers an error where the free functions
 /// panic.
 ///
 /// ```
@@ -81,6 +83,25 @@ impl Future for YieldNow {
 pub struct Builder<'a> {
     name: Option<&'a str>,
     worker: Option<usize>,
+}
+
+std::thread_local! {
+    /// The name a builder's spawn on this thread gives its task, until the
+    /// spawn names it (before the hooks see the task) or the builder does.
+    static NAMING: core::cell::RefCell<Option<std::sync::Arc<str>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Names the task `id`, just made by a builder's spawn on this thread, with
+/// the builder's name, before any hook of its runtime sees it.
+pub(crate) fn name_now(id: Id) {
+    if let Some(name) = NAMING
+        .try_with(|naming| naming.borrow_mut().take())
+        .ok()
+        .flatten()
+    {
+        crate::rt::task::names::set(id, &name);
+    }
 }
 
 impl<'a> Builder<'a> {
@@ -180,12 +201,23 @@ impl<'a> Builder<'a> {
         self.named(|| crate::rt::runtime::try_spawn(handle.inner(), self.worker, future))
     }
 
-    /// Names the task `spawn` makes while this call holds its handle, so
-    /// the name is in place before the task can be destroyed.
+    /// Runs `spawn` with the builder's name waiting for the task it makes,
+    /// then names the task if no hook's spawn did; the name is in place
+    /// while this call holds the task's handle, so before the task can be
+    /// destroyed.
     fn named<T>(self, spawn: impl FnOnce() -> io::Result<Task<T>>) -> io::Result<Task<T>> {
+        let Some(name) = self.name else {
+            return spawn();
+        };
+        let name: std::sync::Arc<str> = std::sync::Arc::from(name);
+        let _ = NAMING.try_with(|naming| *naming.borrow_mut() = Some(std::sync::Arc::clone(&name)));
         let spawned = spawn();
-        if let (Ok(task), Some(name)) = (&spawned, self.name) {
-            crate::rt::task::names::set(task.id(), name);
+        let waiting = NAMING
+            .try_with(|naming| naming.borrow_mut().take())
+            .ok()
+            .flatten();
+        if let (Ok(task), Some(name)) = (&spawned, waiting) {
+            crate::rt::task::names::set(task.id(), &name);
         }
         spawned
     }

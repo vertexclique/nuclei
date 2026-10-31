@@ -655,6 +655,9 @@ impl Shard {
         monitor: Option<Arc<super::handoff::Monitor>>,
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
+        if tuning.record_latencies {
+            shard.shared.counters.record_latencies();
+        }
         shard.until_inbox.set(tuning.inbox_interval);
         shard.tuning = tuning;
         shard.monitor = monitor;
@@ -764,7 +767,7 @@ impl Shard {
             port: kernel,
             io_ops: SegQueue::new(),
             io_closed: AtomicBool::new(false),
-            counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
+            counters: Counters::new(driver.backend(), pool.cap(), owner),
             runtime: std::sync::OnceLock::new(),
             writes: AtomicUsize::new(0),
             released: AtomicBool::new(false),

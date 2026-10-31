@@ -189,6 +189,13 @@ pub(crate) fn current_pinned<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
     })
 }
 
+/// Runs `f` with the slot of this thread, while it runs a worker shard the
+/// monitor watches.
+pub(crate) fn with_slot<R>(f: impl FnOnce(Option<&Slot>) -> R) -> R {
+    // SAFETY: as in `Here::come_back`.
+    HERE.with(|here| f(unsafe { here.slot.get().as_ref() }))
+}
+
 /// Runs `f` with the shard whose driver this thread may use now: the one
 /// it runs, or else its own, which no other thread ever runs.
 #[cfg(ring)]

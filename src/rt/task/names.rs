@@ -29,7 +29,6 @@ pub(crate) fn set(id: Id, name: &str) {
 }
 
 /// The name of the task `id`, if it has one.
-#[allow(dead_code)] // read by the task dump
 pub(crate) fn get(id: Id) -> Option<Arc<str>> {
     if NAMED.load(Ordering::Relaxed) == 0 {
         return None;

@@ -32,6 +32,8 @@ pub(crate) struct Tuning {
     /// Jobs in flight on the runtime's blocking pool: while any is, a shard that
     /// runs dry spins, as one of them may wake it.
     pub(crate) blocking: Option<Arc<crate::sync::internal::AtomicUsize>>,
+    /// The shard times its IO operations, by kind (`Builder::record_latencies`).
+    pub(crate) record_latencies: bool,
 }
 
 impl Default for Tuning {
@@ -44,6 +46,7 @@ impl Default for Tuning {
             lifo: true,
             hooks: ThreadHooks::default(),
             blocking: None,
+            record_latencies: false,
         }
     }
 }
@@ -97,6 +100,7 @@ impl core::fmt::Debug for ThreadHooks {
 #[derive(Debug)]
 pub struct TaskMeta<'a> {
     id: crate::task::Id,
+    name: Option<Arc<str>>,
     _task: core::marker::PhantomData<&'a ()>,
 }
 
@@ -104,6 +108,7 @@ impl TaskMeta<'_> {
     pub(crate) fn new(id: crate::task::Id) -> Self {
         Self {
             id,
+            name: super::task::names::get(id),
             _task: core::marker::PhantomData,
         }
     }
@@ -111,6 +116,12 @@ impl TaskMeta<'_> {
     /// The task's id.
     pub fn id(&self) -> crate::task::Id {
         self.id
+    }
+
+    /// The task's name, as [`task::Builder::name`](crate::task::Builder::name)
+    /// gave it; `None` for a task spawned without one.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
 

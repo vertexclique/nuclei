@@ -112,8 +112,13 @@ pub(crate) struct Counters {
     handoffs: AtomicU64,
     /// The longest poll the runtime's monitor saw, in nanoseconds.
     longest_poll_nanos: AtomicU64,
-    /// The shard's place among its runtime's workers.
-    worker: Option<usize>,
+    /// Times a task's poll spent its budget and yielded.
+    budget_yields: AtomicU64,
+    /// The poll times, while the runtime records them (made once, before the
+    /// shard runs anything).
+    poll_times: OnceLock<Box<Buckets>>,
+    /// The shard's runtime and its place among the runtime's workers.
+    owner: Option<(u64, usize)>,
     /// The shard went: its `Shared` may outlive it, held by a waker.
     gone: AtomicBool,
     backend: IoBackend,
@@ -137,8 +142,8 @@ pub(crate) struct Published {
 
 impl Counters {
     /// The counters of a shard of `backend` whose pool holds `buffer_cap`
-    /// bytes, worker `worker` of its runtime if it is one.
-    pub(crate) fn new(backend: IoBackend, buffer_cap: usize, worker: Option<usize>) -> Self {
+    /// bytes, worker `owner` (a runtime and a place) if it is one.
+    pub(crate) fn new(backend: IoBackend, buffer_cap: usize, owner: Option<(u64, usize)>) -> Self {
         Self {
             polls: AtomicU64::new(0),
             parks: AtomicU64::new(0),
@@ -153,7 +158,9 @@ impl Counters {
             cq_overflows: AtomicU64::new(0),
             handoffs: AtomicU64::new(0),
             longest_poll_nanos: AtomicU64::new(0),
-            worker,
+            budget_yields: AtomicU64::new(0),
+            poll_times: OnceLock::new(),
+            owner,
             gone: AtomicBool::new(false),
             backend,
             buffer_cap,
@@ -189,6 +196,30 @@ impl Counters {
         self.longest_poll_nanos.fetch_max(nanos, Ordering::Relaxed);
     }
 
+    /// The shard records the time of each poll from now on.
+    pub(crate) fn record_latencies(&self) {
+        let _ = self.poll_times.set(Box::new(Buckets::new()));
+    }
+
+    /// A poll of `length` ran on the shard, which records poll times.
+    pub(crate) fn poll_time(&self, length: std::time::Duration) {
+        if let Some(buckets) = self.poll_times.get() {
+            buckets.add(length);
+        }
+    }
+
+    /// A poll on the shard spent its budget and yielded. Only the thread
+    /// inside the shard counts it: a load and a store.
+    pub(crate) fn budget_yield(&self) {
+        let n = self.budget_yields.load(Ordering::Relaxed);
+        self.budget_yields.store(n + 1, Ordering::Relaxed);
+    }
+
+    /// The runtime the shard is a worker of.
+    pub(crate) fn runtime(&self) -> Option<u64> {
+        self.owner.map(|(runtime, _)| runtime)
+    }
+
     /// The shard went: `stats` lists it no more.
     pub(crate) fn went(&self) {
         self.gone.store(true, Ordering::Relaxed);
@@ -208,7 +239,8 @@ impl Counters {
     /// The counts as they are now, with `tasks` the shard's live tasks.
     pub(crate) fn read(&self, tasks: usize) -> ShardStats {
         ShardStats {
-            worker: self.worker,
+            worker: self.owner.map(|(_, place)| place),
+            runtime: self.runtime().map(crate::runtime::RuntimeId::from_raw),
             backend: self.backend,
             tasks,
             polls: self.polls.load(Ordering::Relaxed),
@@ -232,7 +264,31 @@ impl Counters {
             longest_poll: std::time::Duration::from_nanos(
                 self.longest_poll_nanos.load(Ordering::Relaxed),
             ),
+            budget_yields: self.budget_yields.load(Ordering::Relaxed),
+            poll_times: self.poll_times.get().map(|buckets| buckets.read()),
             errors: self.errors.read(),
+        }
+    }
+}
+
+/// A log2 histogram of durations as its writers count it: bucket `i` holds
+/// the samples of `2^i` nanoseconds up to `2^(i+1)` (bucket 0 the ones under
+/// 2). Any thread may add, with one `Relaxed` add.
+pub(crate) struct Buckets([AtomicU64; crate::stats::BUCKETS]);
+
+impl Buckets {
+    pub(crate) fn new() -> Self {
+        Self([const { AtomicU64::new(0) }; crate::stats::BUCKETS])
+    }
+
+    pub(crate) fn add(&self, length: std::time::Duration) {
+        let nanos = u64::try_from(length.as_nanos()).unwrap_or(u64::MAX);
+        self.0[crate::stats::bucket_of(nanos)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn read(&self) -> crate::stats::Histogram {
+        crate::stats::Histogram {
+            buckets: core::array::from_fn(|i| self.0[i].load(Ordering::Relaxed)),
         }
     }
 }
@@ -354,14 +410,45 @@ pub(crate) fn snapshot() -> Stats {
         .filter(|shared| !shared.counters.is_gone())
         .map(|shared| shared.stats())
         .collect();
-    // Workers first, by place; then the threads' own shards.
-    shards.sort_by_key(|shard| (shard.worker.is_none(), shard.worker));
+    // Workers first, by runtime and place; then the threads' own shards.
+    shards.sort_by_key(|shard| (shard.worker.is_none(), shard.runtime, shard.worker));
     Stats {
         shards,
         blocking_threads: super::blocking::threads_alive(),
+        blocking_queue_depth: super::blocking::queued_everywhere(),
         off_shard_errors: OFF_SHARD.read(),
         receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
     }
+}
+
+/// The counts of the worker shards of runtime `runtime`, by place, with the
+/// blocking pool's `threads` and `queued` jobs, and the process's counts of
+/// what belongs to no runtime.
+pub(crate) fn runtime_snapshot(
+    workers: impl Iterator<Item = ShardStats>,
+    threads: usize,
+    queued: usize,
+) -> Stats {
+    Stats {
+        shards: workers.collect(),
+        blocking_threads: threads,
+        blocking_queue_depth: queued,
+        off_shard_errors: OFF_SHARD.read(),
+        receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
+    }
+}
+
+/// A poll on the shard this thread runs spent its budget and yielded. Out
+/// of line, so the budget's check, inlined into every IO future, stays as
+/// small as it was.
+#[cold]
+#[inline(never)]
+pub(crate) fn budget_yield() {
+    super::context::current(|shard| {
+        if let Some(shard) = shard {
+            shard.shared.counters.budget_yield();
+        }
+    });
 }
 
 #[cfg(all(test, not(loom)))]

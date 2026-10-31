@@ -46,7 +46,9 @@ pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
 
 /// Spends one operation of the budget for `poll`, or yields when it is spent:
 /// `Pending`, with the task woken to run again after the others. A `poll`
-/// that answers `Pending` gets its operation back.
+/// that answers `Pending` gets its operation back. Always inlined: it wraps
+/// every IO operation's poll, and its spent branch is a call out of line.
+#[inline(always)]
 pub(crate) fn poll_budget<T>(
     cx: &mut Context<'_>,
     poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
@@ -54,6 +56,7 @@ pub(crate) fn poll_budget<T>(
     let left = LEFT.try_with(Cell::get).ok().flatten();
     match left {
         Some(0) => {
+            crate::rt::counters::budget_yield();
             cx.waker().wake_by_ref();
             Poll::Pending
         }
