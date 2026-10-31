@@ -54,8 +54,18 @@
   128 entries or fewer and the default 256-buffer group had a cap of 1: the multishot receive armed
   for an HTTP client's reply held it, and the request's send waited for the receive to end.
 
+- **A file cut by `set_len` no longer hands out bytes read ahead past its new end.** A cut, a range
+  call (`allocate`) and a copy into the file move its generation on, so a cursor read made after them
+  reads the file as it is.
+
 ### Changed
 
+- **The owned calls are generic over their buffer.** A caller handing a `Vec<u8>` in, and binding the
+  buffer it gets back, compiles as before. Two forms that leaned on the old `Vec<u8>` parameter no
+  longer infer a type: an argument the compiler had to infer from it (`Default::default()`, `.into()`,
+  `Vec::new().into()`), which now needs its type written (`Vec::<u8>::new()`); and naming the address
+  type of `UdpSocket::send_to_owned` or `UnixDatagram::send_to_owned` explicitly, which now takes the
+  buffer type too (`send_to_owned::<A, _>`).
 - **Sizes are validated where they take effect**, and a value outside what the runtime can work
   with is refused as `InvalidInput` naming the setting, its value and the allowed range (the first
   runtime build for the io_uring settings, `Builder::build` for the builder's). Values that were
@@ -78,6 +88,43 @@
 
 ### Added
 
+- **Owned calls take any buffer type.** `read_owned`, `write_owned`, `write_zero_copy`, the datagram
+  owned calls and the file owned calls take any `IoBuf` (writes) or `IoBufMut` (reads) and give the
+  same type back; a caller passing a `Vec<u8>` gets a `Vec<u8>` back as before (the
+  runtime holds the buffer in a vector's size, and boxes any other type once). `Released` is
+  `Released<B = Vec<u8>>`. A caller's own type implements the two unsafe traits.
+- **`AlignedBuf`**, a buffer of a fixed capacity at an address of a chosen alignment, made by a safe
+  constructor: the buffer for a file opened for direct IO. Its memory is the caller's, not charged to
+  the IO buffer cap.
+- **Owned vectored IO**: `write_vectored_owned` writes every buffer of an `IoVecBuf` (`Vec<B>`,
+  `[B; N]`) in order as one write, with no other write of the handle between them, and
+  `read_vectored_owned` fills the rooms of an `IoVecBufMut`'s buffers in order, on TCP and Unix
+  streams, pipes and files. Each kernel call takes every buffer at once: `writev`/`readv` or a
+  `sendmsg`/`recvmsg` of several buffers on epoll and kqueue, `IORING_OP_WRITEV`/`READV` or
+  `SENDMSG`/`RECVMSG` on io_uring, a `WSASend`/`WSARecv` of several `WSABUF`s on I/O completion
+  ports, `pwritev`/`preadv` for files; a call the kernel takes part of goes on from the byte it
+  stopped at. Where the system has no vectored call of the kind, the buffers go one call each, in
+  order: a buffered file on Windows reads and writes so, and a Windows handle that is not a socket
+  writes so and reads into its first room (a short read).
+- **Positional file IO on a shared handle**: `read_at`, `write_at`, `read_exact_at`, `write_all_at`,
+  `read_at_owned`, `write_at_owned` and `read_many_at` (many reads in one call, at most 64 out at
+  once, together on the shard's ring), ordered after the writes accepted at the cursor before them.
+- **More file calls**: `allocate` (`Allocate::{Extend, KeepSize, PunchHole, ZeroRange}`, on the ring
+  as `IORING_OP_FALLOCATE`; a mode the system has not answers `Unsupported`), `sync_range`
+  (`IORING_OP_SYNC_FILE_RANGE` on Linux, a data sync elsewhere), `fs::sync_dir` with the
+  rename-then-sync recipe, `copy_range_to` (`copy_file_range` in bounded chunks, read and write
+  where the kernel cannot), and advisory `lock_file`, `try_lock_file` and `unlock_file` (the
+  blocking lock on the pool, never left held by a dropped future). `sync_all` and `sync_data` are operations of the ring,
+  and a failed sync makes every later one of the handle fail. A file opened for direct IO is read and
+  written with exactly the caller's lengths and offsets.
+- **`read_at` and `write_at` on `Handle<File>` are the async calls**, and shadow std's
+  `FileExt::read_at` and `write_at` reached through `Deref`, which block the worker; std's stay
+  reachable as `(*file).read_at(..)`. The lock calls take names of their own, so std's `File::lock`,
+  `try_lock` and `unlock` through `Deref` are unchanged.
+- **TLA+ models** of a file's positional calls, syncs, direct IO and descriptor leases
+  (`proofs/tla/lent/LentFile.tla`), of a file lock's cancellation (`proofs/tla/flock`) and of many
+  reads in one call (`proofs/tla/many`), each with mutations that break their rules, and a Lean
+  proof that a vectored read fills its buffers' rooms in order (`proofs/lean/Nuclei/Fill.lean`).
 - **`shut` and `abort` on streams.** `TcpStream::shut(how)` and `UnixStream::shut(how)` make std's
   shutdown once the bytes written behind reached the kernel (`Write`, `Both`), and the reading
   half's through the ring's `SHUTDOWN` where the calling thread runs a ring; reads after it answer
@@ -101,10 +148,12 @@
 - **What std's calls through `Deref` do**, on `Handle`: `shutdown`, `set_nonblocking(false)`,
   `take_error`, `Read` and `Write` go around the bytes read ahead and written behind, or block the
   shard; `UdpSocket::connect` is a constructor where `socket.connect(addr)` is std's.
-- **Counts of each worker's IO in `stats`, behind the `io-stats` feature** (off by default):
+- **Each worker's IO in `stats`, behind the `io-stats` feature** (off by default): counts with
   `Builder::count_io` and `ShardStats::io` (`IoCounts`: reads, writes, the bytes of each,
-  accepts). The feature costs every IO call a few instructions, counted or not; without it no IO
-  path carries counting code, and the counting items do not exist.
+  accepts), and the IO latencies `Builder::record_latencies` records in `ShardStats::io_latencies`
+  (`IoLatencies`). The feature costs every IO call a few instructions, counted and timed or not;
+  without it no IO path carries that code, and those items do not exist. The poll-time histograms
+  need no feature.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.

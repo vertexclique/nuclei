@@ -343,13 +343,13 @@ impl Builder {
         self
     }
 
-    /// Counts how long each task poll runs, and how long each IO operation
-    /// waits for the kernel, by kind, in log2 histograms each worker's
-    /// [`ShardStats`](crate::stats::ShardStats) carries (default false: no
-    /// clock is read for it). The poll times cost two clock reads and a call
-    /// around every poll, of every runtime of the process while one records
-    /// them; the IO latencies two clock reads per operation of this
-    /// runtime's workers.
+    /// Counts how long each task poll runs, and (with the `io-stats` feature)
+    /// how long each IO operation waits for the kernel, by kind, in log2
+    /// histograms each worker's [`ShardStats`](crate::stats::ShardStats)
+    /// carries (default false: no clock is read for it). The poll times cost
+    /// two clock reads and a call around every poll, of every runtime of the
+    /// process while one records them; the IO latencies two clock reads per
+    /// operation of this runtime's workers.
     pub fn record_latencies(mut self, record: bool) -> Self {
         self.record_latencies = record;
         self

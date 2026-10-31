@@ -427,11 +427,20 @@ where
 
 /// Calls the spawn hook, if the task's runtime has one, with the name a
 /// `task::Builder` gives the task in place first, so every hook sees it.
+#[inline(always)]
 fn spawned<T>(hooks: Option<&super::tuning::TaskHooks>, task: &Task<T>) {
     if let Some(hooks) = hooks {
-        crate::task::name_now(task.id());
-        super::tuning::call(hooks.spawn.as_ref(), task.id());
+        spawned_with(hooks, task.id());
     }
+}
+
+/// [`spawned`] for a runtime with task hooks: out of line, so a spawn with
+/// none carries none of it.
+#[cold]
+#[inline(never)]
+fn spawned_with(hooks: &super::tuning::TaskHooks, id: task::Id) {
+    crate::task::name_now(id);
+    super::tuning::call(hooks.spawn.as_ref(), id);
 }
 
 /// The task hooks of the runtime set on this thread, looked for only while

@@ -30,6 +30,7 @@ use std::io;
 #[cfg(readiness)]
 use std::os::fd::RawFd;
 
+use crate::buf::owned::OwnedBuf;
 use crate::io::raw::Owned;
 use std::sync::Arc;
 use std::task::Context;
@@ -67,7 +68,7 @@ enum Datagram {
     #[cfg(ring)]
     Ring(crate::rt::shard::recv::RingChunk),
     Owned {
-        buf: Vec<u8>,
+        buf: OwnedBuf,
         start: usize,
     },
 }
@@ -93,11 +94,8 @@ impl Datagram {
 
     /// Appends the datagram to `out`, cut to its spare capacity as the
     /// kernel cuts it.
-    fn append_to(&self, out: &mut Vec<u8>) -> usize {
-        let src = self.bytes();
-        let n = src.len().min(out.capacity() - out.len());
-        out.extend_from_slice(&src[..n]);
-        n
+    fn append_to(&self, out: &mut OwnedBuf) -> usize {
+        out.append(self.bytes())
     }
 
     #[cfg_attr(
@@ -129,7 +127,7 @@ enum Peer {
 
 /// A task's own buffer, lent to the side for the driver to read into.
 struct Lent {
-    buf: Vec<u8>,
+    buf: OwnedBuf,
     /// What the buffer held before: the read's bytes start here.
     from: usize,
     /// The read's result, once the driver made it.
@@ -625,13 +623,19 @@ impl ReadState {
 
     #[cfg(readiness)]
     /// Reads into the spare capacity of the lent buffer, and wakes its task.
+    /// Out of line: its caller checks for a lent buffer, and the read-ahead's
+    /// own path stays small without it.
+    #[inline(never)]
     fn read_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) {
         let Some(lent) = self.lent.as_mut() else {
             return;
         };
-        let spare = lent.buf.spare_capacity_mut();
-        let asked = spare.len();
-        let result = match sys::ready(sys::read_uninit(fd, spare)).inspect(tally::reading) {
+        let asked = lent.buf.capacity() - lent.buf.len();
+        let read = match lent.buf.vectored_mut() {
+            Some(bufs) => sys::readv(fd, bufs.read_iovecs()),
+            None => sys::read_uninit(fd, lent.buf.spare_capacity_mut()),
+        };
+        let result = match sys::ready(read).inspect(tally::reading) {
             None => {
                 self.blocked = true;
                 return;
@@ -640,7 +644,7 @@ impl ReadState {
         };
         if let Ok(n) = result {
             // SAFETY: the kernel wrote the first `n` bytes of the spare
-            // capacity.
+            // capacity (of a vectored buffer, its rooms in order).
             unsafe { lent.buf.set_len(lent.buf.len() + n) };
             self.blocked = drained(kind, self.unsure, n, asked);
         }
@@ -653,6 +657,7 @@ impl ReadState {
     #[cfg(readiness)]
     /// Receives one datagram into the spare capacity of the lent buffer, and
     /// wakes its task.
+    #[inline(never)]
     fn receive_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) {
         let Some(lent) = self.lent.as_mut() else {
             return;
@@ -842,7 +847,7 @@ impl ReadState {
         &mut self,
         io: Io<'_>,
         kind: Kind,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Option<OwnedBuf>,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -912,7 +917,7 @@ impl ReadState {
         &mut self,
         io: Io<'_>,
         kind: Kind,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Option<OwnedBuf>,
         from: &mut Option<Addr>,
         waker: &Waker,
         after: &mut After,
@@ -1021,13 +1026,21 @@ impl ReadState {
                     self.ahead.is_empty(),
                     "bytes were read past the lent buffer"
                 );
-                self.ahead.push(
-                    Piece::Left {
-                        buf: lent.buf,
-                        start: lent.from,
-                    },
-                    after,
-                );
+                match lent.buf.into_vectored() {
+                    // Each buffer's bytes read, in order, past what it held.
+                    Ok(bufs) => {
+                        for (buf, start) in bufs.read_parts() {
+                            self.ahead.push(Piece::Left { buf, start }, after);
+                        }
+                    }
+                    Err(buf) => self.ahead.push(
+                        Piece::Left {
+                            buf,
+                            start: lent.from,
+                        },
+                        after,
+                    ),
+                }
             }
             Some(Err(err)) => self.error = Some(err),
         }
@@ -1035,7 +1048,7 @@ impl ReadState {
     }
 
     /// The lent buffer back, as it is, for a poll that ends in an error.
-    fn reclaim(&mut self, after: &mut After) -> Option<Vec<u8>> {
+    fn reclaim(&mut self, after: &mut After) -> Option<OwnedBuf> {
         if self.lent.as_ref().is_some_and(|l| l.out) {
             // Out with a ring operation, it cannot come back now: its
             // completion hands what came to the read-ahead.

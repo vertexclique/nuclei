@@ -6,19 +6,20 @@
 //! descriptor, of which every job holds a lease until it ends (so a handle
 //! dropped while a job runs leaves its object to the job, which closes it,
 //! the job never meets a reused number, and no call needs a descriptor of
-//! its own: proofs/tla/lent/LentFile.tla). A write's job leaves its end in
-//! a slot (`call`), as a ring's operation does, counted on its shard until
-//! its wake went, which a runtime's drop waits for.
+//! its own: proofs/tla/lent/LentFile.tla); on io_uring an operation of the
+//! shard's ring instead (see `fs::ring`). A write's job leaves its end in a
+//! slot (`call`), as a ring's operation does, counted on its shard until its
+//! wake went, which a runtime's drop waits for.
 //!
-//! One read and one write are in flight at most. A read fills a read-ahead
-//! buffer of the pool, at least [`READ_MIN`] bytes, that the next reads copy
-//! from. A write is copied into a buffer and accepted at once; while it is
-//! in flight, later writes go into one more buffer (the write-behind), which
-//! starts when the first ends, so a run of writes keeps one job going. A
-//! read waits for the writes before it, so it sees them; a write or a seek
-//! moves the epoch on, and a read job of an older epoch is thrown away. A
-//! write that fails keeps its error: every later write fails with it until a
-//! flush reports it.
+//! One read and one write at the cursor are in flight at most. A read fills
+//! a read-ahead buffer of the pool, at least [`READ_MIN`] bytes, that the
+//! next reads copy from. A write is copied into a buffer and accepted at
+//! once; while it is in flight, later writes go into one more buffer (the
+//! write-behind), which starts when the first ends, so a run of writes keeps
+//! one job going. A read waits for the writes before it, so it sees them; a
+//! write or a seek moves the epoch on, and a read job of an older epoch is
+//! thrown away. A write that fails keeps its error: every later write fails
+//! with it until a flush reports it.
 //!
 //! A file opened to append writes at its end whatever its cursor says: its
 //! write jobs call `write(2)` (on Windows, a write at the end), since
@@ -35,25 +36,61 @@
 //! cursor nowhere. A write from a task's buffer is the write in flight like
 //! any other, so whatever comes after it waits for it; dropped, it still
 //! lands, and its buffer goes with the job.
+//!
+//! Reads and writes at offsets of the caller's own (`positional`) never read
+//! or move the cursor or the epoch, and run any number at once; each waits
+//! for the cursor writes accepted before it. When a positional write ends
+//! for its task, the file's generation moves on, and a cursor read counts a
+//! job's bytes, or hands out bytes read ahead, only of the generation it
+//! began in. A positional write whose task went away is kept in the state
+//! (`orphans`) until it landed, and everything after it waits for it.
+//!
+//! A file opened for direct IO (`O_DIRECT` on Linux, `FILE_FLAG_NO_BUFFERING`
+//! on Windows, as the descriptor says when the state is made) has no
+//! read-ahead and no write-behind: each read or write goes to the kernel with
+//! exactly the caller's length and offset, from or into memory placed in its
+//! page as the caller's (see `work`), so the kernel's alignment rules give
+//! the answer they would give the caller's own call. A write at the cursor
+//! then waits for the one in flight instead of joining it.
+//!
+//! `proofs/tla/lent/LentFile.tla` checks these rules.
 
-use core::future::poll_fn;
-use core::pin::Pin;
+mod copy;
+mod durable;
+mod many;
+mod orphans;
+mod owned;
+mod positional;
+mod space;
+mod work;
+
+use crate::buf::owned::OwnedBuf;
 use core::task::{Context, Poll, Waker};
-use std::future::Future;
 use std::io::{self, SeekFrom};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::Wake;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use super::call::{self, FileOutcome, SlotJob};
+use self::orphans::{Orphan, Orphans};
+use self::work::{Job, Lent, Writing, bounce, buffer, poll_task, tally_read, tally_write};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Hooks, Side, WakerSet};
 use crate::io::source::Failure;
 use crate::io::source::requests::Lease;
 use crate::io::sys;
-use crate::rt::counters::tally;
-use crate::rt::task::Task;
+
+pub(crate) use self::copy::COPY_CHUNK;
+#[cfg(ring)]
+pub(crate) use self::durable::sync_on;
+pub(crate) use self::durable::{SyncKind, sync_file};
+#[cfg(test)]
+pub(crate) use self::many::MANY_AT_ONCE;
+pub(crate) use self::space::range_end;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use self::work::bounce as bounce_for_test;
+#[cfg(ring)]
+pub(crate) use self::work::{pread_owned, pwrite_owned};
 
 /// The least a read job asks for, so a run of small reads takes one job.
 pub(crate) const READ_MIN: usize = 64 * 1024;
@@ -64,11 +101,13 @@ const WRITE_MIN: usize = 64 * 1024;
 const FILE_SLOTS: usize = 8;
 
 /// Work on the file state left for its holder (its deferred word).
-mod work {
+mod deferred {
     /// Consume `consumed` bytes of the read-ahead.
     pub(super) const CONSUME: u8 = 1;
     /// The future of a lent write went away.
     pub(super) const ABANDON: u8 = 2;
+    /// A positional write was left by its task (see `orphans`).
+    pub(super) const ORPHAN: u8 = 4;
 }
 
 /// The IO state of a file handle, shared with the waker its jobs wake.
@@ -84,8 +123,17 @@ pub(crate) struct FileIo {
     /// as the state's last holder left them.
     unsent: AtomicBool,
     cursor: AtomicU64,
+    /// Positional writes whose end their task took (or the state took, for
+    /// one its task left): the generation of what the file holds.
+    generation: AtomicU64,
+    /// Positional writes left by their tasks, for the state to take.
+    orphans: Orphans,
+    /// The first sync that failed: every later sync fails with it.
+    sync_failed: OnceLock<Failure>,
     /// The file was opened to append.
     append: bool,
+    /// The file was opened for direct IO.
+    direct: bool,
     /// The calls go to the blocking pool even on a ring, for a test that
     /// holds the pool to keep a call in flight.
     #[cfg(test)]
@@ -102,7 +150,7 @@ impl Hooks<FileState> for FileHooks<'_> {
     fn serve(&self, _st: &mut FileState, _after: &mut After) {}
 
     fn deferred(&self, st: &mut FileState, bits: u8, after: &mut After) {
-        if bits & work::CONSUME != 0 {
+        if bits & deferred::CONSUME != 0 {
             let amt = self.io.consumed.swap(0, Ordering::Acquire);
             let n = st.ahead.as_mut().map_or(0, |ahead| {
                 let n = amt.min(ahead.filled().len());
@@ -111,148 +159,22 @@ impl Hooks<FileState> for FileHooks<'_> {
             });
             st.consumed(n, after);
         }
-        if bits & work::ABANDON != 0 {
+        if bits & deferred::ABANDON != 0 {
             st.abandon_lent(&Waker::from(Arc::clone(self.io)), after);
+        }
+        if bits & deferred::ORPHAN != 0 {
+            self.io.orphans.take(&mut st.orphans);
         }
     }
 
     fn releasing(&self, st: &mut FileState) {
         // Release: read without the guard, on any thread.
         self.io.unsent.store(
-            st.writing.is_some() || st.behind.is_some(),
+            st.writing.is_some() || st.behind.is_some() || !st.orphans.is_empty(),
             Ordering::Release,
         );
         self.io.cursor.store(st.cursor, Ordering::Release);
     }
-}
-
-/// A file's call in flight: a job of the blocking pool, or a call that ends
-/// in a slot (an operation on the ring of the shard whose thread issued it,
-/// or a write the pool makes).
-///
-/// Its IO is counted for `stats` where its end is taken: a read the pool made
-/// by its job's poll, a write the pool made by the write's own count (see
-/// [`Writing`]), and a ring's call as the kernel completes it.
-enum Work<T> {
-    Pool(Task<T>),
-    Slot(SlotJob<T>),
-}
-
-impl<T: Ended> Work<T> {
-    /// The call's end once it came, its error counted for `stats`.
-    fn poll(&mut self, waker: &Waker) -> Poll<T> {
-        let end = match self {
-            Work::Pool(task) => poll_task(task, waker),
-            Work::Slot(job) => job.poll(waker),
-        };
-        if let Poll::Ready(end) = &end
-            && let Some(err) = end.error()
-        {
-            crate::rt::counters::io_error(err);
-        }
-        end
-    }
-
-    /// Whether the blocking pool makes the call, whose bytes its poll counts.
-    #[inline(always)]
-    fn pooled(&self) -> bool {
-        matches!(self, Work::Pool(_))
-    }
-}
-
-/// The bytes a write the pool makes takes, kept for `stats`: none, and no
-/// room, without the `io-stats` feature.
-#[cfg(feature = "io-stats")]
-type Counted = usize;
-#[cfg(not(feature = "io-stats"))]
-#[derive(Clone, Copy)]
-struct Counted;
-
-/// What a write of `bytes` keeps for `stats`: 0 for a ring's, whose bytes are
-/// counted as the kernel completes it.
-#[inline(always)]
-fn counted(bytes: usize) -> Counted {
-    #[cfg(feature = "io-stats")]
-    return bytes;
-    #[cfg(not(feature = "io-stats"))]
-    {
-        let _ = bytes;
-        Counted
-    }
-}
-
-/// A write the pool made ended, `bytes` its count: counted, unless it failed.
-#[inline(always)]
-fn tally_write(bytes: Counted, ok: bool) {
-    #[cfg(feature = "io-stats")]
-    if bytes > 0 && ok && tally::counting() {
-        tally::add_write(bytes);
-    }
-    #[cfg(not(feature = "io-stats"))]
-    let _ = (bytes, ok);
-}
-
-/// The end of a file's call: its result, alone or with the task's buffer.
-trait Ended {
-    fn error(&self) -> Option<&io::Error>;
-}
-
-impl<T> Ended for io::Result<T> {
-    fn error(&self) -> Option<&io::Error> {
-        self.as_ref().err()
-    }
-}
-
-impl<T> Ended for (io::Result<T>, Vec<u8>) {
-    fn error(&self) -> Option<&io::Error> {
-        self.0.as_ref().err()
-    }
-}
-
-struct Job<T> {
-    task: Work<io::Result<T>>,
-    /// Where it reads, and the epoch it read in.
-    at: u64,
-    epoch: u64,
-}
-
-/// A read job into a task's own buffer, which comes back with the result.
-struct LentRead {
-    task: Work<(io::Result<usize>, Vec<u8>)>,
-    at: u64,
-    epoch: u64,
-    /// What the buffer held before: the read's bytes come after.
-    from: usize,
-}
-
-/// The write in flight.
-///
-/// Each carries the bytes it writes when the blocking pool makes the call, 0
-/// for a ring's, whose bytes are counted as the kernel completes it.
-enum Writing {
-    /// From a buffer of the pool.
-    Pool(Work<io::Result<()>>, Counted),
-    /// From a task's own buffer, which comes back with the result.
-    Lent(Work<(io::Result<()>, Vec<u8>)>, Counted),
-    /// At the end of a file opened to append, ending with the file's offset
-    /// after it.
-    Append(Work<io::Result<u64>>, Counted),
-    /// As `Append`, from a task's own buffer.
-    AppendLent(Work<(io::Result<u64>, Vec<u8>)>, Counted),
-}
-
-/// A write from a task's own buffer, from its submission until its task
-/// takes the buffer back.
-#[derive(Default)]
-enum Lent {
-    #[default]
-    None,
-    /// In flight, its task waiting.
-    Out,
-    /// Done, for its task to take.
-    Done(io::Result<()>, Vec<u8>),
-    /// In flight, its task gone: the buffer is dropped when it lands.
-    Orphan,
 }
 
 #[derive(Default)]
@@ -261,8 +183,9 @@ struct FileState {
     cursor: u64,
     /// Moves on with every write and seek.
     epoch: u64,
-    /// Bytes at the cursor, read ahead.
+    /// Bytes at the cursor, read ahead, and the generation they were read in.
     ahead: Option<PoolBuf>,
+    ahead_gen: u64,
     reading: Option<Job<PoolBuf>>,
     writing: Option<Writing>,
     lent: Lent,
@@ -270,20 +193,9 @@ struct FileState {
     behind: Option<PoolBuf>,
     behind_at: u64,
     failed: Option<Failure>,
-    sizing: Option<Task<io::Result<u64>>>,
-}
-
-fn poll_task<T>(task: &mut Task<T>, waker: &Waker) -> Poll<T> {
-    Pin::new(task).poll(&mut Context::from_waker(waker))
-}
-
-/// A buffer of this thread's pool, or the file waits for one.
-fn buffer(len: usize, after: &mut After) -> Option<PoolBuf> {
-    let buf = with_pool(|pool| pool.and_then(|p| p.get(len)));
-    if buf.is_none() {
-        after.starved = true;
-    }
-    buf
+    sizing: Option<crate::rt::task::Task<io::Result<u64>>>,
+    /// Positional writes left by their tasks, out until they land.
+    orphans: Vec<Orphan>,
 }
 
 impl FileIo {
@@ -291,7 +203,7 @@ impl FileIo {
     /// opened by std and read some way already goes on from there).
     pub(crate) fn new(fd: Lease) -> io::Result<Arc<Self>> {
         let cursor = sys::seek(fd.raw(), None)?;
-        let append = sys::appends(fd.raw())?;
+        let mode = sys::file_mode(fd.raw())?;
         Ok(Arc::new(Self {
             fd,
             state: Side::new(FileState {
@@ -302,7 +214,11 @@ impl FileIo {
             consumed: AtomicUsize::new(0),
             unsent: AtomicBool::new(false),
             cursor: AtomicU64::new(cursor),
-            append,
+            generation: AtomicU64::new(0),
+            orphans: Orphans::new(),
+            sync_failed: OnceLock::new(),
+            append: mode.append,
+            direct: mode.direct,
             #[cfg(test)]
             on_pool: AtomicBool::new(false),
         }))
@@ -314,150 +230,24 @@ impl FileIo {
         self.on_pool.store(true, Ordering::Relaxed);
     }
 
-    /// Whether this thread's calls go to its shard's ring.
-    #[cfg(ring)]
-    fn on_ring(&self) -> bool {
-        #[cfg(test)]
-        if self.on_pool.load(Ordering::Relaxed) {
-            return false;
-        }
-        true
+    /// Sends this file's calls to the shard's ring again, where it runs one.
+    #[cfg(test)]
+    pub(crate) fn back_to_ring(&self) {
+        self.on_pool.store(false, Ordering::Relaxed);
     }
 
-    fn submit_read(&self, buf: PoolBuf, at: u64, epoch: u64) -> Job<PoolBuf> {
-        #[cfg(ring)]
-        let buf = match self.on_ring() {
-            true => match super::ring::read(&self.fd, at, buf) {
-                Ok(job) => {
-                    return Job {
-                        task: Work::Slot(job),
-                        at,
-                        epoch,
-                    };
-                }
-                Err(buf) => buf,
-            },
-            false => buf,
-        };
-        let fd = self.fd.clone();
-        let mut buf = buf;
-        let task = crate::runtime::spawn_blocking(move || {
-            let n = sys::pread(fd.raw(), buf.spare(), at)?;
-            buf.set_filled(n);
-            Ok(buf)
-        });
-        Job {
-            task: Work::Pool(task),
-            at,
-            epoch,
-        }
+    /// The descriptor of the handle, whose calls the system's test record
+    /// keeps.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn jobs_fd(&self) -> std::os::fd::RawFd {
+        self.fd.raw()
     }
 
-    /// A write of `buf` at `at`; a pool's wakes `waker` when it ends.
-    fn submit_write(&self, buf: PoolBuf, at: u64, waker: &Waker) -> Writing {
-        let fd = self.fd.clone();
-        let bytes = counted(buf.filled().len());
-        if self.append {
-            return Writing::Append(
-                Work::Slot(call::write_on_pool(
-                    move || FileOutcome::Append(sys::append_all(fd.raw(), buf.filled())),
-                    call::as_append,
-                    waker,
-                )),
-                bytes,
-            );
-        }
-        #[cfg(ring)]
-        let buf = match self.on_ring() {
-            true => match super::ring::write(&self.fd, at, buf) {
-                Ok(job) => return Writing::Pool(Work::Slot(job), counted(0)),
-                Err(buf) => buf,
-            },
-            false => buf,
-        };
-        Writing::Pool(
-            Work::Slot(call::write_on_pool(
-                move || FileOutcome::Write(sys::pwrite_all(fd.raw(), buf.filled(), at)),
-                call::as_write,
-                waker,
-            )),
-            bytes,
-        )
-    }
-
-    fn submit_read_owned(&self, buf: Vec<u8>, at: u64, epoch: u64) -> LentRead {
-        let from = buf.len();
-        #[cfg(ring)]
-        let buf = match self.on_ring() {
-            true => match super::ring::read_lent(&self.fd, at, buf) {
-                Ok(job) => {
-                    return LentRead {
-                        task: Work::Slot(job),
-                        at,
-                        epoch,
-                        from,
-                    };
-                }
-                Err(buf) => buf,
-            },
-            false => buf,
-        };
-        let fd = self.fd.clone();
-        let mut buf = buf;
-        let task = crate::runtime::spawn_blocking(move || {
-            let result = sys::pread_uninit(fd.raw(), buf.spare_capacity_mut(), at);
-            if let Ok(n) = result {
-                // SAFETY: the kernel wrote the first `n` bytes of the spare
-                // capacity.
-                unsafe { buf.set_len(buf.len() + n) };
-            }
-            (result, buf)
-        });
-        LentRead {
-            task: Work::Pool(task),
-            at,
-            epoch,
-            from,
-        }
-    }
-
-    /// A write of a task's `buf` at `at`; a pool's wakes `waker` when it
-    /// ends.
-    fn submit_write_owned(&self, buf: Vec<u8>, at: u64, waker: &Waker) -> Writing {
-        let fd = self.fd.clone();
-        let bytes = counted(buf.len());
-        if self.append {
-            return Writing::AppendLent(
-                Work::Slot(call::write_on_pool(
-                    move || {
-                        let result = sys::append_all(fd.raw(), &buf);
-                        FileOutcome::AppendLent(result, buf)
-                    },
-                    call::as_append_lent,
-                    waker,
-                )),
-                bytes,
-            );
-        }
-        #[cfg(ring)]
-        let buf = match self.on_ring() {
-            true => match super::ring::write_lent(&self.fd, at, buf) {
-                Ok(job) => return Writing::Lent(Work::Slot(job), counted(0)),
-                Err(buf) => buf,
-            },
-            false => buf,
-        };
-        Writing::Lent(
-            Work::Slot(call::write_on_pool(
-                move || {
-                    let result = sys::pwrite_all(fd.raw(), &buf, at);
-                    FileOutcome::WriteLent(result, buf)
-                },
-                call::as_write_lent,
-                waker,
-            )),
-            bytes,
-        )
+    /// The file's generation now.
+    fn generation(&self) -> u64 {
+        // Acquire: pairs with the Release of a positional write's end, so a
+        // read made after it sees what it wrote.
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Runs `step` on the state for a task polling with `cx`: the task is
@@ -498,7 +288,7 @@ impl FileIo {
         }
         crate::coop::poll_budget(cx, |cx| {
             self.with_state(cx, |st, io, waker, after| {
-                match st.fill(io, out.len(), waker, after) {
+                match st.fill(io, out.len(), out.as_ptr() as usize, waker, after) {
                     Poll::Ready(Ok(true)) => {}
                     other => return other.map_ok(|_| 0),
                 }
@@ -511,13 +301,14 @@ impl FileIo {
 
     /// The bytes at the cursor, read ahead: their address and length, empty
     /// at the end of the file. They stay in place until the next call on
-    /// this state that consumes, writes or seeks.
+    /// this state that consumes, writes or seeks. On a file opened for
+    /// direct IO they are one read of [`READ_MIN`] bytes at the cursor.
     pub(crate) fn poll_fill_buf(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<(*const u8, usize)>> {
         self.with_state(cx, |st, io, waker, after| {
-            st.fill(io, READ_MIN, waker, after).map_ok(|filled| {
+            st.fill(io, READ_MIN, 0, waker, after).map_ok(|filled| {
                 match st.ahead.as_ref().filter(|_| filled) {
                     Some(ahead) => (ahead.filled().as_ptr(), ahead.filled().len()),
                     None => (
@@ -534,16 +325,24 @@ impl FileIo {
         self.consumed.fetch_add(amt, Ordering::Release);
         let mut after = After::default();
         self.state
-            .defer(work::CONSUME, &mut after, &FileHooks { io: self });
+            .defer(deferred::CONSUME, &mut after, &FileHooks { io: self });
         after.run();
     }
 
-    /// A read scattered into `bufs`, in order.
+    /// A read scattered into `bufs`, in order. On a file opened for direct
+    /// IO, a read into the first buffer that has room, as the kernel's
+    /// alignment rules apply to each.
     pub(crate) fn poll_read_vectored(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         bufs: &mut [io::IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
+        if self.direct {
+            return match bufs.iter_mut().find(|b| !b.is_empty()) {
+                Some(buf) => self.poll_read(cx, buf),
+                None => Poll::Ready(Ok(0)),
+            };
+        }
         let want: usize = bufs.iter().map(|b| b.len()).sum();
         if want == 0 {
             return Poll::Ready(Ok(0));
@@ -558,7 +357,7 @@ impl FileIo {
         want: usize,
     ) -> Poll<io::Result<usize>> {
         self.with_state(cx, |st, io, waker, after| {
-            match st.fill(io, want, waker, after) {
+            match st.fill(io, want, 0, waker, after) {
                 Poll::Ready(Ok(true)) => {}
                 other => return other.map_ok(|_| 0),
             }
@@ -571,95 +370,6 @@ impl FileIo {
         })
     }
 
-    /// Reads at the cursor into the spare capacity of `buf`, after the bytes
-    /// it holds, and gives it back with the read's result. The job reads
-    /// into `buf` itself (bytes read ahead are copied in instead).
-    pub(crate) async fn read_owned(self: &Arc<Self>, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
-        let mut held = Some(buf);
-        // Dropped with the future, a job in flight is cancelled, or its
-        // result thrown away: the cursor moves only when a result is taken.
-        let mut job = None;
-        let result = poll_fn(|cx| self.poll_read_owned(cx, &mut held, &mut job)).await;
-        (result, held.unwrap_or_default())
-    }
-
-    fn poll_read_owned(
-        self: &Arc<Self>,
-        cx: &mut Context<'_>,
-        held: &mut Option<Vec<u8>>,
-        job: &mut Option<LentRead>,
-    ) -> Poll<io::Result<usize>> {
-        if held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
-            return Poll::Ready(Ok(0));
-        }
-        self.with_state(cx, |st, io, waker, after| {
-            loop {
-                if let Some(lent) = job.as_mut() {
-                    let pooled = lent.task.pooled();
-                    let (result, mut buf) = match lent.task.poll(waker) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(out) => out,
-                    };
-                    if pooled
-                        && tally::counting()
-                        && let Ok(n) = &result
-                    {
-                        tally::add_read(*n);
-                    }
-                    let (at, epoch, from) = (lent.at, lent.epoch, lent.from);
-                    *job = None;
-                    if at != st.cursor || epoch != st.epoch {
-                        // Another read, a write or a seek moved on meanwhile:
-                        // read again where the cursor is.
-                        buf.truncate(from);
-                        *held = Some(buf);
-                        continue;
-                    }
-                    *held = Some(buf);
-                    if let Ok(n) = result {
-                        st.cursor += n as u64;
-                        // Bytes read ahead at the old cursor.
-                        if let Some(ahead) = st.ahead.take() {
-                            after.drop_buf(ahead);
-                        }
-                    }
-                    return Poll::Ready(result);
-                }
-                // A read sees every byte written before it.
-                if st.poll_writes(io, waker, after).is_pending() {
-                    return Poll::Pending;
-                }
-                let Some(buf) = held.as_mut() else {
-                    return Poll::Ready(Err(io::Error::other("the read lost its buffer")));
-                };
-                if let Some(ahead) = st.ahead.as_mut().filter(|a| !a.is_empty()) {
-                    let n = crate::buf::append_spare(ahead.filled(), buf);
-                    ahead.consume(n);
-                    st.consumed(n, after);
-                    return Poll::Ready(Ok(n));
-                }
-                if let Some(buf) = held.take() {
-                    *job = Some(io.submit_read_owned(buf, st.cursor, st.epoch));
-                }
-            }
-        })
-    }
-
-    /// Writes all of `buf` at the cursor, after the writes before it, and
-    /// gives it back with its length. The job writes from `buf` itself.
-    pub(crate) async fn write_owned(
-        self: &Arc<Self>,
-        buf: Vec<u8>,
-    ) -> (io::Result<usize>, Vec<u8>) {
-        let mut op = WriteOwned {
-            io: self,
-            held: Some(buf),
-            out: false,
-        };
-        let result = poll_fn(|cx| op.poll(cx)).await;
-        (result, op.held.take().unwrap_or_default())
-    }
-
     pub(crate) fn poll_write(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -668,7 +378,8 @@ impl FileIo {
         self.poll_write_vectored(cx, &[io::IoSlice::new(bytes)])
     }
 
-    /// A write of the bytes of `bufs`, gathered in order.
+    /// A write of the bytes of `bufs`, gathered in order (on a file opened
+    /// for direct IO, of the first one that has any).
     pub(crate) fn poll_write_vectored(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -741,8 +452,26 @@ impl FileState {
         }
     }
 
-    /// Drives the writes: takes the end of the one in flight, then starts
-    /// the write-behind. Ready once none is in flight.
+    /// Whether the bytes of a read at `at` in `epoch` and `generation` are the
+    /// file's at the cursor now: no read, write or seek moved the cursor or
+    /// the epoch on, and no positional write ended, since.
+    fn counts(&self, io: &FileIo, at: u64, epoch: u64, generation: u64) -> bool {
+        at == self.cursor && epoch == self.epoch && generation == io.generation()
+    }
+
+    /// Bytes read ahead before a positional write ended are not the file's.
+    fn drop_stale_ahead(&mut self, io: &FileIo, after: &mut After) {
+        if self.ahead.is_some()
+            && self.ahead_gen != io.generation()
+            && let Some(stale) = self.ahead.take()
+        {
+            after.drop_buf(stale);
+        }
+    }
+
+    /// Drives the writes: takes the end of the one in flight, then of the
+    /// positional writes left by their tasks, then starts the write-behind.
+    /// Ready once none is in flight.
     fn poll_writes(&mut self, io: &FileIo, waker: &Waker, after: &mut After) -> Poll<()> {
         loop {
             if let Some(writing) = self.writing.as_mut() {
@@ -789,6 +518,9 @@ impl FileState {
                     }
                 }
             }
+            if self.poll_orphans(io, waker).is_pending() {
+                return Poll::Pending;
+            }
             match self.behind.take() {
                 Some(behind) => self.writing = Some(io.submit_write(behind, self.behind_at, waker)),
                 None => return Poll::Ready(()),
@@ -796,9 +528,53 @@ impl FileState {
         }
     }
 
+    /// Takes the ends of the positional writes left by their tasks: Ready
+    /// once every one landed. Each that landed moves the generation on, and
+    /// one that failed is the file's failure, as a lent write's nobody took.
+    #[inline]
+    fn poll_orphans(&mut self, io: &FileIo, waker: &Waker) -> Poll<()> {
+        // The common case, no write left by its task, costs one load: one left
+        // before this step took the state is in `orphans` already, since the
+        // side runs the deferred move before it hands the state on.
+        if self.orphans.is_empty() {
+            return Poll::Ready(());
+        }
+        self.poll_left(io, waker)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn poll_left(&mut self, io: &FileIo, waker: &Waker) -> Poll<()> {
+        io.orphans.take(&mut self.orphans);
+        if self.orphans.is_empty() {
+            return Poll::Ready(());
+        }
+        let before = self.orphans.len();
+        let failed = &mut self.failed;
+        self.orphans.retain_mut(|orphan| match orphan.poll(waker) {
+            Poll::Pending => true,
+            Poll::Ready(err) => {
+                if let Some(err) = err {
+                    *failed = Some(Failure::of(&err));
+                }
+                false
+            }
+        });
+        let landed = before - self.orphans.len();
+        if landed > 0 {
+            // Release: pairs with the Acquire of `FileIo::generation`.
+            io.generation.fetch_add(landed as u64, Ordering::Release);
+        }
+        if self.orphans.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
     /// The end of a write from a task's buffer: the buffer goes back to its
     /// task, or with the job if the task is gone.
-    fn lent_back(&mut self, result: io::Result<()>, buf: Vec<u8>) -> Option<Failure> {
+    fn lent_back(&mut self, result: io::Result<()>, buf: OwnedBuf) -> Option<Failure> {
         let failure = result.as_ref().err().map(Failure::of);
         if matches!(self.lent, Lent::Out) {
             self.lent = Lent::Done(result, buf);
@@ -809,11 +585,14 @@ impl FileState {
     }
 
     /// Makes sure bytes at the cursor are read ahead: `true`, or `false` at
-    /// the end of the file.
+    /// the end of the file. A read job asks for `want` bytes, at least
+    /// [`READ_MIN`]; on a file opened for direct IO exactly `want`, into
+    /// memory placed in its page as the caller's at `addr`.
     fn fill(
         &mut self,
         io: &FileIo,
         want: usize,
+        addr: usize,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<bool>> {
@@ -822,6 +601,7 @@ impl FileState {
             return Poll::Pending;
         }
         loop {
+            self.drop_stale_ahead(io, after);
             if self.ahead.as_ref().is_some_and(|ahead| !ahead.is_empty()) {
                 return Poll::Ready(Ok(true));
             }
@@ -831,18 +611,14 @@ impl FileState {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(result) => result,
                 };
-                if pooled
-                    && tally::counting()
-                    && let Ok(buf) = &result
-                {
-                    tally::add_read(buf.filled().len());
-                }
-                let (at, epoch) = (job.at, job.epoch);
+                tally_read(pooled, &result, |buf| buf.filled().len());
+                let (at, epoch, generation) = (job.at, job.epoch, job.generation);
                 self.reading = None;
                 match result {
                     Err(err) => return Poll::Ready(Err(err)),
-                    // Read before a write or a seek: not the file as it is.
-                    Ok(buf) if at != self.cursor || epoch != self.epoch => after.drop_buf(buf),
+                    // Read before a write, a seek or a positional write's
+                    // end: not the file as it is.
+                    Ok(buf) if !self.counts(io, at, epoch, generation) => after.drop_buf(buf),
                     Ok(buf) if buf.is_empty() => {
                         after.drop_buf(buf);
                         return Poll::Ready(Ok(false));
@@ -851,14 +627,32 @@ impl FileState {
                         if let Some(old) = self.ahead.replace(buf) {
                             after.drop_buf(old);
                         }
+                        self.ahead_gen = generation;
                     }
                 }
                 continue;
             }
-            let Some(buf) = buffer(want.max(READ_MIN), after) else {
-                return Poll::Pending;
+            let (buf, from, len) = if io.direct {
+                match bounce(want, addr, true, waker) {
+                    Some(got) => got,
+                    None => return Poll::Pending,
+                }
+            } else {
+                let Some(buf) = buffer(want.max(READ_MIN), after) else {
+                    return Poll::Pending;
+                };
+                let len = buf.capacity();
+                (buf, 0, len)
             };
-            self.reading = Some(io.submit_read(buf, self.cursor, self.epoch));
+            // Read before the call, so a positional write that ends while it
+            // runs is seen to have.
+            let generation = io.generation();
+            self.reading = Some(Job {
+                task: io.submit_read(buf, from, len, self.cursor),
+                at: self.cursor,
+                epoch: self.epoch,
+                generation,
+            });
         }
     }
 
@@ -869,7 +663,7 @@ impl FileState {
     fn write_owned(
         &mut self,
         io: &FileIo,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Option<OwnedBuf>,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -935,12 +729,15 @@ impl FileState {
         if let Some(failure) = self.failed {
             return Poll::Ready(Err(failure.error()));
         }
+        if io.direct {
+            return self.write_direct(io, bufs, waker, after);
+        }
         let len: usize = bufs.iter().map(|b| b.len()).sum();
         if len == 0 {
             return Poll::Ready(Ok(0));
         }
         self.invalidate(after);
-        let n = if self.writing.is_none() {
+        let n = if self.writing.is_none() && self.orphans.is_empty() {
             // Nothing in flight: these bytes go now.
             let Some(mut buf) = buffer(len.max(WRITE_MIN), after) else {
                 return Poll::Pending;
@@ -969,6 +766,34 @@ impl FileState {
         // whether or not the task polls the file again, so a task that
         // parks holding the file is not kept by its own registration.
         let _ = self.poll_writes(io, waker, after);
+        Poll::Ready(Ok(n))
+    }
+
+    /// A write at the cursor of a file opened for direct IO: the bytes of
+    /// the first buffer that has any, as one call of exactly them, once the
+    /// write in flight landed. Accepted as it is submitted; its error, as
+    /// any write's, fails the next write or the flush.
+    fn write_direct(
+        &mut self,
+        io: &FileIo,
+        bufs: &[io::IoSlice<'_>],
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        let Some(bytes) = bufs.iter().find(|b| !b.is_empty()) else {
+            return Poll::Ready(Ok(0));
+        };
+        if self.writing.is_some() || !self.orphans.is_empty() {
+            return Poll::Pending;
+        }
+        let Some((mut buf, from, n)) = bounce(bytes.len(), bytes.as_ptr() as usize, true, waker)
+        else {
+            return Poll::Pending;
+        };
+        buf.fill_at(from, &bytes[..n]);
+        self.invalidate(after);
+        self.writing = Some(io.submit_write(buf, self.cursor, waker));
+        self.cursor += n as u64;
         Poll::Ready(Ok(n))
     }
 
@@ -1016,36 +841,5 @@ impl FileState {
             self.cursor = target;
         }
         Poll::Ready(Ok(target))
-    }
-}
-
-/// A write whose buffer may be out with its job. Dropped while it is, the
-/// write still lands and the buffer goes with the job.
-struct WriteOwned<'a> {
-    io: &'a Arc<FileIo>,
-    held: Option<Vec<u8>>,
-    out: bool,
-}
-
-impl WriteOwned<'_> {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let held = &mut self.held;
-        let poll = self.io.with_state(cx, |st, io, waker, after| {
-            st.write_owned(io, held, waker, after)
-        });
-        self.out = self.held.is_none();
-        poll
-    }
-}
-
-impl Drop for WriteOwned<'_> {
-    fn drop(&mut self) {
-        if self.out {
-            let mut after = After::default();
-            self.io
-                .state
-                .defer(work::ABANDON, &mut after, &FileHooks { io: self.io });
-            after.run();
-        }
     }
 }

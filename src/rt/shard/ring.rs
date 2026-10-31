@@ -56,7 +56,9 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "io-stats")]
+use std::time::Instant;
 
 use super::Shard;
 use super::recv::RecvGroup;
@@ -67,6 +69,7 @@ use crate::io::source::requests::Lease;
 use crate::io::source::ring::{Arrival, RingMem, RingOp};
 use crate::rt::backend::with_room;
 use crate::rt::counters::tally;
+#[cfg(feature = "io-stats")]
 use crate::rt::counters::{IoKind, IoTimes};
 use crate::rt::park::Notifier;
 use crate::rt::park::ring::{CqeBatch, RingPoller};
@@ -123,14 +126,18 @@ pub(crate) struct ShardRing {
     /// Where the latencies of the operations go, with their submissions'
     /// stamps, while the runtime records them: one word, boxed, so a ring
     /// that records nothing carries none of it in its own layout.
+    #[cfg(feature = "io-stats")]
     timing: std::cell::OnceCell<Box<Timing>>,
     /// Multishot receives and accepts submitted, the receives' arrivals,
     /// and the receives that ended as the group ran dry, for a test.
     #[cfg(test)]
     counts: Cell<(usize, usize, usize)>,
-    /// Files' calls submitted, for a test.
+    /// Files' calls submitted, and each one's opcode, length and offset, for
+    /// a test.
     #[cfg(test)]
     file_calls: Cell<usize>,
+    #[cfg(test)]
+    file_entries: RefCell<Vec<FileEntry>>,
     /// Zero-copy sends' first completions and notifications, for a test.
     #[cfg(test)]
     zc_seen: Cell<(usize, usize)>,
@@ -203,11 +210,14 @@ impl ShardRing {
             cap,
             writes: Cell::new(0),
             recv: RefCell::new(recv),
+            #[cfg(feature = "io-stats")]
             timing: std::cell::OnceCell::new(),
             #[cfg(test)]
             counts: Cell::new((0, 0, 0)),
             #[cfg(test)]
             file_calls: Cell::new(0),
+            #[cfg(test)]
+            file_entries: RefCell::new(Vec::new()),
             #[cfg(test)]
             zc_seen: Cell::new((0, 0)),
         })
@@ -330,6 +340,7 @@ impl ShardRing {
                 return IGNORED;
             }
         };
+        #[cfg(feature = "io-stats")]
         if self.timing.get().is_some() {
             self.stamp(user_data);
         }
@@ -362,6 +373,13 @@ impl ShardRing {
         #[cfg(test)]
         self.file_calls.set(self.file_calls.get() + 1);
         let sqe = op.entry();
+        #[cfg(test)]
+        self.file_entries.borrow_mut().push((
+            sqe.raw().opcode,
+            sqe.raw().len,
+            sqe.raw().off,
+            sqe.raw().op_flags,
+        ));
         let inserted = self.file_ops.borrow_mut().insert(op);
         let user_data = match inserted {
             Ok(user_data) => user_data | FILE_TAG,
@@ -371,6 +389,7 @@ impl ShardRing {
                 return;
             }
         };
+        #[cfg(feature = "io-stats")]
         if self.timing.get().is_some() {
             self.stamp(user_data);
         }
@@ -385,6 +404,7 @@ impl ShardRing {
         };
         self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
         self.admit_waiting();
+        #[cfg(feature = "io-stats")]
         if self.timing.get().is_some() {
             self.timed(user_data, Some(IoKind::File), res);
         }
@@ -543,6 +563,7 @@ impl ShardRing {
             if counts_as_write(&op) {
                 self.writes.set(self.writes.get().saturating_sub(1));
             }
+            #[cfg(feature = "io-stats")]
             if self.timing.get().is_some() {
                 self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
             }
@@ -572,6 +593,7 @@ impl ShardRing {
         if counts_as_write(&op) {
             self.writes.set(self.writes.get().saturating_sub(1));
         }
+        #[cfg(feature = "io-stats")]
         if self.timing.get().is_some() {
             self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
         }
@@ -631,6 +653,7 @@ impl ShardRing {
             self.zc_denied.set(true);
             res = -libc::ECANCELED;
         }
+        #[cfg(feature = "io-stats")]
         if self.timing.get().is_some() {
             self.timed(cqe.user_data, Some(IoKind::Write), res);
         }
@@ -794,6 +817,7 @@ impl ShardRing {
         });
     }
 
+    #[cfg(feature = "io-stats")]
     /// Starts timing the operations submitted from now on into `times`.
     pub(super) fn time_with(&self, times: Arc<IoTimes>) {
         let _ = self.timing.set(Box::new(Timing {
@@ -802,6 +826,7 @@ impl ShardRing {
         }));
     }
 
+    #[cfg(feature = "io-stats")]
     /// The operation of `user_data` was submitted now, while latencies are
     /// recorded.
     #[cold]
@@ -812,6 +837,7 @@ impl ShardRing {
         }
     }
 
+    #[cfg(feature = "io-stats")]
     /// The operation of `user_data` ended with `res`, while latencies are
     /// recorded: its stamp goes, and its latency is counted under `kind` (an
     /// operation of no timed kind, a multishot one, is only let go of).
@@ -827,6 +853,7 @@ impl ShardRing {
         }
     }
 
+    #[cfg(feature = "io-stats")]
     /// An operation of `kind` stamped `issued` ended with `res`: its latency
     /// is counted, unless it was cancelled or told to try again.
     fn time(&self, kind: IoKind, res: i32, issued: Instant) {
@@ -887,11 +914,13 @@ impl ShardRing {
 
 /// A ring's latencies while its runtime records them: where they go, and
 /// when each operation in flight was submitted, by its user data.
+#[cfg(feature = "io-stats")]
 struct Timing {
     times: Arc<IoTimes>,
     stamps: RefCell<std::collections::HashMap<u64, Instant>>,
 }
 
+#[cfg(feature = "io-stats")]
 /// The kind of latency an operation's end counts as, if it is timed: not a
 /// readiness probe, nor a multishot operation (many arrivals for one).
 fn io_kind(mem: &RingMem) -> Option<IoKind> {
@@ -972,6 +1001,10 @@ fn counts_as_write(op: &RingOp) -> bool {
     !op.read && !matches!(op.mem, RingMem::ZcHeld(_))
 }
 
+/// A file's call as a test sees it: its opcode, length, offset and flags.
+#[cfg(test)]
+pub(crate) type FileEntry = (u8, u32, u64, u32);
+
 /// The bit of the user data of a file's call (in the slot index, which the
 /// sources' operations never reach).
 const FILE_TAG: u64 = 1 << 31;
@@ -1028,6 +1061,12 @@ impl ShardRing {
     /// Files' calls submitted so far.
     pub(crate) fn file_calls(&self) -> usize {
         self.file_calls.get()
+    }
+
+    /// The opcode, length, offset and flags of each file's call submitted
+    /// since the last look.
+    pub(crate) fn take_file_entries(&self) -> Vec<FileEntry> {
+        core::mem::take(&mut *self.file_entries.borrow_mut())
     }
 
     /// Multishot receives and accepts in flight.

@@ -111,7 +111,9 @@ pub struct ShardStats {
     /// latencies ([`Builder::record_latencies`](crate::Builder::record_latencies));
     /// `None` when it does not, and `None` on a readiness backend (epoll,
     /// kqueue), whose calls are made once the kernel reports the descriptor
-    /// ready, so there is no wait in the kernel per operation to time.
+    /// ready, so there is no wait in the kernel per operation to time. With
+    /// the `io-stats` feature only.
+    #[cfg(feature = "io-stats")]
     pub io_latencies: Option<IoLatencies>,
     /// The IO operations the shard's thread completed, while its runtime
     /// counts them ([`Builder::count_io`](crate::Builder::count_io));
@@ -157,6 +159,7 @@ pub struct IoCounts {
 /// A multishot receive or accept is one operation for many arrivals and is
 /// not timed; nor is a cancelled operation or a readiness probe. File calls
 /// are timed on the ring, not the ones the blocking pool makes.
+#[cfg(feature = "io-stats")]
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct IoLatencies {

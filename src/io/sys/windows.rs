@@ -12,17 +12,22 @@ use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::windows::io::{BorrowedHandle, FromRawSocket, OwnedHandle, OwnedSocket};
 
+use crate::fs::Allocate;
 use crate::io::raw::Raw;
 use crate::io::source::Kind;
 use crate::syscore::windows::{
-    AF_INET, AF_INET6, DWORD, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION,
-    FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT,
-    FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType,
-    HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK,
-    NtQueryInformationFile, OVERLAPPED, ReadFile, SD_BOTH, SD_RECEIVE, SD_SEND, SIO_UDP_CONNRESET,
-    SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
-    SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-    SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG,
+    AF_INET, AF_INET6, BY_HANDLE_FILE_INFORMATION, DWORD, DeviceIoControl, ERROR_BROKEN_PIPE,
+    ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION, FILE_ALLOCATION_INFO_CLASS, FILE_APPEND_DATA,
+    FILE_BEGIN, FILE_CURRENT, FILE_END_OF_FILE_INFO_CLASS, FILE_MODE_INFORMATION,
+    FILE_NO_INTERMEDIATE_BUFFERING, FILE_STANDARD_INFO, FILE_STANDARD_INFO_CLASS,
+    FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA,
+    FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFileSizeEx, GetFileType, HANDLE, IN_ADDR, INVALID_SOCKET,
+    IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK, NtQueryInformationFile, OVERLAPPED, ReadFile, SD_BOTH,
+    SD_RECEIVE, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE,
+    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
+    SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
+    SOL_SOCKET, STATUS_SUCCESS, SetFileInformationByHandle, SetFilePointerEx, ULONG,
     WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile,
     bind, getsockname, getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, wsa_error,
 };
@@ -92,11 +97,25 @@ pub(crate) fn synchronous(raw: Raw) -> io::Result<bool> {
     Ok(mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) != 0)
 }
 
-/// Whether the file handle `raw` appends: it may add to the file's end and
-/// not write over it (std's `append`).
-pub(crate) fn appends(raw: Raw) -> io::Result<bool> {
+/// How a file's handle was opened, as its handle's IO needs to know.
+pub(crate) struct FileMode {
+    /// It appends: it may add to the file's end and not write over it
+    /// (std's `append`).
+    pub(crate) append: bool,
+    /// With no buffering (`FILE_FLAG_NO_BUFFERING`): the system moves the
+    /// bytes straight between the caller's memory and the device, by its
+    /// alignment rules.
+    pub(crate) direct: bool,
+}
+
+/// How the file handle `raw` was opened.
+pub(crate) fn file_mode(raw: Raw) -> io::Result<FileMode> {
     let access = file_information(raw, FILE_ACCESS_INFORMATION)?;
-    Ok(access & FILE_APPEND_DATA != 0 && access & FILE_WRITE_DATA == 0)
+    let mode = file_information(raw, FILE_MODE_INFORMATION)?;
+    Ok(FileMode {
+        append: access & FILE_APPEND_DATA != 0 && access & FILE_WRITE_DATA == 0,
+        direct: mode & FILE_NO_INTERMEDIATE_BUFFERING != 0,
+    })
 }
 
 /// What the handle `raw` tells of itself in `class`, one ULONG.
@@ -463,7 +482,7 @@ fn at(offset: u64) -> OVERLAPPED {
 
 /// Reads up to `len` bytes at `offset` of the file into `buf`; zero at the
 /// end of the file.
-fn read_at(raw: Raw, buf: *mut u8, len: usize, offset: u64) -> io::Result<usize> {
+pub(super) fn read_at(raw: Raw, buf: *mut u8, len: usize, offset: u64) -> io::Result<usize> {
     let mut ov = at(offset);
     let mut read: DWORD = 0;
     let len = u32::try_from(len).unwrap_or(u32::MAX);
@@ -506,7 +525,7 @@ pub(crate) fn append_all(raw: Raw, buf: &[u8]) -> io::Result<u64> {
 }
 
 /// Writes all of `buf` at `offset`, or with `None` at the file's end.
-fn write_all_at(raw: Raw, mut buf: &[u8], mut offset: Option<u64>) -> io::Result<()> {
+pub(super) fn write_all_at(raw: Raw, mut buf: &[u8], mut offset: Option<u64>) -> io::Result<()> {
     while !buf.is_empty() {
         // Both halves of the offset all ones: the file's end.
         let mut ov = at(offset.unwrap_or(u64::MAX));
@@ -597,4 +616,158 @@ pub(crate) fn reopen_overlapped(raw: Raw) -> io::Result<OwnedHandle> {
 /// Whether the provider has `TransmitFile`, which sends a file range in the kernel.
 pub(crate) fn transmit_file_available() -> bool {
     crate::syscore::windows::winsock::ext().is_ok_and(|ext| ext.transmit_file.is_some())
+}
+
+/// Sets one of the file's sizes (`class`) to `value`.
+fn set_size(raw: Raw, class: i32, value: i64) -> io::Result<()> {
+    // SAFETY: the call reads the one `i64` both classes carry.
+    if unsafe {
+        SetFileInformationByHandle(
+            handle_of(raw),
+            class,
+            core::ptr::from_ref(&value).cast(),
+            size_of::<i64>() as DWORD,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// A control code of the file system that takes `input` (or nothing) and answers nothing.
+fn control<T>(raw: Raw, code: DWORD, input: Option<&T>) -> io::Result<()> {
+    let mut returned: DWORD = 0;
+    let (ptr, len) = match input {
+        Some(input) => (core::ptr::from_ref(input).cast(), size_of::<T>() as DWORD),
+        None => (core::ptr::null(), 0),
+    };
+    // SAFETY: the call reads `len` bytes at `ptr`, which is ours or null.
+    if unsafe {
+        DeviceIoControl(
+            handle_of(raw),
+            code,
+            ptr,
+            len,
+            core::ptr::null_mut(),
+            0,
+            &mut returned,
+            core::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// Zeroes the bytes of the file from `from` to `to`.
+fn zero(raw: Raw, from: i64, to: i64) -> io::Result<()> {
+    let range = FILE_ZERO_DATA_INFORMATION {
+        FileOffset: from,
+        BeyondFinalZero: to,
+    };
+    control(raw, FSCTL_SET_ZERO_DATA, Some(&range))
+}
+
+/// Changes the space the `len` bytes of the file from `offset` use, as `mode`
+/// says: the allocation (and, for `Extend`, the size) grown to the range's
+/// end, a range made a hole of a sparse file, or a range zeroed (the file
+/// grown first when the range ends past its end).
+pub(crate) fn allocate(raw: Raw, offset: u64, len: u64, mode: Allocate) -> io::Result<()> {
+    let past = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the range ends past the largest offset a file can have",
+        )
+    };
+    let end = i64::try_from(offset.saturating_add(len)).map_err(|_| past())?;
+    let from = i64::try_from(offset).map_err(|_| past())?;
+    let mut standard = FILE_STANDARD_INFO {
+        AllocationSize: 0,
+        EndOfFile: 0,
+        NumberOfLinks: 0,
+        DeletePending: 0,
+        Directory: 0,
+    };
+    // SAFETY: the call writes a `FILE_STANDARD_INFO` into our own.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle_of(raw),
+            FILE_STANDARD_INFO_CLASS,
+            core::ptr::from_mut(&mut standard).cast(),
+            size_of::<FILE_STANDARD_INFO>() as DWORD,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    match mode {
+        Allocate::Extend | Allocate::KeepSize => {
+            if end > standard.AllocationSize {
+                set_size(raw, FILE_ALLOCATION_INFO_CLASS, end)?;
+            }
+            if mode == Allocate::Extend && end > standard.EndOfFile {
+                set_size(raw, FILE_END_OF_FILE_INFO_CLASS, end)?;
+            }
+            Ok(())
+        }
+        Allocate::PunchHole => {
+            control::<()>(raw, FSCTL_SET_SPARSE, None)?;
+            let to = end.min(standard.EndOfFile);
+            if from < to {
+                zero(raw, from, to)
+            } else {
+                Ok(())
+            }
+        }
+        Allocate::ZeroRange => {
+            if end > standard.EndOfFile {
+                set_size(raw, FILE_END_OF_FILE_INFO_CLASS, end)?;
+            }
+            zero(raw, from, end)
+        }
+    }
+}
+
+/// The volume and the index of the file `raw` names, which tell it from every other file.
+fn identity(raw: Raw) -> io::Result<(u32, u64)> {
+    let mut info = BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: 0,
+        ftCreationTime: [0; 2],
+        ftLastAccessTime: [0; 2],
+        ftLastWriteTime: [0; 2],
+        dwVolumeSerialNumber: 0,
+        nFileSizeHigh: 0,
+        nFileSizeLow: 0,
+        nNumberOfLinks: 0,
+        nFileIndexHigh: 0,
+        nFileIndexLow: 0,
+    };
+    // SAFETY: the call writes the information into our own.
+    if unsafe { GetFileInformationByHandle(handle_of(raw), &mut info) } == 0 {
+        return Err(last_error());
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+/// Whether the handles `a` and `b` name one file (one volume, one index).
+pub(crate) fn same_file(a: Raw, b: Raw) -> io::Result<bool> {
+    Ok(identity(a)? == identity(b)?)
+}
+
+/// Whether the system copies a range between files in the kernel.
+pub(crate) const COPIES_IN_KERNEL: bool = false;
+
+/// No call here copies a range in the kernel: the caller reads and writes.
+pub(crate) fn copy_file_range(_: Raw, _: u64, _: Raw, _: u64, _: usize) -> io::Result<usize> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Whether `err` says the kernel cannot copy between these two files.
+pub(crate) fn kernel_copy_unavailable(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Unsupported
 }

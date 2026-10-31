@@ -271,7 +271,8 @@ impl Current {
 /// [`current`] has to be asked.
 #[inline(always)]
 pub(crate) fn running_inside(here: &Here) -> Option<&Shard> {
-    if here.inside.get() || here.slot.get().is_null() {
+    // Both looked at, no branch between: the test is one `or` of two flags.
+    if here.inside.get() | here.slot.get().is_null() {
         // SAFETY: as in `current`.
         unsafe { here.current.get().as_ref() }
     } else {
