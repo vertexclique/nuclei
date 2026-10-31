@@ -1,0 +1,9 @@
+# configuration                spec                 expected
+P_window                       MC_ReadMany          pass
+P_tight                        MC_ReadMany          pass
+P_wide                         MC_ReadMany          pass
+M_no_cap                       MC_ReadMany          violated:WithinCap
+M_in_end_order                 MC_ReadMany          violated:ResultInPlace
+M_skips_order                  MC_ReadMany          violated:ResultInPlace
+M_no_advance                   MC_ReadMany          violated:EachOnce
+W_out_of_order                 MC_ReadMany          violated:NoOutOfOrder

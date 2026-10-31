@@ -1777,6 +1777,24 @@ unlock, a drop that reads the word and writes GONE in two steps, each `NoOwnerle
 witnesses (the job gets the lock after its future was dropped, and a dropped future finds the
 lock held and gives it back itself).
 
+## Many reads in one call
+
+`many` (`tla/many/ReadMany.tla`) checks `Handle<File>::read_many_at` (`src/fs/file/many.rs`:
+`FileIo::read_many_at`, with `poll_ordered` of `src/fs/file/positional.rs`): a call of N reads at
+offsets of the task's own, with a cursor write accepted before it and not landed yet. The call
+waits until that write landed, then sends reads out in the order the task named them, at most
+`Cap` at once (`MANY_AT_ONCE`); the kernel makes them in any order, and each time one ends the call
+takes its result into that read's place and sends the next. A read moves one cell; the ring's own
+room only delays a read and is the kernel's. 8 configurations: 3 that must pass (four reads
+through a window of two, three through a window of one, three through a window wider than the
+call), with `WithinCap`, never more reads out than the window holds; `ResultInPlace`, each place
+holds its own read's result, which saw the write before the call; `EachOnce`, no read goes out
+twice; `AllAnswered`, a call that is done answered every read; and `Termination`; 4 mutations (a
+call that sends every read out whatever the window holds breaks `WithinCap`; one that gives
+results back in the order reads end, and one that sends reads before the write before it landed,
+break `ResultInPlace`; one that does not move on to the next read breaks `EachOnce`); and 1 witness
+(a read ends before one named before it).
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the
