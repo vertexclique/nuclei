@@ -97,7 +97,6 @@ impl FileIo {
                     .map(|n| n as u64),
                 )
             },
-            call::as_copied,
             Waker::noop(),
         ));
         Out {
@@ -130,7 +129,6 @@ impl FileIo {
                     (from, n),
                 ))
             },
-            call::as_copied,
             Waker::noop(),
         ));
         Out {

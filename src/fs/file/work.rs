@@ -39,7 +39,10 @@ pub(super) enum Work<T> {
     Slot(SlotJob<T>),
 }
 
-impl<T: Ended> Work<T> {
+impl<T> Work<T>
+where
+    T: Ended + call::End,
+{
     /// The call's end once it came, its error counted for `stats`.
     #[inline]
     pub(super) fn poll(&mut self, waker: &Waker) -> Poll<T> {
@@ -375,7 +378,6 @@ impl FileIo {
         let bytes = buf.filled().len();
         let work = Work::Slot(call::write_on_pool(
             move || FileOutcome::Write(sys::pwrite_all(fd.raw(), buf.filled(), at)),
-            call::as_write,
             waker,
         ));
         (work, bytes)
@@ -390,7 +392,6 @@ impl FileIo {
             let bytes = buf.filled().len();
             let work = Work::Slot(call::write_on_pool(
                 move || FileOutcome::Append(sys::append_all(fd.raw(), buf.filled())),
-                call::as_append,
                 waker,
             ));
             return Writing::Append(work, bytes);
@@ -450,7 +451,6 @@ impl FileIo {
                 let result = pwrite_owned(fd.raw(), &mut buf, 0, at);
                 FileOutcome::WriteLent(result, buf)
             },
-            call::as_write_lent,
             waker,
         ));
         (work, bytes)
@@ -470,7 +470,6 @@ impl FileIo {
                     let result = append_owned(fd.raw(), &mut buf);
                     FileOutcome::AppendLent(result, buf)
                 },
-                call::as_append_lent,
                 waker,
             ));
             return Writing::AppendLent(work, bytes);

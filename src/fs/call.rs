@@ -11,12 +11,12 @@
 //! dropped handle hands on (`rt::linger`, proofs/tla/going/Linger.tla).
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Poll, Waker};
 use std::io;
 use std::sync::Arc;
 
-#[cfg(ring)]
 use crate::buf::PoolBuf;
 use crate::buf::owned::OwnedBuf;
 use crate::rt::shard::Shared;
@@ -132,7 +132,6 @@ impl Slot {
 }
 
 /// A lent read's end: its result, and the task's buffer back.
-#[cfg(ring)]
 pub(crate) type LentReadEnd = (io::Result<usize>, OwnedBuf);
 /// A lent write's end: its result, and the task's buffer back.
 pub(crate) type LentWriteEnd = (io::Result<()>, OwnedBuf);
@@ -140,19 +139,23 @@ pub(crate) type LentWriteEnd = (io::Result<()>, OwnedBuf);
 /// buffer back.
 pub(crate) type LentAppendEnd = (io::Result<u64>, OwnedBuf);
 
-/// A file's call in flight, as the task that waits for it sees it.
+/// A file's call in flight, as the task that waits for it sees it: its end
+/// is taken as `T` (see [`End`]).
 pub(crate) struct SlotJob<T> {
     /// `None` once dropped: it went to this thread's spares.
     slot: Option<Arc<Slot>>,
-    map: fn(FileOutcome) -> T,
+    end: PhantomData<fn() -> T>,
 }
 
-impl<T> SlotJob<T> {
-    /// The job of the call that ends in `slot`, its end taken by `map`.
-    pub(crate) fn new(slot: Arc<Slot>, map: fn(FileOutcome) -> T) -> Self {
+impl<T> SlotJob<T>
+where
+    T: End,
+{
+    /// The job of the call that ends in `slot`.
+    pub(crate) fn new(slot: Arc<Slot>) -> Self {
         Self {
             slot: Some(slot),
-            map,
+            end: PhantomData,
         }
     }
 
@@ -162,11 +165,11 @@ impl<T> SlotJob<T> {
             return Poll::Pending;
         };
         if let Some(outcome) = slot.take() {
-            return Poll::Ready((self.map)(outcome));
+            return Poll::Ready(T::of(outcome));
         }
         slot.waker.register(waker);
         match slot.take() {
-            Some(outcome) => Poll::Ready((self.map)(outcome)),
+            Some(outcome) => Poll::Ready(T::of(outcome)),
             None => Poll::Pending,
         }
     }
@@ -207,8 +210,9 @@ impl Drop for WriteCall {
 /// and leaves its end in a slot, a write counted (see [`WriteCall`]) until
 /// then. `waker` is registered before the call can end, so its end wakes it
 /// whenever it comes.
-pub(crate) fn write_on_pool<T, F>(call: F, map: fn(FileOutcome) -> T, waker: &Waker) -> SlotJob<T>
+pub(crate) fn write_on_pool<T, F>(call: F, waker: &Waker) -> SlotJob<T>
 where
+    T: End,
     F: FnOnce() -> FileOutcome + Send + 'static,
 {
     let slot = Slot::new();
@@ -221,75 +225,87 @@ where
         drop(write);
     })
     .detach();
-    SlotJob::new(slot, map)
+    SlotJob::new(slot)
 }
 
-/// The ends as each kind of call takes them; an end of another kind cannot
-/// come (each call is made with its own), and says so if it does.
-#[cfg(ring)]
-pub(crate) fn as_read(outcome: FileOutcome) -> io::Result<PoolBuf> {
-    match outcome {
-        FileOutcome::Read(result) => result,
-        _ => Err(io::Error::other("a file read ended as another call")),
+/// The end a kind of call takes out of its slot: each call is made with
+/// its own kind of end, so an end of another kind cannot come, and says so
+/// if it does.
+pub(crate) trait End: Sized {
+    fn of(outcome: FileOutcome) -> Self;
+}
+
+/// An end of another kind than its call's.
+#[cold]
+fn mismatched() -> io::Error {
+    io::Error::other("a file call ended as another kind of call")
+}
+
+/// A read into a buffer of the pool, which ends in a slot only on a ring.
+impl End for io::Result<PoolBuf> {
+    #[inline]
+    fn of(outcome: FileOutcome) -> Self {
+        match outcome {
+            #[cfg(ring)]
+            FileOutcome::Read(result) => result,
+            _ => Err(mismatched()),
+        }
     }
 }
 
-#[cfg(ring)]
-pub(crate) fn as_read_lent(outcome: FileOutcome) -> LentReadEnd {
-    match outcome {
-        FileOutcome::ReadLent(result, buf) => (result, buf),
-        _ => (
-            Err(io::Error::other("a file read ended as another call")),
-            OwnedBuf::default(),
-        ),
+/// A write, a range's change or a socket's shutdown, and on a ring a sync.
+impl End for io::Result<()> {
+    #[inline]
+    fn of(outcome: FileOutcome) -> Self {
+        match outcome {
+            FileOutcome::Write(result) => result,
+            #[cfg(ring)]
+            FileOutcome::Sync(result) => result,
+            _ => Err(mismatched()),
+        }
     }
 }
 
-pub(crate) fn as_write(outcome: FileOutcome) -> io::Result<()> {
-    match outcome {
-        FileOutcome::Write(result) => result,
-        _ => Err(io::Error::other("a file write ended as another call")),
+/// An append, ending where the file's offset is after it, or a chunk of a
+/// copy, ending with its count.
+impl End for io::Result<u64> {
+    #[inline]
+    fn of(outcome: FileOutcome) -> Self {
+        match outcome {
+            FileOutcome::Append(result) | FileOutcome::Copied(result) => result,
+            _ => Err(mismatched()),
+        }
     }
 }
 
-#[cfg(ring)]
-pub(crate) fn as_sync(outcome: FileOutcome) -> io::Result<()> {
-    match outcome {
-        FileOutcome::Sync(result) => result,
-        _ => Err(io::Error::other("a file sync ended as another call")),
+/// A read into a task's buffer, which ends in a slot only on a ring.
+impl End for LentReadEnd {
+    #[inline]
+    fn of(outcome: FileOutcome) -> Self {
+        match outcome {
+            #[cfg(ring)]
+            FileOutcome::ReadLent(result, buf) => (result, buf),
+            _ => (Err(mismatched()), OwnedBuf::default()),
+        }
     }
 }
 
-pub(crate) fn as_copied(outcome: FileOutcome) -> io::Result<u64> {
-    match outcome {
-        FileOutcome::Copied(result) => result,
-        _ => Err(io::Error::other("a file copy ended as another call")),
+impl End for LentWriteEnd {
+    #[inline]
+    fn of(outcome: FileOutcome) -> Self {
+        match outcome {
+            FileOutcome::WriteLent(result, buf) => (result, buf),
+            _ => (Err(mismatched()), OwnedBuf::default()),
+        }
     }
 }
 
-pub(crate) fn as_write_lent(outcome: FileOutcome) -> LentWriteEnd {
-    match outcome {
-        FileOutcome::WriteLent(result, buf) => (result, buf),
-        _ => (
-            Err(io::Error::other("a file write ended as another call")),
-            OwnedBuf::default(),
-        ),
-    }
-}
-
-pub(crate) fn as_append(outcome: FileOutcome) -> io::Result<u64> {
-    match outcome {
-        FileOutcome::Append(result) => result,
-        _ => Err(io::Error::other("a file write ended as another call")),
-    }
-}
-
-pub(crate) fn as_append_lent(outcome: FileOutcome) -> LentAppendEnd {
-    match outcome {
-        FileOutcome::AppendLent(result, buf) => (result, buf),
-        _ => (
-            Err(io::Error::other("a file write ended as another call")),
-            OwnedBuf::default(),
-        ),
+impl End for LentAppendEnd {
+    #[inline]
+    fn of(outcome: FileOutcome) -> Self {
+        match outcome {
+            FileOutcome::AppendLent(result, buf) => (result, buf),
+            _ => (Err(mismatched()), OwnedBuf::default()),
+        }
     }
 }

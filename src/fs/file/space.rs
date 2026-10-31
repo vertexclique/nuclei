@@ -73,7 +73,6 @@ impl FileIo {
         let fd = self.fd.clone();
         Work::Slot(call::write_on_pool(
             move || FileOutcome::Write(sys::allocate(fd.raw(), offset, len, mode)),
-            call::as_write,
             waker,
         ))
     }

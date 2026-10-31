@@ -34,6 +34,7 @@ use std::sync::Arc;
 use super::FileIo;
 use super::orphans::Orphan;
 use super::work::{Ended, Work, bounce, tally_read, tally_write};
+use crate::fs::call::End;
 use crate::io::Handle;
 use crate::io::side::After;
 
@@ -176,7 +177,7 @@ where
 
 impl<T> Out<'_, T>
 where
-    T: Ended,
+    T: Ended + End,
     (Work<T>, usize): Into<Orphan>,
 {
     /// The call's end, once it came.
