@@ -125,9 +125,9 @@ pub(crate) unsafe fn syscall(nr: libc::c_long, args: [usize; 6]) -> io::Result<u
             options(nostack),
         );
     }
-    // SAFETY: as above, through libc, which answers -1 and sets `errno` for an error.
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
+        // SAFETY: as above, through libc, which answers -1 and sets `errno` for an error.
         ret = unsafe { libc::syscall(nr, a0, a1, a2, a3, a4, a5) } as isize;
         if ret == -1 {
             return Err(io::Error::last_os_error());
