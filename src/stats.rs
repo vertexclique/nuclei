@@ -29,6 +29,11 @@ pub struct Stats {
     /// outside nuclei's `block_on` and its tasks, or a completion delivered
     /// while its shard was not running.
     pub off_shard_errors: ErrorCounts,
+    /// Shards that started without the io_uring receive buffers their
+    /// configuration asked for, because the system had no memory for them
+    /// (most often the locked-memory limit); their reads use the pool's
+    /// buffers instead.
+    pub receive_buffers_missing: u64,
 }
 
 /// One shard's counters. Those marked "published" are as the shard last
@@ -69,9 +74,11 @@ pub struct ShardStats {
     /// room in the ring's completion queue (none is lost: the kernel keeps
     /// them until there is room); 0 on other backends (published).
     pub cq_overflows: u64,
-    /// Bytes the shard's buffer pool holds, in use and free (published).
+    /// Bytes the shard's IO buffers hold: its pool's, in use and free, and on
+    /// io_uring its receive buffers' (published).
     pub buffer_bytes: usize,
-    /// The most bytes the shard's buffer pool may hold.
+    /// The most bytes the shard's IO buffers may hold, its receive buffers
+    /// included ([`Builder::io_buffer_cap`](crate::Builder::io_buffer_cap)).
     pub buffer_cap: usize,
     /// Times a buffer was wanted while every byte under the pool's cap was
     /// in use; the IO waits for one to come back (published).

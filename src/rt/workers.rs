@@ -223,6 +223,7 @@ impl Workers {
             workers.monitor.clone(),
         )?);
         let shared = Arc::clone(&shard.shared);
+        shared.set_runtime(Arc::downgrade(inner));
         let _ = workers.slots[index].set(Arc::clone(&shared));
         workers.running.fetch_add(1, Ordering::AcqRel);
         let life = Arc::new(Life::new());
@@ -700,12 +701,24 @@ mod placement_tests {
 
     use crate::runtime::{Builder, Runtime};
 
+    /// A runtime of `workers` workers, every one started: placement counts
+    /// only the workers that claimed their slot, and a thread the system
+    /// starts late would take none of a burst spawned at once.
     fn runtime(workers: usize) -> Runtime {
-        Builder::new()
+        let rt = Builder::new()
             .worker_threads(workers)
             .pin_workers(false)
             .build()
-            .unwrap()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while rt.inner().workers.shards().count() < workers {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the workers never started"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rt
     }
 
     /// Spawns `count` tasks from this thread, each held until `release`;

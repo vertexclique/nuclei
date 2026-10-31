@@ -430,7 +430,9 @@ fn connect_patiently(addr: std::net::SocketAddr) -> std::net::TcpStream {
 }
 
 /// Connections taken without their addresses are all served by the one
-/// multishot accept the first armed.
+/// multishot accept the first armed, or by one armed again after the process
+/// had no descriptor to accept into (other tests run in parallel), which ends
+/// the accept.
 #[test]
 fn one_multishot_accept_serves_a_stream_of_connections() {
     let Some(shard) = recv_shard(16, 4096) else {
@@ -449,9 +451,19 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
             .collect::<Vec<_>>()
     });
     let mut seen = Vec::new();
+    let mut ended = 0;
     let served = shard.block_on(crate::time::timeout(Duration::from_secs(30), async {
         for _ in 0..16 {
-            let conn = std::net::TcpStream::from(accept_stream(&src).await);
+            let conn = loop {
+                match poll_fn(|cx| src.poll_accept_stream(cx)).await {
+                    Ok(conn) => break std::net::TcpStream::from(conn),
+                    Err(err) if crate::rt::counters::out_of_descriptors(&err) => {
+                        ended += 1;
+                        crate::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(err) => panic!("{err}"),
+                }
+            };
             // An accepted connection is non-blocking; its byte may still be
             // on its way.
             conn.set_nonblocking(false).unwrap();
@@ -470,7 +482,12 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
         "a connection was lost or taken twice"
     );
     let (armed, _, _) = shard.ring().unwrap().multishot_counts();
-    assert_eq!(armed, 1, "the accept was armed again {} times", armed - 1);
+    assert_eq!(
+        armed,
+        1 + ended,
+        "the accept was armed again {} times, {ended} of them after the process had no descriptor",
+        armed - 1
+    );
     drop(clients.join().unwrap());
     src.retire();
 }
@@ -512,9 +529,15 @@ fn an_accept_after_a_multishot_one_gets_its_peer_from_the_kernel() {
 
 /// Connections that come while no task takes them: past its cap the accept
 /// is stopped, none is lost, and once they are taken the accept is armed
-/// again.
+/// again. Alone in a process of its own: its clients and the connections it
+/// holds take more descriptors than the tests running beside it leave.
 #[test]
 fn past_its_cap_a_multishot_accept_is_stopped_and_loses_no_connection() {
+    if !crate::alone::alone(
+        "rt::shard::ring::tests_recv::past_its_cap_a_multishot_accept_is_stopped_and_loses_no_connection",
+    ) {
+        return;
+    }
     // A completion queue with room for every connection: only the cap stops
     // the accept.
     let Some(shard) = ring_shard_of(1024, 16, 4096) else {

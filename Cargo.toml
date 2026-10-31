@@ -20,7 +20,6 @@ exclude = [
 	"art/*",
 	"proofs/*",
 	"proptest-regressions/*",
-	"ci/*",
 	"benches/*",
 	"doc/*",
 	"docs/*",
@@ -57,6 +56,7 @@ kovan = "0.2.2"
 kovan-channel = "0.2.2"
 kovan-map = "0.2.2"
 kovan-queue = "0.2.2"
+log = "0.4"
 
 [target.'cfg(target_family = "unix")'.dependencies]
 libc = { version = "0.2" }
@@ -77,6 +77,11 @@ proptest = "1"
 [[test]]
 name = "macros_main"
 harness = false
+
+# The op-count gate's program (ci/op_counts.sh), outside the directories cargo discovers.
+[[example]]
+name = "op_count"
+path = "ci/op_count/main.rs"
 
 [[bench]]
 name = "sync"

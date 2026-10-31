@@ -12,11 +12,10 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::future::Future;
 use std::io;
-use std::sync::Arc;
 
 use super::FileIo;
 use crate::buf::{LARGEST, PoolBuf, with_pool};
-use crate::io::raw::file_raw;
+use crate::fs::call::{self, FileOutcome, SlotJob};
 use crate::io::side::After;
 use crate::io::sys;
 use crate::rt::task::Task;
@@ -25,12 +24,12 @@ use crate::rt::task::Task;
 /// rules of direct IO (which never ask for more than a page of memory).
 pub(super) const PAGE: usize = 4096;
 
-/// A file's call in flight: a job of the blocking pool, or an operation on
-/// the ring of the shard whose thread issued it.
+/// A file's call in flight: a job of the blocking pool, or a call that ends
+/// in a slot (an operation on the ring of the shard whose thread issued it,
+/// or a write the pool makes).
 pub(super) enum Work<T> {
     Pool(Task<T>),
-    #[cfg(ring)]
-    Ring(crate::fs::ring::RingJob<T>),
+    Slot(SlotJob<T>),
 }
 
 impl<T: Ended> Work<T> {
@@ -38,8 +37,7 @@ impl<T: Ended> Work<T> {
     pub(super) fn poll(&mut self, waker: &Waker) -> Poll<T> {
         let end = match self {
             Work::Pool(task) => poll_task(task, waker),
-            #[cfg(ring)]
-            Work::Ring(job) => job.poll(waker),
+            Work::Slot(job) => job.poll(waker),
         };
         if let Poll::Ready(end) = &end
             && let Some(err) = end.error()
@@ -52,13 +50,12 @@ impl<T: Ended> Work<T> {
 
 impl<T> Work<T> {
     /// Lets the call run to its end with nobody to take it: a job of the
-    /// pool is detached (dropped, one not started would be cancelled), an
-    /// operation of the ring goes on by itself.
+    /// pool is detached (dropped, one not started would be cancelled), a
+    /// call that ends in a slot goes on by itself.
     pub(super) fn let_go(self) {
         match self {
             Work::Pool(task) => task.detach(),
-            #[cfg(ring)]
-            Work::Ring(job) => drop(job),
+            Work::Slot(job) => drop(job),
         }
     }
 }
@@ -233,48 +230,58 @@ impl FileIo {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::read(&self.fd, at, buf, from, len) {
-                Ok(job) => return Work::Ring(job),
+                Ok(job) => return Work::Slot(job),
                 Err(buf) => buf,
             },
             false => buf,
         };
-        let fd = Arc::clone(&self.fd);
+        let fd = self.fd.clone();
         let mut buf = buf;
         Work::Pool(crate::runtime::spawn_blocking(move || {
             let end = (from + len).min(buf.capacity());
-            let n = sys::pread(file_raw(&fd), &mut buf.spare()[from..end], at)?;
+            let n = sys::pread(fd.raw(), &mut buf.spare()[from..end], at)?;
             buf.set_filled_at(from, n);
             Ok(buf)
         }))
     }
 
     /// A write of the bytes `buf` holds at `at`, whole: for a positional
-    /// write, and the cursor's on a file not opened to append.
-    pub(super) fn submit_pwrite(&self, buf: PoolBuf, at: u64) -> Work<io::Result<()>> {
+    /// write, and the cursor's on a file not opened to append. A write the
+    /// pool makes wakes `waker` when it ends.
+    pub(super) fn submit_pwrite(
+        &self,
+        buf: PoolBuf,
+        at: u64,
+        waker: &Waker,
+    ) -> Work<io::Result<()>> {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::write(&self.fd, at, buf) {
-                Ok(job) => return Work::Ring(job),
+                Ok(job) => return Work::Slot(job),
                 Err(buf) => buf,
             },
             false => buf,
         };
-        let fd = Arc::clone(&self.fd);
-        Work::Pool(crate::runtime::spawn_blocking(move || {
-            sys::pwrite_all(file_raw(&fd), buf.filled(), at)
-        }))
+        let fd = self.fd.clone();
+        Work::Slot(call::write_on_pool(
+            move || FileOutcome::Write(sys::pwrite_all(fd.raw(), buf.filled(), at)),
+            call::as_write,
+            waker,
+        ))
     }
 
     /// The cursor's write of `buf` at `at`, or at the end of a file opened
-    /// to append.
-    pub(super) fn submit_write(&self, buf: PoolBuf, at: u64) -> Writing {
+    /// to append; a write the pool makes wakes `waker` when it ends.
+    pub(super) fn submit_write(&self, buf: PoolBuf, at: u64, waker: &Waker) -> Writing {
         if self.append {
-            let fd = Arc::clone(&self.fd);
-            return Writing::Append(Work::Pool(crate::runtime::spawn_blocking(move || {
-                sys::append_all(file_raw(&fd), buf.filled())
-            })));
+            let fd = self.fd.clone();
+            return Writing::Append(Work::Slot(call::write_on_pool(
+                move || FileOutcome::Append(sys::append_all(fd.raw(), buf.filled())),
+                call::as_append,
+                waker,
+            )));
         }
-        Writing::Pool(self.submit_pwrite(buf, at))
+        Writing::Pool(self.submit_pwrite(buf, at, waker))
     }
 
     /// A read at `at` into the spare capacity of a task's `buf`, after the
@@ -287,15 +294,15 @@ impl FileIo {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::read_lent(&self.fd, at, buf) {
-                Ok(job) => return Work::Ring(job),
+                Ok(job) => return Work::Slot(job),
                 Err(buf) => buf,
             },
             false => buf,
         };
-        let fd = Arc::clone(&self.fd);
+        let fd = self.fd.clone();
         let mut buf = buf;
         Work::Pool(crate::runtime::spawn_blocking(move || {
-            let result = sys::pread_uninit(file_raw(&fd), buf.spare_capacity_mut(), at);
+            let result = sys::pread_uninit(fd.raw(), buf.spare_capacity_mut(), at);
             if let Ok(n) = result {
                 // SAFETY: the kernel wrote the first `n` bytes of the spare
                 // capacity.
@@ -306,35 +313,48 @@ impl FileIo {
     }
 
     /// A write of all of a task's `buf` at `at`: for a positional write, and
-    /// the cursor's on a file not opened to append.
+    /// the cursor's on a file not opened to append. A write the pool makes
+    /// wakes `waker` when it ends.
     pub(super) fn submit_pwrite_owned(
         &self,
         buf: Vec<u8>,
         at: u64,
+        waker: &Waker,
     ) -> Work<(io::Result<()>, Vec<u8>)> {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match crate::fs::ring::write_lent(&self.fd, at, buf) {
-                Ok(job) => return Work::Ring(job),
+                Ok(job) => return Work::Slot(job),
                 Err(buf) => buf,
             },
             false => buf,
         };
-        let fd = Arc::clone(&self.fd);
-        Work::Pool(crate::runtime::spawn_blocking(move || {
-            (sys::pwrite_all(file_raw(&fd), &buf, at), buf)
-        }))
+        let fd = self.fd.clone();
+        Work::Slot(call::write_on_pool(
+            move || {
+                let result = sys::pwrite_all(fd.raw(), &buf, at);
+                FileOutcome::WriteLent(result, buf)
+            },
+            call::as_write_lent,
+            waker,
+        ))
     }
 
     /// The cursor's write of all of a task's `buf` at `at`, or at the end of
-    /// a file opened to append.
-    pub(super) fn submit_write_owned(&self, buf: Vec<u8>, at: u64) -> Writing {
+    /// a file opened to append; a write the pool makes wakes `waker` when it
+    /// ends.
+    pub(super) fn submit_write_owned(&self, buf: Vec<u8>, at: u64, waker: &Waker) -> Writing {
         if self.append {
-            let fd = Arc::clone(&self.fd);
-            return Writing::AppendLent(Work::Pool(crate::runtime::spawn_blocking(move || {
-                (sys::append_all(file_raw(&fd), &buf), buf)
-            })));
+            let fd = self.fd.clone();
+            return Writing::AppendLent(Work::Slot(call::write_on_pool(
+                move || {
+                    let result = sys::append_all(fd.raw(), &buf);
+                    FileOutcome::AppendLent(result, buf)
+                },
+                call::as_append_lent,
+                waker,
+            )));
         }
-        Writing::Lent(self.submit_pwrite_owned(buf, at))
+        Writing::Lent(self.submit_pwrite_owned(buf, at, waker))
     }
 }

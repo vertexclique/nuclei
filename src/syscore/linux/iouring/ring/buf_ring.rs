@@ -35,6 +35,28 @@ use super::{
 
 /// Largest number of descriptors the kernel accepts in one buffer ring.
 const MAX_ENTRIES: u16 = 1 << 15;
+
+#[cfg(test)]
+thread_local! {
+    /// The buffers of a ring made on this thread find no memory, as a mapping the system refuses
+    /// does, for a test.
+    pub(crate) static NO_MEMORY_FOR_TEST: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+/// The memory a ring of `entries` buffers of `buf_size` bytes maps, in whole pages: its
+/// descriptor ring and its buffers.
+pub(crate) fn reservation(entries: u16, buf_size: u32) -> usize {
+    // SAFETY: a plain query.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|&page| page > 0)
+        .unwrap_or(4096);
+    let pages = |bytes: usize| bytes.div_ceil(page).saturating_mul(page);
+    pages(usize::from(entries) * size_of::<IoUringBuf>()).saturating_add(pages(
+        usize::from(entries).saturating_mul(buf_size as usize),
+    ))
+}
 /// Byte offset of the tail inside descriptor 0 (the `resv` field).
 const TAIL_OFFSET: usize = 14;
 
@@ -132,6 +154,10 @@ impl BufRing {
                 io::Error::new(io::ErrorKind::InvalidInput, "the buffer pool is too large")
             })?;
         let ring_map = Mapping::anon(usize::from(entries) * size_of::<IoUringBuf>())?;
+        #[cfg(test)]
+        if NO_MEMORY_FOR_TEST.with(core::cell::Cell::get) {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
         let buf_map = Mapping::anon(buf_bytes)?;
         let ring_fd = ring.fd.try_clone()?;
         let reg = IoUringBufReg {

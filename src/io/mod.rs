@@ -20,7 +20,7 @@
 mod async_fd;
 #[cfg(unix)]
 pub(crate) mod caller;
-mod handle;
+pub(crate) mod handle;
 pub(crate) mod raw;
 mod ready;
 pub(crate) mod side;

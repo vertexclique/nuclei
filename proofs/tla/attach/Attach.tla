@@ -7,10 +7,13 @@
 (* with both sides held and of the ring thread's steps.                    *)
 (*                                                                          *)
 (* In plain words: a thread that is not the ring's performs the attach: it *)
-(* marks the registration under way and posts the ring a copy of the       *)
-(* descriptor. The ring's thread looks whether the registration still     *)
-(* wants it, puts the file into its table, and hands the slot to the       *)
-(* source as a request. Whoever performs that request, with both sides     *)
+(* marks the registration under way and posts the ring a lease on the      *)
+(* handle's object (no copy of the descriptor is made): the object stays   *)
+(* open, its number the handle's, until the ring's thread is done with the *)
+(* attach, however the handle closes meanwhile. The ring's thread looks    *)
+(* whether the registration still wants it, puts the file into its table,  *)
+(* hands the slot to the source as a request, and lets the lease go.      *)
+(* Whoever performs that request, with both sides                          *)
 (* held, keeps the slot if the attach is still under way and the handle    *)
 (* open, else posts the ring to let it go. A close or an evict, performed  *)
 (* the same way, undoes an attach under way. The file must never stay in   *)
@@ -45,6 +48,7 @@ variables
     home = "none",      \* the shard the registration is with: "ring" (this one) or "B"
     slotFrom = "none",  \* the table the slot the source took is of
     fdOpen = TRUE,      \* the handle's descriptor is open
+    leased = FALSE,     \* the attach in the ring's mailbox holds a lease on the object
     table = FALSE,      \* the ring's table holds the file
     mailbox = <<>>,     \* the ring's posted work, in order
     stopped = FALSE,    \* the shard is going away (set before it evicts its sources)
@@ -53,7 +57,8 @@ variables
     closed = FALSE,     \* (record) the close was performed
     evicted = FALSE,    \* (record) the evict was performed
     staleDrop = FALSE,  \* (record) the ring found the attach undone and put nothing in
-    rejected = FALSE;   \* (record) an install the source no longer wanted went back
+    rejected = FALSE,   \* (record) an install the source no longer wanted went back
+    installedClosed = FALSE; \* (record) the ring put the file of a closed descriptor into its table
 
 define
     RequestersDone == \A p \in Requesters : pc[p] = "Done"
@@ -61,18 +66,23 @@ define
     \* The attach to this ring is the registration's: its token, with this
     \* shard. MUTATION token_only: the token alone.
     Ours == token = "t0" /\ (home = "ring" \/ Mutation = "token_only")
+    \* The descriptor after the close: open while the attach's lease is out.
+    \* MUTATION no_lease: the attach holds no lease, so the close closes it at once.
+    KeptOpen == leased /\ Mutation # "no_lease"
 end define;
 
-\* Performs the attach with both sides held: under way, the copy posted.
-\* `attach_now` refuses a shard that stopped.
+\* Performs the attach with both sides held: under way, a lease posted.
+\* `attach_now` refuses a shard that stopped, and a handle that closed (its
+\* descriptor out of the source).
 fair process attacher = "attacher"
 begin
 A_attach:
-    if ~stopped then
+    if ~stopped /\ ~closed then
         reg := "registering";
         ops := TRUE;
         token := "t0";
         home := "ring";
+        leased := TRUE;
         mailbox := Append(mailbox, "attach");
     end if;
 end process;
@@ -105,17 +115,17 @@ P_perform:
         \* MUTATION no_abandon: an attach under way is left to the ring.
         if reg = "registering" /\ ops /\ Mutation # "no_abandon" then
             reg := "unreg" || ops := FALSE || token := "none" || home := "none"
-                || fdOpen := FALSE || closed := TRUE;
+                || fdOpen := KeptOpen || closed := TRUE;
         elsif reg = "registered" then
             reg := "unreg" || ops := FALSE || token := "none" || home := "none"
-                || fdOpen := FALSE || closed := TRUE || mailbox := Append(mailbox, "detach");
+                || fdOpen := KeptOpen || closed := TRUE || mailbox := Append(mailbox, "detach");
         else
-            fdOpen := FALSE || closed := TRUE;
+            fdOpen := KeptOpen || closed := TRUE;
         end if;
         reqs := reqs \ {"close"};
     elsif "installed" \in reqs then
         \* `take_installs`: kept if the attach is still under way and the handle open.
-        if reg = "registering" /\ ops /\ Ours /\ fdOpen then
+        if reg = "registering" /\ ops /\ Ours /\ ~closed then
             reg := "registered" || slotFrom := "ring";
         else
             mailbox := Append(mailbox, "detach");
@@ -147,7 +157,7 @@ fair process reattacher = "reattacher"
 begin
 B_attach:
     await ~Again \/ (evicted /\ reg = "unreg");
-    if Again /\ fdOpen then
+    if Again /\ ~closed then
         reg := "registering" || ops := TRUE || token := "t0" || home := "B";
     end if;
 B_install:
@@ -177,9 +187,12 @@ R_look:
     \* `ring_attached`: a registration that was undone gets nothing.
     if ~(reg = "registering" /\ Ours) then
         staleDrop := TRUE;
-        goto R_loop;
+        goto R_unlease;
     end if;
 R_install:
+    \* The table takes the file of the descriptor the lease keeps open; a close
+    \* may have come since the look.
+    if ~fdOpen then installedClosed := TRUE; end if;
     table := TRUE;
 R_hand:
     \* MUTATION direct: the ring's thread writes the registration itself, as
@@ -190,6 +203,10 @@ R_hand:
         installed := TRUE;
         reqs := reqs \cup {"installed"};
     end if;
+R_unlease:
+    \* The attach's lease goes: a handle that closed meanwhile closes its object now.
+    leased := FALSE;
+    if closed then fdOpen := FALSE; end if;
     goto R_loop;
 end process;
 end algorithm; *)
@@ -207,8 +224,12 @@ AllDone == \A p \in DOMAIN pc : pc[p] = "Done"
 
 \* Once everything is done: a closed source leaves no file in the table and
 \* is not registered; an evicted one is not registered.
-NoLeak == AllDone => /\ (closed => ~table /\ reg # "registered")
+NoLeak == AllDone => /\ (closed => ~table /\ reg # "registered" /\ ~fdOpen)
                      /\ (evicted => ~(reg = "registered" /\ home = "ring"))
+
+\* The ring never puts the file of a descriptor that closed (whose number another file may
+\* have taken) into its table.
+NoClosedInstall == ~installedClosed
 
 \* The table holds the file exactly while the source is registered with the
 \* ring or an install of it is on its way to the source.

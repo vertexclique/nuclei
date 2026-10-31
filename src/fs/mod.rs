@@ -24,6 +24,7 @@
 //! buffer and give it back, so the bytes are read into it and written from
 //! it with no copy.
 
+pub(crate) mod call;
 pub(crate) mod file;
 mod file_ops;
 mod ops;

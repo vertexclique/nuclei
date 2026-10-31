@@ -18,6 +18,11 @@
 //! buffer comes back. So a shard's buffer memory is bounded by its cap,
 //! whatever its connections do.
 //!
+//! The shard's receive group (io_uring's provided buffers, see
+//! `rt::shard::recv`) is charged here too, for as long as it lives
+//! ([`Pool::reserve`]): the pool's own buffers get what is left of the cap,
+//! and a group that leaves no room for one of the smallest class is refused.
+//!
 //! # Where a buffer goes back
 //!
 //! A buffer dropped on its pool's own thread goes straight to the free list.
@@ -53,6 +58,11 @@ pub(crate) const LARGEST: usize = CLASSES[CLASSES.len() - 1];
 const WHOLE: u8 = u8::MAX;
 /// What a shard's pool may hold unless its runtime says otherwise.
 pub(crate) const DEFAULT_CAP: usize = 64 << 20;
+
+/// The largest class a pool whose own buffers may hold `room` bytes takes.
+fn top_for(room: usize) -> Option<usize> {
+    CLASSES.iter().rposition(|&size| size <= room)
+}
 
 /// The class a request of `len` bytes takes: the smallest that holds it, or
 /// the largest.
@@ -206,10 +216,13 @@ fn returned_layout(class: u8, cap: u32) -> Layout {
 pub(crate) struct Pool {
     home: Arc<Home>,
     free: [RefCell<Vec<NonNull<u8>>>; CLASSES.len()],
-    /// Bytes the pool may hold, in use and free.
+    /// Bytes the pool may hold, in use and free, the reservation included.
     cap: usize,
-    /// The largest class that fits under the cap, if any does.
-    top: Option<usize>,
+    /// Of `charged`, the bytes [`reserve`](Self::reserve) took for memory the
+    /// shard holds outside the pool.
+    reserved: Cell<usize>,
+    /// The largest class that fits beside the reservation, if any does.
+    top: Cell<Option<usize>>,
     /// Bytes it holds.
     charged: Cell<usize>,
     /// Times a buffer was wanted with every byte under the cap in use.
@@ -236,15 +249,55 @@ impl Pool {
             }),
             free: Default::default(),
             cap,
-            top: CLASSES.iter().rposition(|&size| size <= cap),
+            reserved: Cell::new(0),
+            top: Cell::new(top_for(cap)),
             charged: Cell::new(0),
             exhausted: Cell::new(0),
         }
     }
 
-    /// Bytes the pool holds, in use and free.
+    /// Bytes the pool holds, in use and free, the reservation included.
     pub(crate) fn charged(&self) -> usize {
         self.charged.get()
+    }
+
+    /// Charges `bytes` of memory the shard holds outside the pool (its
+    /// receive group) for as long as it holds them, through the pool's own
+    /// ledger: the pool's buffers get the rest of the cap. False, charging
+    /// nothing, when that would leave no room for a buffer of the smallest
+    /// class.
+    #[cfg_attr(
+        all(not(ring), not(test)),
+        expect(dead_code, reason = "only a ring's receive group is reserved")
+    )]
+    pub(crate) fn reserve(&self, bytes: usize) -> bool {
+        let reserved = self.reserved.get().saturating_add(bytes);
+        if reserved.saturating_add(CLASSES[0]) > self.cap || !self.charge(bytes) {
+            return false;
+        }
+        self.reserved.set(reserved);
+        self.top.set(top_for(self.room()));
+        true
+    }
+
+    /// Gives back `bytes` that [`reserve`](Self::reserve) charged.
+    pub(crate) fn unreserve(&self, bytes: usize) {
+        let bytes = bytes.min(self.reserved.get());
+        self.release(bytes);
+        self.reserved.set(self.reserved.get() - bytes);
+        self.top.set(top_for(self.room()));
+    }
+
+    /// The bytes [`reserve`](Self::reserve) holds.
+    #[cfg(test)]
+    pub(crate) fn reserved(&self) -> usize {
+        self.reserved.get()
+    }
+
+    /// The bytes the pool's own buffers may hold: the cap less the
+    /// reservation.
+    pub(crate) fn room(&self) -> usize {
+        self.cap - self.reserved.get()
     }
 
     /// Times a buffer was wanted while every byte under the cap was in use.
@@ -260,7 +313,7 @@ impl Pool {
     /// A buffer of at least `len` bytes (or of the largest class that fits
     /// the cap), empty, or `None` when every byte under the cap is in use.
     pub(crate) fn get(&self, len: usize) -> Option<PoolBuf> {
-        self.get_class(class_for(len).min(self.top?))
+        self.get_class(class_for(len).min(self.top.get()?))
     }
 
     fn get_class(&self, class: usize) -> Option<PoolBuf> {
@@ -280,10 +333,10 @@ impl Pool {
         } else {
             len.next_multiple_of(4096)
         };
-        size <= self.cap
+        size <= self.room()
     }
 
-    /// The bytes the pool may hold.
+    /// The bytes the pool may hold, the reservation included.
     pub(crate) fn cap(&self) -> usize {
         self.cap
     }
@@ -298,12 +351,14 @@ impl Pool {
         u32::try_from(size).ok()?;
         // Wholes that came back are freed here, which may make the room.
         let _ = self.take_returned(usize::MAX);
-        if !self.make_room(size) {
+        if !self.charge(size) {
             return None;
         }
         // SAFETY: the layout has a non-zero size.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout_whole(size)) })?;
-        self.charged.set(self.charged.get() + size);
+        let Some(ptr) = NonNull::new(unsafe { alloc_zeroed(layout_whole(size)) }) else {
+            self.release(size);
+            return None;
+        };
         Some(self.buf(ptr, WHOLE, size))
     }
 
@@ -337,16 +392,33 @@ impl Pool {
     /// A new buffer of `class`, charged first; none past the cap.
     fn allocate(&self, class: usize) -> Option<NonNull<u8>> {
         let size = CLASSES[class];
-        if !self.make_room(size) {
+        if !self.charge(size) {
             return None;
         }
         // Zeroed once, when the pool grows: every byte of a buffer is
         // initialized from then on, so a slice over it is always sound, and
         // a recycled buffer costs nothing.
         // SAFETY: the layout has a non-zero size.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout(class)) })?;
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout(class)) });
+        if ptr.is_none() {
+            self.release(size);
+        }
+        ptr
+    }
+
+    /// Counts `size` more bytes against the cap, freeing idle buffers to make
+    /// the room; false, counting nothing, when even that leaves too little.
+    /// With [`release`](Self::release), the one place the ledger moves.
+    fn charge(&self, size: usize) -> bool {
+        if !self.make_room(size) {
+            return false;
+        }
         self.charged.set(self.charged.get() + size);
-        Some(ptr)
+        true
+    }
+
+    fn release(&self, size: usize) {
+        self.charged.set(self.charged.get() - size);
     }
 
     /// Frees idle buffers, the largest first, until `size` more bytes fit
@@ -362,7 +434,7 @@ impl Pool {
                 // SAFETY: allocated with this class's layout; free, so owned
                 // by the pool alone.
                 unsafe { dealloc(ptr.as_ptr(), layout(class)) };
-                self.charged.set(self.charged.get() - CLASSES[class]);
+                self.release(CLASSES[class]);
                 if fits(self.charged.get()) {
                     return true;
                 }
@@ -375,7 +447,7 @@ impl Pool {
     fn free_whole(&self, ptr: NonNull<u8>, cap: u32) {
         // SAFETY: made with this layout, and owned by nobody else.
         unsafe { dealloc(ptr.as_ptr(), layout_whole(cap as usize)) };
-        self.charged.set(self.charged.get() - cap as usize);
+        self.release(cap as usize);
     }
 
     /// Takes back a buffer dropped on this pool's own thread.
@@ -396,7 +468,7 @@ impl Pool {
     /// back since, or if none is out to come back (the request is larger
     /// than the cap allows).
     pub(crate) fn wait_for_return(&self, waker: Waker) {
-        if self.charged.get() == 0 {
+        if self.charged.get() == self.reserved.get() {
             waker.wake();
             return;
         }
@@ -557,6 +629,7 @@ impl PoolBuf {
     }
 
     /// Fills the buffer with `bytes` (as many as fit); returns how many.
+    #[cfg(any(completion, test))]
     pub(crate) fn fill_from(&mut self, bytes: &[u8]) -> usize {
         let n = bytes.len().min(self.capacity());
         self.spare()[..n].copy_from_slice(&bytes[..n]);

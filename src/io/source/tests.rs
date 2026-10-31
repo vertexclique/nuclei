@@ -658,11 +658,11 @@ fn a_revival_with_the_same_descriptor_keeps_the_read_ahead() {
     });
 }
 
-/// A pool asked to hold nothing holds one small buffer: reads still
-/// complete, all through it, as it comes back for each.
+/// A pool given the least cap holds one small buffer beside the receive
+/// group: reads still complete, all through either, as each comes back.
 #[test]
 fn reads_complete_through_a_pool_of_one_small_buffer() {
-    let rt = runtime(Some(0));
+    let rt = runtime(Some(crate::rt::shard::least_buffer_cap()));
     let (a, b) = pair();
     let data = pattern(256 * 1024);
     let expected = data.clone();
@@ -731,47 +731,118 @@ fn a_thread_that_runs_no_shard_is_served_by_the_runtime() {
     assert!(b.src.poll_read(&mut cx, &mut buf, false).is_pending());
     a.io().write_all(b"far").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !woke.0.load(Ordering::SeqCst) {
-        assert!(
-            Instant::now() < deadline,
-            "the runtime never completed the read"
-        );
-        std::thread::yield_now();
-    }
-    match b.src.poll_read(&mut cx, &mut buf, false) {
-        Poll::Ready(Ok(3)) => assert_eq!(&buf[..3], b"far"),
-        other => panic!("{other:?}"),
+    // A poll that finds the side held by the shard is pending, and its holder
+    // wakes it again as it lets go.
+    loop {
+        while !woke.0.swap(false, Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the runtime never completed the read"
+            );
+            std::thread::yield_now();
+        }
+        match b.src.poll_read(&mut cx, &mut buf, false) {
+            Poll::Ready(Ok(3)) => {
+                assert_eq!(&buf[..3], b"far");
+                return;
+            }
+            Poll::Pending => {}
+            other => panic!("{other:?}"),
+        }
     }
 }
 
-/// A datagram larger than any buffer the pool may hold cannot be received
-/// or sent through it: the operation fails at once, saying what to raise.
+/// A datagram larger than any buffer the pool may hold goes straight from
+/// the task's buffer to the kernel and from the kernel into the task's: sent
+/// and received whole, a look at readability first taking none of it.
+#[cfg(unix)]
 #[test]
-fn a_datagram_larger_than_the_pool_allows_fails_loudly() {
-    let rt = runtime(Some(64 * 1024));
+fn a_datagram_larger_than_the_pool_allows_goes_whole_between_the_tasks_buffers() {
+    let group = crate::rt::shard::least_buffer_cap() - crate::buf::CLASSES[0];
+    let rt = runtime(Some(group + 64 * 1024));
     let (a, b) = datagram_pair();
+    // macOS refuses a datagram larger than the sender's buffer (2 KiB for a Unix socket by
+    // default) and holds none larger than the receiver's.
+    for (fd, option) in [
+        (a.as_raw_fd(), libc::SO_SNDBUF),
+        (b.as_raw_fd(), libc::SO_RCVBUF),
+    ] {
+        let size: libc::c_int = 256 * 1024;
+        // SAFETY: a plain setsockopt with a pointer to our own int.
+        let set = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&size as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "{}", io::Error::last_os_error());
+    }
     let a = Owned::new(a, DATAGRAM);
     let b = Owned::new(b, DATAGRAM);
     rt.block_on(async {
-        let big = vec![1u8; 100 * 1024];
+        let big = pattern(100 * 1024);
         // Polled on a worker, whose pool has the cap.
         let (src, bytes) = (Arc::clone(&a.src), big.clone());
         let sent = within(crate::runtime::spawn(async move {
             poll_fn(|cx| src.poll_send(cx, &bytes, super::write::Dest::Connected)).await
         }))
         .await;
-        let err = sent.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
-        assert!(err.to_string().contains("io_buffer_cap"), "{err}");
+        assert_eq!(sent.unwrap(), big.len());
         let src = Arc::clone(&b.src);
         let got = within(crate::runtime::spawn(async move {
-            let mut buf = vec![0u8; 100 * 1024];
-            poll_fn(|cx| src.poll_receive(cx, &mut buf, false))
+            poll_fn(|cx| src.poll_read_ready(cx)).await.unwrap();
+            let mut buf = vec![0u8; 200 * 1024];
+            let n = poll_fn(|cx| src.poll_receive(cx, &mut buf, false))
                 .await
                 .map(|(n, _)| n)
+                .unwrap();
+            buf.truncate(n);
+            buf
         }))
         .await;
-        assert_eq!(got.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+        assert!(got == big, "{} bytes came of {}", got.len(), big.len());
+    });
+}
+
+/// A datagram the kernel refuses fails its own send with the kernel's error,
+/// as std's does, and the next send knows nothing of it.
+#[test]
+fn a_refused_datagram_fails_its_own_send_and_not_the_next() {
+    let rt = runtime(None);
+    let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    a.connect(b.local_addr().unwrap()).unwrap();
+    b.connect(a.local_addr().unwrap()).unwrap();
+    let too_long = vec![7u8; 65_508];
+    let refused = a.send(&too_long).unwrap_err().raw_os_error();
+    let a = Owned::new(a, Kind::Udp);
+    let b = Owned::new(b, Kind::Udp);
+    rt.block_on(async {
+        let src = Arc::clone(&a.src);
+        let (first, second) = within(crate::runtime::spawn(async move {
+            let first =
+                poll_fn(|cx| src.poll_send(cx, &too_long, super::write::Dest::Connected)).await;
+            let second =
+                poll_fn(|cx| src.poll_send(cx, b"next", super::write::Dest::Connected)).await;
+            (first, second)
+        }))
+        .await;
+        assert_eq!(first.unwrap_err().raw_os_error(), refused);
+        assert_eq!(second.unwrap(), 4);
+        let src = Arc::clone(&b.src);
+        let got = within(crate::runtime::spawn(async move {
+            let mut buf = [0u8; 16];
+            let n = poll_fn(|cx| src.poll_receive(cx, &mut buf, false))
+                .await
+                .map(|(n, _)| n)
+                .unwrap();
+            buf[..n].to_vec()
+        }))
+        .await;
+        assert_eq!(got, b"next");
     });
 }
 

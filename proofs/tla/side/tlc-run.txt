@@ -1,34 +1,34 @@
-TLC run of every configuration in proofs/tla/side, 2026-10-24 22:00 UTC.
+TLC run of every configuration in proofs/tla/side, 2026-10-30 20:27 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-P_two                            13663       6376      1  pass                                  pass                                  yes
-P_three                         121885      53014      1  pass                                  pass                                  yes
-P_live                           13663       6376      2  pass                                  pass                                  yes
-M_skip_held                       1070        525      1  deadlock                              deadlock                              yes
-M_release_ignores_ready           2270       1097      1  deadlock                              deadlock                              yes
-M_edge_keeps_cache                1330        621      1  deadlock                              deadlock                              yes
-M_take_needs_zero                 8992       4232      1  violated:Termination                  violated:Termination                  yes
-W_flag                              91         50      1  violated:NoFlag                       violated:NoFlag                       yes
-W_delegate                         249        123      1  violated:NoDelegate                   violated:NoDelegate                   yes
-W_driver_read                      321        158      1  violated:NoDriverRead                 violated:NoDriverRead                 yes
-W_submit_read                      385        189      1  violated:NoSubmitRead                 violated:NoSubmitRead                 yes
-M_release_ignores_waiting         4244       2013      1  deadlock                              deadlock                              yes
-M_flag_in_two_steps               6966       3361      1  deadlock                              deadlock                              yes
-M_contender_no_recheck            3083       1470      1  deadlock                              deadlock                              yes
-W_holder_wake                      759        375      1  violated:NoHolderWake                 violated:NoHolderWake                 yes
-W_retake                           485        239      1  violated:NoRetake                     violated:NoRetake                     yes
-RQ_close                         28276      11175      1  pass                                  pass                                  yes
-RQ_live                          28276      11175      2  pass                                  pass                                  yes
-MQ_release_ignores_req            5440       2207      1  violated:Closed                       violated:Closed                       yes
-MQ_expect_with_req                4319       1741      1  violated:Closed                       violated:Closed                       yes
-MQ_perform_with_one_side          1715        769      1  violated:NoUseOfClosed                violated:NoUseOfClosed                yes
-MQ_drop_closes_at_once             171         94      1  violated:NoUseOfClosed                violated:NoUseOfClosed                yes
-WQ_holder_close                    520        252      1  violated:NoHolderClose                violated:NoHolderClose                yes
-WQ_hand_over                        64         40      1  violated:NoHandOver                   violated:NoHandOver                   yes
-MQ_write_holder_takes_read       39827      15566      3  violated:Termination                  violated:Termination                  yes
-MQ_linger_forgets                27423      10859      2  violated:Termination                  violated:Termination                  yes
-WQ_linger_waits                    247        129      1  violated:NoLingerWait                 violated:NoLingerWait                 yes
+P_two                            13663       6376      2  pass                                  pass                                  yes
+P_three                         121885      53014      4  pass                                  pass                                  yes
+P_live                           13663       6376      5  pass                                  pass                                  yes
+M_skip_held                       1070        525      3  deadlock                              deadlock                              yes
+M_release_ignores_ready           2270       1097      3  deadlock                              deadlock                              yes
+M_edge_keeps_cache                1330        621      2  deadlock                              deadlock                              yes
+M_take_needs_zero                 8992       4232      5  violated:Termination                  violated:Termination                  yes
+W_flag                              91         50      3  violated:NoFlag                       violated:NoFlag                       yes
+W_delegate                         249        123      3  violated:NoDelegate                   violated:NoDelegate                   yes
+W_driver_read                      321        158      3  violated:NoDriverRead                 violated:NoDriverRead                 yes
+W_submit_read                      385        189      4  violated:NoSubmitRead                 violated:NoSubmitRead                 yes
+M_release_ignores_waiting         4244       2013      2  deadlock                              deadlock                              yes
+M_flag_in_two_steps               6966       3361      3  deadlock                              deadlock                              yes
+M_contender_no_recheck            3083       1470      3  deadlock                              deadlock                              yes
+W_holder_wake                      759        375      3  violated:NoHolderWake                 violated:NoHolderWake                 yes
+W_retake                           485        239      3  violated:NoRetake                     violated:NoRetake                     yes
+RQ_close                         28276      11175      4  pass                                  pass                                  yes
+RQ_live                          28276      11175      5  pass                                  pass                                  yes
+MQ_release_ignores_req            5440       2207      4  violated:Closed                       violated:Closed                       yes
+MQ_expect_with_req                4319       1741      3  violated:Closed                       violated:Closed                       yes
+MQ_perform_with_one_side          1715        769      2  violated:NoUseOfClosed                violated:NoUseOfClosed                yes
+MQ_drop_closes_at_once             171         94      2  violated:NoUseOfClosed                violated:NoUseOfClosed                yes
+WQ_holder_close                    520        252      3  violated:NoHolderClose                violated:NoHolderClose                yes
+WQ_hand_over                        64         40      4  violated:NoHandOver                   violated:NoHandOver                   yes
+MQ_write_holder_takes_read       14817       6269      6  violated:Termination                  violated:Termination                  yes
+MQ_linger_forgets                16533       6812      7  violated:Termination                  violated:Termination                  yes
+WQ_linger_waits                    247        129      3  violated:NoLingerWait                 violated:NoLingerWait                 yes
 
 results matching EXPECTED.txt: 27 of 27

@@ -882,51 +882,44 @@ fn a_tcp_dup_and_close_never_lets_the_driver_touch_a_reused_number() {
     });
 }
 
-/// A handle dropped with bytes still to send hands them to a copy of its
-/// descriptor; its own number is closed (at once, or by the source's last
-/// holder as it lets go) and taken by a socket of the test while the bytes
-/// are still out. The bytes still go to the old peer, and nothing goes to
-/// the socket that took the number.
+/// A handle dropped with bytes still to send keeps its object, and so its
+/// number, until the bytes are out: no socket made meanwhile takes the
+/// number, the bytes go to the old peer whole, and once they did the number
+/// is free again.
 #[cfg(unix)]
 #[test]
-fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
-    if !alone("net::tests::bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number")
+fn a_handle_dropped_with_bytes_behind_keeps_its_number_until_they_are_out() {
+    if !alone("net::tests::a_handle_dropped_with_bytes_behind_keeps_its_number_until_they_are_out")
     {
         return;
     }
     let rt = runtime();
-    // The runtime may take the number itself the moment it frees (the task
-    // that delivers the bytes makes a copy of the descriptor): the case is
-    // then made again, with a new handle.
-    let (peer, sent, kept, taker, taker_peer) = (0..20)
-        .find_map(|_| {
-            let (mine, peer) = UnixStream::pair().unwrap();
-            let (sent, number) = rt.block_on(async {
-                let handle = Handle::new(mine).unwrap();
-                let sent = fill_behind(&handle).await;
-                let number = handle.as_raw_fd();
-                drop(handle);
-                (sent, number)
-            });
-            // A new socket takes the lowest free number. Until the drop's
-            // number is free (its close may come from another thread), the
-            // sockets made below it are kept, so every number under it stays
-            // taken and the first made after it closes takes it; those made
-            // above it are let go at once, which bounds the descriptors used.
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            let mut kept = Vec::new();
-            while std::time::Instant::now() < deadline {
-                let (a, b) = UnixStream::pair().unwrap();
-                match a.as_raw_fd().cmp(&number) {
-                    core::cmp::Ordering::Equal => return Some((peer, sent, kept, a, b)),
-                    core::cmp::Ordering::Less => kept.push((a, b)),
-                    core::cmp::Ordering::Greater => {}
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            None
-        })
-        .expect("the dropped handle's number never came free to the test");
+    let (mine, peer) = UnixStream::pair().unwrap();
+    let (sent, number) = rt.block_on(async {
+        let handle = Handle::new(mine).unwrap();
+        let sent = fill_behind(&handle).await;
+        let number = handle.as_raw_fd();
+        drop(handle);
+        (sent, number)
+    });
+    // Sockets made while the bytes are out never take the number: the
+    // lowest free numbers are taken, and the dropped handle's is not free.
+    let mut made = Vec::new();
+    for _ in 0..64 {
+        let (a, b) = UnixStream::pair().unwrap();
+        assert_ne!(
+            a.as_raw_fd(),
+            number,
+            "a socket took the number with bytes out"
+        );
+        assert_ne!(
+            b.as_raw_fd(),
+            number,
+            "a socket took the number with bytes out"
+        );
+        made.push((a, b));
+    }
+    drop(made);
     let got = std::thread::spawn(move || read_to_end_blocking(peer))
         .join()
         .unwrap();
@@ -936,21 +929,29 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         got.len(),
         sent.len()
     );
-    drop(kept);
-    // Nothing reached the socket that took the number.
-    drop(taker);
-    taker_peer.set_nonblocking(true).unwrap();
-    let mut buf = [0u8; 1];
-    assert!(
-        matches!((&taker_peer).read(&mut buf), Ok(0)),
-        "bytes leaked into the new socket"
-    );
+    // Delivered and closed: the number comes free.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut kept = Vec::new();
+    loop {
+        let (a, b) = UnixStream::pair().unwrap();
+        if a.as_raw_fd() == number || b.as_raw_fd() == number {
+            break;
+        }
+        if a.as_raw_fd() < number {
+            kept.push((a, b));
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped handle's number never came free once its bytes were out"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Many handles dropped with bytes still to send, under a lowered limit on
-/// descriptors: each cycle's descriptors (the handle's, its copy, the peer's)
-/// are all closed again, so the count returns to where it began and the limit
-/// is never met.
+/// descriptors: each cycle's descriptors (the handle's, kept by its linger,
+/// and the peer's) are all closed again, so the count returns to where it
+/// began and the limit is never met.
 #[cfg(unix)]
 #[test]
 fn dropped_handles_with_unsent_bytes_leave_no_descriptor_open() {
@@ -1000,3 +1001,5 @@ mod datagram_owned;
 mod emfile;
 
 mod send_file;
+
+mod zero_copy;

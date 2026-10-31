@@ -10,7 +10,7 @@ impl Driver {
         match self {
             Driver::Poll(_) => crate::proactor::POLLER,
             #[cfg(ring)]
-            Driver::Ring(_) => crate::IoBackend::IoUring,
+            Driver::Ring(_) | Driver::Gone => crate::IoBackend::IoUring,
         }
     }
 }
@@ -38,6 +38,8 @@ impl Shard {
         let (ops_in_flight, cq_overflows) = match &self.driver {
             #[cfg(ring)]
             Driver::Ring(ring) => (ring.in_flight(), ring.overflows()),
+            #[cfg(ring)]
+            Driver::Gone => (0, 0),
             // A readiness poller hands the kernel no operation.
             #[cfg(readiness)]
             Driver::Poll(_) => (0, 0),

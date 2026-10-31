@@ -1,7 +1,7 @@
 //! Syncing a file: on io_uring an `IORING_OP_FSYNC` of the shard's ring
 //! (with `IORING_FSYNC_DATASYNC` for a sync of the data), elsewhere a job of
-//! the blocking pool calling std's own sync; either way on the jobs' copy of
-//! the descriptor.
+//! the blocking pool calling std's own sync; either way on the handle's own
+//! descriptor, leased for the call.
 //!
 //! A sync covers every write accepted at the cursor before it was called and
 //! every positional write that returned before it: it waits until the
@@ -20,15 +20,14 @@
 //! succeeded would say nothing of the data that did not reach the device.
 
 use core::future::poll_fn;
-use core::mem::ManuallyDrop;
 use std::io;
 use std::sync::Arc;
 
 use super::FileIo;
 #[cfg(ring)]
 use super::work::Work;
-use crate::io::raw::OwnedFile;
 use crate::io::source::Failure;
+use crate::io::source::requests::Lease;
 
 impl FileIo {
     /// Writes the file's data (with `data_only`, and the metadata a read
@@ -52,32 +51,18 @@ impl FileIo {
         if self.on_ring()
             && let Ok(job) = crate::fs::ring::sync(&self.fd, data_only)
         {
-            let mut work = Work::Ring(job);
+            let mut work = Work::Slot(job);
             return poll_fn(|cx| work.poll(cx.waker())).await;
         }
-        let fd = Arc::clone(&self.fd);
+        let fd = self.fd.clone();
         crate::rt::blocking::call(move || sync_on(&fd, data_only)).await
     }
 }
 
 /// std's sync of the file `fd` (`fdatasync` with `data_only`, else `fsync`;
-/// `F_FULLFSYNC` on Apple's systems; `FlushFileBuffers` on Windows), made
-/// on a view of the descriptor that never closes it.
-pub(crate) fn sync_on(fd: &OwnedFile, data_only: bool) -> io::Result<()> {
-    #[cfg(unix)]
-    // SAFETY: `fd` stays open while it is borrowed, and the view is never
-    // dropped, so it never closes it.
-    let file = ManuallyDrop::new(unsafe {
-        <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(std::os::fd::AsRawFd::as_raw_fd(fd))
-    });
-    #[cfg(windows)]
-    // SAFETY: as on unix: the handle stays open while borrowed, and the view
-    // never closes it.
-    let file = ManuallyDrop::new(unsafe {
-        <std::fs::File as std::os::windows::io::FromRawHandle>::from_raw_handle(
-            std::os::windows::io::AsRawHandle::as_raw_handle(fd),
-        )
-    });
+/// `F_FULLFSYNC` on Apple's systems; `FlushFileBuffers` on Windows).
+pub(crate) fn sync_on(fd: &Lease, data_only: bool) -> io::Result<()> {
+    let file = fd.file();
     if data_only {
         file.sync_data()
     } else {

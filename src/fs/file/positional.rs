@@ -22,7 +22,7 @@
 //! `proofs/tla/lent/LentFile.tla` (scenario "positional") checks the rules.
 
 use core::future::poll_fn;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 use std::fs::File as StdFile;
 use std::io;
 use std::sync::Arc;
@@ -73,7 +73,7 @@ impl FileIo {
         buf.fill_at(from, &bytes[..n]);
         let mut out = Out {
             io: self,
-            work: Some(self.submit_pwrite(buf, at)),
+            work: Some(self.submit_pwrite(buf, at, Waker::noop())),
         };
         poll_fn(|cx| out.poll(cx)).await.map(|()| n)
     }
@@ -103,7 +103,7 @@ impl FileIo {
         let len = buf.len();
         let mut out = Out {
             io: self,
-            work: Some(self.submit_pwrite_owned(buf, at)),
+            work: Some(self.submit_pwrite_owned(buf, at, Waker::noop())),
         };
         let (result, buf) = poll_fn(|cx| out.poll(cx)).await;
         (result.map(|()| len), buf)

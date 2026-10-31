@@ -1,12 +1,14 @@
-TLC run of every configuration in proofs/tla/admission, 2026-10-29 19:56 UTC.
+TLC run of every configuration in proofs/tla/admission, 2026-10-30 17:55 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-G_admits                           360        100      1  pass                                  pass                                  yes
-M_no_group_fit                     189         72      1  violated:CqNeverOverfull              violated:CqNeverOverfull              yes
-M_no_long_exemption                 10          9      1  violated:NoRoomDeadlock               violated:NoRoomDeadlock               yes
-W_room_used                         28         16      1  violated:NoRoomEver                   violated:NoRoomEver                   yes
-W_long_past_cap                     13          9      1  violated:LongWithinCap                violated:LongWithinCap                yes
+G_admits                          2247        400      1  pass                                  pass                                  yes
+M_no_group_fit                     570        165      1  violated:CqNeverOverfull              violated:CqNeverOverfull              yes
+M_no_long_exemption                 22         14      1  violated:NoRoomDeadlock               violated:NoRoomDeadlock               yes
+W_room_used                         67         28      1  violated:NoRoomEver                   violated:NoRoomEver                   yes
+W_long_past_cap                     25         13      1  violated:LongWithinCap                violated:LongWithinCap                yes
+M_once_counted                      46         24      1  violated:NoRoomDeadlock               violated:NoRoomDeadlock               yes
+W_once_past_cap                     54         24      1  violated:OnceWithinCap                violated:OnceWithinCap                yes
 
-results matching EXPECTED.txt: 5 of 5
+results matching EXPECTED.txt: 7 of 7

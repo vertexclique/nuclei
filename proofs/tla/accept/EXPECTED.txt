@@ -6,3 +6,7 @@ M_end_on_emfile                MC_AcceptStream      violated:AllServed
 M_no_backoff                   MC_AcceptStream      violated:NoBusyLoop
 M_no_reset                     MC_AcceptStream      violated:FirstWaitLeast
 W_retry_serves                 MC_AcceptStream      violated:NoRetryServed
+A_drops                        MC_AcceptStream      pass
+M_no_probe                     MC_AcceptStream      violated:LostPerOutage
+M_no_mark                      MC_AcceptStream      violated:LostPerOutage
+W_race_lost                    MC_AcceptStream      violated:NoRaceLoss

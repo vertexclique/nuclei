@@ -2,11 +2,14 @@
 //!
 //! A regular file is always ready to the kernel, so no poller can say when
 //! its IO would not block: each read and write is a job on the blocking
-//! pool, `pread` or `pwrite` at the handle's own cursor, on a copy of the
-//! descriptor that every job keeps open until it ends (so a handle dropped
-//! while a job runs closes only its own descriptor, and the job never meets
-//! a reused number); on io_uring an operation of the shard's ring instead
-//! (see `fs::ring`).
+//! pool, `pread` or `pwrite` at the handle's own cursor, on the handle's own
+//! descriptor, of which every job holds a lease until it ends (so a handle
+//! dropped while a job runs leaves its object to the job, which closes it,
+//! the job never meets a reused number, and no call needs a descriptor of
+//! its own: proofs/tla/lent/LentFile.tla); on io_uring an operation of the
+//! shard's ring instead (see `fs::ring`). A write's job leaves its end in a
+//! slot (`call`), as a ring's operation does, counted on its shard until its
+//! wake went, which a runtime's drop waits for.
 //!
 //! One read and one write at the cursor are in flight at most. A read fills
 //! a read-ahead buffer of the pool, at least [`READ_MIN`] bytes, that the
@@ -68,9 +71,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use self::orphans::{Orphan, Orphans};
 use self::work::{Job, Lent, LentRead, Writing, bounce, buffer, poll_task};
 use crate::buf::{PoolBuf, with_pool};
-use crate::io::raw::{OwnedFile, Raw, file_raw};
 use crate::io::side::{After, Hooks, Side, WakerSet};
 use crate::io::source::Failure;
+use crate::io::source::requests::Lease;
 use crate::io::sys;
 
 #[cfg(ring)]
@@ -98,8 +101,8 @@ mod deferred {
 
 /// The IO state of a file handle, shared with the waker its jobs wake.
 pub(crate) struct FileIo {
-    /// The jobs' copy of the descriptor.
-    fd: Arc<OwnedFile>,
+    /// The lease on the handle's descriptor its jobs share.
+    fd: Lease,
     state: Side<FileState>,
     /// Tasks waiting for a job: all woken when any job ends.
     waiters: WakerSet<FILE_SLOTS>,
@@ -187,11 +190,11 @@ struct FileState {
 impl FileIo {
     /// The IO state of the file `fd`, starting at its own offset (a file
     /// opened by std and read some way already goes on from there).
-    pub(crate) fn new(fd: Raw) -> io::Result<Arc<Self>> {
-        let cursor = sys::seek(fd, None)?;
-        let mode = sys::file_mode(fd)?;
+    pub(crate) fn new(fd: Lease) -> io::Result<Arc<Self>> {
+        let cursor = sys::seek(fd.raw(), None)?;
+        let mode = sys::file_mode(fd.raw())?;
         Ok(Arc::new(Self {
-            fd: Arc::new(sys::duplicate_file(fd)?),
+            fd,
             state: Side::new(FileState {
                 cursor,
                 ..FileState::default()
@@ -222,10 +225,11 @@ impl FileIo {
         self.on_pool.store(false, Ordering::Relaxed);
     }
 
-    /// The jobs' own descriptor, whose calls the system's test record keeps.
+    /// The descriptor of the handle, whose calls the system's test record
+    /// keeps.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn jobs_fd(&self) -> std::os::fd::RawFd {
-        file_raw(&self.fd)
+        self.fd.raw()
     }
 
     /// The file's generation now.
@@ -594,7 +598,7 @@ impl FileState {
                 return Poll::Pending;
             }
             match self.behind.take() {
-                Some(behind) => self.writing = Some(io.submit_write(behind, self.behind_at)),
+                Some(behind) => self.writing = Some(io.submit_write(behind, self.behind_at, waker)),
                 None => return Poll::Ready(()),
             }
         }
@@ -744,7 +748,7 @@ impl FileState {
             };
             let len = buf.len() as u64;
             self.invalidate(after);
-            self.writing = Some(io.submit_write_owned(buf, self.cursor));
+            self.writing = Some(io.submit_write_owned(buf, self.cursor, waker));
             self.cursor += len;
             self.lent = Lent::Out;
         }
@@ -800,7 +804,7 @@ impl FileState {
                 return Poll::Pending;
             };
             let n = buf.append_vectored(bufs);
-            self.writing = Some(io.submit_write(buf, self.cursor));
+            self.writing = Some(io.submit_write(buf, self.cursor, waker));
             n
         } else if let Some(behind) = self.behind.as_mut() {
             match behind.append_vectored(bufs) {
@@ -818,6 +822,11 @@ impl FileState {
             n
         };
         self.cursor += n as u64;
+        // The write in flight is polled once more, a write just started
+        // with it: its end wakes the file's waiters (this task among them)
+        // whether or not the task polls the file again, so a task that
+        // parks holding the file is not kept by its own registration.
+        let _ = self.poll_writes(io, waker, after);
         Poll::Ready(Ok(n))
     }
 
@@ -844,7 +853,7 @@ impl FileState {
         };
         buf.fill_at(from, &bytes[..n]);
         self.invalidate(after);
-        self.writing = Some(io.submit_write(buf, self.cursor));
+        self.writing = Some(io.submit_write(buf, self.cursor, waker));
         self.cursor += n as u64;
         Poll::Ready(Ok(n))
     }
@@ -865,8 +874,8 @@ impl FileState {
             SeekFrom::Current(d) => self.cursor.checked_add_signed(d),
             SeekFrom::End(d) => {
                 let task = self.sizing.get_or_insert_with(|| {
-                    let fd = Arc::clone(&io.fd);
-                    crate::runtime::spawn_blocking(move || sys::file_size(file_raw(&fd)))
+                    let fd = io.fd.clone();
+                    crate::runtime::spawn_blocking(move || sys::file_size(fd.raw()))
                 });
                 let size = match poll_task(task, waker) {
                     Poll::Pending => return Poll::Pending,

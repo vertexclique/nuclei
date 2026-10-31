@@ -1,0 +1,12 @@
+TLC run of every configuration in proofs/tla/shutdown, 2026-10-31 00:38 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+S_linux                             37         25      1  pass                                  pass                                  yes
+S_macos                             37         25      1  pass                                  pass                                  yes
+M_own_flag                          23         17      1  violated:AsTheKernel                  violated:AsTheKernel                  yes
+M_shut_first                        12         10      1  violated:FinLast                      violated:FinLast                      yes
+W_refused                           17         13      1  violated:NoRefusedClose               violated:NoRefusedClose               yes
+
+results matching EXPECTED.txt: 5 of 5

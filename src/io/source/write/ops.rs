@@ -10,6 +10,12 @@
 //! anything written after. One the kernel gives back undone (cancelled as
 //! the source moved, or with the socket not ready) took none of its bytes
 //! and goes out again.
+//!
+//! A zero-copy write's chunks go out one at a time the same way: the first
+//! the ring sends zero-copy shares the buffer, and each later one takes a
+//! hold on it. A send's first completion counts its bytes at once, and the
+//! next chunk goes from where it stopped; the send keeps its hold until the
+//! kernel's notification (`proofs/tla/lent/LentZc.tla`).
 
 use std::io;
 
@@ -22,16 +28,30 @@ use crate::io::source::{Failure, Io, Via};
 use crate::io::sys;
 
 /// The operation that sends a lent write, whose buffer moves into it: a file range, a datagram or
-/// the rest of a stream's bytes.
-fn lent_want(lent: &mut Lent) -> Want {
+/// the rest of a stream's bytes. A send the ring makes zero-copy (`zero_copy`) shares the buffer
+/// from then on, and every later send of it takes a hold on it.
+#[cfg_attr(
+    not(ring),
+    expect(unused_variables, reason = "only a ring sends zero-copy")
+)]
+fn lent_want(lent: &mut Lent, zero_copy: bool) -> Want {
     #[cfg(windows)]
     if let Some(file) = lent.file.clone() {
         return Want::SendFile(file);
     }
-    match lent.to.clone() {
-        Some(to) => Want::SendLentTo(core::mem::take(&mut lent.buf), to),
-        None => Want::SendLent(core::mem::take(&mut lent.buf), lent.sent),
+    if let Some(to) = lent.to.clone() {
+        return Want::SendLentTo(core::mem::take(&mut lent.buf), to);
     }
+    #[cfg(ring)]
+    {
+        if zero_copy && lent.pinned.is_none() {
+            lent.pinned = Some(super::Pinned::new(core::mem::take(&mut lent.buf)));
+        }
+        if let Some((pinned, _)) = &lent.pinned {
+            return Want::SendPinned(pinned.clone(), lent.sent, zero_copy);
+        }
+    }
+    Want::SendLent(core::mem::take(&mut lent.buf), lent.sent)
 }
 
 impl WriteState {
@@ -57,6 +77,12 @@ impl WriteState {
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
         if let Via::Ops(route) = io.via {
             self.submit_ops(route, kind, after);
+        }
+        // A write the pool had no buffer for that found the source between
+        // ports sends from its slot's room now (`write_room`).
+        #[cfg(port)]
+        if self.starved && self.behind.is_none() && !self.ring_holds() {
+            after.wake(&mut self.waiters);
         }
     }
 
@@ -105,7 +131,11 @@ impl WriteState {
             Want::Send(buf)
         } else if let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none() && !l.out) {
             lent.out = true;
-            lent_want(lent)
+            #[cfg(ring)]
+            let zero_copy = lent.zero_copy && issuer.zero_copy(kind, lent.total() - lent.sent);
+            #[cfg(not(ring))]
+            let zero_copy = false;
+            lent_want(lent, zero_copy)
         } else if let Some((buf, target)) = self.queued.take() {
             Want::SendTo(buf, target)
         } else {
@@ -173,6 +203,29 @@ impl WriteState {
                     }
                 }
             },
+            // The rest of the room's bytes goes out next, ahead of anything
+            // written after them.
+            #[cfg(port)]
+            Outcome::SendRoom { .. } if stale => {}
+            #[cfg(port)]
+            Outcome::SendRoom { from, to, answer } => match answer {
+                Answer::Undone { .. } => self.again = Some(Want::SendRoom { from, to }),
+                Answer::Done(Ok(n)) if n > 0 => {
+                    if from + n < to {
+                        self.again = Some(Want::SendRoom { from: from + n, to });
+                    }
+                }
+                other => {
+                    let err = match other {
+                        Answer::Done(Err(err)) => err,
+                        _ => io::ErrorKind::WriteZero.into(),
+                    };
+                    self.failed = Some(Failure::of(&err));
+                    if let Some(behind) = self.behind.take() {
+                        after.drop_buf(behind);
+                    }
+                }
+            },
             Outcome::SendTo(buf, _, Answer::Done(result)) => {
                 if let Err(err) = result {
                     self.error = Some(err);
@@ -180,8 +233,10 @@ impl WriteState {
                 after.drop_buf(buf);
             }
             Outcome::SendLent(buf, answer) | Outcome::SendLentTo(buf, answer) => {
-                self.lent_back(buf, answer, stale, after);
+                self.lent_back(Some(buf), answer, stale, after);
             }
+            #[cfg(ring)]
+            Outcome::SendPinned(answer) => self.lent_back(None, answer, stale, after),
             Outcome::Connect(..) if stale => {}
             // Given back as the source moved: asked again.
             Outcome::Connect(dial, Answer::Undone { not_ready: false }) => self.dial = Some(dial),
@@ -230,14 +285,23 @@ impl WriteState {
         self.connected = Some(result);
     }
 
-    /// The lent buffer's operation completed: the buffer is the side's
-    /// again, with how many of its bytes went. Of one whose task went, a
-    /// write none of which went out is withdrawn.
-    fn lent_back(&mut self, buf: Vec<u8>, answer: Answer<usize>, stale: bool, after: &mut After) {
+    /// The lent buffer's operation completed: the buffer (`None` for one
+    /// the side shares, which it holds already) is the side's again, with how
+    /// many of its bytes went. Of one whose task went, a write none of which
+    /// went out is withdrawn.
+    fn lent_back(
+        &mut self,
+        buf: Option<Vec<u8>>,
+        answer: Answer<usize>,
+        stale: bool,
+        after: &mut After,
+    ) {
         let Some(lent) = self.lent.as_mut().filter(|l| l.out && !stale) else {
             return;
         };
-        lent.buf = buf;
+        if let Some(buf) = buf {
+            lent.buf = buf;
+        }
         lent.out = false;
         match answer {
             Answer::Undone { not_ready } => self.not_ready(not_ready),

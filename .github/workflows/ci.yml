@@ -39,11 +39,11 @@ jobs:
         run: cargo check --all --bins --tests
 
       - name: tests
-        run: cargo test --all
+        run: cargo test --all --no-fail-fast
 
       - name: tests on epoll
         if: runner.os == 'Linux'
-        run: cargo test --all
+        run: cargo test --all --no-fail-fast
         env:
           NUCLEI_BACKEND: epoll
 
@@ -83,10 +83,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: tests on io_uring
-        run: cargo test -p nuclei --target x86_64-unknown-linux-gnu -- --skip hot_loops_make_no_system_call_but_sched_yield
+        run: cargo test -p nuclei --target x86_64-unknown-linux-gnu --no-fail-fast -- --skip hot_loops_make_no_system_call_but_sched_yield
 
       - name: tests on epoll
-        run: cargo test -p nuclei --target x86_64-unknown-linux-gnu -- --skip hot_loops_make_no_system_call_but_sched_yield
+        run: cargo test -p nuclei --target x86_64-unknown-linux-gnu --no-fail-fast -- --skip hot_loops_make_no_system_call_but_sched_yield
         env:
           NUCLEI_BACKEND: epoll
 
@@ -128,6 +128,25 @@ jobs:
         env:
           PROBE_SYSTEMD_RUN: sudo systemd-run
           PROBE_SYSCTL: "1"
+
+  # Instructions per operation of each runtime row (ci/op_count), counted under cachegrind
+  # because the runners have no hardware counters, against ci/op_budget.txt: a change that
+  # makes an operation cost more user-space instructions fails here. The budgets are this
+  # runner's counts (the C library picks its copy routines per CPU model).
+  op_counts:
+    name: Op counts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: op counts
+        run: bash ci/op_counts.sh
 
   check_fmt_and_docs:
     name: Checking fmt and docs

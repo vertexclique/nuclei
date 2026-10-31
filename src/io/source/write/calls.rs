@@ -60,7 +60,7 @@ impl Source {
         crate::coop::poll_budget(cx, |cx| {
             self.poll_writing(cx, |st, io, waker, after| {
                 #[cfg(unix)]
-                if super::super::direct::worth(io, bufs.iter().map(|b| b.len()).sum(), true)
+                if st.writes_itself(io, bufs.iter().map(|b| b.len()).sum())
                     && let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs)
                 {
                     return Poll::Ready(result);
@@ -123,12 +123,38 @@ impl Source {
     ) -> (io::Result<usize>, Vec<u8>) {
         let mut op = WriteOwned {
             source: self,
-            buf: Some(buf),
+            held: Held::of(buf),
             lending: Lending::default(),
             lent: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
-        (result, op.buf.take().unwrap_or_default())
+        (result, op.held.buf.take().unwrap_or_default())
+    }
+
+    /// Writes all of `buf` as [`write_owned`](Self::write_owned) does, the ring sending its large
+    /// chunks zero-copy (see `ring::zero_copy_worth`): the write ends once the kernel took the
+    /// last byte, and the buffer comes back through the [`Released`](crate::net::Released) once
+    /// the kernel let go of every byte. A write the kernel copies has its buffer back at once.
+    pub(crate) async fn write_zero_copy(
+        self: &Arc<Self>,
+        buf: Vec<u8>,
+    ) -> (io::Result<usize>, crate::net::Released) {
+        #[cfg(ring)]
+        if super::super::ring::zero_copy_worth(self.kind, buf.len()) {
+            let mut op = WriteOwned {
+                source: self,
+                held: Held::of(buf),
+                lending: Lending {
+                    zero_copy: true,
+                    ..Lending::default()
+                },
+                lent: false,
+            };
+            let result = poll_fn(|cx| op.poll(cx)).await;
+            return (result, op.held.released());
+        }
+        let (result, buf) = self.write_owned(buf).await;
+        (result, crate::net::Released::ready(buf))
     }
 
     /// Sends all of `buf` as one datagram to `to` and gives it back with the
@@ -140,35 +166,35 @@ impl Source {
         to: Dest<'_>,
     ) -> (io::Result<usize>, Vec<u8>) {
         if buf.len() < super::super::OWNED_DATAGRAM_MIN && self.on_ring() {
-            // A small datagram is cheaper copied and queued, which ends at once, than lent
-            // to the ring and waited for.
+            // A small datagram is cheaper sent by the call itself, which ends at once, than
+            // lent to the ring and waited for.
             let result = poll_fn(|cx| self.poll_send(cx, &buf, to)).await;
             return (result, buf);
         }
         let mut op = WriteOwned {
             source: self,
-            buf: Some(buf),
+            held: Held::of(buf),
             lending: Lending {
                 to: Some(to),
-                file: None,
+                ..Lending::default()
             },
             lent: false,
         };
         let result = poll_fn(|cx| op.poll(cx)).await;
-        (result, op.buf.take().unwrap_or_default())
+        (result, op.held.buf.take().unwrap_or_default())
     }
 
     fn poll_write_owned(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
-        held: &mut Option<Vec<u8>>,
+        held: &mut Held,
         lending: &Lending<'_>,
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
         let poll = self.poll_writing(cx, |st, io, waker, after| {
             st.write_owned(io, kind, held, lending, waker, after)
         });
-        if poll.is_ready() && held.is_none() {
+        if poll.is_ready() && held.lent() {
             // The poll failed with the buffer lent: it comes back as it is.
             // If the side is held now, the poll waits and starts over.
             let mut after = After::default();
@@ -198,14 +224,14 @@ impl Source {
     ) -> io::Result<usize> {
         let mut op = WriteOwned {
             source: self,
-            buf: Some(Vec::new()),
+            held: Held::of(Vec::new()),
             lending: Lending {
-                to: None,
                 file: Some(FileRange {
                     handle,
                     offset,
                     len,
                 }),
+                ..Lending::default()
             },
             lent: false,
         };
@@ -239,7 +265,7 @@ impl Source {
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
         self.poll_writing(cx, |st, io, waker, after| {
-            st.send(io, kind, bytes, dest, waker, after)
+            st.send(io, self.serving_fd(None), kind, bytes, dest, waker, after)
         })
     }
 
@@ -275,7 +301,7 @@ impl Source {
 /// did.
 struct WriteOwned<'a, 'd> {
     source: &'a Arc<Source>,
-    buf: Option<Vec<u8>>,
+    held: Held,
     /// Where a datagram goes; `None` for a stream's bytes.
     lending: Lending<'d>,
     lent: bool,
@@ -285,8 +311,8 @@ impl WriteOwned<'_, '_> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let poll = self
             .source
-            .poll_write_owned(cx, &mut self.buf, &self.lending);
-        self.lent = self.buf.is_none();
+            .poll_write_owned(cx, &mut self.held, &self.lending);
+        self.lent = self.held.lent();
         poll
     }
 }

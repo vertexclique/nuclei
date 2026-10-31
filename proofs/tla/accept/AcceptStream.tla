@@ -2,8 +2,10 @@
 (***************************************************************************)
 (* The stream of connections `TcpListener::accept_multi` gives             *)
 (* (`TcpStreamGenerator::poll_next` in src/net/tcp.rs, `out_of_descriptors` *)
-(* in src/rt/counters.rs), at the grain of its polls, the listener's       *)
-(* answers and the ticks of its timer.                                     *)
+(* in src/rt/counters.rs), and the listener's accept under it on a         *)
+(* readiness poller (`ReadState::accept_ahead` in src/io/source/read.rs),  *)
+(* at the grain of its polls, the listener's answers and the ticks of its  *)
+(* timer.                                                                  *)
 (*                                                                          *)
 (* Who acts. Peers connect, and their connections wait in the listener's   *)
 (* backlog. The environment (the rest of the process) may take every free *)
@@ -13,19 +15,24 @@
 (* What can happen. A poll asks the listener for the next connection: one  *)
 (* in the backlog and a descriptor free, it is accepted and the stream's   *)
 (* pause starts over at its least; none in the backlog, the poll waits for *)
-(* one; the process out of descriptors (EMFILE or ENFILE), the connection  *)
-(* stays in the backlog and the stream waits on a timer for its pause,    *)
-(* which then doubles up to its most, and tries again when the timer      *)
-(* fires; any other error ends the stream, and it accepts nothing more.   *)
-(* The stream's side hands an error over once, and connections queued     *)
-(* before it come first (`ReadState::accept_stream`), so a retry asks the *)
-(* listener afresh.                                                        *)
+(* one; the process out of descriptors (EMFILE or ENFILE), the stream      *)
+(* waits on a timer for its pause, which then doubles up to its most, and *)
+(* tries again when the timer fires; any other error ends the stream, and *)
+(* it accepts nothing more. On macOS an accept that fails for want of a    *)
+(* descriptor closes the connection it took off the backlog (`Drops`), so  *)
+(* after one the side first copies the listener's descriptor and closes   *)
+(* the copy: no descriptor free, it answers EMFILE and takes nothing; one *)
+(* free, it accepts, though the rest of the process may take the last     *)
+(* descriptor in between. The stream's side hands an error over once, and *)
+(* connections queued before it come first (`ReadState::accept_stream`), *)
+(* so a retry asks the listener afresh.                                    *)
 (*                                                                          *)
 (* What must never happen. A connection stays in the backlog for good once *)
-(* descriptors are free again. The stream asks the listener again before   *)
-(* its timer fired (a busy loop). An error other than running out of      *)
-(* descriptors leaves the stream going. The first pause after an accept   *)
-(* is longer than the least.                                               *)
+(* descriptors are free again. More connections are closed than the      *)
+(* outages that began (one each at most: the first accept that met it).   *)
+(* The stream asks the listener again before its timer fired (a busy      *)
+(* loop). An error other than running out of descriptors leaves the       *)
+(* stream going. The first pause after an accept is longer than the least. *)
 (*                                                                          *)
 (* What is abstract. Time is the ticks left on the timer (10 ms is one     *)
 (* tick, so the pause doubles from 1 up to `MaxDelay`); the descriptors   *)
@@ -39,6 +46,7 @@ CONSTANTS                                                                    \* 
     Outages,    \* times the environment takes every free descriptor
     MaxDelay,   \* the stream's longest pause, in ticks (its least is one)
     Other,      \* TRUE: the listener fails once with an error other than running out of descriptors
+    Drops,      \* TRUE: an accept that fails for want of a descriptor closes the connection it took (macOS)
     Mutation    \* "none", or the name of the one rule this run takes away
 
 MinDelay == 1                                                                \* the stream's least pause: one tick
@@ -59,11 +67,29 @@ variables                                                                    \* 
     got = 0,              \* connections the stream handed over
     done = FALSE,         \* the stream ended
     badFirst = FALSE,     \* (record) a first pause after an accept was longer than the least
-    retryServed = FALSE;  \* (record) an accept came after a pause
+    retryServed = FALSE,  \* (record) an accept came after a pause
+    short = FALSE,        \* the side's last accept failed for want of a descriptor: the next one checks first
+    lost = 0,             \* connections a failed accept closed
+    raceLost = FALSE;     \* (record) a connection was closed by an accept whose check had found a descriptor free
 
 define                                                                       \* names the properties use:
     AllIn == connected = N                                                   \* every peer connected
 end define;                                                                  \* end of the names
+
+\* The listener said EMFILE: the stream pauses on its timer, or (mutated) ends or asks again at once.
+macro pause() begin                                                          \* the stream's answer to EMFILE
+    tries := IF tries < 2 THEN tries + 1 ELSE 2;                             \* (ghost) one more try this tick
+    \* MUTATION end_on_emfile: the stream ends for good, as it did before.
+    if Mutation = "end_on_emfile" then done := TRUE;                         \* (mutated) the backlog is left
+    \* MUTATION no_backoff: the stream asks again at once, with no timer.
+    elsif Mutation # "no_backoff" then                                       \* a pause:
+        badFirst := badFirst \/ (~paused /\ delay # MinDelay);               \* (record) a long first pause
+        armed := TRUE;                                                       \* the timer runs (`sleep(delay)`),
+        left := delay;                                                       \* for the pause,
+        delay := Twice(delay);                                               \* the next one doubled,
+        paused := TRUE;                                                      \* a pause since the accept
+    end if;                                                                  \* the stream waits for its timer
+end macro;                                                                   \* end of the answer
 
 \* The peers: each connection joins the backlog.
 fair process peers = "peers"                                                 \* weakly fair, like every process
@@ -109,6 +135,14 @@ S_loop:                                                                      \* 
             await left = 0;                                                  \* the timer fired (else the poll is Pending)
             armed := FALSE;                                                  \* and is done with
         end if;                                                              \* now the listener
+S_check:                                                                     \* `accept_ahead`, after a failed accept
+        \* MUTATION no_probe: the side accepts at once, with no check first.
+        if ~otherErr /\ short /\ Mutation # "no_probe" then                  \* it checks for a free descriptor:
+            if out then                                                      \* the copy of the listener fails (EMFILE):
+                pause();                                                     \* the stream pauses, the backlog untouched
+                goto S_loop;                                                 \* and this poll is over
+            end if;                                                          \* else the copy closes and the accept goes on
+        end if;                                                              \* the rest of the process may act now
 S_accept:                                                                    \* `poll_accept_stream`
         if otherErr then                                                     \* another error:
             done := TRUE;                                                    \* the stream ends (`take_error` says why)
@@ -117,20 +151,18 @@ S_accept:                                                                    \* 
             got := got + 1;                                                  \* handed over,
             retryServed := retryServed \/ paused;                            \* (record) after a pause
             paused := FALSE;                                                 \* no pause since,
+            short := FALSE;                                                  \* the side checks no more,
             \* MUTATION no_reset: the pause does not start over after an accept.
             if Mutation # "no_reset" then delay := MinDelay; end if;         \* and the pause starts over at its least
         elsif backlog > 0 then                                               \* no descriptor left (EMFILE, ENFILE):
-            tries := IF tries < 2 THEN tries + 1 ELSE 2;                     \* (ghost) one more try this tick
-            \* MUTATION end_on_emfile: the stream ends for good, as it did before.
-            if Mutation = "end_on_emfile" then done := TRUE;                 \* (mutated) the backlog is left
-            \* MUTATION no_backoff: the stream asks again at once, with no timer.
-            elsif Mutation # "no_backoff" then                               \* a pause:
-                badFirst := badFirst \/ (~paused /\ delay # MinDelay);         \* (record) a long first pause
-                armed := TRUE;                                               \* the timer runs (`sleep(delay)`),
-                left := delay;                                               \* for the pause,
-                delay := Twice(delay);                                       \* the next one doubled,
-                paused := TRUE;                                              \* a pause since the accept
-            end if;                                                          \* the connection stays in the backlog
+            if Drops then                                                    \* macOS: the accept took a connection,
+                raceLost := raceLost \/ short;                               \* (record) though its check found one free
+                backlog := backlog - 1;                                      \* and closes it
+                lost := lost + 1;                                            \* (counted)
+            end if;                                                          \* elsewhere the connection stays
+            \* MUTATION no_mark: the failed accept leaves the side checking nothing.
+            if Mutation # "no_mark" then short := TRUE; end if;              \* the next accept checks first
+            pause();                                                         \* the stream pauses
         else                                                                 \* nothing in the backlog:
             await backlog > 0 \/ otherErr;                                   \* the poll is Pending until one comes
         end if;                                                              \* the poll is over
@@ -147,8 +179,12 @@ end algorithm; *)                                                            \* 
 (* The properties.                                                         *)
 (***************************************************************************)
 
-\* Every connection in the backlog is accepted in the end, once descriptors are free again.
-AllServed == <>(got = N)                                                     \* the whole backlog is served
+\* Every connection in the backlog is accepted in the end, once descriptors are free again, or was closed by a failed
+\* accept.
+AllServed == <>(got + lost = N)                                              \* the whole backlog is served or closed
+
+\* A failed accept closes at most one connection an outage: the one the first accept that met the outage took.
+LostPerOutage == lost <= outages                                             \* no more closed than outages began
 
 \* No busy loop: the stream asks the listener again after EMFILE only once its timer fired, so at most one EMFILE comes
 \* between two ticks.
@@ -168,4 +204,7 @@ FirstWaitLeast == ~badFirst                                                  \* 
 
 \* A connection is accepted after the stream paused for running out of descriptors.
 NoRetryServed == ~retryServed                                                \* never served after a pause
+
+\* The rest of the process takes the last descriptor between a check that found one and the accept.
+NoRaceLoss == ~raceLost                                                      \* never lost to that race
 =============================================================================

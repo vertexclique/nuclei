@@ -1,0 +1,6 @@
+# configuration                spec                 expected
+S_linux                        MC_Shutdown          pass
+S_macos                        MC_Shutdown          pass
+M_own_flag                     MC_Shutdown          violated:AsTheKernel
+M_shut_first                   MC_Shutdown          violated:FinLast
+W_refused                      MC_Shutdown          violated:NoRefusedClose

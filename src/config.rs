@@ -82,6 +82,13 @@ pub struct IoUringConfiguration {
     /// stays armed for every arrival and a receive that waits holds no buffer
     /// of its own.
     ///
+    /// The buffers, with their descriptors, count against the shard's
+    /// [`io_buffer_cap`](crate::Builder::io_buffer_cap) for as long as the
+    /// shard lives, and the shard's own pool gets the rest; a group that
+    /// leaves the pool less than 512 bytes is refused as the configuration's
+    /// mistake when the shard starts, and one the system has no memory for
+    /// fails the shard's start with `OutOfMemory`.
+    ///
     /// 0 turns multishot receives off, and each read then takes a buffer of
     /// the shard's own pool for its receive. Otherwise a power of two from 1 to
     /// 32768 and below twice `queue_len`, so the group never takes more than
@@ -104,7 +111,9 @@ pub struct IoUringConfiguration {
     /// From 512 (smaller buffers split a stream into chunks of a few packets
     /// each) to 1 GiB; a
     /// value outside is refused as the configuration's mistake when the first
-    /// shard starts. Not checked while `recv_buffers` is 0.
+    /// shard starts. Not checked while `recv_buffers` is 0. `recv_buffers`
+    /// buffers of this size count against the shard's
+    /// [`io_buffer_cap`](crate::Builder::io_buffer_cap), as said there.
     ///
     /// A receive is stopped once the bytes it handed out and its reader has
     /// not taken pass an eighth of the group (at least one buffer), and asked

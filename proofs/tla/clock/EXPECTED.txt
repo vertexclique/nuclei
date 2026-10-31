@@ -1,5 +1,6 @@
 # configuration                spec                 expected
 C_safe                         MC_Clock             pass
+C_safe_live                    MC_Clock             pass
 C_three                        MC_Clock             pass
 C_pair                         MC_Clock             pass
 M_publish_late                 MC_Clock             violated:ClockNeverPassesArmed

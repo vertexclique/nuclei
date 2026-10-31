@@ -1,9 +1,9 @@
 //! The byte streams' calls, on the handle and on a shared reference to it:
 //! `AsyncRead` and `AsyncWrite`, the reads and writes that lend the driver
-//! a buffer of the caller's, readiness, the reads and writes that do not
-//! wait, and a stream's halves. A read side, a write side and a stream (both,
-//! with its halves) each have their macro: a socket stream takes all three,
-//! a pipe's end one side.
+//! a buffer of the caller's (and for TCP, the zero-copy write), readiness,
+//! the reads and writes that do not wait, and a stream's halves. A read
+//! side, a write side and a stream (both, with its halves) each have their
+//! macro: a socket stream takes all three, a pipe's end one side.
 //!
 //! Ready means the handle's own buffers: readable once a read would end at
 //! once (bytes read ahead, the end of the stream, or an error, which the
@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use futures_io::{AsyncRead, AsyncWrite};
 
+use super::Released;
 use super::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 use crate::io::{Handle, Interest, Ready};
 
@@ -265,6 +266,32 @@ macro_rules! stream_io {
 }
 
 stream_io!(TcpStream);
+
+impl Handle<TcpStream> {
+    /// Writes all of `buf` as [`write_owned`](Self::write_owned) does, with the kernel's
+    /// zero-copy send where it has one, and returns the write's result with a [`Released`] that
+    /// gives `buf` back once the kernel let go of it.
+    ///
+    /// The write ends once the kernel took the last byte, as `write_owned`'s does, but the kernel
+    /// keeps reading `buf` until the peer acknowledged every byte; only then does the `Released`
+    /// resolve to it. So a peer that writes before it reads cannot hold the write up, and writes
+    /// pipeline: the next one may start while earlier buffers are still out.
+    ///
+    /// A write of less than 1 MiB, where copying costs less, and every write on epoll, kqueue,
+    /// I/O completion ports or an io_uring kernel without zero-copy sends (or without memory it
+    /// may lock for them), is copied by the kernel as `write_owned`'s is, and its `Released` is
+    /// ready at once. So is a write served by a ring only its own thread may reap: a thread's own
+    /// shard (a stream polled by `block_on` outside the runtime's workers), or the workers of a
+    /// runtime built with [`handoff_after(None)`](crate::runtime::Builder::handoff_after). Their
+    /// rings could not be handed to another thread, which a buffer still out when the thread
+    /// stops would need.
+    ///
+    /// If the future is dropped before it completes, the stream gets `buf` whole or not at all,
+    /// as with `write_owned`. Either way `buf` is dropped only once the kernel let go of it.
+    pub async fn write_zero_copy(&self, buf: Vec<u8>) -> (io::Result<usize>, Released) {
+        self.source().write_zero_copy(buf).await
+    }
+}
 #[cfg(unix)]
 stream_io!(UnixStream);
 #[cfg(unix)]

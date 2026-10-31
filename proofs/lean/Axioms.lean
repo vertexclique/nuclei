@@ -80,13 +80,14 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Wheel.next_window_wraps
 #print axioms Nuclei.Wheel.example_seventy_thousand
 
--- A ring's file slots: every operation keeps a free slot unheld, unnamed and with no open copy;
--- a taken slot has no entry naming it; a free slot is never freed twice; a copy closes only
--- once unheld and unnamed; and the worked example.
+-- A ring's file slots: every operation keeps a free slot unheld, unnamed and with no file;
+-- a taken slot has no entry naming it; a free slot is never freed twice; a named slot is never
+-- free; a source that goes takes its file out of the table at once; and the worked example.
 #print axioms Nuclei.Files.inv_run
 #print axioms Nuclei.Files.taken_slot_is_unnamed
 #print axioms Nuclei.Files.no_double_free
-#print axioms Nuclei.Files.copy_closes_unnamed
+#print axioms Nuclei.Files.named_slot_is_not_free
+#print axioms Nuclei.Files.release_takes_the_file_out
 #print axioms Nuclei.Files.example_reuse_waits
 
 -- A ring's overflow count: an overflow counts once however many waits it lasts, never more than

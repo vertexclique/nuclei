@@ -68,6 +68,8 @@ pub(crate) struct Inner {
     on_panic: crate::sync::Notify,
     /// Seeds the generator of a thread in this runtime's `block_on`.
     rng_seed: Option<RngSeed>,
+    /// What dropped handles left to finish, once no worker takes it.
+    lingering: super::linger::Lingering,
 }
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
@@ -255,9 +257,15 @@ impl Builder {
     /// The most bytes each worker's IO buffers hold (default 64 MiB). Reads
     /// that had to wait land in these buffers, and writes that had to wait
     /// are copied into them; at the cap, IO waits for buffers to come back,
-    /// so a worker's IO memory never grows past it. Any value is accepted; a
-    /// request that cannot fit under a cap too small for it fails with an error
-    /// that names this setting.
+    /// so a worker's IO memory never grows past it. On io_uring the worker's
+    /// receive buffers count against the cap too
+    /// ([`recv_buffers`](crate::config::IoUringConfiguration::recv_buffers) of
+    /// [`recv_buffer_size`](crate::config::IoUringConfiguration::recv_buffer_size)
+    /// bytes, 4 MiB by default, with their descriptors), and the rest is
+    /// left for the others. A cap that leaves less than 512 bytes beside the
+    /// receive buffers is refused with `InvalidInput` when the worker starts;
+    /// otherwise any value is accepted, and a request that cannot fit under a
+    /// cap too small for it fails with an error that names this setting.
     pub fn io_buffer_cap(mut self, bytes: usize) -> Self {
         self.io_buffer_cap = Some(bytes);
         self
@@ -341,6 +349,7 @@ impl Builder {
             keep_alive: self.blocking_keep_alive.unwrap_or(DEFAULT_KEEP_ALIVE),
             stack_size: self.thread_stack_size,
             name: blocking_name,
+            cpu_mask: current_mask(),
         });
         static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (exit_tx, exits) = kovan_channel::unbounded();
@@ -395,6 +404,7 @@ impl Builder {
                 on_panic: crate::sync::Notify::new(),
                 rng_seed: self.rng_seed,
                 guests: kovan_map::HashMap::with_capacity(GUESTS_CAPACITY),
+                lingering: super::linger::Lingering::new(),
             }
         });
         inner.pool.set_owner(Arc::downgrade(&inner));
@@ -440,7 +450,9 @@ impl fmt::Debug for Builder {
 
 /// A runtime: worker shards and a blocking pool. Dropping it stops the
 /// workers, drops the tasks they still hold, and waits for the threads to
-/// exit.
+/// exit; then, on the dropping thread, for what the handles those tasks held
+/// left behind (the bytes a socket's write-behind holds, a file's writes) to
+/// land, each for at most a minute, so nothing they accepted is lost.
 pub struct Runtime {
     inner: Arc<Inner>,
     /// One message per worker that exited.
@@ -500,12 +512,42 @@ impl Runtime {
     }
 
     /// Stops the workers and waits for them up to `timeout`; workers still
-    /// running a task then are left to exit on their own.
+    /// running a task then are left to exit on their own. What the handles
+    /// of the tasks dropped left behind gets the rest of `timeout` to land,
+    /// on this thread; what has not by then is given up.
     pub fn shutdown_timeout(mut self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
         self.stop_and_join(Some(timeout));
+        self.finish_lingering(Some(deadline));
+    }
+
+    /// Runs what dropped handles left behind until every part handed to the
+    /// runtime ended and nothing more can come (no file write the workers
+    /// issued is still to wake its task, no task woken on a stopped worker
+    /// is still to be dropped), for at most a linger's time (each part is
+    /// bounded by its own) or until `deadline`; on this thread, its runtime
+    /// set to this one, so a file's calls run on this blocking pool. Then
+    /// what is left, and the lingers handed later, run on threads of their
+    /// own.
+    fn finish_lingering(&self, deadline: Option<std::time::Instant>) {
+        // Once: a shutdown that ran it (or gave it up) leaves its drop none.
+        if self.inner.lingering.is_over() {
+            return;
+        }
+        if !self.inner.lingers_done() {
+            let linger = std::time::Instant::now() + crate::io::handle::LINGER;
+            let deadline = deadline.map_or(linger, |d| d.min(linger));
+            let _ = block_on_here(
+                &self.inner,
+                crate::time::timeout_at(deadline, self.inner.run_lingers()),
+            );
+        }
+        self.inner.lingering.end();
     }
 
     fn stop_and_join(&mut self, timeout: Option<Duration>) {
+        // Lingers handed from now on wait for this drop, never for a worker.
+        self.inner.lingering.close();
         self.inner.workers.stop_all();
         let threads = self.inner.workers.take_threads();
         if let Some(timeout) = timeout {
@@ -543,6 +585,7 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.stop_and_join(None);
+        self.finish_lingering(None);
     }
 }
 
@@ -600,6 +643,11 @@ impl Inner {
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
+
+    /// What dropped handles left this runtime to finish.
+    pub(crate) fn lingering(&self) -> &super::linger::Lingering {
+        &self.lingering
+    }
 }
 
 /// The process default runtime, started now if it is not running.
@@ -629,11 +677,45 @@ pub(crate) fn with_clock<R>(f: impl FnOnce(Option<&crate::time::clock::Clock>) -
     }
 }
 
+/// The runtime this thread is inside, or the default one if it runs: never
+/// started here (a thread on its way out may ask).
+fn running() -> Option<Arc<Inner>> {
+    context::runtime().or_else(|| DEFAULT.get().map(|rt| Arc::clone(&rt.inner)))
+}
+
+/// [`running`], for a linger's hand-off.
+pub(crate) fn running_inner() -> Option<Arc<Inner>> {
+    running()
+}
+
+/// Spawns a linger on `inner`: on a worker that takes tasks, else (with
+/// `here`) on the shard of this thread (which runs it at its next
+/// `block_on`); the linger back where neither can take it.
+pub(crate) fn spawn_linger(
+    inner: &Arc<Inner>,
+    linger: super::linger::Guarded,
+    here: bool,
+) -> Result<(), super::linger::Guarded> {
+    if let Some(shard) = inner.workers.place(inner.id, inner.local_margin) {
+        spawn_on(inner, shard, linger).detach();
+        return Ok(());
+    }
+    // With no workers, the thread's own shard, if it has one: one is never
+    // made here (a thread on its way out may hand a linger).
+    let running = context::current(|current| current.is_some());
+    if here && (running || context::own_shard_if_made().is_some()) {
+        let _runtime = context::set_runtime(inner);
+        spawn_here(linger, false).detach();
+        return Ok(());
+    }
+    Err(linger)
+}
+
 /// A shard to serve a thread that runs none, of the runtime this thread is
 /// inside or of the default one, if one runs: it never starts one (a thread
 /// on its way out may ask).
 pub(crate) fn running_service_shard() -> Option<Arc<Shared>> {
-    let inner = context::runtime().or_else(|| DEFAULT.get().map(|rt| Arc::clone(&rt.inner)))?;
+    let inner = running()?;
     inner
         .workers
         .place(inner.id, inner.local_margin)
@@ -686,6 +768,15 @@ where
         // No worker takes tasks: the spawning thread's own shard runs it.
         return spawn_here(future, false);
     };
+    spawn_on(inner, shard, future)
+}
+
+/// Spawns `future` on `inner`'s worker `shard`.
+fn spawn_on<F>(inner: &Inner, shard: &Arc<Shared>, future: F) -> Task<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     let hooks = inner.task_hooks.clone();
     let (runnable, task) = task::spawn(
         Counted::new(future, shard),
@@ -900,13 +991,20 @@ where
 /// its way out could not): whether `f` went.
 #[cfg(port)]
 pub(crate) fn spawn_blocking_inside(f: impl FnOnce() + Send + 'static) -> bool {
-    match context::runtime() {
-        Some(inner) => {
-            inner.pool.spawn(f).detach();
+    match blocking_pool_inside() {
+        Some(pool) => {
+            pool.spawn(f).detach();
             true
         }
         None => false,
     }
+}
+
+/// The blocking pool of the runtime this thread is inside, if it is inside one; never the
+/// default runtime's, which it does not start.
+#[cfg(completion)]
+pub(crate) fn blocking_pool_inside() -> Option<Arc<super::blocking::Pool>> {
+    context::runtime().map(|inner| Arc::clone(&inner.pool))
 }
 
 /// The cores this process may run on, in order (Linux; Windows, in the
@@ -915,16 +1013,12 @@ pub(crate) fn spawn_blocking_inside(f: impl FnOnce() + Send + 'static) -> bool {
 pub(crate) fn allowed_cores() -> Vec<usize> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: a plain syscall into a zeroed set of our own.
-        unsafe {
-            let mut set: libc::cpu_set_t = core::mem::zeroed();
-            if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-                return (0..libc::CPU_SETSIZE as usize)
-                    .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
-                    .collect();
-            }
-        }
-        Vec::new()
+        current_mask().map_or_else(Vec::new, |set| {
+            (0..libc::CPU_SETSIZE as usize)
+                // SAFETY: a plain read of a set of our own.
+                .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+                .collect()
+        })
     }
     #[cfg(windows)]
     {
@@ -942,6 +1036,37 @@ pub(crate) fn allowed_cores() -> Vec<usize> {
     {
         Vec::new()
     }
+}
+
+/// A thread's CPU affinity mask.
+#[cfg(target_os = "linux")]
+pub(crate) type CpuMask = libc::cpu_set_t;
+/// A thread's CPU affinity mask; none is kept where threads are not pinned.
+#[cfg(not(target_os = "linux"))]
+pub(crate) type CpuMask = ();
+
+/// The calling thread's affinity mask, `None` where it is not known.
+pub(crate) fn current_mask() -> Option<CpuMask> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain syscall into a zeroed set of our own.
+        unsafe {
+            let mut set: libc::cpu_set_t = core::mem::zeroed();
+            (libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) == 0).then_some(set)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// Runs the calling thread on `mask`. A failure leaves the mask it had,
+/// which costs locality and nothing else.
+pub(crate) fn apply_mask(mask: &CpuMask) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: a plain syscall with a set of our own.
+    let _ = unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), mask) };
+    #[cfg(not(target_os = "linux"))]
+    let _ = mask;
 }
 
 /// Pins the calling thread to `core` (Linux, Windows). A failure leaves it

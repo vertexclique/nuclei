@@ -11,6 +11,11 @@
 //! The buffers stay mapped while any chunk lives (see `BufMem`), so a chunk
 //! that outlives its shard still reads memory that is there.
 //!
+//! The group's memory, its buffers and its descriptor ring
+//! ([`reservation`]), is charged to the shard's IO buffer ledger while the
+//! group lives (see `buf`), so the shard's pool has the rest of
+//! `io_buffer_cap` for its own buffers.
+//!
 //! The bytes of a receive's chunks not given back yet are counted against
 //! the group's per-receive cap: past it the ring cancels the receive, and
 //! its source asks for a new one once its reader took them, so a reader
@@ -27,7 +32,7 @@ use kovan_queue::seg_queue::SegQueue;
 
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::Ring;
-use crate::syscore::linux::iouring::ring::buf_ring::{BufMem, BufRing};
+use crate::syscore::linux::iouring::ring::buf_ring::{self, BufMem, BufRing};
 
 /// The buffer group every multishot receive of a shard draws from.
 const GROUP: u16 = 0;
@@ -115,6 +120,54 @@ pub(crate) struct RingChunk {
     len: u32,
 }
 
+/// The memory a group of `buffers` buffers of `size` bytes takes, its descriptor ring included:
+/// what the shard's ledger is charged while it lives.
+pub(crate) fn reservation(buffers: u16, size: u32) -> usize {
+    if buffers == 0 {
+        return 0;
+    }
+    buf_ring::reservation(buffers, size)
+}
+
+/// The refusal of a group of `buffers` of `size` bytes, `bytes` in all, too large for a shard
+/// whose IO buffers may hold `cap` bytes: it must leave room for one buffer of the pool.
+pub(crate) fn too_large(buffers: u16, size: u32, bytes: usize, cap: usize) -> io::Error {
+    crate::config::refuse(
+        "io_uring recv_buffers x recv_buffer_size",
+        format_args!("{buffers} x {size}, {bytes} bytes in all"),
+        format_args!(
+            "at most io_buffer_cap ({cap} bytes) less {} bytes for the shard's other IO buffers",
+            crate::buf::CLASSES[0]
+        ),
+    )
+}
+
+/// A shard starts without a group of `buffers` of `size` bytes the system had no memory for:
+/// its reads take the pool's buffers. Counted in the stats every time, and said once per
+/// process, so a machine whose locked-memory limit is too low for its shards is told why
+/// and what to change, and a runtime never fails to start over it.
+pub(crate) fn went_without(buffers: u16, size: u32, err: &io::Error) {
+    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    crate::rt::counters::receive_buffers_missing();
+    if SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a plain getrlimit into a struct of our own.
+    let known = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0;
+    let limit = match (known, limit.rlim_cur) {
+        (false, _) => "unknown".to_string(),
+        (true, libc::RLIM_INFINITY) => "unlimited".to_string(),
+        (true, bytes) => format!("{} KiB", bytes / 1024),
+    };
+    log::warn!(
+        "io_uring receive buffers ({buffers} x {size} bytes) could not be set up ({err}); reads use pool buffers instead. The locked-memory limit is {limit}: raise it (ulimit -l) or lower recv_buffers or recv_buffer_size."
+    );
+}
+
 impl RecvGroup {
     /// A group of `entries` buffers (a power of two up to 32768) of `size`
     /// bytes each, registered on `ring`, every buffer given to the kernel.
@@ -178,6 +231,11 @@ impl RecvGroup {
     /// The size of each buffer.
     pub(crate) fn buf_size(&self) -> u32 {
         self.ring.buf_size()
+    }
+
+    /// The memory the group takes, charged to its shard's ledger.
+    pub(crate) fn reservation(&self) -> usize {
+        reservation(self.ring.entries(), self.ring.buf_size())
     }
 
     /// What `len` bytes of a chunk count against the cap of the receive that brought them.

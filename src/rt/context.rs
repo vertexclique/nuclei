@@ -367,11 +367,30 @@ pub(crate) fn runtime() -> Option<Arc<Inner>> {
         .flatten()
 }
 
+/// Whether `inner` is the runtime set on this thread.
+pub(crate) fn runtime_is(inner: *const Inner) -> bool {
+    RUNTIME
+        .try_with(|r| {
+            r.borrow()
+                .as_ref()
+                .is_some_and(|set| Arc::as_ptr(set) == inner)
+        })
+        .unwrap_or(false)
+}
+
 /// Makes `inner` the runtime `spawn` uses on this thread, until the guard
 /// drops.
 pub(crate) fn set_runtime(inner: &Arc<Inner>) -> RuntimeSet {
     let previous = RUNTIME.with(|r| r.replace(Some(Arc::clone(inner))));
     RuntimeSet { previous }
+}
+
+/// [`set_runtime`], unless this thread's locals are gone (it is exiting).
+pub(crate) fn try_set_runtime(inner: &Arc<Inner>) -> Option<RuntimeSet> {
+    let previous = RUNTIME
+        .try_with(|r| r.replace(Some(Arc::clone(inner))))
+        .ok()?;
+    Some(RuntimeSet { previous })
 }
 
 /// Restores the runtime that was set before [`set_runtime`].

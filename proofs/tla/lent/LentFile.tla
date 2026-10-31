@@ -57,6 +57,14 @@
 (* kernel write of exactly its bytes, which waits for the write in flight  *)
 (* instead of joining the write-behind.                                    *)
 (*                                                                          *)
+(* Every call runs on the handle's own descriptor (src/fs/file/mod.rs,     *)
+(* `FileIo::new`; src/io/source/requests.rs, `Lease`): no copy of it is    *)
+(* made, and every job holds a lease on the handle's object until it ran. *)
+(* Once no task borrows the handle it ends (`Ending`): dropped, it hands   *)
+(* its object over and the last lease out closes it; handed back by       *)
+(* `into_inner`, it waits until no lease is out, and the caller may close  *)
+(* the object at once. No call ever runs on a descriptor that closed.      *)
+(*                                                                          *)
 (* What is abstract: the file state's guard (a step under it runs whole), *)
 (* how much a job reads or writes (a cell, or the cells asked for), and    *)
 (* where in time a positional call's own future runs: its end is taken by *)
@@ -67,8 +75,9 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 CONSTANTS
     MayLeave,    \* whether a task may go away while its job is out
     Appending,   \* whether the file was opened to append
-    Scenario,    \* which tasks run: "cursor", "positional", "sync" or "direct"
+    Scenario,    \* which tasks run: "cursor", "positional", "generation", "sync" or "direct"
     SyncMayFail, \* whether the device may fail a sync
+    Ending,      \* how the handle ends once no task borrows it: "none" (it outlives the run), "drop", "into_inner"
     Mutation     \* "none", or the name of the one rule this run takes away
 
 \* The cells of the file, numbered from its start.
@@ -151,7 +160,10 @@ variables
     movedMid = FALSE,                  \* (record) a write cut short on the ring was finished on the pool
     overwrote = FALSE,                 \* (record) an append landed on a cell already written
     offEnd = FALSE,                    \* (record) an append landed and the cursor is not the end
-    pastCursor = FALSE;                \* (record) an append landed elsewhere than the cursor it was made at
+    pastCursor = FALSE,                \* (record) an append landed elsewhere than the cursor it was made at
+    objOpen = TRUE,                    \* the handle's object, its descriptor, is open
+    gone = FALSE,                      \* the handle ended (dropped, or its object handed back)
+    usedClosed = FALSE;                \* (record) a job's call ran on a descriptor that closed
 
 define
     \* A cursor write is in flight: submitted and not landed.
@@ -190,6 +202,14 @@ define
     Counts(j) == /\ j.at = cursor
                  /\ (j.epoch = epoch \/ Mutation = "no_epoch_check")
                  /\ (j.gen = pgen \/ Mutation = "no_gen_check")
+    \* The leases out on the handle's descriptor: every call submitted and not run yet holds one
+    \* (the cursor write in flight, each read job, the positional calls, the sync).
+    Leases == (IF InFlight THEN 1 ELSE 0)
+              + Cardinality({r \in Readers : jobs[r] # NoJob /\ ~jobs[r].ran})
+              + (IF djob # NoJob /\ ~djob.ran THEN 1 ELSE 0)
+              + (IF PosOut /\ ~pjob.ran THEN 1 ELSE 0)
+              + (IF prjob # NoJob /\ ~prjob.ran THEN 1 ELSE 0)
+              + (IF sjob # NoJob /\ ~sjob.ran THEN 1 ELSE 0)
 end define;
 
 \* `poll_writes`, under the guard: a cursor write that ran is taken out of flight (the lent one's
@@ -281,6 +301,8 @@ P_loop:
                 \* MUTATION append_at_cursor: an append lands where the cursor was.
                 with cell = IF Appending /\ Mutation # "append_at_cursor" THEN size ELSE writing.at,
                      len = Len(writing.vals) do
+                    \* A call on a descriptor that closed is recorded.
+                    if ~objOpen then usedClosed := TRUE; end if;
                     if Appending /\ file[cell] # 0 then overwrote := TRUE; end if;
                     if Appending /\ cell # writing.at then pastCursor := TRUE; end if;
                     \* Each cell of the write gets its value.
@@ -292,6 +314,7 @@ P_loop:
             or
                 \* The ring's call takes only part of a one-cell write: half the cell holds the value.
                 await writing.on = "ring" /\ writing.part = 0 /\ Len(writing.vals) = 1;
+                if ~objOpen then usedClosed := TRUE; end if;
                 file[writing.at] := -writing.vals[1];
                 short := TRUE;
                 \* MUTATION no_continuation: a write cut short counts as done.
@@ -304,20 +327,24 @@ P_loop:
         or
             \* A reader's job reads its cell.
             with r \in {q \in Readers : jobs[q] # NoJob /\ ~jobs[q].ran /\ Runs(jobs[q])} do
+                if ~objOpen then usedClosed := TRUE; end if;
                 jobs[r].val := file[jobs[r].at] || jobs[r].ran := TRUE;
             end with;
         or
             \* The read-ahead reader's job reads its cells (past the file's cells, nothing).
             await djob # NoJob /\ ~djob.ran /\ Runs(djob);
+            if ~objOpen then usedClosed := TRUE; end if;
             djob.vals := [i \in 1..djob.len |-> FileAt(djob.at + i - 1)]
                 || djob.ran := TRUE;
         or
             \* The positional read's job reads its cell.
             await prjob # NoJob /\ ~prjob.ran /\ Runs(prjob);
+            if ~objOpen then usedClosed := TRUE; end if;
             prjob.val := file[prjob.at] || prjob.ran := TRUE;
         or
             \* The positional write lands whole, or the ring's call takes half of it first.
             await PosOut /\ ~pjob.ran /\ Runs(pjob);
+            if ~objOpen then usedClosed := TRUE; end if;
             either
                 file[pjob.at] := pjob.val;
                 pjob.ran := TRUE;
@@ -331,6 +358,7 @@ P_loop:
             \* put on the ring with a drain (the mutation) starts only once the ring's writes ended.
             await sjob # NoJob /\ ~sjob.ran /\ Runs(sjob);
             await sjob.drain /\ sjob.on = "ring" => ~(InFlight /\ writing.on = "ring");
+            if ~objOpen then usedClosed := TRUE; end if;
             with ok \in IF SyncMayFail THEN {TRUE, FALSE} ELSE {TRUE} do
                 durable := IF ok THEN file ELSE durable;
                 sjob.ok := ok || sjob.ran := TRUE;
@@ -755,6 +783,32 @@ W_flush_wait:
         holder := "none";
     end if;
 end process;
+
+\* The handle's owner: once no task borrows the handle, it ends as `Ending` says.
+fair process owner = "owner"
+begin
+O_end:
+    if Ending = "none" then goto Done; end if;
+O_wait:
+    await AllDone;
+    if Ending = "drop" then
+        \* Dropped: the object goes to the source; the last lease out closes it.
+        gone := TRUE;
+        \* MUTATION close_at_drop: the descriptor closes at the drop, jobs still out on it.
+        if Mutation = "close_at_drop" then objOpen := FALSE; end if;
+    else
+        \* `into_inner`: the writes behind land and every job out ends first (the retire waits
+        \* for the leases); the caller then has its object back and may close it at once.
+        \* MUTATION into_inner_early: it hands the object back at once.
+        await Leases = 0 \/ Mutation = "into_inner_early";
+        gone := TRUE;
+        objOpen := FALSE;
+    end if;
+O_close:
+    \* The last lease of a dropped handle's object closes it.
+    await Leases = 0;
+    objOpen := FALSE;
+end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
 \* proofs/tla/run_tlc.sh runs it on a temporary copy before every check, so the tree never
@@ -813,6 +867,9 @@ NoSyncAfterFailure == ~okAfterFail
 \* no write that joins others.
 DirectExact == Direct => (kreads \subseteq creads /\ kwrites \subseteq cwrites)
 
+\* No job's call ever runs on a descriptor that closed (or that another file took since).
+NoCallOnClosed == ~usedClosed
+
 \* `Termination` (every process ends) is the one the translator writes for the fair processes.
 
 (***************************************************************************)
@@ -840,4 +897,6 @@ NoReadAhead == kreads \subseteq creads
 NoPosOrphanLanded == ~posOrphanLanded
 \* A sync fails.
 NoSyncFailure == ~failedOnce
+\* A job is still out when the handle was dropped: the job closes its object.
+NoJobAfterDrop == ~(gone /\ Leases > 0)
 =============================================================================

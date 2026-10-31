@@ -25,14 +25,24 @@
 //! never used past `new`. A new IO type must keep this: a type whose
 //! descriptor can change behind `&self` must not get IO methods.
 //!
+//! nuclei makes no descriptor of its own for a handle: every call, the
+//! driver's, a ring's and a job's of the blocking pool, runs on the handle's
+//! own descriptor. A call made away from the driver (a file's read or write
+//! on the pool, a `send_file` chunk, a ring's attach) holds a lease on the
+//! object for as long as it may use the number: a handle dropped meanwhile
+//! hands its object to the source, and the last lease closes it; `get_mut`
+//! and `into_inner` wait for the leases. So a process with no descriptor to
+//! spare does everything std's would.
+//!
 //! # Bytes written behind
 //!
 //! A write is accepted into the handle's write-behind, as the kernel
 //! accepts bytes into a socket's buffer, and the driver writes it out. Those
 //! bytes go out whatever happens to the handle, as std's do: `get_mut` and
 //! `into_inner` wait until the kernel took them, and a handle dropped before
-//! that leaves them to a copy of its descriptor, which delivers them (for
-//! at most [`LINGER`]) and then closes.
+//! that leaves its object to a task, which delivers them (for at most
+//! [`LINGER`]) and then closes it. A runtime that drops waits for those tasks
+//! (see `rt::linger`), and none starts a runtime to run them.
 
 /// How long a dropped handle's unsent bytes may take to reach the kernel.
 // vertexia: one constant for every handle; a builder setting if a peer that
@@ -179,12 +189,13 @@ impl<T: IoObject> Handle<T> {
         }
     }
 
-    /// A regular file's IO state, made now on its first use.
+    /// A regular file's IO state, made now on its first use, on a lease of
+    /// the handle's own descriptor.
     pub(crate) fn file(&self) -> io::Result<&Arc<FileIo>> {
         if let Some(file) = self.file.get() {
             return Ok(file);
         }
-        let file = FileIo::new(self.io.raw_io())?;
+        let file = FileIo::new(self.source().lease()?)?;
         Ok(self.file.get_or_init(|| file))
     }
 
@@ -205,9 +216,10 @@ impl<T> Handle<T> {
     }
 
     /// The IO object, to change. Bytes written behind reach the kernel
-    /// first (this waits for them), then the handle's IO stops; its next
-    /// operation takes the object as it is then (another descriptor
-    /// discards what the old one left).
+    /// first (this waits for them), then the handle's IO stops, and every
+    /// call still out on its descriptor ends; its next operation takes the
+    /// object as it is then (another descriptor discards what the old one
+    /// left).
     pub fn get_mut(&mut self) -> &mut T {
         self.deliver_unsent();
         self.hand_file_back();
@@ -216,8 +228,9 @@ impl<T> Handle<T> {
     }
 
     /// The IO object, back from the handle, once the bytes written behind
-    /// reached the kernel (this waits for them). Bytes the handle read ahead
-    /// and had not handed out are dropped with it.
+    /// reached the kernel and every call still out on its descriptor ended
+    /// (this waits for them). Bytes the handle read ahead and had not handed
+    /// out are dropped with it.
     pub fn into_inner(mut self) -> T {
         self.deliver_unsent();
         self.hand_file_back();
@@ -265,76 +278,57 @@ impl<T> Handle<T> {
 }
 
 impl<T> Drop for Handle<T> {
-    /// Never waits: the source closes the object once no call of the driver
-    /// can use its descriptor (at once, or as the driver lets go of it).
+    /// Never waits: the source closes the object once no call can use its
+    /// descriptor (at once, or as the last lease or the driver lets go of
+    /// it).
     fn drop(&mut self) {
-        // A file's writes in flight keep their own copy of the descriptor;
-        // what waits behind them is handed to a task.
+        // A file's writes in flight hold leases on its descriptor; what waits
+        // behind them is handed to a task, the file's state with its lease.
         if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
-            crate::runtime::spawn(async move {
+            crate::rt::linger::hand(async move {
                 let _ =
                     crate::time::timeout(LINGER, core::future::poll_fn(|cx| file.poll_flush(cx)))
                         .await;
-            })
-            .detach();
+            });
         }
         // SAFETY: taken once, here; the field is never used again.
         let io = unsafe { ManuallyDrop::take(&mut self.io) };
-        #[cfg(unix)]
-        match self
-            .source
-            .has_unsent()
-            .then(|| self.source.duplicate())
-            .flatten()
-        {
-            // The unsent bytes go out through a copy of the descriptor,
-            // which a task keeps and closes once they are out.
-            Some(copy) => {
-                self.source.close(io, Some(copy.as_raw_fd()));
-                crate::runtime::spawn(linger(Arc::clone(&self.source), copy)).detach();
-            }
-            // The registration goes before the descriptor closes.
-            None => self.source.close(io, None),
-        }
-        // Closing a socket cancels its sends, so the object itself stays
-        // with a task until the unsent bytes are out, and closes then.
-        #[cfg(windows)]
-        match self
+        let Some(own) = self
             .source
             .raw_fd()
             .ok()
             .filter(|_| self.source.has_unsent())
-        {
-            Some(socket) => {
-                self.source.close((), Some(socket));
-                let kept = Kept::new(io);
-                crate::runtime::spawn(linger(Arc::clone(&self.source), kept)).detach();
-            }
-            None => self.source.close(io, None),
-        }
+        else {
+            // The registration goes before the descriptor closes.
+            self.source.close(io);
+            return;
+        };
+        // The object itself stays with a task until the unsent bytes are
+        // out, and closes then: the drain needs no descriptor of its own
+        // (and on Windows, closing a socket would cancel its sends).
+        self.source.linger(own);
+        crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io)));
     }
 }
 
-/// Delivers what a dropped handle's write-behind holds through `copy` (on
-/// Windows the object itself), then closes it.
-async fn linger<C: Send + 'static>(source: Arc<Source>, copy: C) {
+/// Delivers what a dropped handle's write-behind holds through `kept`, its
+/// object itself, then closes it.
+async fn linger(source: Arc<Source>, kept: Kept) {
     let _ = crate::time::timeout(LINGER, core::future::poll_fn(|cx| source.poll_drain(cx))).await;
-    source.close(copy, None);
+    source.close(kept);
 }
 
-/// A dropped handle's object, kept while its unsent bytes go out.
-#[cfg(windows)]
+/// A dropped handle's object, kept open while its unsent bytes go out.
 struct Kept {
     ptr: core::ptr::NonNull<()>,
     drop: unsafe fn(core::ptr::NonNull<()>),
 }
 
-// SAFETY: a handle wraps only std's sockets and files (see `IoObject`), all
-// of them `Send`; the type is erased because `Drop` cannot say so.
-#[cfg(windows)]
+// SAFETY: a handle does IO only on std's sockets and files, all of them
+// `Send` (see the module docs), and only a handle with bytes written behind
+// lingers; the type is erased because `Drop` cannot say so.
 unsafe impl Send for Kept {}
 
-#[cfg(windows)]
 impl Kept {
     fn new<T>(io: T) -> Self {
         /// Drops the `T` boxed at `ptr`.
@@ -353,7 +347,6 @@ impl Kept {
     }
 }
 
-#[cfg(windows)]
 impl Drop for Kept {
     fn drop(&mut self) {
         // SAFETY: made by `new`, dropped once, here.

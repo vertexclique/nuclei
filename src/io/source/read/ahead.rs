@@ -1,6 +1,7 @@
 //! A stream's read-ahead: the bytes the driver read that no task took yet,
 //! in the order they came, as pieces of the pool's buffers, of lent buffers
-//! whose task went away, and on a ring of the receive group's buffers.
+//! whose task went away, on a ring of the receive group's buffers, and on a
+//! port of the read slot's own room.
 
 use std::collections::VecDeque;
 use std::io;
@@ -21,6 +22,10 @@ pub(super) enum Piece {
     /// it goes back to the group once taken.
     #[cfg(ring)]
     Ring(crate::rt::shard::recv::RingChunk),
+    /// On a port, read into the read slot's own room, for a read the pool had
+    /// no buffer for.
+    #[cfg(port)]
+    Room(crate::io::source::ops::Room),
 }
 
 impl Piece {
@@ -30,6 +35,8 @@ impl Piece {
             Piece::Left { buf, start } => buf.get(*start..).unwrap_or_default(),
             #[cfg(ring)]
             Piece::Ring(chunk) => chunk.bytes(),
+            #[cfg(port)]
+            Piece::Room(room) => room.bytes(),
         }
     }
 
@@ -39,6 +46,8 @@ impl Piece {
             Piece::Left { buf, start } => *start = (*start + n).min(buf.len()),
             #[cfg(ring)]
             Piece::Ring(chunk) => chunk.consume(n),
+            #[cfg(port)]
+            Piece::Room(room) => room.consume(n),
         }
     }
 

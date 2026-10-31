@@ -1,9 +1,15 @@
 //! A shard that stops running: for now (the outermost `block_on` of its
 //! thread returned) or for good (dropped). What it watches goes, each to be
 //! watched where its user polls next: the sources, each told; the
-//! children, each once its registration ended. A ring waits for the
-//! operations still out to end; a port hands them to a keeper.
+//! children, each once its registration ended. A port hands the operations
+//! still out to a keeper; so does a ring another thread can reap, as its
+//! shard is dropped (`ring::keeper`), and any other ring waits for them a
+//! bounded time. A source whose writes left bytes behind that the kernel has
+//! not taken goes to a linger that writes them out where it runs, for no
+//! task of the handle's may poll that side again (`tla/going/Behind.tla`),
+//! and which a runtime that drops waits for (`rt::linger`).
 
+use core::future::poll_fn;
 use core::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -28,7 +34,11 @@ impl Shard {
     /// and this, its own shard, runs again only at its next one.
     pub(crate) fn leave(&self) {
         let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
-        evict_all(gone, self.shared_addr());
+        evict_all(&gone, self.shared_addr());
+        // On a worker, or with none on this thread's shard, which runs it at
+        // the thread's next `block_on`, as any task spawned here; a runtime
+        // that drops waits for it (`rt::linger`).
+        drain_unsent(&gone, |source| crate::rt::linger::hand(drain(source)));
         self.let_go_of_children();
         // Sources that went before (a dropped handle's) may have left a
         // cancel queued, or their operations still out.
@@ -50,11 +60,29 @@ impl Shard {
 /// holder as it lets go, which comes a driver call later; until then the
 /// holder may still hand this shard's driver an operation, so the
 /// operations out here are only known once every eviction happened.
-fn evict_all(gone: Vec<(u64, Arc<Source>)>, home: usize) {
-    for (_, source) in &gone {
+fn evict_all(gone: &[(u64, Arc<Source>)], home: usize) {
+    for (_, source) in gone {
         source.evict();
     }
-    wait_for_evictions(&gone, home);
+    wait_for_evictions(gone, home);
+}
+
+/// Hands each source of `gone`, evicted, whose write side holds bytes the
+/// kernel has not taken to `spawn`, for a task that writes them out.
+fn drain_unsent(gone: &[(u64, Arc<Source>)], spawn: impl Fn(Arc<Source>)) {
+    gone.iter()
+        .filter(|(_, source)| source.has_unsent())
+        .for_each(|(_, source)| spawn(Arc::clone(source)));
+}
+
+/// Writes out what the write side of `source` holds, on the shard it runs on,
+/// for at most the linger a dropped handle's bytes get.
+async fn drain(source: Arc<Source>) {
+    let _ = crate::time::timeout(
+        crate::io::handle::LINGER,
+        poll_fn(|cx| source.poll_drain(cx)),
+    )
+    .await;
 }
 
 /// Waits until no source of `gone` is registered under its token with the
@@ -141,22 +169,35 @@ impl Drop for Shard {
         // The sources registered here lose their driver: each is told, and
         // registers where it is polled next.
         let gone: Vec<(u64, Arc<Source>)> = self.sources.get_mut().drain_tokens().collect();
-        evict_all(gone, self.shared_addr());
+        evict_all(&gone, self.shared_addr());
+        // A worker that takes tasks drains them; with none the runtime is
+        // going, and its drop does (`rt::linger`).
+        drain_unsent(&gone, |source| crate::rt::linger::hand(drain(source)));
         self.let_go_of_children();
-        // The ring's operations still out are cancelled and their
-        // completions waited for, so no memory they point at goes while the
-        // kernel may write it.
+        // The ring's operations still out are cancelled, and their completions waited for or
+        // left to a keeper, so no memory they point at goes while the kernel may write it.
         #[cfg(ring)]
         if let Driver::Ring(ring) = &self.driver {
-            // Cancels a holder of a source on another thread left here.
-            ring.settle(|| self.apply_io_ops());
-            ring.shut_down();
+            if ring.reapable() {
+                // Cancels a holder of a source on another thread left here; the keeper applies
+                // what comes later.
+                self.apply_io_ops();
+                ring.cancel_all();
+            } else {
+                ring.settle(|| self.apply_io_ops());
+                self.pool.unreserve(ring.shut_down());
+            }
         }
         // The port's operations to a keeper, unless one has them already.
         #[cfg(port)]
         if !self.port_kept() && !self.hand_off_port() {
             self.settle_port();
         }
+        // No timer fires here again: the arm requests never applied orphan
+        // their timers now, and those in the wheel as the loop below lets go
+        // of them (`sleep::Armed`), so each sleep arms again where it is
+        // polled, or its task, woken here, goes too.
+        self.shared.drain_timer_ops();
         // What goes with a task may wake another of the shard's (a timer's
         // waker, a channel its future held): that one comes back through the
         // inbox, and is dropped here too, until none is left.
@@ -179,6 +220,44 @@ impl Drop for Shard {
         // The inbox's taker's role goes, looking at the inbox once more: a
         // pusher that saw the flag while the role was held left its
         // runnable to this drain.
-        self.shared.drop_stopped(true);
+        self.shared.release_inbox();
+        // The mailbox closes, unless a keeper applies it from now on (and
+        // closes it once it is done).
+        #[cfg(ring)]
+        let kept = self.keep_ring();
+        #[cfg(not(ring))]
+        let kept = false;
+        if !kept {
+            self.shared.close_io();
+        }
+    }
+}
+
+impl Shard {
+    /// The shard is dropped: a ring another thread can reap goes to a keeper with what is still
+    /// out once the ready completions are applied. Where no keeper can be had, the shard waits
+    /// for them a bounded time, and what is still out keeps its memory for good.
+    /// Whether the ring went to a keeper, which applies the shard's mailbox
+    /// from then on.
+    #[cfg(ring)]
+    fn keep_ring(&mut self) -> bool {
+        // A ring no keeper can reap was shut down as the shard went.
+        let Driver::Ring(ring) = &self.driver else {
+            return false;
+        };
+        if !ring.reapable() {
+            return false;
+        }
+        // A look that fails leaves the ready completions to the keeper, whose wait meets the
+        // same failure and keeps what is out for good.
+        let looked = ring.wait(None, Some(std::time::Duration::ZERO)).is_ok();
+        if looked && ring.in_flight() == 0 {
+            return false;
+        }
+        let Driver::Ring(ring) = core::mem::replace(&mut self.driver, Driver::Gone) else {
+            return false;
+        };
+        super::ring::keeper::hand_off(ring, Arc::clone(&self.shared));
+        true
     }
 }
