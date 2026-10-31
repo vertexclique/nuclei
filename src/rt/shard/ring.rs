@@ -66,7 +66,7 @@ use crate::io::source::requests::Lease;
 use crate::io::source::ring::{Arrival, RingMem, RingOp};
 use crate::rt::backend::with_room;
 use crate::rt::park::Notifier;
-use crate::rt::park::ring::RingPoller;
+use crate::rt::park::ring::{CqeBatch, RingPoller};
 use crate::syscore::linux::iouring::files::Files;
 use crate::syscore::linux::iouring::ops::Ops;
 use crate::syscore::linux::iouring::ring::sys::{
@@ -111,8 +111,6 @@ pub(crate) struct ShardRing {
     /// Write sides' operations in the kernel: no cap holds them back (a peer
     /// that never reads keeps one for good), but most end within a moment.
     writes: Cell<usize>,
-    /// Completions of the last wait, reused.
-    cqes: RefCell<Vec<IoUringCqe>>,
     /// The buffers multishot receives draw from; `None` when the
     /// configuration asks for none, or once the ring is shut down.
     recv: RefCell<Option<RecvGroup>>,
@@ -193,7 +191,6 @@ impl ShardRing {
             in_kernel: Cell::new(0),
             cap,
             writes: Cell::new(0),
-            cqes: RefCell::new(Vec::with_capacity(256)),
             recv: RefCell::new(recv),
             #[cfg(test)]
             counts: Cell::new((0, 0, 0)),
@@ -475,13 +472,22 @@ impl ShardRing {
         timeout: Option<Duration>,
     ) -> io::Result<(usize, bool)> {
         self.take_back();
-        let mut cqes = core::mem::take(&mut *self.cqes.borrow_mut());
-        let woken = self.poller.borrow_mut().wait(timeout, &mut cqes);
-        let handled = cqes.len();
-        for cqe in cqes.drain(..) {
-            self.complete(shard, cqe);
+        let mut batch = CqeBatch::new();
+        let mut woken = self.poller.borrow_mut().wait(timeout, &mut batch);
+        let mut handled = 0;
+        loop {
+            handled += batch.len();
+            for at in 0..batch.len() {
+                self.complete(shard, batch.get(at));
+            }
+            // A full batch may have left more in the queue.
+            if !batch.is_full() {
+                break;
+            }
+            batch.clear();
+            let (woke_more, _) = self.poller.borrow_mut().reap(&mut batch);
+            woken = woken.map(|w| w || woke_more);
         }
-        *self.cqes.borrow_mut() = cqes;
         self.finish_leaving();
         Ok((handled, woken?))
     }
