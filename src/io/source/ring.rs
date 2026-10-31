@@ -684,7 +684,7 @@ fn entry(
             (RingMem::Send(buf), sqe)
         }
         Want::SendLent(buf, from) => {
-            let sqe = stream_write(kind, slot, buf.get(from..).unwrap_or_default());
+            let sqe = stream_write(kind, slot, buf.rest_from(from));
             (RingMem::SendLent(buf), sqe)
         }
         Want::SendPinned(buf, from, zero_copy) => {

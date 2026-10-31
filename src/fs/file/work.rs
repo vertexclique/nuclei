@@ -17,6 +17,7 @@ use super::FileIo;
 use crate::buf::owned::OwnedBuf;
 use crate::buf::{LARGEST, PoolBuf, with_pool};
 use crate::fs::call::{self, FileOutcome, SlotJob};
+use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::sys;
 use crate::rt::task::Task;
@@ -123,6 +124,32 @@ pub(super) enum Lent {
     Done(io::Result<()>, OwnedBuf),
     /// In flight, its task gone: the buffer is dropped when it lands.
     Orphan,
+}
+
+/// Writes all of a task's `buf` from its `from`th byte at `at` on, every
+/// buffer of a vectored write in turn.
+pub(crate) fn pwrite_owned(fd: Raw, buf: &OwnedBuf, from: usize, at: u64) -> io::Result<()> {
+    let mut done = from;
+    while done < buf.len() {
+        let rest = buf.rest_from(done);
+        sys::pwrite_all(fd, rest, at + (done - from) as u64)?;
+        done += rest.len();
+    }
+    Ok(())
+}
+
+/// Writes all of a task's `buf` at the end of a file opened to append, and
+/// answers where the file's offset is after it.
+fn append_owned(fd: Raw, buf: &OwnedBuf) -> io::Result<u64> {
+    let mut done = 0;
+    loop {
+        let rest = buf.rest_from(done);
+        let end = sys::append_all(fd, rest)?;
+        done += rest.len();
+        if done >= buf.len() {
+            return Ok(end);
+        }
+    }
 }
 
 pub(super) fn poll_task<T>(task: &mut Task<T>, waker: &Waker) -> Poll<T> {
@@ -333,7 +360,7 @@ impl FileIo {
         let fd = self.fd.clone();
         Work::Slot(call::write_on_pool(
             move || {
-                let result = sys::pwrite_all(fd.raw(), &buf, at);
+                let result = pwrite_owned(fd.raw(), &buf, 0, at);
                 FileOutcome::WriteLent(result, buf)
             },
             call::as_write_lent,
@@ -349,7 +376,7 @@ impl FileIo {
             let fd = self.fd.clone();
             return Writing::AppendLent(Work::Slot(call::write_on_pool(
                 move || {
-                    let result = sys::append_all(fd.raw(), &buf);
+                    let result = append_owned(fd.raw(), &buf);
                     FileOutcome::AppendLent(result, buf)
                 },
                 call::as_append_lent,

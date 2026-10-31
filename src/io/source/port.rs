@@ -767,7 +767,7 @@ fn stream_memory(inner: &mut Inner, want: Want) -> Result<bool, NotStream> {
             Ok(false)
         }
         Want::SendLent(buf, from) => {
-            let bytes = buf.get(from..).unwrap_or_default();
+            let bytes = buf.rest_from(from);
             inner.buf = wsabuf(bytes.as_ptr().cast_mut(), bytes.len());
             inner.mem = Some(PortMem::SendLent(buf));
             Ok(false)

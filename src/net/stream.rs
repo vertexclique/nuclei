@@ -22,7 +22,8 @@ use futures_io::{AsyncRead, AsyncWrite};
 
 use super::Released;
 use super::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
-use crate::buf::owned::{IoBuf, IoBufMut};
+use crate::buf::owned::{IoBuf, IoBufMut, OwnedBuf};
+use crate::buf::vectored::{self, IoVecBuf, IoVecBufMut};
 use crate::io::{Handle, Interest, Ready};
 
 /// The read side of a byte stream handle.
@@ -44,6 +45,26 @@ macro_rules! read_side {
                 B: IoBufMut,
             {
                 self.source().read_owned(buf).await
+            }
+
+            /// Reads into the spare capacity of the first of `bufs` that has
+            /// any, after the bytes it holds, as [`read_owned`](Self::read_owned)
+            /// does, and gives `bufs` back with how many bytes came: zero at
+            /// the end of the stream, or when no buffer has spare capacity. It
+            /// is a short read, as std's own `read_vectored` is for a reader
+            /// that reads one buffer at a time: the bytes land in that buffer
+            /// itself, never copied.
+            pub async fn read_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
+            where
+                V: IoVecBufMut,
+            {
+                let mut bufs = vectored::filled(bufs);
+                let Some(room) = bufs.iter_mut().find(|b| b.len() < b.capacity()) else {
+                    return (Ok(0), vectored::into_filled(bufs));
+                };
+                let (result, buf) = self.source().read_owned(core::mem::take(room)).await;
+                *room = buf;
+                (result, vectored::into_filled(bufs))
             }
 
             /// Waits until a read would end at once.
@@ -144,6 +165,22 @@ macro_rules! write_side {
                 B: IoBuf,
             {
                 self.source().write_owned(buf).await
+            }
+
+            /// Writes all of the bytes of `bufs`, each buffer's in order, as
+            /// one write, and gives `bufs` back with how many bytes that was.
+            /// No other write of the stream comes between two of them. The
+            /// driver writes from the buffers themselves, never copied, each
+            /// buffer in calls of its own. If the future is dropped, as with
+            /// [`write_owned`](Self::write_owned): the stream gets all of the
+            /// bytes or none of them.
+            pub async fn write_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
+            where
+                V: IoVecBuf,
+            {
+                let bufs = OwnedBuf::vectored(vectored::written(bufs));
+                let (result, bufs) = self.source().write_owned(bufs).await;
+                (result, vectored::into_written(bufs.into_segments()))
             }
 
             /// Waits until a write would be taken at once.

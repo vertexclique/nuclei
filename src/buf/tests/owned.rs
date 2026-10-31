@@ -1,5 +1,6 @@
 use crate::buf::aligned::AlignedBuf;
 use crate::buf::owned::{IoBuf, IoBufMut, OwnedBuf};
+use crate::buf::vectored;
 
 /// A caller's own buffer: boxed memory and a count of the bytes it holds.
 #[derive(Debug, Default, PartialEq)]
@@ -174,4 +175,93 @@ fn an_empty_callers_buffer_reads_as_no_bytes() {
     let owned = OwnedBuf::filled(Mine::default());
     assert_eq!(&owned[..], b"");
     assert_eq!(owned.capacity(), 0);
+}
+#[test]
+fn vectored_buffers_come_back_in_order_and_unmoved() {
+    let bufs = vec![b"one".to_vec(), b"two".to_vec(), Vec::new()];
+    let ptrs: Vec<_> = bufs.iter().map(|b| b.as_ptr()).collect();
+    let owned = vectored::written(bufs);
+    assert_eq!(owned.len(), 3);
+    assert!(owned.iter().all(|b| matches!(b, OwnedBuf::Vec(_))));
+    let back: Vec<Vec<u8>> = vectored::into_written(owned);
+    assert_eq!(back, [b"one".to_vec(), b"two".to_vec(), Vec::new()]);
+    assert_eq!(back.iter().map(|b| b.as_ptr()).collect::<Vec<_>>(), ptrs);
+
+    let arrays = [
+        AlignedBuf::new(512, 512).unwrap(),
+        AlignedBuf::new(1024, 512).unwrap(),
+    ];
+    let ptrs = arrays.each_ref().map(|b| b.as_ptr());
+    let back: [AlignedBuf; 2] = vectored::into_filled(vectored::filled(arrays));
+    assert_eq!(back.each_ref().map(|b| b.as_ptr()), ptrs);
+    assert_eq!(back.each_ref().map(|b| b.capacity()), [512, 1024]);
+}
+
+#[test]
+fn an_array_missing_a_buffer_gets_an_empty_one_in_its_place() {
+    let back: [Mine; 3] = vectored::into_filled(vec![OwnedBuf::filled(Mine::new(2, b"x"))]);
+    assert_eq!(back[0], Mine::new(2, b"x"));
+    assert_eq!(back[1], Mine::default());
+    assert_eq!(back[2], Mine::default());
+}
+
+#[test]
+fn a_vectored_write_reads_as_its_buffers_in_order() {
+    let segs = vec![
+        OwnedBuf::written(b"abc".to_vec()),
+        OwnedBuf::written(Vec::new()),
+        OwnedBuf::written(Fixed(b"defg")),
+        OwnedBuf::written(b"h".to_vec()),
+    ];
+    let mut owned = OwnedBuf::vectored(segs);
+    assert_eq!((owned.len(), owned.capacity()), (8, 8));
+    assert_eq!(&owned[..], b"", "no one slice of bytes");
+    let rests: Vec<&[u8]> = (0..=9).map(|at| owned.rest_from(at)).collect();
+    assert_eq!(
+        rests,
+        [
+            &b"abc"[..],
+            b"bc",
+            b"c",
+            b"defg",
+            b"efg",
+            b"fg",
+            b"g",
+            b"h",
+            b"",
+            b""
+        ]
+    );
+    assert!(owned.spare_capacity_mut().is_empty());
+    assert_eq!(owned.append(b"x"), 0);
+    owned.truncate(2);
+    assert_eq!(owned.len(), 8, "a write's bytes are never cut");
+    let back = owned.into_segments();
+    assert_eq!(back.len(), 4);
+    assert_eq!(&back[2][..], b"defg");
+}
+
+#[test]
+fn a_single_buffer_is_its_own_segment_and_rest() {
+    let owned = OwnedBuf::written(b"single".to_vec());
+    assert_eq!(owned.rest_from(2), b"ngle");
+    assert_eq!(owned.rest_from(6), b"");
+    assert_eq!(owned.rest_from(60), b"");
+    let segs = owned.into_segments();
+    assert_eq!(segs.len(), 1);
+    assert_eq!(&segs[0][..], b"single");
+}
+
+#[test]
+fn the_runtimes_own_form_passes_through_unchanged() {
+    let vec = b"through".to_vec();
+    let ptr = vec.as_ptr();
+    let owned = OwnedBuf::filled(OwnedBuf::Vec(vec));
+    assert!(matches!(owned, OwnedBuf::Vec(_)));
+    let again: OwnedBuf = owned.into_filled();
+    assert_eq!(again.as_ptr(), ptr);
+    let vectored = OwnedBuf::written(OwnedBuf::vectored(vec![again]));
+    assert!(matches!(vectored, OwnedBuf::Vectored(_)));
+    let back: Vec<u8> = vectored.into_written();
+    assert!(back.is_empty(), "a vectored write is no one buffer");
 }

@@ -88,16 +88,27 @@ impl Lent {
         if let Some(file) = &self.file {
             return file.len as usize;
         }
-        self.bytes().len()
+        self.len()
     }
 
-    /// The buffer's bytes, wherever the buffer is.
-    pub(super) fn bytes(&self) -> &[u8] {
+    /// How many bytes the buffer holds, wherever it is.
+    pub(super) fn len(&self) -> usize {
         #[cfg(ring)]
         if let Some((pinned, _)) = &self.pinned {
-            return pinned.bytes();
+            return pinned.bytes().len();
         }
-        &self.buf
+        self.buf.len()
+    }
+
+    /// The buffer's bytes not sent yet, wherever the buffer is: for a
+    /// vectored write, the rest of the buffer the next byte is in.
+    #[cfg(readiness)]
+    fn rest(&self) -> &[u8] {
+        #[cfg(ring)]
+        if let Some((pinned, _)) = &self.pinned {
+            return pinned.bytes().get(self.sent..).unwrap_or_default();
+        }
+        self.buf.rest_from(self.sent)
     }
 
     /// The task's side of it, as the write ends or the task takes it back: the buffer, or once a
@@ -141,14 +152,13 @@ impl WriteState {
             }
         }
         while lent.done.is_none() && !self.blocked {
-            let rest = lent.bytes().get(lent.sent..).unwrap_or_default();
-            match sys::ready(write_bytes(fd, kind, rest)) {
+            match sys::ready(write_bytes(fd, kind, lent.rest())) {
                 None => self.blocked = true,
                 Some(Ok(0)) => lent.done = Some(Err(io::ErrorKind::WriteZero.into())),
                 Some(Ok(n)) => {
                     lent.sent += n;
                     progress = true;
-                    let len = lent.bytes().len();
+                    let len = lent.len();
                     if lent.sent >= len {
                         lent.done = Some(Ok(len));
                     }

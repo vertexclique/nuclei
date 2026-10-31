@@ -42,6 +42,7 @@ pub(crate) mod aligned;
 pub(crate) mod owned;
 #[cfg(any(ring, unix))]
 pub(crate) mod spare;
+pub(crate) mod vectored;
 
 use core::cell::{Cell, RefCell};
 use core::ptr::NonNull;

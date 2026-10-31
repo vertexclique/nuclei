@@ -177,7 +177,7 @@ impl FileOp {
                 )
             }
             FileMem::WriteLent { buf, done } => {
-                let bytes = buf.get(*done..).unwrap_or_default();
+                let bytes = buf.rest_from(*done);
                 Sqe::write(
                     fd,
                     bytes.as_ptr(),
@@ -283,8 +283,7 @@ impl FileOp {
                     at + done as u64,
                 )),
                 FileMem::WriteLent { buf, done } => {
-                    let result =
-                        sys::pwrite_all(raw, buf.get(done..).unwrap_or_default(), at + done as u64);
+                    let result = crate::fs::file::pwrite_owned(raw, &buf, done, at + done as u64);
                     FileOutcome::WriteLent(result, buf)
                 }
                 FileMem::Sync { data_only } => {

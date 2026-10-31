@@ -191,6 +191,10 @@ pub(crate) enum OwnedBuf {
     /// Boxed: unwind safe as a `Vec<u8>` is, since a panic leaves no
     /// invariant of the caller's buffer half made that the runtime relies on.
     Other(AssertUnwindSafe<Box<dyn Kept>>),
+    /// The buffers of a vectored write, written one after the other: their
+    /// bytes are not one slice, so its `Deref` is empty and its users read
+    /// it through [`rest_from`](Self::rest_from) and [`len`](Self::len).
+    Vectored(Vec<OwnedBuf>),
 }
 
 impl Default for OwnedBuf {
@@ -205,6 +209,10 @@ impl OwnedBuf {
     where
         B: IoBuf,
     {
+        let buf = match cast::<B, OwnedBuf>(buf) {
+            Ok(owned) => return owned,
+            Err(buf) => buf,
+        };
         match cast::<B, Vec<u8>>(buf) {
             Ok(vec) => OwnedBuf::Vec(vec),
             Err(buf) => match cast::<B, AlignedBuf>(buf) {
@@ -219,6 +227,10 @@ impl OwnedBuf {
     where
         B: IoBufMut,
     {
+        let buf = match cast::<B, OwnedBuf>(buf) {
+            Ok(owned) => return owned,
+            Err(buf) => buf,
+        };
         match cast::<B, Vec<u8>>(buf) {
             Ok(vec) => OwnedBuf::Vec(vec),
             Err(buf) => match cast::<B, AlignedBuf>(buf) {
@@ -250,7 +262,11 @@ impl OwnedBuf {
         B: IoBuf,
         K: Kept,
     {
-        match self {
+        let this = match cast::<OwnedBuf, B>(self) {
+            Ok(same) => return same,
+            Err(this) => this,
+        };
+        match this {
             OwnedBuf::Vec(vec) => cast::<Vec<u8>, B>(vec).unwrap_or_default(),
             OwnedBuf::Aligned(aligned) => cast::<AlignedBuf, B>(aligned).unwrap_or_default(),
             OwnedBuf::Other(AssertUnwindSafe(kept)) => {
@@ -258,7 +274,38 @@ impl OwnedBuf {
                 kept.downcast::<K>()
                     .map_or_else(|_| B::default(), |k| unwrap(*k))
             }
+            OwnedBuf::Vectored(_) => B::default(),
         }
+    }
+
+    /// The buffers of a vectored write, held as one.
+    pub(crate) fn vectored(bufs: Vec<OwnedBuf>) -> Self {
+        OwnedBuf::Vectored(bufs)
+    }
+
+    /// The buffers of a vectored write back; a buffer of one is its own.
+    pub(crate) fn into_segments(self) -> Vec<OwnedBuf> {
+        match self {
+            OwnedBuf::Vectored(bufs) => bufs,
+            one => vec![one],
+        }
+    }
+
+    /// The bytes from the `from`th of those it holds to the end of the slice
+    /// that byte is in: all the rest for one buffer, the rest of the buffer
+    /// it falls in for a vectored write. Empty past its end.
+    pub(crate) fn rest_from(&self, from: usize) -> &[u8] {
+        let OwnedBuf::Vectored(bufs) = self else {
+            return self.get(from..).unwrap_or_default();
+        };
+        let mut from = from;
+        for buf in bufs {
+            if from < buf.len() {
+                return buf.rest_from(from);
+            }
+            from -= buf.len();
+        }
+        &[]
     }
 
     /// How many bytes it holds.
@@ -267,6 +314,7 @@ impl OwnedBuf {
             OwnedBuf::Vec(vec) => vec.len(),
             OwnedBuf::Aligned(aligned) => aligned.len(),
             OwnedBuf::Other(kept) => kept.init(),
+            OwnedBuf::Vectored(bufs) => bufs.iter().map(OwnedBuf::len).sum(),
         }
     }
 
@@ -281,6 +329,7 @@ impl OwnedBuf {
             OwnedBuf::Vec(vec) => vec.capacity(),
             OwnedBuf::Aligned(aligned) => aligned.capacity(),
             OwnedBuf::Other(kept) => kept.total(),
+            OwnedBuf::Vectored(_) => self.len(),
         }
     }
 
@@ -289,6 +338,7 @@ impl OwnedBuf {
             OwnedBuf::Vec(vec) => vec.as_mut_ptr(),
             OwnedBuf::Aligned(aligned) => aligned.as_mut_ptr(),
             OwnedBuf::Other(kept) => kept.mut_ptr(),
+            OwnedBuf::Vectored(_) => core::ptr::NonNull::dangling().as_ptr(),
         }
     }
 
@@ -311,6 +361,7 @@ impl OwnedBuf {
                     )
                 }
             }
+            OwnedBuf::Vectored(_) => &mut [],
         }
     }
 
@@ -327,6 +378,8 @@ impl OwnedBuf {
             OwnedBuf::Aligned(aligned) => unsafe { aligned.set_len(len) },
             // SAFETY: the caller's.
             OwnedBuf::Other(kept) => unsafe { kept.set_init(len) },
+            // A write's: nothing is read into it.
+            OwnedBuf::Vectored(_) => {}
         }
     }
 
@@ -383,6 +436,7 @@ impl core::ops::Deref for OwnedBuf {
             OwnedBuf::Other(kept) => unsafe {
                 core::slice::from_raw_parts(kept.ptr(), kept.init())
             },
+            OwnedBuf::Vectored(_) => &[],
         }
     }
 }
@@ -393,5 +447,34 @@ impl core::fmt::Debug for OwnedBuf {
             .field("len", &self.len())
             .field("capacity", &self.capacity())
             .finish()
+    }
+}
+
+// SAFETY: the runtime's own form of a caller's buffer, passed through the
+// owned calls as it is (never through these methods but by the runtime's
+// own code, which reads a vectored write through `rest_from`).
+unsafe impl IoBuf for OwnedBuf {
+    fn stable_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len()
+    }
+
+    fn bytes_total(&self) -> usize {
+        self.capacity()
+    }
+}
+
+// SAFETY: as for `IoBuf`.
+unsafe impl IoBufMut for OwnedBuf {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    unsafe fn set_init(&mut self, pos: usize) {
+        // SAFETY: the caller's.
+        unsafe { self.set_len(pos) }
     }
 }

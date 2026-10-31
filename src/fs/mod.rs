@@ -57,7 +57,8 @@ use std::path::Path;
 
 use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
 
-use crate::buf::owned::{IoBuf, IoBufMut};
+use crate::buf::owned::{IoBuf, IoBufMut, OwnedBuf};
+use crate::buf::vectored::{self, IoVecBuf, IoVecBufMut};
 use crate::io::Handle;
 use crate::io::source::Kind;
 
@@ -120,6 +121,40 @@ impl Handle<StdFile> {
             Ok(file) => file.write_owned(buf).await,
             Err(err) => (Err(err), buf),
         }
+    }
+
+    /// Reads at the cursor into the spare capacity of the first of `bufs`
+    /// that has any, as [`read_owned`](Self::read_owned) does, and gives
+    /// `bufs` back with how many bytes came: zero at the end of the file, or
+    /// when no buffer has spare capacity. It is a short read, as std's own
+    /// `read_vectored` is for a reader that reads one buffer at a time.
+    pub async fn read_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
+    where
+        V: IoVecBufMut,
+    {
+        let mut bufs = vectored::filled(bufs);
+        let Some(room) = bufs.iter_mut().find(|b| b.len() < b.capacity()) else {
+            return (Ok(0), vectored::into_filled(bufs));
+        };
+        let (result, buf) = self.read_owned(core::mem::take(room)).await;
+        *room = buf;
+        (result, vectored::into_filled(bufs))
+    }
+
+    /// Writes all of the bytes of `bufs`, each buffer's in order, at the
+    /// cursor as one write (as [`write_owned`](Self::write_owned) writes
+    /// one buffer), and gives `bufs` back with how many bytes that was. No
+    /// other write of the handle comes between two of them. They are written
+    /// from the buffers themselves, never copied, each buffer in calls of its
+    /// own; on a file opened for direct IO each buffer's memory, length and
+    /// place in the file meet the kernel's alignment rules on their own.
+    pub async fn write_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
+    where
+        V: IoVecBuf,
+    {
+        let bufs = OwnedBuf::vectored(vectored::written(bufs));
+        let (result, bufs) = self.write_owned(bufs).await;
+        (result, vectored::into_written(bufs.into_segments()))
     }
 }
 

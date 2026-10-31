@@ -684,7 +684,11 @@ order and the buffer whole or not at all; `Delivered`, everything written reache
 that passes the lent buffer break `WireOrder`; a task that takes its buffer back once some of
 it went out breaks `NoScribble`; an end that wakes nobody deadlocks), and 3 witnesses (a buffer
 that goes out over several calls, the driver finishing the write of a task that went away, a
-withdrawn write).
+withdrawn write). A vectored write (`write_vectored_owned`) is this write: its buffers are lent
+as one, and each call sends from the buffer the next byte is in, a call that takes less than the
+socket has room for, so the model's rules are its rules. On a file a vectored write is the lent
+write at the cursor of `LentFile.tla`, and a vectored read on either is a lent read into the
+first buffer with room.
 
 The file (`LentFile.tla`) checks a file handle's reads, writes, syncs and seeks
 (`src/fs/file/`: `mod.rs`, `positional.rs`, `orphans.rs`, `durable.rs`, `work.rs`) in five
