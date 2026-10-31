@@ -8,7 +8,10 @@
 //! the whole pool too, and a reader the pool has no buffer for still reads into its own. A binary
 //! of its own, since the configuration is the process's: the smallest ring, with the receive group
 //! off, so every read below 16 KiB is a receive into a buffer of the pool that waits. On epoll and
-//! kqueue no receive waits in the kernel, and every request is answered the same way.
+//! kqueue no receive waits in the kernel, and every request is answered the same way. On a
+//! completion port a read the pool has no buffer for waits in a zero-byte receive, which holds
+//! none, and a reader or a writer it has no buffer for uses its own memory
+//! (proofs/tla/port/PortStarve.tla).
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdStream};

@@ -220,6 +220,7 @@ pub(crate) const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC800_0006;
 pub(crate) const SIO_UDP_CONNRESET: DWORD = 0x9800_000C;
 #[cfg(test)]
 pub(crate) const MSG_OOB: i32 = 0x1;
+pub(crate) const MSG_PEEK: i32 = 0x2;
 pub(crate) const FILE_BEGIN: DWORD = 0;
 pub(crate) const FILE_CURRENT: DWORD = 1;
 
@@ -502,6 +503,7 @@ unsafe extern "system" {
     pub(crate) fn listen(s: SOCKET, backlog: i32) -> i32;
     pub(crate) fn closesocket(s: SOCKET) -> i32;
     pub(crate) fn shutdown(s: SOCKET, how: i32) -> i32;
+    pub(crate) fn recv(s: SOCKET, buf: *mut u8, len: i32, flags: i32) -> i32;
     #[cfg(test)]
     pub(crate) fn send(s: SOCKET, buf: *const u8, len: i32, flags: i32) -> i32;
 }

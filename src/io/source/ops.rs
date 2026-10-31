@@ -29,10 +29,12 @@ use crate::io::side::{After, Hooks};
 
 /// What a side asks its driver to do next.
 pub(crate) enum Want {
-    /// Wait until the socket may be read (`read`) or written: after a kernel
-    /// gave an operation back because it was not, or for a connect under
-    /// way.
-    #[cfg(ring)]
+    /// Wait until the socket may be read (`read`) or written: on a ring after
+    /// a kernel gave an operation back because it was not, or for a connect
+    /// under way; on a port a zero-byte receive, which holds no buffer, for a
+    /// TCP stream's read the pool has no buffer for (a port's sends wait in
+    /// the kernel, so a write side's ends at once).
+    #[cfg(completion)]
     Ready { read: bool },
     /// Accept a connection.
     Accept,
@@ -78,13 +80,17 @@ pub(crate) enum Want {
     /// Send a range of a file to a stream, in the kernel.
     #[cfg(windows)]
     SendFile(crate::io::source::write::FileRange),
+    /// Send a stream the bytes `from..to` of the write slot's own room, where
+    /// a write the pool had no buffer for copied them.
+    #[cfg(port)]
+    SendRoom { from: usize, to: usize },
 }
 
 impl Want {
     /// Whether the read side asked.
     pub(crate) fn of_read(&self) -> bool {
         match self {
-            #[cfg(ring)]
+            #[cfg(completion)]
             Want::Ready { read } => *read,
             Want::Accept
             | Want::Recv(_)
@@ -102,6 +108,8 @@ impl Want {
             Want::SendPinned(..) => false,
             #[cfg(windows)]
             Want::SendFile(_) => false,
+            #[cfg(port)]
+            Want::SendRoom { .. } => false,
         }
     }
 
@@ -138,7 +146,7 @@ pub(crate) enum Answer<T> {
 /// What came back from an operation: the memory its `Want` gave the driver
 /// (its bytes counted in), and the kernel's answer.
 pub(crate) enum Outcome {
-    #[cfg(ring)]
+    #[cfg(completion)]
     Ready(Answer<()>),
     Accept(Answer<(Owned, Addr)>),
     /// A multishot accept ended: after its last connection (`Done(Ok(()))`,
@@ -166,6 +174,13 @@ pub(crate) enum Outcome {
     SendPinned(Answer<usize>),
     SendTo(PoolBuf, Target, Answer<usize>),
     SendLentTo(Vec<u8>, Answer<usize>),
+    /// A send of the bytes `from..to` of the write slot's room ended.
+    #[cfg(port)]
+    SendRoom {
+        from: usize,
+        to: usize,
+        answer: Answer<usize>,
+    },
 }
 
 impl Outcome {

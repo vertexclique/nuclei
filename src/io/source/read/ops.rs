@@ -8,6 +8,12 @@
 //! clears that, and wakes the tasks waiting, which take what came or ask
 //! again. Only the operation's own completion clears it, so a side never
 //! has two operations out, and its mailbox never more than one completion.
+//!
+//! On a port a TCP read the pool has no buffer for waits in a zero-byte
+//! receive, which holds none; once that says bytes came, a receive takes a
+//! buffer for them, or, with the pool still empty, the task reads them into
+//! its own (`read_starved`). So no set of idle peers or stopped readers keeps
+//! a read from its bytes (proofs/tla/port/PortStarve.tla).
 
 use super::{Datagram, Kind, Peer, Piece, ReadState, UDP_MAX};
 use crate::io::raw::Raw;
@@ -23,6 +29,12 @@ impl ReadState {
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
         if !self.waiters.is_empty() || self.lent_waits() {
             self.complete(io, kind, self.want, after);
+            // Bytes came and the pool has no buffer for them: the tasks read
+            // them into their own (`read_starved`).
+            #[cfg(port)]
+            if self.starved && self.readable && self.out.is_none() {
+                after.wake(&mut self.waiters);
+            }
         }
     }
 
@@ -155,10 +167,20 @@ impl ReadState {
                     // (`reads_itself`).
                     #[cfg(ring)]
                     None if self.starved && !self.readable => Want::Ready { read: true },
+                    // On a port a zero-byte receive, which holds none, and once it
+                    // says bytes came the task reads them into its own buffer
+                    // (`read_starved`, proofs/tla/port/PortStarve.tla).
+                    #[cfg(port)]
+                    None if kind == Kind::Tcp && !self.readable => Want::Ready { read: true },
                     None => return,
                 },
             }
         };
+        // The bytes the zero-byte receive said came are this receive's.
+        #[cfg(port)]
+        if matches!(want, Want::Recv(_) | Want::RecvLent(_)) {
+            self.readable = false;
+        }
         self.out = Some(issuer.issue(want, kind, self.epoch, after));
     }
 
@@ -239,6 +261,20 @@ impl ReadState {
                         self.blocked = false;
                         self.edges = self.edges.wrapping_add(1);
                         after.wake(&mut self.waiters);
+                    }
+                }
+            }
+            // Bytes or the end came: the receive into a buffer of the pool goes
+            // out at once (`submit_wanted`), and its end wakes the tasks.
+            #[cfg(port)]
+            Outcome::Ready(answer) => {
+                if !stale && let Answer::Done(result) = answer {
+                    match result {
+                        Ok(()) => {
+                            self.readable = true;
+                            return;
+                        }
+                        Err(err) => self.error = Some(err),
                     }
                 }
             }

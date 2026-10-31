@@ -525,6 +525,13 @@ impl WriteState {
                 self.poll_first = true;
                 self.push(io, kind, after);
             }
+            // On a port such a write sends from the write slot's own room
+            // instead, a few hundred bytes at a time
+            // (proofs/tla/port/PortStarve.tla).
+            #[cfg(port)]
+            if let Some(n) = self.write_room(io, kind, bufs, after) {
+                return Poll::Ready(Ok(n));
+            }
             self.waiters.register(waker);
             return Poll::Pending;
         }
@@ -537,6 +544,28 @@ impl WriteState {
             after.register = true;
         }
         Poll::Ready(Ok(n))
+    }
+
+    /// On a port, a stream write the pool had no buffer for: the front of
+    /// `bufs` is copied into the write slot's own room and sent from there,
+    /// so no writer waits on buffers that reads ahead or receives of other
+    /// connections hold. `None` while the side holds bytes that go first.
+    #[cfg(port)]
+    fn write_room(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        bufs: &[io::IoSlice<'_>],
+        after: &mut After,
+    ) -> Option<usize> {
+        if !self.starved || !kind.streams() || self.behind.is_some() || self.ring_holds() {
+            return None;
+        }
+        let Via::Ops(route) = io.via;
+        let n = route.issuer(after)?.fill_room(bufs);
+        self.again = Some(super::ops::Want::SendRoom { from: 0, to: n });
+        self.push(io, kind, after);
+        Some(n)
     }
 
     fn flush(

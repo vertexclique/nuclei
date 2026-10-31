@@ -18,13 +18,13 @@ use crate::syscore::windows::{
     AF_INET, AF_INET6, DWORD, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, FILE_ACCESS_INFORMATION,
     FILE_APPEND_DATA, FILE_BEGIN, FILE_CURRENT, FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT,
     FILE_SYNCHRONOUS_IO_NONALERT, FILE_TYPE_DISK, FILE_WRITE_DATA, GetFileSizeEx, GetFileType,
-    HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, NtQueryInformationFile,
-    OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE,
-    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
-    SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
+    HANDLE, IN_ADDR, INVALID_SOCKET, IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK,
+    NtQueryInformationFile, OVERLAPPED, ReadFile, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN,
+    SO_MAX_MSG_SIZE, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM,
+    SOCK_RAW, SOCK_RDM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET,
+    SOCKET_ERROR, SOL_SOCKET, STATUS_SUCCESS, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
     WSA_FLAG_OVERLAPPED, WSAIoctl, WSASocketW, WriteFile, bind, getsockname, getsockopt,
-    last_error, setsockopt, shutdown, wsa_error,
+    last_error, recv, setsockopt, shutdown, wsa_error,
 };
 
 fn socket_of(raw: Raw) -> SOCKET {
@@ -128,6 +128,20 @@ fn file_information(raw: Raw, class: u32) -> io::Result<ULONG> {
 pub(crate) fn shutdown_write(raw: Raw) -> io::Result<()> {
     // SAFETY: a plain call on a socket the caller holds.
     check(unsafe { shutdown(socket_of(raw), SD_SEND) })
+}
+
+/// A `recv` (with `peek`, a look that leaves the bytes) on the stream socket
+/// `raw` into `buf`, made only once a zero-byte receive said bytes, the end
+/// or an error came: the socket blocks, and holding them it answers at once.
+pub(crate) fn recv_ready(raw: Raw, buf: &mut [u8], peek: bool) -> io::Result<usize> {
+    let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+    let flags = if peek { MSG_PEEK } else { 0 };
+    // SAFETY: the kernel writes at most `len` bytes into `buf`.
+    let n = unsafe { recv(socket_of(raw), buf.as_mut_ptr(), len, flags) };
+    if n == SOCKET_ERROR {
+        return Err(wsa_error());
+    }
+    Ok(n as usize)
 }
 
 /// Gives a connection `listener` accepted the listener's context, which a
