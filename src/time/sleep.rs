@@ -173,7 +173,7 @@ impl<G: Grain> Timer<G> {
     fn release_armed(&mut self) {
         match core::mem::replace(&mut *self.state, State::Idle) {
             State::Local { owner, key } => {
-                let here = context::current_early(|current| match current {
+                let here = context::current(|current| match current {
                     Some(shard) if shard.is(&owner) => {
                         shard.wheel_of(G::PRECISE).borrow_mut().remove(key);
                         true
@@ -288,7 +288,7 @@ impl<G: Grain> Timer<G> {
         if let Some(shard) = context::running_inside(context::local()) {
             return self.poll_local(shard, cx);
         }
-        context::current_early(|current| match current {
+        context::current(|current| match current {
             Some(shard) => self.poll_local(shard, cx),
             None => self.poll_remote(cx),
         })
@@ -345,7 +345,7 @@ impl RemoteTimer {
     fn fire(&self) {
         // SAFETY: on the firing shard's thread (see `key`).
         if let Some(key) = unsafe { (*self.key.get()).take() } {
-            context::current_early(|current| {
+            context::current(|current| {
                 if let Some(shard) = current {
                     shard.wheel_of(self.precise).borrow_mut().remove(key);
                 }

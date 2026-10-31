@@ -195,13 +195,6 @@ impl Drop for Bracket<'_> {
 /// none if the shard was taken.
 #[inline(always)]
 pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
-    f(current_held().shard())
-}
-
-/// As [`current`], answering `f(None)` at once on a thread that runs no shard: for a caller
-/// whose closure is cheaper called from two places than kept inline whole.
-#[inline(always)]
-pub(crate) fn current_early<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
     let here = local();
     let shard = here.current.get();
     if shard.is_null() {
