@@ -165,12 +165,14 @@ fn many_precise_sleeps_at_once_all_end_after_their_deadlines() {
 fn a_dropped_precise_sleep_does_not_wake_its_task() {
     let rt = runtime(1, false);
     rt.block_on(rt.spawn(async {
-        let mut sleep = Box::pin(time::sleep_precise(Duration::from_micros(200)));
+        // Long enough to be pending at its first poll on a slow machine, and to end, had its
+        // timer been left armed, while the second sleep still waits.
+        let mut sleep = Box::pin(time::sleep_precise(Duration::from_millis(20)));
         assert!(poll_now(sleep.as_mut()).is_pending());
         drop(sleep);
         let start = std::time::Instant::now();
-        time::sleep_precise(Duration::from_millis(2)).await;
-        assert!(start.elapsed() >= Duration::from_millis(2));
+        time::sleep_precise(Duration::from_millis(50)).await;
+        assert!(start.elapsed() >= Duration::from_millis(50));
     }));
 }
 
