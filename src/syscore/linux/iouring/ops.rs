@@ -48,6 +48,7 @@ impl<T> Ops<T> {
 
     /// Keeps `op` and returns the user data its entry carries, or gives `op`
     /// back when the slab is full.
+    #[inline]
     pub(crate) fn insert(&mut self, op: T) -> Result<u64, T> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];

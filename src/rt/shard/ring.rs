@@ -284,9 +284,9 @@ impl ShardRing {
     /// memory, which lives on the heap and does not move with it), on the
     /// slot `op.file`, and returns its user data. It goes into the kernel at
     /// once, never counted against the cap; its slot is named from now on.
+    #[inline]
     pub(crate) fn submit(&self, op: RingOp, sqe: Sqe) -> u64 {
-        self.files.borrow_mut().named(op.file);
-        let sqe = match self.files.borrow().number_of(op.file) {
+        let sqe = match self.files.borrow_mut().name(op.file) {
             Some(own) => sqe.fd(own),
             None => sqe.flags(IOSQE_FIXED_FILE),
         };

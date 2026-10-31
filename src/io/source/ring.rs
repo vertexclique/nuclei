@@ -449,6 +449,7 @@ impl RingIssuer<'_> {
     /// Submits `want` for a side of a source of `kind` in `epoch`, and
     /// returns the operation's user data. A want no entry can carry (an
     /// address no socket can have) completes at once with the reason.
+    #[inline]
     pub(crate) fn issue(&self, want: Want, kind: Kind, epoch: u32, _after: &mut After) -> u64 {
         let read = want.of_read();
         match entry(want, kind, self.file as RawFd, self.ring) {
