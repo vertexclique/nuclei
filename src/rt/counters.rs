@@ -34,6 +34,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::io;
 use std::sync::{Arc, OnceLock, Weak};
 
+#[cfg(feature = "io-stats")]
+pub(crate) mod tally;
+// Without `io-stats`: every count compiles to nothing.
+#[cfg(not(feature = "io-stats"))]
+#[path = "counters/tally_off.rs"]
 pub(crate) mod tally;
 
 use super::shard::Shared;
@@ -127,6 +132,7 @@ pub(crate) struct Counters {
     io_times: OnceLock<Arc<IoTimes>>,
     /// The IO operations counted, while the runtime counts them (made once,
     /// before the shard runs anything).
+    #[cfg(feature = "io-stats")]
     io: OnceLock<Box<IoTotals>>,
     /// The shard's runtime and its place among the runtime's workers.
     owner: Option<(u64, usize)>,
@@ -172,6 +178,7 @@ impl Counters {
             budget_yields: AtomicU64::new(0),
             poll_times: OnceLock::new(),
             io_times: OnceLock::new(),
+            #[cfg(feature = "io-stats")]
             io: OnceLock::new(),
             owner,
             gone: AtomicBool::new(false),
@@ -198,6 +205,7 @@ impl Counters {
         self.cq_overflows.store(now.cq_overflows, Ordering::Relaxed);
         // The thread's counts go to the shard it runs, or nowhere if that
         // shard's runtime does not count them.
+        #[cfg(feature = "io-stats")]
         if tally::counting() {
             let io = tally::take();
             if let Some(totals) = self.io.get() {
@@ -207,6 +215,7 @@ impl Counters {
     }
 
     /// The shard counts its IO operations from now on.
+    #[cfg(feature = "io-stats")]
     pub(crate) fn count_io(&self) {
         tally::start();
         let _ = self.io.set(Box::default());
@@ -305,6 +314,7 @@ impl Counters {
                 .get()
                 .filter(|_| matches!(self.backend, IoBackend::IoUring | IoBackend::Iocp))
                 .map(|times| times.read()),
+            #[cfg(feature = "io-stats")]
             io: self.io.get().map(|totals| totals.read()),
             errors: self.errors.read(),
         }
@@ -312,6 +322,7 @@ impl Counters {
 }
 
 /// A shard's IO operations, as its own thread adds them: a load and a store.
+#[cfg(feature = "io-stats")]
 #[derive(Default)]
 struct IoTotals {
     reads: AtomicU64,
@@ -321,6 +332,7 @@ struct IoTotals {
     accepts: AtomicU64,
 }
 
+#[cfg(feature = "io-stats")]
 impl IoTotals {
     fn add(&self, io: &tally::Taken) {
         for (total, more) in [

@@ -39,6 +39,7 @@ pub(crate) struct Tuning {
     /// The shard times its IO operations, by kind (`Builder::record_latencies`).
     pub(crate) record_latencies: bool,
     /// The shard counts its IO operations (`Builder::count_io`).
+    #[cfg(feature = "io-stats")]
     pub(crate) count_io: bool,
 }
 
@@ -55,6 +56,7 @@ impl Default for Tuning {
             #[cfg(ring)]
             zero_copy_min: crate::io::source::ring::SEND_ZC_MIN,
             record_latencies: false,
+            #[cfg(feature = "io-stats")]
             count_io: false,
         }
     }

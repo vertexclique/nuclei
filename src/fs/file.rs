@@ -160,13 +160,36 @@ impl<T: Ended> Work<T> {
     }
 }
 
-/// A write of `bytes` the pool made ended: counted, unless it failed. A ring's
-/// write passes 0, its bytes counted as the kernel completed it.
+/// The bytes a write the pool makes takes, kept for `stats`: none, and no
+/// room, without the `io-stats` feature.
+#[cfg(feature = "io-stats")]
+type Counted = usize;
+#[cfg(not(feature = "io-stats"))]
+#[derive(Clone, Copy)]
+struct Counted;
+
+/// What a write of `bytes` keeps for `stats`: 0 for a ring's, whose bytes are
+/// counted as the kernel completes it.
 #[inline(always)]
-fn tally_write(bytes: usize, ok: bool) {
+fn counted(bytes: usize) -> Counted {
+    #[cfg(feature = "io-stats")]
+    return bytes;
+    #[cfg(not(feature = "io-stats"))]
+    {
+        let _ = bytes;
+        Counted
+    }
+}
+
+/// A write the pool made ended, `bytes` its count: counted, unless it failed.
+#[inline(always)]
+fn tally_write(bytes: Counted, ok: bool) {
+    #[cfg(feature = "io-stats")]
     if bytes > 0 && ok && tally::counting() {
         tally::add_write(bytes);
     }
+    #[cfg(not(feature = "io-stats"))]
+    let _ = (bytes, ok);
 }
 
 /// The end of a file's call: its result, alone or with the task's buffer.
@@ -208,14 +231,14 @@ struct LentRead {
 /// for a ring's, whose bytes are counted as the kernel completes it.
 enum Writing {
     /// From a buffer of the pool.
-    Pool(Work<io::Result<()>>, usize),
+    Pool(Work<io::Result<()>>, Counted),
     /// From a task's own buffer, which comes back with the result.
-    Lent(Work<(io::Result<()>, Vec<u8>)>, usize),
+    Lent(Work<(io::Result<()>, Vec<u8>)>, Counted),
     /// At the end of a file opened to append, ending with the file's offset
     /// after it.
-    Append(Work<io::Result<u64>>, usize),
+    Append(Work<io::Result<u64>>, Counted),
     /// As `Append`, from a task's own buffer.
-    AppendLent(Work<(io::Result<u64>, Vec<u8>)>, usize),
+    AppendLent(Work<(io::Result<u64>, Vec<u8>)>, Counted),
 }
 
 /// A write from a task's own buffer, from its submission until its task
@@ -333,7 +356,7 @@ impl FileIo {
     /// A write of `buf` at `at`; a pool's wakes `waker` when it ends.
     fn submit_write(&self, buf: PoolBuf, at: u64, waker: &Waker) -> Writing {
         let fd = self.fd.clone();
-        let bytes = buf.filled().len();
+        let bytes = counted(buf.filled().len());
         if self.append {
             return Writing::Append(
                 Work::Slot(call::write_on_pool(
@@ -347,7 +370,7 @@ impl FileIo {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match super::ring::write(&self.fd, at, buf) {
-                Ok(job) => return Writing::Pool(Work::Slot(job), 0),
+                Ok(job) => return Writing::Pool(Work::Slot(job), counted(0)),
                 Err(buf) => buf,
             },
             false => buf,
@@ -402,7 +425,7 @@ impl FileIo {
     /// ends.
     fn submit_write_owned(&self, buf: Vec<u8>, at: u64, waker: &Waker) -> Writing {
         let fd = self.fd.clone();
-        let bytes = buf.len();
+        let bytes = counted(buf.len());
         if self.append {
             return Writing::AppendLent(
                 Work::Slot(call::write_on_pool(
@@ -419,7 +442,7 @@ impl FileIo {
         #[cfg(ring)]
         let buf = match self.on_ring() {
             true => match super::ring::write_lent(&self.fd, at, buf) {
-                Ok(job) => return Writing::Lent(Work::Slot(job), 0),
+                Ok(job) => return Writing::Lent(Work::Slot(job), counted(0)),
                 Err(buf) => buf,
             },
             false => buf,

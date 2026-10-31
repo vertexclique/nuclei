@@ -671,6 +671,7 @@ impl Shard {
         monitor: Option<Arc<super::handoff::Monitor>>,
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
+        #[cfg(feature = "io-stats")]
         if tuning.count_io {
             shard.shared.counters.count_io();
         }
