@@ -21,8 +21,8 @@ tcp_many io_uring 4582 1
 tcp_many epoll 4406 1
 tcp_2w io_uring 5588 1
 tcp_2w epoll 5115 1
-bulk io_uring 71518 1
-bulk epoll 2137 1
+bulk io_uring 70306 1
+bulk epoll 1768 1
 file_read io_uring 2386 1
 file_read epoll 4046 9
 spawn_join io_uring 736 1
