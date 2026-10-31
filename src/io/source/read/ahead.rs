@@ -78,6 +78,13 @@ fn release_empty(piece: Piece, after: &mut After) {
     piece.release(after, None);
 }
 
+/// Lets go of a piece whose bytes were all taken, out of the loop that takes
+/// them.
+#[inline(never)]
+fn release_done(piece: Piece, after: &mut After, shard: Option<&Shard>) {
+    piece.release(after, shard);
+}
+
 /// Bytes read ahead that no task took yet, in the order they came: what
 /// the driver read into the pool, what a lent buffer whose task went away
 /// holds, what multishot receives handed out.
@@ -122,7 +129,7 @@ impl Ahead {
             if front.filled().is_empty()
                 && let Some(done) = self.pieces.pop_front()
             {
-                done.release(after, shard);
+                release_done(done, after, shard);
             }
         }
     }
