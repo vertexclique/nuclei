@@ -184,14 +184,12 @@ pub(crate) enum IoOp {
 
 impl IoOp {
     /// The op's shard went and applies it never: a registration asked of it
-    /// fails, for the next wait to make it elsewhere, and a child it was to
-    /// watch is watched where its user polls next; the rest only goes.
+    /// is made elsewhere, by the next poll of a task waiting on the source,
+    /// and a child it was to watch is watched where its user polls next; the
+    /// rest only goes.
     fn gone(self) {
         match self {
-            IoOp::Register(source) => source.registration_failed(&io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the shard stopped before the registration",
-            )),
+            IoOp::Register(source) => source.registration_orphaned(),
             IoOp::Watch(exit) => {
                 let orphan = Arc::strong_count(&exit) == 1;
                 exit.unwatched(orphan);

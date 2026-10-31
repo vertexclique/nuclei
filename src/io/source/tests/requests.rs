@@ -427,3 +427,39 @@ fn a_shard_that_leaves_waits_for_the_eviction_a_holder_performs() {
     assert!(!src.registered_with(home, token), "the eviction never ran");
     drop(handle);
 }
+
+/// A registration posted to a shard that stops before it makes it fails no IO of the source: the
+/// source is unregistered again (`proofs/tla/attach`: an attach refused leaves it so), and its
+/// next write and read go through where they are polled. Before, the source kept the failure
+/// (a dropped stream's drain took it as the drain's end and gave its bytes up) and stayed
+/// registering, so no later wait registered it again.
+#[test]
+fn a_registration_a_stopped_shard_never_made_fails_no_io() {
+    use crate::rt::shard::{IoOp, Limits, Shard};
+    let (a, b) = pair();
+    // A wait on a thread that runs no shard posted the registration.
+    a.src
+        .reg
+        .state
+        .store(super::super::REGISTERING, Ordering::Release);
+    let stopped = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    stopped.shared.close_io();
+    stopped.shared.post_io(IoOp::Register(Arc::clone(&a.src)));
+    assert_eq!(
+        a.src.reg.state.load(Ordering::Acquire),
+        super::super::UNREGISTERED,
+        "the source still waits for a registration nobody makes"
+    );
+    let rt = runtime(None);
+    rt.block_on(async {
+        write_all(&a.src, b"after").await.unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(within(read(&b.src, &mut buf)).await.unwrap(), 5);
+        assert_eq!(&buf[..5], b"after");
+    });
+}
