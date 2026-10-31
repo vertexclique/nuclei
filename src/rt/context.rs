@@ -302,6 +302,41 @@ pub(crate) enum Polled {
 /// (found by its end, or by a call into the runtime from it).
 #[inline]
 pub(crate) fn poll<R>(shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
+    let here = local();
+    if here.slot.get().is_null() {
+        return poll_unwatched(here, shared, poll);
+    }
+    poll_watched(here, shared, poll)
+}
+
+/// [`poll`] on a shard no monitor watches: no slot to go out of and come
+/// back into, and none can be entered during the poll (only a runner's
+/// first frame enters one), so the epochs are left as they are.
+#[inline(always)]
+fn poll_unwatched<R>(here: &Here, shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
+    /// Back into the shard, by return or unwind.
+    struct Back<'a>(&'a Here, bool);
+    impl Drop for Back<'_> {
+        fn drop(&mut self) {
+            self.0.in_task.set(self.1);
+            self.0.inside.set(true);
+        }
+    }
+    let back = Back(here, here.in_task.replace(true));
+    here.inside.set(false);
+    let result = poll();
+    drop(back);
+    let polled = if here.detached.get() == core::ptr::from_ref(shared) as usize {
+        Polled::Detached
+    } else {
+        Polled::In
+    };
+    (result, polled)
+}
+
+/// [`poll`] on a shard the monitor watches through this thread's slot.
+#[inline(never)]
+fn poll_watched<R>(here: &'static Here, shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
     /// The poll's way back into the shard, taken once, by return or unwind.
     struct Out<'a> {
         here: &'a Here,
@@ -333,7 +368,6 @@ pub(crate) fn poll<R>(shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) 
             }
         }
     }
-    let here = local();
     let mine = here.epochs.get() + 1;
     here.epochs.set(mine);
     let mut out = Out {

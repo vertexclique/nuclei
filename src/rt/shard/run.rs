@@ -37,6 +37,7 @@ pub(crate) enum Worked {
 
 impl Shard {
     /// Polls a runnable's task.
+    #[inline(always)]
     pub(super) fn run(&self, runnable: Runnable) -> Polled {
         context::poll(&self.shared, || {
             runnable.run();
