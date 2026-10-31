@@ -71,10 +71,27 @@ fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
+/// `read(2)` of up to `len` bytes into `buf`. On Linux the system call is
+/// made directly: glibc's wrapper adds a cancellation-point check (about 40
+/// instructions) to every call, and nothing here is cancelled by
+/// `pthread_cancel`.
+///
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes.
+#[inline]
+unsafe fn read_raw(fd: RawFd, buf: *mut u8, len: usize) -> isize {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: as the caller's.
+    return unsafe { libc::syscall(libc::SYS_read, libc::c_long::from(fd), buf, len) as isize };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: as the caller's.
+    return unsafe { libc::read(fd, buf.cast(), len) };
+}
+
 /// `read(2)` (also a stream socket's receive).
 pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
-    retry(|| cvt(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }))
+    retry(|| cvt(unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) }))
 }
 
 /// `recv(2)` with `MSG_PEEK`: a stream's bytes, left on the socket.
@@ -123,8 +140,35 @@ const SEND_FLAGS: libc::c_int = 0;
 /// `send(2)`, never raising `SIGPIPE` for a closed peer (the error comes
 /// back as `BrokenPipe` instead).
 pub(crate) fn send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
-    // SAFETY: reads at most `buf.len()` bytes from `buf`.
-    retry(|| cvt(unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), SEND_FLAGS) }))
+    retry(|| {
+        // SAFETY: reads at most `buf.len()` bytes from `buf`; no address is given.
+        cvt(unsafe { send_raw(fd, buf.as_ptr(), buf.len()) })
+    })
+}
+
+/// `send(2)` of up to `len` bytes of `buf` with `SEND_FLAGS`. On Linux the
+/// system call is made directly, as in `read_raw`.
+///
+/// # Safety
+/// `buf` must be valid for reads of `len` bytes.
+#[inline]
+unsafe fn send_raw(fd: RawFd, buf: *const u8, len: usize) -> isize {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: as the caller's.
+    return unsafe {
+        libc::syscall(
+            libc::SYS_sendto,
+            libc::c_long::from(fd),
+            buf,
+            len,
+            libc::c_long::from(SEND_FLAGS),
+            0 as libc::c_long,
+            0 as libc::c_long,
+        ) as isize
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: as the caller's.
+    return unsafe { libc::send(fd, buf.cast(), len, SEND_FLAGS) };
 }
 
 /// The most slices one vectored call takes.
@@ -904,7 +948,7 @@ pub(crate) fn poll_writable(fd: RawFd) -> io::Result<()> {
 pub(crate) fn read_uninit(fd: RawFd, buf: &mut [core::mem::MaybeUninit<u8>]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`; nothing is read
     // from it.
-    retry(|| cvt(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }))
+    retry(|| cvt(unsafe { read_raw(fd, buf.as_mut_ptr().cast(), buf.len()) }))
 }
 
 /// `pread(2)` into memory not written yet, as [`read_uninit`] at `offset`.
