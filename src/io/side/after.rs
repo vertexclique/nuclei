@@ -191,7 +191,7 @@ impl After {
 /// [`Unwound`] guard alive.
 #[cfg(any(ring, test))]
 fn parking() -> bool {
-    VIEW_LIVE.get() && std::thread::panicking()
+    view_live().get() && std::thread::panicking()
 }
 
 #[cfg(not(any(ring, test)))]
@@ -203,6 +203,16 @@ fn parking() -> bool {
 thread_local! {
     /// A non-owning view of a source is live on this thread (see [`Unwound`]).
     static VIEW_LIVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// This thread's [`VIEW_LIVE`], reached with an inlined access: only its address comes out of
+/// `with`, whose closure is then too small not to be inlined.
+#[cfg(any(ring, test))]
+#[inline(always)]
+fn view_live() -> &'static core::cell::Cell<bool> {
+    // SAFETY: the cell has no destructor, so it lives as long as the thread; it is a `Cell`,
+    // which is not `Sync`, so the reference stays on this thread.
+    unsafe { &*VIEW_LIVE.with(core::ptr::from_ref) }
 }
 
 thread_local! {
@@ -231,7 +241,7 @@ pub(crate) struct Unwound {
 impl Unwound {
     pub(crate) fn enter() -> Self {
         Self {
-            outer: VIEW_LIVE.replace(true),
+            outer: view_live().replace(true),
         }
     }
 }
@@ -239,7 +249,7 @@ impl Unwound {
 #[cfg(any(ring, test))]
 impl Drop for Unwound {
     fn drop(&mut self) {
-        VIEW_LIVE.set(self.outer);
+        view_live().set(self.outer);
         if std::thread::panicking() {
             run_unwound();
         }
