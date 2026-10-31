@@ -1,5 +1,7 @@
 //! The kqueue poller (macOS and the BSDs): an `EVFILT_USER` event for wakes,
-//! and the registrations of the shard's IO sources.
+//! the registrations of the shard's IO sources, and an `EVFILT_TIMER` in
+//! nanoseconds that ends a wait at a precise deadline where the system has
+//! one (the wait's own timeout may be coalesced with other timers).
 
 // The kevent fields and flag constants have different types on different
 // BSDs; the casts that make one source fit them all are no-ops on some.
@@ -8,17 +10,27 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::Readiness;
 
 /// The ident of the wake event; IO registrations use file descriptors.
 const WAKE: libc::uintptr_t = 0;
+/// The ident of the precise deadline's timer (`EVFILT_TIMER` idents are
+/// their own namespace).
+#[cfg(precise_timer)]
+const TIMER: libc::uintptr_t = 0;
 
 /// A shard's poller.
 pub(crate) struct Poller {
     queue: Arc<OwnedFd>,
     events: Vec<libc::kevent>,
+    /// The timer change the next wait submits, for a precise deadline.
+    #[cfg(precise_timer)]
+    timer: Option<libc::kevent>,
+    /// The deadline the timer is armed for, until it fires.
+    #[cfg(precise_timer)]
+    armed_for: Option<Instant>,
 }
 
 // SAFETY: the event buffer is plain data the kernel fills on each wait; its
@@ -122,8 +134,42 @@ impl Poller {
         Ok(Self {
             queue: Arc::new(queue),
             events: Vec::with_capacity(64),
+            #[cfg(precise_timer)]
+            timer: None,
+            #[cfg(precise_timer)]
+            armed_for: None,
         })
     }
+
+    /// Makes the next wait end at the precise deadline `at`, `after` from
+    /// now: a one-shot `EVFILT_TIMER` in nanoseconds (on Apple's systems
+    /// marked critical, so it is not coalesced), submitted with the wait
+    /// itself, so it costs no call of its own. Nothing to do for the deadline
+    /// the timer is armed for already.
+    #[cfg(precise_timer)]
+    pub(crate) fn arm_precise(&mut self, at: Instant, after: Duration) {
+        if self.armed_for == Some(at) {
+            return;
+        }
+        // SAFETY: kevent is plain data; all zeroes is a valid value.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        event.ident = TIMER;
+        event.filter = libc::EVFILT_TIMER as _;
+        event.flags = (libc::EV_ADD | libc::EV_ONESHOT) as _;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let fflags = libc::NOTE_NSECONDS | libc::NOTE_CRITICAL;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let fflags = libc::NOTE_NSECONDS;
+        event.fflags = fflags as _;
+        event.data = after.as_nanos().min(i64::MAX as u128) as _;
+        self.timer = Some(event);
+        self.armed_for = Some(at);
+    }
+
+    /// The wait's own timeout counts nanoseconds here, and no timer filter
+    /// counts finer: it ends a wait at a precise deadline by itself.
+    #[cfg(not(precise_timer))]
+    pub(crate) fn arm_precise(&mut self, _at: Instant, _after: Duration) {}
 
     pub(crate) fn notifier(&self) -> Notifier {
         Notifier {
@@ -168,13 +214,21 @@ impl Poller {
         let ts_ptr = ts
             .as_ref()
             .map_or(std::ptr::null(), |t| t as *const libc::timespec);
+        #[cfg(precise_timer)]
+        let change = self.timer.take();
+        #[cfg(precise_timer)]
+        let (changes, nchanges) = change
+            .as_ref()
+            .map_or((std::ptr::null(), 0), |c| (c as *const libc::kevent, 1));
+        #[cfg(not(precise_timer))]
+        let (changes, nchanges) = (std::ptr::null(), 0);
         // SAFETY: the buffer has room for its capacity; the kernel says how
-        // many it wrote.
+        // many it wrote. The change, if any, is a local that outlives the call.
         let n = unsafe {
             let n = libc::kevent(
                 self.queue.as_raw_fd(),
-                std::ptr::null(),
-                0,
+                changes,
+                nchanges,
                 self.events.as_mut_ptr(),
                 self.events.capacity().min(max).max(1) as _,
                 ts_ptr,
@@ -196,6 +250,20 @@ impl Poller {
         for e in &self.events {
             if e.filter == libc::EVFILT_USER as _ {
                 woken |= e.ident == WAKE;
+                continue;
+            }
+            #[cfg(precise_timer)]
+            if e.filter == libc::EVFILT_TIMER as _ {
+                // Fired, or refused (an `EV_ERROR` for the change): either way
+                // nothing is armed now, and the wait's own timeout still held
+                // the deadline.
+                if u64::from(e.flags) & u64::from(libc::EV_ERROR) != 0 {
+                    log::warn!(
+                        "a precise sleep ends on the wait's own timeout: its timer was refused: {}",
+                        io::Error::from_raw_os_error(e.data as i32)
+                    );
+                }
+                self.armed_for = None;
                 continue;
             }
             // The flags are 16 bits wide on most BSDs and 32 on NetBSD.

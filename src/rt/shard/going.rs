@@ -205,10 +205,14 @@ impl Drop for Shard {
             let lifo = self.lifo.take();
             let queue = core::mem::take(&mut *self.queue.borrow_mut());
             let timers = self.wheel.borrow_mut().take_wakers();
+            let precise = self.precise.borrow_mut().take_wakers();
             let fired = core::mem::take(&mut *self.fired.borrow_mut());
-            let mut quiet =
-                lifo.is_none() && queue.is_empty() && timers.is_empty() && fired.is_empty();
-            drop((lifo, queue, timers, fired));
+            let mut quiet = lifo.is_none()
+                && queue.is_empty()
+                && timers.is_empty()
+                && precise.is_empty()
+                && fired.is_empty();
+            drop((lifo, queue, timers, precise, fired));
             while let Some(runnable) = self.pop_inbox() {
                 drop(runnable);
                 quiet = false;

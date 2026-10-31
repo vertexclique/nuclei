@@ -120,3 +120,59 @@ fn urgent_data_on_a_tcp_socket_is_reported() {
     }
     poller.registrar().delete(mine.as_raw_fd(), true).unwrap();
 }
+
+#[cfg(any(target_os = "linux", target_os = "android", precise_timer))]
+#[test]
+fn a_precise_deadline_ends_a_wait_whose_timeout_is_far() {
+    let mut poller = Poller::new().unwrap();
+    let start = Instant::now();
+    let after = Duration::from_millis(3);
+    poller.arm_precise(start + after, after);
+    poller
+        .wait(Some(Duration::from_secs(10)), |_, _| {})
+        .unwrap();
+    let took = start.elapsed();
+    assert!(took >= after, "never early: {took:?}");
+    assert!(
+        took < Duration::from_secs(5),
+        "the deadline ended it: {took:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", precise_timer))]
+#[test]
+fn an_earlier_precise_deadline_moves_the_timer() {
+    let mut poller = Poller::new().unwrap();
+    let start = Instant::now();
+    poller.arm_precise(start + Duration::from_secs(3), Duration::from_secs(3));
+    let after = Duration::from_millis(2);
+    poller.arm_precise(start + after, after);
+    poller
+        .wait(Some(Duration::from_secs(10)), |_, _| {})
+        .unwrap();
+    let took = start.elapsed();
+    assert!(took >= after, "never early: {took:?}");
+    assert!(
+        took < Duration::from_secs(2),
+        "the earlier deadline ended it: {took:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", precise_timer))]
+#[test]
+fn a_fired_precise_deadline_does_not_end_the_next_wait() {
+    let mut poller = Poller::new().unwrap();
+    let start = Instant::now();
+    let after = Duration::from_millis(1);
+    poller.arm_precise(start + after, after);
+    poller
+        .wait(Some(Duration::from_secs(10)), |_, _| {})
+        .unwrap();
+    let again = Instant::now();
+    assert!(
+        !poller
+            .wait(Some(Duration::from_millis(20)), |_, _| {})
+            .unwrap()
+    );
+    assert!(again.elapsed() >= Duration::from_millis(20), "it timed out");
+}

@@ -1,21 +1,40 @@
-//! The Linux poller: an epoll instance with an eventfd for wakes, and the
-//! registrations of the shard's IO sources.
+//! The Linux poller: an epoll instance with an eventfd for wakes, the
+//! registrations of the shard's IO sources, and a timerfd that ends a wait at
+//! a precise deadline (epoll's own timeout counts milliseconds).
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::Readiness;
 
 /// The epoll data of the wake eventfd; IO registrations never use it.
 const WAKE: u64 = u64::MAX;
+/// The epoll data of the precise timer's timerfd: a token no registration
+/// reaches, as for [`WAKE`] (it would take 2^32 live sources).
+const TIMER: u64 = u64::MAX - 1;
 
 /// A shard's poller.
 pub(crate) struct Poller {
     epoll: Arc<OwnedFd>,
     wake: Arc<OwnedFd>,
     events: Vec<libc::epoll_event>,
+    /// The timerfd of the precise deadlines, made on the first one.
+    timer: Timer,
+}
+
+/// The poller's timerfd.
+enum Timer {
+    /// No precise deadline came yet.
+    Unmade,
+    /// Made and registered; armed for that deadline until it fires.
+    Made {
+        fd: OwnedFd,
+        armed_for: Option<Instant>,
+    },
+    /// It could not be made: precise deadlines end on epoll's millisecond.
+    Failed,
 }
 
 /// Wakes a poller from any thread.
@@ -63,6 +82,7 @@ impl Poller {
                 epoll: Arc::new(epoll),
                 wake: Arc::new(wake),
                 events: Vec::with_capacity(256),
+                timer: Timer::Unmade,
             })
         }
     }
@@ -90,6 +110,82 @@ impl Poller {
         mut on_event: impl FnMut(u64, Readiness),
     ) -> io::Result<bool> {
         self.wait_at_most(usize::MAX, timeout, &mut on_event)
+    }
+
+    /// Makes the next wait end at the precise deadline `at`, `after` from
+    /// now, through the timerfd: the wait's own timeout rounds it up to the
+    /// millisecond. One system call when the deadline is new; none for the
+    /// deadline the timer is armed for already. A timer that cannot be made
+    /// leaves the deadline to that timeout, a millisecond late at most, and
+    /// says so once.
+    pub(crate) fn arm_precise(&mut self, at: Instant, after: Duration) {
+        if let Timer::Unmade = self.timer {
+            self.timer = match self.make_timer() {
+                Ok(fd) => Timer::Made {
+                    fd,
+                    armed_for: None,
+                },
+                Err(err) => {
+                    log::warn!(
+                        "precise sleeps on this shard end on the millisecond: its timer could not be made: {err}"
+                    );
+                    Timer::Failed
+                }
+            };
+        }
+        let Timer::Made { fd, armed_for } = &mut self.timer else {
+            return;
+        };
+        if *armed_for == Some(at) {
+            return;
+        }
+        // A zero time disarms a timerfd: a deadline that is due now gets the
+        // shortest one.
+        let after = after.max(Duration::from_nanos(1));
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: after.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+                tv_nsec: after.subsec_nanos() as _,
+            },
+        };
+        // SAFETY: a plain syscall on our own descriptor with a valid spec.
+        let ret = unsafe { libc::timerfd_settime(fd.as_raw_fd(), 0, &spec, core::ptr::null_mut()) };
+        if ret == 0 {
+            *armed_for = Some(at);
+        } else {
+            *armed_for = None;
+            log::warn!(
+                "a precise sleep ends on the millisecond: its timer could not be armed: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+
+    /// The timerfd of the precise deadlines, registered edge-triggered: each
+    /// expiry is one event, and nothing reads the count back.
+    fn make_timer(&self) -> io::Result<OwnedFd> {
+        // SAFETY: plain syscalls; the descriptor is owned at once.
+        unsafe {
+            let fd = OwnedFd::from_raw_fd(check(libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
+            ))?);
+            let mut event = libc::epoll_event {
+                events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+                u64: TIMER,
+            };
+            check(libc::epoll_ctl(
+                self.epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                fd.as_raw_fd(),
+                &mut event,
+            ))?;
+            Ok(fd)
+        }
     }
 
     /// Blocks until a notifier fires, a registered source is ready, or
@@ -140,6 +236,12 @@ impl Poller {
             let token = event.u64;
             if token == WAKE {
                 woken = true;
+                continue;
+            }
+            if token == TIMER {
+                if let Timer::Made { armed_for, .. } = &mut self.timer {
+                    *armed_for = None;
+                }
                 continue;
             }
             let bits = event.events as libc::c_int;

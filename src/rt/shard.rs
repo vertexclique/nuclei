@@ -610,6 +610,8 @@ pub(crate) struct Shard {
     tuning: super::tuning::Tuning,
     driver: Driver,
     wheel: RefCell<Wheel>,
+    /// The precise sleeps' wheel, in microseconds from the same epoch.
+    precise: RefCell<Wheel>,
     /// The wheel's zero: the clock's origin, the same for every shard, so a
     /// paused clock on the wheels' millisecond grid fires timers at their
     /// deadlines exactly.
@@ -779,6 +781,7 @@ impl Shard {
             tuning: super::tuning::Tuning::default(),
             driver,
             wheel: RefCell::new(Wheel::new()),
+            precise: RefCell::new(Wheel::new()),
             epoch: crate::time::clock::origin(),
             fired: RefCell::new(Vec::new()),
             sources: RefCell::new(Sources::default()),
