@@ -146,7 +146,8 @@ struct Lent {
 #[cfg(completion)]
 const UDP_MAX: usize = u16::MAX as usize;
 
-/// Whether `TCP_INQ` is on for a socket (see `ReadState::inq_wanted`).
+/// Whether the kernel's count of what a read leaves (`TCP_INQ`, or a Unix
+/// stream's `SO_INQ`) is on for a socket (see `ReadState::inq_wanted`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Inq {
@@ -734,23 +735,30 @@ impl ReadState {
     /// that receives or reads ahead of other connections hold
     /// (proofs/tla/ring/RingStarve.tla, proofs/tla/starve/FdStarve.tla).
     #[cfg(unix)]
+    #[inline(always)]
     pub(super) fn reads_itself(&self, io: Io<'_>, kind: Kind, len: usize, peek: bool) -> bool {
-        self.starved
-            || (!peek
-                && ((matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind))
-                    || super::direct::worth(io, len, false)))
+        if self.starved {
+            return true;
+        }
+        !peek
+            && match io.via {
+                Via::Fd(_) => self.inq_wanted(kind) || super::direct::worth(io, len, false),
+                _ => super::direct::worth(io, len, false),
+            }
     }
 
-    /// Whether a TCP read on a readiness driver goes straight into the
-    /// task's buffer at every size: the kernel counts what a read leaves
-    /// (`TCP_INQ`), so even a read that filled its buffer knows whether the
-    /// socket is empty, and the next one waits for an edge instead of
-    /// finding nothing (proofs/tla/starve/FdStarve.tla). Not once the kernel
-    /// refused the option, and not off Linux.
+    /// Whether a TCP or Unix stream read on a readiness driver goes straight
+    /// into the task's buffer at every size: the kernel counts what a read
+    /// leaves (`TCP_INQ`; a Unix stream's `SO_INQ`, Linux 6.17), so even a
+    /// read that filled its buffer knows whether the socket is empty, and the
+    /// next one waits for an edge instead of finding nothing
+    /// (proofs/tla/starve/FdStarve.tla). A Unix stream's count leaves out a
+    /// pending end, which its hangup edge reports instead, as for TCP. Not
+    /// once the kernel refused the option, and not off Linux.
     #[cfg(unix)]
     pub(super) fn inq_wanted(&self, kind: Kind) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        return kind == Kind::Tcp && self.inq != Inq::Off;
+        return kind.counts_left() && self.inq != Inq::Off;
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = kind;
@@ -762,11 +770,11 @@ impl ReadState {
     /// the first time.
     #[cfg(unix)]
     #[inline]
-    pub(super) fn inq_on(&mut self, fd: RawFd) -> bool {
+    pub(super) fn inq_on(&mut self, fd: RawFd, kind: Kind) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             if self.inq == Inq::Unknown {
-                self.inq = if sys::enable_inq(fd) {
+                self.inq = if sys::enable_inq(fd, kind == Kind::Tcp) {
                     Inq::On
                 } else {
                     Inq::Off
@@ -776,7 +784,7 @@ impl ReadState {
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
-            let _ = fd;
+            let _ = (fd, kind);
             false
         }
     }
@@ -821,7 +829,8 @@ impl ReadState {
             return None;
         }
         // `call` is told to count what the socket keeps, when it can.
-        let inq = !peek && matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind) && self.inq_on(fd);
+        let inq =
+            !peek && matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind) && self.inq_on(fd, kind);
         if !inq && !self.reads_itself(io, kind, len, peek) {
             return None;
         }

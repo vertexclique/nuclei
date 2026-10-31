@@ -215,6 +215,18 @@ impl Kind {
         }
     }
 
+    /// A stream socket whose kernel may count what a read leaves (see
+    /// `sys::enable_inq`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[inline(always)]
+    pub(crate) fn counts_left(self) -> bool {
+        if crate::io::sys::UNIX_INQ {
+            self.streams()
+        } else {
+            self == Kind::Tcp
+        }
+    }
+
     /// A datagram socket: its reads and writes are whole datagrams.
     pub(crate) fn datagrams(self) -> bool {
         match self {

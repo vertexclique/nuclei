@@ -271,18 +271,57 @@ pub(crate) fn read_bufs(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Resul
     retry(|| cvt(unsafe { libc::readv(fd, bufs.as_ptr().cast(), count) }))
 }
 
-/// Asks a TCP socket to report, with every receive, how many bytes its
-/// receive queue still holds (`TCP_INQ`, Linux 4.18). False where the kernel
-/// does not know the option.
+/// `SO_INQ` (and its control message `SCM_INQ`) of a Unix stream socket, Linux 6.17, by the
+/// generic socket numbering these architectures use; elsewhere a Unix stream asks for none.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
+const SO_INQ: libc::c_int = 84;
+
+/// Whether a Unix stream socket may count what its reads leave here (see [`enable_inq`]).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn enable_inq(fd: RawFd) -> bool {
+pub(crate) const UNIX_INQ: bool = cfg!(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+));
+
+/// Asks a stream socket to report, with every receive, how many bytes its
+/// receive queue still holds: a TCP socket (`tcp`) by `TCP_INQ` (Linux 4.18),
+/// a Unix stream by `SO_INQ` (Linux 6.17). False where the kernel does not
+/// know the option.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn enable_inq(fd: RawFd, tcp: bool) -> bool {
+    let (level, name) = if tcp {
+        (libc::IPPROTO_TCP, libc::TCP_INQ)
+    } else {
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
+        {
+            (libc::SOL_SOCKET, SO_INQ)
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )))]
+        return false;
+    };
     let one: libc::c_int = 1;
     // SAFETY: a plain setsockopt with a pointer to our own int.
     let ret = unsafe {
         libc::setsockopt(
             fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_INQ,
+            level,
+            name,
             (&one as *const libc::c_int).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         )
@@ -290,10 +329,11 @@ pub(crate) fn enable_inq(fd: RawFd) -> bool {
     ret == 0
 }
 
-/// `recvmsg(2)` on a TCP socket whose `TCP_INQ` is on: reads into `buf` and
-/// answers how many bytes, and how many the receive queue still holds after
-/// them (a pending end of stream counts as one). The second is `None` when
-/// the kernel gave no count.
+/// `recvmsg(2)` on a stream socket whose count is on (see [`enable_inq`]):
+/// reads into `buf` and answers how many bytes, and how many the receive
+/// queue still holds after them (a pending end of stream counts as one on TCP,
+/// as none on a Unix stream, whose hangup edge says it). The second is `None`
+/// when the kernel gave no count.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<usize>)> {
     // Room for one `int` of control data, aligned for a `cmsghdr`.
@@ -326,12 +366,24 @@ pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<u
     // only if it fits, and its data is one `int`.
     let left = unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (!cmsg.is_null()
-            && (*cmsg).cmsg_level == libc::IPPROTO_TCP
-            && (*cmsg).cmsg_type == libc::TCP_CM_INQ)
+        (!cmsg.is_null() && is_inq((*cmsg).cmsg_level, (*cmsg).cmsg_type))
             .then(|| libc::CMSG_DATA(cmsg).cast::<u32>().read_unaligned() as usize)
     };
     Ok((n, left))
+}
+
+/// Whether a control message of `level` and `kind` is a receive's count of what it left.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_inq(level: libc::c_int, kind: libc::c_int) -> bool {
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    if level == libc::SOL_SOCKET && kind == SO_INQ {
+        return true;
+    }
+    level == libc::IPPROTO_TCP && kind == libc::TCP_CM_INQ
 }
 
 /// `shutdown(2)` of the writing half.

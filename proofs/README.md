@@ -1013,7 +1013,10 @@ report again looks at once. A peek leaves the bytes in the socket, so it never m
 drained. A TCP read on Linux goes straight into the task's buffer at every size (`inq_wanted`,
 `read_direct`, `sys::read_inq`): it can fill its buffer exactly, so the kernel's count of what a
 read leaves (`TCP_INQ`, which counts a pending end of stream as one) says whether the socket is
-empty, and a count of none lets the next read wait for the edge. The model's `Exact` runs it on a
+empty, and a count of none lets the next read wait for the edge. A Unix stream's read does the
+same where the kernel counts for it (`SO_INQ`, Linux 6.17), whose count leaves a pending end out:
+the hangup's edge, which marks the side unsure as it does for TCP's `drained`, has the next read
+find the end. The model's `Exact` runs it on a
 request of two pieces, one read each. 11 configurations: 4 that must pass (`Buffers`, every buffer free or holding a request
 read ahead; and `Read`, every task that reads gets its request, with a task that stops, with
 none, and with exact reads), 5 mutations (a starved reader that waits for a buffer to come back, an edge that starves
