@@ -4,6 +4,7 @@
 //! exactly knows whether the socket is empty, and the end of a stream behind
 //! an exact read is seen, whether it came with the bytes or after them. Run on
 //! both backends (`NUCLEI_BACKEND=epoll`).
+#![cfg(unix)]
 
 use std::time::Duration;
 
