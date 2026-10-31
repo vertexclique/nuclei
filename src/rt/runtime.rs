@@ -759,7 +759,7 @@ fn own_shard() -> std::rc::Rc<Shard> {
 }
 
 /// Spawns `future` on `inner`.
-fn spawn_with<F>(inner: &Arc<Inner>, future: F) -> Task<F::Output>
+fn spawn_with<F>(inner: &Inner, future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -925,7 +925,13 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    spawn_with(&current(), future)
+    // With no task hooks nothing the spawn runs is the user's, so nothing
+    // sets or unsets the thread's runtime meanwhile: it is used in place.
+    let spawned = context::with_runtime(|inner| match inner {
+        Some(inner) if inner.task_hooks.is_none() => Ok(spawn_with(inner, future)),
+        _ => Err(future),
+    });
+    spawned.unwrap_or_else(|future| spawn_with(&current(), future))
 }
 
 /// Spawns a task that stays on the calling thread: a worker's shard, or the

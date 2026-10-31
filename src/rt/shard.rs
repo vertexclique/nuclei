@@ -356,11 +356,19 @@ impl Shared {
     /// for a task of the shard dropped where its waker ran (on another
     /// thread, the shard stopped), so what its drop hands on (a dropped
     /// handle's bytes) goes to its runtime (`rt::linger`).
+    #[inline]
     pub(crate) fn enter_runtime(&self) -> Option<super::context::RuntimeSet> {
         let runtime = self.runtime.get()?;
         if super::context::runtime_is(runtime.as_ptr()) {
             return None;
         }
+        Self::set_runtime_here(runtime)
+    }
+
+    #[inline(never)]
+    fn set_runtime_here(
+        runtime: &std::sync::Weak<super::runtime::Inner>,
+    ) -> Option<super::context::RuntimeSet> {
         runtime
             .upgrade()
             .and_then(|inner| super::context::try_set_runtime(&inner))

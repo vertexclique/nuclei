@@ -61,6 +61,9 @@ pub(crate) struct Here {
     /// The budget left in this thread's poll; `None` outside a poll, or in an
     /// unconstrained one (`coop`).
     pub(crate) budget: Cell<Option<u8>>,
+    /// The runtime `RUNTIME` holds, null for none: read in place, never
+    /// followed once `RUNTIME` lets go of it.
+    runtime: Cell<*const Inner>,
 }
 
 impl Here {
@@ -77,6 +80,7 @@ impl Here {
             home: Cell::new(core::ptr::null()),
             task: Cell::new(None),
             budget: Cell::new(None),
+            runtime: Cell::new(core::ptr::null()),
         }
     }
 
@@ -113,9 +117,29 @@ thread_local! {
     static OWN: RefCell<Option<Rc<Shard>>> = const { RefCell::new(None) };
     /// The runtime `spawn` uses here: the worker's, or the one whose
     /// `block_on` (or `enter`) this thread is inside.
-    static RUNTIME: RefCell<Option<Arc<Inner>>> = const { RefCell::new(None) };
+    static RUNTIME: RuntimeCell = const { RuntimeCell(RefCell::new(None)) };
     /// The home of this thread's bound tasks (see `Here::home`).
     static HOME: HomeCell = const { HomeCell(RefCell::new(None)) };
+}
+
+/// The thread's runtime, which `Here::runtime` points at; it points at none
+/// once the cell goes.
+struct RuntimeCell(RefCell<Option<Arc<Inner>>>);
+
+impl RuntimeCell {
+    /// Sets `runtime`, mirrored in `Here::runtime`, and answers the one before.
+    fn replace(&self, runtime: Option<Arc<Inner>>) -> Option<Arc<Inner>> {
+        local()
+            .runtime
+            .set(runtime.as_ref().map_or(core::ptr::null(), Arc::as_ptr));
+        self.0.replace(runtime)
+    }
+}
+
+impl Drop for RuntimeCell {
+    fn drop(&mut self) {
+        local().runtime.set(core::ptr::null());
+    }
 }
 
 /// The thread's home; `Here::home` points at it no more once it goes.
@@ -372,22 +396,34 @@ pub(crate) fn own_shard() -> io::Result<Rc<Shard>> {
 }
 
 /// The runtime `spawn` uses on this thread, if one is set.
+#[inline]
 pub(crate) fn runtime() -> Option<Arc<Inner>> {
-    RUNTIME
-        .try_with(|r| r.borrow().as_ref().map(Arc::clone))
-        .ok()
-        .flatten()
+    let inner = local().runtime.get();
+    if inner.is_null() {
+        return None;
+    }
+    // SAFETY: `RUNTIME` holds a strong reference to the runtime `Here`
+    // names, so it is live, and the count taken here is the clone's.
+    unsafe {
+        Arc::increment_strong_count(inner);
+        Some(Arc::from_raw(inner))
+    }
+}
+
+/// The runtime set on this thread, borrowed in place for `f`, which must not
+/// set or unset the thread's runtime, nor run code that could (`RUNTIME`
+/// holds it meanwhile): no count is taken.
+#[inline]
+pub(crate) fn with_runtime<R>(f: impl FnOnce(Option<&Inner>) -> R) -> R {
+    // SAFETY: `RUNTIME` holds the runtime `Here` names while `f` runs, as
+    // `f` leaves the thread's runtime alone.
+    f(unsafe { local().runtime.get().as_ref() })
 }
 
 /// Whether `inner` is the runtime set on this thread.
+#[inline]
 pub(crate) fn runtime_is(inner: *const Inner) -> bool {
-    RUNTIME
-        .try_with(|r| {
-            r.borrow()
-                .as_ref()
-                .is_some_and(|set| Arc::as_ptr(set) == inner)
-        })
-        .unwrap_or(false)
+    core::ptr::eq(local().runtime.get(), inner)
 }
 
 /// Makes `inner` the runtime `spawn` uses on this thread, until the guard
@@ -413,7 +449,7 @@ pub(crate) struct RuntimeSet {
 impl Drop for RuntimeSet {
     fn drop(&mut self) {
         let previous = self.previous.take();
-        let _ = RUNTIME.try_with(|r| *r.borrow_mut() = previous);
+        let _ = RUNTIME.try_with(|r| drop(r.replace(previous)));
     }
 }
 
