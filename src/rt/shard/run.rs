@@ -211,6 +211,8 @@ impl Shard {
                 continue;
             }
             self.before_park();
+            // A park a blocking job's end cuts short says nothing of other work coming soon.
+            let pool_out = self.blocking_out();
             if shared
                 .park
                 .begin_park(|| self.has_remote_work() || signal.woken.load(Ordering::SeqCst))
@@ -225,7 +227,7 @@ impl Shard {
                 if let Some(unpark) = &self.tuning.hooks.unpark {
                     unpark();
                 }
-                self.slept_for(slept.elapsed());
+                self.slept_for(slept.elapsed(), !pool_out);
             }
             self.after_park();
         }

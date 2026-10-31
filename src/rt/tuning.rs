@@ -30,7 +30,7 @@ pub(crate) struct Tuning {
     pub(crate) lifo: bool,
     pub(crate) hooks: ThreadHooks,
     /// Jobs in flight on the runtime's blocking pool: while any is, a shard that
-    /// runs dry spins, as one of them may wake it.
+    /// runs dry parks, and a park one of them cuts short does not make it spin.
     pub(crate) blocking: Option<Arc<crate::sync::internal::AtomicUsize>>,
 }
 

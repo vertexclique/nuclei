@@ -1074,25 +1074,26 @@ impl Shard {
         self.driver.backend()
     }
 
-    /// Whether something outside this thread can bring it work within a spin's time: a job on
-    /// the runtime's blocking pool (any shard's: the pool does not say whose), or a finite
+    /// Whether something outside this thread can bring it work within a spin's time: a finite
     /// operation of the ring still out. Work posted by other threads is not foreseen, so a shard
-    /// with neither parks at once.
+    /// with none parks at once. A job on the runtime's blocking pool is not such work: it runs
+    /// for as long as it blocks, and its end wakes the shard with one notification.
     fn work_may_come_soon(&self) -> bool {
-        if self
-            .tuning
-            .blocking
-            .as_ref()
-            .is_some_and(|jobs| jobs.load(Ordering::Relaxed) > 0)
-        {
-            return true;
-        }
         #[cfg(ring)]
         return self
             .ring()
             .is_some_and(ring::ShardRing::expects_completions);
         #[cfg(not(ring))]
         false
+    }
+
+    /// Whether a job of the runtime's blocking pool is out (any shard's: the pool does not say
+    /// whose).
+    fn blocking_out(&self) -> bool {
+        self.tuning
+            .blocking
+            .as_ref()
+            .is_some_and(|jobs| jobs.load(Ordering::Relaxed) > 0)
     }
 
     /// The shard's ring, if its IO runs on one.
@@ -1120,3 +1121,5 @@ impl Shard {
 
 #[cfg(all(test, not(loom)))]
 mod tests;
+#[cfg(all(test, not(loom)))]
+mod tests_pool;
