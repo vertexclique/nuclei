@@ -86,6 +86,7 @@ impl Ahead {
     }
 
     /// Adds bytes that came after those held.
+    #[inline]
     pub(super) fn push(&mut self, piece: Piece, after: &mut After) {
         if piece.filled().is_empty() {
             piece.release(after, None);

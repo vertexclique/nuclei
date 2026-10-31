@@ -1398,6 +1398,7 @@ impl ReadState {
     /// `epoch`: the tasks waiting take it. One of an older descriptor only
     /// goes.
     #[cfg(ring)]
+    #[inline]
     pub(super) fn take_arrival(
         &mut self,
         arrival: super::ring::Arrival,

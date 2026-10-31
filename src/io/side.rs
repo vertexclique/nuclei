@@ -918,13 +918,20 @@ impl After {
         self.more.get_or_insert_default()
     }
 
+    #[inline]
     pub(crate) fn wake(&mut self, wakers: &mut Wakers) {
         if let Some(w) = wakers.first.take() {
             self.wake_one(w);
         }
         if !wakers.rest.is_empty() {
-            self.more().wake.append(&mut wakers.rest);
+            self.wake_rest(wakers);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wake_rest(&mut self, wakers: &mut Wakers) {
+        self.more().wake.append(&mut wakers.rest);
     }
 
     /// Drops `wakers` without waking them.
@@ -935,11 +942,18 @@ impl After {
     }
 
     /// Wakes the one task of `waker`.
+    #[inline]
     pub(crate) fn wake_one(&mut self, waker: Waker) {
         match self.wake {
             None => self.wake = Some(waker),
-            Some(_) => self.more().wake.push(waker),
+            Some(_) => self.wake_more(waker),
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wake_more(&mut self, waker: Waker) {
+        self.more().wake.push(waker);
     }
 
     /// Drops `waker` without waking it.
@@ -956,6 +970,7 @@ impl After {
 
     /// Wakes and drops; call with no guard held. Once: it consumes the step,
     /// so its drop finds nothing left to do.
+    #[inline]
     pub(crate) fn run(mut self) {
         self.flush();
         #[cfg(ring)]
@@ -963,15 +978,23 @@ impl After {
         core::mem::forget(self);
     }
 
+    #[inline]
     fn flush(&mut self) {
         drop(self.drop_one.take());
-        let Some(more) = self.more.take() else {
-            if let Some(w) = self.wake.take() {
-                w.wake();
+        match self.more.take() {
+            None => {
+                if let Some(w) = self.wake.take() {
+                    w.wake();
+                }
             }
-            return;
-        };
-        let More { wake, forget, bufs } = *more;
+            Some(more) => self.flush_more(*more),
+        }
+    }
+
+    /// [`flush`](Self::flush) of a step that left more than one waker or buffer.
+    #[inline(never)]
+    fn flush_more(&mut self, more: More) {
+        let More { wake, forget, bufs } = more;
         drop(bufs);
         drop(forget);
         if let Some(w) = self.wake.take() {
