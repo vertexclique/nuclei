@@ -102,7 +102,8 @@ impl ShardRing {
     /// counted. Returns the memory of the receive group let go: none while a receive is stuck.
     fn forget_stuck(&self) -> usize {
         let stuck: Vec<RingOp> = self.ops.borrow_mut().drain().collect();
-        let stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
+        let mut stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
+        stuck_files.iter_mut().for_each(FileOp::give_up);
         let stuck_exits: Vec<ExitOp> = self.exit_ops.borrow_mut().drain().collect();
         LEAKED.fetch_add(
             stuck.len() + stuck_files.len() + stuck_exits.len(),

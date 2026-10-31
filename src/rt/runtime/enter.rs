@@ -87,12 +87,17 @@ impl Runtime {
     }
 
     /// Stops the workers and returns at once: the worker threads drop their
-    /// tasks and exit on their own, without being waited for.
+    /// tasks and exit on their own, without being waited for, and what the
+    /// handles of those tasks left behind is delivered on threads of its
+    /// own.
     pub fn shutdown_background(self) {
+        let lingering = self.inner.lingering();
+        lingering.close();
         self.inner.workers.stop_all();
         // Detached: dropping the handles does not wait. `Drop` finds none
-        // left to join.
+        // left to join, and no lingering to wait for.
         drop(self.inner.workers.take_threads());
+        lingering.end();
     }
 }
 

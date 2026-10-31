@@ -92,9 +92,9 @@ unsafe impl Schedule for Sched {
 }
 
 /// A task's future, counted in its shard's live tasks until it completes
-/// or is dropped.
+/// or is dropped, and dropped inside the shard's runtime wherever that is.
 pub(crate) struct Counted<F> {
-    future: F,
+    future: core::mem::ManuallyDrop<F>,
     shard: *const Shared,
 }
 
@@ -106,7 +106,10 @@ impl<F> Counted<F> {
     /// Counts the task in `shard` from now on.
     pub(crate) fn new(future: F, shard: &Shared) -> Self {
         shard.load.fetch_add(1, Ordering::Relaxed);
-        Self { future, shard }
+        Self {
+            future: core::mem::ManuallyDrop::new(future),
+            shard,
+        }
     }
 }
 
@@ -115,7 +118,7 @@ impl<F: Future> Future for Counted<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         // SAFETY: the future is never moved out of its place: structural pin.
-        unsafe { self.map_unchecked_mut(|c| &mut c.future) }.poll(cx)
+        unsafe { self.map_unchecked_mut(|c| &mut *c.future) }.poll(cx)
     }
 }
 
@@ -123,6 +126,14 @@ impl<F> Drop for Counted<F> {
     fn drop(&mut self) {
         // SAFETY: see `Send` above: the shard outlives the future.
         let shard = unsafe { &*self.shard };
+        {
+            // Woken after its shard stopped, a task is dropped on its
+            // waker's thread: what its drop hands on (a dropped handle's
+            // bytes) still goes to its runtime (proofs/tla/going/Linger.tla).
+            let _runtime = shard.enter_runtime();
+            // SAFETY: dropped once, here, in its place.
+            unsafe { core::mem::ManuallyDrop::drop(&mut self.future) };
+        }
         if shard.load.fetch_sub(1, Ordering::Release) == 1 {
             shard.last_task_done();
         }

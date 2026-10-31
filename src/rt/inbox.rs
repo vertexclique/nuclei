@@ -208,6 +208,12 @@ impl<T: Linked> Inbox<T> {
         })
     }
 
+    /// Whether the queue is empty and nobody holds the taker's role: once a
+    /// shard stopped, every item pushed so far was taken and handed out.
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.taken.load(Ordering::SeqCst) && self.is_empty()
+    }
+
     /// The taker's role, if nobody holds it.
     pub(crate) fn try_take(&self) -> bool {
         self.taken

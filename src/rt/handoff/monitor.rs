@@ -310,6 +310,13 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
             }
         }
     }
+    // A shard that waited for a thread goes here, inside its runtime: what
+    // the handles of its tasks leave goes to that runtime's drop.
+    if let Some(gift) = waiting.take() {
+        let inner = runtime.upgrade();
+        let _runtime = inner.as_ref().map(crate::rt::context::set_runtime);
+        drop(gift);
+    }
 }
 
 /// Takes the shard of `place` from its runner, seen at `word` on the last

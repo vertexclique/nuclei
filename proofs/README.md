@@ -1125,6 +1125,37 @@ kernel, and `DrainEnds`; 3 mutations (no drain task, as before, which left the p
 good, `AllSent`; a drain task that does not register the source, `AllSent`; an operation's end
 that wakes nobody, `AllSent`); and 1 witness (the drain task moves the source to the worker).
 
+`Linger` (`tla/going/Linger.tla`) checks what a dropped handle leaves when its runtime drops
+(`src/rt/linger.rs`, `Runtime::drop` and `finish_lingering` in `src/rt/runtime.rs`, `Counted`'s
+drop in `src/rt/sched.rs`, `Shared::settled` and `drop_stopped` in `src/rt/shard.rs`, the file
+write's count in `src/fs/call.rs`, the handle's drop, a gone shard's sources): a worker's task
+holds a handle whose write-behind holds bytes, and whose file has one write out. A handle dropped
+while the runtime runs hands its linger to a worker; once the runtime's drop began, to the
+runtime's list. The drop stops the worker, whose shard drops its tasks: the handle's (its linger
+to the list), unless that task waits on the write, which then drops it where it ends (a ring's
+keeper, the blocking pool): its wake lands in the stopped shard's inbox, and the thread that drains
+it (the write's own, or another that held the drain) drops the task inside its runtime still. A
+linger's own task not done yet hands what it left back (`Guarded`): at once if the stop wakes it,
+or, held by the write, once the write ends. The write counts itself on the worker's shard until
+its end's wake went. The drop runs the list on its own thread until no linger it counts is left,
+no write is counted on a worker and no worker's stopped inbox is still to be drained, then
+returns; one handed after runs on a thread of its own, with a runtime of its own. A background
+shutdown waits for nothing, and its lingers all run on threads of their own. A shard whose thread
+is blocked in a task's poll after the shard was handed on drops what its inbox holds only once
+that poll returns, which the drop does not wait for. 17 configurations: 3 that must pass
+(`DropWaits`, the drop returns only once every byte reached the peer, `NoDefault`, no runtime is
+started for a linger, and `TypeOK`; liveness, `AllSent` and `Termination`; and a background
+shutdown, with `NoDefault`, `AllSent` and `Termination`), 9 mutations (a drop that does not run its list; one that runs only what its list
+holds as it looks (the fix's first form, which left a file's last writes unlanded); a linger's
+task lost as its worker stops; a linger handed to the stopping shard of its thread, which never
+runs it; the held task dropped outside its runtime, its linger to a thread of its own; a write
+counted out before its wake went; a drop that does not wait for its workers' writes; and one that
+does not wait for a stopped inbox to be drained: all break `DropWaits`; a linger handed to the
+process default runtime, which starts for it, breaks `NoDefault`), and 5 witnesses (a linger's
+task handed back as its worker stops; one held by the write and handed back later; the drop
+running a linger of its list; the task with the handle held by the write as its worker stops;
+another thread draining its wake after the write counted itself out).
+
 ## A blocking job of a Windows handle
 
 `job` (`tla/job/Job.tla`) checks the cancel of a pool thread's call on a Windows handle opened

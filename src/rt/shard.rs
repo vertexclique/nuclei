@@ -125,6 +125,15 @@ pub(crate) struct Shared {
     io_closed: AtomicBool,
     /// What the shard counts, for `stats`.
     pub(crate) counters: Counters,
+    /// A worker's shard: its runtime, inside which a task of the shard woken
+    /// on another thread after the shard stopped is dropped.
+    runtime: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
+    /// File writes issued on the shard whose end's wake has not gone yet.
+    writes: AtomicUsize,
+    /// The shard drained its inbox for the last time as it was dropped, and
+    /// let go of its taker's role: a task woken here from now on is dropped
+    /// by the thread that pushed it, or one that drains for it.
+    released: AtomicBool,
     /// While its runtime's clock is paused: the deadline of the shard's
     /// earliest timer when it last parked (nanoseconds after the clock's
     /// origin, `u64::MAX` for none).
@@ -338,6 +347,64 @@ impl Shared {
         self.stopped.load(Ordering::Acquire)
     }
 
+    /// Makes `runtime` the one this worker's shard belongs to.
+    pub(crate) fn set_runtime(&self, runtime: std::sync::Weak<super::runtime::Inner>) {
+        let _ = self.runtime.set(runtime);
+    }
+
+    /// Sets the shard's runtime on this thread, unless it is set already:
+    /// for a task of the shard dropped where its waker ran (on another
+    /// thread, the shard stopped), so what its drop hands on (a dropped
+    /// handle's bytes) goes to its runtime (`rt::linger`).
+    pub(crate) fn enter_runtime(&self) -> Option<super::context::RuntimeSet> {
+        let runtime = self.runtime.get()?;
+        if super::context::runtime_is(runtime.as_ptr()) {
+            return None;
+        }
+        runtime
+            .upgrade()
+            .and_then(|inner| super::context::try_set_runtime(&inner))
+    }
+
+    /// A file write was issued on the shard.
+    pub(crate) fn write_began(&self) {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A file write issued here ended and its wake went: a runtime's drop
+    /// that waits for the stopped shard looks again.
+    pub(crate) fn write_ended(&self) {
+        if self.writes.fetch_sub(1, Ordering::SeqCst) == 1 && self.stopped.load(Ordering::SeqCst) {
+            self.nudge_runtime();
+        }
+    }
+
+    /// What a runtime's drop waits for of its worker's shard: every file
+    /// write issued here ended with its wake gone, and, once the shard let
+    /// go of its inbox, every task woken since was dropped (the inbox is
+    /// empty and nobody drains it). Read in this order, the inbox after the
+    /// writes, so a task a write's wake left to another thread's drain is
+    /// seen. A shard not let go of yet (its thread blocked in a task's poll,
+    /// the shard handed on) drops what its inbox holds when that thread
+    /// lets go of it, which the drop does not wait for.
+    pub(crate) fn settled(&self) -> bool {
+        self.writes.load(Ordering::SeqCst) == 0
+            && (!self.released.load(Ordering::SeqCst) || self.inbox.is_idle())
+    }
+
+    /// The shard let go of its inbox for good (see [`settled`](Self::settled)).
+    pub(crate) fn release_inbox(&self) {
+        self.drop_stopped(true);
+        self.released.store(true, Ordering::SeqCst);
+    }
+
+    /// Wakes the drop of the shard's runtime, if it waits.
+    fn nudge_runtime(&self) {
+        if let Some(inner) = self.runtime.get().and_then(std::sync::Weak::upgrade) {
+            inner.lingering().nudge();
+        }
+    }
+
     /// Stops the shard: a worker's loop ends at its next look.
     pub(crate) fn stop(&self) {
         self.draining.store(true, Ordering::SeqCst);
@@ -428,9 +495,11 @@ impl Shared {
             }
             holding = false;
             if self.inbox.is_empty() {
-                return;
+                break;
             }
         }
+        // A runtime's drop waits until no task woken here is left to drop.
+        self.nudge_runtime();
     }
 
     /// Whether work was handed to the shard, as any thread sees it (for a
@@ -682,6 +751,9 @@ impl Shard {
             io_ops: SegQueue::new(),
             io_closed: AtomicBool::new(false),
             counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
+            runtime: std::sync::OnceLock::new(),
+            writes: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
             timer_at: AtomicU64::new(u64::MAX),
             parks: AtomicU64::new(0),
         });

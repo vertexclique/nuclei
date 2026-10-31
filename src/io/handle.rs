@@ -41,7 +41,8 @@
 //! bytes go out whatever happens to the handle, as std's do: `get_mut` and
 //! `into_inner` wait until the kernel took them, and a handle dropped before
 //! that leaves its object to a task, which delivers them (for at most
-//! [`LINGER`]) and then closes it.
+//! [`LINGER`]) and then closes it. A runtime that drops waits for those tasks
+//! (see `rt::linger`), and none starts a runtime to run them.
 
 /// How long a dropped handle's unsent bytes may take to reach the kernel.
 // vertexia: one constant for every handle; a builder setting if a peer that
@@ -284,12 +285,11 @@ impl<T> Drop for Handle<T> {
         // A file's writes in flight hold leases on its descriptor; what waits
         // behind them is handed to a task, the file's state with its lease.
         if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
-            crate::runtime::spawn(async move {
+            crate::rt::linger::hand(async move {
                 let _ =
                     crate::time::timeout(LINGER, core::future::poll_fn(|cx| file.poll_flush(cx)))
                         .await;
-            })
-            .detach();
+            });
         }
         // SAFETY: taken once, here; the field is never used again.
         let io = unsafe { ManuallyDrop::take(&mut self.io) };
@@ -307,7 +307,7 @@ impl<T> Drop for Handle<T> {
         // out, and closes then: the drain needs no descriptor of its own
         // (and on Windows, closing a socket would cancel its sends).
         self.source.linger(own);
-        crate::runtime::spawn(linger(Arc::clone(&self.source), Kept::new(io))).detach();
+        crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io)));
     }
 }
 
