@@ -32,7 +32,7 @@
 mod addr;
 mod opt;
 mod released;
-mod send_file;
+pub(crate) mod send_file;
 mod socket;
 mod split;
 mod stream;

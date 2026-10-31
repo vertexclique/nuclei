@@ -40,13 +40,13 @@
 //! accepts bytes into a socket's buffer, and the driver writes it out. Those
 //! bytes go out whatever happens to the handle, as std's do: `get_mut` and
 //! `into_inner` wait until the kernel took them, and a handle dropped before
-//! that leaves its object to a task, which delivers them (for at most
-//! [`LINGER`]) and then closes it. A runtime that drops waits for those tasks
-//! (see `rt::linger`), and none starts a runtime to run them.
+//! that leaves its object to a task, which delivers them (for at most the
+//! runtime's [`write_behind_linger`](crate::runtime::Builder::write_behind_linger))
+//! and then closes it. A runtime that drops waits for those tasks (see
+//! `rt::linger`), and none starts a runtime to run them.
 
-/// How long a dropped handle's unsent bytes may take to reach the kernel.
-// vertexia: one constant for every handle; a builder setting if a peer that
-// never reads must be given up on sooner or later.
+/// How long a dropped handle's unsent bytes may take to reach the kernel, by
+/// default (see [`Builder::write_behind_linger`](crate::runtime::Builder::write_behind_linger)).
 pub(crate) const LINGER: Duration = Duration::from_secs(60);
 
 use core::fmt;
@@ -258,19 +258,19 @@ impl<T> Handle<T> {
 }
 
 impl<T> Handle<T> {
-    /// Waits until the kernel took what the write-behind holds (or
-    /// [`LINGER`] passed): on a shard, its other tasks run meanwhile.
+    /// Waits until the kernel took what the write-behind holds (or the
+    /// runtime's linger passed): on a shard, its other tasks run meanwhile.
     fn deliver_unsent(&self) {
         if self.source.has_unsent() {
             let source = &self.source;
             let _ = crate::sync::internal::blocking(crate::time::timeout(
-                LINGER,
+                crate::rt::linger::time(),
                 core::future::poll_fn(|cx| source.poll_drain(cx)),
             ));
         }
         if let Some(file) = self.file.get().filter(|f| f.has_unsent()) {
             let _ = crate::sync::internal::blocking(crate::time::timeout(
-                LINGER,
+                crate::rt::linger::time(),
                 core::future::poll_fn(|cx| file.poll_flush(cx)),
             ));
         }
@@ -286,9 +286,11 @@ impl<T> Drop for Handle<T> {
         // behind them is handed to a task, the file's state with its lease.
         if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
             crate::rt::linger::hand(async move {
-                let _ =
-                    crate::time::timeout(LINGER, core::future::poll_fn(|cx| file.poll_flush(cx)))
-                        .await;
+                let _ = crate::time::timeout(
+                    crate::rt::linger::time(),
+                    core::future::poll_fn(|cx| file.poll_flush(cx)),
+                )
+                .await;
             });
         }
         // SAFETY: taken once, here; the field is never used again.
@@ -314,7 +316,8 @@ impl<T> Drop for Handle<T> {
 /// Delivers what a dropped handle's write-behind holds through `kept`, its
 /// object itself, then closes it.
 async fn linger(source: Arc<Source>, kept: Kept) {
-    let _ = crate::time::timeout(LINGER, core::future::poll_fn(|cx| source.poll_drain(cx))).await;
+    let drain = core::future::poll_fn(|cx| source.poll_drain(cx));
+    let _ = crate::time::timeout(crate::rt::linger::time(), drain).await;
     source.close(kept);
 }
 

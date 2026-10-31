@@ -35,6 +35,7 @@ use super::task::{self, Task};
 use super::workers::{Start, Workers};
 
 mod enter;
+pub(crate) mod io_knobs;
 mod knobs;
 mod panic;
 pub use self::enter::{EnterGuard, RuntimeId, TryCurrentError, worker_index};
@@ -70,6 +71,8 @@ pub(crate) struct Inner {
     rng_seed: Option<RngSeed>,
     /// What dropped handles left to finish, once no worker takes it.
     lingering: super::linger::Lingering,
+    /// What the runtime's handles read of its builder.
+    pub(crate) io: io_knobs::IoKnobs,
 }
 
 /// Builds a [`Runtime`]. Every setting is optional: an unset one takes the
@@ -98,6 +101,7 @@ pub struct Builder {
     task_hooks: super::tuning::TaskHooks,
     unhandled_panic: UnhandledPanic,
     rng_seed: Option<RngSeed>,
+    io: io_knobs::IoSettings,
 }
 
 impl Default for Builder {
@@ -152,7 +156,7 @@ impl Builder {
                 format_args!("at least {MIN_HANDOFF:?}, or None"),
             ));
         }
-        Ok(())
+        self.io.validate()
     }
 
     /// A builder with every setting at its default.
@@ -175,6 +179,7 @@ impl Builder {
             task_hooks: super::tuning::TaskHooks::default(),
             unhandled_panic: UnhandledPanic::Ignore,
             rng_seed: None,
+            io: io_knobs::IoSettings::default(),
         }
     }
 
@@ -405,6 +410,7 @@ impl Builder {
                 rng_seed: self.rng_seed,
                 guests: kovan_map::HashMap::with_capacity(GUESTS_CAPACITY),
                 lingering: super::linger::Lingering::new(),
+                io: self.io.resolve(),
             }
         });
         inner.pool.set_owner(Arc::downgrade(&inner));
@@ -535,7 +541,7 @@ impl Runtime {
             return;
         }
         if !self.inner.lingers_done() {
-            let linger = std::time::Instant::now() + crate::io::handle::LINGER;
+            let linger = std::time::Instant::now() + self.inner.io.linger;
             let deadline = deadline.map_or(linger, |d| d.min(linger));
             let _ = block_on_here(
                 &self.inner,

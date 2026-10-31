@@ -277,7 +277,9 @@ impl Handle<TcpStream> {
     /// resolve to it. So a peer that writes before it reads cannot hold the write up, and writes
     /// pipeline: the next one may start while earlier buffers are still out.
     ///
-    /// A write of less than 1 MiB, where copying costs less, and every write on epoll, kqueue,
+    /// A write of less than the runtime's
+    /// [`zero_copy_threshold`](crate::runtime::Builder::zero_copy_threshold) (1 MiB by default),
+    /// where copying costs less, and every write on epoll, kqueue,
     /// I/O completion ports or an io_uring kernel without zero-copy sends (or without memory it
     /// may lock for them), is copied by the kernel as `write_owned`'s is, and its `Released` is
     /// ready at once. So is a write served by a ring only its own thread may reap: a thread's own

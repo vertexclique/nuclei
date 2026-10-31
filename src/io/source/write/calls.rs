@@ -132,7 +132,7 @@ impl Source {
     }
 
     /// Writes all of `buf` as [`write_owned`](Self::write_owned) does, the ring sending its large
-    /// chunks zero-copy (see `ring::zero_copy_worth`): the write ends once the kernel took the
+    /// chunks zero-copy (see `RingIssuer::zero_copy`): the write ends once the kernel took the
     /// last byte, and the buffer comes back through the [`Released`](crate::net::Released) once
     /// the kernel let go of every byte. A write the kernel copies has its buffer back at once.
     pub(crate) async fn write_zero_copy(
@@ -140,7 +140,7 @@ impl Source {
         buf: Vec<u8>,
     ) -> (io::Result<usize>, crate::net::Released) {
         #[cfg(ring)]
-        if super::super::ring::zero_copy_worth(self.kind, buf.len()) {
+        if self.kind == Kind::Tcp {
             let mut op = WriteOwned {
                 source: self,
                 held: Held::of(buf),

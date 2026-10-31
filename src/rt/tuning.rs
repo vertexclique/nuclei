@@ -32,6 +32,10 @@ pub(crate) struct Tuning {
     /// Jobs in flight on the runtime's blocking pool: while any is, a shard that
     /// runs dry spins, as one of them may wake it.
     pub(crate) blocking: Option<Arc<crate::sync::internal::AtomicUsize>>,
+    /// The least a zero-copy write must have left for a send of it to go
+    /// zero-copy on the worker's ring.
+    #[cfg(ring)]
+    pub(crate) zero_copy_min: usize,
 }
 
 impl Default for Tuning {
@@ -44,6 +48,8 @@ impl Default for Tuning {
             lifo: true,
             hooks: ThreadHooks::default(),
             blocking: None,
+            #[cfg(ring)]
+            zero_copy_min: crate::io::source::ring::SEND_ZC_MIN,
         }
     }
 }

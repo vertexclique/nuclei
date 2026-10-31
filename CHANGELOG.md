@@ -55,6 +55,11 @@
 
 ### Added
 
+- **IO settings on the builder**: `write_behind_linger` (how long a dropped handle's bytes may
+  take, 60 s by default, more than zero), `zero_copy_threshold` (the least a `write_zero_copy`
+  must have left for a zero-copy send, 1 MiB by default) and `send_file_chunk` (the most one call
+  of a `send_file` sends, 1 MiB by default, from 1 to `0x7ffff000` bytes). Each is read once, as
+  the runtime builds.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.

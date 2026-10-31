@@ -642,6 +642,10 @@ impl Shard {
         monitor: Option<Arc<super::handoff::Monitor>>,
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
+        #[cfg(ring)]
+        if let Some(ring) = shard.ring() {
+            ring.set_zero_copy_min(tuning.zero_copy_min);
+        }
         shard.tuning = tuning;
         shard.monitor = monitor;
         Ok(shard)
