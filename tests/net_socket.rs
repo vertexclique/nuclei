@@ -1,10 +1,13 @@
 //! `nuclei::net`'s socket builders: `TcpSocket`'s options read back as
 //! set, its bind, listen and connect, a socket taken from std, a stream's
-//! linger, and `UnixSocket`'s three ends.
+//! linger, TCP's keepalive timing, user timeout and server options on a
+//! socket and on a stream (`Unsupported` where the system has none), and
+//! `UnixSocket`'s three ends.
 
+use std::io::ErrorKind;
 use std::time::Duration;
 
-use nuclei::net::{TcpListener, TcpSocket, TcpStream};
+use nuclei::net::{TcpKeepalive, TcpListener, TcpSocket, TcpStream};
 
 /// A listener and a connected pair on loopback.
 async fn pair() -> (TcpListener, TcpStream, TcpStream) {
@@ -138,6 +141,169 @@ fn a_stream_lingers_as_set() {
         assert_eq!(server.linger().unwrap(), Some(Duration::ZERO));
         client.set_linger(None).unwrap();
         assert_eq!(client.linger().unwrap(), None);
+    });
+}
+
+/// Whether the system has TCP keepalive timing options.
+const KEEPALIVE_TIMING: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+));
+
+/// Whether the system has the options only Linux has.
+const LINUX: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+fn unsupported<T: core::fmt::Debug>(got: std::io::Result<T>) {
+    let err = got.expect_err("an option the system lacks was taken");
+    assert_eq!(err.kind(), ErrorKind::Unsupported, "{err}");
+    assert!(err.to_string().ends_with(" option"), "{err}");
+}
+
+#[test]
+fn keepalive_timing_reads_back_as_set_on_a_socket_and_a_stream() {
+    let timing = TcpKeepalive {
+        time: Some(Duration::from_secs(60)),
+        interval: Some(Duration::from_secs(10)),
+        retries: Some(5),
+    };
+    let socket = TcpSocket::new_v4().unwrap();
+    if !KEEPALIVE_TIMING {
+        unsupported(socket.set_keepalive_timing(timing));
+        unsupported(socket.keepalive_timing());
+        return;
+    }
+    socket.set_keepalive_timing(timing).unwrap();
+    assert!(socket.keepalive().unwrap());
+    assert_eq!(socket.keepalive_timing().unwrap(), timing);
+    // A part of a second counts as one more; a field left out keeps its value.
+    socket
+        .set_keepalive_timing(TcpKeepalive {
+            time: Some(Duration::from_millis(1500)),
+            ..TcpKeepalive::default()
+        })
+        .unwrap();
+    assert_eq!(
+        socket.keepalive_timing().unwrap(),
+        TcpKeepalive {
+            time: Some(Duration::from_secs(2)),
+            ..timing
+        }
+    );
+    let err = socket
+        .set_keepalive_timing(TcpKeepalive {
+            interval: Some(Duration::from_secs(u64::MAX)),
+            ..TcpKeepalive::default()
+        })
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    nuclei::block_on(async {
+        let (_listener, client, _server) = pair().await;
+        client.set_keepalive_timing(timing).unwrap();
+        assert_eq!(client.keepalive_timing().unwrap(), timing);
+    });
+}
+
+#[test]
+fn the_user_timeout_reads_back_as_set_where_the_system_has_it() {
+    let socket = TcpSocket::new_v4().unwrap();
+    if !LINUX {
+        unsupported(socket.set_user_timeout(Some(Duration::from_secs(1))));
+        unsupported(socket.user_timeout());
+        nuclei::block_on(async {
+            let (_listener, client, _server) = pair().await;
+            unsupported(client.set_user_timeout(None));
+            unsupported(client.user_timeout());
+            unsupported(client.set_quickack(true));
+            unsupported(client.quickack());
+        });
+        return;
+    }
+    assert_eq!(socket.user_timeout().unwrap(), None);
+    socket
+        .set_user_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    assert_eq!(
+        socket.user_timeout().unwrap(),
+        Some(Duration::from_millis(1500))
+    );
+    // A part of a millisecond counts as one more; None gives it back to the system.
+    socket
+        .set_user_timeout(Some(Duration::from_nanos(1)))
+        .unwrap();
+    assert_eq!(
+        socket.user_timeout().unwrap(),
+        Some(Duration::from_millis(1))
+    );
+    socket.set_user_timeout(None).unwrap();
+    assert_eq!(socket.user_timeout().unwrap(), None);
+    let err = socket
+        .set_user_timeout(Some(Duration::from_secs(u64::MAX)))
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    nuclei::block_on(async {
+        let (_listener, client, _server) = pair().await;
+        client
+            .set_user_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(client.user_timeout().unwrap(), Some(Duration::from_secs(3)));
+        client.set_quickack(false).unwrap();
+        assert!(!client.quickack().unwrap());
+        client.set_quickack(true).unwrap();
+        assert!(client.quickack().unwrap());
+    });
+}
+
+#[test]
+fn server_options_read_back_as_set_where_the_system_has_them() {
+    let socket = TcpSocket::new_v4().unwrap();
+    if LINUX {
+        assert_eq!(socket.incoming_cpu().unwrap(), None);
+        socket.set_incoming_cpu(0).unwrap();
+        assert_eq!(socket.incoming_cpu().unwrap(), Some(0));
+        assert_eq!(socket.defer_accept().unwrap(), None);
+        socket
+            .set_defer_accept(Some(Duration::from_secs(5)))
+            .unwrap();
+        // The kernel rounds the wait up to its retransmission steps.
+        let wait = socket.defer_accept().unwrap().unwrap();
+        assert!(wait >= Duration::from_secs(5), "{wait:?}");
+        socket.set_defer_accept(None).unwrap();
+        assert_eq!(socket.defer_accept().unwrap(), None);
+        socket.set_fastopen(16).unwrap();
+        assert_eq!(socket.fastopen().unwrap(), 16);
+    } else {
+        unsupported(socket.set_incoming_cpu(0));
+        unsupported(socket.incoming_cpu());
+        unsupported(socket.set_defer_accept(Some(Duration::from_secs(1))));
+        unsupported(socket.defer_accept());
+        // A fast open the system turned off is the kernel's answer to give, not nuclei's.
+        match socket.set_fastopen(1) {
+            Ok(()) => assert_eq!(socket.fastopen().unwrap(), 1),
+            Err(err) => assert!(!err.to_string().ends_with(" option"), "{err}"),
+        }
+    }
+    // IPv6 may be off on the host: its options are checked only if it is on.
+    if let Ok(v6) = TcpSocket::new_v6() {
+        for only in [true, false] {
+            v6.set_only_v6(only).unwrap();
+            assert_eq!(v6.only_v6().unwrap(), only);
+        }
+    }
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    let listener = socket.listen(16).unwrap();
+    nuclei::block_on(async {
+        let client = TcpStream::connect(addr).await.unwrap();
+        client.send(b"hi").await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2];
+        let mut got = 0;
+        while got < 2 {
+            got += server.recv(&mut buf[got..]).await.unwrap();
+        }
+        assert_eq!(&buf, b"hi");
     });
 }
 

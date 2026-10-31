@@ -35,9 +35,11 @@ pub(crate) mod opt;
 mod released;
 pub(crate) mod send_file;
 mod socket;
+mod sockopt;
 mod split;
 mod stream;
 mod tcp;
+mod tcp_options;
 mod udp;
 #[cfg(unix)]
 pub mod unix;
@@ -46,11 +48,12 @@ mod unix_socket;
 
 pub use self::addr::{ToSocketAddrs, lookup_host};
 pub use self::released::Released;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use self::socket::DeviceName;
 pub use self::socket::TcpSocket;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use self::sockopt::DeviceName;
 pub use self::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};
 pub use self::tcp::TcpStreamGenerator;
+pub use self::tcp_options::TcpKeepalive;
 #[cfg(unix)]
 pub use self::unix_socket::UnixSocket;
 

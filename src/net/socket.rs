@@ -42,30 +42,7 @@ pub struct TcpSocket {
     nonblocking: bool,
 }
 
-/// A network interface's name, as `bind_device` takes it: up to 16 bytes,
-/// held in place.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct DeviceName {
-    bytes: [u8; libc::IFNAMSIZ],
-    len: u8,
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl core::ops::Deref for DeviceName {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl core::fmt::Debug for DeviceName {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:?}", String::from_utf8_lossy(self))
-    }
-}
+super::sockopt::socket_options!(TcpSocket);
 
 impl TcpSocket {
     /// A new IPv4 TCP socket.
@@ -93,7 +70,7 @@ impl TcpSocket {
         })
     }
 
-    fn raw(&self) -> Raw {
+    pub(super) fn raw(&self) -> Raw {
         raw_of(&self.socket)
     }
 
@@ -112,52 +89,6 @@ impl TcpSocket {
     /// Whether `SO_KEEPALIVE` is set.
     pub fn keepalive(&self) -> io::Result<bool> {
         opt::flag(self.raw(), opt::SOL_SOCKET, opt::SO_KEEPALIVE)
-    }
-
-    /// Sets `SO_REUSEADDR`: the socket may bind an address still held by a
-    /// connection that is closing.
-    pub fn set_reuseaddr(&self, reuseaddr: bool) -> io::Result<()> {
-        opt::set_flag(self.raw(), opt::SOL_SOCKET, opt::SO_REUSEADDR, reuseaddr)
-    }
-
-    /// Whether `SO_REUSEADDR` is set.
-    pub fn reuseaddr(&self) -> io::Result<bool> {
-        opt::flag(self.raw(), opt::SOL_SOCKET, opt::SO_REUSEADDR)
-    }
-
-    /// Sets `SO_REUSEPORT`: several sockets may bind the same address and
-    /// port, and the system shares the connections among them.
-    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
-    pub fn set_reuseport(&self, reuseport: bool) -> io::Result<()> {
-        opt::set_flag(self.raw(), opt::SOL_SOCKET, opt::SO_REUSEPORT, reuseport)
-    }
-
-    /// Whether `SO_REUSEPORT` is set.
-    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
-    pub fn reuseport(&self) -> io::Result<bool> {
-        opt::flag(self.raw(), opt::SOL_SOCKET, opt::SO_REUSEPORT)
-    }
-
-    /// Sets the size of the system's send buffer (`SO_SNDBUF`); the system
-    /// may round it (Linux doubles it).
-    pub fn set_send_buffer_size(&self, size: u32) -> io::Result<()> {
-        opt::set_size(self.raw(), opt::SOL_SOCKET, opt::SO_SNDBUF, size)
-    }
-
-    /// The size of the system's send buffer (`SO_SNDBUF`).
-    pub fn send_buffer_size(&self) -> io::Result<u32> {
-        opt::size(self.raw(), opt::SOL_SOCKET, opt::SO_SNDBUF)
-    }
-
-    /// Sets the size of the system's receive buffer (`SO_RCVBUF`); the
-    /// system may round it (Linux doubles it).
-    pub fn set_recv_buffer_size(&self, size: u32) -> io::Result<()> {
-        opt::set_size(self.raw(), opt::SOL_SOCKET, opt::SO_RCVBUF, size)
-    }
-
-    /// The size of the system's receive buffer (`SO_RCVBUF`).
-    pub fn recv_buffer_size(&self) -> io::Result<u32> {
-        opt::size(self.raw(), opt::SOL_SOCKET, opt::SO_RCVBUF)
     }
 
     /// Sets `SO_LINGER`: with `Some(time)` a close waits up to `time` (whole
@@ -187,84 +118,6 @@ impl TcpSocket {
     /// Whether `TCP_NODELAY` is set.
     pub fn nodelay(&self) -> io::Result<bool> {
         self.as_std().nodelay()
-    }
-
-    /// Sets the type of service of the socket's IPv4 packets (`IP_TOS`).
-    pub fn set_tos(&self, tos: u32) -> io::Result<()> {
-        let tos = opt::Int::try_from(tos).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the type of service is out of range",
-            )
-        })?;
-        opt::set(self.raw(), opt::IPPROTO_IP, opt::IP_TOS, tos)
-    }
-
-    /// The type of service of the socket's IPv4 packets (`IP_TOS`).
-    pub fn tos(&self) -> io::Result<u32> {
-        opt::size(self.raw(), opt::IPPROTO_IP, opt::IP_TOS)
-    }
-
-    /// Sets the traffic class of the socket's IPv6 packets (`IPV6_TCLASS`).
-    #[cfg(unix)]
-    pub fn set_tclass_v6(&self, tclass: u32) -> io::Result<()> {
-        let tclass = opt::Int::try_from(tclass).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the traffic class is out of range",
-            )
-        })?;
-        opt::set(self.raw(), opt::IPPROTO_IPV6, opt::IPV6_TCLASS, tclass)
-    }
-
-    /// The traffic class of the socket's IPv6 packets (`IPV6_TCLASS`).
-    #[cfg(unix)]
-    pub fn tclass_v6(&self) -> io::Result<u32> {
-        opt::size(self.raw(), opt::IPPROTO_IPV6, opt::IPV6_TCLASS)
-    }
-
-    /// Binds the socket to the network interface named `interface`
-    /// (`SO_BINDTODEVICE`), or, with `None`, to none.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn bind_device(&self, interface: Option<&[u8]>) -> io::Result<()> {
-        let name = interface.unwrap_or_default();
-        // SAFETY: the option takes the name's bytes as they are.
-        unsafe {
-            opt::set_raw(
-                self.raw(),
-                opt::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                name.as_ptr(),
-                name.len(),
-            )
-        }
-    }
-
-    /// The network interface the socket is bound to, if any
-    /// (`SO_BINDTODEVICE`).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn device(&self) -> io::Result<Option<DeviceName>> {
-        let mut name = DeviceName {
-            bytes: [0; libc::IFNAMSIZ],
-            len: 0,
-        };
-        // SAFETY: the kernel writes at most the buffer's length.
-        let len = unsafe {
-            opt::get_raw(
-                self.raw(),
-                opt::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                name.bytes.as_mut_ptr(),
-                name.bytes.len(),
-            )?
-        };
-        // The kernel counts the name's terminating zero.
-        let len = name.bytes[..len.min(name.bytes.len())]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(len.min(name.bytes.len()));
-        name.len = len as u8;
-        Ok((len > 0).then_some(name))
     }
 
     /// The address the socket is bound to.

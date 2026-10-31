@@ -76,6 +76,11 @@
   must have left for a zero-copy send, 1 MiB by default) and `send_file_chunk` (the most one call
   of a `send_file` sends, 1 MiB by default, from 1 to `0x7ffff000` bytes). Each is read once, as
   the runtime builds.
+- **TCP options**: `TcpKeepalive { time, interval, retries }` with `set_keepalive_timing` and
+  `keepalive_timing` on `TcpSocket` and `TcpStream`; `TcpSocket::set_incoming_cpu`,
+  `set_user_timeout`, `set_only_v6`, `set_fastopen` and `set_defer_accept`, and
+  `TcpStream::set_quickack` and `set_user_timeout`, each with its getter. An option the system
+  does not have answers `Unsupported`.
 - **A TLA+ model of the cadence** (`proofs/tla/cadence`): the wait of a queued operation is bounded
   whatever mix of quick, slow and long tasks runs; removing the new runner's first drive or the time
   bound each breaks it.

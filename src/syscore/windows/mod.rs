@@ -190,6 +190,13 @@ pub(crate) const SOCK_DGRAM: i32 = 2;
 pub(crate) const SOCK_RAW: i32 = 3;
 pub(crate) const SOCK_RDM: i32 = 4;
 pub(crate) const IPPROTO_TCP: i32 = 6;
+pub(crate) const IPPROTO_IPV6: i32 = 41;
+pub(crate) const IPV6_V6ONLY: i32 = 27;
+/// Seconds idle before the first keepalive probe (Windows 10 1709 on).
+pub(crate) const TCP_KEEPALIVE: i32 = 3;
+pub(crate) const TCP_FASTOPEN: i32 = 15;
+pub(crate) const TCP_KEEPCNT: i32 = 16;
+pub(crate) const TCP_KEEPINTVL: i32 = 17;
 pub(crate) const SOL_SOCKET: i32 = 0xFFFF;
 pub(crate) const SO_TYPE: i32 = 0x1008;
 pub(crate) const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
