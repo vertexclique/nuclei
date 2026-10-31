@@ -729,19 +729,26 @@ impl ShardRing {
     /// `op` ended with `res`: its slot is named once less, and its source
     /// gets the completion.
     fn end(&self, shard: Option<&Shard>, op: RingOp, res: i32) {
+        let RingOp {
+            source,
+            file,
+            epoch,
+            read,
+            mem,
+        } = op;
         #[cfg(test)]
-        if res == -libc::ENOBUFS && matches!(op.mem, RingMem::RecvMulti { .. }) {
+        if res == -libc::ENOBUFS && matches!(mem, RingMem::RecvMulti { .. }) {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed, arrived, dry + 1));
         }
-        let kind = op.source.kind();
-        let outcome = op.mem.complete(res, kind);
-        self.hand_over(shard, &op.source, op.file, op.epoch, op.read, outcome);
+        let outcome = mem.complete(res, source.kind());
+        self.hand_over(shard, &source, file, epoch, read, outcome);
     }
 
     /// An operation of `source` on slot `file`, issued in `epoch` for its read side (`read`) or
     /// its write side, ended for that side with `outcome`: the slot is named once less, and the
     /// side gets the completion.
+    #[inline]
     fn hand_over(
         &self,
         shard: Option<&Shard>,

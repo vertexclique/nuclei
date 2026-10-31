@@ -125,6 +125,7 @@ pub(crate) fn zc_outcome(res: i32) -> Outcome {
 
 /// The kernel's answer `res` (a count, or a negated errno) to an operation
 /// that takes bytes or gives a descriptor.
+#[inline]
 fn answer(res: i32) -> Answer<usize> {
     match res {
         r if r == -libc::ECANCELED => Answer::Undone { not_ready: false },
@@ -153,8 +154,34 @@ impl RingMem {
     }
 
     /// The completion of an operation of a source of `kind`, whose kernel
-    /// answer is `res`.
+    /// answer is `res`. The streams' hot ends are inline here; the rest is
+    /// [`complete_rest`](Self::complete_rest).
+    #[inline]
     pub(crate) fn complete(self, res: i32, kind: Kind) -> Outcome {
+        match self {
+            RingMem::Recv(mut buf) => {
+                let answer = answer(res);
+                if let Answer::Done(Ok(n)) = answer {
+                    buf.set_filled(n);
+                }
+                Outcome::Recv(buf, answer)
+            }
+            RingMem::Send(buf) => Outcome::Send(buf, answer(res)),
+            RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
+            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => Outcome::RecvMultiEnd {
+                // A group with no buffer left gives the receive back undone.
+                answer: match res {
+                    r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
+                    r => answer(r),
+                },
+                dry: res == -libc::ENOBUFS,
+            },
+            rest => rest.complete_rest(res, kind),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_rest(self, res: i32, kind: Kind) -> Outcome {
         match self {
             RingMem::Ready => Outcome::Ready(match answer(res) {
                 Answer::Done(result) => Answer::Done(result.map(drop)),
@@ -172,13 +199,6 @@ impl RingMem {
                 }
                 Answer::Undone { not_ready } => Answer::Undone { not_ready },
             }),
-            RingMem::Recv(mut buf) => {
-                let answer = answer(res);
-                if let Answer::Done(Ok(n)) = answer {
-                    buf.set_filled(n);
-                }
-                Outcome::Recv(buf, answer)
-            }
             RingMem::AcceptMulti { .. } => Outcome::AcceptMultiEnd(match res {
                 // Its last connection came as an arrival.
                 r if r >= 0 => Answer::Done(Ok(())),
@@ -191,14 +211,6 @@ impl RingMem {
                     Answer::Undone { not_ready } => Answer::Undone { not_ready },
                 },
             }),
-            RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. } => Outcome::RecvMultiEnd {
-                // A group with no buffer left gives the receive back undone.
-                answer: match res {
-                    r if r == -libc::ENOBUFS => Answer::Undone { not_ready: false },
-                    r => answer(r),
-                },
-                dry: res == -libc::ENOBUFS,
-            },
             RingMem::RecvLent(mut buf) => {
                 let answer = answer(res);
                 if let Answer::Done(Ok(n)) = answer {
@@ -243,13 +255,16 @@ impl RingMem {
                     _ => Answer::Done(Ok(())),
                 },
             ),
-            RingMem::Send(buf) => Outcome::Send(buf, answer(res)),
-            RingMem::SendLent(buf) => Outcome::SendLent(buf, answer(res)),
             RingMem::SendTo(_, buf, target) => Outcome::SendTo(buf, target, answer(res)),
             RingMem::SendLentTo(_, buf) => Outcome::SendLentTo(buf, answer(res)),
             RingMem::SendPinned(_) | RingMem::SendZc { .. } | RingMem::ZcHeld(_) => {
                 Outcome::SendPinned(answer(res))
             }
+            RingMem::Recv(_)
+            | RingMem::Send(_)
+            | RingMem::SendLent(_)
+            | RingMem::RecvMulti { .. }
+            | RingMem::RecvFromMulti { .. } => self.complete(res, kind),
         }
     }
 }
