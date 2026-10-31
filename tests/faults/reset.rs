@@ -157,8 +157,12 @@ pub async fn reset_during_a_read<S: Stream>() {
         let bytes = pattern(sent as u64 + 1, sent);
         for how in READERS {
             let want = oracle_reset_then_read::<S>(&bytes, 4096);
+            let what = format!(
+                "{}: a {how:?} read out, then {sent} bytes and a reset",
+                S::NAME
+            );
             let (ours, peer) = S::pair(false);
-            write_all(&ours, UNREAD).await.unwrap();
+            within(&what, write_all(&ours, UNREAD)).await.unwrap();
             let (go, wait) = mpsc::channel::<()>();
             let to_send = bytes.clone();
             let peer = std::thread::spawn(move || {
@@ -167,10 +171,6 @@ pub async fn reset_during_a_read<S: Stream>() {
                 peer.write_all(&to_send).unwrap();
                 S::reset(peer);
             });
-            let what = format!(
-                "{}: a {how:?} read out, then {sent} bytes and a reset",
-                S::NAME
-            );
             let mut reading = pin!(read_to_end_as(&ours, how, 4096));
             let early = poll_fn(|cx| Poll::Ready(reading.as_mut().poll(cx))).await;
             assert!(

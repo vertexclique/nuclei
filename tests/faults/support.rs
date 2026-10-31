@@ -42,6 +42,16 @@ pub async fn within<F: Future>(what: &str, fut: F) -> F::Output {
     }
 }
 
+/// A round of [`holds_steady`]: bounded at twice [`DEADLINE`], so a step of
+/// it that waits for good fails first, under its own [`within`] and its own
+/// name, rather than the round under the case's.
+async fn round_of<F: Future>(name: &str, round: F) -> F::Output {
+    match nuclei::time::timeout(DEADLINE * 2, round).await {
+        Ok(out) => out,
+        Err(_) => panic!("{name}: a round took longer than {:?}", DEADLINE * 2),
+    }
+}
+
 /// Waits in a task until `done` holds, with a growing pause, and fails
 /// naming `what` past [`DEADLINE`]; the shard runs its other work meanwhile.
 pub async fn until(what: &str, mut done: impl FnMut() -> bool) {
@@ -1027,7 +1037,7 @@ where
         .build()
         .unwrap();
     for _ in 0..2 {
-        rt.block_on(within(name, case()));
+        rt.block_on(round_of(name, case()));
     }
     rt.block_on(round_trip());
     let settle = |before: Option<Held>| {
@@ -1056,7 +1066,7 @@ where
         || (held.len() < 2 + MORE_RUNS && grew(&held[held.len() - 2], &held[held.len() - 1]))
     {
         for _ in 0..rounds {
-            rt.block_on(within(name, case()));
+            rt.block_on(round_of(name, case()));
         }
         held.push(settle(held.last().copied()));
     }
