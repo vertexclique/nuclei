@@ -642,6 +642,37 @@ fn a_revival_with_another_descriptor_discards_the_old_ones_results() {
     drop((a1, a2, b2));
 }
 
+/// As the test above, on a stream that may read straight into the caller's buffer instead of
+/// ahead: only the old socket's bytes never come after the swap.
+#[test]
+fn a_revival_with_another_descriptor_reads_only_the_new_ones_bytes() {
+    let rt = runtime(None);
+    let (a1, b1) = stream_pair();
+    let (a2, b2) = stream_pair();
+    adopt(&b1);
+    adopt(&b2);
+    let src = Source::new(b1.raw(), STREAM);
+    rt.block_on(async {
+        let mut buf = [0u8; 8];
+        let mut waiting = Box::pin(read(&src, &mut buf));
+        pends(&mut waiting).await;
+        drop(waiting);
+        (&a1).write_all(b"old!").unwrap();
+        crate::time::sleep(Duration::from_millis(10)).await;
+    });
+    src.retire();
+    drop(b1);
+    src.revive(b2.raw());
+    (&a2).write_all(b"new").unwrap();
+    rt.block_on(async {
+        let mut buf = [0u8; 8];
+        let n = within(read(&src, &mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"new");
+    });
+    src.retire();
+    drop((a1, a2, b2));
+}
+
 /// A source revived with its own descriptor (a `get_mut` that changed
 /// nothing) keeps what it read ahead.
 #[test]
@@ -657,6 +688,29 @@ fn a_revival_with_the_same_descriptor_keeps_the_read_ahead() {
         a.io().write_all(b"ahead").unwrap();
         crate::time::sleep(Duration::from_millis(10)).await;
         assert!(b.src.has_read_ahead());
+    });
+    b.src.retire();
+    b.src.revive(b.io().raw());
+    rt.block_on(async {
+        let mut buf = [0u8; 8];
+        let n = within(read(&b.src, &mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"ahead");
+    });
+}
+
+/// As the test above, on a stream that may read straight into the caller's buffer instead of
+/// ahead: the bytes that came before the revival are read after it.
+#[test]
+fn a_revival_with_the_same_descriptor_reads_the_bytes_before_it() {
+    let rt = runtime(None);
+    let (a, b) = pair();
+    rt.block_on(async {
+        let mut buf = [0u8; 8];
+        let mut waiting = Box::pin(read(&b.src, &mut buf));
+        pends(&mut waiting).await;
+        drop(waiting);
+        a.io().write_all(b"ahead").unwrap();
+        crate::time::sleep(Duration::from_millis(10)).await;
     });
     b.src.retire();
     b.src.revive(b.io().raw());
