@@ -157,6 +157,10 @@ jobs:
       - name: valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
 
+      # The budgets hold for one compiler: its inlining moves rows. This is the latest stable.
+      - name: compiler
+        run: rustc -Vv
+
       - name: op counts
         run: bash ci/op_counts.sh
 
