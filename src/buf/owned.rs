@@ -191,10 +191,53 @@ where
 /// larger than they were for a vector: any other buffer is boxed.
 pub(crate) enum OwnedBuf {
     Vec(Vec<u8>),
-    Boxed(Box<Boxed>),
+    Boxed(BoxedBuf),
 }
 
 const _: () = assert!(size_of::<OwnedBuf>() == size_of::<Vec<u8>>());
+
+/// A buffer of another type than `Vec<u8>`, boxed, and dropped out of line:
+/// its drop reaches the buffers of a vectored call, each an [`OwnedBuf`], so
+/// inline it would make every drop of an `OwnedBuf` too large to inline.
+pub(crate) struct BoxedBuf(ManuallyDrop<Box<Boxed>>);
+
+impl BoxedBuf {
+    #[inline]
+    fn new(boxed: Boxed) -> Self {
+        Self(ManuallyDrop::new(Box::new(boxed)))
+    }
+
+    /// The buffer, out of its box.
+    fn into_inner(self) -> Boxed {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so the box is taken once.
+        *unsafe { ManuallyDrop::take(&mut this.0) }
+    }
+}
+
+impl Drop for BoxedBuf {
+    #[inline(never)]
+    fn drop(&mut self) {
+        // SAFETY: dropped once, here; `into_inner` takes the box without it.
+        unsafe { ManuallyDrop::drop(&mut self.0) }
+    }
+}
+
+impl core::ops::Deref for BoxedBuf {
+    type Target = Boxed;
+
+    #[inline]
+    fn deref(&self) -> &Boxed {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for BoxedBuf {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Boxed {
+        &mut self.0
+    }
+}
 
 /// A buffer of another type than `Vec<u8>`.
 pub(crate) enum Boxed {
@@ -217,7 +260,7 @@ impl Default for OwnedBuf {
 impl OwnedBuf {
     #[inline]
     fn boxed(boxed: Boxed) -> Self {
-        OwnedBuf::Boxed(Box::new(boxed))
+        OwnedBuf::Boxed(BoxedBuf::new(boxed))
     }
 
     /// The buffer of a write; a `Vec<u8>` as it is.
@@ -304,7 +347,7 @@ impl OwnedBuf {
             Err(OwnedBuf::Boxed(boxed)) => boxed,
             Err(OwnedBuf::Vec(_)) => return B::default(),
         };
-        match *boxed {
+        match boxed.into_inner() {
             Boxed::Aligned(aligned) => cast::<AlignedBuf, B>(aligned).unwrap_or_default(),
             Boxed::Kept(AssertUnwindSafe(kept)) => {
                 let kept: Box<dyn Any> = kept;
@@ -336,9 +379,9 @@ impl OwnedBuf {
     /// The buffers of a vectored call, or the buffer itself when it is one.
     pub(crate) fn into_vectored(self) -> Result<Vectored, OwnedBuf> {
         match self {
-            OwnedBuf::Boxed(boxed) => match *boxed {
+            OwnedBuf::Boxed(boxed) => match boxed.into_inner() {
                 Boxed::Vectored(vectored) => Ok(vectored),
-                one => Err(OwnedBuf::Boxed(Box::new(one))),
+                one => Err(OwnedBuf::boxed(one)),
             },
             one => Err(one),
         }
