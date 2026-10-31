@@ -423,28 +423,28 @@ impl FileIo {
         Writing::Pool(work, bytes)
     }
 
-    /// A read at `at` into the spare capacity of a task's `buf`, after the
-    /// bytes it holds. A ring's call wakes `waker` when it ends, however
-    /// soon; the pool's job wakes the waker it is polled with.
+    /// A read at `at` into the spare capacity of the task's buffer in `held`,
+    /// after the bytes it holds; the buffer goes with the call. A ring's call
+    /// wakes `waker` when it ends, however soon; the pool's job wakes the
+    /// waker it is polled with.
     #[inline]
     pub(super) fn submit_read_owned(
         &self,
-        buf: OwnedBuf,
+        held: &mut Option<OwnedBuf>,
         at: u64,
         waker: &Waker,
     ) -> Work<(io::Result<usize>, OwnedBuf)> {
         #[cfg(ring)]
-        let buf = match self.on_ring() {
-            true => match crate::fs::ring::read_lent(&self.fd, at, buf, waker) {
-                Ok(job) => return Work::Slot(job),
-                Err(buf) => buf,
-            },
-            false => buf,
-        };
+        if self.on_ring()
+            && let Some(job) = crate::fs::ring::read_lent(&self.fd, at, held, waker)
+        {
+            return Work::Slot(job);
+        }
         #[cfg(not(ring))]
         let _ = waker;
         let fd = self.fd.clone();
-        let mut buf = match buf {
+        // An empty `held` (the caller hands its buffer in) reads into none.
+        let mut buf = match held.take().unwrap_or_default() {
             OwnedBuf::Vec(mut vec) => {
                 return Work::Pool(crate::runtime::spawn_blocking(move || {
                     let result = sys::pread_uninit(fd.raw(), vec.spare_capacity_mut(), at);

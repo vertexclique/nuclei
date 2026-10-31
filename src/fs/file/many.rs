@@ -49,7 +49,7 @@ impl FileIo {
                         ends[i] = Some((Ok(0), buf));
                         continue;
                     }
-                    out.push((i, self.submit_read_owned(buf, at, cx.waker())));
+                    out.push((i, self.submit_read_owned(&mut Some(buf), at, cx.waker())));
                 }
                 let before = out.len();
                 out.retain_mut(|(i, work)| match (work.pooled(), work.poll(cx.waker())) {
