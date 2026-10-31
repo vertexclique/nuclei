@@ -30,6 +30,7 @@ pub(super) enum Piece {
 }
 
 impl Piece {
+    #[inline]
     fn filled(&self) -> &[u8] {
         match self {
             Piece::Pool(buf) => buf.filled(),
@@ -41,6 +42,7 @@ impl Piece {
         }
     }
 
+    #[inline]
     fn consume(&mut self, n: usize) {
         match self {
             Piece::Pool(buf) => buf.consume(n),
