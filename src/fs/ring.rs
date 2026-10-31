@@ -225,11 +225,24 @@ impl FileOp {
                     self.at + *done as u64,
                 )
             }
+            FileMem::Sync { .. } | FileMem::Allocate { .. } | FileMem::SyncRange { .. } => {
+                self.call_entry(fd)
+            }
+        }
+    }
+
+    /// The entry of a call that moves no bytes (a sync, a range's space or
+    /// write-back), out of the reads' and writes' way.
+    #[cold]
+    #[inline(never)]
+    fn call_entry(&self, fd: std::os::fd::RawFd) -> Sqe {
+        match &self.mem {
             FileMem::Sync { data_only } => Sqe::fsync(fd, *data_only),
             FileMem::Allocate { len, mode } => {
                 Sqe::fallocate(fd, self.at, *len, sys::fallocate_mode(*mode) as u32)
             }
             FileMem::SyncRange { len } => Sqe::sync_file_range(fd, self.at, *len, SYNC_RANGE_FLAGS),
+            _ => Sqe::nop(),
         }
     }
 

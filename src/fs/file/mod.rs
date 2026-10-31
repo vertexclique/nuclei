@@ -623,8 +623,10 @@ impl FileState {
     /// one that failed is the file's failure, as a lent write's nobody took.
     #[inline]
     fn poll_orphans(&mut self, io: &FileIo, waker: &Waker) -> Poll<()> {
-        // The common case, no write left by its task, costs two loads.
-        if self.orphans.is_empty() && io.orphans.is_empty() {
+        // The common case, no write left by its task, costs one load: one left
+        // before this step took the state is in `orphans` already, since the
+        // side runs the deferred move before it hands the state on.
+        if self.orphans.is_empty() {
             return Poll::Ready(());
         }
         self.poll_left(io, waker)
