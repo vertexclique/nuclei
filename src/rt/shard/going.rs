@@ -166,6 +166,10 @@ impl Drop for Shard {
         // The waker a worker's loop leaves when its look after registering
         // finds it may exit: it holds the shard's `Shared`, which holds it.
         drop(self.shared.stop_waker.take());
+        // The shard-local values go while the shard can still take what they
+        // hand on: a task one wakes is dropped below, a handle's sources
+        // are let go of as any other's.
+        drop(self.locals.take());
         // The sources registered here lose their driver: each is told, and
         // registers where it is polled next.
         let gone: Vec<(u64, Arc<Source>)> = self.sources.get_mut().drain_tokens().collect();

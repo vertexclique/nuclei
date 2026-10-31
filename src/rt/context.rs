@@ -161,6 +161,34 @@ pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
     })
 }
 
+/// Runs `f` with the shard this thread runs, if any, which no other thread
+/// takes from it until `f` returns, even where a nested `block_on` in `f`
+/// polls outside the shard: the slot is pinned meanwhile (a thread nobody
+/// watches has none to pin, and its shard is never taken).
+pub(crate) fn current_pinned<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
+    /// Unpins the slot as `f` returns or unwinds, inside the shard again.
+    struct Pinned<'a>(&'a Slot);
+    impl Drop for Pinned<'_> {
+        fn drop(&mut self) {
+            self.0.unpin();
+        }
+    }
+    current(|shard| {
+        let Some(shard) = shard else {
+            return f(None);
+        };
+        let slot = HERE.with(|here| here.slot.get());
+        // SAFETY: the slot outlives the loop that set it (see `Here::slot`),
+        // and so the shard this thread is inside for the whole call: the pin
+        // keeps the monitor from taking it.
+        let _pinned = unsafe { slot.as_ref() }.map(|slot| {
+            slot.pin();
+            Pinned(slot)
+        });
+        f(Some(shard))
+    })
+}
+
 /// Runs `f` with the shard whose driver this thread may use now: the one
 /// it runs, or else its own, which no other thread ever runs.
 #[cfg(ring)]

@@ -338,7 +338,9 @@ fn take(
         old.slot.cancel();
         return None;
     }
-    if old.slot.word() != word {
+    // A shard-local value lent to the runner's code (a nested `block_on`
+    // in it went outside) keeps the shard where it is.
+    if old.slot.word() != word || old.slot.is_pinned() {
         old.slot.cancel();
         return None;
     }

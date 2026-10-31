@@ -66,6 +66,7 @@ use spin::Spin;
 
 mod children;
 mod going;
+pub(crate) mod locals;
 #[cfg(port)]
 mod port;
 mod run;
@@ -632,6 +633,8 @@ pub(crate) struct Shard {
     children: RefCell<children::Children>,
     /// Where the shard's reads land and its writes wait.
     pool: Pool,
+    /// The values of the `shard_local!` statics, on a worker's shard.
+    locals: locals::Locals,
     /// The keeper of the shard's port while the shard does not run.
     #[cfg(port)]
     keeper: RefCell<Option<Arc<port::Keeper>>>,
@@ -795,9 +798,15 @@ impl Shard {
             sources: RefCell::new(Sources::default()),
             children: RefCell::new(children::Children::default()),
             pool,
+            locals: locals::Locals::default(),
             #[cfg(port)]
             keeper: RefCell::new(None),
         })
+    }
+
+    /// The values of the `shard_local!` statics: a worker's alone.
+    pub(crate) fn locals(&self) -> Option<&locals::Locals> {
+        self.owner.get().is_some().then_some(&self.locals)
     }
 
     /// Watches `source` from now on, under a new token. The caller moved

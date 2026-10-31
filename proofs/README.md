@@ -1750,6 +1750,53 @@ drops every task by design, is not modelled.
 A handoff is one step (its claim, fence and take are `handoff`'s), and the spawners run on
 threads that run no shard.
 
+## A shard-local value across a handoff
+
+`shardlocal` (`tla/shardlocal/ShardLocal.tla`) checks a shard-local value
+(`ShardLocal::try_with` in `src/shard_local.rs`, kept in the shard's `Locals` in
+`src/rt/shard/locals.rs`) while the monitor may hand its shard to another thread
+(`current_pinned`, `current` and `poll` in `src/rt/context.rs`; the slot's `pin`, `unpin`,
+`is_pinned`, `go_out`, `come_back`, `claim`, `take` and `cancel` in `src/rt/handoff/slot.rs`; the
+monitor's `take` in `src/rt/handoff/monitor.rs`). A task's `with` comes back into the shard as
+any call into the runtime does (the word inside, then a look at the claim: a taken claim detaches
+the thread, and `with` answers its access error), pins the slot and lends the value to its
+closure, which may run a nested `block_on` whose poll goes outside the shard again; then it
+unpins and goes outside. The monitor claims, fences, reads the word again and then the pins, and
+takes only if the word is unchanged and nothing is pinned, so a value lent across a nested poll
+keeps the shard where it is. It hands the shard to the spare with a fresh slot, and the value
+goes with the shard.
+
+| property | what it says |
+|----------|--------------|
+| `ExclusiveValue` | at most one thread holds the value at any time |
+| `OneValuePerShard` | every `with` on the shard, by whichever thread runs it, gets the same value, before and after the handoff |
+| `DetachedNeverHolds` | a thread whose shard was taken never holds the value from then on |
+
+The 8 configurations, listed with their expected result in `tla/shardlocal/EXPECTED.txt`:
+
+- **1 that must pass** (`SL_safe`): thread A's two polls and two calls of `with`, one of which
+  may nest a `block_on`, while the monitor watches A's slot and may hand the shard to B, whose
+  task calls `with` too, with every property.
+- **4 mutations that must fail.** A monitor that does not look at the pins
+  (`M_no_pin_check`) takes the shard while A's nested poll is outside with the value lent, and
+  B's `with` gets it too: `ExclusiveValue`; one that looks at the pins but does not read the word
+  again (`M_no_recheck`) takes the shard from a `with` that came back in and has not pinned yet:
+  `ExclusiveValue`, so the pin does not replace the second read; a `with` that takes the value
+  without coming back into the shard (`M_no_bracket`) holds it on a thread the shard was taken
+  from: `DetachedNeverHolds`; the value kept per thread instead of in the shard
+  (`M_per_thread`) gives B's `with` another value than A's: `OneValuePerShard`.
+- **3 witnesses that must fail.** A take after a `with` let go of the value; a take cancelled
+  because the slot was pinned; B holding the value after the handoff.
+
+What the model leaves out. Every step is sequentially consistent, so the store buffer the heavy
+fence exists for is `handoff`'s; the pins are stored inside the shard before the release store of
+the word that goes outside, and the monitor reads them after its acquire load of that word, an
+order the model takes as given. The monitor takes after one look at an outside word, where the
+code waits for a streak of them, so every take the code makes is one the model makes. The shard is
+handed on once; B's task makes one poll with one `with` and no nested `block_on`, as nobody
+watches B's fresh slot. The making of the value on its first use, and its initializer using it
+(`Missing::Making`), are not modelled.
+
 ## A runtime's settings and the default runtime
 
 `builder` (`tla/builder/Builder.tla`) checks how a runtime's settings are checked and how the
