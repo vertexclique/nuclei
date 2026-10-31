@@ -91,7 +91,7 @@ fn drain_unsent(gone: &[(u64, Arc<Source>)], spawn: impl Fn(Arc<Source>)) {
 /// for at most the linger a dropped handle's bytes get.
 async fn drain(source: Arc<Source>) {
     let _ = crate::time::timeout(
-        crate::io::handle::LINGER,
+        crate::rt::linger::time(),
         poll_fn(|cx| source.poll_drain(cx)),
     )
     .await;

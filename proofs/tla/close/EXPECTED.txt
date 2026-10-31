@@ -1,0 +1,17 @@
+# configuration   spec      expected
+C_reads           Close     pass
+C_stalls          Close     pass
+M_shut_first      Close     violated:FinMeansWhole
+M_both_first      Close     violated:FinMeansWhole
+M_abort_lingers   Close     violated:AbortDoesNotDrain
+M_abort_fin       Close     violated:FinMeansWhole
+M_expiry_fin      Close     violated:FinMeansWhole
+W_reset           Close     violated:NoReset
+W_expiry          Close     violated:NoExpiry
+W_shut_waits      Close     violated:NoShutWait
+R_linux           ShutRead  pass
+R_other           ShutRead  pass
+M_keep_ahead      ShutRead  violated:AsStd
+M_drop_on_linux   ShutRead  violated:AsStd
+M_drop_first      ShutRead  violated:AsStd
+W_dropped         ShutRead  violated:NothingDropped

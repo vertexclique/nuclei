@@ -1,4 +1,4 @@
-//! The builder's sizes: a setting below what a runtime can work with makes
+//! The builder's sizes: a setting outside what a runtime can work with makes
 //! `build` fail with `InvalidInput` naming it; the boundary values start a
 //! runtime.
 
@@ -47,6 +47,12 @@ fn a_size_below_its_minimum_is_refused_naming_the_setting() {
             "handoff_after",
             base().handoff_after(Some(Duration::from_micros(999))),
         ),
+        (
+            "write_behind_linger",
+            base().write_behind_linger(Duration::ZERO),
+        ),
+        ("send_file_chunk", base().send_file_chunk(0)),
+        ("send_file_chunk", base().send_file_chunk(0x7fff_f001)),
     ];
     let least = least_cap();
     if least > 0 {
@@ -75,6 +81,11 @@ fn the_boundary_values_and_the_defaults_start_a_runtime() {
         Builder::new().worker_threads(0).max_worker_threads(0),
         base().io_buffer_cap(least_cap()),
         base().local_spawn_margin(0),
+        base().write_behind_linger(Duration::from_nanos(1)),
+        base().send_file_chunk(1),
+        base().send_file_chunk(0x7fff_f000),
+        base().zero_copy_threshold(0),
+        base().zero_copy_threshold(usize::MAX),
     ];
     for builder in accepted {
         let rt = builder.build().expect("the runtime starts");
