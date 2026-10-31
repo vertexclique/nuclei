@@ -129,6 +129,25 @@ jobs:
           PROBE_SYSTEMD_RUN: sudo systemd-run
           PROBE_SYSCTL: "1"
 
+  # Instructions per operation of each runtime row (ci/op_count), counted under cachegrind
+  # because the runners have no hardware counters, against ci/op_budget.txt: a change that
+  # makes an operation cost more user-space instructions fails here. The budgets are this
+  # runner's counts (the C library picks its copy routines per CPU model).
+  op_counts:
+    name: Op counts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: op counts
+        run: bash ci/op_counts.sh
+
   check_fmt_and_docs:
     name: Checking fmt and docs
     runs-on: ubuntu-latest
