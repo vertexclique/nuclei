@@ -478,6 +478,7 @@ impl<S> Side<S> {
     /// urgent data came): done now if the side is free, else by its holder
     /// as it lets go.
     #[cfg(readiness)]
+    #[inline]
     pub(crate) fn drive(&self, after: &mut After, hooks: &impl Hooks<S>, defer: u8) {
         let role = self.role(hooks);
         let (mut held, bits) = match self.hold_biased(role) {
