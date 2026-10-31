@@ -71,6 +71,19 @@ enum State {
     Done,
 }
 
+/// Takes timer `key` out of the wheel of `owner`'s shard if this thread runs it. Out of line, so
+/// a release of a sleep that is not armed stays small.
+#[inline(never)]
+fn remove_here(owner: &Arc<Shared>, key: TimerKey) -> bool {
+    context::current(|current| match current {
+        Some(shard) if shard.is(owner) => {
+            shard.wheel().borrow_mut().remove(key);
+            true
+        }
+        _ => false,
+    })
+}
+
 impl Sleep {
     /// The deadline.
     pub fn deadline(&self) -> Instant {
@@ -94,14 +107,7 @@ impl Sleep {
     fn release(&mut self) {
         match core::mem::replace(&mut self.state, State::Idle) {
             State::Local { owner, key } => {
-                let here = context::current(|current| match current {
-                    Some(shard) if shard.is(&owner) => {
-                        shard.wheel().borrow_mut().remove(key);
-                        true
-                    }
-                    _ => false,
-                });
-                if !here {
+                if !remove_here(&owner, key) {
                     owner.post_timer(TimerOp::Remove(key));
                 }
             }
