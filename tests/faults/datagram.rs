@@ -308,6 +308,105 @@ fn owned_receives_of_two_tasks_at_once_keep_their_own_buffers() {
     }
 }
 
+/// A wake that only says it came.
+struct Flag(AtomicBool);
+
+impl std::task::Wake for Flag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A buffer of room for any datagram, holding `mark` and a colon first.
+fn marked(mark: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 * 1024);
+    buf.extend_from_slice(&[mark, b':']);
+    buf
+}
+
+/// The owned receive of one task waits with its buffer lent while a datagram
+/// the driver received ahead (into a buffer of its own, for a borrowed
+/// receive out before) comes; a second task's owned receive then polls
+/// before the first looks again. Each gets its own buffer back, with a
+/// datagram after the bytes it held, and between them both datagrams.
+async fn owned_receives_with_a_datagram_ahead() {
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let to = rx.local_addr().unwrap();
+    let mut small = [0u8; 16];
+    let mut borrowed = pin!(rx.recv_from(&mut small));
+    let mut first = pin!(rx.recv_owned(marked(b'A')));
+    let flag = Arc::new(Flag(AtomicBool::new(false)));
+    let flagged = Waker::from(Arc::clone(&flag));
+    let quiet = Waker::noop();
+    assert!(
+        borrowed
+            .as_mut()
+            .poll(&mut Context::from_waker(quiet))
+            .is_pending(),
+        "a borrowed receive with nothing sent"
+    );
+    // The driver's receive goes to the kernel before the datagram is sent.
+    nuclei::time::sleep(Duration::from_millis(20)).await;
+    tx.send_to(b"one", to).unwrap();
+    // Polled at once, with no turn of the shard between: the datagram is in
+    // the kernel and the driver's receive has not brought it yet.
+    assert!(
+        first
+            .as_mut()
+            .poll(&mut Context::from_waker(&flagged))
+            .is_pending(),
+        "an owned receive before the driver brought the datagram"
+    );
+    until("the datagram to reach the side", || {
+        flag.0.load(Ordering::SeqCst)
+    })
+    .await;
+    let mut second = pin!(rx.recv_owned(marked(b'B')));
+    let early = second.as_mut().poll(&mut Context::from_waker(quiet));
+    tx.send_to(b"two", to).unwrap();
+    let (a, a_buf) = within("the first owned receive", first).await;
+    let (b, b_buf) = match early {
+        Poll::Ready(out) => out,
+        Poll::Pending => within("the second owned receive", second).await,
+    };
+    assert!(
+        a_buf.starts_with(b"A:"),
+        "the first task got another task's buffer back: {a:?}, {:?}",
+        String::from_utf8_lossy(&a_buf)
+    );
+    assert!(
+        b_buf.starts_with(b"B:"),
+        "the second task got another task's buffer back: {b:?}, {:?}",
+        String::from_utf8_lossy(&b_buf)
+    );
+    assert_eq!(
+        a_buf.len(),
+        a.unwrap() + 2,
+        "the first receive answered another count"
+    );
+    assert_eq!(
+        b_buf.len(),
+        b.unwrap() + 2,
+        "the second receive answered another count"
+    );
+    let mut got = [a_buf[2..].to_vec(), b_buf[2..].to_vec()];
+    got.sort();
+    assert_eq!(got, [b"one".to_vec(), b"two".to_vec()]);
+}
+
+#[test]
+fn owned_receives_with_a_datagram_ahead_keep_their_own_buffers() {
+    if alone("datagram::owned_receives_with_a_datagram_ahead_keep_their_own_buffers") {
+        let rt = runtime();
+        rt.block_on(owned_receives_with_a_datagram_ahead());
+        rt.block_on(round_trip());
+    }
+}
+
 /// A connected socket whose peer's port is closed: the send goes, and the
 /// next receive answers the refusal, as std's do.
 #[test]
@@ -439,6 +538,48 @@ mod unix {
         assert_eq!(got, sent, "{what}: the datagrams the kernel took, in order");
         if !cfg!(target_vendor = "apple") {
             assert_eq!(sent.len(), count as usize, "{what}: a send was refused");
+        }
+    }
+
+    /// Sends on a connected Unix datagram socket whose peer closed answer
+    /// each what std's do: the kernel's own error for each datagram, not an
+    /// earlier one's on a later send; a small datagram and one an owned send
+    /// lends its buffer for alike.
+    #[test]
+    fn sends_to_a_closed_unix_datagram_peer_answer_as_std() {
+        if !alone("datagram::unix::sends_to_a_closed_unix_datagram_peer_answer_as_std") {
+            return;
+        }
+        use std::os::unix::net::UnixDatagram as StdDatagram;
+        for len in [1, 16 * 1024] {
+            let bytes = vec![b'x'; len];
+            let (a, b) = StdDatagram::pair().unwrap();
+            drop(b);
+            let want: Vec<Answer> = (0..3)
+                .map(|_| Answer::of(&a.send(&bytes), |n| *n))
+                .collect();
+            let rt = runtime();
+            rt.block_on(async {
+                for owned in [false, true] {
+                    let (a, b) = UnixDatagram::pair().unwrap();
+                    drop(b);
+                    let mut got = Vec::new();
+                    for _ in 0..3 {
+                        let sent = if owned {
+                            within("a send to a closed peer", a.send_owned(bytes.clone()))
+                                .await
+                                .0
+                        } else {
+                            within("a send to a closed peer", a.send(&bytes)).await
+                        };
+                        got.push(Answer::of(&sent, |n| *n));
+                    }
+                    assert_eq!(
+                        got, want,
+                        "sends of {len} bytes to a closed peer, owned {owned}"
+                    );
+                }
+            });
         }
     }
 

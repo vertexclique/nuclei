@@ -23,6 +23,14 @@
 (* landed the cursor is the end of it, and the writer appends once more    *)
 (* after its seek to the start.                                            *)
 (*                                                                          *)
+(* Every call runs on the handle's own descriptor (src/fs/file.rs,         *)
+(* `FileIo::new`; src/io/source/requests.rs, `Lease`): no copy of it is    *)
+(* made, and every job holds a lease on the handle's object until it ran. *)
+(* Once no task borrows the handle it ends (`Ending`): dropped, it hands   *)
+(* its object over and the last lease out closes it; handed back by       *)
+(* `into_inner`, it waits until no lease is out, and the caller may close  *)
+(* the object at once. No call ever runs on a descriptor that closed.      *)
+(*                                                                          *)
 (* What is abstract: the file state's guard (a step under it runs whole), *)
 (* the write-behind (the copied write is the first, so it goes in flight  *)
 (* at once), and how much a job reads or writes (one cell).               *)
@@ -32,6 +40,7 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 CONSTANTS
     MayLeave,  \* whether a task may go away while its job is out
     Appending, \* whether the file was opened to append
+    Ending,    \* how the handle ends once no task borrows it: "none" (it outlives the run), "drop", "into_inner"
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Readers == {"r1", "r2"}
@@ -58,7 +67,10 @@ variables
     movedMid = FALSE,               \* (record) a write cut short on the ring was finished on the pool
     overwrote = FALSE,              \* (record) an append landed on a cell already written
     offEnd = FALSE,                 \* (record) an append landed and the cursor is not the end
-    pastCursor = FALSE;             \* (record) an append landed elsewhere than the cursor it was made at
+    pastCursor = FALSE,             \* (record) an append landed elsewhere than the cursor it was made at
+    objOpen = TRUE,                 \* the handle's object, its descriptor, is open
+    gone = FALSE,                   \* the handle ended (dropped, or its object handed back)
+    usedClosed = FALSE;             \* (record) a job's call ran on a descriptor that closed
 
 define
     InFlight == writing # NoJob /\ ~writing.ran
@@ -69,6 +81,9 @@ define
     \* A job its runner may make now: the pool's always, the ring's while the shard runs.
     Runs(j) == j.on = "pool" \/ ~shut
     AllDone == \A p \in Readers \cup {"writer"} : pc[p] = "Done"
+    \* The leases out: the write in flight and every read job not run yet each hold one.
+    Leases == (IF InFlight THEN 1 ELSE 0)
+              + Cardinality({r \in Readers : jobs[r] # NoJob /\ ~jobs[r].ran})
 end define;
 
 \* `poll_writes`, under the guard: a write that ran is taken out of flight, and the lent one's
@@ -106,6 +121,7 @@ P_loop:
                 \* All of the write, or the rest of one cut short; an append at the end.
                 \* MUTATION append_at_cursor: an append lands where the cursor was.
                 with cell = IF Appending /\ Mutation # "append_at_cursor" THEN size ELSE writing.at do
+                    if ~objOpen then usedClosed := TRUE; end if;
                     if Appending /\ file[cell] # 0 then overwrote := TRUE; end if;
                     if Appending /\ cell # writing.at then pastCursor := TRUE; end if;
                     file[cell] := writing.val;
@@ -115,6 +131,7 @@ P_loop:
             or
                 \* The ring's call takes only part of it: half the cell holds the value.
                 await writing.on = "ring" /\ writing.part = 0;
+                if ~objOpen then usedClosed := TRUE; end if;
                 file[writing.at] := -writing.val;
                 short := TRUE;
                 \* MUTATION no_continuation: a write cut short counts as done.
@@ -126,6 +143,7 @@ P_loop:
             end either;
         or
             with r \in {q \in Readers : jobs[q] # NoJob /\ ~jobs[q].ran /\ Runs(jobs[q])} do
+                if ~objOpen then usedClosed := TRUE; end if;
                 jobs[r].val := file[jobs[r].at] || jobs[r].ran := TRUE;
             end with;
         or
@@ -290,6 +308,32 @@ W_append_wait:
     await holder = "none" /\ ~InFlight;
     PollWrites(-1);
 end process;
+
+\* The handle's owner: once no task borrows the handle, it ends as `Ending` says.
+fair process owner = "owner"
+begin
+O_end:
+    if Ending = "none" then goto Done; end if;
+O_wait:
+    await AllDone;
+    if Ending = "drop" then
+        \* Dropped: the object goes to the source; the last lease out closes it.
+        gone := TRUE;
+        \* MUTATION close_at_drop: the descriptor closes at the drop, jobs still out on it.
+        if Mutation = "close_at_drop" then objOpen := FALSE; end if;
+    else
+        \* `into_inner`: the writes behind land and every job out ends first (the retire waits
+        \* for the leases); the caller then has its object back and may close it at once.
+        \* MUTATION into_inner_early: it hands the object back at once.
+        await Leases = 0 \/ Mutation = "into_inner_early";
+        gone := TRUE;
+        objOpen := FALSE;
+    end if;
+O_close:
+    \* The last lease of a dropped handle's object closes it.
+    await Leases = 0;
+    objOpen := FALSE;
+end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
 \* proofs/tla/run_tlc.sh runs it on a temporary copy before every check, so the tree never
@@ -318,6 +362,9 @@ NoOverwrite == ~overwrote
 \* Once an append landed and was taken, the cursor is the file's end.
 CursorAtEnd == ~offEnd
 
+\* No job's call ever runs on a descriptor that closed (or that another file took since).
+NoCallOnClosed == ~usedClosed
+
 \* `Termination` (every process ends) is the one the translator writes for the fair processes.
 
 (***************************************************************************)
@@ -337,4 +384,6 @@ NoShortWrite == ~short
 NoMovedMid == ~movedMid
 \* An append lands elsewhere than the cursor it was made at (after the seek to the start).
 NoAppendPastCursor == ~pastCursor
+\* A job is still out when the handle was dropped: the job closes its object.
+NoJobAfterDrop == ~(gone /\ Leases > 0)
 =============================================================================

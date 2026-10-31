@@ -27,8 +27,9 @@
 //! object, only through a request that needs both sides
 //! ([`requests`]): whoever holds both performs it, so it
 //! never overlaps a call of the driver, which holds a side while it makes
-//! one. A dropped handle never waits for that: if a side is held, it hands
-//! its object to the source and the last holder closes it. Retiring marks
+//! one. A dropped handle never waits for that: it hands its object to the
+//! source, which closes it once the close was performed and no lease (a call
+//! on the number away from the driver) is out. Retiring marks
 //! the source stale and deregisters it before the descriptor can change;
 //! the driver skips a stale source, and checks every event's token (slot
 //! index and generation, never a pointer) against the registration in
@@ -875,13 +876,6 @@ impl Source {
             }
             shard.release_source(token);
         }
-    }
-
-    /// A copy of the descriptor (the same open socket under another
-    /// number), close-on-exec; `None` if the process has none to spare.
-    #[cfg(unix)]
-    pub(crate) fn duplicate(&self) -> Option<std::os::fd::OwnedFd> {
-        super::sys::duplicate(self.fd().ok()?).ok()
     }
 
     /// Gives a retired source its descriptor again (the handle's IO object,
