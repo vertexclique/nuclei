@@ -1,8 +1,8 @@
 //! Our `shut` and `abort`, as the peer and our own calls see them: a shut of the writing half
 //! (or of both) delivers every byte written behind before the end, and a second one answers as
 //! std's second shutdown; reads after a shut of the reading half (or of both) answer as std's do
-//! after its shutdown, while writes go on; an abort resets the connection, where a FIN would
-//! end a cut stream as if it were whole; `into_inner` waits for the runtime's linger at most.
+//! after its shutdown, while writes go on; an abort, and a dropped stream whose linger ran out,
+//! reset the connection, where a FIN would end a cut stream as if it were whole.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -210,6 +210,53 @@ fn short_linger() -> nuclei::Runtime {
 /// default minute.
 const SHORT: Duration = Duration::from_secs(20);
 
+pub fn a_linger_that_runs_out_resets_the_connection() {
+    let want = std_reset_kind();
+    let rt = short_linger();
+    let (ours, peer) = TcpStream::pair(true);
+    let bytes = pattern(61, 4 << 20);
+    let written = bytes.clone();
+    let sent = rt.block_on(rt.spawn(async move {
+        let sent = within("filling the write-behind", fill_behind(&ours, &written)).await;
+        drop(ours);
+        sent
+    }));
+    // The peer reads nothing until the linger ran out on the runtime's worker, so the bytes
+    // behind can never all go: on unix the reset shows as the socket's error, which the peer
+    // takes without reading.
+    #[cfg(unix)]
+    {
+        let mut reset = None;
+        eventually("the reset of the linger that ran out", || {
+            reset = peer.take_error().unwrap();
+            reset.is_some()
+        });
+        let reset = reset.unwrap();
+        assert_eq!(reset.kind(), want, "{reset}");
+    }
+    let started = Instant::now();
+    drop(rt);
+    let waited = started.elapsed();
+    assert!(waited < SHORT, "the runtime's drop waited {waited:?}");
+    let mut peer = peer;
+    let (got, end) = std_read_until_end(&mut peer, 8192);
+    assert!(
+        got.len() <= sent && got == bytes[..got.len()],
+        "the peer read {} bytes not all sent, or changed",
+        got.len()
+    );
+    match end {
+        Err(err) => assert_eq!(err.kind(), want, "{err}"),
+        // The reset was taken above: the end may follow what came before it. Elsewhere a peer
+        // that read the end got every byte, the linger having drained once it read.
+        Ok(_) => assert!(
+            cfg!(unix) || got.len() == sent,
+            "the peer read the end after {} of {sent} bytes",
+            got.len()
+        ),
+    }
+}
+
 pub fn into_inner_waits_at_most_the_linger() {
     let rt = short_linger();
     let (ours, peer) = TcpStream::pair(true);
@@ -302,6 +349,13 @@ mod abort {
             let rt = runtime();
             rt.block_on(super::an_abort_resets_the_connection());
             rt.block_on(round_trip());
+        }
+    }
+
+    #[test]
+    fn a_linger_that_runs_out_resets_the_connection() {
+        if alone("shut::abort::a_linger_that_runs_out_resets_the_connection") {
+            super::a_linger_that_runs_out_resets_the_connection();
         }
     }
 

@@ -9,6 +9,10 @@
   dropped with its run, closing the stream with the bytes behind never sent. It now goes on on a
   thread of its own, to its own deadline, as the ones the run never took do
   (`proofs/tla/going/Linger.tla`).
+- **A dropped TCP stream whose linger ran out resets its connection.** The bytes still behind were
+  given up and the stream closed with a FIN, so the peer read a cut stream as a whole one; it now
+  reads `ConnectionReset` (`proofs/tla/close`).
+
 - **IO of a shard handed over repeatedly no longer waits for 61 task runs.** When a task blocks its
   thread past the handoff threshold the shard goes to another thread, and the count of runs before
   the next look at the driver went with it. If the first task of every new runner blocked as well,

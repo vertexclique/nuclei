@@ -42,8 +42,10 @@
 //! `into_inner` wait until the kernel took them, and a handle dropped before
 //! that leaves its object to a task, which delivers them (for at most the
 //! runtime's [`write_behind_linger`](crate::runtime::Builder::write_behind_linger))
-//! and then closes it. A runtime that drops waits for those tasks (see
-//! `rt::linger`), and none starts a runtime to run them.
+//! and then closes it. One whose time ran out gives the rest up, and a TCP
+//! stream's then resets its connection, so the peer never reads a cut stream
+//! as a whole one (`proofs/tla/close`). A runtime that drops waits for those
+//! tasks (see `rt::linger`), and none starts a runtime to run them.
 
 /// How long a dropped handle's unsent bytes may take to reach the kernel, by
 /// default (see [`Builder::write_behind_linger`](crate::runtime::Builder::write_behind_linger)).
@@ -326,15 +328,27 @@ impl<T> Drop for Handle<T> {
         // out, and closes then: the drain needs no descriptor of its own
         // (and on Windows, closing a socket would cancel its sends).
         self.source.linger(own);
-        crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io)));
+        crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io), own));
     }
 }
 
 /// Delivers what a dropped handle's write-behind holds through `kept`, its
-/// object itself, then closes it.
-async fn linger(source: Arc<Source>, kept: Kept) {
+/// object itself (whose descriptor is `own`), then closes it. Bytes still
+/// behind as the drain ends (its time ran out, or it failed) are given up,
+/// and a TCP stream resets: its peer must not read the end of the stream
+/// after a cut one.
+async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
     let drain = core::future::poll_fn(|cx| source.poll_drain(cx));
     let _ = crate::time::timeout(crate::rt::linger::time(), drain).await;
+    if source.has_unsent()
+        && source.kind() == Kind::Tcp
+        && let Err(err) = crate::net::opt::set_linger_time(own, Some(Duration::ZERO))
+    {
+        log::warn!(
+            "a dropped stream's unsent bytes were given up, and its peer is not told: \
+             the stream could not be reset ({err})"
+        );
+    }
     source.close(kept);
 }
 
