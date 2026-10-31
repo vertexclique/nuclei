@@ -6,3 +6,5 @@ W_room_used                    MC_Admission         violated:NoRoomEver
 W_long_past_cap                MC_Admission         violated:LongWithinCap
 M_once_counted                 MC_Admission         violated:NoRoomDeadlock
 W_once_past_cap                MC_Admission         violated:OnceWithinCap
+M_sends_counted                MC_Admission         violated:NoRoomDeadlock
+W_sends_past_cap               MC_Admission         violated:SendsWithinCap

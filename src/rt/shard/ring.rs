@@ -10,22 +10,18 @@
 //! go only once no entry names it.
 //!
 //! An operation gets its user data as it is submitted, and keeps it until
-//! its completion: one can be cancelled by it at any time. At most as many
-//! are in the kernel as the completion queue holds; the rest wait here, in
-//! order, entry and memory together, and go in as completions free room.
-//! One that is cancelled or whose source goes while it waits ends here,
-//! never submitted. A side has one operation out at a time, so the
-//! operations here are bounded by the sources, apart from the zero-copy
-//! sends below.
+//! its completion: one can be cancelled by it at any time. A side has one
+//! operation out at a time, so the operations in flight are bounded by the
+//! sources, apart from the zero-copy sends below.
 //!
 //! A zero-copy send ends for its side at its first completion, and stays here
 //! only to hold its write's buffer until the kernel's notification, which
 //! comes once the peer acknowledged the bytes: the side goes on meanwhile, so
 //! one side may leave several. Each holds at most a chunk the socket's send
-//! buffer took, and none names its slot or counts against the cap once it
-//! only waits. Only a ring a keeper can take sends zero-copy: as its shard
-//! goes, what is still out goes to the keeper with the ring (see `keeper`),
-//! so a buffer is kept until its notification and no longer.
+//! buffer took, and none names its slot once it only waits. Only a ring a
+//! keeper can take sends zero-copy: as its shard goes, what is still out goes
+//! to the keeper with the ring (see `keeper`), so a buffer is kept until its
+//! notification and no longer.
 //!
 //! A multishot receive stays in flight across its arrivals: each completion
 //! that says more come (`IORING_CQE_F_MORE`) hands its buffer of the
@@ -36,16 +32,20 @@
 //!
 //! The group is sized to the ring: at most half its completion queue, so a
 //! small ring (made so under memory pressure) is never filled by arrivals.
-//! A read side's operations (receives of every kind, accepts, polls for
-//! bytes) wait on the network for as long as their peer is idle, so they are
-//! let into the kernel at once and do not count against the cap that finite
-//! operations wait behind: a sleeping connection would otherwise hold the
-//! room a request's send, or the next accept, needs. The multishot receives'
-//! arrivals are bounded by the group's buffers, which the queue keeps room
-//! for. An accept's connections (up to [`ACCEPT_CAP`] each) and the last
-//! completion of each of these operations have no room kept: past the queue
-//! the kernel holds them (`IORING_FEAT_NODROP`, which the poller requires)
-//! until the poller takes them, and none is lost.
+//! The rest of the queue is the cap on the finite operations in the kernel,
+//! the files' reads and writes: past it they wait here, in order, entry and
+//! memory together, and go in as completions free room. Every operation of a
+//! source waits on its peer for as long as the peer pleases (a receive or an
+//! accept until it sends or connects, a send or a poll for room until it
+//! reads), and a child's exit watch on the child, so they go into the kernel
+//! at once and never count against the cap: idle or slow peers would
+//! otherwise hold the room another connection's reply, the next accept or a
+//! file call needs (proofs/tla/admission). The multishot receives' arrivals
+//! are bounded by the group's buffers, which the queue keeps room for. An
+//! accept's connections (up to [`ACCEPT_CAP`] each) and the completion of
+//! each of these operations have no room kept: past the queue the kernel
+//! holds them (`IORING_FEAT_NODROP`, which the poller requires) until the
+//! poller takes them, and none is lost.
 
 use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -92,13 +92,16 @@ pub(crate) struct ShardRing {
     /// is not single-issuer with deferred task work), so a keeper can take it as its shard goes.
     reapable: bool,
     files: RefCell<Files>,
-    /// Operations submitted but not in the kernel yet, by user data, with
+    /// Files' calls submitted but not in the kernel yet, by user data, with
     /// their entries, in order.
     room: RefCell<VecDeque<(u64, Sqe)>>,
-    /// Finite operations in the kernel (see [`counts_against_cap`]), and the
-    /// most it may hold.
+    /// Files' calls in the kernel, the only operations the cap counts, and
+    /// the most it may hold.
     in_kernel: Cell<usize>,
     cap: usize,
+    /// Write sides' operations in the kernel: no cap holds them back (a peer
+    /// that never reads keeps one for good), but most end within a moment.
+    writes: Cell<usize>,
     /// Completions of the last wait, reused.
     cqes: RefCell<Vec<IoUringCqe>>,
     /// The buffers multishot receives draw from; `None` when the
@@ -179,6 +182,7 @@ impl ShardRing {
             room: RefCell::new(VecDeque::new()),
             in_kernel: Cell::new(0),
             cap,
+            writes: Cell::new(0),
             cqes: RefCell::new(Vec::with_capacity(256)),
             recv: RefCell::new(recv),
             #[cfg(test)]
@@ -206,11 +210,11 @@ impl ShardRing {
         self.poller.borrow_mut().enable()
     }
 
-    /// Whether finite operations are out (in the kernel or waiting for room): their completions
-    /// come within a moment. A multishot receive or accept waits on a peer for as long as it
-    /// lives, so it is no sign of one.
+    /// Whether operations whose completions come within a moment are out: files' calls (in the
+    /// kernel or waiting for room) and a write side's. A read side's waits on a peer for as long
+    /// as the peer is idle, and a child's exit watch on the child, so neither is a sign of one.
     pub(crate) fn expects_completions(&self) -> bool {
-        self.in_kernel.get() > 0 || !self.room.borrow().is_empty()
+        self.in_kernel.get() > 0 || self.writes.get() > 0 || !self.room.borrow().is_empty()
     }
 
     /// Keeps the buffer `bid` of the group `back` for the next take-in, if the ring's group is
@@ -270,8 +274,8 @@ impl ShardRing {
 
     /// Submits `op` with its entry `sqe` (whose pointers point into `op`'s
     /// memory, which lives on the heap and does not move with it), on the
-    /// slot `op.file`, and returns its user data. With the kernel full it
-    /// waits for room; its slot is named from now on either way.
+    /// slot `op.file`, and returns its user data. It goes into the kernel at
+    /// once, never counted against the cap; its slot is named from now on.
     pub(crate) fn submit(&self, op: RingOp, sqe: Sqe) -> u64 {
         self.files.borrow_mut().named(op.file);
         let sqe = match self.files.borrow().copy_of(op.file) {
@@ -287,7 +291,7 @@ impl ShardRing {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed + 1, arrived, dry));
         }
-        let counted = counts_against_cap(&op);
+        let write = counts_as_write(&op);
         let inserted = self.ops.borrow_mut().insert(op);
         let user_data = match inserted {
             Ok(user_data) => user_data,
@@ -297,13 +301,16 @@ impl ShardRing {
                 return IGNORED;
             }
         };
-        self.enter(user_data, sqe, counted);
+        if write {
+            self.writes.set(self.writes.get() + 1);
+        }
+        self.enter(user_data, sqe, false);
         user_data
     }
 
     /// Puts the entry of the operation of `user_data` into the kernel, or
-    /// behind the ones waiting for room. A long-lived operation (`counted`
-    /// false) goes in at once and is not counted.
+    /// behind the ones waiting for room. One that waits on a peer or a child
+    /// (`counted` false) goes in at once and is not counted.
     pub(super) fn enter(&self, user_data: u64, sqe: Sqe, counted: bool) {
         let sqe = sqe.user_data(user_data);
         if !counted {
@@ -359,21 +366,9 @@ impl ShardRing {
         }
     }
 
-    /// Cancels the operation of `user_data`: at once if it waits for room,
-    /// else by the kernel (its completion says what it did).
+    /// Cancels the source's operation of `user_data`, which is in the kernel:
+    /// its completion says what it did.
     pub(crate) fn cancel(&self, user_data: u64) {
-        let waiting = {
-            let mut room = self.room.borrow_mut();
-            room.iter()
-                .position(|(u, _)| *u == user_data)
-                .and_then(|at| room.remove(at))
-        };
-        if waiting.is_some() {
-            if let Some(op) = self.ops.borrow_mut().remove(user_data) {
-                self.end(None, op, -libc::ECANCELED);
-            }
-            return;
-        }
         if self.ops.borrow_mut().get_mut(user_data).is_some() {
             self.poller
                 .borrow_mut()
@@ -475,9 +470,8 @@ impl ShardRing {
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
             return;
         };
-        if counts_against_cap(&op) {
-            self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
-            self.admit_waiting();
+        if counts_as_write(&op) {
+            self.writes.set(self.writes.get().saturating_sub(1));
         }
         self.end(shard, op, cqe.res);
     }
@@ -486,10 +480,10 @@ impl ShardRing {
     /// with the bytes the kernel took, ends the send for its side at once, which goes on to its
     /// next chunk or write; the send then stays in the ring only to hold the buffer the kernel may
     /// still read, until its notification (`IORING_CQE_F_NOTIF`), and no longer names its slot or
-    /// counts against the cap, since it waits on the network. A first completion without
-    /// `IORING_CQE_F_MORE` (a send refused before it ran) has no notification after it. The
-    /// kernel posts the notification after the first completion; one that comes before it is kept
-    /// for it. `proofs/tla/lent/LentZc.tla` checks the rule.
+    /// counts among the write sides' operations, since it waits on the network. A first
+    /// completion without `IORING_CQE_F_MORE` (a send refused before it ran) has no notification
+    /// after it. The kernel posts the notification after the first completion; one that comes
+    /// before it is kept for it. `proofs/tla/lent/LentZc.tla` checks the rule.
     fn zero_copy(&self, shard: Option<&Shard>, cqe: &IoUringCqe) -> bool {
         let notif = cqe.flags & IORING_CQE_F_NOTIF != 0;
         let mut ops = self.ops.borrow_mut();
@@ -528,8 +522,7 @@ impl ShardRing {
             self.zc_seen
                 .set((self.zc_seen.get().0 + 1, self.zc_seen.get().1));
         }
-        self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
-        self.admit_waiting();
+        self.writes.set(self.writes.get().saturating_sub(1));
         let mut res = cqe.res;
         if zc_refused(res) {
             // No memory to pin: nothing was sent, and the chunk goes again with a copy.
@@ -768,16 +761,10 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
     configured.min(u16::try_from(fit.min(1 << 15)).unwrap_or(1 << 15))
 }
 
-/// Whether `op` counts against the cap on operations in the kernel: a write
-/// side's does until it waits on its peer alone, and a read side's never.
-/// Every operation of a read side (a receive of any kind, multishot or into
-/// one buffer, an accept, a poll for bytes) waits on its peer for as long as
-/// the peer is idle, and a zero-copy send past its first completion waits
-/// until the peer acknowledged its bytes, so counting them would let idle
-/// connections fill the cap and hold back the sends and accepts that would
-/// wake them (proofs/tla/admission). The one place both the submission and
-/// the end of an operation decide it.
-fn counts_against_cap(op: &RingOp) -> bool {
+/// Whether `op` is one of the write sides' operations counted in `writes`: a
+/// write side's, until a zero-copy send only waits for its notification. The
+/// one place both the submission and the end of an operation decide it.
+fn counts_as_write(op: &RingOp) -> bool {
     !op.read && !matches!(op.mem, RingMem::ZcHeld(_))
 }
 

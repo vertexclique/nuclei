@@ -1,8 +1,9 @@
-//! Connections whose peers never send, and tasks that stop reading, keep no other connection from
-//! being accepted, read and answered: on an io_uring ring the receives of idle peers, each waiting
-//! for its peer, may hold the whole cap on operations in the kernel and the whole pool of IO
-//! buffers, and still the next accept goes in and a reader or a writer the pool has no buffer for
-//! uses its own. The vs-tokio benchmark found the stall at 4096 connections of 16 KiB requests:
+//! Connections whose peers never send, peers that never read, and tasks that stop reading keep no
+//! other connection from being accepted, read and answered: on an io_uring ring the receives of
+//! idle peers, each waiting for its peer, may hold the whole cap on operations in the kernel and
+//! the whole pool of IO buffers, and still the next accept goes in and a reader or a writer the
+//! pool has no buffer for uses its own; sends that wait for peers that never read count against
+//! no cap either. The vs-tokio benchmark found the stall at 4096 connections of 16 KiB requests:
 //! past 3840 waiting receives, the cap of a ring of 2048 entries beside its group, the next accept
 //! waited for good. On every backend bytes read ahead for tasks that peeked and stopped may hold
 //! the whole pool too, and a reader the pool has no buffer for still reads into its own. A binary
@@ -24,7 +25,7 @@ use nuclei::runtime::Builder;
 const QUEUE: u32 = 64;
 /// The cap of the server's buffers, and each read's buffer: one size class, below what a ring
 /// reads straight into a task's buffer.
-const CAP: usize = 1 << 20;
+const CAP: usize = 512 << 10;
 const READ: usize = 4096;
 /// Peers that never send, more than the cap on operations and the pool hold, and peers that send
 /// a request and wait for its reply.
@@ -40,6 +41,13 @@ const HOLD: u8 = 1;
 /// The cap of the buffers such tasks hold, a few of each read's size, and more of them.
 const HELD_CAP: usize = 64 << 10;
 const HOLDERS: usize = HELD_CAP / READ + 4;
+
+/// The first byte of a request whose reply is a stream its peer never reads.
+const FLOOD: u8 = 2;
+/// Peers that never read, more than the cap on operations in the kernel, and the cap of the
+/// buffers their sends' bytes wait in.
+const DEAF: usize = 128 + 16;
+const DEAF_CAP: usize = 64 << 20;
 
 /// Peeks at what came before it reads, so a peek takes the same way as a read.
 async fn serve(stream: TcpStream) {
@@ -70,6 +78,20 @@ async fn serve_or_hold(stream: TcpStream) {
         && buf[0] == HOLD
     {
         nuclei::time::sleep(4 * DEADLINE).await;
+    }
+    serve(stream).await;
+}
+
+/// Peeks at a request that starts with `FLOOD` and answers it with a stream its peer never reads,
+/// until a send waits for good; serves any other.
+async fn serve_or_flood(stream: TcpStream) {
+    let mut buf = vec![0u8; READ];
+    if let Ok(1..) = stream.peek(&mut buf).await
+        && buf[0] == FLOOD
+    {
+        let chunk = vec![9u8; 64 << 10];
+        while stream.send(&chunk).await.is_ok() {}
+        return;
     }
     serve(stream).await;
 }
@@ -179,4 +201,26 @@ fn tasks_that_stop_reading_with_the_pool_full_keep_no_request_from_its_reply() {
     });
     answered(addr);
     drop(held);
+}
+
+/// Sends waiting in the kernel for peers that never read, more than the cap on operations, keep no
+/// other connection's reply from going out.
+#[test]
+fn sends_waiting_for_peers_that_never_read_keep_no_request_from_its_reply() {
+    let (_rt, addr) = server(DEAF_CAP, serve_or_flood);
+    let mut deaf: Vec<StdStream> = (0..DEAF).map(|_| connect(addr)).collect();
+    for stream in &mut deaf {
+        stream.write_all(&[FLOOD; READ]).unwrap();
+    }
+    if nuclei::Proactor::backend() == nuclei::IoBackend::IoUring {
+        // A send of each, and the accept, out.
+        until("a send out for every peer that never reads", || {
+            nuclei::stats()
+                .shards
+                .iter()
+                .any(|s| s.buffer_cap == DEAF_CAP && s.ops_in_flight > DEAF)
+        });
+    }
+    answered(addr);
+    drop(deaf);
 }

@@ -922,7 +922,7 @@ pass (`Buffers`, every buffer free, held by a receive out, a request read ahead 
 yet; and `Served`, every request sent is read and answered, with two idle peers and with none), 3
 mutations (a starved reader that waits for a buffer to come back, a starved writer that does, and a
 poll whose end wakes nobody break `Served`), and 2 witnesses (a reader finds the pool empty; a
-starved side uses its own buffer). `tests/idle_peers.rs` fills the pool of a 1 MiB cap with
+starved side uses its own buffer). `tests/idle_peers.rs` fills the pool of a 512 KiB cap with
 receives of idle peers and checks every other peer is answered.
 
 `lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`):
@@ -1479,27 +1479,32 @@ slack). Time is whole units: a quick run adds none, a slow one `Slow`, a long on
 
 ## What a ring lets into the kernel
 
-`admission` (`tla/admission/Admission.tla`) checks how a shard's ring (`src/rt/shard/ring.rs`)
-admits operations: a completion queue of `C` slots, a receive group whose buffers are arrivals'
-share of it, a cap on the operations counted in the kernel, long-lived operations (every
-operation of a side that reads: multishot receives and accepts, which never end by themselves,
-and one-shot receives into a buffer, polls for bytes and accepts, which end when their peer acts)
-and finite ones (sends, connects, file calls) that wait in room when the cap is used. Before,
-`counts_against_cap` exempted only the multishot ones: in the vs-tokio benchmark 3840 idle
-connections, the cap of a ring of 2048 entries beside its 256-buffer group, filled it with
-one-shot receives that waited for their peers, and the next accept waited in room behind them for
-good, leaving every connection past them unaccepted. 7 configurations: 1 that must pass (the
-group cut to half the queue, long-lived operations of both kinds not counted: a finite operation
+`admission` (`tla/admission/Admission.tla`) checks how a shard's ring (`src/rt/shard/ring.rs`,
+`src/rt/shard/ring/exits.rs`) admits operations: a completion queue of `C` slots, a receive group
+whose buffers are arrivals' share of it, a cap on the operations counted in the kernel, long-lived
+operations (every operation of a source, each waiting on its peer: multishot receives and accepts,
+which never end by themselves; one-shot receives into a buffer, polls for bytes and accepts, which
+end when their peer sends or connects; sends, polls for room and connects under way, which end when
+their peer reads or answers, and a zero-copy send that holds its buffer until the kernel's
+notification, which comes once the peer acknowledged the bytes; and a child's exit watch) and
+finite ones (a file's reads and writes) that wait in room when the cap is used. Before, the ring
+counted the one-shot operations of a side that reads: in the vs-tokio benchmark 3840 idle
+connections, the cap of a ring of 2048 entries beside its 256-buffer group, filled it with one-shot
+receives that waited for their peers, and the next accept waited in room behind them for good,
+leaving every connection past them unaccepted. It counted every operation of a side that writes
+too, so sends to peers that never read could fill the cap the same way and hold every other
+connection's reply, and every file call, in room for good. 9 configurations: 1 that must pass (the
+group cut to half the queue, long-lived operations of every kind not counted: a finite operation
 never waits in room while none is in the kernel, `NoRoomDeadlock`, and arrivals plus finite
-completions fit the queue, `CqNeverOverfull`), 3 mutations (the group not cut breaks
-`CqNeverOverfull`; multishot operations counted, and one-shot ones counted, as they were, let idle
-receives use the cap and break `NoRoomDeadlock`: the request waiting for its reply's receive), and
-3 witnesses (a finite operation does wait in room; a multishot one, and a one-shot one, is let in
-past the cap). An accept's connections and the last entry of each long-lived operation are not
-modelled: no room is kept for them, and past the queue the kernel holds them
-(`IORING_FEAT_NODROP`) until the shard takes them. `tests/idle_peers.rs` fills the cap of the
-smallest ring with receives of idle peers and checks every other peer is still accepted and
-answered.
+completions fit the queue, `CqNeverOverfull`), 4 mutations (the group not cut breaks
+`CqNeverOverfull`; multishot operations counted, one-shot ones of a side that reads counted, and a
+side that writes counted, as they were, let idle or deaf peers use the cap and break
+`NoRoomDeadlock`), and 4 witnesses (a finite operation does wait in room; a multishot one, a
+one-shot one, and a write side's is let in past the cap). An accept's connections and the end of
+each long-lived operation are not modelled: no room is kept for them, and past the queue the kernel
+holds them (`IORING_FEAT_NODROP`) until the shard takes them. `tests/idle_peers.rs` fills the cap
+of the smallest ring with receives of idle peers, and then with sends to peers that never read, and
+checks every other peer is still accepted and answered.
 
 ## A ring's overflow count
 
@@ -1512,7 +1517,12 @@ many waits it lasts (`stutter`), that the count never passes the looks that saw 
 stretches of looks add up when the first ends clear (`split_at_clear`). Its witness shows why
 the look after the completions is there: with it two floods count two, and without it they count
 one; its mutation, counting every set look, breaks `stutter`. An overflow that begins and ends
-between two looks is seen by neither the code nor the model.
+between two looks is seen by neither the code nor the model. `tests/cq_overflow.rs` overflows
+the smallest ring's queue for real: while its shard's thread is held, twice the queue's entries
+of peers connect to four listeners, each with a multishot accept armed, and send a request each,
+and once the thread enters the kernel again the accepts fill the queue and the last completions
+go past it. The test checks the overflow was counted and that every peer is accepted and gets
+its own bytes back.
 
 ## A shard handed to another thread
 

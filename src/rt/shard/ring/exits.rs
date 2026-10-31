@@ -63,7 +63,8 @@ impl ShardRing {
         let op = ExitOp { exit, info, waitid };
         let inserted = self.exit_ops.borrow_mut().insert(op);
         match inserted {
-            Ok(user_data) => self.enter(user_data | FILE_TAG | EXIT_TAG, sqe, true),
+            // The child may run for as long as it likes: never counted against the cap.
+            Ok(user_data) => self.enter(user_data | FILE_TAG | EXIT_TAG, sqe, false),
             // Past 2^30 children watched at once on one ring.
             Err(op) => op.exit.finish(Err(libc::ENOBUFS)),
         }
@@ -74,16 +75,7 @@ impl ShardRing {
         let Some(op) = self.take_exit(user_data) else {
             return;
         };
-        self.in_kernel.set(self.in_kernel.get().saturating_sub(1));
-        self.admit_waiting();
         self.end_exit(op, res);
-    }
-
-    /// A watch that waited for room goes, never submitted.
-    pub(super) fn drop_waiting_exit(&self, user_data: u64) {
-        if let Some(op) = self.take_exit(user_data) {
-            self.end_exit(op, -libc::ECANCELED);
-        }
     }
 
     fn take_exit(&self, user_data: u64) -> Option<ExitOp> {
@@ -118,7 +110,7 @@ impl ShardRing {
     }
 
     /// The shard stops running: each watch is cancelled, and its child let
-    /// go at its completion (a watch still waiting for room, at once).
+    /// go at its completion.
     pub(crate) fn let_go_of_exits(&self) {
         let keys: Vec<u64> = self
             .exit_ops
@@ -127,19 +119,9 @@ impl ShardRing {
             .map(|key| key | FILE_TAG | EXIT_TAG)
             .collect();
         for user_data in keys {
-            let waiting = {
-                let mut room = self.room.borrow_mut();
-                room.iter()
-                    .position(|(u, _)| *u == user_data)
-                    .and_then(|at| room.remove(at))
-            };
-            if waiting.is_some() {
-                self.drop_waiting_exit(user_data);
-            } else {
-                self.poller
-                    .borrow_mut()
-                    .push(Sqe::async_cancel(user_data).user_data(super::IGNORED));
-            }
+            self.poller
+                .borrow_mut()
+                .push(Sqe::async_cancel(user_data).user_data(super::IGNORED));
         }
     }
 }
