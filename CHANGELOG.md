@@ -37,6 +37,12 @@
 
 ### Changed
 
+- **The owned calls are generic over their buffer.** A caller handing a `Vec<u8>` in, and binding the
+  buffer it gets back, compiles as before. Two forms that leaned on the old `Vec<u8>` parameter no
+  longer infer a type: an argument the compiler had to infer from it (`Default::default()`, `.into()`,
+  `Vec::new().into()`), which now needs its type written (`Vec::<u8>::new()`); and naming the address
+  type of `UdpSocket::send_to_owned` or `UnixDatagram::send_to_owned` explicitly, which now takes the
+  buffer type too (`send_to_owned::<A, _>`).
 - **Sizes are validated where they take effect**, and a value outside what the runtime can work
   with is refused as `InvalidInput` naming the setting, its value and the allowed range (the first
   runtime build for the io_uring settings, `Builder::build` for the builder's). Values that were
@@ -78,12 +84,14 @@
   as `IORING_OP_FALLOCATE`; a mode the system has not answers `Unsupported`), `sync_range`
   (`IORING_OP_SYNC_FILE_RANGE` on Linux, a data sync elsewhere), `fs::sync_dir` with the
   rename-then-sync recipe, `copy_range_to` (`copy_file_range` in bounded chunks, read and write
-  where the kernel cannot), and advisory `lock`, `try_lock` and `unlock` (the blocking lock on the
+  where the kernel cannot), and advisory `lock_file`, `try_lock_file` and `unlock_file` (the blocking lock on the
   pool, never left held by a dropped future). `sync_all` and `sync_data` are operations of the ring,
   and a failed sync makes every later one of the handle fail. A file opened for direct IO is read and
   written with exactly the caller's lengths and offsets.
-- **The names shadow std's through `Deref`**: `lock`, `try_lock`, `unlock`, `read_at` and `write_at`
-  on `Handle<File>` are the async calls; std's blocking ones stay reachable as `(*file).lock()`.
+- **`read_at` and `write_at` on `Handle<File>` are the async calls**, and shadow std's
+  `FileExt::read_at` and `write_at` reached through `Deref`, which block the worker; std's stay
+  reachable as `(*file).read_at(..)`. The lock calls take names of their own, so std's `File::lock`,
+  `try_lock` and `unlock` through `Deref` are unchanged.
 - **TLA+ models** of a file's positional calls, syncs, direct IO and descriptor leases
   (`proofs/tla/lent/LentFile.tla`), of a file lock's cancellation (`proofs/tla/flock`) and of many
   reads in one call (`proofs/tla/many`), each with mutations that break their rules.
