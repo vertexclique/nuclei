@@ -31,8 +31,9 @@
   batch of completions and wakes the lone reader an arrival leaves inline; a read side's completion
   is applied at once when the side is free, as a write side's is; a step that left one waker alone
   settles inline.
-- **A connection costs less to open and close.** A source's attach and a dropped handle's close
-  allocate nothing beside the source itself, a new source is written field by field into its
+- **A connection costs less to open and close.** A source's attach allocates nothing beside the source
+  itself, nor does a dropped handle's close when the handle's object fits in a word (a socket's
+  descriptor does), a new source is written field by field into its
   allocation, and a stream a listener accepts inherits the listener's `TCP_INQ` with no
   `setsockopt` of its own (256 connections on epoll made 513 calls and now make 259). CI's budgets
   in `ci/op_budget.txt` were lowered to match these and the changes above.
