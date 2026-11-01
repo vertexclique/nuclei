@@ -766,7 +766,7 @@ impl Source {
     /// drops.
     #[inline(always)]
     fn settle(self: &Arc<Self>, after: After) {
-        if let Err(after) = after.forget_if_nothing() {
+        if let Err(after) = after.settle_light() {
             self.settle_rest(after);
         }
     }
