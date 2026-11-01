@@ -364,6 +364,10 @@ fn a_cached_regular_file_opens_on_the_calling_thread() {
     let path = tmp.file("data");
     let data = pattern(70_000);
     std::fs::write(&path, &data).unwrap();
+    if !crate::fs::open_cached::took::on_local(&path) {
+        eprintln!("skipping: the temporary directory is on a file system opened on the pool");
+        return;
+    }
     // Looked up once, so the kernel's caches hold every part of the path.
     std::fs::metadata(&path).unwrap();
     rt.block_on(async {
@@ -386,6 +390,10 @@ fn a_long_path_opens_on_the_calling_thread_too() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("data");
     std::fs::write(&path, b"long").unwrap();
+    if !crate::fs::open_cached::took::on_local(&path) {
+        eprintln!("skipping: the temporary directory is on a file system opened on the pool");
+        return;
+    }
     std::fs::metadata(&path).unwrap();
     rt.block_on(async {
         let mut file = within(Handle::<File>::open(&path)).await.unwrap();

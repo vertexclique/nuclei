@@ -97,9 +97,9 @@ use crate::io::source::Kind;
 /// [`read_at_owned`](Handle::read_at_owned) and
 /// [`write_at_owned`](Handle::write_at_owned).
 impl Handle<StdFile> {
-    /// Opens the file at `p` for reading: on the calling thread when the
-    /// kernel's caches answer at once and it is a regular file (Linux), on
-    /// the blocking pool otherwise.
+    /// Opens the file at `p` for reading: on the calling thread when it is a
+    /// regular file on a local file system and the kernel's caches answer at
+    /// once (Linux), on the blocking pool otherwise.
     ///
     /// # Errors
     ///

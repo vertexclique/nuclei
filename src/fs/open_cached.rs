@@ -3,15 +3,19 @@
 //! 5.12), for which the kernel resolves the path from its lookup cache alone
 //! and answers `EAGAIN` rather than read a directory from the device.
 //!
-//! Only a regular file is opened here, and the open is non-blocking (as
-//! every handle's descriptor is made anyway, `Handle::adopt`), so it waits
-//! for nothing: not for a lease another process holds. What the path names
-//! is looked at first through an `O_PATH` descriptor, which opens nothing:
-//! a FIFO or a device is never opened here, so no writer of a FIFO sees a
-//! reader come and go. Anything but a regular file, and every open this
-//! cannot answer for whatever reason, goes to the blocking pool as every
-//! open did before, where it waits as a plain open does, and the pool's
-//! answer, an error included, is the one the caller gets.
+//! The lookup is not all an open may wait for: the file system's own open
+//! may ask a server (a network or a user-space file system) and the file
+//! itself may make it wait (the other end of a FIFO, a device, a lease
+//! another process holds). So what the path names is looked at first
+//! through an `O_PATH` descriptor, which opens nothing: only a regular file
+//! on a file system of this machine whose open reads nothing (a known one,
+//! by its magic number) is opened here, non-blocking (as every handle's
+//! descriptor is made anyway, `Handle::adopt`), so not even a lease holds it
+//! up. No FIFO or device is ever opened here, so no writer of a FIFO sees a
+//! reader come and go. Anything else, and every open this cannot answer for
+//! whatever reason, goes to the blocking pool as every open did before,
+//! where it waits as a plain open does, and the pool's answer, an error
+//! included, is the one the caller gets.
 
 #![allow(unsafe_code)]
 
@@ -28,9 +32,10 @@ static CALL: AtomicBool = AtomicBool::new(true);
 /// Paths up to this long go to the kernel from a buffer on the stack.
 const ON_STACK: usize = 384;
 
-/// The regular file at `path`, opened for reading as `File::open` opens it
-/// (non-blocking besides), if the kernel's caches answer the open at once;
-/// `None` when the open goes to the blocking pool.
+/// The regular file at `path` on one of the [`LOCAL`] file systems, opened
+/// for reading as `File::open` opens it (non-blocking besides), if the
+/// kernel's caches answer the open at once; `None` when the open goes to the
+/// blocking pool.
 pub(super) fn open(path: &Path) -> Option<File> {
     if !CALL.load(Ordering::Relaxed) {
         return None;
@@ -51,7 +56,10 @@ pub(super) fn open(path: &Path) -> Option<File> {
     };
     // What the path names, opened as a place only (no file's open runs),
     // and closed again before the open.
-    regular(&openat2(name, libc::O_PATH | libc::O_CLOEXEC)?)?;
+    let place = openat2(name, libc::O_PATH | libc::O_CLOEXEC)?;
+    regular(&place)?;
+    local(&place)?;
+    drop(place);
     let file = openat2(name, libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK)?;
     // The path may have been changed in between: the file opened must be a
     // regular one, and is then as good as any a plain open would have found.
@@ -98,6 +106,35 @@ fn openat2(name: *const u8, flags: i32) -> Option<OwnedFd> {
     }
 }
 
+/// The file systems whose open of a regular file for reading waits for no
+/// device and no server, by the magic number `statfs` gives: ext2 to ext4,
+/// XFS, Btrfs, F2FS, bcachefs, ZFS, tmpfs, ramfs, overlayfs (a container's
+/// root), SquashFS, EROFS, FAT and exFAT.
+const LOCAL: [u32; 13] = [
+    0x0000_EF53,
+    0x5846_5342,
+    0x9123_683E,
+    0xF2F5_2010,
+    0xCA45_1A4E,
+    0x2FC1_2FC1,
+    0x0102_1994,
+    0x8584_58F6,
+    0x794C_7630,
+    0x7371_7368,
+    0xE0F5_E1E2,
+    0x0000_4D44,
+    0x2011_BAB0,
+];
+
+/// `Some` when `fd` lies on one of the [`LOCAL`] file systems.
+fn local(fd: &OwnedFd) -> Option<()> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut fs: libc::statfs = unsafe { core::mem::zeroed() };
+    // SAFETY: the kernel fills our own `statfs` for a descriptor we own.
+    let r = unsafe { libc::fstatfs(fd.as_raw_fd(), &mut fs) };
+    (r == 0 && LOCAL.contains(&(fs.f_type as u32))).then_some(())
+}
+
 /// `Some` when `fd` is a regular file.
 fn regular(fd: &OwnedFd) -> Option<()> {
     // SAFETY: plain data; all zeroes is a valid value.
@@ -119,6 +156,13 @@ pub(super) mod took {
         if let Ok(mut opened) = OPENED.lock() {
             opened.push(path.to_path_buf());
         }
+    }
+
+    /// Whether `path` lies on a file system an open here takes, so a test
+    /// on another one (a network home directory) knows it cannot see one.
+    pub(in crate::fs) fn on_local(path: &Path) -> bool {
+        std::fs::File::open(path)
+            .is_ok_and(|file| super::local(&std::os::fd::OwnedFd::from(file)).is_some())
     }
 
     /// Whether `path` was opened here since the last look.
