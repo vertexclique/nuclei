@@ -648,14 +648,13 @@ impl Source {
         }
         if !self.reg.ops.load(Ordering::Acquire) {
             // Registered with a poller, or about to register where no ring
-            // runs: the driver's calls.
+            // runs: the driver's calls. The registration is looked at first,
+            // one load, where the look for a ring may be a call.
             #[cfg(readiness)]
+            if self.reg.state.load(Ordering::Acquire) == REGISTERED
+                || !current.map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some())
             {
-                let rings =
-                    current.map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
-                if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
-                    return Ok(Via::Fd(fd));
-                }
+                return Ok(Via::Fd(fd));
             }
             #[cfg(not(readiness))]
             let _ = fd;
