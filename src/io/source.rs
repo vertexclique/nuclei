@@ -128,6 +128,14 @@ const NO_FD: Raw = super::raw::NONE;
 /// No registration.
 const NO_TOKEN: u64 = u64::MAX;
 
+/// `Source::inq_children`: not asked yet, asked and on, or refused.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const INQ_UNASKED: u8 = 0;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const INQ_ON: u8 = 1;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const INQ_OFF: u8 = 2;
+
 const UNREGISTERED: u8 = 0;
 const REGISTERING: u8 = 1;
 const REGISTERED: u8 = 2;
@@ -430,6 +438,10 @@ pub(crate) struct Source {
     /// A datagram socket's words for the calls made with no guard.
     #[cfg(unix)]
     quick: quick::Quick,
+    /// A TCP listener's: whether it asked its kernel to count what reads leave
+    /// (`passes_inq`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    inq_children: AtomicU8,
     /// Completions of the sides' ring operations, for their holders.
     #[cfg(completion)]
     read_done: ops::Mailbox,
@@ -489,6 +501,19 @@ impl Source {
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
+        Self::made(fd, kind, ReadState::default())
+    }
+
+    /// A source for `fd`, a TCP stream whose kernel counts what its reads leave already (one
+    /// accepted from a listener that asked it, see [`passes_inq`](Self::passes_inq)).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn new_counting(fd: Raw, kind: Kind) -> Arc<Self> {
+        Self::made(fd, kind, ReadState::counting())
+    }
+
+    /// [`new`](Self::new) with the read side's state `read`.
+    #[inline(always)]
+    fn made(fd: Raw, kind: Kind, read: ReadState) -> Arc<Self> {
         // Made in place: a source is large, and `Arc::new` (or one write of the whole) would
         // build it on the stack and copy it into the allocation.
         let source = Arc::<Self>::new_uninit();
@@ -502,7 +527,7 @@ impl Source {
             addr_of_mut!((*slot).epoch).write(AtomicU32::new(0));
             addr_of_mut!((*slot).retired_epoch).write(AtomicU32::new(0));
             addr_of_mut!((*slot).kind).write(kind);
-            addr_of_mut!((*slot).read).write(Side::biased(ReadState::default()));
+            addr_of_mut!((*slot).read).write(Side::biased(read));
             addr_of_mut!((*slot).write).write(Side::biased(WriteState::default()));
             addr_of_mut!((*slot).read_owner).write(owner::Owner::new());
             addr_of_mut!((*slot).write_owner).write(owner::Owner::new());
@@ -527,6 +552,8 @@ impl Source {
             addr_of_mut!((*slot).unsent).write(AtomicU8::new(0));
             #[cfg(unix)]
             addr_of_mut!((*slot).quick).write(quick::Quick::new(kind));
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            addr_of_mut!((*slot).inq_children).write(AtomicU8::new(INQ_UNASKED));
             #[cfg(completion)]
             addr_of_mut!((*slot).read_done).write(ops::Mailbox::default());
             #[cfg(completion)]
@@ -558,6 +585,8 @@ impl Source {
             unsent: _,
             #[cfg(unix)]
                 quick: _,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+                inq_children: _,
             #[cfg(completion)]
                 read_done: _,
             #[cfg(completion)]
@@ -574,6 +603,28 @@ impl Source {
 
     pub(crate) fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// Whether a connection this TCP listener accepts now starts with its kernel counting what
+    /// its reads leave (`TCP_INQ`, which a TCP socket takes from the listener it is accepted
+    /// from), so its first read sets nothing. The listener asks it of its kernel once, at its
+    /// first accept on a poller (a ring's receives need no count); the connection of that
+    /// accept, made before, asks for its own. One that was queued before and is marked anyway
+    /// reads as one whose kernel gives no count.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn passes_inq(&self) -> bool {
+        match self.inq_children.load(Ordering::Relaxed) {
+            INQ_ON => true,
+            INQ_UNASKED if self.kind == Kind::TcpListener && !self.on_ring() => {
+                let on = self
+                    .fd()
+                    .is_ok_and(|fd| crate::io::sys::enable_inq(fd, true));
+                self.inq_children
+                    .store(if on { INQ_ON } else { INQ_OFF }, Ordering::Relaxed);
+                false
+            }
+            _ => false,
+        }
     }
 
     /// The hooks of a poll's or a request's hold.
