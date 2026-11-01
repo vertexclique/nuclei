@@ -474,54 +474,70 @@ where
                     }
                     false
                 }
-                None => {
-                    let mut future_dropped = false;
-                    loop {
-                        if state & CLOSED != 0 && !future_dropped {
-                            // Cancelled during the poll: the canceller left
-                            // the future to this run.
-                            Self::drop_future(ptr);
-                            future_dropped = true;
-                        }
-                        // Neither woken nor closed: the run's reference goes in
-                        // the same exchange, so no later run of the task (woken
-                        // meanwhile on another thread) is followed by this one's
-                        // drop.
-                        let new = if state & CLOSED != 0 {
-                            state & !RUNNING & !SCHEDULED
-                        } else if state & SCHEDULED != 0 {
-                            state & !RUNNING
-                        } else {
-                            (state & !RUNNING) - REFERENCE
-                        };
-                        match header.state.compare_exchange_weak(
-                            state,
-                            new,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) if state & CLOSED != 0 => {
-                                Self::finish(ptr, state);
-                                return false;
-                            }
-                            Ok(_) if state & SCHEDULED != 0 => {
-                                // Woken during the poll: the run's reference
-                                // goes to the new runnable.
-                                Self::schedule(ptr, ScheduleInfo::new(true));
-                                return true;
-                            }
-                            Ok(_) => {
-                                // The last reference, with no handle: nothing
-                                // can wake or await the task again.
-                                if new & !FLAGS == 0 && new & TASK == 0 {
-                                    Self::drop_future(ptr);
-                                    Self::destroy(ptr);
-                                }
-                                return false;
-                            }
-                            Err(actual) => state = actual,
-                        }
+                None => loop {
+                    if state & CLOSED != 0 {
+                        return Self::end_closed(ptr, state);
                     }
+                    // Neither woken nor closed: the run's reference goes in
+                    // the same exchange, so no later run of the task (woken
+                    // meanwhile on another thread) is followed by this one's
+                    // drop.
+                    let new = if state & SCHEDULED != 0 {
+                        state & !RUNNING
+                    } else {
+                        (state & !RUNNING) - REFERENCE
+                    };
+                    match header.state.compare_exchange_weak(
+                        state,
+                        new,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) if state & SCHEDULED != 0 => {
+                            // Woken during the poll: the run's reference goes
+                            // to the new runnable.
+                            Self::schedule(ptr, ScheduleInfo::new(true));
+                            return true;
+                        }
+                        Ok(_) => {
+                            // The last reference, with no handle: nothing can
+                            // wake or await the task again.
+                            if new & !FLAGS == 0 && new & TASK == 0 {
+                                Self::drop_future(ptr);
+                                Self::destroy(ptr);
+                            }
+                            return false;
+                        }
+                        Err(actual) => state = actual,
+                    }
+                },
+            }
+        }
+    }
+
+    /// The end of a Pending run that finds the task cancelled during the
+    /// poll: the canceller left the future to the run, which drops it, then
+    /// clears RUNNING (and a wake's SCHEDULED) and lets go as `finish` does.
+    #[cold]
+    #[inline(never)]
+    unsafe fn end_closed(ptr: *const (), mut state: usize) -> bool {
+        // SAFETY: the run's reference is live until `finish`, and the future
+        // is the run's to drop.
+        unsafe {
+            Self::drop_future(ptr);
+            let header = &Self::cell(ptr).header;
+            loop {
+                match header.state.compare_exchange_weak(
+                    state,
+                    state & !RUNNING & !SCHEDULED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        Self::finish(ptr, state);
+                        return false;
+                    }
+                    Err(actual) => state = actual,
                 }
             }
         }
