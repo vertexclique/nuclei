@@ -437,3 +437,6 @@ impl Wakers {
         self.rest.append(&mut other.rest);
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod tests;
