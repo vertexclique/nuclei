@@ -77,6 +77,13 @@
 
 ### Changed
 
+- **Each operation's instructions are counted, and CI holds them.** The IO, task and timer paths
+  were reworked one operation at a time: a stream's direct read and write inline into their
+  callers, a step that leaves nothing is made and settled with one store and one look, a task run
+  starts with one addition, timers keep their deadlines in nanoseconds and fire without a removal,
+  and a Unix datagram socket's ring poll stays armed across waits. `ci/op_counts.sh` counts the
+  user instructions per operation of 19 operations, on io_uring and on epoll, under cachegrind, and
+  CI fails when one rises above its budget in `ci/op_budget.txt`.
 - **The owned calls are generic over their buffer.** A caller handing a `Vec<u8>` in, and binding the
   buffer it gets back, compiles as before. Two forms that leaned on the old `Vec<u8>` parameter no
   longer infer a type: an argument the compiler had to infer from it (`Default::default()`, `.into()`,
