@@ -215,12 +215,16 @@ fn dgram_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 fn nuclei_run(row: &str) -> u64 {
-    let rt = nuclei::runtime::Builder::new()
+    let builder = nuclei::runtime::Builder::new()
         .worker_threads(if row == "tcp_2w" { 2 } else { 1 })
-        .pin_workers(false)
-        .handoff_after(None)
-        .build()
-        .expect("the runtime starts");
+        .pin_workers(false);
+    // NUCLEI_HANDOFF=default keeps the builder's handoff watch (10 ms), as an application gets it.
+    let builder = if std::env::var_os("NUCLEI_HANDOFF").is_some_and(|v| v == "default") {
+        builder
+    } else {
+        builder.handoff_after(None)
+    };
+    let rt = builder.build().expect("the runtime starts");
     match row {
         "block_on" => {
             for _ in 0..BLOCK_ON {

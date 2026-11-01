@@ -2,6 +2,7 @@
 # User and kernel instructions, cycles and locked loads per operation of every vs_tokio_count
 # mode, nuclei (default backend and epoll) against tokio and monoio (io_uring and legacy), under
 # the default release profile and under fat LTO. Ends with each nuclei side over its best rival.
+# Sides nuclei-ho and nuclei-epoll-ho keep the default handoff watch (NUCLEI_HANDOFF=default).
 # Usage: benches/vs_tokio_matrix.sh [mode ...]
 # Knobs: SIDES RUNS CPUS EVENTS TARGET TARGET_FAT OUT LOCK
 set -euo pipefail
@@ -45,8 +46,10 @@ measure() {
     local bin=$1 side=$2 mode=$3 i e iters='' v
     local -a env=() samples=()
     case $side in
-        nuclei-epoll) env=(NUCLEI_BACKEND=epoll) side=nuclei ;;
-        nuclei) env=(-u NUCLEI_BACKEND) ;;
+        nuclei-epoll) env=(-u NUCLEI_HANDOFF NUCLEI_BACKEND=epoll) side=nuclei ;;
+        nuclei) env=(-u NUCLEI_BACKEND -u NUCLEI_HANDOFF) ;;
+        nuclei-ho) env=(-u NUCLEI_BACKEND NUCLEI_HANDOFF=default) side=nuclei ;;
+        nuclei-epoll-ho) env=(NUCLEI_BACKEND=epoll NUCLEI_HANDOFF=default) side=nuclei ;;
     esac
     for ((i = 0; i < runs; i++)); do
         env "${env[@]}" nice -n 10 taskset -c "$cpus" perf stat -x, -o "$out" -e "$events" \
@@ -99,8 +102,9 @@ awk -F'\t' '
         for (k = 1; k <= n; k++) {
             key = order[k]; if (key in seen) continue; seen[key] = 1
             split(key, pm, SUBSEP)
-            for (s = 1; s <= 2; s++) {
-                side = s == 1 ? "nuclei" : "nuclei-epoll"; mon = s == 1 ? "monoio" : "monoio-legacy"
+            for (s = 1; s <= 4; s++) {
+                side = s == 1 ? "nuclei" : s == 2 ? "nuclei-epoll" : s == 3 ? "nuclei-ho" : "nuclei-epoll-ho"
+                mon = s % 2 == 1 ? "monoio" : "monoio-legacy"
                 if (!((key, side) in val)) continue
                 printf "%-8s %-15s %-13s", pm[1], pm[2], side
                 for (i = 4; i <= cols; i++) {
