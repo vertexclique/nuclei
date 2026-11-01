@@ -539,8 +539,8 @@ impl Source {
         // A thread of the ring shard the source is registered with: Here, with one look.
         #[cfg(ring)]
         if let Some(shard) = current
-            && self.reg.here.load(Ordering::Acquire) == shard.shared_addr()
             && let Some(ring) = shard.ring()
+            && self.reg.here.load(Ordering::Acquire) == shard.shared_addr()
         {
             return Ok(Via::Ops(route::Route::Here {
                 ring,
