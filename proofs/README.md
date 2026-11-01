@@ -2003,6 +2003,29 @@ the edge a refused write waits for while its writer still holds the side; a look
 the side's mode passes over it on a side made shared, which has no `intent` to raise), and 1
 witness (the edge for nobody is passed over).
 
+## A stream write its owner sends on one bit
+
+`sendsnow` (`tla/sendsnow/SendsNow.tla`) checks the owner's stream write made straight from its
+task's buffer on the one bit its write side's last release left (`Source::send_as_owner` in
+`src/io/source/write/calls.rs`, which looks at the `WRITE_SENDS` bit of `Source::unsent` under the
+owner's biased hold, `Side::with_owner`; the write side's `releasing` hook in
+`src/io/source/hooks.rs`; `WriteState::published` and `sends_now` in `src/io/source/write.rs`) on a
+machine whose stores wait in a store buffer. Every holder of the write side publishes, as it lets
+go, whether the side holds nothing a write straight from a task's buffer must come after (nothing
+written behind, lent, queued or out with a ring, no error, no connect, no blocked write on a
+poller, no caller's own calls); the owner sends on that bit with no look at the side while only
+its own thread ever held it (not shared, no foreign thread came), else its poll holds the side
+and writes behind what it holds. A foreign writer's owned write (`write_owned`) of two parts may
+leave its second part in the side, with its bit still in its store buffer; it made the side shared
+with a plain store before its locked take of the word, so the owner's look sees the mode and keeps
+out. 7 configurations: 3 that must pass (the owner alone; a biased side and a side shared from the
+start, each with a foreign owned write; with `Contiguous`, nothing lands between the parts of the
+owned write, `InOrder`, the owner's bytes go out in the order written, and `AllSent`), 3 mutations
+(a look that leaves out the side's mode sends between the two parts on a side made shared, which
+has no `intent` to raise; a send with no look at the bit goes out ahead of a byte that waits in
+the side; a release that says the side holds nothing while a byte waits there does the same),
+and 1 witness (the owner sends on the bit).
+
 ## A queue with a count
 
 `counted` (`tla/counted/Counted.tla`) checks the queue a ring's thread takes items from without
