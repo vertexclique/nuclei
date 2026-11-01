@@ -169,10 +169,13 @@ pub(super) struct WriteState {
     /// completion clears this.
     #[cfg(completion)]
     out: Option<u64>,
-    /// The ring gave an operation back because the socket was not ready:
-    /// the next one waits for it to be.
+    /// The ring gave an operation back because the socket was not ready
+    /// (or a large write found it full): the next one waits for it to be.
     #[cfg(ring)]
     poll_first: bool,
+    /// The operation out is a poll, which holds no bytes.
+    #[cfg(ring)]
+    polling: bool,
     /// What the driver gave back undone (bytes of the write-behind it took
     /// part of, or none, or a datagram): it goes out first.
     #[cfg(completion)]
@@ -225,7 +228,7 @@ impl WriteState {
     /// write-behind, or out with the ring (or given back by it).
     #[cfg(test)]
     pub(super) fn has_behind(&self) -> bool {
-        self.behind.is_some() || self.ring_holds()
+        self.behind.is_some() || self.ring_unsent()
     }
 
     /// A lent buffer has bytes left to go out.
@@ -319,9 +322,10 @@ impl WriteState {
     /// descriptor `fd`, from the caller's memory, if the side holds nothing
     /// that goes first. The kernel may take part of it, as of any write.
     /// `None` leaves it to the normal path, which writes behind and waits
-    /// for readiness when the socket took nothing.
+    /// for readiness when the socket took nothing (or, for a large write,
+    /// waits for the socket instead: see [`write`](Self::write)).
     #[cfg(unix)]
-    #[inline]
+    #[inline(always)]
     pub(super) fn write_direct(
         &mut self,
         io: Io<'_>,
@@ -459,7 +463,7 @@ impl WriteState {
     }
 
     /// Bytes, a datagram or a connect the completion driver holds or gave
-    /// back.
+    /// back, or a poll it makes for the side.
     #[cfg(completion)]
     fn ring_holds(&self) -> bool {
         self.out.is_some() || self.again.is_some() || self.dial.is_some()
@@ -468,6 +472,17 @@ impl WriteState {
     #[cfg(not(completion))]
     fn ring_holds(&self) -> bool {
         false
+    }
+
+    /// What of [`ring_holds`](Self::ring_holds) is still to go out: a poll
+    /// holds no bytes.
+    fn ring_unsent(&self) -> bool {
+        #[cfg(ring)]
+        return (self.out.is_some() && !self.polling)
+            || self.again.is_some()
+            || self.dial.is_some();
+        #[cfg(not(ring))]
+        self.ring_holds()
     }
 
     #[cfg(readiness)]
@@ -530,12 +545,17 @@ impl WriteState {
 
     /// A write of the bytes of `bufs`, in order (one slice for a plain
     /// write): copied into the write-behind, which the driver writes out at
-    /// once if the socket may take it.
+    /// once if the socket may take it. A stream write of at least
+    /// [`BEHIND_MIN`] bytes whose task waits (`wait`) is never copied: it
+    /// waits for what the side holds to go out, or for the socket to take
+    /// bytes, and then goes straight from the task's buffer (`write_direct`,
+    /// proofs/tla/ring/RingSend.tla).
     fn write(
         &mut self,
         io: Io<'_>,
         kind: Kind,
         bufs: &[io::IoSlice<'_>],
+        wait: bool,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
@@ -554,6 +574,15 @@ impl WriteState {
             self.waiters.register(waker);
             return Poll::Pending;
         }
+        // A large write waits rather than being copied; but a lent buffer
+        // that ended and waits for its task holds nothing ahead, and its
+        // task's taking it wakes nobody, so then it goes behind.
+        #[cfg(unix)]
+        if wait && len >= BEHIND_MIN && kind.streams() && !self.connecting && self.lent.is_none() {
+            return self.wait_for_room(io, kind, waker, after);
+        }
+        #[cfg(not(unix))]
+        let _ = wait;
         let first = self.behind.is_none();
         let n = match self.behind.as_mut() {
             Some(behind) => behind.append_vectored(bufs),
@@ -608,6 +637,32 @@ impl WriteState {
         Poll::Ready(Ok(n))
     }
 
+    /// A large stream write that could not go straight now waits, its task
+    /// woken as what the side holds goes out or the socket takes bytes: the
+    /// edge, or on a ring the side's next operation, which is a poll when
+    /// nothing went first (the direct call found the socket full).
+    #[cfg(unix)]
+    #[cold]
+    #[inline(never)]
+    fn wait_for_room(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        #[cfg(ring)]
+        if matches!(io.via, Via::Ops(_)) && self.behind.is_none() && !self.ring_holds() {
+            self.poll_first = true;
+        }
+        self.waiters.register(waker);
+        if self.push(io, kind, after) {
+            // What the side held went out at once: the write looks again.
+            after.wake(&mut self.waiters);
+        }
+        Poll::Pending
+    }
+
     /// On a port, a write of a stream or a pipe the pool had no buffer for:
     /// the front of `bufs` is copied into the write slot's own room and sent
     /// from there, so no writer waits on buffers that reads ahead or receives
@@ -642,7 +697,7 @@ impl WriteState {
         if let Some(failure) = self.failed.take() {
             return Poll::Ready(Err(failure.error()));
         }
-        if self.behind.is_some() || self.lent_waits() || self.ring_holds() {
+        if self.behind.is_some() || self.lent_waits() || self.ring_unsent() {
             self.waiters.register(waker);
             return Poll::Pending;
         }
@@ -754,7 +809,7 @@ impl WriteState {
             && (self.behind.is_some()
                 || self.lent_waits()
                 || self.queued.is_some()
-                || self.ring_holds())
+                || self.ring_unsent())
     }
 
     /// What the side holds, as a line, for a test that failed.

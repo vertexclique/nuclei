@@ -116,7 +116,7 @@ fn a_dropped_handle_lingers_through_a_held_side() {
     let (sent, src) = rt.block_on(async {
         let handle = Handle::new(mine).unwrap();
         let mut sent = Vec::new();
-        let chunk = pattern(64 * 1024);
+        let chunk = pattern(BEHIND_CHUNK);
         let start = Instant::now();
         while !handle.source().has_unsent() {
             let mut rest = &chunk[..];
@@ -190,7 +190,7 @@ fn a_drain_waiting_before_a_lingering_close_is_woken_by_it() {
     // The kernel takes nothing more: what the source accepts next waits.
     fill(&mine);
     rt.block_on(async {
-        let chunk = pattern(64 * 1024);
+        let chunk = pattern(BEHIND_CHUNK);
         let start = Instant::now();
         while !src.has_unsent() {
             within(poll_fn(|cx| src.poll_write(cx, &chunk)))
@@ -598,7 +598,7 @@ fn a_drain_whose_registration_a_stopped_shard_never_made_delivers_every_byte() {
     let src = Source::new(mine.raw(), STREAM);
     // The kernel takes nothing more: what the source accepts next waits behind.
     let mut expected = fill(&mine);
-    let chunk = pattern(64 * 1024);
+    let chunk = pattern(BEHIND_CHUNK);
     rt.block_on(async {
         let start = Instant::now();
         while !src.has_unsent() {

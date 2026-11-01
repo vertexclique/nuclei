@@ -13,11 +13,15 @@ use nuclei::net::TcpStream;
 use crate::reset::{Writer, write_as};
 use crate::support::*;
 
+/// A write small enough to be copied into the write-behind when the socket is full: one of
+/// 16 KiB or more waits for room instead.
+const BEHIND_CHUNK: usize = 8 << 10;
+
 /// Writes all of `bytes` into the write-behind with plain writes, none flushed, so what
 /// follows finds them behind.
 async fn write_behind<S: Stream>(s: &S, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
-        match write_some(s, bytes).await? {
+        match write_some(s, &bytes[..bytes.len().min(BEHIND_CHUNK)]).await? {
             0 => return Err(io::ErrorKind::WriteZero.into()),
             n => bytes = &bytes[n..],
         }
@@ -29,8 +33,8 @@ async fn write_behind<S: Stream>(s: &S, mut bytes: &[u8]) -> io::Result<()> {
 async fn fill_behind<S: Stream>(s: &S, bytes: &[u8]) -> usize {
     let mut sent = 0;
     while sent < bytes.len() {
-        match nuclei::time::timeout(Duration::from_millis(200), write_some(s, &bytes[sent..])).await
-        {
+        let piece = &bytes[sent..(sent + BEHIND_CHUNK).min(bytes.len())];
+        match nuclei::time::timeout(Duration::from_millis(200), write_some(s, piece)).await {
             Ok(Ok(n)) => sent += n,
             Ok(Err(err)) => panic!("a write before the write-behind filled: {err}"),
             Err(_) => return sent,

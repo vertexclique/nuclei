@@ -259,6 +259,10 @@ fn fill(io: &Stream) -> Vec<u8> {
     written
 }
 
+/// A write small enough to be copied into the write-behind when the socket
+/// is full: one of `BEHIND_MIN` (16 KiB) or more waits for room instead.
+const BEHIND_CHUNK: usize = 8 * 1024;
+
 /// A pattern no shift of itself matches, so misordered bytes show.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 + i / 251) as u8).collect()
@@ -380,7 +384,7 @@ fn a_failed_write_behind_fails_every_write_until_a_flush_reports_it() {
     let (a, b) = pair();
     rt.block_on(async {
         // Fill the socket so a write goes behind.
-        let chunk = vec![1u8; 64 * 1024];
+        let chunk = vec![1u8; BEHIND_CHUNK];
         let start = Instant::now();
         while !a.src.has_write_behind() {
             within(write_all(&a.src, &chunk)).await.unwrap();
@@ -942,5 +946,7 @@ fn tempdir() -> std::path::PathBuf {
 mod biased;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod inq;
+#[cfg(unix)]
+mod large;
 mod owned;
 mod requests;
