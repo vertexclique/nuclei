@@ -99,6 +99,8 @@ pub(crate) struct Pool {
     /// between takes.
     queue: Inbox,
     slots: Box<[Slot]>,
+    /// One past the highest slot a thread ever named: those past it never held a thread.
+    named: AtomicUsize,
     /// One bit per slot, set while its thread waits idle; written by that
     /// thread alone.
     index: Box<[AtomicU64]>,
@@ -143,6 +145,7 @@ impl Pool {
         let pool = Arc::new(Self {
             queue,
             slots,
+            named: AtomicUsize::new(0),
             index,
             hint: AtomicUsize::new(0),
             threads: AtomicUsize::new(0),
@@ -385,6 +388,7 @@ impl Pool {
                         // read it under its guard, so it is retired once.
                         unsafe { retire_node(old.as_raw()) };
                     }
+                    self.named.fetch_max(i + 1, Ordering::Relaxed);
                     return i;
                 }
             }
@@ -470,8 +474,13 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        // Slots are claimed lowest first, and a pool that never ran a job named none.
+        let named = self.named.load(Ordering::Relaxed);
+        if named == 0 {
+            return;
+        }
         let guard = pin();
-        for slot in self.slots.iter() {
+        for slot in &self.slots[..named] {
             let named = slot.thread.load(Ordering::Acquire, &guard);
             if !named.is_null() {
                 // SAFETY: the pool is gone, so no submitter reads the slot;
