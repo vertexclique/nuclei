@@ -106,6 +106,11 @@ pub(crate) struct ShardRing {
     /// is not single-issuer with deferred task work), so a keeper can take it as its shard goes.
     reapable: bool,
     files: RefCell<Files>,
+    /// The fixed files the kernel's table is still to be registered with:
+    /// registered at the first source's attach, so a shard that never has a
+    /// source (a ring a thread makes only to run its tasks and timers)
+    /// costs the kernel no table. Zero once it is, or when there is none.
+    table: Cell<u32>,
     /// Slots of sources that went whose entries did not all reach the
     /// kernel yet (it held completions it had no room for), with the leases
     /// that keep the sources' objects open until they do.
@@ -147,15 +152,16 @@ pub(crate) struct ShardRing {
 }
 
 impl ShardRing {
-    /// A ring as `cfg` describes with a table of `files` fixed files,
-    /// disabled until its first wait or submission.
+    /// A ring as `cfg` describes with a table of `files` fixed files (made
+    /// at the first attach, see `table`), disabled until its first wait or
+    /// submission.
     pub(crate) fn new(cfg: &RingConfig, files: u32) -> io::Result<Self> {
         let poller = RingPoller::new(
             &RingConfig {
                 taskrun_flag: crate::syscore::linux::iouring::ring::taskrun::flag_works(),
                 ..*cfg
             },
-            files,
+            0,
         )?;
         let recv = match group_entries(cfg.recv_buffers, poller.cq_entries()) {
             0 => None,
@@ -207,6 +213,7 @@ impl ShardRing {
             zero_copy_min: Cell::new(crate::io::source::ring::SEND_ZC_MIN),
             reapable: cfg.multi_issuer,
             files: RefCell::new(Files::new(files)),
+            table: Cell::new(files),
             leaving: RefCell::new(Vec::new()),
             room: RefCell::new(VecDeque::new()),
             in_kernel: Cell::new(0),
@@ -472,6 +479,9 @@ impl ShardRing {
     /// waits to name it (no copy is made: a process with no descriptor to
     /// spare registers all the same).
     pub(crate) fn attach(&self, fd: RawFd) -> io::Result<u32> {
+        if self.table.get() != 0 {
+            self.table_or_none();
+        }
         let fixed = self.files.borrow_mut().take();
         match fixed {
             Some(slot) => match self.poller.borrow().update_file(slot, fd) {
@@ -482,6 +492,41 @@ impl ShardRing {
                 }
             },
             None => Ok(self.files.borrow_mut().take_own(fd)),
+        }
+    }
+
+    /// Registers the kernel's table of fixed files, as the first attach
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// The kernel's refusal of the table.
+    pub(crate) fn make_table(&self) -> io::Result<()> {
+        let slots = self.table.get();
+        if slots != 0 {
+            self.poller.borrow().ring().register_files_sparse(slots)?;
+            self.table.set(0);
+        }
+        Ok(())
+    }
+
+    /// [`make_table`](Self::make_table) for the first attach: a table the
+    /// kernel refuses now (no memory, or a descriptor limit lowered since the
+    /// ring was made) leaves the ring without one, said once, and every
+    /// source's entries name its own descriptor, as past a full table.
+    #[cold]
+    #[inline(never)]
+    fn table_or_none(&self) {
+        if let Err(err) = self.make_table() {
+            self.table.set(0);
+            self.files.borrow_mut().without_table();
+            static SAID: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "io_uring's table of fixed files could not be set up ({err}); sockets use their own descriptors instead."
+                );
+            }
         }
     }
 
@@ -917,6 +962,11 @@ impl ShardRing {
         (files.in_use(), files.own_in_use())
     }
 
+    /// The fixed files the kernel's table is still to be registered with.
+    pub(crate) fn table_to_make(&self) -> u32 {
+        self.table.get()
+    }
+
     /// Multishot receives submitted so far, the arrivals they handed out,
     /// and those that ended as the group ran dry.
     pub(crate) fn multishot_counts(&self) -> (usize, usize, usize) {
@@ -1052,7 +1102,9 @@ pub(crate) fn check(cfg: RingConfig) -> io::Result<()> {
         ..cfg
     };
     let files = table_len().min(CHECK_TABLE);
-    ShardRing::new(&small, files)?.enable()
+    let ring = ShardRing::new(&small, files)?;
+    ring.make_table()?;
+    ring.enable()
 }
 
 pub(crate) mod exits;

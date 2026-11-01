@@ -66,6 +66,16 @@ impl Files {
         }
     }
 
+    /// No kernel table after all: every slot names a source's own
+    /// descriptor. Only before any slot was taken.
+    pub(crate) fn without_table(&mut self) {
+        debug_assert!(
+            self.table.is_empty() && self.copies.is_empty(),
+            "the table went after a slot was taken"
+        );
+        self.fixed = 0;
+    }
+
     fn slot(&self, slot: u32) -> Option<&Slot> {
         match slot.checked_sub(self.fixed) {
             None => self.table.get(slot as usize),

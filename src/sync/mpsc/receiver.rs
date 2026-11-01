@@ -1,7 +1,8 @@
 //! The receiving half of the bounded channel.
 
 use core::fmt;
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
+use core::marker::PhantomPinned;
 use core::task::{Context, Poll};
 
 use super::bounded::Bounded;
@@ -81,8 +82,14 @@ impl<T> Receiver<T> {
     /// assert_eq!(now(rx.recv()), Some("world"));
     /// assert_eq!(now(rx.recv()), None);
     /// ```
-    pub async fn recv(&mut self) -> Option<T> {
-        poll_fn(|cx| self.poll_recv(cx)).await
+    pub fn recv(&mut self) -> impl Future<Output = Option<T>> + '_ {
+        // The poll itself, with no state of an `async fn` around it; not
+        // `Unpin`, as the established API's receive future is not.
+        let pinned = PhantomPinned;
+        poll_fn(move |cx| {
+            let _ = &pinned;
+            self.poll_recv(cx)
+        })
     }
 
     /// Receives the next values and appends them to `buffer`, taking at most
