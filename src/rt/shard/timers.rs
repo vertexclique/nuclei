@@ -32,26 +32,18 @@ impl Shard {
     #[inline]
     pub(crate) fn time_of(&self, precise: bool, at: u64) -> u64 {
         let per_second = if precise { MICROS } else { MILLIS };
-        units(Duration::from_nanos(at), per_second, true)
+        units(at, per_second, true)
     }
 
     /// The wheel's time now on the runtime's clock, rounded down: the wheel
     /// never runs ahead of the clock.
     pub(super) fn wheel_now(&self) -> u64 {
-        units(
-            Duration::from_nanos(crate::time::clock::now_nanos()),
-            MILLIS,
-            false,
-        )
+        units(crate::time::clock::now_nanos(), MILLIS, false)
     }
 
     /// The microsecond wheel's time now, rounded down as `wheel_now`.
     fn precise_now(&self) -> u64 {
-        units(
-            Duration::from_nanos(crate::time::clock::now_nanos()),
-            MICROS,
-            false,
-        )
+        units(crate::time::clock::now_nanos(), MICROS, false)
     }
 
     /// The earliest time either wheel has work at, and whether it is the

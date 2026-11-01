@@ -2,7 +2,7 @@
 # The precise sleep's rounding
 
 This file checks the arithmetic a precise sleep rests on (`src/rt/shard/timers.rs`:
-`time_of`, `precise_now`; `src/time/units.rs`: `units`; `src/time/clock.rs`: `now_nanos`, the
+`time_of`, `precise_now`, `wheel_now`; `src/time/units.rs`: `units`; `src/time/clock.rs`: `now_nanos`, the
 nanoseconds after the clock's origin the timers read; `src/time/precise.rs`):
 a deadline is armed in the
 microsecond wheel rounded up, the wheel's time now is the clock rounded down, and a timer fires
@@ -76,32 +76,20 @@ theorem published_within_a_microsecond (d : Nat) :
   unfold armed
   omega
 
-/-- The shard computes an armed microsecond on 64 bits from a span's whole seconds `s` and its
-part of a second `n` (`units`, rounding up): the same number as rounding up all its
-nanoseconds, since a whole second is a whole number of microseconds (for any `n`, so for the
-part of a second the code splits off). -/
-theorem armed_from_seconds (s n : Nat) :
-    armed (s * 1000000000 + n) = s * 1000000 + (n + 999) / 1000 := by
+/-- The shard rounds a deadline up on 64 bits as Rust's `div_ceil` does (`units` in
+`src/time/units.rs`): the quotient, plus one when a remainder is left, which never overflows.
+That is the armed microsecond; its reading of the clock is the plain quotient, `reading`
+itself. -/
+theorem armed_as_the_code_divides (d : Nat) :
+    armed d = d / 1000 + (if d % 1000 = 0 then 0 else 1) := by
   unfold armed
-  omega
-
-/-- The same for the clock's reading, rounding down. -/
-theorem reading_from_seconds (s n : Nat) :
-    reading (s * 1000000000 + n) = s * 1000000 + n / 1000 := by
-  unfold reading
-  omega
+  split <;> omega
 
 /-- The same for the millisecond wheel's armed tick. -/
-theorem armedTick_from_seconds (s n : Nat) :
-    armedTick (s * 1000000000 + n) = s * 1000 + (n + 999999) / 1000000 := by
+theorem armedTick_as_the_code_divides (d : Nat) :
+    armedTick d = d / 1000000 + (if d % 1000000 = 0 then 0 else 1) := by
   unfold armedTick
-  omega
-
-/-- And for its reading of the clock. -/
-theorem readingTick_from_seconds (s n : Nat) :
-    readingTick (s * 1000000000 + n) = s * 1000 + n / 1000000 := by
-  unfold readingTick
-  omega
+  split <;> omega
 
 /-- The worked example. -/
 theorem example_rounding :

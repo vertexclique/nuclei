@@ -233,10 +233,8 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Precise.at_most_a_microsecond_late
 #print axioms Nuclei.Precise.on_the_grid_exactly
 #print axioms Nuclei.Precise.published_within_a_microsecond
-#print axioms Nuclei.Precise.armed_from_seconds
-#print axioms Nuclei.Precise.reading_from_seconds
-#print axioms Nuclei.Precise.armedTick_from_seconds
-#print axioms Nuclei.Precise.readingTick_from_seconds
+#print axioms Nuclei.Precise.armed_as_the_code_divides
+#print axioms Nuclei.Precise.armedTick_as_the_code_divides
 #print axioms Nuclei.Precise.example_rounding
 
 -- The single-shard semaphore: the pass grants the front in order, conserves the permits and
