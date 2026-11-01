@@ -517,7 +517,9 @@ wake latency, and its "coarse" backend stands for both pollers that arm a timer.
 proves the rounding the wheels rest on, for every deadline and clock reading: a deadline armed
 rounded up and a clock read rounded down never fire a timer early, on either wheel; a precise
 timer is due at most a microsecond after its deadline, exactly at it on the microsecond grid; and
-what a paused shard publishes is within a microsecond of the deadline. The microsecond wheel is
+what a paused shard publishes is within a microsecond of the deadline; and the shard's 64-bit
+form of each rounding (`units` in `src/time/units.rs`: whole seconds times the units in a second,
+plus the rounded part of a second) is the rounding of all the nanoseconds. The microsecond wheel is
 the millisecond one with another unit, so `Wheel.lean` covers its placement and cascade.
 
 ## A paused clock that moves by itself
