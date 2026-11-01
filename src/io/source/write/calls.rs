@@ -123,10 +123,10 @@ impl Source {
         bufs: &[io::IoSlice<'_>],
         asked: &mut bool,
     ) -> Option<io::Result<usize>> {
+        let shard = crate::rt::context::running(crate::rt::context::local())?;
         if !self.kind.streams() {
             return None;
         }
-        let shard = crate::rt::context::running(crate::rt::context::local())?;
         let addr = shard.shared_addr();
         if self.reg.home.load(core::sync::atomic::Ordering::Relaxed) != addr
             || !self.write.owned_by(addr)

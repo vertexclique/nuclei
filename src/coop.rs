@@ -174,7 +174,9 @@ pub(crate) fn poll_budget<T>(
     cx: &mut Context<'_>,
     poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
 ) -> Poll<T> {
-    if !spend(cx.waker()) {
+    // `spend` unrolled, so the waker is read on the spent branch alone: read before the test,
+    // it stays live through `poll` and its step reads it again.
+    if !try_spend() && !refused(cx.waker()) {
         return Poll::Pending;
     }
     let result = poll(cx);
