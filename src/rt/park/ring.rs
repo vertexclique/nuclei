@@ -300,8 +300,11 @@ impl RingPoller {
     /// (one may begin while the wait sleeps, or after it ended).
     fn look_for_overflow(&mut self) {
         let overflowed = self.ring.cq_overflow_pending();
-        self.overflows += u64::from(overflowed && !self.overflowed);
-        self.overflowed = overflowed;
+        // The common look finds what the last one found, and writes nothing.
+        if overflowed != self.overflowed {
+            self.overflows += u64::from(overflowed);
+            self.overflowed = overflowed;
+        }
     }
 
     /// Puts the file of `fd` into fixed slot `slot` (-1 empties it).
