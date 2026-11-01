@@ -8,5 +8,7 @@ MFS_edge_quiet                 MC_FdStarve          violated:Read
 MFS_no_look                    MC_FdStarve          violated:Read
 MFS_peek_drains                MC_FdStarve          violated:Read
 MFS_inq_ignored                MC_FdStarve          violated:Read
+MFS_floor_trusted              MC_FdStarve          violated:Read
 WFS_starve                     MC_FdStarve          violated:NoStarve
 WFS_direct                     MC_FdStarve          violated:NoDirect
+WFS_countless                  MC_FdStarve          violated:NoCountless

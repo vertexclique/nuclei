@@ -37,13 +37,23 @@
 (* empty. The kernel says how many bytes are left (`TCP_INQ`, `SO_INQ`):   *)
 (* none, and the next read waits for the next edge; some, and the task     *)
 (* reads again.                                                            *)
-(* A request here is two pieces, and one read takes one. The reader that   *)
-(* treats an exact read as having emptied the socket would wait for an     *)
-(* edge that never comes.                                                  *)
+(* A request here is four pieces, and one read takes one; the peer sends  *)
+(* three, then the last, each part with its edge. The reader that treats  *)
+(* an exact read as having emptied the socket would wait for an edge that  *)
+(* never comes.                                                            *)
+(* What the kernel last counted as left, less the reads since, is a floor *)
+(* on what the socket holds (`ReadState::left` with `Inq::Floor`, kept by  *)
+(* `read_direct` in src/io/source/read/direct.rs only when it covers more  *)
+(* than one read): a read it covers with more to spare asks for no count,  *)
+(* and the socket still holds bytes after it. The read that would take the *)
+(* floor's last piece asks again, since more may have come after the       *)
+(* count. The reader that lets the floor cover that read too, and takes it *)
+(* as having emptied the socket, misses the piece that came after the      *)
+(* count.                                                                  *)
 (*                                                                         *)
 (* What is abstract: the guards (each step runs whole under its side's),   *)
 (* the driver's thread (each edge is served as one step), and the bytes:   *)
-(* one request per connection, read whole (in two pieces with `Exact`).     *)
+(* one request per connection, read whole (in four pieces with `Exact`).    *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -58,7 +68,12 @@ Pool == 1
 \* The connections whose tasks read their request; the first `Holders` only peek at theirs.
 Active == {c \in Conns : c > Holders}
 \* The pieces a request comes in: a read into the task's own buffer takes one.
-Pieces == IF Exact THEN 2 ELSE 1
+Pieces == IF Exact THEN 4 ELSE 1
+\* The pieces the peer sends first; the rest come after, with an edge of their own.
+First == IF Exact THEN 3 ELSE 1
+\* How far the floor must reach for a read to ask for no count: past this one read's piece.
+\* MUTATION floor_trusted: a floor that reaches only to this read's piece covers it too.
+Covered == IF Mutation = "floor_trusted" THEN 0 ELSE 1
 \* Where a task goes after its peek: an active one on to its read, a holder nowhere.
 AfterPeek(c) == IF c \in Active THEN "read" ELSE "hold"
 
@@ -73,20 +88,30 @@ variables
     waits = [c \in Conns |-> FALSE],    \* the side's task waits to be woken
     woken = [c \in Conns |-> FALSE],    \* the waiting task was woken
     phase = [c \in Conns |-> "peek"],   \* the task's next call: "peek", "read"; then "done" or "hold"
+    got = [c \in Conns |-> 0],          \* the pieces of its request the task has read
+    floor = [c \in Conns |-> 0],        \* the floor: the pieces the kernel last counted as left, less the reads since
     direct = FALSE,                     \* (record) a starved reader called on the socket itself
+    countless = FALSE,                  \* (record) a read the floor covered asked for no count
     starvedOnce = FALSE;                \* (record) a reader found the pool empty
 
-\* Each peer sends its one request, which brings an edge.
+\* Each peer sends its one request, each part of it with an edge: `First` pieces, then the rest.
 fair process peer = 0
-variables left = Conns;    \* the peers that have not sent yet
+variables
+    left = Conns,                 \* the peers that have not sent their whole request yet
+    sent = [c \in Conns |-> 0];   \* the pieces of its request each peer has sent so far
 begin
 P_send:
     while left # {} do
-        with c \in left do
-            \* The request is in the socket, and the poller reports it.
-            sock[c] := Pieces;
+        \* The part this peer sends now: `First` pieces first, then the rest.
+        with c \in left, n = IF sent[c] = 0 THEN First ELSE Pieces - sent[c] do
+            \* A peer that sends the rest of its request now is done after it.
+            if sent[c] + n = Pieces then
+                left := left \ {c};
+            end if;
+            \* The part is in the socket, and the poller reports it.
+            sock[c] := sock[c] + n;
+            sent[c] := sent[c] + n;
             edge[c] := TRUE;
-            left := left \ {c};
         end with;
     end while;
 end process;
@@ -150,21 +175,41 @@ R_poll:
                     if Mutation = "peek_drains" then
                         blocked[self] := TRUE;
                     end if;
-                elsif sock[self] = 1 then
-                    \* The read takes the request, and empties the socket.
-                    phase[self] := "done";
-                    sock[self] := 0;
-                    blocked[self] := TRUE;
                 else
-                    \* The read takes one piece and the kernel says more is left (`TCP_INQ`): the
-                    \* task reads again at once.
-                    \* MUTATION inq_ignored: an exact read is taken as having emptied the socket.
-                    sock[self] := sock[self] - 1;
-                    blocked[self] := (Mutation = "inq_ignored");
+                    \* The read takes one piece, which leaves `rest` in the socket.
+                    with rest = sock[self] - 1 do
+                        sock[self] := rest;
+                        \* The task that has every piece of its request is done.
+                        if got[self] = Pieces - 1 then
+                            phase[self] := "done";
+                        end if;
+                        got[self] := got[self] + 1;
+                        if floor[self] > Covered then
+                            \* The floor covers more than this read: it asks for no count, the floor
+                            \* goes down by the piece it took, and the socket still holds some, so
+                            \* the task reads again at once.
+                            \* MUTATION floor_trusted: the read that takes the floor's last piece
+                            \* is taken as having emptied the socket.
+                            blocked[self] := (Mutation = "floor_trusted" /\ floor[self] = 1);
+                            floor[self] := floor[self] - 1;
+                            countless := TRUE;
+                        else
+                            \* The kernel counts what the read left (`TCP_INQ`): none, and the next
+                            \* read waits for the next edge; some, and the task reads again at once.
+                            \* MUTATION inq_ignored: an exact read is taken as having emptied the
+                            \* socket, whatever the kernel says is left.
+                            blocked[self] := (rest = 0 \/ Mutation = "inq_ignored");
+                            \* A count that covers more than one more read is kept as the floor.
+                            if rest > 1 then
+                                floor[self] := rest;
+                            end if;
+                        end if;
+                    end with;
                 end if;
             else
-                \* The socket is empty: the task waits for the next edge.
+                \* The socket is empty: the task waits for the next edge, and the floor is gone.
                 blocked[self] := TRUE;
+                floor[self] := 0;
                 waits[self] := TRUE;
                 woken[self] := FALSE;
             end if;
@@ -245,4 +290,6 @@ Read == <>(\A c \in Active : phase[c] = "done")
 NoStarve == ~starvedOnce
 \* A starved reader peeked or read straight from the socket.
 NoDirect == ~direct
+\* A read the floor covered asked the kernel for no count.
+NoCountless == ~countless
 =============================================================================

@@ -1262,14 +1262,21 @@ read leaves (`TCP_INQ`, which counts a pending end of stream as one) says whethe
 empty, and a count of none lets the next read wait for the edge. A Unix stream's read does the
 same where the kernel counts for it (`SO_INQ`, Linux 6.17), whose count leaves a pending end out:
 the hangup's edge, which marks the side unsure as it does for TCP's `drained`, has the next read
-find the end. The model's `Exact` runs it on a
-request of two pieces, one read each. 11 configurations: 4 that must pass (`Buffers`, every buffer free or holding a request
-read ahead; and `Read`, every task that reads gets its request, with a task that stops, with
-none, and with exact reads), 5 mutations (a starved reader that waits for a buffer to come back, an edge that starves
-the side and wakes nobody, a reader that waits for the next edge after the pool turned it away,
-a peek taken as having emptied the socket, and an exact read taken as having emptied it whatever
-the kernel counts, break `Read`), and 2 witnesses (a reader finds the
-pool empty; a starved reader calls on the socket itself). The second test of
+find the end. What the kernel last counted, less the reads since, is a floor on what the socket
+holds (`Inq::Floor` and `ReadState::left`, kept by `read_direct` only when it covers more than
+one read): a read it covers with more to spare asks for no count (a plain `read`, cheaper in the
+kernel and in the task than the `recvmsg` and its control message), and the read that would take
+the floor's last piece asks again, since more may have come after the count. A read that finds
+the socket empty forgets the floor. The model's `Exact` runs it on a request of four pieces, one
+read each, three sent first and the last after. 13 configurations: 4 that must pass (`Buffers`,
+every buffer free or holding a request read ahead; and `Read`, every task that reads gets its
+request, with a task that stops, with none, and with exact reads), 6 mutations (a starved reader
+that waits for a buffer to come back, an edge that starves the side and wakes nobody, a reader
+that waits for the next edge after the pool turned it away, a peek taken as having emptied the
+socket, an exact read taken as having emptied it whatever the kernel counts, and a floor that
+covers the read taking its last piece, taken as having emptied the socket, break `Read`), and 3
+witnesses (a reader finds the pool empty; a starved reader calls on the socket itself; a read the
+floor covers asks for no count). The second test of
 `tests/idle_peers.rs` fills a pool of a 64 KiB cap with bytes read ahead for tasks that peeked
 and stopped, on every backend, and checks every other peer is answered. A pipe's write the pool
 has no buffer for goes straight from the task's buffer too (`writes_bytes` in
