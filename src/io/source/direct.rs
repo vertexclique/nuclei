@@ -13,7 +13,7 @@
 use super::{Io, Via};
 
 // Smallest borrowed buffer a stream reads or writes directly, by driver and
-// direction. Measured with `tcp_size_<KiB>` of benches/vs_tokio_count.rs,
+// direction. Measured with a sweep of TCP buffer sizes,
 // against the pool path, 5 runs a size over several passes: user
 // instructions fall at every size; cycles fall for epoll writes from 1 KiB
 // and reads from 16 KiB (below, the read that finds the socket empty costs
@@ -32,6 +32,20 @@ const READ_RING: usize = 16 << 10;
 /// Ring writes.
 #[cfg(ring)]
 const WRITE_RING: usize = 0;
+
+/// Whether a borrowed buffer of `len` bytes is written directly, by a poller's side
+/// (`poller`) or a ring's.
+#[inline(always)]
+pub(super) fn worth_write(poller: bool, len: usize) -> bool {
+    #[cfg(ring)]
+    let least = if poller { WRITE_READINESS } else { WRITE_RING };
+    #[cfg(not(ring))]
+    let least = {
+        let _ = poller;
+        WRITE_READINESS
+    };
+    len >= least
+}
 
 /// Whether a borrowed buffer of `len` bytes is read or written directly.
 #[inline]

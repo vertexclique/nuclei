@@ -213,6 +213,18 @@ impl<T: IoObject> Handle<T> {
         }
     }
 
+    /// [`from_nonblocking`](Self::from_nonblocking) for a TCP stream whose kernel counts what
+    /// its reads leave already (see `Source::passes_inq`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn from_nonblocking_counting(io: T, kind: Kind) -> Handle<T> {
+        let source = Source::new_counting(io.raw_io(), kind);
+        Handle {
+            io: ManuallyDrop::new(io),
+            source,
+            file: OnceLock::new(),
+        }
+    }
+
     /// A regular file's IO state, made now on its first use, on a lease of
     /// the handle's own descriptor.
     pub(crate) fn file(&self) -> io::Result<&Arc<FileIo>> {

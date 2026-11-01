@@ -194,7 +194,7 @@ impl<T> Ring<T> {
     ///
     /// The caller is the queue's one receiver: no two calls of this function
     /// on one queue run at once.
-    #[inline]
+    #[inline(always)]
     pub(in crate::sync::mpsc) unsafe fn try_pop(&self) -> Option<T> {
         let pos = self.head.pos.load(Ordering::Relaxed);
         let number = (pos >> self.cell_bits) & self.segment_mask;

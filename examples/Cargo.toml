@@ -1,6 +1,6 @@
 [package]
 name = "nuclei-examples"
-version = "0.0.0"
+version.workspace = true
 authors = ["Theo M. Bulut <vertexclique@gmail.com>"]
 edition = "2018"
 publish = false

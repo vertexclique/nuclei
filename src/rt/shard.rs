@@ -714,8 +714,8 @@ impl Shard {
             .is_some_and(|own| core::ptr::eq(Arc::as_ptr(own), home))
     }
 
-    /// The shard's park ended: its runtime's monitor, asleep while every
-    /// worker was parked, wakes.
+    /// The shard's park ended, or the shard backed out of it: its runtime's
+    /// monitor, asleep while every worker was parked, wakes.
     fn parked_ended(&self) {
         if let Some(monitor) = &self.monitor {
             monitor.worker_woke();
@@ -990,7 +990,12 @@ impl Shard {
         }
         self.lifo_streak.set(0);
         let local = self.queue.borrow_mut().pop_front();
-        local.or_else(|| self.pop_inbox())
+        // A match, not `or_else`: a closure's call can stay out of line, which every run that
+        // finds the local queue empty would pay.
+        match local {
+            Some(r) => Some(r),
+            None => self.pop_inbox(),
+        }
     }
 
     // Inlined into the run loop's `next`: it is looked at on every run that

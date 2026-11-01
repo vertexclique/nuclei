@@ -10,6 +10,7 @@
 mod sync_support;
 
 use std::fmt;
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

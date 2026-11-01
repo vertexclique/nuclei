@@ -276,6 +276,7 @@ impl<T, L: Limit> Chan<T, L> {
     /// # Safety
     ///
     /// The caller is the channel's one receiver (see the module).
+    #[inline(always)]
     unsafe fn pop(&self) -> Pop<T> {
         // SAFETY: the caller's contract.
         if let Some(value) = unsafe { self.queue.try_pop() } {
@@ -300,6 +301,7 @@ impl<T, L: Limit> Chan<T, L> {
     /// # Safety
     ///
     /// As for [`pop`](Self::pop).
+    #[inline(always)]
     unsafe fn next(&self) -> Option<Option<T>> {
         // SAFETY: the caller's contract.
         match unsafe { self.pop() } {

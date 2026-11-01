@@ -1032,9 +1032,10 @@ is out) and the source's count of operations in the kernel. When the kernel comp
 ring's thread lowers the count, leaves the completion in the side's one-slot mailbox and
 defers it to the side: applied at once if the side is free, else by its holder as it lets go,
 which then asks for the next operation. (`Source::op_done` in `src/io/source/ops.rs` tries the
-write side's hold first and applies a completion to a free side with no trip through the
-mailbox, which is the model's put and apply with nothing between them; a held side takes the
-mailbox and the deferred bit, as modelled.) A retire deregisters the source, cancels what is out
+side's hold first, on either side, and applies a completion to a free side with no trip through
+the mailbox, which is the model's put and apply with nothing between them: on the read side
+after the arrivals still queued, as the deferred work takes them; a held side takes the mailbox
+and the deferred bit, as modelled.) A retire deregisters the source, cancels what is out
 and waits until the count is zero: it puts its waker in, raises a flag, and only then looks at
 the count, while the ring's thread lowers the count and then looks at the flag. 11
 configurations: 3 that must pass (`OneOut` and `NoOverwrite`, one operation out and one
@@ -1951,7 +1952,7 @@ end when their peer sends or connects; sends, polls for room and connects under 
 their peer reads or answers, and a zero-copy send that holds its buffer until the kernel's
 notification, which comes once the peer acknowledged the bytes; and a child's exit watch) and
 finite ones (a file's reads and writes) that wait in room when the cap is used. Before, the ring
-counted the one-shot operations of a side that reads: in the vs-tokio benchmark 3840 idle
+counted the one-shot operations of a side that reads: in a many-connections benchmark 3840 idle
 connections, the cap of a ring of 2048 entries beside its 256-buffer group, filled it with one-shot
 receives that waited for their peers, and the next accept waited in room behind them for good,
 leaving every connection past them unaccepted. It counted every operation of a side that writes
@@ -2076,7 +2077,24 @@ from a detached thread, a cancel by the runner). `tla/handoff/Retarget.tla` chec
 `block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
 the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
 1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old
-shard). `lean/Nuclei/Handoff.lean` proves the word's packing (its epoch and its side come back
+shard). `tla/handoff/TakeRef.tla` checks who holds the shard while the monitor takes it (`take`
+in `src/rt/handoff/monitor.rs`, `run_shard` in `src/rt/workers.rs`): the monitor holds the shard
+only weakly, so it gets a reference of its own before it claims the runner's slot, lets go of it
+when the take does not happen, and gives it to the spare when it does; a runner that comes back
+to find the shard taken lets go of its own. 5 configurations: 1 that must pass (the shard never
+freed while the runtime runs, `NoLoss`; every reference with its holder, `RefsHeld`; a taken shard
+reaching a spare, `Rescued`); 2 mutations (the reference got only after the take, as before the
+fix: the runner, back in between, lets go of the last one and frees the shard with its queued
+tasks, `NoLoss`, the macOS cadence failure; a failed take forgetting its reference, `RefsHeld`);
+and 2 witnesses (a take, a take that did not happen). `tla/handoff/Asleep.tla` checks how the
+monitor sleeps while every worker is parked (`run` in `src/rt/handoff/monitor.rs`) and how a
+worker wakes it (`Shard::begin_park` in `src/rt/shard/run.rs`): the monitor says it sleeps and
+looks at the parks again, a worker says it parks and looks for work again, and a worker whose park
+ends or that backs out of it rings a monitor that sleeps. 5 configurations: 1 that must pass (a
+running worker is watched in the end, `Watched`); 3 mutations (the back-out ringing nobody, as
+before the fix: the monitor's looks fall in the moment the worker said it parks, it sleeps, and a
+poll that blocks is never handed on; a park's end ringing nobody; the monitor sleeping on its first look: each breaks `Watched`); and
+1 witness (a back-out while the monitor sleeps). `lean/Nuclei/Handoff.lean` proves the word's packing (its epoch and its side come back
 out, a new poll writes a word no earlier poll wrote, every epoch below `2^63` fits) and the watch:
 the monitor's streak of four is five equal reads outside the shard, which a tick apart or more
 mean the poll has run at least four ticks, and a read that missed the poll just before one that

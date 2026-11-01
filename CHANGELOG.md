@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.5.3
+
+### Fixed
+
+- **A shard taken from a blocked runner is never dropped with its tasks.** The monitor holds a
+  worker's shard only weakly, and got a reference of its own only after its take had succeeded; a
+  runner whose poll ended in between found the shard taken and let go of the last reference, so the
+  shard was dropped with the tasks still queued on it, and each one's handle then found no output
+  (on macOS, about one run in two thousand of the cadence test whose twelve tasks block their
+  runners at once). The monitor now holds the shard before it claims the runner's slot, and lets go
+  of it when the take does not happen (`proofs/tla/handoff/TakeRef.tla`).
+- **A worker that backs out of its park wakes the monitor.** With every worker parked the monitor
+  sleeps until a worker's park ends; a worker that said it parks, found work at its last look and
+  ran on rang nobody, so a monitor that took that moment for every worker parked could sleep while
+  the worker ran, and a poll of it that blocked then waited for its end instead of a handoff (found
+  in the protocol and its model, not seen in a run). The back-out now rings a monitor that sleeps,
+  as a park's end does (`proofs/tla/handoff/Asleep.tla`).
+- **The monitor's ticks on macOS are as short as they say.** The monitor reads each worker's word
+  every quarter of the handoff threshold with a timed park, which macOS coalesces with other
+  timers: on a CI runner a 2.5 ms park took 18 ms at the median and up to 119 ms, so a blocked
+  poll waited 70 ms or more for its handoff instead of 10 ms, and in the cadence test the first
+  handoff came up to 800 ms after the runtime started. The monitor now waits on a kqueue
+  there, its ring a user event and its tick a timer marked critical, which is not coalesced (as a
+  shard's precise sleep's is): 2.5 ms take 3.8 ms at the median and 8.6 ms at most.
+- **A shard on io_uring no longer sleeps through a wake behind a full submission queue.** Entries
+  past the queue's room wait in the shard, the read of its wake's eventfd first in line, and a
+  wait handed the kernel only what the queue held. A shard that queued more operations than its
+  ring has entries between two waits (130 receives on a ring of 64), then waited with no timer
+  due, slept with the wake's read outside the kernel: until one of its operations completed, and
+  with idle peers never, no wake ended the wait, neither another thread's nor that of a timer the
+  shard fired on its way to the wait, whose `block_on` future then never ran again. CI's Ubuntu
+  6.8 job hung 5.5 hours so in `rt::shard::ring::tests_cap`, and a loaded host hangs that test
+  about once in 300 runs, with the ring's table of fixed files and without. A wait that may sleep
+  now hands the kernel every entry first, and only looks where the kernel takes not all of them
+  (`proofs/tla/park`, the `no_submit_first` mutation). The cap tests bound their sends with a
+  deadline, and a watchdog ends the test process with a message after 30 seconds, since a lost
+  wake stops the shard's timers too.
+
+### Changed
+
+- **`File::open` opens on the calling thread when it can answer at once** (Linux). A regular file
+  on a local file system whose path the kernel's caches resolve at once (`openat2` with
+  `RESOLVE_CACHED`, Linux 5.12) is opened on the task's own thread, non-blocking, with no job of
+  the blocking pool. What the path names is looked at first through an `O_PATH` descriptor, so no
+  FIFO, device or file of a network or user-space file system is opened there; those, every open
+  the kernel's caches cannot answer, and every kernel without the call go to the blocking pool as
+  before, and its answer, an error included, is the one the caller gets.
+- **A ring registers its table of fixed files at its first source's attach**, not at its start, so
+  a shard that never attaches a socket or a file (a `block_on` of timers and channels) makes no
+  registration call.
+- **The bounded channel's `send` and `recv` are single-state futures.** `Sender::send` waits for a
+  slot and pushes the value in one future, and the receiver looks at its queue inline; a send that
+  finds a slot free and a receive that finds a message take no state of nested waits. The
+  signatures are the same futures as before (`fn send(&self, value) -> impl Future + '_`), not
+  `Unpin`, and a send dropped while it waits lets go of its place and of a slot it was handed, as
+  before.
+- **The stream and completion paths run fewer instructions per operation.** A stream's side is
+  polled and its bytes sent under its owner's biased hold, inlined, on the stream's own shard; a
+  stream's direct read is decided in one place, and its first read-ahead piece stays out of the
+  queue; the kernel counts what a read leaves out of line only the first time; a going shard asks
+  its sources as their owner, with no heavy fence, so a runtime that drops with many streams open
+  makes no `membarrier` call per stream (on epoll, 256 connections took about 250 calls and now
+  take 1); an arrival's hand-out and delivery and a chunk's
+  take-in are inlined into the ring's completion loop, which enters its unwinding guard once per
+  batch of completions and wakes the lone reader an arrival leaves inline; a read side's completion
+  is applied at once when the side is free, as a write side's is; a step that left one waker alone
+  settles inline.
+- **A connection costs less to open and close.** A source's attach allocates nothing beside the
+  source itself, nor does a dropped handle's close when the handle's object fits in a word (a
+  socket's descriptor does), a new source is written field by field into its allocation, and a
+  stream a listener accepts inherits the listener's `TCP_INQ` with no `setsockopt` of its own (256
+  connections on epoll made 513 calls and now make 259). CI's budgets in `ci/op_budget.txt` were
+  lowered to match these and the changes above.
+- **The API reference is built with `io-stats`**, on the site and on docs.rs, so the IO counts and
+  latencies of `stats` are listed.
+
 ## 0.5.2
 
 ### Fixed
@@ -177,6 +253,17 @@
 - **What std's calls through `Deref` do**, on `Handle`: `shutdown`, `set_nonblocking(false)`,
   `take_error`, `Read` and `Write` go around the bytes read ahead and written behind, or block the
   shard; `UdpSocket::connect` is a constructor where `socket.connect(addr)` is std's.
+- **`sync::local`**: `mpsc`, `oneshot`, `Semaphore` and `Mutex` for the tasks of one shard, with the
+  names, signatures and errors of their `nuclei::sync` twins. They are `!Send`, no path runs an atomic
+  instruction or a fence, and full sends, acquires and locks are served in arrival order.
+- **`sync::mesh`**: a full mesh of bounded channels between a fixed number of parties, one channel
+  for every ordered pair, with backpressure per pair and a `Party::recv` that is fair across senders.
+- **`time::sleep_precise` and `sleep_until_precise`**: waits to the microsecond, where the
+  millisecond of `sleep` is too coarse. A precise deadline that is its shard's earliest arms a kernel
+  timer of its own.
+- **The cooperative budget covers channels and locks**: a receive, acquire or lock of `nuclei::sync`
+  that completes without queueing spends one unit of the task's budget, as completed IO does, so a
+  task on a channel that is always ready yields to the other tasks of its shard.
 - **Each worker's IO in `stats`, behind the `io-stats` feature** (off by default): counts with
   `Builder::count_io` and `ShardStats::io` (`IoCounts`: reads, writes, the bytes of each,
   accepts), and the IO latencies `Builder::record_latencies` records in `ShardStats::io_latencies`

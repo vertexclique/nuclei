@@ -383,7 +383,7 @@ def intro(values, commit):
 
 def write(doc, api):
     values, _ = build_pages.source_values()
-    commit = values["SOURCE"].rstrip("/").rsplit("/", 1)[-1]
+    commit = values["COMMIT"]
     chapters = [("index", "Learn Nuclei", "Where to start, and the chapters in order.")]
     chapters += [(slug, name, line) for _, slug, name, line in build_pages.CHAPTERS]
 
@@ -396,7 +396,7 @@ def write(doc, api):
     API_MD.write_text(reference)
 
     links = "\n".join(f"- [{name}]({BASE}learn/{slug}.md): {line}" for slug, name, line in chapters)
-    changelog_url = f"https://raw.githubusercontent.com/vertexclique/nuclei/{commit}/CHANGELOG.md"
+    changelog_url = "https://raw.githubusercontent.com/vertexclique/nuclei/master/CHANGELOG.md"
     LLMS.write_text(tidy(
         f"# Nuclei\n\n{intro(values, commit)}\n\n"
         f"## Learn\n\n{links}\n\n"

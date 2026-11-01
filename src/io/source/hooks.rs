@@ -21,7 +21,8 @@ pub(super) struct SourceHooks<'a> {
     pub(super) src: &'a Arc<Source>,
     /// The shard this thread runs, when the caller already looked it up.
     pub(super) shard: Option<&'a crate::rt::shard::Shard>,
-    /// The shard a registration under way is made for by its own thread.
+    /// The shard whose own thread makes the call as the shard's: a registration under way
+    /// for it, or a request as it lets go of the source registered there.
     pub(super) claim: Option<&'a Arc<Shared>>,
     /// For the driver's own edge: the registration the event came for.
     #[cfg(readiness)]
@@ -39,8 +40,8 @@ impl SourceHooks<'_> {
 impl SourceHooks<'_> {
     /// The owner of a biased side: the address of the shard this thread
     /// runs, inside it, when the source is homed there or not homed yet, or
-    /// of the shard it is being registered with by that shard's thread; else
-    /// 0. A side keeps the first shard that claims it (see `Side::role`).
+    /// of the shard whose own thread registers it or lets go of it (`claim`);
+    /// else 0. A side keeps the first shard that claims it (see `Side::role`).
     fn owner(&self) -> usize {
         if let Some(claim) = self.claim {
             return Arc::as_ptr(claim) as usize;
@@ -83,9 +84,12 @@ impl SourceHooks<'_> {
 }
 
 impl Hooks<ReadState> for SourceHooks<'_> {
+    /// Every take of the side looks at the epoch, so the look stays in its caller and the
+    /// discard of a state of a descriptor that is gone goes out of line.
+    #[inline(always)]
     fn taken(&self, st: &mut ReadState, after: &mut After) {
         if self.src.catch_up(st.epoch_mut()) {
-            st.discard(after);
+            discard_read(st, after);
         }
     }
 
@@ -166,9 +170,12 @@ impl Hooks<ReadState> for SourceHooks<'_> {
 }
 
 impl Hooks<WriteState> for SourceHooks<'_> {
+    /// Every take of the side looks at the epoch, so the look stays in its caller and the
+    /// discard of a state of a descriptor that is gone goes out of line.
+    #[inline(always)]
     fn taken(&self, st: &mut WriteState, after: &mut After) {
         if self.src.catch_up(st.epoch_mut()) {
-            st.discard(after);
+            discard_write(st, after);
         }
     }
 
@@ -218,6 +225,7 @@ impl Hooks<WriteState> for SourceHooks<'_> {
         }
     }
 
+    #[inline(always)]
     fn releasing(&self, st: &mut WriteState) {
         // Release: a drop on another thread reads the unsent bit; this thread's driver reads the
         // idle bit, only while no other thread ever held the side.
@@ -251,6 +259,21 @@ impl Hooks<WriteState> for SourceHooks<'_> {
 fn leave_read(src: &Source, st: &ReadState) {
     src.quick
         .leave_read(st.quick_word(src.kind, src.datagrams_ahead()));
+}
+
+/// What a side taken after a revival with another descriptor held goes: out of line, as it
+/// comes once per revival.
+#[cold]
+#[inline(never)]
+fn discard_read(st: &mut ReadState, after: &mut After) {
+    st.discard(after);
+}
+
+/// As [`discard_read`], for the write side.
+#[cold]
+#[inline(never)]
+fn discard_write(st: &mut WriteState, after: &mut After) {
+    st.discard(after);
 }
 
 /// As [`leave_read`], for the write side's word.

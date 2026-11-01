@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::buf::owned::{IoBuf, OwnedBuf};
+use crate::io::side::OwnerPoll;
 
 impl Source {
     /// A caller's descriptor: `Ready` with the write side's edge count while
@@ -83,25 +84,148 @@ impl Source {
         bufs: &[io::IoSlice<'_>],
         wait: bool,
     ) -> Poll<io::Result<usize>> {
-        let kind = self.kind;
         crate::coop::poll_budget(
             cx,
             #[inline(always)]
             |cx| {
-                self.poll_writing(
-                    cx,
-                    #[inline(always)]
-                    |st, io, waker, after| {
-                        #[cfg(unix)]
-                        if let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs)
-                        {
-                            return Poll::Ready(result);
+                // Whether the owner's send below found the socket full, so the step does not
+                // ask the kernel again.
+                #[cfg(unix)]
+                let mut asked = false;
+                #[cfg(unix)]
+                if let Some(result) = self.send_as_owner(bufs, &mut asked) {
+                    return Poll::Ready(result);
+                }
+                #[cfg(not(unix))]
+                let asked = false;
+                if let Some(io) = self.here(&self.write) {
+                    let waker = cx.waker();
+                    let mut after = After::default();
+                    let hooks = self.hooks_in(io.shard);
+                    match self.write.poll_owner(
+                        &mut after,
+                        &hooks,
+                        #[inline(always)]
+                        |st, after| {
+                            #[cfg(unix)]
+                            st.drive();
+                            self.write_step(st, io, waker, after, bufs, wait, asked)
+                        },
+                    ) {
+                        OwnerPoll::Done(poll) => return self.finish_poll(after, poll),
+                        OwnerPoll::Left(held, poll) => {
+                            let poll =
+                                held.finish_poll(poll, &mut after, &hooks, &mut |st, after| {
+                                    #[cfg(unix)]
+                                    st.drive();
+                                    self.write_step(st, io, waker, after, bufs, wait, asked)
+                                });
+                            return self.finish_poll(after, poll);
                         }
-                        st.write(io, kind, bufs, wait, waker, after)
-                    },
-                )
+                        OwnerPoll::Refused => self.settle(after),
+                    }
+                }
+                self.poll_write_any(cx, bufs, wait, asked)
             },
         )
+    }
+
+    /// A stream write by the write side's owner, on the shard the source is homed on, made
+    /// straight from `bufs` under the side's biased hold with nothing else of a poll, while the
+    /// side holds nothing (`WriteState::sends_now`; the hold's take catches the side up with a
+    /// revival first): what the kernel took, or `None` for the poll's own way. The hold changes
+    /// nothing of the side, so nothing is published as it lets go: a socket found full is the
+    /// poll's to record (`asked`), which then does not ask the kernel again.
+    #[cfg(unix)]
+    #[inline(always)]
+    fn send_as_owner(
+        self: &Arc<Self>,
+        bufs: &[io::IoSlice<'_>],
+        asked: &mut bool,
+    ) -> Option<io::Result<usize>> {
+        if !self.kind.streams() {
+            return None;
+        }
+        let shard = crate::rt::context::running_inside(crate::rt::context::local())?;
+        let addr = shard.shared_addr();
+        if self.reg.home.load(core::sync::atomic::Ordering::Relaxed) != addr
+            || !self.write.owned_by(addr)
+        {
+            return None;
+        }
+        let poller = !self.on_ring();
+        let mut after = After::default();
+        let sent = self.write.with_owner(
+            &mut after,
+            &self.hooks_in(Some(shard)),
+            #[inline(always)]
+            |st| {
+                if !st.sends_now(poller) || bufs.iter().all(|b| b.is_empty()) {
+                    return None;
+                }
+                let fd = self.serving_fd(None)?;
+                Some(sys::ready(sys::send_bufs(fd, bufs)))
+            },
+        );
+        self.settle(after);
+        match sent?? {
+            Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
+            Some(result) => {
+                tally::writing(&result);
+                Some(result)
+            }
+            None => {
+                *asked = true;
+                None
+            }
+        }
+    }
+
+    /// [`poll_write_bufs`](Self::poll_write_bufs) for every poll [`here`](Self::here) does not
+    /// take.
+    #[inline(never)]
+    fn poll_write_any(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+        wait: bool,
+        asked: bool,
+    ) -> Poll<io::Result<usize>> {
+        self.poll_writing(
+            cx,
+            #[inline(always)]
+            |st, io, waker, after| self.write_step(st, io, waker, after, bufs, wait, asked),
+        )
+    }
+
+    /// A stream write's step: straight from `bufs` while the side holds nothing
+    /// (`write_direct`), unless the kernel just took nothing (`asked`), else through the
+    /// write-behind.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's context, as every step's"
+    )]
+    #[inline(always)]
+    fn write_step(
+        &self,
+        st: &mut WriteState,
+        io: Io<'_>,
+        waker: &Waker,
+        after: &mut After,
+        bufs: &[io::IoSlice<'_>],
+        wait: bool,
+        asked: bool,
+    ) -> Poll<io::Result<usize>> {
+        let kind = self.kind;
+        #[cfg(unix)]
+        if asked {
+            st.found_full(matches!(io.via, Via::Fd(_)));
+        } else if let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs) {
+            return Poll::Ready(result);
+        }
+        #[cfg(not(unix))]
+        let _ = asked;
+        st.write(io, kind, bufs, wait, waker, after)
     }
 
     /// Polls the write side with `step` for the handle's own writes, given

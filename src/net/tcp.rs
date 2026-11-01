@@ -63,9 +63,10 @@ impl Handle<TcpListener> {
         &self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<(Handle<TcpStream>, SocketAddr)>> {
-        self.source().poll_accept(cx).map(|accepted| {
+        let source = self.source();
+        source.poll_accept(cx).map(|accepted| {
             let (fd, addr) = accepted?;
-            Ok((stream(fd), inet(addr)?))
+            Ok((stream(fd, source), inet(addr)?))
         })
     }
 
@@ -73,9 +74,10 @@ impl Handle<TcpListener> {
     /// accept stays armed for every connection that comes, taking them
     /// ahead for this handle.
     fn poll_accept_stream(&self, cx: &mut Context<'_>) -> Poll<io::Result<Handle<TcpStream>>> {
-        self.source()
+        let source = self.source();
+        source
             .poll_accept_stream(cx)
-            .map(|accepted| accepted.map(stream))
+            .map(|accepted| accepted.map(|fd| stream(fd, source)))
     }
 
     /// The connections as they come, without their addresses; the stream
@@ -116,8 +118,14 @@ impl Handle<TcpListener> {
     }
 }
 
-/// An accepted connection, set up already.
-fn stream(fd: crate::io::raw::Owned) -> Handle<TcpStream> {
+/// A connection `listener` accepted, set up already.
+fn stream(fd: crate::io::raw::Owned, listener: &crate::io::Source) -> Handle<TcpStream> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if listener.passes_inq() {
+        return Handle::from_nonblocking_counting(TcpStream::from(fd), Kind::Tcp);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = listener;
     Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp)
 }
 

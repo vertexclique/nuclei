@@ -89,8 +89,7 @@ impl ShardRing {
         }
         // Handed over with nothing borrowed: the source may submit at once.
         if let Some((source, chunk, epoch, datagram)) = delivery {
-            // Before the view, so it drops after it.
-            let _unwound = crate::io::side::Unwound::enter();
+            // The view below is taken inside the batch's `Unwound` (`wait`), which drops after it.
             let mut after = After::default();
             let starved = {
                 // SAFETY: the op's slab entry owns a strong count of the
@@ -124,10 +123,13 @@ impl ShardRing {
                 source.ring_arrival(arrival, epoch, shard, &mut after);
                 after.starved().then(|| std::sync::Arc::clone(&source))
             };
+            // The usual end, a waker of the reader alone, is woken inline.
             if let Some(source) = starved {
                 source.wait_for_buffer();
+                after.run();
+            } else if let Err(after) = after.settle_light() {
+                after.run();
             }
-            after.run();
         }
     }
 
@@ -227,16 +229,17 @@ impl ShardRing {
         source.ring_arrival(Arrival::Conn(conn), epoch, shard, &mut after);
         if after.starved() {
             std::sync::Arc::clone(&source).wait_for_buffer();
+            after.run();
+        } else if let Err(after) = after.settle_light() {
+            after.run();
         }
-        after.run();
     }
 
     /// The multishot poll of `source`, issued in `epoch`, says its socket may
     /// be readable: the side gets the edge as an arrival, with nothing
     /// borrowed, so it may submit at once.
     fn readied(&self, shard: Option<&Shard>, source: *const crate::io::source::Source, epoch: u32) {
-        // Before the view, so it drops after it.
-        let _unwound = crate::io::side::Unwound::enter();
+        // The view below is taken inside the batch's `Unwound` (`wait`), which drops after it.
         let mut after = After::default();
         {
             // SAFETY: as in `arrived`: the poll's slab entry owns a strong count of the source
@@ -246,7 +249,9 @@ impl ShardRing {
             let source = core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(source) });
             source.ring_arrival(Arrival::Ready, epoch, shard, &mut after);
         }
-        after.run();
+        if let Err(after) = after.settle_light() {
+            after.run();
+        }
     }
 
     /// Takes in the buffers chunks gave back and gives them to the kernel
