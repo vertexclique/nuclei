@@ -57,10 +57,10 @@ fn a_sleep_dropped_on_another_thread_is_removed_by_its_shard() {
     });
     assert_eq!(shard.wheel().borrow().armed(), 1);
     std::thread::spawn(move || drop(s)).join().unwrap();
-    // The removal waits in the shard's mailbox until its next look.
-    shard.block_on(async {
-        sleep(Duration::from_millis(1)).await;
-    });
+    // The removal waits in the shard's mailbox until its next look, which a
+    // yield's turn of the loop makes. A sleep would not: one whose first poll
+    // comes after its deadline ends at once, with no turn.
+    shard.block_on(crate::task::yield_now());
     assert_eq!(shard.wheel().borrow().armed(), 0);
 }
 
@@ -101,9 +101,8 @@ fn a_precise_sleep_dropped_on_another_thread_is_removed_by_its_shard() {
     });
     assert_eq!(shard.wheel_of(true).borrow().armed(), 1);
     std::thread::spawn(move || drop(s)).join().unwrap();
-    shard.block_on(async {
-        super::sleep_precise(Duration::from_micros(100)).await;
-    });
+    // As for the millisecond wheel: a yield's turn applies the removal.
+    shard.block_on(crate::task::yield_now());
     assert_eq!(shard.wheel_of(true).borrow().armed(), 0);
 }
 
