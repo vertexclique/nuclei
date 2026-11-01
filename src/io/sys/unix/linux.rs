@@ -6,56 +6,85 @@ use std::os::fd::RawFd;
 
 use super::interrupted;
 
-/// The Linux system call `nr` with `args`, made directly where the architecture's call is
-/// written out (x86-64, AArch64), else through libc's `syscall`: a count, or the error of the
-/// negated errno the kernel answered. glibc's wrappers add a cancellation-point check (about 40
-/// instructions) to every call, and its `syscall` a variadic call and the `errno` round trip;
-/// nothing here is cancelled by `pthread_cancel`.
+/// The Linux system call `nr` with `args` (up to six), made directly where the architecture's
+/// call is written out (x86-64, AArch64), else through libc's `syscall`: a count, or the error of
+/// the negated errno the kernel answered. glibc's wrappers add a cancellation-point check (about
+/// 40 instructions) to every call, and its `syscall` a variadic call and the `errno` round trip;
+/// nothing here is cancelled by `pthread_cancel`. A call of three arguments or fewer loads only
+/// their registers: the kernel reads no others for it.
 ///
 /// # Safety
 /// `args` must be what the call `nr` takes, each pointer among them valid for what the kernel
 /// reads and writes through it for the length of the call.
 #[inline(always)]
-pub(crate) unsafe fn syscall(nr: libc::c_long, args: [usize; 6]) -> io::Result<usize> {
-    let [a0, a1, a2, a3, a4, a5] = args;
+pub(crate) unsafe fn syscall<const N: usize>(
+    nr: libc::c_long,
+    args: [usize; N],
+) -> io::Result<usize> {
+    const { assert!(N <= 6, "a system call takes six arguments at most") };
+    let arg = |i: usize| args.get(i).copied().unwrap_or(0);
     let ret: isize;
     // SAFETY: the caller vouches for the arguments; the kernel answers in the result register
     // and clobbers only the registers named.
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r10") a3,
-            in("r8") a4,
-            in("r9") a5,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
+        if N <= 3 {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") nr as isize => ret,
+                in("rdi") arg(0),
+                in("rsi") arg(1),
+                in("rdx") arg(2),
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        } else {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") nr as isize => ret,
+                in("rdi") arg(0),
+                in("rsi") arg(1),
+                in("rdx") arg(2),
+                in("r10") arg(3),
+                in("r8") arg(4),
+                in("r9") arg(5),
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
     }
     // SAFETY: as above.
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("x8") nr,
-            inlateout("x0") a0 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-            options(nostack),
-        );
+        if N <= 3 {
+            core::arch::asm!(
+                "svc 0",
+                in("x8") nr,
+                inlateout("x0") arg(0) => ret,
+                in("x1") arg(1),
+                in("x2") arg(2),
+                options(nostack),
+            );
+        } else {
+            core::arch::asm!(
+                "svc 0",
+                in("x8") nr,
+                inlateout("x0") arg(0) => ret,
+                in("x1") arg(1),
+                in("x2") arg(2),
+                in("x3") arg(3),
+                in("x4") arg(4),
+                in("x5") arg(5),
+                options(nostack),
+            );
+        }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         // SAFETY: as above, through libc, which answers -1 and sets `errno` for an error.
-        ret = unsafe { libc::syscall(nr, a0, a1, a2, a3, a4, a5) } as isize;
+        ret = unsafe { libc::syscall(nr, arg(0), arg(1), arg(2), arg(3), arg(4), arg(5)) } as isize;
         if ret == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -167,12 +196,7 @@ pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<u
     // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
     // `CONTROL` into `control`, both of which `msg` points at. Made as a
     // system call (see `syscall`).
-    let called = unsafe {
-        syscall(
-            libc::SYS_recvmsg,
-            [fd as usize, (&raw mut msg) as usize, 0, 0, 0, 0],
-        )
-    };
+    let called = unsafe { syscall(libc::SYS_recvmsg, [fd as usize, (&raw mut msg) as usize, 0]) };
     let n = match called {
         Ok(n) => n,
         Err(err) => return read_inq_failed(fd, buf, err),

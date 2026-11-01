@@ -132,8 +132,11 @@ impl Source {
 
     /// A stream write by the write side's owner, on the shard the source is homed on, made
     /// straight from `bufs` under the side's biased hold with nothing else of a poll, while the
-    /// side holds nothing (`WriteState::sends_now`; the hold's take catches the side up with a
-    /// revival first): what the kernel took, or `None` for the poll's own way. The hold changes
+    /// side's last release said it holds nothing (the `WRITE_SENDS` bit of `unsent`,
+    /// `WriteState::sends_now`, proofs/tla/sendsnow/SendsNow.tla; the hold's take catches the
+    /// side up with a revival first, which only clears it): what the kernel took, or `None` for
+    /// the poll's own way. The biased hold is refused once a foreign thread came, so every release
+    /// since the bit's was this shard's own, and none was since. The hold changes
     /// nothing of the side, so nothing is published as it lets go: a socket found full is the
     /// poll's to record (`asked`), which then does not ask the kernel again.
     #[cfg(unix)]
@@ -153,14 +156,19 @@ impl Source {
         {
             return None;
         }
-        let poller = !self.on_ring();
         let mut after = After::default();
         let sent = self.write.with_owner(
             &mut after,
             &self.hooks_in(Some(shard)),
             #[inline(always)]
-            |st| {
-                if !st.sends_now(poller) || bufs.iter().all(|b| b.is_empty()) {
+            |_| {
+                // Relaxed: only this shard ever held the side, so the last release that stored
+                // the bit was this thread's, or came before the handoff's fence.
+                if self.unsent.load(core::sync::atomic::Ordering::Relaxed)
+                    & super::super::WRITE_SENDS
+                    == 0
+                    || bufs.iter().all(|b| b.is_empty())
+                {
                     return None;
                 }
                 let fd = self.serving_fd(None)?;

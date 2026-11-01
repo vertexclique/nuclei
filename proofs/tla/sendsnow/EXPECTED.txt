@@ -1,0 +1,8 @@
+# configuration                spec                 expected
+S_alone                        MC_SendsNow          pass
+S_biased                       MC_SendsNow          pass
+S_shared                       MC_SendsNow          pass
+M_ignore_shared                MC_SendsNow          violated:Contiguous
+M_no_bit                       MC_SendsNow          violated:InOrder
+M_publish_ignores_held         MC_SendsNow          violated:InOrder
+W_fast                         MC_SendsNow          violated:NoFast

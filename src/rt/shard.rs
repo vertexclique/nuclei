@@ -998,9 +998,9 @@ impl Shard {
         }
     }
 
-    // Inlined into the run loop's `next`: it is looked at on every run that
-    // finds the local queue empty.
-    #[inline]
+    // Inlined into the run loop's `next`, whichever codegen unit holds it: it is looked at on
+    // every run that finds the local queue empty.
+    #[inline(always)]
     fn pop_inbox(&self) -> Option<Runnable> {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
