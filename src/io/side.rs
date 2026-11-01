@@ -685,6 +685,7 @@ impl<S> Side<S> {
     }
 
     /// The contents, through exclusive access: nobody else can hold it.
+    #[cfg(test)]
     pub(crate) fn get_mut(&mut self) -> &mut S {
         self.inner.with_mut(|p| {
             // SAFETY: `&mut self` excludes every holder.

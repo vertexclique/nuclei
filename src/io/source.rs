@@ -54,6 +54,7 @@ pub(crate) mod write;
 use self::hooks::SourceHooks;
 
 use core::cell::UnsafeCell;
+use core::ptr::addr_of_mut;
 #[cfg(completion)]
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -126,6 +127,14 @@ const WRITE_IDLE: u8 = 2;
 const NO_FD: Raw = super::raw::NONE;
 /// No registration.
 const NO_TOKEN: u64 = u64::MAX;
+
+/// `Source::inq_children`: not asked yet, asked and on, or refused.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const INQ_UNASKED: u8 = 0;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const INQ_ON: u8 = 1;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const INQ_OFF: u8 = 2;
 
 const UNREGISTERED: u8 = 0;
 const REGISTERING: u8 = 1;
@@ -429,6 +438,10 @@ pub(crate) struct Source {
     /// A datagram socket's words for the calls made with no guard.
     #[cfg(unix)]
     quick: quick::Quick,
+    /// A TCP listener's: whether it asked its kernel to count what reads leave
+    /// (`passes_inq`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    inq_children: AtomicU8,
     /// Completions of the sides' ring operations, for their holders.
     #[cfg(completion)]
     read_done: ops::Mailbox,
@@ -488,62 +501,130 @@ impl Source {
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
-        // Made in place: a source is large, and `Arc::new` would build it on the stack and copy
-        // it into the allocation.
+        Self::made(fd, kind, ReadState::default())
+    }
+
+    /// A source for `fd`, a TCP stream whose kernel counts what its reads leave already (one
+    /// accepted from a listener that asked it, see [`passes_inq`](Self::passes_inq)).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn new_counting(fd: Raw, kind: Kind) -> Arc<Self> {
+        Self::made(fd, kind, ReadState::counting())
+    }
+
+    /// [`new`](Self::new) with the read side's state `read`.
+    #[inline(always)]
+    fn made(fd: Raw, kind: Kind, read: ReadState) -> Arc<Self> {
+        // Made in place: a source is large, and `Arc::new` (or one write of the whole) would
+        // build it on the stack and copy it into the allocation.
         let source = Arc::<Self>::new_uninit();
-        let slot = Arc::as_ptr(&source).cast_mut();
+        let slot = Arc::as_ptr(&source).cast_mut().cast::<Self>();
         // SAFETY: the allocation is fresh and this is its one count, so nothing else reads it
-        // while it is written; `as_ptr` keeps the allocation's own provenance.
+        // while it is written; `as_ptr` keeps the allocation's own provenance. Each field is
+        // written once, through its own place, so no whole source is built anywhere first.
         unsafe {
-            slot.write(core::mem::MaybeUninit::new(Self {
-                fd: AtomicRaw::new(fd),
-                retired_fd: AtomicRaw::new(NO_FD),
-                epoch: AtomicU32::new(0),
-                retired_epoch: AtomicU32::new(0),
-                kind,
-                read: Side::biased(ReadState::default()),
-                write: Side::biased(WriteState::default()),
-                read_owner: owner::Owner::new(),
-                write_owner: owner::Owner::new(),
-                reg: Registration {
-                    state: AtomicU8::new(UNREGISTERED),
-                    token: AtomicU64::new(NO_TOKEN),
-                    shard: UnsafeCell::new(None),
-                    #[cfg(completion)]
-                    ops: AtomicBool::new(false),
-                    #[cfg(ring)]
-                    slot: AtomicU32::new(u32::MAX),
-                    #[cfg(ring)]
-                    datagrams_ahead: AtomicBool::new(false),
-                    home: core::sync::atomic::AtomicUsize::new(0),
-                    #[cfg(ring)]
-                    here: core::sync::atomic::AtomicUsize::new(0),
-                    #[cfg(port)]
-                    awaits_idle: AtomicBool::new(false),
-                },
-                requests: AtomicU8::new(0),
-                ask: Ask::default(),
-                unsent: AtomicU8::new(0),
-                #[cfg(unix)]
-                quick: quick::Quick::new(kind),
+            addr_of_mut!((*slot).fd).write(AtomicRaw::new(fd));
+            addr_of_mut!((*slot).retired_fd).write(AtomicRaw::new(NO_FD));
+            addr_of_mut!((*slot).epoch).write(AtomicU32::new(0));
+            addr_of_mut!((*slot).retired_epoch).write(AtomicU32::new(0));
+            addr_of_mut!((*slot).kind).write(kind);
+            addr_of_mut!((*slot).read).write(Side::biased(read));
+            addr_of_mut!((*slot).write).write(Side::biased(WriteState::default()));
+            addr_of_mut!((*slot).read_owner).write(owner::Owner::new());
+            addr_of_mut!((*slot).write_owner).write(owner::Owner::new());
+            addr_of_mut!((*slot).reg).write(Registration {
+                state: AtomicU8::new(UNREGISTERED),
+                token: AtomicU64::new(NO_TOKEN),
+                shard: UnsafeCell::new(None),
                 #[cfg(completion)]
-                read_done: ops::Mailbox::default(),
-                #[cfg(completion)]
-                write_done: ops::Mailbox::default(),
+                ops: AtomicBool::new(false),
                 #[cfg(ring)]
-                read_arrivals: crate::rt::shard::counted::LazyCounted::new(),
-                #[cfg(completion)]
-                ops_out: core::sync::atomic::AtomicU8::new(0),
+                slot: AtomicU32::new(u32::MAX),
+                #[cfg(ring)]
+                datagrams_ahead: AtomicBool::new(false),
+                home: core::sync::atomic::AtomicUsize::new(0),
+                #[cfg(ring)]
+                here: core::sync::atomic::AtomicUsize::new(0),
                 #[cfg(port)]
-                port: Default::default(),
-            }))
-        };
-        // SAFETY: written whole above.
-        unsafe { source.assume_init() }
+                awaits_idle: AtomicBool::new(false),
+            });
+            addr_of_mut!((*slot).requests).write(AtomicU8::new(0));
+            addr_of_mut!((*slot).ask).write(Ask::default());
+            addr_of_mut!((*slot).unsent).write(AtomicU8::new(0));
+            #[cfg(unix)]
+            addr_of_mut!((*slot).quick).write(quick::Quick::new(kind));
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            addr_of_mut!((*slot).inq_children).write(AtomicU8::new(INQ_UNASKED));
+            #[cfg(completion)]
+            addr_of_mut!((*slot).read_done).write(ops::Mailbox::default());
+            #[cfg(completion)]
+            addr_of_mut!((*slot).write_done).write(ops::Mailbox::default());
+            #[cfg(ring)]
+            addr_of_mut!((*slot).read_arrivals)
+                .write(crate::rt::shard::counted::LazyCounted::new());
+            #[cfg(completion)]
+            addr_of_mut!((*slot).ops_out).write(core::sync::atomic::AtomicU8::new(0));
+            #[cfg(port)]
+            addr_of_mut!((*slot).port).write(Default::default());
+        }
+        // SAFETY: every field was written above.
+        let source = unsafe { source.assume_init() };
+        // Names every field, so one added to the source and not written above fails the build.
+        let Self {
+            fd: _,
+            retired_fd: _,
+            epoch: _,
+            retired_epoch: _,
+            kind: _,
+            read: _,
+            write: _,
+            read_owner: _,
+            write_owner: _,
+            reg: _,
+            requests: _,
+            ask: _,
+            unsent: _,
+            #[cfg(unix)]
+                quick: _,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+                inq_children: _,
+            #[cfg(completion)]
+                read_done: _,
+            #[cfg(completion)]
+                write_done: _,
+            #[cfg(ring)]
+                read_arrivals: _,
+            #[cfg(completion)]
+                ops_out: _,
+            #[cfg(port)]
+                port: _,
+        } = &*source;
+        source
     }
 
     pub(crate) fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// Whether a connection this TCP listener accepts now starts with its kernel counting what
+    /// its reads leave (`TCP_INQ`, which a TCP socket takes from the listener it is accepted
+    /// from), so its first read sets nothing. The listener asks it of its kernel once, at its
+    /// first accept on a poller (a ring's receives need no count); the connection of that
+    /// accept, made before, asks for its own. One that was queued before and is marked anyway
+    /// reads as one whose kernel gives no count.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn passes_inq(&self) -> bool {
+        match self.inq_children.load(Ordering::Relaxed) {
+            INQ_ON => true,
+            INQ_UNASKED if self.kind == Kind::TcpListener && !self.on_ring() => {
+                let on = self
+                    .fd()
+                    .is_ok_and(|fd| crate::io::sys::enable_inq(fd, true));
+                self.inq_children
+                    .store(if on { INQ_ON } else { INQ_OFF }, Ordering::Relaxed);
+                false
+            }
+            _ => false,
+        }
     }
 
     /// The hooks of a poll's or a request's hold.
@@ -752,6 +833,7 @@ impl Source {
 
     /// Whether a side last saw an older epoch than the source's: if so it
     /// catches up, and its state is of a descriptor that is gone.
+    #[inline(always)]
     fn catch_up(&self, seen: &mut u32) -> bool {
         let now = self.epoch.load(Ordering::Acquire);
         if *seen == now {
@@ -1166,17 +1248,6 @@ impl Source {
         self.read.defer(0, &mut after, &hooks);
         self.write.defer(0, &mut after, &hooks);
         self.settle(after);
-    }
-}
-
-impl Drop for Source {
-    fn drop(&mut self) {
-        // Whatever the sides still hold (read-ahead, accepted connections)
-        // goes now; no guard is held, so the buffers may wake whoever waits.
-        let mut after = After::default();
-        self.read.get_mut().discard(&mut after);
-        self.write.get_mut().discard(&mut after);
-        after.run();
     }
 }
 

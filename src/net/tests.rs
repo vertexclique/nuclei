@@ -1005,3 +1005,60 @@ mod emfile;
 mod send_file;
 
 mod zero_copy;
+
+/// Whether `fd`'s kernel counts what its reads leave (`TCP_INQ`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn counts_left(fd: std::os::fd::RawFd) -> bool {
+    let mut on: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a plain getsockopt into an int of our own.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INQ,
+            (&raw mut on).cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+    on != 0
+}
+
+/// A TCP listener on a poller asks its kernel, at its first accept, to count what reads leave,
+/// and the connections it accepts after that take the count from it, so their reads ask nothing
+/// of their own and read what came. On a ring, whose receives need no count, the listener asks
+/// nothing.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_listener_passes_the_count_of_what_reads_leave_to_what_it_accepts_on_a_poller() {
+    let rt = runtime();
+    rt.block_on(rt.spawn(async {
+        let poller = crate::proactor::Proactor::backend() != crate::IoBackend::IoUring;
+        let listener = crate::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _first_peer = TcpStream::connect(addr).unwrap();
+        let (_first, _) = within(listener.accept()).await.unwrap();
+        assert_eq!(
+            counts_left(listener.as_raw_fd()),
+            poller,
+            "the listener's count of what reads leave"
+        );
+        let mut peer = TcpStream::connect(addr).unwrap();
+        let (second, _) = within(listener.accept()).await.unwrap();
+        assert_eq!(
+            counts_left(second.as_raw_fd()),
+            poller,
+            "the connection did not take its listener's count"
+        );
+        peer.write_all(b"counted").unwrap();
+        let mut buf = [0u8; 7];
+        let mut got = 0;
+        while got < buf.len() {
+            got += within(second.recv(&mut buf[got..])).await.unwrap();
+        }
+        assert_eq!(&buf, b"counted");
+        drop(peer);
+        assert_eq!(within(second.recv(&mut buf)).await.unwrap(), 0);
+    }));
+}
