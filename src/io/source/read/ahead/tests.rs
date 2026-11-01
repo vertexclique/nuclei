@@ -71,6 +71,23 @@ fn a_peek_leaves_every_byte_for_the_read() {
 }
 
 #[test]
+fn a_read_the_first_piece_covers_takes_from_it_alone() {
+    let mut ahead = ahead(&[b"abcdef", b"gh"]);
+    let mut out = [0; 2];
+    let mut after = After::default();
+    assert_eq!(ahead.copy_into(&mut out, true, &mut after, None), 2);
+    after.run();
+    assert_eq!(&out, b"ab");
+    assert_eq!(read(&mut ahead, 2), b"ab");
+    assert_eq!(read(&mut ahead, 3), b"cde");
+    assert_eq!(ahead.len(), 3);
+    assert_eq!(read(&mut ahead, 1), b"f");
+    assert_eq!(ahead.len(), 2);
+    assert_eq!(read(&mut ahead, 3), b"gh");
+    assert!(ahead.is_empty());
+}
+
+#[test]
 fn an_empty_piece_is_let_go_at_once() {
     let mut ahead = ahead(&[b""]);
     assert!(ahead.is_empty());
