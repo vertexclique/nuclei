@@ -54,6 +54,7 @@ impl Piece {
         }
     }
 
+    #[inline(always)]
     fn consume(&mut self, n: usize) {
         match self {
             Piece::Pool(buf) => buf.consume(n),
