@@ -306,6 +306,12 @@ struct Registration {
     /// followed. With the token it names the registration, since every
     /// shard numbers its own tokens.
     home: core::sync::atomic::AtomicUsize,
+    /// The address of the `Shared` of the ring shard the source is registered with, published
+    /// once the registration is in place (after `slot` and `state`) and cleared before it goes:
+    /// a thread of that shard reaches the source Here with one look (`Source::via`,
+    /// proofs/tla/attach/Route.tla). 0 for none.
+    #[cfg(ring)]
+    here: core::sync::atomic::AtomicUsize,
     /// A registration found operations of the source out, which keep its
     /// handle on the port they were issued to: it waits for the last to
     /// end (see `ops::Source::waits_for_ops`).
@@ -396,6 +402,8 @@ impl Source {
                 #[cfg(ring)]
                 slot: AtomicU32::new(u32::MAX),
                 home: core::sync::atomic::AtomicUsize::new(0),
+                #[cfg(ring)]
+                here: core::sync::atomic::AtomicUsize::new(0),
                 #[cfg(port)]
                 awaits_idle: AtomicBool::new(false),
             },
@@ -517,6 +525,18 @@ impl Source {
         fd: Raw,
         current: Option<&'a crate::rt::shard::Shard>,
     ) -> io::Result<Via<'a>> {
+        // A thread of the ring shard the source is registered with: Here, with one look.
+        #[cfg(ring)]
+        if let Some(shard) = current
+            && self.reg.here.load(Ordering::Acquire) == shard.shared_addr()
+            && let Some(ring) = shard.ring()
+        {
+            return Ok(Via::Ops(route::Route::Here {
+                ring,
+                source: self,
+                file: self.reg.slot.load(Ordering::Acquire),
+            }));
+        }
         if !self.reg.ops.load(Ordering::Acquire) {
             // Registered with a poller, or about to register where no ring
             // runs: the driver's calls.
@@ -723,6 +743,7 @@ impl Source {
         }
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
+        self.clear_here();
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
             self.undo_with(&shard, read, write);
@@ -774,6 +795,7 @@ impl Source {
     /// next `block_on`, so work posted to it after its look would wait there,
     /// a ring's detach holding the handle's object open.
     fn registration_gone(&self) {
+        self.clear_here();
         self.reg.token.store(NO_TOKEN, Ordering::Release);
         self.reg.home.store(0, Ordering::Release);
     }
@@ -820,6 +842,21 @@ impl Source {
         // failed attach leaves its token, never its `home`.
         self.reg.token.load(Ordering::Acquire) == token
             && self.reg.home.load(Ordering::Acquire) == home
+    }
+
+    /// The registration with a ring shard `home` is in place: its threads reach the source Here
+    /// from now on. Both sides are held, `slot` and `state` stored.
+    #[cfg(ring)]
+    fn publish_here(&self, home: usize) {
+        // Release: a look that finds `here` finds the slot and the state stored before it.
+        self.reg.here.store(home, Ordering::Release);
+    }
+
+    /// The registration goes: no thread reaches the source Here from now on, before anything of
+    /// the registration changes. Both sides are held.
+    fn clear_here(&self) {
+        #[cfg(ring)]
+        self.reg.here.store(0, Ordering::Release);
     }
 
     /// Whether the write side holds bytes or a datagram the kernel has not

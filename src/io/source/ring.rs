@@ -985,9 +985,11 @@ impl Source {
         match here {
             Some(Ok(slot)) => {
                 self.reg.slot.store(slot, Ordering::Release);
+                let home = Arc::as_ptr(&shard) as usize;
                 // SAFETY: both sides are held.
                 unsafe { *self.reg.shard.get() = Some(shard) };
                 self.reg.state.store(super::REGISTERED, Ordering::Release);
+                self.publish_here(home);
                 Ok(())
             }
             Some(Err(err)) => self.ring_attach_failed(&shard, token, err),

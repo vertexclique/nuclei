@@ -1284,7 +1284,7 @@ ring's look and its install, which puts a closed number's file into the table,
 `NoClosedInstall`), and 4 witnesses.
 
 `tla/attach/Route.tla`, in the same family, checks a read of a ring source from a thread that
-runs no shard while the source's registration finishes (`Source::with_io` with `Source::via`
+runs no shard, or another shard, while the source's registration finishes (`Source::with_io` with `Source::via`
 and `Source::submit_if_registered`, `ensure_registered`, `ops_registered`, the side's
 `submit_wanted`). `with_io` reads the route before the side is
 taken: NotYet while the registration is under way, which issues nothing, Elsewhere once it is in
@@ -1293,11 +1293,18 @@ thread, where `ops_registered` submits for a waiter it finds, or by the side's h
 go. After its step, a read whose route was NotYet looks once more and, finding the source
 registered, asks the side to submit through the same path (the fix of commit 4bc2518): without
 it a registration that lands between the route and the step finds no waiter, the step leaves one
-and asks with NotYet, and nothing ever submits. 6 configurations: 4 that must pass (the read
-during the registration and after it, each with `OneSubmit`, one submit for the waiter, and no
-deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`), 1
-mutation (no look after the step breaks `Served`), and 1 witness (the late look asks for the
-submit).
+and asks with NotYet, and nothing ever submits. The route's fast check comes first: the
+registration's `here`, published last as the source is registered with its ring and cleared
+first as the registration goes (`attach_ring`, `install_ring`, `detach`, `evict_now`), names the
+shard whose thread reaches the source Here, and only a thread of that shard takes the Here route
+from it; the model reads it from a thread that runs no shard and from another ring shard's
+thread. 9 configurations: 6 that must pass (the read during the registration and after it, from
+no shard and from another shard, each with `OneSubmit`, one submit for the waiter, and no
+deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`,
+the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the home), 2
+mutations (no look after the step breaks `Served`; a fast check that drops its compare with the
+thread's own shard issues on the other shard's ring and breaks `OnlyHomeIssues`), and 1 witness
+(the late look asks for the submit).
 
 ## A shard that goes
 
