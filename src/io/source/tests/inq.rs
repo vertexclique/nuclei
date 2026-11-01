@@ -3,12 +3,14 @@
 //! the socket is empty, and a kernel that refuses the option leaves the side on
 //! the read-ahead path.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 
 use super::*;
+use crate::io::side::After;
 use crate::io::source::read::ReadState;
+use crate::io::source::{Io, Via};
 
 fn tcp_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -83,6 +85,115 @@ fn a_pending_end_of_stream_is_not_an_empty_socket() {
     assert_ne!(left, Some(0), "the end of the stream is still to be read");
     let (n, _) = sys::read_inq(server.as_raw_fd(), &mut buf).unwrap();
     assert_eq!(n, 0);
+}
+
+/// Waits until the socket `fd` holds `len` bytes to read.
+fn wait_for_bytes(fd: Raw, len: usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut held: libc::c_int = 0;
+        // SAFETY: `FIONREAD` writes one `int`, ours.
+        assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut held) }, 0);
+        if usize::try_from(held).is_ok_and(|held| held >= len) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the bytes never came");
+        std::thread::yield_now();
+    }
+}
+
+/// A poller's direct read of `out` from the TCP socket `fd`, as a task's read makes it, with
+/// whether it asked the kernel to count what the read leaves pushed onto `asked`. `None` when
+/// the read was not made there (the side waits for an edge).
+fn read_direct(
+    st: &mut ReadState,
+    fd: Raw,
+    out: &mut [u8],
+    asked: &mut Vec<bool>,
+) -> Option<io::Result<usize>> {
+    let io = Io {
+        via: Via::Fd(fd),
+        shard: None,
+    };
+    let len = out.len();
+    let poll = st.read_direct(
+        io,
+        Some(fd),
+        Kind::Tcp,
+        len,
+        false,
+        Waker::noop(),
+        |fd, count| {
+            asked.push(count);
+            if count {
+                sys::read_inq(fd, out)
+            } else {
+                sys::read(fd, out).map(|n| (n, None))
+            }
+        },
+    )?;
+    match poll {
+        Poll::Ready(result) => Some(result),
+        Poll::Pending => panic!("a poller's direct read never waits"),
+    }
+}
+
+#[test]
+fn a_read_the_last_count_covers_asks_for_no_count() {
+    let (mut client, server) = tcp_pair();
+    let fd = server.as_raw_fd();
+    let mut st = ReadState::default();
+    let bytes: Vec<u8> = (0..=255).collect();
+    client.write_all(&bytes).unwrap();
+    wait_for_bytes(fd, bytes.len());
+    let mut asked = Vec::new();
+    for piece in bytes.chunks(64) {
+        let mut out = [0u8; 64];
+        let n = read_direct(&mut st, fd, &mut out, &mut asked).map(Result::unwrap);
+        assert_eq!(n, Some(64));
+        assert_eq!(out, piece);
+    }
+    // The first read counts 192 left; the two the count covers ask for none; the last, which
+    // takes what the count left, asks again and learns the socket is empty.
+    assert_eq!(asked, [true, false, false, true]);
+    let mut out = [0u8; 64];
+    assert!(
+        read_direct(&mut st, fd, &mut out, &mut asked).is_none(),
+        "an empty socket waits for its edge with no call"
+    );
+    assert_eq!(asked.len(), 4);
+}
+
+#[test]
+fn a_floor_others_took_from_is_forgotten_once_the_socket_is_empty() {
+    let (mut client, mut server) = tcp_pair();
+    let fd = server.as_raw_fd();
+    let mut st = ReadState::default();
+    client.write_all(&[5u8; 192]).unwrap();
+    wait_for_bytes(fd, 192);
+    let mut asked = Vec::new();
+    let mut out = [0u8; 64];
+    let n = read_direct(&mut st, fd, &mut out, &mut asked).map(Result::unwrap);
+    assert_eq!(n, Some(64));
+    // Another read takes what the count said is left: the floor is above what the socket holds.
+    let mut rest = [0u8; 128];
+    server.read_exact(&mut rest).unwrap();
+    server.set_nonblocking(true).unwrap();
+    assert!(
+        read_direct(&mut st, fd, &mut out, &mut asked).is_none(),
+        "the read finds the socket empty and waits for its edge"
+    );
+    assert_eq!(asked, [true, false]);
+    // The next edge, and bytes: the floor is gone, so the read asks for a count again.
+    let mut after = After::default();
+    st.serve(fd, Kind::Tcp, true, &mut after);
+    drop(after);
+    client.write_all(&[6u8; 64]).unwrap();
+    wait_for_bytes(fd, 64);
+    let n = read_direct(&mut st, fd, &mut out, &mut asked).map(Result::unwrap);
+    assert_eq!(n, Some(64));
+    assert_eq!(out, [6u8; 64]);
+    assert_eq!(asked, [true, false, true]);
 }
 
 #[test]

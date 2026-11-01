@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.4
+
+### Changed
+
+- **A stream read the kernel's last count covers asks for no new count** (Linux, epoll). A read
+  into the task's own buffer asks the kernel how many bytes it leaves (`TCP_INQ`, `SO_INQ`), with
+  `recvmsg` and its control message, to know without another call whether the socket is empty.
+  What that count said was left, less what the reads since took, is a floor on what the socket
+  holds while nothing else takes its bytes: a read the floor covers with more to spare is a plain
+  `read`, the read that would take the floor's last bytes asks again, since more may have come
+  after the count, and a read that finds the socket empty forgets the floor
+  (`proofs/tla/starve`, the `floor_trusted` mutation). A request read in pieces costs less:
+  `tcp_split` on epoll runs 452 user instructions per operation instead of 468 (394 instead of
+  415 under fat LTO) and 6% fewer in the kernel, and the other stream rows on epoll (`tcp`,
+  `tcp_asyncrw`, `unix_stream`, `tcp_many`, `bulk`) 10 to 20 fewer in user space.
+- **A read that takes part of a ring's chunk bounds it once.** What a read takes off a chunk of
+  the receive group is bounded by what the chunk holds, with no saturating steps: `tcp_split` on
+  io_uring runs 3 fewer instructions per operation (401 of 404 under fat LTO). CI's budgets in
+  `ci/op_budget.txt` were lowered to match these and the change above.
+
 ## 0.5.3
 
 ### Fixed
