@@ -84,25 +84,34 @@ fn out_of_descriptors(err: &io::Error) -> bool {
 /// accepts after it take none until a descriptor is free.
 const CLOSED: usize = if cfg!(target_vendor = "apple") { 1 } else { 0 };
 
-/// How many of `clients` the listener's side closed: a closed one reads the
-/// end or a reset, a served one has nothing to read yet.
-fn closed(clients: &[impl std::os::fd::AsRawFd]) -> usize {
+/// How many of `clients` the listener's side closed, each one told for good:
+/// every served connection sent a byte first, so a served client reads that
+/// byte and a closed one its end or a reset. A look that does not wait cannot
+/// tell them apart: macOS hands loopback segments to its input thread
+/// (`dlil_input_async`, bsd/net/dlil_input.c), so the end that the failed
+/// accept's close sent reaches the client some time after the accept
+/// returned, after std's accept too. Each client reads with `DEADLINE` as its timeout.
+fn closed(clients: &mut [impl Read]) -> usize {
     clients
-        .iter()
-        .filter(|client| {
-            let mut byte = 0u8;
-            // SAFETY: a peek of at most one byte into our own byte, on a
-            // descriptor the caller keeps open.
-            let n = unsafe {
-                libc::recv(
-                    client.as_raw_fd(),
-                    (&raw mut byte).cast(),
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
-            };
-            n == 0 || (n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock)
+        .iter_mut()
+        .map(|client| {
+            let mut byte = [0u8; 1];
+            match client.read(&mut byte) {
+                Ok(1) => false,
+                Ok(_) => true,
+                Err(err) => {
+                    assert!(
+                        !matches!(
+                            err.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ),
+                        "a client read neither a byte nor its end within {DEADLINE:?}"
+                    );
+                    true
+                }
+            }
         })
+        .filter(|&ended| ended)
         .count()
 }
 
@@ -380,11 +389,19 @@ fn incoming_connections_answer_the_error_and_serve_the_backlog_after() {
             let _ = std::fs::remove_file(&path);
             let unix = UnixListener::bind(&path).unwrap();
             const CLIENTS: usize = 3;
-            let clients: Vec<_> = (0..CLIENTS)
-                .map(|_| std::net::TcpStream::connect(addr).unwrap())
+            let mut clients: Vec<_> = (0..CLIENTS)
+                .map(|_| {
+                    let client = std::net::TcpStream::connect(addr).unwrap();
+                    client.set_read_timeout(Some(DEADLINE)).unwrap();
+                    client
+                })
                 .collect();
-            let unix_clients: Vec<_> = (0..CLIENTS)
-                .map(|_| StdUnixStream::connect(&path).unwrap())
+            let mut unix_clients: Vec<_> = (0..CLIENTS)
+                .map(|_| {
+                    let client = StdUnixStream::connect(&path).unwrap();
+                    client.set_read_timeout(Some(DEADLINE)).unwrap();
+                    client
+                })
                 .collect();
             let mut starved = Starved::new();
             let mut tcp_in = listener.incoming();
@@ -417,8 +434,22 @@ fn incoming_connections_answer_the_error_and_serve_the_backlog_after() {
                 .await;
                 served.1.push(next.unwrap().unwrap());
             }
-            assert_eq!(closed(&clients), CLOSED, "the TCP connections closed");
-            assert_eq!(closed(&unix_clients), CLOSED, "the Unix connections closed");
+            for served in &served.0 {
+                within("a served byte", write_all(served, b"s"))
+                    .await
+                    .unwrap();
+            }
+            for served in &served.1 {
+                within("a served byte", write_all(served, b"s"))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(closed(&mut clients), CLOSED, "the TCP connections closed");
+            assert_eq!(
+                closed(&mut unix_clients),
+                CLOSED,
+                "the Unix connections closed"
+            );
             drop((served, clients, unix_clients));
             let _ = std::fs::remove_file(&path);
         },
