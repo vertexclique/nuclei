@@ -5,7 +5,7 @@
 use core::mem::ManuallyDrop;
 use std::sync::Arc;
 
-use super::context;
+use super::context::{self, Bracketed};
 use super::handoff::home::Home;
 use super::shard::Shared;
 use super::task::{Runnable, Schedule, ScheduleInfo};
@@ -83,7 +83,7 @@ unsafe impl Schedule for Sched {
             Some(home) => queue_home_here(home, runnable, info),
         };
         if let Some(runnable) = left {
-            self.schedule_elsewhere(runnable, info);
+            self.schedule_elsewhere(runnable);
         }
     }
 
@@ -142,19 +142,44 @@ unsafe impl Schedule for Sched {
 }
 
 /// Queues `runnable`, of a task of `shard` that is not bound to a thread, on
-/// that shard if this thread runs it and needs no bracket to reach it (the
-/// common case, a task woken or spawned on its own shard's thread): what
-/// [`Sched::schedule`]'s general path does then. Hands it back otherwise.
+/// that shard if this thread runs it (the common case, a task woken or
+/// spawned on its own shard's thread): what [`Sched::schedule`] does then.
+/// Hands it back otherwise.
 #[inline(always)]
 pub(crate) fn queue_here(
     shard: &Arc<Shared>,
     runnable: Runnable,
     info: ScheduleInfo,
 ) -> Option<Runnable> {
-    let here = context::local();
-    match context::running_inside(here) {
-        Some(current) if current.is(shard) => {
-            current.push_local_from(runnable, info, here.in_task());
+    // The address alone, which both ways compare: no reference to the schedule's field is
+    // kept for the way out of line.
+    let shard = Arc::as_ptr(shard) as usize;
+    match context::unbracketed(context::local()) {
+        Ok(current) => queue_on(current, shard, runnable, info),
+        Err(Bracketed) => queue_here_bracketed(shard, runnable, info),
+    }
+}
+
+/// [`queue_here`] from a task's code on a shard the monitor watches.
+#[cold]
+#[inline(never)]
+fn queue_here_bracketed(shard: usize, runnable: Runnable, info: ScheduleInfo) -> Option<Runnable> {
+    let held = context::bracketed();
+    queue_on(held.shard(), shard, runnable, info)
+}
+
+/// [`queue_here`] on `current`, the shard this thread runs as a call into it finds it, for the
+/// shard whose `Shared` is at `shard`.
+#[inline(always)]
+fn queue_on(
+    current: Option<&super::shard::Shard>,
+    shard: usize,
+    runnable: Runnable,
+    info: ScheduleInfo,
+) -> Option<Runnable> {
+    match current {
+        Some(current) if current.shared_addr() == shard => {
+            current.push_local_from(runnable, info, context::in_task());
             None
         }
         _ => Some(runnable),
@@ -163,19 +188,43 @@ pub(crate) fn queue_here(
 
 /// Queues `runnable`, of a task bound to `home`, on the shard this thread
 /// runs if the thread is the home's (or runs the shard whose own home it
-/// is) and needs no bracket to reach the shard: what
-/// [`Sched::schedule`]'s general path does then, for a task woken or spawned
-/// on its home's thread. Hands it back otherwise.
+/// is): what [`Sched::schedule`] does then, for a task woken or spawned on
+/// its home's thread. Hands it back otherwise.
 #[inline(always)]
 pub(crate) fn queue_home_here(
     home: &Home,
     runnable: Runnable,
     info: ScheduleInfo,
 ) -> Option<Runnable> {
-    let here = context::local();
-    match context::running_inside(here) {
+    match context::unbracketed(context::local()) {
+        Ok(current) => queue_home_on(current, home, runnable, info),
+        Err(Bracketed) => queue_home_here_bracketed(home, runnable, info),
+    }
+}
+
+/// [`queue_home_here`] from a task's code on a shard the monitor watches.
+#[cold]
+#[inline(never)]
+fn queue_home_here_bracketed(
+    home: &Home,
+    runnable: Runnable,
+    info: ScheduleInfo,
+) -> Option<Runnable> {
+    let held = context::bracketed();
+    queue_home_on(held.shard(), home, runnable, info)
+}
+
+/// [`queue_home_here`] on `current`, the shard this thread runs as a call into it finds it.
+#[inline(always)]
+fn queue_home_on(
+    current: Option<&super::shard::Shard>,
+    home: &Home,
+    runnable: Runnable,
+    info: ScheduleInfo,
+) -> Option<Runnable> {
+    match current {
         Some(current) if context::is_home(home) || current.owns_home(home) => {
-            current.push_local_from(runnable, info, here.in_task());
+            current.push_local_from(runnable, info, context::in_task());
             None
         }
         _ => Some(runnable),
@@ -183,40 +232,18 @@ pub(crate) fn queue_home_here(
 }
 
 impl Sched {
-    /// [`Schedule::schedule`] for a task woken anywhere but inside its own
-    /// shard, or its home's thread for a bound one.
+    /// [`Schedule::schedule`] for a task woken anywhere but on its own
+    /// shard's thread, or its home's for a bound one.
     #[inline(never)]
-    fn schedule_elsewhere(&self, runnable: Runnable, info: ScheduleInfo) {
-        if let Some(home) = &*self.home {
-            let remote = context::current(|current| match current {
-                Some(shard) if context::is_home(home) || shard.owns_home(home) => {
-                    shard.push_local(runnable, info);
-                    None
-                }
-                _ => Some(runnable),
-            });
-            if let Some(runnable) = remote {
-                // As below: the waker keeps the task until the push is done.
-                let keep = runnable.waker();
-                home.push(runnable);
-                drop(keep);
-            }
-            return;
+    fn schedule_elsewhere(&self, runnable: Runnable) {
+        // Once pushed, the shard may run the task to its end and free it,
+        // this schedule with it: the waker keeps it until the push and the
+        // wake are done.
+        let keep = runnable.waker();
+        match &*self.home {
+            Some(home) => home.push(runnable),
+            None => self.shard.push_remote(runnable),
         }
-        let remote = context::current(|current| match current {
-            Some(shard) if shard.is(&self.shard) => {
-                shard.push_local(runnable, info);
-                None
-            }
-            _ => Some(runnable),
-        });
-        if let Some(runnable) = remote {
-            // Once pushed, the shard may run the task to its end and free
-            // it, this schedule with it: the waker keeps it until the push
-            // and the wake are done.
-            let keep = runnable.waker();
-            self.shard.push_remote(runnable);
-            drop(keep);
-        }
+        drop(keep);
     }
 }

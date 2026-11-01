@@ -1,7 +1,8 @@
 //! The rows of the op-count gate: each a fixed amount of work per iteration on a nuclei
 //! runtime, shaped as the `nuclei_run` rows of the comparison bench (one worker, unpinned,
-//! no handoff; `tcp_2w` two workers). `run(row, n)` does `n` iterations of the row and
-//! returns the operations it counted. Included with `#[path]` by any program that wants them.
+//! no handoff; `tcp_2w` two workers; `tcp_watched` the `tcp` row with the handoff watch on).
+//! `run(row, n)` does `n` iterations of the row and returns the operations it counted.
+//! Included with `#[path]` by any program that wants them.
 
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ pub const ROWS: &[&str] = &[
     "tcp_asyncrw",
     "tcp_many",
     "tcp_2w",
+    "tcp_watched",
     "bulk",
     "file_read",
     "spawn_join",
@@ -187,12 +189,14 @@ pub fn backend(rt: &nuclei::runtime::Runtime) -> nuclei::IoBackend {
     rt.block_on(async { nuclei::Proactor::backend() })
 }
 
-/// The runtime a row runs on.
+/// The runtime a row runs on. `tcp_watched` keeps the handoff watch, with a threshold no poll
+/// of the row reaches: its workers pay the watch's every store and look, and the monitor, whose
+/// ticks go by time and not by operation, ticks once in a quarter of an hour.
 pub fn runtime(row: &str) -> nuclei::runtime::Runtime {
     nuclei::runtime::Builder::new()
         .worker_threads(if row == "tcp_2w" { 2 } else { 1 })
         .pin_workers(false)
-        .handoff_after(None)
+        .handoff_after((row == "tcp_watched").then_some(Duration::from_secs(3600)))
         .build()
         .expect("the runtime starts")
 }
@@ -238,7 +242,7 @@ pub fn run(rt: &nuclei::runtime::Runtime, row: &str, n: u64) -> Option<u64> {
             }));
             n
         }
-        "tcp" | "tcp_2w" => {
+        "tcp" | "tcp_2w" | "tcp_watched" => {
             let (tx, rx) = std::sync::mpsc::channel();
             rt.spawn(async move {
                 let listener = nuclei::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

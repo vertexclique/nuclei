@@ -13,7 +13,10 @@
 //! The runner's way back in is a store of the word, a fence and a load of the
 //! claim. Where the monitor has a heavy fence (one that orders every thread
 //! of the process, [`super::fence`]), the runner's fence is the compiler's
-//! only; elsewhere it is a full one.
+//! only; elsewhere it is a full one. A call into the runtime from the task's
+//! code goes in the same way ([`Slot::mark`]) and puts the poll's word back
+//! as it ends ([`Slot::unmark`]), so the poll, if it blocks after the call,
+//! is still seen outside and taken.
 //!
 //! Two more words, each written by the runner alone. The pins, written
 //! inside the shard, are held while a shard-local value is lent to the
@@ -136,7 +139,32 @@ impl Slot {
     /// unless the monitor took the shard. Never waits.
     #[inline]
     pub(crate) fn come_back(&self, epoch: u64) -> Back {
-        self.word.store(inside(epoch), Ordering::Relaxed);
+        self.enter(inside(epoch))
+    }
+
+    /// The runner, in a task's code, calls into its shard: the word says
+    /// inside the poll again, as at the poll's end, before the runner looks
+    /// at the claim. Answers the word it left, which [`unmark`](Self::unmark)
+    /// puts back as the call ends, with what the runner found. Never waits.
+    #[inline(always)]
+    pub(crate) fn mark(&self) -> (u64, Back) {
+        // Only the runner writes the word: this is its own last store, the
+        // poll's outside word.
+        let word = self.word.load(Ordering::Relaxed);
+        (word, self.enter(word & !1))
+    }
+
+    /// The runner's call into its shard ends: the word it left the call
+    /// with, outside again. Release, as [`go_out`](Self::go_out).
+    #[inline(always)]
+    pub(crate) fn unmark(&self, word: u64) {
+        self.word.store(word, Ordering::Release);
+    }
+
+    /// The runner's way in: its word `word`, a fence, its claim.
+    #[inline(always)]
+    fn enter(&self, word: u64) -> Back {
+        self.word.store(word, Ordering::Relaxed);
         if self.full_fence {
             fence(Ordering::SeqCst);
         } else {

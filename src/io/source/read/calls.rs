@@ -4,6 +4,7 @@
 use super::*;
 use crate::buf::owned::{IoBufMut, OwnedBuf};
 use crate::io::side::OwnerPoll;
+use crate::rt::context;
 
 impl Source {
     /// A caller's descriptor: `Ready` with the read side's edge count while
@@ -76,38 +77,17 @@ impl Source {
             #[inline(always)]
             |cx| {
                 if let Some(io) = self.here(&self.read) {
-                    let waker = cx.waker();
-                    let mut after = After::default();
-                    let hooks = self.hooks_in(io.shard);
-                    match self.read.poll_owner(
-                        &mut after,
-                        &hooks,
-                        #[inline(always)]
-                        |st, after| {
-                            #[cfg(unix)]
-                            st.drive();
-                            self.read_step(st, io, waker, after, out, peek)
-                        },
-                    ) {
-                        OwnerPoll::Done(poll) => return self.finish_poll(after, poll),
-                        OwnerPoll::Left(held, poll) => {
-                            let poll =
-                                held.finish_poll(poll, &mut after, &hooks, &mut |st, after| {
-                                    #[cfg(unix)]
-                                    st.drive();
-                                    self.read_step(st, io, waker, after, out, peek)
-                                });
-                            return self.finish_poll(after, poll);
-                        }
-                        OwnerPoll::Refused => self.settle(after),
-                    }
+                    owner_poll!(self, self.read, io, cx, |st, after, waker| self
+                        .read_step(st, io, waker, after, out, peek));
                 }
                 self.poll_read_any(cx, out, peek)
             },
         )
     }
 
-    /// [`poll_read`](Self::poll_read) for every poll [`here`](Self::here) does not take.
+    /// [`poll_read`](Self::poll_read) for every poll [`here`](Self::here) does not take. From a
+    /// task's code on a shard the monitor watches, the owner's poll first, in a bracket that
+    /// ends before what it left is settled.
     #[inline(never)]
     fn poll_read_any(
         self: &Arc<Self>,
@@ -115,6 +95,17 @@ impl Source {
         out: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<usize>> {
+        if context::unbracketed(context::local()).is_err() {
+            let held = context::bracketed();
+            if let Some(io) = held
+                .shard()
+                .and_then(|shard| self.here_on(shard, &self.read))
+            {
+                owner_poll!(self, self.read, io, cx, |st, after, waker| self
+                        .read_step(st, io, waker, after, out, peek), then held.end());
+            }
+            held.end();
+        }
         self.poll_reading(
             cx,
             #[inline(always)]

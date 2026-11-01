@@ -942,15 +942,10 @@ impl Shard {
             .and_then(|(owner, index)| (owner == runtime).then_some(index))
     }
 
-    /// Queues a runnable from this shard's own thread. A task woken by the
+    /// Queues a runnable from this shard's own thread, `in_task` as
+    /// [`in_task`](super::context::in_task) finds it. A task woken by the
     /// task being polled runs next (the LIFO slot), unless it is that task
     /// itself yielding.
-    pub(crate) fn push_local(&self, runnable: Runnable, info: ScheduleInfo) {
-        self.push_local_from(runnable, info, super::context::in_task());
-    }
-
-    /// [`push_local`](Self::push_local) from a caller that read
-    /// [`in_task`](super::context::in_task) already.
     #[inline(always)]
     pub(crate) fn push_local_from(&self, runnable: Runnable, info: ScheduleInfo, in_task: bool) {
         if self.tuning.lifo && !info.woken_while_running && in_task {

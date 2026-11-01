@@ -56,17 +56,40 @@
   signatures are the same futures as before (`fn send(&self, value) -> impl Future + '_`), not
   `Unpin`, and a send dropped while it waits lets go of its place and of a slot it was handed, as
   before.
-- **The stream and completion paths run fewer instructions per operation.** A stream's side is
-  polled and its bytes sent under its owner's biased hold, inlined, on the stream's own shard; a
-  stream's direct read is decided in one place, and its first read-ahead piece stays out of the
-  queue; the kernel counts what a read leaves out of line only the first time; a going shard asks
-  its sources as their owner, with no heavy fence, so a runtime that drops with many streams open
-  makes no `membarrier` call per stream (on epoll, 256 connections took about 250 calls and now
-  take 1); an arrival's hand-out and delivery and a chunk's
-  take-in are inlined into the ring's completion loop, which enters its unwinding guard once per
-  batch of completions and wakes the lone reader an arrival leaves inline; a read side's completion
-  is applied at once when the side is free, as a write side's is; a step that left one waker alone
-  settles inline.
+- **The stream and completion paths run fewer instructions per operation.** A stream read takes the
+  bytes read ahead first, with one look at the first piece, keeps that piece out of the queue and
+  consumes a piece it takes part of inline; a stream's direct read is decided in one place; the
+  kernel counts what a read leaves out of line only the first time; `read` and `recvmsg` load only
+  the registers they take; an arrival's hand-out and delivery and a chunk's take-in are inlined into
+  the ring's completion loop, which enters its unwinding guard once per batch of completions and
+  wakes the lone reader an arrival leaves inline; a read side's completion is applied at once when
+  the side is free, as a write side's is; a step that left one waker alone settles inline; the run
+  loop's look at the inbox and its spin are inlined in every codegen unit; a going shard asks its
+  sources as their owner, with no heavy fence, so a runtime that drops with many streams open makes
+  no `membarrier` call per stream (on epoll, 256 connections took about 250 calls and now take 1).
+- **A stream's owner polls and sends on its own shard under its biased hold**, inlined, and its send
+  looks at one bit each write-side release publishes rather than at the whole write side
+  (`proofs/tla/sendsnow`), while owned writes still go out whole. On a worker the handoff watch
+  follows (the default), a task's poll and send take them in a bracket into the shard (below).
+- **A worker the handoff watch follows takes its shard's own paths from a task's code.** A call
+  into the runtime from a task's code on such a worker (a wake, a spawn, a stream's poll and send
+  as its owner) saw that it needed a bracket into its shard and went the general way with a
+  bracket around it (a stream's side through its lock, a wake through a second look for its
+  shard); it now takes the bracket and, in it, the path a worker with no watch takes. The bracket is
+  the protocol a poll's end already used: the slot's word marked, the claim looked at, and the
+  word the call found put back as it ends, so a poll that blocks after a call is still taken
+  (`proofs/tla/handoff`: a call with no mark, `M_no_call_mark`, breaks `Exclusive`, and one that
+  leaves its mark, `M_call_stays_marked`, breaks `Rescued`). A watched worker's run of a task keeps
+  no guard to come back by (each part of the run that runs the task's code catches a panic or
+  aborts on one), and a thread looks at one word per call where it looked at two. With the default
+  watch on io_uring, default release build, user instructions per operation: a 64-byte TCP round
+  trip 4321 before, 3792 now (3375 with the watch off, 3391 before); a 64 KiB chunk of a bulk
+  stream 1414, 1217 (1060 off); a spawn and its join 899, 791 (632 off); a oneshot round 1127, 1018
+  (859 off); a bounded channel round 651, 611 (530 off); a sleep 1019, 942 (834 off). With the watch
+  off each row costs what it did or less, but a few by a handful of instructions: a datagram round
+  trip on io_uring (3 and 4 more, of 3677 and 4150), a sleep on epoll (3 more, of 831), `block_on`
+  under fat LTO (2 more, of 244), and the file read, whose count moves by ten from run to run. The
+  ops gate counts the TCP row with the watch on too (`tcp_watched` in `ci/op_count`).
 - **A connection costs less to open and close.** A source's attach allocates nothing beside the
   source itself, nor does a dropped handle's close when the handle's object fits in a word (a
   socket's descriptor does), a new source is written field by field into its allocation, and a

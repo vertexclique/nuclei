@@ -39,10 +39,9 @@ impl Shard {
     /// Polls a runnable's task.
     #[inline(always)]
     pub(super) fn run(&self, runnable: Runnable) -> Polled {
-        context::poll(&self.shared, || {
+        context::run_task(&self.shared, || {
             runnable.run();
         })
-        .1
     }
 
     /// Runs `future` to its end on this shard, running the shard's tasks,
