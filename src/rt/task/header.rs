@@ -80,6 +80,25 @@ impl Header {
         }
     }
 
+    /// Claims the awaiter's cell for a completion: the waker it holds,
+    /// whether the cell was the caller's, whose next exchange of the word
+    /// then clears NOTIFYING and AWAITER (the flag held until then, so a
+    /// registration meanwhile wakes its own waker), and the word as the
+    /// claim left it. With a registration or a notification in progress the
+    /// caller takes nothing and leaves the flags to it, as
+    /// [`take`](Self::take) does.
+    #[inline(always)]
+    pub(super) fn claim(&self) -> (Option<Waker>, bool, usize) {
+        let state = self.state.fetch_or(NOTIFYING, Ordering::AcqRel);
+        if state & (NOTIFYING | REGISTERING) != 0 {
+            return (None, false, state | NOTIFYING);
+        }
+        // SAFETY: NOTIFYING is ours and REGISTERING is clear, so nobody else
+        // reaches the cell until the caller's exchange clears the flag.
+        let waker = self.awaiter.with_mut(|cell| unsafe { (*cell).take() });
+        (waker, true, state | NOTIFYING)
+    }
+
     /// Stores `waker` as the awaiter. A notification that raced the store is
     /// handled here: the waker is woken at once instead of being left behind.
     #[inline(always)]

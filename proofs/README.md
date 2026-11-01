@@ -244,16 +244,32 @@ the future behind, never dropped. The TLA+ model found it (the mutation `pending
 brings that behaviour back and must fail), and nuclei's task drops the future in its last
 decrement instead.
 
-The TLA+ family checks 26 configurations: 11 that must pass (the handle awaiting, detaching,
+A run that completes lets go of its reference in the completion's own exchange, the awaiter's
+waker taken just before it with the notifier's flag held across the exchange (`Header::claim`,
+`RawTask::run`): a handle that sees the completion holds the last reference, so its drop frees
+the task on the handle's thread, and the task's memory is back in the cache of the thread that
+awaits it before that thread goes on. An output no handle takes is taken out before that
+exchange and dropped after it, the task let go of, before the awaiter's wake. A run that ends Pending, neither woken nor closed, drops its
+reference in the exchange that clears RUNNING, so no later run of the task, woken meanwhile on
+another runner, is followed by that drop. `RunnerFreesNoAwaited` checks both: the run never
+frees a task whose handle held it as it completed.
+
+The TLA+ family checks 30 configurations: 12 that must pass (the handle awaiting, detaching,
 dropped or cancelling, with one or two runners, wakes by value and by reference, a future that
-wakes itself, a waker dropped without a wake, and liveness under weak fairness), 9 mutations
+wakes itself, a waker dropped without a wake, a handle polled once without a wake, and liveness
+under weak fairness), 12 mutations
 that each take one rule away (a wake during the poll that schedules a second runnable breaks
 `OnePoll`; a run that drops a wake from its own poll, and a handle that sleeps without looking
-again, end in a deadlock; freeing the memory while the handle lives, and a wake by reference
-that makes a runnable without its own reference, break `NothingAfterFree`; a cancel that drops
+again, end in a deadlock; freeing the memory while the handle lives, a wake by reference
+that makes a runnable without its own reference, and a Pending run whose exchange drops its
+reference though the task was woken, break `NothingAfterFree`; a cancel that drops
 the future itself breaks `FutureOnce`; a detach that skips the last-reference free, and a
 completion that leaves the output behind, break `CleanEnd`; the established crate's leak
-breaks `FreedAfterFuture`), and 6 witnesses: a wake during the poll, a cancel during the poll,
+breaks `FreedAfterFuture`; a run that lets go of its reference only after the completion's
+exchange, as it once did, lets a handle polled in between take the output and go, and frees the
+task itself, and a Pending run that drops its reference in a step of its own, as it once did,
+frees the task after another runner completed it and the handle went, both of which break
+`RunnerFreesNoAwaited`), and 6 witnesses: a wake during the poll, a cancel during the poll,
 a cancel found in the queue, a registration of the handle's waker meeting a notification, the
 last waker closing an idle task, and the handle woken from its sleep.
 

@@ -86,6 +86,8 @@ variables
     registerMetNotify = FALSE, \* a registration met a notification
     lastWakerClosed = FALSE,   \* the last waker closed an idle task and scheduled it
     parkWoken = FALSE,         \* the handle slept and was woken
+    freer = "nobody",          \* who freed the memory: "runner", "waker" or "handle"
+    awaitedAtComplete = FALSE, \* the handle still held the task as it completed
     spurious = Spurious;       \* polls without a wake the handle's executor has left
 
 define
@@ -98,10 +100,11 @@ macro touch() begin
     if freed then touchedFreed := TRUE; end if;
 end macro;
 
-\* Frees the memory.
-macro destroy() begin
+\* Frees the memory; `by` is who did.
+macro destroy(by) begin
     freed := TRUE;
     frees := frees + 1;
+    freer := by;
 end macro;
 
 \* Drops the future; `by` is who did.
@@ -117,21 +120,27 @@ macro useOutput(to) begin
     output := to;
 end macro;
 
-\* `drop_ref`, called by a runner: one reference goes; the last one with no handle frees the
-\* task. A task still open then is one nothing can wake or await again (its last waker went
-\* during or just after the poll), so its future is dropped first, here on the runner.
-macro dropRef() begin
-    touch();
+\* The reference's drop of `dropRef`, for a step that has touched the task already (the
+\* exchange after a Pending poll, which clears RUNNING and drops the reference at once).
+macro releaseRef() begin
     \* MUTATION free_ignores_handle: the last reference frees the task though the handle lives.
     if refs = 1 /\ (~tsk \/ Mutation = "free_ignores_handle") then
         \* MUTATION pending_leaks_future: the future of a task still open is left behind
         \* (what the established task crate does).
         if ~(comp \/ clo) /\ Mutation # "pending_leaks_future" then dropFuture("runner"); end if;
         refs := 0;
-        destroy();
+        destroy("runner");
     else
         refs := refs - 1;
     end if;
+end macro;
+
+\* `drop_ref`, called by a runner: one reference goes; the last one with no handle frees the
+\* task. A task still open then is one nothing can wake or await again (its last waker went
+\* during or just after the poll), so its future is dropped first, here on the runner.
+macro dropRef() begin
+    touch();
+    releaseRef();
 end macro;
 
 \* `drop_waker`: as dropRef, but the last waker of a task that is still open (nobody can
@@ -148,7 +157,7 @@ macro dropWaker() begin
             lastWakerClosed := TRUE;        \* (record)
         else
             refs := 0;
-            destroy();
+            destroy("waker");
         end if;
     else
         refs := refs - 1;
@@ -227,7 +236,7 @@ end procedure;
 (***************************************************************************)
 fair process runner \in Runners
 variables ready = FALSE, prevAwt = FALSE, prevTsk = FALSE, prevClo = FALSE,
-          dropped = FALSE;
+          dropped = FALSE, claimed = FALSE, claimNow = FALSE, outDropped = FALSE;
 begin
 R_pop:
     \* Wait for a runnable; once the other threads are done and the queue is empty, stop.
@@ -276,20 +285,93 @@ R_store:
     touch();
     dropFuture("runner");
     output := "stored";
+    outDropped := FALSE;
+    claimed := FALSE;
+    took[self] := FALSE;
+    \* MUTATION release_after_complete: the run lets go of its reference after the
+    \* completion's exchange, as it once did: the exchange, then the awaiter's take, then the
+    \* drop. A handle polled in between takes the output and goes, and the run frees the task.
+    if Mutation = "release_after_complete" then goto R_complete_old; end if;
+R_claim:
+    \* `Header::claim`, when the word shows a stored waker the run has not claimed:
+    \* fetch_or(NOTIFYING). A registration or a notification in progress keeps the cell and
+    \* the flag, and the waker is theirs to wake.
+    if awt /\ ~claimed then
+        touch();
+        if ~(ntf \/ reg) then
+            claimed := TRUE;
+            claimNow := TRUE;
+        end if;
+        ntf := TRUE;
+    end if;
+R_claim_cell:
+    \* The cell is the run's: it takes the waker, NOTIFYING held until the exchange below.
+    if claimNow then
+        touch();
+        took[self] := slot;
+        slot := FALSE;
+        claimNow := FALSE;
+    end if;
+R_out:
+    \* With no handle, or a handle that cancelled during the poll, the run takes the output
+    \* out of the task, while its reference still holds it (the code drops it once the task
+    \* is let go of, before the awaiter's wake: what the model leaves in this step).
+    \* MUTATION complete_leaks_output: it leaves the output behind.
+    touch();
+    if (~tsk \/ clo) /\ ~outDropped /\ Mutation # "complete_leaks_output" then
+        useOutput("dropped");
+        outDropped := TRUE;
+    end if;
 R_complete:
-    \* Not running, not scheduled, completed; closed too when no handle is left to take it.
+    \* One exchange: not running, not scheduled, completed (closed too with no handle left),
+    \* the flags the claim held cleared, and the run's reference gone. A handle that sees the
+    \* completion holds the last reference, so its drop frees the task where it is; with no
+    \* handle and no other reference left, the run frees it here.
+    touch();
+    if awt /\ ~claimed /\ ~(ntf \/ reg) then
+        \* A waker was stored since, its cell free: the exchange fails on the new word, and
+        \* the run claims the waker first.
+        goto R_claim;
+    elsif (~tsk \/ clo) /\ ~outDropped /\ Mutation # "complete_leaks_output" then
+        \* The word changed to one that leaves the output to the run: drop it first.
+        goto R_out;
+    else
+        awaitedAtComplete := tsk;
+        run := FALSE;
+        sch := FALSE;
+        comp := TRUE;
+        if ~tsk then clo := TRUE; end if;
+        if claimed then
+            ntf := FALSE;
+            awt := FALSE;
+        end if;
+        \* MUTATION free_ignores_handle: the last reference frees the task though the handle
+        \* lives.
+        if refs = 1 /\ (~tsk \/ Mutation = "free_ignores_handle") then
+            refs := 0;
+            destroy("runner");
+        else
+            refs := refs - 1;
+        end if;
+    end if;
+R_complete_wake:
+    \* The awaiter is woken; nothing of the task is touched any more.
+    if took[self] then handleWoken := TRUE; took[self] := FALSE; end if;
+    goto R_pop;
+R_complete_old:
+    \* (release_after_complete) The completion's exchange alone.
     touch();
     prevAwt := awt;
     prevTsk := tsk;
     prevClo := clo;
+    awaitedAtComplete := tsk;
     run := FALSE;
     sch := FALSE;
     comp := TRUE;
     if ~tsk then clo := TRUE; end if;
-R_out:
-    \* With no handle, or a handle that cancelled during the poll, the run drops the output.
-    \* MUTATION complete_leaks_output: it leaves the output behind.
-    if (~prevTsk \/ prevClo) /\ Mutation # "complete_leaks_output" then
+R_out_old:
+    \* (release_after_complete) The output dropped after the exchange.
+    if ~prevTsk \/ prevClo then
         useOutput("dropped");
     end if;
     goto R_finish;
@@ -313,10 +395,28 @@ R_pending:
     elsif sch then
         run := FALSE;
         \* MUTATION run_drops_woken: a task woken during its poll is not scheduled again.
-        if Mutation = "run_drops_woken" then goto R_drop; else goto R_resched; end if;
-    else
+        \* MUTATION pending_drops_woken: the exchange drops the run's reference though the
+        \* task was woken, and the runnable it schedules holds none.
+        if Mutation = "run_drops_woken" then
+            goto R_drop;
+        elsif Mutation = "pending_drops_woken" then
+            releaseRef();
+            goto R_resched;
+        else
+            goto R_resched;
+        end if;
+    elsif Mutation = "pending_two_steps" then
+        \* MUTATION pending_two_steps: RUNNING is cleared first and the reference dropped in a
+        \* step of its own, as it once was; a run woken meanwhile on another runner completes
+        \* the task, its handle takes the output and goes, and this late drop frees the task.
         run := FALSE;
         goto R_drop;
+    else
+        \* Neither woken nor closed: RUNNING cleared and the run's reference dropped in one
+        \* exchange, so no later run of the task is followed by this one's drop.
+        run := FALSE;
+        releaseRef();
+        goto R_pop;
     end if;
 R_resched:
     \* Woken during the poll: the run's reference goes to the new runnable.
@@ -531,7 +631,7 @@ H_det_loop:
         \* The last reference of a closed task: free it.
         \* MUTATION detach_skips_last: the handle goes without freeing it.
         tsk := FALSE;
-        destroy();
+        destroy("handle");
         goto H_det_push;
     else
         tsk := FALSE;
@@ -582,9 +682,15 @@ CleanEnd == AllDone => (freed /\ futureDrops = 1 /\ output # "stored")
 \* A handle that awaits a task nobody cancels gets its output.
 AwaitGetsOutput == (HandleOp = "await" /\ pc[HandleT] = "Done") => handleGot = "output"
 
+\* The run never frees a task whose handle held it as it completed: the handle's drop does,
+\* on the handle's thread, so a task's memory goes back where its awaiter runs before the
+\* awaiter goes on (a blocking job's block is back in its spawner's cache before the
+\* spawner spawns again: tests/zero_alloc.rs).
+RunnerFreesNoAwaited == freer = "runner" => ~awaitedAtComplete
+
 \* All the safety properties together.
 Safe == OnePoll /\ FutureOnce /\ NoPollAfterDrop /\ NothingAfterFree /\ OutputOnce
-        /\ FreedAfterFuture /\ CleanEnd /\ AwaitGetsOutput
+        /\ FreedAfterFuture /\ CleanEnd /\ AwaitGetsOutput /\ RunnerFreesNoAwaited
 
 (***************************************************************************)
 (* Witnesses. Each one claims an interesting case never happens; a         *)
