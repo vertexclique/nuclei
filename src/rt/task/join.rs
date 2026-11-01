@@ -63,7 +63,7 @@ impl<T> Task<T> {
     }
 
     /// Lets the task run to its end without a handle; its output is dropped.
-    #[inline]
+    #[inline(always)]
     pub fn detach(self) {
         let mut this = ManuallyDrop::new(self);
         // A handle detached right after the spawn is the common case: one
@@ -81,8 +81,14 @@ impl<T> Task<T> {
         {
             return;
         }
-        let output = this.set_detached();
-        drop(output);
+        this.detach_late();
+    }
+
+    /// A detach after the task ran, was woken or completed: out of line, so
+    /// the exchange above needs no frame.
+    #[inline(never)]
+    fn detach_late(&mut self) {
+        drop(self.set_detached());
     }
 
     /// Cancels the task and waits for its future to be dropped. Returns the
