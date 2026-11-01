@@ -13,19 +13,20 @@ impl Source {
         self: &Arc<Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<u32>> {
-        self.poll_read_side(cx, false, |st, io, waker, after| {
-            st.fd_ready(io, waker, after)
-        })
+        self.poll_read_side(
+            || cx.waker(),
+            false,
+            |st, io, waker, after| st.fd_ready(io, waker, after),
+        )
     }
 
     /// A caller's descriptor would block on a read: the side waits for its
     /// next edge, unless one came after `tick`.
     #[cfg(unix)]
     pub(crate) fn fd_clear_read(self: &Arc<Self>, tick: u32) {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
         // Nothing to wait for and nothing to fail: a registration that
         // failed is the next readiness call's to report.
-        let _ = self.poll_read_side(&mut cx, false, |st, _io, _waker, _after| {
+        let _ = self.poll_read_side(Waker::noop, false, |st, _io, _waker, _after| {
             st.fd_clear(tick);
             Poll::Ready(Ok(()))
         });
@@ -94,8 +95,9 @@ impl Source {
         out: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<usize>> {
-        self.poll_reading(
-            &mut Context::from_waker(waker),
+        self.poll_read_side(
+            || waker,
+            true,
             #[inline(always)]
             |st, io, waker, after| self.read_step(st, io, waker, after, out, peek),
         )
@@ -151,15 +153,16 @@ impl Source {
         cx: &mut Context<'_>,
         step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
-        self.poll_read_side(cx, true, step)
+        self.poll_read_side(|| cx.waker(), true, step)
     }
 
     /// Polls the read side with `step`: for the handle's own reads when
-    /// `drive`, else for its caller's calls.
+    /// `drive`, else for its caller's calls. `waker` gives the poll's waker
+    /// where it is used, so a caller that has its context reads it there.
     #[inline(always)]
-    fn poll_read_side<R>(
+    fn poll_read_side<'w, R>(
         self: &Arc<Self>,
-        cx: &mut Context<'_>,
+        waker: impl Fn() -> &'w Waker,
         drive: bool,
         mut step: impl FnMut(&mut ReadState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
@@ -169,7 +172,7 @@ impl Source {
             |io| {
                 self.read.poll(
                     &mut after,
-                    cx.waker(),
+                    waker(),
                     &self.hooks_in(io.shard),
                     #[inline(always)]
                     |st, after| {
@@ -179,7 +182,7 @@ impl Source {
                         }
                         #[cfg(not(unix))]
                         let _ = drive;
-                        step(st, io, cx.waker(), after)
+                        step(st, io, waker(), after)
                     },
                 )
             },
