@@ -57,10 +57,13 @@ pub(crate) enum RingMem {
     Recv(PoolBuf),
     /// A multishot receive: its arrivals land in the receive group's
     /// buffers. `held`: the bytes of its arrivals not given back yet;
-    /// `stopping`: past the cap, a cancel of it is on its way.
+    /// `stopping`: past the cap, or with the stream's end queued, a cancel
+    /// of it is on its way; `looked`: an arrival made after the kernel armed
+    /// it found no end queued (see `ShardRing::arrived`).
     RecvMulti {
         held: usize,
         stopping: bool,
+        looked: bool,
     },
     /// A multishot receive of datagrams, as `RecvMulti`; its arrivals hold a
     /// header and the sender's address before the payload, the room for
@@ -695,8 +698,9 @@ fn entry(
                 RingMem::RecvMulti {
                     held: 0,
                     stopping: false,
+                    looked: false,
                 },
-                Sqe::recv_multishot(slot, group, 0),
+                recv_multishot(slot, group),
             ),
             None => {
                 return Err(Box::new(Outcome::RecvMultiEnd {
@@ -770,6 +774,19 @@ fn entry(
         }
         Want::SendLentTo(buf, target) => other_send_to_entry(slot, buf, target),
     })
+}
+
+/// A stream's multishot receive on slot `slot` into group `group`. A test may have the kernel
+/// skip its first receive and arm its poll at once (`IORING_RECVSEND_POLL_FIRST`), as it is
+/// armed when bytes and the end come between that receive and the arming.
+#[inline]
+fn recv_multishot(slot: RawFd, group: u16) -> Sqe {
+    let sqe = Sqe::recv_multishot(slot, group, 0);
+    #[cfg(test)]
+    if POLL_FIRST_FOR_TEST.with(core::cell::Cell::get) {
+        return sqe.ioprio(crate::syscore::linux::iouring::ring::sys::IORING_RECVSEND_POLL_FIRST);
+    }
+    sqe
 }
 
 /// A stream read of `len` bytes into `buf` on slot `slot`: `recv` on a
@@ -1090,4 +1107,8 @@ thread_local! {
     /// just before a detach goes to that ring's mailbox.
     pub(crate) static BEFORE_DETACH_POST: core::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { core::cell::RefCell::new(None) };
+    /// Whether the stream multishot receives this thread submits skip their first receive
+    /// (see `recv_multishot`), for a test.
+    pub(crate) static POLL_FIRST_FOR_TEST: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
 }

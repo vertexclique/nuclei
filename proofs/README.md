@@ -1088,6 +1088,25 @@ chunk that counts its length only lets a peer sending a unit at a time past the 
 `CapHeld`; a datagram socket arming a multishot receive on the group gets a datagram cut, breaking
 `NoCut`), and 2 witnesses (a buffer handed out in two pieces, a buffer given back).
 
+`tla/ring/RingEnd.tla` checks that a stream's end reaches its reader through a multishot
+receive (`ShardRing::arrived`, `look_for_end` and `submissions_issued` in
+`src/rt/shard/ring/arrivals.rs`, `sys::end_queued` in `src/io/sys/unix/linux.rs`). Linux takes
+the receive in three moves: a first try, the arming of its poll with one look, and a pass for
+each wake after that. Bytes and an end that come between the try and the arming wake nobody; the
+arming look's one pass takes the bytes, the socket's count of what is left (which leaves out a
+Unix stream's every end and a TCP reset) says none, and the pass waits for a wake that came
+already, so the end is never reported. The ring's thread looks at the socket at the receive's
+first arrival made after the arming (with a submission thread an arrival may come before it, and
+the next one looks again); an end found there stops the receive, and the next one's first try
+takes it. 7 configurations: 4 that must pass (two pieces and an end, on a ring with no submission
+thread and on one with it, with `NoLoss`, no piece lost or made up, `EndLast`, the end after
+every piece, and `OneOut`; and `Termination` for each), 2 mutations (a ring that never looks,
+the code before the fix and the hang `reset_during_a_read` met on CI, and a look made before the
+arming taken as done, each break `Termination`), and 1 witness (the ring stops a receive for an
+end it found queued). `src/rt/shard/ring/tests_end.rs` opens the window on a real kernel every
+time: it has the kernel skip the receive's first try (`IORING_RECVSEND_POLL_FIRST`) with bytes and
+the end already queued, for a Unix stream's reset and close and a TCP reset.
+
 `tla/ring/RingClose.tla` checks a ring source dropped with an operation out
 (`Source::detach_ring` in `src/io/source/ring.rs`, `ShardRing::detach`, `take_out` and
 `finish_leaving` in `src/rt/shard/ring.rs`, `RingPoller::submit_now`, the close's lease in

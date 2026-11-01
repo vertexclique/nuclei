@@ -18,6 +18,8 @@ use std::os::unix::net as unix;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 mod unix_addr;
+#[cfg(ring)]
+pub(crate) use self::linux::end_queued;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use self::linux::{UNIX_INQ, enable_inq, read_inq, syscall};
 pub(crate) use self::unix_addr::{UnixAddr, unix_addr};

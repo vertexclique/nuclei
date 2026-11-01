@@ -13,9 +13,11 @@ use crate::rt::shard::Shard;
 
 impl ShardRing {
     /// Buffer `bid` of the receive group came with `res` bytes for the
-    /// multishot receive of `user_data`: its source gets them as a chunk.
-    /// Past the cap of bytes it holds, the receive is stopped; its source
-    /// asks for another once its reader took them.
+    /// multishot receive of `user_data`, which stays armed if `stays`: its
+    /// source gets them as a chunk. Past the cap of bytes it holds, the
+    /// receive is stopped; its source asks for another once its reader took
+    /// them. A stream's receive not looked at yet is looked at for its end
+    /// (see [`look_for_end`](Self::look_for_end)).
     pub(super) fn arrived(
         &self,
         shard: Option<&Shard>,
@@ -23,8 +25,10 @@ impl ShardRing {
         bid: u16,
         res: i32,
         more: bool,
+        stays: bool,
     ) {
         let mut stop = false;
+        let mut look = false;
         let delivery = {
             let mut recv = self.recv.borrow_mut();
             let Some(group) = recv.as_mut() else {
@@ -34,7 +38,12 @@ impl ShardRing {
             let held = ops.get_mut(user_data).and_then(|op| {
                 let source = std::sync::Arc::as_ptr(&op.source);
                 match &mut op.mem {
-                    RingMem::RecvMulti { held, stopping } => {
+                    RingMem::RecvMulti {
+                        held,
+                        stopping,
+                        looked,
+                    } => {
+                        look = !*looked;
                         Some((op.epoch, held, stopping, false, source))
                     }
                     RingMem::RecvFromMulti { held, stopping, .. } => {
@@ -74,6 +83,9 @@ impl ShardRing {
         };
         if stop {
             self.cancel(user_data);
+        }
+        if look && stays {
+            self.look_for_end(user_data);
         }
         // Handed over with nothing borrowed: the source may submit at once.
         if let Some((source, chunk, epoch, datagram)) = delivery {
@@ -117,6 +129,62 @@ impl ShardRing {
             }
             after.run();
         }
+    }
+
+    /// At an arrival that leaves the stream's multishot receive of `user_data` armed, before
+    /// `looked`: stops the receive if the stream's end is queued already, which it may never
+    /// report. Linux's receive stops trying once the socket's count of what is left says none, a
+    /// count that leaves a queued end out (a Unix stream's every end, a TCP reset), and waits for
+    /// a wake. Bytes and the end that come between its first try and the arming of its poll wake
+    /// nobody: the arming look's one pass takes the bytes and waits for a wake that came already
+    /// (`io_poll_check_events` in io_uring/poll.c passes again on a hangup only with a second
+    /// reference). A look made after the arming that finds no end settles it, as every later end
+    /// wakes the armed poll; one that finds an end stops the receive, and the next one's first
+    /// try takes what is left and the end (proofs/tla/ring/RingEnd.tla). Out of line: the
+    /// arrivals' path only reads `looked`.
+    #[cold]
+    #[inline(never)]
+    fn look_for_end(&self, user_data: u64) {
+        let ended = {
+            let mut ops = self.ops.borrow_mut();
+            let Some(op) = ops.get_mut(user_data) else {
+                return;
+            };
+            let RingMem::RecvMulti {
+                stopping, looked, ..
+            } = &mut op.mem
+            else {
+                return;
+            };
+            let Ok(fd) = op.source.raw_fd() else {
+                return;
+            };
+            if *stopping {
+                *looked = true;
+                return;
+            }
+            let tcp = op.source.kind() == crate::io::source::Kind::Tcp;
+            let ended = crate::io::sys::end_queued(fd, tcp);
+            *looked = ended || self.submissions_issued();
+            *stopping = ended;
+            ended
+        };
+        if ended {
+            self.cancel(user_data);
+        }
+    }
+
+    /// Whether the kernel issued every entry submitted so far, the arming of each multishot
+    /// receive included: on a ring with no submission thread, always by the time this thread
+    /// reaps one of their completions, since the enter that hands an entry over issues it before
+    /// it returns; on a submission thread's ring, once the queue's head, which that thread
+    /// commits after issuing what it took, has reached its tail.
+    fn submissions_issued(&self) -> bool {
+        use crate::syscore::linux::iouring::ring::sys::IORING_SETUP_SQPOLL;
+        self.poller.try_borrow().is_ok_and(|poller| {
+            let ring = poller.ring();
+            ring.flags() & IORING_SETUP_SQPOLL == 0 || ring.sq_ready() == 0
+        })
     }
 
     /// A completion `res` of the operation of `user_data` that carries no
