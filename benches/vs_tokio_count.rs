@@ -6,6 +6,9 @@
 //! on its io_uring driver (`monoio`) or its epoll driver (`monoio-legacy`),
 //! Linux only. `tcp_2w` uses two workers on nuclei, a two-worker multi-thread
 //! runtime on tokio, and a server thread plus a client thread on monoio.
+//! `local_mpsc` and `local_oneshot` run nuclei's single-shard `sync::local`
+//! channels between local tasks of the worker; tokio and monoio run their
+//! `mpsc` and `oneshot` rows there (monoio's channels are local-sync's).
 
 use std::time::Duration;
 
@@ -31,7 +34,7 @@ const BLOCKING: u64 = 20_000;
 const SLEEP_TASKS: u64 = 1_000;
 const SLEEPS_PER_TASK: u64 = 20;
 const ONESHOTS: u64 = 100_000;
-const MODES: &str = "block_on|mpsc|timeout|tcp|unix_dgram|udp|unix_stream|tcp_split|tcp_asyncrw|tcp_many|tcp_2w|bulk|file_read|spawn_join|spawn_blocking|sleep|oneshot";
+const MODES: &str = "block_on|mpsc|timeout|tcp|unix_dgram|udp|unix_stream|tcp_split|tcp_asyncrw|tcp_many|tcp_2w|bulk|file_read|spawn_join|spawn_blocking|sleep|oneshot|local_mpsc|local_oneshot";
 
 #[cfg(unix)]
 fn tmp_path(tag: &str) -> std::path::PathBuf {
@@ -473,6 +476,45 @@ fn nuclei_run(row: &str) -> u64 {
             assert_eq!(total, FILE_SIZE);
             (FILE_SIZE / FILE_CHUNK) as u64
         }
+        "local_mpsc" => {
+            // sync::local channels are !Send and single-shard: both ends are local tasks of one worker
+            rt.block_on(rt.spawn(async {
+                let (to_b, mut from_a) = nuclei::sync::local::mpsc::channel::<u64>(1);
+                let (to_a, mut from_b) = nuclei::sync::local::mpsc::channel::<u64>(1);
+                let a = nuclei::spawn_local(async move {
+                    for i in 0..MPSC_ROUNDS {
+                        to_b.send(i).await.unwrap();
+                        from_b.recv().await.unwrap();
+                    }
+                });
+                let echo = nuclei::spawn_local(async move {
+                    while let Some(i) = from_a.recv().await {
+                        if to_a.send(i).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                a.await;
+                echo.await;
+            }));
+            MPSC_ROUNDS * 2
+        }
+        "local_oneshot" => {
+            rt.block_on(rt.spawn(async {
+                nuclei::spawn_local(async {
+                    for i in 0..ONESHOTS {
+                        let (tx, rx) = nuclei::sync::local::oneshot::channel::<u64>();
+                        nuclei::spawn_local(async move {
+                            let _ = tx.send(i);
+                        })
+                        .detach();
+                        std::hint::black_box(rx.await.unwrap());
+                    }
+                })
+                .await;
+            }));
+            ONESHOTS
+        }
         "spawn_join" => {
             rt.block_on(rt.spawn(async {
                 for i in 0..SPAWNS {
@@ -540,7 +582,7 @@ fn tokio_run(row: &str) -> u64 {
             }
             BLOCK_ON
         }
-        "mpsc" => {
+        "mpsc" | "local_mpsc" => {
             let (to_b, mut from_a) = tokio::sync::mpsc::channel::<u64>(1);
             let (to_a, mut from_b) = tokio::sync::mpsc::channel::<u64>(1);
             let a = rt.spawn(async move {
@@ -791,7 +833,7 @@ fn tokio_run(row: &str) -> u64 {
             .unwrap();
             SLEEP_TASKS * SLEEPS_PER_TASK
         }
-        "oneshot" => {
+        "oneshot" | "local_oneshot" => {
             rt.block_on(rt.spawn(async {
                 for i in 0..ONESHOTS {
                     let (tx, rx) = tokio::sync::oneshot::channel::<u64>();
@@ -969,7 +1011,7 @@ mod monoio_side {
                 }
                 BLOCK_ON
             }
-            "mpsc" => {
+            "mpsc" | "local_mpsc" => {
                 // local_sync channels are !Send and single-thread, monoio's own companion crate
                 rt.block_on(async {
                     let (to_b, mut from_a) = local_sync::mpsc::bounded::channel::<u64>(1);
@@ -1211,7 +1253,7 @@ mod monoio_side {
                 });
                 SLEEP_TASKS * SLEEPS_PER_TASK
             }
-            "oneshot" => {
+            "oneshot" | "local_oneshot" => {
                 rt.block_on(async {
                     for i in 0..ONESHOTS {
                         let (tx, rx) = local_sync::oneshot::channel::<u64>();
