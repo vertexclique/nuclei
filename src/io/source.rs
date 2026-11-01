@@ -488,48 +488,58 @@ impl Source {
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
-        Arc::new(Self {
-            fd: AtomicRaw::new(fd),
-            retired_fd: AtomicRaw::new(NO_FD),
-            epoch: AtomicU32::new(0),
-            retired_epoch: AtomicU32::new(0),
-            kind,
-            read: Side::biased(ReadState::default()),
-            write: Side::biased(WriteState::default()),
-            read_owner: owner::Owner::new(),
-            write_owner: owner::Owner::new(),
-            reg: Registration {
-                state: AtomicU8::new(UNREGISTERED),
-                token: AtomicU64::new(NO_TOKEN),
-                shard: UnsafeCell::new(None),
+        // Made in place: a source is large, and `Arc::new` would build it on the stack and copy
+        // it into the allocation.
+        let source = Arc::<Self>::new_uninit();
+        let slot = Arc::as_ptr(&source).cast_mut();
+        // SAFETY: the allocation is fresh and this is its one count, so nothing else reads it
+        // while it is written; `as_ptr` keeps the allocation's own provenance.
+        unsafe {
+            slot.write(core::mem::MaybeUninit::new(Self {
+                fd: AtomicRaw::new(fd),
+                retired_fd: AtomicRaw::new(NO_FD),
+                epoch: AtomicU32::new(0),
+                retired_epoch: AtomicU32::new(0),
+                kind,
+                read: Side::biased(ReadState::default()),
+                write: Side::biased(WriteState::default()),
+                read_owner: owner::Owner::new(),
+                write_owner: owner::Owner::new(),
+                reg: Registration {
+                    state: AtomicU8::new(UNREGISTERED),
+                    token: AtomicU64::new(NO_TOKEN),
+                    shard: UnsafeCell::new(None),
+                    #[cfg(completion)]
+                    ops: AtomicBool::new(false),
+                    #[cfg(ring)]
+                    slot: AtomicU32::new(u32::MAX),
+                    #[cfg(ring)]
+                    datagrams_ahead: AtomicBool::new(false),
+                    home: core::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(ring)]
+                    here: core::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(port)]
+                    awaits_idle: AtomicBool::new(false),
+                },
+                requests: AtomicU8::new(0),
+                ask: Ask::default(),
+                unsent: AtomicU8::new(0),
+                #[cfg(unix)]
+                quick: quick::Quick::new(kind),
                 #[cfg(completion)]
-                ops: AtomicBool::new(false),
+                read_done: ops::Mailbox::default(),
+                #[cfg(completion)]
+                write_done: ops::Mailbox::default(),
                 #[cfg(ring)]
-                slot: AtomicU32::new(u32::MAX),
-                #[cfg(ring)]
-                datagrams_ahead: AtomicBool::new(false),
-                home: core::sync::atomic::AtomicUsize::new(0),
-                #[cfg(ring)]
-                here: core::sync::atomic::AtomicUsize::new(0),
+                read_arrivals: crate::rt::shard::counted::Counted::new(),
+                #[cfg(completion)]
+                ops_out: core::sync::atomic::AtomicU8::new(0),
                 #[cfg(port)]
-                awaits_idle: AtomicBool::new(false),
-            },
-            requests: AtomicU8::new(0),
-            ask: Ask::default(),
-            unsent: AtomicU8::new(0),
-            #[cfg(unix)]
-            quick: quick::Quick::new(kind),
-            #[cfg(completion)]
-            read_done: ops::Mailbox::default(),
-            #[cfg(completion)]
-            write_done: ops::Mailbox::default(),
-            #[cfg(ring)]
-            read_arrivals: crate::rt::shard::counted::Counted::new(),
-            #[cfg(completion)]
-            ops_out: core::sync::atomic::AtomicU8::new(0),
-            #[cfg(port)]
-            port: Default::default(),
-        })
+                port: Default::default(),
+            }))
+        };
+        // SAFETY: written whole above.
+        unsafe { source.assume_init() }
     }
 
     pub(crate) fn kind(&self) -> Kind {
