@@ -62,6 +62,7 @@ impl<T> Inner<T> {
 
 /// Replaces the waker in `slot` with `waker` unless it already wakes the
 /// same task; the old one is dropped after the cell is set.
+#[inline]
 fn register(slot: &Cell<Option<Waker>>, waker: &Waker) {
     match slot.take() {
         Some(old) if old.will_wake(waker) => slot.set(Some(old)),
@@ -72,6 +73,7 @@ fn register(slot: &Cell<Option<Waker>>, waker: &Waker) {
     }
 }
 
+#[inline]
 fn wake(slot: &Cell<Option<Waker>>) {
     if let Some(waker) = slot.take() {
         waker.wake();

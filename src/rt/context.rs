@@ -634,6 +634,7 @@ impl Drop for RuntimeSet {
 /// The home of a bound task spawned now on `shard`, which this thread runs:
 /// the thread's own as a worker shard's runner, else the shard's, a thread's
 /// own shard.
+#[inline]
 pub(crate) fn home_for(shard: &Shard) -> Arc<Home> {
     let home = local().home.get();
     if home.is_null() {
@@ -660,6 +661,7 @@ fn set_home_ptr(home: &Arc<Home>) {
 }
 
 /// Whether `home` is this thread's.
+#[inline]
 pub(crate) fn is_home(home: &Home) -> bool {
     core::ptr::eq(local().home.get(), home)
 }

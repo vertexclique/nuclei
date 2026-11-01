@@ -34,6 +34,7 @@ impl<T> Unpin for BlockRc<T> {}
 
 impl<T> BlockRc<T> {
     /// `value`, shared, with one handle.
+    #[inline]
     pub(crate) fn new(value: T) -> Self {
         let (ptr, owner) = super::alloc(Layout::new::<Block<T>>());
         let ptr = ptr.cast::<Block<T>>();
@@ -58,6 +59,7 @@ impl<T> BlockRc<T> {
 }
 
 impl<T> Clone for BlockRc<T> {
+    #[inline]
     fn clone(&self) -> Self {
         let count = self.block().count.get();
         if count == usize::MAX {
@@ -74,6 +76,7 @@ impl<T> Clone for BlockRc<T> {
 impl<T> Deref for BlockRc<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &T {
         &self.block().value
     }
