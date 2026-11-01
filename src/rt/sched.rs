@@ -74,7 +74,7 @@ unsafe impl Schedule for Sched {
         self.schedule_elsewhere(runnable, info);
     }
 
-    #[inline]
+    #[inline(always)]
     fn drop_future(&self, drop: impl FnOnce()) {
         if !self.counted {
             return drop();

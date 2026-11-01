@@ -102,6 +102,7 @@ where
 
     /// Allocates a task, scheduled, with its handle and its `Runnable`; its
     /// memory comes from the thread's cache of task blocks (see `memory`).
+    #[inline(always)]
     pub(super) fn allocate(future: F, schedule: S) -> NonNull<()> {
         let (ptr, owner) = crate::mem::alloc(core::alloc::Layout::new::<Cell<F, S>>());
         let ptr = ptr.cast::<Cell<F, S>>();
@@ -269,6 +270,17 @@ where
     }
 
     unsafe fn drop_future(ptr: *const ()) {
+        // SAFETY: the caller's contract.
+        unsafe { Self::drop_future_here(ptr) }
+    }
+
+    /// [`drop_future`](Self::drop_future), inline where a run completes.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the live future.
+    #[inline(always)]
+    unsafe fn drop_future_here(ptr: *const ()) {
         // SAFETY: the caller owns the live future.
         unsafe {
             let cell = Self::cell(ptr);
@@ -389,7 +401,7 @@ where
             match output {
                 Some(output) => {
                     let panicked = output.is_err();
-                    Self::drop_future(ptr);
+                    Self::drop_future_here(ptr);
                     cell.core
                         .with_mut(|core| (*core).output = ManuallyDrop::new(output));
                     loop {
