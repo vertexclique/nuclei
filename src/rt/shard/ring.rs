@@ -261,6 +261,7 @@ impl ShardRing {
     /// Takes in the chunk `item` of the group `back` at once, if the ring's group is that, or
     /// keeps it for the next take-in while the operations are borrowed; `false` when the group
     /// is another or borrowed (the chunk then goes the long way).
+    #[inline(always)]
     pub(crate) fn take_in_now(
         &self,
         back: &Arc<super::recv::Returns>,

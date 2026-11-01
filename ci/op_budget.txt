@@ -9,7 +9,7 @@ tcp io_uring 3559 1
 tcp epoll 2633 1
 unix_dgram io_uring 4213 1
 unix_dgram epoll 3565 1
-udp io_uring 3610 1
+udp io_uring 3584 1
 udp epoll 3130 1
 unix_stream io_uring 3564 1
 unix_stream epoll 2641 1
