@@ -11,7 +11,7 @@
 
 use core::future::Future;
 use core::pin::{Pin, pin};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -84,10 +84,16 @@ impl Shard {
     /// The waker of a `block_on` future on this shard: the one the last call
     /// here left, if nothing else holds it any more, else a new one.
     pub(super) fn signal(&self) -> Arc<Signal> {
-        if let Some(mut signal) = self.signal.take()
-            && Arc::get_mut(&mut signal).is_some_and(Signal::reset)
+        // No `Weak` of a signal is made, so a count of one is the only
+        // holder: a waker another thread dropped last did so before the
+        // acquire, and none is left to wake the next future.
+        if let Some(signal) = self.signal.take()
+            && Arc::strong_count(&signal) == 1
         {
-            return signal;
+            crate::sync::internal::fence(Ordering::Acquire);
+            if signal.reset() {
+                return signal;
+            }
         }
         Arc::new(Signal::new(&self.shared))
     }
@@ -128,7 +134,7 @@ impl Shard {
         mut future: Pin<&mut F>,
         signal: &Arc<Signal>,
     ) -> Result<F::Output, Detached> {
-        let waker = Waker::from(Arc::clone(signal));
+        let waker = Signal::waker(signal);
         let mut cx = Context::from_waker(&waker);
         // Turns in which the future woke itself and no task ran.
         let mut self_woken = 0u32;

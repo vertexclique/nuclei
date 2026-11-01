@@ -198,6 +198,7 @@ impl<G: Grain> Timer<G> {
         }
     }
 
+    #[inline(always)]
     fn poll_local(&mut self, shard: &Shard, cx: &mut Context<'_>) -> Poll<()> {
         if let State::Local { owner, key } = &*self.state
             && shard.is(owner)

@@ -1,5 +1,6 @@
 //! Small blocks: each task is one, and each piece of shared state made and
-//! dropped per operation ([`BlockArc`], a oneshot channel's), taken from this
+//! dropped per operation ([`BlockArc`], a oneshot channel's, and
+//! [`BlockRc`], a local one's), taken from this
 //! thread's cache of blocks of its size when one is there, and given back to
 //! the cache of the thread it came from when it is freed.
 //!
@@ -30,7 +31,9 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 
 mod arc;
+mod rc;
 pub(crate) use self::arc::BlockArc;
+pub(crate) use self::rc::BlockRc;
 
 /// The size step of a class, and the alignment of every cached block.
 pub(crate) const STEP: usize = 64;
@@ -309,6 +312,22 @@ mod cache {
             .ok()
     }
 
+    /// The bytes of blocks this thread holds for its next allocations: in
+    /// its cache, and given back to it by other threads and not taken yet.
+    #[cfg(test)]
+    pub(super) fn held() -> usize {
+        with_lists(|lists, record| {
+            let cached: usize = lists
+                .lists
+                .iter()
+                .enumerate()
+                .map(|(class, blocks)| blocks.len() * block(class).size())
+                .sum();
+            cached + record.bytes.load(Ordering::Relaxed)
+        })
+        .unwrap_or(0)
+    }
+
     /// A free block of `class`, if this thread keeps one or was given one
     /// back, and the owner of the block allocated for it either way.
     #[inline]
@@ -376,9 +395,20 @@ mod cache {
         (None, Owner::NONE)
     }
 
+    pub(super) fn held() -> usize {
+        0
+    }
+
     pub(super) fn keep(_class: usize, _ptr: NonNull<u8>, _owner: Owner) -> bool {
         false
     }
+}
+
+/// The bytes of blocks this thread holds for its next allocations: in its
+/// cache, and given back to it by other threads and not taken yet.
+#[cfg(test)]
+pub(crate) fn held() -> usize {
+    cache::held()
 }
 
 /// Memory for a task of `layout`, and the owner to free it with.

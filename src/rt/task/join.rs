@@ -63,8 +63,24 @@ impl<T> Task<T> {
     }
 
     /// Lets the task run to its end without a handle; its output is dropped.
+    #[inline]
     pub fn detach(self) {
         let mut this = ManuallyDrop::new(self);
+        // A handle detached right after the spawn is the common case: one
+        // exchange, inline.
+        if this
+            .header()
+            .state
+            .compare_exchange_weak(
+                SCHEDULED | TASK | REFERENCE,
+                SCHEDULED | REFERENCE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return;
+        }
         let output = this.set_detached();
         drop(output);
     }
@@ -261,6 +277,7 @@ impl<T> Task<T> {
 
     /// `Some(output)` once the task completed (resuming a panic of its
     /// future), `None` once it was closed without an output for the handle.
+    #[inline(always)]
     fn poll_task(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         match self.poll_raw(cx) {
             Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(output)),
@@ -273,6 +290,7 @@ impl<T> Task<T> {
     /// The output once the task completed (or the panic of its future),
     /// `None` once it was closed without an output for the handle (cancelled,
     /// or dropped by its runtime) and its future is gone.
+    #[inline(always)]
     fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, Panic>>> {
         let header = self.header();
         let mut state = header.state.load(Ordering::Acquire);
@@ -331,6 +349,15 @@ impl<T> Drop for Task<T> {
             unsafe { (self.header().vtable.destroy)(self.ptr.as_ptr().cast_const()) };
             return;
         }
+        self.cancel_and_let_go();
+    }
+}
+
+impl<T> Task<T> {
+    /// The drop of a handle whose task may still run or hold its output:
+    /// out of line, so the drop of an awaited handle carries none of it.
+    #[inline(never)]
+    fn cancel_and_let_go(&mut self) {
         self.set_canceled();
         drop(self.set_detached());
     }
@@ -343,7 +370,7 @@ impl<T> Future for Task<T> {
         clippy::panic,
         reason = "documented under `# Panics` of `Task`; `Task::fallible` answers `None` instead"
     )]
-    #[inline]
+    #[inline(always)]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
         match self.poll_task(cx) {
             Poll::Ready(Some(output)) => Poll::Ready(output),

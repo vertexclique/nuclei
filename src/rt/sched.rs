@@ -63,18 +63,16 @@ impl Sched {
 unsafe impl Schedule for Sched {
     #[inline(always)]
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo) {
-        let runnable = if self.home.is_none() {
-            match queue_here(&self.shard, runnable, info) {
-                Some(runnable) => runnable,
-                None => return,
-            }
-        } else {
-            runnable
+        let left = match &self.home {
+            None => queue_here(&self.shard, runnable, info),
+            Some(home) => queue_home_here(home, runnable, info),
         };
-        self.schedule_elsewhere(runnable, info);
+        if let Some(runnable) = left {
+            self.schedule_elsewhere(runnable, info);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     fn drop_future(&self, drop: impl FnOnce()) {
         if !self.counted {
             return drop();
@@ -148,9 +146,30 @@ pub(crate) fn queue_here(
     }
 }
 
+/// Queues `runnable`, of a task bound to `home`, on the shard this thread
+/// runs if the thread is the home's (or runs the shard whose own home it
+/// is) and needs no bracket to reach the shard: what
+/// [`Sched::schedule`]'s general path does then, for a task woken or spawned
+/// on its home's thread. Hands it back otherwise.
+#[inline(always)]
+pub(crate) fn queue_home_here(
+    home: &Home,
+    runnable: Runnable,
+    info: ScheduleInfo,
+) -> Option<Runnable> {
+    let here = context::local();
+    match context::running_inside(here) {
+        Some(current) if context::is_home(home) || current.owns_home(home) => {
+            current.push_local_from(runnable, info, here.in_task());
+            None
+        }
+        _ => Some(runnable),
+    }
+}
+
 impl Sched {
-    /// [`Schedule::schedule`] for a bound task, or one woken anywhere but
-    /// inside its own shard.
+    /// [`Schedule::schedule`] for a task woken anywhere but inside its own
+    /// shard, or its home's thread for a bound one.
     #[inline(never)]
     fn schedule_elsewhere(&self, runnable: Runnable, info: ScheduleInfo) {
         if let Some(home) = &self.home {

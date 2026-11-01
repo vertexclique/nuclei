@@ -34,17 +34,46 @@ impl Shard {
 
     /// The outermost `block_on` of a thread outside the runtime returned,
     /// and this, its own shard, runs again only at its next one.
+    #[inline]
     pub(crate) fn leave(&self) {
         // A shard that never registered a source since it last left has
         // none to let go of.
         if !self.sources.borrow().is_untouched() {
-            let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
-            evict_all(&gone, self.shared_addr());
-            // On a worker, or with none on this thread's shard, which runs it at
-            // the thread's next `block_on`, as any task spawned here; a runtime
-            // that drops waits for it (`rt::linger`).
-            drain_unsent(&gone, |source| crate::rt::linger::hand(drain(source)));
+            self.let_go_of_sources();
         }
+        if self.nothing_else_to_let_go() {
+            return;
+        }
+        self.let_go_of_the_rest();
+    }
+
+    /// Whether a shard that leaves holds nothing more to let go of: on a
+    /// ring, no operation out (a watched exit is one) and none posted to
+    /// apply; elsewhere no child watched, and no port to hand on.
+    #[inline(always)]
+    fn nothing_else_to_let_go(&self) -> bool {
+        #[cfg(ring)]
+        if let Driver::Ring(ring) = &self.driver {
+            return ring.in_flight() == 0 && self.shared.io_ops.is_empty();
+        }
+        !cfg!(port) && self.children.borrow().is_untouched()
+    }
+
+    /// Lets go of the sources registered here since the shard last left.
+    #[inline(never)]
+    fn let_go_of_sources(&self) {
+        let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
+        evict_all(&gone, self.shared_addr());
+        // On a worker, or with none on this thread's shard, which runs it at
+        // the thread's next `block_on`, as any task spawned here; a runtime
+        // that drops waits for it (`rt::linger`).
+        drain_unsent(&gone, |source| crate::rt::linger::hand(drain(source)));
+    }
+
+    /// What [`leave`](Self::leave) lets go of past the sources: the
+    /// children, and the operations still out.
+    #[inline(never)]
+    fn let_go_of_the_rest(&self) {
         self.let_go_of_children();
         // Sources that went before (a dropped handle's) may have left a
         // cancel queued, or their operations still out: the settle's first
