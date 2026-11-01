@@ -56,17 +56,23 @@
   signatures are the same futures as before (`fn send(&self, value) -> impl Future + '_`), not
   `Unpin`, and a send dropped while it waits lets go of its place and of a slot it was handed, as
   before.
-- **The stream and completion paths run fewer instructions per operation.** A stream's side is
-  polled and its bytes sent under its owner's biased hold, inlined, on the stream's own shard; a
-  stream's direct read is decided in one place, and its first read-ahead piece stays out of the
-  queue; the kernel counts what a read leaves out of line only the first time; a going shard asks
-  its sources as their owner, with no heavy fence, so a runtime that drops with many streams open
-  makes no `membarrier` call per stream (on epoll, 256 connections took about 250 calls and now
-  take 1); an arrival's hand-out and delivery and a chunk's
-  take-in are inlined into the ring's completion loop, which enters its unwinding guard once per
-  batch of completions and wakes the lone reader an arrival leaves inline; a read side's completion
-  is applied at once when the side is free, as a write side's is; a step that left one waker alone
-  settles inline.
+- **The stream and completion paths run fewer instructions per operation.** A stream read takes the
+  bytes read ahead first, with one look at the first piece, keeps that piece out of the queue and
+  consumes a piece it takes part of inline; a stream's direct read is decided in one place; the
+  kernel counts what a read leaves out of line only the first time; `read` and `recvmsg` load only
+  the registers they take; an arrival's hand-out and delivery and a chunk's take-in are inlined into
+  the ring's completion loop, which enters its unwinding guard once per batch of completions and
+  wakes the lone reader an arrival leaves inline; a read side's completion is applied at once when
+  the side is free, as a write side's is; a step that left one waker alone settles inline; the run
+  loop's look at the inbox and its spin are inlined in every codegen unit; a going shard asks its
+  sources as their owner, with no heavy fence, so a runtime that drops with many streams open makes
+  no `membarrier` call per stream (on epoll, 256 connections took about 250 calls and now take 1).
+- **A stream's owner polls and sends on its own shard under its biased hold**, inlined, and its send
+  looks at one bit each write-side release publishes rather than at the whole write side
+  (`proofs/tla/sendsnow`), while owned writes still go out whole. These paths run where a call needs
+  no bracket into its shard: in `block_on` on a thread of its own, and on a worker no handoff watch
+  follows (`Builder::handoff_after(None)`). A worker with the default watch takes the bracketed
+  path, as before.
 - **A connection costs less to open and close.** A source's attach allocates nothing beside the
   source itself, nor does a dropped handle's close when the handle's object fits in a word (a
   socket's descriptor does), a new source is written field by field into its allocation, and a
