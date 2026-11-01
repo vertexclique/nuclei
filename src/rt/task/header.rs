@@ -84,7 +84,8 @@ impl Header {
     /// handled here: the waker is woken at once instead of being left behind.
     #[inline(always)]
     pub(super) fn register(&self, waker: &Waker) {
-        let mut state = self.state.fetch_or(0, Ordering::Acquire);
+        // A stale first look costs the exchange below a retry, no more.
+        let mut state = self.state.load(Ordering::Acquire);
         loop {
             debug_assert!(state & REGISTERING == 0, "one awaiter registers at a time");
             if state & NOTIFYING != 0 {
