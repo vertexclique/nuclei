@@ -24,6 +24,8 @@ use loom::thread;
 
 use super::{Runnable, Schedule, ScheduleInfo, spawn};
 
+mod last_reference;
+
 /// A drop counter loom does not track.
 #[derive(Clone)]
 struct Count(std::sync::Arc<StdAtomicUsize>);

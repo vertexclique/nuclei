@@ -244,16 +244,32 @@ the future behind, never dropped. The TLA+ model found it (the mutation `pending
 brings that behaviour back and must fail), and nuclei's task drops the future in its last
 decrement instead.
 
-The TLA+ family checks 26 configurations: 11 that must pass (the handle awaiting, detaching,
+A run that completes lets go of its reference in the completion's own exchange, the awaiter's
+waker taken just before it with the notifier's flag held across the exchange (`Header::claim`,
+`RawTask::run`): a handle that sees the completion holds the last reference, so its drop frees
+the task on the handle's thread, and the task's memory is back in the cache of the thread that
+awaits it before that thread goes on. An output no handle takes is taken out before that
+exchange and dropped after it, the task let go of, before the awaiter's wake. A run that ends Pending, neither woken nor closed, drops its
+reference in the exchange that clears RUNNING, so no later run of the task, woken meanwhile on
+another runner, is followed by that drop. `RunnerFreesNoAwaited` checks both: the run never
+frees a task whose handle held it as it completed.
+
+The TLA+ family checks 30 configurations: 12 that must pass (the handle awaiting, detaching,
 dropped or cancelling, with one or two runners, wakes by value and by reference, a future that
-wakes itself, a waker dropped without a wake, and liveness under weak fairness), 9 mutations
+wakes itself, a waker dropped without a wake, a handle polled once without a wake, and liveness
+under weak fairness), 12 mutations
 that each take one rule away (a wake during the poll that schedules a second runnable breaks
 `OnePoll`; a run that drops a wake from its own poll, and a handle that sleeps without looking
-again, end in a deadlock; freeing the memory while the handle lives, and a wake by reference
-that makes a runnable without its own reference, break `NothingAfterFree`; a cancel that drops
+again, end in a deadlock; freeing the memory while the handle lives, a wake by reference
+that makes a runnable without its own reference, and a Pending run whose exchange drops its
+reference though the task was woken, break `NothingAfterFree`; a cancel that drops
 the future itself breaks `FutureOnce`; a detach that skips the last-reference free, and a
 completion that leaves the output behind, break `CleanEnd`; the established crate's leak
-breaks `FreedAfterFuture`), and 6 witnesses: a wake during the poll, a cancel during the poll,
+breaks `FreedAfterFuture`; a run that lets go of its reference only after the completion's
+exchange, as it once did, lets a handle polled in between take the output and go, and frees the
+task itself, and a Pending run that drops its reference in a step of its own, as it once did,
+frees the task after another runner completed it and the handle went, both of which break
+`RunnerFreesNoAwaited`), and 6 witnesses: a wake during the poll, a cancel during the poll,
 a cancel found in the queue, a registration of the handle's waker meeting a notification, the
 last waker closing an idle task, and the handle woken from its sleep.
 
@@ -270,6 +286,38 @@ never seen in progress (that is TLA+'s part); the TLA+ model treats the future a
 poll and the run queue as a count; the awaiter's waker cell is modelled by TLA+ only. The task
 theorems also rest on `Classical.choice`, which the arithmetic tactic brings in for its case
 analysis.
+
+## A blocking job's end
+
+`jobend` (`tla/jobend/JobEnd.tla`) checks how the end of a file's call made by a blocking job
+reaches its task (`write_on_pool` and `Ending` in `src/fs/call.rs`, `finish_on_pool` in
+`src/fs/ring.rs`, `RawTask::run` in `src/rt/task/raw.rs`, `Pool::run` in `src/rt/blocking.rs`). A
+task writes round after round; each write is a detached job, a task of its own whose memory is
+a block of the writer's thread's cache. The run of a detached job holds its last reference, so
+the pool thread frees it, and its block goes back to the writer's thread through that thread's
+record (`tla/remote`). The writer looks at the job's slot right after it issues the job, and
+again each time it is woken: an end already there is taken at once. So the pool thread leaves
+the end in the slot only once the job's task is gone: the job returns the end (`Ending`), and
+the run of a task no handle holds drops what it returned after the task is freed. Whichever
+look finds the end, the block is back first, and the writer's next job finds it. The write is
+counted on its shard until the wake went (`tla/going/Linger.tla`), and the pool counts the job
+out after that.
+
+The family checks 8 configurations: 2 that must pass (three writes from a cache warmed with
+one block take nothing from the allocator, each write is counted until its wake and each job
+until it, with no deadlock; and every write ends under weak fairness), 4 mutations (the end
+left and woken inside the job, as it once was, and only the wake moved after the job, both
+break `NoAllocation`: the writer goes on before the block is back, through the wake or through
+its first look; a write uncounted before its wake breaks `CountedUntilWoken`; a job counted out
+before it breaks `CountedOutAfterWake`), and 2 witnesses (the first look finds the end with no
+wake; a block comes back through the record).
+
+What the model leaves out: one block class and one job at a time; the run's exchanges and the
+free are one step (`tla/task` checks the run, and that a handle awaiting a job frees its task
+itself, `RunnerFreesNoAwaited`); the waker cell is one flag per slot, set by the writer and
+taken by the pool thread after the end's flag (the cell's handshake is the atomic waker's); the
+slot's own count, which the pool thread lets go of before the wake, is left out, as a slot is a
+spare among several.
 
 ## The park handshake
 

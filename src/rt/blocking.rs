@@ -40,6 +40,12 @@
 //! thread's by the time a slow submitter reads it, so the name a thread
 //! replaces is retired, not freed. That is one node per thread started,
 //! none per job.
+//!
+//! A detached job that ends a file's call returns that end
+//! (`fs::call::Ending`), which its run drops, publishing it, only once the
+//! job's task is gone: the task's block is back with the thread it came from
+//! before the task woken can spawn again, so a steady stream of calls takes
+//! no block from the allocator (proofs/tla/jobend).
 
 use core::sync::atomic::AtomicU8;
 use std::io;
@@ -193,7 +199,8 @@ impl Pool {
         self.jobs.load(Ordering::SeqCst)
     }
 
-    /// Runs a job, then counts it out. Its awaiter was woken during the run,
+    /// Runs a job, then counts it out. Its awaiter was woken during the run
+    /// (a detached job's end once its task was freed: `fs::call::Ending`),
     /// before the count drops, so a paused clock that sees no job in flight
     /// sees the woken shard's work.
     fn run(&self, runnable: Runnable) {
