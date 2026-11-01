@@ -15,3 +15,8 @@ W_runner_cancel       Handoff     violated:NoRunnerCancel
 R_seqcst              Retarget    pass
 M_retarget_relaxed    Retarget    violated:WokenPolled
 W_old_wake            Retarget    violated:NoOldWake
+T_safe                TakeRef     pass
+M_late_ref            TakeRef     violated:NoLoss
+M_keep_ref            TakeRef     violated:RefsHeld
+W_take                TakeRef     violated:NoTake
+W_failed_take         TakeRef     violated:NoFailedTake
