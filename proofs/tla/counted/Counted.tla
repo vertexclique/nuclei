@@ -109,9 +109,10 @@ begin                                                                        \* 
 P_loop:                                                                      \* the next item
     while i < Items do                                                       \* while it has one
         i := i + 1;                                                          \* this one
-P_claim:                                                                     \* the push claims a cell
+P_early:                                                                     \* (mutated) a count before the cell
         \* MUTATION count_first: the push counts its item before it claims a cell.
         if Mutation = "count_first" then count := count + 1; end if;          \* (mutated) the count first
+P_claim:                                                                     \* the push claims a cell
         queue := Append(queue, [p |-> self, i |-> i, written |-> FALSE]);    \* the next cell, not written yet
 P_write:                                                                     \* the push writes it
         queue := [k \in DOMAIN queue |->                                     \* the queue, with
