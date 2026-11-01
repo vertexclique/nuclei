@@ -3,20 +3,20 @@
 //! 5.12), for which the kernel resolves the path from its lookup cache alone
 //! and answers `EAGAIN` rather than read a directory from the device.
 //!
-//! The lookup is not all an open may wait for: the file system's own open
-//! may ask a server (a network or a user-space file system) and the file
-//! itself may make it wait (the other end of a FIFO, a device, a lease
-//! another process holds). So what the path names is looked at first
-//! through an `O_PATH` descriptor, which opens nothing: only a regular file
-//! on a file system of this machine whose open reads nothing (a known one,
-//! by its magic number) is opened here, non-blocking (as every handle's
-//! descriptor is made anyway, `Handle::adopt`), so not even a lease holds it
-//! up. No FIFO or device is opened here unless the path is swapped for one
-//! between the look and the open; that descriptor is closed at once and the
-//! open goes to the pool, as a plain open of the new file would. Anything else, and every open this cannot answer for
-//! whatever reason, goes to the blocking pool as every open did before,
-//! where it waits as a plain open does, and the pool's answer, an error
-//! included, is the one the caller gets.
+//! The lookup is not all an open may wait for: the file system's own open may
+//! ask a server (a network or a user-space file system) and the file itself
+//! may make it wait (the other end of a FIFO, a device, a lease another
+//! process holds). So what the path names is looked at first through an
+//! `O_PATH` descriptor, which opens nothing: only a regular file on a file
+//! system of this machine whose open reads nothing (a known one, by its magic
+//! number) is opened here, non-blocking (as every handle's descriptor is made
+//! anyway, `Handle::adopt`), so not even a lease holds it up. No FIFO or
+//! device is opened here unless the path is swapped for one between the look
+//! and the open; that descriptor is closed at once and the open goes to the
+//! pool, as a plain open of the new file would. Anything else, and every open
+//! this cannot answer for whatever reason, goes to the blocking pool as every
+//! open did before, where it waits as a plain open does, and the pool's
+//! answer, an error included, is the one the caller gets.
 
 #![allow(unsafe_code)]
 
