@@ -73,8 +73,9 @@ impl ReadState {
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
-            let _ = (fd, kind, len);
-            (false, false)
+            let _ = len;
+            let on = self.inq_wanted(kind) && self.inq_on(fd, kind);
+            (on, on)
         }
     }
 
