@@ -2,10 +2,9 @@
 //! count, not a look at the queue's words.
 //!
 //! Each push counts its item once the push returned, so the count never exceeds the items
-//! pushed whole, and the one consumer takes only counted items: it pops at most the count it
-//! read and takes them off the count. An item whose count is not seen yet stays for the
-//! consumer's next take, as a push under way does in the queue itself
-//! (proofs/tla/counted/Counted.tla).
+//! pushed whole, and a consumer pops at most the count it read and takes what it popped off the
+//! count. An item whose count is not seen yet stays for the consumer's next take, as a push under
+//! way does in the queue itself (proofs/tla/counted/Counted.tla).
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -38,8 +37,23 @@ impl<T> Counted<T> {
         self.count.load(Ordering::Relaxed) == 0
     }
 
-    /// Takes the counted items in order, each into `take`, for the one consumer. A push still
-    /// under way ahead of a counted item keeps the rest for the next call.
+    /// Whether the queue holds an item or a push under way, with a look at its words: for a look
+    /// that must not miss a push whose count is not in yet.
+    pub(crate) fn holds_any(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// The items the queue holds, for a test that failed.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Takes the counted items in order, each into `take`. A push still under way ahead of a
+    /// counted item keeps the rest for the next call. Consumers that take at once with each other
+    /// (the drains of a shard that stopped) may each read a count another takes off, and the
+    /// count may go below zero for a moment (it wraps), until the push whose item one took before
+    /// it was counted counts it: a look then finds work that is not there, never the reverse.
     pub(crate) fn take_all(&self, mut take: impl FnMut(T)) {
         // Acquire: pairs with the count's Release, so each counted item's push is done.
         let counted = self.count.load(Ordering::Acquire);

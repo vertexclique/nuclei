@@ -51,7 +51,7 @@ impl Shard {
         // step applies the one, and with none of the other it is over.
         #[cfg(ring)]
         if let Driver::Ring(ring) = &self.driver {
-            if !self.shared.io_ops.is_empty() {
+            if self.shared.io_ops.holds_any() {
                 self.apply_io_ops();
             }
             if ring.in_flight() != 0 {

@@ -4,9 +4,14 @@
 (* `Counted::push`, `is_empty`, `take_all`), in its two uses: the chunks   *)
 (* of a receive group given back on other threads (src/rt/shard/recv.rs:  *)
 (* `RecvGroup::take_back`, `has_returns`; src/rt/shard/ring.rs:            *)
-(* `ShardRing::take_back`), and the arrivals a ring's thread leaves for    *)
-(* the holder of a source's read side (src/io/source/ring.rs:              *)
-(* `Source::ring_arrival`; src/io/source/hooks.rs: the deferred ARRIVALS). *)
+(* `ShardRing::take_back`), the registration changes and timer work other *)
+(* threads post a shard (src/rt/shard.rs: `Shared::post_io`, `post_timer`, *)
+(* `drain_io_ops`, `drain_timer_ops`, `Shard::apply_io_ops`,               *)
+(* `has_posted_ops`; src/rt/shard/timers.rs: `fire_timers`;                *)
+(* src/rt/shard/ring/keeper.rs: `apply_mailbox`), and the arrivals a ring's *)
+(* thread leaves for the holder of a source's read side                    *)
+(* (src/io/source/ring.rs: `Source::ring_arrival`; src/io/source/hooks.rs: *)
+(* the deferred ARRIVALS).                                                 *)
 (*                                                                          *)
 (* Who acts. Producers push items. A push claims the queue's next cell,    *)
 (* writes its item there, and only then counts it. One consumer at a time *)
@@ -16,7 +21,12 @@
 (* that is what the count is for, a look at one word.                      *)
 (*                                                                          *)
 (* The returns' use (Ring = FALSE): any thread gives chunks back, and the  *)
-(* ring's thread alone takes them in, before each of its waits. The        *)
+(* ring's thread alone takes them in, before each of its waits. A shard's  *)
+(* posted work is the same: any thread posts, and the shard applies it;    *)
+(* once the shard stopped (or went), the threads that post drain it too,  *)
+(* at once with each other (the Drainers): then two passes may read the    *)
+(* same count, and the count may go below zero for a moment, until the    *)
+(* push whose item a pass took before it was counted counts it. The       *)
 (* arrivals' use (Ring = TRUE): the ring's thread alone pushes. When it    *)
 (* cannot hold the read side it queues the arrival and leaves ARRIVALS for *)
 (* the side's holder, who takes the queue before it lets go. When it holds *)
@@ -26,9 +36,9 @@
 (* word, and the side's owner is asked to come and do it.                 *)
 (*                                                                          *)
 (* What must never happen. An item is taken twice, or before an item its  *)
-(* producer pushed earlier. A pop made on the count finds the queue empty *)
-(* (the count said more than the queue held). An item stays in the queue *)
-(* for good.                                                               *)
+(* producer pushed earlier. With one consumer, a pop made on the count    *)
+(* finds the queue empty (the count said more than the queue held). An    *)
+(* item stays in the queue for good.                                       *)
 (*                                                                          *)
 (* What is abstract. The queue is a sequence of cells, each claimed, then *)
 (* written, by its push: kovan's SegQueue, whose pop of a claimed cell not *)
@@ -44,6 +54,7 @@ CONSTANTS                                                                    \* 
     Producers,  \* the threads that give chunks back (the returns' use)
     Items,      \* the items each producer pushes
     Holds,      \* the times the other thread holds the read side (the arrivals' use)
+    Drainers,   \* the threads that drain the queue at once with its consumer (the returns' use)
     Ring,       \* TRUE: the arrivals' use; FALSE: the returns' use
     Mutation    \* "none", or the name of the one rule this run takes away
 
@@ -74,6 +85,8 @@ define                                                                       \* 
     NoBusy == ~busy                                                          \* claimed never to happen
     \* Witness: a direct arrival finds queued ones, which go in first.
     NoQueuedFirst == ~queuedFirst                                            \* claimed never to happen
+    \* Witness: with drainers, the count goes below zero for a moment.
+    NeverBelowZero == count >= 0                                             \* claimed never to happen
 end define;
 
 \* One consumer's pass (`Counted::take_all`): the count read once, at most that many popped.
@@ -81,7 +94,7 @@ procedure TakeAll()
 variables want = 0, got = 0;                                                 \* the count read; the items popped
 begin                                                                        \* the pass:
 T_read:                                                                      \* the count, with Acquire
-    want := count;                                                           \* read once
+    want := IF count < 0 THEN Total ELSE count;                              \* read once (below zero, a word that wrapped)
 T_pop:                                                                       \* each pop
     while got < want do                                                      \* at most that many
         if queue = <<>> then                                                 \* no cell at all:
@@ -135,6 +148,18 @@ K_look:                                                                      \* 
         end if;                                                              \* else the queue is skipped
     end while;                                                               \* every chunk in
 end process;                                                                 \* end of the taker
+
+\* A thread that drains the queue at once with its consumer (a poster to a shard that stopped).
+fair process drainer \in (IF Ring THEN {} ELSE Drainers)                       \* the returns' use only
+begin                                                                        \* its steps:
+D_loop:                                                                      \* the next drain
+    while Len(taken) < Total do                                              \* while items are out
+D_look:                                                                      \* one look at the count
+        if count # 0 then                                                    \* items counted:
+            call TakeAll();                                                  \* taken
+        end if;                                                              \* else the queue is skipped
+    end while;                                                               \* every item taken
+end process;                                                                 \* end of a drainer
 
 \* The ring's thread in the arrivals' use: each arrival goes in directly, or through the queue.
 fair process ring \in (IF Ring THEN {RingT} ELSE {})                          \* the arrivals' use only

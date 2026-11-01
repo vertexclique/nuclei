@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::inbox::{Inbox, Pop};
-use kovan_queue::seg_queue::SegQueue;
+use counted::Counted;
 
 use super::backend::Backend;
 use super::counters::{self, Counters};
@@ -76,7 +76,6 @@ mod stats;
 mod timers;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 pub(crate) use run::Worked;
-#[cfg(ring)]
 pub(crate) mod counted;
 #[cfg(ring)]
 pub(crate) mod recv;
@@ -111,7 +110,7 @@ pub(crate) struct Shared {
     stop_waker: AtomicWaker,
     /// Work on the timer wheel from other threads, applied by the shard
     /// before it fires timers.
-    timer_ops: SegQueue<TimerOp>,
+    timer_ops: Counted<TimerOp>,
     /// The registrations of the shard's readiness poller; `None` on a ring
     /// shard, whose sources' IO is the ring's operations.
     #[cfg(readiness)]
@@ -122,7 +121,7 @@ pub(crate) struct Shared {
     port: Arc<super::park::iocp::Port>,
     /// Registrations other threads ask of the shard, applied before it
     /// polls.
-    io_ops: SegQueue<IoOp>,
+    io_ops: Counted<IoOp>,
     /// Nothing will apply `io_ops` again (the shard went, and its ring's
     /// keeper too): what reaches it then is let go of by its poster.
     io_closed: AtomicBool,
@@ -256,9 +255,7 @@ impl Shared {
     /// where it is polled (proofs/tla/timer, `S_go`); the rest only goes.
     pub(crate) fn drain_timer_ops(&self) {
         crate::sync::internal::fence(Ordering::SeqCst);
-        while let Ok(op) = self.timer_ops.try_pop() {
-            op.orphan();
-        }
+        self.timer_ops.take_all(TimerOp::orphan);
     }
 
     /// Adds and removes the kernel registrations of the shard's readiness
@@ -324,9 +321,7 @@ impl Shared {
 
     fn drain_io_ops(&self) {
         crate::sync::internal::fence(Ordering::SeqCst);
-        while let Ok(op) = self.io_ops.try_pop() {
-            op.gone();
-        }
+        self.io_ops.take_all(IoOp::gone);
     }
 
     /// Frees the slot of a source whose kernel registration is gone: at once
@@ -530,7 +525,7 @@ impl Shared {
     /// paused clock deciding whether the shard is idle); its own thread looks
     /// with [`Shard::has_remote_work`].
     fn has_remote_work(&self) -> bool {
-        !self.inbox.is_empty() || !self.timer_ops.is_empty() || !self.io_ops.is_empty()
+        !self.inbox.is_empty() || self.timer_ops.holds_any() || self.io_ops.holds_any()
     }
 }
 
@@ -788,12 +783,12 @@ impl Shard {
             stopped: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
-            timer_ops: SegQueue::new(),
+            timer_ops: Counted::new(),
             #[cfg(readiness)]
             registrar: kernel,
             #[cfg(port)]
             port: kernel,
-            io_ops: SegQueue::new(),
+            io_ops: Counted::new(),
             io_closed: AtomicBool::new(false),
             counters: Counters::new(driver.backend(), pool.cap(), owner),
             runtime: std::sync::OnceLock::new(),
@@ -876,7 +871,7 @@ impl Shard {
 
     /// Applies the registration changes other threads asked for.
     fn apply_io_ops(&self) {
-        while let Ok(op) = self.shared.io_ops.try_pop() {
+        self.shared.io_ops.take_all(|op| {
             match op {
                 IoOp::Register(source) => match self.register_source(&source) {
                     Ok(()) => {}
@@ -917,7 +912,7 @@ impl Shard {
                     }
                 }
             }
-        }
+        });
     }
 
     /// The address of the shard's `Shared`, which a source keeps to tell

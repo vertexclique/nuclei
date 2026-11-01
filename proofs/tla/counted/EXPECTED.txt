@@ -1,9 +1,11 @@
 # configuration                spec                 expected
 C_returns                      MC_Counted           pass
 C_arrivals                     MC_Counted           pass
+C_drains                       MC_Counted           pass
 M_count_first                  MC_Counted           violated:NoPastEnd
 M_sub_read                     MC_Counted           violated:AllTaken
 M_no_look                      MC_Counted           violated:InOrder
 M_count_late                   MC_Counted           violated:AllTaken
 W_busy                         MC_Counted           violated:NoBusy
 W_queued_first                 MC_Counted           violated:NoQueuedFirst
+W_below_zero                   MC_Counted           violated:NeverBelowZero
