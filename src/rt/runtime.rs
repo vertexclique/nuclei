@@ -392,11 +392,18 @@ pub(crate) fn service_shard() -> Arc<Shared> {
 }
 
 /// This thread's own shard, started now if it is not running.
+fn own_shard() -> std::rc::Rc<Shard> {
+    context::own_shard_if_made().unwrap_or_else(start_own_shard)
+}
+
+/// [`own_shard`] on a thread that has none yet.
+#[cold]
+#[inline(never)]
 #[expect(
     clippy::panic,
     reason = "no caller to hand the error to; documented under `# Panics`"
 )]
-fn own_shard() -> std::rc::Rc<Shard> {
+fn start_own_shard() -> std::rc::Rc<Shard> {
     match context::own_shard() {
         Ok(shard) => shard,
         Err(err) => panic!("this thread's shard could not start: {err}"),

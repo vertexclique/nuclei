@@ -5,7 +5,7 @@ use super::{Limits, Shard};
 use crate::rt::tuning::Tuning;
 use crate::sync::internal::{AtomicUsize, Ordering};
 
-fn worker_with_pool(jobs: &Arc<AtomicUsize>) -> Shard {
+fn worker_with_pool(jobs: &Arc<AtomicUsize>) -> Arc<Shard> {
     let tuning = Tuning {
         blocking: Some(Arc::clone(jobs)),
         ..Tuning::default()
