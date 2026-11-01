@@ -651,6 +651,7 @@ fn a_drain_whose_registration_a_stopped_shard_never_made_delivers_every_byte() {
 /// A runtime dropped while a task holds a stream that waits for bytes: the worker's shard,
 /// going, evicts the source and drops the task, which closes the stream, both as the sides'
 /// owner (no foreign take switched them), and the peer sees the end.
+#[cfg(unix)]
 #[test]
 fn a_runtime_dropped_under_a_waiting_stream_closes_it_as_its_owner() {
     if !crate::rt::handoff::fence::available() {

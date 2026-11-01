@@ -481,6 +481,31 @@ impl<S> Side<S> {
         OwnerPoll::Left(held, out)
     }
 
+    /// The owner's hold for `f`, for a caller [`owned_by`](Self::owned_by) said is the side's
+    /// owner: the biased take, `f`, and the biased release, with none of the hooks of letting go
+    /// on the way that finds nothing left, so `f` changes nothing they publish. `None` when a
+    /// foreign thread came and the biased take was refused, with `f` not run. Work others left
+    /// as `f` ran is done as a holder of the word does it.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub(crate) fn with_owner<R>(
+        &self,
+        after: &mut After,
+        hooks: &impl Hooks<S>,
+        f: impl FnOnce(&mut S) -> R,
+    ) -> Option<R> {
+        let mut held = self.try_biased()?;
+        hooks.taken(held.get(), after);
+        let out = f(held.get());
+        if !self.release_biased() {
+            core::mem::forget(held);
+            return Some(out);
+        }
+        held.bits = (held.bits & !(BIASED | EXPECT)) | u32::from(BUSY);
+        held.release(after, hooks);
+        Some(out)
+    }
+
     /// Whether the side went to shared mode.
     #[cfg(test)]
     pub(crate) fn is_shared(&self) -> bool {
