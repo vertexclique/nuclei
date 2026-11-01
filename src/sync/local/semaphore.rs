@@ -284,7 +284,18 @@ pub struct Acquire<'a> {
 
 impl Acquire<'_> {
     /// Gives up the place in line, or passes on the permits granted; idempotent.
+    /// One that never queued (the common acquire, served at once) has nothing
+    /// to give up: one inline look.
+    #[inline]
     pub(crate) fn cancel(&mut self) {
+        if self.key.is_some() {
+            self.leave_line();
+        }
+    }
+
+    /// [`cancel`](Self::cancel) of an acquire in line, out of line.
+    #[inline(never)]
+    fn leave_line(&mut self) {
         let Some(key) = self.key.take() else {
             return;
         };
