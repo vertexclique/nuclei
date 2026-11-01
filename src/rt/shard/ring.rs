@@ -804,7 +804,7 @@ impl ShardRing {
     /// again, counting each off the receive it went to.
     fn take_back(&self) {
         let mut recv = self.recv.borrow_mut();
-        let Some(group) = recv.as_mut() else {
+        let Some(group) = recv.as_mut().filter(|group| group.has_returns()) else {
             return;
         };
         let mut ops = self.ops.borrow_mut();

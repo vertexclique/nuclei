@@ -28,7 +28,7 @@
 use std::io;
 use std::sync::Arc;
 
-use kovan_queue::seg_queue::SegQueue;
+use super::counted::Counted;
 
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::Ring;
@@ -105,7 +105,7 @@ unsafe impl Send for RecvGroup {}
 // is the upgrade path if a peer sending single bytes across many connections shows up in a profile.
 pub(crate) struct Returns {
     mem: Arc<BufMem>,
-    queue: SegQueue<Back>,
+    queue: Counted<Back>,
 }
 
 /// Bytes `start..end` of a buffer a receive's completion handed out, read
@@ -199,7 +199,7 @@ impl RecvGroup {
         buffers.commit();
         let back = Arc::new(Returns {
             mem: Arc::clone(buffers.memory()),
-            queue: SegQueue::new(),
+            queue: Counted::new(),
         });
         let total = usize::from(entries) * size as usize;
         Ok(Self {
@@ -329,24 +329,43 @@ impl RecvGroup {
     /// to with `release(user_data, charged)`.
     pub(crate) fn take_back(&mut self, mut release: impl FnMut(u64, usize)) {
         let mut any = false;
-        while let Some(Back { bid, owner, len }) =
-            self.local.pop().or_else(|| self.back.queue.try_pop().ok())
-        {
-            if owner != NOT_AN_OP {
-                release(owner, self.charge(len));
-            }
-            #[cfg(test)]
-            {
-                self.out -= len as usize;
-            }
-            if let Some(fill) = self.fills.get_mut(usize::from(bid)) {
-                fill.live = fill.live.saturating_sub(1);
-            }
-            any |= self.settle(bid);
+        while let Some(item) = self.local.pop() {
+            any |= self.take_in(item, &mut release);
+        }
+        if !self.back.queue.is_empty() {
+            // Chunks given back on other threads, taken through a clone of `back`, as their
+            // take-in borrows the group.
+            let back = Arc::clone(&self.back);
+            back.queue
+                .take_all(|item| any |= self.take_in(item, &mut release));
         }
         if any {
             self.ring.commit();
         }
+    }
+
+    /// Whether chunks given back wait to be taken in.
+    #[inline(always)]
+    pub(crate) fn has_returns(&self) -> bool {
+        !self.local.is_empty() || !self.back.queue.is_empty()
+    }
+
+    /// One chunk given back: counted off its receive, and its buffer given to the kernel again if
+    /// it may go (see [`settle`](Self::settle)), which the caller then commits.
+    #[inline(always)]
+    fn take_in(&mut self, item: Back, release: &mut impl FnMut(u64, usize)) -> bool {
+        let Back { bid, owner, len } = item;
+        if owner != NOT_AN_OP {
+            release(owner, self.charge(len));
+        }
+        #[cfg(test)]
+        {
+            self.out -= len as usize;
+        }
+        if let Some(fill) = self.fills.get_mut(usize::from(bid)) {
+            fill.live = fill.live.saturating_sub(1);
+        }
+        self.settle(bid)
     }
 
     /// Keeps the chunk `item` of `back` to take in with the rest, if `back` is this group's:

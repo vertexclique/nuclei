@@ -77,6 +77,8 @@ mod timers;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 pub(crate) use run::Worked;
 #[cfg(ring)]
+pub(crate) mod counted;
+#[cfg(ring)]
 pub(crate) mod recv;
 #[cfg(ring)]
 pub(crate) mod ring;
