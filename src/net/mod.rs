@@ -5,10 +5,20 @@
 //! `recv_from`, `peek_from`) and, for the streams, `AsyncRead` and
 //! `AsyncWrite` on the handle and on a shared reference to it, so two tasks
 //! can read and write one stream at once. A stream's `read_owned` and
-//! `write_owned` take the caller's buffer and give it back, so the driver
-//! reads into it and writes from it with no copy; a TCP stream's
-//! `write_zero_copy` asks the kernel not to copy it either, and gives it back
-//! through a [`Released`] once the kernel let go of it.
+//! `write_owned` take the caller's buffer (any [`IoBuf`](crate::io::IoBuf)
+//! or [`IoBufMut`](crate::io::IoBufMut)) and give it back, so the driver
+//! reads into it and writes from it with no copy, and `read_vectored_owned`
+//! and `write_vectored_owned` do the same with several buffers in one call;
+//! a TCP stream's `write_zero_copy` asks the kernel not to copy it either,
+//! and gives it back through a [`Released`] once the kernel let go of it.
+//! `send_file` sends a range of a file to a stream.
+//!
+//! A stream ends with [`shut`](TcpStream::shut), std's shutdown made once
+//! the bytes written behind reached the kernel, or for TCP with
+//! [`abort`](TcpStream::abort), which resets the connection now.
+//! [`TcpSocket`] and [`UdpSocketBuilder`] set a socket up before it listens,
+//! connects or binds, and [`TcpKeepalive`] times a TCP connection's
+//! keepalive probes.
 //!
 //! An address is anything [`ToSocketAddrs`] takes: numbers are used at
 //! once; a name (`"localhost:80"`) is looked up on the blocking pool, so no

@@ -1,5 +1,6 @@
 //! Nuclei's runtime-independent synchronization primitives: locks, a
-//! semaphore, events, a barrier and once-cells that never block a thread.
+//! semaphore, events, a barrier, once-cells and channels that never block a
+//! thread.
 //!
 //! Every wait in this module is a [`Future`] built from
 //! futures and wakers only: async code awaits it, and any executor polls it
@@ -76,7 +77,8 @@
 //! - **Reentrancy by [`Owner`](crate::sync::Owner).** The reentrant locks are keyed by an
 //!   owner token rather than a thread, because a task can move between
 //!   threads and many tasks can share one.
-//! - **Every target.** State lives in word-sized atomics. On
+//! - **Every target.** State lives in word-sized atomics (in plain cells
+//!   in [`local`](crate::sync::local), whose types stay on one thread). On
 //!   single-threaded wasm the same code runs on one thread, where only
 //!   interleaved tasks contend. The fast paths allocate nothing; a waiter
 //!   node comes from a per-primitive free list and reaches the allocator

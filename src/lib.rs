@@ -13,20 +13,31 @@
 //!
 //! # What is where
 //!
-//! - [`runtime`]: runtimes, their builder and handles, and `block_on`.
-//! - [`task`]: spawning, [`JoinSet`](task::JoinSet), abort handles, ids,
-//!   task-local values and yielding.
-//! - [`net`]: TCP, UDP and Unix sockets, names, socket options, stream
-//!   halves and pipes.
+//! - [`runtime`]: runtimes, their builder and handles, `block_on`, tasks
+//!   placed on a worker one names
+//!   ([`RuntimeHandle::spawn_on_worker`], [`RuntimeHandle::on_each_worker`])
+//!   and values kept per worker ([`shard_local!`]).
+//! - [`task`]: spawning, [`JoinSet`](task::JoinSet), abort handles, ids and
+//!   names, task-local values and yielding.
+//! - [`net`]: TCP, UDP and Unix sockets, names, socket options and builders,
+//!   stream halves, `shut` and `abort`, and pipes.
 //! - [`io`]: [`Handle`], async operations on std's own IO objects, and the
 //!   helpers every stream gets: reads and writes as futures, copies,
-//!   buffers, in-memory pipes, the standard streams and readiness.
-//! - [`fs`]: files, whole-file calls, metadata and directories.
-//! - [`time`]: sleeps, timeouts, intervals and a clock tests can pause.
+//!   buffers, in-memory pipes, the standard streams and readiness; and the
+//!   buffers the owned calls lend the driver ([`io::IoBuf`],
+//!   [`io::AlignedBuf`], [`io::IoVecBuf`]).
+//! - [`fs`]: files, whole-file calls, metadata and directories; IO at an
+//!   offset, direct IO, syncs, the space calls and advisory locks.
+//! - [`time`]: sleeps on a millisecond wheel or to the microsecond,
+//!   timeouts, intervals and a clock tests can pause.
 //! - [`sync`]: locks, semaphores, notifications, once-cells, channels and
-//!   cancellation tokens, for any executor.
+//!   cancellation tokens, for any executor; [`sync::local`], their cheaper
+//!   twins for the tasks of one shard; and [`sync::mesh`], channels between
+//!   every pair of a set of parties.
 //! - [`process`] and [`signal`]: child processes, signals and console events.
-//! - [`stats()`]: a snapshot of what every shard is doing.
+//! - [`stats()`]: a snapshot of what every shard is doing, with poll times
+//!   when recorded and, with the `io-stats` feature, its IO counts and
+//!   latencies.
 //! - [`select!`], [`join!`] and [`try_join!`] wait on several futures in one
 //!   task; `#[nuclei::main]`, `#[nuclei::test]` and `#[nuclei::bench]` run
 //!   an async function in the runtime.
@@ -34,7 +45,8 @@
 //! A call that needs the default runtime or the calling thread's shard
 //! panics if that cannot start (the system refused its poller: no
 //! descriptors or memory left); [`Builder::build`] and [`task::Builder`]
-//! answer the error instead.
+//! answer the error instead. [`Builder::build`] also checks every setting
+//! first, and answers one out of range as `InvalidInput` naming it.
 //!
 //! The guide, a path from the first program to production with an example
 //! that runs for every idea, is at <https://nuclei.rs/learn/>.

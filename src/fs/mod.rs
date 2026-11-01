@@ -3,26 +3,31 @@
 //! ([`read`], [`write`](fn@write), [`metadata`], [`rename`], [`copy`], ...),
 //! directories ([`create_dir_all`], [`DirBuilder`], [`read_dir`] streamed a
 //! page at a time) and links. Calls by path, and a regular file's calls
-//! beside its reads, writes and syncs, run on the blocking pool.
+//! beside its reads, writes, syncs and [`Handle::allocate`], run on the
+//! blocking pool; [`Handle::try_lock_file`], which never waits, runs on the
+//! calling thread.
 //!
 //! A regular file's reads and writes, at the handle's own cursor or at an
 //! offset of the caller's ([`Handle::read_at`], [`Handle::write_at`] and
-//! their forms, which many tasks may make at once on one handle), and its
-//! syncs ([`Handle::sync_all`], [`Handle::sync_data`]), are operations of
-//! the shard's ring on io_uring and jobs of the blocking pool on the other
-//! backends (see `file`). A file opened for direct IO (`O_DIRECT`,
-//! `FILE_FLAG_NO_BUFFERING`) is read and written with exactly the caller's
-//! lengths and offsets, never through the handle's read-ahead or
-//! write-behind. A `File` that is not a regular file (a FIFO, a terminal, a
-//! pipe) is a byte stream the shard's driver serves like a socket (on
-//! Windows, through the completion port, or through jobs of the blocking
-//! pool for a handle opened for synchronous IO). Reads and writes at the
-//! cursor are `AsyncRead` and `AsyncWrite` on the handle and on a shared
-//! reference to it (both share the cursor, as `&File` shares its offset);
-//! `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned`,
-//! `write_owned`, `read_at_owned` and `write_at_owned` take the caller's
-//! buffer and give it back, so the bytes are read into it and written from
-//! it with no copy.
+//! their forms, which many tasks may make at once on one handle, and
+//! [`Handle::read_many_at`], many reads in one call), its syncs
+//! ([`Handle::sync_all`], [`Handle::sync_data`], [`Handle::sync_range`]) and
+//! [`Handle::allocate`] are operations of the shard's ring on io_uring and
+//! jobs of the blocking pool on the other backends (see `file`). A file
+//! opened for direct IO (`O_DIRECT`, `FILE_FLAG_NO_BUFFERING`) is read and
+//! written with exactly the caller's lengths and offsets, never through the
+//! handle's read-ahead or write-behind. A `File` that is not a regular file
+//! (a FIFO, a terminal, a pipe) is a byte stream the shard's driver serves
+//! like a socket (on Windows, through the completion port, or through jobs
+//! of the blocking pool for a handle opened for synchronous IO). Reads and
+//! writes at the cursor are `AsyncRead` and `AsyncWrite` on the handle and
+//! on a shared reference to it (both share the cursor, as `&File` shares its
+//! offset); `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned`,
+//! `write_owned`, `read_at_owned`, `write_at_owned` and the vectored
+//! `read_vectored_owned` and `write_vectored_owned` take the caller's
+//! buffers (any [`IoBuf`] or [`IoBufMut`], an
+//! [`AlignedBuf`](crate::io::AlignedBuf) for direct IO) and give them back,
+//! so the bytes are read into them and written from them with no copy.
 //!
 //! Beside those, a regular file can be asked to change the space a range
 //! uses ([`Handle::allocate`]: reserve, keep the length, punch a hole, zero),
