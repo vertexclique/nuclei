@@ -40,8 +40,6 @@
 - **The API reference is built with `io-stats`**, on the site and on docs.rs, so the IO counts and
   latencies of `stats` are listed.
 
-## 0.5.2
-
 ### Fixed
 
 - **A shard taken from a blocked runner is never dropped with its tasks.** The monitor holds a
@@ -64,6 +62,11 @@
   handoff came up to 800 ms after the runtime started. The monitor now waits on a kqueue
   there, its ring a user event and its tick a timer marked critical, which is not coalesced (as a
   shard's precise sleep's is): 2.5 ms take 3.8 ms at the median and 8.6 ms at most.
+
+## 0.5.2
+
+### Fixed
+
 - **A read on io_uring gets a stream's end that came with its last bytes.** Linux's multishot
   receive stops trying once the socket's count of what is left says none, a count that leaves out
   a Unix stream's every end and a TCP reset, and waits for a wake. Bytes and the end that came
