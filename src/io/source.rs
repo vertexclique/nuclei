@@ -818,6 +818,9 @@ impl Source {
     /// claimed is taken biased (as `Hooks::owner` and `Side::owned_by` find).
     #[inline(always)]
     fn here<'a, S>(self: &'a Arc<Self>, side: &Side<S>) -> Option<Io<'a>> {
+        if self.kind == Kind::File {
+            return None;
+        }
         self.here_on(context::running_inside(context::local())?, side)
     }
 
@@ -931,6 +934,7 @@ impl Source {
         not(ring),
         expect(unused_variables, reason = "only a ring source kicks")
     )]
+    #[inline(always)]
     fn kick(self: &Arc<Self>, after: &mut After) {
         #[cfg(ring)]
         if let Some(home) = after.take_kick() {

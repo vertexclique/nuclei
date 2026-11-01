@@ -449,13 +449,10 @@ pub(crate) enum Polled {
 #[inline]
 pub(crate) fn poll<R>(shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
     let here = local();
-    let slot = here.slot.get();
-    if slot.is_null() {
+    if here.slot.get().is_null() {
         return poll_unwatched(here, shared, poll);
     }
-    // SAFETY: the slot outlives the loop that set it (see `Here::slot`), and
-    // so this poll.
-    poll_watched(here, unsafe { &*slot }, shared, poll)
+    poll_watched(here, shared, poll)
 }
 
 /// [`poll`] on a shard no monitor watches: no slot to go out of and come
@@ -476,17 +473,12 @@ fn poll_unwatched<R>(here: &Here, shared: &Shared, poll: impl FnOnce() -> R) -> 
     (result, polled(here, shared))
 }
 
-/// [`poll`] on a shard the monitor watches through this thread's slot
-/// `slot`. A poll begins inside, its runtime's own code running (the loop,
+/// [`poll`] on a shard the monitor watches through this thread's slot. A
+/// poll begins inside, its runtime's own code running (the loop,
 /// or a call that runs a nested `block_on`), with no bracket under way to
 /// put back.
 #[inline(never)]
-fn poll_watched<R>(
-    here: &'static Here,
-    slot: &'static Slot,
-    shared: &Shared,
-    poll: impl FnOnce() -> R,
-) -> (R, Polled) {
+fn poll_watched<R>(here: &'static Here, shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
     /// The poll's way back into the shard, by return or unwind.
     struct Back {
         here: &'static Here,
@@ -505,6 +497,9 @@ fn poll_watched<R>(
             here.in_task.set(self.in_task);
         }
     }
+    // SAFETY: the slot outlives the loop that set it (see `Here::slot`), and
+    // so this poll.
+    let slot = unsafe { &*here.slot.get() };
     let epoch = here.epochs.get() + 1;
     here.epochs.set(epoch);
     let back = Back {
@@ -527,21 +522,20 @@ fn poll_watched<R>(
 #[inline(always)]
 pub(crate) fn run_task(shared: &Shared, run: impl FnOnce()) -> Polled {
     let here = local();
-    // SAFETY: the slot outlives the loop that set it (see `Here::slot`), and
-    // so this run.
-    match unsafe { here.slot.get().as_ref() } {
-        None => poll_unwatched(here, shared, run).1,
-        Some(slot) => {
-            run_task_watched(here, slot, run);
-            polled(here, shared)
-        }
+    if here.slot.get().is_null() {
+        return poll_unwatched(here, shared, run).1;
     }
+    run_task_watched(here, run);
+    polled(here, shared)
 }
 
-/// [`run_task`] on a shard the monitor watches through this thread's slot `slot`, from inside
-/// it (see [`poll_watched`]).
+/// [`run_task`] on a shard the monitor watches through this thread's slot, from inside it (see
+/// [`poll_watched`]).
 #[inline(never)]
-fn run_task_watched(here: &'static Here, slot: &'static Slot, run: impl FnOnce()) {
+fn run_task_watched(here: &'static Here, run: impl FnOnce()) {
+    // SAFETY: the slot outlives the loop that set it (see `Here::slot`), and
+    // so this run.
+    let slot = unsafe { &*here.slot.get() };
     let epoch = here.epochs.get() + 1;
     here.epochs.set(epoch);
     let in_task = here.in_task.replace(true);

@@ -626,6 +626,9 @@ impl ShardRing {
         Ok((handled, woken?))
     }
 
+    /// One completion the wait reaped. One call, in the wait's loop, inlined there in every
+    /// build: the cost the inliner weighs it at sits near its limit, so the code around it decides.
+    #[inline(always)]
     fn complete(&self, shard: Option<&Shard>, cqe: IoUringCqe) {
         if cqe.user_data & FILE_TAG != 0 {
             if cqe.user_data & EXIT_TAG != 0 {

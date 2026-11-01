@@ -151,6 +151,9 @@ pub(crate) fn queue_here(
     runnable: Runnable,
     info: ScheduleInfo,
 ) -> Option<Runnable> {
+    // The address alone, which both ways compare: no reference to the schedule's field is
+    // kept for the way out of line.
+    let shard = Arc::as_ptr(shard) as usize;
     match context::unbracketed(context::local()) {
         Ok(current) => queue_on(current, shard, runnable, info),
         Err(Bracketed) => queue_here_bracketed(shard, runnable, info),
@@ -158,26 +161,24 @@ pub(crate) fn queue_here(
 }
 
 /// [`queue_here`] from a task's code on a shard the monitor watches.
+#[cold]
 #[inline(never)]
-fn queue_here_bracketed(
-    shard: &Arc<Shared>,
-    runnable: Runnable,
-    info: ScheduleInfo,
-) -> Option<Runnable> {
+fn queue_here_bracketed(shard: usize, runnable: Runnable, info: ScheduleInfo) -> Option<Runnable> {
     let held = context::bracketed();
     queue_on(held.shard(), shard, runnable, info)
 }
 
-/// [`queue_here`] on `current`, the shard this thread runs as a call into it finds it.
+/// [`queue_here`] on `current`, the shard this thread runs as a call into it finds it, for the
+/// shard whose `Shared` is at `shard`.
 #[inline(always)]
 fn queue_on(
     current: Option<&super::shard::Shard>,
-    shard: &Arc<Shared>,
+    shard: usize,
     runnable: Runnable,
     info: ScheduleInfo,
 ) -> Option<Runnable> {
     match current {
-        Some(current) if current.is(shard) => {
+        Some(current) if current.shared_addr() == shard => {
             current.push_local_from(runnable, info, context::in_task());
             None
         }
@@ -202,6 +203,7 @@ pub(crate) fn queue_home_here(
 }
 
 /// [`queue_home_here`] from a task's code on a shard the monitor watches.
+#[cold]
 #[inline(never)]
 fn queue_home_here_bracketed(
     home: &Home,
