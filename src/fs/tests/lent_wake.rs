@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 
 use super::owned::{hold_the_pool, one_blocking_thread, pends};
 use super::*;
@@ -47,19 +47,23 @@ fn a_lent_read_wakes_the_waker_it_was_polled_with() {
             let mut read = Box::pin(file.read_owned(Vec::with_capacity(16)));
             let flag = Arc::new(Flag(AtomicBool::new(false)));
             let waker = Waker::from(Arc::clone(&flag));
+            let first = read.as_mut().poll(&mut Context::from_waker(&waker));
             assert!(
-                read.as_mut()
-                    .poll(&mut Context::from_waker(&waker))
-                    .is_pending()
-                    || !on_pool,
+                first.is_pending() || !on_pool,
                 "the read on the held pool did not wait"
             );
             release.send(()).unwrap();
             within(busy).await;
-            if !flag.0.load(Ordering::SeqCst) {
-                woken(&flag, "the read's end never woke its waker").await;
-            }
-            let (n, got) = within(read).await;
+            // Off the pool the page cache may have answered at once.
+            let (n, got) = match first {
+                Poll::Ready(out) => out,
+                Poll::Pending => {
+                    if !flag.0.load(Ordering::SeqCst) {
+                        woken(&flag, "the read's end never woke its waker").await;
+                    }
+                    within(read).await
+                }
+            };
             assert_eq!(n.unwrap(), 5);
             assert_eq!(got, b"woken");
         });

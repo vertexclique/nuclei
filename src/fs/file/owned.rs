@@ -74,6 +74,12 @@ impl FileIo {
                         if let Some(ahead) = st.ahead.take() {
                             after.drop_buf(ahead);
                         }
+                        // The job read ahead into the cache: the next read
+                        // tries it again.
+                        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+                        if st.cache == super::cached::Cache::Cold {
+                            st.cache = super::cached::Cache::Try;
+                        }
                     }
                     return Poll::Ready(result);
                 }
@@ -101,6 +107,25 @@ impl FileIo {
                 // Read before the call, so a positional write that ends
                 // while it runs is seen to have.
                 let generation = self.generation();
+                // Bytes the page cache has go into the buffer at once, with
+                // no job; they count as a job's would.
+                #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+                if self.reads_cached()
+                    && let super::cached::Now::Read(n) =
+                        super::cached::read(self.fd.raw(), buf, at, &mut st.cache)
+                {
+                    let result = Ok(n);
+                    tally_read(true, &result, |n| *n);
+                    if !st.counts(self, at, st.epoch, generation) {
+                        buf.truncate(from);
+                        continue;
+                    }
+                    st.cursor += n as u64;
+                    if let Some(ahead) = st.ahead.take() {
+                        after.drop_buf(ahead);
+                    }
+                    return Poll::Ready(result);
+                }
                 let task = self.submit_read_owned(held, at, waker);
                 let pooled = task.pooled();
                 *job = Some(LentRead {
