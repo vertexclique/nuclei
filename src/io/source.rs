@@ -40,6 +40,7 @@ mod direct;
 mod hooks;
 #[cfg(completion)]
 pub(crate) mod ops;
+mod owner;
 #[cfg(port)]
 pub(crate) mod port;
 #[cfg(unix)]
@@ -413,8 +414,8 @@ pub(crate) struct Source {
     read: Side<ReadState>,
     write: Side<WriteState>,
     /// The shards that claimed the sides as their owner.
-    read_owner: crate::sync::OnceCell<Arc<Shared>>,
-    write_owner: crate::sync::OnceCell<Arc<Shared>>,
+    read_owner: owner::Owner,
+    write_owner: owner::Owner,
     reg: Registration,
     /// Work that needs both sides, and what it carries (see `requests`).
     requests: AtomicU8,
@@ -495,8 +496,8 @@ impl Source {
             kind,
             read: Side::biased(ReadState::default()),
             write: Side::biased(WriteState::default()),
-            read_owner: Default::default(),
-            write_owner: Default::default(),
+            read_owner: owner::Owner::new(),
+            write_owner: owner::Owner::new(),
             reg: Registration {
                 state: AtomicU8::new(UNREGISTERED),
                 token: AtomicU64::new(NO_TOKEN),

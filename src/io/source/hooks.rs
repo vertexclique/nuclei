@@ -56,20 +56,23 @@ impl SourceHooks<'_> {
     }
 
     /// Keeps the shard that claimed a side, for a nudge to reach.
-    fn claimed(&self, cell: &crate::sync::OnceCell<Arc<Shared>>) {
+    fn claimed(&self, cell: &super::owner::Owner) {
+        if cell.is_set() {
+            return;
+        }
         let shard = self
             .claim
             .cloned()
             .or_else(|| self.shard.map(|s| Arc::clone(&s.shared)));
         if let Some(shard) = shard {
-            let _ = cell.set(shard);
+            cell.set(shard);
         }
     }
 
     /// Asks the shard that owns a side to take and let go of the source's
     /// sides (a ring source's kick, else a touch), serving what a thread
     /// whose heavy fence failed left there.
-    fn nudge(&self, cell: &crate::sync::OnceCell<Arc<Shared>>) {
+    fn nudge(&self, cell: &super::owner::Owner) {
         if let Some(owner) = cell.get() {
             #[cfg(ring)]
             owner.post_io(IoOp::RingKick(Arc::clone(self.src)));
