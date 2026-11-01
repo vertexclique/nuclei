@@ -80,12 +80,20 @@ impl<T> Deref for BlockRc<T> {
 }
 
 impl<T> Drop for BlockRc<T> {
+    #[inline]
     fn drop(&mut self) {
         let count = self.block().count.get() - 1;
         self.block().count.set(count);
-        if count != 0 {
-            return;
+        if count == 0 {
+            self.drop_last();
         }
+    }
+}
+
+impl<T> BlockRc<T> {
+    /// The last handle's drop: the value's, then the block's.
+    #[inline(never)]
+    fn drop_last(&mut self) {
         let owner = self.block().owner;
         // SAFETY: the last handle: nothing reaches the block now. The value
         // is dropped in place, then its memory goes back where it came from.
