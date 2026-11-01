@@ -92,8 +92,9 @@ fn a_unix_datagram_a_dropped_owned_receive_held_comes_first() {
     });
 }
 
-/// Linux answers a send to a Unix datagram peer whose queue is full "not now"
-/// and says when the peer takes one; macOS answers it with an error.
+/// Linux answers a send on a Unix datagram socket whose buffer its datagrams
+/// in the peer's queue fill "not now", and says it may send again once they
+/// take at most a quarter of it; macOS answers it with an error.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_unix_datagram_send_to_a_full_peer_waits_for_room() {
@@ -119,19 +120,22 @@ fn a_unix_datagram_send_to_a_full_peer_waits_for_room() {
                 .is_pending(),
             "a send to a full peer"
         );
+        // The peer takes every datagram queued: the socket says it may send.
+        rx.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 16];
-        assert_eq!(rx.recv(&mut buf).unwrap(), 4);
+        let mut taken = 0;
+        while let Ok(n) = rx.recv(&mut buf) {
+            assert_eq!(&buf[..n], b"fill");
+            taken += 1;
+        }
+        assert_eq!(taken, filled);
         until("the room the peer made to wake the send", || {
             flag.0.load(Ordering::SeqCst)
         })
         .await;
         assert_eq!(within("the send after room came", send).await.unwrap(), 4);
-        rx.set_nonblocking(true).unwrap();
-        let mut got = Vec::new();
-        while let Ok(n) = rx.recv(&mut buf) {
-            got.push(buf[..n].to_vec());
-        }
-        assert_eq!(got.len(), filled);
-        assert_eq!(got.last().map(Vec::as_slice), Some(&b"last"[..]));
+        rx.set_nonblocking(false).unwrap();
+        assert_eq!(rx.recv(&mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"last");
     });
 }
