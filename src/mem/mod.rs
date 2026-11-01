@@ -205,14 +205,20 @@ mod cache {
         #[inline]
         fn keep(&mut self, class: usize, ptr: NonNull<u8>) -> bool {
             let blocks = &mut self.lists[class];
-            if blocks.len() >= kept(class) {
+            let len = blocks.len();
+            if len >= kept(class) {
                 return false;
             }
-            // The list's own room is made once, at its full size.
-            if blocks.capacity() == 0 {
+            // The list's own room is made once, at its full size: a list
+            // below its bound has room, but for the first block.
+            if len == blocks.capacity() {
                 blocks.reserve_exact(kept(class));
             }
-            blocks.push(ptr);
+            // SAFETY: `len` is below the capacity, just checked or made.
+            unsafe {
+                blocks.as_mut_ptr().add(len).write(ptr);
+                blocks.set_len(len + 1);
+            }
             true
         }
 
@@ -292,7 +298,9 @@ mod cache {
         // SAFETY: `FAST` points at the lists while `CACHE` holds them, on this
         // thread only, and no other reference to them is live (see `Cache`).
         let lists = unsafe { FAST.with(Cell::get).as_mut()? };
-        let record = lists.record?;
+        // SAFETY: `with_lists` sets `FAST` only once the lists hold their
+        // record, which they keep until `FAST` is cleared.
+        let record = unsafe { lists.record.unwrap_unchecked() };
         Some((lists, record))
     }
 
@@ -301,12 +309,13 @@ mod cache {
     fn with_lists<R>(f: impl FnOnce(&mut Lists, &'static Record) -> R) -> Option<R> {
         CACHE
             .try_with(|cache| {
-                let lists = cache.0.get();
-                FAST.with(|fast| fast.set(lists));
+                let at = cache.0.get();
                 // SAFETY: the only reference to the lists while `f` runs (see
                 // `Cache`).
-                let lists = unsafe { &mut *lists };
+                let lists = unsafe { &mut *at };
                 let record = *lists.record.get_or_insert_with(claim);
+                // After the record: `fast` takes the record as there.
+                FAST.with(|fast| fast.set(at));
                 f(lists, record)
             })
             .ok()
