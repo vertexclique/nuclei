@@ -273,11 +273,16 @@ impl ShardRing {
         let Some(group) = recv.as_mut() else {
             return false;
         };
-        match self.ops.try_borrow_mut() {
-            Ok(mut ops) => group.take_in_now(back, item, |user_data, charged| {
+        let Ok(mut ops) = self.ops.try_borrow_mut() else {
+            return group.keep_local(back, item);
+        };
+        match group.take_in_now(back, item) {
+            Some(Some((user_data, charged))) => {
                 release_charge(&mut ops, user_data, charged);
-            }),
-            Err(_) => group.keep_local(back, item),
+                true
+            }
+            Some(None) => true,
+            None => false,
         }
     }
 
@@ -601,6 +606,9 @@ impl ShardRing {
         let mut batch = CqeBatch::new();
         let mut woken = self.poller.borrow_mut().wait(timeout, &mut batch);
         let mut handled = 0;
+        // Before every view of a source an arrival takes (see `arrived`), so it drops after them:
+        // one for the whole batch, not one per arrival.
+        let _unwound = crate::io::side::Unwound::enter();
         loop {
             handled += batch.len();
             for at in 0..batch.len() {
@@ -906,6 +914,7 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
 
 /// Counts `charged` bytes of a chunk given back off the multishot receive of `user_data`, if it
 /// is still in flight.
+#[inline(always)]
 fn release_charge(ops: &mut Ops<RingOp>, user_data: u64, charged: usize) {
     if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
         ops.get_mut(user_data).map(|op| &mut op.mem)

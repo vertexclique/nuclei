@@ -248,6 +248,17 @@ pub(super) struct ReadState {
 }
 
 impl ReadState {
+    /// The state of a TCP stream whose kernel counts what its reads leave from the start: one
+    /// accepted from a listener that asks it (`Source::passes_inq`), so its first read asks
+    /// nothing.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn counting() -> Self {
+        Self {
+            inq: Inq::On,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn epoch_mut(&mut self) -> &mut u32 {
         &mut self.epoch
     }

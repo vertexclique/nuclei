@@ -785,6 +785,28 @@ fn reads_complete_through_a_pool_of_one_small_buffer() {
     });
 }
 
+/// A source dropped with bytes still read ahead gives their buffer back to its pool: on a pool
+/// of one small buffer, a read of another source then completes through it.
+#[test]
+fn a_source_dropped_with_bytes_read_ahead_gives_their_buffer_back() {
+    let rt = runtime(Some(crate::rt::shard::least_buffer_cap()));
+    let (a1, b1) = stream_pair();
+    let (a2, b2) = stream_pair();
+    let first = Owned::new(b1, READS_AHEAD);
+    let second = Owned::new(b2, READS_AHEAD);
+    rt.block_on(async {
+        (&a1).write_all(b"ahead").unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(within(read(&first.src, &mut one)).await.unwrap(), 1);
+        assert!(first.src.has_read_ahead(), "the read left nothing ahead");
+        drop(first);
+        (&a2).write_all(b"next").unwrap();
+        let mut buf = [0u8; 4];
+        let n = within(read(&second.src, &mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], &b"next"[..n]);
+    });
+}
+
 /// A source first used inside `block_on` on a thread outside the runtime
 /// registers with that thread's shard, which runs only while it is inside
 /// `block_on`. Once that returns the source goes from it, and a worker's
