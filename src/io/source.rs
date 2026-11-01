@@ -38,42 +38,39 @@
 /// The owner's poll of the side `$side` of `$src` through `$io`, as `Side::poll_owner` runs it,
 /// with `$step` the poll's step (`$st` the side's state, `$after` what the step leaves, `$waker`
 /// the poll's): returns from the closure or function it is expanded in with the poll's result,
-/// once `$leave` (if given) let go of the shard and what the poll left is settled; carries on
-/// past it when a foreign thread came and nothing ran, what the take left settled. One expansion
-/// per caller: the owner's poll is the same code inline on the path that needs no bracket and in
-/// the bracket of the one that does (`poll_read`, `poll_read_any` and the writes').
+/// once what the poll left is settled; carries on past it when a foreign thread came and nothing
+/// ran, what the take left settled, or when the shard was taken before the step marked its call
+/// (`After::enter`). The reads' and the writes' one code.
 macro_rules! owner_poll {
     ($src:expr, $side:expr, $io:expr, $cx:expr,
-     |$st:ident, $after:ident, $waker:ident| $step:expr $(, then $leave:expr)?) => {{
-        let $waker = $cx.waker();
+     |$st:ident, $after:ident, $waker:ident| $step:expr) => {{
         let mut after = After::default();
-        let hooks = $src.hooks_in($io.shard);
-        match $side.poll_owner(
-            &mut after,
-            &hooks,
-            #[inline(always)]
-            |$st, $after| {
-                #[cfg(unix)]
-                $st.drive();
-                $step
-            },
-        ) {
-            OwnerPoll::Done(poll) => {
-                $($leave;)?
-                return $src.finish_poll(after, poll);
-            }
-            OwnerPoll::Left(held, poll) => {
-                let poll = held.finish_poll(poll, &mut after, &hooks, &mut |$st, $after| {
+        // From a task's code on a shard the monitor watches, the call is marked until the
+        // settle; a shard taken meanwhile is left to the poll of any thread.
+        if after.enter() {
+            let hooks = $src.hooks_in($io.shard);
+            match $side.poll_owner(
+                &mut after,
+                &hooks,
+                #[inline(always)]
+                |$st, $after| {
+                    let $waker = $cx.waker();
                     #[cfg(unix)]
                     $st.drive();
                     $step
-                });
-                $($leave;)?
-                return $src.finish_poll(after, poll);
-            }
-            OwnerPoll::Refused => {
-                $($leave;)?
-                $src.settle(after);
+                },
+            ) {
+                OwnerPoll::Done(poll) => return $src.finish_owned_poll(after, poll),
+                OwnerPoll::Left(held, poll) => {
+                    let poll = held.finish_poll(poll, &mut after, &hooks, &mut |$st, $after| {
+                        let $waker = $cx.waker();
+                        #[cfg(unix)]
+                        $st.drive();
+                        $step
+                    });
+                    return $src.finish_owned_poll(after, poll);
+                }
+                OwnerPoll::Refused => $src.settle_owned(after),
             }
         }
     }};
@@ -810,31 +807,17 @@ impl Source {
 
     /// How a poll of `side` reaches the descriptor when it runs on the shard the source is
     /// registered with and takes `side` as that shard's owner; `None` for any other poll, which
-    /// finds its way as [`with_io`](Self::with_io) does. A thread inside its shard, or on one
-    /// nobody watches, needs no bracket (a task's code on a shard the monitor watches finds
-    /// `None` here, and its way out of line takes one); a source registered with that shard is
-    /// reached as `via` finds (the ring's
-    /// operations Here, else the poller's calls on the descriptor); and a side that shard
-    /// claimed is taken biased (as `Hooks::owner` and `Side::owned_by` find).
+    /// finds its way as [`with_io`](Self::with_io) does. Only the shard's fixed parts are looked
+    /// at here: the owner's step marks its call before it touches the rest (`After::enter`). A
+    /// source registered with that shard is reached as `via` finds (the ring's operations Here,
+    /// else the poller's calls on the descriptor); and a side that shard claimed is taken biased
+    /// (as `Hooks::owner` and `Side::owned_by` find).
     #[inline(always)]
     fn here<'a, S>(self: &'a Arc<Self>, side: &Side<S>) -> Option<Io<'a>> {
         if self.kind == Kind::File {
             return None;
         }
-        self.here_on(context::running_inside(context::local())?, side)
-    }
-
-    /// [`here`](Self::here) on `shard`, the shard this thread runs as a call into it finds it:
-    /// from a task's code on a shard the monitor watches, in a bracket (`poll_read_any`).
-    #[inline(always)]
-    fn here_on<'a, S>(
-        self: &'a Arc<Self>,
-        shard: &'a crate::rt::shard::Shard,
-        side: &Side<S>,
-    ) -> Option<Io<'a>> {
-        if self.kind == Kind::File {
-            return None;
-        }
+        let shard = context::running(context::local())?;
         let addr = shard.shared_addr();
         let fd = self.fd.load(Ordering::Acquire);
         if fd == NO_FD || self.reg.home.load(Ordering::Relaxed) != addr || !side.owned_by(addr) {
@@ -919,9 +902,22 @@ impl Source {
         }
     }
 
-    /// [`settle`](Self::settle) for a step that left something.
+    /// [`settle`](Self::settle) of an owner's step, which `After::enter` may have marked: its
+    /// call ends before what the step left is woken.
+    #[inline(always)]
+    fn settle_owned(self: &Arc<Self>, after: After) {
+        if let Err(after) = after.settle_light_owned() {
+            self.settle_rest(after);
+        }
+    }
+
+    /// [`settle`](Self::settle) for a step that left something, or one of a marked call
+    /// (`After::enter`) that left more than a waker, whose call ends first.
     #[inline(never)]
     fn settle_rest(self: &Arc<Self>, mut after: After) {
+        if after.marked() {
+            context::unmark_call();
+        }
         self.kick(&mut after);
         if after.starved() {
             Arc::clone(self).wait_for_buffer();
@@ -962,6 +958,22 @@ impl Source {
     ) -> Poll<io::Result<R>> {
         let watch = after.must_register() || poll.is_pending();
         self.settle(after);
+        if watch && let Err(err) = self.ensure_registered() {
+            return Poll::Ready(Err(err));
+        }
+        poll
+    }
+
+    /// [`finish_poll`](Self::finish_poll) of an owner's poll, which `After::enter` may have
+    /// marked ([`settle_owned`](Self::settle_owned)).
+    #[inline(always)]
+    fn finish_owned_poll<R>(
+        self: &Arc<Self>,
+        after: After,
+        poll: Poll<io::Result<R>>,
+    ) -> Poll<io::Result<R>> {
+        let watch = after.must_register() || poll.is_pending();
+        self.settle_owned(after);
         if watch && let Err(err) = self.ensure_registered() {
             return Poll::Ready(Err(err));
         }

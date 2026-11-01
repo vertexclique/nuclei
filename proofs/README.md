@@ -2087,7 +2087,8 @@ its own bytes back.
 a runner leaves its shard for a task's poll (a release store of its word), comes back at the
 poll's end and at each call into the runtime from the task, every owner's path a task's code
 takes included (a store of its word, the compiler's fence, a load of its claim: a call reads the
-word it left first and puts it back, a release store, as it ends), and cancels a pending claim
+word it left first and puts it back, a release store, as it ends; an IO owner's step ends its
+call as it settles what it left, before its wakes), and cancels a pending claim
 with a compare-and-swap; the monitor sets the claim pending, runs the heavy fence (every buffer
 flushed at once), reads the word again and takes with the opposite compare-and-swap, then hands
 the shard to a spare with a fresh slot. 15 configurations: 2 that must pass (two handoffs, a

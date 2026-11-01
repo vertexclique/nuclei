@@ -42,6 +42,11 @@ const STARVED: u8 = 16;
 /// `After::held`: work was left to the driver, so the source must be
 /// registered.
 const REGISTER: u8 = 32;
+/// `After::held`: the step ran in a call marked into a shard the monitor
+/// watches (`context::mark_call`), which its settle ends before it wakes or
+/// drops what the step left. The sign bit, which an owner's light settle tests
+/// only past its two cases of a step no mark made, so theirs stay as they were.
+const UNMARK: u8 = 128;
 
 #[cfg(ring)]
 const SLOTS: u8 = WAKE | DROP | MORE | KICK;
@@ -92,6 +97,28 @@ impl After {
     #[inline(always)]
     pub(crate) fn set_starved(&mut self) {
         self.held |= STARVED;
+    }
+
+    /// Marks the step's call into the shard this thread runs, where the
+    /// monitor watches it (`context::mark_call`), until the step is settled:
+    /// `false` when the shard was taken and the thread runs none.
+    #[inline(always)]
+    pub(crate) fn enter(&mut self) -> bool {
+        match crate::rt::context::mark_call() {
+            crate::rt::context::Marked::Not => true,
+            crate::rt::context::Marked::In => {
+                self.held |= UNMARK;
+                true
+            }
+            crate::rt::context::Marked::Taken => false,
+        }
+    }
+
+    /// Whether [`enter`](Self::enter) marked the step's call: its settle ends
+    /// the call before it wakes what the step left.
+    #[inline(always)]
+    pub(crate) fn marked(&self) -> bool {
+        self.held & UNMARK != 0
     }
 
     /// Whether work was left to the driver, so the source must be registered.
@@ -276,8 +303,23 @@ impl After {
     }
 }
 
+/// The end of a light settle of a marked step (`After::settle_light_owned`): the call's end,
+/// then its one waker woken, outside the shard as any step's wake from a task's code is (a
+/// waker may run code of its own).
+#[inline(never)]
+fn unmark_and_wake(wake: Option<Waker>) {
+    crate::rt::context::unmark_call();
+    if let Some(wake) = wake {
+        wake.wake();
+    }
+}
+
 impl Drop for After {
     fn drop(&mut self) {
+        debug_assert!(
+            self.held & UNMARK == 0 || std::thread::panicking(),
+            "a marked step dropped unsettled"
+        );
         if parking() {
             self.park();
         } else {
@@ -298,6 +340,25 @@ impl After {
             // Nothing is owned: no waker, no buffer, no allocation, so there is nothing to drop.
             0 => core::mem::forget(self),
             WAKE => self.wake_alone(),
+            _ => return Err(self),
+        }
+        Ok(())
+    }
+
+    /// [`settle_light`](Self::settle_light) of an owner's step, which [`enter`](Self::enter) may
+    /// have marked: such a step that left nothing, or one waker and no flag, ends the call and
+    /// then wakes it; `Err` gives back any other, still marked.
+    #[inline(always)]
+    pub(crate) fn settle_light_owned(mut self) -> Result<(), Self> {
+        match self.held {
+            0 => core::mem::forget(self),
+            WAKE => self.wake_alone(),
+            // A test of the sign past the two above, so theirs stay as an unmarked step's.
+            held if held.cast_signed() < 0 && held & !(UNMARK | WAKE) == 0 => {
+                let wake = self.take_wake();
+                core::mem::forget(self);
+                unmark_and_wake(wake);
+            }
             _ => return Err(self),
         }
         Ok(())

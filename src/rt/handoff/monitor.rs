@@ -631,6 +631,55 @@ mod tests {
         assert_eq!(polled, crate::rt::context::Polled::Detached);
     }
 
+    /// An IO owner's step marks its call with no guard (`mark_call`), the mark kept with what the
+    /// step leaves until its settle ends it (`unmark_call`): a take meanwhile lets the shard be,
+    /// and a call inside the step marks nothing more. Once the step ended the poll is outside
+    /// again and taken, and a step's mark after that finds the shard taken.
+    #[test]
+    fn an_owner_step_mark_holds_off_a_take_until_its_settle() {
+        use crate::rt::context::{self, Marked};
+        let shard = worker_shard();
+        let monitor = Monitor::new(Duration::from_millis(10), 1, Vec::new(), None);
+        let slot = monitor.slot();
+        let first = Runner {
+            slot: Arc::clone(&slot),
+            life: Arc::new(Life::new()),
+        };
+        monitor.started(0, &shard, first.clone());
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let (_, polled) = context::poll(&shard.shared, || {
+            let word = slot.word();
+            assert!(matches!(context::mark_call(), Marked::In));
+            assert!(
+                !slot::is_outside(slot.word()),
+                "the step's call is not marked"
+            );
+            assert!(
+                matches!(context::mark_call(), Marked::Not),
+                "a call in the step marked"
+            );
+            let mut watch = Watch {
+                runner: first.clone(),
+                last: word,
+                streak: STREAK,
+                longest: 0,
+                reported: slot::inside(0),
+            };
+            let place = monitor.places[0].get().unwrap();
+            assert!(
+                take(&monitor, &Weak::new(), place, 0, &mut watch, word).is_none(),
+                "the shard was taken while a step was marked"
+            );
+            context::unmark_call();
+            assert_eq!(slot.word(), word, "the step's end left the poll inside");
+            let gift = take(&monitor, &Weak::new(), place, 0, &mut watch, word)
+                .expect("the poll, outside again, was not taken");
+            assert!(matches!(context::mark_call(), Marked::Taken));
+            drop(gift);
+        });
+        assert_eq!(polled, context::Polled::Detached);
+    }
+
     /// A take that succeeds holds the shard in its gift, so the runner's
     /// letting go of its own reference as it finds the shard taken leaves
     /// the shard to its next runner.

@@ -53,6 +53,9 @@ pub(crate) struct Here {
     slot: Cell<*const Slot>,
     /// The epoch of the last poll begun.
     epochs: Cell<u64>,
+    /// The word of the poll a call marked by [`mark_call`] found, which [`unmark_call`] puts
+    /// back.
+    saved: Cell<u64>,
     /// The address of the `Shared` of the shard this thread was detached
     /// from, compared, never followed; 0 for none.
     detached: Cell<usize>,
@@ -82,6 +85,7 @@ impl Here {
             depth: Cell::new(0),
             slot: Cell::new(core::ptr::null()),
             epochs: Cell::new(0),
+            saved: Cell::new(0),
             detached: Cell::new(0),
             home: Cell::new(core::ptr::null()),
             task: Cell::new(None),
@@ -228,7 +232,7 @@ pub(crate) fn current_held() -> Current {
     if out.is_null() {
         return Current {
             shard: here.current.get(),
-            bracket: Cell::new(None),
+            _bracket: None,
         };
     }
     bracketed()
@@ -248,7 +252,7 @@ pub(crate) fn bracketed() -> Current {
         } else {
             core::ptr::null()
         },
-        bracket: Cell::new(bracket),
+        _bracket: bracket,
     }
 }
 
@@ -277,21 +281,79 @@ pub(crate) fn running_inside(here: &Here) -> Option<&Shard> {
 /// What [`unbracketed`] answers where a call into the shard needs a bracket.
 pub(crate) struct Bracketed;
 
+/// The shard this thread runs, if any, for a caller that marks its call itself
+/// ([`mark_call`]) before it touches anything of the shard but its fixed parts.
+#[inline(always)]
+pub(crate) fn running(here: &Here) -> Option<&Shard> {
+    // SAFETY: as in `Current::shard`.
+    unsafe { here.current.get().as_ref() }
+}
+
+/// What [`mark_call`] did.
+pub(crate) enum Marked {
+    /// No mark was needed: the thread is inside its shard, or nobody watches it.
+    Not,
+    /// The call is marked, a bracket that [`unmark_call`] ends.
+    In,
+    /// The shard was taken: the thread is detached from it and runs none.
+    Taken,
+}
+
+/// Marks a call into the shard this thread runs from a task's code on a shard the monitor
+/// watches, as a bracket does, for a caller that keeps the mark with what it settles last (an
+/// IO step's `After`) and ends it there with [`unmark_call`]: no guard is held meanwhile, and a
+/// thread that needs no mark pays one look at a word. Nothing in the call may mark again or
+/// poll (`out` is null meanwhile, as in a bracket). For a caller that found the thread running
+/// its shard ([`running`]), so not detached from it: `out` is then its slot.
+#[inline(always)]
+pub(crate) fn mark_call() -> Marked {
+    let here = local();
+    if here.out.get().is_null() {
+        return Marked::Not;
+    }
+    debug_assert!(core::ptr::eq(here.out.get(), here.slot.get()));
+    // SAFETY: as in `Bracket::take`; the slot is `out`, read again where the path that needs
+    // no mark does not keep it.
+    let slot = unsafe { &*here.slot.get() };
+    match slot.mark() {
+        (word, Back::In) => {
+            here.saved.set(word);
+            here.out.set(core::ptr::null());
+            Marked::In
+        }
+        (_, Back::Taken) => {
+            detach_here();
+            Marked::Taken
+        }
+    }
+}
+
+/// [`Here::detach`] of this thread, out of line: a caller that reaches it only rarely keeps no
+/// pointer to its `Here` for it (its other looks go to the thread's own storage directly).
+#[cold]
+#[inline(never)]
+fn detach_here() {
+    local().detach();
+}
+
+/// Ends the call [`mark_call`] marked: the poll's word back, outside the shard again.
+#[inline(always)]
+pub(crate) fn unmark_call() {
+    let here = local();
+    let slot = here.slot.get();
+    here.out.set(slot);
+    // SAFETY: as in `Bracket::take`; the call ran no poll, so the thread still runs the shard
+    // whose slot this is.
+    unsafe { &*slot }.unmark(here.saved.get());
+}
+
 /// What [`current_held`] found: the shard, while it lives.
 pub(crate) struct Current {
     shard: *const Shard,
-    bracket: Cell<Option<Bracket>>,
+    _bracket: Option<Bracket>,
 }
 
 impl Current {
-    /// Ends the bracket, if one was made, before the result drops: what follows touches the
-    /// shard no more, the one handed out by [`shard`](Self::shard) included, until a call of
-    /// its own brackets again.
-    #[inline(always)]
-    pub(crate) fn end(&self) {
-        drop(self.bracket.take());
-    }
-
     /// The shard this thread is running, if any.
     #[inline(always)]
     pub(crate) fn shard(&self) -> Option<&Shard> {
