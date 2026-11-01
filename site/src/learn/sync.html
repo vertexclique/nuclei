@@ -1,11 +1,12 @@
 <!--title Sync-->
-<!--lede Locks, semaphores, notifications, once-cells and lock-free structures for async code.-->
+<!--lede Locks, semaphores, notifications, once-cells and lock-free structures for async code, and twins of them for one shard.-->
 <h2 id="model">Futures and wakers, nothing else</h2>
 <p>Every wait in <code>nuclei::sync</code> is a future built from futures and wakers alone, so it works under any executor, not only Nuclei's. A contended wait queues and returns <code>Pending</code>; it never blocks a thread.</p>
 <ul>
 <li><strong>Familiar names.</strong> <code>Mutex</code>, <code>RwLock</code>, <code>Semaphore</code>, <code>Notify</code>, <code>Barrier</code>, <code>OnceCell</code> and <code>SetOnce</code> keep the names, signatures and errors of the established async sync API: code written against it compiles after a change of import.</li>
 <li><strong>Every wait has a <code>try_</code> form</strong> that never waits, and a <code>blocking_</code> form for threads that may block. On a Nuclei shard a <code>blocking_</code> call nests a <code>block_on</code>, so the shard keeps running its other tasks.</li>
 <li><strong>Dropping a wait loses nothing.</strong> A dropped future withdraws its place in line and passes on what was handed to it, so no wakeup is lost. A <code>Barrier</code> wait is the one exception: an arrival that was counted stays counted.</li>
+<li><strong>Fair to the shard.</strong> On a Nuclei shard, a lock, an acquire or a receive that completes spends the task's <a href="#budget">budget</a>, so a loop on one that is always ready still lets other tasks run. Under another executor there is no budget.</li>
 </ul>
 
 <h2 id="mutex">Mutex</h2>
@@ -44,6 +45,26 @@
 
 <h2 id="fairness">Fast, and fair by count</h2>
 <p>The locks and the semaphore let a caller take what is free even while others wait, so a release never waits for a sleeping task to run. A waiter that loses <a href="api:nuclei::sync::MAX_BYPASS"><code>MAX_BYPASS</code></a> times is owed a handoff: nobody gets in ahead of it, and the next release goes to it directly. Fairness is counted, never timed.</p>
+
+<h2 id="budget">The task's budget</h2>
+<p>On a Nuclei shard, a lock or a semaphore acquire that completes spends one operation of the task's <a href="tasks.html#yield">budget</a>, as IO does, and so do a channel receive that completes and a bounded send that completes at its first try. Once the budget is spent the call completes nothing: it wakes its task and answers <code>Pending</code>, so the task goes behind the shard's other tasks.</p>
+<!--example sync_budget-->
+<ul>
+<li>A wait that queued and was then granted spends nothing, so it keeps what it waited for.</li>
+<li>The <code>try_</code> forms never spend. <code>Notify</code>, <code>Event</code>, <code>Latch</code>, <code>Barrier</code> and the once-cells keep no budget.</li>
+<li>Off a Nuclei shard, under another executor, there is no budget, and these calls never yield for it.</li>
+<li><a href="api:nuclei::task::coop::unconstrained"><code>coop::unconstrained</code></a> runs a future with no budget, and <a href="api:nuclei::stats::ShardStats::budget_yields"><code>budget_yields</code></a> counts how often a shard's tasks yielded for it.</li>
+</ul>
+
+<h2 id="local">For the tasks of one shard</h2>
+<p><a href="api:nuclei::sync::local"><code>nuclei::sync::local</code></a> has twins of <code>mpsc</code>, <code>oneshot</code>, <code>Semaphore</code> and <code>Mutex</code> for tasks that share one thread: <a href="tasks.html#local"><code>spawn_local</code></a> tasks, and the future <code>block_on</code> runs. Their state sits in an <code>Rc</code> and plain cells, so no path makes an atomic instruction or a fence, and a message between two tasks takes fewer instructions than on the shared channel (CI counts both, in the <code>mpsc</code> and <code>local_mpsc</code> rows of <a href="@@SOURCE@@ci/op_budget.txt"><code>ci/op_budget.txt</code></a>).</p>
+<!--example sync_local-->
+<ul>
+<li><strong>Not Send.</strong> The types are neither <code>Send</code> nor <code>Sync</code>, so the compiler keeps them on the thread that made them. Share one between tasks with an <code>Rc</code>.</li>
+<li><strong>The same names and errors.</strong> Code switches by changing the path. Left out are the <code>blocking_</code> forms, which on one thread could only wait for themselves, and the weak sender.</li>
+<li><strong>First come, first served.</strong> Waiting sends, acquires and locks are served strictly in the order they came, and a <code>try_</code> form fails while anyone waits. The shared locks let a caller in ahead of a waiter (<a href="#fairness">fair by count</a>); these never do.</li>
+<li>Dropping a wait loses nothing, and the <a href="#budget">budget</a> applies as it does to the shared ones.</li>
+</ul>
 
 <h2 id="lock-free">Lock-free maps and queues</h2>
 <p>For state shared across threads without a lock at all:</p>

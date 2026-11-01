@@ -5,12 +5,15 @@
 <ul>
 <li><code>threads = N</code>: a runtime of its own with N workers; <code>0</code> runs every task on the thread inside <code>block_on</code>.</li>
 <li><code>start_paused = true</code>: a runtime of its own whose clock starts paused (see <a href="time.html#paused">Time</a>).</li>
+<li><code>builder = "path"</code>: a runtime of its own, built from the <code>Builder</code> the function at <code>path</code> returns; <code>threads</code> and <code>start_paused</code>, when given, apply on top of it.</li>
 <li><code>crate = "path"</code>: where the crate is, for code that re-exports it.</li>
 </ul>
 <!--example runtime_attribute-->
 <!--output runtime_attribute-->
 2 worker shards
 <!--/output-->
+<p>With <code>builder</code>, every setting comes from a function of your own:</p>
+<!--example runtime_attribute_builder-->
 
 <h2 id="block-on">block_on</h2>
 <p><code>nuclei::block_on</code> runs a future to its end on the calling thread. The first call, or the first <code>spawn</code>, starts the default runtime, so a plain <code>fn main</code> needs nothing else. (<code>nuclei::drive</code> is the same call under the name earlier versions used.)</p>
@@ -24,7 +27,8 @@
 <h2 id="own">A runtime of your own</h2>
 <p><code>Runtime::new()</code> starts one with every setting at its default; <code>Runtime::builder()</code> sets them (<a href="production.html#builder">every setting</a>). A runtime spawns, runs <code>block_on</code> and runs blocking work, as the free functions do on the default runtime.</p>
 <!--example runtime_builder-->
-<p>Dropping a <code>Runtime</code> stops its workers, drops the tasks they still hold, and waits for the threads to exit. <code>shutdown_timeout</code> bounds that wait; <code>shutdown_background</code> does not wait at all.</p>
+<p>Dropping a <code>Runtime</code> stops its workers, drops the tasks they still hold, and waits for the threads to exit. Bytes that dropped handles wrote behind still go out, each for at most <a href="api:nuclei::Builder::write_behind_linger"><code>write_behind_linger</code></a>; one still under way when the drop is done carries on on a thread of its own. <code>shutdown_timeout</code> bounds the whole wait; <code>shutdown_background</code> does not wait at all.</p>
+<p><code>build</code> checks every setting first: a value no runtime can work with, or two that do not fit together, fails with <code>InvalidInput</code> naming the setting, its value and what it must be (<a href="errors.html#setting">Errors</a>).</p>
 
 <h2 id="handle">Handles and entering</h2>
 <p><code>runtime.handle()</code> gives a <code>RuntimeHandle</code>: cheap to clone, usable from any thread to spawn on that runtime or to <code>block_on</code>. A handle does not keep its runtime running.</p>
@@ -35,6 +39,22 @@
 <li><code>runtime.enter()</code>: makes the free functions (<code>spawn</code>, <code>spawn_blocking</code>, ...) use this runtime on this thread until the guard drops.</li>
 <li><code>id()</code>: a <code>RuntimeId</code>, different for every runtime of the process.</li>
 </ul>
+
+<h2 id="workers">Choosing the worker</h2>
+<p><code>spawn</code> picks the shard for you. To pick it yourself, name the worker: indices run from 0 to <a href="api:nuclei::runtime::RuntimeHandle::workers"><code>workers()</code></a>, and <code>worker_index()</code> says which one the calling code runs on.</p>
+<!--example runtime_workers-->
+<ul>
+<li><a href="api:nuclei::runtime::RuntimeHandle::spawn_on_worker"><code>spawn_on_worker(k, future)</code></a> places a task on worker <code>k</code>, where it stays for its whole life: a <a href="tasks.html#handoff">handoff</a> moves the worker's shard to another thread with its tasks, and <code>worker_index()</code> still answers <code>k</code>.</li>
+<li><a href="api:nuclei::runtime::RuntimeHandle::spawn_local_on_worker"><code>spawn_local_on_worker(k, make)</code></a> runs <code>make</code> on worker <code>k</code> and spawns the future it makes there, so the future need not be <code>Send</code>.</li>
+<li><a href="api:nuclei::runtime::RuntimeHandle::on_each_worker"><code>on_each_worker(make)</code></a> does that once on every worker that takes tasks and gives a <code>JoinSet</code> with one task per worker: a listener per core, a cache per core, a <a href="channels.html#mesh">mesh</a> of channels between them.</li>
+<li><a href="api:nuclei::task::Builder::worker"><code>task::Builder::worker(k)</code></a> places a task spawned with options the same way.</li>
+</ul>
+<p>A worker the runtime does not have, or one that stopped, refuses the task with <code>InvalidInput</code>; a task it took is never dropped unrun.</p>
+
+<h2 id="shard-local">A value per worker</h2>
+<p><a href="api:nuclei::shard_local"><code>shard_local!</code></a> declares a static, a <a href="api:nuclei::runtime::ShardLocal"><code>ShardLocal</code></a>, that holds one value per worker, made on its first use there: a counter, a cache or a buffer that the worker's tasks share without a lock. The value lives in the worker's shard, not in its thread, so it moves with the shard on a handoff and the worker's tasks always see the same one.</p>
+<!--example runtime_shard_local-->
+<p><a href="api:nuclei::runtime::ShardLocal::with"><code>with</code></a> runs a closure on this worker's value, and the shard stays on the thread while it runs: keep the closure short. Only code on a worker reaches one: off the workers (in <code>block_on</code>'s own thread, on the blocking pool, on another thread) <a href="api:nuclei::runtime::ShardLocal::try_with"><code>try_with</code></a> answers a <code>ShardAccessError</code> and <code>with</code> panics.</p>
 
 <h2 id="default">The default runtime, configured</h2>
 <p>The free functions use the runtime the calling thread is inside, or else the default runtime. To configure the default one, build it with <code>build_global</code> before anything starts it.</p>

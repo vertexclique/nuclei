@@ -39,6 +39,27 @@ the default runtime is already running
 <p><code>Builder::build_global</code> returned this: a free function, the attribute or an earlier <code>build_global</code> started the default runtime first.</p>
 <p><strong>Fix:</strong> call <code>build_global</code> before anything spawns, or build a <code>Runtime</code> of your own and use its methods.</p>
 
+<h2 id="setting">a setting is out of range</h2>
+<!--code text error-->
+io_uring queue_len is 32; it must be at least 64
+<!--/code-->
+<p><code>Builder::build</code> (or <code>build_global</code>) returned this as <code>InvalidInput</code>: a setting holds a value no runtime can work with, or one that does not fit with another (<code>max_worker_threads</code> below <code>worker_threads</code>, <code>on_long_poll</code> with <code>handoff_after(None)</code>). The message names the setting, the value and what it must be. The io_uring sizes set with <code>Proactor::with_config</code> are checked by the first runtime built with them.</p>
+<p><strong>Fix:</strong> set a value in the range the message gives, or leave the setting unset for its default. <a href="production.html#builder">Every setting</a> states its range.</p>
+
+<h2 id="worker">worker does not exist</h2>
+<!--code text error-->
+worker 4 does not exist: the runtime has started 4 workers
+<!--/code-->
+<p><code>spawn_on_worker</code>, <code>spawn_local_on_worker</code> or <code>task::Builder::worker</code> named a worker the runtime does not have; a worker that stopped answers <em>has stopped and takes no new task</em>. Both are <code>InvalidInput</code>, and the task was not spawned.</p>
+<p><strong>Fix:</strong> name a worker from 0 to <code>workers()</code> less one, or use <code>on_each_worker</code> to reach every worker there is. See <a href="runtime.html#workers">Runtime</a>.</p>
+
+<h2 id="shard-local">no shard-local value</h2>
+<!--code text panic-->
+this code runs on no worker, so it has no shard-local value: use it in a task
+<!--/code-->
+<p>A <code>shard_local!</code> value was used off the workers: in <code>block_on</code>'s own future, on the blocking pool, or on a thread of its own. Each worker has its own value and these places have none. <code>with</code> panics with this message; <code>try_with</code> answers it as a <code>ShardAccessError</code>.</p>
+<p><strong>Fix:</strong> use the value in a task spawned on the runtime, or handle the error of <code>try_with</code>. See <a href="runtime.html#shard-local">Runtime</a>.</p>
+
 <h2 id="nesting">block_on is nested too deep</h2>
 <!--code text panic-->
 block_on is nested 2 deep on one thread, the most allowed: each level runs on the thread's stack (raise the limit with `Builder::max_nesting`)

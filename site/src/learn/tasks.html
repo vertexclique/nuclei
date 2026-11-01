@@ -28,7 +28,7 @@
 <p><code>join_next_with_id</code> says which task finished, <code>try_join_next</code> never waits, <code>join_all</code> collects every output, and <code>abort_all</code>, <code>detach_all</code> and <code>shutdown</code> end or release them all.</p>
 
 <h2 id="names">Ids and names</h2>
-<p>Every task has an <code>Id</code>, unique in the process and never reused: <code>task.id()</code> from the handle, <code>task::id()</code> from inside it, and the <a href="production.html#hooks">task hooks</a> are given it too. <code>task::Builder</code> spawns with options, a name today, and answers an <code>io::Result</code>.</p>
+<p>Every task has an <code>Id</code>, unique in the process and never reused: <code>task.id()</code> from the handle, <code>task::id()</code> from inside it, and the <a href="production.html#hooks">task hooks</a> are given it too. <code>task::Builder</code> spawns with options and answers an <code>io::Result</code>: a <code>name</code>, which the hooks read with <code>TaskMeta::name</code>, and a <code>worker</code> to place the task on (<a href="runtime.html#workers">Runtime</a>).</p>
 <!--example tasks_builder-->
 
 <h2 id="local">Tasks that are not Send</h2>
@@ -39,10 +39,19 @@
 <p>A blocking call (a synchronous library, a long computation) would hold its shard and every task on it. <code>nuclei::spawn_blocking</code> runs a closure on the runtime's blocking pool instead and returns a <code>Task</code> for its result. The pool grows on demand up to <a href="api:nuclei::Builder::max_blocking_threads"><code>max_blocking_threads</code></a>, and idle threads leave after <a href="api:nuclei::Builder::thread_keep_alive"><code>thread_keep_alive</code></a>.</p>
 <!--example tasks_blocking-->
 
+<h2 id="handoff">A poll that blocks anyway</h2>
+<p>Blocking code finds its way into tasks: a lock of a synchronous library, a slow system call, a loop longer than planned. When one poll of a task runs past <a href="api:nuclei::Builder::handoff_after"><code>handoff_after</code></a> (10 ms by default), the task holds up only itself: its worker's shard, with every other task, timer and IO of it, goes on on another thread on the same core, and the blocked task carries on once its poll returns. A task placed on a worker stays on that worker through it.</p>
+<ul>
+<li>The blocked thread still shares the core, so a handoff is a rescue, not a place to run work: give long work to <code>spawn_blocking</code> or break it up with yields.</li>
+<li>Tasks that <code>spawn_local</code> keeps on the blocked thread, and a nested <code>block_on</code> there, wait for it and finish on that thread.</li>
+<li><a href="api:nuclei::Builder::on_long_poll"><code>on_long_poll</code></a> names the task that blocked (<a href="production.html#hooks">Production</a>), and <code>stats()</code> counts each worker's <code>handoffs</code> and its <code>longest_poll</code>.</li>
+<li>Watching costs each poll two plain stores and a load; <code>handoff_after(None)</code> turns it off.</li>
+</ul>
+
 <h2 id="task-local">Task-local values</h2>
 <p><code>task_local!</code> declares a key whose value belongs to one task: <code>scope</code> runs a future with it set, and any code that future runs reads it with <code>get</code>, <code>with</code> or <code>try_with</code>.</p>
 <!--example tasks_task_local-->
 
 <h2 id="yield">Yielding and the budget</h2>
-<p>Each poll of a task may complete a budget of operations (<a href="api:nuclei::task::coop::BUDGET"><code>coop::BUDGET</code></a>) before it yields, so one busy task cannot hold its shard. A loop that awaits nothing else can spend the budget itself with <code>coop::consume_budget()</code>; <code>task::yield_now()</code> gives the other tasks a turn at once, and <code>coop::unconstrained</code> runs a future with no budget.</p>
+<p>Each poll of a task may complete a budget of operations (<a href="api:nuclei::task::coop::BUDGET"><code>coop::BUDGET</code></a>) before it yields, so one busy task cannot hold its shard. IO that completes spends one, and so does a receive, an acquire or a lock of <a href="sync.html#budget"><code>nuclei::sync</code></a> that completes without waiting, so a loop over a channel that is never empty yields too. A loop that awaits nothing else can spend the budget itself with <code>coop::consume_budget()</code>; <code>task::yield_now()</code> gives the other tasks a turn at once, and <code>coop::unconstrained</code> runs a future with no budget.</p>
 <!--example tasks_yield-->
