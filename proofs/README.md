@@ -1082,18 +1082,21 @@ in `serve`), on epoll or kqueue and on a ring.
 A peer sends a small datagram and then the largest the socket carries, which for a Unix socket
 is more than the pool's largest buffer holds; the task receives each into a buffer that holds
 it, maybe asking first whether the socket is readable. The task receives a datagram itself into
-its own buffer (on epoll and kqueue always, on a ring a Unix datagram), waiting for an edge or
-the ring's poll when none is there; a look at readability looks and takes nothing. The ring's
-poll of a Unix datagram stays armed once made (a multishot poll): each datagram that comes says
-so, as an edge does, and a call that waits asks the kernel again while the poll stays. Only a
-ring's
-UDP socket has the ring receive ahead, into a buffer that holds the largest datagram UDP
-carries. Before, the side received ahead into the pool, into a buffer as large as the task's
+its own buffer (on epoll and kqueue always; on a ring a Unix datagram, and a UDP one unless the
+ring's group holds any UDP datagram whole), waiting for an edge or the ring's poll when none is
+there; a look at readability looks and takes nothing. The ring's poll of a side whose task
+receives itself stays armed once made (a multishot poll): each datagram that comes says so, as
+an edge does, and a call that waits asks the kernel again while the poll stays. Only a ring
+whose group holds any UDP datagram whole receives UDP ahead, into a buffer that holds the
+largest datagram UDP carries. Before, a ring's UDP side always received ahead into the pool,
+which cost a buffer of the pool and its copy per datagram, and before that the side received
+ahead into the pool, into a buffer as large as the task's
 (failing with `OutOfMemory` for a task's buffer the pool could not hold) or, for a look at
 readability, into the pool's largest buffer, which cut a Unix datagram past 64 KiB that the
-task's buffer would have held whole: both found by the size sweep. 16 configurations: 8 that
-must pass (Unix and UDP datagrams on epoll and on a ring, with `NoCut`, every datagram received
-whole, and `InOrder`; and `Termination` for each), 6 mutations (a look that receives ahead into
+task's buffer would have held whole: both found by the size sweep. 18 configurations: 10 that
+must pass (Unix and UDP datagrams on epoll and on a ring, UDP on a ring that receives it ahead
+and on one that does not, with `NoCut`, every datagram received whole, and `InOrder`; and
+`Termination` for each), 6 mutations (a look that receives ahead into
 the pool's largest buffer, a ring's UDP receive ahead into a buffer below the largest datagram,
 and a ring that receives a Unix datagram ahead for a task that receives it itself break `NoCut`;
 a poll, and an edge, that wake nobody, and a call that waits behind the armed poll as behind an

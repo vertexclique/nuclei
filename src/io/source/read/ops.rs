@@ -106,11 +106,11 @@ impl ReadState {
         };
         // Only a ring gives an operation back because the socket was not
         // ready: the next one waits for it to be. A side whose task receives every datagram
-        // itself (a Unix datagram's) arms a poll that stays, so a wait after the next "not now"
-        // submits nothing.
+        // itself (any but a UDP one's the ring receives ahead) arms a poll that stays, so a wait
+        // after the next "not now" submits nothing.
         #[cfg(ring)]
         if self.poll_first {
-            let want = if kind == Kind::UnixDatagram {
+            let want = if kind.datagrams() && !issuer.multishot_datagrams(kind) {
                 self.multi = true;
                 self.armed = true;
                 Want::ReadyMulti
@@ -137,10 +137,11 @@ impl ReadState {
             lent.out = true;
             Want::RecvLentFrom(core::mem::take(&mut lent.buf))
         } else if kind.datagrams() {
-            // A Unix datagram is its task's to receive into its own buffer
-            // (`receive_now`): the ring only polls for it.
+            // A datagram is its task's to receive into its own buffer (`receive_now`) unless the
+            // ring receives UDP datagrams ahead into a group that holds any: the ring only polls
+            // for it.
             #[cfg(ring)]
-            if kind == Kind::UnixDatagram {
+            if !issuer.multishot_datagrams(kind) {
                 return;
             }
             #[cfg(ring)]

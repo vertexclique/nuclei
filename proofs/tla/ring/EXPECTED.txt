@@ -68,6 +68,8 @@ RR_epoll_unix_live             MC_RingRecv          pass
 RR_epoll_udp_live              MC_RingRecv          pass
 RR_ring_unix_live              MC_RingRecv          pass
 RR_ring_udp_live               MC_RingRecv          pass
+RR_ring_udp_direct             MC_RingRecv          pass
+RR_ring_udp_direct_live        MC_RingRecv          pass
 MRR_ahead_largest              MC_RingRecv          violated:NoCut
 MRR_bound_small                MC_RingRecv          violated:NoCut
 MRR_ahead_after_poll           MC_RingRecv          violated:NoCut

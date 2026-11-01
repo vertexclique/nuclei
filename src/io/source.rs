@@ -368,6 +368,10 @@ struct Registration {
     ops: AtomicBool,
     #[cfg(ring)]
     slot: AtomicU32,
+    /// The ring of the last attach receives UDP datagrams ahead
+    /// (`ShardRing::datagrams_ahead`); else a task receives its own.
+    #[cfg(ring)]
+    datagrams_ahead: AtomicBool,
     /// The address of the `Shared` of the shard the registration in place
     /// (or a ring attach under way) is with, else 0: compared, never
     /// followed. With the token it names the registration, since every
@@ -444,6 +448,18 @@ impl Source {
         false
     }
 
+    /// Whether the ring the source is attached to receives its UDP datagrams ahead (see
+    /// `ShardRing::datagrams_ahead`).
+    #[cfg(ring)]
+    fn datagrams_ahead(&self) -> bool {
+        self.reg.datagrams_ahead.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(ring))]
+    fn datagrams_ahead(&self) -> bool {
+        false
+    }
+
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
@@ -465,6 +481,8 @@ impl Source {
                 ops: AtomicBool::new(false),
                 #[cfg(ring)]
                 slot: AtomicU32::new(u32::MAX),
+                #[cfg(ring)]
+                datagrams_ahead: AtomicBool::new(false),
                 home: core::sync::atomic::AtomicUsize::new(0),
                 #[cfg(port)]
                 awaits_idle: AtomicBool::new(false),

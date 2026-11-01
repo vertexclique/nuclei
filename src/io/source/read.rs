@@ -6,8 +6,8 @@
 //! what the driver completed, copying it into its own buffer; only a
 //! stream read into a buffer big enough (see `direct`) makes the call
 //! itself, into that buffer, when the read-ahead holds nothing, and so does
-//! a datagram receive on unix (on a ring, a Unix datagram's: a UDP datagram
-//! fits a buffer of the pool's largest class), so no datagram is cut to a
+//! a datagram receive on unix (on a ring too, unless the ring receives UDP
+//! ahead into a group whose buffers hold any datagram), so no datagram is cut to a
 //! buffer of the pool. What no task took yet waits here: a stream's
 //! read-ahead (in the order it came: a buffer of the pool, a lent buffer's
 //! leftover, or on a ring the buffers of the shard's receive group that a
@@ -306,12 +306,13 @@ impl ReadState {
         io: Io<'_>,
         fd: Option<crate::io::raw::Raw>,
         kind: Kind,
+        ahead: bool,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<bool> {
         #[cfg(unix)]
         if kind.datagrams()
-            && let Some(fd) = self.task_receives(io, fd, kind)
+            && let Some(fd) = self.task_receives(io, fd, kind, ahead)
         {
             return self.datagram_ready(io, fd, kind, waker, after);
         }

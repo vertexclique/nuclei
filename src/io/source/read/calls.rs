@@ -47,8 +47,15 @@ impl Source {
     ) -> Poll<io::Result<bool>> {
         let kind = self.kind;
         self.poll_reading(cx, |st, io, waker, after| {
-            st.ready(io, self.serving_fd(None), kind, waker, after)
-                .map(Ok)
+            st.ready(
+                io,
+                self.serving_fd(None),
+                kind,
+                self.datagrams_ahead(),
+                waker,
+                after,
+            )
+            .map(Ok)
         })
     }
 
@@ -356,6 +363,7 @@ impl Source {
                 io,
                 self.serving_fd(None),
                 kind,
+                self.datagrams_ahead(),
                 out,
                 peek,
                 seen,

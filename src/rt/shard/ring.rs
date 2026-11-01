@@ -304,6 +304,16 @@ impl ShardRing {
         self.recv.borrow().as_ref().map(RecvGroup::buf_size)
     }
 
+    /// Whether the ring receives UDP datagrams ahead, with a multishot receive into its group:
+    /// one of whole buffers that each hold any datagram (see `DATAGRAM_ROOM`). Elsewhere a UDP
+    /// datagram is its task's to receive into its own buffer, as a Unix one always is.
+    pub(crate) fn datagrams_ahead(&self) -> bool {
+        !self.recv_group_incremental()
+            && self
+                .recv_buf_size()
+                .is_some_and(|s| s >= crate::io::source::ring::DATAGRAM_ROOM)
+    }
+
     /// The memory the ring's group takes (0 without one), charged to the shard's ledger.
     pub(crate) fn recv_reservation(&self) -> usize {
         self.recv

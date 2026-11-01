@@ -145,7 +145,7 @@ impl Hooks<ReadState> for SourceHooks<'_> {
         if self.src.kind.datagrams() {
             self.src
                 .quick
-                .leave_read(st.quick_word(self.src.kind, self.src.on_ring()));
+                .leave_read(st.quick_word(self.src.kind, self.src.datagrams_ahead()));
         }
         #[cfg(not(unix))]
         let _ = st;

@@ -528,12 +528,7 @@ impl RingIssuer<'_> {
     /// hold any datagram (a Unix datagram may be larger than any buffer, and
     /// a buffer filled in pieces may have less room left than a datagram).
     pub(crate) fn multishot_datagrams(&self, kind: Kind) -> bool {
-        kind == Kind::Udp
-            && !self.ring.recv_group_incremental()
-            && self
-                .ring
-                .recv_buf_size()
-                .is_some_and(|s| s >= DATAGRAM_ROOM)
+        kind == Kind::Udp && self.ring.datagrams_ahead()
     }
 }
 
@@ -1047,6 +1042,9 @@ impl Source {
         {
             return;
         }
+        self.reg
+            .datagrams_ahead
+            .store(ring.datagrams_ahead(), Ordering::Release);
         self.ring_installed(shard, token, ring.attach(lease.raw()));
     }
 

@@ -1,11 +1,12 @@
 //! A datagram socket's receives that the task makes itself, on unix: on
-//! epoll and kqueue every one, on a ring a Unix datagram's, and a UDP one's
-//! while the pool has no buffer for the side. The datagram
-//! goes from the kernel straight into the task's buffer, whole whenever the
-//! buffer holds it, so no buffer of the pool cuts it or refuses it for its
-//! size; a look at readability looks and takes nothing. With no datagram
-//! there the task waits for an edge or the ring's poll, and tries again
-//! (proofs/tla/ring/RingRecv.tla).
+//! epoll and kqueue every one; on a ring a Unix datagram's, and a UDP one's
+//! unless the ring receives UDP ahead into a group whose buffers hold any
+//! datagram (and the pool has a buffer for the side when the group runs
+//! dry). The datagram goes from the kernel straight into the task's buffer,
+//! whole whenever the buffer holds it, so no buffer of the pool cuts it or
+//! refuses it for its size; a look at readability looks and takes nothing.
+//! With no datagram there the task waits for an edge or the ring's poll,
+//! which stays armed, and tries again (proofs/tla/ring/RingRecv.tla).
 
 use core::task::{Poll, Waker};
 use std::io;
@@ -19,24 +20,34 @@ use crate::rt::counters::tally;
 
 impl ReadState {
     /// The descriptor a datagram's task receives on itself: on epoll and
-    /// kqueue every socket's, on a ring a Unix datagram socket's (a UDP
-    /// datagram fits a buffer of the pool's largest class, which the ring
-    /// receives into ahead, unless the pool has none for the side: then the
-    /// task receives too, proofs/tla/ring/RingStarve.tla). `None` leaves it
-    /// to the driver.
+    /// kqueue every socket's; on a ring a Unix datagram socket's, and a UDP
+    /// one's unless the ring receives UDP datagrams `ahead` into a group of
+    /// whole buffers that each hold any datagram, and the pool has a buffer
+    /// for the side when the group runs dry (else the task receives too,
+    /// proofs/tla/ring/RingStarve.tla). `None` leaves it to the driver.
     #[cfg_attr(
         not(ring),
         expect(
             unused_variables,
-            reason = "only a ring reads the descriptor and the kind"
+            reason = "only a ring reads the descriptor, the kind and whether it receives ahead"
         )
     )]
-    pub(super) fn task_receives(&self, io: Io<'_>, fd: Option<RawFd>, kind: Kind) -> Option<RawFd> {
+    pub(super) fn task_receives(
+        &self,
+        io: Io<'_>,
+        fd: Option<RawFd>,
+        kind: Kind,
+        ahead: bool,
+    ) -> Option<RawFd> {
         match io.via {
             #[cfg(readiness)]
             Via::Fd(fd) => Some(fd),
             #[cfg(ring)]
-            Via::Ops(_) if (kind == Kind::UnixDatagram || self.starved) && !self.user_fd => fd,
+            Via::Ops(_)
+                if (kind == Kind::UnixDatagram || !ahead || self.starved) && !self.user_fd =>
+            {
+                fd
+            }
             #[cfg(ring)]
             Via::Ops(_) => None,
             #[cfg(not(completion))]
@@ -95,13 +106,14 @@ impl ReadState {
         io: Io<'_>,
         fd: Option<RawFd>,
         kind: Kind,
+        ahead: bool,
         out: &mut [u8],
         peek: bool,
         seen: Option<u32>,
         waker: &Waker,
         after: &mut After,
     ) -> Option<Poll<io::Result<(usize, A)>>> {
-        let fd = self.task_receives(io, fd, kind)?;
+        let fd = self.task_receives(io, fd, kind, ahead)?;
         if self.has_result() || self.lent.is_some() {
             return None;
         }
@@ -132,7 +144,7 @@ impl ReadState {
     /// which it must while the side holds what comes first or a lent
     /// buffer, the caller makes its own calls, the last call found the
     /// socket empty and no edge came, an operation of the ring is out, or
-    /// the ring receives the side's datagrams ahead.
+    /// the ring receives the side's datagrams `ahead`.
     #[cfg_attr(
         not(ring),
         expect(
@@ -141,13 +153,13 @@ impl ReadState {
         )
     )]
     #[inline(always)]
-    pub(crate) fn quick_word(&self, kind: Kind, on_ring: bool) -> u32 {
+    pub(crate) fn quick_word(&self, kind: Kind, ahead: bool) -> u32 {
         let holds = self.has_result() || self.lent.is_some() || self.user_fd || self.blocked;
         #[cfg(ring)]
         let holds = holds
             || (self.out.is_some() && !self.armed)
             || self.poll_first
-            || (on_ring && kind != Kind::UnixDatagram && !self.starved);
+            || (ahead && kind != Kind::UnixDatagram && !self.starved);
         quick::read_word(self.edges, holds)
     }
 

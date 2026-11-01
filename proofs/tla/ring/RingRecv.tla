@@ -18,7 +18,9 @@
 (* asks the kernel again while the poll stays. Only a ring's UDP socket    *)
 (* has the ring receive ahead into a buffer of the pool, one that holds    *)
 (* the largest datagram UDP carries, and the task takes from what came     *)
-(* ahead. Asking whether the socket is readable looks, and takes nothing. *)
+(* ahead, on a ring whose group holds any UDP datagram whole; elsewhere   *)
+(* the task receives UDP itself too. Asking whether the socket is          *)
+(* readable looks, and takes nothing.                                      *)
 (*                                                                          *)
 (* What must never happen: a datagram cut although the task's buffer holds *)
 (* it (the bug the size sweep found: a datagram read ahead into a buffer   *)
@@ -34,6 +36,7 @@ EXTENDS Integers, Sequences, TLC
 CONSTANTS
     Ring,      \* TRUE: an io_uring ring; FALSE: epoll or kqueue
     Unix,      \* TRUE: a Unix datagram socket, whose datagrams may outgrow the pool; FALSE: UDP
+    Ahead,     \* TRUE: a ring whose group holds any UDP datagram whole receives UDP ahead
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The units the pool's largest buffer holds.
@@ -43,8 +46,9 @@ Largest == 2
 Sizes == IF Unix THEN <<1, 3>> ELSE <<1, Largest>>
 \* How many datagrams there are.
 N == Len(Sizes)
-\* Whether the task receives straight into its own buffer, or takes what the ring read ahead.
-Direct == ~Ring \/ Unix
+\* Whether the task receives straight into its own buffer, or takes what the ring read ahead:
+\* only a ring's UDP side receives ahead, and only on a ring that does (`datagrams_ahead`).
+Direct == ~Ring \/ Unix \/ ~Ahead
 \* The buffer of the pool a ring's UDP receive ahead takes: one that holds the largest datagram.
 \* MUTATION bound_small: a buffer bound below the largest datagram UDP carries.
 Bound == IF Mutation = "bound_small" THEN Largest - 1 ELSE Largest
@@ -89,11 +93,12 @@ begin
 R_loop:
     while TRUE do
         either
-            \* A task waits and nothing is out: a UDP side has a datagram received ahead, a Unix
-            \* side a poll that says one came.
-            \* MUTATION ahead_after_poll: a Unix side gets a receive ahead into the smallest buffer.
+            \* A task waits and nothing is out: a side the ring receives ahead has a datagram
+            \* received ahead, one whose task receives itself a poll that says one came.
+            \* MUTATION ahead_after_poll: a side whose task receives itself gets a receive ahead
+            \* into the smallest buffer.
             await waits /\ out = "none";
-            if Unix /\ Mutation # "ahead_after_poll" then
+            if Direct /\ Mutation # "ahead_after_poll" then
                 \* The poll is armed, and at once has a datagram to tell if one is there.
                 out := "poll";
                 edge := socket # <<>>;
@@ -130,10 +135,10 @@ T_loop:
             skip;
         or
 T_look:
-            \* Is the socket readable? A UDP side on a ring has it once a datagram came ahead.
+            \* Is the socket readable? A side the ring receives ahead has it once a datagram came.
             \* MUTATION ahead_largest: every side looks by receiving ahead into the pool's largest
             \* buffer, as it did before.
-            if (Ring /\ ~Unix) \/ Mutation = "ahead_largest" then
+            if ~Direct \/ Mutation = "ahead_largest" then
                 if ahead # <<>> then
                     skip;
                 elsif ~Ring /\ socket # <<>> then
@@ -210,5 +215,5 @@ Termination == <>(pc["task"] = "Done")
 \* A call waited for an edge, the ring's poll or a receive ahead.
 NoWait == ~waited
 \* A datagram the ring received ahead was taken by a receive.
-NoAheadTaken == Len(got) = 0 \/ ~Ring \/ Unix
+NoAheadTaken == Len(got) = 0 \/ Direct
 =============================================================================
