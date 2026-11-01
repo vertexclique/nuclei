@@ -99,7 +99,7 @@ impl Source {
                 #[cfg(not(unix))]
                 let asked = false;
                 if let Some(io) = self.here(&self.write) {
-                    owner_poll!(self, self.write, io, cx, |st, after, waker| self
+                    owner_poll!(self, self.write, io, cx.waker(), |st, after, waker| self
                         .write_step(st, io, waker, after, bufs, wait, asked));
                 }
                 self.poll_write_any(cx, bufs, wait, asked)

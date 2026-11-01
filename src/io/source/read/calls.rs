@@ -75,25 +75,27 @@ impl Source {
             cx,
             #[inline(always)]
             |cx| {
+                let cx_waker = cx.waker();
                 if let Some(io) = self.here(&self.read) {
-                    owner_poll!(self, self.read, io, cx, |st, after, waker| self
+                    owner_poll!(self, self.read, io, cx_waker, |st, after, waker| self
                         .read_step(st, io, waker, after, out, peek));
                 }
-                self.poll_read_any(cx, out, peek)
+                self.poll_read_any(cx_waker, out, peek)
             },
         )
     }
 
-    /// [`poll_read`](Self::poll_read) for every poll [`here`](Self::here) does not take.
+    /// [`poll_read`](Self::poll_read) for every poll [`here`](Self::here) does not take, given
+    /// the poll's waker, all of its context a read looks at.
     #[inline(never)]
     fn poll_read_any(
         self: &Arc<Self>,
-        cx: &mut Context<'_>,
+        waker: &Waker,
         out: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<usize>> {
         self.poll_reading(
-            cx,
+            &mut Context::from_waker(waker),
             #[inline(always)]
             |st, io, waker, after| self.read_step(st, io, waker, after, out, peek),
         )

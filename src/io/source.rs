@@ -37,12 +37,12 @@
 
 /// The owner's poll of the side `$side` of `$src` through `$io`, as `Side::poll_owner` runs it,
 /// with `$step` the poll's step (`$st` the side's state, `$after` what the step leaves, `$waker`
-/// the poll's): returns from the closure or function it is expanded in with the poll's result,
+/// the poll's waker `$wk`): returns from the closure or function it is expanded in with the poll's result,
 /// once what the poll left is settled; carries on past it when a foreign thread came and nothing
 /// ran, what the take left settled, or when the shard was taken before the step marked its call
 /// (`After::enter`). The reads' and the writes' one code.
 macro_rules! owner_poll {
-    ($src:expr, $side:expr, $io:expr, $cx:expr,
+    ($src:expr, $side:expr, $io:expr, $wk:expr,
      |$st:ident, $after:ident, $waker:ident| $step:expr) => {{
         let mut after = After::default();
         // From a task's code on a shard the monitor watches, the call is marked until the
@@ -54,7 +54,7 @@ macro_rules! owner_poll {
                 &hooks,
                 #[inline(always)]
                 |$st, $after| {
-                    let $waker = $cx.waker();
+                    let $waker = $wk;
                     #[cfg(unix)]
                     $st.drive();
                     $step
@@ -62,8 +62,10 @@ macro_rules! owner_poll {
             ) {
                 OwnerPoll::Done(poll) => return $src.finish_owned_poll(after, poll),
                 OwnerPoll::Left(held, poll) => {
+                    // Taken out here, the `dyn` step holds the waker, so the poll's context
+                    // never leaves its frame.
+                    let $waker = $wk;
                     let poll = held.finish_poll(poll, &mut after, &hooks, &mut |$st, $after| {
-                        let $waker = $cx.waker();
                         #[cfg(unix)]
                         $st.drive();
                         $step
