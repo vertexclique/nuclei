@@ -1324,8 +1324,8 @@ then misses, `NoStrandedDetach`); and 2 witnesses (the other shard's registratio
 same number while the shard waits; a holder's eviction).
 
 `Behind` (`tla/going/Behind.tla`) checks the bytes a source's writes took into its write-behind
-when the shard that drove them goes (`Shard::leave` and `drain_unsent` in
-`src/rt/shard/going.rs`, `Source::poll_drain`, `WriteState::submit_ops` and `op_done`,
+when the shard that drove them goes (`Shard::leave`, its `let_go_of_sources`, and `drain_unsent`
+in `src/rt/shard/going.rs`, `Source::poll_drain`, `WriteState::submit_ops` and `op_done`,
 `attach_port` and `waits_for_ops`): no task of the handle's may poll that side again, so the
 shard hands a source that still holds bytes to a drain task on a worker. The task looks each
 time it is woken: with nothing left it ends; registered nowhere with nothing out, it registers
