@@ -547,6 +547,90 @@ mod tests {
         assert_eq!(monitor.bell.rings(), 1, "the monitor asleep was not rung");
     }
 
+    /// A call into the shard from the task's code is marked in the slot (the word says inside
+    /// the poll) before the runner looks at its claim: a take meanwhile finds the mark after its
+    /// fence and lets the shard be. The call's end puts the poll's word back, so the poll, still
+    /// running, is taken at the next look; a call after that finds the shard gone.
+    #[test]
+    fn a_take_lets_a_call_under_way_be_and_takes_the_poll_once_it_ends() {
+        let shard = worker_shard();
+        let (monitor, slot, mut watch) = watched(&shard);
+        let (word, back) = slot.mark();
+        assert_eq!(back, slot::Back::In);
+        assert_eq!(word, slot::outside(1), "the call read the poll's word");
+        assert!(
+            take_outside(&monitor, &mut watch).is_none(),
+            "the shard was taken while a call was in it"
+        );
+        slot.unmark(word);
+        assert_eq!(slot.word(), slot::outside(1), "the poll is outside again");
+        let gift = take_outside(&monitor, &mut watch).expect("the poll, outside again, is taken");
+        assert_eq!(
+            slot.mark().1,
+            slot::Back::Taken,
+            "a call after the take went into the shard"
+        );
+        drop(gift);
+    }
+
+    /// A call from the task's code whose mark meets a claim still pending cancels it and goes
+    /// in: the take that follows fails, and nothing else is claimed.
+    #[test]
+    fn a_call_that_meets_a_pending_claim_cancels_it_and_the_take_fails() {
+        let shard = worker_shard();
+        let (_monitor, slot, _watch) = watched(&shard);
+        slot.claim();
+        let (word, back) = slot.mark();
+        assert_eq!(back, slot::Back::In);
+        assert!(
+            !slot.take(),
+            "the take won over a call that cancelled first"
+        );
+        slot.unmark(word);
+        assert_eq!(slot.come_back(1), slot::Back::In);
+    }
+
+    /// A poll the monitor takes while it blocks, through the thread's own context: the call the
+    /// task's code makes after the take finds no shard (the thread is detached from it, and the
+    /// call takes the paths of any other thread), and the poll ends detached.
+    #[test]
+    fn a_call_after_the_take_finds_no_shard_and_the_poll_ends_detached() {
+        let shard = worker_shard();
+        let monitor = Monitor::new(Duration::from_millis(10), 1, Vec::new(), None);
+        let slot = monitor.slot();
+        let first = Runner {
+            slot: Arc::clone(&slot),
+            life: Arc::new(Life::new()),
+        };
+        monitor.started(0, &shard, first.clone());
+        let _entered = crate::rt::context::enter_watched(&shard, Some(&slot));
+        let (found, polled) = crate::rt::context::poll(&shard.shared, || {
+            let before = crate::rt::context::current(|current| current.is_some());
+            // The poll blocks; the monitor's look sees it outside and takes the shard.
+            let word = slot.word();
+            assert!(slot::is_outside(word), "the poll is outside its shard");
+            let mut watch = Watch {
+                runner: first.clone(),
+                last: word,
+                streak: STREAK,
+                longest: 0,
+                reported: slot::inside(0),
+            };
+            let place = monitor.places[0].get().unwrap();
+            let gift = take(&monitor, &Weak::new(), place, 0, &mut watch, word)
+                .expect("the blocked poll was taken");
+            let after = crate::rt::context::current(|current| current.is_some());
+            drop(gift);
+            (before, after)
+        });
+        assert_eq!(
+            found,
+            (true, false),
+            "a call after the take found the shard"
+        );
+        assert_eq!(polled, crate::rt::context::Polled::Detached);
+    }
+
     /// A take that succeeds holds the shard in its gift, so the runner's
     /// letting go of its own reference as it finds the shard taken leaves
     /// the shard to its next runner.

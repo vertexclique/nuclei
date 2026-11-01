@@ -13,7 +13,10 @@
 //! The runner's way back in is a store of the word, a fence and a load of the
 //! claim. Where the monitor has a heavy fence (one that orders every thread
 //! of the process, [`super::fence`]), the runner's fence is the compiler's
-//! only; elsewhere it is a full one.
+//! only; elsewhere it is a full one. A call into the runtime from the task's
+//! code goes in the same way ([`Slot::mark`]) and puts the poll's word back
+//! as it ends ([`Slot::unmark`]), so the poll, if it blocks after the call,
+//! is still seen outside and taken.
 //!
 //! Two more words, each written by the runner alone. The pins, written
 //! inside the shard, are held while a shard-local value is lent to the
@@ -136,7 +139,32 @@ impl Slot {
     /// unless the monitor took the shard. Never waits.
     #[inline]
     pub(crate) fn come_back(&self, epoch: u64) -> Back {
-        self.word.store(inside(epoch), Ordering::Relaxed);
+        self.enter(inside(epoch))
+    }
+
+    /// The runner, in a task's code, calls into its shard: the word says
+    /// inside the poll again, as at the poll's end, before the runner looks
+    /// at the claim. Answers the word it left, which [`unmark`](Self::unmark)
+    /// puts back as the call ends, with what the runner found. Never waits.
+    #[inline(always)]
+    pub(crate) fn mark(&self) -> (u64, Back) {
+        // Only the runner writes the word: this is its own last store, the
+        // poll's outside word.
+        let word = self.word.load(Ordering::Relaxed);
+        (word, self.enter(word & !1))
+    }
+
+    /// The runner's call into its shard ends: the word it left the call
+    /// with, outside again. Release, as [`go_out`](Self::go_out).
+    #[inline(always)]
+    pub(crate) fn unmark(&self, word: u64) {
+        self.word.store(word, Ordering::Release);
+    }
+
+    /// The runner's way in: its word `word`, a fence, its claim.
+    #[inline(always)]
+    fn enter(&self, word: u64) -> Back {
+        self.word.store(word, Ordering::Relaxed);
         if self.full_fence {
             fence(Ordering::SeqCst);
         } else {
@@ -248,5 +276,90 @@ mod tests {
         slot.cancel();
         assert_eq!(slot.come_back(7), Back::In);
         assert!(!slot.take(), "nothing pending");
+    }
+}
+
+/// Loom models of a call into the shard from the task's code racing the monitor's take of the
+/// poll it is in: the call's mark and its look at the claim on one side, the claim, the fence,
+/// the look at the word and the take on the other (proofs/tla/handoff/Handoff.tla, the bracket).
+/// Under loom the monitor has no heavy fence, so both sides take a sequentially consistent one.
+///
+/// ```text
+/// RUSTFLAGS="--cfg loom" cargo test --release --lib rt::handoff::slot::loom_tests
+/// ```
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::cell::UnsafeCell;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    use super::*;
+
+    /// The monitor's take of the poll of epoch 1, seen outside: whether it took the shard, and
+    /// so went in.
+    fn take_outside(slot: &Slot) -> bool {
+        slot.claim();
+        fence(Ordering::SeqCst);
+        if slot.word() == outside(1) && slot.take() {
+            return true;
+        }
+        slot.cancel();
+        false
+    }
+
+    /// Exactly one of the two goes into the shard, whose cell loom watches for the other's
+    /// access: the call, unless the take came first; the take, only before the call's mark.
+    #[test]
+    fn a_call_and_a_take_never_both_go_in() {
+        loom::model(|| {
+            let slot = Arc::new(Slot::new(true));
+            let shard = Arc::new(UnsafeCell::new(0u32));
+            slot.go_out(1);
+            let monitor = {
+                let (slot, shard) = (Arc::clone(&slot), Arc::clone(&shard));
+                thread::spawn(move || {
+                    let took = take_outside(&slot);
+                    if took {
+                        // SAFETY: loom checks that no other access races this one.
+                        shard.with_mut(|cell| unsafe { *cell += 1 });
+                    }
+                    took
+                })
+            };
+            let (word, back) = slot.mark();
+            let called = back == Back::In;
+            if called {
+                // SAFETY: as above.
+                shard.with_mut(|cell| unsafe { *cell += 1 });
+                slot.unmark(word);
+            }
+            let took = monitor.join().unwrap();
+            assert!(
+                called != took,
+                "the call went in: {called}, the take: {took}"
+            );
+        });
+    }
+
+    /// A call that ended leaves the poll outside: the take that follows it takes the shard, and
+    /// a call after that finds it taken.
+    #[test]
+    fn a_take_after_a_call_ended_takes_the_poll() {
+        loom::model(|| {
+            let slot = Arc::new(Slot::new(true));
+            slot.go_out(1);
+            let (word, back) = slot.mark();
+            assert_eq!(back, Back::In);
+            slot.unmark(word);
+            let monitor = {
+                let slot = Arc::clone(&slot);
+                thread::spawn(move || take_outside(&slot))
+            };
+            assert!(
+                monitor.join().unwrap(),
+                "the poll, outside again, was not taken"
+            );
+            assert_eq!(slot.mark().1, Back::Taken);
+        });
     }
 }

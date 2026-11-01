@@ -35,6 +35,50 @@
 //! index and generation, never a pointer) against the registration in
 //! place, so an event for one that is gone does nothing.
 
+/// The owner's poll of the side `$side` of `$src` through `$io`, as `Side::poll_owner` runs it,
+/// with `$step` the poll's step (`$st` the side's state, `$after` what the step leaves, `$waker`
+/// the poll's): returns from the closure or function it is expanded in with the poll's result,
+/// once `$leave` (if given) let go of the shard and what the poll left is settled; carries on
+/// past it when a foreign thread came and nothing ran, what the take left settled. One expansion
+/// per caller: the owner's poll is the same code inline on the path that needs no bracket and in
+/// the bracket of the one that does (`poll_read`, `poll_read_any` and the writes').
+macro_rules! owner_poll {
+    ($src:expr, $side:expr, $io:expr, $cx:expr,
+     |$st:ident, $after:ident, $waker:ident| $step:expr $(, then $leave:expr)?) => {{
+        let $waker = $cx.waker();
+        let mut after = After::default();
+        let hooks = $src.hooks_in($io.shard);
+        match $side.poll_owner(
+            &mut after,
+            &hooks,
+            #[inline(always)]
+            |$st, $after| {
+                #[cfg(unix)]
+                $st.drive();
+                $step
+            },
+        ) {
+            OwnerPoll::Done(poll) => {
+                $($leave;)?
+                return $src.finish_poll(after, poll);
+            }
+            OwnerPoll::Left(held, poll) => {
+                let poll = held.finish_poll(poll, &mut after, &hooks, &mut |$st, $after| {
+                    #[cfg(unix)]
+                    $st.drive();
+                    $step
+                });
+                $($leave;)?
+                return $src.finish_poll(after, poll);
+            }
+            OwnerPoll::Refused => {
+                $($leave;)?
+                $src.settle(after);
+            }
+        }
+    }};
+}
+
 #[cfg(unix)]
 mod direct;
 mod hooks;
@@ -766,16 +810,28 @@ impl Source {
 
     /// How a poll of `side` reaches the descriptor when it runs on the shard the source is
     /// registered with and takes `side` as that shard's owner; `None` for any other poll, which
-    /// finds its way as [`with_io`](Self::with_io) does. A thread inside its shard needs no
-    /// bracket; a source registered with that shard is reached as `via` finds (the ring's
+    /// finds its way as [`with_io`](Self::with_io) does. A thread inside its shard, or on one
+    /// nobody watches, needs no bracket (a task's code on a shard the monitor watches finds
+    /// `None` here, and its way out of line takes one); a source registered with that shard is
+    /// reached as `via` finds (the ring's
     /// operations Here, else the poller's calls on the descriptor); and a side that shard
     /// claimed is taken biased (as `Hooks::owner` and `Side::owned_by` find).
     #[inline(always)]
     fn here<'a, S>(self: &'a Arc<Self>, side: &Side<S>) -> Option<Io<'a>> {
+        self.here_on(context::running_inside(context::local())?, side)
+    }
+
+    /// [`here`](Self::here) on `shard`, the shard this thread runs as a call into it finds it:
+    /// from a task's code on a shard the monitor watches, in a bracket (`poll_read_any`).
+    #[inline(always)]
+    fn here_on<'a, S>(
+        self: &'a Arc<Self>,
+        shard: &'a crate::rt::shard::Shard,
+        side: &Side<S>,
+    ) -> Option<Io<'a>> {
         if self.kind == Kind::File {
             return None;
         }
-        let shard = context::running_inside(context::local())?;
         let addr = shard.shared_addr();
         let fd = self.fd.load(Ordering::Acquire);
         if fd == NO_FD || self.reg.home.load(Ordering::Relaxed) != addr || !side.owned_by(addr) {

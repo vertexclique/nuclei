@@ -4,6 +4,7 @@
 use super::*;
 use crate::buf::owned::{IoBuf, OwnedBuf};
 use crate::io::side::OwnerPoll;
+use crate::rt::context;
 
 impl Source {
     /// A caller's descriptor: `Ready` with the write side's edge count while
@@ -99,31 +100,8 @@ impl Source {
                 #[cfg(not(unix))]
                 let asked = false;
                 if let Some(io) = self.here(&self.write) {
-                    let waker = cx.waker();
-                    let mut after = After::default();
-                    let hooks = self.hooks_in(io.shard);
-                    match self.write.poll_owner(
-                        &mut after,
-                        &hooks,
-                        #[inline(always)]
-                        |st, after| {
-                            #[cfg(unix)]
-                            st.drive();
-                            self.write_step(st, io, waker, after, bufs, wait, asked)
-                        },
-                    ) {
-                        OwnerPoll::Done(poll) => return self.finish_poll(after, poll),
-                        OwnerPoll::Left(held, poll) => {
-                            let poll =
-                                held.finish_poll(poll, &mut after, &hooks, &mut |st, after| {
-                                    #[cfg(unix)]
-                                    st.drive();
-                                    self.write_step(st, io, waker, after, bufs, wait, asked)
-                                });
-                            return self.finish_poll(after, poll);
-                        }
-                        OwnerPoll::Refused => self.settle(after),
-                    }
+                    owner_poll!(self, self.write, io, cx, |st, after, waker| self
+                        .write_step(st, io, waker, after, bufs, wait, asked));
                 }
                 self.poll_write_any(cx, bufs, wait, asked)
             },
@@ -146,10 +124,28 @@ impl Source {
         bufs: &[io::IoSlice<'_>],
         asked: &mut bool,
     ) -> Option<io::Result<usize>> {
+        self.send_on(
+            context::running_inside(context::local())?,
+            bufs,
+            asked,
+            || {},
+        )
+    }
+
+    /// [`send_as_owner`](Self::send_as_owner) on `shard`, the shard this thread runs as a call
+    /// into it finds it; `leave` lets go of the shard before what the hold left is settled.
+    #[cfg(unix)]
+    #[inline(always)]
+    fn send_on(
+        self: &Arc<Self>,
+        shard: &crate::rt::shard::Shard,
+        bufs: &[io::IoSlice<'_>],
+        asked: &mut bool,
+        leave: impl FnOnce(),
+    ) -> Option<io::Result<usize>> {
         if !self.kind.streams() {
             return None;
         }
-        let shard = crate::rt::context::running_inside(crate::rt::context::local())?;
         let addr = shard.shared_addr();
         if self.reg.home.load(core::sync::atomic::Ordering::Relaxed) != addr
             || !self.write.owned_by(addr)
@@ -175,6 +171,7 @@ impl Source {
                 Some(sys::ready(sys::send_bufs(fd, bufs)))
             },
         );
+        leave();
         self.settle(after);
         match sent?? {
             Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
@@ -199,6 +196,24 @@ impl Source {
         wait: bool,
         asked: bool,
     ) -> Poll<io::Result<usize>> {
+        // From a task's code on a shard the monitor watches, the owner's send and poll first, in
+        // a bracket that ends before what they left is settled.
+        #[cfg(unix)]
+        let mut asked = asked;
+        if context::unbracketed(context::local()).is_err() {
+            let held = context::bracketed();
+            if let Some(shard) = held.shard() {
+                #[cfg(unix)]
+                if let Some(result) = self.send_on(shard, bufs, &mut asked, || held.end()) {
+                    return Poll::Ready(result);
+                }
+                if let Some(io) = self.here_on(shard, &self.write) {
+                    owner_poll!(self, self.write, io, cx, |st, after, waker| self
+                        .write_step(st, io, waker, after, bufs, wait, asked), then held.end());
+                }
+            }
+            held.end();
+        }
         self.poll_writing(
             cx,
             #[inline(always)]
