@@ -40,12 +40,6 @@
 //! thread's by the time a slow submitter reads it, so the name a thread
 //! replaces is retired, not freed. That is one node per thread started,
 //! none per job.
-//!
-//! A detached job that ends a file's call returns that end
-//! (`fs::call::Ending`), which its run drops, publishing it, only once the
-//! job's task is gone: the task's block is back with the thread it came from
-//! before the task woken can spawn again, so a steady stream of calls takes
-//! no block from the allocator (proofs/tla/jobend).
 
 use core::sync::atomic::AtomicU8;
 use std::io;
@@ -199,8 +193,7 @@ impl Pool {
         self.jobs.load(Ordering::SeqCst)
     }
 
-    /// Runs a job, then counts it out. Its awaiter was woken during the run
-    /// (a detached job's end once its task was freed: `fs::call::Ending`),
+    /// Runs a job, then counts it out. Its awaiter was woken during the run,
     /// before the count drops, so a paused clock that sees no job in flight
     /// sees the woken shard's work.
     fn run(&self, runnable: Runnable) {
@@ -432,16 +425,20 @@ impl Pool {
                 self.clear_bit(me);
                 continue;
             }
-            // The clock is read once to start the keep-alive, then only after
-            // a park that ends with the slot still idle.
+            // The first park waits the whole keep-alive, so a thread woken
+            // within it reads the clock once, for the deadline.
             let deadline = Instant::now() + self.config.keep_alive;
-            let mut left = self.config.keep_alive;
-            while slot.state.load(Ordering::SeqCst) != WOKEN && !left.is_zero() {
-                std::thread::park_timeout(left);
+            let mut wait = self.config.keep_alive;
+            while slot.state.load(Ordering::SeqCst) != WOKEN {
+                std::thread::park_timeout(wait);
                 if slot.state.load(Ordering::SeqCst) == WOKEN {
                     break;
                 }
-                left = deadline.saturating_duration_since(Instant::now());
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                wait = deadline - now;
             }
             // Before the slot leaves idle: a freed slot may be another
             // thread's at once, and a late clear would erase its bit.

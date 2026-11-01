@@ -30,12 +30,14 @@ async fn pair() -> (TcpStream, TcpStream) {
 }
 
 /// Writes until a write would wait, the write-behind full; returns the bytes
-/// the writes took.
+/// the writes took. Each write is small enough to be copied behind: one of
+/// 16 KiB or more waits for room instead.
 async fn fill(conn: &TcpStream) -> usize {
     let data: Vec<u8> = (0..4 << 20).map(byte).collect();
     let mut sent = 0;
     loop {
-        let mut send = pin!(conn.send(&data[sent..]));
+        let piece = &data[sent..(sent + (8 << 10)).min(data.len())];
+        let mut send = pin!(conn.send(piece));
         match poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await {
             Poll::Ready(n) => sent += n.unwrap(),
             Poll::Pending => return sent,

@@ -452,14 +452,14 @@ impl Handle<UnixDatagram> {
         poll_fn(|cx| self.poll_receive(cx, buf, peek)).await
     }
 
+    #[inline(always)]
     fn poll_receive(
         &self,
         cx: &mut Context<'_>,
         buf: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<(usize, UnixSocketAddr)>> {
-        let (n, addr) = core::task::ready!(self.source().poll_receive(cx, buf, peek))?;
-        Poll::Ready(unix(addr).map(|addr| (n, addr)))
+        self.source().poll_receive_as(cx, buf, peek)
     }
 
     /// Waits until a receive would end at once: a datagram came, or an

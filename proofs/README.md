@@ -957,6 +957,32 @@ sender while no descriptor is free). The Rust test
 `a_datagrams_sender_is_peeked_and_it_stays_to_be_received` in `tests/net_api.rs` and the
 `buffers_*` rows of `tests/sizes/datagrams.rs` peek a sender and receive into an empty buffer.
 
+## A datagram call made with no guard
+
+`dgram` (`tla/dgram/DgramQuick.tla`, `tla/dgram/DgramQuickSend.tla`) checks the datagram calls
+a task makes at once, with no guard, while the side holds nothing (`poll_receive_as` in
+`src/io/source/read/calls.rs`, `poll_send` in `src/io/source/write/calls.rs`, each with its
+guarded call out of line in `poll_receive_held` and `poll_send_held`, the word of
+`src/io/source/quick.rs` that `quick_word` and `quick_holds` compute and `releasing` in
+`src/io/source/hooks.rs` leaves as each holder lets go, `receive_now` and `send_now` under the
+guard, the edges of `serve` and `on_event`). Each side's last holder leaves a word: raised while
+the side holds something or waits for an edge, and on the read side its count of edges. A call
+that finds it clear asks the kernel at once. A receive the kernel answers "not now" takes the
+guard with the word it saw, and waits without asking again only if no edge was counted since; a
+send raises the word under the guard before it asks again, so the writable edges the driver lets
+go by while the word is clear are never one a call waits for. In the receive model a task drops
+an owned receive whose buffer the driver may have filled, then receives the rest; in the send
+model a task sends into a socket that fills while a peer reads. 16 configurations: 4 that must
+pass (`InOrder` and `Termination` for each), 6 mutations (a word that forgets the datagram the
+side holds breaks `InOrder`; a receive that waits on the word it saw whatever came since, one that
+compares with the word left rather than the side's own count after an edge served in its hold, a
+send that raises the word only as it lets go, one that waits without asking again, and a word
+that forgets a call waiting for room break `Termination`), and 6 witnesses (a receive and a send
+made with no guard, a receive that waits on the word it saw, a datagram held from the dropped
+receive taken first, a writable edge let go by, a send that waits for room).
+`tests/faults/datagram_quick.rs` drops an owned receive the driver filled before two borrowed
+receives (UDP and Unix), and waits for room on a full Unix datagram peer, on each backend.
+
 ## A caller's own descriptor
 
 `asyncfd` (`tla/asyncfd/AsyncFd.tla`) checks `AsyncFd` (`src/io/async_fd.rs`) and the side's
@@ -1110,31 +1136,57 @@ lent send of a task that went still out overtakes it, breaking `InOrder`; a poll
 nobody breaks `Termination`), and 3 witnesses (a call that waits for room, a refusal answered by
 its own call, a call that waits behind the lent send of a task that went).
 
+The same model checks a stream's writes (`Stream`: `write_direct`, `wait_for_room` and `write` in
+`src/io/source/write.rs`). The task writes small chunks and large ones (16 KiB or more,
+`BEHIND_MIN`); a chunk goes to the kernel from the task's own buffer when nothing of the side is
+ahead of it and the socket has room. A small one that cannot is copied into the write-behind and
+taken at once, and the ring sends the write-behind once nothing else is out. A large one is never
+copied: it waits for what is ahead of it to go out, or for the poll when the socket is full, and
+tries again. Before, a large chunk that found the socket full was copied too, so a send of every
+chunk stayed out with the ring and every later chunk was copied as well (the bulk row of
+`ci/op_count`, a 64 KiB copy for every chunk). 10 configurations: 2 that
+must pass (`OwnResult`, `InOrder` and `NoLargeCopy`, no large chunk is ever in the write-behind or
+the ring's send of it; and `Termination` with `Delivered`), 5 mutations (a large chunk that goes to
+the kernel with the write-behind ahead overtakes it, breaking `InOrder`; the old copy breaks
+`NoLargeCopy`; a send's end that wakes nobody, a full socket that asks for no poll, and a poll that
+wakes nobody each leave the large chunk waiting, breaking `Termination`), and 3 witnesses (a large
+chunk that waits for the poll, one that waits for the write-behind ahead of it, a small chunk
+copied into the write-behind).
+
 `tla/ring/RingRecv.tla` checks a datagram socket's receives (`receive_now` and
-`datagram_ready` in `src/io/source/read.rs`, the bound in `datagram_want` and the poll's end in
-`op_done`, `src/io/source/read/ops.rs`, the edge in `serve`), on epoll or kqueue and on a ring.
+`datagram_ready` in `src/io/source/read/datagram.rs`, the bound in `datagram_want` and the ring's
+poll armed in `submit_ops`, `src/io/source/read/ops.rs`, its arrivals in `take_arrival`, the edge
+in `serve`), on epoll or kqueue and on a ring.
 A peer sends a small datagram and then the largest the socket carries, which for a Unix socket
 is more than the pool's largest buffer holds; the task receives each into a buffer that holds
 it, maybe asking first whether the socket is readable. The task receives a datagram itself into
-its own buffer (on epoll and kqueue always, on a ring a Unix datagram), waiting for an edge or
-the ring's poll when none is there; a look at readability looks and takes nothing. Only a ring's
-UDP socket has the ring receive ahead, into a buffer that holds the largest datagram UDP
-carries. Before, the side received ahead into the pool, into a buffer as large as the task's
+its own buffer (on epoll and kqueue always; on a ring a Unix datagram, and a UDP one unless the
+ring's group holds any UDP datagram whole), waiting for an edge or the ring's poll when none is
+there; a look at readability looks and takes nothing. The ring's poll of a side whose task
+receives itself stays armed once made (a multishot poll): each datagram that comes says so, as
+an edge does, and a call that waits asks the kernel again while the poll stays. Only a ring
+whose group holds any UDP datagram whole receives UDP ahead, into a buffer that holds the
+largest datagram UDP carries. Before, a ring's UDP side always received ahead into the pool,
+which cost a buffer of the pool and its copy per datagram, and before that the side received
+ahead into the pool, into a buffer as large as the task's
 (failing with `OutOfMemory` for a task's buffer the pool could not hold) or, for a look at
 readability, into the pool's largest buffer, which cut a Unix datagram past 64 KiB that the
-task's buffer would have held whole: both found by the size sweep. 15 configurations: 8 that
-must pass (Unix and UDP datagrams on epoll and on a ring, with `NoCut`, every datagram received
-whole, and `InOrder`; and `Termination` for each), 5 mutations (a look that receives ahead into
+task's buffer would have held whole: both found by the size sweep. 18 configurations: 10 that
+must pass (Unix and UDP datagrams on epoll and on a ring, UDP on a ring that receives it ahead
+and on one that does not, with `NoCut`, every datagram received whole, and `InOrder`; and
+`Termination` for each), 6 mutations (a look that receives ahead into
 the pool's largest buffer, a ring's UDP receive ahead into a buffer below the largest datagram,
 and a ring that receives a Unix datagram ahead for a task that receives it itself break `NoCut`;
-a poll, and an edge, that wake nobody break `Termination`), and 2 witnesses (a call that waits
-for the poll, a datagram received ahead and taken).
+a poll, and an edge, that wake nobody, and a call that waits behind the armed poll as behind an
+operation out, break `Termination`), and 2 witnesses (a call that waits for the poll, a datagram
+received ahead and taken).
 
 `tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
 `reads_itself` in `src/io/source/read.rs`, `write`, `write_direct` and `writes_itself` in
 `src/io/source/write.rs`; a ring write goes direct at every size, `WRITE_RING` of
-`src/io/source/direct.rs` being 0). Three connections over a pool of two buffers, two of whose peers never
+`src/io/source/direct.rs` being 0, and a reply of 16 KiB or more never takes a buffer, waiting for a
+poll as a starved writer does, see `tla/ring/RingSend.tla`). Three connections over a pool of two buffers, two of whose peers never
 send: with no receive group to draw from (none configured, or the group dry) a read takes a buffer
 of the pool for a receive that waits in the kernel, and holds it while its peer stays idle. Before,
 a reader or a writer that found the pool empty waited for a buffer to come back and armed nothing,
