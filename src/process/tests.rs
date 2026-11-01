@@ -154,8 +154,10 @@ mod unix {
     /// A thousand children live at once, each one's exit reported: half
     /// killed, half exiting on their own once their stdin ends. Each waits
     /// for what ends it, so all of them run until then, however long the
-    /// spawns take. Alone in its process: the thousand pidfds, pipes and
-    /// pids would crowd tests that count descriptors.
+    /// spawns take: a killed one sleeps far past the deadline of the process
+    /// the case runs in (a sleep of a minute ended on its own on a slow
+    /// runner whose spawns took longer). Alone in its process: the thousand
+    /// pidfds, pipes and pids would crowd tests that count descriptors.
     #[test]
     fn a_thousand_live_children_each_report_their_exit() {
         if !crate::alone::alone(
@@ -176,7 +178,7 @@ mod unix {
             let mut children: Vec<_> = (0..1000)
                 .map(|i| {
                     if i % 2 == 0 {
-                        Command::new("sleep").arg("60").spawn().unwrap()
+                        Command::new("sleep").arg("3600").spawn().unwrap()
                     } else {
                         sh("read line; exit 3")
                             .stdin(Stdio::piped())

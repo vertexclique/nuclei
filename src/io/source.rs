@@ -42,6 +42,8 @@ mod hooks;
 pub(crate) mod ops;
 #[cfg(port)]
 pub(crate) mod port;
+#[cfg(unix)]
+mod quick;
 mod read;
 pub(crate) mod requests;
 #[cfg(ring)]
@@ -252,6 +254,71 @@ pub(crate) enum Addr {
     Unix(crate::buf::spare::Spare<unix::SocketAddr>),
 }
 
+/// A datagram's sender as a receive hands it out: an internet address, a
+/// Unix one, or either ([`Addr`]).
+pub(crate) trait Sender: Sized {
+    /// A datagram received straight from `fd`, a socket of `kind`, into `out`
+    /// (left on the socket with `peek`), with its sender.
+    #[cfg(unix)]
+    fn receive(fd: Raw, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)>;
+
+    /// The sender of a datagram the side held.
+    fn from_addr(addr: Addr) -> io::Result<Self>;
+}
+
+impl Sender for Addr {
+    #[cfg(unix)]
+    #[inline(always)]
+    fn receive(fd: Raw, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        match kind {
+            Kind::UnixDatagram => crate::io::sys::recv_from_unix(fd, out, peek)
+                .map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)))),
+            _ => crate::io::sys::recv_from_udp(fd, out, peek).map(|(n, a)| (n, Addr::Inet(a))),
+        }
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        Ok(addr)
+    }
+}
+
+impl Sender for SocketAddr {
+    #[cfg(unix)]
+    #[inline(always)]
+    fn receive(fd: Raw, _kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        crate::io::sys::recv_from_udp(fd, out, peek)
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        match addr {
+            Addr::Inet(addr) => Ok(addr),
+            #[cfg(unix)]
+            Addr::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a UDP datagram came with no internet address",
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Sender for unix::SocketAddr {
+    #[inline(always)]
+    fn receive(fd: Raw, _kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        crate::io::sys::recv_from_unix(fd, out, peek)
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        match addr {
+            Addr::Unix(addr) => Ok(addr.into_inner()),
+            Addr::Inet(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a Unix socket's peer has an internet address",
+            )),
+        }
+    }
+}
+
 /// Where a datagram goes.
 #[derive(Clone, Debug)]
 pub(crate) enum Target {
@@ -301,6 +368,10 @@ struct Registration {
     ops: AtomicBool,
     #[cfg(ring)]
     slot: AtomicU32,
+    /// The ring of the shard of the last registration receives UDP datagrams
+    /// ahead (`ShardRing::datagrams_ahead`); else a task receives its own.
+    #[cfg(ring)]
+    datagrams_ahead: AtomicBool,
     /// The address of the `Shared` of the shard the registration in place
     /// (or a ring attach under way) is with, else 0: compared, never
     /// followed. With the token it names the registration, since every
@@ -337,6 +408,9 @@ pub(crate) struct Source {
     /// Whether the write side holds bytes or a datagram the kernel has not
     /// taken, as its last holder left it.
     unsent: AtomicBool,
+    /// A datagram socket's words for the calls made with no guard.
+    #[cfg(unix)]
+    quick: quick::Quick,
     /// Completions of the sides' ring operations, for their holders.
     #[cfg(completion)]
     read_done: ops::Mailbox,
@@ -374,6 +448,25 @@ impl Source {
         false
     }
 
+    /// Whether the ring the source is attached to receives its UDP datagrams ahead (see
+    /// `ShardRing::datagrams_ahead`).
+    #[cfg(ring)]
+    fn datagrams_ahead(&self) -> bool {
+        self.reg.datagrams_ahead.load(Ordering::Acquire)
+    }
+
+    /// The source registers with a shard whose ring receives UDP datagrams ahead (`ahead`), or
+    /// not: set before the registration, so the first receive already knows it.
+    #[cfg(ring)]
+    pub(crate) fn registers_with(&self, ahead: bool) {
+        self.reg.datagrams_ahead.store(ahead, Ordering::Release);
+    }
+
+    #[cfg(not(ring))]
+    fn datagrams_ahead(&self) -> bool {
+        false
+    }
+
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
@@ -395,6 +488,8 @@ impl Source {
                 ops: AtomicBool::new(false),
                 #[cfg(ring)]
                 slot: AtomicU32::new(u32::MAX),
+                #[cfg(ring)]
+                datagrams_ahead: AtomicBool::new(false),
                 home: core::sync::atomic::AtomicUsize::new(0),
                 #[cfg(port)]
                 awaits_idle: AtomicBool::new(false),
@@ -402,6 +497,8 @@ impl Source {
             requests: AtomicU8::new(0),
             ask: Ask::default(),
             unsent: AtomicBool::new(false),
+            #[cfg(unix)]
+            quick: quick::Quick::new(kind),
             #[cfg(completion)]
             read_done: ops::Mailbox::default(),
             #[cfg(completion)]
@@ -446,6 +543,7 @@ impl Source {
 
     /// The descriptor for a poll: the handle revived the source before it
     /// polled, so it is never stale here.
+    #[inline(always)]
     fn fd(&self) -> io::Result<Raw> {
         match self.fd.load(Ordering::Acquire) {
             NO_FD => Err(io::Error::new(
@@ -836,6 +934,11 @@ impl Source {
         readiness: Readiness,
         shard: &crate::rt::shard::Shard,
     ) {
+        // A datagram's write side that holds nothing and waits for nothing has no use for room,
+        // and a send that finds the socket full raises its word before it asks the kernel
+        // again (`quick`): every writable edge after that call reaches the side. Any other
+        // source's word stays raised.
+        let writable = readiness.writable && !self.quick.write_clear();
         let mut after = After::default();
         let hooks = SourceHooks {
             src: self,
@@ -851,7 +954,7 @@ impl Source {
             };
             self.read.drive(&mut after, &hooks, unsure);
         }
-        if readiness.writable {
+        if writable {
             self.write.drive(&mut after, &hooks, 0);
         }
         // If the driver's own pool ran out, the readers hear when a buffer

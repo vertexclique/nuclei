@@ -841,6 +841,8 @@ impl Shard {
     /// Watches `source` from now on, under a new token. The caller moved
     /// the source's registration to registering.
     pub(crate) fn register_source(&self, source: &Arc<Source>) -> io::Result<()> {
+        #[cfg(ring)]
+        source.registers_with(self.ring().is_some_and(ring::ShardRing::datagrams_ahead));
         let token = match self.sources.borrow_mut().insert(Arc::clone(source)) {
             Ok(token) => token,
             Err(err) => {

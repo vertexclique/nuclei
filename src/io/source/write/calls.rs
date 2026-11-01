@@ -320,8 +320,35 @@ impl Source {
         })
     }
 
-    /// Sends a datagram to `dest`: copied, queued and sent by the driver.
+    /// Sends a datagram to `dest`: on unix handed to the kernel by the task
+    /// itself, at once and with no guard while the side holds nothing (see
+    /// `quick`); on a port copied, queued and sent by the driver.
+    #[inline(always)]
     pub(crate) fn poll_send(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        dest: Dest<'_>,
+    ) -> Poll<io::Result<usize>> {
+        #[cfg(unix)]
+        if self.quick.write_clear() {
+            let fd = match self.fd() {
+                Ok(fd) => fd,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+            if let Some(result) = sys::ready(send_datagram(fd, bytes, dest)) {
+                tally::writing(&result);
+                return Poll::Ready(result);
+            }
+        }
+        self.poll_send_held(cx, bytes, dest)
+    }
+
+    /// [`poll_send`](Self::poll_send) through the side. One copy for every
+    /// caller, out of line: the side's path stays one, as the stream calls'
+    /// paths through it are.
+    #[inline(never)]
+    fn poll_send_held(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         bytes: &[u8],
@@ -329,6 +356,10 @@ impl Source {
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
         self.poll_writing(cx, |st, io, waker, after| {
+            // Raised before the side's own call: every writable edge after a call that finds
+            // the socket full reaches the side.
+            #[cfg(unix)]
+            self.quick.hold_write();
             st.send(io, self.serving_fd(None), kind, bytes, dest, waker, after)
         })
     }

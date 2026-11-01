@@ -194,6 +194,16 @@ pub(crate) async fn resolve<A: ToSocketAddrs + ?Sized>(addr: &A) -> io::Result<A
     sealed::Sealed::resolve(addr).addrs().await
 }
 
+/// The first address `addr` names, or `None` if it names none: a number at
+/// once, with no lookup's future polled for it.
+pub(crate) async fn first<A: ToSocketAddrs + ?Sized>(addr: &A) -> io::Result<Option<SocketAddr>> {
+    match sealed::Sealed::resolve(addr) {
+        Resolve::One(addr) => Ok(Some(addr)),
+        Resolve::Slice(addrs) => Ok(addrs.first().copied()),
+        name => Ok(name.addrs().await?.next()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +239,19 @@ mod tests {
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|a| a.ip().is_loopback() && a.port() == 80));
         assert!(crate::block_on(resolve("no.such.host.invalid:80")).is_err());
+    }
+
+    #[test]
+    fn the_first_address_is_the_lookups_first() {
+        let a: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let b: SocketAddr = "[::1]:443".parse().unwrap();
+        let none: [SocketAddr; 0] = [];
+        assert_eq!(crate::block_on(first(&a)).unwrap(), Some(a));
+        assert_eq!(crate::block_on(first(&[b, a][..])).unwrap(), Some(b));
+        assert_eq!(crate::block_on(first(&none[..])).unwrap(), None);
+        assert_eq!(crate::block_on(first("[::1]:443")).unwrap(), Some(b));
+        let looked = crate::block_on(first("localhost:80")).unwrap();
+        assert!(looked.is_some_and(|l| l.ip().is_loopback() && l.port() == 80));
+        assert!(crate::block_on(first("no.such.host.invalid:80")).is_err());
     }
 }
