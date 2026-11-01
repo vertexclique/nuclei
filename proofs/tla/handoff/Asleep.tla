@@ -25,7 +25,8 @@
 (*                                                                          *)
 (* What is abstract. One worker, one piece of work that comes once, a poll *)
 (* that blocks for good once it runs; the bell keeps one ring until it is  *)
-(* waited for, as a thread's park token does.                              *)
+(* waited for, as a thread's park token does, and the user event of the    *)
+(* bell's kqueue on Apple's systems (src/rt/handoff/bell.rs).              *)
 (***************************************************************************)
 EXTENDS Integers, TLC                                                        \* numbers and TLC's helpers
 
