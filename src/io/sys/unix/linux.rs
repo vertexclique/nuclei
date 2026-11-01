@@ -122,6 +122,25 @@ pub(crate) fn enable_inq(fd: RawFd, tcp: bool) -> bool {
     ret == 0
 }
 
+/// Whether the stream socket `fd` has an end queued that its receive count leaves out, by a
+/// `poll(2)` that waits for nothing and takes nothing: a Unix stream's every end (the peer's
+/// close, reset or shutdown of writing), a TCP socket's reset. TCP counts a FIN as a byte left.
+#[cfg(ring)]
+pub(crate) fn end_queued(fd: RawFd, tcp: bool) -> bool {
+    let ends = if tcp {
+        libc::POLLERR
+    } else {
+        libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR
+    };
+    let mut look = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: one `pollfd` of ours and a timeout of zero: the kernel only fills `revents`.
+    unsafe { libc::poll(&mut look, 1, 0) == 1 && look.revents & ends != 0 }
+}
+
 /// `recvmsg(2)` on a stream socket whose count is on (see [`enable_inq`]):
 /// reads into `buf` and answers how many bytes, and how many the receive
 /// queue still holds after them (a pending end of stream counts as one on TCP,

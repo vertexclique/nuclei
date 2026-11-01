@@ -606,6 +606,7 @@ impl ShardRing {
                 bid,
                 cqe.res,
                 cqe.flags & IORING_CQE_F_BUF_MORE != 0,
+                cqe.flags & IORING_CQE_F_MORE != 0,
             );
         } else if self.zero_copy(shard, &cqe) {
             return;
@@ -1065,6 +1066,8 @@ mod tests;
 mod tests_armed;
 #[cfg(test)]
 mod tests_cap;
+#[cfg(test)]
+mod tests_end;
 #[cfg(test)]
 mod tests_inc;
 #[cfg(test)]

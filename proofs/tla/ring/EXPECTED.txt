@@ -110,3 +110,10 @@ MC_table_until_done            MC_RingClose         violated:ClosedAtDrop
 MC_free_at_release             MC_RingClose         violated:SlotReserved
 WC_leaves                      MC_RingClose         violated:NoLeaving
 WC_reuse                       MC_RingClose         violated:NoReuse
+RE_safe                        MC_RingEnd           pass
+RE_live                        MC_RingEnd           pass
+RE_sqpoll_safe                 MC_RingEnd           pass
+RE_sqpoll_live                 MC_RingEnd           pass
+MRE_no_look                    MC_RingEnd           violated:Termination
+MRE_look_unissued              MC_RingEnd           violated:Termination
+WRE_end_stop                   MC_RingEnd           violated:NoEndStop
