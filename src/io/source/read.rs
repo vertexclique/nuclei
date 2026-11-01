@@ -248,6 +248,17 @@ pub(super) struct ReadState {
 }
 
 impl ReadState {
+    /// The state of a TCP stream whose kernel counts what its reads leave from the start: one
+    /// accepted from a listener that asks it (`Source::passes_inq`), so its first read asks
+    /// nothing.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn counting() -> Self {
+        Self {
+            inq: Inq::On,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn epoch_mut(&mut self) -> &mut u32 {
         &mut self.epoch
     }
@@ -752,8 +763,48 @@ impl ReadState {
 
     /// A stream read (or peek) into `out`: the driver reads into the pool
     /// first if the socket may hold bytes, and the task copies them out.
-    #[inline]
+    /// Inlined, the read of a side that holds nothing and has nothing to ask
+    /// for ([`quiet`](Self::quiet)): it waits, with nothing to call or take.
+    #[inline(always)]
     fn read(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        out: &mut [u8],
+        peek: bool,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        if self.quiet(io) {
+            self.wait(waker, out.len());
+            return Poll::Pending;
+        }
+        self.read_any(io, kind, out, peek, waker, after)
+    }
+
+    /// Whether a stream read finds nothing to take and nothing to ask the
+    /// driver for, as [`read_any`](Self::read_any) would find it: no bytes
+    /// ahead, no end and no error, and either a poller's socket that was
+    /// empty after the last edge or a ring's multishot receive that stays
+    /// out (`armed_and_quiet`).
+    #[inline(always)]
+    fn quiet(&self, io: Io<'_>) -> bool {
+        self.ahead.is_empty()
+            && !self.eof
+            && self.error.is_none()
+            && match io.via {
+                #[cfg(readiness)]
+                Via::Fd(_) => self.blocked,
+                #[cfg(completion)]
+                Via::Ops(_) => self.armed_and_quiet(),
+                #[cfg(not(completion))]
+                Via::None(never, _) => match never {},
+            }
+    }
+
+    /// [`read`](Self::read) of any side.
+    #[inline]
+    fn read_any(
         &mut self,
         io: Io<'_>,
         kind: Kind,

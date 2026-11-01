@@ -218,13 +218,28 @@ impl After {
     }
 
     /// Wakes and drops; call with no guard held. Once: it consumes the step,
-    /// so its drop finds nothing left to do.
+    /// so its drop finds nothing left to do. A step that left one waker
+    /// alone, the usual one that left anything, is woken inline.
     #[inline]
     pub(crate) fn run(mut self) {
+        if self.held & SLOTS == WAKE {
+            self.wake_alone();
+            return;
+        }
         if self.held & SLOTS != 0 {
             self.run_held();
         }
         core::mem::forget(self);
+    }
+
+    /// Wakes the one waker of a step whose slots hold that alone, and
+    /// consumes the step.
+    #[inline(always)]
+    fn wake_alone(mut self) {
+        if let Some(w) = self.take_wake() {
+            core::mem::forget(self);
+            w.wake();
+        }
     }
 
     /// [`run`](Self::run) of a step that left a value.
@@ -274,17 +289,18 @@ impl Drop for After {
 }
 
 impl After {
-    /// Consumes a step that left nothing to do, without the work of settling it: `Err` gives
-    /// back one that did.
+    /// Settles a step that left nothing, or one waker and no flag, the usual cases, inline: it
+    /// wakes that waker and consumes the step. `Err` gives back any other, for the caller to
+    /// settle as its flags ask and then [`run`](Self::run).
     #[inline(always)]
-    pub(crate) fn forget_if_nothing(self) -> Result<(), Self> {
-        if self.held == 0 {
+    pub(crate) fn settle_light(self) -> Result<(), Self> {
+        match self.held {
             // Nothing is owned: no waker, no buffer, no allocation, so there is nothing to drop.
-            core::mem::forget(self);
-            Ok(())
-        } else {
-            Err(self)
+            0 => core::mem::forget(self),
+            WAKE => self.wake_alone(),
+            _ => return Err(self),
         }
+        Ok(())
     }
 
     #[inline(always)]

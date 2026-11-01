@@ -647,3 +647,111 @@ fn a_drain_whose_registration_a_stopped_shard_never_made_delivers_every_byte() {
     src.close(mine);
     drop(rt);
 }
+
+/// An object wider than a word, which a dropped handle hands over boxed: it is dropped once, by
+/// the last to let go, as one that fits in the word (a socket) is.
+#[cfg(unix)]
+struct Wide {
+    stream: Stream,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+    _room: [u64; 3],
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for Wide {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Wide {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dropped_handle_of_an_object_wider_than_a_word_drops_it_once_the_holder_lets_go() {
+    let (mine, peer) = stream_pair();
+    peer.set_nonblocking(true).unwrap();
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = Handle::new(Wide {
+        stream: mine,
+        drops: Arc::clone(&drops),
+        _room: [0; 3],
+    })
+    .unwrap();
+    let src = Arc::clone(handle.source());
+    let held = src.read.try_hold().expect("the side is free");
+    drop(handle);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "dropped while a side was held"
+    );
+    assert!(
+        !peer_sees_end(&peer),
+        "the descriptor closed while a side was held"
+    );
+    let mut after = After::default();
+    held.release(&mut after, &src.hooks());
+    after.run();
+    assert_eq!(drops.load(Ordering::SeqCst), 1, "not dropped exactly once");
+    assert!(peer_sees_end(&peer), "the close never ran");
+    drop(src);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "dropped again with the source"
+    );
+}
+
+/// A runtime dropped while a task holds a stream that waits for bytes: the worker's shard,
+/// going, evicts the source and drops the task, which closes the stream, both as the sides'
+/// owner (no foreign take switched them), and the peer sees the end.
+#[cfg(unix)]
+#[test]
+fn a_runtime_dropped_under_a_waiting_stream_closes_it_as_its_owner() {
+    if !crate::rt::handoff::fence::available() {
+        eprintln!("skipping: no heavy fence here, so every side starts shared");
+        return;
+    }
+    let (mine, peer) = stream_pair();
+    peer.set_nonblocking(true).unwrap();
+    let rt = runtime(None);
+    // A ring's completions that come as it settles are its own thread's to take, not a request.
+    let on_ring = rt.block_on(
+        rt.spawn(async { crate::proactor::Proactor::backend() == crate::IoBackend::IoUring }),
+    );
+    let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+    let task = rt.spawn(async move {
+        let handle = Handle::new(mine).unwrap();
+        polled_tx.send(Arc::clone(handle.source())).unwrap();
+        let mut buf = [0u8; 1];
+        let _ = handle.recv(&mut buf).await;
+        drop(handle);
+    });
+    let src = polled_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the task never ran");
+    until_some("the read never registered the source", || {
+        (src.registration().0 != 0).then_some(())
+    });
+    task.detach();
+    drop(rt);
+    assert!(
+        peer_sees_end(&peer),
+        "the dropped task's stream never closed"
+    );
+    if on_ring {
+        eprintln!("skipping the look at the sides: the shard runs a ring here");
+        return;
+    }
+    assert_eq!(
+        src.shared(),
+        (false, false),
+        "the teardown took a side as a foreign thread"
+    );
+}

@@ -28,7 +28,23 @@ fn wakes(count: &Count) -> usize {
 
 #[test]
 fn a_step_that_left_nothing_is_settled_with_no_work() {
-    assert!(After::default().forget_if_nothing().is_ok());
+    assert!(After::default().settle_light().is_ok());
+}
+
+#[test]
+fn a_step_that_left_one_waker_alone_is_settled_by_waking_it_once() {
+    let (count, waker) = counted();
+    let mut after = After::default();
+    after.wake_one(waker);
+    assert!(after.settle_light().is_ok());
+    assert_eq!(wakes(&count), 1);
+    assert_eq!(Arc::strong_count(&count), 1, "the waker was not consumed");
+
+    let (count, waker) = counted();
+    let mut after = After::default();
+    after.wake_one(waker);
+    after.run();
+    assert_eq!(wakes(&count), 1, "run woke a lone waker other than once");
 }
 
 #[test]
@@ -37,19 +53,40 @@ fn a_raised_flag_alone_is_left_work() {
     assert!(!after.starved() && !after.must_register());
     after.set_starved();
     assert!(after.starved() && !after.must_register());
-    let mut after = after
-        .forget_if_nothing()
-        .expect_err("a starved side is work");
+    let mut after = after.settle_light().expect_err("a starved side is work");
     after.set_must_register();
     assert!(after.must_register());
     after.run();
 
     let mut after = After::default();
     after.set_must_register();
-    let after = after
-        .forget_if_nothing()
-        .expect_err("a registration is work");
+    let after = after.settle_light().expect_err("a registration is work");
     after.run();
+}
+
+#[test]
+fn a_waker_with_a_flag_or_a_buffer_is_left_to_the_caller() {
+    let pool = Pool::new(1 << 20);
+    let (count, waker) = counted();
+    let mut after = After::default();
+    after.wake_one(waker.clone());
+    after.set_starved();
+    let after = after.settle_light().expect_err("a starved side is work");
+    assert_eq!(
+        wakes(&count),
+        0,
+        "the waker was woken before its flag was seen"
+    );
+    assert!(after.starved());
+    after.run();
+    assert_eq!(wakes(&count), 1);
+
+    let mut after = After::default();
+    after.wake_one(waker);
+    after.drop_buf(pool.get(512).expect("a buffer"));
+    let after = after.settle_light().expect_err("a buffer to drop is work");
+    after.run();
+    assert_eq!(wakes(&count), 2);
 }
 
 #[test]

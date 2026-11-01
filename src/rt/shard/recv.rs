@@ -83,6 +83,10 @@ struct Fill {
     done: bool,
 }
 
+/// What a chunk taken in leaves to count off the receive it went to: that receive's user data
+/// and the bytes the chunk counted against it, or none for a chunk that counted against none.
+pub(crate) type Charge = Option<(u64, usize)>;
+
 /// What a chunk puts on the return queue: its buffer, the receive it counted against and its bytes.
 #[derive(Clone, Copy)]
 pub(crate) struct Back {
@@ -260,6 +264,7 @@ impl RecvGroup {
     /// next completion on it continues after these); `None` for an id or a
     /// length outside the group (the buffer then goes back with
     /// [`give_back`](Self::give_back)).
+    #[inline(always)]
     pub(crate) fn hand_out(
         &mut self,
         user_data: u64,
@@ -306,6 +311,7 @@ impl RecvGroup {
 
     /// Gives buffer `bid` to the kernel again if it is done and no chunk of it is out. Returns
     /// whether it did, for the caller to commit.
+    #[inline(always)]
     fn settle(&mut self, bid: u16) -> bool {
         let Some(fill) = self.fills.get_mut(usize::from(bid)) else {
             return false;
@@ -313,7 +319,15 @@ impl RecvGroup {
         if fill.live > 0 || !fill.done {
             return false;
         }
-        *fill = Fill::default();
+        self.readd(bid)
+    }
+
+    /// Gives buffer `bid`, done and with no chunk out, to the kernel again; whether it did.
+    #[inline(always)]
+    fn readd(&mut self, bid: u16) -> bool {
+        if let Some(fill) = self.fills.get_mut(usize::from(bid)) {
+            *fill = Fill::default();
+        }
         #[cfg(test)]
         {
             self.readded += 1;
@@ -328,15 +342,21 @@ impl RecvGroup {
     /// to with `release(user_data, charged)`.
     pub(crate) fn take_back(&mut self, mut release: impl FnMut(u64, usize)) {
         let mut any = false;
+        let mut take = |group: &mut Self, item| {
+            let (charge, readded) = group.take_in(item);
+            if let Some((user_data, charged)) = charge {
+                release(user_data, charged);
+            }
+            any |= readded;
+        };
         while let Some(item) = self.local.pop() {
-            any |= self.take_in(item, &mut release);
+            take(self, item);
         }
         if !self.back.queue.is_empty() {
             // Chunks given back on other threads, taken through a clone of `back`, as their
             // take-in borrows the group.
             let back = Arc::clone(&self.back);
-            back.queue
-                .take_all(|item| any |= self.take_in(item, &mut release));
+            back.queue.take_all(|item| take(self, item));
         }
         if any {
             self.ring.commit();
@@ -350,38 +370,41 @@ impl RecvGroup {
     }
 
     /// Takes in the chunk `item` of `back` at once, as [`take_back`](Self::take_back) does, if
-    /// `back` is this group's: for a chunk given back on the ring's own thread.
-    pub(crate) fn take_in_now(
-        &mut self,
-        back: &Arc<Returns>,
-        item: Back,
-        mut release: impl FnMut(u64, usize),
-    ) -> bool {
+    /// `back` is this group's: for a chunk given back on the ring's own thread. `None` for
+    /// another group's; else what to count off the receive it went to, as `take_in` says.
+    #[inline(always)]
+    pub(crate) fn take_in_now(&mut self, back: &Arc<Returns>, item: Back) -> Option<Charge> {
         if !Arc::ptr_eq(&self.back, back) {
-            return false;
+            return None;
         }
-        if self.take_in(item, &mut release) {
+        let (charge, readded) = self.take_in(item);
+        if readded {
             self.ring.commit();
         }
-        true
+        Some(charge)
     }
 
-    /// One chunk given back: counted off its receive, and its buffer given to the kernel again if
-    /// it may go (see [`settle`](Self::settle)), which the caller then commits.
+    /// One chunk given back: its buffer given to the kernel again if it may go (see
+    /// [`settle`](Self::settle)), which the caller then commits (the `bool`), and what to count
+    /// off the receive it went to.
     #[inline(always)]
-    fn take_in(&mut self, item: Back, release: &mut impl FnMut(u64, usize)) -> bool {
+    fn take_in(&mut self, item: Back) -> (Charge, bool) {
         let Back { bid, owner, len } = item;
-        if owner != NOT_AN_OP {
-            release(owner, self.charge(len));
-        }
+        let charge = (owner != NOT_AN_OP).then(|| (owner, self.charge(len)));
         #[cfg(test)]
         {
             self.out -= len as usize;
         }
-        if let Some(fill) = self.fills.get_mut(usize::from(bid)) {
-            fill.live = fill.live.saturating_sub(1);
+        // One look at the buffer: a chunk of a buffer the kernel still fills, or not the last
+        // of its chunks, only counts itself off.
+        let Some(fill) = self.fills.get_mut(usize::from(bid)) else {
+            return (charge, false);
+        };
+        fill.live = fill.live.saturating_sub(1);
+        if fill.live > 0 || !fill.done {
+            return (charge, false);
         }
-        self.settle(bid)
+        (charge, self.readd(bid))
     }
 
     /// Keeps the chunk `item` of `back` to take in with the rest, if `back` is this group's:

@@ -92,6 +92,67 @@ fn sources_past_a_full_table_run_on_their_own_descriptors() {
     );
 }
 
+/// Writes `bytes` through `src` and reads them back from `peer`.
+async fn write_through(src: &Arc<Source>, peer: &UnixStream, bytes: &[u8]) {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let n = poll_fn(|cx| src.poll_write(cx, rest)).await.unwrap();
+        rest = &rest[n..];
+    }
+    poll_fn(|cx| src.poll_flush(cx)).await.unwrap();
+    let mut got = vec![0u8; bytes.len()];
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    (&*peer).read_exact(&mut got).unwrap();
+    assert_eq!(got, bytes);
+}
+
+/// A ring's table of fixed files is registered with the kernel at the first
+/// source's attach, not as the ring is made: a ring no source ever uses
+/// costs the kernel no table.
+#[test]
+fn a_rings_table_is_made_at_its_first_attach() {
+    let Some(shard) = ring_shard(4) else { return };
+    let _current = context::enter(&shard);
+    let ring = shard.ring().expect("a ring shard");
+    shard.block_on(async {});
+    assert_eq!(ring.table_to_make(), 4, "the table was made with no source");
+    let (_mine, src, peer) = source_pair();
+    shard.block_on(write_through(&src, &peer, b"fixed"));
+    assert_eq!(ring.table_to_make(), 0);
+    assert_eq!(ring.files_in_use(), (1, 0), "the source took a fixed file");
+    src.retire();
+    shard.block_on(async {});
+}
+
+/// A table the kernel refuses at the first attach (here, more files than any
+/// table may hold) leaves the ring without one: every source runs on its own
+/// descriptor, and its bytes go through all the same.
+#[test]
+fn a_table_the_kernel_refuses_leaves_the_sources_on_their_own_descriptors() {
+    let Some(shard) = ring_shard(u32::MAX) else {
+        return;
+    };
+    let _current = context::enter(&shard);
+    let ring = shard.ring().expect("a ring shard");
+    let pairs: Vec<_> = (0..2).map(|_| source_pair()).collect();
+    shard.block_on(async {
+        for (_, src, peer) in &pairs {
+            write_through(src, peer, b"own").await;
+        }
+    });
+    assert_eq!(ring.table_to_make(), 0);
+    assert_eq!(
+        ring.files_in_use(),
+        (2, 2),
+        "both sources name their own descriptors"
+    );
+    for (_, src, _) in &pairs {
+        src.retire();
+    }
+    shard.block_on(async {});
+    assert_eq!(ring.files_in_use(), (0, 0));
+}
+
 /// A source with a read out on the ring retires: the read is cancelled
 /// before the retire returns, so bytes that come after it stay in the
 /// socket for whoever reads it next.

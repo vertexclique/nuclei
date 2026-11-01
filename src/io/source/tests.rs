@@ -378,6 +378,43 @@ fn writes_past_the_socket_buffer_arrive_whole_and_in_order() {
     drop(b);
 }
 
+/// Small writes of the side's owner, a worker's task, into a socket whose buffers hold a few of
+/// them, with a reader taking a few bytes at a time on another task: each goes straight to the
+/// kernel while the side holds nothing, and behind what it holds once one found the socket full,
+/// and every byte arrives once, in order.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_owners_small_writes_into_a_filling_socket_arrive_in_order() {
+    let rt = runtime(None);
+    let (a, b) = pair();
+    set_buffers(a.src.raw_fd().unwrap(), 4096);
+    set_buffers(b.src.raw_fd().unwrap(), 4096);
+    let data = pattern(256 * 1024);
+    let expected = data.clone();
+    let ok = rt.block_on(rt.spawn(async move {
+        let reader_src = Arc::clone(&b.src);
+        let reader = crate::runtime::spawn(async move {
+            let mut got = Vec::with_capacity(expected.len());
+            let mut buf = [0u8; 700];
+            while got.len() < expected.len() {
+                match within(read(&reader_src, &mut buf)).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            got == expected
+        });
+        for chunk in data.chunks(1000) {
+            within(write_all(&a.src, chunk)).await.unwrap();
+        }
+        within(flush(&a.src)).await.unwrap();
+        let ok = within(reader).await;
+        drop(b);
+        ok
+    }));
+    assert!(ok, "the bytes arrived out of order, twice or not at all");
+}
+
 #[test]
 fn a_failed_write_behind_fails_every_write_until_a_flush_reports_it() {
     let rt = runtime(None);
@@ -745,6 +782,28 @@ fn reads_complete_through_a_pool_of_one_small_buffer() {
         assert!(within(reader).await);
         writer.join().unwrap();
         drop(a);
+    });
+}
+
+/// A source dropped with bytes still read ahead gives their buffer back to its pool: on a pool
+/// of one small buffer, a read of another source then completes through it.
+#[test]
+fn a_source_dropped_with_bytes_read_ahead_gives_their_buffer_back() {
+    let rt = runtime(Some(crate::rt::shard::least_buffer_cap()));
+    let (a1, b1) = stream_pair();
+    let (a2, b2) = stream_pair();
+    let first = Owned::new(b1, READS_AHEAD);
+    let second = Owned::new(b2, READS_AHEAD);
+    rt.block_on(async {
+        (&a1).write_all(b"ahead").unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(within(read(&first.src, &mut one)).await.unwrap(), 1);
+        assert!(first.src.has_read_ahead(), "the read left nothing ahead");
+        drop(first);
+        (&a2).write_all(b"next").unwrap();
+        let mut buf = [0u8; 4];
+        let n = within(read(&second.src, &mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], &b"next"[..n]);
     });
 }
 

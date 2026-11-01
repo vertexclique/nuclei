@@ -250,6 +250,28 @@ fn a_send_future_dropped_early_sends_nothing_and_drops_its_value() {
 }
 
 #[test]
+fn a_send_future_dropped_before_its_first_poll_holds_no_slot() {
+    let drops = Drops::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    drop(tx.send(drops.value()));
+    assert_eq!(drops.count(), 1, "the value went with the future");
+    assert_eq!(tx.capacity(), 1);
+    tx.try_send(drops.value()).unwrap();
+    drop(rx.try_recv().unwrap());
+    assert_eq!(drops.count(), 2);
+}
+
+#[test]
+#[should_panic(expected = "polled after it completed")]
+fn a_send_future_polled_after_it_completed_panics() {
+    let (tx, _rx) = mpsc::channel(2);
+    let mut send = Box::pin(tx.send(1));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(send.as_mut().poll(&mut cx).is_ready());
+    let _ = send.as_mut().poll(&mut cx);
+}
+
+#[test]
 fn a_recv_future_dropped_early_takes_nothing() {
     let (tx, mut rx) = mpsc::channel(4);
 

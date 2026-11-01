@@ -14,8 +14,11 @@
 //! receiver closing closes the semaphore: waiting senders end at once, what
 //! was set aside for them comes back, and every later reservation fails.
 
+#![allow(unsafe_code)]
+
 use core::fmt;
 use core::future::Future;
+use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -212,13 +215,12 @@ impl<T> Sender<T> {
     /// let err = now(tx.send(2)).unwrap_err();
     /// assert_eq!(err.0, 2);
     /// ```
-    pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
-        match self.reserve().await {
-            Ok(permit) => {
-                permit.send(value);
-                Ok(())
-            }
-            Err(_) => Err(SendError(value)),
+    pub fn send(&self, value: T) -> impl Future<Output = Result<(), SendError<T>>> + '_ {
+        Sending {
+            chan: &self.chan,
+            wait: FairWait::new(),
+            value: Some(value),
+            _pinned: PhantomPinned,
         }
     }
 
@@ -717,6 +719,80 @@ async fn reserve_inner<T>(chan: &Chan<T, Bounded>, n: usize) -> Result<(), SendE
         taken: false,
     }
     .await
+}
+
+/// The future of [`Sender::send`]: the wait of [`reserve_inner`] for one
+/// slot and the push of the value into it, as one future, so a send that
+/// finds a slot free takes it and pushes with no state of nested waits.
+///
+/// It ends as a [`Reserve`] for one slot followed by a [`Permit`] send does:
+/// a wait that fails, or that is dropped before it completes, lets go of its
+/// place (and of a slot it was handed meanwhile) and wakes a receiver that
+/// waits for a closed channel to go idle; the value is dropped after that.
+struct Sending<'a, T> {
+    chan: &'a Chan<T, Bounded>,
+    wait: FairWait,
+    /// The value to send: taken when the wait ends, so `None` once the
+    /// future completed.
+    value: Option<T>,
+    /// Not `Unpin`, as the established API's send future is not.
+    _pinned: PhantomPinned,
+}
+
+impl<T> Sending<'_, T> {
+    /// What a [`Reserve`] that did not get its slot does as it is dropped.
+    fn let_go(&mut self) {
+        self.wait.cancel(&self.chan.limit.sem, 1);
+        self.chan.wake_if_finished();
+    }
+}
+
+impl<T> Future for Sending<'_, T> {
+    type Output = Result<(), SendError<T>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: nothing of the future is pinned in place: the wait's node
+        // lives in its queue's pool, and the value moves into the channel or
+        // back to the caller, never borrowed across polls.
+        let this = unsafe { self.get_unchecked_mut() };
+        if this.value.is_none() {
+            polled_after_completion();
+        }
+        let granted = core::task::ready!(this.wait.poll(&this.chan.limit.sem, 1, cx.waker()));
+        let Some(value) = this.value.take() else {
+            polled_after_completion();
+        };
+        match granted {
+            Ok(()) => {
+                // The slot goes to the value, as a permit's send does.
+                this.chan.send(value);
+                Poll::Ready(Ok(()))
+            }
+            Err(_) => {
+                this.let_go();
+                Poll::Ready(Err(SendError(value)))
+            }
+        }
+    }
+}
+
+impl<T> Drop for Sending<'_, T> {
+    fn drop(&mut self) {
+        if self.value.is_some() {
+            self.let_go();
+        }
+    }
+}
+
+/// A `send` future polled again after it completed, which the `Future`
+/// contract rules out.
+#[cold]
+#[expect(
+    clippy::panic,
+    reason = "polled after it completed, which the `Future` contract rules out"
+)]
+fn polled_after_completion() -> ! {
+    panic!("`Sender::send` polled after it completed");
 }
 
 /// The wait of [`reserve_inner`].

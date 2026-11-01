@@ -56,18 +56,14 @@ impl ReadState {
     }
 
     /// Whether the receives of `fd` report what they leave: asks the kernel
-    /// the first time.
+    /// the first time, out of line.
     #[cfg(unix)]
-    #[inline]
+    #[inline(always)]
     pub(in crate::io::source) fn inq_on(&mut self, fd: RawFd, kind: Kind) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             if self.inq == Inq::Unknown {
-                self.inq = if sys::enable_inq(fd, kind == Kind::Tcp) {
-                    Inq::On
-                } else {
-                    Inq::Off
-                };
+                self.ask_inq(fd, kind);
             }
             self.inq == Inq::On
         }
@@ -76,6 +72,19 @@ impl ReadState {
             let _ = (fd, kind);
             false
         }
+    }
+
+    /// [`inq_on`](Self::inq_on)'s first look: asks the kernel to count what
+    /// the receives of `fd` leave.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cold]
+    #[inline(never)]
+    fn ask_inq(&mut self, fd: RawFd, kind: Kind) {
+        self.inq = if sys::enable_inq(fd, kind == Kind::Tcp) {
+            Inq::On
+        } else {
+            Inq::Off
+        };
     }
 
     /// Whether a read of `kind` may go straight into the task's buffer: a
@@ -87,10 +96,11 @@ impl ReadState {
     }
 
     /// A stream read (or `peek`) of `len` bytes made by `call` straight on
-    /// the descriptor `fd`, into the caller's memory, if the side holds
-    /// nothing that comes first. `None` leaves the read to the normal path,
-    /// which waits for readiness when the socket had nothing; `Pending` is a
-    /// multishot receive being stopped so the next poll can call.
+    /// the descriptor `fd`, into the caller's memory, if it goes there
+    /// (`reads_itself`) and the side holds nothing that comes first. `None`
+    /// leaves the read to the normal path, which waits for readiness when the
+    /// socket had nothing; `Pending` is a multishot receive being stopped so
+    /// the next poll can call.
     #[cfg(unix)]
     #[expect(
         clippy::too_many_arguments,
@@ -108,6 +118,14 @@ impl ReadState {
         call: impl FnOnce(RawFd, bool) -> io::Result<(usize, Option<usize>)>,
     ) -> Option<Poll<io::Result<usize>>> {
         let fd = fd?;
+        match io.via {
+            // A poller's side that found the socket empty waits for the next edge.
+            Via::Fd(_) if self.blocked => return None,
+            Via::Fd(_) => {}
+            // A small read stays with the ring's receive.
+            _ if !self.reads_itself(io, kind, len, peek) => return None,
+            _ => {}
+        }
         if !self.reads_bytes(kind)
             || len == 0
             || !self.ahead.is_empty()
@@ -120,11 +138,10 @@ impl ReadState {
         // `call` is told to count what the socket keeps, when it can.
         let inq =
             !peek && matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind) && self.inq_on(fd, kind);
-        if !inq && !self.reads_itself(io, kind, len, peek) {
+        if !inq && matches!(io.via, Via::Fd(_)) && !self.reads_itself(io, kind, len, peek) {
             return None;
         }
         match io.via {
-            Via::Fd(_) if self.blocked => return None,
             Via::Fd(_) => {}
             #[cfg(ring)]
             Via::Ops(route) => {

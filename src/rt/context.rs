@@ -66,6 +66,8 @@ pub(crate) struct Here {
     runtime: Cell<*const Inner>,
     /// The shard `OWN` holds, null for none yet or once it went.
     own: Cell<*const Shard>,
+    /// The shard this thread lets go of as its runner (`letting_go`), null for none.
+    letting_go: Cell<*const Arc<Shared>>,
 }
 
 impl Here {
@@ -84,6 +86,7 @@ impl Here {
             budget: Cell::new(crate::coop::UNBUDGETED),
             runtime: Cell::new(core::ptr::null()),
             own: Cell::new(core::ptr::null()),
+            letting_go: Cell::new(core::ptr::null()),
         }
     }
 
@@ -263,6 +266,29 @@ impl Current {
         // current no more. The borrow ends with `self`, inside the call that made it.
         unsafe { self.shard.as_ref() }
     }
+}
+
+/// Marks the shard of `shared` as the one this thread lets go of, as the only thread that
+/// runs it, while `f` runs: as it drops, its sources' registrations and its tasks going. A
+/// source's request made meanwhile is the shard's own ([`letting_go_of`]), as one from inside
+/// it is.
+pub(crate) fn letting_go<R>(shared: &Arc<Shared>, f: impl FnOnce() -> R) -> R {
+    /// Puts back what the mark replaced, as `f` returns or unwinds.
+    struct Restore(*const Arc<Shared>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            local().letting_go.set(self.0);
+        }
+    }
+    let _restore = Restore(local().letting_go.replace(shared));
+    f()
+}
+
+/// Runs `f` with the shard this thread lets go of ([`letting_go`]), if any.
+pub(crate) fn letting_go_of<R>(f: impl FnOnce(Option<&Arc<Shared>>) -> R) -> R {
+    // SAFETY: the mark points at an `Arc` that outlives the `letting_go` call that set it,
+    // and is cleared before that call returns; the borrow ends with `f`.
+    f(unsafe { local().letting_go.get().as_ref() })
 }
 
 /// The shard this thread runs, when a call into it from here needs no
