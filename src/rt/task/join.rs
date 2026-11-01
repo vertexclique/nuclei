@@ -261,6 +261,7 @@ impl<T> Task<T> {
 
     /// `Some(output)` once the task completed (resuming a panic of its
     /// future), `None` once it was closed without an output for the handle.
+    #[inline(always)]
     fn poll_task(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         match self.poll_raw(cx) {
             Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(output)),
@@ -273,6 +274,7 @@ impl<T> Task<T> {
     /// The output once the task completed (or the panic of its future),
     /// `None` once it was closed without an output for the handle (cancelled,
     /// or dropped by its runtime) and its future is gone.
+    #[inline(always)]
     fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, Panic>>> {
         let header = self.header();
         let mut state = header.state.load(Ordering::Acquire);
@@ -352,7 +354,7 @@ impl<T> Future for Task<T> {
         clippy::panic,
         reason = "documented under `# Panics` of `Task`; `Task::fallible` answers `None` instead"
     )]
-    #[inline]
+    #[inline(always)]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
         match self.poll_task(cx) {
             Poll::Ready(Some(output)) => Poll::Ready(output),
