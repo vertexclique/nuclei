@@ -903,6 +903,7 @@ impl Source {
     /// receive or accept, submitted in `epoch`. The side takes it at once if
     /// free, else its holder does as it lets go. The wakes and drops come
     /// into `after`, for the caller to run once it no longer borrows the source.
+    #[inline(always)]
     pub(crate) fn ring_arrival(
         self: &Arc<Self>,
         arrival: Arrival,
