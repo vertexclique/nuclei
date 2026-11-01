@@ -51,7 +51,9 @@ pub(crate) mod write;
 use self::hooks::SourceHooks;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+#[cfg(completion)]
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -110,6 +112,12 @@ pub(crate) mod route {
     #[cfg(ring)]
     pub(crate) use super::ring::RingIo as Route;
 }
+
+/// `Source::unsent`: the write side holds what the kernel has not taken.
+const UNSENT: u8 = 1;
+/// `Source::unsent`: the write side waits for nothing a write edge brings.
+#[cfg(readiness)]
+const WRITE_IDLE: u8 = 2;
 
 /// No descriptor: the source is retired.
 const NO_FD: Raw = super::raw::NONE;
@@ -340,9 +348,12 @@ pub(crate) struct Source {
     /// Work that needs both sides, and what it carries (see `requests`).
     requests: AtomicU8,
     ask: Ask,
-    /// Whether the write side holds bytes or a datagram the kernel has not
-    /// taken, as its last holder left it.
-    unsent: AtomicBool,
+    /// As the write side's last holder left it: whether it holds bytes or a datagram the kernel
+    /// has not taken (`UNSENT`), and whether it waits for nothing a write edge brings
+    /// (`WRITE_IDLE`, `WriteState::idle`), so the driver passes over an edge of a side only its
+    /// own thread holds (`write_wants_no_edge`, proofs/tla/edgeskip/EdgeSkip.tla). One byte, so
+    /// a release publishes both with one store.
+    unsent: AtomicU8,
     /// Completions of the sides' ring operations, for their holders.
     #[cfg(completion)]
     read_done: ops::Mailbox,
@@ -409,7 +420,7 @@ impl Source {
             },
             requests: AtomicU8::new(0),
             ask: Ask::default(),
-            unsent: AtomicBool::new(false),
+            unsent: AtomicU8::new(0),
             #[cfg(completion)]
             read_done: ops::Mailbox::default(),
             #[cfg(completion)]
@@ -862,7 +873,19 @@ impl Source {
     /// Whether the write side holds bytes or a datagram the kernel has not
     /// taken yet, as its last holder left it.
     pub(crate) fn has_unsent(&self) -> bool {
-        self.unsent.load(Ordering::Acquire)
+        self.unsent.load(Ordering::Acquire) & UNSENT != 0
+    }
+
+    /// Whether a write edge brings the write side nothing, so the driver of `shard` passes over
+    /// it: only this thread ever held the side (biased to `shard`, never shared, no foreign
+    /// thread came), and its last release left it idle. A foreign holder makes the side shared
+    /// with a locked instruction before it holds it, so its refused write is never passed over
+    /// (proofs/tla/edgeskip/EdgeSkip.tla).
+    #[cfg(readiness)]
+    #[inline(always)]
+    fn write_wants_no_edge(&self, shard: &crate::rt::shard::Shard) -> bool {
+        self.write.biased_to(shard.shared_addr())
+            && self.unsent.load(Ordering::Relaxed) & WRITE_IDLE != 0
     }
 
     /// The driver saw readiness for `token`.
@@ -888,7 +911,7 @@ impl Source {
             };
             self.read.drive(&mut after, &hooks, unsure);
         }
-        if readiness.writable {
+        if readiness.writable && !self.write_wants_no_edge(shard) {
             self.write.drive(&mut after, &hooks, 0);
         }
         // If the driver's own pool ran out, the readers hear when a buffer

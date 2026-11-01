@@ -401,6 +401,36 @@ impl WriteState {
         buf
     }
 
+    /// The side waits for nothing a write edge brings: no write blocked, nothing written
+    /// behind, no connect, no lent buffer waiting, no caller's own calls. An edge then only
+    /// counts, and the caller's calls, which read the count, are not on.
+    #[cfg(readiness)]
+    #[inline(always)]
+    pub(super) fn idle(&self) -> bool {
+        !self.user_fd
+            && !self.blocked
+            && !self.connecting
+            && self.behind.is_none()
+            && !self.lent_waits()
+    }
+
+    /// [`idle`](Self::idle) as the bit `Source::unsent` publishes it in, for a source a readiness
+    /// driver serves (`ring`: its operations run on a ring, which has no edges to pass over).
+    #[inline(always)]
+    pub(super) fn idle_bit(&self, ring: bool) -> u8 {
+        #[cfg(readiness)]
+        return if !ring && self.idle() {
+            super::WRITE_IDLE
+        } else {
+            0
+        };
+        #[cfg(not(readiness))]
+        {
+            let _ = ring;
+            0
+        }
+    }
+
     #[cfg(readiness)]
     /// The driver's part: on readiness, does what the side holds and wakes
     /// the tasks that wait on any of it.
@@ -408,13 +438,7 @@ impl WriteState {
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         // An edge that finds the side idle only counts: the cheap and usual
         // case (a socket is writable with every readable edge on epoll).
-        if edge
-            && !self.user_fd
-            && !self.blocked
-            && !self.connecting
-            && self.behind.is_none()
-            && !self.lent_waits()
-        {
+        if edge && self.idle() {
             self.edges = self.edges.wrapping_add(1);
             return;
         }

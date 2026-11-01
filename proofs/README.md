@@ -1845,6 +1845,25 @@ bytes themselves, and the kernel's rule that a vectored read fills its descripto
 left out. The property test `buf::tests::vectored::a_read_fills_rooms_in_order` checks the Rust
 code against the same rules.
 
+## A write edge nobody waits for
+
+`edgeskip` (`tla/edgeskip/EdgeSkip.tla`) checks the epoll driver passing over a write edge
+(`Source::on_event` and `write_wants_no_edge` in `src/io/source.rs`, `Side::biased_to` in
+`src/io/side.rs`, the write side's `releasing` hook in `src/io/source/hooks.rs`, `WriteState::idle`
+in `src/io/source/write.rs`) on a machine whose stores wait in a store buffer. Every holder of the
+write side publishes, as it lets go, whether the side waits for nothing an edge brings (no write
+blocked, nothing written behind, no connect, no lent buffer, no caller's own calls); the driver
+passes over a write edge only when the side was only ever held by its own thread (biased to it, not
+shared, no foreign thread came) and that thread's last release said idle. A foreign writer makes
+the side shared with a plain store before its locked take of the word, so once it holds, the
+driver's look sees the side shared, even while its own not-idle store still waits in its buffer.
+5 configurations: 2 that must pass (a biased side and a side made shared, each with an edge for
+nobody first and a foreign write the socket may refuse, with `WriteGoes`, the write goes out in the
+end, and no deadlock), 2 mutations that must deadlock (a look at `write_idle` alone passes over
+the edge a refused write waits for while its writer still holds the side; a look that leaves out
+the side's mode passes over it on a side made shared, which has no `intent` to raise), and 1
+witness (the edge for nobody is passed over).
+
 ## A queue with a count
 
 `counted` (`tla/counted/Counted.tla`) checks the queue a ring's thread takes items from without
