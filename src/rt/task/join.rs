@@ -63,8 +63,24 @@ impl<T> Task<T> {
     }
 
     /// Lets the task run to its end without a handle; its output is dropped.
+    #[inline]
     pub fn detach(self) {
         let mut this = ManuallyDrop::new(self);
+        // A handle detached right after the spawn is the common case: one
+        // exchange, inline.
+        if this
+            .header()
+            .state
+            .compare_exchange_weak(
+                SCHEDULED | TASK | REFERENCE,
+                SCHEDULED | REFERENCE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return;
+        }
         let output = this.set_detached();
         drop(output);
     }
