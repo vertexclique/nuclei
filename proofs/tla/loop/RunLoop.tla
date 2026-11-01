@@ -19,9 +19,11 @@
 (* order it makes its looks in.                                            *)
 (*                                                                          *)
 (* What is modelled: the three kinds of turn, in any order the environment  *)
-(* picks, and the two counts (`since_drive` and the turns the future woke   *)
-(* itself). What is abstract: what a task or the future does, and the look  *)
-(* itself (one step, which completes all the IO that is ready).            *)
+(* picks, and the two counts (`Shard::since_drive`, which the code keeps   *)
+(* as a count down to the next run that weighs a look, and the turns the    *)
+(* future woke itself). What is abstract: what a task or the future does,  *)
+(* and the look itself (one step, which completes all the IO that is       *)
+(* ready).                                                                  *)
 (***************************************************************************)
 EXTENDS Integers
 
@@ -31,7 +33,7 @@ CONSTANTS
 
 (* --algorithm RunLoop
 variables
-    since = 0,              \* task runs since the last look (`since_drive`)
+    since = 0,              \* task runs since the last look (`Shard::since_drive`)
     selfWoken = 0,          \* turns in which no task ran and the future woke itself
     gap = 0,                \* turns since the last look
     lookedSelfWoken = FALSE; \* record: a look came from the future's turns

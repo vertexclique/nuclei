@@ -1899,7 +1899,8 @@ clears only its own.
 (`src/rt/shard.rs`, `Shard::block_on`). Each turn, in any order, either a task runs, or no
 task runs and the future woke itself again, or nothing is ready and the loop spins and parks
 (both look). Every `N` task runs bring a look without waiting, and so do every `N` turns of
-the future's own. 4 configurations: 1 that must pass (the driver gets a look at least once
+the future's own. The code counts the runs down to the next one that weighs a look (the `N`th,
+or a multiple of `QUARTZ_EVERY`), one decrement a run: the same runs, counted. 4 configurations: 1 that must pass (the driver gets a look at least once
 every `2N - 1` turns, `BoundedGap`), 1 mutation (not counting the future's own turns lets a
 future that keeps waking itself starve the driver, breaking `BoundedGap`: the bug a test
 caught, where IO such a future waited on never completed), and 2 witnesses (a look that came
