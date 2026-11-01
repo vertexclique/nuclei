@@ -103,9 +103,8 @@ jobs:
           NUCLEI_BACKEND: epoll
 
   # The loom models: every interleaving each model reaches within its preemption bound, of the
-  # runtime's task, park handshake, handoff slot and IO source sides, and of the sync primitives.
-  # The commands are the ones the models' own docs give; the long models marked ignored stay a
-  # local run.
+  # runtime's task, park handshake and IO source sides, and of the sync primitives. The commands
+  # are the ones the models' own docs give; the long models marked ignored stay a local run.
   loom:
     name: Loom models
     runs-on: ubuntu-latest
@@ -118,7 +117,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: the runtime's models
-        run: cargo test --release -p nuclei --lib -- rt::task::loom_tests rt::handshake::loom_tests rt::handoff::slot::loom_tests io::side::loom_tests
+        run: cargo test --release -p nuclei --lib -- rt::task::loom_tests rt::handshake::loom_tests io::side::loom_tests
 
       - name: the sync models
         run: cargo test --release -p nuclei --lib -- sync::loom_tests

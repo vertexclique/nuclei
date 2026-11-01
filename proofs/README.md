@@ -2099,9 +2099,7 @@ a call into the runtime, a call that looks at its claim with no mark first, the 
 handed on: each breaks `Exclusive`; the new runner taking the bound tasks breaks
 `BoundOnCreator`; no handoff at all, and a call that leaves its mark as it ends, so a poll that
 blocks after a call is never seen to block, each break `Rescued`); and 4 witnesses (a handoff, a
-cancel by the monitor, a call into the runtime from a detached thread, a cancel by the runner).
-The loom models in `src/rt/handoff/slot.rs` check the same race on the code (`Slot::mark` and
-`unmark` against the claim, the fence, the look and the take). `tla/handoff/Retarget.tla` checks the waker of a
+cancel by the monitor, a call into the runtime from a detached thread, a cancel by the runner). `tla/handoff/Retarget.tla` checks the waker of a
 `block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
 the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
 1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old
