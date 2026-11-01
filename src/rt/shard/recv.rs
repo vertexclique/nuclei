@@ -29,7 +29,7 @@
 use std::io;
 use std::sync::Arc;
 
-use super::counted::Counted;
+use super::counted::LazyCounted;
 
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::Ring;
@@ -106,7 +106,7 @@ unsafe impl Send for RecvGroup {}
 // is the upgrade path if a peer sending single bytes across many connections shows up in a profile.
 pub(crate) struct Returns {
     mem: Arc<BufMem>,
-    queue: Counted<Back>,
+    queue: LazyCounted<Back>,
 }
 
 /// Bytes `start..end` of a buffer a receive's completion handed out, read
@@ -194,13 +194,11 @@ impl RecvGroup {
                 // Refused (an older kernel) or not asked: the plain group.
                 _ => (BufRing::new(ring, GROUP, entries, size)?, false),
             };
-        for bid in 0..entries {
-            buffers.add(bid)?;
-        }
+        buffers.add_all()?;
         buffers.commit();
         let back = Arc::new(Returns {
             mem: Arc::clone(buffers.memory()),
-            queue: Counted::new(),
+            queue: LazyCounted::new(),
         });
         let total = usize::from(entries) * size as usize;
         Ok(Self {

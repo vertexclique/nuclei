@@ -22,6 +22,8 @@ pub(crate) mod taskrun;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_add_all;
+#[cfg(test)]
 mod tests_net;
 #[cfg(test)]
 mod tests_setup;

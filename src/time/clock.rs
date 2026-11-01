@@ -128,29 +128,28 @@ fn monotonic() -> Option<u64> {
 /// The monotonic clock's reading that std's instant `at` is, where std's
 /// instants are that clock's readings and say so: read from the seconds and
 /// nanoseconds its `Debug` form shows, once, then checked against the clock
-/// itself (an instant taken between two readings lies between them). `None`
+/// itself (an instant taken between two readings lies between them, its
+/// reading being `at`'s plus std's own exact difference of the two). `None`
 /// where any of that does not hold: every reading then goes through std.
 fn reading_of(at: Instant) -> Option<u64> {
-    let parts = |i: Instant| -> Option<u64> {
-        let shown = format!("{i:?}");
-        let field = |name: &str| -> Option<u64> {
-            let from = shown.find(name)? + name.len();
-            let digits: String = shown[from..]
-                .chars()
-                .skip_while(|c| *c == ' ')
-                .take_while(char::is_ascii_digit)
-                .collect();
-            digits.parse().ok()
-        };
-        field("tv_sec:")?
-            .checked_mul(1_000_000_000)?
-            .checked_add(field("tv_nsec:")?)
+    let shown = format!("{at:?}");
+    let field = |name: &str| -> Option<u64> {
+        let from = shown.find(name)? + name.len();
+        let digits = shown[from..].trim_start_matches(' ');
+        let end = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        digits[..end].parse().ok()
     };
-    let reading = parts(at)?;
+    let reading = field("tv_sec:")?
+        .checked_mul(1_000_000_000)?
+        .checked_add(field("tv_nsec:")?)?;
     let before = monotonic()?;
-    let probe = parts(Instant::now())?;
+    let probe = Instant::now();
     let after = monotonic()?;
-    (before <= probe && probe <= after && reading <= probe).then_some(reading)
+    let since = u64::try_from(probe.checked_duration_since(at)?.as_nanos()).ok()?;
+    let probe = reading.checked_add(since)?;
+    (before <= probe && probe <= after).then_some(reading)
 }
 
 /// A runtime's clock.
@@ -430,3 +429,6 @@ mod tests {
         assert!(!clock.is_paused());
     }
 }
+
+#[cfg(test)]
+mod tests_origin;
