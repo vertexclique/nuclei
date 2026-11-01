@@ -1032,9 +1032,10 @@ is out) and the source's count of operations in the kernel. When the kernel comp
 ring's thread lowers the count, leaves the completion in the side's one-slot mailbox and
 defers it to the side: applied at once if the side is free, else by its holder as it lets go,
 which then asks for the next operation. (`Source::op_done` in `src/io/source/ops.rs` tries the
-write side's hold first and applies a completion to a free side with no trip through the
-mailbox, which is the model's put and apply with nothing between them; a held side takes the
-mailbox and the deferred bit, as modelled.) A retire deregisters the source, cancels what is out
+side's hold first, on either side, and applies a completion to a free side with no trip through
+the mailbox, which is the model's put and apply with nothing between them: on the read side
+after the arrivals still queued, as the deferred work takes them; a held side takes the mailbox
+and the deferred bit, as modelled.) A retire deregisters the source, cancels what is out
 and waits until the count is zero: it puts its waker in, raises a flag, and only then looks at
 the count, while the ring's thread lowers the count and then looks at the flag. 11
 configurations: 3 that must pass (`OneOut` and `NoOverwrite`, one operation out and one
@@ -1951,7 +1952,7 @@ end when their peer sends or connects; sends, polls for room and connects under 
 their peer reads or answers, and a zero-copy send that holds its buffer until the kernel's
 notification, which comes once the peer acknowledged the bytes; and a child's exit watch) and
 finite ones (a file's reads and writes) that wait in room when the cap is used. Before, the ring
-counted the one-shot operations of a side that reads: in the vs-tokio benchmark 3840 idle
+counted the one-shot operations of a side that reads: in a many-connections benchmark 3840 idle
 connections, the cap of a ring of 2048 entries beside its 256-buffer group, filled it with one-shot
 receives that waited for their peers, and the next accept waited in room behind them for good,
 leaving every connection past them unaccepted. It counted every operation of a side that writes
@@ -2001,6 +2002,29 @@ end, and no deadlock), 2 mutations that must deadlock (a look at `write_idle` al
 the edge a refused write waits for while its writer still holds the side; a look that leaves out
 the side's mode passes over it on a side made shared, which has no `intent` to raise), and 1
 witness (the edge for nobody is passed over).
+
+## A stream write its owner sends on one bit
+
+`sendsnow` (`tla/sendsnow/SendsNow.tla`) checks the owner's stream write made straight from its
+task's buffer on the one bit its write side's last release left (`Source::send_as_owner` in
+`src/io/source/write/calls.rs`, which looks at the `WRITE_SENDS` bit of `Source::unsent` under the
+owner's biased hold, `Side::with_owner`; the write side's `releasing` hook in
+`src/io/source/hooks.rs`; `WriteState::published` and `sends_now` in `src/io/source/write.rs`) on a
+machine whose stores wait in a store buffer. Every holder of the write side publishes, as it lets
+go, whether the side holds nothing a write straight from a task's buffer must come after (nothing
+written behind, lent, queued or out with a ring, no error, no connect, no blocked write on a
+poller, no caller's own calls); the owner sends on that bit with no look at the side while only
+its own thread ever held it (not shared, no foreign thread came), else its poll holds the side
+and writes behind what it holds. A foreign writer's owned write (`write_owned`) of two parts may
+leave its second part in the side, with its bit still in its store buffer; it made the side shared
+with a plain store before its locked take of the word, so the owner's look sees the mode and keeps
+out. 7 configurations: 3 that must pass (the owner alone; a biased side and a side shared from the
+start, each with a foreign owned write; with `Contiguous`, nothing lands between the parts of the
+owned write, `InOrder`, the owner's bytes go out in the order written, and `AllSent`), 3 mutations
+(a look that leaves out the side's mode sends between the two parts on a side made shared, which
+has no `intent` to raise; a send with no look at the bit goes out ahead of a byte that waits in
+the side; a release that says the side holds nothing while a byte waits there does the same),
+and 1 witness (the owner sends on the bit).
 
 ## A queue with a count
 
@@ -2061,22 +2085,42 @@ its own bytes back.
 `handoff` (`tla/handoff/Handoff.tla`) checks the shard handoff (`src/rt/handoff/`,
 `src/rt/context.rs`) on a machine whose stores wait in a store buffer of two entries, as x86's do:
 a runner leaves its shard for a task's poll (a release store of its word), comes back at the
-poll's end and at each call into the runtime from the task (a store of its word, the compiler's
-fence, a load of its claim), and cancels a pending claim with a compare-and-swap; the monitor
-sets the claim pending, runs the heavy fence (every buffer flushed at once), reads the word again
-and takes with the opposite compare-and-swap, then hands the shard to a spare with a fresh slot.
-16 configurations: 2 that must pass (two handoffs, a remote push and a bound task: at most one
-thread inside the shard, `Exclusive`, a detached thread staying out, a bound task on its creator
-only; a first poll that never returns, every remote push run anyway, `Rescued`); 6 mutations,
-each of which must break a property (no heavy fence, no second read of the word, no look at the
-claim at a poll's end or in a call into the runtime, the old runner's slot handed on: each breaks
-`Exclusive`; the new runner taking the bound tasks breaks `BoundOnCreator`; no handoff at all
-breaks `Rescued`); and 4 witnesses (a handoff, a cancel by the monitor, a call into the runtime
-from a detached thread, a cancel by the runner). `tla/handoff/Retarget.tla` checks the waker of a
+poll's end and at each call into the runtime from the task, every owner's path a task's code
+takes included (a store of its word, the compiler's fence, a load of its claim: a call reads the
+word it left first and puts it back, a release store, as it ends), and cancels a pending claim
+with a compare-and-swap; the monitor sets the claim pending, runs the heavy fence (every buffer
+flushed at once), reads the word again and takes with the opposite compare-and-swap, then hands
+the shard to a spare with a fresh slot. 15 configurations: 2 that must pass (two handoffs, a
+remote push and a bound task: at most one thread inside the shard, `Exclusive`, a detached thread
+staying out, a bound task on its creator only; a first poll that makes a call and then never
+returns, every remote push run anyway, `Rescued`); 9 mutations, each of which must break a
+property (no heavy fence, no second read of the word, no look at the claim at a poll's end or in
+a call into the runtime, a call that looks at its claim with no mark first, the old runner's slot
+handed on: each breaks `Exclusive`; the new runner taking the bound tasks breaks
+`BoundOnCreator`; no handoff at all, and a call that leaves its mark as it ends, so a poll that
+blocks after a call is never seen to block, each break `Rescued`); and 4 witnesses (a handoff, a
+cancel by the monitor, a call into the runtime from a detached thread, a cancel by the runner). `tla/handoff/Retarget.tla` checks the waker of a
 `block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
 the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
 1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old
-shard). `lean/Nuclei/Handoff.lean` proves the word's packing (its epoch and its side come back
+shard). `tla/handoff/TakeRef.tla` checks who holds the shard while the monitor takes it (`take`
+in `src/rt/handoff/monitor.rs`, `run_shard` in `src/rt/workers.rs`): the monitor holds the shard
+only weakly, so it gets a reference of its own before it claims the runner's slot, lets go of it
+when the take does not happen, and gives it to the spare when it does; a runner that comes back
+to find the shard taken lets go of its own. 5 configurations: 1 that must pass (the shard never
+freed while the runtime runs, `NoLoss`; every reference with its holder, `RefsHeld`; a taken shard
+reaching a spare, `Rescued`); 2 mutations (the reference got only after the take, as before the
+fix: the runner, back in between, lets go of the last one and frees the shard with its queued
+tasks, `NoLoss`, the macOS cadence failure; a failed take forgetting its reference, `RefsHeld`);
+and 2 witnesses (a take, a take that did not happen). `tla/handoff/Asleep.tla` checks how the
+monitor sleeps while every worker is parked (`run` in `src/rt/handoff/monitor.rs`) and how a
+worker wakes it (`Shard::begin_park` in `src/rt/shard/run.rs`): the monitor says it sleeps and
+looks at the parks again, a worker says it parks and looks for work again, and a worker whose park
+ends or that backs out of it rings a monitor that sleeps. 5 configurations: 1 that must pass (a
+running worker is watched in the end, `Watched`); 3 mutations (the back-out ringing nobody, as
+before the fix: the monitor's looks fall in the moment the worker said it parks, it sleeps, and a
+poll that blocks is never handed on; a park's end ringing nobody; the monitor sleeping on its first look: each breaks `Watched`); and
+1 witness (a back-out while the monitor sleeps). `lean/Nuclei/Handoff.lean` proves the word's packing (its epoch and its side come back
 out, a new poll writes a word no earlier poll wrote, every epoch below `2^63` fits) and the watch:
 the monitor's streak of four is five equal reads outside the shard, which a tick apart or more
 mean the poll has run at least four ticks, and a read that missed the poll just before one that

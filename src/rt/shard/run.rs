@@ -39,10 +39,9 @@ impl Shard {
     /// Polls a runnable's task.
     #[inline(always)]
     pub(super) fn run(&self, runnable: Runnable) -> Polled {
-        context::poll(&self.shared, || {
+        context::run_task(&self.shared, || {
             runnable.run();
         })
-        .1
     }
 
     /// Runs `future` to its end on this shard, running the shard's tasks,
@@ -223,10 +222,7 @@ impl Shard {
             self.before_park();
             // A park a blocking job's end cuts short says nothing of other work coming soon.
             let pool_out = self.blocking_out();
-            if shared
-                .park
-                .begin_park(|| self.has_remote_work() || signal.woken.load(Ordering::SeqCst))
-            {
+            if self.begin_park(|| self.has_remote_work() || signal.woken.load(Ordering::SeqCst)) {
                 let slept = Instant::now();
                 if let Some(park) = &self.tuning.hooks.park {
                     park();
@@ -241,6 +237,20 @@ impl Shard {
             }
             self.after_park();
         }
+    }
+
+    /// Says the shard parks and looks for work once more (`Handshake::begin_park`): whether it
+    /// parks. A shard that backs out runs on, so its runtime's monitor, which may have taken the
+    /// moment it said it parked for every worker parked and gone to sleep, is rung as a park's end
+    /// rings it: else the monitor sleeps while the shard runs, and rescues no poll that blocks
+    /// (proofs/tla/handoff/Asleep.tla).
+    #[inline(always)]
+    pub(crate) fn begin_park(&self, has_work: impl FnOnce() -> bool) -> bool {
+        let parks = self.shared.park.begin_park(has_work);
+        if !parks {
+            self.parked_ended();
+        }
+        parks
     }
 
     /// One turn of the shard, for a caller driving it by hand: runs every
@@ -261,7 +271,7 @@ impl Shard {
         if quiet {
             self.before_park();
         }
-        let sleeps = quiet && shared.park.begin_park(|| self.has_remote_work());
+        let sleeps = quiet && self.begin_park(|| self.has_remote_work());
         let wait = if sleeps || wait == Some(Duration::ZERO) {
             wait
         } else {

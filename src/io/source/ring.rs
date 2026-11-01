@@ -110,7 +110,7 @@ pub(crate) enum RingMem {
 /// its runtime's `Builder::zero_copy_threshold` instead (`ShardRing::zero_copy_min`). A smaller
 /// write is copied whole, and its buffer handed back at once. Below it, pinning the
 /// pages costs more than the copy it saves: on the development host's loopback (where the receive
-/// path copies what a send pinned), the `owned_size_*` modes of benches/vs_tokio_count.rs
+/// path copies what a send pinned), a sweep of owned write sizes
 /// measured total cycles per write above the copy's from 16 KiB to 512 KiB, level with it at
 /// 1 MiB. A datagram never goes zero-copy: the same sweep from 16 KiB to 60 KiB, all UDP carries,
 /// cost 30 to 50 percent more kernel cycles.
@@ -903,6 +903,7 @@ impl Source {
     /// receive or accept, submitted in `epoch`. The side takes it at once if
     /// free, else its holder does as it lets go. The wakes and drops come
     /// into `after`, for the caller to run once it no longer borrows the source.
+    #[inline(always)]
     pub(crate) fn ring_arrival(
         self: &Arc<Self>,
         arrival: Arrival,

@@ -105,7 +105,7 @@ pub(super) fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
 unsafe fn read_raw(fd: RawFd, buf: *mut u8, len: usize) -> io::Result<usize> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: as the caller's.
-    return unsafe { syscall(libc::SYS_read, [fd as usize, buf as usize, len, 0, 0, 0]) };
+    return unsafe { syscall(libc::SYS_read, [fd as usize, buf as usize, len]) };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     // SAFETY: as the caller's.
     return cvt(unsafe { libc::read(fd, buf.cast(), len) });

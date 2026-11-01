@@ -5,19 +5,22 @@
 //! threshold and reads each worker's word: a read equal to the last while
 //! the worker is outside its shard extends a streak, and the fourth in a row
 //! (the poll ran at least four ticks and under five) takes the shard. With
-//! every worker parked it sleeps, and a worker that ends its park wakes it:
-//! the monitor says it sleeps and then looks at the parks again, the worker
-//! ends its park and then looks at the monitor, with a sequentially
-//! consistent fence on both sides.
+//! every worker parked it sleeps, and a worker that ends its park, or backs
+//! out of it, wakes it: the monitor says it sleeps and then looks at the
+//! parks again, the worker ends its park (or backs out) and then looks at
+//! the monitor, with a sequentially consistent fence on both sides
+//! (proofs/tla/handoff/Asleep.tla).
 //!
-//! The take (proofs/tla/handoff): the claim pending, the heavy fence, the
-//! word read again; still the same, the runner is outside and comes back
-//! only through its claim, so the claim goes from pending to taken, unless
-//! the runner cancelled it first. The shard is then the monitor's: the
-//! runnables in its own queues go back to their schedules, its old runner is
-//! let off its core, and the shard goes, with a fresh slot, to a spare
-//! thread (one is started when none waits; if that fails the shard waits
-//! for the next tick, no worse off than with no handoff).
+//! The take (proofs/tla/handoff): a reference to the shard first (the
+//! monitor holds it only weakly, and once the take succeeds its runner may
+//! let go of its own at once, `TakeRef.tla`), the claim pending, the heavy
+//! fence, the word read again; still the same, the runner is outside and
+//! comes back only through its claim, so the claim goes from pending to
+//! taken, unless the runner cancelled it first. The shard is then the
+//! monitor's: the runnables in its own queues go back to their schedules,
+//! its old runner is let off its core, and the shard goes, with a fresh
+//! slot, to a spare thread (one is started when none waits; if that fails
+//! the shard waits for the next tick, no worse off than with no handoff).
 
 use core::pin::pin;
 use std::sync::{Arc, OnceLock, Weak};
@@ -343,7 +346,7 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
             });
             if waiting.is_none() {
                 watch.streak = 0;
-                if let Some(gift) = take(monitor, place, index, watch, word) {
+                if let Some(gift) = take(monitor, runtime, place, index, watch, word) {
                     place.shared.counters.longest_poll(tick * STREAK);
                     waiting = deliver(&mut watches, gift);
                 }
@@ -353,24 +356,36 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
             }
         }
     }
-    // A shard that waited for a thread goes here, inside its runtime: what
-    // the handles of its tasks leave goes to that runtime's drop.
+    // A shard that waited for a thread goes here.
     if let Some(gift) = waiting.take() {
-        let inner = runtime.upgrade();
-        let _runtime = inner.as_ref().map(crate::rt::context::set_runtime);
-        drop(gift);
+        let_go(runtime, gift);
     }
+}
+
+/// Drops what holds a shard on the monitor's thread inside the shard's
+/// runtime: the drop may be the shard's last, and what the handles of its
+/// tasks leave then goes to that runtime's drop.
+fn let_go<T>(runtime: &Weak<Inner>, held: T) {
+    let inner = runtime.upgrade();
+    let _runtime = inner.as_ref().map(crate::rt::context::set_runtime);
+    drop(held);
 }
 
 /// Takes the shard of `place` from its runner, seen at `word` on the last
 /// reads; on success, the gift for its next runner.
 fn take(
     monitor: &Monitor,
+    runtime: &Weak<Inner>,
     place: &Place,
     index: usize,
     watch: &mut Watch,
     word: u64,
 ) -> Option<Gift> {
+    // Held before the claim: once the take below succeeds, the runner may
+    // come back at once, find the shard taken and let go of its own
+    // reference, the last one but this (proofs/tla/handoff/TakeRef.tla).
+    // None left: the shard went, and nothing is claimed.
+    let shard = place.shard.0.upgrade()?;
     let old = &watch.runner;
     old.slot.claim();
     if monitor.full_fence {
@@ -379,20 +394,22 @@ fn take(
         // The heavy fence failed, which `available` said it would not: no
         // take may rely on it.
         old.slot.cancel();
+        let_go(runtime, shard);
         return None;
     }
     // A shard-local value lent to the runner's code (a nested `block_on`
     // in it went outside) keeps the shard where it is.
     if old.slot.word() != word || old.slot.is_pinned() {
         old.slot.cancel();
+        let_go(runtime, shard);
         return None;
     }
     if !old.slot.take() {
         // The runner came back first.
+        let_go(runtime, shard);
         return None;
     }
-    // The shard is the monitor's. The blocked runner still holds it.
-    let shard = place.shard.0.upgrade()?;
+    // The shard is the monitor's, its reference held since before the claim.
     old.life.detach();
     old.life.unpin(&monitor.cores);
     shard.hand_over_queues();
@@ -431,4 +448,199 @@ fn give(monitor: &Monitor, runtime: &Weak<Inner>, gift: Gift) -> Result<(usize, 
     let life = Arc::new(Life::new());
     crate::rt::workers::Workers::spawn_runner(&inner, gift, Arc::clone(&life))?;
     Ok((place, life))
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use crate::rt::shard::Limits;
+
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "a worker's shard is shared by count, as `Workers` makes it"
+    )]
+    fn worker_shard() -> Arc<Shard> {
+        Arc::new(
+            Shard::new(Limits {
+                max_nesting: 8,
+                buffer_cap: crate::buf::DEFAULT_CAP,
+                backend: crate::rt::backend::chosen().unwrap(),
+            })
+            .unwrap(),
+        )
+    }
+
+    /// A monitor with one place, its shard `shard` run by a runner outside
+    /// it in the poll of epoch 1; the runner's slot, and its watch as the
+    /// fourth equal read leaves it.
+    fn watched(shard: &Arc<Shard>) -> (Monitor, Arc<Slot>, Watch) {
+        let monitor = Monitor::new(Duration::from_millis(10), 1, Vec::new(), None);
+        let slot = monitor.slot();
+        let first = Runner {
+            slot: Arc::clone(&slot),
+            life: Arc::new(Life::new()),
+        };
+        monitor.started(0, shard, first.clone());
+        slot.go_out(1);
+        let watch = Watch {
+            runner: first,
+            last: slot::outside(1),
+            streak: STREAK,
+            longest: 0,
+            reported: slot::inside(0),
+        };
+        (monitor, slot, watch)
+    }
+
+    /// The take of place 0, its runner seen outside in the poll of epoch 1.
+    fn take_outside(monitor: &Monitor, watch: &mut Watch) -> Option<Gift> {
+        let place = monitor.places[0].get().unwrap();
+        take(monitor, &Weak::new(), place, 0, watch, slot::outside(1))
+    }
+
+    /// The runner of a shard nobody else holds lets go of it at the moment
+    /// the take succeeds: a take that claimed first and held the shard after
+    /// found it gone, and left the runner detached from a shard nobody runs,
+    /// its queued tasks dropped (the macOS cadence failure). The take holds
+    /// the shard before it claims: with no holder left it takes nothing, and
+    /// the runner goes back in.
+    #[test]
+    fn a_take_claims_nothing_of_a_shard_no_one_holds() {
+        let shard = worker_shard();
+        let (monitor, slot, mut watch) = watched(&shard);
+        drop(shard);
+        assert!(take_outside(&monitor, &mut watch).is_none());
+        assert_eq!(slot.come_back(1), slot::Back::In);
+    }
+
+    /// A worker that says it parks, finds work at its last look and backs
+    /// out runs on, so it rings the monitor that took that moment for every
+    /// worker parked and sleeps, as a park's end does: else the monitor
+    /// sleeps while the worker runs, and rescues none of its polls that
+    /// block. A monitor awake is not rung.
+    #[test]
+    fn a_worker_backing_out_of_its_park_rings_the_monitor_asleep() {
+        let monitor = Arc::new(Monitor::new(Duration::from_millis(10), 1, Vec::new(), None));
+        let shard = Shard::worker(
+            Limits {
+                max_nesting: 8,
+                buffer_cap: crate::buf::DEFAULT_CAP,
+                backend: crate::rt::backend::chosen().unwrap(),
+            },
+            crate::rt::tuning::Tuning::default(),
+            1,
+            0,
+            Some(Arc::clone(&monitor)),
+        )
+        .unwrap();
+        monitor.asleep.store(false, Ordering::SeqCst);
+        assert!(
+            !shard.begin_park(|| true),
+            "work came: the worker backs out"
+        );
+        assert_eq!(monitor.bell.rings(), 0, "a monitor awake was rung");
+        monitor.asleep.store(true, Ordering::SeqCst);
+        assert!(
+            !shard.begin_park(|| true),
+            "work came: the worker backs out"
+        );
+        assert_eq!(monitor.bell.rings(), 1, "the monitor asleep was not rung");
+    }
+
+    /// A call into the shard from the task's code is marked in the slot (the word says inside
+    /// the poll) before the runner looks at its claim: a take meanwhile finds the mark after its
+    /// fence and lets the shard be. The call's end puts the poll's word back, so the poll, still
+    /// running, is taken at the next look; a call after that finds the shard gone.
+    #[test]
+    fn a_take_lets_a_call_under_way_be_and_takes_the_poll_once_it_ends() {
+        let shard = worker_shard();
+        let (monitor, slot, mut watch) = watched(&shard);
+        let (word, back) = slot.mark();
+        assert_eq!(back, slot::Back::In);
+        assert_eq!(word, slot::outside(1), "the call read the poll's word");
+        assert!(
+            take_outside(&monitor, &mut watch).is_none(),
+            "the shard was taken while a call was in it"
+        );
+        slot.unmark(word);
+        assert_eq!(slot.word(), slot::outside(1), "the poll is outside again");
+        let gift = take_outside(&monitor, &mut watch).expect("the poll, outside again, is taken");
+        assert_eq!(
+            slot.mark().1,
+            slot::Back::Taken,
+            "a call after the take went into the shard"
+        );
+        drop(gift);
+    }
+
+    /// A call from the task's code whose mark meets a claim still pending cancels it and goes
+    /// in: the take that follows fails, and nothing else is claimed.
+    #[test]
+    fn a_call_that_meets_a_pending_claim_cancels_it_and_the_take_fails() {
+        let shard = worker_shard();
+        let (_monitor, slot, _watch) = watched(&shard);
+        slot.claim();
+        let (word, back) = slot.mark();
+        assert_eq!(back, slot::Back::In);
+        assert!(
+            !slot.take(),
+            "the take won over a call that cancelled first"
+        );
+        slot.unmark(word);
+        assert_eq!(slot.come_back(1), slot::Back::In);
+    }
+
+    /// A poll the monitor takes while it blocks, through the thread's own context: the call the
+    /// task's code makes after the take finds no shard (the thread is detached from it, and the
+    /// call takes the paths of any other thread), and the poll ends detached.
+    #[test]
+    fn a_call_after_the_take_finds_no_shard_and_the_poll_ends_detached() {
+        let shard = worker_shard();
+        let monitor = Monitor::new(Duration::from_millis(10), 1, Vec::new(), None);
+        let slot = monitor.slot();
+        let first = Runner {
+            slot: Arc::clone(&slot),
+            life: Arc::new(Life::new()),
+        };
+        monitor.started(0, &shard, first.clone());
+        let _entered = crate::rt::context::enter_watched(&shard, Some(&slot));
+        let (found, polled) = crate::rt::context::poll(&shard.shared, || {
+            let before = crate::rt::context::current(|current| current.is_some());
+            // The poll blocks; the monitor's look sees it outside and takes the shard.
+            let word = slot.word();
+            assert!(slot::is_outside(word), "the poll is outside its shard");
+            let mut watch = Watch {
+                runner: first.clone(),
+                last: word,
+                streak: STREAK,
+                longest: 0,
+                reported: slot::inside(0),
+            };
+            let place = monitor.places[0].get().unwrap();
+            let gift = take(&monitor, &Weak::new(), place, 0, &mut watch, word)
+                .expect("the blocked poll was taken");
+            let after = crate::rt::context::current(|current| current.is_some());
+            drop(gift);
+            (before, after)
+        });
+        assert_eq!(
+            found,
+            (true, false),
+            "a call after the take found the shard"
+        );
+        assert_eq!(polled, crate::rt::context::Polled::Detached);
+    }
+
+    /// A take that succeeds holds the shard in its gift, so the runner's
+    /// letting go of its own reference as it finds the shard taken leaves
+    /// the shard to its next runner.
+    #[test]
+    fn a_taken_shard_outlives_its_runner_letting_go() {
+        let shard = worker_shard();
+        let (monitor, slot, mut watch) = watched(&shard);
+        let gift = take_outside(&monitor, &mut watch).expect("the runner was outside");
+        assert_eq!(slot.come_back(1), slot::Back::Taken);
+        drop(shard);
+        assert_eq!(Arc::strong_count(&gift.shard.0), 1);
+    }
 }

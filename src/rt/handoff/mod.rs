@@ -13,10 +13,13 @@
 //! not move) wait in its [`Home`](home::Home) and run there too; then it
 //! waits as a spare.
 //!
-//! What the worker pays: two plain stores and a load per poll, and a store, a
-//! load and a store per call into the runtime from a task's code (the
-//! compiler's fence between, where the process has a heavy fence, see
-//! [`fence`]; a full fence elsewhere). proofs/tla/handoff checks the
+//! What the worker pays: two plain stores and a load per poll, and per call
+//! into the runtime from a task's code (every path of the runtime that
+//! touches the shard, the owner's own among them, takes one: a bracket) a
+//! load and a store of its word and a load of its claim, and a store as the
+//! call ends (the compiler's fence between, where the process has a heavy
+//! fence, see [`fence`]; a full fence elsewhere). A thread on a shard nobody
+//! watches looks at one word per call. proofs/tla/handoff checks the
 //! protocol, with the store buffers of x86 and every mutation of it that
 //! must fail.
 

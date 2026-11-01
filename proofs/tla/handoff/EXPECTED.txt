@@ -5,6 +5,8 @@ M_no_fence            Handoff     violated:Exclusive
 M_no_recheck          Handoff     violated:Exclusive
 M_no_poll_check       Handoff     violated:Exclusive
 M_no_bracket_check    Handoff     violated:Exclusive
+M_no_call_mark        Handoff     violated:Exclusive
+M_call_stays_marked   Handoff     violated:Rescued
 M_slot_reuse          Handoff     violated:Exclusive
 M_bound_any           Handoff     violated:BoundOnCreator
 M_no_handoff          Handoff     violated:Rescued
@@ -15,3 +17,13 @@ W_runner_cancel       Handoff     violated:NoRunnerCancel
 R_seqcst              Retarget    pass
 M_retarget_relaxed    Retarget    violated:WokenPolled
 W_old_wake            Retarget    violated:NoOldWake
+T_safe                TakeRef     pass
+M_late_ref            TakeRef     violated:NoLoss
+M_keep_ref            TakeRef     violated:RefsHeld
+W_take                TakeRef     violated:NoTake
+W_failed_take         TakeRef     violated:NoFailedTake
+A_safe                Asleep      pass
+M_no_backout_ring     Asleep      violated:Watched
+M_no_wake_ring        Asleep      violated:Watched
+M_no_second_look      Asleep      violated:Watched
+W_backout_asleep      Asleep      violated:NoBackOutAsleep

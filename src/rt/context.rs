@@ -11,9 +11,10 @@
 //! thread that runs a worker shard the monitor watches has a slot
 //! (`rt::handoff`): each poll it starts leaves the shard in a new epoch, and
 //! each poll's end, and each call into the runtime from the task's code (a
-//! bracket, in [`current`]), comes back in, unless the monitor took the
-//! shard meanwhile. A thread whose shard was taken is detached from it: from
-//! then on it runs no shard, and its calls take the paths of any other
+//! bracket, in [`current`], whichever path of the runtime makes it), comes
+//! back in, unless the monitor took the shard meanwhile; a call goes out
+//! again as it ends. A thread whose shard was taken is detached from it:
+//! from then on it runs no shard, and its calls take the paths of any other
 //! thread (proofs/tla/handoff).
 
 use core::cell::{Cell, RefCell};
@@ -40,15 +41,17 @@ pub(crate) struct Here {
     /// A task's poll (or a `block_on` future's) is on this thread's stack: a
     /// wake it makes goes to the LIFO slot.
     in_task: Cell<bool>,
-    /// The thread runs its shard's own code.
-    inside: Cell<bool>,
+    /// The thread's slot while it runs a task's code (or a `block_on`
+    /// future's) on a shard the monitor watches, with no call into the
+    /// runtime under way: such a call is a bracket. Null inside the shard, in
+    /// a call, and on a shard nobody watches, whose calls need none.
+    out: Cell<*const Slot>,
     /// The nesting of `block_on` on this thread.
     depth: Cell<usize>,
     /// The thread's slot while it runs a worker shard the monitor watches,
     /// null otherwise; kept alive by the loop that entered the shard.
     slot: Cell<*const Slot>,
-    /// The epoch of the poll in progress, and the last one begun.
-    epoch: Cell<u64>,
+    /// The epoch of the last poll begun.
     epochs: Cell<u64>,
     /// The address of the `Shared` of the shard this thread was detached
     /// from, compared, never followed; 0 for none.
@@ -66,6 +69,8 @@ pub(crate) struct Here {
     runtime: Cell<*const Inner>,
     /// The shard `OWN` holds, null for none yet or once it went.
     own: Cell<*const Shard>,
+    /// The shard this thread lets go of as its runner (`letting_go`), null for none.
+    letting_go: Cell<*const Arc<Shared>>,
 }
 
 impl Here {
@@ -73,10 +78,9 @@ impl Here {
         Self {
             current: Cell::new(core::ptr::null()),
             in_task: Cell::new(false),
-            inside: Cell::new(false),
+            out: Cell::new(core::ptr::null()),
             depth: Cell::new(0),
             slot: Cell::new(core::ptr::null()),
-            epoch: Cell::new(0),
             epochs: Cell::new(0),
             detached: Cell::new(0),
             home: Cell::new(core::ptr::null()),
@@ -84,20 +88,7 @@ impl Here {
             budget: Cell::new(crate::coop::UNBUDGETED),
             runtime: Cell::new(core::ptr::null()),
             own: Cell::new(core::ptr::null()),
-        }
-    }
-
-    /// Comes back into the shard from the poll of `epoch`: whether the shard
-    /// is still this thread's (always, for a shard nobody watches).
-    #[inline]
-    fn come_back(&self, epoch: u64) -> bool {
-        // SAFETY: the slot outlives the loop that set it (see `slot`).
-        match unsafe { self.slot.get().as_ref() } {
-            Some(slot) if slot.come_back(epoch) == Back::Taken => {
-                self.detach();
-                false
-            }
-            _ => true,
+            letting_go: Cell::new(core::ptr::null()),
         }
     }
 
@@ -110,6 +101,7 @@ impl Here {
         }
         self.current.set(core::ptr::null());
         self.slot.set(core::ptr::null());
+        self.out.set(core::ptr::null());
     }
 }
 
@@ -174,53 +166,56 @@ pub(crate) fn local() -> &'static Here {
     HERE.with(|here| unsafe { &*core::ptr::from_ref(here) })
 }
 
-/// A call into the runtime from a task's code: inside the shard until it
-/// drops, then out again in the poll's epoch.
-struct Bracket<'a>(&'a Here);
+/// A call into the runtime from a task's code on a shard the monitor
+/// watches: inside the shard until it drops, then out again with the poll's
+/// word.
+struct Bracket {
+    slot: &'static Slot,
+    word: u64,
+}
 
-impl Drop for Bracket<'_> {
-    fn drop(&mut self) {
-        let here = self.0;
-        here.inside.set(false);
-        // SAFETY: as in `Here::come_back`; a thread detached meanwhile has
-        // no slot any more.
-        if let Some(slot) = unsafe { here.slot.get().as_ref() } {
-            slot.go_out(here.epoch.get());
+impl Bracket {
+    /// Comes back into the shard from `here`, whose task's code runs outside
+    /// it with the slot `slot`: `None` when the shard was taken, and the
+    /// thread is detached from it.
+    #[inline(always)]
+    fn take(here: &'static Here, slot: *const Slot) -> Option<Self> {
+        // SAFETY: the slot outlives the loop that set it (see `Here::slot`),
+        // and so every call its polls make.
+        let slot = unsafe { &*slot };
+        match slot.mark() {
+            (word, Back::In) => {
+                here.out.set(core::ptr::null());
+                Some(Self { slot, word })
+            }
+            (_, Back::Taken) => {
+                here.detach();
+                None
+            }
         }
     }
 }
 
-/// Runs `f` with the shard this thread is running, if any. Called from a
-/// task's code, it comes back into the shard first (a bracket), and finds
-/// none if the shard was taken.
-#[inline(always)]
-pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
-    let here = local();
-    let shard = here.current.get();
-    if shard.is_null() {
-        return f(None);
+impl Drop for Bracket {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // A thread detached in the call (a nested `block_on`'s poll found the
+        // shard taken) marks its slot again at its next call, finds it taken
+        // for good and runs no shard.
+        local().out.set(self.slot);
+        self.slot.unmark(self.word);
     }
-    let _bracket = match bracket(here) {
-        Some(bracket) => bracket,
-        None => return f(None),
-    };
-    // SAFETY: as in `Current::shard`.
-    f(unsafe { shard.as_ref() })
 }
 
-/// The bracket a call into the current shard from here needs (`None` inside, or with no
-/// monitor), or `None` when the shard was taken and this thread is detached from it. The one
-/// rule [`current`] and [`current_held`] share.
+/// Runs `f` with the shard this thread is running, if any. Called from a
+/// task's code on a shard the monitor watches, it comes back into the shard
+/// first (a bracket), and finds none if the shard was taken. Every path of
+/// the runtime that touches the shard it runs comes here, the owner's fast
+/// paths too.
 #[inline(always)]
-fn bracket(here: &'static Here) -> Option<Option<Bracket<'static>>> {
-    if here.inside.get() || here.slot.get().is_null() {
-        Some(None)
-    } else if here.come_back(here.epoch.get()) {
-        here.inside.set(true);
-        Some(Some(Bracket(here)))
-    } else {
-        None
-    }
+pub(crate) fn current<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
+    let held = current_held();
+    f(held.shard())
 }
 
 /// The shard this thread is running, as [`current`] finds it, held for as long as the result
@@ -229,32 +224,74 @@ fn bracket(here: &'static Here) -> Option<Option<Bracket<'static>>> {
 #[inline(always)]
 pub(crate) fn current_held() -> Current {
     let here = local();
-    let shard = here.current.get();
-    if shard.is_null() {
+    let out = here.out.get();
+    if out.is_null() {
         return Current {
-            shard,
-            _bracket: None,
+            shard: here.current.get(),
+            bracket: Cell::new(None),
         };
     }
-    match bracket(here) {
-        Some(bracket) => Current {
-            shard,
-            _bracket: bracket,
+    bracketed()
+}
+
+/// The shard this thread is running, in a bracket held for as long as the result lives, for a
+/// caller [`unbracketed`] answered [`Bracketed`]: what [`current_held`] finds there.
+#[inline(always)]
+pub(crate) fn bracketed() -> Current {
+    let here = local();
+    let out = here.out.get();
+    debug_assert!(!out.is_null(), "a bracket where none is needed");
+    let bracket = Bracket::take(here, out);
+    Current {
+        shard: if bracket.is_some() {
+            here.current.get()
+        } else {
+            core::ptr::null()
         },
-        None => Current {
-            shard: core::ptr::null(),
-            _bracket: None,
-        },
+        bracket: Cell::new(bracket),
     }
 }
+
+/// The shard this thread runs, if any, when a call into it from here needs no bracket: the
+/// thread is inside it, or no monitor watches it. [`Bracketed`] from a task's code on a shard
+/// the monitor watches, whose call goes through [`bracketed`] instead; a hot path makes that
+/// call out of line, so what its bracket holds costs the path that needs none nothing.
+#[inline(always)]
+pub(crate) fn unbracketed(here: &Here) -> Result<Option<&Shard>, Bracketed> {
+    if here.out.get().is_null() {
+        // SAFETY: as in `Current::shard`.
+        Ok(unsafe { here.current.get().as_ref() })
+    } else {
+        Err(Bracketed)
+    }
+}
+
+/// The shard this thread runs, when a call into it from here needs no bracket: what
+/// [`unbracketed`] finds, `None` where it answers [`Bracketed`] too, for a caller whose way
+/// for no shard here (out of line) takes the bracket.
+#[inline(always)]
+pub(crate) fn running_inside(here: &Here) -> Option<&Shard> {
+    unbracketed(here).ok().flatten()
+}
+
+/// What [`unbracketed`] answers where a call into the shard needs a bracket.
+pub(crate) struct Bracketed;
 
 /// What [`current_held`] found: the shard, while it lives.
 pub(crate) struct Current {
     shard: *const Shard,
-    _bracket: Option<Bracket<'static>>,
+    bracket: Cell<Option<Bracket>>,
 }
 
 impl Current {
+    /// Ends the bracket, if one was made, before the result drops: what follows touches the
+    /// shard no more, the one handed out by [`shard`](Self::shard) included, until a call of
+    /// its own brackets again.
+    #[inline(always)]
+    pub(crate) fn end(&self) {
+        drop(self.bracket.take());
+    }
+
     /// The shard this thread is running, if any.
     #[inline(always)]
     pub(crate) fn shard(&self) -> Option<&Shard> {
@@ -265,28 +302,27 @@ impl Current {
     }
 }
 
-/// The shard this thread runs, when a call into it from here needs no
-/// bracket (the thread is inside it, or no monitor watches it): what
-/// [`current`] would hand its closure, without the closure. `None` where
-/// [`current`] has to be asked.
-#[inline(always)]
-pub(crate) fn running_inside(here: &Here) -> Option<&Shard> {
-    // Both looked at, no branch between: the test is one `or` of two flags.
-    if here.inside.get() | here.slot.get().is_null() {
-        // SAFETY: as in `current`.
-        unsafe { here.current.get().as_ref() }
-    } else {
-        None
+/// Marks the shard of `shared` as the one this thread lets go of, as the only thread that
+/// runs it, while `f` runs: as it drops, its sources' registrations and its tasks going. A
+/// source's request made meanwhile is the shard's own ([`letting_go_of`]), as one from inside
+/// it is.
+pub(crate) fn letting_go<R>(shared: &Arc<Shared>, f: impl FnOnce() -> R) -> R {
+    /// Puts back what the mark replaced, as `f` returns or unwinds.
+    struct Restore(*const Arc<Shared>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            local().letting_go.set(self.0);
+        }
     }
+    let _restore = Restore(local().letting_go.replace(shared));
+    f()
 }
 
-impl Here {
-    /// Whether a task's poll (or a `block_on` future's) is on this thread's
-    /// stack ([`in_task`]).
-    #[inline(always)]
-    pub(crate) fn in_task(&self) -> bool {
-        self.in_task.get()
-    }
+/// Runs `f` with the shard this thread lets go of ([`letting_go`]), if any.
+pub(crate) fn letting_go_of<R>(f: impl FnOnce(Option<&Arc<Shared>>) -> R) -> R {
+    // SAFETY: the mark points at an `Arc` that outlives the `letting_go` call that set it,
+    // and is cleared before that call returns; the borrow ends with `f`.
+    f(unsafe { local().letting_go.get().as_ref() })
 }
 
 /// Runs `f` with the shard this thread runs, if any, which no other thread
@@ -320,7 +356,7 @@ pub(crate) fn current_pinned<R>(f: impl FnOnce(Option<&Shard>) -> R) -> R {
 /// Runs `f` with the slot of this thread, while it runs a worker shard the
 /// monitor watches.
 pub(crate) fn with_slot<R>(f: impl FnOnce(Option<&Slot>) -> R) -> R {
-    // SAFETY: as in `Here::come_back`.
+    // SAFETY: the slot outlives the loop that set it (see `Here::slot`).
     f(unsafe { local().slot.get().as_ref() })
 }
 
@@ -374,7 +410,7 @@ fn enter_with<'a>(here: &Here, shard: &'a Shard, slot: Option<&'a Slot>) -> Ente
         slot: here
             .slot
             .replace(slot.map_or(core::ptr::null(), core::ptr::from_ref)),
-        inside: here.inside.replace(true),
+        out: here.out.replace(core::ptr::null()),
         _shard: core::marker::PhantomData,
     }
 }
@@ -383,7 +419,7 @@ fn enter_with<'a>(here: &Here, shard: &'a Shard, slot: Option<&'a Slot>) -> Ente
 pub(crate) struct Entered<'a> {
     previous: *const Shard,
     slot: *const Slot,
-    inside: bool,
+    out: *const Slot,
     _shard: core::marker::PhantomData<&'a Shard>,
 }
 
@@ -392,7 +428,7 @@ impl Drop for Entered<'_> {
         let here = local();
         here.current.set(self.previous);
         here.slot.set(self.slot);
-        here.inside.set(self.inside);
+        here.out.set(self.out);
     }
 }
 
@@ -420,81 +456,107 @@ pub(crate) fn poll<R>(shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) 
 }
 
 /// [`poll`] on a shard no monitor watches: no slot to go out of and come
-/// back into, and none can be entered during the poll (only a runner's
-/// first frame enters one), so the epochs are left as they are.
+/// back into, and no call from the poll needs a bracket.
 #[inline(always)]
 fn poll_unwatched<R>(here: &Here, shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
     /// Back into the shard, by return or unwind.
     struct Back<'a>(&'a Here, bool);
     impl Drop for Back<'_> {
+        #[inline(always)]
         fn drop(&mut self) {
             self.0.in_task.set(self.1);
-            self.0.inside.set(true);
         }
     }
     let back = Back(here, here.in_task.replace(true));
-    here.inside.set(false);
     let result = poll();
     drop(back);
-    let polled = if here.detached.get() == core::ptr::from_ref(shared) as usize {
+    (result, polled(here, shared))
+}
+
+/// [`poll`] on a shard the monitor watches through this thread's slot. A
+/// poll begins inside, its runtime's own code running (the loop,
+/// or a call that runs a nested `block_on`), with no bracket under way to
+/// put back.
+#[inline(never)]
+fn poll_watched<R>(here: &'static Here, shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
+    /// The poll's way back into the shard, by return or unwind.
+    struct Back {
+        here: &'static Here,
+        slot: &'static Slot,
+        epoch: u64,
+        in_task: bool,
+    }
+    impl Drop for Back {
+        #[inline(always)]
+        fn drop(&mut self) {
+            let here = self.here;
+            here.out.set(core::ptr::null());
+            if self.slot.come_back(self.epoch) == super::handoff::slot::Back::Taken {
+                here.detach();
+            }
+            here.in_task.set(self.in_task);
+        }
+    }
+    // SAFETY: the slot outlives the loop that set it (see `Here::slot`), and
+    // so this poll.
+    let slot = unsafe { &*here.slot.get() };
+    let epoch = here.epochs.get() + 1;
+    here.epochs.set(epoch);
+    let back = Back {
+        here,
+        slot,
+        epoch,
+        in_task: here.in_task.replace(true),
+    };
+    here.out.set(slot);
+    slot.go_out(epoch);
+    let result = poll();
+    drop(back);
+    (result, polled(here, shared))
+}
+
+/// [`poll`] for a task's run, `run`, which never unwinds: each part of it that runs the task's
+/// own code (its future, its hooks, its drops) catches a panic or aborts on one
+/// (`rt::task::raw`). On a shard the monitor watches, the run then keeps no guard to come back
+/// in by: an unwind there would be the runtime's own bug, and aborts.
+#[inline(always)]
+pub(crate) fn run_task(shared: &Shared, run: impl FnOnce()) -> Polled {
+    let here = local();
+    if here.slot.get().is_null() {
+        return poll_unwatched(here, shared, run).1;
+    }
+    run_task_watched(here, run);
+    polled(here, shared)
+}
+
+/// [`run_task`] on a shard the monitor watches through this thread's slot, from inside it (see
+/// [`poll_watched`]).
+#[inline(never)]
+fn run_task_watched(here: &'static Here, run: impl FnOnce()) {
+    // SAFETY: the slot outlives the loop that set it (see `Here::slot`), and
+    // so this run.
+    let slot = unsafe { &*here.slot.get() };
+    let epoch = here.epochs.get() + 1;
+    here.epochs.set(epoch);
+    let in_task = here.in_task.replace(true);
+    here.out.set(slot);
+    slot.go_out(epoch);
+    super::task::abort_on_panic(run);
+    here.out.set(core::ptr::null());
+    if slot.come_back(epoch) == Back::Taken {
+        here.detach();
+    }
+    here.in_task.set(in_task);
+}
+
+/// What a poll on the shard of `shared` found as it ended.
+#[inline(always)]
+fn polled(here: &Here, shared: &Shared) -> Polled {
+    if here.detached.get() == core::ptr::from_ref(shared) as usize {
         Polled::Detached
     } else {
         Polled::In
-    };
-    (result, polled)
-}
-
-/// [`poll`] on a shard the monitor watches through this thread's slot.
-#[inline(never)]
-fn poll_watched<R>(here: &'static Here, shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
-    /// The poll's way back into the shard, taken once, by return or unwind.
-    struct Out<'a> {
-        here: &'a Here,
-        shared: usize,
-        in_task: bool,
-        epoch: u64,
-        mine: u64,
-        done: bool,
     }
-    impl Out<'_> {
-        fn back(&mut self) -> Polled {
-            self.done = true;
-            let here = self.here;
-            here.come_back(self.mine);
-            here.in_task.set(self.in_task);
-            here.inside.set(true);
-            here.epoch.set(self.epoch);
-            if here.detached.get() == self.shared {
-                Polled::Detached
-            } else {
-                Polled::In
-            }
-        }
-    }
-    impl Drop for Out<'_> {
-        fn drop(&mut self) {
-            if !self.done {
-                self.back();
-            }
-        }
-    }
-    let mine = here.epochs.get() + 1;
-    here.epochs.set(mine);
-    let mut out = Out {
-        here,
-        shared: core::ptr::from_ref(shared) as usize,
-        in_task: here.in_task.replace(true),
-        epoch: here.epoch.replace(mine),
-        mine,
-        done: false,
-    };
-    here.inside.set(false);
-    // SAFETY: as in `Here::come_back`.
-    if let Some(slot) = unsafe { here.slot.get().as_ref() } {
-        slot.go_out(mine);
-    }
-    let result = poll();
-    (result, out.back())
 }
 
 /// Whether a task's poll (or a `block_on` future's) is on this thread's

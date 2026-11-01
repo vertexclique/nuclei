@@ -714,8 +714,8 @@ impl Shard {
             .is_some_and(|own| core::ptr::eq(Arc::as_ptr(own), home))
     }
 
-    /// The shard's park ended: its runtime's monitor, asleep while every
-    /// worker was parked, wakes.
+    /// The shard's park ended, or the shard backed out of it: its runtime's
+    /// monitor, asleep while every worker was parked, wakes.
     fn parked_ended(&self) {
         if let Some(monitor) = &self.monitor {
             monitor.worker_woke();
@@ -942,15 +942,10 @@ impl Shard {
             .and_then(|(owner, index)| (owner == runtime).then_some(index))
     }
 
-    /// Queues a runnable from this shard's own thread. A task woken by the
+    /// Queues a runnable from this shard's own thread, `in_task` as
+    /// [`in_task`](super::context::in_task) finds it. A task woken by the
     /// task being polled runs next (the LIFO slot), unless it is that task
     /// itself yielding.
-    pub(crate) fn push_local(&self, runnable: Runnable, info: ScheduleInfo) {
-        self.push_local_from(runnable, info, super::context::in_task());
-    }
-
-    /// [`push_local`](Self::push_local) from a caller that read
-    /// [`in_task`](super::context::in_task) already.
     #[inline(always)]
     pub(crate) fn push_local_from(&self, runnable: Runnable, info: ScheduleInfo, in_task: bool) {
         if self.tuning.lifo && !info.woken_while_running && in_task {
@@ -990,12 +985,17 @@ impl Shard {
         }
         self.lifo_streak.set(0);
         let local = self.queue.borrow_mut().pop_front();
-        local.or_else(|| self.pop_inbox())
+        // A match, not `or_else`: a closure's call can stay out of line, which every run that
+        // finds the local queue empty would pay.
+        match local {
+            Some(r) => Some(r),
+            None => self.pop_inbox(),
+        }
     }
 
-    // Inlined into the run loop's `next`: it is looked at on every run that
-    // finds the local queue empty.
-    #[inline]
+    // Inlined into the run loop's `next`, whichever codegen unit holds it: it is looked at on
+    // every run that finds the local queue empty.
+    #[inline(always)]
     fn pop_inbox(&self) -> Option<Runnable> {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).

@@ -1,8 +1,11 @@
 //! Running one test alone in a process of its own: for a case that needs
 //! the whole process (the next descriptor number, a seccomp filter, a
-//! resource limit that cannot be raised again).
+//! resource limit that cannot be raised again); and a watchdog that ends the
+//! process of a test that hangs.
 
 use std::io::Read;
+#[cfg(unix)]
+use std::io::Write;
 use std::time::Duration;
 
 /// Set in a process of this test binary that runs one test alone.
@@ -83,4 +86,38 @@ pub(crate) fn open_descriptors() -> Vec<i32> {
     (0..soft)
         .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
         .collect()
+}
+
+/// A test's watchdog: unless dropped within `limit`, it writes `what` and
+/// `report()` to the process's standard error (past the harness's capture,
+/// which an abort throws away) and aborts, so a hang fails at once and says
+/// where it was rather than holding the suite until the job's own limit.
+#[cfg(unix)]
+pub(crate) struct Watchdog(Option<std::sync::mpsc::Sender<()>>);
+
+#[cfg(unix)]
+impl Watchdog {
+    pub(crate) fn new(
+        what: &'static str,
+        limit: Duration,
+        report: impl Fn() -> String + Send + 'static,
+    ) -> Self {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(limit) {
+                let _ = writeln!(std::io::stderr(), "{what} hung: {}", report());
+                std::process::abort();
+            }
+        });
+        Self(Some(done))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            let _ = done.send(());
+        }
+    }
 }

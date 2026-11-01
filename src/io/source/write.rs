@@ -217,6 +217,17 @@ fn send_datagram(fd: RawFd, bytes: &[u8], dest: Dest<'_>) -> io::Result<usize> {
     }
 }
 
+/// What a stream write straight from the task's buffer did (`WriteState::write_direct_as`).
+#[cfg(unix)]
+pub(super) enum Direct {
+    /// The kernel took bytes, or the call failed.
+    Wrote(io::Result<usize>),
+    /// The kernel took nothing now.
+    Full,
+    /// No call was made: the side holds something that goes first.
+    Not,
+}
+
 impl WriteState {
     pub(super) fn epoch_mut(&mut self) -> &mut u32 {
         &mut self.epoch
@@ -313,13 +324,15 @@ impl WriteState {
     /// waits on buffers that receives of other connections hold
     /// (proofs/tla/ring/RingStarve.tla).
     /// A pipe's goes too, while the pool has no buffer for it (`writes_bytes`).
+    /// On a poller's side (`poller`) or a ring's.
     #[cfg(unix)]
-    pub(super) fn writes_itself(&self, io: Io<'_>, len: usize) -> bool {
+    #[inline(always)]
+    pub(super) fn writes_itself(&self, poller: bool, len: usize) -> bool {
         #[cfg(ring)]
-        if self.starved && matches!(io.via, Via::Ops(_)) {
+        if self.starved && !poller {
             return true;
         }
-        super::direct::worth(io, len, true)
+        super::direct::worth_write(poller, len)
     }
 
     /// A stream write of the bytes of `bufs` made straight on the
@@ -337,22 +350,33 @@ impl WriteState {
         kind: Kind,
         bufs: &[io::IoSlice<'_>],
     ) -> Option<io::Result<usize>> {
-        let fd = fd?;
+        match self.write_direct_as(matches!(io.via, Via::Fd(_)), fd, kind, bufs) {
+            Direct::Wrote(result) => Some(result),
+            Direct::Full | Direct::Not => None,
+        }
+    }
+
+    /// [`write_direct`](Self::write_direct) on a poller's side (`poller`) or a ring's, which
+    /// tells a call the kernel took nothing of (`Full`) from one not made (`Not`).
+    #[cfg(unix)]
+    #[inline(always)]
+    pub(super) fn write_direct_as(
+        &mut self,
+        poller: bool,
+        fd: Option<RawFd>,
+        kind: Kind,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Direct {
+        let Some(fd) = fd else {
+            return Direct::Not;
+        };
         let len: usize = bufs.iter().map(|b| b.len()).sum();
-        let waits = matches!(io.via, Via::Fd(_)) && self.blocked;
         if !self.writes_bytes(kind)
             || len == 0
-            || !self.writes_itself(io, len)
-            || waits
-            || self.failed.is_some()
-            || self.error.is_some()
-            || self.connecting
-            || self.behind.is_some()
-            || self.lent.is_some()
-            || self.queued.is_some()
-            || self.ring_holds()
+            || !self.writes_itself(poller, len)
+            || !self.holds_nothing(poller)
         {
-            return None;
+            return Direct::Not;
         }
         let call = if kind.streams() {
             sys::send_bufs(fd, bufs)
@@ -361,22 +385,58 @@ impl WriteState {
         };
         match sys::ready(call) {
             None => {
-                if matches!(io.via, Via::Fd(_)) {
+                if poller {
                     self.blocked = true;
                 }
-                None
+                Direct::Full
             }
             Some(Ok(0)) => {
                 self.direct = true;
-                Some(Err(io::ErrorKind::WriteZero.into()))
+                Direct::Wrote(Err(io::ErrorKind::WriteZero.into()))
             }
             // Moved through as it is, counted by reference: taken apart and
             // made again, the result cost the call a drop of its own.
             Some(result) => {
                 tally::writing(&result);
                 self.direct = true;
-                Some(result)
+                Direct::Wrote(result)
             }
+        }
+    }
+
+    /// Whether the side holds nothing a write straight from the task's buffer must come after,
+    /// and waits for no edge, on a poller's side (`poller`) or a ring's: no write that found the
+    /// socket full since the last edge, no error, no connect, nothing written behind, lent,
+    /// queued or out with the ring.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub(super) fn holds_nothing(&self, poller: bool) -> bool {
+        !(poller && self.blocked)
+            && self.failed.is_none()
+            && self.error.is_none()
+            && !self.connecting
+            && self.behind.is_none()
+            && self.lent.is_none()
+            && self.queued.is_none()
+            && !self.ring_holds()
+    }
+
+    /// Whether the handle's own write may go straight from the task's buffer with nothing else
+    /// of a hold's work: the side holds nothing (`holds_nothing`) and takes no caller's own
+    /// calls.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub(super) fn sends_now(&self, poller: bool) -> bool {
+        !self.user_fd && self.holds_nothing(poller)
+    }
+
+    /// The handle's own write found the socket full with no hold of the side (`asked`): what
+    /// the side's own call would have left.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub(super) fn found_full(&mut self, poller: bool) {
+        if poller {
+            self.blocked = true;
         }
     }
 
@@ -426,19 +486,40 @@ impl WriteState {
             && !self.lent_waits()
     }
 
-    /// What `Source::unsent` publishes as the side is let go: the unsent bit, and for a source a
-    /// readiness driver serves (not `ring`) the idle bit. After a hold whose step only wrote
-    /// directly, known without a look: a direct write needs a side that holds nothing and, on a
-    /// readiness driver, is not blocked, and the step began by leaving the caller's own calls.
+    /// What `Source::unsent` publishes as the side is let go: the unsent bit, for a source a
+    /// readiness driver serves (not `ring`) the idle bit, and the sends bit (`sends_now`). After
+    /// a hold whose step only wrote directly, known without a look: a direct write needs a side
+    /// that holds nothing and, on a readiness driver, is not blocked, and the step began by
+    /// leaving the caller's own calls.
     #[inline(always)]
     pub(super) fn published(&mut self, ring: bool) -> u8 {
         if core::mem::take(&mut self.direct) {
             #[cfg(readiness)]
-            return if ring { 0 } else { super::WRITE_IDLE };
+            return if ring {
+                super::WRITE_SENDS
+            } else {
+                super::WRITE_IDLE | super::WRITE_SENDS
+            };
             #[cfg(not(readiness))]
             return 0;
         }
-        u8::from(self.has_unsent()) | self.idle_bit(ring)
+        u8::from(self.has_unsent()) | self.idle_bit(ring) | self.sends_bit(ring)
+    }
+
+    /// [`sends_now`](Self::sends_now) as the bit `Source::unsent` publishes it in.
+    #[inline(always)]
+    fn sends_bit(&self, ring: bool) -> u8 {
+        #[cfg(unix)]
+        return if self.sends_now(!ring) {
+            super::WRITE_SENDS
+        } else {
+            0
+        };
+        #[cfg(not(unix))]
+        {
+            let _ = ring;
+            0
+        }
     }
 
     /// [`idle`](Self::idle) as the bit `Source::unsent` publishes it in, for a source a readiness

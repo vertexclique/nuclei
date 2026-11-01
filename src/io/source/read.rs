@@ -248,6 +248,17 @@ pub(super) struct ReadState {
 }
 
 impl ReadState {
+    /// The state of a TCP stream whose kernel counts what its reads leave from the start: one
+    /// accepted from a listener that asks it (`Source::passes_inq`), so its first read asks
+    /// nothing.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn counting() -> Self {
+        Self {
+            inq: Inq::On,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn epoch_mut(&mut self) -> &mut u32 {
         &mut self.epoch
     }
@@ -573,6 +584,27 @@ impl ReadState {
         }
     }
 
+    /// A stream read (or peek) of the bytes read ahead, which come first: copied into `out`,
+    /// consumed unless `peek`, as [`read_any`](Self::read_any) takes them, and the tasks still
+    /// waiting woken if some are left for them; `None` when none are held. Bytes held leave a
+    /// direct read and the driver's call nothing to do (`read_direct` and `complete` find a
+    /// result held), so a read that finds them goes no further.
+    #[inline(always)]
+    fn take_ahead(
+        &mut self,
+        out: &mut [u8],
+        peek: bool,
+        after: &mut After,
+        shard: Option<&crate::rt::shard::Shard>,
+    ) -> Option<usize> {
+        if self.ahead.is_empty() {
+            return None;
+        }
+        let n = self.ahead.copy_into(out, peek, after, shard);
+        self.pass_on(after);
+        Some(n)
+    }
+
     /// A completed result for a task that asked: wakes the others waiting
     /// if some of it is left for them.
     fn pass_on(&mut self, after: &mut After) {
@@ -752,8 +784,52 @@ impl ReadState {
 
     /// A stream read (or peek) into `out`: the driver reads into the pool
     /// first if the socket may hold bytes, and the task copies them out.
-    #[inline]
+    /// Inlined, the read of bytes held ahead ([`take_ahead`](Self::take_ahead)), and of a side
+    /// that holds nothing and has nothing to ask for ([`quiet`](Self::quiet)): it waits, with
+    /// nothing to call or take.
+    #[inline(always)]
     fn read(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        out: &mut [u8],
+        peek: bool,
+        waker: &Waker,
+        after: &mut After,
+    ) -> Poll<io::Result<usize>> {
+        if let Some(n) = self.take_ahead(out, peek, after, io.shard) {
+            return Poll::Ready(Ok(n));
+        }
+        if self.quiet(io) {
+            self.wait(waker, out.len());
+            return Poll::Pending;
+        }
+        self.read_any(io, kind, out, peek, waker, after)
+    }
+
+    /// Whether a stream read finds nothing to take and nothing to ask the
+    /// driver for, as [`read_any`](Self::read_any) would find it: no bytes
+    /// ahead, no end and no error, and either a poller's socket that was
+    /// empty after the last edge or a ring's multishot receive that stays
+    /// out (`armed_and_quiet`).
+    #[inline(always)]
+    fn quiet(&self, io: Io<'_>) -> bool {
+        self.ahead.is_empty()
+            && !self.eof
+            && self.error.is_none()
+            && match io.via {
+                #[cfg(readiness)]
+                Via::Fd(_) => self.blocked,
+                #[cfg(completion)]
+                Via::Ops(_) => self.armed_and_quiet(),
+                #[cfg(not(completion))]
+                Via::None(never, _) => match never {},
+            }
+    }
+
+    /// [`read`](Self::read) of any side.
+    #[inline]
+    fn read_any(
         &mut self,
         io: Io<'_>,
         kind: Kind,

@@ -294,6 +294,50 @@ fn a_receive_in_flight_across_a_handoff_gets_its_bytes_in_order() {
     rt.block_on(blocked);
 }
 
+/// A task that calls into its shard in its poll, on the shard's own paths (a send on a socket
+/// the shard owns, a wake of a task of the shard, a spawn), and then blocks is handed on still:
+/// each call marks itself and puts the poll's word back as it ends, so the monitor sees one poll
+/// past the threshold. The shard's other work runs meanwhile, and the send reached the peer.
+#[test]
+fn a_task_that_calls_into_its_shard_and_then_blocks_is_handed_on() {
+    let rt = on();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let (to_waiter, mut at_waiter) = mpsc::channel::<u32>(1);
+    let waiter = rt.spawn(async move { at_waiter.recv().await });
+    let (spawned_tx, spawned_rx) = std::sync::mpsc::channel();
+    let blocked = rt.spawn(async move {
+        let stream = nuclei::Handle::<TcpStream>::connect(addr).await.unwrap();
+        // One poll from here on: the calls, then the block.
+        stream.send(b"ping").await.unwrap();
+        to_waiter.try_send(3).unwrap();
+        let spawned = nuclei::spawn(async { 11u32 });
+        spawned_tx.send(spawned).unwrap();
+        held.hold(false);
+        stream
+    });
+    let (mut peer, _) = listener.accept().unwrap();
+    let mut got = [0u8; 4];
+    std::io::Read::read_exact(&mut peer, &mut got).unwrap();
+    let spawned = spawned_rx.recv().unwrap();
+    assert_eq!(
+        rt.block_on(spawned),
+        11,
+        "the task spawned before the block ran"
+    );
+    assert_eq!(
+        rt.block_on(waiter),
+        Some(3),
+        "the task woken before the block ran"
+    );
+    rt.block_on(rt.spawn(nuclei::time::sleep(Duration::from_millis(20))));
+    gate.release_after("the woken task, the spawned one or the shard's timer");
+    assert_eq!(&got, b"ping");
+    drop(rt.block_on(blocked));
+}
+
 #[cfg(target_os = "linux")]
 fn worker_threads() -> usize {
     std::fs::read_dir("/proc/self/task")

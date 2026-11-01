@@ -5,7 +5,8 @@
 //! page at a time) and links. Calls by path, and a regular file's calls
 //! beside its reads, writes, syncs and [`Handle::allocate`], run on the
 //! blocking pool; [`Handle::try_lock_file`], which never waits, runs on the
-//! calling thread.
+//! calling thread, and so does `File::open` on Linux for a regular file on a
+//! local file system whose path the kernel's caches resolve at once.
 //!
 //! A regular file's reads and writes, at the handle's own cursor or at an
 //! offset of the caller's ([`Handle::read_at`], [`Handle::write_at`] and
@@ -47,6 +48,8 @@ mod copy_range;
 pub(crate) mod file;
 mod file_ops;
 mod lock;
+#[cfg(target_os = "linux")]
+mod open_cached;
 mod ops;
 mod read_dir;
 #[cfg(ring)]
@@ -95,12 +98,18 @@ use crate::io::source::Kind;
 /// [`read_at_owned`](Handle::read_at_owned) and
 /// [`write_at_owned`](Handle::write_at_owned).
 impl Handle<StdFile> {
-    /// Opens the file at `p` for reading, on the blocking pool.
+    /// Opens the file at `p` for reading: on the calling thread when it is a
+    /// regular file on a local file system and the kernel's caches answer at
+    /// once (Linux), on the blocking pool otherwise.
     ///
     /// # Errors
     ///
     /// As [`File::open`].
     pub async fn open(p: impl AsRef<Path>) -> io::Result<Handle<StdFile>> {
+        #[cfg(target_os = "linux")]
+        if let Some(file) = open_cached::open(p.as_ref()) {
+            return Handle::adopt(file, Kind::File);
+        }
         let path = p.as_ref().to_path_buf();
         let file = ops::blocking(move || StdFile::open(path)).await?;
         Handle::new(file)

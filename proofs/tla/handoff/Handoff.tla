@@ -1,21 +1,26 @@
 ------------------------------ MODULE Handoff ------------------------------
 (***************************************************************************)
 (* The shard handoff (src/rt/handoff/, its callers in src/rt/shard.rs and  *)
-(* src/rt/context.rs: `poll_watched`, the bracket of `current`) on a       *)
-(* machine whose stores wait in a store buffer, as x86's do. A shard no    *)
-(* monitor watches has no slot, and its polls (`poll_unwatched`) take no   *)
-(* part in this protocol.                                                  *)
+(* src/rt/context.rs: `poll_watched`, `run_task_watched`, the bracket of   *)
+(* `bracketed`, which `current`, `current_held` and every owner's path a   *)
+(* task's code takes on a watched shard go through: `queue_here_bracketed` *)
+(* in src/rt/sched.rs, `poll_read_any` and `poll_write_any` in             *)
+(* src/io/source/) on a machine whose stores wait in a store buffer, as    *)
+(* x86's do. A shard no monitor watches has no slot, and its polls         *)
+(* (`poll_unwatched`) and calls take no part in this protocol.             *)
 (*                                                                          *)
 (* In plain words: one thread at a time runs a shard (its runner). Each    *)
 (* runner has a slot of its own: a word it writes (in the loop, or in a    *)
 (* task's poll at some epoch) and a claim the monitor writes (none,        *)
 (* pending, taken). Before each poll the runner writes "task" and leaves   *)
 (* the shard to the task's code; after the poll, and whenever the task's   *)
-(* code calls into the runtime (a bracket), it writes "loop", then reads   *)
-(* its claim, with no fence between the two (a compiler fence only): none  *)
-(* and it goes in; a claim pending it cancels with a compare-and-swap      *)
-(* (pending to none) and goes in, a claim taken it leaves the shard. The   *)
-(* monitor, *)
+(* code calls into the runtime (a bracket: the mark of the call), it       *)
+(* writes "loop", then reads its claim, with no fence between the two (a   *)
+(* compiler fence only): none and it goes in; a claim pending it cancels   *)
+(* with a compare-and-swap (pending to none) and goes in, a claim taken it *)
+(* leaves the shard. A call reads the word it left first (its own last     *)
+(* store) and writes it back as it ends, so the poll is outside again and  *)
+(* can still be taken if it blocks after the call. The monitor,            *)
 (* seeing a runner in one poll too long, writes "pending", runs the heavy  *)
 (* fence (membarrier: every thread's buffered stores reach memory), then   *)
 (* reads the runner's word again: still the same "task", and the runner is *)
@@ -144,7 +149,9 @@ P_push:
 end process;
 
 fair process thread \in Threads
-variables sl = 0, e = 0, polls = 0, c = NONE, br = 0;
+\* sl: the slot the thread runs with; e: its poll's epoch; polls: polls this turn; c: the claim it
+\* read; br: calls this poll made; saved: the word a call read at its start, put back at its end.
+variables sl = 0, e = 0, polls = 0, c = NONE, br = 0, saved = 0;
 begin
 T_begin:
     if self = 1 then
@@ -194,9 +201,14 @@ R_task:
         goto Blocked;
     end either;
 B_store:
-    \* A bracket: the task calls into the runtime. word := loop, a compiler fence only.
+    \* A bracket: the task calls into the runtime (`Slot::mark`). It reads the word it left, its own
+    \* newest store (the poll's "task"), and marks the call: word := loop, a compiler fence only.
     await Len(buf[self]) < BufCap;
-    buf[self] := Append(buf[self], <<"word", sl, 0>>);
+    saved := ReadAt(word, buf[self], "word", sl);
+    \* (MUTATION no_call_mark: the call reads its claim with no mark first.)
+    if Mode # "no_call_mark" then
+        buf[self] := Append(buf[self], <<"word", sl, 0>>);
+    end if;
 B_check:
     c := ReadAt(claim, buf[self], "claim", sl);
     if c = NONE \/ Mode = "no_bracket_check" then
@@ -219,11 +231,16 @@ B_cas:
         inS := inS \cup {self};
     end if;
 B_in:
-    \* The runtime's work, inside the shard; then word := (task, e), a release store.
+    \* The runtime's work, inside the shard; then the call ends (`Slot::unmark`).
     inS := inS \ {self};
 B_out:
-    await Len(buf[self]) < BufCap;
-    buf[self] := Append(buf[self], <<"word", sl, e>>);
+    \* word := the word the call read at its start, a release store: outside the shard again.
+    \* (MUTATION call_stays_marked: the call leaves its mark, so the word says loop for the rest
+    \* of the poll.)
+    if Mode # "call_stays_marked" then
+        await Len(buf[self]) < BufCap;
+        buf[self] := Append(buf[self], <<"word", sl, saved>>);
+    end if;
     goto R_task;
 E_store:
     \* The poll ends: word := loop, a compiler fence only.

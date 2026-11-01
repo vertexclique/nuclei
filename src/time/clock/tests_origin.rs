@@ -1,9 +1,13 @@
 //! The origin's reading of the monotonic clock: known where std's instants are that clock's
 //! readings, and the same as what std's own arithmetic gives.
 
-use std::time::{Duration, Instant};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::time::Duration;
+use std::time::Instant;
 
-use super::{monotonic, nanos, reading_of, system_nanos};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use super::{monotonic, reading_of};
+use super::{nanos, system_nanos};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
