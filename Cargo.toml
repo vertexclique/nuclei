@@ -116,6 +116,9 @@ harness = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(nuclei_nightly)'] }
 
 
+[package.metadata.docs.rs]
+features = ["io-stats"]
+
 [workspace]
 members = [
   ".",
