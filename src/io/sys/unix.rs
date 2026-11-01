@@ -73,7 +73,7 @@ pub(super) fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T>
 
 /// Whether a call was cut short by a signal.
 #[inline(always)]
-fn interrupted(e: &io::Error) -> bool {
+pub(super) fn interrupted(e: &io::Error) -> bool {
     match e.raw_os_error() {
         Some(code) => code == libc::EINTR,
         None => e.kind() == io::ErrorKind::Interrupted,
@@ -111,8 +111,21 @@ unsafe fn read_raw(fd: RawFd, buf: *mut u8, len: usize) -> io::Result<usize> {
     return cvt(unsafe { libc::read(fd, buf.cast(), len) });
 }
 
-/// `read(2)` (also a stream socket's receive).
+/// `read(2)` (also a stream socket's receive). Inlined: a call a signal cut
+/// short is made again out of line.
+#[inline(always)]
 pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: writes at most `buf.len()` bytes into `buf`.
+    match unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) } {
+        Err(e) if interrupted(&e) => read_again(fd, buf),
+        other => other,
+    }
+}
+
+/// [`read`] once a signal cut it short.
+#[cold]
+#[inline(never)]
+fn read_again(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
     retry(|| unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) })
 }

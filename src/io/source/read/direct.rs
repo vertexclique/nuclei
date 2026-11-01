@@ -146,7 +146,12 @@ impl ReadState {
         {
             self.readable = false;
         }
-        match sys::ready(call(fd, inq)) {
+        // A read that came back goes on inline; one that failed is looked at out of line.
+        let called = match call(fd, inq) {
+            Ok(read) => Some(Ok(read)),
+            Err(err) => sys::ready(Err(err)),
+        };
+        match called {
             None => {
                 match io.via {
                     Via::Fd(_) => self.blocked = true,
