@@ -264,6 +264,33 @@ impl BufRing {
         Ok(())
     }
 
+    /// Queues every buffer, in id order, for the kernel to use: what [`BufRing::add`] of each id
+    /// does, in one pass. Fails, queuing none, when descriptors are queued and not committed.
+    pub(crate) fn add_all(&mut self) -> io::Result<()> {
+        if self.pending != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "more buffers were added than the ring holds",
+            ));
+        }
+        let descs = self.maps.0.as_ptr().cast::<IoUringBuf>();
+        let bufs = self.maps.1.map.as_ptr();
+        for bid in 0..self.entries {
+            let slot = self.tail.wrapping_add(bid) & (self.entries - 1);
+            let buf = bufs.wrapping_add(usize::from(bid) * self.buf_size as usize);
+            // SAFETY: as in `add`: `slot` is below `entries`, so the descriptor lies inside the
+            // ring mapping, and only `addr`, `len` and `bid` are written.
+            unsafe {
+                let desc = descs.add(usize::from(slot));
+                addr_of_mut!((*desc).addr).write(buf.expose_provenance() as u64);
+                addr_of_mut!((*desc).len).write(self.buf_size);
+                addr_of_mut!((*desc).bid).write(bid);
+            }
+        }
+        self.pending = self.entries;
+        Ok(())
+    }
+
     /// Publishes every descriptor added since the last commit to the kernel.
     pub(crate) fn commit(&mut self) {
         if self.pending == 0 {

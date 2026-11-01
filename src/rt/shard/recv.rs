@@ -194,9 +194,7 @@ impl RecvGroup {
                 // Refused (an older kernel) or not asked: the plain group.
                 _ => (BufRing::new(ring, GROUP, entries, size)?, false),
             };
-        for bid in 0..entries {
-            buffers.add(bid)?;
-        }
+        buffers.add_all()?;
         buffers.commit();
         let back = Arc::new(Returns {
             mem: Arc::clone(buffers.memory()),
