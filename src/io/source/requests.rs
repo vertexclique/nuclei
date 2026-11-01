@@ -29,7 +29,7 @@
 
 use crate::io::raw::{AtomicRaw, Raw};
 use core::cell::UnsafeCell;
-use core::ptr::NonNull;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use core::task::Poll;
 use std::io;
@@ -820,20 +820,36 @@ enum Held {
     More,
 }
 
-/// A boxed object of a type the box no longer names, with its drop.
+/// An object of a type the slot no longer names, with its drop: in the word itself when it fits
+/// there (a socket or a file is its descriptor), else boxed, the word its pointer.
 struct Erased {
-    ptr: NonNull<()>,
-    drop: unsafe fn(NonNull<()>),
+    word: MaybeUninit<*mut ()>,
+    drop: unsafe fn(MaybeUninit<*mut ()>),
 }
 
-/// Drops the `Box<T>` behind `ptr`.
+/// Whether a `T` fits in [`Erased::word`].
+const fn fits_in_word<T>() -> bool {
+    size_of::<T>() <= size_of::<*mut ()>() && align_of::<T>() <= align_of::<*mut ()>()
+}
+
+/// Drops the `T` the word holds.
 ///
 /// # Safety
 ///
-/// `ptr` came from `Box::<T>::into_raw` and is dropped once.
-unsafe fn drop_boxed<T>(ptr: NonNull<()>) {
+/// `word` holds a `T` written by [`Keep::hand_over`], dropped once.
+unsafe fn drop_in_word<T>(word: MaybeUninit<*mut ()>) {
+    // SAFETY: as the caller promises; the word's alignment is at least `T`'s.
+    drop(unsafe { word.as_ptr().cast::<T>().read() });
+}
+
+/// Drops the `Box<T>` the word points to.
+///
+/// # Safety
+///
+/// The word came from `Box::<T>::into_raw` and is dropped once.
+unsafe fn drop_boxed<T>(word: MaybeUninit<*mut ()>) {
     // SAFETY: as the caller promises.
-    drop(unsafe { Box::from_raw(ptr.cast::<T>().as_ptr()) });
+    drop(unsafe { Box::from_raw(word.assume_init().cast::<T>()) });
 }
 
 // SAFETY: the object is written by the handing thread before its holds can
@@ -856,9 +872,19 @@ impl Keep {
     /// The handle hands its object over, before it asks for the close (so
     /// the close's hold is still up).
     fn hand_over<T>(&self, io: T) {
-        let erased = Erased {
-            ptr: NonNull::from(Box::leak(Box::new(io))).cast(),
-            drop: drop_boxed::<T>,
+        let erased = if fits_in_word::<T>() {
+            let mut word = MaybeUninit::<*mut ()>::uninit();
+            // SAFETY: the word has the room and the alignment of a `T` (`fits_in_word`).
+            unsafe { word.as_mut_ptr().cast::<T>().write(io) };
+            Erased {
+                word,
+                drop: drop_in_word::<T>,
+            }
+        } else {
+            Erased {
+                word: MaybeUninit::new(Box::into_raw(Box::new(io)).cast()),
+                drop: drop_boxed::<T>,
+            }
         };
         // SAFETY: the close's hold is up, so no release takes the slot yet.
         unsafe { *self.object.get() = Some(erased) };
@@ -876,8 +902,8 @@ impl Keep {
             1 => {
                 // SAFETY: the last hold: no other thread reaches the slot.
                 if let Some(erased) = unsafe { (*self.object.get()).take() } {
-                    // SAFETY: made from `Box::<T>::into_raw` with its own drop.
-                    unsafe { (erased.drop)(erased.ptr) };
+                    // SAFETY: made by `hand_over` with its own drop.
+                    unsafe { (erased.drop)(erased.word) };
                 }
                 Held::Dropped
             }
@@ -896,8 +922,8 @@ impl Drop for Keep {
     fn drop(&mut self) {
         // A source dropped with its object still kept (no close was asked).
         if let Some(erased) = self.object.get_mut().take() {
-            // SAFETY: made from `Box::<T>::into_raw` with its own drop.
-            unsafe { (erased.drop)(erased.ptr) };
+            // SAFETY: made by `hand_over` with its own drop.
+            unsafe { (erased.drop)(erased.word) };
         }
     }
 }

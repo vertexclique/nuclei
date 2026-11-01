@@ -647,3 +647,63 @@ fn a_drain_whose_registration_a_stopped_shard_never_made_delivers_every_byte() {
     src.close(mine);
     drop(rt);
 }
+
+/// An object wider than a word, which a dropped handle hands over boxed: it is dropped once, by
+/// the last to let go, as one that fits in the word (a socket) is.
+#[cfg(unix)]
+struct Wide {
+    stream: Stream,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+    _room: [u64; 3],
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for Wide {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Wide {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dropped_handle_of_an_object_wider_than_a_word_drops_it_once_the_holder_lets_go() {
+    let (mine, peer) = stream_pair();
+    peer.set_nonblocking(true).unwrap();
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle = Handle::new(Wide {
+        stream: mine,
+        drops: Arc::clone(&drops),
+        _room: [0; 3],
+    })
+    .unwrap();
+    let src = Arc::clone(handle.source());
+    let held = src.read.try_hold().expect("the side is free");
+    drop(handle);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "dropped while a side was held"
+    );
+    assert!(
+        !peer_sees_end(&peer),
+        "the descriptor closed while a side was held"
+    );
+    let mut after = After::default();
+    held.release(&mut after, &src.hooks());
+    after.run();
+    assert_eq!(drops.load(Ordering::SeqCst), 1, "not dropped exactly once");
+    assert!(peer_sees_end(&peer), "the close never ran");
+    drop(src);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "dropped again with the source"
+    );
+}
