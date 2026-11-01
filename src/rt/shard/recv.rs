@@ -113,12 +113,21 @@ pub(crate) struct Returns {
 /// chunks drops and the kernel is done with it.
 pub(crate) struct RingChunk {
     back: Arc<Returns>,
+    /// The first byte of the buffer, in the memory `back` keeps mapped.
+    base: core::ptr::NonNull<u8>,
     bid: u16,
     start: u32,
     end: u32,
     owner: u64,
     len: u32,
 }
+
+// SAFETY: `base` points into the buffer memory `back` keeps mapped, which is plain memory, and
+// the kernel does not write the buffer while the chunk lives (see `bytes`): reading it from any
+// thread is as for the rest of the fields.
+unsafe impl Send for RingChunk {}
+// SAFETY: as for `Send`; a shared chunk only reads.
+unsafe impl Sync for RingChunk {}
 
 /// The memory a group of `buffers` buffers of `size` bytes takes, its descriptor ring included:
 /// what the shard's ledger is charged while it lives.
@@ -263,6 +272,7 @@ impl RecvGroup {
         let fill = self.fills.get_mut(usize::from(bid))?;
         let start = if self.incremental { fill.used } else { 0 };
         let end = start.checked_add(len).filter(|&end| end <= size)?;
+        let base = self.back.mem.base(bid)?;
         fill.used = end;
         fill.live += 1;
         fill.done = !more;
@@ -272,6 +282,7 @@ impl RecvGroup {
         }
         Some(RingChunk {
             back: Arc::clone(&self.back),
+            base,
             bid,
             start,
             end,
@@ -370,9 +381,16 @@ impl RecvGroup {
 impl RingChunk {
     /// The bytes not taken yet.
     pub(crate) fn bytes(&self) -> &[u8] {
-        // SAFETY: the buffer was handed out and goes back only when this
-        // chunk drops, so the kernel does not write it while it lives.
-        unsafe { self.back.mem.bytes(self.bid, self.start, self.end) }.unwrap_or_default()
+        // SAFETY: `start <= end <= buf_size` (as handed out, and as `narrow` and `consume` keep
+        // them), so the range lies inside the buffer `back` keeps mapped; the buffer was handed
+        // out and goes back only when this chunk drops, so the kernel does not write it while it
+        // lives.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.base.as_ptr().add(self.start as usize),
+                (self.end - self.start) as usize,
+            )
+        }
     }
 
     /// Keeps only bytes `start..end` of the buffer: the payload of a
