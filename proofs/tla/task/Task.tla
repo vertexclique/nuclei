@@ -251,13 +251,15 @@ R_pop:
         dropped := FALSE;
     end if;
 R_start:
-    \* The first exchange of the run: a task cancelled in the queue is not polled.
+    \* The first exchange of the run, one addition: SCHEDULED, which the task of every runnable
+    \* has and nothing clears while the runnable waits, becomes RUNNING, whatever else the word
+    \* holds. A task cancelled in the queue is then not polled.
     touch();
+    sch := FALSE;
+    run := TRUE;
     if clo then
         goto R_closed;
     else
-        sch := FALSE;
-        run := TRUE;
         polling := polling + 1;
         maxPolling := Max2(maxPolling, polling);
     end if;
@@ -430,14 +432,16 @@ R_drop:
     dropRef();
     goto R_pop;
 R_closed:
-    \* Cancelled while it waited in the queue: drop the future, then clear SCHEDULED.
+    \* Cancelled while it waited in the queue: drop the future, then clear RUNNING, which the
+    \* first exchange set.
     touch();
     dropFuture("runner");
     cancelledQueued := TRUE;                 \* (record)
 R_closed_clear:
     touch();
     prevAwt := awt;
-    sch := FALSE;
+    \* MUTATION closed_keeps_running: RUNNING stays set, so the task looks polled for ever.
+    if Mutation # "closed_keeps_running" then run := FALSE; end if;
 R_finish:
     \* `finish`: take the awaiter, drop the run's reference, then wake the awaiter.
     if prevAwt then call Take(FALSE); end if;
@@ -692,9 +696,14 @@ AwaitGetsOutput == (HandleOp = "await" /\ pc[HandleT] = "Done") => handleGot = "
 \* spawner spawns again: tests/zero_alloc.rs).
 RunnerFreesNoAwaited == freer = "runner" => ~awaitedAtComplete
 
+\* A runner starts a run only on a task that is scheduled and not running: what lets the
+\* run's first exchange be one addition that turns SCHEDULED into RUNNING.
+RunnableScheduled == \A r \in Runners : pc[r] = "R_start" => (sch /\ ~run)
+
 \* All the safety properties together.
 Safe == OnePoll /\ FutureOnce /\ NoPollAfterDrop /\ NothingAfterFree /\ OutputOnce
         /\ FreedAfterFuture /\ CleanEnd /\ AwaitGetsOutput /\ RunnerFreesNoAwaited
+        /\ RunnableScheduled
 
 (***************************************************************************)
 (* Witnesses. Each one claims an interesting case never happens; a         *)

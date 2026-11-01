@@ -358,24 +358,19 @@ where
                 ManuallyDrop::new(Waker::from_raw(RawWaker::new(ptr, &header.vtable.waker)));
             let cx = &mut Context::from_waker(&waker);
 
-            let mut state = header.state.load(Ordering::Acquire);
-            loop {
-                if state & CLOSED != 0 {
-                    // Cancelled while it waited in the queue.
-                    Self::drop_future(ptr);
-                    let state = header.state.fetch_and(!SCHEDULED, Ordering::AcqRel);
-                    Self::finish(ptr, state);
-                    return false;
-                }
-                match header.state.compare_exchange_weak(
-                    state,
-                    (state & !SCHEDULED) | RUNNING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => state = actual,
-                }
+            // A runnable's task is scheduled and not running, and nothing
+            // clears SCHEDULED while the runnable waits: one addition turns
+            // SCHEDULED into RUNNING, whatever else the word holds.
+            let state = header
+                .state
+                .fetch_add(RUNNING - SCHEDULED, Ordering::AcqRel);
+            debug_assert_eq!(state & (SCHEDULED | RUNNING), SCHEDULED);
+            if state & CLOSED != 0 {
+                // Cancelled while it waited in the queue.
+                Self::drop_future(ptr);
+                let state = header.state.fetch_and(!RUNNING, Ordering::AcqRel);
+                Self::finish(ptr, state);
+                return false;
             }
 
             // The task and a fresh budget are this thread's for the poll, the

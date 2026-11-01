@@ -23,6 +23,8 @@ M_pending_leaks_future         MC_Task              violated:FreedAfterFuture
 M_release_after_complete       MC_Task              violated:RunnerFreesNoAwaited
 M_pending_two_steps            MC_Task              violated:RunnerFreesNoAwaited
 M_pending_drops_woken          MC_Task              violated:NothingAfterFree
+M_closed_keeps_running         MC_Task              deadlock
+M_wake_running_entry           MC_Task              violated:RunnableScheduled
 W_wake_while_running           MC_Task              violated:NoWakeWhileRunning
 W_cancel_while_running         MC_Task              violated:NoCancelWhileRunning
 W_cancel_in_queue              MC_Task              violated:NoCancelInQueue

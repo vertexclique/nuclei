@@ -209,9 +209,10 @@ fn wake_racing_poll(lose_wakes: bool) {
 
 #[test]
 fn a_wake_racing_the_poll_is_never_lost() {
-    // The floors below count the run's exchanges after its poll as one each: a
-    // completion or a Pending end lets go of the run's reference in its exchange.
-    model("a_wake_racing_the_poll_is_never_lost", 162, || {
+    // The floors below count the run's start as one addition and its exchanges
+    // after its poll as one each: a completion or a Pending end lets go of the
+    // run's reference in its exchange.
+    model("a_wake_racing_the_poll_is_never_lost", 156, || {
         wake_racing_poll(false)
     });
 }
@@ -258,7 +259,7 @@ fn a_cancel_racing_the_run_drops_the_future_once() {
 /// awaiter is woken (or sees the output at once) and gets the output.
 #[test]
 fn an_awaiter_racing_the_completion_is_woken() {
-    model("an_awaiter_racing_the_completion_is_woken", 1448, || {
+    model("an_awaiter_racing_the_completion_is_woken", 911, || {
         let scheds = Count::new();
         let queue = Arc::new(Mutex::new(Vec::new()));
         let (runnable, task) = spawn(async { 7 }, Sched::new(&queue, &scheds));
@@ -277,7 +278,7 @@ fn an_awaiter_racing_the_completion_is_woken() {
 fn a_detach_racing_the_completion_drops_the_output_once() {
     model(
         "a_detach_racing_the_completion_drops_the_output_once",
-        31,
+        22,
         || {
             let (outputs, scheds) = (Count::new(), Count::new());
             let queue = Arc::new(Mutex::new(Vec::new()));
