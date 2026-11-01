@@ -14,19 +14,20 @@ impl Source {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<u32>> {
         let kind = self.kind;
-        self.poll_write_side(cx, false, |st, io, waker, after| {
-            st.fd_ready(io, kind, waker, after)
-        })
+        self.poll_write_side(
+            || cx.waker(),
+            false,
+            |st, io, waker, after| st.fd_ready(io, kind, waker, after),
+        )
     }
 
     /// A caller's descriptor would block on a write: the side waits for its
     /// next edge, unless one came after `tick`.
     #[cfg(unix)]
     pub(crate) fn fd_clear_write(self: &Arc<Self>, tick: u32) {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
         // Nothing to wait for and nothing to fail: a registration that
         // failed is the next readiness call's to report.
-        let _ = self.poll_write_side(&mut cx, false, |st, _io, _waker, _after| {
+        let _ = self.poll_write_side(Waker::noop, false, |st, _io, _waker, _after| {
             st.fd_clear(tick);
             Poll::Ready(Ok(()))
         });
@@ -88,6 +89,7 @@ impl Source {
             cx,
             #[inline(always)]
             |cx| {
+                let cx_waker = cx.waker();
                 // Whether the owner's send below found the socket full, so the step does not
                 // ask the kernel again.
                 #[cfg(unix)]
@@ -99,10 +101,10 @@ impl Source {
                 #[cfg(not(unix))]
                 let asked = false;
                 if let Some(io) = self.here(&self.write) {
-                    owner_poll!(self, self.write, io, cx.waker(), |st, after, waker| self
+                    owner_poll!(self, self.write, io, cx_waker, |st, after, waker| self
                         .write_step(st, io, waker, after, bufs, wait, asked));
                 }
-                self.poll_write_any(cx, bufs, wait, asked)
+                self.poll_write_any(cx_waker, bufs, wait, asked)
             },
         )
     }
@@ -171,17 +173,18 @@ impl Source {
     }
 
     /// [`poll_write_bufs`](Self::poll_write_bufs) for every poll [`here`](Self::here) does not
-    /// take.
+    /// take, given the poll's waker, all of its context a write looks at.
     #[inline(never)]
     fn poll_write_any(
         self: &Arc<Self>,
-        cx: &mut Context<'_>,
+        waker: &Waker,
         bufs: &[io::IoSlice<'_>],
         wait: bool,
         asked: bool,
     ) -> Poll<io::Result<usize>> {
-        self.poll_writing(
-            cx,
+        self.poll_write_side(
+            || waker,
+            true,
             #[inline(always)]
             |st, io, waker, after| self.write_step(st, io, waker, after, bufs, wait, asked),
         )
@@ -225,15 +228,16 @@ impl Source {
         cx: &mut Context<'_>,
         step: impl FnMut(&mut WriteState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
-        self.poll_write_side(cx, true, step)
+        self.poll_write_side(|| cx.waker(), true, step)
     }
 
     /// Polls the write side with `step`: for the handle's own writes when
-    /// `drive`, else for its caller's calls.
+    /// `drive`, else for its caller's calls. `waker` gives the poll's waker
+    /// where it is used, as the read side's does.
     #[inline(always)]
-    fn poll_write_side<R>(
+    fn poll_write_side<'w, R>(
         self: &Arc<Self>,
-        cx: &mut Context<'_>,
+        waker: impl Fn() -> &'w Waker,
         drive: bool,
         mut step: impl FnMut(&mut WriteState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
@@ -243,7 +247,7 @@ impl Source {
             |io| {
                 self.write.poll(
                     &mut after,
-                    cx.waker(),
+                    waker(),
                     &self.hooks_in(io.shard),
                     #[inline(always)]
                     |st, after| {
@@ -253,7 +257,7 @@ impl Source {
                         }
                         #[cfg(not(unix))]
                         let _ = drive;
-                        step(st, io, cx.waker(), after)
+                        step(st, io, waker(), after)
                     },
                 )
             },
