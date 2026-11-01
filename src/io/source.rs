@@ -437,7 +437,7 @@ pub(crate) struct Source {
     /// A multishot receive's or accept's arrivals, from its ring's thread to
     /// the read side's holder, in order, each with the epoch it came in.
     #[cfg(ring)]
-    read_arrivals: crate::rt::shard::counted::Counted<(ring::Arrival, u32)>,
+    read_arrivals: crate::rt::shard::counted::LazyCounted<(ring::Arrival, u32)>,
     /// The sides' operations in the kernel's hands: a retire waits until
     /// none is.
     #[cfg(completion)]
@@ -531,7 +531,7 @@ impl Source {
                 #[cfg(completion)]
                 write_done: ops::Mailbox::default(),
                 #[cfg(ring)]
-                read_arrivals: crate::rt::shard::counted::Counted::new(),
+                read_arrivals: crate::rt::shard::counted::LazyCounted::new(),
                 #[cfg(completion)]
                 ops_out: core::sync::atomic::AtomicU8::new(0),
                 #[cfg(port)]

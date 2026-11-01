@@ -6,9 +6,12 @@
 //! count. An item whose count is not seen yet stays for the consumer's next take, as a push under
 //! way does in the queue itself (proofs/tla/counted/Counted.tla).
 
+use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kovan_queue::seg_queue::SegQueue;
+
+use crate::sync::internal::{AtomicPtr, take_ptr};
 
 /// A queue of many producers and one consumer, counted (see the module docs).
 pub(crate) struct Counted<T> {
@@ -71,5 +74,85 @@ impl<T> Counted<T> {
     }
 }
 
+/// A [`Counted`] made at its first push: one word until then, so an owner that seldom queues
+/// (a source whose arrivals mostly go straight to a free side) allocates nothing for it, and keeps
+/// the queue's cache-line alignment out of its own layout. A push that loses the race to make it
+/// frees its own and uses the one made.
+pub(crate) struct LazyCounted<T> {
+    queue: AtomicPtr<Counted<T>>,
+}
+
+impl<T> LazyCounted<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// The queue, if a push made it.
+    #[inline(always)]
+    fn made(&self) -> Option<&Counted<T>> {
+        // SAFETY: a published queue lives until the drop, which takes `&mut self`; Acquire pairs
+        // with the publishing Release, so its words are seen whole.
+        unsafe { self.queue.load(Ordering::Acquire).as_ref() }
+    }
+
+    /// As [`Counted::push`], making the queue first if no push did.
+    pub(crate) fn push(&self, item: T) {
+        match self.made() {
+            Some(queue) => queue.push(item),
+            None => self.make().push(item),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn make(&self) -> &Counted<T> {
+        let fresh = Box::into_raw(Box::new(Counted::new()));
+        match self.queue.compare_exchange(
+            ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // SAFETY: published, it lives until the drop.
+            Ok(_) => unsafe { &*fresh },
+            Err(made) => {
+                // SAFETY: `fresh` was never published; `made` was, and lives until the drop.
+                unsafe {
+                    drop(Box::from_raw(fresh));
+                    &*made
+                }
+            }
+        }
+    }
+
+    /// As [`Counted::is_empty`]; a queue not made yet holds nothing.
+    #[inline(always)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.made().is_none_or(Counted::is_empty)
+    }
+
+    /// As [`Counted::take_all`].
+    #[inline(always)]
+    pub(crate) fn take_all(&self, take: impl FnMut(T)) {
+        if let Some(queue) = self.made() {
+            queue.take_all(take);
+        }
+    }
+}
+
+impl<T> Drop for LazyCounted<T> {
+    fn drop(&mut self) {
+        let queue = take_ptr(&mut self.queue);
+        if !queue.is_null() {
+            // SAFETY: the box `make` published, let go of once, here.
+            drop(unsafe { Box::from_raw(queue) });
+        }
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests;
+#[cfg(all(test, not(loom)))]
+mod tests_lazy;
