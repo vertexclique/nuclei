@@ -205,12 +205,15 @@ impl Shard {
             // costs neither a park nor the kernel's wake of this thread. The
             // queues of posted work, which a moment ago held nothing (they
             // were applied above), are looked at last, past ready IO.
-            if self.spin.run(self.work_may_come_soon(), || {
-                self.has_remote_tasks()
-                    || signal.woken.load(Ordering::Relaxed)
-                    || self.io_ready_now()
-                    || self.has_posted_ops()
-            }) {
+            if self.spin.run(
+                || self.work_may_come_soon(),
+                || {
+                    self.has_remote_tasks()
+                        || signal.woken.load(Ordering::Relaxed)
+                        || self.io_ready_now()
+                        || self.has_posted_ops()
+                },
+            ) {
                 continue;
             }
             self.before_park();
