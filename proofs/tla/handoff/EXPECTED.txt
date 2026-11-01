@@ -20,3 +20,8 @@ M_late_ref            TakeRef     violated:NoLoss
 M_keep_ref            TakeRef     violated:RefsHeld
 W_take                TakeRef     violated:NoTake
 W_failed_take         TakeRef     violated:NoFailedTake
+A_safe                Asleep      pass
+M_no_backout_ring     Asleep      violated:Watched
+M_no_wake_ring        Asleep      violated:Watched
+M_no_second_look      Asleep      violated:Watched
+W_backout_asleep      Asleep      violated:NoBackOutAsleep
