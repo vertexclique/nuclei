@@ -93,7 +93,9 @@ impl<T> MessageQueue<T> for Bounded<T> {
         }
     }
 
-    #[inline]
+    // Inlined at each of the receiver's looks: a look that finds the ring
+    // empty is a few loads, which a call would double.
+    #[inline(always)]
     unsafe fn try_pop(&self) -> Option<T> {
         match self {
             // SAFETY: the caller's contract, passed on.

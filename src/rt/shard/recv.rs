@@ -260,6 +260,7 @@ impl RecvGroup {
     /// next completion on it continues after these); `None` for an id or a
     /// length outside the group (the buffer then goes back with
     /// [`give_back`](Self::give_back)).
+    #[inline(always)]
     pub(crate) fn hand_out(
         &mut self,
         user_data: u64,

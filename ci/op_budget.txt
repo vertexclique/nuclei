@@ -1,8 +1,8 @@
 # row backend instructions_per_op tolerance_percent: medians of ci/op_counts.sh on the CI runner; the tolerance is 1.5 times the observed min-max spread, at least 1.
 block_on io_uring 311 1
 block_on epoll 287 1
-mpsc io_uring 619 1
-mpsc epoll 616 1
+mpsc io_uring 513 1
+mpsc epoll 511 1
 timeout io_uring 71 1
 timeout epoll 71 1
 tcp io_uring 3686 1
