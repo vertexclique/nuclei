@@ -37,6 +37,12 @@ pub(crate) enum Want {
     /// the kernel, so a write side's ends at once).
     #[cfg(completion)]
     Ready { read: bool },
+    /// Wait, until stopped, for the socket of a side that receives its
+    /// datagrams itself to be readable: each time it may be, the side is told
+    /// with an arrival ([`Arrival::Ready`](crate::io::source::ring::Arrival)),
+    /// and the poll stays armed (its end as [`Outcome::ReadyMultiEnd`]).
+    #[cfg(ring)]
+    ReadyMulti,
     /// Accept a connection.
     Accept,
     /// Accept connections as they come, until the accept is stopped: each
@@ -103,7 +109,7 @@ impl Want {
             | Want::RecvFrom(_)
             | Want::RecvLentFrom(_) => true,
             #[cfg(ring)]
-            Want::RecvMulti | Want::AcceptMulti | Want::RecvFromMulti => true,
+            Want::RecvMulti | Want::AcceptMulti | Want::RecvFromMulti | Want::ReadyMulti => true,
             Want::Connect(_)
             | Want::Send(_)
             | Want::SendLent(..)
@@ -193,6 +199,10 @@ pub(crate) enum Answer<T> {
 pub(crate) enum Outcome {
     #[cfg(completion)]
     Ready(Answer<()>),
+    /// A multishot poll ended: on an error, a stop, or after its last
+    /// arrival (`Done(Ok(()))`, handed over already).
+    #[cfg(ring)]
+    ReadyMultiEnd(Answer<()>),
     Accept(Answer<(Owned, Addr)>),
     /// A multishot accept ended: after its last connection (`Done(Ok(()))`,
     /// handed over already), an error, or a stop.

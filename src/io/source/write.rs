@@ -802,6 +802,26 @@ impl WriteState {
         }
     }
 
+    /// Whether a datagram send must go through the side, and a writable edge
+    /// reach it (`quick`): it reports an error first, holds or waits for
+    /// something, has a call that found the socket full and no edge since,
+    /// or the caller makes its own calls.
+    #[cfg(unix)]
+    pub(super) fn quick_holds(&self) -> bool {
+        let holds = self.blocked
+            || !self.waiters.is_empty()
+            || self.error.is_some()
+            || self.queued.is_some()
+            || self.lent_waits()
+            || self.behind.is_some()
+            || self.connecting
+            || self.user_fd
+            || self.ring_holds();
+        #[cfg(ring)]
+        let holds = holds || self.poll_first;
+        holds
+    }
+
     /// Bytes or a datagram accepted and not handed to the kernel yet, that
     /// the driver can still deliver.
     pub(super) fn has_unsent(&self) -> bool {

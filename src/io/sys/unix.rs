@@ -13,14 +13,14 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net as unix;
-use std::path::Path;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
+mod unix_addr;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use self::linux::{UNIX_INQ, enable_inq, read_inq, syscall};
+pub(crate) use self::unix_addr::{UnixAddr, unix_addr};
 
 /// A std socket of type `S` over `fd` for one call, never closed by it.
 ///
@@ -61,9 +61,19 @@ fn counted(e: io::Error) -> io::Error {
 pub(super) fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         match call() {
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // The code itself, not std's kind (which is decoded from it).
+            Err(e) if interrupted(&e) => {}
             other => return other,
         }
+    }
+}
+
+/// Whether a call was cut short by a signal.
+#[inline(always)]
+fn interrupted(e: &io::Error) -> bool {
+    match e.raw_os_error() {
+        Some(code) => code == libc::EINTR,
+        None => e.kind() == io::ErrorKind::Interrupted,
     }
 }
 
@@ -541,101 +551,6 @@ pub(crate) fn connect_unix(fd: RawFd, addr: &UnixAddr) -> io::Result<bool> {
     connect_raw(fd, addr.as_ptr(), addr.len)
 }
 
-/// A Unix socket address in its raw form: a path, or on Linux an
-/// abstract name. Made once on the caller's stack and copied by value, so
-/// no send, connect or bind allocates for its address.
-#[derive(Clone, Copy)]
-pub(crate) struct UnixAddr {
-    pub(crate) raw: libc::sockaddr_un,
-    pub(crate) len: libc::socklen_t,
-}
-
-impl UnixAddr {
-    /// The address of the socket file at `path`.
-    pub(crate) fn path(path: &Path) -> io::Result<UnixAddr> {
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the socket path holds a NUL byte",
-            ));
-        }
-        // The path, then its terminating zero.
-        Self::from_bytes(bytes, 1)
-    }
-
-    /// The address in Linux's abstract namespace named `name`.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(crate) fn abstract_name(name: &[u8]) -> io::Result<UnixAddr> {
-        let mut with_nul = [0u8; 108];
-        let len = name.len() + 1;
-        if len > with_nul.len() {
-            return Err(too_long());
-        }
-        with_nul[1..len].copy_from_slice(name);
-        Self::from_bytes(&with_nul[..len], 0)
-    }
-
-    /// The raw form of std's address: a path, or (Linux) an abstract name.
-    pub(crate) fn of(addr: &unix::SocketAddr) -> io::Result<UnixAddr> {
-        if let Some(path) = addr.as_pathname() {
-            return Self::path(path);
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            #[cfg(target_os = "android")]
-            use std::os::android::net::SocketAddrExt;
-            #[cfg(target_os = "linux")]
-            use std::os::linux::net::SocketAddrExt;
-            if let Some(name) = addr.as_abstract_name() {
-                return Self::abstract_name(name);
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "an unnamed Unix socket address names no socket",
-        ))
-    }
-
-    /// `bytes` in `sun_path`, followed by `extra` counted zero bytes.
-    fn from_bytes(bytes: &[u8], extra: usize) -> io::Result<UnixAddr> {
-        // SAFETY: plain data; all zeroes is a valid value.
-        let mut raw: libc::sockaddr_un = unsafe { core::mem::zeroed() };
-        if bytes.len() + extra > raw.sun_path.len() {
-            return Err(too_long());
-        }
-        raw.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        for (dst, &src) in raw.sun_path.iter_mut().zip(bytes) {
-            *dst = src as libc::c_char;
-        }
-        let len = core::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + extra;
-        Ok(UnixAddr {
-            raw,
-            len: len as libc::socklen_t,
-        })
-    }
-
-    pub(crate) fn as_ptr(&self) -> *const libc::sockaddr {
-        (&self.raw as *const libc::sockaddr_un).cast()
-    }
-}
-
-fn too_long() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "the socket address is too long",
-    )
-}
-
-impl core::fmt::Debug for UnixAddr {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match unix_addr(&self.raw, self.len) {
-            Ok(addr) => write!(f, "{addr:?}"),
-            Err(_) => f.write_str("(unnamed)"),
-        }
-    }
-}
-
 fn connect_raw(fd: RawFd, addr: *const libc::sockaddr, len: libc::socklen_t) -> io::Result<bool> {
     // SAFETY: `addr` points at `len` bytes of address the caller built.
     if unsafe { libc::connect(fd, addr, len) } == 0 {
@@ -651,15 +566,15 @@ fn connect_raw(fd: RawFd, addr: *const libc::sockaddr, len: libc::socklen_t) -> 
 }
 
 /// `recvfrom(2)` into memory not written yet: the kernel writes the bytes it
-/// returns, and the sender's raw address. With `peek` the datagram stays on
-/// the socket.
+/// returns, and the sender's raw address into `storage`, whose length it
+/// answers with. With `peek` the datagram stays on the socket.
+#[inline(always)]
 fn recv_from_raw(
     fd: RawFd,
     buf: &mut [core::mem::MaybeUninit<u8>],
     peek: bool,
-) -> io::Result<(usize, libc::sockaddr_storage, libc::socklen_t)> {
-    // SAFETY: plain data; all zeroes is a valid value.
-    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    storage: &mut libc::sockaddr_storage,
+) -> io::Result<(usize, libc::socklen_t)> {
     let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let flags = if peek { libc::MSG_PEEK } else { 0 };
     let n = retry(|| {
@@ -674,7 +589,7 @@ fn recv_from_raw(
                     buf.as_mut_ptr() as usize,
                     buf.len(),
                     flags as usize,
-                    (&raw mut storage) as usize,
+                    core::ptr::from_mut(storage) as usize,
                     (&raw mut len) as usize,
                 ],
             )
@@ -687,12 +602,12 @@ fn recv_from_raw(
                 buf.as_mut_ptr().cast(),
                 buf.len(),
                 flags,
-                (&raw mut storage).cast(),
+                core::ptr::from_mut(storage).cast(),
                 &mut len,
             )
         });
     })?;
-    Ok((n, storage, len))
+    Ok((n, len))
 }
 
 /// `sendto(2)` of `buf` to the `len` bytes of address at `addr`, with `SEND_FLAGS`; made as a
@@ -728,27 +643,50 @@ unsafe fn send_to_raw(
 
 /// A datagram from a UDP socket into memory not written yet, with its
 /// sender; with `peek` it stays on the socket.
+#[inline(always)]
 pub(crate) fn recv_from_udp_uninit(
     fd: RawFd,
     buf: &mut [core::mem::MaybeUninit<u8>],
     peek: bool,
 ) -> io::Result<(usize, SocketAddr)> {
-    let (n, storage, len) = recv_from_raw(fd, buf, peek)?;
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let (n, len) = recv_from_raw(fd, buf, peek, &mut storage)?;
     if len == 0 || libc::c_int::from(storage.ss_family) == libc::AF_UNSPEC {
-        // macOS names no sender for a receive into an empty buffer. A connected socket takes
-        // datagrams from its peer alone, whom the kernel names; one connected to nothing has
-        // no sender to give, as std's receive has none.
-        // SAFETY: see `borrow`; the fd is a UDP socket.
-        let socket = unsafe { borrow::<UdpSocket>(fd) };
-        return match socket.peer_addr() {
-            Ok(peer) => Ok((n, peer)),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the system named no sender for a datagram received into an empty buffer",
-            )),
-        };
+        return no_sender(fd, n);
     }
     Ok((n, inet_addr(&storage, len)?))
+}
+
+/// A datagram from a UDP socket into `buf`, with its sender; with `peek` it
+/// stays on the socket.
+#[inline(always)]
+pub(crate) fn recv_from_udp(
+    fd: RawFd,
+    buf: &mut [u8],
+    peek: bool,
+) -> io::Result<(usize, SocketAddr)> {
+    // SAFETY: the kernel only writes bytes into `buf`, so it stays initialized.
+    let into = unsafe { &mut *(core::ptr::from_mut(buf) as *mut [core::mem::MaybeUninit<u8>]) };
+    recv_from_udp_uninit(fd, into, peek)
+}
+
+/// The sender of a datagram the kernel named none for. macOS names none for
+/// a receive into an empty buffer: a connected socket takes datagrams from
+/// its peer alone, whom the kernel names; one connected to nothing has no
+/// sender to give, as std's receive has none.
+#[cold]
+#[inline(never)]
+fn no_sender(fd: RawFd, n: usize) -> io::Result<(usize, SocketAddr)> {
+    // SAFETY: see `borrow`; the fd is a UDP socket.
+    let socket = unsafe { borrow::<UdpSocket>(fd) };
+    match socket.peer_addr() {
+        Ok(peer) => Ok((n, peer)),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the system named no sender for a datagram received into an empty buffer",
+        )),
+    }
 }
 
 /// A datagram from a Unix datagram socket into memory not written yet, with
@@ -758,11 +696,33 @@ pub(crate) fn recv_from_unix_uninit(
     buf: &mut [core::mem::MaybeUninit<u8>],
     peek: bool,
 ) -> io::Result<(usize, unix::SocketAddr)> {
-    let (n, storage, len) = recv_from_raw(fd, buf, peek)?;
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let (n, len) = recv_from_raw(fd, buf, peek, &mut storage)?;
     // SAFETY: an `AF_UNIX` address fits `sockaddr_un`, which the storage is
     // at least as large as.
     let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };
     Ok((n, unix_addr(un, len)?))
+}
+
+/// A datagram from a Unix datagram socket into `buf`, with its sender; with
+/// `peek` it stays on the socket. A receive is std's own, whose address the
+/// kernel writes where std keeps it, so nothing is copied or looked through
+/// to name the sender.
+#[inline(always)]
+pub(crate) fn recv_from_unix(
+    fd: RawFd,
+    buf: &mut [u8],
+    peek: bool,
+) -> io::Result<(usize, unix::SocketAddr)> {
+    if peek {
+        // SAFETY: the kernel only writes bytes into `buf`, so it stays initialized.
+        let into = unsafe { &mut *(core::ptr::from_mut(buf) as *mut [core::mem::MaybeUninit<u8>]) };
+        return recv_from_unix_uninit(fd, into, true);
+    }
+    // SAFETY: see `borrow`; the fd is a Unix datagram socket.
+    let socket = unsafe { borrow::<unix::UnixDatagram>(fd) };
+    retry(|| socket.recv_from(buf))
 }
 
 /// A datagram to `addr` on a UDP socket.
@@ -776,44 +736,6 @@ pub(crate) fn send_to_udp(fd: RawFd, buf: &[u8], addr: SocketAddr) -> io::Result
 pub(crate) fn send_to_unix(fd: RawFd, buf: &[u8], addr: &UnixAddr) -> io::Result<usize> {
     // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
     retry(|| unsafe { send_to_raw(fd, buf, addr.as_ptr(), addr.len) })
-}
-
-/// A Unix socket address from its raw form: a path, an abstract name
-/// (Linux), or unnamed.
-pub(crate) fn unix_addr(
-    storage: &libc::sockaddr_un,
-    len: libc::socklen_t,
-) -> io::Result<unix::SocketAddr> {
-    let base = core::mem::offset_of!(libc::sockaddr_un, sun_path);
-    let path_len = (len as usize)
-        .saturating_sub(base)
-        .min(storage.sun_path.len());
-    // SAFETY: `c_char` and `u8` have one layout; the slice is within
-    // `sun_path`.
-    let raw: &[u8] =
-        unsafe { core::slice::from_raw_parts(storage.sun_path.as_ptr().cast(), path_len) };
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let [0, name @ ..] = raw
-        && !name.is_empty()
-    {
-        #[cfg(target_os = "android")]
-        use std::os::android::net::SocketAddrExt;
-        #[cfg(target_os = "linux")]
-        use std::os::linux::net::SocketAddrExt;
-        return unix::SocketAddr::from_abstract_name(name);
-    }
-    let path = raw.split(|&b| b == 0).next().unwrap_or_default();
-    if path.is_empty() {
-        return unnamed();
-    }
-    unix::SocketAddr::from_pathname(std::ffi::OsStr::from_bytes(path))
-}
-
-/// The unnamed address, from an empty path: no socket is made for it, so a
-/// datagram the kernel handed over is never lost to a process with no
-/// descriptor to spare.
-fn unnamed() -> io::Result<unix::SocketAddr> {
-    unix::SocketAddr::from_pathname("")
 }
 
 /// `offset` as the system's file offset.

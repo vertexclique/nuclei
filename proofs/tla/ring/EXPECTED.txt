@@ -78,11 +78,14 @@ RR_epoll_unix_live             MC_RingRecv          pass
 RR_epoll_udp_live              MC_RingRecv          pass
 RR_ring_unix_live              MC_RingRecv          pass
 RR_ring_udp_live               MC_RingRecv          pass
+RR_ring_udp_direct             MC_RingRecv          pass
+RR_ring_udp_direct_live        MC_RingRecv          pass
 MRR_ahead_largest              MC_RingRecv          violated:NoCut
 MRR_bound_small                MC_RingRecv          violated:NoCut
 MRR_ahead_after_poll           MC_RingRecv          violated:NoCut
 MRR_no_wake_ring               MC_RingRecv          violated:Termination
 MRR_no_wake_edge               MC_RingRecv          violated:Termination
+MRR_armed_waits                MC_RingRecv          violated:Termination
 WRR_wait                       MC_RingRecv          violated:NoWait
 WRR_ahead                      MC_RingRecv          violated:NoAheadTaken
 RV_safe                        MC_RingStarve        pass
