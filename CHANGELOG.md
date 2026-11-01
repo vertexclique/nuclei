@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- **A read on io_uring gets a stream's end that came with its last bytes.** Linux's multishot
+  receive stops trying once the socket's count of what is left says none, a count that leaves out
+  a Unix stream's every end and a TCP reset, and waits for a wake. Bytes and the end that came
+  between its first try and the arming of its poll woke nobody, so the receive took the bytes and
+  waited for good with the end in the socket, and so did the read (three times in CI's full Linux
+  suites, in the Unix reset fault test). The ring's thread now looks at the socket
+  once, at the receive's first arrival after the arming, and stops a receive whose end is queued;
+  the next receive takes it (`proofs/tla/ring/RingEnd.tla`).
 - **A Unix connect to a full backlog no longer holds a thread of the blocking pool.** Linux answers
   it `EAGAIN`, and the connect went to a blocking connect of a new socket on the pool, which a
   dropped future never stopped, and which lost the options set on the caller's socket. It now

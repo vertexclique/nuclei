@@ -20,7 +20,7 @@ impl Shard {
     /// counted in: what a test reads without waiting for the shard to look.
     #[cfg(test)]
     pub(crate) fn publish_now(&self) {
-        self.count_again(self.since_drive.get());
+        self.count_again(self.since_drive());
         self.publish();
     }
 

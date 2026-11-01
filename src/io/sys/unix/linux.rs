@@ -4,7 +4,7 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use super::retry;
+use super::interrupted;
 
 /// The Linux system call `nr` with `args`, made directly where the architecture's call is
 /// written out (x86-64, AArch64), else through libc's `syscall`: a count, or the error of the
@@ -122,11 +122,32 @@ pub(crate) fn enable_inq(fd: RawFd, tcp: bool) -> bool {
     ret == 0
 }
 
+/// Whether the stream socket `fd` has an end queued that its receive count leaves out, by a
+/// `poll(2)` that waits for nothing and takes nothing: a Unix stream's every end (the peer's
+/// close, reset or shutdown of writing), a TCP socket's reset. TCP counts a FIN as a byte left.
+#[cfg(ring)]
+pub(crate) fn end_queued(fd: RawFd, tcp: bool) -> bool {
+    let ends = if tcp {
+        libc::POLLERR
+    } else {
+        libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR
+    };
+    let mut look = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: one `pollfd` of ours and a timeout of zero: the kernel only fills `revents`.
+    unsafe { libc::poll(&mut look, 1, 0) == 1 && look.revents & ends != 0 }
+}
+
 /// `recvmsg(2)` on a stream socket whose count is on (see [`enable_inq`]):
 /// reads into `buf` and answers how many bytes, and how many the receive
 /// queue still holds after them (a pending end of stream counts as one on TCP,
 /// as none on a Unix stream, whose hangup edge says it). The second is `None`
-/// when the kernel gave no count.
+/// when the kernel gave no count. Inlined: a call that failed, or that a
+/// signal cut short, goes on out of line.
+#[inline(always)]
 pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<usize>)> {
     // Room for one `int` of control data, aligned for a `cmsghdr`.
     // SAFETY: `CMSG_SPACE` is arithmetic on its argument.
@@ -139,21 +160,23 @@ pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<u
     };
     // SAFETY: an all-zero `msghdr` is valid (no name, no control data).
     let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
-    let n = retry(|| {
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = CONTROL as _;
-        // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
-        // `CONTROL` into `control`, both of which `msg` points at. Made as a
-        // system call (see `syscall`).
-        unsafe {
-            syscall(
-                libc::SYS_recvmsg,
-                [fd as usize, (&raw mut msg) as usize, 0, 0, 0, 0],
-            )
-        }
-    })?;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = CONTROL as _;
+    // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
+    // `CONTROL` into `control`, both of which `msg` points at. Made as a
+    // system call (see `syscall`).
+    let called = unsafe {
+        syscall(
+            libc::SYS_recvmsg,
+            [fd as usize, (&raw mut msg) as usize, 0, 0, 0, 0],
+        )
+    };
+    let n = match called {
+        Ok(n) => n,
+        Err(err) => return read_inq_failed(fd, buf, err),
+    };
     // SAFETY: the kernel filled `msg`'s control data; the header is read
     // only if it fits, and its data is one `int`.
     let left = unsafe {
@@ -162,6 +185,21 @@ pub(crate) fn read_inq(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<u
             .then(|| libc::CMSG_DATA(cmsg).cast::<u32>().read_unaligned() as usize)
     };
     Ok((n, left))
+}
+
+/// [`read_inq`] whose call failed with `err`: made again if a signal cut it
+/// short, else the error.
+#[cold]
+#[inline(never)]
+fn read_inq_failed(
+    fd: RawFd,
+    buf: &mut [u8],
+    err: io::Error,
+) -> io::Result<(usize, Option<usize>)> {
+    if interrupted(&err) {
+        return read_inq(fd, buf);
+    }
+    Err(err)
 }
 
 /// Whether a control message of `level` and `kind` is a receive's count of what it left.

@@ -16,7 +16,7 @@ use core::task::{Context, Poll};
 use std::time::Duration;
 
 use super::Instant;
-use super::sleep::{Fine, Timer, far_future};
+use super::sleep::{Fine, Timer};
 
 /// Waits until `duration` has passed, to the microsecond.
 ///
@@ -42,12 +42,11 @@ use super::sleep::{Fine, Timer, far_future};
 /// assert_eq!(start.elapsed(), Duration::from_micros(250));
 /// # });
 /// ```
+#[inline]
 pub fn sleep_precise(duration: Duration) -> SleepPrecise {
-    sleep_until_precise(
-        Instant::now()
-            .checked_add(duration)
-            .unwrap_or_else(far_future),
-    )
+    SleepPrecise {
+        timer: Timer::after(duration),
+    }
 }
 
 /// Waits until `deadline`, to the microsecond (see [`sleep_precise`]).
@@ -72,7 +71,7 @@ pub struct SleepPrecise {
 impl SleepPrecise {
     /// The deadline.
     pub fn deadline(&self) -> Instant {
-        self.timer.deadline
+        self.timer.deadline()
     }
 
     /// Whether the deadline has passed.
@@ -89,6 +88,7 @@ impl SleepPrecise {
 impl Future for SleepPrecise {
     type Output = ();
 
+    #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.get_mut().timer.poll(cx)
     }

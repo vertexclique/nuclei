@@ -413,6 +413,17 @@ impl<S> Side<S> {
         self.take(0, hooks)
     }
 
+    /// Whether only the owner `who` ever held the side: biased to it, not shared, and no
+    /// foreign thread came. A foreign holder stores shared mode before its locked take of the
+    /// word, so once it holds, a look on any thread sees the side shared. Plain loads.
+    #[cfg(readiness)]
+    #[inline(always)]
+    pub(crate) fn biased_to(&self, who: usize) -> bool {
+        !self.shared.load(Ordering::Relaxed)
+            && self.intent.load(Ordering::Relaxed) == 0
+            && self.owner.load(Ordering::Relaxed) == who
+    }
+
     /// Whether the side went to shared mode.
     #[cfg(test)]
     pub(crate) fn is_shared(&self) -> bool {

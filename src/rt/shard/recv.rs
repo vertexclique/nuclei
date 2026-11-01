@@ -6,8 +6,9 @@
 //! hands a buffer out as a [`RingChunk`], which the source's reader may take
 //! on any thread; dropped, the chunk puts its buffer on the group's return
 //! queue, and the ring's thread takes the queue in before it next waits. A
-//! chunk dropped on the ring's own thread skips the queue: it goes onto the
-//! group's local list, taken in with it.
+//! chunk dropped on the ring's own thread skips the queue: it is taken in at
+//! once, or, while the ring's operations are borrowed, goes onto the group's
+//! local list, taken in with the queue.
 //! The buffers stay mapped while any chunk lives (see `BufMem`), so a chunk
 //! that outlives its shard still reads memory that is there.
 //!
@@ -28,7 +29,7 @@
 use std::io;
 use std::sync::Arc;
 
-use kovan_queue::seg_queue::SegQueue;
+use super::counted::LazyCounted;
 
 use crate::syscore::linux::iouring::ops::NOT_AN_OP;
 use crate::syscore::linux::iouring::ring::Ring;
@@ -105,7 +106,7 @@ unsafe impl Send for RecvGroup {}
 // is the upgrade path if a peer sending single bytes across many connections shows up in a profile.
 pub(crate) struct Returns {
     mem: Arc<BufMem>,
-    queue: SegQueue<Back>,
+    queue: LazyCounted<Back>,
 }
 
 /// Bytes `start..end` of a buffer a receive's completion handed out, read
@@ -113,12 +114,21 @@ pub(crate) struct Returns {
 /// chunks drops and the kernel is done with it.
 pub(crate) struct RingChunk {
     back: Arc<Returns>,
+    /// The first byte of the buffer, in the memory `back` keeps mapped.
+    base: core::ptr::NonNull<u8>,
     bid: u16,
     start: u32,
     end: u32,
     owner: u64,
     len: u32,
 }
+
+// SAFETY: `base` points into the buffer memory `back` keeps mapped, which is plain memory, and
+// the kernel does not write the buffer while the chunk lives (see `bytes`): reading it from any
+// thread is as for the rest of the fields.
+unsafe impl Send for RingChunk {}
+// SAFETY: as for `Send`; a shared chunk only reads.
+unsafe impl Sync for RingChunk {}
 
 /// The memory a group of `buffers` buffers of `size` bytes takes, its descriptor ring included:
 /// what the shard's ledger is charged while it lives.
@@ -184,13 +194,11 @@ impl RecvGroup {
                 // Refused (an older kernel) or not asked: the plain group.
                 _ => (BufRing::new(ring, GROUP, entries, size)?, false),
             };
-        for bid in 0..entries {
-            buffers.add(bid)?;
-        }
+        buffers.add_all()?;
         buffers.commit();
         let back = Arc::new(Returns {
             mem: Arc::clone(buffers.memory()),
-            queue: SegQueue::new(),
+            queue: LazyCounted::new(),
         });
         let total = usize::from(entries) * size as usize;
         Ok(Self {
@@ -263,6 +271,7 @@ impl RecvGroup {
         let fill = self.fills.get_mut(usize::from(bid))?;
         let start = if self.incremental { fill.used } else { 0 };
         let end = start.checked_add(len).filter(|&end| end <= size)?;
+        let base = self.back.mem.base(bid)?;
         fill.used = end;
         fill.live += 1;
         fill.done = !more;
@@ -272,6 +281,7 @@ impl RecvGroup {
         }
         Some(RingChunk {
             back: Arc::clone(&self.back),
+            base,
             bid,
             start,
             end,
@@ -318,28 +328,64 @@ impl RecvGroup {
     /// to with `release(user_data, charged)`.
     pub(crate) fn take_back(&mut self, mut release: impl FnMut(u64, usize)) {
         let mut any = false;
-        while let Some(Back { bid, owner, len }) =
-            self.local.pop().or_else(|| self.back.queue.try_pop().ok())
-        {
-            if owner != NOT_AN_OP {
-                release(owner, self.charge(len));
-            }
-            #[cfg(test)]
-            {
-                self.out -= len as usize;
-            }
-            if let Some(fill) = self.fills.get_mut(usize::from(bid)) {
-                fill.live = fill.live.saturating_sub(1);
-            }
-            any |= self.settle(bid);
+        while let Some(item) = self.local.pop() {
+            any |= self.take_in(item, &mut release);
+        }
+        if !self.back.queue.is_empty() {
+            // Chunks given back on other threads, taken through a clone of `back`, as their
+            // take-in borrows the group.
+            let back = Arc::clone(&self.back);
+            back.queue
+                .take_all(|item| any |= self.take_in(item, &mut release));
         }
         if any {
             self.ring.commit();
         }
     }
 
+    /// Whether chunks given back wait to be taken in.
+    #[inline(always)]
+    pub(crate) fn has_returns(&self) -> bool {
+        !self.local.is_empty() || !self.back.queue.is_empty()
+    }
+
+    /// Takes in the chunk `item` of `back` at once, as [`take_back`](Self::take_back) does, if
+    /// `back` is this group's: for a chunk given back on the ring's own thread.
+    pub(crate) fn take_in_now(
+        &mut self,
+        back: &Arc<Returns>,
+        item: Back,
+        mut release: impl FnMut(u64, usize),
+    ) -> bool {
+        if !Arc::ptr_eq(&self.back, back) {
+            return false;
+        }
+        if self.take_in(item, &mut release) {
+            self.ring.commit();
+        }
+        true
+    }
+
+    /// One chunk given back: counted off its receive, and its buffer given to the kernel again if
+    /// it may go (see [`settle`](Self::settle)), which the caller then commits.
+    #[inline(always)]
+    fn take_in(&mut self, item: Back, release: &mut impl FnMut(u64, usize)) -> bool {
+        let Back { bid, owner, len } = item;
+        if owner != NOT_AN_OP {
+            release(owner, self.charge(len));
+        }
+        #[cfg(test)]
+        {
+            self.out -= len as usize;
+        }
+        if let Some(fill) = self.fills.get_mut(usize::from(bid)) {
+            fill.live = fill.live.saturating_sub(1);
+        }
+        self.settle(bid)
+    }
+
     /// Keeps the chunk `item` of `back` to take in with the rest, if `back` is this group's:
-    /// for a chunk dropped on the ring's own thread.
+    /// for a chunk dropped on the ring's own thread while the ring's operations are borrowed.
     pub(crate) fn keep_local(&mut self, back: &Arc<Returns>, item: Back) -> bool {
         let mine = Arc::ptr_eq(&self.back, back) && self.local.len() < self.local.capacity();
         if mine {
@@ -370,9 +416,16 @@ impl RecvGroup {
 impl RingChunk {
     /// The bytes not taken yet.
     pub(crate) fn bytes(&self) -> &[u8] {
-        // SAFETY: the buffer was handed out and goes back only when this
-        // chunk drops, so the kernel does not write it while it lives.
-        unsafe { self.back.mem.bytes(self.bid, self.start, self.end) }.unwrap_or_default()
+        // SAFETY: `start <= end <= buf_size` (as handed out, and as `narrow` and `consume` keep
+        // them), so the range lies inside the buffer `back` keeps mapped; the buffer was handed
+        // out and goes back only when this chunk drops, so the kernel does not write it while it
+        // lives.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.base.as_ptr().add(self.start as usize),
+                (self.end - self.start) as usize,
+            )
+        }
     }
 
     /// Keeps only bytes `start..end` of the buffer: the payload of a
@@ -419,7 +472,7 @@ impl RingChunk {
         let item = self.item();
         let kept = shard
             .and_then(super::Shard::ring)
-            .is_some_and(|ring| ring.keep_local(&self.back, item));
+            .is_some_and(|ring| ring.take_in_now(&self.back, item));
         if !kept {
             self.back.queue.push(item);
         }
@@ -436,7 +489,7 @@ impl Drop for RingChunk {
         let kept = crate::rt::context::current_held()
             .shard()
             .and_then(crate::rt::shard::Shard::ring)
-            .is_some_and(|ring| ring.keep_local(&self.back, item));
+            .is_some_and(|ring| ring.take_in_now(&self.back, item));
         if !kept {
             self.back.queue.push(item);
         }

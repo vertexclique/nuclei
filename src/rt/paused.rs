@@ -67,7 +67,7 @@ fn wake_all(inner: &Inner) {
     for shard in inner.workers.shards() {
         shard.unpark();
     }
-    for shard in inner.guests.values() {
+    for shard in inner.guests_made().into_iter().flat_map(|g| g.values()) {
         shard.unpark();
     }
 }
@@ -97,7 +97,8 @@ fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
     }
     let mut seen: Vec<(Arc<Shared>, u64)> = Vec::new();
     let mut earliest = u64::MAX;
-    for shard in inner.workers.shards().cloned().chain(inner.guests.values()) {
+    let guests = inner.guests_made().into_iter().flat_map(|g| g.values());
+    for shard in inner.workers.shards().cloned().chain(guests) {
         if !shard.idle() {
             return false;
         }
@@ -152,7 +153,7 @@ impl<'a> Guest<'a> {
 
     #[inline(never)]
     fn join(inner: &Inner, key: usize, shard: &Arc<Shared>) {
-        inner.guests.insert(key, Arc::clone(shard));
+        inner.guests().insert(key, Arc::clone(shard));
         inner.clock.member_changed();
     }
 
@@ -167,7 +168,11 @@ impl<'a> Guest<'a> {
         });
         if on_own {
             let key = Arc::as_ptr(&own.shared) as usize;
-            if inner.guests.insert(key, Arc::clone(&own.shared)).is_none() {
+            if inner
+                .guests()
+                .insert(key, Arc::clone(&own.shared))
+                .is_none()
+            {
                 inner.clock.member_changed();
             }
         }
@@ -186,7 +191,11 @@ impl Drop for Guest<'_> {
 impl Guest<'_> {
     #[inline(never)]
     fn leave(&self) {
-        if self.inner.guests.remove(&self.key).is_some() {
+        if self
+            .inner
+            .guests_made()
+            .is_some_and(|guests| guests.remove(&self.key).is_some())
+        {
             self.inner.clock.member_changed();
             // The shards left may all be idle now.
             try_advance(self.inner, None);

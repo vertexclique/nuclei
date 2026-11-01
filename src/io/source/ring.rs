@@ -44,6 +44,9 @@ pub(crate) struct RingOp {
 /// What an operation's entry points at, kept until its completion.
 pub(crate) enum RingMem {
     Ready,
+    /// A multishot poll of a side whose task receives its datagrams itself:
+    /// each completion that keeps it armed is an arrival.
+    ReadyMulti,
     Accept(Spare<RawAddr>),
     /// A multishot accept: `handed` connections so far; `stopping`: past
     /// the cap, a cancel of it is on its way.
@@ -54,10 +57,13 @@ pub(crate) enum RingMem {
     Recv(PoolBuf),
     /// A multishot receive: its arrivals land in the receive group's
     /// buffers. `held`: the bytes of its arrivals not given back yet;
-    /// `stopping`: past the cap, a cancel of it is on its way.
+    /// `stopping`: past the cap, or with the stream's end queued, a cancel
+    /// of it is on its way; `looked`: an arrival made after the kernel armed
+    /// it found no end queued (see `ShardRing::arrived`).
     RecvMulti {
         held: usize,
         stopping: bool,
+        looked: bool,
     },
     /// A multishot receive of datagrams, as `RecvMulti`; its arrivals hold a
     /// header and the sender's address before the payload, the room for
@@ -205,6 +211,11 @@ impl RingMem {
     fn complete_rest(self, res: i32, kind: Kind) -> Outcome {
         match self {
             RingMem::Ready => Outcome::Ready(match answer(res) {
+                Answer::Done(result) => Answer::Done(result.map(drop)),
+                Answer::Undone { not_ready } => Answer::Undone { not_ready },
+            }),
+            RingMem::ReadyMulti => Outcome::ReadyMultiEnd(match answer(res) {
+                // Its last readiness came as an arrival.
                 Answer::Done(result) => Answer::Done(result.map(drop)),
                 Answer::Undone { not_ready } => Answer::Undone { not_ready },
             }),
@@ -459,7 +470,7 @@ impl<'a> RingIo<'a> {
         match self {
             RingIo::Here { ring, source, file } => Some(RingIssuer { ring, source, file }),
             RingIo::Elsewhere { source } => {
-                after.kick = source.home_held();
+                after.set_kick(source.home_held());
                 None
             }
             RingIo::NotYet => None,
@@ -520,17 +531,15 @@ impl RingIssuer<'_> {
     /// hold any datagram (a Unix datagram may be larger than any buffer, and
     /// a buffer filled in pieces may have less room left than a datagram).
     pub(crate) fn multishot_datagrams(&self, kind: Kind) -> bool {
-        kind == Kind::Udp
-            && !self.ring.recv_group_incremental()
-            && self
-                .ring
-                .recv_buf_size()
-                .is_some_and(|s| s >= DATAGRAM_ROOM)
+        kind == Kind::Udp && self.ring.datagrams_ahead()
     }
 }
 
-/// What a multishot receive or accept hands the side as it comes.
+/// What a multishot receive, accept or poll hands the side as it comes.
 pub(crate) enum Arrival {
+    /// The socket of a side whose task receives its datagrams itself may be
+    /// readable: the multishot poll's edge.
+    Ready,
     /// A receive's buffer of bytes.
     Chunk(crate::rt::shard::recv::RingChunk),
     /// An accepted connection, whose peer is asked of the kernel when a task
@@ -633,6 +642,10 @@ fn entry(
             let events = if read { libc::POLLIN } else { libc::POLLOUT };
             (RingMem::Ready, Sqe::poll_add(slot, events as u32))
         }
+        Want::ReadyMulti => (
+            RingMem::ReadyMulti,
+            Sqe::poll_add_multi(slot, libc::POLLIN as u32),
+        ),
         Want::Accept => {
             let mut addr = Spare::new(RawAddr::empty());
             let sqe = Sqe::accept(
@@ -685,8 +698,9 @@ fn entry(
                 RingMem::RecvMulti {
                     held: 0,
                     stopping: false,
+                    looked: false,
                 },
-                Sqe::recv_multishot(slot, group, 0),
+                recv_multishot(slot, group),
             ),
             None => {
                 return Err(Box::new(Outcome::RecvMultiEnd {
@@ -695,28 +709,25 @@ fn entry(
                 }));
             }
         },
-        Want::RecvLent(mut buf) => {
-            let sqe = match buf.vectored_mut() {
-                Some(bufs) => stream_readv(kind, slot, bufs),
-                None => {
-                    let spare = buf.spare_capacity_mut();
-                    stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len())
-                }
-            };
-            (RingMem::RecvLent(buf), sqe)
+        Want::RecvLent(OwnedBuf::Vec(mut buf)) => {
+            let spare = buf.spare_capacity_mut();
+            let sqe = stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len());
+            (RingMem::RecvLent(OwnedBuf::Vec(buf)), sqe)
         }
+        Want::RecvLent(buf) => other_read_entry(kind, slot, buf),
         Want::RecvFrom(mut buf) => {
             let spare = buf.spare();
             let mut msg = Msg::receiving(spare.as_mut_ptr(), spare.len());
             let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
             (RingMem::RecvFrom(msg, buf), sqe)
         }
-        Want::RecvLentFrom(mut buf) => {
+        Want::RecvLentFrom(OwnedBuf::Vec(mut buf)) => {
             let spare = buf.spare_capacity_mut();
             let mut msg = Msg::receiving(spare.as_mut_ptr().cast(), spare.len());
             let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
-            (RingMem::RecvLentFrom(msg, buf), sqe)
+            (RingMem::RecvLentFrom(msg, OwnedBuf::Vec(buf)), sqe)
         }
+        Want::RecvLentFrom(buf) => other_receive_entry(slot, buf),
         Want::Connect(dial) => {
             let addr = Spare::new(RawAddr::of(&dial));
             let sqe = Sqe::connect(slot, addr.as_ptr(), addr.len);
@@ -726,13 +737,11 @@ fn entry(
             let sqe = stream_write(kind, slot, buf.filled());
             (RingMem::Send(buf), sqe)
         }
-        Want::SendLent(mut buf, from) => {
-            let sqe = match buf.vectored_mut() {
-                Some(bufs) => stream_writev(kind, slot, bufs, from),
-                None => stream_write(kind, slot, buf.rest_from(from)),
-            };
-            (RingMem::SendLent(buf), sqe)
+        Want::SendLent(OwnedBuf::Vec(buf), from) => {
+            let sqe = stream_write(kind, slot, buf.get(from..).unwrap_or_default());
+            (RingMem::SendLent(OwnedBuf::Vec(buf)), sqe)
         }
+        Want::SendLent(buf, from) => other_write_entry(kind, slot, buf, from),
         Want::SendPinned(buf, from, zero_copy) => {
             let rest = buf.bytes().get(from..).unwrap_or_default();
             if zero_copy {
@@ -751,27 +760,33 @@ fn entry(
             }
         }
         Want::SendTo(buf, target) => {
-            let to = match &target {
-                Target::Connected => None,
-                Target::Inet(addr) => Some(RawAddr::inet(addr)),
-                Target::Unix(addr) => Some(RawAddr::unix(addr)),
-            };
+            let to = raw_target(&target);
             let bytes = buf.filled();
             let msg = Msg::new(bytes.as_ptr().cast_mut(), bytes.len(), to);
             let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
             (RingMem::SendTo(msg, buf, target), sqe)
         }
-        Want::SendLentTo(buf, target) => {
-            let to = match &target {
-                Target::Connected => None,
-                Target::Inet(addr) => Some(RawAddr::inet(addr)),
-                Target::Unix(addr) => Some(RawAddr::unix(addr)),
-            };
+        Want::SendLentTo(OwnedBuf::Vec(buf), target) => {
+            let to = raw_target(&target);
             let msg = Msg::new(buf.as_ptr().cast_mut(), buf.len(), to);
             let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
-            (RingMem::SendLentTo(msg, buf), sqe)
+            (RingMem::SendLentTo(msg, OwnedBuf::Vec(buf)), sqe)
         }
+        Want::SendLentTo(buf, target) => other_send_to_entry(slot, buf, target),
     })
+}
+
+/// A stream's multishot receive on slot `slot` into group `group`. A test may have the kernel
+/// skip its first receive and arm its poll at once (`IORING_RECVSEND_POLL_FIRST`), as it is
+/// armed when bytes and the end come between that receive and the arming.
+#[inline]
+fn recv_multishot(slot: RawFd, group: u16) -> Sqe {
+    let sqe = Sqe::recv_multishot(slot, group, 0);
+    #[cfg(test)]
+    if POLL_FIRST_FOR_TEST.with(core::cell::Cell::get) {
+        return sqe.ioprio(crate::syscore::linux::iouring::ring::sys::IORING_RECVSEND_POLL_FIRST);
+    }
+    sqe
 }
 
 /// A stream read of `len` bytes into `buf` on slot `slot`: `recv` on a
@@ -782,6 +797,61 @@ fn stream_read(kind: Kind, slot: RawFd, buf: *mut u8, len: usize) -> Sqe {
         Kind::Bytes => Sqe::read(slot, buf, len, u64::MAX),
         _ => Sqe::recv(slot, buf, len, 0),
     }
+}
+
+/// The entry of a stream read into a task's buffer of another type than a
+/// vector: into the rooms of a vectored read's buffers, or the spare
+/// capacity of one buffer. Out of the hot `entry`, whose vectors' reads it
+/// would otherwise make larger.
+#[inline(never)]
+fn other_read_entry(kind: Kind, slot: RawFd, mut buf: OwnedBuf) -> (RingMem, Sqe) {
+    let sqe = match buf.vectored_mut() {
+        Some(bufs) => stream_readv(kind, slot, bufs),
+        None => {
+            let spare = buf.spare_capacity_mut();
+            stream_read(kind, slot, spare.as_mut_ptr().cast(), spare.len())
+        }
+    };
+    (RingMem::RecvLent(buf), sqe)
+}
+
+/// The raw address a datagram's send names for `target`; `None` for a
+/// connected socket's.
+#[inline]
+fn raw_target(target: &Target) -> Option<RawAddr> {
+    match target {
+        Target::Connected => None,
+        Target::Inet(addr) => Some(RawAddr::inet(addr)),
+        Target::Unix(addr) => Some(RawAddr::unix(addr)),
+    }
+}
+
+/// As [`other_read_entry`], for a datagram's receive with its sender.
+#[inline(never)]
+fn other_receive_entry(slot: RawFd, mut buf: OwnedBuf) -> (RingMem, Sqe) {
+    let spare = buf.spare_capacity_mut();
+    let mut msg = Msg::receiving(spare.as_mut_ptr().cast(), spare.len());
+    let sqe = Sqe::recvmsg(slot, &mut msg.hdr, 0);
+    (RingMem::RecvLentFrom(msg, buf), sqe)
+}
+
+/// As [`other_read_entry`], for a datagram's send to `target`.
+#[inline(never)]
+fn other_send_to_entry(slot: RawFd, buf: OwnedBuf, target: Target) -> (RingMem, Sqe) {
+    let to = raw_target(&target);
+    let msg = Msg::new(buf.as_ptr().cast_mut(), buf.len(), to);
+    let sqe = Sqe::sendmsg(slot, &msg.hdr, sys::SEND_FLAGS as u32);
+    (RingMem::SendLentTo(msg, buf), sqe)
+}
+
+/// As [`other_read_entry`], for a stream write from the `from`th byte on.
+#[inline(never)]
+fn other_write_entry(kind: Kind, slot: RawFd, mut buf: OwnedBuf, from: usize) -> (RingMem, Sqe) {
+    let sqe = match buf.vectored_mut() {
+        Some(bufs) => stream_writev(kind, slot, bufs, from),
+        None => stream_write(kind, slot, buf.rest_from(from)),
+    };
+    (RingMem::SendLent(buf), sqe)
 }
 
 /// A stream read into the rooms of the buffers of a vectored read, in order:
@@ -847,8 +917,10 @@ impl Source {
         // arrival and goes in first: the order holds.
         if let Some(mut held) = self.read.try_hold_for(&hooks) {
             hooks.taken(held.get(), after);
-            while let Ok((queued, at)) = self.read_arrivals.try_pop() {
-                held.get().take_arrival(queued, at, after);
+            if !self.read_arrivals.is_empty() {
+                let st = held.get();
+                self.read_arrivals
+                    .take_all(|(queued, at)| st.take_arrival(queued, at, after));
             }
             held.get().take_arrival(arrival, epoch, after);
             held.release(after, &hooks);
@@ -940,9 +1012,11 @@ impl Source {
         match here {
             Some(Ok(slot)) => {
                 self.reg.slot.store(slot, Ordering::Release);
+                let home = Arc::as_ptr(&shard) as usize;
                 // SAFETY: both sides are held.
                 unsafe { *self.reg.shard.get() = Some(shard) };
                 self.reg.state.store(super::REGISTERED, Ordering::Release);
+                self.publish_here(home);
                 Ok(())
             }
             Some(Err(err)) => self.ring_attach_failed(&shard, token, err),
@@ -1033,4 +1107,8 @@ thread_local! {
     /// just before a detach goes to that ring's mailbox.
     pub(crate) static BEFORE_DETACH_POST: core::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { core::cell::RefCell::new(None) };
+    /// Whether the stream multishot receives this thread submits skip their first receive
+    /// (see `recv_multishot`), for a test.
+    pub(crate) static POLL_FIRST_FOR_TEST: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
 }

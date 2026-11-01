@@ -1,5 +1,6 @@
 //! Small blocks: each task is one, and each piece of shared state made and
-//! dropped per operation ([`BlockArc`], a oneshot channel's), taken from this
+//! dropped per operation ([`BlockArc`], a oneshot channel's, and
+//! [`BlockRc`], a local one's), taken from this
 //! thread's cache of blocks of its size when one is there, and given back to
 //! the cache of the thread it came from when it is freed.
 //!
@@ -30,7 +31,9 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 
 mod arc;
+mod rc;
 pub(crate) use self::arc::BlockArc;
+pub(crate) use self::rc::BlockRc;
 
 /// The size step of a class, and the alignment of every cached block.
 pub(crate) const STEP: usize = 64;
@@ -202,14 +205,20 @@ mod cache {
         #[inline]
         fn keep(&mut self, class: usize, ptr: NonNull<u8>) -> bool {
             let blocks = &mut self.lists[class];
-            if blocks.len() >= kept(class) {
+            let len = blocks.len();
+            if len >= kept(class) {
                 return false;
             }
-            // The list's own room is made once, at its full size.
-            if blocks.capacity() == 0 {
+            // The list's own room is made once, at its full size: a list
+            // below its bound has room, but for the first block.
+            if len == blocks.capacity() {
                 blocks.reserve_exact(kept(class));
             }
-            blocks.push(ptr);
+            // SAFETY: `len` is below the capacity, just checked or made.
+            unsafe {
+                blocks.as_mut_ptr().add(len).write(ptr);
+                blocks.set_len(len + 1);
+            }
             true
         }
 
@@ -289,7 +298,9 @@ mod cache {
         // SAFETY: `FAST` points at the lists while `CACHE` holds them, on this
         // thread only, and no other reference to them is live (see `Cache`).
         let lists = unsafe { FAST.with(Cell::get).as_mut()? };
-        let record = lists.record?;
+        // SAFETY: `with_lists` sets `FAST` only once the lists hold their
+        // record, which they keep until `FAST` is cleared.
+        let record = unsafe { lists.record.unwrap_unchecked() };
         Some((lists, record))
     }
 
@@ -298,15 +309,32 @@ mod cache {
     fn with_lists<R>(f: impl FnOnce(&mut Lists, &'static Record) -> R) -> Option<R> {
         CACHE
             .try_with(|cache| {
-                let lists = cache.0.get();
-                FAST.with(|fast| fast.set(lists));
+                let at = cache.0.get();
                 // SAFETY: the only reference to the lists while `f` runs (see
                 // `Cache`).
-                let lists = unsafe { &mut *lists };
+                let lists = unsafe { &mut *at };
                 let record = *lists.record.get_or_insert_with(claim);
+                // After the record: `fast` takes the record as there.
+                FAST.with(|fast| fast.set(at));
                 f(lists, record)
             })
             .ok()
+    }
+
+    /// The bytes of blocks this thread holds for its next allocations: in
+    /// its cache, and given back to it by other threads and not taken yet.
+    #[cfg(test)]
+    pub(super) fn held() -> usize {
+        with_lists(|lists, record| {
+            let cached: usize = lists
+                .lists
+                .iter()
+                .enumerate()
+                .map(|(class, blocks)| blocks.len() * block(class).size())
+                .sum();
+            cached + record.bytes.load(Ordering::Relaxed)
+        })
+        .unwrap_or(0)
     }
 
     /// A free block of `class`, if this thread keeps one or was given one
@@ -376,9 +404,20 @@ mod cache {
         (None, Owner::NONE)
     }
 
+    pub(super) fn held() -> usize {
+        0
+    }
+
     pub(super) fn keep(_class: usize, _ptr: NonNull<u8>, _owner: Owner) -> bool {
         false
     }
+}
+
+/// The bytes of blocks this thread holds for its next allocations: in its
+/// cache, and given back to it by other threads and not taken yet.
+#[cfg(test)]
+pub(crate) fn held() -> usize {
+    cache::held()
 }
 
 /// Memory for a task of `layout`, and the owner to free it with.

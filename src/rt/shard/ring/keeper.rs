@@ -189,13 +189,11 @@ impl Kept {
 /// thread leaves its detach or its cancel there. Nothing registers with a shard that went, nor
 /// runs on it, so the rest only goes.
 fn apply_mailbox(ring: &ShardRing, shared: &Shared) {
-    while let Ok(op) = shared.io_ops.try_pop() {
-        match op {
-            IoOp::RingDetach(slot, out, lease) => ring.detach(slot, out, lease),
-            IoOp::RingCancel(user_data) => {
-                ring.cancel(user_data);
-            }
-            other => drop(other),
+    shared.io_ops.take_all(|op| match op {
+        IoOp::RingDetach(slot, out, lease) => ring.detach(slot, out, lease),
+        IoOp::RingCancel(user_data) => {
+            ring.cancel(user_data);
         }
-    }
+        other => drop(other),
+    });
 }

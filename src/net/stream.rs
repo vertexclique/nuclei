@@ -106,6 +106,7 @@ macro_rules! read_side {
         }
 
         impl AsyncRead for &Handle<$ty> {
+            #[inline]
             fn poll_read(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -114,6 +115,7 @@ macro_rules! read_side {
                 self.source().poll_read(cx, buf, false)
             }
 
+            #[inline]
             fn poll_read_vectored(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -124,6 +126,7 @@ macro_rules! read_side {
         }
 
         impl AsyncRead for Handle<$ty> {
+            #[inline]
             fn poll_read(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -132,6 +135,7 @@ macro_rules! read_side {
                 self.source().poll_read(cx, buf, false)
             }
 
+            #[inline]
             fn poll_read_vectored(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -210,7 +214,7 @@ macro_rules! write_side {
             /// `WouldBlock` when the write-behind has no room, and the error
             /// that stopped earlier bytes.
             pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
-                super::at_once(|cx| self.source().poll_write(cx, buf))
+                super::at_once(|cx| self.source().poll_write_behind(cx, &[io::IoSlice::new(buf)]))
             }
 
             /// Hands the bytes of `bufs`, in order, to the write-behind
@@ -220,11 +224,12 @@ macro_rules! write_side {
             ///
             /// As [`try_write`](Self::try_write).
             pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-                super::at_once(|cx| self.source().poll_write_vectored(cx, bufs))
+                super::at_once(|cx| self.source().poll_write_behind(cx, bufs))
             }
         }
 
         impl AsyncWrite for &Handle<$ty> {
+            #[inline]
             fn poll_write(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -233,6 +238,7 @@ macro_rules! write_side {
                 self.source().poll_write(cx, buf)
             }
 
+            #[inline]
             fn poll_write_vectored(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -251,6 +257,7 @@ macro_rules! write_side {
         }
 
         impl AsyncWrite for Handle<$ty> {
+            #[inline]
             fn poll_write(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -259,6 +266,7 @@ macro_rules! write_side {
                 self.source().poll_write(cx, buf)
             }
 
+            #[inline]
             fn poll_write_vectored(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,

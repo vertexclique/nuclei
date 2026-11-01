@@ -63,12 +63,12 @@ use std::time::Instant;
 use super::Shard;
 use super::recv::RecvGroup;
 use crate::fs::ring::FileOp;
-use crate::io::side::After;
+
 use crate::io::source::ops::Done;
 use crate::io::source::requests::Lease;
-use crate::io::source::ring::{Arrival, RingMem, RingOp};
+use crate::io::source::ring::{RingMem, RingOp};
 use crate::rt::backend::with_room;
-use crate::rt::counters::tally;
+
 #[cfg(feature = "io-stats")]
 use crate::rt::counters::{IoKind, IoTimes};
 use crate::rt::park::Notifier;
@@ -132,6 +132,9 @@ pub(crate) struct ShardRing {
     /// and the receives that ended as the group ran dry, for a test.
     #[cfg(test)]
     counts: Cell<(usize, usize, usize)>,
+    /// Multishot polls submitted, for a test.
+    #[cfg(test)]
+    polls_armed: Cell<usize>,
     /// Files' calls submitted, and each one's opcode, length and offset, for
     /// a test.
     #[cfg(test)]
@@ -215,6 +218,8 @@ impl ShardRing {
             #[cfg(test)]
             counts: Cell::new((0, 0, 0)),
             #[cfg(test)]
+            polls_armed: Cell::new(0),
+            #[cfg(test)]
             file_calls: Cell::new(0),
             #[cfg(test)]
             file_entries: RefCell::new(Vec::new()),
@@ -246,16 +251,26 @@ impl ShardRing {
         self.in_kernel.get() > 0 || self.writes.get() > 0 || !self.room.borrow().is_empty()
     }
 
-    /// Keeps the buffer `bid` of the group `back` for the next take-in, if the ring's group is
-    /// that; `false` when it is not or the group is borrowed (the buffer then goes the long way).
-    pub(crate) fn keep_local(
+    /// Takes in the chunk `item` of the group `back` at once, if the ring's group is that, or
+    /// keeps it for the next take-in while the operations are borrowed; `false` when the group
+    /// is another or borrowed (the chunk then goes the long way).
+    pub(crate) fn take_in_now(
         &self,
         back: &Arc<super::recv::Returns>,
         item: super::recv::Back,
     ) -> bool {
-        self.recv
-            .try_borrow_mut()
-            .is_ok_and(|mut group| group.as_mut().is_some_and(|g| g.keep_local(back, item)))
+        let Ok(mut recv) = self.recv.try_borrow_mut() else {
+            return false;
+        };
+        let Some(group) = recv.as_mut() else {
+            return false;
+        };
+        match self.ops.try_borrow_mut() {
+            Ok(mut ops) => group.take_in_now(back, item, |user_data, charged| {
+                release_charge(&mut ops, user_data, charged);
+            }),
+            Err(_) => group.keep_local(back, item),
+        }
     }
 
     /// The group id multishot receives draw from, if the ring has a group.
@@ -299,6 +314,16 @@ impl ShardRing {
         self.recv.borrow().as_ref().map(RecvGroup::buf_size)
     }
 
+    /// Whether the ring receives UDP datagrams ahead, with a multishot receive into its group:
+    /// one of whole buffers that each hold any datagram (see `DATAGRAM_ROOM`). Elsewhere a UDP
+    /// datagram is its task's to receive into its own buffer, as a Unix one always is.
+    pub(crate) fn datagrams_ahead(&self) -> bool {
+        !self.recv_group_incremental()
+            && self
+                .recv_buf_size()
+                .is_some_and(|s| s >= crate::io::source::ring::DATAGRAM_ROOM)
+    }
+
     /// The memory the ring's group takes (0 without one), charged to the shard's ledger.
     pub(crate) fn recv_reservation(&self) -> usize {
         self.recv
@@ -329,6 +354,10 @@ impl ShardRing {
         ) {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed + 1, arrived, dry));
+        }
+        #[cfg(test)]
+        if matches!(op.mem, RingMem::ReadyMulti) {
+            self.polls_armed.set(self.polls_armed.get() + 1);
         }
         let write = counts_as_write(&op);
         let inserted = self.ops.borrow_mut().insert(op);
@@ -577,6 +606,7 @@ impl ShardRing {
                 bid,
                 cqe.res,
                 cqe.flags & IORING_CQE_F_BUF_MORE != 0,
+                cqe.flags & IORING_CQE_F_MORE != 0,
             );
         } else if self.zero_copy(shard, &cqe) {
             return;
@@ -661,160 +691,6 @@ impl ShardRing {
         self.hand_over(shard, &source, file, epoch, false, outcome);
         drop(ended);
         true
-    }
-
-    /// Buffer `bid` of the receive group came with `res` bytes for the
-    /// multishot receive of `user_data`: its source gets them as a chunk.
-    /// Past the cap of bytes it holds, the receive is stopped; its source
-    /// asks for another once its reader took them.
-    fn arrived(&self, shard: Option<&Shard>, user_data: u64, bid: u16, res: i32, more: bool) {
-        let mut stop = false;
-        let delivery = {
-            let mut recv = self.recv.borrow_mut();
-            let Some(group) = recv.as_mut() else {
-                return;
-            };
-            let mut ops = self.ops.borrow_mut();
-            let held = ops.get_mut(user_data).and_then(|op| {
-                let source = std::sync::Arc::as_ptr(&op.source);
-                match &mut op.mem {
-                    RingMem::RecvMulti { held, stopping } => {
-                        Some((op.epoch, held, stopping, false, source))
-                    }
-                    RingMem::RecvFromMulti { held, stopping, .. } => {
-                        Some((op.epoch, held, stopping, true, source))
-                    }
-                    _ => None,
-                }
-            });
-            match (u32::try_from(res), held) {
-                (Ok(len @ 1..), Some((epoch, held, stopping, datagram, source))) => {
-                    match group.hand_out(user_data, bid, len, more) {
-                        Some(chunk) => {
-                            if !datagram {
-                                tally::read(len as usize);
-                            }
-                            *held += chunk.charged(group);
-                            if *held > group.cap() && !*stopping {
-                                *stopping = true;
-                                stop = true;
-                            }
-                            Some((source, chunk, epoch, datagram))
-                        }
-                        // An id or a length outside the group: the buffer goes back.
-                        None => {
-                            group.give_back(bid, len, more);
-                            None
-                        }
-                    }
-                }
-                // No bytes, or no receive to give them to: the buffer goes
-                // back at once.
-                _ => {
-                    group.give_back(bid, u32::try_from(res).unwrap_or(0), more);
-                    None
-                }
-            }
-        };
-        if stop {
-            self.cancel(user_data);
-        }
-        // Handed over with nothing borrowed: the source may submit at once.
-        if let Some((source, chunk, epoch, datagram)) = delivery {
-            // Before the view, so it drops after it.
-            let _unwound = crate::io::side::Unwound::enter();
-            let mut after = After::default();
-            let starved = {
-                // SAFETY: the op's slab entry owns a strong count of the
-                // source until its final completion, which this thread
-                // processes only after this call returns. Until the view is
-                // dropped below nothing runs foreign code or removes the
-                // entry: a cancel only queues a cancel entry (a multishot
-                // receive never waits for room), and the shard's shutdown
-                // runs on this thread outside any source code. The wakes
-                // run after the view is gone. The view is never dropped as
-                // an `Arc`.
-                let source =
-                    core::mem::ManuallyDrop::new(unsafe { std::sync::Arc::from_raw(source) });
-                #[cfg(test)]
-                {
-                    let (armed, arrived, dry) = self.counts.get();
-                    self.counts.set((armed, arrived + 1, dry));
-                }
-                let arrival = if datagram {
-                    // A buffer not laid out as the kernel says is only given back.
-                    match crate::io::source::ring::datagram_of(chunk, source.kind()) {
-                        Some((payload, from)) => {
-                            tally::read(payload.len());
-                            Arrival::Datagram(payload, from)
-                        }
-                        None => return,
-                    }
-                } else {
-                    Arrival::Chunk(chunk)
-                };
-                source.ring_arrival(arrival, epoch, shard, &mut after);
-                after.starved.then(|| std::sync::Arc::clone(&source))
-            };
-            if let Some(source) = starved {
-                source.wait_for_buffer();
-            }
-            after.run();
-        }
-    }
-
-    /// A completion `res` of the operation of `user_data` that carries no
-    /// buffer: for a multishot accept, a connection (its descriptor), handed
-    /// to the source as it comes. Past the cap of connections one accept
-    /// hands over, the accept is stopped; its source asks for another once
-    /// its tasks took them.
-    fn accepted(&self, shard: Option<&Shard>, user_data: u64, res: i32) {
-        let delivery = {
-            let mut ops = self.ops.borrow_mut();
-            let Some(op) = ops.get_mut(user_data) else {
-                return;
-            };
-            let RingMem::AcceptMulti { handed, stopping } = &mut op.mem else {
-                return;
-            };
-            *handed += 1;
-            let stop = *handed > ACCEPT_CAP && !*stopping;
-            if stop {
-                *stopping = true;
-            }
-            // SAFETY: the kernel made this descriptor for us.
-            let conn =
-                unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(res) };
-            (std::sync::Arc::clone(&op.source), conn, op.epoch, stop)
-        };
-        let (source, conn, epoch, stop) = delivery;
-        tally::accepted(1);
-        if stop {
-            self.cancel(user_data);
-        }
-        let mut after = After::default();
-        source.ring_arrival(Arrival::Conn(conn), epoch, shard, &mut after);
-        if after.starved {
-            std::sync::Arc::clone(&source).wait_for_buffer();
-        }
-        after.run();
-    }
-
-    /// Takes in the buffers chunks gave back and gives them to the kernel
-    /// again, counting each off the receive it went to.
-    fn take_back(&self) {
-        let mut recv = self.recv.borrow_mut();
-        let Some(group) = recv.as_mut() else {
-            return;
-        };
-        let mut ops = self.ops.borrow_mut();
-        group.take_back(|user_data, charged| {
-            if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
-                ops.get_mut(user_data).map(|op| &mut op.mem)
-            {
-                *held = held.saturating_sub(charged);
-            }
-        });
     }
 
     #[cfg(feature = "io-stats")]
@@ -982,6 +858,16 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
     configured.min(u16::try_from(fit.min(1 << 15)).unwrap_or(1 << 15))
 }
 
+/// Counts `charged` bytes of a chunk given back off the multishot receive of `user_data`, if it
+/// is still in flight.
+fn release_charge(ops: &mut Ops<RingOp>, user_data: u64, charged: usize) {
+    if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
+        ops.get_mut(user_data).map(|op| &mut op.mem)
+    {
+        *held = held.saturating_sub(charged);
+    }
+}
+
 /// Whether `op` is one of the write sides' operations counted in `writes`: a
 /// write side's, until a zero-copy send only waits for its notification. The
 /// one place both the submission and the end of an operation decide it.
@@ -994,6 +880,7 @@ fn ends_plain(op: &RingOp) -> bool {
             | RingMem::RecvMulti { .. }
             | RingMem::RecvFromMulti { .. }
             | RingMem::AcceptMulti { .. }
+            | RingMem::ReadyMulti
     )
 }
 
@@ -1034,6 +921,11 @@ impl ShardRing {
     /// and those that ended as the group ran dry.
     pub(crate) fn multishot_counts(&self) -> (usize, usize, usize) {
         self.counts.get()
+    }
+
+    /// Multishot polls submitted so far.
+    pub(crate) fn polls_armed(&self) -> usize {
+        self.polls_armed.get()
     }
 
     /// Bytes of the group's buffers handed out and not given back, whether
@@ -1167,10 +1059,15 @@ pub(crate) mod exits;
 pub(crate) mod keeper;
 #[cfg(test)]
 pub(crate) use keeper::leaked;
+mod arrivals;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_armed;
+#[cfg(test)]
 mod tests_cap;
+#[cfg(test)]
+mod tests_end;
 #[cfg(test)]
 mod tests_inc;
 #[cfg(test)]

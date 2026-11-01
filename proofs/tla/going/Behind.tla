@@ -1,8 +1,8 @@
 -------------------------------- MODULE Behind --------------------------------
 (***************************************************************************)
 (* Bytes a source's writes took into its write-behind, when the shard that *)
-(* drove them goes (`Shard::leave` and `drain_unsent` in                   *)
-(* src/rt/shard/going.rs, `Source::poll_drain` in                          *)
+(* drove them goes (`Shard::leave`, its `let_go_of_sources`, and           *)
+(* `drain_unsent` in src/rt/shard/going.rs, `Source::poll_drain` in        *)
 (* src/io/source/write/calls.rs, `WriteState::submit_ops` and `op_done` in *)
 (* src/io/source/write/ops.rs, `attach_port` and `waits_for_ops` in        *)
 (* src/io/source/port.rs).                                                 *)

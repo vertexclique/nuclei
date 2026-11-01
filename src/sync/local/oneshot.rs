@@ -2,7 +2,8 @@
 //! on one shard.
 //!
 //! The names, signatures and errors follow [`sync::oneshot`](crate::sync::oneshot),
-//! so code switches by changing the path. The state is one `Rc` with a
+//! so code switches by changing the path. The state is one counted block of
+//! the thread's cache (as an `Rc`, so no allocation in steady state) with a
 //! `Cell` of three bits (value sent, receiver closed, sender dropped), the
 //! value in a cell and the two wakers in cells: no atomic and no fence. The
 //! sender sends at most one value and never waits; the receiver is a
@@ -22,8 +23,8 @@ use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use std::rc::Rc;
 
+use crate::mem::BlockRc as Rc;
 pub use crate::sync::oneshot::error;
 use crate::sync::oneshot::error::{RecvError, TryRecvError};
 
@@ -48,7 +49,7 @@ impl<T> Inner<T> {
     }
 
     fn put(&self, value: T) {
-        // SAFETY: `!Sync` (an `Rc`), and this step runs no user code and
+        // SAFETY: `!Sync` (a `BlockRc`), and this step runs no user code and
         // calls no other step; the cell is empty until the one send.
         unsafe { *self.value.get() = Some(value) };
     }
@@ -61,6 +62,7 @@ impl<T> Inner<T> {
 
 /// Replaces the waker in `slot` with `waker` unless it already wakes the
 /// same task; the old one is dropped after the cell is set.
+#[inline]
 fn register(slot: &Cell<Option<Waker>>, waker: &Waker) {
     match slot.take() {
         Some(old) if old.will_wake(waker) => slot.set(Some(old)),
@@ -71,6 +73,7 @@ fn register(slot: &Cell<Option<Waker>>, waker: &Waker) {
     }
 }
 
+#[inline]
 fn wake(slot: &Cell<Option<Waker>>) {
     if let Some(waker) = slot.take() {
         waker.wake();

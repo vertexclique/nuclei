@@ -2,7 +2,9 @@
 # The precise sleep's rounding
 
 This file checks the arithmetic a precise sleep rests on (`src/rt/shard/timers.rs`:
-`time_of`, `units_after`, `precise_now`; `src/time/precise.rs`): a deadline is armed in the
+`time_of`, `precise_now`, `wheel_now`; `src/time/units.rs`: `units`; `src/time/clock.rs`: `now_nanos`, the
+nanoseconds after the clock's origin the timers read; `src/time/precise.rs`):
+a deadline is armed in the
 microsecond wheel rounded up, the wheel's time now is the clock rounded down, and a timer fires
 once that time reaches its deadline's. So a precise sleep never ends before its deadline, and
 the wheel never adds a microsecond to it.
@@ -73,6 +75,21 @@ theorem published_within_a_microsecond (d : Nat) :
     d ≤ armed d * 1000 ∧ armed d * 1000 < d + 1000 := by
   unfold armed
   omega
+
+/-- The shard rounds a deadline up on 64 bits as Rust's `div_ceil` does (`units` in
+`src/time/units.rs`): the quotient, plus one when a remainder is left, which never overflows.
+That is the armed microsecond; its reading of the clock is the plain quotient, `reading`
+itself. -/
+theorem armed_as_the_code_divides (d : Nat) :
+    armed d = d / 1000 + (if d % 1000 = 0 then 0 else 1) := by
+  unfold armed
+  split <;> omega
+
+/-- The same for the millisecond wheel's armed tick. -/
+theorem armedTick_as_the_code_divides (d : Nat) :
+    armedTick d = d / 1000000 + (if d % 1000000 = 0 then 0 else 1) := by
+  unfold armedTick
+  split <;> omega
 
 /-- The worked example. -/
 theorem example_rounding :

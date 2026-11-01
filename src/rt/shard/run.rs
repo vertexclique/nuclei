@@ -11,7 +11,7 @@
 
 use core::future::Future;
 use core::pin::{Pin, pin};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,7 +71,7 @@ impl Shard {
         // handed on again and again, each runner's first task blocking, would
         // otherwise be handed on before any runner reached the driver, and
         // the operation would wait out `driver_interval` runs.
-        self.count_again(self.since_drive.get());
+        self.count_again(self.since_drive());
         self.drive_or_report(Some(Duration::ZERO));
         let stopped = pin!(self.shared.stopped());
         let signal = self.signal();
@@ -84,10 +84,16 @@ impl Shard {
     /// The waker of a `block_on` future on this shard: the one the last call
     /// here left, if nothing else holds it any more, else a new one.
     pub(super) fn signal(&self) -> Arc<Signal> {
-        if let Some(mut signal) = self.signal.take()
-            && Arc::get_mut(&mut signal).is_some_and(Signal::reset)
+        // No `Weak` of a signal is made, so a count of one is the only
+        // holder: a waker another thread dropped last did so before the
+        // acquire, and none is left to wake the next future.
+        if let Some(signal) = self.signal.take()
+            && Arc::strong_count(&signal) == 1
         {
-            return signal;
+            crate::sync::internal::fence(Ordering::Acquire);
+            if signal.reset() {
+                return signal;
+            }
         }
         Arc::new(Signal::new(&self.shared))
     }
@@ -128,7 +134,7 @@ impl Shard {
         mut future: Pin<&mut F>,
         signal: &Arc<Signal>,
     ) -> Result<F::Output, Detached> {
-        let waker = Waker::from(Arc::clone(signal));
+        let waker = Signal::waker(signal);
         let mut cx = Context::from_waker(&waker);
         // Turns in which the future woke itself and no task ran.
         let mut self_woken = 0u32;
@@ -162,18 +168,13 @@ impl Shard {
                 if self.run(runnable) == Polled::Detached {
                     return Err(Detached);
                 }
-                let since = self.since_drive.get() + 1;
-                // Past the run count, or (checked once every `QUARTZ_EVERY`
-                // runs, by a mask) past the time bound since the last look:
-                // a few long runs hold the driver off as much as many short.
-                if since >= self.tuning.driver_interval
-                    || (since & (QUARTZ_EVERY - 1) == 0 && self.drive_overdue())
-                {
-                    // Timers and the poller get a look, without a wait.
-                    self.count_again(since);
-                    self.drive_or_report(Some(Duration::ZERO));
+                // One decrement a run; the runs that weigh a look are the
+                // count's stops.
+                let left = self.drive_left.get() - 1;
+                if left == 0 {
+                    self.drive_count_stop();
                 } else {
-                    self.since_drive.set(since);
+                    self.drive_left.set(left);
                 }
                 continue;
             }
@@ -194,20 +195,29 @@ impl Shard {
                 self_woken += 1;
                 if self_woken >= self.tuning.driver_interval {
                     self_woken = 0;
-                    self.count_again(self.since_drive.get());
+                    self.count_again(self.since_drive());
                     self.drive_or_report(Some(Duration::ZERO));
                 }
                 continue;
             }
-            self.count_again(self.since_drive.get());
+            self.count_again(self.since_drive());
             let shared = &self.shared;
             // The spin looks at the poller too: IO that comes within it
-            // costs neither a park nor the kernel's wake of this thread.
-            if self.spin.run(self.work_may_come_soon(), || {
-                self.has_remote_work()
-                    || signal.woken.load(Ordering::Relaxed)
-                    || self.io_ready_now()
-            }) {
+            // costs neither a park nor the kernel's wake of this thread. The
+            // queues of posted work, which a moment ago held nothing (they
+            // were applied above), are looked at last, past ready IO; the
+            // inbox and the homes, which the run queue's last pop just found
+            // empty, from the second look on.
+            let mut first = true;
+            if self.spin.run(
+                || self.work_may_come_soon(),
+                || {
+                    (!core::mem::take(&mut first) && self.has_remote_tasks())
+                        || signal.woken.load(Ordering::Relaxed)
+                        || self.io_ready_now()
+                        || self.has_posted_ops()
+                },
+            ) {
                 continue;
             }
             self.before_park();
@@ -302,7 +312,39 @@ impl Shard {
     /// polls there, never one by one.
     pub(super) fn count_again(&self, runs: u32) {
         self.polls.set(self.polls.get() + u64::from(runs));
-        self.since_drive.set(0);
+        self.count_drive_from(0, self.tuning.driver_interval);
+    }
+
+    /// Runs since timers and the poller were last looked at.
+    #[inline]
+    pub(super) fn since_drive(&self) -> u32 {
+        self.drive_at.get() - self.drive_left.get()
+    }
+
+    /// Counts down from `since` runs to the next run that weighs a look: the
+    /// next multiple of `QUARTZ_EVERY`, or `interval` (the driver interval)
+    /// if it comes first. `since` is below `interval`.
+    pub(super) fn count_drive_from(&self, since: u32, interval: u32) {
+        let quartz = (since - since % QUARTZ_EVERY).saturating_add(QUARTZ_EVERY);
+        let at = quartz.min(interval);
+        self.drive_at.set(at);
+        self.drive_left.set(at - since);
+    }
+
+    /// A run the count stopped at: past the run count, or (at every
+    /// `QUARTZ_EVERY`th run) past the time bound since the last look, timers
+    /// and the poller get a look, without a wait; a few long runs hold the
+    /// driver off as much as many short. Otherwise the count goes on.
+    #[inline(never)]
+    fn drive_count_stop(&self) {
+        let since = self.drive_at.get();
+        let interval = self.tuning.driver_interval;
+        if since >= interval || (since.is_multiple_of(QUARTZ_EVERY) && self.drive_overdue()) {
+            self.count_again(since);
+            self.drive_or_report(Some(Duration::ZERO));
+        } else {
+            self.count_drive_from(since, interval);
+        }
     }
 
     /// Drives the poller; a failure of the poller itself cannot be handed to

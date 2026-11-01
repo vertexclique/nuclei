@@ -137,7 +137,8 @@ fn a_foreign_poll_during_the_owners_write_leaves_the_write_whole() {
     let (a, b) = pair();
     home_on_worker(&rt, &a, &b);
     // The socket takes no more before the write starts, so the write cannot
-    // go straight to it: it is left to the driver, and the task waits.
+    // go straight to it: it is left to the driver, and the task waits. Its
+    // writes are small enough to go behind, so the foreign flush waits too.
     let filled = fill(a.io());
     let data = pattern(4 << 20);
     let pending = Arc::new(AtomicBool::new(false));
@@ -146,8 +147,9 @@ fn a_foreign_poll_during_the_owners_write_leaves_the_write_whole() {
         rt.spawn(async move {
             let mut at = 0;
             while at < data.len() {
+                let piece = &data[at..(at + BEHIND_CHUNK).min(data.len())];
                 let n = within(poll_fn(|cx| {
-                    let polled = src.poll_write(cx, &data[at..]);
+                    let polled = src.poll_write(cx, piece);
                     if polled.is_pending() {
                         seen.store(true, Ordering::SeqCst);
                     }

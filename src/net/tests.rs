@@ -574,13 +574,15 @@ fn stream_impls_are_on_the_handle_and_its_reference(h: &Handle<TcpStream>, u: &H
 }
 
 /// Writes until a write goes behind (the socket is full); returns every
-/// byte written, in order.
+/// byte written, in order. Each write is small enough to be copied behind:
+/// one of 16 KiB or more waits for room instead.
 async fn fill_behind(h: &Handle<Pair>) -> Vec<u8> {
+    const CHUNK: usize = 8 * 1024;
     let mut sent = Vec::new();
     let mut seq = 0usize;
     while !h.source.has_unsent() {
-        let chunk: Vec<u8> = (0..16 * 1024)
-            .map(|i| ((seq * 16 * 1024 + i) % 251) as u8)
+        let chunk: Vec<u8> = (0..CHUNK)
+            .map(|i| ((seq * CHUNK + i) % 251) as u8)
             .collect();
         seq += 1;
         let n = within(h.send(&chunk)).await.unwrap();

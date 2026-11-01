@@ -96,27 +96,65 @@ where
         let Some((shard, ring)) = current.and_then(|shard| Some((shard, shard.ring()?))) else {
             return Err(buf);
         };
-        let slot = Slot::new();
-        if let Some(waker) = waker {
-            slot.register(waker);
-        }
-        let mem = mem(buf);
-        let write = matches!(
-            mem,
-            FileMem::Write { .. }
-                | FileMem::WriteLent { .. }
-                | FileMem::Call(Call::Allocate { .. })
-        )
-        .then(|| WriteCall::on(&shard.shared));
-        ring.submit_file(FileOp {
-            fd: fd.clone(),
-            at,
-            mem,
-            slot: Arc::clone(&slot),
-            write,
-        });
-        Ok(SlotJob::new(slot))
+        Ok(issue(shard, ring, fd, at, buf, mem, waker))
     })
+}
+
+/// As [`submit`], for a buffer the caller holds: taken out of `held` only
+/// when the call goes on the ring, so a thread with none moves it nowhere.
+#[inline]
+fn submit_held<B, T, M>(
+    fd: &Lease,
+    at: u64,
+    held: &mut Option<B>,
+    mem: M,
+    waker: Option<&Waker>,
+) -> Option<SlotJob<T>>
+where
+    T: End,
+    M: FnOnce(B) -> FileMem,
+{
+    crate::rt::context::current(|current| {
+        let (shard, ring) = current.and_then(|shard| Some((shard, shard.ring()?)))?;
+        let buf = held.take()?;
+        Some(issue(shard, ring, fd, at, buf, mem, waker))
+    })
+}
+
+/// The call of `buf` (made into `mem`) on `fd` at `at`, on `ring` of
+/// `shard`: the one issue [`submit`] and [`submit_held`] make.
+#[inline(always)]
+fn issue<B, T, M>(
+    shard: &crate::rt::shard::Shard,
+    ring: &crate::rt::shard::ring::ShardRing,
+    fd: &Lease,
+    at: u64,
+    buf: B,
+    mem: M,
+    waker: Option<&Waker>,
+) -> SlotJob<T>
+where
+    T: End,
+    M: FnOnce(B) -> FileMem,
+{
+    let slot = Slot::new();
+    if let Some(waker) = waker {
+        slot.register(waker);
+    }
+    let mem = mem(buf);
+    let write = matches!(
+        mem,
+        FileMem::Write { .. } | FileMem::WriteLent { .. } | FileMem::Call(Call::Allocate { .. })
+    )
+    .then(|| WriteCall::on(&shard.shared));
+    ring.submit_file(FileOp {
+        fd: fd.clone(),
+        at,
+        mem,
+        slot: Arc::clone(&slot),
+        write,
+    });
+    SlotJob::new(slot)
 }
 
 /// A read at `at` into `len` bytes of `buf` from `from`, on this thread's
@@ -187,16 +225,17 @@ pub(crate) fn sync_range(fd: &Lease, offset: u64, len: u32) -> Result<SlotJob<io
     .map_err(drop)
 }
 
-/// A read at `at` into the spare capacity of a task's `buf`, whose end wakes
-/// `waker`.
+/// A read at `at` into the spare capacity of the task's buffer in `held`,
+/// whose end wakes `waker`; `None`, with the buffer left in `held`, when
+/// this thread runs no ring.
 #[inline]
 pub(crate) fn read_lent(
     fd: &Lease,
     at: u64,
-    buf: OwnedBuf,
+    held: &mut Option<OwnedBuf>,
     waker: &Waker,
-) -> Result<SlotJob<LentReadEnd>, OwnedBuf> {
-    submit(fd, at, buf, FileMem::ReadLent, Some(waker))
+) -> Option<SlotJob<LentReadEnd>> {
+    submit_held(fd, at, held, FileMem::ReadLent, Some(waker))
 }
 
 /// A write of all of `buf` at `at`.
@@ -425,13 +464,11 @@ impl FileOp {
                 }
                 FileMem::Shutdown(how) => FileOutcome::Write(sys::shutdown_raw(raw, how)),
             };
-            slot.put(outcome);
-            // Once the wake went: a task it dropped handed what it left first.
-            drop(write);
+            crate::fs::call::Ending::new(slot, outcome, write)
         };
         match crate::rt::runtime::blocking_pool_inside() {
             Some(pool) => pool.spawn(call).detach(),
-            None => call(),
+            None => drop(call()),
         }
     }
 }

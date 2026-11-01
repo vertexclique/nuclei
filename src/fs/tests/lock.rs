@@ -153,6 +153,10 @@ fn a_lock_dropped_after_its_job_got_the_lock_gives_it_back() {
         hold.send(()).unwrap();
         within(busy).await;
         within(becomes(&path, false)).await;
+        // The pool's one thread runs this after the lock's job ended, so the
+        // job has handed the lock to its future, which gives it back as it
+        // drops.
+        within(crate::runtime::spawn_blocking(|| ())).await;
         drop(taken);
         assert!(free(&path).await, "the lock stayed held");
     });

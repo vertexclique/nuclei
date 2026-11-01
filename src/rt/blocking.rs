@@ -40,6 +40,12 @@
 //! thread's by the time a slow submitter reads it, so the name a thread
 //! replaces is retired, not freed. That is one node per thread started,
 //! none per job.
+//!
+//! A detached job that ends a file's call returns that end
+//! (`fs::call::Ending`), which its run drops, publishing it, only once the
+//! job's task is gone: the task's block is back with the thread it came from
+//! before the task woken can spawn again, so a steady stream of calls takes
+//! no block from the allocator (proofs/tla/jobend).
 
 use core::sync::atomic::AtomicU8;
 use std::io;
@@ -93,6 +99,8 @@ pub(crate) struct Pool {
     /// between takes.
     queue: Inbox,
     slots: Box<[Slot]>,
+    /// One past the highest slot a thread ever named: those past it never held a thread.
+    named: AtomicUsize,
     /// One bit per slot, set while its thread waits idle; written by that
     /// thread alone.
     index: Box<[AtomicU64]>,
@@ -137,6 +145,7 @@ impl Pool {
         let pool = Arc::new(Self {
             queue,
             slots,
+            named: AtomicUsize::new(0),
             index,
             hint: AtomicUsize::new(0),
             threads: AtomicUsize::new(0),
@@ -193,7 +202,8 @@ impl Pool {
         self.jobs.load(Ordering::SeqCst)
     }
 
-    /// Runs a job, then counts it out. Its awaiter was woken during the run,
+    /// Runs a job, then counts it out. Its awaiter was woken during the run
+    /// (a detached job's end once its task was freed: `fs::call::Ending`),
     /// before the count drops, so a paused clock that sees no job in flight
     /// sees the woken shard's work.
     fn run(&self, runnable: Runnable) {
@@ -378,6 +388,7 @@ impl Pool {
                         // read it under its guard, so it is retired once.
                         unsafe { retire_node(old.as_raw()) };
                     }
+                    self.named.fetch_max(i + 1, Ordering::Relaxed);
                     return i;
                 }
             }
@@ -425,16 +436,16 @@ impl Pool {
                 self.clear_bit(me);
                 continue;
             }
+            // The clock is read once to start the keep-alive, then only after
+            // a park that ends with the slot still idle.
             let deadline = Instant::now() + self.config.keep_alive;
-            loop {
+            let mut left = self.config.keep_alive;
+            while slot.state.load(Ordering::SeqCst) != WOKEN && !left.is_zero() {
+                std::thread::park_timeout(left);
                 if slot.state.load(Ordering::SeqCst) == WOKEN {
                     break;
                 }
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                std::thread::park_timeout(deadline - now);
+                left = deadline.saturating_duration_since(Instant::now());
             }
             // Before the slot leaves idle: a freed slot may be another
             // thread's at once, and a late clear would erase its bit.
@@ -463,8 +474,15 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        // Release: a take that reads the count finds this pool's count of holders at zero.
+        POOLS_GONE.fetch_add(1, core::sync::atomic::Ordering::Release);
+        // Slots are claimed lowest first, and a pool that never ran a job named none.
+        let named = self.named.load(Ordering::Relaxed);
+        if named == 0 {
+            return;
+        }
         let guard = pin();
-        for slot in self.slots.iter() {
+        for slot in &self.slots[..named] {
             let named = slot.thread.load(Ordering::Acquire, &guard);
             if !named.is_null() {
                 // SAFETY: the pool is gone, so no submitter reads the slot;
@@ -488,8 +506,18 @@ fn pools() -> &'static kovan_map::HashMap<usize, std::sync::Weak<Pool>> {
     POOLS.get_or_init(|| kovan_map::HashMap::with_capacity(64))
 }
 
+/// Pools dropped since the last [`take_out_gone`] looked: with none, no entry is there to take
+/// out (a pool's holders are all gone before its drop runs).
+static POOLS_GONE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Takes out the entries of pools that went.
 fn take_out_gone() {
+    // Acquire: pairs with the drop's Release. A pool that goes after the swap counts again.
+    if POOLS_GONE.load(core::sync::atomic::Ordering::Relaxed) == 0
+        || POOLS_GONE.swap(0, core::sync::atomic::Ordering::Acquire) == 0
+    {
+        return;
+    }
     let gone: Vec<usize> = pools()
         .iter()
         .filter(|(_, pool)| pool.strong_count() == 0)

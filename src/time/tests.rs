@@ -128,9 +128,10 @@ fn a_reset_precise_sleep_is_armed_once_at_its_new_deadline() {
 #[test]
 fn the_microsecond_wheel_rounds_a_deadline_up_and_never_early() {
     let shard = shard();
-    let at = crate::time::clock::origin() + Duration::from_nanos(2_000_001);
+    let at =
+        crate::time::clock::nanos(crate::time::clock::origin() + Duration::from_nanos(2_000_001));
     assert_eq!(shard.time_of(true, at), 2_001);
     assert_eq!(shard.time_of(false, at), 3);
-    let exact = crate::time::clock::origin() + Duration::from_micros(7);
+    let exact = crate::time::clock::nanos(crate::time::clock::origin() + Duration::from_micros(7));
     assert_eq!(shard.time_of(true, exact), 7);
 }

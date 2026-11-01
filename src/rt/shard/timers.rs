@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::Shard;
 use crate::sync::internal::Ordering;
+use crate::time::units::{MICROS, MILLIS, units};
 use crate::time::wheel::Wheel;
 
 impl Shard {
@@ -25,41 +26,24 @@ impl Shard {
         if precise { &self.precise } else { &self.wheel }
     }
 
-    /// The deadline `at` in the time of the wheel `precise` picks.
+    /// The deadline `at` (nanoseconds after the epoch, the clock's origin)
+    /// in the time of the wheel `precise` picks, rounded up: a timer never
+    /// fires before its deadline.
     #[inline]
-    pub(crate) fn time_of(&self, precise: bool, at: Instant) -> u64 {
-        if precise {
-            self.units_after(at, 1_000)
-        } else {
-            self.wheel_time(at)
-        }
-    }
-
-    /// The wheel's time for the deadline `at`, rounded up to its
-    /// millisecond: a timer never fires before its deadline.
-    pub(crate) fn wheel_time(&self, at: Instant) -> u64 {
-        self.units_after(at, 1_000_000)
-    }
-
-    /// `at` in units of `unit` nanoseconds after the epoch, rounded up: what
-    /// a wheel arms, so its timer never fires before `at`.
-    #[inline]
-    fn units_after(&self, at: Instant, unit: u128) -> u64 {
-        let since = at.saturating_duration_since(self.epoch);
-        u64::try_from(since.as_nanos().div_ceil(unit)).unwrap_or(u64::MAX)
+    pub(crate) fn time_of(&self, precise: bool, at: u64) -> u64 {
+        let per_second = if precise { MICROS } else { MILLIS };
+        units(at, per_second, true)
     }
 
     /// The wheel's time now on the runtime's clock, rounded down: the wheel
     /// never runs ahead of the clock.
     pub(super) fn wheel_now(&self) -> u64 {
-        let since = crate::time::clock::now().saturating_duration_since(self.epoch);
-        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        units(crate::time::clock::now_nanos(), MILLIS, false)
     }
 
     /// The microsecond wheel's time now, rounded down as `wheel_now`.
     fn precise_now(&self) -> u64 {
-        let since = crate::time::clock::now().saturating_duration_since(self.epoch);
-        u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
+        units(crate::time::clock::now_nanos(), MICROS, false)
     }
 
     /// The earliest time either wheel has work at, and whether it is the
@@ -191,9 +175,9 @@ impl Shard {
     fn fire_armed_timers(&self) {
         if !self.shared.timer_ops.is_empty() {
             let mut wheel = self.wheel.borrow_mut();
-            while let Ok(op) = self.shared.timer_ops.try_pop() {
-                op.apply(self, &mut wheel);
-            }
+            self.shared
+                .timer_ops
+                .take_all(|op| op.apply(self, &mut wheel));
         }
         if self.precise.borrow().armed() != 0 {
             self.fire_precise();

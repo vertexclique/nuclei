@@ -7,7 +7,7 @@ use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 use std::io;
 use std::sync::Arc;
 
@@ -32,6 +32,9 @@ impl FileIo {
         }
     }
 
+    /// The read's own end wakes its task (the ring's slot or the pool's job
+    /// holds the task's waker), so the task waits with the file's waiters,
+    /// woken as any job ends, only while a write it waits for is in flight.
     fn poll_read_owned(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -41,7 +44,10 @@ impl FileIo {
         if held.as_ref().is_some_and(|b| b.len() == b.capacity()) {
             return Poll::Ready(Ok(0));
         }
-        self.with_state(cx, |st, io, waker, after| {
+        let waker = cx.waker();
+        let mut after = After::default();
+        let hooks = FileHooks { io: self };
+        let out = self.state.poll(&mut after, waker, &hooks, |st, after| {
             loop {
                 if let Some(lent) = job.as_mut() {
                     let pooled = lent.task.pooled();
@@ -53,7 +59,7 @@ impl FileIo {
                     let (at, epoch, generation, from) =
                         (lent.at, lent.epoch, lent.generation, lent.from);
                     *job = None;
-                    if !st.counts(io, at, epoch, generation) {
+                    if !st.counts(self, at, epoch, generation) {
                         // Another read, a write, a seek or a positional
                         // write's end moved on meanwhile: read again where
                         // the cursor is.
@@ -68,20 +74,31 @@ impl FileIo {
                         if let Some(ahead) = st.ahead.take() {
                             after.drop_buf(ahead);
                         }
+                        // The job read ahead into the cache: the next read
+                        // tries it again.
+                        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+                        if st.cache == super::cached::Cache::Cold {
+                            st.cache = super::cached::Cache::Try;
+                        }
                     }
                     return Poll::Ready(result);
                 }
-                // A read sees every byte written before it.
-                if st.poll_writes(io, waker, after).is_pending() {
-                    return Poll::Pending;
+                // A read sees every byte written before it: a write in flight
+                // wakes the file's waiters as it ends, and the task waits with
+                // them, registered before the write is looked at.
+                if !st.writes_idle() {
+                    self.waiters.register(waker);
+                    let file = Waker::from(Arc::clone(self));
+                    if st.poll_writes(self, &file, after).is_pending() {
+                        return Poll::Pending;
+                    }
                 }
-                let Some(mut buf) = held.take() else {
+                let Some(buf) = held.as_mut() else {
                     return Poll::Ready(Err(io::Error::other("the read lost its buffer")));
                 };
-                st.drop_stale_ahead(io, after);
+                st.drop_stale_ahead(self, after);
                 if let Some(ahead) = st.ahead.as_mut().filter(|a| !a.is_empty()) {
-                    let n = crate::buf::append_spare(ahead.filled(), &mut buf);
-                    *held = Some(buf);
+                    let n = crate::buf::append_spare(ahead.filled(), buf);
                     ahead.consume(n);
                     st.consumed(n, after);
                     return Poll::Ready(Ok(n));
@@ -89,8 +106,27 @@ impl FileIo {
                 let (at, from) = (st.cursor, buf.len());
                 // Read before the call, so a positional write that ends
                 // while it runs is seen to have.
-                let generation = io.generation();
-                let task = io.submit_read_owned(buf, at, waker);
+                let generation = self.generation();
+                // Bytes the page cache has go into the buffer at once, with
+                // no job; they count as a job's would.
+                #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+                if self.reads_cached()
+                    && let super::cached::Now::Read(n) =
+                        super::cached::read(self.fd.raw(), buf, at, &mut st.cache)
+                {
+                    let result = Ok(n);
+                    tally_read(true, &result, |n| *n);
+                    if !st.counts(self, at, st.epoch, generation) {
+                        buf.truncate(from);
+                        continue;
+                    }
+                    st.cursor += n as u64;
+                    if let Some(ahead) = st.ahead.take() {
+                        after.drop_buf(ahead);
+                    }
+                    return Poll::Ready(result);
+                }
+                let task = self.submit_read_owned(held, at, waker);
                 let pooled = task.pooled();
                 *job = Some(LentRead {
                     task,
@@ -105,7 +141,9 @@ impl FileIo {
                     return Poll::Pending;
                 }
             }
-        })
+        });
+        after.run();
+        out
     }
 
     /// Writes all of `buf` at the cursor, after the writes before it, and

@@ -66,7 +66,7 @@ pub(crate) struct Inner {
     /// The shards of threads inside this runtime's `block_on` while its clock
     /// is paused, by address: with the workers, the shards a paused clock
     /// waits for before it moves by itself.
-    pub(crate) guests: kovan_map::HashMap<usize, Arc<Shared>>,
+    guests: OnceLock<kovan_map::HashMap<usize, Arc<Shared>>>,
     /// The task hooks every task of this runtime carries, if any is set.
     task_hooks: Option<Arc<super::tuning::TaskHooks>>,
     /// The runtime shuts down when a task panics; and once one did.
@@ -278,6 +278,16 @@ impl fmt::Debug for RuntimeHandle {
 static DEFAULT: OnceLock<Runtime> = OnceLock::new();
 
 impl Inner {
+    /// The guests, made at the first join: a runtime whose clock never pauses has none.
+    pub(crate) fn guests(&self) -> &kovan_map::HashMap<usize, Arc<Shared>> {
+        self.guests
+            .get_or_init(|| kovan_map::HashMap::with_capacity(builder::GUESTS_CAPACITY))
+    }
+
+    /// The guests, if any ever joined.
+    pub(crate) fn guests_made(&self) -> Option<&kovan_map::HashMap<usize, Arc<Shared>>> {
+        self.guests.get()
+    }
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -394,6 +404,7 @@ fn own_shard() -> std::rc::Rc<Shard> {
 }
 
 /// Spawns `future` on `inner`.
+#[inline(always)]
 fn spawn_with<F>(inner: &Inner, future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
@@ -407,6 +418,7 @@ where
 }
 
 /// Spawns `future` on `inner`'s worker `shard`.
+#[inline(always)]
 fn spawn_on<F>(inner: &Inner, shard: &Arc<Shared>, future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
@@ -468,19 +480,38 @@ where
     let (shared, home) =
         context::current(|current| current.map(place)).unwrap_or_else(|| place(&own_shard()));
     let hooks = context_hooks();
-    let (runnable, task) = if let Some(home) = home {
+    let (runnable, task, bound_to) = if let Some(home) = home {
+        let at = Arc::as_ptr(&home);
         // SAFETY: the task's schedule sends a woken bound task only to its
         // home's thread (leaked rather than dropped if that thread is gone);
         // the future is 'static.
-        unsafe { task::spawn_unchecked(future, Sched::counted(shared, Some(home), hooks.clone())) }
+        let (runnable, task) = unsafe {
+            task::spawn_unchecked(future, Sched::counted(shared, Some(home), hooks.clone()))
+        };
+        (runnable, task, Some(at))
     } else {
         // SAFETY: the task's schedule sends a woken task of this shard back
         // to it; the future is 'static, and `Send` (a caller with `bound`
         // false is `spawn`'s, whose future is).
-        unsafe { task::spawn_unchecked(future, Sched::counted(shared, None, hooks.clone())) }
+        let (runnable, task) =
+            unsafe { task::spawn_unchecked(future, Sched::counted(shared, None, hooks.clone())) };
+        (runnable, task, None)
     };
     spawned(hooks.as_deref(), &task);
-    runnable.schedule();
+    // A bound task as its schedule would queue it, without the turn through
+    // the task's table.
+    let left = match bound_to {
+        Some(home) => {
+            // SAFETY: the task's schedule holds its home while the runnable
+            // lives.
+            let home = unsafe { &*home };
+            super::sched::queue_home_here(home, runnable, ScheduleInfo::new(false))
+        }
+        None => Some(runnable),
+    };
+    if let Some(runnable) = left {
+        runnable.schedule();
+    }
     task
 }
 
@@ -561,7 +592,18 @@ where
         Some(inner) if inner.task_hooks.is_none() => Ok(spawn_with(inner, future)),
         _ => Err(future),
     });
-    spawned.unwrap_or_else(|future| spawn_with(&current(), future))
+    spawned.unwrap_or_else(spawn_current)
+}
+
+/// [`spawn`] on the runtime [`current`] finds: out of line, so the spawn of a
+/// thread whose runtime is set and has no hooks carries none of it.
+#[inline(never)]
+fn spawn_current<F>(future: F) -> Task<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_with(&current(), future)
 }
 
 /// Spawns a task that stays on the calling thread: a worker's shard, or the

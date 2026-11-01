@@ -75,20 +75,17 @@ unsafe impl Send for BufMem {}
 unsafe impl Sync for BufMem {}
 
 impl BufMem {
-    /// Bytes `start..end` of buffer `bid`, or `None` when they are out of range.
-    ///
-    /// # Safety
-    ///
-    /// The buffer is not queued in its ring (a completion handed it out and it was not re-added
-    /// yet), so the kernel does not write it while the slice lives.
-    pub(crate) unsafe fn bytes(&self, bid: u16, start: u32, end: u32) -> Option<&[u8]> {
-        if bid >= self.entries || start > end || end > self.buf_size {
+    /// The first byte of buffer `bid`, or `None` when there is no such buffer. Its `buf_size`
+    /// bytes stay mapped as long as `self`; they may be read only while the buffer is not queued
+    /// in its ring (a completion handed it out and it was not re-added yet), so the kernel does
+    /// not write them meanwhile.
+    pub(crate) fn base(&self, bid: u16) -> Option<core::ptr::NonNull<u8>> {
+        if bid >= self.entries {
             return None;
         }
-        let at = usize::from(bid) * self.buf_size as usize + start as usize;
-        // SAFETY: the range lies inside the mapping (checked above), which lives as long as
-        // `self`; the caller's: the kernel does not write it now.
-        Some(unsafe { slice::from_raw_parts(self.map.as_ptr().add(at), (end - start) as usize) })
+        let at = usize::from(bid) * self.buf_size as usize;
+        // SAFETY: buffer `bid` lies inside the mapping, so the offset stays in it.
+        core::ptr::NonNull::new(unsafe { self.map.as_ptr().add(at) })
     }
 }
 
@@ -264,6 +261,33 @@ impl BufRing {
             addr_of_mut!((*desc).bid).write(bid);
         }
         self.pending += 1;
+        Ok(())
+    }
+
+    /// Queues every buffer, in id order, for the kernel to use: what [`BufRing::add`] of each id
+    /// does, in one pass. Fails, queuing none, when descriptors are queued and not committed.
+    pub(crate) fn add_all(&mut self) -> io::Result<()> {
+        if self.pending != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "more buffers were added than the ring holds",
+            ));
+        }
+        let descs = self.maps.0.as_ptr().cast::<IoUringBuf>();
+        let bufs = self.maps.1.map.as_ptr();
+        for bid in 0..self.entries {
+            let slot = self.tail.wrapping_add(bid) & (self.entries - 1);
+            let buf = bufs.wrapping_add(usize::from(bid) * self.buf_size as usize);
+            // SAFETY: as in `add`: `slot` is below `entries`, so the descriptor lies inside the
+            // ring mapping, and only `addr`, `len` and `bid` are written.
+            unsafe {
+                let desc = descs.add(usize::from(slot));
+                addr_of_mut!((*desc).addr).write(buf.expose_provenance() as u64);
+                addr_of_mut!((*desc).len).write(self.buf_size);
+                addr_of_mut!((*desc).bid).write(bid);
+            }
+        }
+        self.pending = self.entries;
         Ok(())
     }
 

@@ -216,21 +216,43 @@ fn a_removed_timer_never_fires_and_its_key_goes_stale() {
 }
 
 #[test]
-fn a_reset_moves_the_deadline_and_arms_a_fired_timer_again() {
+fn a_reset_moves_an_armed_timers_deadline() {
     let mut wheel = Wheel::new();
     let (w, count) = waker();
     let key = wheel.insert(10, &w);
     wheel.reset(key, 100, &w);
     assert_eq!(advance(&mut wheel, 50), 0);
     assert_eq!(advance(&mut wheel, 100), 1);
+    assert_eq!(count.0.load(Ordering::SeqCst), 1);
+    // Fired, the timer let go of its entry: its key is stale, and a reset of
+    // it does nothing.
     wheel.reset(key, 130, &w);
-    assert!(!wheel.is_fired(key));
-    assert_eq!(advance(&mut wheel, 130), 1);
-    assert_eq!(count.0.load(Ordering::SeqCst), 2);
+    assert!(wheel.is_fired(key));
+    assert_eq!(wheel.armed(), 0);
     // A deadline already passed fires at once, with no wake.
+    let key = wheel.insert(200, &w);
     wheel.reset(key, 5, &w);
     assert!(wheel.is_fired(key));
-    assert_eq!(count.0.load(Ordering::SeqCst), 2);
+    assert_eq!(wheel.armed(), 0);
+    assert_eq!(count.0.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_fired_timer_lets_go_of_its_entry_for_the_next_one() {
+    let mut wheel = Wheel::new();
+    let (w, _count) = waker();
+    let key = wheel.insert(10, &w);
+    assert_eq!(advance(&mut wheel, 10), 1);
+    assert!(wheel.is_fired(key));
+    let before = wheel.entries.len();
+    let next = wheel.insert(20, &w);
+    assert_eq!(wheel.entries.len(), before, "the fired entry is reused");
+    assert!(!wheel.is_fired(next));
+    assert!(wheel.is_fired(key), "the old key reaches no entry");
+    // One armed for a time already passed takes no entry at all.
+    let passed = wheel.insert(3, &w);
+    assert!(wheel.is_fired(passed));
+    assert_eq!(wheel.entries.len(), before);
 }
 
 #[test]
@@ -332,8 +354,10 @@ proptest! {
                     }
                 }
                 Op::Reset(i, d) => {
+                    // A fired timer's key is stale: a reset of it does nothing.
                     if let Some(t) = timers.get_mut(i)
                         && !t.4
+                        && !t.3
                     {
                         let (w, c) = waker();
                         let when = now + d;

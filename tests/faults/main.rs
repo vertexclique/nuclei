@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 mod cancel;
 mod datagram;
+mod datagram_quick;
 mod drops;
 #[cfg(unix)]
 mod emfile;

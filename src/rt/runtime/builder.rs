@@ -76,7 +76,7 @@ const MIN_STACK: usize = 128 * 1024;
 /// The shortest `handoff_after`: the watch measures in milliseconds.
 const MIN_HANDOFF: Duration = Duration::from_millis(1);
 /// The smallest table the guest map accepts; it grows past it on demand.
-const GUESTS_CAPACITY: usize = 64;
+pub(super) const GUESTS_CAPACITY: usize = 64;
 
 impl Builder {
     /// Refuses a setting no runtime can work with, or one that does not fit
@@ -470,7 +470,7 @@ impl Builder {
                 panicked: std::sync::atomic::AtomicBool::new(false),
                 on_panic: crate::sync::Notify::new(),
                 rng_seed: self.rng_seed,
-                guests: kovan_map::HashMap::with_capacity(GUESTS_CAPACITY),
+                guests: std::sync::OnceLock::new(),
                 lingering: super::super::linger::Lingering::new(),
                 io: self.io.resolve(),
             }

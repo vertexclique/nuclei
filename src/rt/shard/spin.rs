@@ -47,10 +47,15 @@ impl Spin {
     }
 
     /// With `expecting` work, spins until `found` says it is there (true) or
-    /// the budget is spent (false).
-    pub(super) fn run(&self, expecting: bool, mut found: impl FnMut() -> bool) -> bool {
+    /// the budget is spent (false). `expecting` is asked only of a shard that
+    /// is not hot, the one that needs it.
+    pub(super) fn run(
+        &self,
+        expecting: impl FnOnce() -> bool,
+        mut found: impl FnMut() -> bool,
+    ) -> bool {
         let budget = self.budget.get();
-        if !(expecting || self.hot.get()) || budget == 0 {
+        if budget == 0 || !(self.hot.get() || expecting()) {
             return false;
         }
         // The first look comes before the clock and the first pause: work already there costs
@@ -108,19 +113,19 @@ mod tests {
     fn a_spin_that_finds_work_doubles_the_budget_and_one_that_runs_out_halves_it() {
         let spin = Spin::new();
         assert_eq!(spin.budget.get(), SPIN_START);
-        assert!(spin.run(true, || true));
+        assert!(spin.run(|| true, || true));
         assert_eq!(spin.budget.get(), SPIN_START * 2);
-        assert!(!spin.run(true, || false));
+        assert!(!spin.run(|| true, || false));
         assert_eq!(spin.budget.get(), SPIN_START);
         for _ in 0..20 {
-            spin.run(true, || true);
+            spin.run(|| true, || true);
         }
         assert_eq!(spin.budget.get(), SPIN_MAX, "capped");
         for _ in 0..20 {
-            spin.run(true, || false);
+            spin.run(|| true, || false);
         }
         assert_eq!(spin.budget.get(), 0, "an idle shard stops spinning");
-        assert!(!spin.run(true, || true), "a spent budget does not spin");
+        assert!(!spin.run(|| true, || true), "a spent budget does not spin");
     }
 
     #[test]
@@ -128,25 +133,28 @@ mod tests {
         let spin = Spin::new();
         assert!(!spin.hot.get());
         let mut looks = 0;
-        assert!(!spin.run(false, || {
-            looks += 1;
-            true
-        }));
+        assert!(!spin.run(
+            || false,
+            || {
+                looks += 1;
+                true
+            }
+        ));
         assert_eq!(looks, 0, "it never looked");
         assert_eq!(spin.budget.get(), SPIN_START);
         spin.parked_for(Duration::from_micros(3));
         assert!(spin.hot.get(), "a short park: work comes soon after one");
-        assert!(spin.run(false, || true), "so it spins unasked");
-        assert!(!spin.run(false, || false));
+        assert!(spin.run(|| false, || true), "so it spins unasked");
+        assert!(!spin.run(|| false, || false));
         assert!(!spin.hot.get(), "a spin that ran out ends it");
-        assert!(!spin.run(false, || true));
+        assert!(!spin.run(|| false, || true));
     }
 
     #[test]
     fn a_spin_ends_by_time_not_by_looks() {
         let spin = Spin::new();
         let start = std::time::Instant::now();
-        assert!(!spin.run(true, || false));
+        assert!(!spin.run(|| true, || false));
         let spent = start.elapsed();
         assert!(
             spent >= Duration::from_nanos(u64::from(SPIN_START)),
@@ -159,7 +167,7 @@ mod tests {
     fn a_short_park_starts_the_spin_again() {
         let spin = Spin::new();
         for _ in 0..20 {
-            spin.run(true, || false);
+            spin.run(|| true, || false);
         }
         spin.parked_for(Duration::from_millis(5));
         assert_eq!(

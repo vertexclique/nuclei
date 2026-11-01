@@ -19,7 +19,10 @@ pub(super) enum Piece {
     // vertexia: the caller's allocation, kept uncharged by the pool (one per
     // source at most, freed by the next reads); copy it into pool buffers if
     // kept buffers must count against the cap.
-    Left { buf: OwnedBuf, start: usize },
+    Left { buf: Vec<u8>, start: usize },
+    /// As `Left`, a lent buffer of another type than a vector, apart so that
+    /// a vector's pieces reach their bytes as they always did.
+    LeftOther { buf: OwnedBuf, start: usize },
     /// A buffer of the shard's receive group a multishot receive filled;
     /// it goes back to the group once taken.
     #[cfg(ring)]
@@ -31,11 +34,19 @@ pub(super) enum Piece {
 }
 
 impl Piece {
-    #[inline]
+    /// The bytes a lent buffer whose task went away holds from `start`.
+    pub(super) fn left(buf: OwnedBuf, start: usize) -> Self {
+        match buf {
+            OwnedBuf::Vec(buf) => Piece::Left { buf, start },
+            buf => Piece::LeftOther { buf, start },
+        }
+    }
+
     fn filled(&self) -> &[u8] {
         match self {
             Piece::Pool(buf) => buf.filled(),
             Piece::Left { buf, start } => buf.get(*start..).unwrap_or_default(),
+            Piece::LeftOther { buf, start } => other_bytes(buf, *start),
             #[cfg(ring)]
             Piece::Ring(chunk) => chunk.bytes(),
             #[cfg(port)]
@@ -43,11 +54,11 @@ impl Piece {
         }
     }
 
-    #[inline]
     fn consume(&mut self, n: usize) {
         match self {
             Piece::Pool(buf) => buf.consume(n),
             Piece::Left { buf, start } => *start = (*start + n).min(buf.len()),
+            Piece::LeftOther { buf, start } => *start = (*start + n).min(other_len(buf)),
             #[cfg(ring)]
             Piece::Ring(chunk) => chunk.consume(n),
             #[cfg(port)]
@@ -70,6 +81,18 @@ impl Piece {
     }
 }
 
+/// The bytes of a lent buffer of another type than a vector from `start`.
+#[inline(never)]
+fn other_bytes(buf: &OwnedBuf, start: usize) -> &[u8] {
+    buf.get(start..).unwrap_or_default()
+}
+
+/// How many bytes a lent buffer of another type than a vector holds.
+#[inline(never)]
+fn other_len(buf: &OwnedBuf) -> usize {
+    buf.len()
+}
+
 /// Bytes read ahead that no task took yet, in the order they came: what
 /// the driver read into the pool, what a lent buffer whose task went away
 /// holds, what multishot receives handed out.
@@ -79,14 +102,12 @@ pub(super) struct Ahead {
 }
 
 impl Ahead {
-    #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.pieces.is_empty()
     }
 
     /// The bytes held.
     #[cfg(test)]
-    #[inline]
     pub(super) fn len(&self) -> usize {
         self.pieces.iter().map(|p| p.filled().len()).sum()
     }
@@ -102,7 +123,6 @@ impl Ahead {
     }
 
     /// Takes `n` bytes off the front, letting go of the pieces emptied.
-    #[inline]
     pub(super) fn consume(&mut self, mut n: usize, after: &mut After, shard: Option<&Shard>) {
         while n > 0 {
             let Some(front) = self.pieces.front_mut() else {
@@ -129,9 +149,11 @@ impl Ahead {
         after: &mut After,
         shard: Option<&Shard>,
     ) -> usize {
-        // One piece, the usual case: one look at its bytes.
-        if self.pieces.len() == 1
-            && let Some(piece) = self.pieces.front_mut()
+        // One piece, or a first piece that holds the whole read, the usual cases: one look at
+        // its bytes.
+        let one = self.pieces.len() == 1;
+        if let Some(piece) = self.pieces.front_mut()
+            && (one || piece.filled().len() >= out.len())
         {
             let src = piece.filled();
             let (all, n) = (src.len(), src.len().min(out.len()));
@@ -216,7 +238,6 @@ impl Ahead {
     }
 
     /// Lets go of every byte held.
-    #[inline]
     pub(super) fn release(&mut self, after: &mut After) {
         for piece in self.pieces.drain(..) {
             piece.release(after, None);

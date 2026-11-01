@@ -2,6 +2,7 @@
 //! tasks placement reads (a shard's) and a detached thread waits on (a
 //! home's).
 
+use core::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use super::context;
@@ -10,14 +11,16 @@ use super::shard::Shared;
 use super::task::{Runnable, Schedule, ScheduleInfo};
 use crate::sync::internal::Ordering;
 
-/// The schedule of a task placed on a shard.
+/// The schedule of a task placed on a shard. Its fields are let go of in
+/// its own drop, inline in the task's destroy, rather than in a drop glue
+/// called there.
 pub(crate) struct Sched {
-    shard: Arc<Shared>,
+    shard: ManuallyDrop<Arc<Shared>>,
     /// The home of a task whose future is not `Send`: it runs on its home's
     /// thread only, whichever shard that thread runs.
-    home: Option<Arc<Home>>,
+    home: ManuallyDrop<Option<Arc<Home>>>,
     /// Its runtime's task hooks, if it has any.
-    hooks: Option<Arc<super::tuning::TaskHooks>>,
+    hooks: ManuallyDrop<Option<Arc<super::tuning::TaskHooks>>>,
     /// The task counts in its shard's live tasks (and, bound, in its home's)
     /// until its future is dropped, which happens inside the shard's
     /// runtime wherever that is (proofs/tla/going/Linger.tla).
@@ -38,9 +41,9 @@ impl Sched {
         }
         shard.load.fetch_add(1, Ordering::Relaxed);
         Self {
-            shard,
-            home,
-            hooks,
+            shard: ManuallyDrop::new(shard),
+            home: ManuallyDrop::new(home),
+            hooks: ManuallyDrop::new(hooks),
             counted: true,
         }
     }
@@ -50,10 +53,22 @@ impl Sched {
     #[cfg(unix)]
     pub(crate) fn uncounted(shard: Arc<Shared>) -> Self {
         Self {
-            shard,
-            home: None,
-            hooks: None,
+            shard: ManuallyDrop::new(shard),
+            home: ManuallyDrop::new(None),
+            hooks: ManuallyDrop::new(None),
             counted: false,
+        }
+    }
+}
+
+impl Drop for Sched {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: each field is dropped once, here, and never used again.
+        unsafe {
+            ManuallyDrop::drop(&mut self.shard);
+            ManuallyDrop::drop(&mut self.home);
+            ManuallyDrop::drop(&mut self.hooks);
         }
     }
 }
@@ -63,18 +78,16 @@ impl Sched {
 unsafe impl Schedule for Sched {
     #[inline(always)]
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo) {
-        let runnable = if self.home.is_none() {
-            match queue_here(&self.shard, runnable, info) {
-                Some(runnable) => runnable,
-                None => return,
-            }
-        } else {
-            runnable
+        let left = match &*self.home {
+            None => queue_here(&self.shard, runnable, info),
+            Some(home) => queue_home_here(home, runnable, info),
         };
-        self.schedule_elsewhere(runnable, info);
+        if let Some(runnable) = left {
+            self.schedule_elsewhere(runnable, info);
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     fn drop_future(&self, drop: impl FnOnce()) {
         if !self.counted {
             return drop();
@@ -84,7 +97,7 @@ unsafe impl Schedule for Sched {
             // waker's thread: what its drop hands on (a dropped handle's
             // bytes) still goes to its runtime (proofs/tla/going/Linger.tla).
             let _runtime = self.shard.enter_runtime();
-            if let Some(home) = &self.home {
+            if let Some(home) = &*self.home {
                 home.ended();
             }
             drop();
@@ -96,21 +109,21 @@ unsafe impl Schedule for Sched {
 
     #[inline]
     fn before_poll(&self, id: super::task::Id) {
-        if let Some(hooks) = &self.hooks {
+        if let Some(hooks) = &*self.hooks {
             super::tuning::call(hooks.before_poll.as_ref(), id);
         }
     }
 
     #[inline]
     fn after_poll(&self, id: super::task::Id) {
-        if let Some(hooks) = &self.hooks {
+        if let Some(hooks) = &*self.hooks {
             super::tuning::call(hooks.after_poll.as_ref(), id);
         }
     }
 
     #[inline]
     fn terminated(&self, id: super::task::Id) {
-        if let Some(hooks) = &self.hooks {
+        if let Some(hooks) = &*self.hooks {
             super::tuning::call(hooks.terminate.as_ref(), id);
         }
     }
@@ -148,12 +161,33 @@ pub(crate) fn queue_here(
     }
 }
 
+/// Queues `runnable`, of a task bound to `home`, on the shard this thread
+/// runs if the thread is the home's (or runs the shard whose own home it
+/// is) and needs no bracket to reach the shard: what
+/// [`Sched::schedule`]'s general path does then, for a task woken or spawned
+/// on its home's thread. Hands it back otherwise.
+#[inline(always)]
+pub(crate) fn queue_home_here(
+    home: &Home,
+    runnable: Runnable,
+    info: ScheduleInfo,
+) -> Option<Runnable> {
+    let here = context::local();
+    match context::running_inside(here) {
+        Some(current) if context::is_home(home) || current.owns_home(home) => {
+            current.push_local_from(runnable, info, here.in_task());
+            None
+        }
+        _ => Some(runnable),
+    }
+}
+
 impl Sched {
-    /// [`Schedule::schedule`] for a bound task, or one woken anywhere but
-    /// inside its own shard.
+    /// [`Schedule::schedule`] for a task woken anywhere but inside its own
+    /// shard, or its home's thread for a bound one.
     #[inline(never)]
     fn schedule_elsewhere(&self, runnable: Runnable, info: ScheduleInfo) {
-        if let Some(home) = &self.home {
+        if let Some(home) = &*self.home {
             let remote = context::current(|current| match current {
                 Some(shard) if context::is_home(home) || shard.owns_home(home) => {
                     shard.push_local(runnable, info);

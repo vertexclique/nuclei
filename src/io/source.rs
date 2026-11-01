@@ -40,8 +40,11 @@ mod direct;
 mod hooks;
 #[cfg(completion)]
 pub(crate) mod ops;
+mod owner;
 #[cfg(port)]
 pub(crate) mod port;
+#[cfg(unix)]
+mod quick;
 mod read;
 pub(crate) mod requests;
 #[cfg(ring)]
@@ -51,7 +54,9 @@ pub(crate) mod write;
 use self::hooks::SourceHooks;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+#[cfg(completion)]
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -110,6 +115,12 @@ pub(crate) mod route {
     #[cfg(ring)]
     pub(crate) use super::ring::RingIo as Route;
 }
+
+/// `Source::unsent`: the write side holds what the kernel has not taken.
+const UNSENT: u8 = 1;
+/// `Source::unsent`: the write side waits for nothing a write edge brings.
+#[cfg(readiness)]
+const WRITE_IDLE: u8 = 2;
 
 /// No descriptor: the source is retired.
 const NO_FD: Raw = super::raw::NONE;
@@ -252,6 +263,71 @@ pub(crate) enum Addr {
     Unix(crate::buf::spare::Spare<unix::SocketAddr>),
 }
 
+/// A datagram's sender as a receive hands it out: an internet address, a
+/// Unix one, or either ([`Addr`]).
+pub(crate) trait Sender: Sized {
+    /// A datagram received straight from `fd`, a socket of `kind`, into `out`
+    /// (left on the socket with `peek`), with its sender.
+    #[cfg(unix)]
+    fn receive(fd: Raw, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)>;
+
+    /// The sender of a datagram the side held.
+    fn from_addr(addr: Addr) -> io::Result<Self>;
+}
+
+impl Sender for Addr {
+    #[cfg(unix)]
+    #[inline(always)]
+    fn receive(fd: Raw, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        match kind {
+            Kind::UnixDatagram => crate::io::sys::recv_from_unix(fd, out, peek)
+                .map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)))),
+            _ => crate::io::sys::recv_from_udp(fd, out, peek).map(|(n, a)| (n, Addr::Inet(a))),
+        }
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        Ok(addr)
+    }
+}
+
+impl Sender for SocketAddr {
+    #[cfg(unix)]
+    #[inline(always)]
+    fn receive(fd: Raw, _kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        crate::io::sys::recv_from_udp(fd, out, peek)
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        match addr {
+            Addr::Inet(addr) => Ok(addr),
+            #[cfg(unix)]
+            Addr::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a UDP datagram came with no internet address",
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Sender for unix::SocketAddr {
+    #[inline(always)]
+    fn receive(fd: Raw, _kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        crate::io::sys::recv_from_unix(fd, out, peek)
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        match addr {
+            Addr::Unix(addr) => Ok(addr.into_inner()),
+            Addr::Inet(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a Unix socket's peer has an internet address",
+            )),
+        }
+    }
+}
+
 /// Where a datagram goes.
 #[derive(Clone, Debug)]
 pub(crate) enum Target {
@@ -301,11 +377,21 @@ struct Registration {
     ops: AtomicBool,
     #[cfg(ring)]
     slot: AtomicU32,
+    /// The ring of the shard of the last registration receives UDP datagrams
+    /// ahead (`ShardRing::datagrams_ahead`); else a task receives its own.
+    #[cfg(ring)]
+    datagrams_ahead: AtomicBool,
     /// The address of the `Shared` of the shard the registration in place
     /// (or a ring attach under way) is with, else 0: compared, never
     /// followed. With the token it names the registration, since every
     /// shard numbers its own tokens.
     home: core::sync::atomic::AtomicUsize,
+    /// The address of the `Shared` of the ring shard the source is registered with, published
+    /// once the registration is in place (after `slot` and `state`) and cleared before it goes:
+    /// a thread of that shard reaches the source Here with one look (`Source::via`,
+    /// proofs/tla/attach/Route.tla). 0 for none.
+    #[cfg(ring)]
+    here: core::sync::atomic::AtomicUsize,
     /// A registration found operations of the source out, which keep its
     /// handle on the port they were issued to: it waits for the last to
     /// end (see `ops::Source::waits_for_ops`).
@@ -328,15 +414,21 @@ pub(crate) struct Source {
     read: Side<ReadState>,
     write: Side<WriteState>,
     /// The shards that claimed the sides as their owner.
-    read_owner: crate::sync::OnceCell<Arc<Shared>>,
-    write_owner: crate::sync::OnceCell<Arc<Shared>>,
+    read_owner: owner::Owner,
+    write_owner: owner::Owner,
     reg: Registration,
     /// Work that needs both sides, and what it carries (see `requests`).
     requests: AtomicU8,
     ask: Ask,
-    /// Whether the write side holds bytes or a datagram the kernel has not
-    /// taken, as its last holder left it.
-    unsent: AtomicBool,
+    /// As the write side's last holder left it: whether it holds bytes or a datagram the kernel
+    /// has not taken (`UNSENT`), and whether it waits for nothing a write edge brings
+    /// (`WRITE_IDLE`, `WriteState::idle`), so the driver passes over an edge of a side only its
+    /// own thread holds (`write_wants_no_edge`, proofs/tla/edgeskip/EdgeSkip.tla). One byte, so
+    /// a release publishes both with one store.
+    unsent: AtomicU8,
+    /// A datagram socket's words for the calls made with no guard.
+    #[cfg(unix)]
+    quick: quick::Quick,
     /// Completions of the sides' ring operations, for their holders.
     #[cfg(completion)]
     read_done: ops::Mailbox,
@@ -345,7 +437,7 @@ pub(crate) struct Source {
     /// A multishot receive's or accept's arrivals, from its ring's thread to
     /// the read side's holder, in order, each with the epoch it came in.
     #[cfg(ring)]
-    read_arrivals: kovan_queue::seg_queue::SegQueue<(ring::Arrival, u32)>,
+    read_arrivals: crate::rt::shard::counted::LazyCounted<(ring::Arrival, u32)>,
     /// The sides' operations in the kernel's hands: a retire waits until
     /// none is.
     #[cfg(completion)]
@@ -374,45 +466,80 @@ impl Source {
         false
     }
 
+    /// Whether the ring the source is attached to receives its UDP datagrams ahead (see
+    /// `ShardRing::datagrams_ahead`).
+    #[cfg(ring)]
+    fn datagrams_ahead(&self) -> bool {
+        self.reg.datagrams_ahead.load(Ordering::Acquire)
+    }
+
+    /// The source registers with a shard whose ring receives UDP datagrams ahead (`ahead`), or
+    /// not: set before the registration, so the first receive already knows it.
+    #[cfg(ring)]
+    pub(crate) fn registers_with(&self, ahead: bool) {
+        self.reg.datagrams_ahead.store(ahead, Ordering::Release);
+    }
+
+    #[cfg(not(ring))]
+    fn datagrams_ahead(&self) -> bool {
+        false
+    }
+
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
-        Arc::new(Self {
-            fd: AtomicRaw::new(fd),
-            retired_fd: AtomicRaw::new(NO_FD),
-            epoch: AtomicU32::new(0),
-            retired_epoch: AtomicU32::new(0),
-            kind,
-            read: Side::biased(ReadState::default()),
-            write: Side::biased(WriteState::default()),
-            read_owner: Default::default(),
-            write_owner: Default::default(),
-            reg: Registration {
-                state: AtomicU8::new(UNREGISTERED),
-                token: AtomicU64::new(NO_TOKEN),
-                shard: UnsafeCell::new(None),
+        // Made in place: a source is large, and `Arc::new` would build it on the stack and copy
+        // it into the allocation.
+        let source = Arc::<Self>::new_uninit();
+        let slot = Arc::as_ptr(&source).cast_mut();
+        // SAFETY: the allocation is fresh and this is its one count, so nothing else reads it
+        // while it is written; `as_ptr` keeps the allocation's own provenance.
+        unsafe {
+            slot.write(core::mem::MaybeUninit::new(Self {
+                fd: AtomicRaw::new(fd),
+                retired_fd: AtomicRaw::new(NO_FD),
+                epoch: AtomicU32::new(0),
+                retired_epoch: AtomicU32::new(0),
+                kind,
+                read: Side::biased(ReadState::default()),
+                write: Side::biased(WriteState::default()),
+                read_owner: owner::Owner::new(),
+                write_owner: owner::Owner::new(),
+                reg: Registration {
+                    state: AtomicU8::new(UNREGISTERED),
+                    token: AtomicU64::new(NO_TOKEN),
+                    shard: UnsafeCell::new(None),
+                    #[cfg(completion)]
+                    ops: AtomicBool::new(false),
+                    #[cfg(ring)]
+                    slot: AtomicU32::new(u32::MAX),
+                    #[cfg(ring)]
+                    datagrams_ahead: AtomicBool::new(false),
+                    home: core::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(ring)]
+                    here: core::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(port)]
+                    awaits_idle: AtomicBool::new(false),
+                },
+                requests: AtomicU8::new(0),
+                ask: Ask::default(),
+                unsent: AtomicU8::new(0),
+                #[cfg(unix)]
+                quick: quick::Quick::new(kind),
                 #[cfg(completion)]
-                ops: AtomicBool::new(false),
+                read_done: ops::Mailbox::default(),
+                #[cfg(completion)]
+                write_done: ops::Mailbox::default(),
                 #[cfg(ring)]
-                slot: AtomicU32::new(u32::MAX),
-                home: core::sync::atomic::AtomicUsize::new(0),
+                read_arrivals: crate::rt::shard::counted::LazyCounted::new(),
+                #[cfg(completion)]
+                ops_out: core::sync::atomic::AtomicU8::new(0),
                 #[cfg(port)]
-                awaits_idle: AtomicBool::new(false),
-            },
-            requests: AtomicU8::new(0),
-            ask: Ask::default(),
-            unsent: AtomicBool::new(false),
-            #[cfg(completion)]
-            read_done: ops::Mailbox::default(),
-            #[cfg(completion)]
-            write_done: ops::Mailbox::default(),
-            #[cfg(ring)]
-            read_arrivals: kovan_queue::seg_queue::SegQueue::new(),
-            #[cfg(completion)]
-            ops_out: core::sync::atomic::AtomicU8::new(0),
-            #[cfg(port)]
-            port: Default::default(),
-        })
+                port: Default::default(),
+            }))
+        };
+        // SAFETY: written whole above.
+        unsafe { source.assume_init() }
     }
 
     pub(crate) fn kind(&self) -> Kind {
@@ -446,6 +573,7 @@ impl Source {
 
     /// The descriptor for a poll: the handle revived the source before it
     /// polled, so it is never stale here.
+    #[inline(always)]
     fn fd(&self) -> io::Result<Raw> {
         match self.fd.load(Ordering::Acquire) {
             NO_FD => Err(io::Error::new(
@@ -517,16 +645,27 @@ impl Source {
         fd: Raw,
         current: Option<&'a crate::rt::shard::Shard>,
     ) -> io::Result<Via<'a>> {
+        // A thread of the ring shard the source is registered with: Here, with one look.
+        #[cfg(ring)]
+        if let Some(shard) = current
+            && let Some(ring) = shard.ring()
+            && self.reg.here.load(Ordering::Acquire) == shard.shared_addr()
+        {
+            return Ok(Via::Ops(route::Route::Here {
+                ring,
+                source: self,
+                file: self.reg.slot.load(Ordering::Acquire),
+            }));
+        }
         if !self.reg.ops.load(Ordering::Acquire) {
             // Registered with a poller, or about to register where no ring
-            // runs: the driver's calls.
+            // runs: the driver's calls. The registration is looked at first,
+            // one load, where the look for a ring may be a call.
             #[cfg(readiness)]
+            if self.reg.state.load(Ordering::Acquire) == REGISTERED
+                || !current.map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some())
             {
-                let rings =
-                    current.map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
-                if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
-                    return Ok(Via::Fd(fd));
-                }
+                return Ok(Via::Fd(fd));
             }
             #[cfg(not(readiness))]
             let _ = fd;
@@ -596,7 +735,7 @@ impl Source {
     #[inline(never)]
     fn settle_rest(self: &Arc<Self>, mut after: After) {
         self.kick(&mut after);
-        if after.starved {
+        if after.starved() {
             Arc::clone(self).wait_for_buffer();
         }
         after.run();
@@ -609,7 +748,7 @@ impl Source {
     )]
     fn kick(self: &Arc<Self>, after: &mut After) {
         #[cfg(ring)]
-        if let Some(home) = after.kick.take() {
+        if let Some(home) = after.take_kick() {
             home.post_io(crate::rt::shard::IoOp::RingKick(Arc::clone(self)));
         }
     }
@@ -632,7 +771,7 @@ impl Source {
         after: After,
         poll: Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
-        let watch = after.register || poll.is_pending();
+        let watch = after.must_register() || poll.is_pending();
         self.settle(after);
         if watch && let Err(err) = self.ensure_registered() {
             return Poll::Ready(Err(err));
@@ -723,6 +862,7 @@ impl Source {
         }
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
+        self.clear_here();
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
             self.undo_with(&shard, read, write);
@@ -774,6 +914,7 @@ impl Source {
     /// next `block_on`, so work posted to it after its look would wait there,
     /// a ring's detach holding the handle's object open.
     fn registration_gone(&self) {
+        self.clear_here();
         self.reg.token.store(NO_TOKEN, Ordering::Release);
         self.reg.home.store(0, Ordering::Release);
     }
@@ -822,10 +963,37 @@ impl Source {
             && self.reg.home.load(Ordering::Acquire) == home
     }
 
+    /// The registration with a ring shard `home` is in place: its threads reach the source Here
+    /// from now on. Both sides are held, `slot` and `state` stored.
+    #[cfg(ring)]
+    fn publish_here(&self, home: usize) {
+        // Release: a look that finds `here` finds the slot and the state stored before it.
+        self.reg.here.store(home, Ordering::Release);
+    }
+
+    /// The registration goes: no thread reaches the source Here from now on, before anything of
+    /// the registration changes. Both sides are held.
+    fn clear_here(&self) {
+        #[cfg(ring)]
+        self.reg.here.store(0, Ordering::Release);
+    }
+
     /// Whether the write side holds bytes or a datagram the kernel has not
     /// taken yet, as its last holder left it.
     pub(crate) fn has_unsent(&self) -> bool {
-        self.unsent.load(Ordering::Acquire)
+        self.unsent.load(Ordering::Acquire) & UNSENT != 0
+    }
+
+    /// Whether a write edge brings the write side nothing, so the driver of `shard` passes over
+    /// it: only this thread ever held the side (biased to `shard`, never shared, no foreign
+    /// thread came), and its last release left it idle. A foreign holder makes the side shared
+    /// with a locked instruction before it holds it, so its refused write is never passed over
+    /// (proofs/tla/edgeskip/EdgeSkip.tla).
+    #[cfg(readiness)]
+    #[inline(always)]
+    fn write_wants_no_edge(&self, shard: &crate::rt::shard::Shard) -> bool {
+        self.write.biased_to(shard.shared_addr())
+            && self.unsent.load(Ordering::Relaxed) & WRITE_IDLE != 0
     }
 
     /// The driver saw readiness for `token`.
@@ -836,6 +1004,11 @@ impl Source {
         readiness: Readiness,
         shard: &crate::rt::shard::Shard,
     ) {
+        // A datagram's write side that holds nothing and waits for nothing has no use for room,
+        // and a send that finds the socket full raises its word before it asks the kernel
+        // again (`quick`): every writable edge after that call reaches the side. Any other
+        // source's word stays raised.
+        let writable = readiness.writable && !self.quick.write_clear();
         let mut after = After::default();
         let hooks = SourceHooks {
             src: self,
@@ -851,7 +1024,7 @@ impl Source {
             };
             self.read.drive(&mut after, &hooks, unsure);
         }
-        if readiness.writable {
+        if writable && !self.write_wants_no_edge(shard) {
             self.write.drive(&mut after, &hooks, 0);
         }
         // If the driver's own pool ran out, the readers hear when a buffer

@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::inbox::{Inbox, Pop};
-use kovan_queue::seg_queue::SegQueue;
+use counted::Counted;
 
 use super::backend::Backend;
 use super::counters::{self, Counters};
@@ -76,6 +76,7 @@ mod stats;
 mod timers;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 pub(crate) use run::Worked;
+pub(crate) mod counted;
 #[cfg(ring)]
 pub(crate) mod recv;
 #[cfg(ring)]
@@ -109,7 +110,7 @@ pub(crate) struct Shared {
     stop_waker: AtomicWaker,
     /// Work on the timer wheel from other threads, applied by the shard
     /// before it fires timers.
-    timer_ops: SegQueue<TimerOp>,
+    timer_ops: Counted<TimerOp>,
     /// The registrations of the shard's readiness poller; `None` on a ring
     /// shard, whose sources' IO is the ring's operations.
     #[cfg(readiness)]
@@ -120,7 +121,7 @@ pub(crate) struct Shared {
     port: Arc<super::park::iocp::Port>,
     /// Registrations other threads ask of the shard, applied before it
     /// polls.
-    io_ops: SegQueue<IoOp>,
+    io_ops: Counted<IoOp>,
     /// Nothing will apply `io_ops` again (the shard went, and its ring's
     /// keeper too): what reaches it then is let go of by its poster.
     io_closed: AtomicBool,
@@ -254,9 +255,7 @@ impl Shared {
     /// where it is polled (proofs/tla/timer, `S_go`); the rest only goes.
     pub(crate) fn drain_timer_ops(&self) {
         crate::sync::internal::fence(Ordering::SeqCst);
-        while let Ok(op) = self.timer_ops.try_pop() {
-            op.orphan();
-        }
+        self.timer_ops.take_all(TimerOp::orphan);
     }
 
     /// Adds and removes the kernel registrations of the shard's readiness
@@ -322,9 +321,7 @@ impl Shared {
 
     fn drain_io_ops(&self) {
         crate::sync::internal::fence(Ordering::SeqCst);
-        while let Ok(op) = self.io_ops.try_pop() {
-            op.gone();
-        }
+        self.io_ops.take_all(IoOp::gone);
     }
 
     /// Frees the slot of a source whose kernel registration is gone: at once
@@ -528,7 +525,7 @@ impl Shared {
     /// paused clock deciding whether the shard is idle); its own thread looks
     /// with [`Shard::has_remote_work`].
     fn has_remote_work(&self) -> bool {
-        !self.inbox.is_empty() || !self.timer_ops.is_empty() || !self.io_ops.is_empty()
+        !self.inbox.is_empty() || self.timer_ops.holds_any() || self.io_ops.holds_any()
     }
 }
 
@@ -604,11 +601,15 @@ pub(crate) struct Shard {
     lifo_streak: Cell<u32>,
     /// Runs left before the inbox is looked at first (`tuning.inbox_interval` at the start).
     until_inbox: Cell<u32>,
-    /// Runs since timers and the poller were last looked at.
-    since_drive: Cell<u32>,
+    /// The runs since timers and the poller were last looked at, as a count
+    /// down to the next run that weighs a look (`drive_at`, the next multiple
+    /// of `QUARTZ_EVERY` or `tuning.driver_interval`): `drive_at - drive_left`
+    /// (`Shard::since_drive`), one decrement a run.
+    drive_left: Cell<u32>,
+    drive_at: Cell<u32>,
     /// The `Quartz` reading of the last look at timers and the poller.
     last_drive: Cell<u64>,
-    /// Task polls run (the run loop's are added from `since_drive` as it
+    /// Task polls run (the run loop's are added from `since_drive()` as it
     /// starts again), and runnables taken from other threads: published for
     /// `stats` with the rest of the shard's cells.
     polls: Cell<u64>,
@@ -681,6 +682,7 @@ impl Shard {
             shard.time_io();
         }
         shard.until_inbox.set(tuning.inbox_interval);
+        shard.count_drive_from(0, tuning.driver_interval);
         #[cfg(ring)]
         if let Some(ring) = shard.ring() {
             ring.set_zero_copy_min(tuning.zero_copy_min);
@@ -786,12 +788,12 @@ impl Shard {
             stopped: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
-            timer_ops: SegQueue::new(),
+            timer_ops: Counted::new(),
             #[cfg(readiness)]
             registrar: kernel,
             #[cfg(port)]
             port: kernel,
-            io_ops: SegQueue::new(),
+            io_ops: Counted::new(),
             io_closed: AtomicBool::new(false),
             counters: Counters::new(driver.backend(), pool.cap(), owner),
             runtime: std::sync::OnceLock::new(),
@@ -808,7 +810,8 @@ impl Shard {
             lifo: Cell::new(None),
             lifo_streak: Cell::new(0),
             until_inbox: Cell::new(super::tuning::Tuning::default().inbox_interval),
-            since_drive: Cell::new(0),
+            drive_left: Cell::new(1),
+            drive_at: Cell::new(1),
             last_drive: Cell::new(super::quartz::Quartz::now()),
             polls: Cell::new(0),
             sleeps: Cell::new(0),
@@ -844,6 +847,8 @@ impl Shard {
     /// Watches `source` from now on, under a new token. The caller moved
     /// the source's registration to registering.
     pub(crate) fn register_source(&self, source: &Arc<Source>) -> io::Result<()> {
+        #[cfg(ring)]
+        source.registers_with(self.ring().is_some_and(ring::ShardRing::datagrams_ahead));
         let token = match self.sources.borrow_mut().insert(Arc::clone(source)) {
             Ok(token) => token,
             Err(err) => {
@@ -874,7 +879,7 @@ impl Shard {
 
     /// Applies the registration changes other threads asked for.
     fn apply_io_ops(&self) {
-        while let Ok(op) = self.shared.io_ops.try_pop() {
+        self.shared.io_ops.take_all(|op| {
             match op {
                 IoOp::Register(source) => match self.register_source(&source) {
                     Ok(()) => {}
@@ -915,7 +920,7 @@ impl Shard {
                     }
                 }
             }
-        }
+        });
     }
 
     /// The address of the shard's `Shared`, which a source keeps to tell
@@ -1017,14 +1022,26 @@ impl Shard {
     /// back ([`Inbox::is_drained`]).
     #[inline]
     fn has_remote_work(&self) -> bool {
-        let shared = &self.shared;
+        self.has_remote_tasks() || self.has_posted_ops()
+    }
+
+    /// The tasks of [`has_remote_work`](Self::has_remote_work): runnables in the inbox or a home.
+    #[inline]
+    fn has_remote_tasks(&self) -> bool {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
-        let drained = unsafe { shared.inbox.is_drained() }
+        let drained = unsafe { self.shared.inbox.is_drained() }
             && super::context::home_is_drained()
             // SAFETY: as in `pop_inbox`.
             && self.home.get().is_none_or(|home| unsafe { home.is_drained() });
-        !drained || !shared.timer_ops.is_empty() || !shared.io_ops.is_empty()
+        !drained
+    }
+
+    /// The rest of [`has_remote_work`](Self::has_remote_work): work on the timer wheel and
+    /// registration changes other threads posted.
+    #[inline]
+    fn has_posted_ops(&self) -> bool {
+        !self.shared.timer_ops.is_empty() || !self.shared.io_ops.is_empty()
     }
 
     /// Runnables queued on this thread now, the LIFO slot's included.

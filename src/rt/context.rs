@@ -634,9 +634,18 @@ impl Drop for RuntimeSet {
 /// The home of a bound task spawned now on `shard`, which this thread runs:
 /// the thread's own as a worker shard's runner, else the shard's, a thread's
 /// own shard.
+#[inline]
 pub(crate) fn home_for(shard: &Shard) -> Arc<Home> {
-    HOME.with(|home| home.0.borrow().clone())
-        .unwrap_or_else(|| shard.own_home())
+    let home = local().home.get();
+    if home.is_null() {
+        return shard.own_home();
+    }
+    // SAFETY: `HOME` holds a strong reference to the home `Here` names, so it
+    // is live, and the count taken here is the clone's.
+    unsafe {
+        Arc::increment_strong_count(home);
+        Arc::from_raw(home)
+    }
 }
 
 /// Makes `home` this thread's, for the bound tasks it spawns from now on: a
@@ -652,6 +661,7 @@ fn set_home_ptr(home: &Arc<Home>) {
 }
 
 /// Whether `home` is this thread's.
+#[inline]
 pub(crate) fn is_home(home: &Home) -> bool {
     core::ptr::eq(local().home.get(), home)
 }

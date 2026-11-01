@@ -56,20 +56,23 @@ impl SourceHooks<'_> {
     }
 
     /// Keeps the shard that claimed a side, for a nudge to reach.
-    fn claimed(&self, cell: &crate::sync::OnceCell<Arc<Shared>>) {
+    fn claimed(&self, cell: &super::owner::Owner) {
+        if cell.is_set() {
+            return;
+        }
         let shard = self
             .claim
             .cloned()
             .or_else(|| self.shard.map(|s| Arc::clone(&s.shared)));
         if let Some(shard) = shard {
-            let _ = cell.set(shard);
+            cell.set(shard);
         }
     }
 
     /// Asks the shard that owns a side to take and let go of the source's
     /// sides (a ring source's kick, else a touch), serving what a thread
     /// whose heavy fence failed left there.
-    fn nudge(&self, cell: &crate::sync::OnceCell<Arc<Shared>>) {
+    fn nudge(&self, cell: &super::owner::Owner) {
         if let Some(owner) = cell.get() {
             #[cfg(ring)]
             owner.post_io(IoOp::RingKick(Arc::clone(self.src)));
@@ -112,9 +115,9 @@ impl Hooks<ReadState> for SourceHooks<'_> {
             // An operation's arrivals go first: its end comes after them.
             #[cfg(ring)]
             if bits & (read_work::ARRIVALS | read_work::DONE) != 0 {
-                while let Ok((arrival, epoch)) = self.src.read_arrivals.try_pop() {
-                    st.take_arrival(arrival, epoch, after);
-                }
+                self.src
+                    .read_arrivals
+                    .take_all(|(arrival, epoch)| st.take_arrival(arrival, epoch, after));
             }
             if bits & read_work::DONE != 0
                 && let Some(done) = self.src.read_done.take()
@@ -136,6 +139,17 @@ impl Hooks<ReadState> for SourceHooks<'_> {
 
     fn requests(&self, st: &mut ReadState, after: &mut After) {
         self.src.requests_holding_read(self, st, after);
+    }
+
+    #[inline(always)]
+    fn releasing(&self, st: &mut ReadState) {
+        // What a datagram receive made with no guard reads (`quick`).
+        #[cfg(unix)]
+        if self.src.quick.on() {
+            leave_read(self.src, st);
+        }
+        #[cfg(not(unix))]
+        let _ = st;
     }
 
     fn owner(&self) -> usize {
@@ -205,8 +219,16 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     }
 
     fn releasing(&self, st: &mut WriteState) {
-        // Release: a drop on another thread reads it.
-        self.src.unsent.store(st.has_unsent(), Ordering::Release);
+        // Release: a drop on another thread reads the unsent bit; this thread's driver reads the
+        // idle bit, only while no other thread ever held the side.
+        self.src
+            .unsent
+            .store(st.published(self.src.on_ring()), Ordering::Release);
+        // What a datagram send made with no guard, and the driver's edge, read (`quick`).
+        #[cfg(unix)]
+        if self.src.quick.on() {
+            leave_write(self.src, st);
+        }
     }
 
     fn owner(&self) -> usize {
@@ -220,4 +242,20 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     fn nudge(&self) {
         SourceHooks::nudge(self, &self.src.write_owner);
     }
+}
+
+/// A datagram side's holder leaves the read side's word (`quick`). Out of
+/// line, so every stream's release keeps only the look at the kind.
+#[cfg(unix)]
+#[inline(never)]
+fn leave_read(src: &Source, st: &ReadState) {
+    src.quick
+        .leave_read(st.quick_word(src.kind, src.datagrams_ahead()));
+}
+
+/// As [`leave_read`], for the write side's word.
+#[cfg(unix)]
+#[inline(never)]
+fn leave_write(src: &Source, st: &WriteState) {
+    src.quick.leave_write(st.quick_holds());
 }

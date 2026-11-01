@@ -64,7 +64,7 @@
 //!   [`oneshot`](crate::sync::oneshot), [`broadcast`](crate::sync::broadcast)
 //!   or [`watch`](crate::sync::watch) that completes spends one operation of
 //!   the task's cooperative budget, as IO does
-//!   ([`task::coop`](crate::task::coop)), and so does an acquire of a
+//!   ([`task::coop`]), and so does an acquire of a
 //!   semaphore, a lock (the reentrant ones too) or a bounded send that
 //!   completes at its first attempt. When the budget is spent the call
 //!   completes nothing, wakes its task and returns `Pending`, so a loop on a

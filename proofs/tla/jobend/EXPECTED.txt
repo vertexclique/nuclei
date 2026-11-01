@@ -1,0 +1,9 @@
+# configuration                spec                 expected
+J_safe                         MC_JobEnd            pass
+J_live                         MC_JobEnd            pass
+M_end_in_job                   MC_JobEnd            violated:NoAllocation
+M_wake_after_job               MC_JobEnd            violated:NoAllocation
+M_write_first                  MC_JobEnd            violated:CountedUntilWoken
+M_count_first                  MC_JobEnd            violated:CountedOutAfterWake
+W_early                        MC_JobEnd            violated:NoEarlyLook
+W_took_back                    MC_JobEnd            violated:NoTookBack

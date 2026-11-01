@@ -1,0 +1,6 @@
+# configuration                spec                 expected
+E_biased                       MC_EdgeSkip          pass
+E_shared                       MC_EdgeSkip          pass
+M_skip_idle_only               MC_EdgeSkip          deadlock
+M_skip_no_shared               MC_EdgeSkip          deadlock
+W_skip                         MC_EdgeSkip          violated:NoSkip

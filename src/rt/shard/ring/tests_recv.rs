@@ -371,21 +371,34 @@ fn a_chunk_outlives_its_shard() {
         });
     }
     drop(shard);
-    // Read on a thread with no shard: what is held comes from the chunks.
+    // Read on a thread with no shard: what is held comes from the chunks. The poll registers the
+    // source with a shard of the process's runtime, whose thread takes both sides to put it in
+    // place, and the ring's keeper takes the read side as the cancelled receive ends: a poll that
+    // finds the side held that way waits for the holder's wake, then reads what is held.
     let mut rest = vec![0u8; 16 * 1024];
     let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let waker = std::task::Waker::from(Arc::new(Flag(Arc::clone(&woke))));
     let mut cx = std::task::Context::from_waker(&waker);
-    match src.poll_read(&mut cx, &mut rest, false) {
-        core::task::Poll::Ready(Ok(n)) => {
-            assert!(n > 0);
-            assert!(
-                rest[..n] == data[1..=n],
-                "the bytes held changed after the shard went"
-            );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let n = loop {
+        match src.poll_read(&mut cx, &mut rest, false) {
+            core::task::Poll::Ready(Ok(n)) => break n,
+            core::task::Poll::Pending => {
+                let mut nap = Duration::from_micros(50);
+                while !woke.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline, "the read was never woken");
+                    std::thread::sleep(nap);
+                    nap = (nap * 2).min(Duration::from_millis(10));
+                }
+            }
+            other => panic!("the bytes held were not there: {other:?}"),
         }
-        other => panic!("the bytes held were not there: {other:?}"),
-    }
+    };
+    assert!(n > 0);
+    assert!(
+        rest[..n] == data[1..=n],
+        "the bytes held changed after the shard went"
+    );
     src.retire();
 }
 
