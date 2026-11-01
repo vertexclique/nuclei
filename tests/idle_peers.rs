@@ -54,6 +54,14 @@ const FLOOD: u8 = 2;
 /// buffers their sends' bytes wait in.
 const DEAF: usize = 128 + 16;
 const DEAF_CAP: usize = 64 << 20;
+/// The kernel buffers of each connection whose peer never reads: the peer's receive buffer, set
+/// before its connect, and the flood's send buffer. Left to the system they grow, and on macOS the
+/// peers then hold about all the memory the kernel lets TCP have (a thirty-second of the machine's,
+/// `tcp_memacct` in bsd/netinet/tcp_subr.c: 194 MiB of a 7 GiB runner's 179 MiB soft limit). Past
+/// that limit the kernel refuses sends (`ENOBUFS`) and drops segments, of other connections too,
+/// whatever serves them. Bounded, the peers hold about 51 MiB there (macOS keeps a loopback receive
+/// buffer at 319 KiB at least).
+const DEAF_BUFFER: u32 = 16 << 10;
 
 /// Peeks at what came before it reads, so a peek takes the same way as a read. A call that fails
 /// ends the connection, its error kept for a failure's message: a peer then reads a reset, the
@@ -115,11 +123,31 @@ async fn serve_or_flood(stream: TcpStream) {
     if let Ok(1..) = stream.peek(&mut buf).await
         && buf[0] == FLOOD
     {
+        set_send_buffer(&stream, DEAF_BUFFER);
         let chunk = vec![9u8; 64 << 10];
         while stream.send(&chunk).await.is_ok() {}
         return;
     }
     serve(stream).await;
+}
+
+/// Sets the send buffer of `stream`'s socket to `size`, through a socket that borrows its handle.
+fn set_send_buffer(stream: &TcpStream, size: u32) {
+    #[cfg(unix)]
+    // SAFETY: the stream's descriptor stays open while the socket lives, and the socket is never
+    // dropped, so the descriptor stays the stream's.
+    let socket = unsafe {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        nuclei::net::TcpSocket::from_raw_fd(stream.as_raw_fd())
+    };
+    #[cfg(windows)]
+    // SAFETY: as above, for the stream's socket handle.
+    let socket = unsafe {
+        use std::os::windows::io::{AsRawSocket, FromRawSocket};
+        nuclei::net::TcpSocket::from_raw_socket(stream.as_raw_socket())
+    };
+    let socket = core::mem::ManuallyDrop::new(socket);
+    socket.set_send_buffer_size(size).unwrap();
 }
 
 /// The smallest ring, with no receive group, for every test of the binary.
@@ -246,6 +274,17 @@ fn connect(addr: SocketAddr) -> StdStream {
     stream
 }
 
+/// A peer that never reads, its receive buffer `DEAF_BUFFER` (std connects with no way to set it
+/// first).
+fn connect_deaf(addr: SocketAddr) -> StdStream {
+    let socket = nuclei::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(DEAF_BUFFER).unwrap();
+    let stream = nuclei::block_on(socket.connect(addr)).unwrap().into_inner();
+    stream.set_nonblocking(false).unwrap();
+    stream.set_read_timeout(Some(DEADLINE)).unwrap();
+    stream
+}
+
 #[test]
 fn idle_peers_holding_the_cap_and_the_pool_keep_no_request_from_its_reply() {
     let _alone = one_at_a_time();
@@ -283,7 +322,7 @@ fn tasks_that_stop_reading_with_the_pool_full_keep_no_request_from_its_reply() {
 fn sends_waiting_for_peers_that_never_read_keep_no_request_from_its_reply() {
     let _alone = one_at_a_time();
     let (_rt, addr) = server(DEAF_CAP, serve_or_flood);
-    let mut deaf: Vec<StdStream> = (0..DEAF).map(|_| connect(addr)).collect();
+    let mut deaf: Vec<StdStream> = (0..DEAF).map(|_| connect_deaf(addr)).collect();
     for stream in &mut deaf {
         stream.write_all(&[FLOOD; READ]).unwrap();
     }
