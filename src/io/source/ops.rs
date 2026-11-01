@@ -432,6 +432,11 @@ impl Source {
         write: &mut super::write::WriteState,
         after: &mut After,
     ) {
+        // A source registered before its first operation (the usual case) holds nothing yet, and
+        // nothing waits on it: the route is not looked up for nothing.
+        if !read.wants_ops() && !write.wants_ops() {
+            return;
+        }
         self.with_route(None, |io| {
             read.submit_wanted(io, self.kind, after);
             write.submit_wanted(io, self.kind, after);
