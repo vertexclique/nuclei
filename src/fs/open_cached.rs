@@ -11,8 +11,9 @@
 //! on a file system of this machine whose open reads nothing (a known one,
 //! by its magic number) is opened here, non-blocking (as every handle's
 //! descriptor is made anyway, `Handle::adopt`), so not even a lease holds it
-//! up. No FIFO or device is ever opened here, so no writer of a FIFO sees a
-//! reader come and go. Anything else, and every open this cannot answer for
+//! up. No FIFO or device is opened here unless the path is swapped for one
+//! between the look and the open; that descriptor is closed at once and the
+//! open goes to the pool, as a plain open of the new file would. Anything else, and every open this cannot answer for
 //! whatever reason, goes to the blocking pool as every open did before,
 //! where it waits as a plain open does, and the pool's answer, an error
 //! included, is the one the caller gets.
