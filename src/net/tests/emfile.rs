@@ -4,9 +4,8 @@
 //! Each case runs alone in its process, for it lowers the descriptor limit.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
@@ -25,25 +24,37 @@ const RETRIES: usize = 3;
 /// retries after it take none.
 const CLOSED: usize = if cfg!(target_vendor = "apple") { 1 } else { 0 };
 
-/// How many of `clients` the listener's side closed: a closed one reads the
-/// end or a reset, a served one has nothing to read yet.
-fn closed(clients: &[impl AsRawFd]) -> usize {
+/// How long a client waits for its served byte or its end.
+const READ_WITHIN: Duration = Duration::from_secs(10);
+
+/// How many of `clients` the listener's side closed, each one told for good:
+/// every served connection sent a byte first, so a served client reads that
+/// byte and a closed one its end or a reset. A look that does not wait cannot
+/// tell them apart: macOS hands loopback segments to its input thread
+/// (`dlil_input_async`, bsd/net/dlil_input.c), so the end that the failed
+/// accept's close sent reaches the client some time after the accept
+/// returned, after std's accept too.
+fn closed(clients: &mut [impl Read]) -> usize {
     clients
-        .iter()
-        .filter(|client| {
-            let mut byte = 0u8;
-            // SAFETY: a peek of at most one byte into our own byte, on a
-            // descriptor the caller keeps open.
-            let n = unsafe {
-                libc::recv(
-                    client.as_raw_fd(),
-                    (&raw mut byte).cast(),
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
-            };
-            n == 0 || (n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock)
+        .iter_mut()
+        .map(|client| {
+            let mut byte = [0u8; 1];
+            match client.read(&mut byte) {
+                Ok(1) => false,
+                Ok(_) => true,
+                Err(err) => {
+                    assert!(
+                        !matches!(
+                            err.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ),
+                        "a client read neither a byte nor its end within {READ_WITHIN:?}"
+                    );
+                    true
+                }
+            }
         })
+        .filter(|&ended| ended)
         .count()
 }
 
@@ -103,8 +114,12 @@ fn tcp_case(multi: bool) {
         let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let mut stream = within(listener.accept_multi()).await.unwrap();
-        let clients: Vec<_> = (0..CLIENTS)
-            .map(|_| TcpStream::connect(addr).unwrap())
+        let mut clients: Vec<_> = (0..CLIENTS)
+            .map(|_| {
+                let client = TcpStream::connect(addr).unwrap();
+                client.set_read_timeout(Some(READ_WITHIN)).unwrap();
+                client
+            })
             .collect();
         let mut starved = Starved::new();
         let mut served = Vec::new();
@@ -132,7 +147,10 @@ fn tcp_case(multi: bool) {
                 served.push(within(listener.accept()).await.unwrap().0);
             }
         }
-        assert_eq!(closed(&clients), CLOSED);
+        for stream in &served {
+            assert_eq!(within(stream.send(b"s")).await.unwrap(), 1);
+        }
+        assert_eq!(closed(&mut clients), CLOSED);
     });
 }
 
@@ -141,8 +159,12 @@ fn unix_case() {
     let _ = std::fs::remove_file(&path);
     runtime().block_on(async {
         let listener = Handle::<UnixListener>::bind(&path).unwrap();
-        let clients: Vec<_> = (0..CLIENTS)
-            .map(|_| UnixStream::connect(&path).unwrap())
+        let mut clients: Vec<_> = (0..CLIENTS)
+            .map(|_| {
+                let client = UnixStream::connect(&path).unwrap();
+                client.set_read_timeout(Some(READ_WITHIN)).unwrap();
+                client
+            })
             .collect();
         let mut starved = Starved::new();
         for _ in 0..RETRIES {
@@ -155,7 +177,10 @@ fn unix_case() {
         for _ in 0..CLIENTS - CLOSED {
             served.push(within(listener.accept()).await.unwrap().0);
         }
-        assert_eq!(closed(&clients), CLOSED);
+        for stream in &served {
+            assert_eq!(within(stream.send(b"s")).await.unwrap(), 1);
+        }
+        assert_eq!(closed(&mut clients), CLOSED);
     });
     let _ = std::fs::remove_file(&path);
 }
