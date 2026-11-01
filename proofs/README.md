@@ -901,7 +901,8 @@ sender while no descriptor is free). The Rust test
 
 `dgram` (`tla/dgram/DgramQuick.tla`, `tla/dgram/DgramQuickSend.tla`) checks the datagram calls
 a task makes at once, with no guard, while the side holds nothing (`poll_receive_as` in
-`src/io/source/read/calls.rs`, `poll_send` in `src/io/source/write/calls.rs`, the word of
+`src/io/source/read/calls.rs`, `poll_send` in `src/io/source/write/calls.rs`, each with its
+guarded call out of line in `poll_receive_held` and `poll_send_held`, the word of
 `src/io/source/quick.rs` that `quick_word` and `quick_holds` compute and `releasing` in
 `src/io/source/hooks.rs` leaves as each holder lets go, `receive_now` and `send_now` under the
 guard, the edges of `serve` and `on_event`). Each side's last holder leaves a word: raised while
