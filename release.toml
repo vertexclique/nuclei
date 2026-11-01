@@ -1,0 +1,2 @@
+# Every crate releases with the one version of [workspace.package].
+shared-version = true
