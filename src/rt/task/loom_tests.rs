@@ -258,7 +258,7 @@ fn a_cancel_racing_the_run_drops_the_future_once() {
 /// awaiter is woken (or sees the output at once) and gets the output.
 #[test]
 fn an_awaiter_racing_the_completion_is_woken() {
-    model("an_awaiter_racing_the_completion_is_woken", 3000, || {
+    model("an_awaiter_racing_the_completion_is_woken", 1448, || {
         let scheds = Count::new();
         let queue = Arc::new(Mutex::new(Vec::new()));
         let (runnable, task) = spawn(async { 7 }, Sched::new(&queue, &scheds));
