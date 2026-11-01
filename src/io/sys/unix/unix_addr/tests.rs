@@ -6,8 +6,8 @@ use proptest::prelude::*;
 
 use super::*;
 
-/// Paths of every length a word scan splits differently, with a NUL at each
-/// place, or none.
+/// Paths of every length up to past a few words, with a NUL at each place,
+/// or none.
 fn path_bytes() -> impl Strategy<Value = Vec<u8>> {
     (0usize..40, proptest::option::of(0usize..40), 1u8..=255).prop_map(|(len, nul, fill)| {
         let mut bytes = vec![fill; len];
@@ -45,7 +45,7 @@ proptest! {
 }
 
 #[test]
-fn a_nul_in_each_byte_of_a_word_is_found() {
+fn a_nul_at_each_place_is_found() {
     for len in 8..=24 {
         for at in 0..len {
             let mut bytes = vec![0x80u8; len];

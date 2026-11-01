@@ -87,21 +87,10 @@ impl UnixAddr {
     }
 }
 
-/// Whether `bytes` holds a zero byte, looked at eight bytes at a time: a
-/// word has one exactly when subtracting one from each of its bytes borrows
-/// into a byte whose top bit was clear.
+/// Whether `bytes` holds a zero byte, by the C library's own scan.
 fn has_nul(bytes: &[u8]) -> bool {
-    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
-    const TOPS: u64 = u64::from_ne_bytes([0x80; 8]);
-    let zero_in = |word: &[u8; 8]| {
-        let w = u64::from_ne_bytes(*word);
-        w.wrapping_sub(ONES) & !w & TOPS != 0
-    };
-    match bytes.last_chunk::<8>() {
-        // The last word overlaps the words before it: every byte is in one.
-        Some(last) => bytes.as_chunks::<8>().0.iter().any(zero_in) || zero_in(last),
-        None => bytes.contains(&0),
-    }
+    // SAFETY: reads at most `bytes.len()` bytes of `bytes`.
+    !unsafe { libc::memchr(bytes.as_ptr().cast(), 0, bytes.len()) }.is_null()
 }
 
 fn too_long() -> io::Error {
