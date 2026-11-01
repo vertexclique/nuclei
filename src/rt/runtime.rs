@@ -470,19 +470,38 @@ where
     let (shared, home) =
         context::current(|current| current.map(place)).unwrap_or_else(|| place(&own_shard()));
     let hooks = context_hooks();
-    let (runnable, task) = if let Some(home) = home {
+    let (runnable, task, bound_to) = if let Some(home) = home {
+        let at = Arc::as_ptr(&home);
         // SAFETY: the task's schedule sends a woken bound task only to its
         // home's thread (leaked rather than dropped if that thread is gone);
         // the future is 'static.
-        unsafe { task::spawn_unchecked(future, Sched::counted(shared, Some(home), hooks.clone())) }
+        let (runnable, task) = unsafe {
+            task::spawn_unchecked(future, Sched::counted(shared, Some(home), hooks.clone()))
+        };
+        (runnable, task, Some(at))
     } else {
         // SAFETY: the task's schedule sends a woken task of this shard back
         // to it; the future is 'static, and `Send` (a caller with `bound`
         // false is `spawn`'s, whose future is).
-        unsafe { task::spawn_unchecked(future, Sched::counted(shared, None, hooks.clone())) }
+        let (runnable, task) =
+            unsafe { task::spawn_unchecked(future, Sched::counted(shared, None, hooks.clone())) };
+        (runnable, task, None)
     };
     spawned(hooks.as_deref(), &task);
-    runnable.schedule();
+    // A bound task as its schedule would queue it, without the turn through
+    // the task's table.
+    let left = match bound_to {
+        Some(home) => {
+            // SAFETY: the task's schedule holds its home while the runnable
+            // lives.
+            let home = unsafe { &*home };
+            super::sched::queue_home_here(home, runnable, ScheduleInfo::new(false))
+        }
+        None => Some(runnable),
+    };
+    if let Some(runnable) = left {
+        runnable.schedule();
+    }
     task
 }
 

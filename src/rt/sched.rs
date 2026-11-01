@@ -152,7 +152,11 @@ pub(crate) fn queue_here(
 /// [`Sched::schedule`]'s general path does then, for a task woken or spawned
 /// on its home's thread. Hands it back otherwise.
 #[inline(always)]
-fn queue_home_here(home: &Home, runnable: Runnable, info: ScheduleInfo) -> Option<Runnable> {
+pub(crate) fn queue_home_here(
+    home: &Home,
+    runnable: Runnable,
+    info: ScheduleInfo,
+) -> Option<Runnable> {
     let here = context::local();
     match context::running_inside(here) {
         Some(current) if context::is_home(home) || current.owns_home(home) => {
