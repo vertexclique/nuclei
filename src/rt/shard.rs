@@ -601,11 +601,15 @@ pub(crate) struct Shard {
     lifo_streak: Cell<u32>,
     /// Runs left before the inbox is looked at first (`tuning.inbox_interval` at the start).
     until_inbox: Cell<u32>,
-    /// Runs since timers and the poller were last looked at.
-    since_drive: Cell<u32>,
+    /// The runs since timers and the poller were last looked at, as a count
+    /// down to the next run that weighs a look (`drive_at`, the next multiple
+    /// of `QUARTZ_EVERY` or `tuning.driver_interval`): `drive_at - drive_left`
+    /// (`Shard::since_drive`), one decrement a run.
+    drive_left: Cell<u32>,
+    drive_at: Cell<u32>,
     /// The `Quartz` reading of the last look at timers and the poller.
     last_drive: Cell<u64>,
-    /// Task polls run (the run loop's are added from `since_drive` as it
+    /// Task polls run (the run loop's are added from `since_drive()` as it
     /// starts again), and runnables taken from other threads: published for
     /// `stats` with the rest of the shard's cells.
     polls: Cell<u64>,
@@ -678,6 +682,7 @@ impl Shard {
             shard.time_io();
         }
         shard.until_inbox.set(tuning.inbox_interval);
+        shard.count_drive_from(0, tuning.driver_interval);
         #[cfg(ring)]
         if let Some(ring) = shard.ring() {
             ring.set_zero_copy_min(tuning.zero_copy_min);
@@ -805,7 +810,8 @@ impl Shard {
             lifo: Cell::new(None),
             lifo_streak: Cell::new(0),
             until_inbox: Cell::new(super::tuning::Tuning::default().inbox_interval),
-            since_drive: Cell::new(0),
+            drive_left: Cell::new(1),
+            drive_at: Cell::new(1),
             last_drive: Cell::new(super::quartz::Quartz::now()),
             polls: Cell::new(0),
             sleeps: Cell::new(0),

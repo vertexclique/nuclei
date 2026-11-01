@@ -256,14 +256,21 @@ waker's data and table to tell): it does not wake itself and poll again for as l
 completion takes. A run that ends Pending, neither woken nor closed, drops its
 reference in the exchange that clears RUNNING, so no later run of the task, woken meanwhile on
 another runner, is followed by that drop. `RunnerFreesNoAwaited` checks both: the run never
-frees a task whose handle held it as it completed.
+frees a task whose handle held it as it completed. A run starts with one addition, not an
+exchange: the task of every runnable is scheduled and not running, and nothing clears
+SCHEDULED while the runnable waits (`RunnableScheduled`), so adding RUNNING less SCHEDULED
+turns the one flag into the other whatever else the word holds; a run that then finds the task
+cancelled in the queue clears RUNNING after dropping the future.
 
-The TLA+ family checks 30 configurations: 12 that must pass (the handle awaiting, detaching,
+The TLA+ family checks 32 configurations: 12 that must pass (the handle awaiting, detaching,
 dropped or cancelling, with one or two runners, wakes by value and by reference, a future that
 wakes itself, a waker dropped without a wake, a handle polled once without a wake, and liveness
-under weak fairness), 12 mutations
+under weak fairness), 14 mutations
 that each take one rule away (a wake during the poll that schedules a second runnable breaks
-`OnePoll`; a run that drops a wake from its own poll, and a handle that sleeps without looking
+`OnePoll`, and `RunnableScheduled` too: the second run would start on a running task, where the
+addition carries into the next flag; a run that finds the task cancelled in the queue and leaves
+RUNNING set ends in a deadlock, the cancelling handle waiting for ever for a future it thinks is
+being polled; a run that drops a wake from its own poll, and a handle that sleeps without looking
 again, end in a deadlock; freeing the memory while the handle lives, a wake by reference
 that makes a runnable without its own reference, and a Pending run whose exchange drops its
 reference though the task was woken, break `NothingAfterFree`; a cancel that drops
@@ -1911,7 +1918,8 @@ clears only its own.
 (`src/rt/shard.rs`, `Shard::block_on`). Each turn, in any order, either a task runs, or no
 task runs and the future woke itself again, or nothing is ready and the loop spins and parks
 (both look). Every `N` task runs bring a look without waiting, and so do every `N` turns of
-the future's own. 4 configurations: 1 that must pass (the driver gets a look at least once
+the future's own. The code counts the runs down to the next one that weighs a look (the `N`th,
+or a multiple of `QUARTZ_EVERY`), one decrement a run: the same runs, counted. 4 configurations: 1 that must pass (the driver gets a look at least once
 every `2N - 1` turns, `BoundedGap`), 1 mutation (not counting the future's own turns lets a
 future that keeps waking itself starve the driver, breaking `BoundedGap`: the bug a test
 caught, where IO such a future waited on never completed), and 2 witnesses (a look that came
