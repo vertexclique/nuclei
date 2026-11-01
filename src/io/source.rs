@@ -174,7 +174,7 @@ mod write_work {
 
 /// The least room a datagram's owned call must have before the ring lends the caller's buffer to
 /// an operation of its own; below it the call copies, as the borrowed calls do. From the
-/// `udp_bytes_*` modes of benches/vs_tokio_count.rs: total cycles per datagram favored the copy
+/// sweep of datagram sizes: total cycles per datagram favored the copy
 /// at 64 B to 8 KiB and the lent buffer from 12 KiB.
 pub(crate) const OWNED_DATAGRAM_MIN: usize = 12 * 1024;
 

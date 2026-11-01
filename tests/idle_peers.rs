@@ -3,14 +3,14 @@
 //! idle peers, each waiting for its peer, may hold the whole cap on operations in the kernel and
 //! the whole pool of IO buffers, and still the next accept goes in and a reader or a writer the
 //! pool has no buffer for uses its own; sends that wait for peers that never read count against
-//! no cap either. The vs-tokio benchmark found the stall at 4096 connections of 16 KiB requests:
-//! past 3840 waiting receives, the cap of a ring of 2048 entries beside its group, the next accept
-//! waited for good. On every backend bytes read ahead for tasks that peeked and stopped may hold
-//! the whole pool too, and a reader the pool has no buffer for still reads into its own. A binary
-//! of its own, since the configuration is the process's: the smallest ring, with the receive group
-//! off, so every read below 16 KiB is a receive into a buffer of the pool that waits. On epoll and
-//! kqueue no receive waits in the kernel, and every request is answered the same way. On a
-//! completion port a read the pool has no buffer for waits in a zero-byte receive, which holds
+//! no cap either. A many-connections benchmark found the stall at 4096 connections of 16 KiB
+//! requests: past 3840 waiting receives, the cap of a ring of 2048 entries beside its group, the
+//! next accept waited for good. On every backend bytes read ahead for tasks that peeked and stopped
+//! may hold the whole pool too, and a reader the pool has no buffer for still reads into its own. A
+//! binary of its own, since the configuration is the process's: the smallest ring, with the receive
+//! group off, so every read below 16 KiB is a receive into a buffer of the pool that waits. On
+//! epoll and kqueue no receive waits in the kernel, and every request is answered the same way. On
+//! a completion port a read the pool has no buffer for waits in a zero-byte receive, which holds
 //! none, and a reader or a writer it has no buffer for uses its own memory
 //! (proofs/tla/port/PortStarve.tla). The same holds for datagram sockets nobody sends to and for
 //! pipes nobody writes to, on every backend.

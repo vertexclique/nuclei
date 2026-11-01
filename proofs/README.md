@@ -1951,7 +1951,7 @@ end when their peer sends or connects; sends, polls for room and connects under 
 their peer reads or answers, and a zero-copy send that holds its buffer until the kernel's
 notification, which comes once the peer acknowledged the bytes; and a child's exit watch) and
 finite ones (a file's reads and writes) that wait in room when the cap is used. Before, the ring
-counted the one-shot operations of a side that reads: in the vs-tokio benchmark 3840 idle
+counted the one-shot operations of a side that reads: in a many-connections benchmark 3840 idle
 connections, the cap of a ring of 2048 entries beside its 256-buffer group, filled it with one-shot
 receives that waited for their peers, and the next accept waited in room behind them for good,
 leaving every connection past them unaccepted. It counted every operation of a side that writes

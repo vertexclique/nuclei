@@ -13,7 +13,7 @@
 use super::{Io, Via};
 
 // Smallest borrowed buffer a stream reads or writes directly, by driver and
-// direction. Measured with `tcp_size_<KiB>` of benches/vs_tokio_count.rs,
+// direction. Measured with a sweep of TCP buffer sizes,
 // against the pool path, 5 runs a size over several passes: user
 // instructions fall at every size; cycles fall for epoll writes from 1 KiB
 // and reads from 16 KiB (below, the read that finds the socket empty costs
