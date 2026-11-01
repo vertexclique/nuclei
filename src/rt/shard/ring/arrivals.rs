@@ -124,10 +124,13 @@ impl ShardRing {
                 source.ring_arrival(arrival, epoch, shard, &mut after);
                 after.starved().then(|| std::sync::Arc::clone(&source))
             };
+            // The usual end, a waker of the reader alone, is woken inline.
             if let Some(source) = starved {
                 source.wait_for_buffer();
+                after.run();
+            } else if let Err(after) = after.settle_light() {
+                after.run();
             }
-            after.run();
         }
     }
 
@@ -227,8 +230,10 @@ impl ShardRing {
         source.ring_arrival(Arrival::Conn(conn), epoch, shard, &mut after);
         if after.starved() {
             std::sync::Arc::clone(&source).wait_for_buffer();
+            after.run();
+        } else if let Err(after) = after.settle_light() {
+            after.run();
         }
-        after.run();
     }
 
     /// The multishot poll of `source`, issued in `epoch`, says its socket may
@@ -246,7 +251,9 @@ impl ShardRing {
             let source = core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(source) });
             source.ring_arrival(Arrival::Ready, epoch, shard, &mut after);
         }
-        after.run();
+        if let Err(after) = after.settle_light() {
+            after.run();
+        }
     }
 
     /// Takes in the buffers chunks gave back and gives them to the kernel
