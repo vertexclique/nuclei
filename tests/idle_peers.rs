@@ -55,13 +55,23 @@ const FLOOD: u8 = 2;
 const DEAF: usize = 128 + 16;
 const DEAF_CAP: usize = 64 << 20;
 
-/// Peeks at what came before it reads, so a peek takes the same way as a read.
+/// Peeks at what came before it reads, so a peek takes the same way as a read. A call that fails
+/// ends the connection, its error kept for a failure's message: a peer then reads a reset, the
+/// request it sent unread.
 async fn serve(stream: TcpStream) {
     let mut buf = vec![0u8; READ];
     let mut pending = 0;
-    while let Ok(1..) = stream.peek(&mut buf).await
-        && let Ok(n @ 1..) = stream.recv(&mut buf).await
-    {
+    loop {
+        match stream.peek(&mut buf).await {
+            Ok(1..) => {}
+            Ok(0) => return,
+            Err(err) => return served_error("peek", &err),
+        }
+        let n = match stream.recv(&mut buf).await {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(err) => return served_error("recv", &err),
+        };
         pending += n;
         while pending >= READ {
             pending -= READ;
@@ -69,11 +79,21 @@ async fn serve(stream: TcpStream) {
             while !reply.is_empty() {
                 match stream.send(reply).await {
                     Ok(n) => reply = &reply[n..],
-                    Err(_) => return,
+                    Err(err) => return served_error("send", &err),
                 }
             }
         }
     }
+}
+
+/// The errors the servers' calls on their connections met, for a failure to name.
+static SERVE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn served_error(call: &str, err: &std::io::Error) {
+    SERVE_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(format!("{call}: {err}"));
 }
 
 /// Peeks at a request that starts with `HOLD` and then waits past the test's end, its bytes read
@@ -196,8 +216,13 @@ fn answered(addr: SocketAddr) {
         let mut reply = [0u8; REPLY];
         if let Err(err) = stream.read_exact(&mut reply) {
             panic!(
-                "peer {i} of {ACTIVE} got no reply within {DEADLINE:?}: {err} (accept errors: {:?})",
-                accept_errors()
+                "peer {i} of {ACTIVE} got no reply within {DEADLINE:?}: {err} (accept errors: {:?}, \
+                 the servers' call errors: {:?})",
+                accept_errors(),
+                SERVE_ERRORS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
             );
         }
         assert_eq!(reply, [7u8; REPLY]);
