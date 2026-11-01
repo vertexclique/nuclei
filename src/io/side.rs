@@ -204,6 +204,17 @@ enum Take<'a, S> {
     Unserved,
 }
 
+/// What the owner's poll ([`Side::poll_owner`]) did.
+pub(crate) enum OwnerPoll<'a, S, R> {
+    /// The step ran and the side was let go with nothing left.
+    Done(Poll<R>),
+    /// The step ran, and work others left as it did keeps the side held: the caller finishes
+    /// it with [`Held::finish_poll`].
+    Left(Held<'a, S>, Poll<R>),
+    /// A foreign thread came: nothing ran.
+    Refused,
+}
+
 /// How a thread takes a side.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -422,6 +433,46 @@ impl<S> Side<S> {
         !self.shared.load(Ordering::Relaxed)
             && self.intent.load(Ordering::Relaxed) == 0
             && self.owner.load(Ordering::Relaxed) == who
+    }
+
+    /// Whether a poll of the thread whose shard's address is `who` takes the side as its owner,
+    /// as [`role`](Self::role) finds it for a caller whose [`Hooks::owner`] is `who`: the side is
+    /// not shared, `who` claimed it, and the owner does not hold it now.
+    #[inline(always)]
+    pub(crate) fn owned_by(&self, who: usize) -> bool {
+        // Acquire, as in `role`.
+        !self.shared.load(Ordering::Acquire)
+            && self.owner.load(Ordering::Relaxed) == who
+            && self.own.load(Ordering::Relaxed) == 0
+    }
+
+    /// [`poll`](Self::poll) by the side's owner, for a caller [`owned_by`](Self::owned_by) said
+    /// it is: the biased take, `step`, and the biased release, all inlined, with no loop.
+    /// [`OwnerPoll::Refused`] when a foreign thread came and the biased take was refused: nothing
+    /// ran, and the caller polls as any other does. A release that found work left gives the
+    /// side back still held, for the caller to finish with [`Held::finish_poll`].
+    #[inline(always)]
+    pub(crate) fn poll_owner<R>(
+        &self,
+        after: &mut After,
+        hooks: &impl Hooks<S>,
+        step: impl FnOnce(&mut S, &mut After) -> Poll<R>,
+    ) -> OwnerPoll<'_, S, R> {
+        let Some(mut held) = self.try_biased() else {
+            return OwnerPoll::Refused;
+        };
+        hooks.taken(held.get(), after);
+        let out = step(held.get(), after);
+        hooks.releasing(held.get());
+        if !self.release_biased() {
+            core::mem::forget(held);
+            hooks.released(false, after);
+            return OwnerPoll::Done(out);
+        }
+        // Work was left: the side is held through the word now, and done as a holder of the
+        // word does it.
+        held.bits = (held.bits & !(BIASED | EXPECT)) | u32::from(BUSY);
+        OwnerPoll::Left(held, out)
     }
 
     /// Whether the side went to shared mode.
@@ -757,6 +808,29 @@ impl<S> Held<'_, S> {
             }
         }
         self.release_word(after, hooks)
+    }
+
+    /// The rest of a poll whose owner, letting go biased, found work others left
+    /// ([`OwnerPoll::Left`]): the side is held through the word, and `step` runs again after each
+    /// driver's part while `out` is pending. The step comes as a trait object, so this rare path
+    /// is one copy for every step of a result type.
+    #[inline(never)]
+    pub(crate) fn finish_poll<R>(
+        mut self,
+        mut out: Poll<R>,
+        after: &mut After,
+        hooks: &impl Hooks<S>,
+        step: &mut dyn FnMut(&mut S, &mut After) -> Poll<R>,
+    ) -> Poll<R> {
+        loop {
+            match self.release_word(after, hooks) {
+                Ok(()) => return out,
+                Err(again) => self = again,
+            }
+            if out.is_pending() {
+                out = step(self.get(), after);
+            }
+        }
     }
 
     /// The owner holds the side biased.

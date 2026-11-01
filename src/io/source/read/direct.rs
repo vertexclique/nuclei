@@ -108,6 +108,10 @@ impl ReadState {
         call: impl FnOnce(RawFd, bool) -> io::Result<(usize, Option<usize>)>,
     ) -> Option<Poll<io::Result<usize>>> {
         let fd = fd?;
+        // A poller's side that found the socket empty waits for the next edge.
+        if matches!(io.via, Via::Fd(_)) && self.blocked {
+            return None;
+        }
         if !self.reads_bytes(kind)
             || len == 0
             || !self.ahead.is_empty()
@@ -124,7 +128,6 @@ impl ReadState {
             return None;
         }
         match io.via {
-            Via::Fd(_) if self.blocked => return None,
             Via::Fd(_) => {}
             #[cfg(ring)]
             Via::Ops(route) => {
