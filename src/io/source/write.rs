@@ -408,7 +408,7 @@ impl WriteState {
         });
         if buf.is_none() && !self.starved {
             self.starved = true;
-            after.starved = true;
+            after.set_starved();
         }
         buf
     }
@@ -679,7 +679,7 @@ impl WriteState {
             return Poll::Ready(Err(failure.error()));
         }
         if self.behind.is_some() {
-            after.register = true;
+            after.set_must_register();
         }
         Poll::Ready(Ok(n))
     }
@@ -952,7 +952,7 @@ impl WriteState {
                         Ok(true) => return Poll::Ready(Ok(())),
                         Ok(false) => {
                             self.connecting = true;
-                            after.register = true;
+                            after.set_must_register();
                         }
                         Err(err) => {
                             self.connect_started = false;

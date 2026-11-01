@@ -264,7 +264,7 @@ pub(super) fn poll_task<T>(task: &mut Task<T>, waker: &Waker) -> Poll<T> {
 pub(super) fn buffer(len: usize, after: &mut After) -> Option<PoolBuf> {
     let buf = with_pool(|pool| pool.and_then(|p| p.get(len)));
     if buf.is_none() {
-        after.starved = true;
+        after.set_starved();
     }
     buf
 }

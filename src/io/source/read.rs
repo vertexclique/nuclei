@@ -463,7 +463,7 @@ impl ReadState {
             with_pool(|pool| pool.and_then(|p| if whole { p.get_whole(len) } else { p.get(len) }));
         if buf.is_none() && !self.starved {
             self.starved = true;
-            after.starved = true;
+            after.set_starved();
         }
         buf
     }

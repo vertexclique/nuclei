@@ -724,7 +724,7 @@ impl Source {
     #[inline(never)]
     fn settle_rest(self: &Arc<Self>, mut after: After) {
         self.kick(&mut after);
-        if after.starved {
+        if after.starved() {
             Arc::clone(self).wait_for_buffer();
         }
         after.run();
@@ -737,7 +737,7 @@ impl Source {
     )]
     fn kick(self: &Arc<Self>, after: &mut After) {
         #[cfg(ring)]
-        if let Some(home) = after.kick.take() {
+        if let Some(home) = after.take_kick() {
             home.post_io(crate::rt::shard::IoOp::RingKick(Arc::clone(self)));
         }
     }
@@ -760,7 +760,7 @@ impl Source {
         after: After,
         poll: Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
-        let watch = after.register || poll.is_pending();
+        let watch = after.must_register() || poll.is_pending();
         self.settle(after);
         if watch && let Err(err) = self.ensure_registered() {
             return Poll::Ready(Err(err));
