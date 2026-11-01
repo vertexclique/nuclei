@@ -6,8 +6,9 @@
 //! hands a buffer out as a [`RingChunk`], which the source's reader may take
 //! on any thread; dropped, the chunk puts its buffer on the group's return
 //! queue, and the ring's thread takes the queue in before it next waits. A
-//! chunk dropped on the ring's own thread skips the queue: it goes onto the
-//! group's local list, taken in with it.
+//! chunk dropped on the ring's own thread skips the queue: it is taken in at
+//! once, or, while the ring's operations are borrowed, goes onto the group's
+//! local list, taken in with the queue.
 //! The buffers stay mapped while any chunk lives (see `BufMem`), so a chunk
 //! that outlives its shard still reads memory that is there.
 //!
@@ -350,6 +351,23 @@ impl RecvGroup {
         !self.local.is_empty() || !self.back.queue.is_empty()
     }
 
+    /// Takes in the chunk `item` of `back` at once, as [`take_back`](Self::take_back) does, if
+    /// `back` is this group's: for a chunk given back on the ring's own thread.
+    pub(crate) fn take_in_now(
+        &mut self,
+        back: &Arc<Returns>,
+        item: Back,
+        mut release: impl FnMut(u64, usize),
+    ) -> bool {
+        if !Arc::ptr_eq(&self.back, back) {
+            return false;
+        }
+        if self.take_in(item, &mut release) {
+            self.ring.commit();
+        }
+        true
+    }
+
     /// One chunk given back: counted off its receive, and its buffer given to the kernel again if
     /// it may go (see [`settle`](Self::settle)), which the caller then commits.
     #[inline(always)]
@@ -369,7 +387,7 @@ impl RecvGroup {
     }
 
     /// Keeps the chunk `item` of `back` to take in with the rest, if `back` is this group's:
-    /// for a chunk dropped on the ring's own thread.
+    /// for a chunk dropped on the ring's own thread while the ring's operations are borrowed.
     pub(crate) fn keep_local(&mut self, back: &Arc<Returns>, item: Back) -> bool {
         let mine = Arc::ptr_eq(&self.back, back) && self.local.len() < self.local.capacity();
         if mine {
@@ -456,7 +474,7 @@ impl RingChunk {
         let item = self.item();
         let kept = shard
             .and_then(super::Shard::ring)
-            .is_some_and(|ring| ring.keep_local(&self.back, item));
+            .is_some_and(|ring| ring.take_in_now(&self.back, item));
         if !kept {
             self.back.queue.push(item);
         }
@@ -473,7 +491,7 @@ impl Drop for RingChunk {
         let kept = crate::rt::context::current_held()
             .shard()
             .and_then(crate::rt::shard::Shard::ring)
-            .is_some_and(|ring| ring.keep_local(&self.back, item));
+            .is_some_and(|ring| ring.take_in_now(&self.back, item));
         if !kept {
             self.back.queue.push(item);
         }

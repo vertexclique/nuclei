@@ -986,8 +986,8 @@ socket, a big read's stop, and a receive armed again after it). The reader makes
 big reads, so a reader that keeps switching between sizes cannot spin the model.
 
 `tla/ring/RingInc.tla` checks the same receives on a group filled in pieces (`IOU_PBUF_RING_INC`;
-`RecvGroup::hand_out`, `settle`, `take_back` and `charge` in `src/rt/shard/recv.rs`, `arrived` in
-`src/rt/shard/ring.rs`). The kernel keeps a buffer while it has room: each message goes after the
+`RecvGroup::hand_out`, `settle`, `take_back`, `take_in_now` and `charge` in `src/rt/shard/recv.rs`,
+`arrived` and `take_in_now` in `src/rt/shard/ring.rs`). The kernel keeps a buffer while it has room: each message goes after the
 bytes already there, and its completion carries BUF_MORE until the one that fills the buffer; a
 receive that ends leaves the buffer partly filled for the next. For each buffer the ring's thread
 counts where the next piece starts, the chunks of it out and whether the kernel is done with it,
