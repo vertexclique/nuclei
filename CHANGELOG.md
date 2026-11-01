@@ -11,6 +11,12 @@
   (on macOS, about one run in two thousand of the cadence test whose twelve tasks block their
   runners at once). The monitor now holds the shard before it claims the runner's slot, and lets go
   of it when the take does not happen (`proofs/tla/handoff/TakeRef.tla`).
+- **A worker that backs out of its park wakes the monitor.** With every worker parked the monitor
+  sleeps until a worker's park ends; a worker that said it parks, found work at its last look and
+  ran on rang nobody, so a monitor that took that moment for every worker parked could sleep while
+  the worker ran, and a poll of it that blocked then waited for its end instead of a handoff (found
+  in the protocol and its model, not seen in a run). The back-out now rings a monitor that sleeps,
+  as a park's end does (`proofs/tla/handoff/Asleep.tla`).
 - **A read on io_uring gets a stream's end that came with its last bytes.** Linux's multishot
   receive stops trying once the socket's count of what is left says none, a count that leaves out
   a Unix stream's every end and a TCP reset, and waits for a wake. Bytes and the end that came

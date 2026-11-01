@@ -5,10 +5,11 @@
 //! threshold and reads each worker's word: a read equal to the last while
 //! the worker is outside its shard extends a streak, and the fourth in a row
 //! (the poll ran at least four ticks and under five) takes the shard. With
-//! every worker parked it sleeps, and a worker that ends its park wakes it:
-//! the monitor says it sleeps and then looks at the parks again, the worker
-//! ends its park and then looks at the monitor, with a sequentially
-//! consistent fence on both sides.
+//! every worker parked it sleeps, and a worker that ends its park, or backs
+//! out of it, wakes it: the monitor says it sleeps and then looks at the
+//! parks again, the worker ends its park (or backs out) and then looks at
+//! the monitor, with a sequentially consistent fence on both sides
+//! (proofs/tla/handoff/Asleep.tla).
 //!
 //! The take (proofs/tla/handoff): a reference to the shard first (the
 //! monitor holds it only weakly, and once the take succeeds its runner may
@@ -510,6 +511,40 @@ mod tests {
         drop(shard);
         assert!(take_outside(&monitor, &mut watch).is_none());
         assert_eq!(slot.come_back(1), slot::Back::In);
+    }
+
+    /// A worker that says it parks, finds work at its last look and backs
+    /// out runs on, so it rings the monitor that took that moment for every
+    /// worker parked and sleeps, as a park's end does: else the monitor
+    /// sleeps while the worker runs, and rescues none of its polls that
+    /// block. A monitor awake is not rung.
+    #[test]
+    fn a_worker_backing_out_of_its_park_rings_the_monitor_asleep() {
+        let monitor = Arc::new(Monitor::new(Duration::from_millis(10), 1, Vec::new(), None));
+        let shard = Shard::worker(
+            Limits {
+                max_nesting: 8,
+                buffer_cap: crate::buf::DEFAULT_CAP,
+                backend: crate::rt::backend::chosen().unwrap(),
+            },
+            crate::rt::tuning::Tuning::default(),
+            1,
+            0,
+            Some(Arc::clone(&monitor)),
+        )
+        .unwrap();
+        monitor.asleep.store(false, Ordering::SeqCst);
+        assert!(
+            !shard.begin_park(|| true),
+            "work came: the worker backs out"
+        );
+        assert_eq!(monitor.bell.rings(), 0, "a monitor awake was rung");
+        monitor.asleep.store(true, Ordering::SeqCst);
+        assert!(
+            !shard.begin_park(|| true),
+            "work came: the worker backs out"
+        );
+        assert_eq!(monitor.bell.rings(), 1, "the monitor asleep was not rung");
     }
 
     /// A take that succeeds holds the shard in its gift, so the runner's

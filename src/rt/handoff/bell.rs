@@ -17,6 +17,9 @@ pub(super) struct Bell {
     thread: OnceLock<Thread>,
     #[cfg(windows)]
     handles: Option<windows::Handles>,
+    /// The rings so far, for a test to count.
+    #[cfg(test)]
+    rings: core::sync::atomic::AtomicUsize,
 }
 
 impl Bell {
@@ -25,7 +28,15 @@ impl Bell {
             thread: OnceLock::new(),
             #[cfg(windows)]
             handles: windows::Handles::new(),
+            #[cfg(test)]
+            rings: core::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// The rings so far.
+    #[cfg(test)]
+    pub(super) fn rings(&self) -> usize {
+        self.rings.load(core::sync::atomic::Ordering::SeqCst)
     }
 
     /// Makes the calling thread the one that waits on the bell.
@@ -53,6 +64,9 @@ impl Bell {
 
     /// Ends the waiting thread's wait, or its next one.
     pub(super) fn ring(&self) {
+        #[cfg(test)]
+        self.rings
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         #[cfg(windows)]
         if let Some(handles) = &self.handles {
             handles.ring();
