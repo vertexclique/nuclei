@@ -19,6 +19,8 @@
 <h2 id="poll">For futures of your own</h2>
 <p>A future or stream written by hand polls instead: <code>poll_accept</code>, <code>poll_peek</code>, <code>poll_read_ready</code>, <code>poll_write_ready</code>, and for datagrams <code>poll_recv_ready</code>, <code>poll_send_ready</code> and <code>poll_peek_sender</code>. Each keeps the waker of its <code>Context</code> until the answer is ready.</p>
 <!--example readiness_poll-->
+<p>A UDP socket also polls its datagrams themselves: <a href="api:nuclei::io::Handle::poll_recv_from"><code>poll_recv_from</code></a> receives one into a <code>ReadBuf</code> and answers its sender, cutting what does not fit, and <a href="api:nuclei::io::Handle::poll_send_to"><code>poll_send_to</code></a> sends one to an address.</p>
+<!--example readiness_udp_poll-->
 
 <h2 id="own-calls">Calls of your own on a socket</h2>
 <p>For a socket option or a system call Nuclei does not make, <code>async_io(interest, f)</code> runs <code>f</code>, your own call on the socket, each time it may be ready, until it answers other than <code>WouldBlock</code>; <code>try_io</code> runs it once, now (Unix).</p>

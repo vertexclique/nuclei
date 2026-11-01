@@ -4,8 +4,9 @@
 //! or the future `block_on` runs): the state sits in `Rc`s and plain cells,
 //! so the types are `!Send` and `!Sync`, and no path executes an atomic
 //! instruction or a fence. That makes them cheaper than their atomic
-//! twins in [`sync`](crate::sync), which the op-count rows `local_mpsc` and
-//! `local_oneshot` measure. The names and signatures mirror the atomic ones, so
+//! twins in [`sync`](crate::sync): CI counts the instructions of a message
+//! and of a one-shot reply on both (`ci/op_budget.txt`). The names and
+//! signatures mirror the atomic ones, so
 //! code switches by changing the path: [`mpsc`] for
 //! [`sync::mpsc`](crate::sync::mpsc), [`oneshot`] for
 //! [`sync::oneshot`](crate::sync::oneshot), [`Semaphore`] for

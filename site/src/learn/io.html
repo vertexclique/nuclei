@@ -22,6 +22,21 @@
 <p><code>io::copy</code> moves everything a reader gives into a writer, then flushes; <code>copy_buf</code> does it from a buffered reader's own buffer. <code>copy_bidirectional</code> runs both directions between two streams at once, the heart of a proxy, and answers the bytes moved each way.</p>
 <!--example io_copy-->
 
+<h2 id="owned">Buffers you lend</h2>
+<p>The owned calls (<code>read_owned</code>, <code>write_owned</code>, <code>write_zero_copy</code>, and the datagram and file forms) lend the driver your buffer and give it back, so the kernel reads into and writes from your memory and no byte is copied (<a href="proactive.html#lending">How it works</a>). A write takes any <a href="api:nuclei::io::IoBuf"><code>IoBuf</code></a> and a read any <a href="api:nuclei::io::IoBufMut"><code>IoBufMut</code></a>, and each gives back the same type: a <code>Vec&lt;u8&gt;</code> in, a <code>Vec&lt;u8&gt;</code> out.</p>
+<!--example io_owned-->
+<ul>
+<li><a href="api:nuclei::io::AlignedBuf"><code>AlignedBuf</code></a> is a buffer of a fixed capacity at an address of the alignment you choose, made by a safe constructor (<code>new</code> or <code>zeroed</code>): the buffer for a file opened for <a href="fs.html#direct">direct IO</a>. Its memory is yours, not charged to the runtime's <a href="api:nuclei::Builder::io_buffer_cap"><code>io_buffer_cap</code></a>.</li>
+<li>A type of your own (a shared byte buffer, memory of a registered region) implements the two traits. They are unsafe: the memory must stay in place while the runtime holds the value, even when the value moves.</li>
+<li>The runtime keeps a <code>Vec&lt;u8&gt;</code> or an <code>AlignedBuf</code> as it is while a call has it, and boxes a buffer of any other type once.</li>
+<li>Where the compiler cannot see the buffer's type, write it: <code>Vec::&lt;u8&gt;::new()</code>, not <code>Vec::new().into()</code> or <code>Default::default()</code>, and <code>send_to_owned::&lt;A, _&gt;</code> where you name the address type.</li>
+</ul>
+
+<h2 id="vectored">Several buffers in one call</h2>
+<p><code>write_vectored_owned</code> writes every buffer of an <a href="api:nuclei::io::IoVecBuf"><code>IoVecBuf</code></a> in order as one write: no other write of the handle comes between two of them. <code>read_vectored_owned</code> fills the room of each buffer of an <a href="api:nuclei::io::IoVecBufMut"><code>IoVecBufMut</code></a> before the next one's. Both take a <code>Vec</code> or an array of any owned buffer type and give the buffers back together. TCP and Unix streams, pipes and files have both.</p>
+<!--example io_vectored-->
+<p>Each call of the kernel takes every buffer at once: <code>writev</code> and <code>readv</code>, or a <code>sendmsg</code> and <code>recvmsg</code> of several buffers, on epoll and kqueue; their ring operations on io_uring; a <code>WSASend</code> or <code>WSARecv</code> of several buffers on I/O completion ports; <code>pwritev</code> and <code>preadv</code> for files. A call the kernel takes part of goes on from the byte it stopped at. Where the system has no vectored call of the kind, the buffers go one call each, in order: a buffered file on Windows does so, and a Windows handle that is not a socket writes that way and reads into its first buffer only.</p>
+
 <h2 id="memory">In memory</h2>
 <p>Streams with no socket behind them, for tests and for joining parts of a program:</p>
 <ul>

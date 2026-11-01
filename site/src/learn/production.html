@@ -1,13 +1,15 @@
 <!--title Production-->
 <!--lede Every runtime setting, the hooks, the counters, a clean shutdown, and tests.-->
 <h2 id="builder">Every runtime setting</h2>
-<p>Every setting is optional, and an unset one takes a default that needs no configuration to work well. Set them on a <code>Builder</code>, then <code>build</code> a runtime of your own or <code>build_global</code> the default one (<a href="runtime.html#default">Runtime</a>).</p>
+<p>Every setting is optional, and an unset one takes a default that needs no configuration to work well. Set them on a <code>Builder</code>, then <code>build</code> a runtime of your own or <code>build_global</code> the default one (<a href="runtime.html#default">Runtime</a>). <code>build</code> checks them all before it starts a thread: a value outside what the runtime can work with fails with <code>InvalidInput</code> naming the setting, its value and the range it must be in (<a href="errors.html#setting">Errors</a>).</p>
 <!--example prod_builder-->
 <!--api-table
 Setting | What it sets (its default)
 nuclei::runtime::Builder::worker_threads
 nuclei::runtime::Builder::max_worker_threads
 nuclei::runtime::Builder::pin_workers
+nuclei::runtime::Builder::worker_cores
+nuclei::runtime::Builder::blocking_cores
 nuclei::runtime::Builder::thread_name
 nuclei::runtime::Builder::thread_name_fn
 nuclei::runtime::Builder::thread_stack_size
@@ -15,7 +17,11 @@ nuclei::runtime::Builder::max_nesting
 nuclei::runtime::Builder::max_blocking_threads
 nuclei::runtime::Builder::thread_keep_alive
 nuclei::runtime::Builder::local_spawn_margin
+nuclei::runtime::Builder::handoff_after
 nuclei::runtime::Builder::io_buffer_cap
+nuclei::runtime::Builder::write_behind_linger
+nuclei::runtime::Builder::zero_copy_threshold
+nuclei::runtime::Builder::send_file_chunk
 nuclei::runtime::Builder::event_interval
 nuclei::runtime::Builder::global_queue_interval
 nuclei::runtime::Builder::max_io_events_per_tick
@@ -24,7 +30,10 @@ nuclei::runtime::Builder::rng_seed
 nuclei::runtime::Builder::unhandled_panic
 nuclei::runtime::Builder::start_paused
 nuclei::runtime::Builder::backend
+nuclei::runtime::Builder::io_uring
+nuclei::runtime::Builder::record_latencies
 -->
+<p>A busy worker looks at its timers and IO every <code>event_interval</code> task runs, and also, checked every 16 runs, whenever its last look is more than a millisecond old, so a run of slow tasks cannot keep IO waiting for long.</p>
 
 <h2 id="hooks">Hooks</h2>
 <p>A runtime calls hooks of yours on its threads and around its tasks: for metrics, tracing or thread setup. Each task hook is given the task's <code>Id</code>.</p>
@@ -39,11 +48,14 @@ nuclei::runtime::Builder::on_task_spawn
 nuclei::runtime::Builder::on_before_task_poll
 nuclei::runtime::Builder::on_after_task_poll
 nuclei::runtime::Builder::on_task_terminate
+nuclei::runtime::Builder::on_long_poll
 -->
-<p>A hook runs in the middle of the runtime's work: keep it short, and never panic in one.</p>
+<p>A hook runs in the middle of the runtime's work: keep it short, and never panic in one. Task hooks get a <code>TaskMeta</code>: the task's <code>id()</code>, and its <code>name()</code> when <code>task::Builder</code> gave one.</p>
+<p><code>on_long_poll</code> finds the task that holds a worker up: it is called, on the watch's own thread, for each poll that runs past <code>handoff_after</code> (<a href="tasks.html#handoff">Tasks</a>).</p>
+<!--example prod_long_poll-->
 
 <h2 id="iouring">The io_uring configuration</h2>
-<p>The ring of every shard is configured once per process, before any IO, with <code>Proactor::with_config</code>. A second call, or one after IO has started (which configures the defaults), panics.</p>
+<p>The rings are configured once per process, before any IO, with <code>Proactor::with_config</code>: every runtime starts from these settings. A second call, or one after IO has started (which configures the defaults), panics. <a href="api:nuclei::Builder::io_uring"><code>Builder::io_uring</code></a> gives one runtime's workers ring settings of their own instead, and <code>build</code> answers a setting a ring cannot work with as an error rather than a panic.</p>
 <!--example prod_config-->
 <!--api-table
 Field | What it sets (its default)
@@ -57,13 +69,15 @@ nuclei::config::IoUringConfiguration::per_numa_unbounded_worker_count
 nuclei::config::IoUringConfiguration::aggressive_poll
 -->
 <p>Four presets fill the struct from a queue length: <code>interrupt_driven</code> (the one to pick when unsure), <code>low_latency_driven</code> and <code>kernel_poll_only</code> (a kernel submission thread), and <code>io_poll</code>. <code>NucleiConfig::backend</code> is the backend of every runtime that names none.</p>
+<p>The sizes are checked where they take effect: <code>queue_len</code> at least 64, <code>recv_buffers</code> 0 or a power of two below twice <code>queue_len</code>, and <code>recv_buffer_size</code> from 512 bytes to 1 GiB while there are receive buffers. A value outside fails the first runtime built with it, with <code>InvalidInput</code> naming the setting.</p>
 
 <h2 id="stats">Counters</h2>
-<p><code>nuclei::stats()</code> takes a snapshot of every shard alive in the process (each runtime's workers, then the shard of each thread in <code>block_on</code>) and of the blocking pools. It reads the shards without stopping them; most counts are published by a shard as it is about to wait for work, and by a busy one every few hundred task runs.</p>
+<p><code>nuclei::stats()</code> takes a snapshot of every shard alive in the process (each runtime's workers, then the shard of each thread in <code>block_on</code>) and of the blocking pools; <code>Runtime::stats</code> takes one of a single runtime's workers and pool. It reads the shards without stopping them; most counts are published by a shard as it is about to wait for work, and by a busy one every few hundred task runs.</p>
 <!--example prod_stats-->
 <!--api-table
 Field | What it counts
 nuclei::stats::ShardStats::worker
+nuclei::stats::ShardStats::runtime
 nuclei::stats::ShardStats::backend
 nuclei::stats::ShardStats::tasks
 nuclei::stats::ShardStats::polls
@@ -78,9 +92,22 @@ nuclei::stats::ShardStats::buffer_bytes
 nuclei::stats::ShardStats::buffer_cap
 nuclei::stats::ShardStats::buffer_exhausted
 nuclei::stats::ShardStats::timers
+nuclei::stats::ShardStats::handoffs
+nuclei::stats::ShardStats::longest_poll
+nuclei::stats::ShardStats::budget_yields
+nuclei::stats::ShardStats::poll_times
 nuclei::stats::ShardStats::errors
 -->
-<p><code>Stats</code> also has <code>blocking_threads</code>, and <code>off_shard_errors</code> for IO run on threads that run no shard.</p>
+<p><code>Stats</code> also has <code>blocking_threads</code> and <code>blocking_queue_depth</code>, <code>off_shard_errors</code> for IO run on threads that run no shard, and <code>receive_buffers_missing</code> for shards that started without the io_uring receive buffers they asked for.</p>
+
+<h2 id="io-stats">IO counts and latencies</h2>
+<p>A runtime built with <code>record_latencies(true)</code> keeps a log2 <a href="api:nuclei::stats::Histogram"><code>Histogram</code></a> of how long each task poll ran, in <code>ShardStats::poll_times</code>. With the <code>io-stats</code> feature (<a href="setup.html#features">Setup</a>) it can also count and time each worker's IO:</p>
+<ul>
+<li><code>Builder::count_io(true)</code> fills <code>ShardStats::io</code>, an <code>IoCounts</code>: reads and writes with the bytes of each, and accepts.</li>
+<li><code>record_latencies(true)</code> also fills <code>ShardStats::io_latencies</code>, an <code>IoLatencies</code>: the time from submission to completion of reads, writes, accepts, connects and file calls. On epoll and kqueue it is <code>None</code>: the driver makes each call once the kernel says it is ready, so there is no wait in the kernel to time.</li>
+</ul>
+<!--example prod_io_stats-->
+<p>Without the feature, no IO path carries counting or timing code, and these items do not exist. With it, every IO call costs a few instructions, counted or not, so leave it off where nobody reads the counts. The API reference here is built with the default features and does not list them; <code>cargo doc --features io-stats</code> documents them.</p>
 
 <h2 id="shutdown">A clean shutdown</h2>
 <p>A server stops taking connections when asked, lets the open ones finish, and gives up after a deadline. A <code>CancellationToken</code> carries the request to every task, Ctrl-C raises it, a <code>JoinSet</code> holds the connections, and <code>timeout</code> bounds the drain.</p>

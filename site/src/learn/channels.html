@@ -9,9 +9,11 @@
 <tr><td data-label="Channel"><code>oneshot::channel()</code></td><td data-label="For">One value, once: a reply to a request.</td></tr>
 <tr><td data-label="Channel"><code>broadcast::channel(n)</code></td><td data-label="For">Every receiver sees every message; one that falls <code>n</code> behind is told how many it missed.</td></tr>
 <tr><td data-label="Channel"><code>watch::channel(v)</code></td><td data-label="For">One value many tasks read, and the news that it changed.</td></tr>
+<tr><td data-label="Channel"><code>local::mpsc::channel(n)</code>, <code>local::oneshot::channel()</code></td><td data-label="For">mpsc and oneshot for the tasks of one shard: not <code>Send</code>, with no atomic instruction on any path (<a href="sync.html#local">Sync</a>).</td></tr>
+<tr><td data-label="Channel"><code>mesh::mesh(n, capacity)</code></td><td data-label="For">A bounded mpsc channel between every pair of <code>n</code> parties, such as one party per worker (<a href="#mesh">below</a>).</td></tr>
 </tbody>
 </table>
-<p>Like everything in <a href="sync.html#model"><code>nuclei::sync</code></a>, they work under any executor, and their receives are safe to drop halfway.</p>
+<p>Like everything in <a href="sync.html#model"><code>nuclei::sync</code></a>, they work under any executor, and their receives are safe to drop halfway. On a Nuclei shard a receive that completes spends one operation of the task's <a href="sync.html#budget">budget</a>, so a loop on a channel that is never empty still lets the shard's other tasks run.</p>
 
 <h2 id="mpsc">mpsc</h2>
 <p>Senders clone; the channel closes when the last one drops, and <code>recv</code> then gives <code>None</code>. <code>recv_many</code> takes up to a limit at once; the receiver's <code>close</code> stops new sends and lets it drain what is there.</p>
@@ -32,6 +34,16 @@
 <h2 id="watch">watch</h2>
 <!--example chan_watch-->
 <p><code>borrow</code> reads the current value; <code>changed</code> waits for one this receiver has not seen, and <code>wait_for</code> for one that passes a test. <code>send_modify</code> changes the value in place, and <code>send_if_modified</code> tells the receivers only when the change says so.</p>
+
+<h2 id="mesh">A mesh between workers</h2>
+<p><a href="api:nuclei::sync::mesh::mesh"><code>mesh(n, capacity)</code></a> joins <code>n</code> parties, each ordered pair by a bounded <code>mpsc</code> channel of <code>capacity</code> messages, and gives each its <a href="api:nuclei::sync::mesh::Party"><code>Party</code></a>: its senders to every party and its receivers from every party, indexed by party. A party may send to itself, so a send to whoever owns a key needs no special case. The mesh only builds channels: put each party in a task of its own, here one per worker with <a href="runtime.html#workers"><code>spawn_on_worker</code></a>.</p>
+<!--example chan_mesh-->
+<ul>
+<li><code>send_to(to, value)</code> waits for room on the channel to <code>to</code> alone: a full channel holds up no other pair. <code>try_send_to</code> never waits.</li>
+<li><code>recv()</code> takes from any party, with its index, round robin from the one after the last that delivered, so a party that floods cannot starve a quiet one. <code>recv_from(from)</code> takes from one party.</li>
+<li><code>recv()</code> ends once every channel into the party has ended. The party's sender to itself keeps one open, so a party calls <code>close_senders</code> when it is done sending.</li>
+<li><code>n</code> parties make <code>n * n</code> channels.</li>
+</ul>
 
 <h2 id="cancel">Cancellation tokens</h2>
 <p>A <a href="api:nuclei::sync::CancellationToken"><code>CancellationToken</code></a> tells any number of tasks to stop. Clones share one state; a child token is cancelled with its parent, and on its own without touching the parent.</p>

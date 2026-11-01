@@ -8,7 +8,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
-nuclei = { path = "../.." }
+# io-stats for the counts and latencies the Production page reads.
+nuclei = { path = "../..", features = ["io-stats"] }
+# The open flag of a file read and written with direct IO.
+libc = "0.2"
 
 [package.metadata.learn]
 # Servers that run until they are stopped: built and linted, never run.

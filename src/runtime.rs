@@ -9,9 +9,16 @@
 //! future on the calling thread and nests: called from a task, it keeps the
 //! shard running its other tasks until the future completes.
 //!
+//! [`RuntimeHandle::spawn_on_worker`], [`RuntimeHandle::on_each_worker`] and
+//! [`task::Builder::worker`](crate::task::Builder::worker) place a task on a
+//! worker the caller names, where it stays; [`shard_local!`](crate::shard_local)
+//! keeps a [`ShardLocal`](crate::runtime::ShardLocal) value per worker, which moves with the worker's
+//! shard when a handoff gives the shard to another thread.
+//!
 //! The free functions use the runtime the calling thread is inside, or the
 //! process default runtime, which starts on first use with no configuration
-//! (one worker per core). [`Builder`] sets everything else.
+//! (one worker per core). [`Builder`] sets everything else, and
+//! [`Runtime::stats`] reads one runtime's counters.
 //!
 //! ```
 //! use nuclei::runtime::{Runtime, spawn};

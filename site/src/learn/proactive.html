@@ -5,7 +5,7 @@
 <ul>
 <li><strong>A task stays where it was placed.</strong> Nothing steals it: no lock or cache line is shared to move it, and its timers and IO stay on one core.</li>
 <li><strong>Placement keeps work near.</strong> A task spawned on a worker stays on that worker while it is no busier than the others (a margin you can set); the first spawn from another thread picks the less loaded of two shards.</li>
-<li><strong>A long computation holds its shard.</strong> Code that runs for a long time without an <code>.await</code> keeps the shard's other tasks waiting. Give it to <a href="tasks.html#blocking">the blocking pool</a>, or split it with <a href="tasks.html#yield">yields</a>.</li>
+<li><strong>A task that blocks holds up only itself.</strong> A poll that runs past <a href="api:nuclei::Builder::handoff_after"><code>handoff_after</code></a> (10 ms by default) hands the shard, with its other tasks, timers and IO, to another thread on the same core (<a href="tasks.html#handoff">Tasks</a>). The blocked thread still shares that core, so give long work to <a href="tasks.html#blocking">the blocking pool</a>, or split it with <a href="tasks.html#yield">yields</a>.</li>
 </ul>
 
 <h2 id="proactor">The driver completes the IO</h2>
@@ -29,10 +29,11 @@
 </ul>
 <p>So a write that returned means the bytes are Nuclei's to deliver, not that the kernel has them. <code>flush</code> waits until the kernel has every byte and reports a write that failed; <code>shutdown</code> flushes, then ends the write side so the peer sees the end of the stream.</p>
 <!--example proactive_write_behind-->
-<p>A write that fails keeps its error: later writes fail with it until a flush reports it. Bytes written behind are delivered even if the handle is dropped first: a copy of its descriptor sends them, for a bounded time, and then closes.</p>
+<p>A write that fails keeps its error: later writes fail with it until a flush reports it. Bytes written behind are delivered even if the handle is dropped first: a task sends them on the handle's own descriptor, for at most <a href="api:nuclei::Builder::write_behind_linger"><code>write_behind_linger</code></a> (one minute by default, <a href="production.html#builder">every setting</a>), and then closes it. Past that the rest is given up, and a TCP stream's connection is reset, so the peer reads <code>ConnectionReset</code> rather than a cut stream that looks whole. <code>abort</code> resets a TCP stream at once (<a href="net.html#shut">Networking</a>).</p>
+<p>A runtime's drop waits for these tasks, running them for at most the same time. One it has not finished by then goes on, on a thread of its own, to its own deadline, as do the ones handed over after the drop.</p>
 
 <h2 id="lending">Lending a buffer</h2>
-<p>Where the copy matters, lend the driver your own <code>Vec&lt;u8&gt;</code>. <code>read_owned</code> reads into its spare capacity and gives it back with the count; <code>write_owned</code> writes all of it and gives it back once the kernel took the last byte. TCP streams, Unix streams and files have both.</p>
+<p>Where the copy matters, lend the driver a buffer of your own. <code>read_owned</code> reads into its spare capacity and gives it back with the count; <code>write_owned</code> writes all of it and gives it back once the kernel took the last byte. Each takes any buffer type that implements <a href="io.html#owned"><code>IoBuf</code></a> (writes) or <code>IoBufMut</code> (reads), a <code>Vec&lt;u8&gt;</code> among them, and gives the same type back. TCP and Unix streams, pipes and files have both, and <code>read_vectored_owned</code> and <code>write_vectored_owned</code> lend several buffers in one call (<a href="io.html#vectored">IO utilities</a>).</p>
 <!--example proactive_owned-->
 
 <h2 id="cancel">Dropping a future halfway</h2>

@@ -1,7 +1,8 @@
 //! Cooperative scheduling: every poll of a task (and of `block_on`'s own
 //! future) gets a budget of [`BUDGET`] operations. IO that completes spends
-//! one, and so does every receive, acquire and lock of `nuclei::sync` that
-//! completes; a task whose budget is spent is answered `Pending` and woken at
+//! one, and so does a receive, acquire or lock of `nuclei::sync` that
+//! completes without queueing (a wait that queued and was granted spends
+//! nothing); a task whose budget is spent is answered `Pending` and woken at
 //! once, so it goes behind the other tasks of its shard instead of starving
 //! them on IO or a channel that is always ready. An IO operation that does
 //! not complete is refunded: only progress spends budget.

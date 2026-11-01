@@ -1,5 +1,9 @@
 //! What the runtime is doing: a snapshot of every shard's counters, taken
-//! by [`stats()`](crate::stats()).
+//! by [`stats()`](crate::stats()), or of one runtime's by
+//! [`Runtime::stats`](crate::Runtime::stats). A runtime built with
+//! [`Builder::record_latencies`](crate::Builder::record_latencies) adds a
+//! [`Histogram`] of its poll times, and with the `io-stats` feature each
+//! worker's IO counts and latencies.
 //!
 //! The snapshot covers every shard alive in the process: each runtime's
 //! workers, and the shard of each thread that runs `block_on` (made on its

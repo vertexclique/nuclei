@@ -75,10 +75,11 @@ it as Markdown, and [llms-full.txt](https://nuclei.rs/llms-full.txt) holds it in
 | Windows | I/O completion ports |
 
 On Linux the runtime first tries io_uring and falls back to epoll when it cannot be used: on a
-kernel before 6.1 (its rings are single-issuer with deferred task work), or where a sandbox
-refuses it. It probes safely, even under a seccomp filter that kills a process for calling
-`io_uring_setup`. CI runs the suite on io_uring and on epoll on Linux 6.1, 6.6 and 6.12, on kqueue
-on macOS, and on completion ports on Windows. `NUCLEI_BACKEND` picks one: `auto`, `io_uring` or
+kernel before 6.1, where a sandbox refuses it, or where the kernel refuses a feature a shard's
+ring needs (the buffer rings some Ubuntu 6.8 kernels refuse). It probes safely, even under a
+seccomp filter that kills a process for calling `io_uring_setup`. CI runs the suite on io_uring
+and on epoll on Linux 6.1, 6.6 and 6.12 and on the runner's own kernel, on kqueue on macOS, and
+on completion ports on Windows. `NUCLEI_BACKEND` picks one: `auto`, `io_uring` or
 `epoll` on Linux, `kqueue` on macOS and the BSDs, `iocp` on Windows.
 
 ## What it has
@@ -87,31 +88,52 @@ on macOS, and on completion ports on Windows. `NUCLEI_BACKEND` picks one: `auto`
   shard it was placed on. `block_on` works anywhere, nested in a task too, and keeps its shard's
   other tasks and IO going. A task that blocks inside its poll holds up only itself: past
   `Builder::handoff_after` (10 ms) its shard, with every other task, timer and IO of it, goes on
-  on another thread.
+  on another thread, and `Builder::on_long_poll` names the task. `spawn_on_worker` and
+  `on_each_worker` place tasks on the workers one names, and `shard_local!` keeps a value per
+  worker. `Builder::build` checks every setting and names the one out of range.
 * **Tasks.** `spawn`, `spawn_local` for tasks that are not `Send`, `spawn_blocking` for blocking
-  work; `JoinSet`, abort handles, task ids, task-local values and a cooperative budget.
-  `select!`, `join!` and `try_join!` wait on several futures in one task.
+  work; `JoinSet`, abort handles, task ids and names, task-local values and a cooperative budget
+  that IO, channels and locks spend. `select!`, `join!` and `try_join!` wait on several futures
+  in one task.
 * **Networking.** `nuclei::net`: TCP, UDP and Unix sockets, names looked up off the shards,
-  socket builders, stream halves, pipes and FIFOs, readiness waits and `try_` calls.
+  socket builders for TCP, UDP and Unix sockets, keepalive timing and the server's TCP options,
+  stream halves, `shut` and `abort`, `send_file` and zero-copy writes, pipes and FIFOs, readiness
+  waits and `try_` calls.
 * **IO.** `nuclei::io`: reads and writes as futures, copies, buffered readers and writers,
-  in-memory pipes, the standard streams, and `AsyncFd` for descriptors of one's own. A stream
-  lends the driver the caller's own buffer with `read_owned` and `write_owned`.
+  in-memory pipes, the standard streams, and `AsyncFd` for descriptors of one's own. The owned
+  calls lend the driver the caller's own buffer of any `IoBuf` type (a `Vec<u8>`, an aligned
+  `AlignedBuf`, a type of one's own), one buffer or several in one vectored call.
 * **Files.** `nuclei::fs`: files, whole-file calls, metadata and directories read a page at a
-  time.
-* **Time.** `sleep`, `timeout` and intervals on a timer wheel per shard, and a clock tests can
-  pause and move by hand.
+  time; reads and writes at an offset on a shared handle, many reads in one call, direct IO,
+  syncs on the ring, `allocate`, `sync_range`, `copy_range_to`, `sync_dir` and advisory locks.
+* **Time.** `sleep`, `timeout` and intervals on a millisecond timer wheel per shard,
+  `sleep_precise` to the microsecond, and a clock tests can pause and move by hand.
 * **Sync.** `nuclei::sync` has mutexes, reader-writer locks (with upgradable reads), reentrant
   locks, semaphores, `Notify`, barriers, events, latches, once-cells, cancellation tokens, and
   mpsc, oneshot, broadcast and watch channels. They need only futures and wakers, so they work
-  under any executor.
+  under any executor. `sync::local` has mpsc, oneshot, a semaphore and a mutex for the tasks of
+  one shard, with no atomic instruction, and `sync::mesh` a bounded channel between every pair of
+  a fixed number of parties, one per worker for instance.
 * **Processes and signals.** `nuclei::process` spawns children and waits for their exits;
   `nuclei::signal` delivers Unix signals and Windows console events as streams.
-* **Stats.** `nuclei::stats()` takes a snapshot of every shard: its tasks, polls, IO in flight,
-  buffers, timers and errors by kind.
+* **Stats.** `nuclei::stats()` and `Runtime::stats` take a snapshot of every shard: its tasks,
+  polls, IO in flight, buffers, timers, handoffs and errors by kind, and with
+  `Builder::record_latencies` a histogram of poll times. The `io-stats` feature adds each
+  worker's IO counts and latencies.
 * **No allocation in steady state.** Once warm, a TCP round trip, UDP datagrams, file reads and
   writes, a spawn, a `JoinSet` spawn and join and a oneshot channel make no call into the
   allocator on the thread that runs them (`tests/zero_alloc.rs` counts it).
 * **Dependencies.** `libc` (on Unix), the `kovan` crates, `futures-io` and `futures-core`.
+
+## Features
+
+| Feature | Default | What it gives |
+|---|---|---|
+| `iouring` | on | The io_uring driver, on Linux and Android. Without it those systems run on epoll. |
+| `epoll` | on | Names epoll beside `iouring`. Epoll is built on Linux either way. |
+| `attributes` | on | `#[nuclei::main]`, `#[nuclei::test]` and `#[nuclei::bench]`. |
+| `recycle` | off | Node memory of the lock-free queues, maps and channels underneath, from a per-thread cache instead of the global allocator. For applications, not libraries. |
+| `io-stats` | off | Each worker's IO counts and latencies in `stats`. Without it no IO path carries counting or timing code. |
 
 ## Checked
 
