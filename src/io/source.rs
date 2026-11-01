@@ -1170,17 +1170,6 @@ impl Source {
     }
 }
 
-impl Drop for Source {
-    fn drop(&mut self) {
-        // Whatever the sides still hold (read-ahead, accepted connections)
-        // goes now; no guard is held, so the buffers may wake whoever waits.
-        let mut after = After::default();
-        self.read.get_mut().discard(&mut after);
-        self.write.get_mut().discard(&mut after);
-        after.run();
-    }
-}
-
 /// A source woken as a buffer came back to a pool it ran out of: its tasks
 /// waiting for a buffer try again.
 impl Wake for Source {
