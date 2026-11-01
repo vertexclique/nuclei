@@ -118,12 +118,21 @@ impl Slot {
     }
 
     /// Leaves the call's end and wakes its task.
+    #[cfg(ring)]
     pub(crate) fn put(&self, outcome: FileOutcome) {
+        if let Some(waker) = self.fill(outcome) {
+            waker.wake();
+        }
+    }
+
+    /// Leaves the call's end, and takes out the waker its task left, to
+    /// wake.
+    fn fill(&self, outcome: FileOutcome) -> Option<Waker> {
         // SAFETY: written once, before `full` is raised.
         unsafe { *self.outcome.get() = Some(outcome) };
         // Release: the task reads the outcome after it sees the flag.
         self.full.store(true, Ordering::Release);
-        self.waker.wake();
+        self.waker.take()
     }
 
     /// The call's end, once it was left.
@@ -225,13 +234,46 @@ where
     slot.waker.register(waker);
     let write = WriteCall::here();
     let end = Arc::clone(&slot);
-    crate::runtime::spawn_blocking(move || {
-        end.put(call());
-        // Once the wake went: a task it dropped handed what it left first.
-        drop(write);
-    })
-    .detach();
+    crate::runtime::spawn_blocking(move || Ending::new(end, call(), write)).detach();
     SlotJob::new(slot)
+}
+
+/// The end of a call a blocking job made: `outcome`, for `slot`, and the
+/// write counted until its wake went. The job returns it, and it is
+/// published as it drops: a detached job's run drops what it returns once
+/// the job's task is gone (`RawTask::run`), so the task woken finds that
+/// task's block back with the thread it came from; off the pool, at once.
+pub(crate) struct Ending {
+    end: Option<(Arc<Slot>, FileOutcome)>,
+    write: Option<WriteCall>,
+}
+
+impl Ending {
+    /// The end `outcome` of the call of `slot`, with `write` counted until
+    /// its wake went.
+    pub(crate) fn new(slot: Arc<Slot>, outcome: FileOutcome, write: Option<WriteCall>) -> Self {
+        Self {
+            end: Some((slot, outcome)),
+            write,
+        }
+    }
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        let Some((slot, outcome)) = self.end.take() else {
+            return;
+        };
+        let waker = slot.fill(outcome);
+        // The thread's count goes before the wake: the slot is a spare the
+        // task can take again once it is woken.
+        drop(slot);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        // Once the wake went: a task it dropped handed what it left first.
+        drop(self.write.take());
+    }
 }
 
 /// The end a kind of call takes out of its slot: each call is made with

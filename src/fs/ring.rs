@@ -464,13 +464,11 @@ impl FileOp {
                 }
                 FileMem::Shutdown(how) => FileOutcome::Write(sys::shutdown_raw(raw, how)),
             };
-            slot.put(outcome);
-            // Once the wake went: a task it dropped handed what it left first.
-            drop(write);
+            crate::fs::call::Ending::new(slot, outcome, write)
         };
         match crate::rt::runtime::blocking_pool_inside() {
             Some(pool) => pool.spawn(call).detach(),
-            None => call(),
+            None => drop(call()),
         }
     }
 }

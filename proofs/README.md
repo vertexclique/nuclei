@@ -287,6 +287,38 @@ poll and the run queue as a count; the awaiter's waker cell is modelled by TLA+ 
 theorems also rest on `Classical.choice`, which the arithmetic tactic brings in for its case
 analysis.
 
+## A blocking job's end
+
+`jobend` (`tla/jobend/JobEnd.tla`) checks how the end of a file's call made by a blocking job
+reaches its task (`write_on_pool` and `Ending` in `src/fs/call.rs`, `finish_on_pool` in
+`src/fs/ring.rs`, `RawTask::run` in `src/rt/task/raw.rs`, `Pool::run` in `src/rt/blocking.rs`). A
+task writes round after round; each write is a detached job, a task of its own whose memory is
+a block of the writer's thread's cache. The run of a detached job holds its last reference, so
+the pool thread frees it, and its block goes back to the writer's thread through that thread's
+record (`tla/remote`). The writer looks at the job's slot right after it issues the job, and
+again each time it is woken: an end already there is taken at once. So the pool thread leaves
+the end in the slot only once the job's task is gone: the job returns the end (`Ending`), and
+the run of a task no handle holds drops what it returned after the task is freed. Whichever
+look finds the end, the block is back first, and the writer's next job finds it. The write is
+counted on its shard until the wake went (`tla/going/Linger.tla`), and the pool counts the job
+out after that.
+
+The family checks 8 configurations: 2 that must pass (three writes from a cache warmed with
+one block take nothing from the allocator, each write is counted until its wake and each job
+until it, with no deadlock; and every write ends under weak fairness), 4 mutations (the end
+left and woken inside the job, as it once was, and only the wake moved after the job, both
+break `NoAllocation`: the writer goes on before the block is back, through the wake or through
+its first look; a write uncounted before its wake breaks `CountedUntilWoken`; a job counted out
+before it breaks `CountedOutAfterWake`), and 2 witnesses (the first look finds the end with no
+wake; a block comes back through the record).
+
+What the model leaves out: one block class and one job at a time; the run's exchanges and the
+free are one step (`tla/task` checks the run, and that a handle awaiting a job frees its task
+itself, `RunnerFreesNoAwaited`); the waker cell is one flag per slot, set by the writer and
+taken by the pool thread after the end's flag (the cell's handshake is the atomic waker's); the
+slot's own count, which the pool thread lets go of before the wake, is left out, as a slot is a
+spare among several.
+
 ## The park handshake
 
 `park` (`tla/park/Park.tla`) checks how a shard goes to sleep without losing a wake
