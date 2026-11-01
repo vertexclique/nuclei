@@ -142,6 +142,10 @@ pub(crate) struct Lending<'d> {
 pub(super) struct WriteState {
     /// The last call would have blocked, and no edge came since.
     blocked: bool,
+    /// The hold's step made a direct write and changed nothing else: the side holds nothing
+    /// unsent and waits for no edge, so its release publishes that without looking
+    /// (`published`).
+    direct: bool,
     waiters: Wakers,
     /// A write found the pool empty; the source waits for a buffer.
     starved: bool,
@@ -358,11 +362,15 @@ impl WriteState {
                 }
                 None
             }
-            Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
+            Some(Ok(0)) => {
+                self.direct = true;
+                Some(Err(io::ErrorKind::WriteZero.into()))
+            }
             // Moved through as it is, counted by reference: taken apart and
             // made again, the result cost the call a drop of its own.
             Some(result) => {
                 tally::writing(&result);
+                self.direct = true;
                 Some(result)
             }
         }
@@ -412,6 +420,21 @@ impl WriteState {
             && !self.connecting
             && self.behind.is_none()
             && !self.lent_waits()
+    }
+
+    /// What `Source::unsent` publishes as the side is let go: the unsent bit, and for a source a
+    /// readiness driver serves (not `ring`) the idle bit. After a hold whose step only wrote
+    /// directly, known without a look: a direct write needs a side that holds nothing and, on a
+    /// readiness driver, is not blocked, and the step began by leaving the caller's own calls.
+    #[inline(always)]
+    pub(super) fn published(&mut self, ring: bool) -> u8 {
+        if core::mem::take(&mut self.direct) {
+            #[cfg(readiness)]
+            return if ring { 0 } else { super::WRITE_IDLE };
+            #[cfg(not(readiness))]
+            return 0;
+        }
+        u8::from(self.has_unsent()) | self.idle_bit(ring)
     }
 
     /// [`idle`](Self::idle) as the bit `Source::unsent` publishes it in, for a source a readiness

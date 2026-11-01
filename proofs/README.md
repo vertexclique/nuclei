@@ -1850,7 +1850,8 @@ code against the same rules.
 `edgeskip` (`tla/edgeskip/EdgeSkip.tla`) checks the epoll driver passing over a write edge
 (`Source::on_event` and `write_wants_no_edge` in `src/io/source.rs`, `Side::biased_to` in
 `src/io/side.rs`, the write side's `releasing` hook in `src/io/source/hooks.rs`, `WriteState::idle`
-in `src/io/source/write.rs`) on a machine whose stores wait in a store buffer. Every holder of the
+and `published` in `src/io/source/write.rs`, which after a hold whose step only wrote directly
+publishes idle without a look, a direct write needing that state) on a machine whose stores wait in a store buffer. Every holder of the
 write side publishes, as it lets go, whether the side waits for nothing an edge brings (no write
 blocked, nothing written behind, no connect, no lent buffer, no caller's own calls); the driver
 passes over a write edge only when the side was only ever held by its own thread (biased to it, not

@@ -207,10 +207,9 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     fn releasing(&self, st: &mut WriteState) {
         // Release: a drop on another thread reads the unsent bit; this thread's driver reads the
         // idle bit, only while no other thread ever held the side.
-        self.src.unsent.store(
-            u8::from(st.has_unsent()) | st.idle_bit(self.src.on_ring()),
-            Ordering::Release,
-        );
+        self.src
+            .unsent
+            .store(st.published(self.src.on_ring()), Ordering::Release);
     }
 
     fn owner(&self) -> usize {
