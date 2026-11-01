@@ -186,9 +186,19 @@ impl Source {
     /// taken here: performing goes through it (see the module docs).
     fn request(self: &Arc<Self>, bits: u8, after: &mut After) -> Done {
         // The shard this thread runs is looked up inside the bracket that
-        // keeps it in the shard, so a request from its thread is its owner's.
-        crate::rt::context::current(|current| {
-            self.request_with(bits, after, &self.hooks_in(current))
+        // keeps it in the shard, so a request from its thread is its owner's;
+        // so is one its thread makes as it lets go of the shard (its sources
+        // evicted, its tasks dropped), as the only thread that runs it.
+        crate::rt::context::current(|current| match current {
+            Some(_) => self.request_with(bits, after, &self.hooks_in(current)),
+            None => crate::rt::context::letting_go_of(|going| {
+                // Only for sides that shard already claimed: no shard that goes claims one.
+                let hooks = SourceHooks {
+                    claim: going.filter(|shard| self.read.claimed_by(Arc::as_ptr(shard) as usize)),
+                    ..self.hooks()
+                };
+                self.request_with(bits, after, &hooks)
+            }),
         })
     }
 

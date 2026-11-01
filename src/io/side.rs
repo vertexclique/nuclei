@@ -435,6 +435,12 @@ impl<S> Side<S> {
             && self.owner.load(Ordering::Relaxed) == who
     }
 
+    /// Whether the shard whose address is `who` claimed the side as its owner.
+    #[inline]
+    pub(crate) fn claimed_by(&self, who: usize) -> bool {
+        self.owner.load(Ordering::Relaxed) == who
+    }
+
     /// Whether a poll of the thread whose shard's address is `who` takes the side as its owner,
     /// as [`role`](Self::role) finds it for a caller whose [`Hooks::owner`] is `who`: the side is
     /// not shared, `who` claimed it, and the owner does not hold it now.
