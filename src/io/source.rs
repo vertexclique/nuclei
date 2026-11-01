@@ -27,25 +27,36 @@
 //! object, only through a request that needs both sides
 //! ([`requests`]): whoever holds both performs it, so it
 //! never overlaps a call of the driver, which holds a side while it makes
-//! one. A dropped handle never waits for that: if a side is held, it hands
-//! its object to the source and the last holder closes it. Retiring marks
+//! one. A dropped handle never waits for that: it hands its object to the
+//! source, which closes it once the close was performed and no lease (a call
+//! on the number away from the driver) is out. Retiring marks
 //! the source stale and deregisters it before the descriptor can change;
 //! the driver skips a stale source, and checks every event's token (slot
 //! index and generation, never a pointer) against the registration in
 //! place, so an event for one that is gone does nothing.
 
+#[cfg(unix)]
+mod direct;
+mod hooks;
 #[cfg(completion)]
 pub(crate) mod ops;
+mod owner;
 #[cfg(port)]
 pub(crate) mod port;
+#[cfg(unix)]
+mod quick;
 mod read;
 pub(crate) mod requests;
 #[cfg(ring)]
 pub(crate) mod ring;
 pub(crate) mod write;
 
+use self::hooks::SourceHooks;
+
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+#[cfg(completion)]
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -57,15 +68,32 @@ use self::read::ReadState;
 use self::requests::Ask;
 use self::write::WriteState;
 use super::raw::{AtomicRaw, Raw};
-use super::side::{After, Hooks, Side};
+use super::side::{After, Side};
 use crate::rt::context;
 #[cfg(readiness)]
 use crate::rt::park::Readiness;
 use crate::rt::shard::{IoOp, Shared};
 
+/// How the driver's part of a source reaches the descriptor, and the pool
+/// of the thread that reaches it, looked up once for the whole step.
+#[derive(Clone, Copy)]
+pub(crate) struct Io<'a> {
+    pub(crate) via: Via<'a>,
+    /// The shard this thread runs, or `None` where it runs none: a buffer
+    /// then comes from the thread's fallback pool.
+    pub(crate) shard: Option<&'a crate::rt::shard::Shard>,
+}
+
+impl Io<'_> {
+    /// The pool of the shard this thread runs, if the step knows it.
+    pub(crate) fn pool(&self) -> Option<&crate::buf::Pool> {
+        self.shard.map(crate::rt::shard::Shard::pool)
+    }
+}
+
 /// How the driver's part of a source reaches the descriptor.
 #[derive(Clone, Copy)]
-pub(crate) enum Io<'a> {
+pub(crate) enum Via<'a> {
     /// Calls on the descriptor, made by the driver itself (epoll, kqueue).
     #[cfg(readiness)]
     Fd(Raw),
@@ -87,6 +115,12 @@ pub(crate) mod route {
     #[cfg(ring)]
     pub(crate) use super::ring::RingIo as Route;
 }
+
+/// `Source::unsent`: the write side holds what the kernel has not taken.
+const UNSENT: u8 = 1;
+/// `Source::unsent`: the write side waits for nothing a write edge brings.
+#[cfg(readiness)]
+const WRITE_IDLE: u8 = 2;
 
 /// No descriptor: the source is retired.
 const NO_FD: Raw = super::raw::NONE;
@@ -137,6 +171,12 @@ mod write_work {
     #[cfg(port)]
     pub(super) const LOOK: u8 = 16;
 }
+
+/// The least room a datagram's owned call must have before the ring lends the caller's buffer to
+/// an operation of its own; below it the call copies, as the borrowed calls do. From the
+/// `udp_bytes_*` modes of benches/vs_tokio_count.rs: total cycles per datagram favored the copy
+/// at 64 B to 8 KiB and the lent buffer from 12 KiB.
+pub(crate) const OWNED_DATAGRAM_MIN: usize = 12 * 1024;
 
 /// What kind of descriptor a source is: which system calls fit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +229,18 @@ impl Kind {
         }
     }
 
+    /// A stream socket whose kernel may count what a read leaves (see
+    /// `sys::enable_inq`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[inline(always)]
+    pub(crate) fn counts_left(self) -> bool {
+        if crate::io::sys::UNIX_INQ {
+            self.streams()
+        } else {
+            self == Kind::Tcp
+        }
+    }
+
     /// A datagram socket: its reads and writes are whole datagrams.
     pub(crate) fn datagrams(self) -> bool {
         match self {
@@ -200,12 +252,80 @@ impl Kind {
     }
 }
 
+#[cfg(unix)]
+crate::buf::spare::reused!(unix::SocketAddr, crate::io::sys::UnixAddr);
+
 /// A peer's address.
 #[derive(Clone, Debug)]
 pub(crate) enum Addr {
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(unix::SocketAddr),
+    Unix(crate::buf::spare::Spare<unix::SocketAddr>),
+}
+
+/// A datagram's sender as a receive hands it out: an internet address, a
+/// Unix one, or either ([`Addr`]).
+pub(crate) trait Sender: Sized {
+    /// A datagram received straight from `fd`, a socket of `kind`, into `out`
+    /// (left on the socket with `peek`), with its sender.
+    #[cfg(unix)]
+    fn receive(fd: Raw, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)>;
+
+    /// The sender of a datagram the side held.
+    fn from_addr(addr: Addr) -> io::Result<Self>;
+}
+
+impl Sender for Addr {
+    #[cfg(unix)]
+    #[inline(always)]
+    fn receive(fd: Raw, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        match kind {
+            Kind::UnixDatagram => crate::io::sys::recv_from_unix(fd, out, peek)
+                .map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)))),
+            _ => crate::io::sys::recv_from_udp(fd, out, peek).map(|(n, a)| (n, Addr::Inet(a))),
+        }
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        Ok(addr)
+    }
+}
+
+impl Sender for SocketAddr {
+    #[cfg(unix)]
+    #[inline(always)]
+    fn receive(fd: Raw, _kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        crate::io::sys::recv_from_udp(fd, out, peek)
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        match addr {
+            Addr::Inet(addr) => Ok(addr),
+            #[cfg(unix)]
+            Addr::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a UDP datagram came with no internet address",
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Sender for unix::SocketAddr {
+    #[inline(always)]
+    fn receive(fd: Raw, _kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        crate::io::sys::recv_from_unix(fd, out, peek)
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        match addr {
+            Addr::Unix(addr) => Ok(addr.into_inner()),
+            Addr::Inet(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a Unix socket's peer has an internet address",
+            )),
+        }
+    }
 }
 
 /// Where a datagram goes.
@@ -215,7 +335,7 @@ pub(crate) enum Target {
     Connected,
     Inet(SocketAddr),
     #[cfg(unix)]
-    Unix(crate::io::sys::UnixAddr),
+    Unix(crate::buf::spare::Spare<crate::io::sys::UnixAddr>),
 }
 
 /// An error kept to be reported again: the kernel's code, or its kind.
@@ -257,11 +377,21 @@ struct Registration {
     ops: AtomicBool,
     #[cfg(ring)]
     slot: AtomicU32,
+    /// The ring of the shard of the last registration receives UDP datagrams
+    /// ahead (`ShardRing::datagrams_ahead`); else a task receives its own.
+    #[cfg(ring)]
+    datagrams_ahead: AtomicBool,
     /// The address of the `Shared` of the shard the registration in place
     /// (or a ring attach under way) is with, else 0: compared, never
     /// followed. With the token it names the registration, since every
     /// shard numbers its own tokens.
     home: core::sync::atomic::AtomicUsize,
+    /// The address of the `Shared` of the ring shard the source is registered with, published
+    /// once the registration is in place (after `slot` and `state`) and cleared before it goes:
+    /// a thread of that shard reaches the source Here with one look (`Source::via`,
+    /// proofs/tla/attach/Route.tla). 0 for none.
+    #[cfg(ring)]
+    here: core::sync::atomic::AtomicUsize,
     /// A registration found operations of the source out, which keep its
     /// handle on the port they were issued to: it waits for the last to
     /// end (see `ops::Source::waits_for_ops`).
@@ -283,13 +413,22 @@ pub(crate) struct Source {
     kind: Kind,
     read: Side<ReadState>,
     write: Side<WriteState>,
+    /// The shards that claimed the sides as their owner.
+    read_owner: owner::Owner,
+    write_owner: owner::Owner,
     reg: Registration,
     /// Work that needs both sides, and what it carries (see `requests`).
     requests: AtomicU8,
     ask: Ask,
-    /// Whether the write side holds bytes or a datagram the kernel has not
-    /// taken, as its last holder left it.
-    unsent: AtomicBool,
+    /// As the write side's last holder left it: whether it holds bytes or a datagram the kernel
+    /// has not taken (`UNSENT`), and whether it waits for nothing a write edge brings
+    /// (`WRITE_IDLE`, `WriteState::idle`), so the driver passes over an edge of a side only its
+    /// own thread holds (`write_wants_no_edge`, proofs/tla/edgeskip/EdgeSkip.tla). One byte, so
+    /// a release publishes both with one store.
+    unsent: AtomicU8,
+    /// A datagram socket's words for the calls made with no guard.
+    #[cfg(unix)]
+    quick: quick::Quick,
     /// Completions of the sides' ring operations, for their holders.
     #[cfg(completion)]
     read_done: ops::Mailbox,
@@ -298,7 +437,7 @@ pub(crate) struct Source {
     /// A multishot receive's or accept's arrivals, from its ring's thread to
     /// the read side's holder, in order, each with the epoch it came in.
     #[cfg(ring)]
-    read_arrivals: kovan_queue::seg_queue::SegQueue<(ring::Arrival, u32)>,
+    read_arrivals: crate::rt::shard::counted::LazyCounted<(ring::Arrival, u32)>,
     /// The sides' operations in the kernel's hands: a retire waits until
     /// none is.
     #[cfg(completion)]
@@ -315,173 +454,92 @@ unsafe impl Send for Source {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for Source {}
 
-/// What a holder of one of the source's sides does for the work others
-/// left it: the driver's part with the descriptor in place, side-local
-/// work, the source's requests, and a side's catching up with a revival.
-#[derive(Clone, Copy)]
-struct SourceHooks<'a> {
-    src: &'a Arc<Source>,
-    /// For the driver's own edge: the registration the event came for.
-    #[cfg(readiness)]
-    token: Option<u64>,
-}
-
-impl Hooks<ReadState> for SourceHooks<'_> {
-    fn taken(&self, st: &mut ReadState, after: &mut After) {
-        if self.src.catch_up(st.epoch_mut()) {
-            st.discard(after);
-        }
-    }
-
-    fn serve(&self, st: &mut ReadState, after: &mut After) {
-        // Only a readiness driver serves edges.
-        #[cfg(readiness)]
-        if let Some(fd) = self.src.serving_fd(self.token) {
-            st.serve(fd, self.src.kind, true, after);
-        }
-        #[cfg(not(readiness))]
-        let _ = (st, after);
-    }
-
-    fn deferred(&self, st: &mut ReadState, bits: u8, after: &mut After) {
-        if bits & read_work::UNSURE != 0 {
-            st.short_reads_unsure();
-        }
-        if bits & read_work::UNSTARVE != 0 {
-            st.unstarve(after);
-        }
-        if bits & read_work::ABANDON != 0 {
-            st.abandon_lent(after);
-        }
-        #[cfg(completion)]
-        {
-            // An operation's arrivals go first: its end comes after them.
-            #[cfg(ring)]
-            if bits & (read_work::ARRIVALS | read_work::DONE) != 0 {
-                while let Ok((arrival, epoch)) = self.src.read_arrivals.try_pop() {
-                    st.take_arrival(arrival, epoch, after);
-                }
-            }
-            if bits & read_work::DONE != 0
-                && let Some(done) = self.src.read_done.take()
-            {
-                st.op_done(done, self.src.serving_fd(None), after);
-            }
-            // After a completion, a kick or the registration, what the
-            // side still wants goes to the ring: the tasks that wait are
-            // woken by what it brings.
-            if bits & (read_work::DONE | read_work::SUBMIT) != 0 {
-                self.src
-                    .with_route(|io| st.submit_wanted(io, self.src.kind, after));
-            }
-        }
-        #[cfg(port)]
-        if bits & read_work::LOOK != 0 {
-            st.wake_all(after);
-        }
-    }
-
-    fn requests(&self, st: &mut ReadState, after: &mut After) {
-        self.src.requests_holding_read(st, after);
-    }
-}
-
-impl Hooks<WriteState> for SourceHooks<'_> {
-    fn taken(&self, st: &mut WriteState, after: &mut After) {
-        if self.src.catch_up(st.epoch_mut()) {
-            st.discard(after);
-        }
-    }
-
-    fn serve(&self, st: &mut WriteState, after: &mut After) {
-        // Only a readiness driver serves edges.
-        #[cfg(readiness)]
-        if let Some(fd) = self.src.serving_fd(self.token) {
-            st.serve(fd, self.src.kind, true, after);
-        }
-        #[cfg(not(readiness))]
-        let _ = (st, after);
-    }
-
-    fn deferred(&self, st: &mut WriteState, bits: u8, after: &mut After) {
-        if bits & write_work::UNSTARVE != 0 {
-            st.unstarve(after);
-        }
-        if bits & write_work::ABANDON != 0 {
-            st.abandon_lent(after);
-            #[cfg(completion)]
-            if let Some(user_data) = st.withdrawal() {
-                self.src.cancel_op(user_data);
-            }
-        }
-        #[cfg(completion)]
-        {
-            if bits & write_work::DONE != 0
-                && let Some(done) = self.src.write_done.take()
-            {
-                st.op_done(done, self.src.serving_fd(None), after);
-            }
-            if bits & (write_work::DONE | write_work::SUBMIT) != 0 {
-                self.src
-                    .with_route(|io| st.submit_wanted(io, self.src.kind, after));
-            }
-        }
-        #[cfg(port)]
-        if bits & write_work::LOOK != 0 {
-            st.wake_all(after);
-        }
-    }
-
-    fn released(&self, saw_requests: bool, after: &mut After) {
-        if saw_requests {
-            self.src.requests_after_write(after);
-        }
-    }
-
-    fn releasing(&self, st: &mut WriteState) {
-        // Release: a drop on another thread reads it.
-        self.src.unsent.store(st.has_unsent(), Ordering::Release);
-    }
-}
-
 impl Source {
+    /// Whether the source's operations run on a ring.
+    #[cfg(ring)]
+    fn on_ring(&self) -> bool {
+        self.reg.ops.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(ring))]
+    fn on_ring(&self) -> bool {
+        false
+    }
+
+    /// Whether the ring the source is attached to receives its UDP datagrams ahead (see
+    /// `ShardRing::datagrams_ahead`).
+    #[cfg(ring)]
+    fn datagrams_ahead(&self) -> bool {
+        self.reg.datagrams_ahead.load(Ordering::Acquire)
+    }
+
+    /// The source registers with a shard whose ring receives UDP datagrams ahead (`ahead`), or
+    /// not: set before the registration, so the first receive already knows it.
+    #[cfg(ring)]
+    pub(crate) fn registers_with(&self, ahead: bool) {
+        self.reg.datagrams_ahead.store(ahead, Ordering::Release);
+    }
+
+    #[cfg(not(ring))]
+    fn datagrams_ahead(&self) -> bool {
+        false
+    }
+
     /// A source for `fd`, which the caller set non-blocking and keeps open
     /// for the source's life (until it is retired or closed).
     pub(crate) fn new(fd: Raw, kind: Kind) -> Arc<Self> {
-        Arc::new(Self {
-            fd: AtomicRaw::new(fd),
-            retired_fd: AtomicRaw::new(NO_FD),
-            epoch: AtomicU32::new(0),
-            retired_epoch: AtomicU32::new(0),
-            kind,
-            read: Side::new(ReadState::default()),
-            write: Side::new(WriteState::default()),
-            reg: Registration {
-                state: AtomicU8::new(UNREGISTERED),
-                token: AtomicU64::new(NO_TOKEN),
-                shard: UnsafeCell::new(None),
+        // Made in place: a source is large, and `Arc::new` would build it on the stack and copy
+        // it into the allocation.
+        let source = Arc::<Self>::new_uninit();
+        let slot = Arc::as_ptr(&source).cast_mut();
+        // SAFETY: the allocation is fresh and this is its one count, so nothing else reads it
+        // while it is written; `as_ptr` keeps the allocation's own provenance.
+        unsafe {
+            slot.write(core::mem::MaybeUninit::new(Self {
+                fd: AtomicRaw::new(fd),
+                retired_fd: AtomicRaw::new(NO_FD),
+                epoch: AtomicU32::new(0),
+                retired_epoch: AtomicU32::new(0),
+                kind,
+                read: Side::biased(ReadState::default()),
+                write: Side::biased(WriteState::default()),
+                read_owner: owner::Owner::new(),
+                write_owner: owner::Owner::new(),
+                reg: Registration {
+                    state: AtomicU8::new(UNREGISTERED),
+                    token: AtomicU64::new(NO_TOKEN),
+                    shard: UnsafeCell::new(None),
+                    #[cfg(completion)]
+                    ops: AtomicBool::new(false),
+                    #[cfg(ring)]
+                    slot: AtomicU32::new(u32::MAX),
+                    #[cfg(ring)]
+                    datagrams_ahead: AtomicBool::new(false),
+                    home: core::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(ring)]
+                    here: core::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(port)]
+                    awaits_idle: AtomicBool::new(false),
+                },
+                requests: AtomicU8::new(0),
+                ask: Ask::default(),
+                unsent: AtomicU8::new(0),
+                #[cfg(unix)]
+                quick: quick::Quick::new(kind),
                 #[cfg(completion)]
-                ops: AtomicBool::new(false),
+                read_done: ops::Mailbox::default(),
+                #[cfg(completion)]
+                write_done: ops::Mailbox::default(),
                 #[cfg(ring)]
-                slot: AtomicU32::new(u32::MAX),
-                home: core::sync::atomic::AtomicUsize::new(0),
+                read_arrivals: crate::rt::shard::counted::LazyCounted::new(),
+                #[cfg(completion)]
+                ops_out: core::sync::atomic::AtomicU8::new(0),
                 #[cfg(port)]
-                awaits_idle: AtomicBool::new(false),
-            },
-            requests: AtomicU8::new(0),
-            ask: Ask::default(),
-            unsent: AtomicBool::new(false),
-            #[cfg(completion)]
-            read_done: ops::Mailbox::default(),
-            #[cfg(completion)]
-            write_done: ops::Mailbox::default(),
-            #[cfg(ring)]
-            read_arrivals: kovan_queue::seg_queue::SegQueue::new(),
-            #[cfg(completion)]
-            ops_out: core::sync::atomic::AtomicU8::new(0),
-            #[cfg(port)]
-            port: Default::default(),
-        })
+                port: Default::default(),
+            }))
+        };
+        // SAFETY: written whole above.
+        unsafe { source.assume_init() }
     }
 
     pub(crate) fn kind(&self) -> Kind {
@@ -490,8 +548,19 @@ impl Source {
 
     /// The hooks of a poll's or a request's hold.
     fn hooks(self: &Arc<Self>) -> SourceHooks<'_> {
+        self.hooks_in(None)
+    }
+
+    /// [`hooks`](Self::hooks) for a step that knows the shard its thread
+    /// runs, so the hooks do not look it up again.
+    fn hooks_in<'a>(
+        self: &'a Arc<Self>,
+        shard: Option<&'a crate::rt::shard::Shard>,
+    ) -> SourceHooks<'a> {
         SourceHooks {
             src: self,
+            shard,
+            claim: None,
             #[cfg(readiness)]
             token: None,
         }
@@ -504,6 +573,7 @@ impl Source {
 
     /// The descriptor for a poll: the handle revived the source before it
     /// polled, so it is never stale here.
+    #[inline(always)]
     fn fd(&self) -> io::Result<Raw> {
         match self.fd.load(Ordering::Acquire) {
             NO_FD => Err(io::Error::new(
@@ -520,39 +590,105 @@ impl Source {
     /// register with a ring (this thread's shard runs one, or the
     /// process's shards do) registers before its first operation, which
     /// waits until the registration is in place.
+    #[inline(always)]
     fn with_io<R>(self: &Arc<Self>, f: impl FnOnce(Io<'_>) -> R) -> io::Result<R> {
         let fd = self.fd()?;
+        // Every source but a regular file is reached from the shard this thread runs, as long
+        // as `held` lives. One call of `f`, so it is inlined here.
         #[cfg(completion)]
-        if self.kind != Kind::File {
-            return context::current(|current| {
-                if !self.reg.ops.load(Ordering::Acquire) {
-                    // Registered with a poller, or about to register where
-                    // no ring runs: the driver's calls.
-                    #[cfg(readiness)]
-                    {
-                        let rings = current
-                            .map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some());
-                        if !rings || self.reg.state.load(Ordering::Acquire) == REGISTERED {
-                            return Ok(f(Io::Fd(fd)));
-                        }
-                    }
-                    self.ensure_registered()?;
-                }
-                Ok(f(Io::Ops(
-                    self.route(current).unwrap_or(route::Route::NotYet),
-                )))
-            });
+        let held = (self.kind != Kind::File).then(context::current_held);
+        #[cfg(completion)]
+        let io = match &held {
+            Some(held) => Io {
+                via: self.via(fd, held.shard())?,
+                shard: held.shard(),
+            },
+            None => Self::file_io(fd)?,
+        };
+        #[cfg(not(completion))]
+        let io = Self::file_io(fd)?;
+        #[cfg(completion)]
+        let not_yet = matches!(io.via, Via::Ops(route::Route::NotYet));
+        let out = f(io);
+        #[cfg(completion)]
+        if not_yet {
+            self.submit_if_registered(io.shard);
         }
+        Ok(out)
+    }
+
+    /// The way a regular file's step reaches its descriptor `fd` (and, where no completion
+    /// driver is built, every source's): calls on it, from no shard.
+    #[inline(always)]
+    fn file_io(fd: Raw) -> io::Result<Io<'static>> {
         #[cfg(readiness)]
-        return Ok(f(Io::Fd(fd)));
+        return Ok(Io {
+            via: Via::Fd(fd),
+            shard: None,
+        });
         // A regular file's IO goes through the file's jobs, never here.
         #[cfg(not(readiness))]
         {
-            let _ = (fd, f);
+            let _ = fd;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "a regular file is read and written through its handle",
             ))
+        }
+    }
+
+    /// How this thread's step reaches the descriptor `fd` (see [`with_io`](Self::with_io)).
+    #[cfg(completion)]
+    #[inline(always)]
+    fn via<'a>(
+        self: &'a Arc<Self>,
+        fd: Raw,
+        current: Option<&'a crate::rt::shard::Shard>,
+    ) -> io::Result<Via<'a>> {
+        // A thread of the ring shard the source is registered with: Here, with one look.
+        #[cfg(ring)]
+        if let Some(shard) = current
+            && let Some(ring) = shard.ring()
+            && self.reg.here.load(Ordering::Acquire) == shard.shared_addr()
+        {
+            return Ok(Via::Ops(route::Route::Here {
+                ring,
+                source: self,
+                file: self.reg.slot.load(Ordering::Acquire),
+            }));
+        }
+        if !self.reg.ops.load(Ordering::Acquire) {
+            // Registered with a poller, or about to register where no ring
+            // runs: the driver's calls. The registration is looked at first,
+            // one load, where the look for a ring may be a call.
+            #[cfg(readiness)]
+            if self.reg.state.load(Ordering::Acquire) == REGISTERED
+                || !current.map_or_else(crate::rt::runtime::service_rings, |s| s.ring().is_some())
+            {
+                return Ok(Via::Fd(fd));
+            }
+            #[cfg(not(readiness))]
+            let _ = fd;
+            self.ensure_registered()?;
+        }
+        Ok(Via::Ops(
+            self.route(current).unwrap_or(route::Route::NotYet),
+        ))
+    }
+
+    /// The route was read before the sides were taken: a registration that
+    /// finished meanwhile submitted nothing for what the step left, so the
+    /// sides are asked to submit.
+    #[cfg(completion)]
+    #[cold]
+    #[inline(never)]
+    fn submit_if_registered(self: &Arc<Self>, current: Option<&crate::rt::shard::Shard>) {
+        if self.reg.state.load(Ordering::Acquire) == REGISTERED {
+            let mut after = After::default();
+            let hooks = self.hooks_in(current);
+            self.read.defer(read_work::SUBMIT, &mut after, &hooks);
+            self.write.defer(write_work::SUBMIT, &mut after, &hooks);
+            self.settle(after);
         }
     }
 
@@ -588,29 +724,54 @@ impl Source {
     /// What every step leaves for once no guard is held: a side that ran out
     /// of buffers waits for one of this thread's pool, then the wakes and
     /// drops.
-    fn settle(self: &Arc<Self>, mut after: After) {
-        #[cfg(ring)]
-        if let Some(home) = after.kick.take() {
-            home.post_io(crate::rt::shard::IoOp::RingKick(Arc::clone(self)));
+    #[inline(always)]
+    fn settle(self: &Arc<Self>, after: After) {
+        if let Err(after) = after.forget_if_nothing() {
+            self.settle_rest(after);
         }
-        if after.starved {
-            crate::buf::with_pool(|pool| {
-                if let Some(pool) = pool {
-                    pool.wait_for_return(Arc::clone(self).into());
-                }
-            });
+    }
+
+    /// [`settle`](Self::settle) for a step that left something.
+    #[inline(never)]
+    fn settle_rest(self: &Arc<Self>, mut after: After) {
+        self.kick(&mut after);
+        if after.starved() {
+            Arc::clone(self).wait_for_buffer();
         }
         after.run();
     }
 
+    /// Posts the ring thread the submit a side of a ring source asked for.
+    #[cfg_attr(
+        not(ring),
+        expect(unused_variables, reason = "only a ring source kicks")
+    )]
+    fn kick(self: &Arc<Self>, after: &mut After) {
+        #[cfg(ring)]
+        if let Some(home) = after.take_kick() {
+            home.post_io(crate::rt::shard::IoOp::RingKick(Arc::clone(self)));
+        }
+    }
+
+    /// Has this thread's pool wake the source when a buffer comes back. May
+    /// wake at once, so no borrowed view of the source may be live.
+    pub(crate) fn wait_for_buffer(self: Arc<Self>) {
+        crate::buf::with_pool(|pool| {
+            if let Some(pool) = pool {
+                pool.wait_for_return(self.into());
+            }
+        });
+    }
+
     /// The end of a poll: settles, and makes sure a driver watches the
     /// source when the poll waits or left work to it.
+    #[inline(always)]
     fn finish_poll<R>(
         self: &Arc<Self>,
         after: After,
         poll: Poll<io::Result<R>>,
     ) -> Poll<io::Result<R>> {
-        let watch = after.register || poll.is_pending();
+        let watch = after.must_register() || poll.is_pending();
         self.settle(after);
         if watch && let Err(err) = self.ensure_registered() {
             return Poll::Ready(Err(err));
@@ -620,6 +781,7 @@ impl Source {
 
     /// Makes sure the driver of some shard watches the source: the current
     /// shard's, or (on a thread that runs none) one of the runtime's.
+    #[inline(always)]
     fn ensure_registered(self: &Arc<Self>) -> io::Result<()> {
         // Registered, or being registered by another poll (readiness is
         // reported once the registration is in place). A shard that goes
@@ -627,6 +789,13 @@ impl Source {
         if self.reg.state.load(Ordering::Acquire) != UNREGISTERED {
             return Ok(());
         }
+        self.register()
+    }
+
+    /// [`ensure_registered`](Self::ensure_registered) for a source no shard
+    /// watches.
+    #[inline(never)]
+    fn register(self: &Arc<Self>) -> io::Result<()> {
         if self
             .reg
             .state
@@ -640,7 +809,30 @@ impl Source {
         {
             return Ok(());
         }
-        match context::current(|current| current.map(|shard| shard.register_source(self))) {
+        // A shard that stopped (a worker going, its thread finishing what
+        // the stop left) registers nothing, as `proofs/tla/attach` has it:
+        // the source stays unregistered, and the tasks waiting on it are
+        // woken, so the stopping shard hands them on (a dropped task hands
+        // its linger to the runtime's drop, `rt::linger`) and they register
+        // it where they are polled next. Waiting unwoken, they would wait
+        // out their deadline.
+        let registered = context::current(|current| {
+            current.map(|shard| {
+                if shard.shared.is_stopped() {
+                    self.registration_abandoned();
+                    Err(requests::stopped_shard())
+                } else {
+                    shard.register_source(self)
+                }
+            })
+        });
+        match registered {
+            // Refused for its stop, here or by the attach (which set the
+            // registration back to none): the tasks look again.
+            Some(Err(err)) if requests::is_stopped_shard(&err) => {
+                self.look_again();
+                Ok(())
+            }
             Some(result) => result,
             None => {
                 crate::rt::runtime::service_shard().post_io(IoOp::Register(Arc::clone(self)));
@@ -657,7 +849,6 @@ impl Source {
 
     /// Deregisters the source; both sides are held by the caller, who
     /// hands their states in.
-    #[cfg_attr(not(ring), expect(unused_variables))]
     fn detach(self: &Arc<Self>, read: &ReadState, write: &WriteState) {
         // An attach still under way on a ring's thread is undone: the ring's
         // install of the file then finds it unwanted and lets it go.
@@ -671,30 +862,37 @@ impl Source {
         }
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
-        let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
-        self.reg.home.store(0, Ordering::Release);
+        self.clear_here();
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
-            #[cfg(ring)]
-            if self.reg.ops.swap(false, Ordering::AcqRel) {
-                // The ring holds the file: the descriptor may close at once,
-                // and the ring cancels what the sides have out.
-                let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
-                self.detach_ring(&shard, slot, [read.out(), write.out()]);
-                shard.release_source(token);
-                return;
-            }
-            #[cfg(port)]
-            if self.reg.ops.swap(false, Ordering::AcqRel) {
-                // What the sides have out is cancelled; its packets still
-                // come, to whichever port the socket goes to next.
-                self.detach_port();
-                shard.release_source(token);
-                return;
-            }
-            #[cfg(readiness)]
+            self.undo_with(&shard, read, write);
+            shard.release_source(self.reg.token.load(Ordering::Acquire));
+        }
+        self.registration_gone();
+    }
+
+    /// What `detach` undoes on `shard`'s driver, the registration's state
+    /// gone already; both sides are held.
+    #[cfg_attr(not(ring), expect(unused_variables))]
+    fn undo_with(self: &Arc<Self>, shard: &Arc<Shared>, read: &ReadState, write: &WriteState) {
+        #[cfg(ring)]
+        if self.reg.ops.swap(false, Ordering::AcqRel) {
+            // The ring holds the file: the descriptor may close at once,
+            // and the ring cancels what the sides have out.
+            let slot = self.reg.slot.swap(u32::MAX, Ordering::AcqRel);
+            self.detach_ring(shard, slot, [read.out(), write.out()]);
+            return;
+        }
+        #[cfg(port)]
+        if self.reg.ops.swap(false, Ordering::AcqRel) {
+            // What the sides have out is cancelled; its packets still
+            // come, to whichever port the socket goes to next. A port is
+            // the only driver there.
+            self.detach_port();
+        }
+        #[cfg(readiness)]
+        {
             let fd = self.fd.load(Ordering::Acquire);
-            #[cfg(readiness)]
             if fd != NO_FD
                 && let Some(registrar) = shard.registrar()
             {
@@ -703,15 +901,22 @@ impl Source {
                 // kernel's registration.
                 let _ = registrar.delete(fd, self.kind == Kind::Tcp);
             }
-            shard.release_source(token);
         }
     }
 
-    /// A copy of the descriptor (the same open socket under another
-    /// number), close-on-exec; `None` if the process has none to spare.
-    #[cfg(unix)]
-    pub(crate) fn duplicate(&self) -> Option<std::os::fd::OwnedFd> {
-        super::sys::duplicate(self.fd().ok()?).ok()
+    /// The last step of every end of a registration, with both sides held:
+    /// its token and its home go. Its state went first, so no poll routes
+    /// through it meanwhile, and what its shard must undo (a ring's detach
+    /// with its lease, a slot to release) is in that shard's mailbox by now:
+    /// the shard's wait for the end ([`registered_with`](Self::registered_with),
+    /// `rt::shard::going`) sees it end only then, and finds that work there
+    /// when it looks. A thread's own shard that left runs again only at its
+    /// next `block_on`, so work posted to it after its look would wait there,
+    /// a ring's detach holding the handle's object open.
+    fn registration_gone(&self) {
+        self.clear_here();
+        self.reg.token.store(NO_TOKEN, Ordering::Release);
+        self.reg.home.store(0, Ordering::Release);
     }
 
     /// Gives a retired source its descriptor again (the handle's IO object,
@@ -739,6 +944,7 @@ impl Source {
     }
 
     /// Whether the source is retired: the handle's next poll revives it.
+    #[inline]
     pub(crate) fn is_retired(&self) -> bool {
         self.fd.load(Ordering::Acquire) == NO_FD
     }
@@ -748,26 +954,66 @@ impl Source {
     /// another thread's holder performs, say) has not happened yet. A
     /// registration with another shard since is not it, whatever its token.
     pub(crate) fn registered_with(&self, home: usize, token: u64) -> bool {
-        // The token first. Every end of a registration clears `home` before
-        // the state, and a registration elsewhere stores its token after it
-        // took the state: a token seen from it comes with `home` cleared or
-        // moved on. A failed attach leaves its token, never its `home`.
+        // The token first. Every end of a registration clears `home` last
+        // (`registration_gone`), with both sides held, and a registration
+        // elsewhere stores its token only with both sides held, after that:
+        // a token seen from it comes with `home` cleared or moved on. A
+        // failed attach leaves its token, never its `home`.
         self.reg.token.load(Ordering::Acquire) == token
             && self.reg.home.load(Ordering::Acquire) == home
+    }
+
+    /// The registration with a ring shard `home` is in place: its threads reach the source Here
+    /// from now on. Both sides are held, `slot` and `state` stored.
+    #[cfg(ring)]
+    fn publish_here(&self, home: usize) {
+        // Release: a look that finds `here` finds the slot and the state stored before it.
+        self.reg.here.store(home, Ordering::Release);
+    }
+
+    /// The registration goes: no thread reaches the source Here from now on, before anything of
+    /// the registration changes. Both sides are held.
+    fn clear_here(&self) {
+        #[cfg(ring)]
+        self.reg.here.store(0, Ordering::Release);
     }
 
     /// Whether the write side holds bytes or a datagram the kernel has not
     /// taken yet, as its last holder left it.
     pub(crate) fn has_unsent(&self) -> bool {
-        self.unsent.load(Ordering::Acquire)
+        self.unsent.load(Ordering::Acquire) & UNSENT != 0
+    }
+
+    /// Whether a write edge brings the write side nothing, so the driver of `shard` passes over
+    /// it: only this thread ever held the side (biased to `shard`, never shared, no foreign
+    /// thread came), and its last release left it idle. A foreign holder makes the side shared
+    /// with a locked instruction before it holds it, so its refused write is never passed over
+    /// (proofs/tla/edgeskip/EdgeSkip.tla).
+    #[cfg(readiness)]
+    #[inline(always)]
+    fn write_wants_no_edge(&self, shard: &crate::rt::shard::Shard) -> bool {
+        self.write.biased_to(shard.shared_addr())
+            && self.unsent.load(Ordering::Relaxed) & WRITE_IDLE != 0
     }
 
     /// The driver saw readiness for `token`.
     #[cfg(readiness)]
-    pub(crate) fn on_event(self: &Arc<Self>, token: u64, readiness: Readiness) {
+    pub(crate) fn on_event(
+        self: &Arc<Self>,
+        token: u64,
+        readiness: Readiness,
+        shard: &crate::rt::shard::Shard,
+    ) {
+        // A datagram's write side that holds nothing and waits for nothing has no use for room,
+        // and a send that finds the socket full raises its word before it asks the kernel
+        // again (`quick`): every writable edge after that call reaches the side. Any other
+        // source's word stays raised.
+        let writable = readiness.writable && !self.quick.write_clear();
         let mut after = After::default();
         let hooks = SourceHooks {
             src: self,
+            shard: Some(shard),
+            claim: None,
             token: Some(token),
         };
         if readiness.readable {
@@ -778,7 +1024,7 @@ impl Source {
             };
             self.read.drive(&mut after, &hooks, unsure);
         }
-        if readiness.writable {
+        if writable && !self.write_wants_no_edge(shard) {
             self.write.drive(&mut after, &hooks, 0);
         }
         // If the driver's own pool ran out, the readers hear when a buffer
@@ -789,6 +1035,11 @@ impl Source {
 
 #[cfg(test)]
 impl Source {
+    /// Whether the read side and the write side went to shared mode.
+    pub(crate) fn shared(&self) -> (bool, bool) {
+        (self.read.is_shared(), self.write.is_shared())
+    }
+
     /// The registration in place: its shard's address and its token.
     pub(crate) fn registration(&self) -> (usize, u64) {
         (
@@ -844,7 +1095,7 @@ impl Source {
         )
     }
 
-    fn has_read_ahead(self: &Arc<Self>) -> bool {
+    pub(crate) fn has_read_ahead(self: &Arc<Self>) -> bool {
         let mut after = After::default();
         let hooks = self.hooks();
         self.read.try_hold().is_some_and(|mut held| {
@@ -862,6 +1113,19 @@ impl Source {
             held.release(&mut after, &hooks);
             found
         })
+    }
+}
+
+impl Source {
+    /// A thread whose heavy fence failed left work on the sides: this shard's
+    /// thread takes and lets go of each, as their owner, which serves it.
+    #[cfg(not(ring))]
+    pub(crate) fn touch(self: &Arc<Self>, shard: &crate::rt::shard::Shard) {
+        let mut after = After::default();
+        let hooks = self.hooks_in(Some(shard));
+        self.read.defer(0, &mut after, &hooks);
+        self.write.defer(0, &mut after, &hooks);
+        self.settle(after);
     }
 }
 

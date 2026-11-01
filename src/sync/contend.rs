@@ -183,6 +183,36 @@ fn spin_take<L: Lock>(lock: &L, need: usize, mut seen: usize) -> bool {
     false
 }
 
+/// A first poll took `need` without waiting: it spends one operation of the
+/// poll's budget (see `coop`), or, with the budget spent, gives `need` back
+/// and yields. A grant to a queued waiter spends nothing: that wait yielded,
+/// and giving the grant back would cost it its place.
+#[inline]
+pub(super) fn taken_at_once<L: Lock + ?Sized>(
+    lock: &L,
+    need: usize,
+    waker: &Waker,
+) -> Poll<Result<(), Closed>> {
+    admitted(lock, need, crate::coop::spend(waker))
+}
+
+/// What a first attempt that took `need` comes to once the budget answered:
+/// complete when `admit`, else `need` goes back (serving whoever queued for it
+/// meanwhile) and the caller yields.
+#[inline]
+pub(super) fn admitted<L: Lock + ?Sized>(
+    lock: &L,
+    need: usize,
+    admit: bool,
+) -> Poll<Result<(), Closed>> {
+    if admit {
+        Poll::Ready(Ok(()))
+    } else {
+        lock.give_back(need);
+        Poll::Pending
+    }
+}
+
 /// A future's contended acquire.
 pub(super) struct Contend {
     wait: Wait,
@@ -254,13 +284,17 @@ impl Contend {
                 None => lock.try_take(need),
             };
             match first {
-                Ok(()) => return Poll::Ready(Ok(())),
+                Ok(()) => return taken_at_once(lock, need, waker),
                 Err(seen) => {
                     if lock.closed(seen) {
-                        return Poll::Ready(Err(Closed));
+                        return if crate::coop::spend(waker) {
+                            Poll::Ready(Err(Closed))
+                        } else {
+                            Poll::Pending
+                        };
                     }
                     if L::SPINS && spin_take(lock, need, seen) {
-                        return Poll::Ready(Ok(()));
+                        return taken_at_once(lock, need, waker);
                     }
                 }
             }

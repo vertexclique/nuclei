@@ -27,6 +27,12 @@
 (* the queue's lists and the drain role (the families of each primitive   *)
 (* check them); a waker is an id, and each registration brings a new one, *)
 (* so the waker the future waits on is always its latest.                 *)
+(*                                                                          *)
+(* States that differ only in what nobody reads again are kept as one: a   *)
+(* party's own values go back to where they started once read for the last *)
+(* time, a call of a waker nobody waits on any more is forgotten, the wake *)
+(* list of a pass that claimed nothing (an empty one) leaves once the      *)
+(* passes are over, and the witnesses read the state itself, not a record. *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -40,7 +46,8 @@ CONSTANTS
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Futures == 1..Rounds
-MaxPasses == Rounds * (Nudges + 2)
+\* A round has at most Nudges nudge passes, then one pass that grants or prunes.
+MaxPasses == Rounds * (Nudges + 1)
 Passes == 1..MaxPasses
 WakeLists == {100 + i : i \in Passes}
 Drainer == 50
@@ -58,19 +65,23 @@ variables
     queued = FALSE,             \* the queue holds the node
     owedCount = 0,              \* the queue's count of owed waiters
     \* The wakes.
-    called = {},                \* the wakers called so far
+    called = {},                \* the wakers called that their futures still wait on
     latest = [f \in Futures |-> 0],
     started = [i \in Passes |-> FALSE],
     claimedIn = [i \in Passes |-> FALSE],
     wakeHolder = 0,             \* the pass whose wake list holds the wake reference
-    \* Records.
-    againSeen = FALSE, spinMarked = FALSE, claimedWhileSpinning = FALSE,
-    forgiven = FALSE, cancelTook = FALSE;
+    \* Records: what happened once, kept for a property to read. (The other
+    \* witnesses look at the state itself, so no record keeps states apart.)
+    spinMarked = FALSE, claimedWhileSpinning = FALSE;
 
 define
     Procs == Futures \cup {Drainer} \cup WakeLists
     AllDone == \A q \in Procs : pc[q] = "Done"
-    AllEnd == <>AllDone
+    \* Everything ends. Once every party is at its end it stays there (an ended
+    \* party takes no step, under every mutation too), so "in the end, all are
+    \* ended" is the same as "all are ended again and again", which TLC checks
+    \* directly, without the extra machinery an "in the end" needs.
+    AllEnd == []<>AllDone
     \* No party acts on the node after it let go of its reference.
     FutureLabels == {"F_settle", "F_poll", "F_spin", "F_park1", "F_write", "F_arm2",
                      "F_owe", "F_cancel", "F_withdraw", "F_cancelRead", "F_releaseF"}
@@ -89,22 +100,26 @@ define
     OwedSettled == owedCount >= 0 /\ (AllDone => owedCount = 0)
     \* A mark that comes while the future spins claims no waker.
     NoClaimWhileSpinning == ~claimedWhileSpinning
-    \* Witnesses.
-    NoAgain == ~againSeen
+    \* Witnesses (NoAgain and NoCancelTake read a party's own values, so they
+    \* follow the translation below).
     NoSpinMark == ~spinMarked
     NoReuse == round <= 1
-    NoForgive == ~forgiven
-    NoCancelTake == ~cancelTook
+    \* No node the queue let go still carries an owed mark. Once the queue lets
+    \* go, nobody takes the mark back, and the next future clears it as it takes
+    \* the node: so this breaks exactly as the queue lets an owed node go, which
+    \* is when it settles the mark.
+    NoForgive == ~(owed /\ ~queued)
 end define;
 
 \* `touch`: sets `bit` on a waiting node, claiming its armed waker for pass
 \* `p`'s wake list if nobody registers or takes; `once` leaves a node that
-\* already carries a nudge alone.
+\* already carries a nudge alone. Its four outcomes (skipped, pending, claimed,
+\* marked) are the four branches; nothing reads them after, so none is kept.
 macro touch(bit, once) begin
     if phase # "W" then
-        touchRes := "skipped";
+        skip;    \* skipped: the node no longer waits
     elsif once /\ nudged then
-        touchRes := "pending";
+        skip;    \* pending: the last nudge is still on the node
     elsif armed /\ ~taking /\ (~reg \/ Mutation = "claim_registering") then
         taken := cur;
         armed := FALSE;
@@ -114,11 +129,9 @@ macro touch(bit, once) begin
         claimedIn[p] := TRUE;
         claimedWhileSpinning := claimedWhileSpinning \/ \E f \in Futures : pc[f] = "F_spin";
         if bit = "N" then nudged := TRUE; else phase := "G"; end if;
-        touchRes := "claimed";
     else
         spinMarked := spinMarked \/ \E f \in Futures : pc[f] = "F_spin";
         if bit = "N" then nudged := TRUE; else phase := "G"; end if;
-        touchRes := "marked";
     end if;
 end macro;
 
@@ -127,7 +140,6 @@ end macro;
 macro release(bit) begin
     if bit = "Q" /\ owed /\ Mutation # "release_forgets_owed" then
         owedCount := owedCount - 1;
-        forgiven := TRUE;
     end if;
     if refs = {bit} \/ (bit = "Q" /\ Mutation = "free_on_queue_release") then
         refs := {};
@@ -163,6 +175,7 @@ F_next:
         goto F_releaseF;
     elsif res = "nudged" then
         \* It competes again: it loses and waits again, or wins and leaves.
+        res := "pending";    \* read: nothing reads it again before the next look sets it
         either
             goto F_poll;
         or
@@ -225,6 +238,8 @@ F_park1:
 F_write:
     k := k + 1;
     slot[cur] := Waker(self, k);
+    \* The waker it replaces is waited on by nobody now: its call is forgotten.
+    called := called \ {latest[self]};
     latest[self] := Waker(self, k);
 F_arm2:
     \* Arms the waker, reading the marks in the same swap.
@@ -259,20 +274,24 @@ F_withdraw:
 F_cancelRead:
     if wasArmed then
         slot[readSlot] := 0;
-        cancelTook := TRUE;
     end if;
 F_releaseF:
     release("F");
+    \* Nobody reads the future's own values after this: they go back to where
+    \* they started, and its wakers are forgotten, so two ended futures that
+    \* differ only there are one state.
+    k := 0; res := "pending"; wasArmed := FALSE; readSlot := 0; owing := FALSE; sp := 0;
+    latest[self] := 0;
+    called := {w \in called : w \div 10 # self};
 end process;
 
 fair process drainer = Drainer
-variables r = 1, n = 0, p = 0, touchRes = "none";
+variables r = 1, n = 0, p = 0;  \* the round, its nudges so far, the pass
 begin
 D_round:
     while r <= Rounds do
 D_wait:
         await round = r /\ pc[r] # "F_take";
-        n := 0;
 D_pass:
         while queued do
             p := p + 1;
@@ -293,9 +312,12 @@ D_grantRel:
             end if;
 D_end:
             \* The pass gives up the drain role; its wake list runs.
-            started[p] := TRUE;
+            \* A pass that claimed no waker has an empty wake list: its process
+            \* has nothing to do, and leaves once the passes are over.
+            started[p] := claimedIn[p];
         end while;
         r := r + 1;
+        n := 0;    \* the next round's nudges start from none, as soon as this one ends
     end while;
 end process;
 
@@ -304,6 +326,7 @@ variables wk = 0, again = FALSE;
 begin
 W_start:
     await started[self - 100] \/ pc[Drainer] = "Done";
+    started[self - 100] := FALSE;    \* the pass's start is read: nothing looks at it again
     if ~claimedIn[self - 100] then
         goto Done;
     end if;
@@ -311,22 +334,27 @@ W_take:
     \* `take_claimed`: the waker of the taken slot.
     wk := slot[taken];
     slot[taken] := 0;
+    claimedIn[self - 100] := FALSE;    \* the pass's claim is read: nothing looks at it again
 W_cas:
     if armed /\ ~reg /\ (nudged \/ phase = "G") /\ Mutation # "no_again" then
         \* A waker armed meanwhile on a granted or nudged node: claimed too.
         taken := cur;
         armed := FALSE;
-        againSeen := TRUE;
         again := TRUE;
     else
         taking := FALSE;
         again := FALSE;
+        wakeHolder := 0;    \* the wake reference goes: no pass holds it now
         release("W");
     end if;
 W_call:
-    if wk # 0 then
+    \* The call wakes its future only if that future still waits on this waker:
+    \* a waker since replaced, or one of a future that ended, wakes nobody.
+    if wk # 0 /\ wk = latest[wk \div 10] then
         called := called \cup {wk};
     end if;
+    \* Nobody reads the waker after its call.
+    wk := 0;
     if again then
         goto W_take;
     end if;
@@ -337,6 +365,12 @@ end algorithm; *)
 \* holds a translation that could fall out of date with the algorithm above.
 \* BEGIN TRANSLATION
 \* END TRANSLATION
+
+\* Witness: no wake list is claiming again a waker armed during its take.
+NoAgain == \A w \in WakeLists : ~again[w]
+\* Witness: no leaving future has just taken back its armed waker (it is past
+\* the take-back with the waker it found armed).
+NoCancelTake == \A f \in Futures : ~(pc[f] = "F_releaseF" /\ wasArmed[f])
 
 \* No two parties touch one slot at once: the slot a registering future
 \* writes, and the one a withdrawing future reads, are never the one a take

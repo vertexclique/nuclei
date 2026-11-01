@@ -19,19 +19,137 @@ use std::time::{Duration, Instant};
 static ALTERED: AtomicUsize = AtomicUsize::new(0);
 
 /// The origin every clock's nanoseconds count from, and every shard's timer
+/// wheel its milliseconds: an instant of std's, and the reading of the
+/// system's monotonic clock it is, where that clock is read directly.
+struct Origin {
+    at: Instant,
+    reading: Option<u64>,
+}
+
+fn origin_of() -> &'static Origin {
+    static ORIGIN: OnceLock<Origin> = OnceLock::new();
+    ORIGIN.get_or_init(|| {
+        let at = Instant::now();
+        Origin {
+            at,
+            reading: reading_of(at),
+        }
+    })
+}
+
+/// The origin every clock's nanoseconds count from, and every shard's timer
 /// wheel its milliseconds.
 pub(crate) fn origin() -> Instant {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    *ORIGIN.get_or_init(Instant::now)
+    origin_of().at
 }
 
 /// Nanoseconds from the origin to `at`; zero before it.
-fn nanos(at: Instant) -> u64 {
+pub(crate) fn nanos(at: Instant) -> u64 {
     u64::try_from(at.saturating_duration_since(origin()).as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn instant(nanos: u64) -> Instant {
+/// The instant `nanos` after the origin.
+pub(crate) fn instant(nanos: u64) -> Instant {
     origin() + Duration::from_nanos(nanos)
+}
+
+/// Whether the clock is read directly, not through std's instants.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn reads_directly() -> bool {
+    origin_of().reading.is_some()
+}
+
+/// The origin's reading of the monotonic clock, kept where one load reaches
+/// it: [`UNREAD`] until the origin is made, [`THROUGH_STD`] where the clock
+/// is read through std's instants.
+static READING: AtomicU64 = AtomicU64::new(UNREAD);
+const UNREAD: u64 = u64::MAX;
+const THROUGH_STD: u64 = u64::MAX - 1;
+
+/// The system's monotonic clock now, in nanoseconds after the origin: what
+/// [`nanos`] of `Instant::now()` gives, read without std's arithmetic where
+/// std's instants are the clock's readings (Linux, Android), and through it
+/// elsewhere.
+#[inline]
+pub(crate) fn system_nanos() -> u64 {
+    let origin = READING.load(Ordering::Relaxed);
+    if origin < THROUGH_STD
+        && let Some(now) = monotonic()
+    {
+        return now.saturating_sub(origin);
+    }
+    system_nanos_slow(origin)
+}
+
+/// [`system_nanos`] before the origin is read, or through std.
+#[cold]
+#[inline(never)]
+fn system_nanos_slow(origin: u64) -> u64 {
+    if origin == UNREAD {
+        let reading = origin_of().reading.unwrap_or(THROUGH_STD);
+        READING.store(reading, Ordering::Relaxed);
+        if reading < THROUGH_STD
+            && let Some(now) = monotonic()
+        {
+            return now.saturating_sub(reading);
+        }
+    }
+    nanos(Instant::now())
+}
+
+/// The monotonic clock std's instants read, in nanoseconds: on Linux and
+/// Android, `CLOCK_MONOTONIC`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[inline]
+fn monotonic() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec for the call to fill in.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return None;
+    }
+    // The monotonic clock counts up from boot: neither field is negative, and
+    // the nanoseconds fit 64 bits for centuries.
+    Some(
+        (ts.tv_sec as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(ts.tv_nsec as u64),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[inline]
+fn monotonic() -> Option<u64> {
+    None
+}
+
+/// The monotonic clock's reading that std's instant `at` is, where std's
+/// instants are that clock's readings and say so: read from the seconds and
+/// nanoseconds its `Debug` form shows, once, then checked against the clock
+/// itself (an instant taken between two readings lies between them, its
+/// reading being `at`'s plus std's own exact difference of the two). `None`
+/// where any of that does not hold: every reading then goes through std.
+fn reading_of(at: Instant) -> Option<u64> {
+    let shown = format!("{at:?}");
+    let field = |name: &str| -> Option<u64> {
+        let from = shown.find(name)? + name.len();
+        let digits = shown[from..].trim_start_matches(' ');
+        let end = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        digits[..end].parse().ok()
+    };
+    let reading = field("tv_sec:")?
+        .checked_mul(1_000_000_000)?
+        .checked_add(field("tv_nsec:")?)?;
+    let before = monotonic()?;
+    let probe = Instant::now();
+    let after = monotonic()?;
+    let since = u64::try_from(probe.checked_duration_since(at)?.as_nanos()).ok()?;
+    let probe = reading.checked_add(since)?;
+    (before <= probe && probe <= after).then_some(reading)
 }
 
 /// A runtime's clock.
@@ -79,11 +197,11 @@ impl Clock {
         instant(self.now_nanos())
     }
 
-    fn now_nanos(&self) -> u64 {
+    pub(crate) fn now_nanos(&self) -> u64 {
         let read = if self.paused.load(Ordering::Acquire) {
             self.base.load(Ordering::Acquire)
         } else {
-            nanos(Instant::now()).saturating_add_signed(self.skew.load(Ordering::Acquire))
+            system_nanos().saturating_add_signed(self.skew.load(Ordering::Acquire))
         };
         let last = self.last.fetch_max(read, Ordering::AcqRel);
         read.max(last)
@@ -96,11 +214,13 @@ impl Clock {
         }
     }
 
+    #[inline]
     pub(crate) fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
     }
 
     /// Whether the clock was ever paused or advanced.
+    #[inline]
     pub(crate) fn is_altered(&self) -> bool {
         self.altered.load(Ordering::Acquire)
     }
@@ -206,6 +326,7 @@ impl Drop for Clock {
 /// Whether any live runtime's clock was paused or advanced: while none was,
 /// every clock is the system's and the park path skips the paused clock's
 /// work.
+#[inline]
 pub(crate) fn any_altered() -> bool {
     ALTERED.load(Ordering::Relaxed) != 0
 }
@@ -216,8 +337,19 @@ pub(crate) fn to_nanos(at: Instant) -> u64 {
     nanos(at)
 }
 
+/// [`now`] in nanoseconds after the origin: what the timers and the wheels
+/// read.
+#[inline]
+pub(crate) fn now_nanos() -> u64 {
+    if ALTERED.load(Ordering::Relaxed) == 0 {
+        return system_nanos();
+    }
+    crate::rt::runtime::with_clock(|clock| clock.map_or_else(system_nanos, Clock::now_nanos))
+}
+
 /// The time now on the clock of the runtime this thread is inside (or of the
 /// default runtime, if one runs), or the system's.
+#[inline]
 pub(crate) fn now() -> Instant {
     if ALTERED.load(Ordering::Relaxed) == 0 {
         return Instant::now();
@@ -297,3 +429,6 @@ mod tests {
         assert!(!clock.is_paused());
     }
 }
+
+#[cfg(test)]
+mod tests_origin;

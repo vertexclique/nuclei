@@ -1,19 +1,21 @@
-TLC run of every configuration in proofs/tla/watch, 2026-10-25 18:00 UTC.
+TLC run of every configuration in proofs/tla/watch, 2026-10-30 20:19 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-L_sends                        1266300     384326     22  pass                                  pass                                  yes
-L_modifies                      133315      52331      4  pass                                  pass                                  yes
-L_mixed                        6039208    1836542    115  pass                                  pass                                  yes
-L_closed                          2497       1104      2  pass                                  pass                                  yes
-M_store_not_cas                   1046        606      1  violated:NoLostModify                 violated:NoLostModify                 yes
-M_read_before_notified           10177       4115      3  violated:ReceiverEnds                 violated:ReceiverEnds                 yes
-M_closed_first                     117         78      1  violated:ErrOnlyWhenSeen              violated:ErrOnlyWhenSeen              yes
-M_value_first                       65         47      1  violated:PairedNoOlder                violated:PairedNoOlder                yes
-M_count_before_notified           2579       1148      2  violated:ProducerEnds                 violated:ProducerEnds                 yes
-W_change_seen                       49         34      1  violated:NoChangeSeen                 violated:NoChangeSeen                 yes
-W_cas_retry                         39         29      1  violated:NoRetry                      violated:NoRetry                      yes
-W_borrow_ahead                      41         30      2  violated:NeverAhead                   violated:NeverAhead                   yes
+L_sends                          23424       9169      9  pass                                  pass                                  yes
+L_sends_borrow                   10350       4103      6  pass                                  pass                                  yes
+L_modifies                      133315      52331     16  pass                                  pass                                  yes
+L_mixed                         110370      43327     15  pass                                  pass                                  yes
+L_mixed_borrow                   46877      18693      4  pass                                  pass                                  yes
+L_closed                          2497       1104      5  pass                                  pass                                  yes
+M_store_not_cas                   1046        606      4  violated:NoLostModify                 violated:NoLostModify                 yes
+M_read_before_notified           10177       4115      5  violated:ReceiverEnds                 violated:ReceiverEnds                 yes
+M_closed_first                     117         78      3  violated:ErrOnlyWhenSeen              violated:ErrOnlyWhenSeen              yes
+M_value_first                       65         47      4  violated:PairedNoOlder                violated:PairedNoOlder                yes
+M_count_before_notified           2579       1148      6  violated:ProducerEnds                 violated:ProducerEnds                 yes
+W_change_seen                       49         34      3  violated:NoChangeSeen                 violated:NoChangeSeen                 yes
+W_cas_retry                         39         29      4  violated:NoRetry                      violated:NoRetry                      yes
+W_borrow_ahead                      41         30      3  violated:NeverAhead                   violated:NeverAhead                   yes
 
-results matching EXPECTED.txt: 12 of 12
+results matching EXPECTED.txt: 14 of 14

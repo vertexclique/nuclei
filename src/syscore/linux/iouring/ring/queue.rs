@@ -16,8 +16,8 @@ use std::{
 use super::{
     sqe::Sqe,
     sys::{
-        IORING_SQ_CQ_OVERFLOW, IORING_SQ_NEED_WAKEUP, IoCqringOffsets, IoSqringOffsets, IoUringCqe,
-        IoUringSqe,
+        IORING_SQ_CQ_OVERFLOW, IORING_SQ_NEED_WAKEUP, IORING_SQ_TASKRUN, IoCqringOffsets,
+        IoSqringOffsets, IoUringCqe, IoUringSqe,
     },
 };
 
@@ -125,6 +125,13 @@ impl Sq {
         // SAFETY: `ktail` points into the ring mapping, which outlives `self` (see `new`).
         // Release: the entry writes above must be visible before the kernel can see the new tail.
         unsafe { &*self.ktail }.store(self.tail, Ordering::Release);
+    }
+
+    /// Whether the kernel flags task work for the ring's submitter to run; needs
+    /// `IORING_SETUP_TASKRUN_FLAG`.
+    pub(crate) fn taskrun_pending(&self) -> bool {
+        // Relaxed: a hint; the enter that runs the work synchronises with the kernel.
+        self.flags().load(Ordering::Relaxed) & IORING_SQ_TASKRUN != 0
     }
 
     /// For a ring with a kernel submission thread, after [`Sq::publish`]: whether the thread has

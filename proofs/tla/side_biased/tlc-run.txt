@@ -1,0 +1,61 @@
+TLC run of every configuration in proofs/tla/side_biased, 2026-10-30 08:39 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+P_one                            39533      16235      3  pass                                  pass                                  yes
+P_work                           26283      10037      3  pass                                  pass                                  yes
+P_two                           521917     173577     11  pass                                  pass                                  yes
+P_two_work                      128544      38507      4  pass                                  pass                                  yes
+P_handoff                       262245      77304      4  pass                                  pass                                  yes
+P_handoff_old                    35517      14132      3  pass                                  pass                                  yes
+P_live                           34079      13671      4  pass                                  pass                                  yes
+P_live_handoff                   21398       8454      4  pass                                  pass                                  yes
+M_no_fence                         840        339      2  violated:Exclusive                    violated:Exclusive                    yes
+M_owner_no_intent                  759        315      1  violated:Exclusive                    violated:Exclusive                    yes
+M_release_no_look                 1729        695      2  deadlock                              deadlock                              yes
+M_release_plain_look              2329        941      2  deadlock                              deadlock                              yes
+M_release_no_retake               2585       1038      2  violated:NoLostWork                   violated:NoLostWork                   yes
+M_move_mid_take                    881        345      1  violated:Exclusive                    violated:Exclusive                    yes
+M_handoff_no_drain               47667      13737      3  violated:Exclusive                    violated:Exclusive                    yes
+M_foreign_stays_biased             907        372      1  violated:Exclusive                    violated:Exclusive                    yes
+M_mode_skips_fallback              759        315      2  violated:Exclusive                    violated:Exclusive                    yes
+W_leave                            504        214      1  violated:NoLeave                      violated:NoLeave                      yes
+W_shared                           158         73      2  violated:NoShared                     violated:NoShared                     yes
+W_handoff                           37         22      1  violated:NoHandoff                    violated:NoHandoff                    yes
+W_release_wake                    2046        827      2  violated:NoReleaseWake                violated:NoReleaseWake                yes
+W_retake_work                     2251        919      2  violated:NoRetakeWork                 violated:NoRetakeWork                 yes
+P_fail                           15695       6810      4  pass                                  pass                                  yes
+P_fail_edges                     75310      30940      5  pass                                  pass                                  yes
+P_fail_always                     6435       2665      2  pass                                  pass                                  yes
+P_fail_noowner                     166         83      2  pass                                  pass                                  yes
+P_fail_work                      44150      17375      3  pass                                  pass                                  yes
+P_fail_two                     2568848     858984     14  pass                                  pass                                  yes
+P_fail_handoff                   76536      31371      3  pass                                  pass                                  yes
+P_fail_live                       6435       2665      3  pass                                  pass                                  yes
+P_fail_live_maybe                24808      11028      4  pass                                  pass                                  yes
+P_fail_live_noowner                118         59      2  pass                                  pass                                  yes
+P_fail_live_handoff              76536      31371      6  pass                                  pass                                  yes
+M_unfenced_reads_own               902        398      2  violated:Exclusive                    violated:Exclusive                    yes
+M_never_switch                    5455       2180      3  violated:Termination                  violated:Termination                  yes
+M_switch_before_release          31283      10333      3  violated:Exclusive                    violated:Exclusive                    yes
+M_nudge_lost                      2998       1177      1  deadlock                              deadlock                              yes
+W_unserved                        1199        526      2  violated:NoUnserved                   violated:NoUnserved                   yes
+W_fail_shared                       94         49      1  violated:NoFailShared                 violated:NoFailShared                 yes
+W_nudge                           2601       1043      2  violated:NoNudgePass                  violated:NoNudgePass                  yes
+R_two                             8449       2208      2  pass                                  pass                                  yes
+R_three                          22927       5595      2  pass                                  pass                                  yes
+R_live                            8449       2208      1  pass                                  pass                                  yes
+MR_no_fence                        734        261      2  violated:FreedAfterOps                violated:FreedAfterOps                yes
+MR_flag_before_dec                2415        695      2  violated:Termination                  violated:Termination                  yes
+MR_count_before_flag               746        270      1  violated:FreedAfterOps                violated:FreedAfterOps                yes
+WR_owner_wake                     1510        452      2  violated:NoOwnerWake                  violated:NoOwnerWake                  yes
+WR_sleep                           492        183      1  violated:NoRetireSleep                violated:NoRetireSleep                yes
+R_rehome                         24478       7130      2  pass                                  pass                                  yes
+R_rehome_two                     58739      17226      2  pass                                  pass                                  yes
+R_rehome_live                    24478       7130      3  pass                                  pass                                  yes
+MR_rehome_early_submit             690        320      1  violated:NoLostUpdate                 violated:NoLostUpdate                 yes
+MR_rehome_no_fence                4552       1600      1  violated:NoLostUpdate                 violated:NoLostUpdate                 yes
+WR_rehome_waits                   4515       1546      2  violated:NoRehomeWait                 violated:NoRehomeWait                 yes
+
+results matching EXPECTED.txt: 54 of 54

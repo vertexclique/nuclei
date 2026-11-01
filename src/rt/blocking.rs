@@ -26,11 +26,26 @@
 //! job, or the job's submitter sees the thread idle. proofs/tla/pool checks
 //! it at the grain of these steps.
 //!
+//! Beside the slots is a bitmap with one bit per slot. A thread sets its own
+//! bit after it marks its slot idle and before its look at the queue, and
+//! clears it after it takes its slot back, and before the compare-and-swap
+//! that ends its wait: only a slot's own thread writes its bit. A submitter
+//! reads the bitmap one word per load, and tries the compare-and-swap (idle
+//! to woken) on the slots of set bits only; a stale bit loses that swap and
+//! it goes on to the next. With no bit leading to a claim it starts a thread
+//! while there is room. That is proofs/tla/pool/PoolIndex.tla.
+//!
 //! A slot names its thread for the submitters that wake it through a
 //! `kovan` pointer read under a guard: a slot a thread left may be another
 //! thread's by the time a slow submitter reads it, so the name a thread
 //! replaces is retired, not freed. That is one node per thread started,
 //! none per job.
+//!
+//! A detached job that ends a file's call returns that end
+//! (`fs::call::Ending`), which its run drops, publishing it, only once the
+//! job's task is gone: the task's block is back with the thread it came from
+//! before the task woken can spawn again, so a steady stream of calls takes
+//! no block from the allocator (proofs/tla/jobend).
 
 use core::sync::atomic::AtomicU8;
 use std::io;
@@ -41,7 +56,7 @@ use kovan::{Atomic, RetiredNode, Shared as Ptr, alloc_node, drop_node, pin, reti
 
 use super::inbox::{Inbox, Pop};
 use super::task::{self, Runnable, Schedule, ScheduleInfo, Task};
-use crate::sync::internal::{AtomicUsize, Ordering};
+use crate::sync::internal::{AtomicU64, AtomicUsize, Ordering};
 
 /// The pool's settings.
 #[derive(Clone)]
@@ -52,6 +67,8 @@ pub(crate) struct PoolConfig {
     pub(crate) keep_alive: Duration,
     pub(crate) stack_size: Option<usize>,
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
+    /// The mask the runtime was built with; a pool thread runs on it.
+    pub(crate) cpu_mask: Option<super::runtime::CpuMask>,
 }
 
 /// A slot's states.
@@ -59,6 +76,9 @@ const FREE: u8 = 0;
 const BUSY: u8 = 1;
 const IDLE: u8 = 2;
 const WOKEN: u8 = 3;
+
+/// Slots per word of the index.
+const WORD: usize = u64::BITS as usize;
 
 /// The thread a slot names, as a node `kovan` reclaims.
 #[repr(C)]
@@ -79,13 +99,20 @@ pub(crate) struct Pool {
     /// between takes.
     queue: Inbox,
     slots: Box<[Slot]>,
-    /// Where a submitter's scan of the slots starts.
+    /// One past the highest slot a thread ever named: those past it never held a thread.
+    named: AtomicUsize,
+    /// One bit per slot, set while its thread waits idle; written by that
+    /// thread alone.
+    index: Box<[AtomicU64]>,
+    /// Where a submitter's scan of the index starts.
     hint: AtomicUsize,
     threads: AtomicUsize,
     idle: AtomicUsize,
     /// Jobs submitted and not yet run to their end: a paused clock does not
     /// move by itself while one is in flight.
-    jobs: AtomicUsize,
+    jobs: Arc<AtomicUsize>,
+    /// Jobs in the queue, not taken by a thread yet, for `stats`.
+    queued: AtomicUsize,
     /// The runtime the pool belongs to, told when its last job ends.
     owner: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
     config: PoolConfig,
@@ -107,22 +134,40 @@ impl Pool {
         let queue = Inbox::new();
         // SAFETY: its maker holds the role; the pool's threads take turns.
         unsafe { queue.release() };
-        let slots = (0..config.max_threads.max(1))
+        let n = config.max_threads.max(1);
+        let slots = (0..n)
             .map(|_| Slot {
                 state: AtomicU8::new(FREE),
                 thread: Atomic::null(),
             })
             .collect();
-        Arc::new(Self {
+        let index = (0..n.div_ceil(WORD)).map(|_| AtomicU64::new(0)).collect();
+        let pool = Arc::new(Self {
             queue,
             slots,
+            named: AtomicUsize::new(0),
+            index,
             hint: AtomicUsize::new(0),
             threads: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),
-            jobs: AtomicUsize::new(0),
+            jobs: Arc::new(AtomicUsize::new(0)),
+            queued: AtomicUsize::new(0),
             owner: std::sync::OnceLock::new(),
             config,
-        })
+        });
+        take_out_gone();
+        pools().insert(Arc::as_ptr(&pool) as usize, Arc::downgrade(&pool));
+        pool
+    }
+
+    /// Jobs waiting in the queue for a thread to take them.
+    pub(crate) fn queued(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// Threads of this pool alive now.
+    pub(crate) fn threads_now(&self) -> usize {
+        self.threads.load(Ordering::Relaxed)
     }
 
     /// Runs `f` on a pool thread.
@@ -147,12 +192,18 @@ impl Pool {
         let _ = self.owner.set(owner);
     }
 
+    /// The count of [`jobs`](Self::jobs), for a shard that spins while one may wake it.
+    pub(crate) fn jobs_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.jobs)
+    }
+
     /// Jobs submitted and not yet run to their end.
     pub(crate) fn jobs(&self) -> usize {
         self.jobs.load(Ordering::SeqCst)
     }
 
-    /// Runs a job, then counts it out. Its awaiter was woken during the run,
+    /// Runs a job, then counts it out. Its awaiter was woken during the run
+    /// (a detached job's end once its task was freed: `fs::call::Ending`),
     /// before the count drops, so a paused clock that sees no job in flight
     /// sees the woken shard's work.
     fn run(&self, runnable: Runnable) {
@@ -166,6 +217,7 @@ impl Pool {
 
     fn submit(self: &Arc<Self>, runnable: Runnable) {
         self.jobs.fetch_add(1, Ordering::SeqCst);
+        self.queued.fetch_add(1, Ordering::Relaxed);
         self.queue.push(runnable);
         if self.idle.load(Ordering::SeqCst) > 0 && self.wake_one() {
             return;
@@ -173,29 +225,63 @@ impl Pool {
         self.start_thread();
     }
 
-    /// Claims an idle slot and unparks its thread; `false` if none is idle.
+    /// Claims an idle slot and unparks its thread; `false` if no set bit of
+    /// the index led to a claim.
     fn wake_one(&self) -> bool {
         let n = self.slots.len();
-        let from = self.hint.fetch_add(1, Ordering::Relaxed);
-        for i in (0..n).map(|k| (from + k) % n) {
-            let slot = &self.slots[i];
-            if slot
-                .state
-                .compare_exchange(IDLE, WOKEN, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                self.idle.fetch_sub(1, Ordering::SeqCst);
-                let guard = pin();
-                // SAFETY: the guard keeps the name alive while it is read; the
-                // thread stored it before it marked its slot idle.
-                if let Some(named) = unsafe { slot.thread.load(Ordering::Acquire, &guard).as_ref() }
-                {
-                    named.thread.unpark();
+        let words = self.index.len();
+        let from = self.hint.fetch_add(1, Ordering::Relaxed) % n;
+        let (first, low) = (from / WORD, from % WORD);
+        // The hint's word twice: its bits from the hint on, then, after the
+        // others, its bits before it.
+        for step in 0..=words {
+            let w = (first + step) % words;
+            let mut bits = self.index[w].load(Ordering::SeqCst);
+            if step == 0 {
+                bits &= !0u64 << low;
+            } else if step == words {
+                bits &= !(!0u64 << low);
+            }
+            while bits != 0 {
+                let i = w * WORD + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if self.claim(i) {
+                    return true;
                 }
-                return true;
             }
         }
         false
+    }
+
+    /// Claims slot `i` if it is idle (the one step that takes a thread),
+    /// counts it out and unparks its thread.
+    fn claim(&self, i: usize) -> bool {
+        let slot = &self.slots[i];
+        if slot
+            .state
+            .compare_exchange(IDLE, WOKEN, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        self.idle.fetch_sub(1, Ordering::SeqCst);
+        let guard = pin();
+        // SAFETY: the guard keeps the name alive while it is read; the
+        // thread stored it before it marked its slot idle.
+        if let Some(named) = unsafe { slot.thread.load(Ordering::Acquire, &guard).as_ref() } {
+            named.thread.unpark();
+        }
+        true
+    }
+
+    /// Sets slot `i`'s bit; called by its thread alone.
+    fn set_bit(&self, i: usize) {
+        self.index[i / WORD].fetch_or(1 << (i % WORD), Ordering::SeqCst);
+    }
+
+    /// Clears slot `i`'s bit; called by its thread alone.
+    fn clear_bit(&self, i: usize) {
+        self.index[i / WORD].fetch_and(!(1 << (i % WORD)), Ordering::SeqCst);
     }
 
     /// The next job, taking the queue's role for one take; `None` when the
@@ -211,7 +297,10 @@ impl Pool {
                     popped
                 };
                 match popped {
-                    Pop::Item(runnable) => return Some(runnable),
+                    Pop::Item(runnable) => {
+                        self.queued.fetch_sub(1, Ordering::Relaxed);
+                        return Some(runnable);
+                    }
                     Pop::Empty => return None,
                     Pop::Busy => {}
                 }
@@ -299,6 +388,7 @@ impl Pool {
                         // read it under its guard, so it is retired once.
                         unsafe { retire_node(old.as_raw()) };
                     }
+                    self.named.fetch_max(i + 1, Ordering::Relaxed);
                     return i;
                 }
             }
@@ -316,6 +406,11 @@ impl Pool {
     /// A pool thread's life.
     fn work(self: Arc<Self>) {
         let _alive = Alive::new();
+        // A thread inherits its creator's mask, and a pinned worker often
+        // creates pool threads.
+        if let Some(mask) = &self.config.cpu_mask {
+            super::runtime::apply_mask(mask);
+        }
         let _stopping = self.config.hooks.started();
         let mut me = self.claim_slot();
         loop {
@@ -325,6 +420,7 @@ impl Pool {
             let slot = &self.slots[me];
             self.idle.fetch_add(1, Ordering::SeqCst);
             slot.state.store(IDLE, Ordering::SeqCst);
+            self.set_bit(me);
             // A job pushed while the submitter saw this thread busy.
             if !self.queue.is_empty() {
                 if slot
@@ -337,19 +433,23 @@ impl Pool {
                     // Claimed: the submitter counted it out.
                     slot.state.store(BUSY, Ordering::SeqCst);
                 }
+                self.clear_bit(me);
                 continue;
             }
+            // The clock is read once to start the keep-alive, then only after
+            // a park that ends with the slot still idle.
             let deadline = Instant::now() + self.config.keep_alive;
-            loop {
+            let mut left = self.config.keep_alive;
+            while slot.state.load(Ordering::SeqCst) != WOKEN && !left.is_zero() {
+                std::thread::park_timeout(left);
                 if slot.state.load(Ordering::SeqCst) == WOKEN {
                     break;
                 }
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                std::thread::park_timeout(deadline - now);
+                left = deadline.saturating_duration_since(Instant::now());
             }
+            // Before the slot leaves idle: a freed slot may be another
+            // thread's at once, and a late clear would erase its bit.
+            self.clear_bit(me);
             if slot
                 .state
                 .compare_exchange(IDLE, FREE, Ordering::SeqCst, Ordering::SeqCst)
@@ -374,8 +474,15 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        // Release: a take that reads the count finds this pool's count of holders at zero.
+        POOLS_GONE.fetch_add(1, core::sync::atomic::Ordering::Release);
+        // Slots are claimed lowest first, and a pool that never ran a job named none.
+        let named = self.named.load(Ordering::Relaxed);
+        if named == 0 {
+            return;
+        }
         let guard = pin();
-        for slot in self.slots.iter() {
+        for slot in &self.slots[..named] {
             let named = slot.thread.load(Ordering::Acquire, &guard);
             if !named.is_null() {
                 // SAFETY: the pool is gone, so no submitter reads the slot;
@@ -388,6 +495,48 @@ impl Drop for Pool {
 
 /// Threads of every blocking pool alive now.
 static ALIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Every pool made, by address (which the entry's allocation keeps from
+/// reuse), for `stats`. A pool that went is taken out at the next pool's
+/// making or the next snapshot, on a thread that runs, as the shards'
+/// registry does (`rt::counters`): a pool may go in a thread's exit.
+fn pools() -> &'static kovan_map::HashMap<usize, std::sync::Weak<Pool>> {
+    static POOLS: std::sync::OnceLock<kovan_map::HashMap<usize, std::sync::Weak<Pool>>> =
+        std::sync::OnceLock::new();
+    POOLS.get_or_init(|| kovan_map::HashMap::with_capacity(64))
+}
+
+/// Pools dropped since the last [`take_out_gone`] looked: with none, no entry is there to take
+/// out (a pool's holders are all gone before its drop runs).
+static POOLS_GONE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Takes out the entries of pools that went.
+fn take_out_gone() {
+    // Acquire: pairs with the drop's Release. A pool that goes after the swap counts again.
+    if POOLS_GONE.load(core::sync::atomic::Ordering::Relaxed) == 0
+        || POOLS_GONE.swap(0, core::sync::atomic::Ordering::Acquire) == 0
+    {
+        return;
+    }
+    let gone: Vec<usize> = pools()
+        .iter()
+        .filter(|(_, pool)| pool.strong_count() == 0)
+        .map(|(key, _)| key)
+        .collect();
+    for key in gone {
+        drop(pools().remove(&key));
+    }
+}
+
+/// Jobs waiting in the queues of every pool alive, for `stats`.
+pub(crate) fn queued_everywhere() -> usize {
+    take_out_gone();
+    pools()
+        .values()
+        .filter_map(|pool| pool.upgrade())
+        .map(|pool| pool.queued())
+        .sum()
+}
 
 /// Runs `call` on the blocking pool and answers its result; a call whose task
 /// was lost (its runtime shut down) is an error, not a panic.
@@ -437,6 +586,7 @@ mod tests {
             keep_alive,
             stack_size: None,
             name: Arc::new(|| "test-blocking".to_string()),
+            cpu_mask: None,
         })
     }
 
@@ -549,5 +699,105 @@ mod tests {
         assert_eq!(ran.load(SeqCst), SUBMITTERS * EACH);
         assert!(pool.threads() <= 2);
         wait_for("the jobs to be counted out", || pool.jobs() == 0);
+    }
+
+    fn bits(pool: &Pool) -> u32 {
+        use std::sync::atomic::Ordering::SeqCst;
+        pool.index.iter().map(|w| w.load(SeqCst).count_ones()).sum()
+    }
+
+    /// Submitters on threads against a pool at its cap, with jobs that block
+    /// long enough to keep it there: every job runs once, over one word of
+    /// the index and over several (proofs/tla/pool/PoolIndex.tla).
+    #[test]
+    fn every_job_runs_once_at_the_cap() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const SUBMITTERS: usize = 8;
+        const EACH: usize = 500;
+        for max in [8, 70] {
+            let pool = pool(max, Duration::from_secs(5));
+            let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let submitters: Vec<_> = (0..SUBMITTERS)
+                .map(|_| {
+                    let (pool, ran) = (Arc::clone(&pool), Arc::clone(&ran));
+                    std::thread::spawn(move || {
+                        for i in 0..EACH {
+                            let ran = Arc::clone(&ran);
+                            let task = pool.spawn(move || {
+                                if i % 8 == 0 {
+                                    std::thread::sleep(Duration::from_micros(200));
+                                }
+                                ran.fetch_add(1, SeqCst)
+                            });
+                            if i % 2 == 0 {
+                                crate::sync::internal::block_on(task);
+                            } else {
+                                task.detach();
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for s in submitters {
+                s.join().unwrap();
+            }
+            wait_for("every job to run", || ran.load(SeqCst) == SUBMITTERS * EACH);
+            assert_eq!(ran.load(SeqCst), SUBMITTERS * EACH);
+            assert!(pool.threads() <= max);
+            wait_for("the jobs to be counted out", || pool.jobs() == 0);
+        }
+    }
+
+    /// Submitters racing a thread as it goes idle and takes its slot back:
+    /// each job is sent the moment the last one's closure returned, by one of
+    /// two submitters, with a long keep-alive. A job the index lost would
+    /// wait it out.
+    #[test]
+    fn a_thread_going_idle_while_submitters_race_loses_no_job() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let pool = pool(2, Duration::from_secs(30));
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let submitters: Vec<_> = (0..2)
+            .map(|_| {
+                let (pool, done) = (Arc::clone(&pool), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    for _ in 0..5_000 {
+                        let before = done.load(SeqCst);
+                        let ran = Arc::clone(&done);
+                        pool.spawn(move || ran.fetch_add(1, SeqCst)).detach();
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while done.load(SeqCst) == before {
+                            assert!(Instant::now() < deadline, "a job waited for the keep-alive");
+                            core::hint::spin_loop();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for s in submitters {
+            s.join().unwrap();
+        }
+        wait_for("every job to run", || done.load(SeqCst) == 10_000);
+        wait_for("the jobs to be counted out", || pool.jobs() == 0);
+    }
+
+    /// The keep-alive exit with the index: threads that leave take their bits
+    /// with them, and a job after they left starts a thread again.
+    #[test]
+    fn the_keep_alive_exit_leaves_no_bit_set() {
+        let pool = pool(70, Duration::from_millis(10));
+        for _ in 0..3 {
+            let tasks: Vec<_> = (0..70)
+                .map(|i| {
+                    pool.spawn(move || std::thread::sleep(Duration::from_micros(100 * (i % 5))))
+                })
+                .collect();
+            for task in tasks {
+                crate::sync::internal::block_on(task);
+            }
+            wait_for("the idle threads to exit", || pool.threads() == 0);
+            assert_eq!(bits(&pool), 0);
+            assert_eq!(pool.idle.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 }

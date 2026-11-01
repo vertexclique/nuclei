@@ -16,7 +16,10 @@
 //! so arming and cancelling are O(1) and allocate nothing once the slab has
 //! grown to the most timers alive at once. A [`TimerKey`] carries the
 //! entry's generation: a key whose timer is gone never reaches the entry
-//! that reuses its place.
+//! that reuses its place. A timer that fires lets go of its entry as it
+//! fires, and one armed for a time the wheel passed already takes none: a
+//! key that reaches no entry reads as fired, so its owner has nothing to
+//! remove.
 //!
 //! The wheel is shard-local and knows only milliseconds since its own
 //! start; the time module converts instants and rounds deadlines up, so a
@@ -48,6 +51,14 @@ pub(crate) struct TimerKey {
     generation: u32,
 }
 
+impl TimerKey {
+    /// The key of a timer that fired as it was armed: it reaches no entry.
+    const FIRED: Self = Self {
+        index: usize::MAX,
+        generation: 0,
+    };
+}
+
 /// Where an entry is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Place {
@@ -55,8 +66,6 @@ enum Place {
     Free,
     /// Linked into a slot.
     Armed { level: u8, slot: u8 },
-    /// Its deadline passed: its waker was taken and woken.
-    Fired,
 }
 
 struct Entry {
@@ -166,16 +175,16 @@ impl Wheel {
     /// Arms a timer for `when`, waking `waker` once the wheel passes it. A
     /// deadline the wheel has passed already is fired at once, without a
     /// wake: the caller sees it fired when it looks.
+    #[inline(always)]
     pub(crate) fn insert(&mut self, when: u64, waker: &Waker) -> TimerKey {
+        if when <= self.elapsed {
+            return TimerKey::FIRED;
+        }
         let index = self.alloc();
         let entry = &mut self.entries[index];
         entry.when = when;
-        if when <= self.elapsed {
-            entry.place = Place::Fired;
-        } else {
-            entry.waker = Some(waker.clone());
-            self.link(index);
-        }
+        entry.waker = Some(waker.clone());
+        self.link(index);
         TimerKey {
             index,
             generation: self.entries[index].generation,
@@ -183,10 +192,9 @@ impl Wheel {
     }
 
     /// Whether the timer of `key` has fired. A stale key reads as fired: its
-    /// timer is gone, so nothing will fire it again.
+    /// timer is gone (fired, or removed), so nothing will fire it again.
     pub(crate) fn is_fired(&self, key: TimerKey) -> bool {
-        self.entry(key)
-            .is_none_or(|entry| entry.place == Place::Fired)
+        self.entry(key).is_none()
     }
 
     /// Replaces the waker of an armed timer, unless it would wake the same
@@ -194,43 +202,43 @@ impl Wheel {
     pub(crate) fn set_waker(&mut self, key: TimerKey, waker: &Waker) {
         if let Some(index) = self.live(key) {
             let entry = &mut self.entries[index];
-            if entry.place != Place::Fired {
-                match &entry.waker {
-                    Some(old) if old.will_wake(waker) => {}
-                    _ => entry.waker = Some(waker.clone()),
-                }
+            match &entry.waker {
+                Some(old) if old.will_wake(waker) => {}
+                _ => entry.waker = Some(waker.clone()),
             }
         }
     }
 
-    /// Moves the timer of `key` to a new deadline, armed again if it had
-    /// fired. A stale key does nothing.
+    /// Moves the armed timer of `key` to a new deadline; one the wheel
+    /// passed already fires at once, without a wake, and its key goes stale.
+    /// A stale key does nothing.
     #[cfg(test)]
     pub(crate) fn reset(&mut self, key: TimerKey, when: u64, waker: &Waker) {
         let Some(index) = self.live(key) else { return };
-        if let Place::Armed { .. } = self.entries[index].place {
-            self.unlink(index);
+        self.unlink(index);
+        if when <= self.elapsed {
+            self.release(index);
+            return;
         }
         let entry = &mut self.entries[index];
         entry.when = when;
-        if when <= self.elapsed {
-            entry.place = Place::Fired;
-            entry.waker = None;
-        } else {
-            if !entry.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
-                entry.waker = Some(waker.clone());
-            }
-            self.link(index);
+        if !entry.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+            entry.waker = Some(waker.clone());
         }
+        self.link(index);
     }
 
-    /// Removes the timer of `key`, armed or fired; its key goes stale. A
-    /// stale key does nothing.
+    /// Removes the armed timer of `key`; its key goes stale. A stale key (a
+    /// timer fired or removed already) does nothing.
     pub(crate) fn remove(&mut self, key: TimerKey) {
         let Some(index) = self.live(key) else { return };
-        if let Place::Armed { .. } = self.entries[index].place {
-            self.unlink(index);
-        }
+        self.unlink(index);
+        self.release(index);
+    }
+
+    /// Puts the unlinked entry `index` on the free list, its key stale.
+    #[inline]
+    fn release(&mut self, index: usize) {
         let entry = &mut self.entries[index];
         entry.waker = None;
         entry.place = Place::Free;
@@ -262,11 +270,12 @@ impl Wheel {
                 let entry = &mut self.entries[index];
                 let next = entry.next;
                 if entry.when <= now {
-                    entry.place = Place::Fired;
                     self.armed -= 1;
                     if let Some(waker) = entry.waker.take() {
                         fired.push(waker);
                     }
+                    // Fired: the entry goes, and its key reads as fired.
+                    self.release(index);
                 } else {
                     // Not due yet: placed again, on a lower level (or, for a
                     // deadline beyond the wheel's span, on the top level).
@@ -321,6 +330,9 @@ impl Wheel {
     }
 
     /// Links an entry into the slot its deadline belongs to now.
+    // Always inlined into `insert` and the cascade: a call costs every armed
+    // timer its arguments and its return.
+    #[inline(always)]
     fn link(&mut self, index: usize) {
         let when = self.entries[index].when;
         // A deadline beyond the span is placed at the span's edge.
@@ -368,12 +380,19 @@ impl Wheel {
     }
 
     /// A free entry, from the free list or a new one.
+    #[inline]
     fn alloc(&mut self) -> usize {
         if self.free != NIL {
             let index = self.free;
             self.free = self.entries[index].next;
             return index;
         }
+        self.grow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) -> usize {
         let index = self.entries.len();
         self.entries.push(Entry {
             when: 0,

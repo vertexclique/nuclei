@@ -145,37 +145,74 @@ fn timers_count_the_armed_ones() {
     });
 }
 
+/// The least cap leaves the pool one buffer of the smallest class beside the
+/// receive group, which the bytes count from the start.
 #[test]
 fn the_buffer_pool_counts_its_bytes_and_each_time_it_ran_dry() {
+    let least = crate::rt::shard::least_buffer_cap();
     let rt = crate::Builder::new()
         .worker_threads(1)
         .pin_workers(false)
-        .io_buffer_cap(0)
+        .io_buffer_cap(least)
         .build()
         .unwrap();
-    let task = rt.spawn(async {
+    let task = rt.spawn(async move {
         let start = here();
         assert_eq!(start.worker, Some(0));
         let smallest = crate::buf::CLASSES[0];
-        assert_eq!(
-            start.buffer_cap, smallest,
-            "the pool holds one buffer at least"
-        );
+        assert_eq!(start.buffer_cap, least);
+        let group = least - smallest;
         let held = crate::buf::with_pool(|pool| {
             let pool = pool.expect("a worker's pool");
+            assert_eq!(pool.reserved(), group, "the receive group is charged");
             let held = pool.get(smallest).expect("the one buffer");
             assert!(pool.get(smallest).is_none(), "no room for a second");
             held
         });
         publish();
         let dry = here();
-        assert_eq!((dry.buffer_bytes, dry.buffer_exhausted), (smallest, 1));
+        assert_eq!(
+            (dry.buffer_bytes, dry.buffer_exhausted),
+            (group + smallest, 1)
+        );
         drop(held);
         publish();
         // Free, and still held by the pool for the next read.
-        assert_eq!(here().buffer_bytes, smallest);
+        assert_eq!(here().buffer_bytes, group + smallest);
     });
     rt.block_on(task);
+}
+
+/// One byte less than the least cap is refused at the start, naming the
+/// settings and the numbers, where a receive group is charged; with none it
+/// starts, lifted to one buffer of the smallest class.
+#[test]
+fn a_cap_below_the_receive_group_is_refused_at_the_start() {
+    let least = crate::rt::shard::least_buffer_cap();
+    let built = crate::Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .io_buffer_cap(least - 1)
+        .build();
+    if least == crate::buf::CLASSES[0] {
+        // No group: any cap is lifted to one buffer of the smallest class.
+        assert!(built.is_ok(), "{:?}", built.err());
+        return;
+    }
+    let Err(err) = built else {
+        panic!("a runtime started with no room beside its receive group");
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    let message = err.to_string();
+    for named in [
+        "recv_buffers",
+        "recv_buffer_size",
+        "io_buffer_cap",
+        &(least - crate::buf::CLASSES[0]).to_string(),
+        &(least - 1).to_string(),
+    ] {
+        assert!(message.contains(named), "{message} names no {named}");
+    }
 }
 
 #[test]

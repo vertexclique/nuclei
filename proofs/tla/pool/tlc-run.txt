@@ -1,16 +1,36 @@
-TLC run of every configuration in proofs/tla/pool, 2026-10-26 23:44 UTC.
+TLC run of every configuration in proofs/tla/pool, 2026-10-30 08:41 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
 Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-PO_safe                        2416093     673172      3  pass                                  pass                                  yes
-PO_live                        2416093     673172     11  pass                                  pass                                  yes
-PO_one                            3904       2130      2  pass                                  pass                                  yes
-MO_no_look                         218        133      0  violated:AllRan                       violated:AllRan                       yes
+PO_safe                        2416093     673172      4  pass                                  pass                                  yes
+PO_live                        2416093     673172     17  pass                                  pass                                  yes
+PO_one                            3904       2130      1  pass                                  pass                                  yes
+MO_no_look                         218        133      1  violated:AllRan                       violated:AllRan                       yes
 MO_no_last_look                    718        420      1  violated:AllRan                       violated:AllRan                       yes
 WO_wake                            115         76      1  violated:NoWake                       violated:NoWake                       yes
 WO_look_found                       99         65      1  violated:NoLookFound                  violated:NoLookFound                  yes
-WO_timeout                          34         25      1  violated:NoTimeout                    violated:NoTimeout                    yes
+WO_timeout                          34         25      2  violated:NoTimeout                    violated:NoTimeout                    yes
 WO_reclaim                         283        179      1  violated:NoReclaim                    violated:NoReclaim                    yes
+PI_safe                         299755     107164      2  pass                                  pass                                  yes
+PI_three                        576241     204012      4  pass                                  pass                                  yes
+PI_live                         299755     107164      4  pass                                  pass                                  yes
+PI_no_keepalive                  72089      27440      4  pass                                  pass                                  yes
+PI_cap                            3456       1931      2  pass                                  pass                                  yes
+PI_relaxed                      421907     154092      2  pass                                  pass                                  yes
+PI_relaxed_live                 144609      56800      5  pass                                  pass                                  yes
+PI_relaxed_cap                    7083       3156      2  pass                                  pass                                  yes
+PI_never_clear_runs              72089      27440      3  pass                                  pass                                  yes
+PI_no_fallback_seqcst             3220       1808      1  pass                                  pass                                  yes
+MI_bit_after_look                 3209       1448      2  violated:AllRan                       violated:AllRan                       yes
+MI_trust_index                    1407        691      1  violated:IdleCounted                  violated:IdleCounted                  yes
+MI_never_clear                    1187        586      1  violated:IndexTight                   violated:IndexTight                   yes
+MI_no_fallback                     887        511      2  violated:AllRan                       violated:AllRan                       yes
+MI_relaxed_start                   962        551      1  violated:AllRan                       violated:AllRan                       yes
+MI_submitter_clears               3866       2175      2  violated:AllRan                       violated:AllRan                       yes
+MI_clear_after_free              57758      24265      2  violated:IndexComplete                violated:IndexComplete                yes
+WI_stale_start                    5827       2706      2  violated:NoStaleStart                 violated:NoStaleStart                 yes
+WI_stale_cas                      5842       2713      1  violated:NoStaleCas                   violated:NoStaleCas                   yes
+WI_wake                           4496       2096      2  violated:NoWake                       violated:NoWake                       yes
 
-results matching EXPECTED.txt: 9 of 9
+results matching EXPECTED.txt: 29 of 29

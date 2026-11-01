@@ -1,18 +1,19 @@
-TLC run of every configuration in proofs/tla/clock, 2026-10-26 18:30 UTC.
+TLC run of every configuration in proofs/tla/clock, 2026-10-30 19:43 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 16, or 1 worker where a violation is expected. Limit: 1500 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-C_safe                        11338191    3705462    178  pass                                  pass                                  yes
-C_three                       10101891    2662564    201  pass                                  pass                                  yes
-C_pair                        13499621    4563672    215  pass                                  pass                                  yes
-M_publish_late                 1334314     460445      9  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
-M_busy_no_wait                 1978288     678615     12  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
-M_no_recheck                     71484      25218      1  violated:NoBadJump                    violated:NoBadJump                    yes
-M_no_wait_advance              1989847     678569     13  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
-M_no_job_check                  138352      46384      2  violated:NoBadJump                    violated:NoBadJump                    yes
-M_no_attempt                   2794611     848083    276  violated:TimersFire                   violated:TimersFire                   yes
-W_jump                         1495792     481178     10  violated:NoJumpW                      violated:NoJumpW                      yes
-C_rearm                         736515     257356     12  pass                                  pass                                  yes
+C_safe                         9286866    3049926    123  pass                                  pass                                  yes
+C_safe_live                     206628      71338     27  pass                                  pass                                  yes
+C_three                        1650509     434056     30  pass                                  pass                                  yes
+C_pair                         4602673    1547948     69  pass                                  pass                                  yes
+M_publish_late                  488019     165251     37  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_busy_no_wait                  750330     253678     39  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_no_recheck                     69150      24356      7  violated:NoBadJump                    violated:NoBadJump                    yes
+M_no_wait_advance               755981     254051     31  violated:ClockNeverPassesArmed        violated:ClockNeverPassesArmed        yes
+M_no_job_check                  138352      46384     12  violated:NoBadJump                    violated:NoBadJump                    yes
+M_no_attempt                      7207       3192      8  violated:TimersFire                   violated:TimersFire                   yes
+W_jump                           86331      29330      9  violated:NoJumpW                      violated:NoJumpW                      yes
+C_rearm                         294201     102392     36  pass                                  pass                                  yes
 
-results matching EXPECTED.txt: 11 of 11
+results matching EXPECTED.txt: 12 of 12

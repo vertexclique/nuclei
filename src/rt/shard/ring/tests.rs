@@ -44,10 +44,11 @@ fn source_pair() -> (UnixStream, Arc<Source>, UnixStream) {
 }
 
 /// Three sources on a ring with one fixed file: the first takes it, the
-/// others run on the ring's copies of their descriptors, and bytes go both
-/// ways on all three. Once they retire, the ring holds no file of theirs.
+/// others run on their own descriptors, which the ring never copies, and
+/// bytes go both ways on all three. Once they retire, the ring holds no file
+/// of theirs.
 #[test]
-fn sources_past_a_full_table_run_on_copies() {
+fn sources_past_a_full_table_run_on_their_own_descriptors() {
     let Some(shard) = ring_shard(1) else { return };
     let _current = context::enter(&shard);
     let pairs: Vec<_> = (0..3).map(|_| source_pair()).collect();
@@ -74,7 +75,12 @@ fn sources_past_a_full_table_run_on_copies() {
         }
     });
     let ring = shard.ring().expect("a ring shard");
-    assert_eq!(ring.files_in_use(), (3, 2), "one fixed file, two copies");
+    assert_eq!(
+        ring.files_in_use(),
+        (3, 2),
+        "one fixed file, two slots naming the sources' own descriptors"
+    );
+
     for (_, src, _) in &pairs {
         src.retire();
     }

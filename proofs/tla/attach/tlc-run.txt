@@ -1,19 +1,25 @@
-TLC run of every configuration in proofs/tla/attach, 2026-10-25 22:57 UTC.
+TLC run of every configuration in proofs/tla/attach, 2026-10-30 08:40 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 2, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
 A_close                           1271        486      1  pass                                  pass                                  yes
 A_evict                            954        354      1  pass                                  pass                                  yes
 A_both                            2118        786      1  pass                                  pass                                  yes
-A_live                            2118        786      1  pass                                  pass                                  yes
+A_live                            2118        786      2  pass                                  pass                                  yes
 A_again                            428        206      1  pass                                  pass                                  yes
 M_direct                           974        369      1  violated:NoLeak                       violated:NoLeak                       yes
 M_no_abandon                       848        319      1  violated:NoLeak                       violated:NoLeak                       yes
 M_token_only                       316        156      1  violated:NoForeignSlot                violated:NoForeignSlot                yes
 W_registered                       297        117      1  violated:NoRegistered                 violated:NoRegistered                 yes
-W_stale_drop                       381        156      1  violated:NoStaleDrop                  violated:NoStaleDrop                  yes
+W_stale_drop                       381        156      2  violated:NoStaleDrop                  violated:NoStaleDrop                  yes
 W_rejected                         878        328      1  violated:NoRejected                   violated:NoRejected                   yes
 W_again                            105         58      1  violated:NoRegisteredWithB            violated:NoRegisteredWithB            yes
+RT_late                            112         79      1  pass                                  pass                                  yes
+RT_late_live                       112         79      1  pass                                  pass                                  yes
+RT_registered                       27         19      1  pass                                  pass                                  yes
+RT_registered_live                  27         19      1  pass                                  pass                                  yes
+MT_no_resubmit                      91         65      1  violated:Served                       violated:Served                       yes
+WT_late                             41         34      1  violated:NoLateResubmit               violated:NoLateResubmit               yes
 
-results matching EXPECTED.txt: 12 of 12
+results matching EXPECTED.txt: 18 of 18

@@ -1,6 +1,6 @@
 //! TCP listeners and streams.
 
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
@@ -17,6 +17,8 @@ use crate::io::raw::Owned;
 use crate::io::source::write::Peer;
 use crate::io::source::{Addr, Kind};
 use crate::io::{Handle, sys};
+use crate::rt::counters::out_of_descriptors;
+use crate::time::{Sleep, sleep};
 
 impl Handle<TcpListener> {
     /// A listener bound to the first of the addresses `addr` names that
@@ -37,6 +39,11 @@ impl Handle<TcpListener> {
     }
 
     /// The next connection, with its peer's address.
+    ///
+    /// On macOS an accept that finds the process out of descriptors closes
+    /// the connection it took off the backlog, as the system's own does; the
+    /// next ones fail with the same error and take none until a descriptor
+    /// is free.
     ///
     /// # Errors
     ///
@@ -81,7 +88,12 @@ impl Handle<TcpListener> {
 
     /// The connections as they come, from a stream that owns its own copy of
     /// the listener, so it may outlive this handle. A connection reset before
-    /// it was taken is skipped; any other error ends the stream, and
+    /// it was taken is skipped, and so is the process having no descriptor
+    /// left to accept into: the stream waits, with a growing pause, until
+    /// there is one, and the connections wait in the listener's backlog (on
+    /// macOS but for the one the first accept to find none took, which the
+    /// system closes, as [`accept`](Self::accept) says).
+    /// Any other error ends the stream, and
     /// [`TcpStreamGenerator::take_error`] says what it was.
     ///
     /// On io_uring the stream keeps one accept armed for every connection
@@ -98,6 +110,8 @@ impl Handle<TcpListener> {
             listener: Handle::adopt(listener, Kind::TcpListener)?,
             error: None,
             done: false,
+            backoff: None,
+            delay: OUT_OF_DESCRIPTORS_DELAY,
         })
     }
 }
@@ -138,7 +152,14 @@ pub struct TcpStreamGenerator {
     listener: Handle<TcpListener>,
     error: Option<io::Error>,
     done: bool,
+    backoff: Option<Sleep>,
+    delay: Duration,
 }
+
+/// The first wait of a generator whose process has no descriptor to accept
+/// into, doubled up to [`OUT_OF_DESCRIPTORS_DELAY_MAX`] while it lasts.
+const OUT_OF_DESCRIPTORS_DELAY: Duration = Duration::from_millis(10);
+const OUT_OF_DESCRIPTORS_DELAY_MAX: Duration = Duration::from_secs(1);
 
 impl TcpStreamGenerator {
     /// Why the stream ended, once it has.
@@ -153,10 +174,23 @@ impl Stream for TcpStreamGenerator {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         while !this.done {
+            if let Some(backoff) = this.backoff.as_mut() {
+                if Pin::new(backoff).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                this.backoff = None;
+            }
             match this.listener.poll_accept_stream(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(stream)) => return Poll::Ready(Some(stream)),
+                Poll::Ready(Ok(stream)) => {
+                    this.delay = OUT_OF_DESCRIPTORS_DELAY;
+                    return Poll::Ready(Some(stream));
+                }
                 Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::ConnectionAborted => {}
+                Poll::Ready(Err(err)) if out_of_descriptors(&err) => {
+                    this.backoff = Some(sleep(this.delay));
+                    this.delay = (this.delay * 2).min(OUT_OF_DESCRIPTORS_DELAY_MAX);
+                }
                 Poll::Ready(Err(err)) => {
                     this.error = Some(err);
                     this.done = true;

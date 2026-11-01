@@ -9,3 +9,10 @@ M_drop_keeps_waker             MC_Timer             violated:NoWakeAfterDrop
 W_cancel_armed                 MC_Timer             violated:NoCancelOfArmed
 W_cancel_before_arm            MC_Timer             violated:NoCancelBeforeArm
 W_fire_wake                    MC_Timer             violated:NoFireWake
+T_goes                         MC_Timer             pass
+T_goes_drop                    MC_Timer             pass
+T_live_goes                    MC_Timer             pass
+T_live_goes_drop               MC_Timer             pass
+M_no_orphan                    MC_Timer             violated:NoStrandedWaker
+M_no_rearm                     MC_Timer             violated:Termination
+W_orphan_rearm                 MC_Timer             violated:NoRearm

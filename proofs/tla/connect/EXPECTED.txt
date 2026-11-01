@@ -1,0 +1,8 @@
+# configuration   spec      expected
+S_accepts         Connect   pass
+S_never           Connect   pass
+M_pool            Connect   violated:FreedOnDrop
+M_no_retry        Connect   violated:NoWouldBlock
+M_fresh           Connect   violated:OwnSocket
+M_no_restart      Connect   violated:OkMeansQueued
+W_retried         Connect   violated:NeverRetried

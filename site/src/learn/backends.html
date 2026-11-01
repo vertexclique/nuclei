@@ -15,16 +15,16 @@
 <ul>
 <li>Linux and Android 6.1 or later, with the <code>iouring</code> feature (on by default). The ring is Nuclei's own, on <code>libc</code> alone.</li>
 <li>The probe is safe even under a seccomp filter that kills a process for calling <code>io_uring_setup</code>; where io_uring is refused (an older kernel, a container's policy), <code>auto</code> runs epoll.</li>
-<li>Each shard owns one ring, used by its own thread alone: single issuer with deferred task work, unless a kernel submission thread is configured (<code>sqpoll_wake_interval</code>).</li>
-<li>A stream keeps one multishot receive armed, and <code>accept_multi</code> one multishot accept, filled from the shard's receive group (<a href="production.html#iouring"><code>recv_buffers</code>, <code>recv_buffer_size</code></a>).</li>
-<li>Regular files are read and written with ring operations at the handle's cursor.</li>
+<li>Each shard owns one ring. A worker's ring takes submissions from whichever thread runs its shard, one at a time, since a <a href="tasks.html#handoff">handoff</a> may move the shard; the shard of a thread in <code>block_on</code>, and a worker with <code>handoff_after(None)</code>, use a single-issuer ring with deferred task work. A kernel submission thread (<code>sqpoll_wake_interval</code>) replaces both.</li>
+<li>A stream keeps one multishot receive armed, and <code>accept_multi</code> one multishot accept, filled from the shard's receive group (<a href="production.html#iouring"><code>recv_buffers</code>, <code>recv_buffer_size</code></a>). The group fits in half the completion queue, and an armed receive or accept that waits on an idle connection takes no room from other operations.</li>
+<li>Regular files are read, written, synced and allocated with ring operations, at the handle's cursor or at an offset (<a href="fs.html#positional">Files</a>). A <code>write_zero_copy</code> of at least <code>zero_copy_threshold</code> bytes is sent without a copy.</li>
 </ul>
 
 <h2 id="epoll">epoll</h2>
 <ul>
 <li>Linux, Android and illumos. On Linux it is what <code>auto</code> picks where io_uring cannot be had.</li>
 <li>A readiness poller: the shard's driver makes each call when the descriptor may be ready, into the shard's buffers. Your code sees the same completion API.</li>
-<li>Regular files run as <code>pread</code> and <code>pwrite</code> jobs on the blocking pool. A child's exit comes through its pidfd.</li>
+<li>Regular files run as jobs on the blocking pool: <code>pread</code> and <code>pwrite</code> (<code>preadv</code> and <code>pwritev</code> for several buffers), syncs and the space calls. A child's exit comes through its pidfd.</li>
 </ul>
 
 <h2 id="kqueue">kqueue</h2>
@@ -40,7 +40,7 @@
 <li>A handle takes std's TCP and UDP sockets, files, and a child's pipes. There are no Unix sockets on Windows.</li>
 <li>A pipe or console opened for synchronous IO cannot complete on a port, so its calls run as jobs of the blocking pool and come back to the shard like the kernel's completions.</li>
 <li>A TCP write, once issued, is always finished: a cancelled send there may have handed bytes to the network stack while saying it took none.</li>
-<li>Timed waits use a high-resolution waitable timer where the system offers one, so timers are not rounded to the 15.6 ms system tick.</li>
+<li>Timed waits use a high-resolution waitable timer where the system offers one, so timers are not rounded to the 15.6 ms system tick, and the handoff's watch acts at its threshold.</li>
 </ul>
 
 <h2 id="ci">What is tested where</h2>

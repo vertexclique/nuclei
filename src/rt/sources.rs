@@ -127,6 +127,13 @@ impl<T, const TAG: u64> Tokens<T, TAG> {
             })
     }
 
+    /// Whether no slot was ever taken since the last drain: draining then
+    /// finds nothing.
+    #[inline]
+    pub(crate) fn is_untouched(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// How many entries are registered.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

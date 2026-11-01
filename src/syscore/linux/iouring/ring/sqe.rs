@@ -160,6 +160,25 @@ impl Sqe {
         })
     }
 
+    /// `fallocate(2)` of the `len` bytes of the file from `offset`, as `mode` says; completes with 0.
+    pub(crate) fn fallocate(fd: RawFd, offset: u64, len: u64, mode: u32) -> Self {
+        Self::new(Opcode::Fallocate, fd).with(|s| {
+            s.off = offset;
+            s.addr = len;
+            s.len = mode;
+        })
+    }
+
+    /// `sync_file_range(2)` of the `len` bytes of the file from `offset` (zero: to the end), with
+    /// the `SYNC_FILE_RANGE_*` `flags`; completes with 0.
+    pub(crate) fn sync_file_range(fd: RawFd, offset: u64, len: u32, flags: u32) -> Self {
+        Self::new(Opcode::SyncFileRange, fd).with(|s| {
+            s.off = offset;
+            s.len = len;
+            s.op_flags = flags;
+        })
+    }
+
     /// `accept4(2)`; completes with the new fd. `peer` and `peer_len` may be null.
     /// Every pointer argument must stay valid and unmoved until the final completion.
     pub(crate) fn accept(
@@ -203,6 +222,20 @@ impl Sqe {
     /// Every pointer argument must stay valid and unmoved until the final completion.
     pub(crate) fn send(fd: RawFd, buf: *const u8, len: u32, flags: i32) -> Self {
         Self::new(Opcode::Send, fd).with(|s| {
+            s.addr = addr(buf);
+            s.len = len;
+            s.op_flags = flags as u32;
+        })
+    }
+
+    /// Zero-copy `send(2)` of `len` bytes from `buf`: the first completion carries the byte count
+    /// and `IORING_CQE_F_MORE`, and a second one with `IORING_CQE_F_NOTIF` says the kernel is done
+    /// with the memory. The notification follows a failed send too (its first completion carries
+    /// the error with `MORE`); a first completion without `MORE` is a send refused before it ran,
+    /// and none follows.
+    /// Every pointer argument must stay valid and unmoved until the notification.
+    pub(crate) fn send_zc(fd: RawFd, buf: *const u8, len: u32, flags: i32) -> Self {
+        Self::new(Opcode::SendZc, fd).with(|s| {
             s.addr = addr(buf);
             s.len = len;
             s.op_flags = flags as u32;

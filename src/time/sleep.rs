@@ -1,16 +1,20 @@
 //! [`Sleep`]: a future that completes at a deadline, on the timer wheel of
-//! the shard that polls it.
+//! the shard that polls it, and the timer both it and
+//! [`SleepPrecise`](super::SleepPrecise) are built on, generic over the wheel
+//! it arms: the millisecond one, or the microsecond one off it.
 
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::future::Future;
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::sync::Arc;
 use std::task::Wake;
 use std::time::Duration;
 
-use super::Instant;
+use super::{Instant, clock};
 
 use super::wheel::{TimerKey, Wheel};
 use crate::rt::context;
@@ -22,20 +26,19 @@ use crate::sync::internal::{AtomicBool, Ordering};
 ///
 /// The wait is at least `duration`, rounded up to the timer wheel's
 /// millisecond; a busy shard may let it run later by the time its current
-/// task takes to yield.
+/// task takes to yield. [`sleep_precise`](super::sleep_precise) waits to the
+/// microsecond instead.
+#[inline(always)]
 pub fn sleep(duration: Duration) -> Sleep {
-    sleep_until(
-        Instant::now()
-            .checked_add(duration)
-            .unwrap_or_else(far_future),
-    )
+    Sleep {
+        timer: Timer::after(duration),
+    }
 }
 
 /// Waits until `deadline`.
 pub fn sleep_until(deadline: impl Into<Instant>) -> Sleep {
     Sleep {
-        deadline: deadline.into(),
-        state: State::Idle,
+        timer: Timer::new(deadline.into()),
     }
 }
 
@@ -53,8 +56,85 @@ pub(super) fn far_future() -> Instant {
 /// timer.
 #[must_use = "a sleep does nothing unless awaited"]
 pub struct Sleep {
-    deadline: Instant,
-    state: State,
+    timer: Timer<Coarse>,
+}
+
+impl Sleep {
+    /// The deadline.
+    pub fn deadline(&self) -> Instant {
+        self.timer.deadline()
+    }
+
+    /// Whether the deadline has passed.
+    pub fn is_elapsed(&self) -> bool {
+        self.timer.is_elapsed()
+    }
+
+    /// Moves the deadline; the sleep is pending again until it.
+    pub fn reset(self: Pin<&mut Self>, deadline: impl Into<Instant>) {
+        self.get_mut().timer.reset(deadline.into());
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    #[inline(always)]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().timer.poll(cx)
+    }
+}
+
+impl fmt::Debug for Sleep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sleep")
+            .field("deadline", &self.deadline())
+            .field("elapsed", &self.is_elapsed())
+            .finish()
+    }
+}
+
+/// Which of a shard's wheels a timer is armed in.
+pub(crate) trait Grain {
+    /// The microsecond wheel, off the millisecond one.
+    const PRECISE: bool;
+}
+
+/// The millisecond wheel, of [`Sleep`].
+pub(crate) struct Coarse;
+
+impl Grain for Coarse {
+    const PRECISE: bool = false;
+}
+
+/// The microsecond wheel, of [`SleepPrecise`](super::SleepPrecise).
+pub(crate) struct Fine;
+
+impl Grain for Fine {
+    const PRECISE: bool = true;
+}
+
+/// A timer that completes at its deadline, in a wheel of grain `G` of the
+/// shard that polls it. Dropping it cancels it.
+pub(super) struct Timer<G: Grain> {
+    deadline: Deadline,
+    /// Never dropped as it is: the drop releases what it holds, which leaves
+    /// it holding nothing.
+    state: ManuallyDrop<State>,
+    grain: PhantomData<G>,
+}
+
+/// A timer's deadline, as it was made: the expiry checks and the wheels read
+/// it in nanoseconds after the clock's origin, which only the poll that arms
+/// the timer asks for.
+#[derive(Clone, Copy)]
+enum Deadline {
+    /// Made from a duration: nanoseconds after the origin, which name its
+    /// instant exactly.
+    Nanos(u64),
+    /// Given as an instant (`sleep_until`, `reset`), which its nanoseconds
+    /// may not reach (before the origin, past their range).
+    Given(Instant),
 }
 
 enum State {
@@ -71,38 +151,92 @@ enum State {
     Done,
 }
 
-impl Sleep {
+impl<G: Grain> Timer<G> {
+    pub(super) fn new(deadline: Instant) -> Self {
+        Self {
+            deadline: Deadline::Given(deadline),
+            state: ManuallyDrop::new(State::Idle),
+            grain: PhantomData,
+        }
+    }
+
+    /// A timer `duration` from now on the runtime's clock: the clock read
+    /// once, in nanoseconds; one past their range is [`far_future`]'s, as an
+    /// instant would be.
+    #[inline(always)]
+    pub(super) fn after(duration: Duration) -> Self {
+        let span = duration
+            .as_secs()
+            .checked_mul(1_000_000_000)
+            .and_then(|whole| whole.checked_add(u64::from(duration.subsec_nanos())));
+        // Read outside a closure, which the clock's read would keep from
+        // being inlined.
+        let now = clock::now_nanos();
+        match span.and_then(|span| now.checked_add(span)) {
+            Some(at) => Self {
+                deadline: Deadline::Nanos(at),
+                state: ManuallyDrop::new(State::Idle),
+                grain: PhantomData,
+            },
+            None => Self::new(far_future()),
+        }
+    }
+
     /// The deadline.
-    pub fn deadline(&self) -> Instant {
-        self.deadline
+    pub(super) fn deadline(&self) -> Instant {
+        match self.deadline {
+            Deadline::Nanos(at) => Instant::from_std(clock::instant(at)),
+            Deadline::Given(at) => at,
+        }
+    }
+
+    /// The deadline in nanoseconds after the clock's origin.
+    #[inline]
+    fn nanos(&self) -> u64 {
+        match self.deadline {
+            Deadline::Nanos(at) => at,
+            Deadline::Given(at) => clock::nanos(at.into_std()),
+        }
     }
 
     /// Whether the deadline has passed.
-    pub fn is_elapsed(&self) -> bool {
-        matches!(self.state, State::Done) || Instant::now() >= self.deadline
+    pub(super) fn is_elapsed(&self) -> bool {
+        matches!(*self.state, State::Done) || clock::now_nanos() >= self.nanos()
     }
 
-    /// Moves the deadline; the sleep is pending again until it.
-    pub fn reset(self: Pin<&mut Self>, deadline: impl Into<Instant>) {
-        let deadline = deadline.into();
-        let this = self.get_mut();
-        this.release();
-        this.deadline = deadline;
+    /// Moves the deadline; the timer is pending again until it.
+    pub(super) fn reset(&mut self, deadline: Instant) {
+        self.release();
+        self.deadline = Deadline::Given(deadline);
     }
 
-    /// Lets go of the timer, wherever it is armed.
+    /// Lets go of the timer, wherever it is armed, and leaves the timer idle.
+    #[inline]
     fn release(&mut self) {
-        match core::mem::replace(&mut self.state, State::Idle) {
+        match *self.state {
+            State::Idle => {}
+            // Fired: nothing to let go of, and pending again (a reset).
+            State::Done => *self.state = State::Idle,
+            State::Local { .. } | State::Remote { .. } => self.release_armed(),
+        }
+    }
+
+    #[inline(never)]
+    fn release_armed(&mut self) {
+        match core::mem::replace(&mut *self.state, State::Idle) {
             State::Local { owner, key } => {
                 let here = context::current(|current| match current {
                     Some(shard) if shard.is(&owner) => {
-                        shard.wheel().borrow_mut().remove(key);
+                        shard.wheel_of(G::PRECISE).borrow_mut().remove(key);
                         true
                     }
                     _ => false,
                 });
                 if !here {
-                    owner.post_timer(TimerOp::Remove(key));
+                    owner.post_timer(TimerOp::Remove {
+                        key,
+                        precise: G::PRECISE,
+                    });
                 }
             }
             State::Remote { shard, cell } => {
@@ -116,42 +250,43 @@ impl Sleep {
         }
     }
 
+    #[inline(always)]
     fn poll_local(&mut self, shard: &Shard, cx: &mut Context<'_>) -> Poll<()> {
-        if let State::Local { owner, key } = &self.state
+        if let State::Local { owner, key } = &*self.state
             && shard.is(owner)
         {
             let key = *key;
-            let mut wheel = shard.wheel().borrow_mut();
+            let mut wheel = shard.wheel_of(G::PRECISE).borrow_mut();
+            // A fired timer let go of its entry as it fired.
             if wheel.is_fired(key) {
-                wheel.remove(key);
                 drop(wheel);
-                self.state = State::Done;
+                self.end_local();
                 return Poll::Ready(());
             }
             wheel.set_waker(key, cx.waker());
             return Poll::Pending;
         }
-        if let State::Remote { cell, .. } = &self.state {
-            return Self::poll_cell(cell, cx).map(|()| self.state = State::Done);
+        if let State::Remote { cell, .. } = &*self.state {
+            return poll_cell(cell, cx).map(|()| *self.state = State::Done);
         }
         // Not armed here: armed now (after letting go of an arming on
         // another shard, if it moved).
         self.release();
-        if Instant::now() >= self.deadline {
-            self.state = State::Done;
+        let at = self.nanos();
+        if clock::now_nanos() >= at {
+            *self.state = State::Done;
             return Poll::Ready(());
         }
-        let at = shard.wheel_time(self.deadline.into_std());
-        let mut wheel = shard.wheel().borrow_mut();
+        let at = shard.time_of(G::PRECISE, at);
+        let mut wheel = shard.wheel_of(G::PRECISE).borrow_mut();
         let key = wheel.insert(at, cx.waker());
         if wheel.is_fired(key) {
-            wheel.remove(key);
             drop(wheel);
-            self.state = State::Done;
+            *self.state = State::Done;
             return Poll::Ready(());
         }
         drop(wheel);
-        self.state = State::Local {
+        *self.state = State::Local {
             owner: Arc::clone(&shard.shared),
             key,
         };
@@ -159,70 +294,99 @@ impl Sleep {
     }
 
     fn poll_remote(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let State::Remote { cell, .. } = &self.state {
-            return Self::poll_cell(cell, cx).map(|()| self.state = State::Done);
+        if let State::Remote { cell, .. } = &*self.state {
+            return poll_cell(cell, cx).map(|()| *self.state = State::Done);
         }
         self.release();
-        if Instant::now() >= self.deadline {
-            self.state = State::Done;
+        let at = self.nanos();
+        if clock::now_nanos() >= at {
+            *self.state = State::Done;
             return Poll::Ready(());
         }
         let cell = Arc::new(RemoteTimer {
             fired: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            orphaned: AtomicBool::new(false),
+            precise: G::PRECISE,
             waker: AtomicWaker::new(),
             key: UnsafeCell::new(None),
         });
         cell.waker.register(cx.waker());
         let shard = crate::rt::runtime::service_shard();
         shard.post_timer(TimerOp::Insert {
-            at: self.deadline,
+            at,
             cell: Arc::clone(&cell),
         });
-        self.state = State::Remote { shard, cell };
+        *self.state = State::Remote { shard, cell };
         Poll::Pending
     }
 
-    fn poll_cell(cell: &RemoteTimer, cx: &mut Context<'_>) -> Poll<()> {
-        if cell.fired.load(Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-        cell.waker.register(cx.waker());
-        if cell.fired.load(Ordering::Acquire) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
+    /// Ends a timer armed here that fired.
+    #[inline(always)]
+    fn end_local(&mut self) {
+        // The state is `Local`: its owner goes, and nothing else.
+        if let State::Local { owner, .. } = core::mem::replace(&mut *self.state, State::Done) {
+            drop(owner);
         }
     }
-}
 
-impl Future for Sleep {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        if let State::Done = this.state {
+    #[inline(always)]
+    pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        // A sleep's usual end: armed on the shard this thread runs, and
+        // fired.
+        if let State::Local { owner, key } = &*self.state
+            && let Some(shard) = context::running_inside(context::local())
+            && shard.is(owner)
+            && shard.wheel_of(G::PRECISE).borrow().is_fired(*key)
+        {
+            self.end_local();
             return Poll::Ready(());
         }
+        self.poll_any(cx)
+    }
+
+    #[inline(never)]
+    fn poll_any(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let State::Done = *self.state {
+            return Poll::Ready(());
+        }
+        if let State::Remote { cell, .. } = &*self.state
+            && cell.orphaned.load(Ordering::Acquire)
+        {
+            // The shard that held the timer went without firing it, and holds
+            // it no more: it is armed again where this poll runs.
+            *self.state = State::Idle;
+        }
+        // On the shard this thread runs with no bracket to take, as `current`
+        // would hand it over.
+        if let Some(shard) = context::running_inside(context::local()) {
+            return self.poll_local(shard, cx);
+        }
         context::current(|current| match current {
-            Some(shard) => this.poll_local(shard, cx),
-            None => this.poll_remote(cx),
+            Some(shard) => self.poll_local(shard, cx),
+            None => self.poll_remote(cx),
         })
     }
 }
 
-impl Drop for Sleep {
+impl<G: Grain> Drop for Timer<G> {
     fn drop(&mut self) {
-        self.release();
+        // What the state holds goes here; idle or done, it holds nothing.
+        if matches!(*self.state, State::Local { .. } | State::Remote { .. }) {
+            self.release_armed();
+        }
     }
 }
 
-impl fmt::Debug for Sleep {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Sleep")
-            .field("deadline", &self.deadline)
-            .field("elapsed", &self.is_elapsed())
-            .finish()
+fn poll_cell(cell: &RemoteTimer, cx: &mut Context<'_>) -> Poll<()> {
+    if cell.fired.load(Ordering::Acquire) {
+        return Poll::Ready(());
+    }
+    cell.waker.register(cx.waker());
+    if cell.fired.load(Ordering::Acquire) {
+        Poll::Ready(())
+    } else {
+        Poll::Pending
     }
 }
 
@@ -230,46 +394,79 @@ impl fmt::Debug for Sleep {
 pub(crate) struct RemoteTimer {
     fired: AtomicBool,
     cancelled: AtomicBool,
+    /// The shard let go of the timer without firing it, as it went: the
+    /// sleep arms it again where it is polled next.
+    orphaned: AtomicBool,
+    /// Armed in the firing shard's microsecond wheel, not its millisecond
+    /// one.
+    precise: bool,
     waker: AtomicWaker,
     /// Where the timer is in the firing shard's wheel. Read and written by
     /// that shard's thread only (arming, cancelling and firing all run there).
     key: UnsafeCell<Option<TimerKey>>,
 }
 
-// SAFETY: every field but `key` is atomic; `key` is touched only by the
-// thread of the shard that fires the timer (see its docs).
+// SAFETY: every field but `key` is atomic or never written after the cell is
+// made; `key` is touched only by the thread of the shard that fires the timer
+// (see its docs).
 unsafe impl Send for RemoteTimer {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for RemoteTimer {}
 
-impl Wake for RemoteTimer {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
+impl RemoteTimer {
+    /// Fires the timer: called by the firing shard once the wheel let go of
+    /// it, its entry gone with the fire.
+    fn fire(&self) {
+        // SAFETY: on the firing shard's thread (see `key`).
+        unsafe { *self.key.get() = None };
+        self.fired.store(true, Ordering::Release);
+        self.waker.wake();
     }
 
-    fn wake_by_ref(self: &Arc<Self>) {
-        // Called by the firing shard once the wheel let go of the timer: the
-        // fired entry is removed here, as nobody else holds its key.
-        // SAFETY: on the firing shard's thread (see `key`).
-        if let Some(key) = unsafe { (*self.key.get()).take() } {
-            context::current(|current| {
-                if let Some(shard) = current {
-                    shard.wheel().borrow_mut().remove(key);
-                }
-            });
+    /// The shard that was to fire the timer let go of it unfired, as it went:
+    /// unless it fired or was cancelled, the sleep's task is woken, to arm it
+    /// again where it is polled (or be dropped, its own shard gone too). The
+    /// cell keeps the task's waker no longer, so the task, which holds the
+    /// cell, is not kept by it for good (proofs/tla/timer, `NoStrandedWaker`).
+    pub(crate) fn orphan(&self) {
+        if self.fired.load(Ordering::Acquire) || self.cancelled.load(Ordering::SeqCst) {
+            return;
         }
-        self.fired.store(true, Ordering::Release);
+        self.orphaned.store(true, Ordering::Release);
         self.waker.wake();
     }
 }
 
-/// Work on a shard's timer wheel from another thread.
+/// A remote timer as its shard's wheel holds it: fired when the wheel wakes
+/// it, orphaned when the wheel drops it unfired (the shard went).
+struct Armed(Arc<RemoteTimer>);
+
+impl Wake for Armed {
+    fn wake(self: Arc<Self>) {
+        self.0.fire();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fire();
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        // A fire or a cancel came first: nothing to do.
+        self.0.orphan();
+    }
+}
+
+/// Work on a shard's timer wheels from another thread.
 pub(crate) enum TimerOp {
-    /// Arm a timer that fires `cell`, for a thread with no shard.
-    Insert { at: Instant, cell: Arc<RemoteTimer> },
-    /// Remove a timer of this wheel armed by a sleep that moved away or was
-    /// dropped on another thread.
-    Remove(TimerKey),
+    /// Arm a timer that fires `cell` at `at` (nanoseconds after the clock's
+    /// origin), for a thread with no shard, in the wheel `cell` names.
+    Insert { at: u64, cell: Arc<RemoteTimer> },
+    /// Remove a timer of this shard (of its microsecond wheel when
+    /// `precise`) armed by a sleep that moved away or was dropped on another
+    /// thread.
+    Remove { key: TimerKey, precise: bool },
     /// Cancel a timer armed by `Insert`.
     Cancel(Arc<RemoteTimer>),
 }
@@ -281,31 +478,60 @@ impl TimerOp {
         matches!(self, Self::Insert { .. })
     }
 
-    /// Applies the op on its shard's thread.
+    /// The op's shard went and applies it never: an arm request orphans its
+    /// timer; a removal or a cancel had nothing left to do.
+    pub(crate) fn orphan(self) {
+        if let Self::Insert { cell, .. } = self {
+            cell.orphan();
+        }
+    }
+
+    /// Applies the op on its shard's thread; `wheel` is the shard's
+    /// millisecond wheel, which the caller holds.
     pub(crate) fn apply(self, shard: &Shard, wheel: &mut Wheel) {
         match self {
             Self::Insert { at, cell } => {
                 if cell.cancelled.load(Ordering::SeqCst) {
                     return;
                 }
-                let waker = Waker::from(Arc::clone(&cell));
-                let key = wheel.insert(shard.wheel_time(at.into_std()), &waker);
-                if wheel.is_fired(key) {
-                    wheel.remove(key);
-                    cell.fired.store(true, Ordering::Release);
-                    cell.waker.wake();
+                let waker = Waker::from(Arc::new(Armed(Arc::clone(&cell))));
+                let at = shard.time_of(cell.precise, at);
+                let fired = if cell.precise {
+                    arm(&mut shard.wheel_of(true).borrow_mut(), at, &waker)
                 } else {
+                    arm(wheel, at, &waker)
+                };
+                match fired {
+                    None => {
+                        cell.fired.store(true, Ordering::Release);
+                        cell.waker.wake();
+                    }
                     // SAFETY: on this shard's thread (see `RemoteTimer::key`).
-                    unsafe { *cell.key.get() = Some(key) };
+                    Some(key) => unsafe { *cell.key.get() = Some(key) },
                 }
             }
-            Self::Remove(key) => wheel.remove(key),
+            Self::Remove {
+                key,
+                precise: false,
+            } => wheel.remove(key),
+            Self::Remove { key, precise: true } => shard.wheel_of(true).borrow_mut().remove(key),
             Self::Cancel(cell) => {
                 // SAFETY: on this shard's thread (see `RemoteTimer::key`).
                 if let Some(key) = unsafe { (*cell.key.get()).take() } {
-                    wheel.remove(key);
+                    if cell.precise {
+                        shard.wheel_of(true).borrow_mut().remove(key);
+                    } else {
+                        wheel.remove(key);
+                    }
                 }
             }
         }
     }
+}
+
+/// Arms a timer for `at` in `wheel`: its key, or `None` when the deadline
+/// passed already (it took no entry).
+fn arm(wheel: &mut Wheel, at: u64, waker: &Waker) -> Option<TimerKey> {
+    let key = wheel.insert(at, waker);
+    (!wheel.is_fired(key)).then_some(key)
 }

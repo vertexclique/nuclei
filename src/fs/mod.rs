@@ -3,28 +3,58 @@
 //! ([`read`], [`write`](fn@write), [`metadata`], [`rename`], [`copy`], ...),
 //! directories ([`create_dir_all`], [`DirBuilder`], [`read_dir`] streamed a
 //! page at a time) and links. Calls by path, and a regular file's calls
-//! beside its reads and writes, run on the blocking pool.
+//! beside its reads, writes, syncs and [`Handle::allocate`], run on the
+//! blocking pool; [`Handle::try_lock_file`], which never waits, runs on the
+//! calling thread.
 //!
-//! A regular file's reads and writes, at the handle's own cursor, are
-//! operations of the shard's ring on io_uring and jobs of the blocking pool
-//! on the other backends (see `file`); a `File` that is not a regular file
+//! A regular file's reads and writes, at the handle's own cursor or at an
+//! offset of the caller's ([`Handle::read_at`], [`Handle::write_at`] and
+//! their forms, which many tasks may make at once on one handle, and
+//! [`Handle::read_many_at`], many reads in one call), its syncs
+//! ([`Handle::sync_all`], [`Handle::sync_data`], [`Handle::sync_range`]) and
+//! [`Handle::allocate`] are operations of the shard's ring on io_uring and
+//! jobs of the blocking pool on the other backends (see `file`). A file
+//! opened for direct IO (`O_DIRECT`, `FILE_FLAG_NO_BUFFERING`) is read and
+//! written with exactly the caller's lengths and offsets, never through the
+//! handle's read-ahead or write-behind. A `File` that is not a regular file
 //! (a FIFO, a terminal, a pipe) is a byte stream the shard's driver serves
 //! like a socket (on Windows, through the completion port, or through jobs
-//! of the blocking pool for a handle opened for synchronous IO). Reads
-//! and writes are `AsyncRead` and `AsyncWrite` on the handle and on a shared
-//! reference to it (both share the cursor, as `&File` shares its offset);
-//! `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned` and
-//! `write_owned` take the caller's buffer and give it back, so the bytes are
-//! read into it and written from it with no copy.
+//! of the blocking pool for a handle opened for synchronous IO). Reads and
+//! writes at the cursor are `AsyncRead` and `AsyncWrite` on the handle and
+//! on a shared reference to it (both share the cursor, as `&File` shares its
+//! offset); `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned`,
+//! `write_owned`, `read_at_owned`, `write_at_owned` and the vectored
+//! `read_vectored_owned` and `write_vectored_owned` take the caller's
+//! buffers (any [`IoBuf`] or [`IoBufMut`], an
+//! [`AlignedBuf`](crate::io::AlignedBuf) for direct IO) and give them back,
+//! so the bytes are read into them and written from them with no copy.
+//!
+//! Beside those, a regular file can be asked to change the space a range
+//! uses ([`Handle::allocate`]: reserve, keep the length, punch a hole, zero),
+//! to write a range back ([`Handle::sync_range`]), to copy a range into
+//! another file in the kernel where the system can ([`Handle::copy_range_to`]),
+//! and to take an advisory lock without blocking the worker
+//! ([`Handle::lock_file`], [`Handle::try_lock_file`], [`Handle::unlock_file`]).
+//!
+//! A file's name in its directory needs [`sync_dir`] to survive a crash. To
+//! replace a file atomically: write a temporary file in the same directory,
+//! `sync_all` it, [`rename`] it over the target, then [`sync_dir`] the
+//! directory.
 
+mod allocate;
+pub(crate) mod call;
+mod copy_range;
 pub(crate) mod file;
 mod file_ops;
+mod lock;
 mod ops;
 mod read_dir;
 #[cfg(ring)]
 pub(crate) mod ring;
+mod sync_dir;
 
-pub use std::fs::{FileTimes, FileType, Metadata, Permissions};
+pub use self::allocate::Allocate;
+pub use std::fs::{FileTimes, FileType, Metadata, Permissions, TryLockError};
 
 #[cfg(unix)]
 pub use self::ops::symlink;
@@ -36,6 +66,7 @@ pub use self::ops::{
 #[cfg(windows)]
 pub use self::ops::{symlink_dir, symlink_file};
 pub use self::read_dir::{DirEntry, ReadDir, read_dir};
+pub use self::sync_dir::sync_dir;
 
 /// A file: std's `File` in a [`Handle`], with async reads, writes, seeks and
 /// calls.
@@ -49,9 +80,20 @@ use std::path::Path;
 
 use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
 
+use crate::buf::owned::{IoBuf, IoBufMut, OwnedBuf};
+use crate::buf::vectored::{self, IoVecBuf, IoVecBufMut};
 use crate::io::Handle;
 use crate::io::source::Kind;
 
+/// A file's calls. std's own `File::lock`, `FileExt::read_at` and
+/// `FileExt::write_at` (on Windows `seek_read` and `seek_write`), reached
+/// through `Deref`, block the worker thread that makes them. Use the async
+/// calls instead: [`lock_file`](Handle::lock_file),
+/// [`try_lock_file`](Handle::try_lock_file) and
+/// [`unlock_file`](Handle::unlock_file), [`read_at`](Handle::read_at) and
+/// [`write_at`](Handle::write_at), and, with no copy of the bytes,
+/// [`read_at_owned`](Handle::read_at_owned) and
+/// [`write_at_owned`](Handle::write_at_owned).
 impl Handle<StdFile> {
     /// Opens the file at `p` for reading, on the blocking pool.
     ///
@@ -75,8 +117,13 @@ impl Handle<StdFile> {
     /// landed.
     ///
     /// If the future is dropped before it completes, the cursor stays where
-    /// it was.
-    pub async fn read_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// it was. `buf` is any [`IoBufMut`]: a `Vec<u8>`, an
+    /// [`AlignedBuf`](crate::io::AlignedBuf) for a file opened for direct IO,
+    /// or a type of the caller's.
+    pub async fn read_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
         if !self.is_regular() {
             return self.source().read_owned(buf).await;
         }
@@ -93,8 +140,12 @@ impl Handle<StdFile> {
     ///
     /// If the future is dropped before it completes, the write is withdrawn
     /// while it still waits for the writes before it, and lands whole, in
-    /// its place, once it started.
-    pub async fn write_owned(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// its place, once it started. `buf` is any [`IoBuf`], as for
+    /// [`read_owned`](Self::read_owned).
+    pub async fn write_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
         if !self.is_regular() {
             return self.source().write_owned(buf).await;
         }
@@ -102,6 +153,42 @@ impl Handle<StdFile> {
             Ok(file) => file.write_owned(buf).await,
             Err(err) => (Err(err), buf),
         }
+    }
+
+    /// Reads at the cursor into the spare capacity of `bufs`, after the
+    /// bytes each holds, filling each buffer's room before the next one's,
+    /// as [`read_owned`](Self::read_owned) reads into one, and gives `bufs`
+    /// back with how many bytes came: zero at the end of the file, or when no
+    /// buffer has spare capacity. One call of the kernel takes every room
+    /// (`preadv`, or `IORING_OP_READV` on the ring); on Windows, which has no
+    /// vectored read of a buffered file, one read a buffer, in order, until
+    /// one comes short.
+    pub async fn read_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
+    where
+        V: IoVecBufMut,
+    {
+        let bufs = OwnedBuf::vectored_read(vectored::filled(bufs));
+        let (result, bufs) = self.read_owned(bufs).await;
+        (result, vectored::into_filled(bufs.into_segments()))
+    }
+
+    /// Writes all of the bytes of `bufs`, each buffer's in order, at the
+    /// cursor as one write (as [`write_owned`](Self::write_owned) writes
+    /// one buffer), and gives `bufs` back with how many bytes that was. No
+    /// other write of the handle comes between two of them. One call of the
+    /// kernel takes every buffer left (`pwritev`, `writev` for a file opened
+    /// to append, or `IORING_OP_WRITEV` on the ring; on Windows, which has no
+    /// vectored write of a buffered file, one write a buffer, in order), from
+    /// the buffers themselves, never copied; on a file opened for direct IO
+    /// each buffer's memory and length meet the kernel's alignment rules on
+    /// their own.
+    pub async fn write_vectored_owned<V>(&self, bufs: V) -> (io::Result<usize>, V)
+    where
+        V: IoVecBuf,
+    {
+        let bufs = OwnedBuf::vectored(vectored::written(bufs));
+        let (result, bufs) = self.write_owned(bufs).await;
+        (result, vectored::into_written(bufs.into_segments()))
     }
 }
 

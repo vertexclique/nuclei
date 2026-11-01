@@ -28,13 +28,35 @@ use std::{
 use super::{
     Ring, refused,
     sys::{
-        IORING_REGISTER_PBUF_RING, IORING_UNREGISTER_PBUF_RING, IoUringBuf, IoUringBufReg, Mapping,
-        cqe_buffer_id, io_uring_register,
+        IORING_REGISTER_PBUF_RING, IORING_UNREGISTER_PBUF_RING, IOU_PBUF_RING_INC, IoUringBuf,
+        IoUringBufReg, Mapping, cqe_buffer_id, io_uring_register,
     },
 };
 
 /// Largest number of descriptors the kernel accepts in one buffer ring.
 const MAX_ENTRIES: u16 = 1 << 15;
+
+#[cfg(test)]
+thread_local! {
+    /// The buffers of a ring made on this thread find no memory, as a mapping the system refuses
+    /// does, for a test.
+    pub(crate) static NO_MEMORY_FOR_TEST: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+/// The memory a ring of `entries` buffers of `buf_size` bytes maps, in whole pages: its
+/// descriptor ring and its buffers.
+pub(crate) fn reservation(entries: u16, buf_size: u32) -> usize {
+    // SAFETY: a plain query.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|&page| page > 0)
+        .unwrap_or(4096);
+    let pages = |bytes: usize| bytes.div_ceil(page).saturating_mul(page);
+    pages(usize::from(entries) * size_of::<IoUringBuf>()).saturating_add(pages(
+        usize::from(entries).saturating_mul(buf_size as usize),
+    ))
+}
 /// Byte offset of the tail inside descriptor 0 (the `resv` field).
 const TAIL_OFFSET: usize = 14;
 
@@ -53,20 +75,17 @@ unsafe impl Send for BufMem {}
 unsafe impl Sync for BufMem {}
 
 impl BufMem {
-    /// Bytes `start..end` of buffer `bid`, or `None` when they are out of range.
-    ///
-    /// # Safety
-    ///
-    /// The buffer is not queued in its ring (a completion handed it out and it was not re-added
-    /// yet), so the kernel does not write it while the slice lives.
-    pub(crate) unsafe fn bytes(&self, bid: u16, start: u32, end: u32) -> Option<&[u8]> {
-        if bid >= self.entries || start > end || end > self.buf_size {
+    /// The first byte of buffer `bid`, or `None` when there is no such buffer. Its `buf_size`
+    /// bytes stay mapped as long as `self`; they may be read only while the buffer is not queued
+    /// in its ring (a completion handed it out and it was not re-added yet), so the kernel does
+    /// not write them meanwhile.
+    pub(crate) fn base(&self, bid: u16) -> Option<core::ptr::NonNull<u8>> {
+        if bid >= self.entries {
             return None;
         }
-        let at = usize::from(bid) * self.buf_size as usize + start as usize;
-        // SAFETY: the range lies inside the mapping (checked above), which lives as long as
-        // `self`; the caller's: the kernel does not write it now.
-        Some(unsafe { slice::from_raw_parts(self.map.as_ptr().add(at), (end - start) as usize) })
+        let at = usize::from(bid) * self.buf_size as usize;
+        // SAFETY: buffer `bid` lies inside the mapping, so the offset stays in it.
+        core::ptr::NonNull::new(unsafe { self.map.as_ptr().add(at) })
     }
 }
 
@@ -92,6 +111,28 @@ impl BufRing {
     /// registers them as group `bgid` on `ring` and returns the empty-looking ring: call
     /// [`BufRing::add`] for each buffer id, then [`BufRing::commit`], before arming a receive.
     pub(crate) fn new(ring: &Ring, bgid: u16, entries: u16, buf_size: u32) -> io::Result<BufRing> {
+        Self::registered(ring, bgid, entries, buf_size, 0)
+    }
+
+    /// As [`BufRing::new`], with incremental buffers: the kernel fills a buffer in pieces, one
+    /// completion each (`IORING_CQE_F_BUF_MORE` while room is left), and the application tracks
+    /// where the next piece starts. The kernel refuses it before Linux 6.12.
+    pub(crate) fn incremental(
+        ring: &Ring,
+        bgid: u16,
+        entries: u16,
+        buf_size: u32,
+    ) -> io::Result<BufRing> {
+        Self::registered(ring, bgid, entries, buf_size, IOU_PBUF_RING_INC)
+    }
+
+    fn registered(
+        ring: &Ring,
+        bgid: u16,
+        entries: u16,
+        buf_size: u32,
+        flags: u16,
+    ) -> io::Result<BufRing> {
         if !entries.is_power_of_two() || entries > MAX_ENTRIES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -110,12 +151,17 @@ impl BufRing {
                 io::Error::new(io::ErrorKind::InvalidInput, "the buffer pool is too large")
             })?;
         let ring_map = Mapping::anon(usize::from(entries) * size_of::<IoUringBuf>())?;
+        #[cfg(test)]
+        if NO_MEMORY_FOR_TEST.with(core::cell::Cell::get) {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
         let buf_map = Mapping::anon(buf_bytes)?;
         let ring_fd = ring.fd.try_clone()?;
         let reg = IoUringBufReg {
             ring_addr: ring_map.as_ptr().expose_provenance() as u64,
             ring_entries: u32::from(entries),
             bgid,
+            flags,
             ..IoUringBufReg::default()
         };
         // SAFETY: `reg` is a valid `io_uring_buf_reg` and `ring_map` is the page-aligned,
@@ -215,6 +261,33 @@ impl BufRing {
             addr_of_mut!((*desc).bid).write(bid);
         }
         self.pending += 1;
+        Ok(())
+    }
+
+    /// Queues every buffer, in id order, for the kernel to use: what [`BufRing::add`] of each id
+    /// does, in one pass. Fails, queuing none, when descriptors are queued and not committed.
+    pub(crate) fn add_all(&mut self) -> io::Result<()> {
+        if self.pending != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "more buffers were added than the ring holds",
+            ));
+        }
+        let descs = self.maps.0.as_ptr().cast::<IoUringBuf>();
+        let bufs = self.maps.1.map.as_ptr();
+        for bid in 0..self.entries {
+            let slot = self.tail.wrapping_add(bid) & (self.entries - 1);
+            let buf = bufs.wrapping_add(usize::from(bid) * self.buf_size as usize);
+            // SAFETY: as in `add`: `slot` is below `entries`, so the descriptor lies inside the
+            // ring mapping, and only `addr`, `len` and `bid` are written.
+            unsafe {
+                let desc = descs.add(usize::from(slot));
+                addr_of_mut!((*desc).addr).write(buf.expose_provenance() as u64);
+                addr_of_mut!((*desc).len).write(self.buf_size);
+                addr_of_mut!((*desc).bid).write(bid);
+            }
+        }
+        self.pending = self.entries;
         Ok(())
     }
 

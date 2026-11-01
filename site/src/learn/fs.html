@@ -5,16 +5,47 @@
 <!--example fs_whole-->
 
 <h2 id="file">Opening a file</h2>
-<p>A <a href="api:nuclei::fs::File"><code>File</code></a> is std's file in a <code>Handle</code>: <code>File::open</code> reads, <code>File::create</code> writes (creating or cutting the file), <code>File::create_new</code> fails if the file exists, and <a href="api:nuclei::fs::OpenOptions"><code>OpenOptions</code></a> sets the rest (append, truncate, the mode and the open flags on Unix). A file reads and writes through the <a href="io.html#traits">IO helpers</a> and has a cursor that <code>seek</code> moves.</p>
+<p>A <a href="api:nuclei::fs::File"><code>File</code></a> is std's file in a <code>Handle</code>: <code>File::open</code> reads, <code>File::create</code> writes (creating or cutting the file), <code>File::create_new</code> creates a file to read and write and fails if it exists, and <a href="api:nuclei::fs::OpenOptions"><code>OpenOptions</code></a> sets the rest (append, truncate, the mode and the open flags on Unix). A file reads and writes through the <a href="io.html#traits">IO helpers</a> and has a cursor that <code>seek</code> moves.</p>
 <!--example fs_file-->
 <ul>
-<li><code>flush</code> waits until the system has the bytes written behind; <code>sync_all</code> and <code>sync_data</code> put them on the device.</li>
+<li><code>flush</code> waits until the system has the bytes written behind; <code>sync_all</code> and <code>sync_data</code> put them on the device (<a href="#durable">Surviving a crash</a>).</li>
 <li><code>metadata</code>, <code>set_len</code>, <code>set_permissions</code>, <code>set_times</code> and <code>set_modified</code> work on the open file; <code>try_clone</code> gives a second handle with a cursor of its own.</li>
+<li>A read at the cursor sees the changes made beside it: bytes it read ahead before a positional write, a cut by <code>set_len</code>, an <code>allocate</code> or a copy into the file are never handed out after the change.</li>
 </ul>
 
 <h2 id="owned">Lending buffers</h2>
-<p>As on streams (<a href="proactive.html#lending">How it works</a>), <code>read_owned</code> and <code>write_owned</code> take your vector and give it back, so no byte is copied.</p>
+<p>As on streams (<a href="proactive.html#lending">How it works</a>), <code>read_owned</code> and <code>write_owned</code> take your buffer and give it back, so no byte is copied. The buffer is a <code>Vec&lt;u8&gt;</code>, an <code>AlignedBuf</code>, or a type of your own (<a href="io.html#owned">IO utilities</a>).</p>
 <!--example fs_owned-->
+
+<h2 id="positional">Reads and writes at an offset</h2>
+<p><a href="api:nuclei::io::Handle::read_at"><code>read_at</code></a> and <a href="api:nuclei::io::Handle::write_at"><code>write_at</code></a> read and write at an offset you give, on a shared reference to the handle, so any number of tasks may use one file at once. They never read or move the cursor. <code>read_exact_at</code> and <code>write_all_at</code> do the whole length, and <code>read_at_owned</code> and <code>write_at_owned</code> lend your buffer.</p>
+<!--example fs_positional-->
+<ul>
+<li>A positional call lands after every write accepted at the cursor before it, and a read sees every positional write that returned before it. Two positional writes running at once land in either order, as two threads' <code>pwrite</code> calls do.</li>
+<li>A positional write whose future is dropped still lands, and every later call of the handle waits for it.</li>
+<li><code>read_at</code> and <code>write_at</code> go through a buffer of the runtime's pool, at most 64 KiB a call; the owned forms use your buffer itself.</li>
+<li><a href="api:nuclei::io::Handle::read_many_at"><code>read_many_at</code></a> makes many reads in one call and gives each buffer back in order with its result. On io_uring they go to the kernel together, at most 64 out at once.</li>
+<li>These are the async calls, and they shadow std's <code>FileExt::read_at</code> and <code>write_at</code>, which the handle reaches through <code>Deref</code> and which block the worker. std's stay reachable as <code>(*file).read_at(..)</code>.</li>
+</ul>
+
+<h2 id="durable">Surviving a crash</h2>
+<p><a href="api:nuclei::io::Handle::sync_all"><code>sync_all</code></a> writes the file's data and metadata through to the device, and <code>sync_data</code> its data, once every write accepted before the call landed. A file's sync does not cover its name in its directory; <a href="api:nuclei::fs::sync_dir"><code>fs::sync_dir</code></a> does. To replace a file so a crash leaves the old contents or the new and never a mix, write a temporary file in the same directory, sync it, rename it over the target, then sync the directory.</p>
+<!--example fs_durable-->
+<p>Once a sync of a handle failed, every later sync of it fails with the same error, since the system reports a lost write-back only once. Open the file again to start over.</p>
+
+<h2 id="space">Space, write-back and copies</h2>
+<p><a href="api:nuclei::io::Handle::allocate"><code>allocate</code></a> changes the space a range of the file uses, as its <a href="api:nuclei::fs::Allocate"><code>Allocate</code></a> mode says: <code>Extend</code> reserves it and grows the file, <code>KeepSize</code> reserves it and keeps the length, <code>PunchHole</code> frees it, and <code>ZeroRange</code> makes it read as zeros. A system that cannot do a mode answers <code>Unsupported</code> (macOS cannot zero a range in place), and a file system may refuse one with its own error.</p>
+<p><a href="api:nuclei::io::Handle::sync_range"><code>sync_range</code></a> writes a range back and waits for it; it writes no metadata, so it is not a durability guarantee. <a href="api:nuclei::io::Handle::copy_range_to"><code>copy_range_to</code></a> copies a range into another file, in the kernel where the system can, in chunks of at most 16 MiB, and moves neither cursor.</p>
+<!--example fs_space-->
+
+<h2 id="locks">Locks</h2>
+<p><a href="api:nuclei::io::Handle::lock_file"><code>lock_file</code></a> takes an advisory lock on the whole file, shared or exclusive, and waits for it on the blocking pool so the worker runs on. A future dropped while it waits never leaves the file locked with nobody to release it. <a href="api:nuclei::io::Handle::try_lock_file"><code>try_lock_file</code></a> answers at once, with <code>WouldBlock</code> when another holder has the lock, and <a href="api:nuclei::io::Handle::unlock_file"><code>unlock_file</code></a> releases it once the writes before it landed.</p>
+<!--example fs_lock-->
+<p>std's own <code>lock</code>, <code>try_lock</code> and <code>unlock</code> stay reachable through <code>Deref</code>; std's <code>lock</code> blocks the worker while it waits.</p>
+
+<h2 id="direct">Direct IO</h2>
+<p>A file opened for direct IO (<code>O_DIRECT</code> on Linux, <code>FILE_FLAG_NO_BUFFERING</code> on Windows) skips the system's page cache. Nuclei reads and writes it with exactly your lengths and offsets, with no read-ahead and no write-behind, so the kernel's alignment rules apply to your calls as they would to your own system calls: the memory's address, the offset and the length are multiples of the device's block size. <a href="api:nuclei::io::AlignedBuf"><code>AlignedBuf</code></a> gives memory at the alignment you ask for.</p>
+<!--example fs_direct-->
 
 <h2 id="dirs">Directories</h2>
 <p><code>create_dir</code>, <code>create_dir_all</code> and <a href="api:nuclei::fs::DirBuilder"><code>DirBuilder</code></a> (recursive, with a mode on Unix) make them; <code>remove_dir</code> and <code>remove_dir_all</code> take them away. <code>read_dir</code> streams the entries a page at a time, so a directory of any size is read without holding it all.</p>
@@ -22,4 +53,4 @@
 <p>Links: <code>hard_link</code>, <code>read_link</code> and <code>canonicalize</code>, <code>symlink</code> on Unix, <code>symlink_file</code> and <code>symlink_dir</code> on Windows.</p>
 
 <h2 id="where">Where file IO runs</h2>
-<p>A regular file is always ready to the kernel, so no poller can say when its IO would wait. On io_uring a file's reads and writes go to the shard's ring; on the other backends each is a job of the blocking pool, at the handle's own cursor. Calls by path, and the calls beside a file's reads and writes, run on the blocking pool. A <code>File</code> that is not a regular file (a FIFO, a terminal, a pipe) is a byte stream the driver serves like a socket.</p>
+<p>A regular file is always ready to the kernel, so no poller can say when its IO would wait. On io_uring a file's reads and writes, at the cursor and at an offset, its syncs, <code>sync_range</code> and <code>allocate</code> are operations of the shard's ring; on the other backends each is a job of the blocking pool. Calls by path, <code>lock_file</code>, <code>copy_range_to</code> and the file's other calls run on the blocking pool; <code>try_lock_file</code> runs on the calling thread, since it never waits. A <code>File</code> that is not a regular file (a FIFO, a terminal, a pipe) is a byte stream the driver serves like a socket.</p>

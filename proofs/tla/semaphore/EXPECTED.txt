@@ -1,7 +1,8 @@
 # configuration                spec                 expected
 L_barge                        MC_Semaphore         pass
-L_pair                         MC_Semaphore         pass
-L_cancel                       MC_Semaphore         pass
+L_pair                         MC_SemaphoreSym      pass
+L_pair_live                    MC_Semaphore         pass
+L_cancel                       MC_SemaphoreSym      pass
 L_cancel_live                  MC_Semaphore         pass
 L_weighted                     MC_Semaphore         pass
 L_close                        MC_Semaphore         pass

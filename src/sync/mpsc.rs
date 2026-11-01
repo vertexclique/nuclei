@@ -91,8 +91,20 @@
 //!   progress on another thread. Such a value is not in the channel yet, and
 //!   its sender wakes the receiver when it is; the established API parks the
 //!   thread until the send finishes.
-//! - There is no cooperative-scheduling budget: a receiver that always finds a
-//!   value never yields.
+//!
+//! # Cooperative scheduling
+//!
+//! On a nuclei shard, every receive that completes (`recv`, `recv_many` and
+//! the two `poll_` forms) spends one operation of its task's cooperative
+//! budget, as IO does, and so does a send or a reservation that completes
+//! at its first attempt; one whose slots were granted after it waited in
+//! line spends nothing, as giving them back would cost it its place. When
+//! the budget is spent the call takes nothing, wakes its task and returns
+//! `Pending`, so a loop on a channel that is always ready yields to the
+//! shard's other tasks within [`BUDGET`](crate::task::coop::BUDGET)
+//! operations. [`Receiver::try_recv`], [`Sender::try_send`] and the other
+//! calls that never wait spend nothing, and off a nuclei shard there is no
+//! budget: nothing yields for it.
 //!
 //! # Progress
 //!

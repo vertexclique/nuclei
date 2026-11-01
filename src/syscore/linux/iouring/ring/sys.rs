@@ -339,6 +339,8 @@ pub(crate) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 pub(crate) const IORING_CQE_F_MORE: u32 = 1 << 1;
 pub(crate) const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
 pub(crate) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
+/// The buffer a completion used has room left: the next completion on its group continues in it.
+pub(crate) const IORING_CQE_F_BUF_MORE: u32 = 1 << 4;
 pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
 // io_uring_register opcodes.
@@ -354,6 +356,10 @@ pub(crate) const IORING_REGISTER_FILES_UPDATE2: u32 = 14;
 /// `io_uring_rsrc_register.flags`: register an empty table.
 pub(crate) const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 pub(crate) const IORING_UNREGISTER_PBUF_RING: u32 = 23;
+
+/// `io_uring_buf_reg.flags`: the kernel fills each buffer in pieces, completing with
+/// `IORING_CQE_F_BUF_MORE` while it has room (Linux 6.12).
+pub(crate) const IOU_PBUF_RING_INC: u16 = 2;
 
 // mmap offsets of the ring regions.
 pub(crate) const IORING_OFF_SQ_RING: u64 = 0;
@@ -595,21 +601,38 @@ pub(crate) unsafe fn io_uring_enter(
     argsz: usize,
 ) -> io::Result<u32> {
     // SAFETY: the caller upholds the contract on `arg` and `argsz`.
-    let r = unsafe {
-        libc::syscall(
+    unsafe { enter_syscall(fd, to_submit, min_complete, flags, arg, argsz) }
+}
+
+/// The `io_uring_enter` system call, issued directly (see `io::sys::syscall`: the libc wrapper's
+/// variadic call and errno round trip cost a few dozen instructions in every wait).
+///
+/// # Safety
+/// As for [`io_uring_enter`].
+#[inline]
+unsafe fn enter_syscall(
+    fd: RawFd,
+    to_submit: u32,
+    min_complete: u32,
+    flags: u32,
+    arg: *const c_void,
+    argsz: usize,
+) -> io::Result<u32> {
+    // SAFETY: the caller upholds the contract on `arg` and `argsz`.
+    unsafe {
+        crate::io::sys::syscall(
             libc::SYS_io_uring_enter,
-            fd as libc::c_long,
-            to_submit as libc::c_long,
-            min_complete as libc::c_long,
-            flags as libc::c_long,
-            arg,
-            argsz,
+            [
+                fd as usize,
+                to_submit as usize,
+                min_complete as usize,
+                flags as usize,
+                arg as usize,
+                argsz,
+            ],
         )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
     }
-    Ok(r as u32)
+    .map(|n| n as u32)
 }
 
 /// `io_uring_register(2)`; returns what the kernel returned.

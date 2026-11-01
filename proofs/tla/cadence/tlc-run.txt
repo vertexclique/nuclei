@@ -1,0 +1,13 @@
+TLC run of every configuration in proofs/tla/cadence, 2026-10-29 19:56 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+G_bounded                          145         82      1  pass                                  pass                                  yes
+M_no_first_drive                    72         56      1  violated:Bounded                      violated:Bounded                      yes
+M_no_time_rule                      83         56      1  violated:Bounded                      violated:Bounded                      yes
+W_first_drive                       11         10      1  violated:NoFirstDrive                 violated:NoFirstDrive                 yes
+W_time_drive                        25         21      1  violated:NoTimeDrive                  violated:NoTimeDrive                  yes
+W_wait_reaches_worst                37         28      1  violated:WaitBelowWorst               violated:WaitBelowWorst               yes
+
+results matching EXPECTED.txt: 6 of 6

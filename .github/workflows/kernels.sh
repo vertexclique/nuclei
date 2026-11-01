@@ -32,11 +32,11 @@ if [[ $series == ubuntu-24.04 ]]; then
 else
     # The series' releases, newest first; the first with an amd64 kernel package is the one.
     pattern="v${series//./\\.}(\\.[0-9]+)?"
-    mapfile -t releases < <(curl -fsSL "$base/" | grep -oE "href=\"$pattern/\"" |
+    mapfile -t releases < <(curl -fsSL --retry 4 --retry-all-errors --max-time 60 "$base/" | grep -oE "href=\"$pattern/\"" |
         sed -E 's/^href="(v[^/]+)\/"$/\1/' | sort -Vr)
     version=""
     for release in "${releases[@]}"; do
-        if curl -fsSL "$base/$release/amd64/" 2>/dev/null | grep -qE 'linux-image-[^"]*generic[^"]*_amd64\.deb'; then
+        if curl -fsSL --retry 4 --retry-all-errors --max-time 60 "$base/$release/amd64/" 2>/dev/null | grep -qE 'linux-image-[^"]*generic[^"]*_amd64\.deb'; then
             version=$release
             break
         fi
@@ -54,14 +54,28 @@ mapfile -t bins < <(cargo test -p nuclei --no-run --message-format=json 2>/dev/n
 runner=$PWD/target/kernels-run.sh
 {
     echo '#!/bin/sh'
-    echo 'set -e'
     echo 'uname -r'
+    # Every binary runs on every pass, and the run fails at the end if any failed, so one
+    # failure never hides the ones after it.
+    echo 'failed=0'
     for bin in "${bins[@]}"; do
         for pass in "${passes[@]}"; do
             echo "echo '== $(basename "$bin") on ${pass%%|*}'"
-            echo "${pass#*|} '$bin' --test-threads=4"
+            echo "${pass#*|} '$bin' --test-threads=4 || { echo 'FAILED: $(basename "$bin") on ${pass%%|*}'; failed=1; }"
         done
     done
+    echo 'exit $failed'
 } >"$runner"
 chmod +x "$runner"
+# The kernel comes from kernel.ubuntu.com, which sometimes stalls mid-download. Fetch it first,
+# with a few tries, by booting it to run nothing; virtme-ng keeps what it fetched under
+# ~/.cache/virtme-ng/<version>, so the run below boots the same kernel without downloading, and a
+# stalled mirror never reads as a failed test. A try that fails drops that directory, since
+# virtme-ng skips a package file that exists, even one cut off mid-download.
+for try in 1 2 3; do
+    vng --run "$version" --memory 1G --cpus 1 -- true && break
+    rm -rf "$HOME/.cache/virtme-ng/$version"
+    ((try < 3)) || { echo "kernel $version could not be fetched from $base" >&2; exit 2; }
+    sleep $((try * 30))
+done
 vng --run "$version" --memory 4G --cpus 4 -- "$runner"

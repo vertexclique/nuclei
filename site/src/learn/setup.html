@@ -36,6 +36,7 @@ iouring: The io_uring driver, on Linux and Android. Without it those systems run
 epoll: Names epoll beside <code>iouring</code>. Epoll is built on Linux either way.
 attributes: <code>#[nuclei::main]</code>, <code>#[nuclei::test]</code> and <code>#[nuclei::bench]</code>.
 recycle: Node memory of the lock-free queues, maps and channels underneath, from a per-thread cache instead of the global allocator.
+io-stats: Each worker's IO in <code>stats</code>: counts of its operations and bytes, and IO latencies when recorded (<a href="production.html#io-stats">Production</a>). Off by default; without it no IO path carries counting or timing code.
 <!--/features-->
 <p><code>recycle</code> is for applications: cargo turns a feature on for every user of a crate in a build, so a library that enabled it would enable it for all of them.</p>
 <!--code toml Cargo.toml-->

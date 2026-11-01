@@ -136,13 +136,16 @@ fn the_backend_choice_sees_a_refused_buffer_ring() {
         assert!(why.contains(FEATURE), "{why}");
         assert_eq!(usable_with(config(0)), Ok(()));
         let refused = || usable_with(config(256));
-        assert!(matches!(decide(None, None, refused), Ok(Backend::Poll)));
-        let err = decide(None, Some(IoBackend::IoUring), refused).unwrap_err();
+        assert!(matches!(
+            decide(None, None, refused, super::ring),
+            Ok(Backend::Poll)
+        ));
+        let err = decide(None, Some(IoBackend::IoUring), refused, super::ring).unwrap_err();
         assert!(err.contains(FEATURE), "{err}");
-        let err = decide(Some("io_uring"), None, refused).unwrap_err();
+        let err = decide(Some("io_uring"), None, refused, super::ring).unwrap_err();
         assert!(err.contains(FEATURE), "{err}");
         assert!(matches!(
-            decide(None, None, || usable_with(config(0))),
+            decide(None, None, || usable_with(config(0)), super::ring),
             Ok(Backend::RingOrPoll(_))
         ));
     }) else {

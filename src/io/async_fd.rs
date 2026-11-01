@@ -416,11 +416,10 @@ mod tests {
 
     use super::*;
 
+    /// Whether this thread's shard, which serves the test's descriptor, runs a ring: other tests
+    /// may run shards on the poller meanwhile.
     fn on_ring() -> bool {
-        crate::stats()
-            .shards
-            .iter()
-            .all(|shard| shard.backend == crate::IoBackend::IoUring)
+        crate::Proactor::backend() == crate::IoBackend::IoUring
     }
 
     /// An edge that comes between a call that would block and the clear of

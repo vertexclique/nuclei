@@ -22,7 +22,8 @@ MQ_expect_with_req             MC_Requests          violated:Closed
 MQ_perform_with_one_side       MC_Requests          violated:NoUseOfClosed
 MQ_drop_closes_at_once         MC_Requests          violated:NoUseOfClosed
 WQ_holder_close                MC_Requests          violated:NoHolderClose
-WQ_hand_over                   MC_Requests          violated:NoHandOver
+WQ_lease_drops                 MC_Requests          violated:NoLeaseDrop
 MQ_write_holder_takes_read     MC_Requests          violated:Termination
 MQ_linger_forgets              MC_Requests          violated:Termination
 WQ_linger_waits                MC_Requests          violated:NoLingerWait
+MQ_ignore_leases               MC_Requests          violated:NoUseOfClosed

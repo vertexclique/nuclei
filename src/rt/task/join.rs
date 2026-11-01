@@ -24,9 +24,10 @@ use crate::sync::internal::Ordering;
 ///
 /// # Panics
 ///
-/// Awaiting a task that its runtime dropped before it completed (the
-/// runtime shut down) panics; [`fallible`](Self::fallible) gives a handle
-/// that returns `None` instead.
+/// Awaiting a task that was cancelled before it completed (through an
+/// [`AbortHandle`], or by its runtime's shutdown) panics;
+/// [`join`](Self::join) answers a [`JoinError`] instead, and
+/// [`fallible`](Self::fallible) gives a handle that returns `None`.
 #[must_use = "dropping a task cancels it; call `detach` to let it run"]
 pub struct Task<T> {
     ptr: NonNull<()>,
@@ -62,10 +63,32 @@ impl<T> Task<T> {
     }
 
     /// Lets the task run to its end without a handle; its output is dropped.
+    #[inline(always)]
     pub fn detach(self) {
         let mut this = ManuallyDrop::new(self);
-        let output = this.set_detached();
-        drop(output);
+        // A handle detached right after the spawn is the common case: one
+        // exchange, inline.
+        if this
+            .header()
+            .state
+            .compare_exchange_weak(
+                SCHEDULED | TASK | REFERENCE,
+                SCHEDULED | REFERENCE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        this.detach_late();
+    }
+
+    /// A detach after the task ran, was woken or completed: out of line, so
+    /// the exchange above needs no frame.
+    #[inline(never)]
+    fn detach_late(&mut self) {
+        drop(self.set_detached());
     }
 
     /// Cancels the task and waits for its future to be dropped. Returns the
@@ -260,6 +283,7 @@ impl<T> Task<T> {
 
     /// `Some(output)` once the task completed (resuming a panic of its
     /// future), `None` once it was closed without an output for the handle.
+    #[inline(always)]
     fn poll_task(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         match self.poll_raw(cx) {
             Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(output)),
@@ -272,6 +296,7 @@ impl<T> Task<T> {
     /// The output once the task completed (or the panic of its future),
     /// `None` once it was closed without an output for the handle (cancelled,
     /// or dropped by its runtime) and its future is gone.
+    #[inline(always)]
     fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, Panic>>> {
         let header = self.header();
         let mut state = header.state.load(Ordering::Acquire);
@@ -320,7 +345,25 @@ impl<T> Task<T> {
 }
 
 impl<T> Drop for Task<T> {
+    #[inline]
     fn drop(&mut self) {
+        // The output taken and every reference gone, nothing but the handle
+        // reaches the task and its word cannot change: what the cancel and the
+        // detach below would end in, the free, comes at once.
+        if self.header().state.load(Ordering::Acquire) == COMPLETED | CLOSED | TASK {
+            // SAFETY: the handle is the task's last holder.
+            unsafe { (self.header().vtable.destroy)(self.ptr.as_ptr().cast_const()) };
+            return;
+        }
+        self.cancel_and_let_go();
+    }
+}
+
+impl<T> Task<T> {
+    /// The drop of a handle whose task may still run or hold its output:
+    /// out of line, so the drop of an awaited handle carries none of it.
+    #[inline(never)]
+    fn cancel_and_let_go(&mut self) {
         self.set_canceled();
         drop(self.set_detached());
     }
@@ -333,6 +376,7 @@ impl<T> Future for Task<T> {
         clippy::panic,
         reason = "documented under `# Panics` of `Task`; `Task::fallible` answers `None` instead"
     )]
+    #[inline(always)]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
         match self.poll_task(cx) {
             Poll::Ready(Some(output)) => Poll::Ready(output),

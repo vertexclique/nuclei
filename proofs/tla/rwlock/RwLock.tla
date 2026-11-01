@@ -24,6 +24,13 @@
 (* owe-or-take and its settling, a withdrawal, and the drain's passes with *)
 (* each grant and nudge. What is abstract, as in the semaphore model: the  *)
 (* spin before queueing, the node's waker handshake, and the list's sweep. *)
+(*                                                                          *)
+(* States that differ only in what nobody reads again are kept as one: a   *)
+(* step's own working values go back to where they started once read for   *)
+(* the last time, and a node is forgotten (its marks go back to where they *)
+(* started) once its future and the queue are both done with it: as a      *)
+(* pass lets a withdrawn node go, and as a future takes or gives back its  *)
+(* grant.                                                                  *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -32,7 +39,9 @@ CONSTANTS
     MaxBypass,  \* MAX_BYPASS
     Mutation    \* "none", or the name of the one rule this run takes away
 
-Tasks == 1..Len(Prog)
+\* The tasks are the names Prog gives programs to: 1, 2, ... for a sequence, or
+\* model values (MC_RwLockSym), which a symmetry set can swap.
+Tasks == DOMAIN Prog
 \* One request per operation, and one for each upgrade's own wait.
 Reqs == UNION {{<<t, j>> : j \in 1..Len(Prog[t])} : t \in Tasks}
         \cup UNION {{<<t, j + 100>> : j \in {i \in 1..Len(Prog[t]) : Prog[t][i] = "upgrade"}} : t \in Tasks}
@@ -72,6 +81,8 @@ variables
 define
     State == [readers |-> readers, writer |-> writer, upgradable |-> upgradable,
               upgrading |-> upgrading]
+    \* The word of a free lock: where a pass's sharing walk starts from, before it walks.
+    FreeWord == [readers |-> 0, writer |-> FALSE, upgradable |-> FALSE, upgrading |-> FALSE]
     Admits(k, s) ==
         CASE k = "read" -> ~s.writer /\ (~s.upgrading \/ Mutation = "read_ignores_upgrading")
           [] k = "write" -> ~s.writer /\ ~s.upgradable /\ s.readers = 0
@@ -99,11 +110,33 @@ define
     NoStrandedArrival == \A r \in Range(arrivals) : enqueued[r] => draining
     AllDone == \A t \in Tasks : pc[t] = "Done"
     FreeAtEnd == AllDone => ~writer /\ ~upgradable /\ ~upgrading /\ readers = 0
-    AllTasksEnd == <>AllDone
+    \* Once every task ended, no waiter is counted owed a handoff any more: each
+    \* owed mark was settled as its node left the queue, so nothing holds a
+    \* later reader or writer back.
+    OwedSettled == AllDone => owedCount = 0
+    \* Every task ends. Once every task is at its end it stays there (an ended
+    \* task takes no step, under every mutation too), so "in the end, all are
+    \* ended" is the same as "all are ended again and again", which TLC checks
+    \* directly, without the extra machinery an "in the end" needs.
+    AllTasksEnd == []<>AllDone
     \* Witnesses.
     NoUpgradeWait == ~upgradeWaited
     NoDowngrade == ~downgraded
 end define;
+
+\* `forget`: the nodes in S are done with. Their futures will not look at them
+\* again (a future looks at its node only while it asks), and the queue let
+\* them go (it looks only at the nodes on its stack, its list and the upgrade's
+\* slot), so their marks go back to where they started: two states that differ
+\* only in what a finished node carried are one state.
+macro forget(S) begin
+    phase := [x \in Reqs |-> IF x \in S THEN "none" ELSE phase[x]];   \* as if never queued
+    nudged := [x \in Reqs |-> nudged[x] /\ x \notin S];              \* no nudge left on it
+    owed := [x \in Reqs |-> owed[x] /\ x \notin S];                  \* no owed mark left on it
+    kind := [x \in Reqs |-> IF x \in S THEN "read" ELSE kind[x]];     \* its first kind again
+    woken := [x \in Reqs |-> woken[x] /\ x \notin S];                \* no wake on its way
+    enqueued := [x \in Reqs |-> enqueued[x] /\ x \notin S];          \* no enqueue recorded
+end macro;
 
 macro claimOrDirty(claimed) begin
     if draining then
@@ -115,8 +148,10 @@ macro claimOrDirty(claimed) begin
     end if;
 end macro;
 
+\* (The withdrawn nodes a pass lets go, and the front a handoff looks at, are
+\* named within their one step, so they are not kept between steps.)
 procedure Drain()
-variables wfBefore = FALSE, wl = {}, gone = {}, front = NoReq, at = 1, sharing = State,
+variables wfBefore = FALSE, wl = {}, at = 1, sharing = FreeWord,
           raised = FALSE, sent = FALSE, noneLeft = FALSE;
 begin
 D_clear:
@@ -125,13 +160,28 @@ D_clear:
     wakeFront := FALSE;
 D_absorb:
     \* A dropped upgrade's node goes first; an arriving upgrade takes the slot.
-    gone := {r \in Range(arrivals) : phase[r] = "cancelled"};
-    upgSlot := IF \E r \in Range(arrivals) \ gone : kind[r] = "upgrade"
-               THEN CHOOSE r \in Range(arrivals) \ gone : kind[r] = "upgrade"
-               ELSE IF upgSlot # NoReq /\ phase[upgSlot] = "cancelled" THEN NoReq ELSE upgSlot;
-    list := SelectSeq(list \o arrivals, LAMBDA r : phase[r] # "cancelled" /\ kind[r] # "upgrade");
-    arrivals := <<>>;
-    owedCount := owedCount - Cardinality({r \in gone \cup {x \in Range(list) : phase[x] = "cancelled"} : owed[r]});
+    with gone = {r \in Range(arrivals) : phase[r] = "cancelled"},    \* the withdrawn arrivals
+         left = {r \in Range(list) \cup Range(arrivals) : phase[r] = "cancelled"} do  \* all of them
+        upgSlot := IF \E r \in Range(arrivals) \ gone : kind[r] = "upgrade"
+                   THEN CHOOSE r \in Range(arrivals) \ gone : kind[r] = "upgrade"
+                   ELSE IF upgSlot # NoReq /\ phase[upgSlot] = "cancelled" THEN NoReq ELSE upgSlot;
+        list := SelectSeq(list \o arrivals, LAMBDA r : phase[r] # "cancelled" /\ kind[r] # "upgrade");
+        arrivals := <<>>;
+        \* Every withdrawn node on the stack and the list leaves both here (an
+        \* upgrade is never withdrawn, so none of them is the upgrade's). The
+        \* queue letting a node go settles its owed mark (`release_queued`, in
+        \* src/sync/waiter/node.rs, forgives it), so each owed one is counted out.
+        \* MUTATION absorb_after_sweep: the count looks at the list after it was
+        \* swept, where no withdrawn node is left, so an owed node withdrawn on
+        \* the list stays counted for good.
+        if Mutation = "absorb_after_sweep" then
+            owedCount := owedCount - Cardinality({r \in gone \cup {x \in Range(list) : phase[x] = "cancelled"}
+                                                  : owed[r]});
+        else
+            owedCount := owedCount - Cardinality({r \in left : owed[r]});
+        end if;
+        forget(left);
+    end with;
 D_upgrade:
     \* The upgrade is granted once the last reader left.
     if upgSlot # NoReq /\ upgrading /\ (readers = 0 \/ Mutation = "upgrade_over_readers") then
@@ -143,7 +193,7 @@ D_upgrade:
     end if;
 D_handoff:
     if handoffBit /\ list # <<>> then
-        front := Head(list);
+      with front = Head(list) do    \* the front waiter, named for this step only
         if Admits(kind[front], State) then
             list := Tail(list);
             if owed[front] then
@@ -164,9 +214,11 @@ D_handoff:
                     goto D_handoff;
                 end if;
             else
+                forget({front});    \* withdrawn: its future left it, the queue lets it go
                 goto D_handoff;
             end if;
         end if;
+      end with;
     end if;
 D_nudgeStart:
     if ~(handoffBit /\ owedCount > 0) /\ list # <<>> then
@@ -209,8 +261,11 @@ D_nudgeEnd:
     end if;
 D_end:
     noneLeft := (\A k \in 1..Len(list) : phase[list[k]] = "cancelled") /\ upgSlot = NoReq;
+    \* The nudge walk's values are read for the last time: back to their start.
+    wfBefore := FALSE; at := 1; sharing := FreeWord; raised := FALSE; sent := FALSE;
 D_exit:
     if dirty /\ Mutation # "exit_ignores_dirty" then
+        noneLeft := FALSE;    \* read: the next pass computes it again
         goto D_clear;
     elsif ~noneLeft /\ wakeFront then
         goto D_clear;
@@ -223,9 +278,11 @@ D_exit:
             queuedBit := FALSE;
             wakeFront := FALSE;
         end if;
+        noneLeft := FALSE;    \* read for the last time
     end if;
 D_wake:
-    woken := [r \in Reqs |-> woken[r] \/ r \in wl];
+    \* A wake reaches the futures still asking; a forgotten node's wakes nobody.
+    woken := [r \in Reqs |-> woken[r] \/ (r \in wl /\ phase[r] # "none")];
     return;
 end procedure;
 
@@ -298,6 +355,7 @@ Q_enqTr:
     claimOrDirty(claimed);
 Q_enqDrain:
     if claimed then
+        claimed := FALSE;    \* read: back to its start
         call Drain();
     end if;
 Q_park:
@@ -305,6 +363,7 @@ Q_park:
         nudgeOut := FALSE;
         held[self] := ak;
         pending[ar] := "none";
+        forget({ar});    \* granted and taken: the queue let it go at the grant
         return;
     elsif nudged[ar] then
         nudged[ar] := FALSE;
@@ -378,10 +437,12 @@ Q_settleTr:
     end if;
 Q_settleDrain:
     if claimed then
+        claimed := FALSE;    \* read: back to its start
         call Drain();
     end if;
 Q_after:
     if took then
+        took := FALSE; marked := FALSE; seenHandoff := FALSE;    \* read for the last time
         goto Q_won;
     end if;
 Q_lost:
@@ -391,6 +452,7 @@ Q_lost:
             counted[ar] := counted[ar] + 1;
         end if;
     end if;
+    marked := FALSE; took := FALSE; seenHandoff := FALSE;    \* read for the last time
     goto Q_park;
 Q_won:
     if phase[ar] = "waiting" then
@@ -406,6 +468,7 @@ Q_won:
     end if;
 Q_undo:
     pending[ar] := "none";
+    forget({ar});    \* given back: its future is done with it, the queue let it go
     call Unlock(ak, FALSE);
     return;
 Q_withdraw:
@@ -417,6 +480,7 @@ Q_withdraw:
         nudgeOut := FALSE;
         held[self] := ak;
         pending[ar] := "none";
+        forget({ar});    \* granted as it is dropped: the queue let it go at the grant
         goto Q_dropGrant;
     else
         return;
@@ -429,6 +493,7 @@ Q_wdTr:
     if wasNudged then
         wakeFront := TRUE;
     end if;
+    wasNudged := FALSE;    \* read for the last time
     claimOrDirty(claimed);
 Q_wdDrain:
     if claimed then
@@ -465,6 +530,7 @@ G_enqTr:
     claimOrDirty(claimed);
 G_enqDrain:
     if claimed then
+        claimed := FALSE;    \* read: back to its start
         call Drain();
     end if;
 G_park:
@@ -476,6 +542,7 @@ G_finish:
     upgrading := FALSE;
     writer := TRUE;
     held[self] := "write";
+    forget({ur});    \* the upgrade's node: the slot let it go at the grant
     return;
 end procedure;
 

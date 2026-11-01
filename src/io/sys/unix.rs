@@ -13,9 +13,16 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream, UdpSocket};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::{self as unix, UnixDatagram};
-use std::path::Path;
+use std::os::unix::net as unix;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod linux;
+mod unix_addr;
+#[cfg(ring)]
+pub(crate) use self::linux::end_queued;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use self::linux::{UNIX_INQ, enable_inq, read_inq, syscall};
+pub(crate) use self::unix_addr::{UnixAddr, unix_addr};
 
 /// A std socket of type `S` over `fd` for one call, never closed by it.
 ///
@@ -30,32 +37,50 @@ unsafe fn borrow<S: FromRawFd>(fd: RawFd) -> ManuallyDrop<S> {
 
 /// The answer of a call that may have to wait: `None` for "not now"
 /// (`EAGAIN`, `EWOULDBLOCK`), or the call's result (an error counted for
-/// `stats`).
+/// `stats`). Always inlined: it decides every call's result on the read
+/// and write paths.
+#[inline(always)]
 pub(crate) fn ready<T>(result: io::Result<T>) -> Option<io::Result<T>> {
     match result {
         // The code itself, not std's kind (which is decoded from it).
         Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK) => {
             None
         }
-        Err(e) => {
-            crate::rt::counters::io_error(&e);
-            Some(Err(e))
-        }
+        Err(e) => Some(Err(counted(e))),
         ok => Some(ok),
     }
 }
 
+/// Counts a call's failure `e` for `stats`, and hands it back.
+#[cold]
+#[inline(never)]
+fn counted(e: io::Error) -> io::Error {
+    crate::rt::counters::io_error(&e);
+    e
+}
+
 /// Makes `call` again while a signal cuts it short.
-fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+#[inline(always)]
+pub(super) fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     loop {
         match call() {
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // The code itself, not std's kind (which is decoded from it).
+            Err(e) if interrupted(&e) => {}
             other => return other,
         }
     }
 }
 
-fn cvt(ret: isize) -> io::Result<usize> {
+/// Whether a call was cut short by a signal.
+#[inline(always)]
+pub(super) fn interrupted(e: &io::Error) -> bool {
+    match e.raw_os_error() {
+        Some(code) => code == libc::EINTR,
+        None => e.kind() == io::ErrorKind::Interrupted,
+    }
+}
+
+pub(super) fn cvt(ret: isize) -> io::Result<usize> {
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -63,7 +88,7 @@ fn cvt(ret: isize) -> io::Result<usize> {
     }
 }
 
-fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
+pub(super) fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -71,16 +96,61 @@ fn cvt_int(ret: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
-/// `read(2)` (also a stream socket's receive).
+/// `read(2)` of up to `len` bytes into `buf`, made as a system call on Linux
+/// (see [`syscall`]).
+///
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes.
+#[inline]
+unsafe fn read_raw(fd: RawFd, buf: *mut u8, len: usize) -> io::Result<usize> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: as the caller's.
+    return unsafe { syscall(libc::SYS_read, [fd as usize, buf as usize, len, 0, 0, 0]) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: as the caller's.
+    return cvt(unsafe { libc::read(fd, buf.cast(), len) });
+}
+
+/// `read(2)` (also a stream socket's receive). Inlined: a call a signal cut
+/// short is made again out of line.
+#[inline(always)]
 pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
-    retry(|| cvt(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }))
+    match unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) } {
+        Err(e) if interrupted(&e) => read_again(fd, buf),
+        other => other,
+    }
+}
+
+/// [`read`] once a signal cut it short.
+#[cold]
+#[inline(never)]
+fn read_again(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: writes at most `buf.len()` bytes into `buf`.
+    retry(|| unsafe { read_raw(fd, buf.as_mut_ptr(), buf.len()) })
+}
+
+/// `recv(2)` with `MSG_PEEK`: a stream's bytes, left on the socket.
+pub(crate) fn peek(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: writes at most `buf.len()` bytes into `buf`.
+    retry(|| cvt(unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_PEEK) }))
 }
 
 /// `write(2)`.
 pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     // SAFETY: reads at most `buf.len()` bytes from `buf`.
     retry(|| cvt(unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) }))
+}
+
+/// `writev(2)` of `bufs` in order (one call, the first `IOV_MAX` slices).
+pub(crate) fn write_bufs(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    if let [one] = bufs {
+        return write(fd, one);
+    }
+    let count = bufs.len().min(IOV_MAX) as libc::c_int;
+    // SAFETY: `IoSlice` is `iovec` on unix; the kernel reads at most the
+    // lengths of the first `count` slices.
+    retry(|| cvt(unsafe { libc::writev(fd, bufs.as_ptr().cast(), count) }))
 }
 
 #[cfg(any(
@@ -101,19 +171,94 @@ pub(crate) const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
     target_os = "openbsd",
     target_os = "dragonfly"
 )))]
-const SEND_FLAGS: libc::c_int = 0;
+pub(crate) const SEND_FLAGS: libc::c_int = 0;
 
 /// `send(2)`, never raising `SIGPIPE` for a closed peer (the error comes
 /// back as `BrokenPipe` instead).
+#[inline]
 pub(crate) fn send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
-    // SAFETY: reads at most `buf.len()` bytes from `buf`.
-    retry(|| cvt(unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), SEND_FLAGS) }))
+    retry(|| {
+        // SAFETY: reads at most `buf.len()` bytes from `buf`; no address is given.
+        unsafe { send_raw(fd, buf.as_ptr(), buf.len()) }
+    })
 }
 
-/// `shutdown(2)` of the writing half.
-pub(crate) fn shutdown_write(fd: RawFd) -> io::Result<()> {
+/// `send(2)` of up to `len` bytes of `buf` with `SEND_FLAGS`, made as a
+/// system call on Linux (see [`syscall`]).
+///
+/// # Safety
+/// `buf` must be valid for reads of `len` bytes.
+#[inline]
+unsafe fn send_raw(fd: RawFd, buf: *const u8, len: usize) -> io::Result<usize> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: as the caller's.
+    return unsafe {
+        syscall(
+            libc::SYS_sendto,
+            [fd as usize, buf as usize, len, SEND_FLAGS as usize, 0, 0],
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: as the caller's.
+    return cvt(unsafe { libc::send(fd, buf.cast(), len, SEND_FLAGS) });
+}
+
+/// The most slices one vectored call takes.
+const IOV_MAX: usize = 1024;
+
+/// `send(2)` of the bytes of `bufs` in order (one call, the first
+/// `IOV_MAX` slices at most), as [`send`] with no `SIGPIPE`.
+#[inline]
+pub(crate) fn send_bufs(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    if let [one] = bufs {
+        return send(fd, one);
+    }
+    send_msg(fd, bufs)
+}
+
+/// [`send_bufs`] of more than one slice, in one `sendmsg(2)`.
+#[inline(never)]
+fn send_msg(fd: RawFd, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    // SAFETY: an all-zero `msghdr` is valid (no name, no control data).
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    let bufs = bufs.get(..IOV_MAX).unwrap_or(bufs);
+    msg.msg_iov = bufs.as_ptr().cast_mut().cast();
+    msg.msg_iovlen = bufs.len() as _;
+    // SAFETY: `IoSlice` is `iovec` on unix; the kernel reads at most the
+    // lengths of `bufs` from them and writes nothing to them.
+    retry(|| cvt(unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) }))
+}
+
+/// `readv(2)` into `bufs` in order (one call, the first `IOV_MAX` slices at
+/// most).
+pub(crate) fn read_bufs(fd: RawFd, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+    if let [one] = bufs {
+        return read(fd, one);
+    }
+    let count = bufs.len().min(IOV_MAX) as libc::c_int;
+    // SAFETY: `IoSliceMut` is `iovec` on unix; the kernel writes at most the
+    // lengths of the first `count` slices.
+    retry(|| cvt(unsafe { libc::readv(fd, bufs.as_ptr().cast(), count) }))
+}
+
+/// `shutdown(2)` of the halves `how` names.
+pub(crate) fn shutdown(fd: RawFd, how: std::net::Shutdown) -> io::Result<()> {
+    shutdown_raw(fd, shut_how(how))
+}
+
+/// `shutdown(2)` of the halves its own `how` names.
+pub(crate) fn shutdown_raw(fd: RawFd, how: libc::c_int) -> io::Result<()> {
     // SAFETY: a plain syscall on a socket the caller holds.
-    cvt_int(unsafe { libc::shutdown(fd, libc::SHUT_WR) }).map(drop)
+    cvt_int(unsafe { libc::shutdown(fd, how) }).map(drop)
+}
+
+/// `shutdown(2)`'s name for the halves `how` names.
+fn shut_how(how: std::net::Shutdown) -> libc::c_int {
+    match how {
+        std::net::Shutdown::Read => libc::SHUT_RD,
+        std::net::Shutdown::Write => libc::SHUT_WR,
+        std::net::Shutdown::Both => libc::SHUT_RDWR,
+    }
 }
 
 /// The pending error of a socket (`SO_ERROR`): how a non-blocking connect
@@ -422,118 +567,6 @@ pub(crate) fn connect_unix(fd: RawFd, addr: &UnixAddr) -> io::Result<bool> {
     connect_raw(fd, addr.as_ptr(), addr.len)
 }
 
-/// A Unix stream connected to `addr` by a connect that waits: what a full
-/// backlog leaves, made on the blocking pool.
-pub(crate) fn connect_unix_waiting(addr: &UnixAddr) -> io::Result<OwnedFd> {
-    use std::os::fd::AsRawFd;
-    let socket = socket(libc::AF_UNIX, libc::SOCK_STREAM)?;
-    let fd = socket.as_raw_fd();
-    // SAFETY: plain fcntl calls on our own descriptor.
-    unsafe {
-        let flags = cvt_int(libc::fcntl(fd, libc::F_GETFL))?;
-        cvt_int(libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK))?;
-        // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
-        retry(|| cvt_int(libc::connect(fd, addr.as_ptr(), addr.len)))?;
-        cvt_int(libc::fcntl(fd, libc::F_SETFL, flags))?;
-    }
-    Ok(socket)
-}
-
-/// A Unix socket address in its raw form: a path, or on Linux an
-/// abstract name. Made once on the caller's stack and copied by value, so
-/// no send, connect or bind allocates for its address.
-#[derive(Clone, Copy)]
-pub(crate) struct UnixAddr {
-    pub(crate) raw: libc::sockaddr_un,
-    pub(crate) len: libc::socklen_t,
-}
-
-impl UnixAddr {
-    /// The address of the socket file at `path`.
-    pub(crate) fn path(path: &Path) -> io::Result<UnixAddr> {
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the socket path holds a NUL byte",
-            ));
-        }
-        // The path, then its terminating zero.
-        Self::from_bytes(bytes, 1)
-    }
-
-    /// The address in Linux's abstract namespace named `name`.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(crate) fn abstract_name(name: &[u8]) -> io::Result<UnixAddr> {
-        let mut with_nul = [0u8; 108];
-        let len = name.len() + 1;
-        if len > with_nul.len() {
-            return Err(too_long());
-        }
-        with_nul[1..len].copy_from_slice(name);
-        Self::from_bytes(&with_nul[..len], 0)
-    }
-
-    /// The raw form of std's address: a path, or (Linux) an abstract name.
-    pub(crate) fn of(addr: &unix::SocketAddr) -> io::Result<UnixAddr> {
-        if let Some(path) = addr.as_pathname() {
-            return Self::path(path);
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            #[cfg(target_os = "android")]
-            use std::os::android::net::SocketAddrExt;
-            #[cfg(target_os = "linux")]
-            use std::os::linux::net::SocketAddrExt;
-            if let Some(name) = addr.as_abstract_name() {
-                return Self::abstract_name(name);
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "an unnamed Unix socket address names no socket",
-        ))
-    }
-
-    /// `bytes` in `sun_path`, followed by `extra` counted zero bytes.
-    fn from_bytes(bytes: &[u8], extra: usize) -> io::Result<UnixAddr> {
-        // SAFETY: plain data; all zeroes is a valid value.
-        let mut raw: libc::sockaddr_un = unsafe { core::mem::zeroed() };
-        if bytes.len() + extra > raw.sun_path.len() {
-            return Err(too_long());
-        }
-        raw.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        for (dst, &src) in raw.sun_path.iter_mut().zip(bytes) {
-            *dst = src as libc::c_char;
-        }
-        let len = core::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + extra;
-        Ok(UnixAddr {
-            raw,
-            len: len as libc::socklen_t,
-        })
-    }
-
-    pub(crate) fn as_ptr(&self) -> *const libc::sockaddr {
-        (&self.raw as *const libc::sockaddr_un).cast()
-    }
-}
-
-fn too_long() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "the socket address is too long",
-    )
-}
-
-impl core::fmt::Debug for UnixAddr {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match unix_addr(&self.raw, self.len) {
-            Ok(addr) => write!(f, "{addr:?}"),
-            Err(_) => f.write_str("(unnamed)"),
-        }
-    }
-}
-
 fn connect_raw(fd: RawFd, addr: *const libc::sockaddr, len: libc::socklen_t) -> io::Result<bool> {
     // SAFETY: `addr` points at `len` bytes of address the caller built.
     if unsafe { libc::connect(fd, addr, len) } == 0 {
@@ -548,89 +581,181 @@ fn connect_raw(fd: RawFd, addr: *const libc::sockaddr, len: libc::socklen_t) -> 
     }
 }
 
-/// A datagram from a UDP socket, with its sender.
-pub(crate) fn recv_from_udp(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-    // SAFETY: see `borrow`; the fd is a UDP socket.
-    let socket = unsafe { borrow::<UdpSocket>(fd) };
-    retry(|| socket.recv_from(buf))
+/// `recvfrom(2)` into memory not written yet: the kernel writes the bytes it
+/// returns, and the sender's raw address into `storage`, whose length it
+/// answers with. With `peek` the datagram stays on the socket.
+#[inline(always)]
+fn recv_from_raw(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+    peek: bool,
+    storage: &mut libc::sockaddr_storage,
+) -> io::Result<(usize, libc::socklen_t)> {
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let flags = if peek { libc::MSG_PEEK } else { 0 };
+    let n = retry(|| {
+        // SAFETY: writes at most `buf.len()` bytes into `buf` and at most
+        // `len` bytes into the storage; nothing is read from either.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return unsafe {
+            syscall(
+                libc::SYS_recvfrom,
+                [
+                    fd as usize,
+                    buf.as_mut_ptr() as usize,
+                    buf.len(),
+                    flags as usize,
+                    core::ptr::from_mut(storage) as usize,
+                    (&raw mut len) as usize,
+                ],
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        return cvt(unsafe {
+            libc::recvfrom(
+                fd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                flags,
+                core::ptr::from_mut(storage).cast(),
+                &mut len,
+            )
+        });
+    })?;
+    Ok((n, len))
 }
 
-/// A datagram from a Unix datagram socket, with its sender.
-pub(crate) fn recv_from_unix(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, unix::SocketAddr)> {
+/// `sendto(2)` of `buf` to the `len` bytes of address at `addr`, with `SEND_FLAGS`; made as a
+/// system call on Linux (see [`syscall`]).
+///
+/// # Safety
+/// `addr` must be valid for reads of `len` bytes.
+unsafe fn send_to_raw(
+    fd: RawFd,
+    buf: &[u8],
+    addr: *const libc::sockaddr,
+    len: libc::socklen_t,
+) -> io::Result<usize> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: reads at most `buf.len()` bytes of `buf`, and the caller's address.
+    return unsafe {
+        syscall(
+            libc::SYS_sendto,
+            [
+                fd as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+                SEND_FLAGS as usize,
+                addr as usize,
+                len as usize,
+            ],
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: as above.
+    return cvt(unsafe { libc::sendto(fd, buf.as_ptr().cast(), buf.len(), SEND_FLAGS, addr, len) });
+}
+
+/// A datagram from a UDP socket into memory not written yet, with its
+/// sender; with `peek` it stays on the socket.
+#[inline(always)]
+pub(crate) fn recv_from_udp_uninit(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+    peek: bool,
+) -> io::Result<(usize, SocketAddr)> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let (n, len) = recv_from_raw(fd, buf, peek, &mut storage)?;
+    if len == 0 || libc::c_int::from(storage.ss_family) == libc::AF_UNSPEC {
+        return no_sender(fd, n);
+    }
+    Ok((n, inet_addr(&storage, len)?))
+}
+
+/// A datagram from a UDP socket into `buf`, with its sender; with `peek` it
+/// stays on the socket.
+#[inline(always)]
+pub(crate) fn recv_from_udp(
+    fd: RawFd,
+    buf: &mut [u8],
+    peek: bool,
+) -> io::Result<(usize, SocketAddr)> {
+    // SAFETY: the kernel only writes bytes into `buf`, so it stays initialized.
+    let into = unsafe { &mut *(core::ptr::from_mut(buf) as *mut [core::mem::MaybeUninit<u8>]) };
+    recv_from_udp_uninit(fd, into, peek)
+}
+
+/// The sender of a datagram the kernel named none for. macOS names none for
+/// a receive into an empty buffer: a connected socket takes datagrams from
+/// its peer alone, whom the kernel names; one connected to nothing has no
+/// sender to give, as std's receive has none.
+#[cold]
+#[inline(never)]
+fn no_sender(fd: RawFd, n: usize) -> io::Result<(usize, SocketAddr)> {
+    // SAFETY: see `borrow`; the fd is a UDP socket.
+    let socket = unsafe { borrow::<UdpSocket>(fd) };
+    match socket.peer_addr() {
+        Ok(peer) => Ok((n, peer)),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the system named no sender for a datagram received into an empty buffer",
+        )),
+    }
+}
+
+/// A datagram from a Unix datagram socket into memory not written yet, with
+/// its sender; with `peek` it stays on the socket.
+pub(crate) fn recv_from_unix_uninit(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+    peek: bool,
+) -> io::Result<(usize, unix::SocketAddr)> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let (n, len) = recv_from_raw(fd, buf, peek, &mut storage)?;
+    // SAFETY: an `AF_UNIX` address fits `sockaddr_un`, which the storage is
+    // at least as large as.
+    let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };
+    Ok((n, unix_addr(un, len)?))
+}
+
+/// A datagram from a Unix datagram socket into `buf`, with its sender; with
+/// `peek` it stays on the socket. A receive is std's own, whose address the
+/// kernel writes where std keeps it, so nothing is copied or looked through
+/// to name the sender.
+#[inline(always)]
+pub(crate) fn recv_from_unix(
+    fd: RawFd,
+    buf: &mut [u8],
+    peek: bool,
+) -> io::Result<(usize, unix::SocketAddr)> {
+    if peek {
+        // SAFETY: the kernel only writes bytes into `buf`, so it stays initialized.
+        let into = unsafe { &mut *(core::ptr::from_mut(buf) as *mut [core::mem::MaybeUninit<u8>]) };
+        return recv_from_unix_uninit(fd, into, true);
+    }
     // SAFETY: see `borrow`; the fd is a Unix datagram socket.
-    let socket = unsafe { borrow::<UnixDatagram>(fd) };
+    let socket = unsafe { borrow::<unix::UnixDatagram>(fd) };
     retry(|| socket.recv_from(buf))
 }
 
 /// A datagram to `addr` on a UDP socket.
 pub(crate) fn send_to_udp(fd: RawFd, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-    // SAFETY: see `borrow`; the fd is a UDP socket.
-    let socket = unsafe { borrow::<UdpSocket>(fd) };
-    retry(|| socket.send_to(buf, addr))
+    let (raw, len) = raw_inet(&addr);
+    // SAFETY: the address is `len` bytes of `raw`.
+    retry(|| unsafe { send_to_raw(fd, buf, (&raw const raw).cast(), len) })
 }
 
 /// A datagram to `addr` on a Unix datagram socket.
 pub(crate) fn send_to_unix(fd: RawFd, buf: &[u8], addr: &UnixAddr) -> io::Result<usize> {
-    retry(|| {
-        // SAFETY: reads at most `buf.len()` bytes; the address is `len`
-        // bytes of the caller's `sockaddr_un`.
-        cvt(unsafe {
-            libc::sendto(
-                fd,
-                buf.as_ptr().cast(),
-                buf.len(),
-                SEND_FLAGS,
-                addr.as_ptr(),
-                addr.len,
-            )
-        })
-    })
-}
-
-/// A Unix socket address from its raw form: a path, an abstract name
-/// (Linux), or unnamed.
-pub(crate) fn unix_addr(
-    storage: &libc::sockaddr_un,
-    len: libc::socklen_t,
-) -> io::Result<unix::SocketAddr> {
-    let base = core::mem::offset_of!(libc::sockaddr_un, sun_path);
-    let path_len = (len as usize)
-        .saturating_sub(base)
-        .min(storage.sun_path.len());
-    // SAFETY: `c_char` and `u8` have one layout; the slice is within
-    // `sun_path`.
-    let raw: &[u8] =
-        unsafe { core::slice::from_raw_parts(storage.sun_path.as_ptr().cast(), path_len) };
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let [0, name @ ..] = raw
-        && !name.is_empty()
-    {
-        #[cfg(target_os = "android")]
-        use std::os::android::net::SocketAddrExt;
-        #[cfg(target_os = "linux")]
-        use std::os::linux::net::SocketAddrExt;
-        return unix::SocketAddr::from_abstract_name(name);
-    }
-    let path = raw.split(|&b| b == 0).next().unwrap_or_default();
-    if path.is_empty() {
-        return unnamed();
-    }
-    unix::SocketAddr::from_pathname(std::ffi::OsStr::from_bytes(path))
-}
-
-/// The unnamed address: std makes one only from an unbound socket, so it is
-/// made once.
-fn unnamed() -> io::Result<unix::SocketAddr> {
-    static UNNAMED: std::sync::OnceLock<unix::SocketAddr> = std::sync::OnceLock::new();
-    if let Some(addr) = UNNAMED.get() {
-        return Ok(addr.clone());
-    }
-    let addr = UnixDatagram::unbound()?.local_addr()?;
-    Ok(UNNAMED.get_or_init(|| addr).clone())
+    // SAFETY: the address is `len` bytes of the caller's `sockaddr_un`.
+    retry(|| unsafe { send_to_raw(fd, buf, addr.as_ptr(), addr.len) })
 }
 
 /// `offset` as the system's file offset.
-fn file_offset(offset: u64) -> io::Result<libc::off_t> {
+pub(super) fn file_offset(offset: u64) -> io::Result<libc::off_t> {
     libc::off_t::try_from(offset).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -641,6 +766,8 @@ fn file_offset(offset: u64) -> io::Result<libc::off_t> {
 
 /// `pread(2)`: reads at `offset` without moving the file's own offset.
 pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(test)]
+    file_calls::note(fd, (b'r', buf.len(), offset));
     let offset = file_offset(offset)?;
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
     retry(|| cvt(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) }))
@@ -650,6 +777,8 @@ pub(crate) fn pread(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize>
 /// file's own offset.
 pub(crate) fn pwrite_all(fd: RawFd, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
+        #[cfg(test)]
+        file_calls::note(fd, (b'w', buf.len(), offset));
         let at = file_offset(offset)?;
         // SAFETY: reads at most `buf.len()` bytes from `buf`.
         let n = retry(|| cvt(unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), at) }))?;
@@ -677,11 +806,28 @@ pub(crate) fn append_all(fd: RawFd, mut buf: &[u8]) -> io::Result<u64> {
     seek(fd, None)
 }
 
-/// Whether the file `fd` was opened to append (`O_APPEND`).
-pub(crate) fn appends(fd: RawFd) -> io::Result<bool> {
+/// How a file's descriptor was opened, as its handle's IO needs to know.
+pub(crate) struct FileMode {
+    /// To append (`O_APPEND`): every write lands at the end.
+    pub(crate) append: bool,
+    /// For direct IO (`O_DIRECT`, on Linux): the kernel moves the bytes
+    /// straight between the caller's memory and the device, by its alignment
+    /// rules. Apple's `F_NOCACHE` sets no such rule and is not this.
+    pub(crate) direct: bool,
+}
+
+/// How the file `fd` was opened (`F_GETFL`).
+pub(crate) fn file_mode(fd: RawFd) -> io::Result<FileMode> {
     // SAFETY: a plain fcntl on the caller's open descriptor.
     let flags = cvt_int(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
-    Ok(flags & libc::O_APPEND != 0)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let direct = flags & libc::O_DIRECT != 0;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let direct = false;
+    Ok(FileMode {
+        append: flags & libc::O_APPEND != 0,
+        direct,
+    })
 }
 
 /// Moves the file's own offset to `offset` (`SEEK_SET`); with `None`, only
@@ -709,12 +855,9 @@ pub(crate) fn file_size(fd: RawFd) -> io::Result<u64> {
     Ok(st.st_size as u64)
 }
 
-/// A copy of `fd` (the same open file under another number), close-on-exec.
-/// A copy of a file's descriptor, as [`duplicate`] makes it.
-pub(crate) fn duplicate_file(fd: RawFd) -> io::Result<OwnedFd> {
-    duplicate(fd)
-}
-
+/// A copy of `fd` (the same open file under another number), close-on-exec:
+/// only the accept's probe for a free descriptor makes one, and closes it at
+/// once.
 pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: a plain fcntl on the caller's open descriptor.
     let copy = cvt_int(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })?;
@@ -722,12 +865,95 @@ pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(copy) })
 }
 
+/// Whether the system moves a file's bytes to a socket in the kernel.
+pub(crate) const SENDS_FILES: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+));
+
+/// Sends up to `len` bytes of the regular file `file` from `offset` to the
+/// socket `sock` in the kernel, without them entering user space. The socket
+/// is not waited for: a full one is `WouldBlock`. The count may be short, and
+/// is zero at the end of the file. This reads the file, so it may block on a
+/// page that is not cached.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn send_file(sock: RawFd, file: RawFd, offset: u64, len: usize) -> io::Result<usize> {
+    let mut at = file_offset(offset)?;
+    // SAFETY: the kernel reads the file at `at` and writes the socket; `at`
+    // is ours to advance.
+    retry(|| cvt(unsafe { libc::sendfile(sock, file, &mut at, len) }))
+}
+
+/// See the Linux form.
+#[cfg(target_os = "macos")]
+pub(crate) fn send_file(sock: RawFd, file: RawFd, offset: u64, len: usize) -> io::Result<usize> {
+    let at = file_offset(offset)?;
+    retry(|| {
+        // In: the bytes asked for. Out: the bytes sent, also when the call
+        // fails because the socket is full or a signal came.
+        let mut sent = libc::off_t::try_from(len).unwrap_or(libc::off_t::MAX);
+        // SAFETY: the kernel reads the file at `at` and writes the socket;
+        // `sent` is ours; there is no header or trailer.
+        let r = unsafe { libc::sendfile(file, sock, at, &mut sent, core::ptr::null_mut(), 0) };
+        match cvt_int(r) {
+            Ok(_) => Ok(sent as usize),
+            Err(_) if sent > 0 => Ok(sent as usize),
+            Err(err) => Err(err),
+        }
+    })
+}
+
+/// See the Linux form.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn send_file(sock: RawFd, file: RawFd, offset: u64, len: usize) -> io::Result<usize> {
+    let at = file_offset(offset)?;
+    retry(|| {
+        let mut sent: libc::off_t = 0;
+        // SAFETY: the kernel reads the file at `at` and writes the socket;
+        // `sent` is ours; there is no header or trailer.
+        let r = unsafe { libc::sendfile(file, sock, at, len, core::ptr::null_mut(), &mut sent, 0) };
+        match cvt_int(r) {
+            Ok(_) => Ok(sent as usize),
+            Err(_) if sent > 0 => Ok(sent as usize),
+            Err(err) => Err(err),
+        }
+    })
+}
+
+/// No call moves a file's bytes to a socket in the kernel here: the caller
+/// reads and writes instead (see [`SENDS_FILES`]).
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+)))]
+pub(crate) fn send_file(_: RawFd, _: RawFd, _: u64, _: usize) -> io::Result<usize> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// `Ok` when the socket `fd` may take a write now, else `WouldBlock`.
+pub(crate) fn poll_writable(fd: RawFd) -> io::Result<()> {
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`; a zero timeout does not wait.
+    match retry(|| cvt_int(unsafe { libc::poll(&mut poll, 1, 0) }))? {
+        0 => Err(io::ErrorKind::WouldBlock.into()),
+        _ => Ok(()),
+    }
+}
+
 /// `read(2)` into memory not written yet: the kernel writes the bytes it
 /// returns, and the caller takes that many as initialized.
 pub(crate) fn read_uninit(fd: RawFd, buf: &mut [core::mem::MaybeUninit<u8>]) -> io::Result<usize> {
     // SAFETY: writes at most `buf.len()` bytes into `buf`; nothing is read
     // from it.
-    retry(|| cvt(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }))
+    retry(|| unsafe { read_raw(fd, buf.as_mut_ptr().cast(), buf.len()) })
 }
 
 /// `pread(2)` into memory not written yet, as [`read_uninit`] at `offset`.
@@ -736,6 +962,8 @@ pub(crate) fn pread_uninit(
     buf: &mut [core::mem::MaybeUninit<u8>],
     offset: u64,
 ) -> io::Result<usize> {
+    #[cfg(test)]
+    file_calls::note(fd, (b'r', buf.len(), offset));
     let offset = file_offset(offset)?;
     // SAFETY: writes at most `buf.len()` bytes into `buf`.
     retry(|| cvt(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) }))
@@ -752,4 +980,36 @@ pub(crate) fn adopt_accepted(_listener: RawFd, _conn: &OwnedFd) -> io::Result<()
 #[cfg(ring)]
 pub(crate) fn adopt_connected(_fd: RawFd) -> io::Result<()> {
     Ok(())
+}
+
+/// The file calls the blocking pool made, for a test: each `pread` and
+/// `pwrite` with its descriptor, length and offset.
+#[cfg(test)]
+pub(crate) mod file_calls {
+    use std::os::fd::RawFd;
+    use std::sync::Mutex;
+
+    /// A `pread` (`b'r'`) or a `pwrite` (`b'w'`) of `len` bytes at `at`.
+    pub(crate) type Call = (u8, usize, u64);
+
+    static CALLS: Mutex<Vec<(RawFd, Call)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn note(fd: RawFd, call: Call) {
+        if let Ok(mut calls) = CALLS.lock() {
+            calls.push((fd, call));
+        }
+    }
+
+    /// The calls made on `fd` since the last look, in order.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take(fd: RawFd) -> Vec<Call> {
+        let Ok(mut calls) = CALLS.lock() else {
+            return Vec::new();
+        };
+        let (mine, rest) = core::mem::take(&mut *calls)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(of, _)| *of == fd);
+        *calls = rest;
+        mine.into_iter().map(|(_, call)| call).collect()
+    }
 }

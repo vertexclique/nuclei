@@ -435,11 +435,18 @@ impl UpgradeWait {
         let park = if self.wait.is_queued() {
             self.wait.park(&lock.queue, Some(waker))
         } else {
+            // An upgrade that completes at once spends one operation of the
+            // poll's budget (see `coop`); it cannot be undone, so the budget
+            // is looked at before it starts.
+            if crate::coop::exhausted(waker) {
+                return Poll::Pending;
+            }
             if !self.started {
                 self.started = true;
                 lock.queue.state.fetch_or(UPGRADING, Ordering::AcqRel);
             }
             if lock.try_upgrade() {
+                crate::coop::try_spend();
                 return Poll::Ready(());
             }
             lock.enqueue(&mut self.wait, UPGRADE, waker);
@@ -476,6 +483,8 @@ mod tests {
     use std::task::Wake;
 
     use super::*;
+    use crate::sync::MAX_BYPASS;
+    use crate::sync::test_support::Polled;
 
     /// A lock raced by other threads as each pass of a drain begins (each
     /// is told the pass's number, from 1).
@@ -616,5 +625,43 @@ mod tests {
         );
         lock.upgradable_unlock();
         assert!(lock.try_kind(WRITE), "the lock is free at the end");
+    }
+
+    /// A writer that readers keep getting in past until it is owed a
+    /// handoff, dropped while its node sits on the waiting list. The queue
+    /// settles the node's owed mark as it lets the node go, so once the
+    /// readers leave nothing is owed and no handoff is up: a later reader
+    /// and a later writer get in at once. (`OwedSettled` in
+    /// proofs/tla/rwlock/RwLock.tla checks the same end state.)
+    #[test]
+    fn an_owed_writer_dropped_on_the_list_leaves_no_handoff_behind() {
+        let lock = RawRwLock::without_spin();
+        assert!(lock.try_kind(READ), "a reader is inside");
+        let mut wait = RwWait::new();
+        let mut writer = Polled::new(core::future::poll_fn(|cx| {
+            wait.poll(&lock, WRITE, cx.waker())
+        }));
+        writer.pending();
+        for _ in 0..MAX_BYPASS {
+            lock.read_unlock();
+            assert!(
+                lock.try_kind(READ),
+                "a reader gets in past the writer before it is owed"
+            );
+            writer.pending();
+        }
+        assert!(lock.queue().hands_off(), "the writer is owed a handoff");
+        drop(writer);
+        wait.cancel(&lock, WRITE);
+        lock.read_unlock();
+        assert_eq!(
+            lock.queue().state.load(Ordering::Acquire) & HANDOFF,
+            0,
+            "the handoff is still up with its owed writer gone"
+        );
+        assert!(lock.try_kind(READ), "a later reader gets in");
+        lock.read_unlock();
+        assert!(lock.try_kind(WRITE), "a later writer gets in");
+        lock.write_unlock();
     }
 }

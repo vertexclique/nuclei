@@ -1,0 +1,14 @@
+# configuration                spec                 expected
+C_recv                         MC_Coop              pass
+C_acq                          MC_Coop              pass
+C_mixed                        MC_Coop              pass
+C_live_recv                    MC_Coop              pass
+C_live_acq                     MC_Coop              pass
+M_take_then_check              MC_Coop              violated:NoValueLost
+M_no_spend                     MC_Coop              violated:BoundedPoll
+M_no_wake                      MC_Coop              violated:Termination
+M_keep_on_refuse               MC_Coop              violated:Conservation
+M_give_back_no_serve           MC_Coop              violated:NoIdleWhileQueued
+W_refusal                      MC_Coop              violated:NoRefusal
+W_other_between                MC_Coop              violated:NoOtherBetween
+W_serve_by_give_back           MC_Coop              violated:NoServeByGiveBack

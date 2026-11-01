@@ -17,8 +17,12 @@
 //! inbox (first every [`INBOX_INTERVAL`] runs, so remote work is not
 //! starved). Every [`DRIVER_INTERVAL`] runs, and every [`DRIVER_INTERVAL`]
 //! turns in which only the future ran (it keeps waking itself), it fires
-//! due timers and polls the poller without waiting, which completes the IO
-//! of every source that became ready (see `io::source`); with the queues
+//! due timers and polls the poller without waiting, as does every
+//! [`QUARTZ_EVERY`](super::tuning::QUARTZ_EVERY)th run once the coarse clock says
+//! [`DRIVE_BOUND`](super::tuning::DRIVE_BOUND) has passed since the last look, so a
+//! few long runs hold the driver off no longer than many short ones; a runner
+//! that takes the shard over looks before it runs a task. The look completes
+//! the IO of every source that became ready (see `io::source`); with the queues
 //! empty it fires due timers each turn. With nothing to run and the future
 //! not woken it spins briefly (see [`Spin`]), looking at the poller as it
 //! does, then parks until the next timer, a remote push or a wake of the
@@ -42,7 +46,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::inbox::{Inbox, Pop};
-use kovan_queue::seg_queue::SegQueue;
+use counted::Counted;
 
 use super::backend::Backend;
 use super::counters::{self, Counters};
@@ -62,6 +66,7 @@ use spin::Spin;
 
 mod children;
 mod going;
+pub(crate) mod locals;
 #[cfg(port)]
 mod port;
 mod run;
@@ -71,6 +76,7 @@ mod stats;
 mod timers;
 pub(crate) use children::{watch_exit, watch_exit_elsewhere};
 pub(crate) use run::Worked;
+pub(crate) mod counted;
 #[cfg(ring)]
 pub(crate) mod recv;
 #[cfg(ring)]
@@ -104,7 +110,7 @@ pub(crate) struct Shared {
     stop_waker: AtomicWaker,
     /// Work on the timer wheel from other threads, applied by the shard
     /// before it fires timers.
-    timer_ops: SegQueue<TimerOp>,
+    timer_ops: Counted<TimerOp>,
     /// The registrations of the shard's readiness poller; `None` on a ring
     /// shard, whose sources' IO is the ring's operations.
     #[cfg(readiness)]
@@ -115,9 +121,23 @@ pub(crate) struct Shared {
     port: Arc<super::park::iocp::Port>,
     /// Registrations other threads ask of the shard, applied before it
     /// polls.
-    io_ops: SegQueue<IoOp>,
+    io_ops: Counted<IoOp>,
+    /// Nothing will apply `io_ops` again (the shard went, and its ring's
+    /// keeper too): what reaches it then is let go of by its poster.
+    io_closed: AtomicBool,
     /// What the shard counts, for `stats`.
     pub(crate) counters: Counters,
+    /// A worker's shard: its runtime, inside which a task of the shard woken
+    /// on another thread after the shard stopped is dropped.
+    runtime: std::sync::OnceLock<std::sync::Weak<super::runtime::Inner>>,
+    /// The address of that runtime, 0 for none: compared, never followed.
+    runtime_addr: AtomicUsize,
+    /// File writes issued on the shard whose end's wake has not gone yet.
+    writes: AtomicUsize,
+    /// The shard drained its inbox for the last time as it was dropped, and
+    /// let go of its taker's role: a task woken here from now on is dropped
+    /// by the thread that pushed it, or one that drains for it.
+    released: AtomicBool,
     /// While its runtime's clock is paused: the deadline of the shard's
     /// earliest timer when it last parked (nanoseconds after the clock's
     /// origin, `u64::MAX` for none).
@@ -134,23 +154,50 @@ pub(crate) enum IoOp {
     /// A source went (its kernel registration is already gone): free its
     /// slot.
     Release(u64),
-    /// Put the file of a source into the ring's table: a copy of its
-    /// descriptor, made while the source could not close, which the ring
-    /// closes once the table holds the file.
+    /// Put the file of a source into the ring's table (or a slot naming its
+    /// descriptor): a lease on the handle's object, taken while the source
+    /// could not close, which keeps the number the handle's until the ring
+    /// took it.
     #[cfg(ring)]
-    RingAttach(u64, std::os::fd::OwnedFd),
-    /// A ring source went: cancel its sides' operations (by user data)
-    /// and let go of its slot.
+    RingAttach(u64, crate::io::source::requests::Lease),
+    /// A ring source went: cancel its sides' operations (by user data),
+    /// hand every entry naming its slot to the kernel and take its file out
+    /// of it, then let go of the lease that kept the object open meanwhile.
     #[cfg(ring)]
-    RingDetach(u32, [Option<u64>; 2]),
+    RingDetach(
+        u32,
+        [Option<u64>; 2],
+        Option<crate::io::source::requests::Lease>,
+    ),
     /// A ring source's side wants an operation submitted.
     #[cfg(ring)]
     RingKick(Arc<Source>),
     /// Cancel the ring operation of this user data.
     #[cfg(ring)]
     RingCancel(u64),
+    /// A thread whose heavy fence failed left work on a source's sides: the
+    /// owner takes and lets go of them, which serves it.
+    #[cfg(not(ring))]
+    Touch(Arc<Source>),
     /// Watch a child's exit for a thread that runs no shard.
     Watch(Arc<crate::process::exit::Exit>),
+}
+
+impl IoOp {
+    /// The op's shard went and applies it never: a registration asked of it
+    /// is made elsewhere, by the next poll of a task waiting on the source,
+    /// and a child it was to watch is watched where its user polls next; the
+    /// rest only goes.
+    fn gone(self) {
+        match self {
+            IoOp::Register(source) => source.registration_orphaned(),
+            IoOp::Watch(exit) => {
+                let orphan = Arc::strong_count(&exit) == 1;
+                exit.unwatched(orphan);
+            }
+            other => drop(other),
+        }
+    }
 }
 
 impl Shared {
@@ -186,13 +233,29 @@ impl Shared {
     }
 
     /// Hands work on the timer wheel to the shard. An arm request wakes the
-    /// shard, which may sleep past the new deadline otherwise.
+    /// shard, which may sleep past the new deadline otherwise. A shard that
+    /// stopped applies nothing more: what reaches it then is drained here.
     pub(crate) fn post_timer(&self, op: TimerOp) {
         let wake = op.needs_wake();
         self.timer_ops.push(op);
+        // Pairs with the fence of `drain_timer_ops`: either this sees the
+        // stop, or the shard's last drain finds the op.
+        crate::sync::internal::fence(Ordering::SeqCst);
+        if self.stopped.load(Ordering::SeqCst) {
+            self.drain_timer_ops();
+            return;
+        }
         if wake {
             self.unpark();
         }
+    }
+
+    /// Drains the timer work of a shard that stopped and fires no timer
+    /// again: an arm request's timer is orphaned, and its sleep arms it again
+    /// where it is polled (proofs/tla/timer, `S_go`); the rest only goes.
+    pub(crate) fn drain_timer_ops(&self) {
+        crate::sync::internal::fence(Ordering::SeqCst);
+        self.timer_ops.take_all(TimerOp::orphan);
     }
 
     /// Adds and removes the kernel registrations of the shard's readiness
@@ -233,10 +296,32 @@ impl Shared {
         )
     }
 
-    /// Hands a registration change to the shard and wakes it.
+    /// Hands a registration change to the shard and wakes it. One that
+    /// nothing will apply (the shard and its ring's keeper went) is let go
+    /// of here, as the shard's last look does.
     pub(crate) fn post_io(&self, op: IoOp) {
         self.io_ops.push(op);
+        // Pairs with the fence of `close_io`: either this sees the mailbox
+        // closed, or its last drain finds the op.
+        crate::sync::internal::fence(Ordering::SeqCst);
+        if self.io_closed.load(Ordering::SeqCst) {
+            self.drain_io_ops();
+            return;
+        }
         self.unpark();
+    }
+
+    /// Nothing applies the mailbox from now on: what it holds is let go of,
+    /// and so is what reaches it later. The ring it was for is gone, with
+    /// every entry it had, so a lease a detach carries may close its object.
+    pub(crate) fn close_io(&self) {
+        self.io_closed.store(true, Ordering::SeqCst);
+        self.drain_io_ops();
+    }
+
+    fn drain_io_ops(&self) {
+        crate::sync::internal::fence(Ordering::SeqCst);
+        self.io_ops.take_all(IoOp::gone);
     }
 
     /// Frees the slot of a source whose kernel registration is gone: at once
@@ -260,6 +345,75 @@ impl Shared {
         self.stopped.load(Ordering::Acquire)
     }
 
+    /// Makes `runtime` the one this worker's shard belongs to.
+    pub(crate) fn set_runtime(&self, runtime: std::sync::Weak<super::runtime::Inner>) {
+        let addr = runtime.as_ptr() as usize;
+        if self.runtime.set(runtime).is_ok() {
+            self.runtime_addr.store(addr, Ordering::Release);
+        }
+    }
+
+    /// Sets the shard's runtime on this thread, unless it is set already:
+    /// for a task of the shard dropped where its waker ran (on another
+    /// thread, the shard stopped), so what its drop hands on (a dropped
+    /// handle's bytes) goes to its runtime (`rt::linger`).
+    #[inline]
+    pub(crate) fn enter_runtime(&self) -> Option<super::context::RuntimeSet> {
+        let addr = self.runtime_addr.load(Ordering::Acquire);
+        if addr == 0 || super::context::runtime_is(addr as *const super::runtime::Inner) {
+            return None;
+        }
+        Self::set_runtime_here(self.runtime.get()?)
+    }
+
+    #[inline(never)]
+    fn set_runtime_here(
+        runtime: &std::sync::Weak<super::runtime::Inner>,
+    ) -> Option<super::context::RuntimeSet> {
+        runtime
+            .upgrade()
+            .and_then(|inner| super::context::try_set_runtime(&inner))
+    }
+
+    /// A file write was issued on the shard.
+    pub(crate) fn write_began(&self) {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A file write issued here ended and its wake went: a runtime's drop
+    /// that waits for the stopped shard looks again.
+    pub(crate) fn write_ended(&self) {
+        if self.writes.fetch_sub(1, Ordering::SeqCst) == 1 && self.stopped.load(Ordering::SeqCst) {
+            self.nudge_runtime();
+        }
+    }
+
+    /// What a runtime's drop waits for of its worker's shard: every file
+    /// write issued here ended with its wake gone, and, once the shard let
+    /// go of its inbox, every task woken since was dropped (the inbox is
+    /// empty and nobody drains it). Read in this order, the inbox after the
+    /// writes, so a task a write's wake left to another thread's drain is
+    /// seen. A shard not let go of yet (its thread blocked in a task's poll,
+    /// the shard handed on) drops what its inbox holds when that thread
+    /// lets go of it, which the drop does not wait for.
+    pub(crate) fn settled(&self) -> bool {
+        self.writes.load(Ordering::SeqCst) == 0
+            && (!self.released.load(Ordering::SeqCst) || self.inbox.is_idle())
+    }
+
+    /// The shard let go of its inbox for good (see [`settled`](Self::settled)).
+    pub(crate) fn release_inbox(&self) {
+        self.drop_stopped(true);
+        self.released.store(true, Ordering::SeqCst);
+    }
+
+    /// Wakes the drop of the shard's runtime, if it waits.
+    fn nudge_runtime(&self) {
+        if let Some(inner) = self.runtime.get().and_then(std::sync::Weak::upgrade) {
+            inner.lingering().nudge();
+        }
+    }
+
     /// Stops the shard: a worker's loop ends at its next look.
     pub(crate) fn stop(&self) {
         self.draining.store(true, Ordering::SeqCst);
@@ -269,6 +423,7 @@ impl Shared {
     }
 
     /// Whether placement may give the shard a new task.
+    #[inline]
     pub(crate) fn takes_tasks(&self) -> bool {
         !self.draining.load(Ordering::Relaxed)
     }
@@ -295,8 +450,17 @@ impl Shared {
     }
 
     fn may_exit(&self) -> bool {
-        self.is_stopped()
-            || (self.draining.load(Ordering::Acquire) && self.load.load(Ordering::Acquire) == 0)
+        if self.is_stopped() {
+            return true;
+        }
+        if !self.draining.load(Ordering::Acquire) {
+            return false;
+        }
+        // Pairs with the fence of a placement's second look
+        // (`runtime::placement`): either it sees the drain, or this sees its
+        // task counted (proofs/tla/placement).
+        crate::sync::internal::fence(Ordering::SeqCst);
+        self.load.load(Ordering::Acquire) == 0
     }
 
     /// Completes once the shard is stopped, or drained of its tasks: the
@@ -350,16 +514,18 @@ impl Shared {
             }
             holding = false;
             if self.inbox.is_empty() {
-                return;
+                break;
             }
         }
+        // A runtime's drop waits until no task woken here is left to drop.
+        self.nudge_runtime();
     }
 
     /// Whether work was handed to the shard, as any thread sees it (for a
     /// paused clock deciding whether the shard is idle); its own thread looks
     /// with [`Shard::has_remote_work`].
     fn has_remote_work(&self) -> bool {
-        !self.inbox.is_empty() || !self.timer_ops.is_empty() || !self.io_ops.is_empty()
+        !self.inbox.is_empty() || self.timer_ops.holds_any() || self.io_ops.holds_any()
     }
 }
 
@@ -371,6 +537,42 @@ pub(crate) struct Limits {
     pub(crate) buffer_cap: usize,
     /// What the shard drives its IO with.
     pub(crate) backend: Backend,
+}
+
+/// Charges `pool` with the receive group the ring of `backend` asks for, and
+/// returns its bytes (0 off a ring, or with no group); refuses a group that
+/// leaves the pool no room for a buffer of its own.
+fn reserve_group(pool: &Pool, backend: Backend) -> io::Result<usize> {
+    #[cfg(ring)]
+    if let Backend::Ring(cfg) | Backend::RingOrPoll(cfg) = backend {
+        let bytes = recv::reservation(cfg.recv_buffers, cfg.recv_buffer_size);
+        if !pool.reserve(bytes) {
+            return Err(recv::too_large(
+                cfg.recv_buffers,
+                cfg.recv_buffer_size,
+                bytes,
+                pool.cap(),
+            ));
+        }
+        return Ok(bytes);
+    }
+    let _ = (pool, backend);
+    Ok(0)
+}
+
+/// The least `io_buffer_cap` a runtime of the process's backend starts
+/// with: the receive group of each shard, and one buffer of the pool's
+/// smallest class.
+#[cfg(test)]
+pub(crate) fn least_buffer_cap() -> usize {
+    let group = match super::backend::chosen() {
+        #[cfg(ring)]
+        Ok(Backend::Ring(cfg) | Backend::RingOrPoll(cfg)) => {
+            recv::reservation(cfg.recv_buffers, cfg.recv_buffer_size)
+        }
+        _ => 0,
+    };
+    group + crate::buf::CLASSES[0]
 }
 
 /// What a shard waits on and does its sources' IO with.
@@ -385,6 +587,10 @@ enum Driver {
     /// A ring: the sources' IO is its operations.
     #[cfg(ring)]
     Ring(ring::ShardRing),
+    /// The ring went to a keeper as the shard went (`ring::keeper`): only the shard's drop sees
+    /// this.
+    #[cfg(ring)]
+    Gone,
 }
 
 /// The part of a shard its own thread owns.
@@ -393,10 +599,17 @@ pub(crate) struct Shard {
     queue: RefCell<VecDeque<Runnable>>,
     lifo: Cell<Option<Runnable>>,
     lifo_streak: Cell<u32>,
-    tick: Cell<u32>,
-    /// Runs since timers and the poller were last looked at.
-    since_drive: Cell<u32>,
-    /// Task polls run (the run loop's are added from `since_drive` as it
+    /// Runs left before the inbox is looked at first (`tuning.inbox_interval` at the start).
+    until_inbox: Cell<u32>,
+    /// The runs since timers and the poller were last looked at, as a count
+    /// down to the next run that weighs a look (`drive_at`, the next multiple
+    /// of `QUARTZ_EVERY` or `tuning.driver_interval`): `drive_at - drive_left`
+    /// (`Shard::since_drive`), one decrement a run.
+    drive_left: Cell<u32>,
+    drive_at: Cell<u32>,
+    /// The `Quartz` reading of the last look at timers and the poller.
+    last_drive: Cell<u64>,
+    /// Task polls run (the run loop's are added from `since_drive()` as it
     /// starts again), and runnables taken from other threads: published for
     /// `stats` with the rest of the shard's cells.
     polls: Cell<u64>,
@@ -421,18 +634,24 @@ pub(crate) struct Shard {
     tuning: super::tuning::Tuning,
     driver: Driver,
     wheel: RefCell<Wheel>,
+    /// The precise sleeps' wheel, in microseconds from the same epoch.
+    precise: RefCell<Wheel>,
     /// The wheel's zero: the clock's origin, the same for every shard, so a
     /// paused clock on the wheels' millisecond grid fires timers at their
     /// deadlines exactly.
     epoch: Instant,
     /// Wakers of fired timers, woken once the wheel is let go; reused.
     fired: RefCell<Vec<Waker>>,
+    /// The waker the last `block_on` here left, for the next one's future.
+    signal: Cell<Option<Arc<signal::Signal>>>,
     /// The IO sources the poller watches, by token.
     sources: RefCell<Sources>,
     /// The children whose exits the poller or the port watches, by token.
     children: RefCell<children::Children>,
     /// Where the shard's reads land and its writes wait.
     pool: Pool,
+    /// The values of the `shard_local!` statics, on a worker's shard.
+    locals: locals::Locals,
     /// The keeper of the shard's port while the shard does not run.
     #[cfg(port)]
     keeper: RefCell<Option<Arc<port::Keeper>>>,
@@ -453,6 +672,21 @@ impl Shard {
         monitor: Option<Arc<super::handoff::Monitor>>,
     ) -> io::Result<Self> {
         let mut shard = Self::made(limits, Some((runtime, index)))?;
+        #[cfg(feature = "io-stats")]
+        if tuning.count_io {
+            shard.shared.counters.count_io();
+        }
+        if tuning.record_latencies {
+            shard.shared.counters.record_latencies();
+            #[cfg(all(completion, feature = "io-stats"))]
+            shard.time_io();
+        }
+        shard.until_inbox.set(tuning.inbox_interval);
+        shard.count_drive_from(0, tuning.driver_interval);
+        #[cfg(ring)]
+        if let Some(ring) = shard.ring() {
+            ring.set_zero_copy_min(tuning.zero_copy_min);
+        }
         shard.tuning = tuning;
         shard.monitor = monitor;
         Ok(shard)
@@ -507,6 +741,11 @@ impl Shard {
             let (notifier, port) = (poller.notifier(), Arc::clone(poller.port()));
             Ok((Driver::Poll(RefCell::new(poller)), notifier, port))
         };
+        let pool = Pool::new(limits.buffer_cap);
+        // The receive group asked for is charged before it is made; what the
+        // ring made in the end is less on a ring made smaller, and nothing on
+        // the poller, and the rest is given back below.
+        let reserved = reserve_group(&pool, limits.backend)?;
         // The poller's registrar, or the port its handles bind to.
         let (driver, notifier, kernel) = match limits.backend {
             Backend::Poll => poller()?,
@@ -533,7 +772,14 @@ impl Shard {
                 }
             }
         };
-        let pool = Pool::new(limits.buffer_cap);
+        let made = match &driver {
+            #[cfg(ring)]
+            Driver::Ring(ring) => ring.recv_reservation(),
+            #[cfg(ring)]
+            Driver::Gone => 0,
+            Driver::Poll(_) => 0,
+        };
+        pool.unreserve(reserved.saturating_sub(made));
         let shared = Arc::new(Shared {
             inbox: Inbox::new(),
             park: ParkState::new(),
@@ -542,13 +788,18 @@ impl Shard {
             stopped: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
-            timer_ops: SegQueue::new(),
+            timer_ops: Counted::new(),
             #[cfg(readiness)]
             registrar: kernel,
             #[cfg(port)]
             port: kernel,
-            io_ops: SegQueue::new(),
-            counters: Counters::new(driver.backend(), pool.cap(), owner.map(|(_, index)| index)),
+            io_ops: Counted::new(),
+            io_closed: AtomicBool::new(false),
+            counters: Counters::new(driver.backend(), pool.cap(), owner),
+            runtime: std::sync::OnceLock::new(),
+            runtime_addr: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
             timer_at: AtomicU64::new(u64::MAX),
             parks: AtomicU64::new(0),
         });
@@ -558,8 +809,10 @@ impl Shard {
             queue: RefCell::new(VecDeque::new()),
             lifo: Cell::new(None),
             lifo_streak: Cell::new(0),
-            tick: Cell::new(0),
-            since_drive: Cell::new(0),
+            until_inbox: Cell::new(super::tuning::Tuning::default().inbox_interval),
+            drive_left: Cell::new(1),
+            drive_at: Cell::new(1),
+            last_drive: Cell::new(super::quartz::Quartz::now()),
             polls: Cell::new(0),
             sleeps: Cell::new(0),
             slept: Cell::new(Duration::ZERO),
@@ -573,19 +826,29 @@ impl Shard {
             tuning: super::tuning::Tuning::default(),
             driver,
             wheel: RefCell::new(Wheel::new()),
+            precise: RefCell::new(Wheel::new()),
             epoch: crate::time::clock::origin(),
             fired: RefCell::new(Vec::new()),
+            signal: Cell::new(None),
             sources: RefCell::new(Sources::default()),
             children: RefCell::new(children::Children::default()),
             pool,
+            locals: locals::Locals::default(),
             #[cfg(port)]
             keeper: RefCell::new(None),
         })
     }
 
+    /// The values of the `shard_local!` statics: a worker's alone.
+    pub(crate) fn locals(&self) -> Option<&locals::Locals> {
+        self.owner.get().is_some().then_some(&self.locals)
+    }
+
     /// Watches `source` from now on, under a new token. The caller moved
     /// the source's registration to registering.
     pub(crate) fn register_source(&self, source: &Arc<Source>) -> io::Result<()> {
+        #[cfg(ring)]
+        source.registers_with(self.ring().is_some_and(ring::ShardRing::datagrams_ahead));
         let token = match self.sources.borrow_mut().insert(Arc::clone(source)) {
             Ok(token) => token,
             Err(err) => {
@@ -616,34 +879,40 @@ impl Shard {
 
     /// Applies the registration changes other threads asked for.
     fn apply_io_ops(&self) {
-        while let Ok(op) = self.shared.io_ops.try_pop() {
+        self.shared.io_ops.take_all(|op| {
             match op {
-                IoOp::Register(source) => {
-                    if let Err(err) = self.register_source(&source) {
-                        source.registration_failed(&err);
+                IoOp::Register(source) => match self.register_source(&source) {
+                    Ok(()) => {}
+                    // The shard stopped: no failure, the attach set the
+                    // registration back to none, and its tasks look again.
+                    Err(err) if crate::io::source::requests::is_stopped_shard(&err) => {
+                        source.look_again();
                     }
-                }
+                    Err(err) => source.registration_failed(&err),
+                },
                 IoOp::Release(token) => {
                     let gone = self.sources.borrow_mut().remove(token);
                     drop(gone);
                 }
                 IoOp::Watch(exit) => self.watch(exit),
                 #[cfg(ring)]
-                IoOp::RingAttach(token, copy) => {
+                IoOp::RingAttach(token, lease) => {
                     let source = self.sources.borrow().get(token).cloned();
                     if let (Some(ring), Some(source)) = (self.ring(), source) {
-                        source.ring_attached(ring, &self.shared, &copy, token);
+                        source.ring_attached(ring, &self.shared, &lease, token);
                     }
-                    drop(copy);
+                    drop(lease);
                 }
                 #[cfg(ring)]
-                IoOp::RingDetach(slot, out) => {
+                IoOp::RingDetach(slot, out, lease) => {
                     if let Some(ring) = self.ring() {
-                        ring.detach(slot, out);
+                        ring.detach(slot, out, lease);
                     }
                 }
                 #[cfg(ring)]
-                IoOp::RingKick(source) => source.ring_kick(),
+                IoOp::RingKick(source) => source.ring_kick(self),
+                #[cfg(not(ring))]
+                IoOp::Touch(source) => source.touch(self),
                 #[cfg(ring)]
                 IoOp::RingCancel(user_data) => {
                     if let Some(ring) = self.ring() {
@@ -651,7 +920,7 @@ impl Shard {
                     }
                 }
             }
-        }
+        });
     }
 
     /// The address of the shard's `Shared`, which a source keeps to tell
@@ -677,7 +946,14 @@ impl Shard {
     /// task being polled runs next (the LIFO slot), unless it is that task
     /// itself yielding.
     pub(crate) fn push_local(&self, runnable: Runnable, info: ScheduleInfo) {
-        if self.tuning.lifo && !info.woken_while_running && super::context::in_task() {
+        self.push_local_from(runnable, info, super::context::in_task());
+    }
+
+    /// [`push_local`](Self::push_local) from a caller that read
+    /// [`in_task`](super::context::in_task) already.
+    #[inline(always)]
+    pub(crate) fn push_local_from(&self, runnable: Runnable, info: ScheduleInfo, in_task: bool) {
+        if self.tuning.lifo && !info.woken_while_running && in_task {
             if let Some(previous) = self.lifo.replace(Some(runnable)) {
                 self.queue.borrow_mut().push_back(previous);
             }
@@ -687,27 +963,39 @@ impl Shard {
     }
 
     /// The next runnable, in the loop's order.
+    #[inline(always)]
     fn next(&self) -> Option<Runnable> {
-        let tick = self.tick.get().wrapping_add(1);
-        self.tick.set(tick);
-        if tick.is_multiple_of(self.tuning.inbox_interval)
-            && let Some(r) = self.pop_inbox()
-        {
-            return Some(r);
+        let left = self.until_inbox.get().wrapping_sub(1);
+        if left == 0 {
+            self.until_inbox.set(self.tuning.inbox_interval);
+            if let Some(r) = self.pop_inbox() {
+                return Some(r);
+            }
+        } else {
+            self.until_inbox.set(left);
         }
         if let Some(r) = self.lifo.take() {
             if self.lifo_streak.get() < LIFO_MAX {
                 self.lifo_streak.set(self.lifo_streak.get() + 1);
                 return Some(r);
             }
-            // The slot's task ran enough times in a row: to the back.
-            self.queue.borrow_mut().push_back(r);
+            // The slot's task ran enough times in a row: to the back, which
+            // is the front when nothing else is queued.
+            let mut queue = self.queue.borrow_mut();
+            if queue.is_empty() {
+                self.lifo_streak.set(0);
+                return Some(r);
+            }
+            queue.push_back(r);
         }
         self.lifo_streak.set(0);
         let local = self.queue.borrow_mut().pop_front();
         local.or_else(|| self.pop_inbox())
     }
 
+    // Inlined into the run loop's `next`: it is looked at on every run that
+    // finds the local queue empty.
+    #[inline]
     fn pop_inbox(&self) -> Option<Runnable> {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
@@ -732,15 +1020,28 @@ impl Shard {
     /// [`Shared::has_remote_work`], a look from any thread, misses the tasks
     /// this shard's last pop left behind its end as it put an inbox's stub
     /// back ([`Inbox::is_drained`]).
+    #[inline]
     fn has_remote_work(&self) -> bool {
-        let shared = &self.shared;
+        self.has_remote_tasks() || self.has_posted_ops()
+    }
+
+    /// The tasks of [`has_remote_work`](Self::has_remote_work): runnables in the inbox or a home.
+    #[inline]
+    fn has_remote_tasks(&self) -> bool {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
-        let drained = unsafe { shared.inbox.is_drained() }
+        let drained = unsafe { self.shared.inbox.is_drained() }
             && super::context::home_is_drained()
             // SAFETY: as in `pop_inbox`.
             && self.home.get().is_none_or(|home| unsafe { home.is_drained() });
-        !drained || !shared.timer_ops.is_empty() || !shared.io_ops.is_empty()
+        !drained
+    }
+
+    /// The rest of [`has_remote_work`](Self::has_remote_work): work on the timer wheel and
+    /// registration changes other threads posted.
+    #[inline]
+    fn has_posted_ops(&self) -> bool {
+        !self.shared.timer_ops.is_empty() || !self.shared.io_ops.is_empty()
     }
 
     /// Runnables queued on this thread now, the LIFO slot's included.
@@ -752,11 +1053,8 @@ impl Shard {
     }
 
     fn has_local_work(&self) -> bool {
-        // The LIFO slot is looked at by taking it and putting it back.
-        let lifo = self.lifo.take();
-        let busy = lifo.is_some() || !self.queue.borrow().is_empty();
-        self.lifo.set(lifo);
-        busy
+        // SAFETY: a shard's cells are its thread's alone, and no reference into the slot is live.
+        unsafe { (*self.lifo.as_ptr()).is_some() || !self.queue.borrow().is_empty() }
     }
 
     /// Applies registration changes and fires due timers, then looks at the
@@ -766,6 +1064,7 @@ impl Shard {
         // The run loop's look between tasks, or its park (which may not wait
         // after all, its timer due): a park publishes the counts always, the
         // shard about to go quiet, and a look once every few.
+        self.last_drive.set(super::quartz::Quartz::now());
         let looks = self.looks.get().wrapping_add(1);
         self.looks.set(looks);
         let publish = wait != Some(Duration::ZERO) || looks.is_multiple_of(PUBLISH_INTERVAL);
@@ -809,7 +1108,7 @@ impl Shard {
                         if token & crate::rt::sources::CHILD != 0 {
                             self.exit_came(token);
                         } else if let Some(source) = sources.get(token) {
-                            source.on_event(token, readiness);
+                            source.on_event(token, readiness, self);
                         }
                     })?;
                 Ok(events)
@@ -827,12 +1126,14 @@ impl Shard {
                     // SAFETY: a packet of a source's key is one of its
                     // operations, its OVERLAPPED the first field of a
                     // slot the operation's strong reference keeps.
-                    unsafe { crate::io::source::port::complete(entry) };
+                    unsafe { crate::io::source::port::complete(entry, Some(self)) };
                 })?;
                 Ok(events)
             }
             #[cfg(ring)]
-            Driver::Ring(ring) => ring.wait(timeout).map(|(handled, _)| handled),
+            Driver::Ring(ring) => ring.wait(Some(self), timeout).map(|(handled, _)| handled),
+            #[cfg(ring)]
+            Driver::Gone => Ok(0),
         }
     }
 
@@ -841,12 +1142,34 @@ impl Shard {
         self.driver.backend()
     }
 
+    /// Whether something outside this thread can bring it work within a spin's time: a finite
+    /// operation of the ring still out. Work posted by other threads is not foreseen, so a shard
+    /// with none parks at once. A job on the runtime's blocking pool is not such work: it runs
+    /// for as long as it blocks, and its end wakes the shard with one notification.
+    fn work_may_come_soon(&self) -> bool {
+        #[cfg(ring)]
+        return self
+            .ring()
+            .is_some_and(ring::ShardRing::expects_completions);
+        #[cfg(not(ring))]
+        false
+    }
+
+    /// Whether a job of the runtime's blocking pool is out (any shard's: the pool does not say
+    /// whose).
+    fn blocking_out(&self) -> bool {
+        self.tuning
+            .blocking
+            .as_ref()
+            .is_some_and(|jobs| jobs.load(Ordering::Relaxed) > 0)
+    }
+
     /// The shard's ring, if its IO runs on one.
     #[cfg(ring)]
     pub(crate) fn ring(&self) -> Option<&ring::ShardRing> {
         match &self.driver {
             Driver::Ring(ring) => Some(ring),
-            Driver::Poll(_) => None,
+            Driver::Poll(_) | Driver::Gone => None,
         }
     }
 
@@ -866,3 +1189,7 @@ impl Shard {
 
 #[cfg(all(test, not(loom)))]
 mod tests;
+#[cfg(all(test, not(loom)))]
+mod tests_pool;
+#[cfg(all(test, not(loom)))]
+mod tests_signal;

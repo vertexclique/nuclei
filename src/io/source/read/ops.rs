@@ -8,8 +8,14 @@
 //! clears that, and wakes the tasks waiting, which take what came or ask
 //! again. Only the operation's own completion clears it, so a side never
 //! has two operations out, and its mailbox never more than one completion.
+//!
+//! On a port a TCP read the pool has no buffer for waits in a zero-byte
+//! receive, which holds none; once that says bytes came, a receive takes a
+//! buffer for them, or, with the pool still empty, the task reads them into
+//! its own (`read_starved`). So no set of idle peers or stopped readers keeps
+//! a read from its bytes (proofs/tla/port/PortStarve.tla).
 
-use super::{Datagram, Kind, Peer, Piece, ReadState};
+use super::{Datagram, Kind, Peer, Piece, ReadState, UDP_MAX};
 use crate::io::raw::Raw;
 use crate::io::side::After;
 use crate::io::source::Io;
@@ -23,6 +29,25 @@ impl ReadState {
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
         if !self.waiters.is_empty() || self.lent_waits() {
             self.complete(io, kind, self.want, after);
+            // Bytes came and the pool has no buffer for them: the tasks read
+            // them into their own (`read_starved`).
+            #[cfg(port)]
+            if self.starved && self.readable && self.out.is_none() {
+                after.wake(&mut self.waiters);
+            }
+        }
+    }
+
+    /// Stops the multishot receive out, once: a task takes the next bytes
+    /// itself, and its end wakes the tasks.
+    #[cfg(ring)]
+    pub(super) fn stop_multi(&mut self, route: Route<'_>) {
+        if let Some(id) = self.out
+            && self.multi
+            && !self.multi_stopping
+        {
+            self.multi_stopping = true;
+            route.cancel(id);
         }
     }
 
@@ -30,6 +55,7 @@ impl ReadState {
     /// waiting tasks need (`len` asked), unless one is out or a result waits
     /// to be taken. A route that cannot issue here leaves it to the thread
     /// that can.
+    #[inline(never)]
     pub(super) fn submit_ops(
         &mut self,
         route: Route<'_>,
@@ -40,17 +66,13 @@ impl ReadState {
         // A lent buffer that waits with nothing read ahead takes the next
         // bytes itself: a multishot receive out is stopped for it.
         #[cfg(ring)]
-        if let Some(id) = self.out
-            && self.multi
-            && !self.multi_stopping
-            && self.ahead.is_empty()
+        if self.ahead.is_empty()
             && self
                 .lent
                 .as_ref()
                 .is_some_and(|l| !l.out && l.done.is_none())
         {
-            self.multi_stopping = true;
-            route.cancel(id);
+            self.stop_multi(route);
         }
         // The caller's own calls: only a poll, while the side is not ready
         // and a task waits. A receive of the driver's still out is stopped
@@ -84,10 +106,19 @@ impl ReadState {
             return;
         };
         // Only a ring gives an operation back because the socket was not
-        // ready: the next one waits for it to be.
+        // ready: the next one waits for it to be. A side whose task receives every datagram
+        // itself (any but a UDP one's the ring receives ahead) arms a poll that stays, so a wait
+        // after the next "not now" submits nothing.
         #[cfg(ring)]
         if self.poll_first {
-            self.out = Some(issuer.issue(Want::Ready { read: true }, kind, self.epoch, after));
+            let want = if kind.datagrams() && !issuer.multishot_datagrams(kind) {
+                self.multi = true;
+                self.armed = true;
+                Want::ReadyMulti
+            } else {
+                Want::Ready { read: true }
+            };
+            self.out = Some(issuer.issue(want, kind, self.epoch, after));
             return;
         }
         let want = if kind.listens() {
@@ -100,15 +131,41 @@ impl ReadState {
             }
             #[cfg(not(ring))]
             Want::Accept
+        } else if kind.datagrams() && self.lent.as_ref().is_some_and(|l| !l.out) {
+            let Some(lent) = self.lent.as_mut() else {
+                return;
+            };
+            lent.out = true;
+            Want::RecvLentFrom(core::mem::take(&mut lent.buf))
         } else if kind.datagrams() {
+            // A datagram is its task's to receive into its own buffer (`receive_now`) unless the
+            // ring receives UDP datagrams ahead into a group that holds any: the ring only polls
+            // for it.
+            #[cfg(ring)]
+            if !issuer.multishot_datagrams(kind) {
+                return;
+            }
             #[cfg(ring)]
             let multi = !self.dry && issuer.multishot_datagrams(kind);
             #[cfg(not(ring))]
             let multi = false;
-            let Some(want) = self.datagram_want(multi, len, after) else {
-                return;
-            };
-            want
+            match self.datagram_want(multi, len, after) {
+                Some(want) => want,
+                // No buffer of the pool: a poll that holds none, and the task
+                // receives into its own buffer (`task_receives`).
+                #[cfg(ring)]
+                None if self.starved && !self.readable && self.error.is_none() => {
+                    Want::Ready { read: true }
+                }
+                // On a port a zero-byte receive that looks, leaving the
+                // datagram queued, and once it says one came the task
+                // receives it into its own buffer (`receive_starved`).
+                #[cfg(port)]
+                None if self.starved && !self.readable && self.error.is_none() => {
+                    Want::Ready { read: true }
+                }
+                None => return,
+            }
         } else {
             match self.lent.as_mut().filter(|l| !l.out) {
                 Some(lent) => {
@@ -120,14 +177,35 @@ impl ReadState {
                     self.multi = true;
                     Want::RecvMulti
                 }
-                None => {
-                    let Some(buf) = self.buffer(len, false, after) else {
-                        return;
-                    };
-                    Want::Recv(buf)
-                }
+                None => match self.buffer(len, false, after) {
+                    Some(buf) => Want::Recv(buf),
+                    // No buffer of the pool: rather than wait for one that a
+                    // receive of another connection may hold for good, a poll
+                    // that holds none, and the task reads into its own buffer
+                    // (`reads_itself`).
+                    #[cfg(ring)]
+                    None if self.starved && !self.readable => Want::Ready { read: true },
+                    // On a port a zero-byte receive, which holds none, and once it
+                    // says bytes came the task reads them into its own buffer
+                    // (`read_starved`, proofs/tla/port/PortStarve.tla).
+                    #[cfg(port)]
+                    None if kind == Kind::Tcp && !self.readable => Want::Ready { read: true },
+                    // A pipe's read goes into the slot's own room, which holds
+                    // no buffer of the pool.
+                    #[cfg(port)]
+                    None if kind == Kind::Bytes => Want::RecvRoom,
+                    None => return,
+                },
             }
         };
+        // The bytes the zero-byte receive said came are this receive's.
+        #[cfg(port)]
+        if matches!(
+            want,
+            Want::Recv(_) | Want::RecvLent(_) | Want::RecvFrom(_) | Want::RecvLentFrom(_)
+        ) {
+            self.readable = false;
+        }
         self.out = Some(issuer.issue(want, kind, self.epoch, after));
     }
 
@@ -142,7 +220,11 @@ impl ReadState {
         }
         #[cfg(not(ring))]
         let _ = multi;
-        self.buffer(len, true, after).map(Want::RecvFrom)
+        // Only UDP is received ahead, and no UDP datagram is longer than its
+        // length field counts: a larger buffer of the task's needs no larger
+        // one of the pool.
+        self.buffer(len.min(UDP_MAX), true, after)
+            .map(Want::RecvFrom)
     }
 
     /// A receive into a buffer of the pool completed.
@@ -193,14 +275,63 @@ impl ReadState {
             Outcome::Ready(answer) => {
                 if !stale && let Answer::Done(result) = answer {
                     self.poll_first = false;
+                    // The ring's edge: a task's call made with no guard that found the socket
+                    // empty before it asks again (`receive_now`).
+                    self.edges = self.edges.wrapping_add(1);
                     if let Err(err) = result {
                         self.error = Some(err);
                     }
-                    if self.user_fd {
-                        self.blocked = false;
-                        self.edges = self.edges.wrapping_add(1);
+                    self.readable = self.starved;
+                    if core::mem::take(&mut self.task_polls) || self.starved {
                         after.wake(&mut self.waiters);
                     }
+                    if self.user_fd {
+                        self.blocked = false;
+                        after.wake(&mut self.waiters);
+                    }
+                }
+            }
+            // Bytes, the end or an error came: the receive into a buffer of the
+            // pool goes out at once (`submit_wanted`), and its end wakes the
+            // tasks.
+            #[cfg(port)]
+            Outcome::Ready(answer) => {
+                // Its error, if any, is the receive's after it to report and
+                // clear: a look clears none (a UDP socket's report of a
+                // port unreachable stays queued under MSG_PEEK).
+                if !stale && let Answer::Done(_) = answer {
+                    self.readable = true;
+                    return;
+                }
+            }
+            // A pipe's bytes read into the slot's room are read ahead from
+            // there.
+            #[cfg(port)]
+            Outcome::RecvRoom(answer) => {
+                if !stale {
+                    match answer {
+                        Answer::Undone { .. } => {}
+                        Answer::Done(Ok(room)) if room.bytes().is_empty() => self.eof = true,
+                        Answer::Done(Ok(room)) => self.ahead.push(Piece::Room(room), after),
+                        Answer::Done(Err(err)) => self.error = Some(err),
+                    }
+                }
+            }
+            #[cfg(ring)]
+            Outcome::ReadyMultiEnd(answer) => {
+                self.multi = false;
+                self.multi_stopping = false;
+                self.armed = false;
+                if !stale {
+                    match answer {
+                        // Its readiness came as arrivals.
+                        Answer::Done(Ok(())) => {}
+                        Answer::Done(Err(err)) => self.error = Some(err),
+                        // Stopped: a lent buffer or the caller's calls go first.
+                        Answer::Undone { .. } => {}
+                    }
+                    // A task that waits looks again, and arms another if it still must wait.
+                    after.wake(&mut self.waiters);
                 }
             }
             #[cfg(ring)]
@@ -246,6 +377,30 @@ impl ReadState {
                     if lent.orphan {
                         // Its task went while the buffer was out: what came
                         // is the read-ahead now.
+                        self.abandon_lent(after);
+                    } else if lent.done.is_some()
+                        && let Some(w) = lent.waker.take()
+                    {
+                        after.wake_one(w);
+                    }
+                }
+            }
+            Outcome::RecvLentFrom(buf, answer) => {
+                if let Some(lent) = self.lent.as_mut().filter(|l| l.out && !stale) {
+                    lent.buf = buf;
+                    lent.out = false;
+                    match answer {
+                        Answer::Undone { not_ready } => self.not_ready(not_ready),
+                        Answer::Done(Ok((n, from))) => {
+                            lent.done = Some(Ok(n));
+                            lent.peer = Some(from);
+                        }
+                        Answer::Done(Err(err)) => lent.done = Some(Err(err)),
+                    }
+                    let Some(lent) = self.lent.as_mut() else {
+                        return;
+                    };
+                    if lent.orphan {
                         self.abandon_lent(after);
                     } else if lent.done.is_some()
                         && let Some(w) = lent.waker.take()
@@ -300,8 +455,15 @@ impl ReadState {
             // The write side's.
             other => other.release(after),
         }
-        // The tasks waiting take what came, or ask again.
+        // The tasks waiting take what came, or ask again; a lent buffer
+        // that waits takes it first.
         self.want = 0;
+        if self.has_result()
+            && self.lent_idle()
+            && let Some(w) = self.lent.as_mut().and_then(|l| l.waker.take())
+        {
+            after.wake_one(w);
+        }
         after.wake(&mut self.waiters);
     }
 }

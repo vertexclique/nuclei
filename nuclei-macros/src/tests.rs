@@ -116,7 +116,7 @@ fn options_threads_max_u32() {
 fn options_error_unknown_option() {
     assert_eq!(
         options_error(&[id("flavor"), punct('='), num("4")]),
-        "unknown option `flavor`; #[nuclei::main] accepts `threads = <number>`, `start_paused = true` or `crate = \"<path>\"`"
+        "unknown option `flavor`; #[nuclei::main] accepts `threads = <number>`, `start_paused = true`, `builder = \"<path>\"` or `crate = \"<path>\"`"
     );
 }
 
@@ -126,7 +126,7 @@ fn options_error_unknown_option_names_the_macro() {
         crate::parse::parse_options(&[id("size"), punct('='), num("4")], Macro::Bench).unwrap_err();
     assert_eq!(
         err.message,
-        "unknown option `size`; #[nuclei::bench] accepts `threads = <number>`, `start_paused = true` or `crate = \"<path>\"`"
+        "unknown option `size`; #[nuclei::bench] accepts `threads = <number>`, `start_paused = true`, `builder = \"<path>\"` or `crate = \"<path>\"`"
     );
 }
 
@@ -224,7 +224,7 @@ fn options_error_duplicate() {
 fn options_error_leading_comma() {
     assert_eq!(
         options_error(&[punct(','), id("threads"), punct('='), num("4")]),
-        "write an option as `threads = <number>`, `start_paused = true` or `crate = \"<path>\"`"
+        "write an option as `threads = <number>`, `start_paused = true`, `builder = \"<path>\"` or `crate = \"<path>\"`"
     );
 }
 
@@ -635,4 +635,252 @@ fn expand_main_keeps_a_relative_crate_path() {
     };
     let out = render(&expand_main(&it, &opts));
     assert!(out.contains("{ crate::rt::block_on(async"), "{out}");
+}
+
+const BUILDER_MESSAGE: &str = "give builder the path of a function that returns a nuclei::Builder, as a string: `builder = \"runtime::builder\"`";
+
+fn builder_option(path: &str) -> Vec<Tok> {
+    vec![id("builder"), punct('='), str_lit(path)]
+}
+
+fn builder_of(path: &str) -> Option<Vec<String>> {
+    opts(&builder_option(path)).unwrap().builder
+}
+
+fn segments(parts: &[&str]) -> Option<Vec<String>> {
+    Some(parts.iter().map(|part| part.to_string()).collect())
+}
+
+#[test]
+fn options_builder_path() {
+    assert_eq!(
+        builder_of("runtime::builder"),
+        segments(&["runtime", "builder"])
+    );
+    assert_eq!(
+        builder_of("::runtime::builder"),
+        segments(&["runtime", "builder"])
+    );
+    assert_eq!(builder_of("build"), segments(&["build"]));
+    assert_eq!(
+        builder_of("crate::cfg::_build2"),
+        segments(&["crate", "cfg", "_build2"])
+    );
+    assert_eq!(builder_of("self::build"), segments(&["self", "build"]));
+}
+
+#[test]
+fn options_builder_sets_nothing_else() {
+    assert_eq!(
+        opts(&builder_option("a::b")).unwrap(),
+        Options {
+            builder: segments(&["a", "b"]),
+            ..Options::default()
+        }
+    );
+    assert!(opts(&builder_option("a::b")).unwrap().own_runtime());
+}
+
+#[test]
+fn options_builder_beside_the_others_in_any_order() {
+    let mut toks = builder_option("cfg::build");
+    toks.extend([punct(','), id("threads"), punct('='), num("2"), punct(',')]);
+    toks.extend([id("start_paused"), punct('='), id("true"), punct(',')]);
+    toks.extend([
+        id("crate"),
+        punct('='),
+        str_lit("my_crate::nuclei"),
+        punct(','),
+    ]);
+    let parsed = opts(&toks).unwrap();
+    assert_eq!(
+        parsed,
+        Options {
+            threads: Some(2),
+            start_paused: true,
+            krate: segments(&["my_crate", "nuclei"]),
+            builder: segments(&["cfg", "build"]),
+        }
+    );
+    let mut reversed = vec![id("threads"), punct('='), num("2"), punct(',')];
+    reversed.extend(builder_option("cfg::build"));
+    reversed.push(punct(','));
+    assert_eq!(
+        opts(&reversed).unwrap().builder,
+        segments(&["cfg", "build"])
+    );
+}
+
+#[test]
+fn options_builder_is_accepted_by_every_macro() {
+    for mac in [Macro::Main, Macro::Test, Macro::Bench] {
+        let parsed = crate::parse::parse_options(&builder_option("a::b"), mac).unwrap();
+        assert_eq!(parsed.builder, segments(&["a", "b"]));
+    }
+}
+
+#[test]
+fn options_error_builder_twice() {
+    let mut toks = builder_option("a::b");
+    toks.push(punct(','));
+    toks.extend(builder_option("c::d"));
+    assert_eq!(
+        options_error(&toks),
+        "builder is set more than once; write it a single time"
+    );
+}
+
+#[test]
+fn options_error_builder_value() {
+    for bad in ["", "::", "a::", "1x", "a b", "a::::b", "a-b", "a::b()"] {
+        assert_eq!(
+            options_error(&builder_option(bad)),
+            BUILDER_MESSAGE,
+            "{bad:?}"
+        );
+    }
+    let wrong_kinds = [
+        id("runtime"),
+        num("4"),
+        id("true"),
+        Tok::Literal("r\"a::b\"".to_string(), None),
+        group(Parenthesis, vec![str_lit("a::b")]),
+    ];
+    for value in wrong_kinds {
+        assert_eq!(
+            options_error(&[id("builder"), punct('='), value.clone()]),
+            BUILDER_MESSAGE,
+            "{value:?}"
+        );
+    }
+    assert_eq!(options_error(&[id("builder"), punct('=')]), BUILDER_MESSAGE);
+}
+
+#[test]
+fn options_error_builder_missing_equals() {
+    assert_eq!(
+        options_error(&[id("builder"), str_lit("a::b")]),
+        "write the option as `builder = \"<path>\"`"
+    );
+}
+
+#[test]
+fn options_error_builder_not_followed_by_a_comma() {
+    let mut toks = builder_option("a::b");
+    toks.extend([id("threads"), punct('='), num("2")]);
+    assert_eq!(options_error(&toks), "separate options with a comma");
+}
+
+#[test]
+fn expand_test_builds_the_runtime_from_the_builder_function() {
+    let it = parsed(&item("main", Vec::new()));
+    let opts = Options {
+        builder: segments(&["runtime", "builder"]),
+        ..Options::default()
+    };
+    let out = render(&expand_test(&it, &opts));
+    assert!(
+        out.contains(
+            "runtime::builder().build().expect(\"the nuclei runtime failed to start\").block_on(async"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("worker_threads"), "{out}");
+    assert!(!out.contains("start_paused"), "{out}");
+    assert!(
+        !out.contains("::nuclei::block_on"),
+        "the default runtime is used: {out}"
+    );
+    assert!(!out.contains("Runtime::builder"), "{out}");
+}
+
+#[test]
+fn expand_main_applies_threads_on_top_of_the_builder() {
+    let it = parsed(&item("main", Vec::new()));
+    let opts = Options {
+        threads: Some(3),
+        builder: segments(&["crate", "cfg", "build"]),
+        ..Options::default()
+    };
+    let out = render(&expand_main(&it, &opts));
+    assert!(
+        out.contains("crate::cfg::build().worker_threads(3).build().expect("),
+        "{out}"
+    );
+}
+
+#[test]
+fn expand_test_applies_start_paused_on_top_of_the_builder() {
+    let it = parsed(&item("main", Vec::new()));
+    let paused = Options {
+        start_paused: true,
+        builder: segments(&["build"]),
+        ..Options::default()
+    };
+    let out = render(&expand_test(&it, &paused));
+    assert!(
+        out.contains("build().start_paused(true).build().expect("),
+        "{out}"
+    );
+    assert!(
+        !out.contains("worker_threads"),
+        "a paused builder keeps its workers: {out}"
+    );
+
+    let both = Options {
+        threads: Some(2),
+        start_paused: true,
+        builder: segments(&["build"]),
+        ..Options::default()
+    };
+    let out = render(&expand_test(&it, &both));
+    assert!(
+        out.contains("build().worker_threads(2).start_paused(true).build().expect("),
+        "{out}"
+    );
+}
+
+#[test]
+fn expand_test_with_threads_zero_and_a_builder_asks_for_no_workers() {
+    let it = parsed(&item("main", Vec::new()));
+    let opts = Options {
+        threads: Some(0),
+        builder: segments(&["build"]),
+        ..Options::default()
+    };
+    let out = render(&expand_test(&it, &opts));
+    assert!(out.contains("build().worker_threads(0).build()"), "{out}");
+}
+
+#[test]
+fn expand_names_the_builder_function_as_written_beside_a_crate_path() {
+    let it = parsed(&item("main", Vec::new()));
+    let opts = Options {
+        krate: segments(&["my_crate", "nuclei"]),
+        builder: segments(&["cfg", "build"]),
+        ..Options::default()
+    };
+    let out = render(&expand_main(&it, &opts));
+    assert!(out.contains("{ cfg::build().build().expect("), "{out}");
+    assert!(
+        !out.contains("my_crate"),
+        "the builder is not under the crate path: {out}"
+    );
+}
+
+#[test]
+fn expand_bench_builds_its_runtime_once_from_the_builder_function() {
+    let it = parsed(&item("main", Vec::new()));
+    let opts = Options {
+        builder: segments(&["runtime", "builder"]),
+        ..Options::default()
+    };
+    let out = render(&expand_bench(&it, &opts));
+    assert!(
+        out.contains(
+            "let __nuclei_runtime = runtime::builder().build().expect(\"the nuclei runtime failed to start\");"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("__nuclei_runtime.block_on(async"), "{out}");
 }

@@ -80,14 +80,23 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Wheel.next_window_wraps
 #print axioms Nuclei.Wheel.example_seventy_thousand
 
--- A ring's file slots: every operation keeps a free slot unheld, unnamed and with no open copy;
--- a taken slot has no entry naming it; a free slot is never freed twice; a copy closes only
--- once unheld and unnamed; and the worked example.
+-- A ring's file slots: every operation keeps a free slot unheld, unnamed and with no file;
+-- a taken slot has no entry naming it; a free slot is never freed twice; a named slot is never
+-- free; a source that goes takes its file out of the table at once; and the worked example.
 #print axioms Nuclei.Files.inv_run
 #print axioms Nuclei.Files.taken_slot_is_unnamed
 #print axioms Nuclei.Files.no_double_free
-#print axioms Nuclei.Files.copy_closes_unnamed
+#print axioms Nuclei.Files.named_slot_is_not_free
+#print axioms Nuclei.Files.release_takes_the_file_out
 #print axioms Nuclei.Files.example_reuse_waits
+
+-- A vectored read's fill: each room takes at most its size, the rooms take the whole count (or
+-- all their room), and a room that is not filled is the last that takes anything.
+#print axioms Nuclei.Fill.fill_length
+#print axioms Nuclei.Fill.fill_total
+#print axioms Nuclei.Fill.fill_fits
+#print axioms Nuclei.Fill.fill_zero
+#print axioms Nuclei.Fill.fill_in_order
 
 -- A ring's overflow count: an overflow counts once however many waits it lasts, never more than
 -- the looks that saw it, a set look after a clear one counts, and stretches split at a clear
@@ -203,3 +212,45 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Handshake.one_side_sees
 #print axioms Nuclei.Handshake.later_swaps_read_down
 #print axioms Nuclei.Handshake.a_burst_notifies_once
+
+-- The cooperative budget: a spend refuses only when the budget is spent and takes one unit; a
+-- poll completes at most its budget and its program, a program within the budget completes
+-- whole, a longer one yields with nothing left, and outside a budgeted poll nothing yields.
+#print axioms Nuclei.Coop.spend_refuses_only_when_spent
+#print axioms Nuclei.Coop.spend_takes_one
+#print axioms Nuclei.Coop.completes_at_most_the_budget
+#print axioms Nuclei.Coop.completes_at_most_the_program
+#print axioms Nuclei.Coop.a_program_within_the_budget_completes
+#print axioms Nuclei.Coop.a_longer_program_yields_after_the_budget
+#print axioms Nuclei.Coop.nothing_yields_unbudgeted
+#print axioms Nuclei.Coop.example_budget_two
+#print axioms Nuclei.Coop.example_budget_128
+
+-- The precise sleep's rounding: never early, on either wheel; at most a microsecond late; exact
+-- on the microsecond grid; the published time within a microsecond of the deadline.
+#print axioms Nuclei.Precise.never_early
+#print axioms Nuclei.Precise.never_early_on_the_tick
+#print axioms Nuclei.Precise.at_most_a_microsecond_late
+#print axioms Nuclei.Precise.on_the_grid_exactly
+#print axioms Nuclei.Precise.published_within_a_microsecond
+#print axioms Nuclei.Precise.armed_as_the_code_divides
+#print axioms Nuclei.Precise.armedTick_as_the_code_divides
+#print axioms Nuclei.Precise.example_rounding
+
+-- The single-shard semaphore: the pass grants the front in order, conserves the permits and
+-- stops at an unfit front; every operation, and every run, keeps the count and leaves no waiter
+-- whose need is free at the front.
+#print axioms Nuclei.LocalSemaphore.serve_grants_the_front
+#print axioms Nuclei.LocalSemaphore.serve_conserves
+#print axioms Nuclei.LocalSemaphore.serve_leaves_an_unfit_front
+#print axioms Nuclei.LocalSemaphore.fresh_good
+#print axioms Nuclei.LocalSemaphore.step_good
+#print axioms Nuclei.LocalSemaphore.run_good
+#print axioms Nuclei.LocalSemaphore.example_front_first
+
+-- The mesh's layout: a party's sender to another and that one's receiver from it are one
+-- channel, and a channel joins exactly one pair.
+#print axioms Nuclei.Mesh.the_ends_meet
+#print axioms Nuclei.Mesh.one_pair_per_channel
+#print axioms Nuclei.Mesh.pairs_do_not_share
+#print axioms Nuclei.Mesh.example_three

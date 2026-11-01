@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use kovan_queue::seg_queue::SegQueue;
 
+use super::bell::Bell;
 use super::life::Life;
 use super::slot::{self, Slot};
 use crate::rt::runtime::Inner;
@@ -100,6 +101,14 @@ impl Spare {
     }
 }
 
+impl Drop for Spare {
+    /// A gift handed to a spare that had seen the close and gone: its shard
+    /// goes with the spare, never kept for good.
+    fn drop(&mut self) {
+        drop(self.take_gift());
+    }
+}
+
 /// A runtime's watch over its workers.
 pub(crate) struct Monitor {
     /// A poll this long is a blocked one.
@@ -110,29 +119,51 @@ pub(crate) struct Monitor {
     spares: SegQueue<Arc<Spare>>,
     /// The monitor sleeps: every worker parked.
     asleep: AtomicBool,
-    thread: OnceLock<Thread>,
+    bell: Bell,
     closed: AtomicBool,
     /// Wakes the threads waiting for their bound tasks once closed.
     closing: crate::sync::Notify,
     /// The cores of the process, which a blocked thread may run on.
     cores: Vec<usize>,
+    /// Told of each poll seen past the threshold.
+    long_poll: Option<crate::rt::tuning::TaskHook>,
 }
 
 impl Monitor {
     /// The watch of a runtime with room for `places` workers, a poll of
-    /// `after` a blocked one.
-    pub(crate) fn new(after: Duration, places: usize, cores: Vec<usize>) -> Self {
+    /// `after` a blocked one, each told to `long_poll`.
+    pub(crate) fn new(
+        after: Duration,
+        places: usize,
+        cores: Vec<usize>,
+        long_poll: Option<crate::rt::tuning::TaskHook>,
+    ) -> Self {
         Self {
             after,
             full_fence: !super::fence::available(),
             places: (0..places).map(|_| OnceLock::new()).collect(),
             spares: SegQueue::new(),
             asleep: AtomicBool::new(false),
-            thread: OnceLock::new(),
+            bell: Bell::new(),
             closed: AtomicBool::new(false),
             closing: crate::sync::Notify::new(),
             cores,
+            long_poll,
         }
+    }
+
+    /// Tells the long-poll hook of the poll of task `task` (0: a poll that
+    /// is no task's, which nothing is told of). A hook that panics is let
+    /// go of: the watch goes on.
+    fn report_long(&self, task: u64) {
+        let (Some(hook), Some(id)) = (
+            &self.long_poll,
+            core::num::NonZeroU64::new(task).map(crate::rt::task::Id),
+        ) else {
+            return;
+        };
+        let meta = crate::rt::tuning::TaskMeta::new(id);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(&meta)));
     }
 
     /// A slot for a new runner.
@@ -155,10 +186,8 @@ impl Monitor {
     /// A worker's park ended, or a worker started: an asleep monitor wakes.
     pub(crate) fn worker_woke(&self) {
         fence(Ordering::SeqCst);
-        if self.asleep.load(Ordering::SeqCst)
-            && let Some(thread) = self.thread.get()
-        {
-            thread.unpark();
+        if self.asleep.load(Ordering::SeqCst) {
+            self.bell.ring();
         }
     }
 
@@ -166,9 +195,7 @@ impl Monitor {
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.closing.notify_waiters();
-        if let Some(thread) = self.thread.get() {
-            thread.unpark();
-        }
+        self.bell.ring();
         while let Ok(spare) = self.spares.try_pop() {
             spare.thread.unpark();
         }
@@ -227,12 +254,14 @@ struct Watch {
     last: u64,
     streak: u32,
     longest: u32,
+    /// The word of the last poll told to the long-poll hook.
+    reported: u64,
 }
 
 /// The monitor's thread: watches the workers of the runtime of `runtime`
 /// until it shuts down.
 pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
-    let _ = monitor.thread.set(std::thread::current());
+    monitor.bell.bind();
     let tick = (monitor.after / STREAK).max(Duration::from_micros(100));
     let mut watches: Vec<Option<Watch>> = (0..monitor.places.len()).map(|_| None).collect();
     let mut waiting: Option<Gift> = None;
@@ -255,7 +284,7 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
             monitor.asleep.store(true, Ordering::SeqCst);
             fence(Ordering::SeqCst);
             if monitor.all_parked() && !monitor.is_closed() {
-                std::thread::park();
+                monitor.bell.wait();
             }
             monitor.asleep.store(false, Ordering::SeqCst);
             watches
@@ -272,7 +301,7 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
             && !left.is_zero()
             && !monitor.is_closed()
         {
-            std::thread::park_timeout(left);
+            monitor.bell.wait_for(left);
         }
         for (index, place) in monitor.places.iter().enumerate() {
             let Some(place) = place.get() else {
@@ -283,6 +312,7 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
                 last: slot::inside(0),
                 streak: 0,
                 longest: 0,
+                reported: slot::inside(0),
             });
             let word = watch.runner.slot.word();
             if slot::is_outside(word) && word == watch.last {
@@ -295,15 +325,40 @@ pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
                 watch.streak = 0;
             }
             watch.last = word;
-            if watch.streak < STREAK || waiting.is_some() {
+            if watch.streak < STREAK {
                 continue;
             }
-            watch.streak = 0;
-            if let Some(gift) = take(monitor, place, index, watch, word) {
-                place.shared.counters.longest_poll(tick * STREAK);
-                waiting = deliver(&mut watches, gift);
+            // Once per word: read before the take, which gives the runner a
+            // fresh slot; told after it, so the hook delays no rescue. The
+            // word read again: a poll that ended meanwhile is not told under
+            // the task that came after it (proofs/tla/longpoll).
+            let long = (watch.reported != word).then(|| {
+                watch.reported = word;
+                let task = watch.runner.slot.task();
+                if watch.runner.slot.word() == word {
+                    task
+                } else {
+                    0
+                }
+            });
+            if waiting.is_none() {
+                watch.streak = 0;
+                if let Some(gift) = take(monitor, place, index, watch, word) {
+                    place.shared.counters.longest_poll(tick * STREAK);
+                    waiting = deliver(&mut watches, gift);
+                }
+            }
+            if let Some(task) = long {
+                monitor.report_long(task);
             }
         }
+    }
+    // A shard that waited for a thread goes here, inside its runtime: what
+    // the handles of its tasks leave goes to that runtime's drop.
+    if let Some(gift) = waiting.take() {
+        let inner = runtime.upgrade();
+        let _runtime = inner.as_ref().map(crate::rt::context::set_runtime);
+        drop(gift);
     }
 }
 
@@ -326,7 +381,9 @@ fn take(
         old.slot.cancel();
         return None;
     }
-    if old.slot.word() != word {
+    // A shard-local value lent to the runner's code (a nested `block_on`
+    // in it went outside) keeps the shard where it is.
+    if old.slot.word() != word || old.slot.is_pinned() {
         old.slot.cancel();
         return None;
     }
@@ -347,6 +404,8 @@ fn take(
         life: Arc::clone(&old.life),
     };
     watch.last = slot::inside(0);
+    // The new runner's words are its own: none is held back as told.
+    watch.reported = slot::inside(0);
     Some(Gift {
         place: index,
         shard: Owned(shard),

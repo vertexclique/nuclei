@@ -5,12 +5,23 @@
 
 use std::sync::Arc;
 
+/// Task runs between reads of the coarse clock; a power of two, so the run
+/// loop tells the runs apart with a mask.
+pub(crate) const QUARTZ_EVERY: u32 = 16;
+/// Nanoseconds of task running after which a worker shard looks at its driver
+/// (1 ms), whatever the count of runs.
+pub(crate) const DRIVE_BOUND: u64 = 1_000_000;
+
 /// How a worker shard runs its loop, and the hooks it calls when it parks;
 /// a shard that is not a worker keeps the defaults.
 #[derive(Clone, Debug)]
 pub(crate) struct Tuning {
     /// Task runs between looks at the driver (timers and IO).
     pub(crate) driver_interval: u32,
+    /// Nanoseconds of task running after which the driver gets a look, however
+    /// few runs that was (read from [`Quartz`](super::quartz::Quartz) every
+    /// [`QUARTZ_EVERY`] runs).
+    pub(crate) drive_bound: u64,
     /// Task runs between looks at the inbox first.
     pub(crate) inbox_interval: u32,
     /// The most IO events one look at the driver takes.
@@ -18,16 +29,35 @@ pub(crate) struct Tuning {
     /// A task woken by the running task runs next.
     pub(crate) lifo: bool,
     pub(crate) hooks: ThreadHooks,
+    /// Jobs in flight on the runtime's blocking pool: while any is, a shard that
+    /// runs dry parks, and a park one of them cuts short does not make it spin.
+    pub(crate) blocking: Option<Arc<crate::sync::internal::AtomicUsize>>,
+    /// The least a zero-copy write must have left for a send of it to go
+    /// zero-copy on the worker's ring.
+    #[cfg(ring)]
+    pub(crate) zero_copy_min: usize,
+    /// The shard times its IO operations, by kind (`Builder::record_latencies`).
+    pub(crate) record_latencies: bool,
+    /// The shard counts its IO operations (`Builder::count_io`).
+    #[cfg(feature = "io-stats")]
+    pub(crate) count_io: bool,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
         Self {
             driver_interval: super::shard::DRIVER_INTERVAL,
+            drive_bound: DRIVE_BOUND,
             inbox_interval: super::shard::INBOX_INTERVAL,
             max_io_events: usize::MAX,
             lifo: true,
             hooks: ThreadHooks::default(),
+            blocking: None,
+            #[cfg(ring)]
+            zero_copy_min: crate::io::source::ring::SEND_ZC_MIN,
+            record_latencies: false,
+            #[cfg(feature = "io-stats")]
+            count_io: false,
         }
     }
 }
@@ -81,6 +111,7 @@ impl core::fmt::Debug for ThreadHooks {
 #[derive(Debug)]
 pub struct TaskMeta<'a> {
     id: crate::task::Id,
+    name: Option<Arc<str>>,
     _task: core::marker::PhantomData<&'a ()>,
 }
 
@@ -88,6 +119,7 @@ impl TaskMeta<'_> {
     pub(crate) fn new(id: crate::task::Id) -> Self {
         Self {
             id,
+            name: super::task::names::get(id),
             _task: core::marker::PhantomData,
         }
     }
@@ -95,6 +127,12 @@ impl TaskMeta<'_> {
     /// The task's id.
     pub fn id(&self) -> crate::task::Id {
         self.id
+    }
+
+    /// The task's name, as [`task::Builder::name`](crate::task::Builder::name)
+    /// gave it; `None` for a task spawned without one.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
 
@@ -126,11 +164,6 @@ impl TaskHooks {
 /// Whether any runtime of the process has task hooks: while none does, a
 /// spawn that does not know its runtime looks for none.
 pub(crate) static ANY_TASK_HOOKS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Whether any runtime of the process has a hook around each poll: while
-/// none does, a poll calls none.
-pub(crate) static ANY_POLL_HOOKS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// What a runtime does when one of its tasks panics

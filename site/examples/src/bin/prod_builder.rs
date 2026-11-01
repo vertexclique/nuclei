@@ -19,7 +19,9 @@ fn main() -> std::io::Result<()> {
         .max_blocking_threads(128) // default 512
         .thread_keep_alive(Duration::from_secs(5)) // default 10 seconds
         .local_spawn_margin(16) // default 32
+        .handoff_after(Some(Duration::from_millis(20))) // default 10 ms
         .io_buffer_cap(32 * 1024 * 1024) // default 64 MiB per worker
+        .write_behind_linger(Duration::from_secs(5)) // default one minute
         .event_interval(31) // default 61
         .global_queue_interval(15) // default 31
         .max_io_events_per_tick(256) // default: all that are ready

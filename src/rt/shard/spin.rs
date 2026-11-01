@@ -1,14 +1,14 @@
 //! How long a shard spins before it parks: [`Spin`].
 
 use core::cell::Cell;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// The most pause hints a shard spins before it parks.
-const SPIN_MAX: u32 = 2048;
+/// The longest a shard spins before it parks, in nanoseconds.
+const SPIN_MAX: u32 = 16_000;
 /// The spin a fresh shard starts with.
-const SPIN_START: u32 = 256;
+const SPIN_START: u32 = 4_000;
 /// The spin a shard whose park was cut short starts again with.
-const SPIN_RESTART: u32 = 64;
+const SPIN_RESTART: u32 = 1_000;
 /// A park that ended this soon would have been caught by a spin.
 const SHORT_PARK: Duration = Duration::from_micros(50);
 /// The longest gap between two looks of a spin, in pauses: each look reads
@@ -22,44 +22,82 @@ const SPIN_GAP_MAX: u32 = 64;
 /// poller too, without waiting) costs no kernel wake of the thread. A spin
 /// that found work doubles the budget; one that ran out halves it, so a
 /// shard whose work comes only after long gaps stops spinning; a park that
-/// ended soon after it began sets it going again. The budget counts pause
-/// hints, not time, and is a hint: it only sizes the next spin.
+/// ended soon after it began sets it going again. The budget is time, read
+/// from the clock after each gap of pauses (never every pause), and is a
+/// hint: it only sizes the next spin.
+///
+/// A shard spins only while work may come soon: its caller says so (finite
+/// operations of its ring out), or the shard has seen work come from another
+/// thread within a spin or soon after a park (`hot`) and nothing since has
+/// said otherwise. Else it parks at once and the budget stays. A job of its
+/// runtime's blocking pool is not work that comes soon: it runs for as long
+/// as it blocks, its end wakes the parked shard with one notification, and a
+/// park it cuts short does not make the shard hot.
 pub(crate) struct Spin {
     budget: Cell<u32>,
+    hot: Cell<bool>,
 }
 
 impl Spin {
     pub(super) fn new() -> Self {
         Self {
             budget: Cell::new(SPIN_START),
+            hot: Cell::new(false),
         }
     }
 
-    /// Spins until `found` says work is there (true) or the budget is spent
-    /// (false).
-    pub(super) fn run(&self, mut found: impl FnMut() -> bool) -> bool {
+    /// With `expecting` work, spins until `found` says it is there (true) or
+    /// the budget is spent (false). `expecting` is asked only of a shard that
+    /// is not hot, the one that needs it.
+    pub(super) fn run(
+        &self,
+        expecting: impl FnOnce() -> bool,
+        mut found: impl FnMut() -> bool,
+    ) -> bool {
         let budget = self.budget.get();
-        let mut spent = 0;
-        let mut gap = 1;
-        while spent < budget {
-            for _ in 0..gap {
-                core::hint::spin_loop();
-            }
-            spent += gap;
-            gap = (gap * 2).min(SPIN_GAP_MAX);
-            if found() {
-                self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
-                return true;
+        if budget == 0 || !(self.hot.get() || expecting()) {
+            return false;
+        }
+        // The first look comes before the clock and the first pause: work already there costs
+        // neither, and the budget runs from a failed look.
+        let mut hit = found();
+        if !hit {
+            let limit = Duration::from_nanos(u64::from(budget));
+            let start = Instant::now();
+            let mut gap = 1;
+            loop {
+                for _ in 0..gap {
+                    core::hint::spin_loop();
+                }
+                gap = (gap * 2).min(SPIN_GAP_MAX);
+                hit = found();
+                if hit || start.elapsed() >= limit {
+                    break;
+                }
             }
         }
+        if hit {
+            self.budget.set((budget * 2).clamp(SPIN_RESTART, SPIN_MAX));
+            self.hot.set(true);
+            return true;
+        }
         self.budget.set(budget / 2);
+        self.hot.set(false);
         false
+    }
+
+    /// Whether work came soon after a spin or a park, so the next spin runs
+    /// unasked.
+    #[cfg(test)]
+    pub(super) fn is_hot(&self) -> bool {
+        self.hot.get()
     }
 
     /// The shard slept for `slept`: a short sleep means work came right
     /// after the spin gave up.
     pub(super) fn parked_for(&self, slept: Duration) {
         if slept < SHORT_PARK {
+            self.hot.set(true);
             self.budget.set(self.budget.get().max(SPIN_RESTART));
         }
     }
@@ -75,26 +113,61 @@ mod tests {
     fn a_spin_that_finds_work_doubles_the_budget_and_one_that_runs_out_halves_it() {
         let spin = Spin::new();
         assert_eq!(spin.budget.get(), SPIN_START);
-        assert!(spin.run(|| true));
+        assert!(spin.run(|| true, || true));
         assert_eq!(spin.budget.get(), SPIN_START * 2);
-        assert!(!spin.run(|| false));
+        assert!(!spin.run(|| true, || false));
         assert_eq!(spin.budget.get(), SPIN_START);
         for _ in 0..20 {
-            spin.run(|| true);
+            spin.run(|| true, || true);
         }
         assert_eq!(spin.budget.get(), SPIN_MAX, "capped");
         for _ in 0..20 {
-            spin.run(|| false);
+            spin.run(|| true, || false);
         }
         assert_eq!(spin.budget.get(), 0, "an idle shard stops spinning");
-        assert!(!spin.run(|| true), "a spent budget does not spin");
+        assert!(!spin.run(|| true, || true), "a spent budget does not spin");
+    }
+
+    #[test]
+    fn a_shard_expecting_nothing_parks_at_once_and_keeps_its_budget() {
+        let spin = Spin::new();
+        assert!(!spin.hot.get());
+        let mut looks = 0;
+        assert!(!spin.run(
+            || false,
+            || {
+                looks += 1;
+                true
+            }
+        ));
+        assert_eq!(looks, 0, "it never looked");
+        assert_eq!(spin.budget.get(), SPIN_START);
+        spin.parked_for(Duration::from_micros(3));
+        assert!(spin.hot.get(), "a short park: work comes soon after one");
+        assert!(spin.run(|| false, || true), "so it spins unasked");
+        assert!(!spin.run(|| false, || false));
+        assert!(!spin.hot.get(), "a spin that ran out ends it");
+        assert!(!spin.run(|| false, || true));
+    }
+
+    #[test]
+    fn a_spin_ends_by_time_not_by_looks() {
+        let spin = Spin::new();
+        let start = std::time::Instant::now();
+        assert!(!spin.run(|| true, || false));
+        let spent = start.elapsed();
+        assert!(
+            spent >= Duration::from_nanos(u64::from(SPIN_START)),
+            "{spent:?}"
+        );
+        assert!(spent < Duration::from_millis(50), "{spent:?}");
     }
 
     #[test]
     fn a_short_park_starts_the_spin_again() {
         let spin = Spin::new();
         for _ in 0..20 {
-            spin.run(|| false);
+            spin.run(|| true, || false);
         }
         spin.parked_for(Duration::from_millis(5));
         assert_eq!(

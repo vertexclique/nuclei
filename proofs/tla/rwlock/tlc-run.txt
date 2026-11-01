@@ -1,21 +1,22 @@
-TLC run of every configuration in proofs/tla/rwlock, 2026-10-25 21:50 UTC.
+TLC run of every configuration in proofs/tla/rwlock, 2026-10-30 20:29 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers 4, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
 
 configuration                generated   distinct    sec  result                                expected                              match
-L_read_write                     98401      53205      6  pass                                  pass                                  yes
-L_writers                       105910      57252      7  pass                                  pass                                  yes
-L_upgrade                         7774       4258      2  pass                                  pass                                  yes
-L_downgrade                      18446       9947      2  pass                                  pass                                  yes
-L_upg_upg                        11544       6320      3  pass                                  pass                                  yes
-L_barge_writer                  345079     184672     15  pass                                  pass                                  yes
-L_drop                        27725570   10030284    158  pass                                  pass                                  yes
-L_drop_live                      13384       7294      2  pass                                  pass                                  yes
-M_read_ignores_upgrading            35         24      1  violated:NoReaderWhileUpgrading       violated:NoReaderWhileUpgrading       yes
-M_upgrade_over_readers            1011        615      2  violated:NoUpgradeOverReaders         violated:NoUpgradeOverReaders         yes
-M_release_no_pass                 4191       2321      2  violated:AllTasksEnd                  violated:AllTasksEnd                  yes
-M_exit_ignores_dirty             20455       9066      2  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
-W_upgrade_wait                      68         45      1  violated:NoUpgradeWait                violated:NoUpgradeWait                yes
-W_downgrade                         14         11      1  violated:NoDowngrade                  violated:NoDowngrade                  yes
+L_read_write                     28886      15493     11  pass                                  pass                                  yes
+L_writers                        34216      18391     10  pass                                  pass                                  yes
+L_upgrade                         4438       2433      6  pass                                  pass                                  yes
+L_downgrade                       7911       4242      5  pass                                  pass                                  yes
+L_upg_upg                         6077       3326      5  pass                                  pass                                  yes
+L_barge_writer                   81643      43451     16  pass                                  pass                                  yes
+L_drop                         2907446    1046328     43  pass                                  pass                                  yes
+L_drop_live                       7397       4013      6  pass                                  pass                                  yes
+M_read_ignores_upgrading            35         24      4  violated:NoReaderWhileUpgrading       violated:NoReaderWhileUpgrading       yes
+M_upgrade_over_readers             732        441      4  violated:NoUpgradeOverReaders         violated:NoUpgradeOverReaders         yes
+M_release_no_pass                 2883       1611      7  violated:AllTasksEnd                  violated:AllTasksEnd                  yes
+M_exit_ignores_dirty             14799       6476      6  violated:NoStrandedArrival            violated:NoStrandedArrival            yes
+M_absorb_after_sweep            802751     308501     58  violated:OwedSettled                  violated:OwedSettled                  yes
+W_upgrade_wait                      68         45      2  violated:NoUpgradeWait                violated:NoUpgradeWait                yes
+W_downgrade                         14         11      2  violated:NoDowngrade                  violated:NoDowngrade                  yes
 
-results matching EXPECTED.txt: 14 of 14
+results matching EXPECTED.txt: 15 of 15

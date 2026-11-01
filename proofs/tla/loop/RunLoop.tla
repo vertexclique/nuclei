@@ -1,7 +1,7 @@
 ------------------------------ MODULE RunLoop ------------------------------
 (***************************************************************************)
 (* How often a shard's run loop looks at its IO driver                     *)
-(* (src/rt/shard.rs: `Shard::block_on`), one turn of the loop per step.    *)
+(* (src/rt/shard/run.rs: `Shard::run_loop`), one turn of the loop per step. *)
 (*                                                                          *)
 (* In plain words: each turn the loop polls its future if it was woken,     *)
 (* then runs one task if one is ready. Every `N` task runs it looks at the  *)
@@ -13,12 +13,17 @@
 (* run and the future not woken spins and parks, and both look. A future   *)
 (* that woke itself in its poll (a yield) lets the tasks queued at that    *)
 (* moment run before it is polled again: each of those turns runs a task  *)
-(* and counts as one, so the counts below are the same.                    *)
+(* and counts as one, so the counts below are the same. The spin looks     *)
+(* first and starts its clock after that look failed (`Spin::run`,         *)
+(* src/rt/shard/spin.rs): the model sees the spin as the look, whatever    *)
+(* order it makes its looks in.                                            *)
 (*                                                                          *)
 (* What is modelled: the three kinds of turn, in any order the environment  *)
-(* picks, and the two counts (`since_drive` and the turns the future woke   *)
-(* itself). What is abstract: what a task or the future does, and the look  *)
-(* itself (one step, which completes all the IO that is ready).            *)
+(* picks, and the two counts (`Shard::since_drive`, which the code keeps   *)
+(* as a count down to the next run that weighs a look, and the turns the    *)
+(* future woke itself). What is abstract: what a task or the future does,  *)
+(* and the look itself (one step, which completes all the IO that is       *)
+(* ready).                                                                  *)
 (***************************************************************************)
 EXTENDS Integers
 
@@ -28,7 +33,7 @@ CONSTANTS
 
 (* --algorithm RunLoop
 variables
-    since = 0,              \* task runs since the last look (`since_drive`)
+    since = 0,              \* task runs since the last look (`Shard::since_drive`)
     selfWoken = 0,          \* turns in which no task ran and the future woke itself
     gap = 0,                \* turns since the last look
     lookedSelfWoken = FALSE; \* record: a look came from the future's turns

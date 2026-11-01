@@ -20,6 +20,7 @@
 //! protocol, with the store buffers of x86 and every mutation of it that
 //! must fail.
 
+mod bell;
 pub(crate) mod fence;
 pub(crate) mod home;
 pub(crate) mod life;

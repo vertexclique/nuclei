@@ -10,7 +10,7 @@ impl Driver {
         match self {
             Driver::Poll(_) => crate::proactor::POLLER,
             #[cfg(ring)]
-            Driver::Ring(_) => crate::IoBackend::IoUring,
+            Driver::Ring(_) | Driver::Gone => crate::IoBackend::IoUring,
         }
     }
 }
@@ -20,16 +20,37 @@ impl Shard {
     /// counted in: what a test reads without waiting for the shard to look.
     #[cfg(test)]
     pub(crate) fn publish_now(&self) {
-        self.count_again(self.since_drive.get());
+        self.count_again(self.since_drive());
         self.publish();
     }
 
-    /// Counts a sleep of `slept` for `stats` and tells the spin how long it
-    /// was.
-    pub(super) fn slept_for(&self, slept: std::time::Duration) {
+    #[cfg(all(completion, feature = "io-stats"))]
+    /// Has the shard's ring or port stamp the operations it issues from now
+    /// on, to record their latencies; a readiness poller issues none.
+    pub(super) fn time_io(&self) {
+        let Some(times) = self.shared.counters.io_times() else {
+            return;
+        };
+        match &self.driver {
+            #[cfg(ring)]
+            Driver::Ring(ring) => ring.time_with(std::sync::Arc::clone(times)),
+            #[cfg(ring)]
+            Driver::Gone => {}
+            #[cfg(readiness)]
+            Driver::Poll(_) => {}
+            #[cfg(port)]
+            Driver::Poll(_) => self.shared.port.time_with(std::sync::Arc::clone(times)),
+        }
+    }
+
+    /// Counts a sleep of `slept` for `stats` and, unless a blocking job was out
+    /// (`tells_the_spin` false), tells the spin how long it was.
+    pub(super) fn slept_for(&self, slept: std::time::Duration, tells_the_spin: bool) {
         self.sleeps.set(self.sleeps.get() + 1);
         self.slept.set(self.slept.get() + slept);
-        self.spin.parked_for(slept);
+        if tells_the_spin {
+            self.spin.parked_for(slept);
+        }
     }
 
     /// Publishes the polls, the sleeps, the queue, the remote wakes, the
@@ -38,6 +59,8 @@ impl Shard {
         let (ops_in_flight, cq_overflows) = match &self.driver {
             #[cfg(ring)]
             Driver::Ring(ring) => (ring.in_flight(), ring.overflows()),
+            #[cfg(ring)]
+            Driver::Gone => (0, 0),
             // A readiness poller hands the kernel no operation.
             #[cfg(readiness)]
             Driver::Poll(_) => (0, 0),

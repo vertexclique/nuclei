@@ -18,17 +18,19 @@
 //! while it holds its own can livelock.
 //!
 //! The requests: attaching the source to a shard's poller, a shard's evict,
-//! a failed registration, a retire (`get_mut`, `into_inner`), and a dropped
-//! handle's close, with or without a hand-off to a copy of the descriptor
-//! (the linger of bytes written behind). A dropped handle whose close cannot
-//! run at once hands its IO object to the source: whoever performs the close
-//! drops it, after the deregistration, so its descriptor closes only once
-//! no call of the driver can use it.
+//! a failed registration, one a shard stopped before it made it, a retire (`get_mut`, `into_inner`), and a dropped
+//! handle's close, with or without a linger (the drain of bytes written
+//! behind, on the handle's own object). A dropped handle hands its IO object
+//! to the source ([`Keep`]): it is dropped once the close was performed,
+//! after the deregistration, and no lease is out, so its descriptor closes
+//! only once no call of the driver, no job of the blocking pool and no entry
+//! queued on a ring can use it. A retire waits for the leases the same way
+//! before the object changes hands.
 
 use crate::io::raw::{AtomicRaw, Raw};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use core::task::Poll;
 use std::io;
 use std::sync::Arc;
@@ -37,7 +39,7 @@ use std::sync::Arc;
 use super::Kind;
 use super::read::ReadState;
 use super::write::WriteState;
-use super::{Failure, NO_FD, NO_TOKEN, REGISTERED, Source, UNREGISTERED};
+use super::{Failure, NO_FD, REGISTERED, Source, SourceHooks, UNREGISTERED};
 use crate::io::side::After;
 use crate::rt::shard::Shared;
 use crate::sync::atomic_waker::AtomicWaker;
@@ -50,30 +52,57 @@ const EVICT: u8 = 2;
 const FAIL: u8 = 4;
 /// Stop all IO and deregister before the IO object changes hands.
 const RETIRE: u8 = 8;
-/// The handle is gone: deregister, and drop its object.
+/// The handle is gone: deregister, and let go of its object.
 const CLOSE: u8 = 16;
-/// The handle is gone with bytes still to send: deregister, go on with the
-/// copy in `Ask::linger_fd`, and drop its object.
+/// The handle is gone with bytes still to send: deregister, and go on with
+/// the descriptor in `Ask::linger_fd` (the handle's own, which the linger
+/// keeps open), for the drain to register again.
 const LINGER: u8 = 32;
 /// A ring put the file into its table for an attach performed on another
 /// thread (`Ask::installs`): the registration takes it if it still wants
 /// it, else the ring lets it go.
 #[cfg(ring)]
 const INSTALLED: u8 = 64;
+/// A shard stopped before it made the source's registration: no failure, as
+/// `proofs/tla/attach` has it (an attach refused leaves the source
+/// unregistered); every task waiting on the source looks again, to register
+/// it where it polls next.
+const ORPHANED: u8 = 128;
+
+/// What an attach to a shard that stopped first answers.
+#[derive(Debug)]
+struct StoppedShard;
+
+impl core::fmt::Display for StoppedShard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the shard stopped before the registration")
+    }
+}
+
+impl std::error::Error for StoppedShard {}
+
+pub(super) fn stopped_shard() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, StoppedShard)
+}
+
+/// Whether `err` is an attach refused because its shard stopped first.
+pub(crate) fn is_stopped_shard(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<StoppedShard>())
+}
 
 /// What pending requests carry. Each field is written by its requester
 /// before the request's bit is raised (Release) and read by the performer
 /// after the bit is taken (Acquire).
-#[derive(Default)]
 pub(crate) struct Ask {
     /// The shard and token of an attach.
     attach: AtomicPtr<(Arc<Shared>, u64)>,
     /// The failure of a registration.
     failure: AtomicPtr<Failure>,
-    /// The copy of the descriptor a linger goes on with.
+    /// The descriptor a linger goes on with.
     linger_fd: AtomicRaw,
-    /// A dropped handle's IO object, for the close to drop.
-    doomed: Doomed,
+    /// The handle's IO object once it dropped, and what keeps it open.
+    pub(super) keep: Keep,
     /// The retire was performed; its requester waits on the waker.
     retired: AtomicBool,
     pub(super) retire_waker: AtomicWaker,
@@ -94,6 +123,22 @@ struct Install {
     shard: Arc<Shared>,
     slot: io::Result<u32>,
     next: *mut Install,
+}
+
+impl Default for Ask {
+    fn default() -> Self {
+        Self {
+            attach: AtomicPtr::default(),
+            failure: AtomicPtr::default(),
+            linger_fd: AtomicRaw::new(NO_FD),
+            keep: Keep::new(),
+            retired: AtomicBool::new(false),
+            retire_waker: AtomicWaker::new(),
+            awaits_ops: AtomicBool::new(false),
+            #[cfg(ring)]
+            installs: AtomicPtr::default(),
+        }
+    }
 }
 
 impl Drop for Ask {
@@ -117,9 +162,11 @@ impl Drop for Ask {
                 let install = *unsafe { Box::from_raw(next) };
                 next = install.next;
                 if let Ok(slot) = install.slot {
-                    install
-                        .shard
-                        .post_io(crate::rt::shard::IoOp::RingDetach(slot, [None, None]));
+                    install.shard.post_io(crate::rt::shard::IoOp::RingDetach(
+                        slot,
+                        [None, None],
+                        None,
+                    ));
                 }
             }
         }
@@ -138,16 +185,29 @@ impl Source {
     /// free; else leaves them to the sides' holders. Only the read side is
     /// taken here: performing goes through it (see the module docs).
     fn request(self: &Arc<Self>, bits: u8, after: &mut After) -> Done {
+        // The shard this thread runs is looked up inside the bracket that
+        // keeps it in the shard, so a request from its thread is its owner's.
+        crate::rt::context::current(|current| {
+            self.request_with(bits, after, &self.hooks_in(current))
+        })
+    }
+
+    fn request_with(
+        self: &Arc<Self>,
+        bits: u8,
+        after: &mut After,
+        hooks: &SourceHooks<'_>,
+    ) -> Done {
         // Release: the performer that takes the bits reads what they carry.
         self.requests.fetch_or(bits, Ordering::Release);
-        let Some(mut read) = self.read.take_for_request() else {
+        let Some(mut read) = self.read.take_for_request(hooks) else {
             return Done {
                 here: false,
                 attached: None,
             };
         };
-        let done = self.try_write_and_perform(read.get(), after, true);
-        read.release(after, &self.hooks());
+        let done = self.try_write_and_perform(hooks, read.get(), after, true);
+        read.release(after, hooks);
         done
     }
 
@@ -156,6 +216,7 @@ impl Source {
     /// pending requests.
     fn try_write_and_perform(
         self: &Arc<Self>,
+        hooks: &SourceHooks<'_>,
         read: &mut ReadState,
         after: &mut After,
         here: bool,
@@ -166,14 +227,14 @@ impl Source {
                 attached: None,
             };
         }
-        let Some(mut write) = self.write.take_for_request() else {
+        let Some(mut write) = self.write.take_for_request(hooks) else {
             return Done {
                 here: false,
                 attached: None,
             };
         };
         let attached = self.perform(read, write.get(), after, here);
-        write.release(after, &self.hooks());
+        write.release(after, hooks);
         Done {
             here: true,
             attached,
@@ -181,8 +242,13 @@ impl Source {
     }
 
     /// For the read side's holder that saw `REQ`.
-    pub(super) fn requests_holding_read(self: &Arc<Self>, read: &mut ReadState, after: &mut After) {
-        self.try_write_and_perform(read, after, false);
+    pub(super) fn requests_holding_read(
+        self: &Arc<Self>,
+        hooks: &SourceHooks<'_>,
+        read: &mut ReadState,
+        after: &mut After,
+    ) {
+        self.try_write_and_perform(hooks, read, after, false);
     }
 
     /// For a holder of the write side that saw `REQ` and has let it go: one
@@ -190,13 +256,17 @@ impl Source {
     /// read side while it holds its own, so two holders never pass the
     /// request back and forth); getting it, it goes on as the read side's
     /// holder.
-    pub(super) fn requests_after_write(self: &Arc<Self>, after: &mut After) {
+    pub(super) fn requests_after_write(
+        self: &Arc<Self>,
+        hooks: &SourceHooks<'_>,
+        after: &mut After,
+    ) {
         if self.requests.load(Ordering::Acquire) == 0 {
             return;
         }
-        if let Some(mut read) = self.read.take_for_request() {
-            self.try_write_and_perform(read.get(), after, false);
-            read.release(after, &self.hooks());
+        if let Some(mut read) = self.read.take_for_request(hooks) {
+            self.try_write_and_perform(hooks, read.get(), after, false);
+            read.release(after, hooks);
         }
     }
 
@@ -247,8 +317,10 @@ impl Source {
                     after.wake_one(waker);
                 }
             }
-            if bits & (CLOSE | LINGER) != 0 {
-                self.ask.doomed.closed();
+            if bits & CLOSE != 0 {
+                // The close's own hold on the object goes: the object is
+                // dropped now, or by the last lease out.
+                self.release_hold();
             }
         }
         if bits & FAIL != 0 {
@@ -279,12 +351,21 @@ impl Source {
             self.ops_registered(read, write, after);
         }
         if !here && let Some(Err(err)) = &attached {
-            let failure = Failure::of(err);
-            read.fail(failure, after);
-            write.fail(failure, after);
+            if is_stopped_shard(err) {
+                read.wake_all(after);
+                write.wake_all(after);
+            } else {
+                let failure = Failure::of(err);
+                read.fail(failure, after);
+                write.fail(failure, after);
+            }
         }
         if bits & EVICT != 0 {
             self.evict_now(read, write, after);
+        }
+        if bits & ORPHANED != 0 {
+            read.wake_all(after);
+            write.wake_all(after);
         }
         attached
     }
@@ -358,6 +439,7 @@ impl Source {
                 (true, Ok(slot)) => {
                     self.reg.slot.store(slot, Ordering::Release);
                     self.reg.state.store(REGISTERED, Ordering::Release);
+                    self.publish_here(Arc::as_ptr(&install.shard) as usize);
                     // Tasks that waited look again, and what the sides hold
                     // goes to the ring.
                     self.ops_registered(read, write, after);
@@ -380,13 +462,12 @@ impl Source {
     pub(super) fn abandon_ring_attach(&self) {
         // SAFETY: both sides are held.
         let shard = unsafe { (*self.reg.shard.get()).take() };
-        let token = self.reg.token.swap(NO_TOKEN, Ordering::AcqRel);
-        self.reg.home.store(0, Ordering::Release);
         self.reg.ops.store(false, Ordering::Release);
         self.reg.state.store(UNREGISTERED, Ordering::Release);
         if let Some(shard) = shard {
-            shard.release_source(token);
+            shard.release_source(self.reg.token.load(Ordering::Acquire));
         }
+        self.registration_gone();
     }
 
     /// Whether an attach to a ring is under way on the ring's thread: its
@@ -426,10 +507,7 @@ impl Source {
                 io::ErrorKind::NotConnected,
                 "the handle closed before its registration",
             )),
-            _ if shard.is_stopped() => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the shard stopped before the registration",
-            )),
+            _ if shard.is_stopped() => Err(stopped_shard()),
             #[cfg(ring)]
             fd if shard.is_ring() => return self.attach_ring(shard, token, fd),
             #[cfg(port)]
@@ -475,8 +553,7 @@ impl Source {
         if self.reg.state.load(Ordering::Acquire) == REGISTERED {
             // SAFETY: both sides are held.
             let shard = unsafe { (*self.reg.shard.get()).take() };
-            self.reg.token.store(NO_TOKEN, Ordering::Release);
-            self.reg.home.store(0, Ordering::Release);
+            self.clear_here();
             self.reg.state.store(UNREGISTERED, Ordering::Release);
             #[cfg(ring)]
             if self.reg.ops.swap(false, Ordering::AcqRel) {
@@ -501,6 +578,7 @@ impl Source {
             }
             #[cfg(not(readiness))]
             drop(shard);
+            self.registration_gone();
         }
         read.wake_all(after);
         write.wake_all(after);
@@ -523,9 +601,31 @@ impl Source {
             drop(unsafe { Box::from_raw(old) });
         }
         let mut after = After::default();
-        let done = self.request(ATTACH, &mut after);
+        // Called on the shard's own thread, inside it: the owner of the
+        // sides the registration will home there.
+        let hooks = SourceHooks {
+            claim: Some(shard),
+            ..self.hooks()
+        };
+        let done = self.request_with(ATTACH, &mut after, &hooks);
         after.run();
         done.attached.filter(|_| done.here)
+    }
+
+    /// A registration posted to a shard that stopped before it made it: the
+    /// source is unregistered, and the tasks waiting on it look again, to
+    /// register it where they poll next (no failure of its IO).
+    pub(crate) fn registration_orphaned(self: &Arc<Self>) {
+        self.registration_abandoned();
+        self.look_again();
+    }
+
+    /// Every task waiting on the source looks again, to register it where it
+    /// polls next: its registration went back to none.
+    pub(crate) fn look_again(self: &Arc<Self>) {
+        let mut after = After::default();
+        self.request(ORPHANED, &mut after);
+        after.run();
     }
 
     /// A registration the shard made for a thread that runs none failed:
@@ -553,23 +653,25 @@ impl Source {
     /// this waits for it (on a shard, its other tasks run meanwhile): the
     /// object must not change while a call of the driver may use it. On a
     /// ring it waits, the same way, until the kernel is done with every
-    /// operation of the source, so none takes bytes from the object after.
+    /// operation of the source, so none takes bytes from the object after;
+    /// and everywhere until no lease is out (a job of the blocking pool, an
+    /// attach or a detach in a ring's mailbox), so none uses its number.
     pub(crate) fn retire(self: &Arc<Self>) {
         self.ask.retired.store(false, Ordering::Release);
         let mut after = After::default();
         let done = self.request(RETIRE, &mut after);
         after.run();
-        if done.here && self.ops_idle() {
+        if done.here && self.ops_idle() && !self.ask.keep.leased() {
             return;
         }
         let ask = &self.ask;
         crate::sync::internal::blocking(core::future::poll_fn(|cx| {
             ask.retire_waker.register(cx.waker());
             // SeqCst, after the waker is in: a completion that leaves no
-            // operation out either sees the flag (and takes the waker) or
-            // its count is seen here.
+            // operation out, or a lease that leaves none, either sees the
+            // flag (and takes the waker) or its count is seen here.
             ask.awaits_ops.store(true, Ordering::SeqCst);
-            if ask.retired.load(Ordering::Acquire) && self.ops_idle() {
+            if ask.retired.load(Ordering::Acquire) && self.ops_idle() && !ask.keep.leased() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -578,48 +680,145 @@ impl Source {
         ask.awaits_ops.store(false, Ordering::SeqCst);
     }
 
-    /// The handle is gone: its registration goes and `io`, its IO object, is
-    /// dropped (its descriptor closed) once no call of the driver can use
-    /// it. With `linger`, a copy of the descriptor the caller keeps open, the
-    /// source goes on with that copy to deliver what the write side holds.
-    /// Never waits: if a side is held, the source keeps `io` and its last
-    /// holder drops it.
-    pub(crate) fn close<T>(self: &Arc<Self>, io: T, linger: Option<Raw>) {
-        let bit = match linger {
-            Some(copy) => {
-                self.ask.linger_fd.store(copy, Ordering::Release);
-                LINGER
-            }
-            None => CLOSE,
-        };
+    /// The handle is gone: its registration goes, and `io`, its IO object, is
+    /// dropped (its descriptor closed) once the close was performed and no
+    /// lease is out, so no call of the driver, no job of the blocking pool
+    /// and no entry queued on a ring can use its number. Never waits: if a
+    /// side is held, its holder performs the close; the last of the close
+    /// and the leases drops the object.
+    pub(crate) fn close<T>(self: &Arc<Self>, io: T) {
+        // Before the request: whoever performs it may drop the object at once.
+        self.ask.keep.hand_over(io);
         let mut after = After::default();
-        let done = self.request(bit, &mut after);
+        self.request(CLOSE, &mut after);
         after.run();
-        if done.here {
-            // Deregistered here: no call of the driver uses the number now.
-            drop(io);
-        } else {
-            self.ask.doomed.hand_over(io);
+    }
+
+    /// The handle is gone with bytes still to send, which a task drains on
+    /// `fd`, the handle's own descriptor, its object kept open meanwhile: the
+    /// registration goes now (cancelling what is out, for the drain to
+    /// register again where it runs), and the source goes on with `fd`.
+    pub(crate) fn linger(self: &Arc<Self>, fd: Raw) {
+        self.ask.linger_fd.store(fd, Ordering::Release);
+        let mut after = After::default();
+        self.request(LINGER, &mut after);
+        after.run();
+    }
+
+    /// A lease on the handle's object, which keeps its descriptor open until
+    /// it drops, for a call made on the number away from the driver (a job
+    /// of the blocking pool, a ring's attach). Taken by a holder of the
+    /// handle, or of another lease.
+    ///
+    /// # Errors
+    ///
+    /// The handle's IO object is not in place (retired).
+    pub(crate) fn lease(self: &Arc<Self>) -> io::Result<Lease> {
+        let raw = self.fd()?;
+        Ok(self.hold(raw))
+    }
+
+    /// A lease that names `raw` (`NO_FD` for one that only holds).
+    pub(super) fn hold(self: &Arc<Self>, raw: Raw) -> Lease {
+        self.ask.keep.hold();
+        Lease {
+            source: Arc::clone(self),
+            raw,
+        }
+    }
+
+    /// A hold on the object goes: the last drops it, and a retire waiting
+    /// for the leases looks again once one hold is left (the close's own: a
+    /// retire comes only before the close).
+    fn release_hold(&self) {
+        match self.ask.keep.release() {
+            Held::Dropped => {}
+            Held::OneLeft => {
+                if self.ask.awaits_ops.load(Ordering::SeqCst)
+                    && let Some(waker) = self.ask.retire_waker.take()
+                {
+                    waker.wake();
+                }
+            }
+            Held::More => {}
         }
     }
 }
 
-/// A dropped handle's IO object, left to whoever performs the source's
-/// close. The handle hands it over, and the performer marks the close done,
-/// each with one swap; whichever comes second drops the object.
+/// A hold on a handle's IO object: its descriptor stays open, and its number
+/// the handle's, while the lease lives (see [`Source::lease`]).
+pub(crate) struct Lease {
+    source: Arc<Source>,
+    raw: Raw,
+}
+
+impl Lease {
+    /// The descriptor the lease keeps open.
+    pub(crate) fn raw(&self) -> Raw {
+        self.raw
+    }
+
+    /// The file of the descriptor, for a call of std's on it; the view never
+    /// closes it.
+    pub(crate) fn file(&self) -> core::mem::ManuallyDrop<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            // SAFETY: the lease keeps the descriptor open while the view
+            // lives, and the view is never dropped as a file.
+            core::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(self.raw) })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::FromRawHandle;
+            // SAFETY: as above, for the file's handle.
+            core::mem::ManuallyDrop::new(unsafe {
+                std::fs::File::from_raw_handle(self.raw as usize as std::os::windows::io::RawHandle)
+            })
+        }
+    }
+}
+
+impl Clone for Lease {
+    fn clone(&self) -> Self {
+        self.source.hold(self.raw)
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.source.release_hold();
+    }
+}
+
+impl core::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Lease").field("raw", &self.raw).finish()
+    }
+}
+
+/// A handle's IO object once the handle dropped, and the holds that keep it
+/// open: one for the close until it is performed, and one for every lease.
+/// The handle hands the object over before it asks for the close; whichever
+/// hold goes last drops it (proofs/tla/side/Requests.tla).
 ///
-/// The object goes to another thread only for a source a driver or a poll
-/// was using: IO exists only on std's sockets and files (see the handle's
-/// docs), all of them `Send`, so the type-erased drop below is sound.
-#[derive(Default)]
-struct Doomed {
-    state: AtomicU8,
+/// The object goes to another thread only for a source a driver, a poll or
+/// a lease was using: IO exists only on std's sockets and files (see the
+/// handle's docs), all of them `Send`, so the type-erased drop below is
+/// sound.
+pub(super) struct Keep {
+    holds: AtomicUsize,
     object: UnsafeCell<Option<Erased>>,
 }
 
-// The state starts at 0: nothing handed over, the close not performed.
-const STORED: u8 = 1;
-const CLOSED: u8 = 2;
+/// What a hold that went left.
+enum Held {
+    /// It was the last: the object was dropped.
+    Dropped,
+    /// One hold is left: before a close, the close's own, so no lease is out.
+    OneLeft,
+    More,
+}
 
 /// A boxed object of a type the box no longer names, with its drop.
 struct Erased {
@@ -637,49 +836,68 @@ unsafe fn drop_boxed<T>(ptr: NonNull<()>) {
     drop(unsafe { Box::from_raw(ptr.cast::<T>().as_ptr()) });
 }
 
-// SAFETY: the object is touched by the handing thread before its swap and by
-// the dropping thread after the other swap, never both; see the type's docs
-// for why the object may be dropped on another thread.
-unsafe impl Send for Doomed {}
+// SAFETY: the object is written by the handing thread before its holds can
+// all go, and taken by the thread whose release is the last, after every
+// other release (AcqRel); see the type's docs for why it may be dropped on
+// another thread.
+unsafe impl Send for Keep {}
 // SAFETY: as for `Send`.
-unsafe impl Sync for Doomed {}
+unsafe impl Sync for Keep {}
 
-impl Doomed {
-    /// The handle hands its object over; dropped here if the close was
-    /// performed already.
+impl Keep {
+    /// The close's hold only.
+    fn new() -> Self {
+        Self {
+            holds: AtomicUsize::new(1),
+            object: UnsafeCell::new(None),
+        }
+    }
+
+    /// The handle hands its object over, before it asks for the close (so
+    /// the close's hold is still up).
     fn hand_over<T>(&self, io: T) {
         let erased = Erased {
             ptr: NonNull::from(Box::leak(Box::new(io))).cast(),
             drop: drop_boxed::<T>,
         };
-        // SAFETY: before the swap below the slot is this thread's alone.
+        // SAFETY: the close's hold is up, so no release takes the slot yet.
         unsafe { *self.object.get() = Some(erased) };
-        // AcqRel: publishes the object to the performer, or acquires the
-        // performer's close.
-        if self.state.swap(STORED, Ordering::AcqRel) == CLOSED {
-            self.drop_object();
+    }
+
+    /// A hold more, by a holder of the handle or of another hold.
+    fn hold(&self) {
+        self.holds.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A hold goes; the last drops the object.
+    fn release(&self) -> Held {
+        // SeqCst: against a retire that raises its flag and then looks.
+        match self.holds.fetch_sub(1, Ordering::SeqCst) {
+            1 => {
+                // SAFETY: the last hold: no other thread reaches the slot.
+                if let Some(erased) = unsafe { (*self.object.get()).take() } {
+                    // SAFETY: made from `Box::<T>::into_raw` with its own drop.
+                    unsafe { (erased.drop)(erased.ptr) };
+                }
+                Held::Dropped
+            }
+            2 => Held::OneLeft,
+            _ => Held::More,
         }
     }
 
-    /// The performer marks the close done; drops the object if the handle
-    /// handed it over already.
-    fn closed(&self) {
-        if self.state.swap(CLOSED, Ordering::AcqRel) == STORED {
-            self.drop_object();
-        }
-    }
-
-    fn drop_object(&self) {
-        // SAFETY: whichever swap came second reaches the slot, once.
-        if let Some(erased) = unsafe { (*self.object.get()).take() } {
-            // SAFETY: made from `Box::<T>::into_raw` with its own drop.
-            unsafe { (erased.drop)(erased.ptr) };
-        }
+    /// Whether a lease is out: a hold beside the close's.
+    pub(super) fn leased(&self) -> bool {
+        self.holds.load(Ordering::SeqCst) > 1
     }
 }
 
-impl Drop for Doomed {
+impl Drop for Keep {
     fn drop(&mut self) {
-        self.drop_object();
+        // A source dropped with its object still kept (no close was asked).
+        if let Some(erased) = self.object.get_mut().take() {
+            // SAFETY: made from `Box::<T>::into_raw` with its own drop.
+            unsafe { (erased.drop)(erased.ptr) };
+        }
     }
 }

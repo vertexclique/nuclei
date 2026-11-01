@@ -5,10 +5,11 @@ use core::task::{Context, Poll};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
-use super::addr::{ToSocketAddrs, resolve};
+use super::addr::{ToSocketAddrs, first, resolve};
 use super::none_worked;
+use crate::buf::owned::{IoBuf, IoBufMut};
 use crate::io::source::write::Dest;
-use crate::io::source::{Addr, Kind};
+use crate::io::source::{Kind, Sender};
 use crate::io::{Handle, Interest, ReadBuf, Ready};
 
 impl Handle<UdpSocket> {
@@ -32,6 +33,14 @@ impl Handle<UdpSocket> {
     /// A socket on an ephemeral local port, connected to the first of
     /// `sock_addrs` it can connect to: `send` and `recv` then talk to that
     /// peer only.
+    ///
+    /// This makes a socket: it is called as `UdpSocket::connect(addr)`.
+    /// Called on a socket, `socket.connect(addr)` is std's own
+    /// `UdpSocket::connect`, reached through `Deref`, which connects that
+    /// socket in place and looks a name up with a blocking call, on the
+    /// calling thread (a shard's, with every task of it). Connect a socket
+    /// in place with a numeric address, or look the name up first with
+    /// [`lookup_host`](super::lookup_host).
     ///
     /// # Errors
     ///
@@ -60,8 +69,9 @@ impl Handle<UdpSocket> {
     ///
     /// # Errors
     ///
-    /// As `send(2)`, or the error of an earlier datagram sent after its call
-    /// returned.
+    /// As `send(2)` of this datagram. On Windows the completion port sends it
+    /// after the call returns, so a failure the stack finds only then (its
+    /// size is checked first) is the next send's error.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Connected)).await
     }
@@ -74,6 +84,66 @@ impl Handle<UdpSocket> {
     /// As `recv(2)`.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.receive(buf, false).await.map(|(n, _)| n)
+    }
+
+    /// Sends all of `buf` as one datagram to the connected peer and gives
+    /// it back with its length. The driver sends from `buf` itself, so the
+    /// bytes are never copied.
+    ///
+    /// If the future is dropped before it completes, the datagram is sent
+    /// whole or not at all: one the driver has not handed to the kernel is
+    /// withdrawn, and one already handed over goes out. `buf` is any
+    /// [`IoBuf`](crate::io::IoBuf).
+    pub async fn send_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBuf,
+    {
+        self.source().send_owned(buf, Dest::Connected).await
+    }
+
+    /// Sends all of `buf` as one datagram to the first address `addr` names
+    /// and gives it back with its length, as [`send_owned`](Self::send_owned)
+    /// sends to the connected peer.
+    pub async fn send_to_owned<A, B>(&self, buf: B, addr: A) -> (io::Result<usize>, B)
+    where
+        A: ToSocketAddrs,
+        B: IoBuf,
+    {
+        let target = match first(&addr).await {
+            Ok(target) => target.ok_or_else(|| none_worked(None)),
+            Err(err) => Err(err),
+        };
+        match target {
+            Ok(target) => self.source().send_owned(buf, Dest::Inet(target)).await,
+            Err(err) => (Err(err), buf),
+        }
+    }
+
+    /// Receives a datagram from the connected peer into the spare capacity
+    /// of `buf`, after the bytes it holds, and gives `buf` back with the
+    /// datagram's length. The driver receives into `buf` itself, so the bytes
+    /// are never copied; what does not fit is cut.
+    ///
+    /// If the future is dropped before it completes, a datagram the driver
+    /// received into `buf` stays with the socket for its next receive, so
+    /// none is lost. `buf` is any [`IoBufMut`](crate::io::IoBufMut).
+    pub async fn recv_owned<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: IoBufMut,
+    {
+        let (result, buf) = self.recv_from_owned(buf).await;
+        (result.map(|(n, _)| n), buf)
+    }
+
+    /// Receives a datagram with its sender's address into the spare capacity
+    /// of `buf`, as [`recv_owned`](Self::recv_owned).
+    pub async fn recv_from_owned<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
+    where
+        B: IoBufMut,
+    {
+        let (result, buf) = self.source().recv_from_owned(buf).await;
+        let result = result.and_then(|(n, addr)| SocketAddr::from_addr(addr).map(|addr| (n, addr)));
+        (result, buf)
     }
 
     /// Looks at the next datagram without taking it.
@@ -89,12 +159,10 @@ impl Handle<UdpSocket> {
     ///
     /// # Errors
     ///
-    /// As `sendto(2)`, the lookup's, or an earlier datagram's.
+    /// As `sendto(2)` of this datagram (on Windows, as for
+    /// [`send`](Self::send)), or the lookup's.
     pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
-        let addr = resolve(&addr)
-            .await?
-            .next()
-            .ok_or_else(|| none_worked(None))?;
+        let addr = first(&addr).await?.ok_or_else(|| none_worked(None))?;
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Inet(addr))).await
     }
 
@@ -114,6 +182,40 @@ impl Handle<UdpSocket> {
     /// As `recvfrom(2)` with `MSG_PEEK`.
     pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.receive(buf, true).await
+    }
+
+    /// Polls for a datagram and its sender, received into the unfilled part
+    /// of `buf`, which advances by its length; what does not fit is cut.
+    /// `Pending` with `cx`'s waker kept until one comes.
+    ///
+    /// # Errors
+    ///
+    /// As `recvfrom(2)`.
+    pub fn poll_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<SocketAddr>> {
+        let (n, addr) =
+            core::task::ready!(self.poll_receive(cx, buf.initialize_unfilled(), false))?;
+        buf.advance(n);
+        Poll::Ready(Ok(addr))
+    }
+
+    /// Polls to send a datagram to `target`, `Pending` with `cx`'s waker kept
+    /// while one is still queued.
+    ///
+    /// # Errors
+    ///
+    /// As `sendto(2)` of this datagram (on Windows, as for
+    /// [`send`](Self::send)).
+    pub fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.source().poll_send(cx, buf, Dest::Inet(target))
     }
 
     /// Waits until a receive would end at once: a datagram came, or an
@@ -234,13 +336,20 @@ impl Handle<UdpSocket> {
     }
 
     /// Polls for the sender of the next datagram, which stays to be
-    /// received. No byte of it is copied.
+    /// received. At most one byte of it is copied, and dropped.
     ///
     /// # Errors
     ///
     /// As `recvfrom(2)` with `MSG_PEEK`.
     pub fn poll_peek_sender(&self, cx: &mut Context<'_>) -> Poll<io::Result<SocketAddr>> {
-        self.poll_receive(cx, &mut [], true)
+        // macOS names no sender for a receive into an empty buffer: a peek of one byte gets
+        // it named, and leaves the datagram whole on the socket. Windows names it for an
+        // empty one, and answers a peek cut short with an error.
+        #[cfg(unix)]
+        let mut room = [0u8; 1];
+        #[cfg(windows)]
+        let mut room = [0u8; 0];
+        self.poll_receive(cx, &mut room, true)
             .map(|r| r.map(|(_, addr)| addr))
     }
 
@@ -274,20 +383,13 @@ impl Handle<UdpSocket> {
         poll_fn(|cx| self.poll_receive(cx, buf, peek)).await
     }
 
+    #[inline(always)]
     fn poll_receive(
         &self,
         cx: &mut Context<'_>,
         buf: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<(usize, SocketAddr)>> {
-        let (n, addr) = core::task::ready!(self.source().poll_receive(cx, buf, peek))?;
-        Poll::Ready(match addr {
-            Addr::Inet(addr) => Ok((n, addr)),
-            #[cfg(unix)]
-            Addr::Unix(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a UDP datagram came with no internet address",
-            )),
-        })
+        self.source().poll_receive_as(cx, buf, peek)
     }
 }

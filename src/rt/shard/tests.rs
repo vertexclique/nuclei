@@ -12,7 +12,10 @@ fn sleep_on(shard: &Shard, at: Instant) -> impl core::future::Future<Output = ()
         let mut wheel = shard.wheel().borrow_mut();
         match key {
             None => {
-                key = Some(wheel.insert(shard.wheel_time(at), cx.waker()));
+                key = Some(wheel.insert(
+                    shard.time_of(false, crate::time::clock::nanos(at)),
+                    cx.waker(),
+                ));
             }
             Some(k) if wheel.is_fired(k) => {
                 wheel.remove(k);

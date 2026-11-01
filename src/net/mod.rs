@@ -5,8 +5,20 @@
 //! `recv_from`, `peek_from`) and, for the streams, `AsyncRead` and
 //! `AsyncWrite` on the handle and on a shared reference to it, so two tasks
 //! can read and write one stream at once. A stream's `read_owned` and
-//! `write_owned` take the caller's buffer and give it back, so the driver
-//! reads into it and writes from it with no copy.
+//! `write_owned` take the caller's buffer (any [`IoBuf`](crate::io::IoBuf)
+//! or [`IoBufMut`](crate::io::IoBufMut)) and give it back, so the driver
+//! reads into it and writes from it with no copy, and `read_vectored_owned`
+//! and `write_vectored_owned` do the same with several buffers in one call;
+//! a TCP stream's `write_zero_copy` asks the kernel not to copy it either,
+//! and gives it back through a [`Released`] once the kernel let go of it.
+//! `send_file` sends a range of a file to a stream.
+//!
+//! A stream ends with [`shut`](TcpStream::shut), std's shutdown made once
+//! the bytes written behind reached the kernel, or for TCP with
+//! [`abort`](TcpStream::abort), which resets the connection now.
+//! [`TcpSocket`] and [`UdpSocketBuilder`] set a socket up before it listens,
+//! connects or binds, and [`TcpKeepalive`] times a TCP connection's
+//! keepalive probes.
 //!
 //! An address is anything [`ToSocketAddrs`] takes: numbers are used at
 //! once; a name (`"localhost:80"`) is looked up on the blocking pool, so no
@@ -28,23 +40,32 @@
 //! ```
 
 mod addr;
-mod opt;
+mod close;
+pub(crate) mod opt;
+mod released;
+pub(crate) mod send_file;
 mod socket;
+mod sockopt;
 mod split;
 mod stream;
 mod tcp;
+mod tcp_options;
 mod udp;
+mod udp_socket;
 #[cfg(unix)]
 pub mod unix;
 #[cfg(unix)]
 mod unix_socket;
 
 pub use self::addr::{ToSocketAddrs, lookup_host};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use self::socket::DeviceName;
+pub use self::released::Released;
 pub use self::socket::TcpSocket;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use self::sockopt::DeviceName;
 pub use self::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};
 pub use self::tcp::TcpStreamGenerator;
+pub use self::tcp_options::TcpKeepalive;
+pub use self::udp_socket::UdpSocketBuilder;
 #[cfg(unix)]
 pub use self::unix_socket::UnixSocket;
 
@@ -54,14 +75,20 @@ use crate::io::Handle;
 
 /// A TCP listener: std's, with an async `accept`.
 pub type TcpListener = Handle<std::net::TcpListener>;
-/// A TCP stream: std's, with async reads and writes.
+/// A TCP stream: std's, with async reads and writes. A few of std's calls
+/// reached through `Deref` go around the handle (`shutdown` among them): see
+/// [`Handle`].
 pub type TcpStream = Handle<std::net::TcpStream>;
-/// A UDP socket: std's, with async sends and receives.
+/// A UDP socket: std's, with async sends and receives. Its
+/// [`connect`](UdpSocket::connect) makes a socket;
+/// `socket.connect(addr)` on one is std's own (see there).
 pub type UdpSocket = Handle<std::net::UdpSocket>;
 /// A Unix stream listener: std's, with an async `accept`.
 #[cfg(unix)]
 pub type UnixListener = Handle<std::os::unix::net::UnixListener>;
-/// A Unix stream: std's, with async reads and writes.
+/// A Unix stream: std's, with async reads and writes. A few of std's calls
+/// reached through `Deref` go around the handle (`shutdown` among them): see
+/// [`Handle`].
 #[cfg(unix)]
 pub type UnixStream = Handle<std::os::unix::net::UnixStream>;
 /// A Unix datagram socket: std's, with async sends and receives.

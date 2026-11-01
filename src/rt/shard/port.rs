@@ -68,7 +68,7 @@ impl Shard {
                     // SAFETY: as on the shard: a packet of a source's key is
                     // one of its operations, its OVERLAPPED the first field
                     // of a slot the operation's strong reference keeps.
-                    |entry| unsafe { crate::io::source::port::complete(entry) },
+                    |entry| unsafe { crate::io::source::port::complete(entry, None) },
                 );
                 if keeper.state.swap(DONE, Ordering::AcqRel) == STOPPING {
                     keeper.thread.unpark();

@@ -208,6 +208,19 @@ fn a_reset_sleep_waits_for_its_new_deadline() {
 }
 
 #[test]
+fn a_fired_sleep_reset_waits_for_its_new_deadline() {
+    let rt = runtime(1);
+    rt.block_on(async {
+        let mut s = Box::pin(time::sleep(Duration::from_millis(1)));
+        s.as_mut().await;
+        let start = Instant::now();
+        s.as_mut().reset(start + Duration::from_millis(10));
+        s.as_mut().await;
+        assert!(start.elapsed() >= Duration::from_millis(10));
+    });
+}
+
+#[test]
 fn a_sleep_works_on_a_thread_that_runs_no_shard() {
     let start = Instant::now();
     foreign_block_on(time::sleep(Duration::from_millis(15)));

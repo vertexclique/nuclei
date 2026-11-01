@@ -67,7 +67,7 @@ fn wake_all(inner: &Inner) {
     for shard in inner.workers.shards() {
         shard.unpark();
     }
-    for shard in inner.guests.values() {
+    for shard in inner.guests_made().into_iter().flat_map(|g| g.values()) {
         shard.unpark();
     }
 }
@@ -97,7 +97,8 @@ fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
     }
     let mut seen: Vec<(Arc<Shared>, u64)> = Vec::new();
     let mut earliest = u64::MAX;
-    for shard in inner.workers.shards().cloned().chain(inner.guests.values()) {
+    let guests = inner.guests_made().into_iter().flat_map(|g| g.values());
+    for shard in inner.workers.shards().cloned().chain(guests) {
         if !shard.idle() {
             return false;
         }
@@ -141,13 +142,19 @@ pub(crate) struct Guest<'a> {
 impl<'a> Guest<'a> {
     /// Counts `shard` in `inner` if its clock is paused (or was ever
     /// altered, so a pause during the call is seen when it ends).
+    #[inline]
     pub(crate) fn enter(inner: &'a Arc<Inner>, shard: &Arc<Shared>) -> Guest<'a> {
         let key = Arc::as_ptr(shard) as usize;
         if inner.clock.is_paused() {
-            inner.guests.insert(key, Arc::clone(shard));
-            inner.clock.member_changed();
+            Self::join(inner, key, shard);
         }
         Guest { inner, key }
+    }
+
+    #[inline(never)]
+    fn join(inner: &Inner, key: usize, shard: &Arc<Shared>) {
+        inner.guests().insert(key, Arc::clone(shard));
+        inner.clock.member_changed();
     }
 
     /// Counts the calling thread's own shard in `inner`, if the thread is
@@ -161,7 +168,11 @@ impl<'a> Guest<'a> {
         });
         if on_own {
             let key = Arc::as_ptr(&own.shared) as usize;
-            if inner.guests.insert(key, Arc::clone(&own.shared)).is_none() {
+            if inner
+                .guests()
+                .insert(key, Arc::clone(&own.shared))
+                .is_none()
+            {
                 inner.clock.member_changed();
             }
         }
@@ -169,11 +180,22 @@ impl<'a> Guest<'a> {
 }
 
 impl Drop for Guest<'_> {
+    #[inline]
     fn drop(&mut self) {
-        if !self.inner.clock.is_altered() {
-            return;
+        if self.inner.clock.is_altered() {
+            self.leave();
         }
-        if self.inner.guests.remove(&self.key).is_some() {
+    }
+}
+
+impl Guest<'_> {
+    #[inline(never)]
+    fn leave(&self) {
+        if self
+            .inner
+            .guests_made()
+            .is_some_and(|guests| guests.remove(&self.key).is_some())
+        {
             self.inner.clock.member_changed();
             // The shards left may all be idle now.
             try_advance(self.inner, None);

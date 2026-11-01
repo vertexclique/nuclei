@@ -1,248 +1,266 @@
-//! A file's calls on io_uring: a read or a write at an offset, issued on
-//! the ring of the shard whose thread asks for it, instead of a job of the
-//! blocking pool.
+//! A file's calls on io_uring: a read or a write at an offset, or a sync,
+//! issued on the ring of the shard whose thread asks for it, instead of a
+//! job of the blocking pool.
 //!
-//! The operation keeps a copy of the file's descriptor and the buffer it
+//! The operation keeps a lease on the handle's descriptor and the buffer it
 //! reads into or writes from until its last completion, so neither goes
-//! while the kernel may use them. A write the kernel took only part of goes
+//! while the kernel may use them (and the number reaches no other file while
+//! the entry waits for room). A write the kernel took only part of goes
 //! on with the rest from the ring's thread. Its end is left in a slot the
-//! task that waits for it polls ([`RingJob`]); a task that went away leaves
-//! the end to nobody, and the buffer goes with the operation. An operation
-//! cancelled because its shard went finishes its call on the blocking pool,
-//! so a write that started still lands.
+//! task that waits for it polls (`call`); a task that went away leaves the
+//! end to nobody, and the buffer goes with the operation. A write is counted
+//! on its shard until its end's wake went (`call::WriteCall`). An operation
+//! cancelled because its shard went finishes its call on the blocking pool
+//! (or, on a thread inside no runtime, there), so a write that started still
+//! lands.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Poll, Waker};
+use core::task::Waker;
 use std::io;
 use std::sync::Arc;
 
+use super::Allocate;
+use super::call::{End, FileOutcome, LentReadEnd, LentWriteEnd, Slot, SlotJob, WriteCall};
+use super::file::{SyncKind, sync_on};
 use crate::buf::PoolBuf;
-use crate::io::raw::{OwnedFile, file_raw};
+use crate::buf::owned::OwnedBuf;
+use crate::io::source::requests::Lease;
 use crate::io::sys;
-use crate::sync::atomic_waker::AtomicWaker;
+use crate::rt::counters::tally;
 use crate::syscore::linux::iouring::ring::Sqe;
 
 /// What a file's operation reads into or writes from.
 pub(crate) enum FileMem {
-    /// A read into the spare room of a buffer of the pool.
-    Read(PoolBuf),
+    /// A read into `len` bytes of a buffer of the pool from `from` (each
+    /// within the buffer's `u32` capacity, so the variant is no larger than
+    /// a write's).
+    Read { buf: PoolBuf, from: u32, len: u32 },
     /// A read into the spare capacity of a task's buffer.
-    ReadLent(Vec<u8>),
+    ReadLent(OwnedBuf),
     /// A write of a buffer of the pool, `done` of its bytes landed.
     Write { buf: PoolBuf, done: usize },
     /// A write of a task's buffer, `done` of its bytes landed.
-    WriteLent { buf: Vec<u8>, done: usize },
+    WriteLent { buf: OwnedBuf, done: usize },
+    /// A call that moves no bytes: a sync, a range's space or write-back.
+    Call(Call),
+    /// A socket's shutdown of the halves `shutdown(2)`'s `how` names, the
+    /// one call of a socket's that goes this way: its lease keeps the
+    /// descriptor's number the socket's until the call ran.
+    Shutdown(libc::c_int),
 }
 
-/// How a file's operation ended, with its buffer.
-pub(crate) enum FileOutcome {
-    Read(io::Result<PoolBuf>),
-    ReadLent(io::Result<usize>, Vec<u8>),
-    Write(io::Result<()>),
-    WriteLent(io::Result<()>, Vec<u8>),
+/// A file's call that moves no bytes, apart from the reads and writes: a
+/// narrow field of its own by the operation's tag would keep the tag a byte,
+/// and every move of a read or a write would copy the bytes around it.
+pub(crate) enum Call {
+    /// A sync of the file's data (`data_only`) or of all of it.
+    Sync { data_only: bool },
+    /// A change of the space `len` bytes from `at` use, as `mode` says.
+    Allocate { len: u64, mode: Allocate },
+    /// A write-back of `len` bytes from `at` (zero: to the file's end).
+    SyncRange { len: u32 },
 }
+
+/// The flags of a range write-back: wait before, write, and wait after
+/// (`SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+/// SYNC_FILE_RANGE_WAIT_AFTER`, the kernel's own numbers).
+const SYNC_RANGE_FLAGS: u32 = 1 | 2 | 4;
 
 /// A file's operation on a ring.
 pub(crate) struct FileOp {
-    fd: Arc<OwnedFile>,
+    fd: Lease,
     /// Where the call reads or writes.
     at: u64,
     mem: FileMem,
     slot: Arc<Slot>,
-}
-
-/// Where an operation's end waits for its task.
-pub(crate) struct Slot {
-    full: AtomicBool,
-    outcome: UnsafeCell<Option<FileOutcome>>,
-    waker: AtomicWaker,
-}
-
-// SAFETY: the outcome is written once, before `full` is raised, by the
-// thread that ends the operation, and taken only after `full` is seen.
-unsafe impl Send for Slot {}
-// SAFETY: as for `Send`.
-unsafe impl Sync for Slot {}
-
-/// Slots a thread keeps for its next calls.
-const SPARE_SLOTS: usize = 8;
-
-thread_local! {
-    /// Slots of this thread's ended calls. One is used again only once the
-    /// ring let go of it too: in steady state a call allocates no slot.
-    static SPARES: core::cell::RefCell<Vec<Arc<Slot>>> =
-        const { core::cell::RefCell::new(Vec::new()) };
-}
-
-impl Slot {
-    fn fresh() -> Self {
-        Self {
-            full: AtomicBool::new(false),
-            outcome: UnsafeCell::new(None),
-            waker: AtomicWaker::new(),
-        }
-    }
-
-    /// A slot for a new call: a spare nobody else holds, made fresh, or a
-    /// new one.
-    fn new() -> Arc<Self> {
-        let spare = SPARES.try_with(|spares| {
-            let mut spares = spares.try_borrow_mut().ok()?;
-            let at = spares
-                .iter_mut()
-                .position(|slot| Arc::get_mut(slot).is_some())?;
-            let mut slot = spares.swap_remove(at);
-            // Unique (`get_mut` is), so nothing else reaches it: an outcome
-            // or waker left from its last call goes here.
-            if let Some(only) = Arc::get_mut(&mut slot) {
-                *only = Self::fresh();
-            }
-            Some(slot)
-        });
-        spare
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| Arc::new(Self::fresh()))
-    }
-
-    /// Keeps `slot`, whose task is done with it, for a later call.
-    fn spare(slot: Arc<Self>) {
-        let _ = SPARES.try_with(|spares| {
-            if let Ok(mut spares) = spares.try_borrow_mut()
-                && spares.len() < SPARE_SLOTS
-            {
-                if spares.capacity() == 0 {
-                    spares.reserve_exact(SPARE_SLOTS);
-                }
-                spares.push(slot);
-            }
-        });
-    }
-
-    fn put(&self, outcome: FileOutcome) {
-        // SAFETY: written once, before `full` is raised.
-        unsafe { *self.outcome.get() = Some(outcome) };
-        // Release: the task reads the outcome after it sees the flag.
-        self.full.store(true, Ordering::Release);
-        self.waker.wake();
-    }
-
-    fn take(&self) -> Option<FileOutcome> {
-        // Acquire: pairs with the Release of `put`.
-        if !self.full.load(Ordering::Acquire) {
-            return None;
-        }
-        // SAFETY: `full` is set: the ending thread is done with the outcome.
-        unsafe { (*self.outcome.get()).take() }
-    }
-}
-
-/// A lent read's end: its result, and the task's buffer back.
-type LentReadEnd = (io::Result<usize>, Vec<u8>);
-/// A lent write's end: its result, and the task's buffer back.
-type LentWriteEnd = (io::Result<()>, Vec<u8>);
-
-/// A file's call in flight on a ring, as the task that waits for it sees it.
-pub(crate) struct RingJob<T> {
-    /// `None` once dropped: it went to this thread's spares.
-    slot: Option<Arc<Slot>>,
-    map: fn(FileOutcome) -> T,
-}
-
-impl<T> RingJob<T> {
-    /// The call's end once it came, else `Pending` with `waker` woken then.
-    pub(crate) fn poll(&mut self, waker: &Waker) -> Poll<T> {
-        let Some(slot) = &self.slot else {
-            return Poll::Pending;
-        };
-        if let Some(outcome) = slot.take() {
-            return Poll::Ready((self.map)(outcome));
-        }
-        slot.waker.register(waker);
-        match slot.take() {
-            Some(outcome) => Poll::Ready((self.map)(outcome)),
-            None => Poll::Pending,
-        }
-    }
-}
-
-impl<T> Drop for RingJob<T> {
-    fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            Slot::spare(slot);
-        }
-    }
+    /// A write's count on the shard that issued it; let go of after the
+    /// slot was filled, its wake gone.
+    write: Option<WriteCall>,
 }
 
 /// Issues the call of `buf` (made into `mem`) on `fd` at `at` on the ring of
 /// this thread's shard, if it runs one; else gives `buf` back for the
-/// blocking pool.
-fn submit<B, T>(
-    fd: &Arc<OwnedFile>,
+/// blocking pool. With `waker`, its end wakes `waker` however soon it comes.
+#[inline]
+fn submit<B, T, M>(
+    fd: &Lease,
     at: u64,
     buf: B,
-    mem: fn(B) -> FileMem,
-    map: fn(FileOutcome) -> T,
-) -> Result<RingJob<T>, B> {
+    mem: M,
+    waker: Option<&Waker>,
+) -> Result<SlotJob<T>, B>
+where
+    T: End,
+    M: FnOnce(B) -> FileMem,
+{
     crate::rt::context::current(|current| {
-        let Some(ring) = current.and_then(|shard| shard.ring()) else {
+        let Some((shard, ring)) = current.and_then(|shard| Some((shard, shard.ring()?))) else {
             return Err(buf);
         };
-        let slot = Slot::new();
-        ring.submit_file(FileOp {
-            fd: Arc::clone(fd),
-            at,
-            mem: mem(buf),
-            slot: Arc::clone(&slot),
-        });
-        Ok(RingJob {
-            slot: Some(slot),
-            map,
-        })
+        Ok(issue(shard, ring, fd, at, buf, mem, waker))
     })
 }
 
-/// A read at `at` into the spare room of `buf`, on this thread's ring.
+/// As [`submit`], for a buffer the caller holds: taken out of `held` only
+/// when the call goes on the ring, so a thread with none moves it nowhere.
+#[inline]
+fn submit_held<B, T, M>(
+    fd: &Lease,
+    at: u64,
+    held: &mut Option<B>,
+    mem: M,
+    waker: Option<&Waker>,
+) -> Option<SlotJob<T>>
+where
+    T: End,
+    M: FnOnce(B) -> FileMem,
+{
+    crate::rt::context::current(|current| {
+        let (shard, ring) = current.and_then(|shard| Some((shard, shard.ring()?)))?;
+        let buf = held.take()?;
+        Some(issue(shard, ring, fd, at, buf, mem, waker))
+    })
+}
+
+/// The call of `buf` (made into `mem`) on `fd` at `at`, on `ring` of
+/// `shard`: the one issue [`submit`] and [`submit_held`] make.
+#[inline(always)]
+fn issue<B, T, M>(
+    shard: &crate::rt::shard::Shard,
+    ring: &crate::rt::shard::ring::ShardRing,
+    fd: &Lease,
+    at: u64,
+    buf: B,
+    mem: M,
+    waker: Option<&Waker>,
+) -> SlotJob<T>
+where
+    T: End,
+    M: FnOnce(B) -> FileMem,
+{
+    let slot = Slot::new();
+    if let Some(waker) = waker {
+        slot.register(waker);
+    }
+    let mem = mem(buf);
+    let write = matches!(
+        mem,
+        FileMem::Write { .. } | FileMem::WriteLent { .. } | FileMem::Call(Call::Allocate { .. })
+    )
+    .then(|| WriteCall::on(&shard.shared));
+    ring.submit_file(FileOp {
+        fd: fd.clone(),
+        at,
+        mem,
+        slot: Arc::clone(&slot),
+        write,
+    });
+    SlotJob::new(slot)
+}
+
+/// A read at `at` into `len` bytes of `buf` from `from`, on this thread's
+/// ring.
+#[inline]
 pub(crate) fn read(
-    fd: &Arc<OwnedFile>,
+    fd: &Lease,
     at: u64,
     buf: PoolBuf,
-) -> Result<RingJob<io::Result<PoolBuf>>, PoolBuf> {
-    submit(fd, at, buf, FileMem::Read, as_read)
-}
-
-/// A read at `at` into the spare capacity of a task's `buf`.
-pub(crate) fn read_lent(
-    fd: &Arc<OwnedFile>,
-    at: u64,
-    buf: Vec<u8>,
-) -> Result<RingJob<LentReadEnd>, Vec<u8>> {
-    submit(fd, at, buf, FileMem::ReadLent, as_read_lent)
-}
-
-/// A write of all of `buf` at `at`.
-pub(crate) fn write(
-    fd: &Arc<OwnedFile>,
-    at: u64,
-    buf: PoolBuf,
-) -> Result<RingJob<io::Result<()>>, PoolBuf> {
-    submit(fd, at, buf, |buf| FileMem::Write { buf, done: 0 }, as_write)
-}
-
-/// A write of all of a task's `buf` at `at`.
-pub(crate) fn write_lent(
-    fd: &Arc<OwnedFile>,
-    at: u64,
-    buf: Vec<u8>,
-) -> Result<RingJob<LentWriteEnd>, Vec<u8>> {
+    from: usize,
+    len: usize,
+) -> Result<SlotJob<io::Result<PoolBuf>>, PoolBuf> {
     submit(
         fd,
         at,
-        buf,
-        |buf| FileMem::WriteLent { buf, done: 0 },
-        as_write_lent,
+        (buf, from, len),
+        |(buf, from, len)| FileMem::Read {
+            buf,
+            from: u32::try_from(from).unwrap_or(u32::MAX),
+            len: u32::try_from(len).unwrap_or(u32::MAX),
+        },
+        None,
     )
+    .map_err(|(buf, _, _)| buf)
+}
+
+/// A sync of the file's data (`data_only`) or of all of it, on this
+/// thread's ring; `Err` when the thread runs none.
+pub(crate) fn sync(fd: &Lease, data_only: bool) -> Result<SlotJob<io::Result<()>>, ()> {
+    submit(
+        fd,
+        0,
+        data_only,
+        |data_only| FileMem::Call(Call::Sync { data_only }),
+        None,
+    )
+    .map_err(drop)
+}
+
+/// A change of the space the `len` bytes from `offset` use, as `mode` says,
+/// on this thread's ring; `Err` when the thread runs none.
+pub(crate) fn allocate(
+    fd: &Lease,
+    offset: u64,
+    len: u64,
+    mode: Allocate,
+) -> Result<SlotJob<io::Result<()>>, ()> {
+    submit(
+        fd,
+        offset,
+        (len, mode),
+        |(len, mode)| FileMem::Call(Call::Allocate { len, mode }),
+        None,
+    )
+    .map_err(drop)
+}
+
+/// A write-back of the `len` bytes from `offset` (zero: to the end), on this
+/// thread's ring; `Err` when the thread runs none.
+pub(crate) fn sync_range(fd: &Lease, offset: u64, len: u32) -> Result<SlotJob<io::Result<()>>, ()> {
+    submit(
+        fd,
+        offset,
+        len,
+        |len| FileMem::Call(Call::SyncRange { len }),
+        None,
+    )
+    .map_err(drop)
+}
+
+/// A read at `at` into the spare capacity of the task's buffer in `held`,
+/// whose end wakes `waker`; `None`, with the buffer left in `held`, when
+/// this thread runs no ring.
+#[inline]
+pub(crate) fn read_lent(
+    fd: &Lease,
+    at: u64,
+    held: &mut Option<OwnedBuf>,
+    waker: &Waker,
+) -> Option<SlotJob<LentReadEnd>> {
+    submit_held(fd, at, held, FileMem::ReadLent, Some(waker))
+}
+
+/// A write of all of `buf` at `at`.
+#[inline]
+pub(crate) fn write(fd: &Lease, at: u64, buf: PoolBuf) -> Result<SlotJob<io::Result<()>>, PoolBuf> {
+    submit(fd, at, buf, |buf| FileMem::Write { buf, done: 0 }, None)
+}
+
+/// A shutdown of the socket `fd`'s halves `how` (as `shutdown(2)` names
+/// them), on this thread's ring; `how` back where this thread runs none.
+pub(crate) fn shutdown(
+    fd: &Lease,
+    how: libc::c_int,
+) -> Result<SlotJob<io::Result<()>>, libc::c_int> {
+    submit(fd, 0, how, FileMem::Shutdown, None)
+}
+
+/// A write of all of a task's `buf` at `at`.
+#[inline]
+pub(crate) fn write_lent(
+    fd: &Lease,
+    at: u64,
+    buf: OwnedBuf,
+) -> Result<SlotJob<LentWriteEnd>, OwnedBuf> {
+    submit(fd, at, buf, |buf| FileMem::WriteLent { buf, done: 0 }, None)
 }
 
 fn len32(len: usize) -> u32 {
@@ -253,16 +271,19 @@ impl FileOp {
     /// The entry for the operation's next call. Its pointers point into the
     /// operation's buffer, whose memory does not move with the operation.
     pub(crate) fn entry(&mut self) -> Sqe {
-        let fd = file_raw(&self.fd);
+        let fd = self.fd.raw();
         match &mut self.mem {
-            FileMem::Read(buf) => {
+            FileMem::Read { buf, from, len } => {
                 let spare = buf.spare();
-                Sqe::read(fd, spare.as_mut_ptr(), len32(spare.len()), self.at)
+                let room = spare.get_mut(*from as usize..).unwrap_or_default();
+                let len = (*len as usize).min(room.len());
+                Sqe::read(fd, room.as_mut_ptr(), len32(len), self.at)
             }
-            FileMem::ReadLent(buf) => {
-                let spare = buf.spare_capacity_mut();
+            FileMem::ReadLent(OwnedBuf::Vec(vec)) => {
+                let spare = vec.spare_capacity_mut();
                 Sqe::read(fd, spare.as_mut_ptr().cast(), len32(spare.len()), self.at)
             }
+            FileMem::ReadLent(buf) => other_read_entry(fd, buf, self.at),
             FileMem::Write { buf, done } => {
                 let bytes = buf.filled().get(*done..).unwrap_or_default();
                 Sqe::write(
@@ -273,7 +294,10 @@ impl FileOp {
                 )
             }
             FileMem::WriteLent { buf, done } => {
-                let bytes = buf.get(*done..).unwrap_or_default();
+                if let Some(bufs) = buf.vectored_mut() {
+                    return vectored_entry(fd, bufs, Some(*done), self.at);
+                }
+                let bytes = buf.rest_from(*done);
                 Sqe::write(
                     fd,
                     bytes.as_ptr(),
@@ -281,6 +305,25 @@ impl FileOp {
                     self.at + *done as u64,
                 )
             }
+            FileMem::Call(_) | FileMem::Shutdown(_) => self.call_entry(fd),
+        }
+    }
+
+    /// The entry of a call that moves no bytes (a sync, a range's space or
+    /// write-back), out of the reads' and writes' way.
+    #[cold]
+    #[inline(never)]
+    fn call_entry(&self, fd: std::os::fd::RawFd) -> Sqe {
+        match &self.mem {
+            FileMem::Call(Call::Sync { data_only }) => Sqe::fsync(fd, *data_only),
+            FileMem::Call(Call::Allocate { len, mode }) => {
+                Sqe::fallocate(fd, self.at, *len, sys::fallocate_mode(*mode) as u32)
+            }
+            FileMem::Call(Call::SyncRange { len }) => {
+                Sqe::sync_file_range(fd, self.at, *len, SYNC_RANGE_FLAGS)
+            }
+            FileMem::Shutdown(how) => Sqe::shutdown(fd, *how),
+            _ => Sqe::nop(),
         }
     }
 
@@ -288,6 +331,9 @@ impl FileOp {
     /// the operation again, for the rest of a write; or its end, left for
     /// its task.
     pub(crate) fn complete(mut self, res: i32) -> Option<FileOp> {
+        if tally::counting() {
+            self.tally(res);
+        }
         if res == -libc::ECANCELED {
             // Its shard went: the call is made on the blocking pool.
             self.finish_on_pool();
@@ -311,45 +357,81 @@ impl FileOp {
             r => Ok(r as usize),
         };
         let outcome = match self.mem {
-            FileMem::Read(mut buf) => FileOutcome::Read(result.map(|n| {
-                buf.set_filled(n);
+            FileMem::Read { mut buf, from, .. } => FileOutcome::Read(result.map(|n| {
+                buf.set_filled_at(from as usize, n);
                 buf
             })),
             FileMem::ReadLent(mut buf) => {
                 if let Ok(n) = result {
                     // SAFETY: the kernel wrote the first `n` bytes of the
-                    // spare capacity.
-                    unsafe { buf.set_len(buf.len() + n) };
+                    // spare capacity (of a vectored read, its rooms in order).
+                    unsafe { buf.add_len(n) };
                 }
                 FileOutcome::ReadLent(result, buf)
             }
             FileMem::Write { .. } => FileOutcome::Write(written(result)),
             FileMem::WriteLent { buf, .. } => FileOutcome::WriteLent(written(result), buf),
+            FileMem::Call(Call::Sync { .. } | Call::SyncRange { .. }) => {
+                FileOutcome::Sync(result.map(drop))
+            }
+            FileMem::Call(Call::Allocate { .. }) => FileOutcome::Write(result.map(drop)),
+            FileMem::Shutdown(_) => FileOutcome::Write(result.map(drop)),
         };
         self.slot.put(outcome);
+        // Once the wake went: a task it dropped handed what it left first.
+        drop(self.write.take());
         None
     }
 
-    /// Makes what is left of the call on the blocking pool, and leaves its
-    /// end in the slot.
+    /// The call's `res` bytes are counted, if it read or wrote any; for a
+    /// caller that found [`tally::counting`].
+    #[cold]
+    #[inline(never)]
+    fn tally(&self, res: i32) {
+        let Ok(n) = usize::try_from(res) else {
+            return;
+        };
+        match self.mem {
+            FileMem::Read { .. } | FileMem::ReadLent(_) => tally::add_read(n),
+            FileMem::Write { .. } | FileMem::WriteLent { .. } if n > 0 => tally::add_write(n),
+            _ => {}
+        }
+    }
+
+    /// The operation is kept for good, its completion never to come: a
+    /// runtime's drop does not wait for it.
+    pub(crate) fn give_up(&mut self) {
+        self.write = None;
+    }
+
+    /// Makes what is left of the call on the blocking pool of the runtime
+    /// this thread is inside, and leaves its end in the slot. With none (a
+    /// ring's keeper, itself a blocking job or a thread of its own), it is
+    /// made here: no runtime is started for it.
     fn finish_on_pool(self) {
-        let FileOp { fd, at, mem, slot } = self;
-        let job = crate::runtime::spawn_blocking(move || {
-            let raw = file_raw(&fd);
+        let FileOp {
+            fd,
+            at,
+            mem,
+            slot,
+            write,
+            ..
+        } = self;
+        let call = move || {
+            let raw = fd.raw();
             let outcome = match mem {
-                FileMem::Read(mut buf) => {
-                    FileOutcome::Read(sys::pread(raw, buf.spare(), at).map(|n| {
-                        buf.set_filled(n);
+                FileMem::Read { mut buf, from, len } => {
+                    let (from, len) = (from as usize, len as usize);
+                    let spare = buf.spare();
+                    let end = from.saturating_add(len).min(spare.len());
+                    let room = spare.get_mut(from..end).unwrap_or_default();
+                    FileOutcome::Read(sys::pread(raw, room, at).map(|n| {
+                        buf.set_filled_at(from, n);
                         buf
                     }))
                 }
                 FileMem::ReadLent(mut buf) => {
-                    let result = sys::pread_uninit(raw, buf.spare_capacity_mut(), at);
-                    if let Ok(n) = result {
-                        // SAFETY: the call wrote the first `n` bytes of the
-                        // spare capacity.
-                        unsafe { buf.set_len(buf.len() + n) };
-                    }
+                    let result = crate::fs::file::pread_owned(raw, &mut buf, at);
                     FileOutcome::ReadLent(result, buf)
                 }
                 FileMem::Write { buf, done } => FileOutcome::Write(sys::pwrite_all(
@@ -357,15 +439,71 @@ impl FileOp {
                     buf.filled().get(done..).unwrap_or_default(),
                     at + done as u64,
                 )),
-                FileMem::WriteLent { buf, done } => {
+                FileMem::WriteLent { mut buf, done } => {
                     let result =
-                        sys::pwrite_all(raw, buf.get(done..).unwrap_or_default(), at + done as u64);
+                        crate::fs::file::pwrite_owned(raw, &mut buf, done, at + done as u64);
                     FileOutcome::WriteLent(result, buf)
                 }
+                FileMem::Call(Call::Sync { data_only }) => FileOutcome::Sync(sync_on(
+                    &fd,
+                    if data_only {
+                        SyncKind::Data
+                    } else {
+                        SyncKind::All
+                    },
+                )),
+                FileMem::Call(Call::SyncRange { len }) => FileOutcome::Sync(sync_on(
+                    &fd,
+                    SyncKind::Range {
+                        offset: at,
+                        len: u64::from(len),
+                    },
+                )),
+                FileMem::Call(Call::Allocate { len, mode }) => {
+                    FileOutcome::Write(sys::allocate(raw, at, len, mode))
+                }
+                FileMem::Shutdown(how) => FileOutcome::Write(sys::shutdown_raw(raw, how)),
             };
-            slot.put(outcome);
-        });
-        job.detach();
+            crate::fs::call::Ending::new(slot, outcome, write)
+        };
+        match crate::rt::runtime::blocking_pool_inside() {
+            Some(pool) => pool.spawn(call).detach(),
+            None => drop(call()),
+        }
+    }
+}
+
+/// The entry of a read at `at` into a task's buffer of another type than a
+/// vector: into every room of a vectored read, or the spare capacity of one
+/// buffer. Out of line, as a vector's is the common one.
+#[inline(never)]
+fn other_read_entry(fd: std::os::fd::RawFd, buf: &mut OwnedBuf, at: u64) -> Sqe {
+    if let Some(bufs) = buf.vectored_mut() {
+        return vectored_entry(fd, bufs, None, at);
+    }
+    let spare = buf.spare_capacity_mut();
+    Sqe::read(fd, spare.as_mut_ptr().cast(), len32(spare.len()), at)
+}
+
+/// The entry of a vectored call at `at`: a read into every room, or with
+/// `Some(done)` a write of every byte from the `done`th on. Out of line, as
+/// the one-buffer calls are the common ones.
+#[inline(never)]
+fn vectored_entry(
+    fd: std::os::fd::RawFd,
+    bufs: &mut crate::buf::vectored::Vectored,
+    done: Option<usize>,
+    at: u64,
+) -> Sqe {
+    match done {
+        None => {
+            let iov = bufs.read_iovecs();
+            Sqe::readv(fd, iov.as_ptr(), len32(iov.len()), at)
+        }
+        Some(done) => {
+            let iov = bufs.write_iovecs(done);
+            Sqe::writev(fd, iov.as_ptr(), len32(iov.len()), at + done as u64)
+        }
     }
 }
 
@@ -378,46 +516,9 @@ fn written(result: io::Result<usize>) -> io::Result<()> {
     }
 }
 
-/// The ends as each kind of job takes them; an end of another kind cannot
-/// come (each job is made with its own), and says so if it does.
-fn as_read(outcome: FileOutcome) -> io::Result<PoolBuf> {
-    match outcome {
-        FileOutcome::Read(result) => result,
-        _ => Err(io::Error::other("a file read ended as another call")),
-    }
-}
-
-fn as_read_lent(outcome: FileOutcome) -> LentReadEnd {
-    match outcome {
-        FileOutcome::ReadLent(result, buf) => (result, buf),
-        _ => (
-            Err(io::Error::other("a file read ended as another call")),
-            Vec::new(),
-        ),
-    }
-}
-
-fn as_write(outcome: FileOutcome) -> io::Result<()> {
-    match outcome {
-        FileOutcome::Write(result) => result,
-        _ => Err(io::Error::other("a file write ended as another call")),
-    }
-}
-
-fn as_write_lent(outcome: FileOutcome) -> LentWriteEnd {
-    match outcome {
-        FileOutcome::WriteLent(result, buf) => (result, buf),
-        _ => (
-            Err(io::Error::other("a file write ended as another call")),
-            Vec::new(),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::OwnedFd;
     use std::time::Duration;
 
     use super::*;
@@ -441,15 +542,19 @@ mod tests {
         (file, path)
     }
 
+    /// An operation on `file`, through a lease of a source over its own
+    /// descriptor (the file outlives the operation).
     fn op_of(file: &std::fs::File, at: u64, mem: FileMem) -> (FileOp, Arc<Slot>) {
+        use std::os::fd::AsRawFd;
         let slot = Slot::new();
-        let fd: OwnedFd = file.try_clone().unwrap().into();
+        let source = crate::io::Source::new(file.as_raw_fd(), crate::io::source::Kind::File);
         (
             FileOp {
-                fd: Arc::new(fd),
+                fd: source.lease().unwrap(),
                 at,
                 mem,
                 slot: Arc::clone(&slot),
+                write: None,
             },
             slot,
         )
@@ -464,7 +569,7 @@ mod tests {
             &file,
             10,
             FileMem::WriteLent {
-                buf: b"0123456789".to_vec(),
+                buf: OwnedBuf::Vec(b"0123456789".to_vec()),
                 done: 0,
             },
         );
@@ -479,14 +584,15 @@ mod tests {
         assert_eq!((entry.raw().off, entry.raw().len), (14, 6));
         assert!(rest.complete(6).is_none(), "the whole write landed");
         match slot.take() {
-            Some(FileOutcome::WriteLent(Ok(()), buf)) => assert_eq!(buf, b"0123456789"),
+            Some(FileOutcome::WriteLent(Ok(()), buf)) => assert_eq!(&*buf, b"0123456789"),
             _ => panic!("the write did not end whole"),
         }
         std::fs::remove_file(path).unwrap();
     }
 
-    /// A call cancelled because its shard went is made on the blocking pool:
-    /// a write still lands, a read still reads.
+    /// A call cancelled because its shard went is made on the blocking pool
+    /// (here, on a thread inside no runtime): a write still lands, a read
+    /// still reads.
     #[test]
     fn a_call_cancelled_as_its_shard_went_is_made_on_the_pool() {
         let (mut file, path) = temp_file("cancelled");
@@ -494,7 +600,7 @@ mod tests {
             &file,
             0,
             FileMem::WriteLent {
-                buf: b"landed".to_vec(),
+                buf: OwnedBuf::Vec(b"landed".to_vec()),
                 done: 0,
             },
         );

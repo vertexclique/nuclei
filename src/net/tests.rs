@@ -574,13 +574,15 @@ fn stream_impls_are_on_the_handle_and_its_reference(h: &Handle<TcpStream>, u: &H
 }
 
 /// Writes until a write goes behind (the socket is full); returns every
-/// byte written, in order.
+/// byte written, in order. Each write is small enough to be copied behind:
+/// one of 16 KiB or more waits for room instead.
 async fn fill_behind(h: &Handle<Pair>) -> Vec<u8> {
+    const CHUNK: usize = 8 * 1024;
     let mut sent = Vec::new();
     let mut seq = 0usize;
     while !h.source.has_unsent() {
-        let chunk: Vec<u8> = (0..16 * 1024)
-            .map(|i| ((seq * 16 * 1024 + i) % 251) as u8)
+        let chunk: Vec<u8> = (0..CHUNK)
+            .map(|i| ((seq * CHUNK + i) % 251) as u8)
             .collect();
         seq += 1;
         let n = within(h.send(&chunk)).await.unwrap();
@@ -882,15 +884,14 @@ fn a_tcp_dup_and_close_never_lets_the_driver_touch_a_reused_number() {
     });
 }
 
-/// A handle dropped with bytes still to send hands them to a copy of its
-/// descriptor; its own number is closed (at once, or by the source's last
-/// holder as it lets go) and taken by a socket of the test while the bytes
-/// are still out. The bytes still go to the old peer, and nothing goes to
-/// the socket that took the number.
+/// A handle dropped with bytes still to send keeps its object, and so its
+/// number, until the bytes are out: no socket made meanwhile takes the
+/// number, the bytes go to the old peer whole, and once they did the number
+/// is free again.
 #[cfg(unix)]
 #[test]
-fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
-    if !alone("net::tests::bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number")
+fn a_handle_dropped_with_bytes_behind_keeps_its_number_until_they_are_out() {
+    if !alone("net::tests::a_handle_dropped_with_bytes_behind_keeps_its_number_until_they_are_out")
     {
         return;
     }
@@ -903,25 +904,24 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         drop(handle);
         (sent, number)
     });
-    // A new socket takes the lowest free number. Until the drop's number is
-    // free (its close may come from another thread, and the runtime's own
-    // descriptors may come and go meanwhile), the sockets made are kept, so
-    // every number below it stays taken and the first made after it closes
-    // takes it.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut kept = Vec::new();
-    let (taker, taker_peer) = loop {
+    // Sockets made while the bytes are out never take the number: the
+    // lowest free numbers are taken, and the dropped handle's is not free.
+    let mut made = Vec::new();
+    for _ in 0..64 {
         let (a, b) = UnixStream::pair().unwrap();
-        if a.as_raw_fd() == number {
-            break (a, b);
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the dropped handle's number {number} never came free"
+        assert_ne!(
+            a.as_raw_fd(),
+            number,
+            "a socket took the number with bytes out"
         );
-        kept.push((a, b));
-        std::thread::sleep(Duration::from_millis(1));
-    };
+        assert_ne!(
+            b.as_raw_fd(),
+            number,
+            "a socket took the number with bytes out"
+        );
+        made.push((a, b));
+    }
+    drop(made);
     let got = std::thread::spawn(move || read_to_end_blocking(peer))
         .join()
         .unwrap();
@@ -931,16 +931,77 @@ fn bytes_delivered_after_a_drop_never_go_to_a_socket_that_took_the_number() {
         got.len(),
         sent.len()
     );
-    drop(kept);
-    // Nothing reached the socket that took the number.
-    drop(taker);
-    taker_peer.set_nonblocking(true).unwrap();
-    let mut buf = [0u8; 1];
-    assert!(
-        matches!((&taker_peer).read(&mut buf), Ok(0)),
-        "bytes leaked into the new socket"
-    );
+    // Delivered and closed: the number comes free.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut kept = Vec::new();
+    loop {
+        let (a, b) = UnixStream::pair().unwrap();
+        if a.as_raw_fd() == number || b.as_raw_fd() == number {
+            break;
+        }
+        if a.as_raw_fd() < number {
+            kept.push((a, b));
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped handle's number never came free once its bytes were out"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Many handles dropped with bytes still to send, under a lowered limit on
+/// descriptors: each cycle's descriptors (the handle's, kept by its linger,
+/// and the peer's) are all closed again, so the count returns to where it
+/// began and the limit is never met.
+#[cfg(unix)]
+#[test]
+fn dropped_handles_with_unsent_bytes_leave_no_descriptor_open() {
+    if !alone("net::tests::dropped_handles_with_unsent_bytes_leave_no_descriptor_open") {
+        return;
+    }
+    let open = || crate::alone::open_descriptors().len();
+    let rt = runtime();
+    let before = open();
+    // A limit is a descriptor number: the room is above the highest open.
+    let top = crate::alone::open_descriptors()
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let limit = libc::rlimit {
+        rlim_cur: top as libc::rlim_t + 64,
+        rlim_max: top as libc::rlim_t + 64,
+    };
+    // SAFETY: lowers this process's own limit with a valid struct.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    for _ in 0..1500 {
+        let (mine, peer) = UnixStream::pair().unwrap();
+        rt.block_on(async {
+            let handle = Handle::new(mine).unwrap();
+            fill_behind(&handle).await;
+            drop(handle);
+        });
+        drop(peer);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while open() > before + 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} descriptors open, {before} before",
+            open()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(windows)]
 mod windows;
+
+mod datagram_owned;
+
+#[cfg(unix)]
+mod emfile;
+
+mod send_file;
+
+mod zero_copy;

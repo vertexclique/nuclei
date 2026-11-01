@@ -135,6 +135,13 @@ fn thread_hooks_run_on_every_thread_the_runtime_starts() {
             nuclei::time::sleep(Duration::from_millis(5)).await;
         }
     });
+    // A worker the system has not run yet calls its start hook once it runs.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pause = Duration::from_millis(1);
+    while starts.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
+    }
     assert!(
         starts.load(Ordering::SeqCst) >= 3,
         "two workers and a blocking thread"
@@ -172,9 +179,10 @@ fn the_scheduler_knobs_keep_the_runtime_working() {
 }
 
 #[test]
-#[should_panic(expected = "event_interval must be at least 1")]
-fn a_zero_event_interval_is_refused() {
-    let _ = Runtime::builder().event_interval(0);
+fn a_zero_event_interval_is_refused_by_build() {
+    let err = Runtime::builder().event_interval(0).build().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("event_interval"), "{err}");
 }
 
 #[test]

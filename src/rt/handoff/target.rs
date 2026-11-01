@@ -41,6 +41,11 @@ impl Target {
         }
     }
 
+    /// Whether the target moved.
+    pub(crate) fn moved(&self) -> bool {
+        self.moved.load(Ordering::Acquire)
+    }
+
     /// Moves the target to `to`; a second move does nothing. The caller then
     /// looks for what was said before it sleeps on `to`.
     pub(crate) fn move_to(&self, to: &Arc<Shared>) {

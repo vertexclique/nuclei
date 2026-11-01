@@ -24,10 +24,19 @@ fn recv_shard(buffers: u16, size: u32) -> Option<Shard> {
     ring_shard_of(64, buffers, size)
 }
 
+/// As [`recv_shard`], with a group of whole buffers: a datagram cannot share
+/// a buffer filled in pieces, so multishot datagrams need this one.
+fn plain_shard(buffers: u16, size: u32) -> Option<Shard> {
+    super::super::recv::INCREMENTAL_FOR_TEST.with(|t| t.set(Some(false)));
+    let shard = ring_shard_of(64, buffers, size);
+    super::super::recv::INCREMENTAL_FOR_TEST.with(|t| t.set(None));
+    shard
+}
+
 /// As [`recv_shard`], on a ring of `entries` submission entries (twice as
 /// many completions): a ring whose completion queue overflows ends its
 /// multishot operations itself.
-fn ring_shard_of(entries: u32, buffers: u16, size: u32) -> Option<Shard> {
+pub(super) fn ring_shard_of(entries: u32, buffers: u16, size: u32) -> Option<Shard> {
     let shard = Shard::new(Limits {
         max_nesting: 8,
         buffer_cap: crate::buf::DEFAULT_CAP,
@@ -51,7 +60,7 @@ fn ring_shard_of(entries: u32, buffers: u16, size: u32) -> Option<Shard> {
 }
 
 /// A socket of a pair with its source, and the pair's other end.
-fn source_pair() -> (UnixStream, Arc<Source>, UnixStream) {
+pub(super) fn source_pair() -> (UnixStream, Arc<Source>, UnixStream) {
     let (mine, peer) = UnixStream::pair().unwrap();
     sys::set_nonblocking(mine.as_raw_fd()).unwrap();
     let src = Source::new(mine.as_raw_fd(), Kind::Stream);
@@ -148,8 +157,12 @@ fn a_long_stream_arrives_whole_and_in_order_across_the_buffers() {
         peer
     });
     shard.block_on(async {
+        // Reads under the size a buffer is read into directly, so the
+        // group serves them.
         let mut got = vec![0u8; expected.len()];
-        read_exact(&src, &mut got).await;
+        for piece in got.chunks_mut(4096) {
+            read_exact(&src, piece).await;
+        }
         assert!(got == expected, "the bytes arrived changed or out of order");
     });
     // Some reads may go through the pool when a burst outruns the group.
@@ -348,25 +361,44 @@ fn a_chunk_outlives_its_shard() {
             let mut first = [0u8; 1];
             read_exact(&src, &mut first).await;
             assert_eq!(first[0], expected[0]);
-            pause(Duration::from_millis(50)).await;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut nap = Duration::from_millis(1);
+            while !src.has_read_ahead() {
+                assert!(Instant::now() < deadline, "no chunk was held in time");
+                pause(nap).await;
+                nap = (nap * 2).min(Duration::from_millis(50));
+            }
         });
     }
     drop(shard);
-    // Read on a thread with no shard: what is held comes from the chunks.
+    // Read on a thread with no shard: what is held comes from the chunks. The poll registers the
+    // source with a shard of the process's runtime, whose thread takes both sides to put it in
+    // place, and the ring's keeper takes the read side as the cancelled receive ends: a poll that
+    // finds the side held that way waits for the holder's wake, then reads what is held.
     let mut rest = vec![0u8; 16 * 1024];
     let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let waker = std::task::Waker::from(Arc::new(Flag(Arc::clone(&woke))));
     let mut cx = std::task::Context::from_waker(&waker);
-    match src.poll_read(&mut cx, &mut rest, false) {
-        core::task::Poll::Ready(Ok(n)) => {
-            assert!(n > 0);
-            assert!(
-                rest[..n] == data[1..=n],
-                "the bytes held changed after the shard went"
-            );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let n = loop {
+        match src.poll_read(&mut cx, &mut rest, false) {
+            core::task::Poll::Ready(Ok(n)) => break n,
+            core::task::Poll::Pending => {
+                let mut nap = Duration::from_micros(50);
+                while !woke.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline, "the read was never woken");
+                    std::thread::sleep(nap);
+                    nap = (nap * 2).min(Duration::from_millis(10));
+                }
+            }
+            other => panic!("the bytes held were not there: {other:?}"),
         }
-        other => panic!("the bytes held were not there: {other:?}"),
-    }
+    };
+    assert!(n > 0);
+    assert!(
+        rest[..n] == data[1..=n],
+        "the bytes held changed after the shard went"
+    );
     src.retire();
 }
 
@@ -387,12 +419,39 @@ fn listener_source() -> (std::net::TcpListener, Arc<Source>, std::net::SocketAdd
     (listener, src, addr)
 }
 
+/// The next connection; a process short of descriptors (other tests run in
+/// parallel) is waited out.
 async fn accept_stream(src: &Arc<Source>) -> crate::io::raw::Owned {
-    poll_fn(|cx| src.poll_accept_stream(cx)).await.unwrap()
+    loop {
+        match poll_fn(|cx| src.poll_accept_stream(cx)).await {
+            Ok(conn) => return conn,
+            Err(err) if crate::rt::counters::out_of_descriptors(&err) => {
+                crate::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
+}
+
+/// A client connection, made again while the process has no descriptor for
+/// it: a client that died of that would leave the accepting side waiting for
+/// good.
+fn connect_patiently(addr: std::net::SocketAddr) -> std::net::TcpStream {
+    loop {
+        match std::net::TcpStream::connect(addr) {
+            Ok(c) => return c,
+            Err(err) if crate::rt::counters::out_of_descriptors(&err) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
 }
 
 /// Connections taken without their addresses are all served by the one
-/// multishot accept the first armed.
+/// multishot accept the first armed, or by one armed again after the process
+/// had no descriptor to accept into (other tests run in parallel), which ends
+/// the accept.
 #[test]
 fn one_multishot_accept_serves_a_stream_of_connections() {
     let Some(shard) = recv_shard(16, 4096) else {
@@ -403,7 +462,7 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
     let clients = std::thread::spawn(move || {
         (0..16)
             .map(|i| {
-                let mut c = std::net::TcpStream::connect(addr).unwrap();
+                let mut c = connect_patiently(addr);
                 c.write_all(&[i]).unwrap();
                 std::thread::sleep(Duration::from_millis(1));
                 c
@@ -411,9 +470,19 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
             .collect::<Vec<_>>()
     });
     let mut seen = Vec::new();
-    shard.block_on(async {
+    let mut ended = 0;
+    let served = shard.block_on(crate::time::timeout(Duration::from_secs(30), async {
         for _ in 0..16 {
-            let conn = std::net::TcpStream::from(accept_stream(&src).await);
+            let conn = loop {
+                match poll_fn(|cx| src.poll_accept_stream(cx)).await {
+                    Ok(conn) => break std::net::TcpStream::from(conn),
+                    Err(err) if crate::rt::counters::out_of_descriptors(&err) => {
+                        ended += 1;
+                        crate::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(err) => panic!("{err}"),
+                }
+            };
             // An accepted connection is non-blocking; its byte may still be
             // on its way.
             conn.set_nonblocking(false).unwrap();
@@ -423,7 +492,8 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
             assert_eq!(n, 1);
             seen.push(b[0]);
         }
-    });
+    }));
+    served.expect("a connection never came");
     seen.sort_unstable();
     assert_eq!(
         seen,
@@ -431,7 +501,12 @@ fn one_multishot_accept_serves_a_stream_of_connections() {
         "a connection was lost or taken twice"
     );
     let (armed, _, _) = shard.ring().unwrap().multishot_counts();
-    assert_eq!(armed, 1, "the accept was armed again {} times", armed - 1);
+    assert_eq!(
+        armed,
+        1 + ended,
+        "the accept was armed again {} times, {ended} of them after the process had no descriptor",
+        armed - 1
+    );
     drop(clients.join().unwrap());
     src.retire();
 }
@@ -473,9 +548,15 @@ fn an_accept_after_a_multishot_one_gets_its_peer_from_the_kernel() {
 
 /// Connections that come while no task takes them: past its cap the accept
 /// is stopped, none is lost, and once they are taken the accept is armed
-/// again.
+/// again. Alone in a process of its own: its clients and the connections it
+/// holds take more descriptors than the tests running beside it leave.
 #[test]
 fn past_its_cap_a_multishot_accept_is_stopped_and_loses_no_connection() {
+    if !crate::alone::alone(
+        "rt::shard::ring::tests_recv::past_its_cap_a_multishot_accept_is_stopped_and_loses_no_connection",
+    ) {
+        return;
+    }
     // A completion queue with room for every connection: only the cap stops
     // the accept.
     let Some(shard) = ring_shard_of(1024, 16, 4096) else {
@@ -546,7 +627,7 @@ const DATAGRAM_BUFFERS: u32 = 66 * 1024;
 /// their senders through the one multishot receive the first armed.
 #[test]
 fn datagrams_come_whole_with_their_senders_through_one_multishot_receive() {
-    let Some(shard) = recv_shard(16, DATAGRAM_BUFFERS) else {
+    let Some(shard) = plain_shard(16, DATAGRAM_BUFFERS) else {
         return;
     };
     let _current = context::enter(&shard);
@@ -593,7 +674,7 @@ fn datagrams_come_whole_with_their_senders_through_one_multishot_receive() {
 /// cuts it, and the next one comes whole.
 #[test]
 fn a_multishot_datagram_is_cut_to_the_readers_buffer() {
-    let Some(shard) = recv_shard(16, DATAGRAM_BUFFERS) else {
+    let Some(shard) = plain_shard(16, DATAGRAM_BUFFERS) else {
         return;
     };
     let _current = context::enter(&shard);
