@@ -307,6 +307,7 @@ impl RecvGroup {
 
     /// Gives buffer `bid` to the kernel again if it is done and no chunk of it is out. Returns
     /// whether it did, for the caller to commit.
+    #[inline(always)]
     fn settle(&mut self, bid: u16) -> bool {
         let Some(fill) = self.fills.get_mut(usize::from(bid)) else {
             return false;
@@ -352,6 +353,7 @@ impl RecvGroup {
 
     /// Takes in the chunk `item` of `back` at once, as [`take_back`](Self::take_back) does, if
     /// `back` is this group's: for a chunk given back on the ring's own thread.
+    #[inline(always)]
     pub(crate) fn take_in_now(
         &mut self,
         back: &Arc<Returns>,
