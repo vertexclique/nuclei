@@ -474,6 +474,14 @@ impl FileState {
         }
     }
 
+    /// No write is in flight or waits to go: [`poll_writes`](Self::poll_writes)
+    /// would be Ready at once. Positional writes left by their tasks are here
+    /// already (see `poll_orphans`).
+    #[inline(always)]
+    fn writes_idle(&self) -> bool {
+        self.writing.is_none() && self.behind.is_none() && self.orphans.is_empty()
+    }
+
     /// Drives the writes: takes the end of the one in flight, then of the
     /// positional writes left by their tasks, then starts the write-behind.
     /// Ready once none is in flight.
