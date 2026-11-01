@@ -177,6 +177,17 @@
 - **What std's calls through `Deref` do**, on `Handle`: `shutdown`, `set_nonblocking(false)`,
   `take_error`, `Read` and `Write` go around the bytes read ahead and written behind, or block the
   shard; `UdpSocket::connect` is a constructor where `socket.connect(addr)` is std's.
+- **`sync::local`**: `mpsc`, `oneshot`, `Semaphore` and `Mutex` for the tasks of one shard, with the
+  names, signatures and errors of their `nuclei::sync` twins. They are `!Send`, no path runs an atomic
+  instruction or a fence, and full sends, acquires and locks are served in arrival order.
+- **`sync::mesh`**: a full mesh of bounded channels between a fixed number of parties, one channel
+  for every ordered pair, with backpressure per pair and a `Party::recv` that is fair across senders.
+- **`time::sleep_precise` and `sleep_until_precise`**: waits to the microsecond, where the
+  millisecond of `sleep` is too coarse. A precise deadline that is its shard's earliest arms a kernel
+  timer of its own.
+- **The cooperative budget covers channels and locks**: a receive, acquire or lock of `nuclei::sync`
+  that completes without queueing spends one unit of the task's budget, as completed IO does, so a
+  task on a channel that is always ready yields to the other tasks of its shard.
 - **Each worker's IO in `stats`, behind the `io-stats` feature** (off by default): counts with
   `Builder::count_io` and `ShardStats::io` (`IoCounts`: reads, writes, the bytes of each,
   accepts), and the IO latencies `Builder::record_latencies` records in `ShardStats::io_latencies`
