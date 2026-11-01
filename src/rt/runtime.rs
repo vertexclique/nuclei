@@ -394,6 +394,7 @@ fn own_shard() -> std::rc::Rc<Shard> {
 }
 
 /// Spawns `future` on `inner`.
+#[inline(always)]
 fn spawn_with<F>(inner: &Inner, future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
@@ -407,6 +408,7 @@ where
 }
 
 /// Spawns `future` on `inner`'s worker `shard`.
+#[inline(always)]
 fn spawn_on<F>(inner: &Inner, shard: &Arc<Shared>, future: F) -> Task<F::Output>
 where
     F: Future + Send + 'static,
@@ -561,7 +563,18 @@ where
         Some(inner) if inner.task_hooks.is_none() => Ok(spawn_with(inner, future)),
         _ => Err(future),
     });
-    spawned.unwrap_or_else(|future| spawn_with(&current(), future))
+    spawned.unwrap_or_else(spawn_current)
+}
+
+/// [`spawn`] on the runtime [`current`] finds: out of line, so the spawn of a
+/// thread whose runtime is set and has no hooks carries none of it.
+#[inline(never)]
+fn spawn_current<F>(future: F) -> Task<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_with(&current(), future)
 }
 
 /// Spawns a task that stays on the calling thread: a worker's shard, or the
