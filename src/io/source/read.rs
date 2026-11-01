@@ -573,6 +573,27 @@ impl ReadState {
         }
     }
 
+    /// A stream read (or peek) of the bytes read ahead, which come first: copied into `out`,
+    /// consumed unless `peek`, as [`read_any`](Self::read_any) takes them, and the tasks still
+    /// waiting woken if some are left for them; `None` when none are held. Bytes held leave a
+    /// direct read and the driver's call nothing to do (`read_direct` and `complete` find a
+    /// result held), so a read that finds them goes no further.
+    #[inline(always)]
+    fn take_ahead(
+        &mut self,
+        out: &mut [u8],
+        peek: bool,
+        after: &mut After,
+        shard: Option<&crate::rt::shard::Shard>,
+    ) -> Option<usize> {
+        if self.ahead.is_empty() {
+            return None;
+        }
+        let n = self.ahead.copy_into(out, peek, after, shard);
+        self.pass_on(after);
+        Some(n)
+    }
+
     /// A completed result for a task that asked: wakes the others waiting
     /// if some of it is left for them.
     fn pass_on(&mut self, after: &mut After) {
@@ -752,8 +773,9 @@ impl ReadState {
 
     /// A stream read (or peek) into `out`: the driver reads into the pool
     /// first if the socket may hold bytes, and the task copies them out.
-    /// Inlined, the read of a side that holds nothing and has nothing to ask
-    /// for ([`quiet`](Self::quiet)): it waits, with nothing to call or take.
+    /// Inlined, the read of bytes held ahead ([`take_ahead`](Self::take_ahead)), and of a side
+    /// that holds nothing and has nothing to ask for ([`quiet`](Self::quiet)): it waits, with
+    /// nothing to call or take.
     #[inline(always)]
     fn read(
         &mut self,
@@ -764,6 +786,9 @@ impl ReadState {
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<usize>> {
+        if let Some(n) = self.take_ahead(out, peek, after, io.shard) {
+            return Poll::Ready(Ok(n));
+        }
         if self.quiet(io) {
             self.wait(waker, out.len());
             return Poll::Pending;

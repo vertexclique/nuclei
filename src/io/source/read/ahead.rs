@@ -160,7 +160,7 @@ impl Ahead {
 
     /// Copies bytes into `out`, in order, consumed unless `peek`; returns
     /// how many.
-    #[inline]
+    #[inline(always)]
     pub(super) fn copy_into(
         &mut self,
         out: &mut [u8],
@@ -170,23 +170,23 @@ impl Ahead {
     ) -> usize {
         // One piece, or a first piece that holds the whole read, the usual cases: one look at
         // its bytes.
-        let one = self.rest.is_empty();
-        if let Some(piece) = self.first.as_mut()
-            && (one || piece.filled().len() >= out.len())
-        {
+        if let Some(piece) = self.first.as_mut() {
             let src = piece.filled();
-            let (all, n) = (src.len(), src.len().min(out.len()));
-            out[..n].copy_from_slice(&src[..n]);
-            if !peek {
-                if n == all {
-                    if let Some(done) = self.pop_front() {
-                        done.release(after, shard);
+            let all = src.len();
+            if all >= out.len() || self.rest.is_empty() {
+                let n = all.min(out.len());
+                out[..n].copy_from_slice(&src[..n]);
+                if !peek {
+                    if n == all {
+                        if let Some(done) = self.pop_front() {
+                            done.release(after, shard);
+                        }
+                    } else {
+                        piece.consume(n);
                     }
-                } else {
-                    piece.consume(n);
                 }
+                return n;
             }
-            return n;
         }
         self.copy_pieces(out, peek, after, shard)
     }
