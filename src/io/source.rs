@@ -752,6 +752,7 @@ impl Source {
 
     /// Whether a side last saw an older epoch than the source's: if so it
     /// catches up, and its state is of a descriptor that is gone.
+    #[inline(always)]
     fn catch_up(&self, seen: &mut u32) -> bool {
         let now = self.epoch.load(Ordering::Acquire);
         if *seen == now {
