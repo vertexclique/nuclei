@@ -474,6 +474,8 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        // Release: a take that reads the count finds this pool's count of holders at zero.
+        POOLS_GONE.fetch_add(1, core::sync::atomic::Ordering::Release);
         // Slots are claimed lowest first, and a pool that never ran a job named none.
         let named = self.named.load(Ordering::Relaxed);
         if named == 0 {
@@ -504,8 +506,18 @@ fn pools() -> &'static kovan_map::HashMap<usize, std::sync::Weak<Pool>> {
     POOLS.get_or_init(|| kovan_map::HashMap::with_capacity(64))
 }
 
+/// Pools dropped since the last [`take_out_gone`] looked: with none, no entry is there to take
+/// out (a pool's holders are all gone before its drop runs).
+static POOLS_GONE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Takes out the entries of pools that went.
 fn take_out_gone() {
+    // Acquire: pairs with the drop's Release. A pool that goes after the swap counts again.
+    if POOLS_GONE.load(core::sync::atomic::Ordering::Relaxed) == 0
+        || POOLS_GONE.swap(0, core::sync::atomic::Ordering::Acquire) == 0
+    {
+        return;
+    }
     let gone: Vec<usize> = pools()
         .iter()
         .filter(|(_, pool)| pool.strong_count() == 0)
