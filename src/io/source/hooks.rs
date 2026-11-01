@@ -112,9 +112,9 @@ impl Hooks<ReadState> for SourceHooks<'_> {
             // An operation's arrivals go first: its end comes after them.
             #[cfg(ring)]
             if bits & (read_work::ARRIVALS | read_work::DONE) != 0 {
-                while let Ok((arrival, epoch)) = self.src.read_arrivals.try_pop() {
-                    st.take_arrival(arrival, epoch, after);
-                }
+                self.src
+                    .read_arrivals
+                    .take_all(|(arrival, epoch)| st.take_arrival(arrival, epoch, after));
             }
             if bits & read_work::DONE != 0
                 && let Some(done) = self.src.read_done.take()

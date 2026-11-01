@@ -192,9 +192,9 @@ impl Shard {
     fn fire_armed_timers(&self) {
         if !self.shared.timer_ops.is_empty() {
             let mut wheel = self.wheel.borrow_mut();
-            while let Ok(op) = self.shared.timer_ops.try_pop() {
-                op.apply(self, &mut wheel);
-            }
+            self.shared
+                .timer_ops
+                .take_all(|op| op.apply(self, &mut wheel));
         }
         if self.precise.borrow().armed() != 0 {
             self.fire_precise();
