@@ -55,6 +55,68 @@ impl ReadState {
         }
     }
 
+    /// Whether a poller's read of `len` bytes from `fd` asks the kernel to count what it leaves
+    /// where the kernel can (the first), and does now (the second): not while the floor of its
+    /// last count, less what was read since, covers more than this read, so the socket still
+    /// holds bytes after it. One look on the way of a read with no floor kept.
+    #[cfg(unix)]
+    #[inline(always)]
+    fn count_now(&mut self, fd: RawFd, kind: Kind, len: usize) -> (bool, bool) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        match self.inq {
+            Inq::On => (true, true),
+            Inq::Floor => (true, self.left as usize <= len),
+            Inq::Unknown | Inq::Off => {
+                let on = self.inq_wanted(kind) && self.inq_on(fd, kind);
+                (on, on)
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = (fd, kind, len);
+            (false, false)
+        }
+    }
+
+    /// The kernel counted `left` bytes left after a read of `len`: kept as the floor when it
+    /// covers more than another read of that size.
+    #[cfg(unix)]
+    #[inline(always)]
+    fn keep_floor(&mut self, left: usize, len: usize) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if left > len {
+            // A count past `u32` keeps what fits, still a floor.
+            self.left = u32::try_from(left).unwrap_or(u32::MAX);
+            self.inq = Inq::Floor;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = (left, len);
+    }
+
+    /// A read with no count took `n` bytes: the floor goes down by them.
+    #[cfg(unix)]
+    #[inline(always)]
+    fn lower_floor(&mut self, n: usize) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.left = self
+                .left
+                .saturating_sub(u32::try_from(n).unwrap_or(u32::MAX));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = n;
+    }
+
+    /// The socket was found empty: no floor is left.
+    #[cfg(unix)]
+    #[inline(always)]
+    fn forget_floor(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.left = 0;
+        }
+    }
+
     /// Whether the receives of `fd` report what they leave: asks the kernel
     /// the first time, out of line.
     #[cfg(unix)]
@@ -65,7 +127,7 @@ impl ReadState {
             if self.inq == Inq::Unknown {
                 self.ask_inq(fd, kind);
             }
-            self.inq == Inq::On
+            matches!(self.inq, Inq::On | Inq::Floor)
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
@@ -135,9 +197,13 @@ impl ReadState {
         {
             return None;
         }
-        // `call` is told to count what the socket keeps, when it can.
-        let inq =
-            !peek && matches!(io.via, Via::Fd(_)) && self.inq_wanted(kind) && self.inq_on(fd, kind);
+        // `call` is told to count what the socket keeps, when it can and the floor of the
+        // kernel's last count does not cover more than this read (`count_now`).
+        let (inq, count) = if !peek && matches!(io.via, Via::Fd(_)) {
+            self.count_now(fd, kind, len)
+        } else {
+            (false, false)
+        };
         if !inq && matches!(io.via, Via::Fd(_)) && !self.reads_itself(io, kind, len, peek) {
             return None;
         }
@@ -164,14 +230,17 @@ impl ReadState {
             self.readable = false;
         }
         // A read that came back goes on inline; one that failed is looked at out of line.
-        let called = match call(fd, inq) {
+        let called = match call(fd, count) {
             Ok(read) => Some(Ok(read)),
             Err(err) => sys::ready(Err(err)),
         };
         match called {
             None => {
                 match io.via {
-                    Via::Fd(_) => self.blocked = true,
+                    Via::Fd(_) => {
+                        self.blocked = true;
+                        self.forget_floor();
+                    }
                     #[cfg(ring)]
                     Via::Ops(_) => self.poll_first = true,
                     #[cfg(not(completion))]
@@ -187,8 +256,15 @@ impl ReadState {
                 if matches!(io.via, Via::Fd(_)) && !peek {
                     self.blocked = match left {
                         // The kernel counted what is left: none, and nothing is.
-                        Some(left) => n > 0 && !self.unsure && left == 0,
-                        None => drained(kind, self.unsure, n, len),
+                        Some(0) => n > 0 && !self.unsure,
+                        Some(left) => {
+                            self.keep_floor(left, len);
+                            false
+                        }
+                        None => {
+                            self.lower_floor(n);
+                            drained(kind, self.unsure, n, len)
+                        }
                     };
                 }
                 Some(Poll::Ready(Ok(n)))

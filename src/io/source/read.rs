@@ -157,6 +157,10 @@ enum Inq {
     #[default]
     Unknown,
     On,
+    /// On, and what the kernel last counted as left, less what reads took since, is a floor on
+    /// what the socket holds (`ReadState::left`): a read it covers with more to spare needs no
+    /// count.
+    Floor,
     /// The kernel does not know the option.
     Off,
 }
@@ -182,6 +186,11 @@ pub(super) struct ReadState {
     /// Whether the kernel counts what a read of this TCP socket leaves.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     inq: Inq,
+    /// With `Inq::Floor`, what the kernel last counted as left in the socket, less what direct
+    /// reads took since: a floor on what it holds while nothing else takes its bytes, and above
+    /// it otherwise (`read_direct`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    left: u32,
     /// The last accept failed for want of a descriptor: the next one looks
     /// for a free one first (see [`ReadState::accept_checked`]).
     #[cfg(readiness)]
@@ -1410,6 +1419,10 @@ impl ReadState {
         self.eof = false;
         self.error = None;
         self.blocked = false;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.left = 0;
+        }
         #[cfg(ring)]
         {
             self.poll_first = false;
