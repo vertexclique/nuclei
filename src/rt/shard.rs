@@ -1019,14 +1019,26 @@ impl Shard {
     /// back ([`Inbox::is_drained`]).
     #[inline]
     fn has_remote_work(&self) -> bool {
-        let shared = &self.shared;
+        self.has_remote_tasks() || self.has_posted_ops()
+    }
+
+    /// The tasks of [`has_remote_work`](Self::has_remote_work): runnables in the inbox or a home.
+    #[inline]
+    fn has_remote_tasks(&self) -> bool {
         // SAFETY: the shard holds the inbox's taker's role until it goes
         // (`stop` lets go of it, last).
-        let drained = unsafe { shared.inbox.is_drained() }
+        let drained = unsafe { self.shared.inbox.is_drained() }
             && super::context::home_is_drained()
             // SAFETY: as in `pop_inbox`.
             && self.home.get().is_none_or(|home| unsafe { home.is_drained() });
-        !drained || !shared.timer_ops.is_empty() || !shared.io_ops.is_empty()
+        !drained
+    }
+
+    /// The rest of [`has_remote_work`](Self::has_remote_work): work on the timer wheel and
+    /// registration changes other threads posted.
+    #[inline]
+    fn has_posted_ops(&self) -> bool {
+        !self.shared.timer_ops.is_empty() || !self.shared.io_ops.is_empty()
     }
 
     /// Runnables queued on this thread now, the LIFO slot's included.
