@@ -42,13 +42,51 @@ fn tmp_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("nuclei-op-count-{}-{tag}", std::process::id()))
 }
 
+/// The file row's file of `size` bytes of data, made once: beside the program, under the
+/// build's target directory, on the disk the build is on. Not the system's temporary
+/// directory, which may be memory (tmpfs), where reads take other paths than a database's
+/// do; a file on a memory filesystem is refused, so such a directory never decides the row.
 fn bench_file(size: usize) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("nuclei-op-count-file-{size}"));
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| refuse("the program's directory is unknown"));
+    let path = dir.join(format!("nuclei-op-count-file-{size}"));
     if std::fs::metadata(&path).map_or(true, |m| m.len() != size as u64) {
-        let file = std::fs::File::create(&path).expect("the file is made");
-        file.set_len(size as u64).expect("the file is sized");
+        let data: Vec<u8> = (0..size).map(|i| (i * 7 + i / 251) as u8).collect();
+        std::fs::write(&path, data).unwrap_or_else(|err| refuse(&format!("{err}")));
+    }
+    #[cfg(target_os = "linux")]
+    if on_memory(&path) {
+        refuse(
+            "the file row's file is on a memory filesystem; build into a target directory on a disk",
+        );
     }
     path
+}
+
+/// Whether `path` lies on a filesystem in memory (tmpfs, ramfs).
+#[cfg(target_os = "linux")]
+fn on_memory(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    const RAMFS_MAGIC: i64 = 0x8584_58f6;
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: plain data; the call fills it for the path named.
+    let mut fs: libc::statfs = unsafe { core::mem::zeroed() };
+    // SAFETY: `name` is a C string and `fs` is the call's to fill.
+    if unsafe { libc::statfs(name.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    matches!(fs.f_type as u32 as i64, TMPFS_MAGIC | RAMFS_MAGIC)
+}
+
+/// Ends the program with `why`, as an unusable setup.
+fn refuse(why: &str) -> ! {
+    eprintln!("op_count: {why}");
+    std::process::exit(2);
 }
 
 type NTcp = nuclei::net::TcpStream;
