@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::task::Wake;
 use std::time::Duration;
 
-use super::Instant;
+use super::{Instant, clock};
 
 use super::wheel::{TimerKey, Wheel};
 use crate::rt::context;
@@ -28,12 +28,11 @@ use crate::sync::internal::{AtomicBool, Ordering};
 /// millisecond; a busy shard may let it run later by the time its current
 /// task takes to yield. [`sleep_precise`](super::sleep_precise) waits to the
 /// microsecond instead.
+#[inline]
 pub fn sleep(duration: Duration) -> Sleep {
-    sleep_until(
-        Instant::now()
-            .checked_add(duration)
-            .unwrap_or_else(far_future),
-    )
+    Sleep {
+        timer: Timer::after(duration),
+    }
 }
 
 /// Waits until `deadline`.
@@ -63,7 +62,7 @@ pub struct Sleep {
 impl Sleep {
     /// The deadline.
     pub fn deadline(&self) -> Instant {
-        self.timer.deadline
+        self.timer.deadline()
     }
 
     /// Whether the deadline has passed.
@@ -117,11 +116,24 @@ impl Grain for Fine {
 /// A timer that completes at its deadline, in a wheel of grain `G` of the
 /// shard that polls it. Dropping it cancels it.
 pub(super) struct Timer<G: Grain> {
-    pub(super) deadline: Instant,
+    deadline: Deadline,
     /// Never dropped as it is: the drop releases what it holds, which leaves
     /// it holding nothing.
     state: ManuallyDrop<State>,
     grain: PhantomData<G>,
+}
+
+/// A timer's deadline, as it was made: the expiry checks and the wheels read
+/// it in nanoseconds after the clock's origin, which only the poll that arms
+/// the timer asks for.
+#[derive(Clone, Copy)]
+enum Deadline {
+    /// Made from a duration: nanoseconds after the origin, which name its
+    /// instant exactly.
+    Nanos(u64),
+    /// Given as an instant (`sleep_until`, `reset`), which its nanoseconds
+    /// may not reach (before the origin, past their range).
+    Given(Instant),
 }
 
 enum State {
@@ -141,21 +153,58 @@ enum State {
 impl<G: Grain> Timer<G> {
     pub(super) fn new(deadline: Instant) -> Self {
         Self {
-            deadline,
+            deadline: Deadline::Given(deadline),
             state: ManuallyDrop::new(State::Idle),
             grain: PhantomData,
         }
     }
 
+    /// A timer `duration` from now on the runtime's clock: the clock read
+    /// once, in nanoseconds; one past their range is [`far_future`]'s, as an
+    /// instant would be.
+    #[inline(always)]
+    pub(super) fn after(duration: Duration) -> Self {
+        let at = duration
+            .as_secs()
+            .checked_mul(1_000_000_000)
+            .and_then(|whole| whole.checked_add(u64::from(duration.subsec_nanos())))
+            .and_then(|span| clock::now_nanos().checked_add(span));
+        match at {
+            Some(at) => Self {
+                deadline: Deadline::Nanos(at),
+                state: ManuallyDrop::new(State::Idle),
+                grain: PhantomData,
+            },
+            None => Self::new(far_future()),
+        }
+    }
+
+    /// The deadline.
+    pub(super) fn deadline(&self) -> Instant {
+        match self.deadline {
+            Deadline::Nanos(at) => Instant::from_std(clock::instant(at)),
+            Deadline::Given(at) => at,
+        }
+    }
+
+    /// The deadline in nanoseconds after the clock's origin.
+    #[inline]
+    fn nanos(&self) -> u64 {
+        match self.deadline {
+            Deadline::Nanos(at) => at,
+            Deadline::Given(at) => clock::nanos(at.into_std()),
+        }
+    }
+
     /// Whether the deadline has passed.
     pub(super) fn is_elapsed(&self) -> bool {
-        matches!(*self.state, State::Done) || Instant::now() >= self.deadline
+        matches!(*self.state, State::Done) || clock::now_nanos() >= self.nanos()
     }
 
     /// Moves the deadline; the timer is pending again until it.
     pub(super) fn reset(&mut self, deadline: Instant) {
         self.release();
-        self.deadline = deadline;
+        self.deadline = Deadline::Given(deadline);
     }
 
     /// Lets go of the timer, wherever it is armed, and leaves the timer idle.
@@ -225,11 +274,12 @@ impl<G: Grain> Timer<G> {
         // Not armed here: armed now (after letting go of an arming on
         // another shard, if it moved).
         self.release();
-        if Instant::now() >= self.deadline {
+        let at = self.nanos();
+        if clock::now_nanos() >= at {
             *self.state = State::Done;
             return Poll::Ready(());
         }
-        let at = shard.time_of(G::PRECISE, self.deadline.into_std());
+        let at = shard.time_of(G::PRECISE, at);
         let mut wheel = shard.wheel_of(G::PRECISE).borrow_mut();
         let key = wheel.insert(at, cx.waker());
         if wheel.is_fired(key) {
@@ -251,7 +301,8 @@ impl<G: Grain> Timer<G> {
             return poll_cell(cell, cx).map(|()| *self.state = State::Done);
         }
         self.release();
-        if Instant::now() >= self.deadline {
+        let at = self.nanos();
+        if clock::now_nanos() >= at {
             *self.state = State::Done;
             return Poll::Ready(());
         }
@@ -266,7 +317,7 @@ impl<G: Grain> Timer<G> {
         cell.waker.register(cx.waker());
         let shard = crate::rt::runtime::service_shard();
         shard.post_timer(TimerOp::Insert {
-            at: self.deadline,
+            at,
             cell: Arc::clone(&cell),
         });
         *self.state = State::Remote { shard, cell };
@@ -393,9 +444,9 @@ impl Drop for Armed {
 
 /// Work on a shard's timer wheels from another thread.
 pub(crate) enum TimerOp {
-    /// Arm a timer that fires `cell`, for a thread with no shard, in the
-    /// wheel `cell` names.
-    Insert { at: Instant, cell: Arc<RemoteTimer> },
+    /// Arm a timer that fires `cell` at `at` (nanoseconds after the clock's
+    /// origin), for a thread with no shard, in the wheel `cell` names.
+    Insert { at: u64, cell: Arc<RemoteTimer> },
     /// Remove a timer of this shard (of its microsecond wheel when
     /// `precise`) armed by a sleep that moved away or was dropped on another
     /// thread.
@@ -428,7 +479,7 @@ impl TimerOp {
                     return;
                 }
                 let waker = Waker::from(Arc::new(Armed(Arc::clone(&cell))));
-                let at = shard.time_of(cell.precise, at.into_std());
+                let at = shard.time_of(cell.precise, at);
                 let fired = if cell.precise {
                     arm(&mut shard.wheel_of(true).borrow_mut(), at, &waker)
                 } else {

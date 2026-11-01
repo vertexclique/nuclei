@@ -26,41 +26,32 @@ impl Shard {
         if precise { &self.precise } else { &self.wheel }
     }
 
-    /// The deadline `at` in the time of the wheel `precise` picks.
+    /// The deadline `at` (nanoseconds after the epoch, the clock's origin)
+    /// in the time of the wheel `precise` picks, rounded up: a timer never
+    /// fires before its deadline.
     #[inline]
-    pub(crate) fn time_of(&self, precise: bool, at: Instant) -> u64 {
-        if precise {
-            self.units_after(at, MICROS)
-        } else {
-            self.wheel_time(at)
-        }
-    }
-
-    /// The wheel's time for the deadline `at`, rounded up to its
-    /// millisecond: a timer never fires before its deadline.
-    #[inline]
-    pub(crate) fn wheel_time(&self, at: Instant) -> u64 {
-        self.units_after(at, MILLIS)
-    }
-
-    /// `at` in units of `1 / per_second` after the epoch, rounded up: what
-    /// a wheel arms, so its timer never fires before `at`.
-    #[inline]
-    fn units_after(&self, at: Instant, per_second: u64) -> u64 {
-        units(at.saturating_duration_since(self.epoch), per_second, true)
+    pub(crate) fn time_of(&self, precise: bool, at: u64) -> u64 {
+        let per_second = if precise { MICROS } else { MILLIS };
+        units(Duration::from_nanos(at), per_second, true)
     }
 
     /// The wheel's time now on the runtime's clock, rounded down: the wheel
     /// never runs ahead of the clock.
     pub(super) fn wheel_now(&self) -> u64 {
-        let since = crate::time::clock::now().saturating_duration_since(self.epoch);
-        units(since, MILLIS, false)
+        units(
+            Duration::from_nanos(crate::time::clock::now_nanos()),
+            MILLIS,
+            false,
+        )
     }
 
     /// The microsecond wheel's time now, rounded down as `wheel_now`.
     fn precise_now(&self) -> u64 {
-        let since = crate::time::clock::now().saturating_duration_since(self.epoch);
-        units(since, MICROS, false)
+        units(
+            Duration::from_nanos(crate::time::clock::now_nanos()),
+            MICROS,
+            false,
+        )
     }
 
     /// The earliest time either wheel has work at, and whether it is the

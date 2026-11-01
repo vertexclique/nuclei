@@ -22,6 +22,8 @@ pub(crate) mod clock;
 pub mod error;
 mod instant;
 mod interval;
+#[cfg(all(test, not(loom)))]
+mod nanos_tests;
 mod precise;
 mod sleep;
 mod timeout;

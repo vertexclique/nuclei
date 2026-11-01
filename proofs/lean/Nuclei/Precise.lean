@@ -2,7 +2,8 @@
 # The precise sleep's rounding
 
 This file checks the arithmetic a precise sleep rests on (`src/rt/shard/timers.rs`:
-`time_of`, `units_after`, `precise_now`; `src/time/units.rs`: `units`; `src/time/precise.rs`):
+`time_of`, `precise_now`; `src/time/units.rs`: `units`; `src/time/clock.rs`: `now_nanos`, the
+nanoseconds after the clock's origin the timers read; `src/time/precise.rs`):
 a deadline is armed in the
 microsecond wheel rounded up, the wheel's time now is the clock rounded down, and a timer fires
 once that time reaches its deadline's. So a precise sleep never ends before its deadline, and

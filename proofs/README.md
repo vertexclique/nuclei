@@ -525,7 +525,11 @@ rounded up and a clock read rounded down never fire a timer early, on either whe
 timer is due at most a microsecond after its deadline, exactly at it on the microsecond grid; and
 what a paused shard publishes is within a microsecond of the deadline; and the shard's 64-bit
 form of each rounding (`units` in `src/time/units.rs`: whole seconds times the units in a second,
-plus the rounded part of a second) is the rounding of all the nanoseconds. The microsecond wheel is
+plus the rounded part of a second) is the rounding of all the nanoseconds. The timers keep their
+deadlines in those nanoseconds after the clock's origin (`Timer` in `src/time/sleep.rs`), and read
+the clock in them (`now_nanos` in `src/time/clock.rs`: on Linux and Android the monotonic clock
+std's instants are, read directly), converting from and to std's instants only where one is given
+or asked for. The microsecond wheel is
 the millisecond one with another unit, so `Wheel.lean` covers its placement and cascade.
 
 ## A paused clock that moves by itself
