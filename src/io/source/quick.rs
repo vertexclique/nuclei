@@ -19,19 +19,38 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use super::Kind;
+
 /// The call goes through the side.
 pub(super) const HOLDS: u32 = 1;
 
 /// What each side's last holder left for the calls made with no guard.
-#[derive(Default)]
 pub(super) struct Quick {
     /// `HOLDS`, and above it the read side's count of edges.
     read: AtomicU32,
     /// `HOLDS`.
     write: AtomicU32,
+    /// The source is a datagram socket's: its holders leave the words.
+    on: bool,
 }
 
 impl Quick {
+    /// The words of a source of `kind`: any but a datagram socket's write
+    /// word stays raised, so every writable edge reaches its side.
+    pub(super) fn new(kind: Kind) -> Self {
+        Self {
+            read: AtomicU32::new(0),
+            write: AtomicU32::new(if kind.datagrams() { 0 } else { HOLDS }),
+            on: kind.datagrams(),
+        }
+    }
+
+    /// Whether the source's holders leave the words.
+    #[inline(always)]
+    pub(super) fn on(&self) -> bool {
+        self.on
+    }
+
     /// The read side's word, if a receive may go to the kernel at once.
     #[inline(always)]
     pub(super) fn read_clear(&self) -> Option<u32> {

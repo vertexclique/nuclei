@@ -326,40 +326,26 @@ impl Source {
         self.poll_receive_as(cx, out, peek)
     }
 
-    /// [`poll_receive`](Self::poll_receive), with the sender as the handle
-    /// hands it out. On unix a side that holds nothing has the task's own
-    /// call made at once, with no guard; one the kernel answers "not now"
-    /// goes through the side with the word it saw (see `quick`).
-    #[inline(always)]
-    pub(crate) fn poll_receive_as<A: Sender>(
+    /// [`poll_receive_as`](Self::poll_receive_as) through the side, `seen`
+    /// the word a call made with no guard saw before the kernel said "not
+    /// now". One copy for every sender type and every caller, out of line: the
+    /// side's path stays one, as the stream calls' paths through it are.
+    #[inline(never)]
+    fn poll_receive_held(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         out: &mut [u8],
         peek: bool,
-    ) -> Poll<io::Result<(usize, A)>> {
+        #[cfg_attr(
+            not(unix),
+            expect(unused_variables, reason = "only unix calls with no guard")
+        )]
+        seen: Option<u32>,
+    ) -> Poll<io::Result<(usize, Addr)>> {
         let kind = self.kind;
-        #[cfg(unix)]
-        let seen = match self.quick.read_clear() {
-            Some(word) => {
-                let fd = match self.fd() {
-                    Ok(fd) => fd,
-                    Err(err) => return Poll::Ready(Err(err)),
-                };
-                match sys::ready(A::receive(fd, kind, out, peek)) {
-                    Some(result) => {
-                        if !peek {
-                            tally::received(&result);
-                        }
-                        return Poll::Ready(result);
-                    }
-                    None => Some(word),
-                }
-            }
-            None => None,
-        };
         self.poll_reading(cx, |st, io, waker, after| {
             #[cfg(unix)]
-            if let Some(poll) = st.receive_now::<A>(
+            if let Some(poll) = st.receive_now::<Addr>(
                 io,
                 self.serving_fd(None),
                 kind,
@@ -373,8 +359,43 @@ impl Source {
                 return poll;
             }
             st.receive(io, kind, out, peek, waker, after)
-                .map(|r| r.and_then(|(n, addr)| A::from_addr(addr).map(|a| (n, a))))
         })
+    }
+
+    /// [`poll_receive`](Self::poll_receive), with the sender as the handle
+    /// hands it out. On unix a side that holds nothing has the task's own
+    /// call made at once, with no guard; one the kernel answers "not now"
+    /// goes through the side with the word it saw (see `quick`).
+    #[inline(always)]
+    pub(crate) fn poll_receive_as<A: Sender>(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        out: &mut [u8],
+        peek: bool,
+    ) -> Poll<io::Result<(usize, A)>> {
+        #[cfg(unix)]
+        let seen = match self.quick.read_clear() {
+            Some(word) => {
+                let fd = match self.fd() {
+                    Ok(fd) => fd,
+                    Err(err) => return Poll::Ready(Err(err)),
+                };
+                match sys::ready(A::receive(fd, self.kind, out, peek)) {
+                    Some(result) => {
+                        if !peek {
+                            tally::received(&result);
+                        }
+                        return Poll::Ready(result);
+                    }
+                    None => Some(word),
+                }
+            }
+            None => None,
+        };
+        #[cfg(not(unix))]
+        let seen = None;
+        self.poll_receive_held(cx, out, peek, seen)
+            .map(|r| r.and_then(|(n, addr)| A::from_addr(addr).map(|a| (n, a))))
     }
 }
 

@@ -491,7 +491,7 @@ impl Source {
             ask: Ask::default(),
             unsent: AtomicBool::new(false),
             #[cfg(unix)]
-            quick: quick::Quick::default(),
+            quick: quick::Quick::new(kind),
             #[cfg(completion)]
             read_done: ops::Mailbox::default(),
             #[cfg(completion)]
@@ -536,6 +536,7 @@ impl Source {
 
     /// The descriptor for a poll: the handle revived the source before it
     /// polled, so it is never stale here.
+    #[inline(always)]
     fn fd(&self) -> io::Result<Raw> {
         match self.fd.load(Ordering::Acquire) {
             NO_FD => Err(io::Error::new(
@@ -926,6 +927,11 @@ impl Source {
         readiness: Readiness,
         shard: &crate::rt::shard::Shard,
     ) {
+        // A datagram's write side that holds nothing and waits for nothing has no use for room,
+        // and a send that finds the socket full raises its word before it asks the kernel
+        // again (`quick`): every writable edge after that call reaches the side. Any other
+        // source's word stays raised.
+        let writable = readiness.writable && !self.quick.write_clear();
         let mut after = After::default();
         let hooks = SourceHooks {
             src: self,
@@ -941,10 +947,7 @@ impl Source {
             };
             self.read.drive(&mut after, &hooks, unsure);
         }
-        // A datagram's write side that holds nothing and waits for nothing has no use for room,
-        // and a send that finds the socket full raises its word before it asks the kernel
-        // again (`quick`): every writable edge after that call reaches the side.
-        if readiness.writable && (!self.kind.datagrams() || !self.quick.write_clear()) {
+        if writable {
             self.write.drive(&mut after, &hooks, 0);
         }
         // If the driver's own pool ran out, the readers hear when a buffer

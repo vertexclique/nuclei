@@ -297,7 +297,6 @@ impl Source {
         bytes: &[u8],
         dest: Dest<'_>,
     ) -> Poll<io::Result<usize>> {
-        let kind = self.kind;
         #[cfg(unix)]
         if self.quick.write_clear() {
             let fd = match self.fd() {
@@ -309,6 +308,20 @@ impl Source {
                 return Poll::Ready(result);
             }
         }
+        self.poll_send_held(cx, bytes, dest)
+    }
+
+    /// [`poll_send`](Self::poll_send) through the side. One copy for every
+    /// caller, out of line: the side's path stays one, as the stream calls'
+    /// paths through it are.
+    #[inline(never)]
+    fn poll_send_held(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+        dest: Dest<'_>,
+    ) -> Poll<io::Result<usize>> {
+        let kind = self.kind;
         self.poll_writing(cx, |st, io, waker, after| {
             // Raised before the side's own call: every writable edge after a call that finds
             // the socket full reaches the side.

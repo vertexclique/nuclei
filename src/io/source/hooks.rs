@@ -142,10 +142,8 @@ impl Hooks<ReadState> for SourceHooks<'_> {
     fn releasing(&self, st: &mut ReadState) {
         // What a datagram receive made with no guard reads (`quick`).
         #[cfg(unix)]
-        if self.src.kind.datagrams() {
-            self.src
-                .quick
-                .leave_read(st.quick_word(self.src.kind, self.src.datagrams_ahead()));
+        if self.src.quick.on() {
+            leave_read(self.src, st);
         }
         #[cfg(not(unix))]
         let _ = st;
@@ -222,8 +220,8 @@ impl Hooks<WriteState> for SourceHooks<'_> {
         self.src.unsent.store(st.has_unsent(), Ordering::Release);
         // What a datagram send made with no guard, and the driver's edge, read (`quick`).
         #[cfg(unix)]
-        if self.src.kind.datagrams() {
-            self.src.quick.leave_write(st.quick_holds());
+        if self.src.quick.on() {
+            leave_write(self.src, st);
         }
     }
 
@@ -238,4 +236,20 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     fn nudge(&self) {
         SourceHooks::nudge(self, &self.src.write_owner);
     }
+}
+
+/// A datagram side's holder leaves the read side's word (`quick`). Out of
+/// line, so every stream's release keeps only the look at the kind.
+#[cfg(unix)]
+#[inline(never)]
+fn leave_read(src: &Source, st: &ReadState) {
+    src.quick
+        .leave_read(st.quick_word(src.kind, src.datagrams_ahead()));
+}
+
+/// As [`leave_read`], for the write side's word.
+#[cfg(unix)]
+#[inline(never)]
+fn leave_write(src: &Source, st: &WriteState) {
+    src.quick.leave_write(st.quick_holds());
 }
