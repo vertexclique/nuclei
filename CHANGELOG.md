@@ -2,6 +2,29 @@
 
 ## 0.5.3
 
+### Fixed
+
+- **A shard taken from a blocked runner is never dropped with its tasks.** The monitor holds a
+  worker's shard only weakly, and got a reference of its own only after its take had succeeded; a
+  runner whose poll ended in between found the shard taken and let go of the last reference, so the
+  shard was dropped with the tasks still queued on it, and each one's handle then found no output
+  (on macOS, about one run in two thousand of the cadence test whose twelve tasks block their
+  runners at once). The monitor now holds the shard before it claims the runner's slot, and lets go
+  of it when the take does not happen (`proofs/tla/handoff/TakeRef.tla`).
+- **A worker that backs out of its park wakes the monitor.** With every worker parked the monitor
+  sleeps until a worker's park ends; a worker that said it parks, found work at its last look and
+  ran on rang nobody, so a monitor that took that moment for every worker parked could sleep while
+  the worker ran, and a poll of it that blocked then waited for its end instead of a handoff (found
+  in the protocol and its model, not seen in a run). The back-out now rings a monitor that sleeps,
+  as a park's end does (`proofs/tla/handoff/Asleep.tla`).
+- **The monitor's ticks on macOS are as short as they say.** The monitor reads each worker's word
+  every quarter of the handoff threshold with a timed park, which macOS coalesces with other
+  timers: on a CI runner a 2.5 ms park took 18 ms at the median and up to 119 ms, so a blocked
+  poll waited 70 ms or more for its handoff instead of 10 ms, and in the cadence test the first
+  handoff came up to 800 ms after the runtime started. The monitor now waits on a kqueue
+  there, its ring a user event and its tick a timer marked critical, which is not coalesced (as a
+  shard's precise sleep's is): 2.5 ms take 3.8 ms at the median and 8.6 ms at most.
+
 ### Changed
 
 - **`File::open` opens on the calling thread when it can answer at once** (Linux). A regular file
@@ -39,29 +62,6 @@
   lowered to match these and the changes above.
 - **The API reference is built with `io-stats`**, on the site and on docs.rs, so the IO counts and
   latencies of `stats` are listed.
-
-### Fixed
-
-- **A shard taken from a blocked runner is never dropped with its tasks.** The monitor holds a
-  worker's shard only weakly, and got a reference of its own only after its take had succeeded; a
-  runner whose poll ended in between found the shard taken and let go of the last reference, so the
-  shard was dropped with the tasks still queued on it, and each one's handle then found no output
-  (on macOS, about one run in two thousand of the cadence test whose twelve tasks block their
-  runners at once). The monitor now holds the shard before it claims the runner's slot, and lets go
-  of it when the take does not happen (`proofs/tla/handoff/TakeRef.tla`).
-- **A worker that backs out of its park wakes the monitor.** With every worker parked the monitor
-  sleeps until a worker's park ends; a worker that said it parks, found work at its last look and
-  ran on rang nobody, so a monitor that took that moment for every worker parked could sleep while
-  the worker ran, and a poll of it that blocked then waited for its end instead of a handoff (found
-  in the protocol and its model, not seen in a run). The back-out now rings a monitor that sleeps,
-  as a park's end does (`proofs/tla/handoff/Asleep.tla`).
-- **The monitor's ticks on macOS are as short as they say.** The monitor reads each worker's word
-  every quarter of the handoff threshold with a timed park, which macOS coalesces with other
-  timers: on a CI runner a 2.5 ms park took 18 ms at the median and up to 119 ms, so a blocked
-  poll waited 70 ms or more for its handoff instead of 10 ms, and in the cadence test the first
-  handoff came up to 800 ms after the runtime started. The monitor now waits on a kqueue
-  there, its ring a user event and its tick a timer marked critical, which is not coalesced (as a
-  shard's precise sleep's is): 2.5 ms take 3.8 ms at the median and 8.6 ms at most.
 
 ## 0.5.2
 
