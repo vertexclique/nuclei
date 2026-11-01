@@ -6,7 +6,8 @@
 //! enabled by the shard's own thread before its first submission: a ring
 //! with one issuer belongs to the thread that enables it. Entries that find
 //! the submission queue full wait here, in order, and go in as room frees;
-//! nothing is dropped and nothing blocks.
+//! nothing is dropped and nothing blocks. A wait that may sleep hands them
+//! all to the kernel first, so the wake's read is always in when it sleeps.
 
 use core::mem::MaybeUninit;
 use std::collections::VecDeque;
@@ -227,8 +228,8 @@ impl RingPoller {
             0,
         )
         .user_data(NOT_AN_OP);
-        // The wake goes in first, so a full queue never leaves the shard
-        // unwakeable.
+        // Past a full queue the wake waits first in line, and a wait that may
+        // sleep hands it to the kernel before it does (see `wait`).
         if self.ring.push(&sqe).is_err() {
             self.waiting.push_front(sqe);
         }
@@ -251,7 +252,14 @@ impl RingPoller {
         // The enter below flushes what the kernel holds into the queue as
         // room frees up.
         self.look_for_overflow();
-        let looking = timeout == Some(Duration::ZERO);
+        // A wait that may sleep hands the kernel every entry first, the wake's
+        // read among them: one left behind a full submission queue would leave
+        // the wait to the operations alone, and a wake from another thread, or
+        // from a timer this thread fired on its way here, would end nothing
+        // (proofs/tla/park, the no_submit_first mutation). Where the kernel
+        // takes not all of them, the wait only looks, and the next one goes on.
+        let looking =
+            timeout == Some(Duration::ZERO) || (!self.waiting.is_empty() && !self.submit_now()?);
         let mut entered = false;
         let result = if looking {
             self.ring
@@ -438,6 +446,41 @@ mod tests {
         }
         let got: Vec<u64> = out.iter().map(|c| c.user_data).collect();
         assert_eq!(got, (0..40).collect::<Vec<_>>());
+    }
+
+    /// More entries than the submission queue holds, none of which completes: a wait that may
+    /// sleep still has the wake's read in the kernel, so the wake ends it at once.
+    #[test]
+    fn a_wake_ends_a_wait_with_more_entries_than_the_queue_holds() {
+        let Some(mut p) = poller() else { return };
+        let mut fds = [0; 2];
+        // SAFETY: the kernel fills the two descriptors of our array.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let reads = p.ring.sq_entries() as usize + 4;
+        let mut bytes = vec![0u8; reads];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            p.push(Sqe::read(fds[0], core::ptr::from_mut(byte), 1, u64::MAX).user_data(i as u64));
+        }
+        p.notifier().notify();
+        let mut out = Vec::new();
+        assert!(
+            p.wait(Some(Duration::from_secs(10)), &mut out).unwrap(),
+            "the wake waited behind a full submission queue"
+        );
+        // The reads end (the pipe's writer closes) before their bytes go.
+        // SAFETY: closes our own write end.
+        unsafe { libc::close(fds[1]) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while out.len() < reads {
+            p.wait(Some(Duration::from_millis(100)), &mut out).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "{} of {reads} reads ended",
+                out.len()
+            );
+        }
+        // SAFETY: closes our own read end.
+        unsafe { libc::close(fds[0]) };
     }
 
     /// A look with nothing to submit that enters the kernel never, as the ring's mode allows, still

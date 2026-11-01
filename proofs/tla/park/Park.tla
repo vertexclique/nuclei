@@ -28,6 +28,22 @@
 (* `inbox` (EmptyAtSleep, MI_head_only); the poller is one flag that a     *)
 (* notification raises and a wait lowers (an eventfd's counter,           *)
 (* collapsed).                                                             *)
+(*                                                                          *)
+(* On a ring (src/rt/park/ring.rs `RingPoller::wait`) that flag ends the  *)
+(* wait only while the ring's read of the eventfd, the wake's read, is in *)
+(* the kernel. The shard's operations go into a submission queue of a     *)
+(* fixed size; past it they wait in the poller, the wake's read first in  *)
+(* line, and an enter hands the kernel only what the queue holds. So a    *)
+(* wait that may sleep hands the kernel every entry first. A `block_on`   *)
+(* future's own timer, fired by the drive on the way to park, wakes the   *)
+(* shard through the handshake (src/rt/shard/signal.rs `wake_by_ref`),    *)
+(* not through its run queue: the drive then waits, and only the          *)
+(* notification ends that wait. Before, an operation burst larger than    *)
+(* the queue (130 idle receives on a ring of 64 entries) left the wake's  *)
+(* read out while the shard slept with no deadline, and the future's      *)
+(* notification, or any thread's, ended nothing (src/rt/shard/ring/       *)
+(* tests_cap.rs hung in CI). Abstract: the kernel takes every entry it is *)
+(* handed; where it takes not all, the code's wait only looks instead.    *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
@@ -36,6 +52,10 @@ CONSTANTS
     TimerTask, \* TRUE: a task of the shard's own sleeps on a timer of its wheel
     ProactorWake, \* TRUE: the shard's thread is inside `Proactor::wait`, whose one
                \* wait only a `Proactor::wake` ends, and one comes
+    TimerFuture, \* TRUE: the shard's `block_on` future sleeps on a timer of its wheel, and
+               \* its waker wakes the shard through the handshake, not its run queue
+    FullQueue, \* TRUE: the shard's operations fill its ring's submission queue before it
+               \* parks, so the wake's read waits behind them, outside the kernel
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The shard's thread number: no waker uses it.
@@ -59,13 +79,18 @@ variables
     timerArmed = TimerTask, \* the task's timer is in the wheel, not fired
     timerDue = FALSE,  \* its deadline passed
     local = 0,         \* the shard's own runnable tasks (the timer's, once it fired)
-    driveFired = FALSE;\* (record) the timer fired in the drive on the way to park
+    driveFired = FALSE,\* (record) the timer fired in the drive on the way to park
+    futureArmed = TimerFuture, \* the future's timer is in the wheel, not fired
+    futureDue = FALSE, \* its deadline passed
+    futureWoken = FALSE, \* the future's signal says it was woken, so the loop polls it
+    wakeIn = ~FullQueue, \* the wake's read is in the kernel, where a notification ends a wait
+    outFired = FALSE;  \* (record) the drive fired the future's timer while the wake's read was out
 
 define
     \* Every waker is done.
     WakersDone == \A w \in Wakers : pc[w] = "Done"
-    \* All the work ran: the wakers' and the timer's task.
-    AllRan == consumed = Total /\ local = 0 /\ ~timerArmed
+    \* All the work ran: the wakers', the timer's task and the future woken by its timer.
+    AllRan == consumed = Total /\ local = 0 /\ ~timerArmed /\ ~futureArmed /\ ~futureWoken
 end define;
 
 fair process shard = ShardT
@@ -79,12 +104,22 @@ S_run:
     elsif local > 0 then
         local := local - 1;
         goto S_run;
+    elsif futureWoken then
+        \* The future's signal says it was woken: the loop polls it, and it finishes.
+        futureWoken := FALSE;
+        goto S_run;
     end if;
 S_fire:
     \* The loop fires the timers that are due.
     if timerArmed /\ timerDue then
         timerArmed := FALSE;
         local := local + 1;
+        goto S_run;
+    elsif futureArmed /\ futureDue then
+        \* The future's timer: its waker marks the signal (the shard does not park, so the
+        \* handshake notifies nothing), and the loop polls the future.
+        futureArmed := FALSE;
+        futureWoken := TRUE;
         goto S_run;
     end if;
 S_publish:
@@ -105,6 +140,17 @@ S_drive:
         local := local + 1;
         driveFired := TRUE;                 \* (record)
     end if;
+    \* ... the future's among them: its waker marks the signal, and the shard parking, takes
+    \* the flag back and notifies the poller, as any waker does.
+    if futureArmed /\ futureDue then
+        futureArmed := FALSE;
+        futureWoken := TRUE;
+        if ~wakeIn then outFired := TRUE; end if; \* (record)
+        if parked then
+            parked := FALSE;
+            pending := TRUE;
+        end if;
+    end if;
 S_check:
     \* ... and only looks at the poller if that woke a task of the shard's own, which
     \* nothing else would wake it for.
@@ -113,11 +159,19 @@ S_check:
         parked := FALSE;
         goto S_run;
     end if;
+S_submit:
+    \* The wait that may sleep hands the kernel every entry first, the wake's read among them.
+    \* MUTATION no_submit_first: the enter hands the kernel only what the submission queue
+    \* holds, so behind a full queue the wake's read stays out while the shard sleeps.
+    if Mutation # "no_submit_first" then
+        wakeIn := TRUE;
+    end if;
 S_sleep:
-    \* The poller's wait: until a notification, the deadline of a timer still in the wheel,
-    \* or (the model's end) until every waker is done and all the work ran.
-    await pending \/ (timerArmed /\ timerDue) \/ (WakersDone /\ AllRan /\ ~ProactorWake);
-    if pending then
+    \* The poller's wait: until a notification the wake's read sees, the deadline of a timer
+    \* still in the wheel, or (the model's end) until every waker is done and all the work ran.
+    await (pending /\ wakeIn) \/ (timerArmed /\ timerDue) \/ (futureArmed /\ futureDue)
+          \/ (WakersDone /\ AllRan /\ ~ProactorWake);
+    if pending /\ wakeIn then
         pending := FALSE;
         parked := FALSE;                    \* `end_park`
         \* The one wait of `Proactor::wait` ended: the call returns.
@@ -126,8 +180,10 @@ S_sleep:
         else
             goto S_run;
         end if;
-    elsif timerArmed /\ timerDue then
+    elsif (timerArmed /\ timerDue) \/ (futureArmed /\ futureDue) then
         parked := FALSE;
+        \* The wait ended at a deadline: what waited behind the queue goes in at the next one.
+        wakeIn := TRUE;
         goto S_run;
     end if;
 end process;
@@ -138,6 +194,10 @@ begin
 C_tick:
     if timerArmed then
         timerDue := TRUE;
+    end if;
+    \* The future's deadline passes at the same tick (the model needs one moment only).
+    if futureArmed then
+        futureDue := TRUE;
     end if;
 end process;
 
@@ -199,8 +259,12 @@ ConsumedOnce == consumed <= Total /\ inbox >= 0
 \* One notification per park at most: every notification took the flag back first.
 OneNotifyPerPark == notifies <= Total
 
+\* A shard asleep with a notification left for it has the wake's read in the kernel to see it:
+\* otherwise only an operation's completion could end the wait, and an idle peer sends none.
+SleepSeesWake == (pc[ShardT] = "S_sleep" /\ pending) => wakeIn
+
 \* All the safety properties together.
-Safe == ConsumedOnce /\ OneNotifyPerPark
+Safe == ConsumedOnce /\ OneNotifyPerPark /\ SleepSeesWake
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)
@@ -215,4 +279,7 @@ NoRecheckFind == ~rechecked
 NoSpurious == ~spurious
 \* The timer comes due on the shard's way to park, and the drive fires it.
 NoDriveFire == ~driveFired
+\* The future's timer comes due on the shard's way to park while the wake's read is out behind a
+\* full queue, and the drive fires it.
+NoOutFire == ~outFired
 =============================================================================
