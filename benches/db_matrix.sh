@@ -34,7 +34,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-scratch=/tmp/claude-1000/-home-vcq-projects-defradb-rs/4fac2f63-a8e9-41cf-a60c-4cd1dddb63eb/scratchpad
+scratch=${BENCH_SCRATCH:-${TMPDIR:-/tmp}/nuclei-bench}
 lock=${LOCK:-$scratch/bench.lock}
 if [ -z "${DB_MATRIX_LOCKED:-}" ]; then
     mkdir -p "$(dirname "$lock")"
