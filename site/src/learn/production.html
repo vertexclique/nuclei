@@ -107,7 +107,7 @@ nuclei::stats::ShardStats::errors
 <li><code>record_latencies(true)</code> also fills <code>ShardStats::io_latencies</code>, an <code>IoLatencies</code>: the time from submission to completion of reads, writes, accepts, connects and file calls. On epoll and kqueue it is <code>None</code>: the driver makes each call once the kernel says it is ready, so there is no wait in the kernel to time.</li>
 </ul>
 <!--example prod_io_stats-->
-<p>Without the feature, no IO path carries counting or timing code, and these items do not exist. With it, every IO call costs a few instructions, counted or not, so leave it off where nobody reads the counts. The API reference here is built with the default features and does not list them; <code>cargo doc --features io-stats</code> documents them.</p>
+<p>Without the feature, no IO path carries counting or timing code, and these items do not exist. With it, every IO call costs a few instructions, counted or not, so leave it off where nobody reads the counts. The API reference here is built with <code>io-stats</code> on, so it lists them; they exist only with <code>io-stats</code> on.</p>
 
 <h2 id="shutdown">A clean shutdown</h2>
 <p>A server stops taking connections when asked, lets the open ones finish, and gives up after a deadline. A <code>CancellationToken</code> carries the request to every task, Ctrl-C raises it, a <code>JoinSet</code> holds the connections, and <code>timeout</code> bounds the drain.</p>

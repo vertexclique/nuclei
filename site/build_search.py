@@ -15,7 +15,7 @@ What it indexes:
 Where the API comes from. The public names come from the source: src/lib.rs, its re-exports and
 the public modules under src/, read with their cfg attributes evaluated for each platform. The
 pages, kinds, anchors and summaries come from rustdoc, which the script runs for the target
-docs.rs builds (x86_64-unknown-linux-gnu, default features) and copies to site/api/, so every
+docs.rs builds (x86_64-unknown-linux-gnu, the default features and io-stats) and copies to site/api/, so every
 link is a page the site serves and never a guess. The two must agree: a name public in the source
 that rustdoc does not document, or the other way round, stops the build. A name public only on
 another platform (the Windows console events) is indexed from the source with its platform, and
@@ -36,7 +36,8 @@ SITE = ROOT / "site"
 OUT = SITE / "search.json"
 API = SITE / "api"
 DOCS_TARGET = "x86_64-unknown-linux-gnu"
-DEFAULT_FEATURES = {"iouring", "epoll", "attributes"}
+# The features the reference is built with: the default ones and io-stats, whose items it lists.
+DOC_FEATURES = {"iouring", "epoll", "attributes", "io-stats"}
 
 
 def fail(message):
@@ -49,7 +50,7 @@ def squash(text):
 
 # Rust source: the public names of every public module, per platform. ------------------------
 
-# The build script's short cfg names (build.rs) as they come out with the default features.
+# The build script's short cfg names (build.rs) as they come out with the documented features.
 PLATFORMS = {
     "linux": {"unix": True, "windows": False, "target_os": "linux", "target_family": "unix",
               "ring": True, "port": False, "completion": True, "readiness": True},
@@ -107,7 +108,7 @@ def tokens(source):
 
 
 def cfg_true(tokens_, platform):
-    """Evaluates a cfg predicate given as tokens, for one platform with default features."""
+    """Evaluates a cfg predicate given as tokens, for one platform with the documented features."""
     facts = PLATFORMS[platform]
     pos = 0
 
@@ -132,7 +133,7 @@ def cfg_true(tokens_, platform):
             value = tokens_[pos + 1][1].strip('"')
             pos += 2
             if name == "feature":
-                return value in DEFAULT_FEATURES
+                return value in DOC_FEATURES
             if name in facts:
                 return facts[name] == value
             if name == "target_pointer_width":
@@ -430,7 +431,7 @@ def text_of(fragment):
 
 def run_rustdoc():
     target_dir = ROOT / "target"
-    command = ["cargo", "doc", "--no-deps", "--lib", "-p", "nuclei", "--target", DOCS_TARGET]
+    command = ["cargo", "doc", "--no-deps", "--lib", "-p", "nuclei", "--features", "io-stats", "--target", DOCS_TARGET]
     print("build_search: " + " ".join(command), file=sys.stderr)
     result = subprocess.run(command, cwd=ROOT)
     if result.returncode != 0:

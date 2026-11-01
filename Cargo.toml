@@ -1,6 +1,6 @@
 [package]
 name = "nuclei"
-version = "0.5.2"
+version.workspace = true
 authors = ["Theo M. Bulut <vertexclique@gmail.com>"]
 edition = "2024"
 rust-version = "1.99"
@@ -56,7 +56,7 @@ recycle = ["kovan/recycle", "kovan-channel/recycle", "kovan-map/recycle", "kovan
 io-stats = []
 
 [dependencies]
-nuclei-macros = { version = "0.5.1", path = "nuclei-macros", optional = true }
+nuclei-macros = { version = "0.5.3", path = "nuclei-macros", optional = true }
 futures-io = "0.3"
 futures-core = { version = "0.3", default-features = false }
 kovan = "0.2.3"
@@ -116,9 +116,16 @@ harness = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(nuclei_nightly)'] }
 
 
+[package.metadata.docs.rs]
+features = ["io-stats"]
+
 [workspace]
 members = [
   ".",
   "examples",
   "nuclei-macros",
 ]
+
+# Every crate of the workspace carries this one version, and they release together.
+[workspace.package]
+version = "0.5.3"
