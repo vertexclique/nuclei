@@ -470,7 +470,7 @@ impl<'a> RingIo<'a> {
         match self {
             RingIo::Here { ring, source, file } => Some(RingIssuer { ring, source, file }),
             RingIo::Elsewhere { source } => {
-                after.kick = source.home_held();
+                after.set_kick(source.home_held());
                 None
             }
             RingIo::NotYet => None,

@@ -306,7 +306,7 @@ impl FileIo {
             .poll(&mut after, cx.waker(), &hooks, |st, after| {
                 step(st, self, &waker, after)
             });
-        if after.starved {
+        if after.starved() {
             with_pool(|pool| {
                 if let Some(pool) = pool {
                     pool.wait_for_return(waker.clone());

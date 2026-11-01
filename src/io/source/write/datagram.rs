@@ -93,7 +93,7 @@ impl WriteState {
             return Poll::Ready(Err(err));
         }
         if self.queued.is_some() {
-            after.register = true;
+            after.set_must_register();
         }
         Poll::Ready(Ok(bytes.len()))
     }

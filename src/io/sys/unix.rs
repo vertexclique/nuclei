@@ -37,8 +37,9 @@ unsafe fn borrow<S: FromRawFd>(fd: RawFd) -> ManuallyDrop<S> {
 
 /// The answer of a call that may have to wait: `None` for "not now"
 /// (`EAGAIN`, `EWOULDBLOCK`), or the call's result (an error counted for
-/// `stats`).
-#[inline]
+/// `stats`). Always inlined: it decides every call's result on the read
+/// and write paths.
+#[inline(always)]
 pub(crate) fn ready<T>(result: io::Result<T>) -> Option<io::Result<T>> {
     match result {
         // The code itself, not std's kind (which is decoded from it).

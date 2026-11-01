@@ -463,7 +463,7 @@ impl ReadState {
             with_pool(|pool| pool.and_then(|p| if whole { p.get_whole(len) } else { p.get(len) }));
         if buf.is_none() && !self.starved {
             self.starved = true;
-            after.starved = true;
+            after.set_starved();
         }
         buf
     }
@@ -502,8 +502,9 @@ impl ReadState {
     /// buffer if there is one, else into the pool's (`len` asked); a
     /// listener's connections; a socket's datagrams (`len` each). Nothing
     /// while the last call would have blocked and no edge came since, or
-    /// while a result waits to be taken.
-    #[inline]
+    /// while a result waits to be taken. Always inlined, the calls it may
+    /// make out of line: a read that finds the side quiet makes no call.
+    #[inline(always)]
     fn complete(&mut self, io: Io<'_>, kind: Kind, len: usize, after: &mut After) {
         match io.via {
             #[cfg(readiness)]
@@ -523,6 +524,7 @@ impl ReadState {
     /// stop it) and the caller makes no calls of its own, so `submit_ops` would find it out and
     /// do nothing.
     #[cfg(completion)]
+    #[inline(always)]
     fn armed_and_quiet(&self) -> bool {
         #[cfg(ring)]
         return self.out.is_some()

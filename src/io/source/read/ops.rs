@@ -55,6 +55,7 @@ impl ReadState {
     /// waiting tasks need (`len` asked), unless one is out or a result waits
     /// to be taken. A route that cannot issue here leaves it to the thread
     /// that can.
+    #[inline(never)]
     pub(super) fn submit_ops(
         &mut self,
         route: Route<'_>,

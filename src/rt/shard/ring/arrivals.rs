@@ -122,7 +122,7 @@ impl ShardRing {
                     Arrival::Chunk(chunk)
                 };
                 source.ring_arrival(arrival, epoch, shard, &mut after);
-                after.starved.then(|| std::sync::Arc::clone(&source))
+                after.starved().then(|| std::sync::Arc::clone(&source))
             };
             if let Some(source) = starved {
                 source.wait_for_buffer();
@@ -225,7 +225,7 @@ impl ShardRing {
         }
         let mut after = After::default();
         source.ring_arrival(Arrival::Conn(conn), epoch, shard, &mut after);
-        if after.starved {
+        if after.starved() {
             std::sync::Arc::clone(&source).wait_for_buffer();
         }
         after.run();
