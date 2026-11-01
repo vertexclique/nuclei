@@ -5,7 +5,7 @@ use core::task::{Context, Poll};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
-use super::addr::{ToSocketAddrs, resolve};
+use super::addr::{ToSocketAddrs, first, resolve};
 use super::none_worked;
 use crate::buf::owned::{IoBuf, IoBufMut};
 use crate::io::source::write::Dest;
@@ -109,8 +109,8 @@ impl Handle<UdpSocket> {
         A: ToSocketAddrs,
         B: IoBuf,
     {
-        let target = match resolve(&addr).await {
-            Ok(mut addrs) => addrs.next().ok_or_else(|| none_worked(None)),
+        let target = match first(&addr).await {
+            Ok(target) => target.ok_or_else(|| none_worked(None)),
             Err(err) => Err(err),
         };
         match target {
@@ -162,10 +162,7 @@ impl Handle<UdpSocket> {
     /// As `sendto(2)` of this datagram (on Windows, as for
     /// [`send`](Self::send)), or the lookup's.
     pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
-        let addr = resolve(&addr)
-            .await?
-            .next()
-            .ok_or_else(|| none_worked(None))?;
+        let addr = first(&addr).await?.ok_or_else(|| none_worked(None))?;
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Inet(addr))).await
     }
 
