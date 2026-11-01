@@ -105,6 +105,11 @@
 
 ### Added
 
+- **The attribute macros take a builder.** `#[nuclei::main]`, `#[nuclei::test]` and
+  `#[nuclei::bench]` take `builder = "path"`: the runtime is built from the `nuclei::Builder` that
+  function returns, with `threads` and `start_paused` applied on top when given (nuclei-macros
+  0.5.1).
+
 - **Owned calls take any buffer type.** `read_owned`, `write_owned`, `write_zero_copy`, the datagram
   owned calls and the file owned calls take any `IoBuf` (writes) or `IoBufMut` (reads) and give the
   same type back; a caller passing a `Vec<u8>` gets a `Vec<u8>` back as before (the
