@@ -56,18 +56,14 @@ impl ReadState {
     }
 
     /// Whether the receives of `fd` report what they leave: asks the kernel
-    /// the first time.
+    /// the first time, out of line.
     #[cfg(unix)]
-    #[inline]
+    #[inline(always)]
     pub(in crate::io::source) fn inq_on(&mut self, fd: RawFd, kind: Kind) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             if self.inq == Inq::Unknown {
-                self.inq = if sys::enable_inq(fd, kind == Kind::Tcp) {
-                    Inq::On
-                } else {
-                    Inq::Off
-                };
+                self.ask_inq(fd, kind);
             }
             self.inq == Inq::On
         }
@@ -76,6 +72,19 @@ impl ReadState {
             let _ = (fd, kind);
             false
         }
+    }
+
+    /// [`inq_on`](Self::inq_on)'s first look: asks the kernel to count what
+    /// the receives of `fd` leave.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cold]
+    #[inline(never)]
+    fn ask_inq(&mut self, fd: RawFd, kind: Kind) {
+        self.inq = if sys::enable_inq(fd, kind == Kind::Tcp) {
+            Inq::On
+        } else {
+            Inq::Off
+        };
     }
 
     /// Whether a read of `kind` may go straight into the task's buffer: a
