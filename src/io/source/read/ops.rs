@@ -105,10 +105,19 @@ impl ReadState {
             return;
         };
         // Only a ring gives an operation back because the socket was not
-        // ready: the next one waits for it to be.
+        // ready: the next one waits for it to be. A side whose task receives every datagram
+        // itself (a Unix datagram's) arms a poll that stays, so a wait after the next "not now"
+        // submits nothing.
         #[cfg(ring)]
         if self.poll_first {
-            self.out = Some(issuer.issue(Want::Ready { read: true }, kind, self.epoch, after));
+            let want = if kind == Kind::UnixDatagram {
+                self.multi = true;
+                self.armed = true;
+                Want::ReadyMulti
+            } else {
+                Want::Ready { read: true }
+            };
+            self.out = Some(issuer.issue(want, kind, self.epoch, after));
             return;
         }
         let want = if kind.listens() {
@@ -304,6 +313,23 @@ impl ReadState {
                         Answer::Done(Ok(room)) => self.ahead.push(Piece::Room(room), after),
                         Answer::Done(Err(err)) => self.error = Some(err),
                     }
+                }
+            }
+            #[cfg(ring)]
+            Outcome::ReadyMultiEnd(answer) => {
+                self.multi = false;
+                self.multi_stopping = false;
+                self.armed = false;
+                if !stale {
+                    match answer {
+                        // Its readiness came as arrivals.
+                        Answer::Done(Ok(())) => {}
+                        Answer::Done(Err(err)) => self.error = Some(err),
+                        // Stopped: a lent buffer or the caller's calls go first.
+                        Answer::Undone { .. } => {}
+                    }
+                    // A task that waits looks again, and arms another if it still must wait.
+                    after.wake(&mut self.waiters);
                 }
             }
             #[cfg(ring)]

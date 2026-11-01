@@ -73,6 +73,7 @@ MRR_bound_small                MC_RingRecv          violated:NoCut
 MRR_ahead_after_poll           MC_RingRecv          violated:NoCut
 MRR_no_wake_ring               MC_RingRecv          violated:Termination
 MRR_no_wake_edge               MC_RingRecv          violated:Termination
+MRR_armed_waits                MC_RingRecv          violated:Termination
 WRR_wait                       MC_RingRecv          violated:NoWait
 WRR_ahead                      MC_RingRecv          violated:NoAheadTaken
 RV_safe                        MC_RingStarve        pass

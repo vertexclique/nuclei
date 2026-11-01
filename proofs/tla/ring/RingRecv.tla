@@ -1,9 +1,10 @@
 ----------------------------- MODULE RingRecv -----------------------------
 (***************************************************************************)
-(* A datagram socket's receives (src/io/source/read.rs `receive_now`,      *)
-(* `datagram_ready` and the bound in `read/ops.rs` `datagram_want`; the    *)
-(* poll's end in `op_done`, the edge in `serve`), on epoll or kqueue and on *)
-(* an io_uring ring, at the grain of a step under the side's guard.        *)
+(* A datagram socket's receives (src/io/source/read/datagram.rs           *)
+(* `receive_now` and `datagram_ready`, the bound in `read/ops.rs`          *)
+(* `datagram_want`; the ring's poll armed in `submit_ops` and its arrivals *)
+(* in `take_arrival` of read.rs, the edge in `serve`), on epoll or kqueue  *)
+(* and on an io_uring ring, at the grain of a step under the side's guard. *)
 (*                                                                          *)
 (* In plain words: a peer sends datagrams, and the socket holds them in    *)
 (* order. A task receives them one call after another, into a buffer that  *)
@@ -12,10 +13,12 @@
 (* own buffer by the task itself: on epoll and kqueue always, on a ring    *)
 (* for a Unix datagram (which may be larger than any buffer of the pool).  *)
 (* With nothing there the call waits for an edge, or for a poll of the     *)
-(* ring, and tries again. Only a ring's UDP socket has the ring receive    *)
-(* ahead into a buffer of the pool, one that holds the largest datagram    *)
-(* UDP carries, and the task takes from what came ahead. Asking whether    *)
-(* the socket is readable looks, and takes nothing.                        *)
+(* ring, and tries again. The ring's poll stays armed once made: each      *)
+(* datagram that comes says so, as an edge does, and the call that waits   *)
+(* asks the kernel again while the poll stays. Only a ring's UDP socket    *)
+(* has the ring receive ahead into a buffer of the pool, one that holds    *)
+(* the largest datagram UDP carries, and the task takes from what came     *)
+(* ahead. Asking whether the socket is readable looks, and takes nothing. *)
 (*                                                                          *)
 (* What must never happen: a datagram cut although the task's buffer holds *)
 (* it (the bug the size sweep found: a datagram read ahead into a buffer   *)
@@ -53,7 +56,8 @@ variables
     sent = 0,              \* datagrams the peer sent so far
     socket = <<>>,         \* datagrams the socket holds, oldest first, by number
     ahead = <<>>,          \* datagrams received ahead into the pool, as <<number, units kept>>
-    out = "none",          \* the ring's operation for the side: "none", "recv" or "poll"
+    out = "none",          \* the ring's operation for the side: "none", "recv" or "poll" (armed)
+    edge = FALSE,          \* the armed poll has a datagram's arrival to tell the side
     waits = FALSE,         \* the task waits for an edge, the ring's poll or what comes ahead
     woken = FALSE,         \* the waiting task was woken
     got = <<>>,            \* what the task received, as <<number, units>>
@@ -72,6 +76,10 @@ P_send:
         if ~Ring /\ waits /\ Mutation # "no_wake" then
             woken := TRUE;
         end if;
+        \* On a ring the armed poll sees it, and has it to tell the side.
+        if Ring /\ out = "poll" then
+            edge := TRUE;
+        end if;
     end while;
 end process;
 
@@ -86,7 +94,9 @@ R_loop:
             \* MUTATION ahead_after_poll: a Unix side gets a receive ahead into the smallest buffer.
             await waits /\ out = "none";
             if Unix /\ Mutation # "ahead_after_poll" then
+                \* The poll is armed, and at once has a datagram to tell if one is there.
                 out := "poll";
+                edge := socket # <<>>;
             else
                 out := "recv";
             end if;
@@ -99,11 +109,11 @@ R_loop:
             out := "none";
             woken := TRUE;
         or
-            \* The poll ends once a datagram came; it takes nothing.
-            \* MUTATION no_wake: the poll's end wakes nobody.
-            await out = "poll" /\ socket # <<>>;
-            out := "none";
-            if Mutation # "no_wake" then
+            \* The armed poll tells the side a datagram came, and stays armed; it takes nothing.
+            \* MUTATION no_wake: its word wakes nobody.
+            await edge;
+            edge := FALSE;
+            if waits /\ Mutation # "no_wake" then
                 woken := TRUE;
             end if;
         end either;
@@ -154,8 +164,10 @@ T_recv:
             got := Append(got, Head(ahead));
             ahead := Tail(ahead);
             at := at + 1;
-        elsif Direct /\ socket # <<>> then
-            \* The task's own receive takes the oldest datagram whole.
+        elsif Direct /\ socket # <<>> /\ ~(Mutation = "armed_waits" /\ out = "poll") then
+            \* The task's own receive takes the oldest datagram whole, the armed poll staying.
+            \* MUTATION armed_waits: the armed poll counts as an operation out, which the call
+            \* waits behind, so it never asks the kernel again.
             got := Append(got, <<Head(socket), Sizes[Head(socket)]>>);
             socket := Tail(socket);
             at := at + 1;

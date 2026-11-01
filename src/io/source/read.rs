@@ -230,6 +230,11 @@ pub(super) struct ReadState {
     /// stopped (for a lent buffer, which takes the next bytes itself).
     #[cfg(ring)]
     multi: bool,
+    /// The multishot operation out is the poll of a side whose task receives
+    /// its datagrams itself: it stays armed, says each time the socket may be
+    /// readable (`take_arrival`), and holds nothing.
+    #[cfg(ring)]
+    armed: bool,
     #[cfg(ring)]
     multi_stopping: bool,
     /// The tasks that wait for connections take no address: an accept may
@@ -1196,8 +1201,14 @@ impl ReadState {
     pub(super) fn report(&self) -> String {
         #[cfg(ring)]
         let ops = format!(
-            ", out {:?}, multishot {}, stopping {}, poll first {}, dry {}, epoch {}",
-            self.out, self.multi, self.multi_stopping, self.poll_first, self.dry, self.epoch
+            ", out {:?}, multishot {}, armed {}, stopping {}, poll first {}, dry {}, epoch {}",
+            self.out,
+            self.multi,
+            self.armed,
+            self.multi_stopping,
+            self.poll_first,
+            self.dry,
+            self.epoch
         );
         #[cfg(all(completion, not(ring)))]
         let ops = format!(", out {:?}, epoch {}", self.out, self.epoch);
@@ -1285,6 +1296,12 @@ impl ReadState {
             super::ring::Arrival::Conn(conn) => self.accepted.push_back((conn, Peer::Ask)),
             super::ring::Arrival::Datagram(payload, from) => {
                 self.datagrams.push_back((Datagram::Ring(payload), from));
+            }
+            // The ring's edge: a task that found the socket empty receives again
+            // (`receive_now`), and one made with no guard that saw the count before it asks again.
+            super::ring::Arrival::Ready => {
+                self.poll_first = false;
+                self.edges = self.edges.wrapping_add(1);
             }
         }
         self.want = 0;

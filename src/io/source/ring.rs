@@ -44,6 +44,9 @@ pub(crate) struct RingOp {
 /// What an operation's entry points at, kept until its completion.
 pub(crate) enum RingMem {
     Ready,
+    /// A multishot poll of a side whose task receives its datagrams itself:
+    /// each completion that keeps it armed is an arrival.
+    ReadyMulti,
     Accept(Spare<RawAddr>),
     /// A multishot accept: `handed` connections so far; `stopping`: past
     /// the cap, a cancel of it is on its way.
@@ -205,6 +208,11 @@ impl RingMem {
     fn complete_rest(self, res: i32, kind: Kind) -> Outcome {
         match self {
             RingMem::Ready => Outcome::Ready(match answer(res) {
+                Answer::Done(result) => Answer::Done(result.map(drop)),
+                Answer::Undone { not_ready } => Answer::Undone { not_ready },
+            }),
+            RingMem::ReadyMulti => Outcome::ReadyMultiEnd(match answer(res) {
+                // Its last readiness came as an arrival.
                 Answer::Done(result) => Answer::Done(result.map(drop)),
                 Answer::Undone { not_ready } => Answer::Undone { not_ready },
             }),
@@ -529,8 +537,11 @@ impl RingIssuer<'_> {
     }
 }
 
-/// What a multishot receive or accept hands the side as it comes.
+/// What a multishot receive, accept or poll hands the side as it comes.
 pub(crate) enum Arrival {
+    /// The socket of a side whose task receives its datagrams itself may be
+    /// readable: the multishot poll's edge.
+    Ready,
     /// A receive's buffer of bytes.
     Chunk(crate::rt::shard::recv::RingChunk),
     /// An accepted connection, whose peer is asked of the kernel when a task
@@ -633,6 +644,10 @@ fn entry(
             let events = if read { libc::POLLIN } else { libc::POLLOUT };
             (RingMem::Ready, Sqe::poll_add(slot, events as u32))
         }
+        Want::ReadyMulti => (
+            RingMem::ReadyMulti,
+            Sqe::poll_add_multi(slot, libc::POLLIN as u32),
+        ),
         Want::Accept => {
             let mut addr = Spare::new(RawAddr::empty());
             let sqe = Sqe::accept(

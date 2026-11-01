@@ -51,7 +51,7 @@ impl ReadState {
             #[cfg(readiness)]
             Via::Fd(_) => self.blocked,
             #[cfg(ring)]
-            Via::Ops(_) => self.out.is_some() || self.poll_first,
+            Via::Ops(_) => self.poll_first || (self.out.is_some() && !self.armed),
             #[cfg(not(completion))]
             Via::None(never, _) => match never {},
         }
@@ -145,7 +145,7 @@ impl ReadState {
         let holds = self.has_result() || self.lent.is_some() || self.user_fd || self.blocked;
         #[cfg(ring)]
         let holds = holds
-            || self.out.is_some()
+            || (self.out.is_some() && !self.armed)
             || self.poll_first
             || (on_ring && kind != Kind::UnixDatagram && !self.starved);
         quick::read_word(self.edges, holds)

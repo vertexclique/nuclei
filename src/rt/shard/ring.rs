@@ -63,10 +63,12 @@ use std::time::Instant;
 use super::Shard;
 use super::recv::RecvGroup;
 use crate::fs::ring::FileOp;
+
 use crate::io::source::ops::Done;
 use crate::io::source::requests::Lease;
 use crate::io::source::ring::{RingMem, RingOp};
 use crate::rt::backend::with_room;
+
 #[cfg(feature = "io-stats")]
 use crate::rt::counters::{IoKind, IoTimes};
 use crate::rt::park::Notifier;
@@ -130,6 +132,9 @@ pub(crate) struct ShardRing {
     /// and the receives that ended as the group ran dry, for a test.
     #[cfg(test)]
     counts: Cell<(usize, usize, usize)>,
+    /// Multishot polls submitted, for a test.
+    #[cfg(test)]
+    polls_armed: Cell<usize>,
     /// Files' calls submitted, and each one's opcode, length and offset, for
     /// a test.
     #[cfg(test)]
@@ -212,6 +217,8 @@ impl ShardRing {
             timing: std::cell::OnceCell::new(),
             #[cfg(test)]
             counts: Cell::new((0, 0, 0)),
+            #[cfg(test)]
+            polls_armed: Cell::new(0),
             #[cfg(test)]
             file_calls: Cell::new(0),
             #[cfg(test)]
@@ -327,6 +334,10 @@ impl ShardRing {
         ) {
             let (armed, arrived, dry) = self.counts.get();
             self.counts.set((armed + 1, arrived, dry));
+        }
+        #[cfg(test)]
+        if matches!(op.mem, RingMem::ReadyMulti) {
+            self.polls_armed.set(self.polls_armed.get() + 1);
         }
         let write = counts_as_write(&op);
         let inserted = self.ops.borrow_mut().insert(op);
@@ -838,6 +849,7 @@ fn ends_plain(op: &RingOp) -> bool {
             | RingMem::RecvMulti { .. }
             | RingMem::RecvFromMulti { .. }
             | RingMem::AcceptMulti { .. }
+            | RingMem::ReadyMulti
     )
 }
 
@@ -878,6 +890,11 @@ impl ShardRing {
     /// and those that ended as the group ran dry.
     pub(crate) fn multishot_counts(&self) -> (usize, usize, usize) {
         self.counts.get()
+    }
+
+    /// Multishot polls submitted so far.
+    pub(crate) fn polls_armed(&self) -> usize {
+        self.polls_armed.get()
     }
 
     /// Bytes of the group's buffers handed out and not given back, whether
@@ -1014,6 +1031,8 @@ pub(crate) use keeper::leaked;
 mod arrivals;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_armed;
 #[cfg(test)]
 mod tests_cap;
 #[cfg(test)]

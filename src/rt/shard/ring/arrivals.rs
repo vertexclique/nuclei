@@ -1,6 +1,9 @@
 //! What a multishot operation hands its source as it comes: a receive's
-//! buffers of the group, an accept's connections. Each goes to the source
-//! with nothing of the ring borrowed, so the source may submit at once.
+//! buffers of the group, an accept's connections, a poll's readiness. Each
+//! goes to the source with nothing of the ring borrowed, so the source may
+//! submit at once.
+
+use std::sync::Arc;
 
 use super::{ACCEPT_CAP, ShardRing};
 use crate::io::side::After;
@@ -118,17 +121,24 @@ impl ShardRing {
 
     /// A completion `res` of the operation of `user_data` that carries no
     /// buffer: for a multishot accept, a connection (its descriptor), handed
-    /// to the source as it comes. Past the cap of connections one accept
-    /// hands over, the accept is stopped; its source asks for another once
-    /// its tasks took them.
+    /// to the source as it comes; for a multishot poll, readiness. Past the
+    /// cap of connections one accept hands over, the accept is stopped; its
+    /// source asks for another once its tasks took them.
     pub(super) fn accepted(&self, shard: Option<&Shard>, user_data: u64, res: i32) {
         let delivery = {
             let mut ops = self.ops.borrow_mut();
             let Some(op) = ops.get_mut(user_data) else {
                 return;
             };
-            let RingMem::AcceptMulti { handed, stopping } = &mut op.mem else {
-                return;
+            let (handed, stopping) = match &mut op.mem {
+                RingMem::AcceptMulti { handed, stopping } => (handed, stopping),
+                RingMem::ReadyMulti => {
+                    let (source, epoch) = (Arc::as_ptr(&op.source), op.epoch);
+                    drop(ops);
+                    self.readied(shard, source, epoch);
+                    return;
+                }
+                _ => return,
             };
             *handed += 1;
             let stop = *handed > ACCEPT_CAP && !*stopping;
@@ -149,6 +159,24 @@ impl ShardRing {
         source.ring_arrival(Arrival::Conn(conn), epoch, shard, &mut after);
         if after.starved {
             std::sync::Arc::clone(&source).wait_for_buffer();
+        }
+        after.run();
+    }
+
+    /// The multishot poll of `source`, issued in `epoch`, says its socket may
+    /// be readable: the side gets the edge as an arrival, with nothing
+    /// borrowed, so it may submit at once.
+    fn readied(&self, shard: Option<&Shard>, source: *const crate::io::source::Source, epoch: u32) {
+        // Before the view, so it drops after it.
+        let _unwound = crate::io::side::Unwound::enter();
+        let mut after = After::default();
+        {
+            // SAFETY: as in `arrived`: the poll's slab entry owns a strong count of the source
+            // until its final completion, which this thread processes only after this call
+            // returns, and nothing removes the entry while the view lives (a cancel only queues
+            // an entry). The wakes run after the view is gone; it is never dropped as an `Arc`.
+            let source = core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(source) });
+            source.ring_arrival(Arrival::Ready, epoch, shard, &mut after);
         }
         after.run();
     }

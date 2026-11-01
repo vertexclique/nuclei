@@ -1076,24 +1076,29 @@ nobody breaks `Termination`), and 3 witnesses (a call that waits for room, a ref
 its own call, a call that waits behind the lent send of a task that went).
 
 `tla/ring/RingRecv.tla` checks a datagram socket's receives (`receive_now` and
-`datagram_ready` in `src/io/source/read.rs`, the bound in `datagram_want` and the poll's end in
-`op_done`, `src/io/source/read/ops.rs`, the edge in `serve`), on epoll or kqueue and on a ring.
+`datagram_ready` in `src/io/source/read/datagram.rs`, the bound in `datagram_want` and the ring's
+poll armed in `submit_ops`, `src/io/source/read/ops.rs`, its arrivals in `take_arrival`, the edge
+in `serve`), on epoll or kqueue and on a ring.
 A peer sends a small datagram and then the largest the socket carries, which for a Unix socket
 is more than the pool's largest buffer holds; the task receives each into a buffer that holds
 it, maybe asking first whether the socket is readable. The task receives a datagram itself into
 its own buffer (on epoll and kqueue always, on a ring a Unix datagram), waiting for an edge or
-the ring's poll when none is there; a look at readability looks and takes nothing. Only a ring's
+the ring's poll when none is there; a look at readability looks and takes nothing. The ring's
+poll of a Unix datagram stays armed once made (a multishot poll): each datagram that comes says
+so, as an edge does, and a call that waits asks the kernel again while the poll stays. Only a
+ring's
 UDP socket has the ring receive ahead, into a buffer that holds the largest datagram UDP
 carries. Before, the side received ahead into the pool, into a buffer as large as the task's
 (failing with `OutOfMemory` for a task's buffer the pool could not hold) or, for a look at
 readability, into the pool's largest buffer, which cut a Unix datagram past 64 KiB that the
-task's buffer would have held whole: both found by the size sweep. 15 configurations: 8 that
+task's buffer would have held whole: both found by the size sweep. 16 configurations: 8 that
 must pass (Unix and UDP datagrams on epoll and on a ring, with `NoCut`, every datagram received
-whole, and `InOrder`; and `Termination` for each), 5 mutations (a look that receives ahead into
+whole, and `InOrder`; and `Termination` for each), 6 mutations (a look that receives ahead into
 the pool's largest buffer, a ring's UDP receive ahead into a buffer below the largest datagram,
 and a ring that receives a Unix datagram ahead for a task that receives it itself break `NoCut`;
-a poll, and an edge, that wake nobody break `Termination`), and 2 witnesses (a call that waits
-for the poll, a datagram received ahead and taken).
+a poll, and an edge, that wake nobody, and a call that waits behind the armed poll as behind an
+operation out, break `Termination`), and 2 witnesses (a call that waits for the poll, a datagram
+received ahead and taken).
 
 `tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
