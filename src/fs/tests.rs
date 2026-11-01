@@ -336,10 +336,13 @@ fn a_fifo_opened_as_a_file_is_watched_by_the_poller() {
 }
 
 mod allocate;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod cached;
 mod copy_range;
 #[cfg(target_os = "linux")]
 mod direct;
 mod durable;
+mod lent_wake;
 mod lock;
 mod many;
 mod owned;

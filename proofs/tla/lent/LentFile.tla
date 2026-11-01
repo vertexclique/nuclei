@@ -79,7 +79,16 @@
 (* What is abstract: the file state's guard (a step under it runs whole), *)
 (* how much a job reads or writes (a cell, or the cells asked for), and    *)
 (* where in time a positional call's own future runs: its end is taken by *)
-(* its task in one step.                                                   *)
+(* its task in one step. The wakes are abstract too: a task's `await`      *)
+(* stands for its waker. A read into a task's own buffer is woken by its   *)
+(* own job's end (the ring's slot or the pool's job holds the task's      *)
+(* waker), and joins the file's waiters, whom every job's end wakes, only  *)
+(* while a write it waits for is in flight, registered before it looks at *)
+(* that write (src/fs/file/owned.rs `poll_read_owned`). On Linux such a    *)
+(* read whose bytes the page cache has is made at once on the task's own  *)
+(* thread, with no job (src/fs/file/cached.rs, `RWF_NOWAIT`): the run      *)
+(* here in which its job reads at once and its task takes the end at once, *)
+(* with the cursor, the epoch and the generation checked as for any job.   *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 

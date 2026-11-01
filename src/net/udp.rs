@@ -5,11 +5,11 @@ use core::task::{Context, Poll};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
-use super::addr::{ToSocketAddrs, resolve};
+use super::addr::{ToSocketAddrs, first, resolve};
 use super::none_worked;
 use crate::buf::owned::{IoBuf, IoBufMut};
 use crate::io::source::write::Dest;
-use crate::io::source::{Addr, Kind};
+use crate::io::source::{Kind, Sender};
 use crate::io::{Handle, Interest, ReadBuf, Ready};
 
 impl Handle<UdpSocket> {
@@ -109,8 +109,8 @@ impl Handle<UdpSocket> {
         A: ToSocketAddrs,
         B: IoBuf,
     {
-        let target = match resolve(&addr).await {
-            Ok(mut addrs) => addrs.next().ok_or_else(|| none_worked(None)),
+        let target = match first(&addr).await {
+            Ok(target) => target.ok_or_else(|| none_worked(None)),
             Err(err) => Err(err),
         };
         match target {
@@ -142,7 +142,7 @@ impl Handle<UdpSocket> {
         B: IoBufMut,
     {
         let (result, buf) = self.source().recv_from_owned(buf).await;
-        let result = result.and_then(|(n, addr)| inet(addr).map(|addr| (n, addr)));
+        let result = result.and_then(|(n, addr)| SocketAddr::from_addr(addr).map(|addr| (n, addr)));
         (result, buf)
     }
 
@@ -162,10 +162,7 @@ impl Handle<UdpSocket> {
     /// As `sendto(2)` of this datagram (on Windows, as for
     /// [`send`](Self::send)), or the lookup's.
     pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
-        let addr = resolve(&addr)
-            .await?
-            .next()
-            .ok_or_else(|| none_worked(None))?;
+        let addr = first(&addr).await?.ok_or_else(|| none_worked(None))?;
         poll_fn(|cx| self.source().poll_send(cx, buf, Dest::Inet(addr))).await
     }
 
@@ -386,32 +383,13 @@ impl Handle<UdpSocket> {
         poll_fn(|cx| self.poll_receive(cx, buf, peek)).await
     }
 
+    #[inline(always)]
     fn poll_receive(
         &self,
         cx: &mut Context<'_>,
         buf: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<(usize, SocketAddr)>> {
-        let (n, addr) = core::task::ready!(self.source().poll_receive(cx, buf, peek))?;
-        Poll::Ready(match addr {
-            Addr::Inet(addr) => Ok((n, addr)),
-            #[cfg(unix)]
-            Addr::Unix(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a UDP datagram came with no internet address",
-            )),
-        })
-    }
-}
-
-/// The internet address of a UDP datagram's sender.
-fn inet(addr: Addr) -> io::Result<SocketAddr> {
-    match addr {
-        Addr::Inet(addr) => Ok(addr),
-        #[cfg(unix)]
-        Addr::Unix(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "a UDP datagram came with no internet address",
-        )),
+        self.source().poll_receive_as(cx, buf, peek)
     }
 }

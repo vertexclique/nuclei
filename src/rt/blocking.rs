@@ -425,8 +425,12 @@ impl Pool {
                 self.clear_bit(me);
                 continue;
             }
+            // The first park waits the whole keep-alive, so a thread woken
+            // within it reads the clock once, for the deadline.
             let deadline = Instant::now() + self.config.keep_alive;
-            loop {
+            let mut wait = self.config.keep_alive;
+            while slot.state.load(Ordering::SeqCst) != WOKEN {
+                std::thread::park_timeout(wait);
                 if slot.state.load(Ordering::SeqCst) == WOKEN {
                     break;
                 }
@@ -434,7 +438,7 @@ impl Pool {
                 if now >= deadline {
                     break;
                 }
-                std::thread::park_timeout(deadline - now);
+                wait = deadline - now;
             }
             // Before the slot leaves idle: a freed slot may be another
             // thread's at once, and a late clear would erase its bit.

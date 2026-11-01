@@ -55,6 +55,8 @@
 //!
 //! `proofs/tla/lent/LentFile.tla` checks these rules.
 
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod cached;
 mod copy;
 mod durable;
 mod many;
@@ -201,6 +203,9 @@ struct FileState {
     sizing: Option<crate::rt::task::Task<io::Result<u64>>>,
     /// Positional writes left by their tasks, out until they land.
     orphans: Vec<Orphan>,
+    /// Whether a lent read at the cursor tries the page cache first.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    cache: cached::Cache,
 }
 
 impl FileIo {
@@ -233,6 +238,35 @@ impl FileIo {
     #[cfg(test)]
     pub(crate) fn keep_on_pool(&self) {
         self.on_pool.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this file's lent reads may be read from the page cache at
+    /// once, with no job: none on a file opened for direct IO, whose calls
+    /// go to the device, nor for a test that holds the pool to keep a call
+    /// in flight.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[inline(always)]
+    fn reads_cached(&self) -> bool {
+        #[cfg(test)]
+        if self.on_pool.load(Ordering::Relaxed) {
+            return false;
+        }
+        !self.direct
+    }
+
+    /// Whether this file's lent reads try the page cache at once: the kernel
+    /// has the call, and the file's filesystem did not refuse it.
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+    pub(crate) fn tries_cache(self: &Arc<Self>) -> bool {
+        let mut after = After::default();
+        let hooks = FileHooks { io: self };
+        let held = self.state.try_hold().map(|mut held| {
+            let cache = held.get().cache;
+            held.release(&mut after, &hooks);
+            cache
+        });
+        after.run();
+        cached::has_call() && held.is_some_and(|cache| cache != cached::Cache::Never)
     }
 
     /// Sends this file's calls to the shard's ring again, where it runs one.
@@ -472,6 +506,14 @@ impl FileState {
         {
             after.drop_buf(stale);
         }
+    }
+
+    /// No write is in flight or waits to go: [`poll_writes`](Self::poll_writes)
+    /// would be Ready at once. Positional writes left by their tasks are here
+    /// already (see `poll_orphans`).
+    #[inline(always)]
+    fn writes_idle(&self) -> bool {
+        self.writing.is_none() && self.behind.is_none() && self.orphans.is_empty()
     }
 
     /// Drives the writes: takes the end of the one in flight, then of the

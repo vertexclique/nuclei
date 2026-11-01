@@ -105,10 +105,19 @@ impl ReadState {
             return;
         };
         // Only a ring gives an operation back because the socket was not
-        // ready: the next one waits for it to be.
+        // ready: the next one waits for it to be. A side whose task receives every datagram
+        // itself (any but a UDP one's the ring receives ahead) arms a poll that stays, so a wait
+        // after the next "not now" submits nothing.
         #[cfg(ring)]
         if self.poll_first {
-            self.out = Some(issuer.issue(Want::Ready { read: true }, kind, self.epoch, after));
+            let want = if kind.datagrams() && !issuer.multishot_datagrams(kind) {
+                self.multi = true;
+                self.armed = true;
+                Want::ReadyMulti
+            } else {
+                Want::Ready { read: true }
+            };
+            self.out = Some(issuer.issue(want, kind, self.epoch, after));
             return;
         }
         let want = if kind.listens() {
@@ -128,10 +137,11 @@ impl ReadState {
             lent.out = true;
             Want::RecvLentFrom(core::mem::take(&mut lent.buf))
         } else if kind.datagrams() {
-            // A Unix datagram is its task's to receive into its own buffer
-            // (`receive_now`): the ring only polls for it.
+            // A datagram is its task's to receive into its own buffer (`receive_now`) unless the
+            // ring receives UDP datagrams ahead into a group that holds any: the ring only polls
+            // for it.
             #[cfg(ring)]
-            if kind == Kind::UnixDatagram {
+            if !issuer.multishot_datagrams(kind) {
                 return;
             }
             #[cfg(ring)]
@@ -264,6 +274,9 @@ impl ReadState {
             Outcome::Ready(answer) => {
                 if !stale && let Answer::Done(result) = answer {
                     self.poll_first = false;
+                    // The ring's edge: a task's call made with no guard that found the socket
+                    // empty before it asks again (`receive_now`).
+                    self.edges = self.edges.wrapping_add(1);
                     if let Err(err) = result {
                         self.error = Some(err);
                     }
@@ -273,7 +286,6 @@ impl ReadState {
                     }
                     if self.user_fd {
                         self.blocked = false;
-                        self.edges = self.edges.wrapping_add(1);
                         after.wake(&mut self.waiters);
                     }
                 }
@@ -302,6 +314,23 @@ impl ReadState {
                         Answer::Done(Ok(room)) => self.ahead.push(Piece::Room(room), after),
                         Answer::Done(Err(err)) => self.error = Some(err),
                     }
+                }
+            }
+            #[cfg(ring)]
+            Outcome::ReadyMultiEnd(answer) => {
+                self.multi = false;
+                self.multi_stopping = false;
+                self.armed = false;
+                if !stale {
+                    match answer {
+                        // Its readiness came as arrivals.
+                        Answer::Done(Ok(())) => {}
+                        Answer::Done(Err(err)) => self.error = Some(err),
+                        // Stopped: a lent buffer or the caller's calls go first.
+                        Answer::Undone { .. } => {}
+                    }
+                    // A task that waits looks again, and arms another if it still must wait.
+                    after.wake(&mut self.waiters);
                 }
             }
             #[cfg(ring)]
