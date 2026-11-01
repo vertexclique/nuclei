@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **A shard taken from a blocked runner is never dropped with its tasks.** The monitor holds a
+  worker's shard only weakly, and got a reference of its own only after its take had succeeded; a
+  runner whose poll ended in between found the shard taken and let go of the last reference, so the
+  shard was dropped with the tasks still queued on it, and each one's handle then found no output
+  (on macOS, about one run in two thousand of the cadence test whose twelve tasks block their
+  runners at once). The monitor now holds the shard before it claims the runner's slot, and lets go
+  of it when the take does not happen (`proofs/tla/handoff/TakeRef.tla`).
 - **A read on io_uring gets a stream's end that came with its last bytes.** Linux's multishot
   receive stops trying once the socket's count of what is left says none, a count that leaves out
   a Unix stream's every end and a TCP reset, and waits for a wake. Bytes and the end that came
