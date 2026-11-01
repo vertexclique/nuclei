@@ -965,13 +965,13 @@ mod monoio_side {
         match row {
             "block_on" => {
                 for _ in 0..BLOCK_ON {
-                    std::hint::black_box(rt.block_on(async { 1u8 }));
+                    std::hint::black_box(rt.block_on(monoio::spawn(async move { 1u8 })));
                 }
                 BLOCK_ON
             }
             "mpsc" => {
                 // local_sync channels are !Send and single-thread, monoio's own companion crate
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     let (to_b, mut from_a) = local_sync::mpsc::bounded::channel::<u64>(1);
                     let (to_a, mut from_b) = local_sync::mpsc::bounded::channel::<u64>(1);
                     let a = monoio::spawn(async move {
@@ -989,25 +989,25 @@ mod monoio_side {
                     });
                     a.await;
                     echo.await;
-                });
+                }));
                 MPSC_ROUNDS * 2
             }
             "timeout" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     for _ in 0..TIMEOUTS {
                         monoio::time::timeout(Duration::from_secs(1), async {})
                             .await
                             .unwrap();
                     }
-                });
+                }));
                 TIMEOUTS
             }
             "tcp" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     let addr = listen_echo(1);
                     let mut conn = TcpStream::connect(addr).await.unwrap();
                     rounds(&mut conn, TCP_ROUNDS).await;
-                });
+                }));
                 TCP_ROUNDS
             }
             "tcp_2w" => {
@@ -1061,7 +1061,7 @@ mod monoio_side {
                 DGRAM_ROUNDS
             }
             "udp" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     let a = UdpSocket::bind("127.0.0.1:0").unwrap();
                     let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
                     let (a_addr, echo_addr) = (a.local_addr().unwrap(), echo.local_addr().unwrap());
@@ -1088,7 +1088,7 @@ mod monoio_side {
                         reply.clear();
                     }
                     server.await;
-                });
+                }));
                 UDP_ROUNDS
             }
             "unix_stream" => {
@@ -1110,23 +1110,23 @@ mod monoio_side {
                 UNIX_ROUNDS
             }
             "tcp_split" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     let addr = listen_echo(1);
                     split_client(addr).await;
-                });
+                }));
                 TCP_ROUNDS
             }
             "tcp_asyncrw" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                     let addr = listener.local_addr().unwrap();
                     monoio::spawn(asyncrw_echo(listener));
                     asyncrw_client(addr).await;
-                });
+                }));
                 TCP_ROUNDS
             }
             "tcp_many" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     let addr = listen_echo(MANY_CONNS);
                     let tasks: Vec<_> = (0..MANY_CONNS)
                         .map(|_| {
@@ -1139,11 +1139,11 @@ mod monoio_side {
                     for task in tasks {
                         task.await;
                     }
-                });
+                }));
                 MANY_CONNS * MANY_ROUNDS
             }
             "bulk" => {
-                let total = rt.block_on(async {
+                let total = rt.block_on(monoio::spawn(async move {
                     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                     let addr = listener.local_addr().unwrap();
                     let receiver = monoio::spawn(bulk_receiver(listener));
@@ -1155,7 +1155,7 @@ mod monoio_side {
                         chunk = back;
                     }
                     receiver.await
-                });
+                }));
                 assert_eq!(total, BULK);
                 (BULK / BULK_CHUNK) as u64
             }
@@ -1179,23 +1179,23 @@ mod monoio_side {
                 (FILE_SIZE / FILE_CHUNK) as u64
             }
             "spawn_join" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     for i in 0..SPAWNS {
                         std::hint::black_box(monoio::spawn(async move { i }).await);
                     }
-                });
+                }));
                 SPAWNS
             }
             "spawn_blocking" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     for i in 0..BLOCKING {
                         std::hint::black_box(monoio::spawn_blocking(move || i).await.unwrap());
                     }
-                });
+                }));
                 BLOCKING
             }
             "sleep" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     let tasks: Vec<_> = (0..SLEEP_TASKS)
                         .map(|_| {
                             monoio::spawn(async {
@@ -1208,11 +1208,11 @@ mod monoio_side {
                     for task in tasks {
                         task.await;
                     }
-                });
+                }));
                 SLEEP_TASKS * SLEEPS_PER_TASK
             }
             "oneshot" => {
-                rt.block_on(async {
+                rt.block_on(monoio::spawn(async move {
                     for i in 0..ONESHOTS {
                         let (tx, rx) = local_sync::oneshot::channel::<u64>();
                         monoio::spawn(async move {
@@ -1220,7 +1220,7 @@ mod monoio_side {
                         });
                         std::hint::black_box(rx.await.unwrap());
                     }
-                });
+                }));
                 ONESHOTS
             }
             _ => usage(),
