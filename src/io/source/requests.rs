@@ -439,6 +439,7 @@ impl Source {
                 (true, Ok(slot)) => {
                     self.reg.slot.store(slot, Ordering::Release);
                     self.reg.state.store(REGISTERED, Ordering::Release);
+                    self.publish_here(Arc::as_ptr(&install.shard) as usize);
                     // Tasks that waited look again, and what the sides hold
                     // goes to the ring.
                     self.ops_registered(read, write, after);
@@ -552,6 +553,7 @@ impl Source {
         if self.reg.state.load(Ordering::Acquire) == REGISTERED {
             // SAFETY: both sides are held.
             let shard = unsafe { (*self.reg.shard.get()).take() };
+            self.clear_here();
             self.reg.state.store(UNREGISTERED, Ordering::Release);
             #[cfg(ring)]
             if self.reg.ops.swap(false, Ordering::AcqRel) {

@@ -944,6 +944,7 @@ fn tempdir() -> std::path::PathBuf {
 }
 
 mod biased;
+mod edge_skip;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod inq;
 #[cfg(unix)]

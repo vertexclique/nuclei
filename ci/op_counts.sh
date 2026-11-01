@@ -72,6 +72,13 @@ report=${OP_REPORT:-0}
 printf '%-15s %-9s %10s %10s %10s %10s\n' row backend median min max spread
 while read -r row n1 n2; do
   [[ -n $row && ( -z $ONLY || " $ONLY " == *" $row "* ) ]] || continue
+  # Once natively at both counts first, so what a row makes before it runs (the file row's
+  # file, of data) is there before cachegrind counts.
+  "$BIN" "$row" "$n1" >/dev/null && "$BIN" "$row" "$n2" >/dev/null || {
+    echo "$row: the program failed natively"
+    failed=1
+    continue
+  }
   for backend in $BACKENDS; do
     vals=()
     ok=1

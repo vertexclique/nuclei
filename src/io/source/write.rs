@@ -142,6 +142,10 @@ pub(crate) struct Lending<'d> {
 pub(super) struct WriteState {
     /// The last call would have blocked, and no edge came since.
     blocked: bool,
+    /// The hold's step made a direct write and changed nothing else: the side holds nothing
+    /// unsent and waits for no edge, so its release publishes that without looking
+    /// (`published`).
+    direct: bool,
     waiters: Wakers,
     /// A write found the pool empty; the source waits for a buffer.
     starved: bool,
@@ -362,11 +366,15 @@ impl WriteState {
                 }
                 None
             }
-            Some(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
+            Some(Ok(0)) => {
+                self.direct = true;
+                Some(Err(io::ErrorKind::WriteZero.into()))
+            }
             // Moved through as it is, counted by reference: taken apart and
             // made again, the result cost the call a drop of its own.
             Some(result) => {
                 tally::writing(&result);
+                self.direct = true;
                 Some(result)
             }
         }
@@ -405,6 +413,51 @@ impl WriteState {
         buf
     }
 
+    /// The side waits for nothing a write edge brings: no write blocked, nothing written
+    /// behind, no connect, no lent buffer waiting, no caller's own calls. An edge then only
+    /// counts, and the caller's calls, which read the count, are not on.
+    #[cfg(readiness)]
+    #[inline(always)]
+    pub(super) fn idle(&self) -> bool {
+        !self.user_fd
+            && !self.blocked
+            && !self.connecting
+            && self.behind.is_none()
+            && !self.lent_waits()
+    }
+
+    /// What `Source::unsent` publishes as the side is let go: the unsent bit, and for a source a
+    /// readiness driver serves (not `ring`) the idle bit. After a hold whose step only wrote
+    /// directly, known without a look: a direct write needs a side that holds nothing and, on a
+    /// readiness driver, is not blocked, and the step began by leaving the caller's own calls.
+    #[inline(always)]
+    pub(super) fn published(&mut self, ring: bool) -> u8 {
+        if core::mem::take(&mut self.direct) {
+            #[cfg(readiness)]
+            return if ring { 0 } else { super::WRITE_IDLE };
+            #[cfg(not(readiness))]
+            return 0;
+        }
+        u8::from(self.has_unsent()) | self.idle_bit(ring)
+    }
+
+    /// [`idle`](Self::idle) as the bit `Source::unsent` publishes it in, for a source a readiness
+    /// driver serves (`ring`: its operations run on a ring, which has no edges to pass over).
+    #[inline(always)]
+    pub(super) fn idle_bit(&self, ring: bool) -> u8 {
+        #[cfg(readiness)]
+        return if !ring && self.idle() {
+            super::WRITE_IDLE
+        } else {
+            0
+        };
+        #[cfg(not(readiness))]
+        {
+            let _ = ring;
+            0
+        }
+    }
+
     #[cfg(readiness)]
     /// The driver's part: on readiness, does what the side holds and wakes
     /// the tasks that wait on any of it.
@@ -412,13 +465,7 @@ impl WriteState {
     pub(super) fn serve(&mut self, fd: RawFd, kind: Kind, edge: bool, after: &mut After) {
         // An edge that finds the side idle only counts: the cheap and usual
         // case (a socket is writable with every readable edge on epoll).
-        if edge
-            && !self.user_fd
-            && !self.blocked
-            && !self.connecting
-            && self.behind.is_none()
-            && !self.lent_waits()
-        {
+        if edge && self.idle() {
             self.edges = self.edges.wrapping_add(1);
             return;
         }
