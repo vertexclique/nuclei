@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.3
+
+### Changed
+
+- **`File::open` opens on the calling thread when it can answer at once** (Linux). A regular file
+  on a local file system whose path the kernel's caches resolve at once (`openat2` with
+  `RESOLVE_CACHED`, Linux 5.12) is opened on the task's own thread, non-blocking, with no job of
+  the blocking pool. What the path names is looked at first through an `O_PATH` descriptor, so no
+  FIFO, device or file of a network or user-space file system is opened there; those, every open
+  the kernel's caches cannot answer, and every kernel without the call go to the blocking pool as
+  before, and its answer, an error included, is the one the caller gets.
+- **A ring registers its table of fixed files at its first source's attach**, not at its start, so
+  a shard that never attaches a socket or a file (a `block_on` of timers and channels) makes no
+  registration call.
+- **The bounded channel's `send` and `recv` are single-state futures.** `Sender::send` waits for a
+  slot and pushes the value in one future, and the receiver looks at its queue inline; a send that
+  finds a slot free and a receive that finds a message take no state of nested waits. The
+  signatures are the same futures as before (`fn send(&self, value) -> impl Future + '_`), not
+  `Unpin`, and a send dropped while it waits lets go of its place and of a slot it was handed, as
+  before.
+- **The stream and completion paths run fewer instructions per operation.** A stream's side is
+  polled and its bytes sent under its owner's biased hold, inlined, on the stream's own shard; a
+  stream's direct read is decided in one place, and its first read-ahead piece stays out of the
+  queue; the kernel counts what a read leaves out of line only the first time; a going shard asks
+  its sources as their owner, with no heavy fence, so a runtime that drops with many streams open
+  makes no `membarrier` call per stream (on epoll, 256 connections took about 250 calls and now
+  take 1); an arrival's hand-out and delivery and a chunk's
+  take-in are inlined into the ring's completion loop; a step that left one waker alone settles
+  inline. CI's budgets in `ci/op_budget.txt` were lowered to match.
+- **The API reference is built with `io-stats`**, on the site and on docs.rs, so the IO counts and
+  latencies of `stats` are listed.
+
 ## 0.5.2
 
 ### Fixed
