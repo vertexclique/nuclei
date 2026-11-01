@@ -35,11 +35,13 @@ pub(super) struct Quick {
 }
 
 impl Quick {
-    /// The words of a source of `kind`: any but a datagram socket's write
-    /// word stays raised, so every writable edge reaches its side.
+    /// The words of a source of `kind`. A datagram socket's first receive
+    /// goes through the side, which settles how it receives; any other
+    /// source's write word stays raised, so every writable edge reaches its
+    /// side.
     pub(super) fn new(kind: Kind) -> Self {
         Self {
-            read: AtomicU32::new(0),
+            read: AtomicU32::new(HOLDS),
             write: AtomicU32::new(if kind.datagrams() { 0 } else { HOLDS }),
             on: kind.datagrams(),
         }

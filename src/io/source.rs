@@ -368,8 +368,8 @@ struct Registration {
     ops: AtomicBool,
     #[cfg(ring)]
     slot: AtomicU32,
-    /// The ring of the last attach receives UDP datagrams ahead
-    /// (`ShardRing::datagrams_ahead`); else a task receives its own.
+    /// The ring of the shard of the last registration receives UDP datagrams
+    /// ahead (`ShardRing::datagrams_ahead`); else a task receives its own.
     #[cfg(ring)]
     datagrams_ahead: AtomicBool,
     /// The address of the `Shared` of the shard the registration in place
@@ -453,6 +453,13 @@ impl Source {
     #[cfg(ring)]
     fn datagrams_ahead(&self) -> bool {
         self.reg.datagrams_ahead.load(Ordering::Acquire)
+    }
+
+    /// The source registers with a shard whose ring receives UDP datagrams ahead (`ahead`), or
+    /// not: set before the registration, so the first receive already knows it.
+    #[cfg(ring)]
+    pub(crate) fn registers_with(&self, ahead: bool) {
+        self.reg.datagrams_ahead.store(ahead, Ordering::Release);
     }
 
     #[cfg(not(ring))]

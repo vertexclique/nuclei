@@ -1042,9 +1042,6 @@ impl Source {
         {
             return;
         }
-        self.reg
-            .datagrams_ahead
-            .store(ring.datagrams_ahead(), Ordering::Release);
         self.ring_installed(shard, token, ring.attach(lease.raw()));
     }
 
