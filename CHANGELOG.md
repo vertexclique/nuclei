@@ -2,6 +2,22 @@
 
 ## 0.5.3
 
+### Fixed
+
+- **A shard on io_uring no longer sleeps through a wake behind a full submission queue.** Entries
+  past the queue's room wait in the shard, the read of its wake's eventfd first in line, and a
+  wait handed the kernel only what the queue held. A shard that queued more operations than its
+  ring has entries between two waits (130 receives on a ring of 64), then waited with no timer
+  due, slept with the wake's read outside the kernel: until one of its operations completed, and
+  with idle peers never, no wake ended the wait, neither another thread's nor that of a timer the
+  shard fired on its way to the wait, whose `block_on` future then never ran again. CI's Ubuntu
+  6.8 job hung 5.5 hours so in `rt::shard::ring::tests_cap`, and a loaded host hangs that test
+  about once in 300 runs, with the ring's table of fixed files and without. A wait that may sleep
+  now hands the kernel every entry first, and only looks where the kernel takes not all of them
+  (`proofs/tla/park`, the `no_submit_first` mutation). The cap tests bound their sends with a
+  deadline, and a watchdog ends the test process with a message after 30 seconds, since a lost
+  wake stops the shard's timers too.
+
 ### Changed
 
 - **`File::open` opens on the calling thread when it can answer at once** (Linux). A regular file
