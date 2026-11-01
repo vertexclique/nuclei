@@ -568,7 +568,7 @@ impl ReadState {
     /// A completed result for a task that asked: wakes the others waiting
     /// if some of it is left for them.
     fn pass_on(&mut self, after: &mut After) {
-        if self.has_result() && !self.waiters.is_empty() {
+        if !self.waiters.is_empty() && self.has_result() {
             after.wake(&mut self.waiters);
         }
     }
