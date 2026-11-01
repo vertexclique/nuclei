@@ -1,0 +1,16 @@
+TLC run of every configuration in proofs/tla/jobend, 2026-11-01 01:56 UTC.
+Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+J_safe                            3369       1908      2  pass                                  pass                                  yes
+J_live                            3369       1908      1  pass                                  pass                                  yes
+M_end_in_job                        53         41      1  violated:NoAllocation                 violated:NoAllocation                 yes
+M_wake_after_job                    58         43      1  violated:NoAllocation                 violated:NoAllocation                 yes
+M_write_first                       37         26      2  violated:CountedUntilWoken            violated:CountedUntilWoken            yes
+M_count_first                       23         17      1  violated:CountedOutAfterWake          violated:CountedOutAfterWake          yes
+W_early                             36         25      1  violated:NoEarlyLook                  violated:NoEarlyLook                  yes
+W_took_back                         65         47      1  violated:NoTookBack                   violated:NoTookBack                   yes
+
+results matching EXPECTED.txt: 8 of 8
+Temporarily overriding HOME='/home/runner/work/_temp/f7510b9a-50b7-4b5a-b754-5617f54b6c27' before making global git config changes

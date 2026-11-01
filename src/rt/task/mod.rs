@@ -236,6 +236,7 @@ impl core::fmt::Debug for Runnable {
 /// Spawns `future` as a task that `schedule` places when it is woken.
 /// Returns the task's runnable, scheduled once and not yet handed to
 /// `schedule`, and its handle.
+#[inline(always)]
 pub(crate) fn spawn<F, S>(future: F, schedule: S) -> (Runnable, Task<F::Output>)
 where
     F: Future + Send + 'static,
@@ -255,6 +256,7 @@ where
 /// (its owner's, for a future that is not `Send`), everything it borrows
 /// outlives the task, and the schedule may be called from any thread that
 /// holds a waker.
+#[inline(always)]
 pub(crate) unsafe fn spawn_unchecked<F, S>(future: F, schedule: S) -> (Runnable, Task<F::Output>)
 where
     F: Future,

@@ -35,7 +35,9 @@ use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::header::Header;
-use super::state::{AWAITER, CLOSED, COMPLETED, FLAGS, REFERENCE, RUNNING, SCHEDULED, TASK};
+use super::state::{
+    AWAITER, CLOSED, COMPLETED, FLAGS, NOTIFYING, REFERENCE, REGISTERING, RUNNING, SCHEDULED, TASK,
+};
 use super::{Runnable, Schedule, ScheduleInfo, abort_on_panic};
 use crate::sync::internal::{Ordering, UnsafeCell};
 
@@ -102,6 +104,7 @@ where
 
     /// Allocates a task, scheduled, with its handle and its `Runnable`; its
     /// memory comes from the thread's cache of task blocks (see `memory`).
+    #[inline(always)]
     pub(super) fn allocate(future: F, schedule: S) -> NonNull<()> {
         let (ptr, owner) = crate::mem::alloc(core::alloc::Layout::new::<Cell<F, S>>());
         let ptr = ptr.cast::<Cell<F, S>>();
@@ -269,6 +272,17 @@ where
     }
 
     unsafe fn drop_future(ptr: *const ()) {
+        // SAFETY: the caller's contract.
+        unsafe { Self::drop_future_here(ptr) }
+    }
+
+    /// [`drop_future`](Self::drop_future), inline where a run completes.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the live future.
+    #[inline(always)]
+    unsafe fn drop_future_here(ptr: *const ()) {
         // SAFETY: the caller owns the live future.
         unsafe {
             let cell = Self::cell(ptr);
@@ -389,41 +403,81 @@ where
             match output {
                 Some(output) => {
                     let panicked = output.is_err();
-                    Self::drop_future(ptr);
+                    Self::drop_future_here(ptr);
                     cell.core
                         .with_mut(|core| (*core).output = ManuallyDrop::new(output));
-                    loop {
-                        // With no handle left, nobody takes the output: the
-                        // task closes and drops it.
-                        let done = (state & !RUNNING & !SCHEDULED) | COMPLETED;
-                        let new = if state & TASK == 0 {
-                            done | CLOSED
-                        } else {
-                            done
-                        };
+                    // Before the exchange below, which may hand the memory to
+                    // the handle: the hook, and the awaiter, taken with the
+                    // notifier's flag held across the exchange (a registration
+                    // that meets it wakes its own waker).
+                    if panicked {
+                        cell.schedule.panicked(header.id);
+                    }
+                    let mut awaiter = None;
+                    let mut claimed = false;
+                    let mut unclaimed = None;
+                    let last = loop {
+                        // A waker stored, its cell free, and not the run's yet:
+                        // claimed first, so the exchange clears its flags. One a
+                        // registration or a notification holds is theirs to wake.
+                        if !claimed
+                            && state & AWAITER != 0
+                            && state & (NOTIFYING | REGISTERING) == 0
+                        {
+                            let (waker, ours, now) = header.claim();
+                            if ours {
+                                awaiter = waker;
+                                claimed = true;
+                            }
+                            state = now;
+                        }
+                        // With no handle left, or a handle that cancelled, nobody
+                        // takes the output: the run takes it out, while its
+                        // reference still holds the task, and drops it once the
+                        // task is let go of (a detached blocking job's end so
+                        // follows its free: `fs::call::Ending`).
+                        if (state & TASK == 0 || state & CLOSED != 0) && unclaimed.is_none() {
+                            unclaimed = Some(
+                                cell.core
+                                    .with_mut(|core| ManuallyDrop::take(&mut (*core).output)),
+                            );
+                        }
+                        // Completed, closed too with no handle, and the run's
+                        // reference gone in the same exchange: a handle that
+                        // sees the completion holds the last reference, so its
+                        // drop frees the task where the handle is.
+                        let mut new = (state & !RUNNING & !SCHEDULED) | COMPLETED;
+                        if state & TASK == 0 {
+                            new |= CLOSED;
+                        }
+                        if claimed {
+                            new &= !(NOTIFYING | AWAITER);
+                        }
+                        new -= REFERENCE;
                         match header.state.compare_exchange_weak(
                             state,
                             new,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         ) {
-                            Ok(_) => {
-                                if state & TASK == 0 || state & CLOSED != 0 {
-                                    abort_on_panic(|| {
-                                        cell.core.with_mut(|core| {
-                                            ManuallyDrop::drop(&mut (*core).output)
-                                        })
-                                    });
-                                }
-                                if panicked {
-                                    cell.schedule.panicked(header.id);
-                                }
-                                Self::finish(ptr, state);
-                                return false;
-                            }
+                            Ok(_) => break new & !FLAGS == 0 && new & TASK == 0,
                             Err(actual) => state = actual,
                         }
+                    };
+                    // Nothing of the task is touched from here on, unless the
+                    // run's reference was the last one, with no handle.
+                    if last {
+                        Self::destroy(ptr);
                     }
+                    // Before the awaiter learns of the end: what a cancel waits
+                    // for is gone by then.
+                    if let Some(output) = unclaimed {
+                        abort_on_panic(|| drop(output));
+                    }
+                    if let Some(waker) = awaiter {
+                        abort_on_panic(|| waker.wake());
+                    }
+                    false
                 }
                 None => {
                     let mut future_dropped = false;
@@ -434,10 +488,16 @@ where
                             Self::drop_future(ptr);
                             future_dropped = true;
                         }
+                        // Neither woken nor closed: the run's reference goes in
+                        // the same exchange, so no later run of the task (woken
+                        // meanwhile on another thread) is followed by this one's
+                        // drop.
                         let new = if state & CLOSED != 0 {
                             state & !RUNNING & !SCHEDULED
-                        } else {
+                        } else if state & SCHEDULED != 0 {
                             state & !RUNNING
+                        } else {
+                            (state & !RUNNING) - REFERENCE
                         };
                         match header.state.compare_exchange_weak(
                             state,
@@ -456,7 +516,12 @@ where
                                 return true;
                             }
                             Ok(_) => {
-                                Self::drop_ref(ptr);
+                                // The last reference, with no handle: nothing
+                                // can wake or await the task again.
+                                if new & !FLAGS == 0 && new & TASK == 0 {
+                                    Self::drop_future(ptr);
+                                    Self::destroy(ptr);
+                                }
                                 return false;
                             }
                             Err(actual) => state = actual,

@@ -25,6 +25,7 @@ mod interval;
 mod precise;
 mod sleep;
 mod timeout;
+pub(crate) mod units;
 pub(crate) mod wheel;
 
 pub use self::instant::Instant;

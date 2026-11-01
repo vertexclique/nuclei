@@ -1,7 +1,8 @@
 -------------------------------- MODULE Local --------------------------------
 (***************************************************************************)
 (* The single-shard semaphore (src/sync/local/semaphore.rs: `Acquire::poll`, *)
-(* `Acquire::cancel`, `Semaphore::serve`, `try_acquire_many`; its line in  *)
+(* `Acquire::cancel` and its `leave_line`, `Semaphore::serve`,             *)
+(* `try_acquire_many`; its line in                                         *)
 (* src/sync/local/waiters.rs), which `sync::local::Mutex` and the bounded *)
 (* `sync::local::mpsc` channel's slots are built on, at the grain of one   *)
 (* poll or one drop of a task.                                             *)

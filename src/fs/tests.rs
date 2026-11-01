@@ -342,6 +342,7 @@ mod copy_range;
 #[cfg(target_os = "linux")]
 mod direct;
 mod durable;
+mod job_end;
 mod lent_wake;
 mod lock;
 mod many;
