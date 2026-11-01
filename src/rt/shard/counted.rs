@@ -6,11 +6,13 @@
 //! count. An item whose count is not seen yet stays for the consumer's next take, as a push under
 //! way does in the queue itself (proofs/tla/counted/Counted.tla).
 
+#[cfg(ring)]
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kovan_queue::seg_queue::SegQueue;
 
+#[cfg(ring)]
 use crate::sync::internal::{AtomicPtr, take_ptr};
 
 /// A queue of many producers and one consumer, counted (see the module docs).
@@ -78,10 +80,12 @@ impl<T> Counted<T> {
 /// (a source whose arrivals mostly go straight to a free side) allocates nothing for it, and keeps
 /// the queue's cache-line alignment out of its own layout. A push that loses the race to make it
 /// frees its own and uses the one made.
+#[cfg(ring)]
 pub(crate) struct LazyCounted<T> {
     queue: AtomicPtr<Counted<T>>,
 }
 
+#[cfg(ring)]
 impl<T> LazyCounted<T> {
     pub(crate) fn new() -> Self {
         Self {
@@ -142,6 +146,7 @@ impl<T> LazyCounted<T> {
     }
 }
 
+#[cfg(ring)]
 impl<T> Drop for LazyCounted<T> {
     fn drop(&mut self) {
         let queue = take_ptr(&mut self.queue);
@@ -154,5 +159,5 @@ impl<T> Drop for LazyCounted<T> {
 
 #[cfg(all(test, not(loom)))]
 mod tests;
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, ring, not(loom)))]
 mod tests_lazy;
