@@ -23,7 +23,7 @@ tcp_2w io_uring 4763 1
 tcp_2w epoll 4038 1
 bulk io_uring 69824 1
 bulk epoll 1514 1
-file_read io_uring 2339 1
+file_read io_uring 2279 1
 file_read epoll 3310 9
 spawn_join io_uring 730 1
 spawn_join epoll 725 1
