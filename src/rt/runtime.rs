@@ -66,7 +66,7 @@ pub(crate) struct Inner {
     /// The shards of threads inside this runtime's `block_on` while its clock
     /// is paused, by address: with the workers, the shards a paused clock
     /// waits for before it moves by itself.
-    pub(crate) guests: kovan_map::HashMap<usize, Arc<Shared>>,
+    guests: OnceLock<kovan_map::HashMap<usize, Arc<Shared>>>,
     /// The task hooks every task of this runtime carries, if any is set.
     task_hooks: Option<Arc<super::tuning::TaskHooks>>,
     /// The runtime shuts down when a task panics; and once one did.
@@ -278,6 +278,16 @@ impl fmt::Debug for RuntimeHandle {
 static DEFAULT: OnceLock<Runtime> = OnceLock::new();
 
 impl Inner {
+    /// The guests, made at the first join: a runtime whose clock never pauses has none.
+    pub(crate) fn guests(&self) -> &kovan_map::HashMap<usize, Arc<Shared>> {
+        self.guests
+            .get_or_init(|| kovan_map::HashMap::with_capacity(builder::GUESTS_CAPACITY))
+    }
+
+    /// The guests, if any ever joined.
+    pub(crate) fn guests_made(&self) -> Option<&kovan_map::HashMap<usize, Arc<Shared>>> {
+        self.guests.get()
+    }
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
