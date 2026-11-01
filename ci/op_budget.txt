@@ -7,9 +7,9 @@ timeout io_uring 71 1
 timeout epoll 71 1
 tcp io_uring 3239 1
 tcp epoll 2478 1
-unix_dgram io_uring 4036 1
+unix_dgram io_uring 4032 1
 unix_dgram epoll 3562 1
-udp io_uring 3508 1
+udp io_uring 3504 1
 udp epoll 3128 1
 unix_stream io_uring 3244 1
 unix_stream epoll 2487 1

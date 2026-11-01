@@ -13,10 +13,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::tests_recv::{ring_shard_of, source_pair};
+use crate::alone::Watchdog;
 use crate::rt::context;
 
 /// How long a send may take; far above what an idle shard needs.
 const DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long a test may take in all before its watchdog ends the process.
+const HANG: Duration = Duration::from_secs(30);
+
+/// Ends the process, naming `test` and whether the byte reached the peer (`arrived`), unless
+/// the test is done within [`HANG`]: a shard that sleeps through its own wake stops its timers
+/// too, so no deadline of the test's own could fire.
+fn watch(test: &'static str, arrived: &Arc<AtomicBool>) -> Watchdog {
+    let arrived = Arc::clone(arrived);
+    Watchdog::new(test, HANG, move || {
+        let byte = if arrived.load(Ordering::SeqCst) {
+            "reached"
+        } else {
+            "never reached"
+        };
+        format!("the byte {byte} the peer")
+    })
+}
 
 #[test]
 fn a_small_ring_gives_its_group_no_more_than_half_its_completion_queue() {
@@ -67,6 +86,8 @@ fn a_request_is_sent_while_the_receive_for_its_reply_is_armed_on_a_small_ring() 
 
 #[test]
 fn idle_connections_beyond_the_cap_hold_up_no_send() {
+    let arrived = Arc::new(AtomicBool::new(false));
+    let _hung = watch("idle_connections_beyond_the_cap_hold_up_no_send", &arrived);
     let Some(shard) = ring_shard_of(64, 16, 4096) else {
         return;
     };
@@ -74,7 +95,6 @@ fn idle_connections_beyond_the_cap_hold_up_no_send() {
     // The cap is 128 - 16 = 112: more idle reads than that.
     let idle: Vec<_> = (0..130).map(|_| source_pair()).collect();
     let (_mine, src, mut peer) = source_pair();
-    let arrived = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&arrived);
     let reader = std::thread::spawn(move || {
         let mut got = [0u8; 1];
@@ -91,7 +111,11 @@ fn idle_connections_beyond_the_cap_hold_up_no_send() {
             Poll::Ready(())
         })
         .await;
-        poll_fn(|cx| src.poll_write(cx, b"q")).await.unwrap();
+        let sent = crate::time::timeout(DEADLINE, poll_fn(|cx| src.poll_write(cx, b"q"))).await;
+        assert_eq!(
+            sent.expect("the send waited behind idle receives").unwrap(),
+            1
+        );
         // The byte must reach the peer while the shard keeps running.
         let deadline = Instant::now() + DEADLINE;
         while !arrived.load(Ordering::SeqCst) && Instant::now() < deadline {
@@ -116,6 +140,11 @@ fn idle_one_shot_receives_beyond_the_cap_hold_up_no_send() {
     use crate::rt::backend::Backend;
     use crate::rt::shard::{Limits, Shard};
     use crate::syscore::linux::iouring::ring::RingConfig;
+    let arrived = Arc::new(AtomicBool::new(false));
+    let _hung = watch(
+        "idle_one_shot_receives_beyond_the_cap_hold_up_no_send",
+        &arrived,
+    );
     let shard = match Shard::new(Limits {
         max_nesting: 8,
         buffer_cap: crate::buf::DEFAULT_CAP,
@@ -131,7 +160,6 @@ fn idle_one_shot_receives_beyond_the_cap_hold_up_no_send() {
     // No group: the cap is the 128 completions of the ring, and more idle reads than that.
     let idle: Vec<_> = (0..130).map(|_| source_pair()).collect();
     let (_mine, src, mut peer) = source_pair();
-    let arrived = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&arrived);
     let reader = std::thread::spawn(move || {
         let mut got = [0u8; 1];
@@ -148,7 +176,12 @@ fn idle_one_shot_receives_beyond_the_cap_hold_up_no_send() {
             Poll::Ready(())
         })
         .await;
-        poll_fn(|cx| src.poll_write(cx, b"q")).await.unwrap();
+        let sent = crate::time::timeout(DEADLINE, poll_fn(|cx| src.poll_write(cx, b"q"))).await;
+        assert_eq!(
+            sent.expect("the send waited behind idle one-shot receives")
+                .unwrap(),
+            1
+        );
         // The byte must reach the peer while the shard keeps running.
         let deadline = Instant::now() + DEADLINE;
         let mut pause = Duration::from_millis(1);
