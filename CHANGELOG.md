@@ -27,8 +27,15 @@
   its sources as their owner, with no heavy fence, so a runtime that drops with many streams open
   makes no `membarrier` call per stream (on epoll, 256 connections took about 250 calls and now
   take 1); an arrival's hand-out and delivery and a chunk's
-  take-in are inlined into the ring's completion loop; a step that left one waker alone settles
-  inline. CI's budgets in `ci/op_budget.txt` were lowered to match.
+  take-in are inlined into the ring's completion loop, which enters its unwinding guard once per
+  batch of completions and wakes the lone reader an arrival leaves inline; a read side's completion
+  is applied at once when the side is free, as a write side's is; a step that left one waker alone
+  settles inline.
+- **A connection costs less to open and close.** A source's attach and a dropped handle's close
+  allocate nothing beside the source itself, a new source is written field by field into its
+  allocation, and a stream a listener accepts inherits the listener's `TCP_INQ` with no
+  `setsockopt` of its own (256 connections on epoll made 513 calls and now make 259). CI's budgets
+  in `ci/op_budget.txt` were lowered to match these and the changes above.
 - **The API reference is built with `io-stats`**, on the site and on docs.rs, so the IO counts and
   latencies of `stats` are listed.
 
