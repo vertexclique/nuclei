@@ -331,6 +331,15 @@ impl<T> Drop for Task<T> {
             unsafe { (self.header().vtable.destroy)(self.ptr.as_ptr().cast_const()) };
             return;
         }
+        self.cancel_and_let_go();
+    }
+}
+
+impl<T> Task<T> {
+    /// The drop of a handle whose task may still run or hold its output:
+    /// out of line, so the drop of an awaited handle carries none of it.
+    #[inline(never)]
+    fn cancel_and_let_go(&mut self) {
         self.set_canceled();
         drop(self.set_detached());
     }
