@@ -40,8 +40,10 @@ impl Source {
         self.poll_writing(cx, |st, _io, waker, _after| st.ready(waker).map(Ok))
     }
 
-    /// Writes `bytes` to a stream: copied into the write-behind and written
-    /// out by the driver.
+    /// Writes `bytes` to a stream: straight to the kernel while the side
+    /// holds nothing, else copied into the write-behind and written out by
+    /// the driver. A large stream write waits instead of being copied (see
+    /// `write_direct`).
     pub(crate) fn poll_write(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -51,24 +53,55 @@ impl Source {
     }
 
     /// Writes the bytes of `bufs`, gathered in order, as
-    /// [`poll_write`](Self::poll_write) writes one slice. Inlined, so a single slice's
-    /// length is known where the call is made.
+    /// [`poll_write`](Self::poll_write) writes one slice.
     #[inline(always)]
     pub(crate) fn poll_write_vectored(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
+        self.poll_write_bufs(cx, bufs, true)
+    }
+
+    /// A write of `bufs` that never waits for the socket: what the kernel
+    /// takes now, or else a copy into the write-behind (`try_write`).
+    pub(crate) fn poll_write_behind(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_bufs(cx, bufs, false)
+    }
+
+    /// The writes of `bufs`; a large stream write waits for the socket when
+    /// `wait`. Inlined, so a single slice's length is known where the call
+    /// is made.
+    #[inline(always)]
+    fn poll_write_bufs(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+        wait: bool,
+    ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
-        crate::coop::poll_budget(cx, |cx| {
-            self.poll_writing(cx, |st, io, waker, after| {
-                #[cfg(unix)]
-                if let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs) {
-                    return Poll::Ready(result);
-                }
-                st.write(io, kind, bufs, waker, after)
-            })
-        })
+        crate::coop::poll_budget(
+            cx,
+            #[inline(always)]
+            |cx| {
+                self.poll_writing(
+                    cx,
+                    #[inline(always)]
+                    |st, io, waker, after| {
+                        #[cfg(unix)]
+                        if let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs)
+                        {
+                            return Poll::Ready(result);
+                        }
+                        st.write(io, kind, bufs, wait, waker, after)
+                    },
+                )
+            },
+        )
     }
 
     /// Polls the write side with `step` for the handle's own writes, given

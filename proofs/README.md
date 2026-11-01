@@ -1052,6 +1052,23 @@ lent send of a task that went still out overtakes it, breaking `InOrder`; a poll
 nobody breaks `Termination`), and 3 witnesses (a call that waits for room, a refusal answered by
 its own call, a call that waits behind the lent send of a task that went).
 
+The same model checks a stream's writes (`Stream`: `write_direct`, `wait_for_room` and `write` in
+`src/io/source/write.rs`). The task writes small chunks and large ones (16 KiB or more,
+`BEHIND_MIN`); a chunk goes to the kernel from the task's own buffer when nothing of the side is
+ahead of it and the socket has room. A small one that cannot is copied into the write-behind and
+taken at once, and the ring sends the write-behind once nothing else is out. A large one is never
+copied: it waits for what is ahead of it to go out, or for the poll when the socket is full, and
+tries again. Before, a large chunk that found the socket full was copied too, so a send of every
+chunk stayed out with the ring and every later chunk was copied as well (the bulk row of
+`ci/op_count`, a 64 KiB copy for every chunk). 10 configurations: 2 that
+must pass (`OwnResult`, `InOrder` and `NoLargeCopy`, no large chunk is ever in the write-behind or
+the ring's send of it; and `Termination` with `Delivered`), 5 mutations (a large chunk that goes to
+the kernel with the write-behind ahead overtakes it, breaking `InOrder`; the old copy breaks
+`NoLargeCopy`; a send's end that wakes nobody, a full socket that asks for no poll, and a poll that
+wakes nobody each leave the large chunk waiting, breaking `Termination`), and 3 witnesses (a large
+chunk that waits for the poll, one that waits for the write-behind ahead of it, a small chunk
+copied into the write-behind).
+
 `tla/ring/RingRecv.tla` checks a datagram socket's receives (`receive_now` and
 `datagram_ready` in `src/io/source/read.rs`, the bound in `datagram_want` and the poll's end in
 `op_done`, `src/io/source/read/ops.rs`, the edge in `serve`), on epoll or kqueue and on a ring.
@@ -1076,7 +1093,8 @@ for the poll, a datagram received ahead and taken).
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
 `reads_itself` in `src/io/source/read.rs`, `write`, `write_direct` and `writes_itself` in
 `src/io/source/write.rs`; a ring write goes direct at every size, `WRITE_RING` of
-`src/io/source/direct.rs` being 0). Three connections over a pool of two buffers, two of whose peers never
+`src/io/source/direct.rs` being 0, and a reply of 16 KiB or more never takes a buffer, waiting for a
+poll as a starved writer does, see `tla/ring/RingSend.tla`). Three connections over a pool of two buffers, two of whose peers never
 send: with no receive group to draw from (none configured, or the group dry) a read takes a buffer
 of the pool for a receive that waits in the kernel, and holds it while its peer stays idle. Before,
 a reader or a writer that found the pool empty waited for a buffer to come back and armed nothing,

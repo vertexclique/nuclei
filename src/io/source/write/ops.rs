@@ -112,6 +112,7 @@ impl WriteState {
                 && !self.waiters.is_empty()
                 && let Some(issuer) = route.issuer(after)
             {
+                self.polling = true;
                 self.out = Some(issuer.issue(Want::Ready { read: false }, kind, self.epoch, after));
             }
             return;
@@ -131,6 +132,7 @@ impl WriteState {
         };
         #[cfg(ring)]
         if self.poll_first {
+            self.polling = true;
             self.out = Some(issuer.issue(Want::Ready { read: false }, kind, self.epoch, after));
             return;
         }
@@ -179,6 +181,10 @@ impl WriteState {
     /// source's descriptor, for a connect's end.
     pub(crate) fn op_done(&mut self, done: Done, fd: Option<Raw>, after: &mut After) {
         self.out = None;
+        #[cfg(ring)]
+        {
+            self.polling = false;
+        }
         // An operation of a descriptor that is gone: what it holds is
         // dropped.
         let stale = done.epoch != self.epoch;

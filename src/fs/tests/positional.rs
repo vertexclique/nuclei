@@ -238,6 +238,16 @@ fn a_lent_read_taken_after_a_positional_write_reads_again() {
     let tmp = Temp::new("pos-lent-gen");
     let path = tmp.file("data");
     std::fs::write(&path, b"old!old!").unwrap();
+    // Out of the page cache, so the read is a job and not made at once.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let file = File::open(&path).unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: advice on the file's own descriptor; it reads nothing.
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(rc, 0, "the advice was refused");
+    }
     let got = rt.block_on(async {
         within(spawn(async move {
             let open = OpenOptions::new()

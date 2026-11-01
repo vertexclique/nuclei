@@ -60,6 +60,16 @@ MRS_no_wake                    MC_RingSend          violated:Termination
 WRS_again                      MC_RingSend          violated:NoAgain
 WRS_refused                    MC_RingSend          violated:NoRefused
 WRS_behind_lent                MC_RingSend          violated:NoBehindLent
+RS_stream                      MC_RingSend          pass
+RS_stream_live                 MC_RingSend          pass
+MRS_stream_direct_ahead        MC_RingSend          violated:InOrder
+MRS_copy_large                 MC_RingSend          violated:NoLargeCopy
+MRS_no_wake_send               MC_RingSend          violated:Termination
+MRS_no_poll                    MC_RingSend          violated:Termination
+MRS_stream_no_wake             MC_RingSend          violated:Termination
+WRS_stream_again               MC_RingSend          violated:NoAgain
+WRS_waited_send                MC_RingSend          violated:NoWaitedSend
+WRS_copied                     MC_RingSend          violated:NoCopied
 RR_epoll_unix                  MC_RingRecv          pass
 RR_epoll_udp                   MC_RingRecv          pass
 RR_ring_unix                   MC_RingRecv          pass
