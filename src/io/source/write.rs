@@ -486,19 +486,40 @@ impl WriteState {
             && !self.lent_waits()
     }
 
-    /// What `Source::unsent` publishes as the side is let go: the unsent bit, and for a source a
-    /// readiness driver serves (not `ring`) the idle bit. After a hold whose step only wrote
-    /// directly, known without a look: a direct write needs a side that holds nothing and, on a
-    /// readiness driver, is not blocked, and the step began by leaving the caller's own calls.
+    /// What `Source::unsent` publishes as the side is let go: the unsent bit, for a source a
+    /// readiness driver serves (not `ring`) the idle bit, and the sends bit (`sends_now`). After
+    /// a hold whose step only wrote directly, known without a look: a direct write needs a side
+    /// that holds nothing and, on a readiness driver, is not blocked, and the step began by
+    /// leaving the caller's own calls.
     #[inline(always)]
     pub(super) fn published(&mut self, ring: bool) -> u8 {
         if core::mem::take(&mut self.direct) {
             #[cfg(readiness)]
-            return if ring { 0 } else { super::WRITE_IDLE };
+            return if ring {
+                super::WRITE_SENDS
+            } else {
+                super::WRITE_IDLE | super::WRITE_SENDS
+            };
             #[cfg(not(readiness))]
             return 0;
         }
-        u8::from(self.has_unsent()) | self.idle_bit(ring)
+        u8::from(self.has_unsent()) | self.idle_bit(ring) | self.sends_bit(ring)
+    }
+
+    /// [`sends_now`](Self::sends_now) as the bit `Source::unsent` publishes it in.
+    #[inline(always)]
+    fn sends_bit(&self, ring: bool) -> u8 {
+        #[cfg(unix)]
+        return if self.sends_now(!ring) {
+            super::WRITE_SENDS
+        } else {
+            0
+        };
+        #[cfg(not(unix))]
+        {
+            let _ = ring;
+            0
+        }
     }
 
     /// [`idle`](Self::idle) as the bit `Source::unsent` publishes it in, for a source a readiness

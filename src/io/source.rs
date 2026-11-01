@@ -122,6 +122,10 @@ const UNSENT: u8 = 1;
 /// `Source::unsent`: the write side waits for nothing a write edge brings.
 #[cfg(readiness)]
 const WRITE_IDLE: u8 = 2;
+/// `Source::unsent`: the write side holds nothing a write straight from the task's buffer must
+/// come after (`WriteState::sends_now`), read by its owner under its biased hold.
+#[cfg(unix)]
+const WRITE_SENDS: u8 = 4;
 
 /// No descriptor: the source is retired.
 const NO_FD: Raw = super::raw::NONE;
@@ -430,10 +434,13 @@ pub(crate) struct Source {
     requests: AtomicU8,
     ask: Ask,
     /// As the write side's last holder left it: whether it holds bytes or a datagram the kernel
-    /// has not taken (`UNSENT`), and whether it waits for nothing a write edge brings
+    /// has not taken (`UNSENT`), whether it waits for nothing a write edge brings
     /// (`WRITE_IDLE`, `WriteState::idle`), so the driver passes over an edge of a side only its
-    /// own thread holds (`write_wants_no_edge`, proofs/tla/edgeskip/EdgeSkip.tla). One byte, so
-    /// a release publishes both with one store.
+    /// own thread holds (`write_wants_no_edge`, proofs/tla/edgeskip/EdgeSkip.tla), and whether
+    /// it holds nothing a write straight from the task's buffer must come after (`WRITE_SENDS`,
+    /// `WriteState::sends_now`), so the owner of a side only its own thread holds sends on the
+    /// bit alone (`send_as_owner`, proofs/tla/sendsnow/SendsNow.tla). One byte, so a release
+    /// publishes them all with one store.
     unsent: AtomicU8,
     /// A datagram socket's words for the calls made with no guard.
     #[cfg(unix)]

@@ -228,7 +228,8 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     #[inline(always)]
     fn releasing(&self, st: &mut WriteState) {
         // Release: a drop on another thread reads the unsent bit; this thread's driver reads the
-        // idle bit, only while no other thread ever held the side.
+        // idle bit, and its owner's send the sends bit, only while no other thread ever held the
+        // side.
         self.src
             .unsent
             .store(st.published(self.src.on_ring()), Ordering::Release);
