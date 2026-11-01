@@ -77,26 +77,27 @@ theorem published_within_a_microsecond (d : Nat) :
 
 /-- The shard computes an armed microsecond on 64 bits from a span's whole seconds `s` and its
 part of a second `n` (`units`, rounding up): the same number as rounding up all its
-nanoseconds, since a whole second is a whole number of microseconds. -/
-theorem armed_from_seconds (s n : Nat) (part : n < 1000000000) :
+nanoseconds, since a whole second is a whole number of microseconds (for any `n`, so for the
+part of a second the code splits off). -/
+theorem armed_from_seconds (s n : Nat) :
     armed (s * 1000000000 + n) = s * 1000000 + (n + 999) / 1000 := by
   unfold armed
   omega
 
 /-- The same for the clock's reading, rounding down. -/
-theorem reading_from_seconds (s n : Nat) (part : n < 1000000000) :
+theorem reading_from_seconds (s n : Nat) :
     reading (s * 1000000000 + n) = s * 1000000 + n / 1000 := by
   unfold reading
   omega
 
 /-- The same for the millisecond wheel's armed tick. -/
-theorem armedTick_from_seconds (s n : Nat) (part : n < 1000000000) :
+theorem armedTick_from_seconds (s n : Nat) :
     armedTick (s * 1000000000 + n) = s * 1000 + (n + 999999) / 1000000 := by
   unfold armedTick
   omega
 
 /-- And for its reading of the clock. -/
-theorem readingTick_from_seconds (s n : Nat) (part : n < 1000000000) :
+theorem readingTick_from_seconds (s n : Nat) :
     readingTick (s * 1000000000 + n) = s * 1000 + n / 1000000 := by
   unfold readingTick
   omega
