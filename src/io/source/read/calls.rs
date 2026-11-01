@@ -122,7 +122,7 @@ impl Source {
         )
     }
 
-    /// A stream read's step: straight into `out` when it goes there (`reads_itself`), else
+    /// A stream read's step: straight into `out` when it goes there (`read_direct`), else
     /// through the read-ahead.
     #[inline(always)]
     fn read_step(
@@ -136,31 +136,29 @@ impl Source {
     ) -> Poll<io::Result<usize>> {
         let kind = self.kind;
         #[cfg(unix)]
-        if st.reads_itself(io, kind, out.len(), peek)
-            && let Some(poll) = st.read_direct(
-                io,
-                self.serving_fd(None),
-                kind,
-                out.len(),
-                peek,
-                waker,
-                #[inline(always)]
-                |fd, inq| {
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    if inq {
-                        return sys::read_inq(fd, out);
-                    }
-                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    let _ = inq;
-                    let read = if peek {
-                        sys::peek(fd, out)
-                    } else {
-                        sys::read(fd, out)
-                    };
-                    read.map(|n| (n, None))
-                },
-            )
-        {
+        if let Some(poll) = st.read_direct(
+            io,
+            self.serving_fd(None),
+            kind,
+            out.len(),
+            peek,
+            waker,
+            #[inline(always)]
+            |fd, inq| {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if inq {
+                    return sys::read_inq(fd, out);
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let _ = inq;
+                let read = if peek {
+                    sys::peek(fd, out)
+                } else {
+                    sys::read(fd, out)
+                };
+                read.map(|n| (n, None))
+            },
+        ) {
             return poll;
         }
         st.read(io, kind, out, peek, waker, after)
@@ -337,17 +335,15 @@ impl Source {
                 #[cfg(unix)]
                 {
                     let len = bufs.iter().map(|b| b.len()).sum();
-                    if st.reads_itself(io, kind, len, false)
-                        && let Some(poll) = st.read_direct(
-                            io,
-                            self.serving_fd(None),
-                            kind,
-                            len,
-                            false,
-                            waker,
-                            |fd, _| sys::read_bufs(fd, bufs).map(|n| (n, None)),
-                        )
-                    {
+                    if let Some(poll) = st.read_direct(
+                        io,
+                        self.serving_fd(None),
+                        kind,
+                        len,
+                        false,
+                        waker,
+                        |fd, _| sys::read_bufs(fd, bufs).map(|n| (n, None)),
+                    ) {
                         return poll;
                     }
                 }
