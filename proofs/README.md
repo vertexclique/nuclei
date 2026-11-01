@@ -1978,8 +1978,10 @@ witness (the edge for nobody is passed over).
 ## A queue with a count
 
 `counted` (`tla/counted/Counted.tla`) checks the queue a ring's thread takes items from without
-a look at the queue's words when nothing waits (`Counted` in `src/rt/shard/counted.rs`), in its
-two uses: the chunks of a receive group given back on other threads, which the ring's thread
+a look at the queue's words when nothing waits (`Counted` in `src/rt/shard/counted.rs`, and
+`LazyCounted` there, which makes the queue at its first push: before it a look or a take finds
+none, the empty queue the model starts from, and the push publishes it before it claims a
+cell), in its two uses: the chunks of a receive group given back on other threads, which the ring's thread
 takes in before each wait (`RecvGroup::take_back` and `has_returns` in `src/rt/shard/recv.rs`,
 `ShardRing::take_back` in `src/rt/shard/ring.rs`), the registration changes and timer work other
 threads post a shard (`Shared::post_io`, `post_timer`, `drain_io_ops`, `drain_timer_ops`,
