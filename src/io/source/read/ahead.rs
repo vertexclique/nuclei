@@ -98,18 +98,35 @@ fn other_len(buf: &OwnedBuf) -> usize {
 /// holds, what multishot receives handed out.
 #[derive(Default)]
 pub(super) struct Ahead {
-    pieces: VecDeque<Piece>,
+    /// The first piece: a read almost always finds one piece at most, which then takes no
+    /// trip through the queue.
+    first: Option<Piece>,
+    /// The pieces after `first`, in order; empty while `first` is.
+    rest: VecDeque<Piece>,
 }
 
 impl Ahead {
+    #[inline(always)]
     pub(super) fn is_empty(&self) -> bool {
-        self.pieces.is_empty()
+        self.first.is_none()
     }
 
     /// The bytes held.
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.pieces.iter().map(|p| p.filled().len()).sum()
+        self.pieces().map(|p| p.filled().len()).sum()
+    }
+
+    /// Every piece, in order.
+    fn pieces(&self) -> impl Iterator<Item = &Piece> {
+        self.first.iter().chain(&self.rest)
+    }
+
+    /// Takes the first piece off; the next becomes the first.
+    #[inline(always)]
+    fn pop_front(&mut self) -> Option<Piece> {
+        let next = self.rest.pop_front();
+        core::mem::replace(&mut self.first, next)
     }
 
     /// Adds bytes that came after those held.
@@ -117,22 +134,24 @@ impl Ahead {
     pub(super) fn push(&mut self, piece: Piece, after: &mut After) {
         if piece.filled().is_empty() {
             piece.release(after, None);
+        } else if self.first.is_none() {
+            self.first = Some(piece);
         } else {
-            self.pieces.push_back(piece);
+            self.rest.push_back(piece);
         }
     }
 
     /// Takes `n` bytes off the front, letting go of the pieces emptied.
     pub(super) fn consume(&mut self, mut n: usize, after: &mut After, shard: Option<&Shard>) {
         while n > 0 {
-            let Some(front) = self.pieces.front_mut() else {
+            let Some(front) = self.first.as_mut() else {
                 return;
             };
             let here = front.filled().len().min(n);
             front.consume(here);
             n -= here;
             if front.filled().is_empty()
-                && let Some(done) = self.pieces.pop_front()
+                && let Some(done) = self.pop_front()
             {
                 done.release(after, shard);
             }
@@ -151,8 +170,8 @@ impl Ahead {
     ) -> usize {
         // One piece, or a first piece that holds the whole read, the usual cases: one look at
         // its bytes.
-        let one = self.pieces.len() == 1;
-        if let Some(piece) = self.pieces.front_mut()
+        let one = self.rest.is_empty();
+        if let Some(piece) = self.first.as_mut()
             && (one || piece.filled().len() >= out.len())
         {
             let src = piece.filled();
@@ -160,7 +179,7 @@ impl Ahead {
             out[..n].copy_from_slice(&src[..n]);
             if !peek {
                 if n == all {
-                    if let Some(done) = self.pieces.pop_front() {
+                    if let Some(done) = self.pop_front() {
                         done.release(after, shard);
                     }
                 } else {
@@ -182,7 +201,7 @@ impl Ahead {
         shard: Option<&Shard>,
     ) -> usize {
         let mut n = 0;
-        for piece in &self.pieces {
+        for piece in self.pieces() {
             let src = piece.filled();
             let take = src.len().min(out.len() - n);
             out[n..n + take].copy_from_slice(&src[..take]);
@@ -205,7 +224,7 @@ impl Ahead {
         shard: Option<&Shard>,
     ) -> usize {
         let mut n = 0;
-        for piece in &self.pieces {
+        for piece in self.pieces() {
             let copied = copy_vectored_from(piece.filled(), bufs, n);
             n += copied;
             if copied < piece.filled().len() {
@@ -225,7 +244,7 @@ impl Ahead {
         shard: Option<&Shard>,
     ) -> usize {
         let mut n = 0;
-        for piece in &self.pieces {
+        for piece in self.pieces() {
             let src = piece.filled();
             let copied = crate::buf::append_spare(src, buf);
             n += copied;
@@ -239,7 +258,7 @@ impl Ahead {
 
     /// Lets go of every byte held.
     pub(super) fn release(&mut self, after: &mut After) {
-        for piece in self.pieces.drain(..) {
+        for piece in self.first.take().into_iter().chain(self.rest.drain(..)) {
             piece.release(after, None);
         }
     }
@@ -265,3 +284,6 @@ fn copy_vectored_from(src: &[u8], bufs: &mut [io::IoSliceMut<'_>], mut skip: usi
     }
     n
 }
+
+#[cfg(all(test, not(loom)))]
+mod tests;

@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::task::{Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use super::{After, Hooks, Side};
+use super::{After, Hooks, OwnerPoll, Side};
 
 #[derive(Default)]
 struct State {
@@ -501,5 +501,105 @@ fn foreign_polls_without_a_fence_never_share_the_side_and_are_all_served() {
     foreign.join().unwrap();
     let mut side = Arc::into_inner(side).unwrap();
     assert_eq!(steps(&mut side), ROUNDS + owner_steps, "a step was lost");
+    assert_eq!(side.words(), (0, 0), "a flag was left up");
+}
+
+/// The owner's poll of a side it claimed: [`Side::poll_owner`] runs the step once under the
+/// biased hold, with the word untouched, and lets go with nothing left.
+#[test]
+fn the_owners_poll_runs_its_step_once_without_touching_the_word() {
+    let Some(mut side) = biased() else { return };
+    let (_, waker) = counted();
+    assert!(!side.owned_by(1), "a side nobody claimed has no owner");
+    assert!(poll(&side, &waker, &OWNER).is_ready());
+    assert!(side.owned_by(1) && !side.owned_by(2));
+    let mut after = After::default();
+    let done = matches!(
+        side.poll_owner(&mut after, &OWNER, |st, _| {
+            assert_eq!(side.words().0, 0, "the word was taken");
+            assert!(
+                !side.owned_by(1),
+                "the owner's own hold is not another owner's take"
+            );
+            st.steps += 1;
+            Poll::Ready(())
+        }),
+        OwnerPoll::Done(Poll::Ready(()))
+    );
+    after.run();
+    assert!(done);
+    assert_eq!(steps(&mut side), 2);
+    assert_eq!(side.words(), (0, 0));
+    assert!(!side.is_shared());
+}
+
+/// Once a foreign thread came, the owner's poll is refused before its step runs, and the side
+/// is polled as any other then.
+#[test]
+fn the_owners_poll_is_refused_once_a_foreign_thread_came() {
+    let Some(side) = biased() else { return };
+    let side = Arc::new(side);
+    let (held, go, owner) = hold_until(&side);
+    held.recv_timeout(Duration::from_secs(10)).unwrap();
+    defer(&side, 4, &FOREIGN);
+    go.send(()).unwrap();
+    owner.join().unwrap();
+    let mut side = Arc::into_inner(side).unwrap();
+    assert!(side.owned_by(1), "the foreign thread switched the side");
+    let mut after = After::default();
+    let refused = matches!(
+        side.poll_owner(&mut after, &OWNER, step),
+        OwnerPoll::Refused
+    );
+    after.run();
+    assert!(refused);
+    assert_eq!(steps(&mut side), 1, "a refused poll ran its step");
+    let (_, waker) = counted();
+    assert!(poll(&side, &waker, &OWNER).is_ready());
+    assert_eq!(steps(&mut side), 2);
+    assert_eq!(side.get_mut().seen, 4, "the foreign thread's work was lost");
+    assert_eq!(side.words(), (0, 0));
+}
+
+/// Work a foreign thread leaves while the owner's poll holds keeps the side held as the
+/// owner lets go: the caller finishes it with [`Held::finish_poll`](super::Held::finish_poll),
+/// which does that work, and the step runs again after an edge's driver's part while it waits.
+#[test]
+fn work_left_during_the_owners_poll_is_finished_with_the_step_again() {
+    let Some(mut side) = biased() else { return };
+    let (_, waker) = counted();
+    assert!(poll(&side, &waker, &OWNER).is_ready());
+    let mut step = |st: &mut State, after: &mut After| {
+        st.steps += 1;
+        if st.steps > 2 {
+            return Poll::Ready(());
+        }
+        defer(&side, 4, &FOREIGN);
+        #[cfg(readiness)]
+        side.drive(after, &FOREIGN, 0);
+        let _ = after;
+        Poll::Pending
+    };
+    let mut after = After::default();
+    let polled = match side.poll_owner(&mut after, &OWNER, |st, after| step(st, after)) {
+        OwnerPoll::Left(held, out) => held.finish_poll(out, &mut after, &OWNER, &mut step),
+        OwnerPoll::Done(_) => panic!("the foreign thread's work was not seen"),
+        OwnerPoll::Refused => panic!("the owner's poll was refused"),
+    };
+    after.run();
+    assert_eq!(side.get_mut().seen, 4, "the work left was lost");
+    #[cfg(readiness)]
+    {
+        assert!(
+            polled.is_ready(),
+            "the step did not run again after the edge"
+        );
+        assert_eq!(steps(&mut side), 3);
+    }
+    #[cfg(not(readiness))]
+    {
+        assert!(polled.is_pending());
+        assert_eq!(steps(&mut side), 2);
+    }
     assert_eq!(side.words(), (0, 0), "a flag was left up");
 }

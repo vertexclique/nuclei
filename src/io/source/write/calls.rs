@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::buf::owned::{IoBuf, OwnedBuf};
+use crate::io::side::OwnerPoll;
 
 impl Source {
     /// A caller's descriptor: `Ready` with the write side's edge count while
@@ -83,25 +84,76 @@ impl Source {
         bufs: &[io::IoSlice<'_>],
         wait: bool,
     ) -> Poll<io::Result<usize>> {
-        let kind = self.kind;
         crate::coop::poll_budget(
             cx,
             #[inline(always)]
             |cx| {
-                self.poll_writing(
-                    cx,
-                    #[inline(always)]
-                    |st, io, waker, after| {
-                        #[cfg(unix)]
-                        if let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs)
-                        {
-                            return Poll::Ready(result);
+                if let Some(io) = self.here(&self.write) {
+                    let waker = cx.waker();
+                    let mut after = After::default();
+                    let hooks = self.hooks_in(io.shard);
+                    match self.write.poll_owner(
+                        &mut after,
+                        &hooks,
+                        #[inline(always)]
+                        |st, after| {
+                            #[cfg(unix)]
+                            st.drive();
+                            self.write_step(st, io, waker, after, bufs, wait)
+                        },
+                    ) {
+                        OwnerPoll::Done(poll) => return self.finish_poll(after, poll),
+                        OwnerPoll::Left(held, poll) => {
+                            let poll =
+                                held.finish_poll(poll, &mut after, &hooks, &mut |st, after| {
+                                    #[cfg(unix)]
+                                    st.drive();
+                                    self.write_step(st, io, waker, after, bufs, wait)
+                                });
+                            return self.finish_poll(after, poll);
                         }
-                        st.write(io, kind, bufs, wait, waker, after)
-                    },
-                )
+                        OwnerPoll::Refused => self.settle(after),
+                    }
+                }
+                self.poll_write_any(cx, bufs, wait)
             },
         )
+    }
+
+    /// [`poll_write_bufs`](Self::poll_write_bufs) for every poll [`here`](Self::here) does not
+    /// take.
+    #[inline(never)]
+    fn poll_write_any(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+        wait: bool,
+    ) -> Poll<io::Result<usize>> {
+        self.poll_writing(
+            cx,
+            #[inline(always)]
+            |st, io, waker, after| self.write_step(st, io, waker, after, bufs, wait),
+        )
+    }
+
+    /// A stream write's step: straight from `bufs` while the side holds nothing
+    /// (`write_direct`), else through the write-behind.
+    #[inline(always)]
+    fn write_step(
+        &self,
+        st: &mut WriteState,
+        io: Io<'_>,
+        waker: &Waker,
+        after: &mut After,
+        bufs: &[io::IoSlice<'_>],
+        wait: bool,
+    ) -> Poll<io::Result<usize>> {
+        let kind = self.kind;
+        #[cfg(unix)]
+        if let Some(result) = st.write_direct(io, self.serving_fd(None), kind, bufs) {
+            return Poll::Ready(result);
+        }
+        st.write(io, kind, bufs, wait, waker, after)
     }
 
     /// Polls the write side with `step` for the handle's own writes, given

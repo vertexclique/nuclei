@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::buf::owned::{IoBufMut, OwnedBuf};
+use crate::io::side::OwnerPoll;
 
 impl Source {
     /// A caller's descriptor: `Ready` with the read side's edge count while
@@ -70,39 +71,97 @@ impl Source {
         if out.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let kind = self.kind;
-        crate::coop::poll_budget(cx, |cx| {
-            self.poll_reading(cx, |st, io, waker, after| {
-                #[cfg(unix)]
-                if st.reads_itself(io, kind, out.len(), peek)
-                    && let Some(poll) = st.read_direct(
-                        io,
-                        self.serving_fd(None),
-                        kind,
-                        out.len(),
-                        peek,
-                        waker,
-                        |fd, inq| {
-                            #[cfg(any(target_os = "linux", target_os = "android"))]
-                            if inq {
-                                return sys::read_inq(fd, out);
-                            }
-                            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                            let _ = inq;
-                            let read = if peek {
-                                sys::peek(fd, out)
-                            } else {
-                                sys::read(fd, out)
-                            };
-                            read.map(|n| (n, None))
+        crate::coop::poll_budget(
+            cx,
+            #[inline(always)]
+            |cx| {
+                if let Some(io) = self.here(&self.read) {
+                    let waker = cx.waker();
+                    let mut after = After::default();
+                    let hooks = self.hooks_in(io.shard);
+                    match self.read.poll_owner(
+                        &mut after,
+                        &hooks,
+                        #[inline(always)]
+                        |st, after| {
+                            #[cfg(unix)]
+                            st.drive();
+                            self.read_step(st, io, waker, after, out, peek)
                         },
-                    )
-                {
-                    return poll;
+                    ) {
+                        OwnerPoll::Done(poll) => return self.finish_poll(after, poll),
+                        OwnerPoll::Left(held, poll) => {
+                            let poll =
+                                held.finish_poll(poll, &mut after, &hooks, &mut |st, after| {
+                                    #[cfg(unix)]
+                                    st.drive();
+                                    self.read_step(st, io, waker, after, out, peek)
+                                });
+                            return self.finish_poll(after, poll);
+                        }
+                        OwnerPoll::Refused => self.settle(after),
+                    }
                 }
-                st.read(io, kind, out, peek, waker, after)
-            })
-        })
+                self.poll_read_any(cx, out, peek)
+            },
+        )
+    }
+
+    /// [`poll_read`](Self::poll_read) for every poll [`here`](Self::here) does not take.
+    #[inline(never)]
+    fn poll_read_any(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        out: &mut [u8],
+        peek: bool,
+    ) -> Poll<io::Result<usize>> {
+        self.poll_reading(
+            cx,
+            #[inline(always)]
+            |st, io, waker, after| self.read_step(st, io, waker, after, out, peek),
+        )
+    }
+
+    /// A stream read's step: straight into `out` when it goes there (`read_direct`), else
+    /// through the read-ahead.
+    #[inline(always)]
+    fn read_step(
+        &self,
+        st: &mut ReadState,
+        io: Io<'_>,
+        waker: &Waker,
+        after: &mut After,
+        out: &mut [u8],
+        peek: bool,
+    ) -> Poll<io::Result<usize>> {
+        let kind = self.kind;
+        #[cfg(unix)]
+        if let Some(poll) = st.read_direct(
+            io,
+            self.serving_fd(None),
+            kind,
+            out.len(),
+            peek,
+            waker,
+            #[inline(always)]
+            |fd, inq| {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if inq {
+                    return sys::read_inq(fd, out);
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let _ = inq;
+                let read = if peek {
+                    sys::peek(fd, out)
+                } else {
+                    sys::read(fd, out)
+                };
+                read.map(|n| (n, None))
+            },
+        ) {
+            return poll;
+        }
+        st.read(io, kind, out, peek, waker, after)
     }
 
     /// Polls the read side with `step` for the handle's own reads, given
@@ -276,17 +335,15 @@ impl Source {
                 #[cfg(unix)]
                 {
                     let len = bufs.iter().map(|b| b.len()).sum();
-                    if st.reads_itself(io, kind, len, false)
-                        && let Some(poll) = st.read_direct(
-                            io,
-                            self.serving_fd(None),
-                            kind,
-                            len,
-                            false,
-                            waker,
-                            |fd, _| sys::read_bufs(fd, bufs).map(|n| (n, None)),
-                        )
-                    {
+                    if let Some(poll) = st.read_direct(
+                        io,
+                        self.serving_fd(None),
+                        kind,
+                        len,
+                        false,
+                        waker,
+                        |fd, _| sys::read_bufs(fd, bufs).map(|n| (n, None)),
+                    ) {
                         return poll;
                     }
                 }

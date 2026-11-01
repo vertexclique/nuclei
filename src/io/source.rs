@@ -676,6 +676,46 @@ impl Source {
         ))
     }
 
+    /// How a poll of `side` reaches the descriptor when it runs on the shard the source is
+    /// registered with and takes `side` as that shard's owner; `None` for any other poll, which
+    /// finds its way as [`with_io`](Self::with_io) does. A thread inside its shard needs no
+    /// bracket; a source registered with that shard is reached as `via` finds (the ring's
+    /// operations Here, else the poller's calls on the descriptor); and a side that shard
+    /// claimed is taken biased (as `Hooks::owner` and `Side::owned_by` find).
+    #[inline(always)]
+    fn here<'a, S>(self: &'a Arc<Self>, side: &Side<S>) -> Option<Io<'a>> {
+        if self.kind == Kind::File {
+            return None;
+        }
+        let shard = context::running_inside(context::local())?;
+        let addr = shard.shared_addr();
+        let fd = self.fd.load(Ordering::Acquire);
+        if fd == NO_FD || self.reg.home.load(Ordering::Relaxed) != addr || !side.owned_by(addr) {
+            return None;
+        }
+        #[cfg(ring)]
+        if let Some(ring) = shard.ring()
+            && self.reg.here.load(Ordering::Acquire) == addr
+        {
+            return Some(Io {
+                via: Via::Ops(route::Route::Here {
+                    ring,
+                    source: self,
+                    file: self.reg.slot.load(Ordering::Acquire),
+                }),
+                shard: Some(shard),
+            });
+        }
+        #[cfg(readiness)]
+        if !self.on_ring() && self.reg.state.load(Ordering::Acquire) == REGISTERED {
+            return Some(Io {
+                via: Via::Fd(fd),
+                shard: Some(shard),
+            });
+        }
+        None
+    }
+
     /// The route was read before the sides were taken: a registration that
     /// finished meanwhile submitted nothing for what the step left, so the
     /// sides are asked to submit.
@@ -726,7 +766,7 @@ impl Source {
     /// drops.
     #[inline(always)]
     fn settle(self: &Arc<Self>, after: After) {
-        if let Err(after) = after.forget_if_nothing() {
+        if let Err(after) = after.settle_light() {
             self.settle_rest(after);
         }
     }
