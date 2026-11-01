@@ -89,8 +89,7 @@ impl ShardRing {
         }
         // Handed over with nothing borrowed: the source may submit at once.
         if let Some((source, chunk, epoch, datagram)) = delivery {
-            // Before the view, so it drops after it.
-            let _unwound = crate::io::side::Unwound::enter();
+            // The view below is taken inside the batch's `Unwound` (`wait`), which drops after it.
             let mut after = After::default();
             let starved = {
                 // SAFETY: the op's slab entry owns a strong count of the
@@ -240,8 +239,7 @@ impl ShardRing {
     /// be readable: the side gets the edge as an arrival, with nothing
     /// borrowed, so it may submit at once.
     fn readied(&self, shard: Option<&Shard>, source: *const crate::io::source::Source, epoch: u32) {
-        // Before the view, so it drops after it.
-        let _unwound = crate::io::side::Unwound::enter();
+        // The view below is taken inside the batch's `Unwound` (`wait`), which drops after it.
         let mut after = After::default();
         {
             // SAFETY: as in `arrived`: the poll's slab entry owns a strong count of the source

@@ -606,6 +606,9 @@ impl ShardRing {
         let mut batch = CqeBatch::new();
         let mut woken = self.poller.borrow_mut().wait(timeout, &mut batch);
         let mut handled = 0;
+        // Before every view of a source an arrival takes (see `arrived`), so it drops after them:
+        // one for the whole batch, not one per arrival.
+        let _unwound = crate::io::side::Unwound::enter();
         loop {
             handled += batch.len();
             for at in 0..batch.len() {
