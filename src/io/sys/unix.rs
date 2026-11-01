@@ -658,6 +658,19 @@ pub(crate) fn recv_from_udp_uninit(
     Ok((n, inet_addr(&storage, len)?))
 }
 
+/// A datagram from a UDP socket into `buf`, with its sender; with `peek` it
+/// stays on the socket.
+#[inline(always)]
+pub(crate) fn recv_from_udp(
+    fd: RawFd,
+    buf: &mut [u8],
+    peek: bool,
+) -> io::Result<(usize, SocketAddr)> {
+    // SAFETY: the kernel only writes bytes into `buf`, so it stays initialized.
+    let into = unsafe { &mut *(core::ptr::from_mut(buf) as *mut [core::mem::MaybeUninit<u8>]) };
+    recv_from_udp_uninit(fd, into, peek)
+}
+
 /// The sender of a datagram the kernel named none for. macOS names none for
 /// a receive into an empty buffer: a connected socket takes datagrams from
 /// its peer alone, whom the kernel names; one connected to nothing has no
@@ -690,6 +703,26 @@ pub(crate) fn recv_from_unix_uninit(
     // at least as large as.
     let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };
     Ok((n, unix_addr(un, len)?))
+}
+
+/// A datagram from a Unix datagram socket into `buf`, with its sender; with
+/// `peek` it stays on the socket. A receive is std's own, whose address the
+/// kernel writes where std keeps it, so nothing is copied or looked through
+/// to name the sender.
+#[inline(always)]
+pub(crate) fn recv_from_unix(
+    fd: RawFd,
+    buf: &mut [u8],
+    peek: bool,
+) -> io::Result<(usize, unix::SocketAddr)> {
+    if peek {
+        // SAFETY: the kernel only writes bytes into `buf`, so it stays initialized.
+        let into = unsafe { &mut *(core::ptr::from_mut(buf) as *mut [core::mem::MaybeUninit<u8>]) };
+        return recv_from_unix_uninit(fd, into, true);
+    }
+    // SAFETY: see `borrow`; the fd is a Unix datagram socket.
+    let socket = unsafe { borrow::<unix::UnixDatagram>(fd) };
+    retry(|| socket.recv_from(buf))
 }
 
 /// A datagram to `addr` on a UDP socket.

@@ -138,6 +138,19 @@ impl Hooks<ReadState> for SourceHooks<'_> {
         self.src.requests_holding_read(self, st, after);
     }
 
+    #[inline(always)]
+    fn releasing(&self, st: &mut ReadState) {
+        // What a datagram receive made with no guard reads (`quick`).
+        #[cfg(unix)]
+        if self.src.kind.datagrams() {
+            self.src
+                .quick
+                .leave_read(st.quick_word(self.src.kind, self.src.on_ring()));
+        }
+        #[cfg(not(unix))]
+        let _ = st;
+    }
+
     fn owner(&self) -> usize {
         SourceHooks::owner(self)
     }
@@ -207,6 +220,11 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     fn releasing(&self, st: &mut WriteState) {
         // Release: a drop on another thread reads it.
         self.src.unsent.store(st.has_unsent(), Ordering::Release);
+        // What a datagram send made with no guard, and the driver's edge, read (`quick`).
+        #[cfg(unix)]
+        if self.src.kind.datagrams() {
+            self.src.quick.leave_write(st.quick_holds());
+        }
     }
 
     fn owner(&self) -> usize {

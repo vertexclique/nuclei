@@ -9,7 +9,7 @@ use super::addr::{ToSocketAddrs, first, resolve};
 use super::none_worked;
 use crate::buf::owned::{IoBuf, IoBufMut};
 use crate::io::source::write::Dest;
-use crate::io::source::{Addr, Kind};
+use crate::io::source::{Kind, Sender};
 use crate::io::{Handle, Interest, ReadBuf, Ready};
 
 impl Handle<UdpSocket> {
@@ -142,7 +142,7 @@ impl Handle<UdpSocket> {
         B: IoBufMut,
     {
         let (result, buf) = self.source().recv_from_owned(buf).await;
-        let result = result.and_then(|(n, addr)| inet(addr).map(|addr| (n, addr)));
+        let result = result.and_then(|(n, addr)| SocketAddr::from_addr(addr).map(|addr| (n, addr)));
         (result, buf)
     }
 
@@ -383,32 +383,13 @@ impl Handle<UdpSocket> {
         poll_fn(|cx| self.poll_receive(cx, buf, peek)).await
     }
 
+    #[inline(always)]
     fn poll_receive(
         &self,
         cx: &mut Context<'_>,
         buf: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<(usize, SocketAddr)>> {
-        let (n, addr) = core::task::ready!(self.source().poll_receive(cx, buf, peek))?;
-        Poll::Ready(match addr {
-            Addr::Inet(addr) => Ok((n, addr)),
-            #[cfg(unix)]
-            Addr::Unix(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a UDP datagram came with no internet address",
-            )),
-        })
-    }
-}
-
-/// The internet address of a UDP datagram's sender.
-fn inet(addr: Addr) -> io::Result<SocketAddr> {
-    match addr {
-        Addr::Inet(addr) => Ok(addr),
-        #[cfg(unix)]
-        Addr::Unix(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "a UDP datagram came with no internet address",
-        )),
+        self.source().poll_receive_as(cx, buf, peek)
     }
 }

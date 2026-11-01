@@ -264,6 +264,9 @@ impl ReadState {
             Outcome::Ready(answer) => {
                 if !stale && let Answer::Done(result) = answer {
                     self.poll_first = false;
+                    // The ring's edge: a task's call made with no guard that found the socket
+                    // empty before it asks again (`receive_now`).
+                    self.edges = self.edges.wrapping_add(1);
                     if let Err(err) = result {
                         self.error = Some(err);
                     }
@@ -273,7 +276,6 @@ impl ReadState {
                     }
                     if self.user_fd {
                         self.blocked = false;
-                        self.edges = self.edges.wrapping_add(1);
                         after.wake(&mut self.waiters);
                     }
                 }

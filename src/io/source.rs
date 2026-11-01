@@ -42,6 +42,8 @@ mod hooks;
 pub(crate) mod ops;
 #[cfg(port)]
 pub(crate) mod port;
+#[cfg(unix)]
+mod quick;
 mod read;
 pub(crate) mod requests;
 #[cfg(ring)]
@@ -252,6 +254,71 @@ pub(crate) enum Addr {
     Unix(crate::buf::spare::Spare<unix::SocketAddr>),
 }
 
+/// A datagram's sender as a receive hands it out: an internet address, a
+/// Unix one, or either ([`Addr`]).
+pub(crate) trait Sender: Sized {
+    /// A datagram received straight from `fd`, a socket of `kind`, into `out`
+    /// (left on the socket with `peek`), with its sender.
+    #[cfg(unix)]
+    fn receive(fd: Raw, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)>;
+
+    /// The sender of a datagram the side held.
+    fn from_addr(addr: Addr) -> io::Result<Self>;
+}
+
+impl Sender for Addr {
+    #[cfg(unix)]
+    #[inline(always)]
+    fn receive(fd: Raw, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        match kind {
+            Kind::UnixDatagram => crate::io::sys::recv_from_unix(fd, out, peek)
+                .map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)))),
+            _ => crate::io::sys::recv_from_udp(fd, out, peek).map(|(n, a)| (n, Addr::Inet(a))),
+        }
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        Ok(addr)
+    }
+}
+
+impl Sender for SocketAddr {
+    #[cfg(unix)]
+    #[inline(always)]
+    fn receive(fd: Raw, _kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        crate::io::sys::recv_from_udp(fd, out, peek)
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        match addr {
+            Addr::Inet(addr) => Ok(addr),
+            #[cfg(unix)]
+            Addr::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a UDP datagram came with no internet address",
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Sender for unix::SocketAddr {
+    #[inline(always)]
+    fn receive(fd: Raw, _kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Self)> {
+        crate::io::sys::recv_from_unix(fd, out, peek)
+    }
+
+    fn from_addr(addr: Addr) -> io::Result<Self> {
+        match addr {
+            Addr::Unix(addr) => Ok(addr.into_inner()),
+            Addr::Inet(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a Unix socket's peer has an internet address",
+            )),
+        }
+    }
+}
+
 /// Where a datagram goes.
 #[derive(Clone, Debug)]
 pub(crate) enum Target {
@@ -337,6 +404,9 @@ pub(crate) struct Source {
     /// Whether the write side holds bytes or a datagram the kernel has not
     /// taken, as its last holder left it.
     unsent: AtomicBool,
+    /// A datagram socket's words for the calls made with no guard.
+    #[cfg(unix)]
+    quick: quick::Quick,
     /// Completions of the sides' ring operations, for their holders.
     #[cfg(completion)]
     read_done: ops::Mailbox,
@@ -402,6 +472,8 @@ impl Source {
             requests: AtomicU8::new(0),
             ask: Ask::default(),
             unsent: AtomicBool::new(false),
+            #[cfg(unix)]
+            quick: quick::Quick::default(),
             #[cfg(completion)]
             read_done: ops::Mailbox::default(),
             #[cfg(completion)]
@@ -851,7 +923,10 @@ impl Source {
             };
             self.read.drive(&mut after, &hooks, unsure);
         }
-        if readiness.writable {
+        // A datagram's write side that holds nothing and waits for nothing has no use for room,
+        // and a send that finds the socket full raises its word before it asks the kernel
+        // again (`quick`): every writable edge after that call reaches the side.
+        if readiness.writable && (!self.kind.datagrams() || !self.quick.write_clear()) {
             self.write.drive(&mut after, &hooks, 0);
         }
         // If the driver's own pool ran out, the readers hear when a buffer

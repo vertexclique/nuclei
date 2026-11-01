@@ -35,7 +35,7 @@ use crate::io::raw::Owned;
 use std::sync::Arc;
 use std::task::Context;
 
-use super::{Addr, Failure, Io, Kind, Source, Via};
+use super::{Addr, Failure, Io, Kind, Sender, Source, Via};
 use crate::buf::{PoolBuf, with_pool};
 use crate::io::side::{After, Wakers};
 #[cfg(readiness)]
@@ -1121,35 +1121,19 @@ impl ReadState {
         }
     }
 
-    /// A datagram receive (or peek) into `out`: on unix the task's own (see
-    /// [`receive_now`](Self::receive_now)); else the driver receives into
-    /// the pool first if the socket may hold one, and the task copies it out
-    /// (what does not fit `out` is cut, as the kernel cuts it).
-    #[cfg_attr(
-        not(unix),
-        expect(
-            unused_variables,
-            reason = "only unix tasks receive datagrams themselves"
-        )
-    )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the step's context, as every step's"
-    )]
+    /// A datagram receive (or peek) into `out` that is not the task's own
+    /// (on unix [`receive_now`](Self::receive_now) is first): the driver
+    /// receives into the pool first if the socket may hold one, and the task
+    /// copies it out (what does not fit `out` is cut, as the kernel cuts it).
     fn receive(
         &mut self,
         io: Io<'_>,
-        fd: Option<crate::io::raw::Raw>,
         kind: Kind,
         out: &mut [u8],
         peek: bool,
         waker: &Waker,
         after: &mut After,
     ) -> Poll<io::Result<(usize, Addr)>> {
-        #[cfg(unix)]
-        if let Some(poll) = self.receive_now(io, fd, kind, out, peek, waker, after) {
-            return poll;
-        }
         self.complete(io, kind, out.len(), after);
         let taken = match self.datagrams.front() {
             Some((datagram, addr)) => {

@@ -13,7 +13,7 @@ use std::os::fd::RawFd;
 
 use super::ReadState;
 use crate::io::side::After;
-use crate::io::source::{Addr, Io, Kind, Via};
+use crate::io::source::{Addr, Io, Kind, Sender, Via, quick};
 use crate::io::sys;
 use crate::rt::counters::tally;
 
@@ -80,46 +80,91 @@ impl ReadState {
     /// whatever the pool may hold, and cut to `out` as the kernel cuts it.
     /// Nothing the side holds may come first. With none there the call waits
     /// for an edge or the ring's poll, and tries again
-    /// (proofs/tla/ring/RingRecv.tla). `None` leaves the receive to the
-    /// driver.
+    /// (proofs/tla/ring/RingRecv.tla). `seen` is the word a call made with no
+    /// guard saw before the kernel answered it "not now": if no edge was
+    /// counted since, the socket had nothing after the last edge, and the
+    /// call waits without asking again (proofs/tla/dgram). `None` leaves the
+    /// receive to the driver.
     #[expect(
         clippy::too_many_arguments,
         reason = "the step's context, as every step's"
     )]
-    pub(super) fn receive_now(
+    #[inline(always)]
+    pub(crate) fn receive_now<A: Sender>(
         &mut self,
         io: Io<'_>,
         fd: Option<RawFd>,
         kind: Kind,
         out: &mut [u8],
         peek: bool,
+        seen: Option<u32>,
         waker: &Waker,
         after: &mut After,
-    ) -> Option<Poll<io::Result<(usize, Addr)>>> {
+    ) -> Option<Poll<io::Result<(usize, A)>>> {
         let fd = self.task_receives(io, fd, kind)?;
         if self.has_result() || self.lent.is_some() {
             return None;
+        }
+        if seen == Some(quick::read_word(self.edges, false)) {
+            self.came_empty(io);
         }
         if !self.waits_for_datagram(io) {
             #[cfg(ring)]
             {
                 self.readable = false;
             }
-            match sys::ready(receive_into(fd, kind, out, peek)).inspect(|r| {
-                if !peek {
-                    tally::received(r);
-                }
-            }) {
-                Some(result) => return Some(Poll::Ready(result)),
-                None => {
-                    if matches!(io.via, Via::Fd(_)) {
-                        self.blocked = true;
+            match sys::ready(A::receive(fd, kind, out, peek)) {
+                Some(result) => {
+                    if !peek {
+                        tally::received(&result);
                     }
+                    return Some(Poll::Ready(result));
                 }
+                None => self.came_empty(io),
             }
         }
         self.wait_for_datagram(io, kind, waker, after);
         Some(Poll::Pending)
+    }
+
+    /// The word a datagram receive made with no guard reads (`quick`): the
+    /// edges counted, and whether the receive must go through the side,
+    /// which it must while the side holds what comes first or a lent
+    /// buffer, the caller makes its own calls, the last call found the
+    /// socket empty and no edge came, an operation of the ring is out, or
+    /// the ring receives the side's datagrams ahead.
+    #[cfg_attr(
+        not(ring),
+        expect(
+            unused_variables,
+            reason = "only a ring receives ahead or has operations out"
+        )
+    )]
+    #[inline(always)]
+    pub(crate) fn quick_word(&self, kind: Kind, on_ring: bool) -> u32 {
+        let holds = self.has_result() || self.lent.is_some() || self.user_fd || self.blocked;
+        #[cfg(ring)]
+        let holds = holds
+            || self.out.is_some()
+            || self.poll_first
+            || (on_ring && kind != Kind::UnixDatagram && !self.starved);
+        quick::read_word(self.edges, holds)
+    }
+
+    /// The kernel had no datagram for the task's own receive: the next one
+    /// waits for an edge, or behind the ring's poll.
+    fn came_empty(&mut self, io: Io<'_>) {
+        match io.via {
+            #[cfg(readiness)]
+            Via::Fd(_) => self.blocked = true,
+            #[cfg(ring)]
+            Via::Ops(_) => {
+                self.readable = false;
+                self.poll_first = true;
+            }
+            #[cfg(not(completion))]
+            Via::None(never, _) => match never {},
+        }
     }
 
     /// Whether a datagram is there for a task that receives it itself:
@@ -140,7 +185,7 @@ impl ReadState {
             {
                 self.readable = false;
             }
-            match sys::ready(receive_into(fd, kind, &mut [0; 1], true)) {
+            match sys::ready(Addr::receive(fd, kind, &mut [0; 1], true)) {
                 Some(Ok(_)) => return Poll::Ready(false),
                 Some(Err(err)) => {
                     self.error = Some(err);
@@ -155,18 +200,5 @@ impl ReadState {
         }
         self.wait_for_datagram(io, kind, waker, after);
         Poll::Pending
-    }
-}
-
-/// Receives a datagram with its sender's address straight into `out`; with
-/// `peek` it stays on the socket.
-fn receive_into(fd: RawFd, kind: Kind, out: &mut [u8], peek: bool) -> io::Result<(usize, Addr)> {
-    // SAFETY: the kernel only writes bytes into `out`, so it stays
-    // initialized.
-    let into = unsafe { &mut *(core::ptr::from_mut(out) as *mut [core::mem::MaybeUninit<u8>]) };
-    match kind {
-        Kind::UnixDatagram => sys::recv_from_unix_uninit(fd, into, peek)
-            .map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)))),
-        _ => sys::recv_from_udp_uninit(fd, into, peek).map(|(n, a)| (n, Addr::Inet(a))),
     }
 }

@@ -316,9 +316,56 @@ impl Source {
         out: &mut [u8],
         peek: bool,
     ) -> Poll<io::Result<(usize, Addr)>> {
+        self.poll_receive_as(cx, out, peek)
+    }
+
+    /// [`poll_receive`](Self::poll_receive), with the sender as the handle
+    /// hands it out. On unix a side that holds nothing has the task's own
+    /// call made at once, with no guard; one the kernel answers "not now"
+    /// goes through the side with the word it saw (see `quick`).
+    #[inline(always)]
+    pub(crate) fn poll_receive_as<A: Sender>(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+        out: &mut [u8],
+        peek: bool,
+    ) -> Poll<io::Result<(usize, A)>> {
         let kind = self.kind;
+        #[cfg(unix)]
+        let seen = match self.quick.read_clear() {
+            Some(word) => {
+                let fd = match self.fd() {
+                    Ok(fd) => fd,
+                    Err(err) => return Poll::Ready(Err(err)),
+                };
+                match sys::ready(A::receive(fd, kind, out, peek)) {
+                    Some(result) => {
+                        if !peek {
+                            tally::received(&result);
+                        }
+                        return Poll::Ready(result);
+                    }
+                    None => Some(word),
+                }
+            }
+            None => None,
+        };
         self.poll_reading(cx, |st, io, waker, after| {
-            st.receive(io, self.serving_fd(None), kind, out, peek, waker, after)
+            #[cfg(unix)]
+            if let Some(poll) = st.receive_now::<A>(
+                io,
+                self.serving_fd(None),
+                kind,
+                out,
+                peek,
+                seen,
+                waker,
+                after,
+            ) {
+                return poll;
+            }
+            st.receive(io, kind, out, peek, waker, after)
+                .map(|r| r.and_then(|(n, addr)| A::from_addr(addr).map(|a| (n, a))))
         })
     }
 }

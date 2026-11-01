@@ -1,0 +1,17 @@
+# configuration                spec                 expected
+DQ_safe                        MC_DgramQuick        pass
+DQ_live                        MC_DgramQuick        pass
+MDQ_no_holds                   MC_DgramQuick        violated:InOrder
+MDQ_no_edge_check              MC_DgramQuick        violated:Termination
+MDQ_published_edges            MC_DgramQuick        violated:Termination
+WDQ_quick                      MC_DgramQuick        violated:NoQuickGot
+WDQ_seen_wait                  MC_DgramQuick        violated:NoSeenWait
+WDQ_held                       MC_DgramQuick        violated:NoHeldGot
+DS_safe                        MC_DgramQuickSend    pass
+DS_live                        MC_DgramQuickSend    pass
+MDS_no_raise                   MC_DgramQuickSend    violated:Termination
+MDS_no_retry                   MC_DgramQuickSend    violated:Termination
+MDS_forget_wait                MC_DgramQuickSend    violated:Termination
+WDS_quick                      MC_DgramQuickSend    violated:NoQuickSent
+WDS_skip                       MC_DgramQuickSend    violated:NoSkip
+WDS_wait                       MC_DgramQuickSend    violated:NoWait

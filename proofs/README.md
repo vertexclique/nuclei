@@ -897,6 +897,31 @@ sender while no descriptor is free). The Rust test
 `a_datagrams_sender_is_peeked_and_it_stays_to_be_received` in `tests/net_api.rs` and the
 `buffers_*` rows of `tests/sizes/datagrams.rs` peek a sender and receive into an empty buffer.
 
+## A datagram call made with no guard
+
+`dgram` (`tla/dgram/DgramQuick.tla`, `tla/dgram/DgramQuickSend.tla`) checks the datagram calls
+a task makes at once, with no guard, while the side holds nothing (`poll_receive_as` in
+`src/io/source/read/calls.rs`, `poll_send` in `src/io/source/write/calls.rs`, the word of
+`src/io/source/quick.rs` that `quick_word` and `quick_holds` compute and `releasing` in
+`src/io/source/hooks.rs` leaves as each holder lets go, `receive_now` and `send_now` under the
+guard, the edges of `serve` and `on_event`). Each side's last holder leaves a word: raised while
+the side holds something or waits for an edge, and on the read side its count of edges. A call
+that finds it clear asks the kernel at once. A receive the kernel answers "not now" takes the
+guard with the word it saw, and waits without asking again only if no edge was counted since; a
+send raises the word under the guard before it asks again, so the writable edges the driver lets
+go by while the word is clear are never one a call waits for. In the receive model a task drops
+an owned receive whose buffer the driver may have filled, then receives the rest; in the send
+model a task sends into a socket that fills while a peer reads. 16 configurations: 4 that must
+pass (`InOrder` and `Termination` for each), 6 mutations (a word that forgets the datagram the
+side holds breaks `InOrder`; a receive that waits on the word it saw whatever came since, one that
+compares with the word left rather than the side's own count after an edge served in its hold, a
+send that raises the word only as it lets go, one that waits without asking again, and a word
+that forgets a call waiting for room break `Termination`), and 6 witnesses (a receive and a send
+made with no guard, a receive that waits on the word it saw, a datagram held from the dropped
+receive taken first, a writable edge let go by, a send that waits for room).
+`tests/faults/datagram_quick.rs` drops an owned receive the driver filled before two borrowed
+receives (UDP and Unix), and waits for room on a full Unix datagram peer, on each backend.
+
 ## A caller's own descriptor
 
 `asyncfd` (`tla/asyncfd/AsyncFd.tla`) checks `AsyncFd` (`src/io/async_fd.rs`) and the side's
