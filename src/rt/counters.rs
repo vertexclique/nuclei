@@ -269,6 +269,8 @@ impl Counters {
     /// The shard went: `stats` lists it no more.
     pub(crate) fn went(&self) {
         self.gone.store(true, Ordering::Relaxed);
+        // Release: the take that reads the count sees the flag.
+        WENT.fetch_add(1, Ordering::Release);
     }
 
     fn is_gone(&self) -> bool {
@@ -532,6 +534,10 @@ fn registry() -> &'static kovan_map::HashMap<usize, Weak<Shared>> {
     SHARDS.get_or_init(|| kovan_map::HashMap::with_capacity(64))
 }
 
+/// Shards that went since the last [`take_out_gone`] looked: with none, nothing is there to take
+/// out. Every entry that can go went first (a shard's drop says so before its `Shared` can go).
+static WENT: AtomicUsize = AtomicUsize::new(0);
+
 /// A shard was made.
 pub(crate) fn register(shared: &Arc<Shared>) {
     take_out_gone();
@@ -541,6 +547,11 @@ pub(crate) fn register(shared: &Arc<Shared>) {
 /// Takes out the entries of shards that went. The work scales with the
 /// shards alive and gone since the last time.
 fn take_out_gone() {
+    // Acquire: pairs with `went`'s Release, so every flag counted is seen below. A shard that
+    // goes after the swap counts again, for the next take.
+    if WENT.load(Ordering::Relaxed) == 0 || WENT.swap(0, Ordering::Acquire) == 0 {
+        return;
+    }
     let gone: Vec<usize> = registry()
         .iter()
         .filter(|(_, shard)| shard.upgrade().is_none_or(|s| s.counters.is_gone()))
