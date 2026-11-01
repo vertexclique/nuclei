@@ -5,7 +5,8 @@
 //! page at a time) and links. Calls by path, and a regular file's calls
 //! beside its reads, writes, syncs and [`Handle::allocate`], run on the
 //! blocking pool; [`Handle::try_lock_file`], which never waits, runs on the
-//! calling thread.
+//! calling thread, and so does `File::open` on Linux for a regular file on a
+//! local file system whose path the kernel's caches resolve at once.
 //!
 //! A regular file's reads and writes, at the handle's own cursor or at an
 //! offset of the caller's ([`Handle::read_at`], [`Handle::write_at`] and
