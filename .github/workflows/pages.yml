@@ -2,15 +2,15 @@ name: Pages
 
 # The site is built from the commit, all of it: `python3 site/build.py --examples` writes the
 # pages (site/src/ with the Learn examples and the values of the source: versions from Cargo.toml,
-# the kernel series from kernels.yml, links pinned to the commit), the API reference (rustdoc), the
+# the kernel series from kernels.yml, links to master), the API reference (rustdoc), the
 # search index and the files for language models (llms.txt, llms-full.txt, every page as Markdown),
 # then builds, lints and runs every Learn example on io_uring and on epoll.
-# Nothing it writes is committed. A push to master or to the 0.5 branch that touches anything the
+# Nothing it writes is committed. A push to master that touches anything the
 # site reads deploys it; a pull request runs the same build, so a page, an example or the index
 # that disagrees with the source fails before the merge.
 on:
   push:
-    branches: [master, modernize-2026]
+    branches: [master]
     paths: &site-inputs
       - "site/**"
       - "src/**"

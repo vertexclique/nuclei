@@ -40,7 +40,7 @@ The markers:
     -->
     @@NAME@@                         a value of the source: NUCLEI_VERSION, NUCLEI_MINOR,
                                      RUST_VERSION, CI_KERNELS (the Linux series the kernel matrix
-                                     runs), SOURCE (the repository at the commit built)
+                                     runs), SOURCE (the repository on master)
 
 Every link between pages is checked: a link to a page or an anchor that does not exist stops the
 build, as does an example on no page or a marker naming none.
@@ -211,6 +211,8 @@ def source_values():
     manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
     package = manifest["package"]
     version, rust_version = package.get("version"), package.get("rust-version")
+    if isinstance(version, dict) and version.get("workspace"):
+        version = manifest.get("workspace", {}).get("package", {}).get("version")
     if not version or not rust_version:
         fail("Cargo.toml gives no version or rust-version")
     kernels = re.search(r"series:\s*\[([^\]]*)\]", (ROOT / ".github/workflows/kernels.yml").read_text())
@@ -225,9 +227,9 @@ def source_values():
         "NUCLEI_MINOR": ".".join(version.split(".")[:2]),
         "RUST_VERSION": rust_version,
         "CI_KERNELS": ", ".join(series[:-1]) + " and " + series[-1] if len(series) > 1 else series[0],
-        # The repository's files as this commit has them, so a link never names a file the
-        # branch it was built from lacks.
-        "SOURCE": f"https://github.com/vertexclique/nuclei/blob/{commit.stdout.strip()}/",
+        # The site deploys from master, so its links name master's files: always the latest.
+        "SOURCE": "https://github.com/vertexclique/nuclei/blob/master/",
+        "COMMIT": commit.stdout.strip(),
     }, manifest["features"]
 
 
