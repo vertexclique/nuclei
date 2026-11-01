@@ -354,3 +354,86 @@ mod sync_range;
 mod vectored;
 #[cfg(windows)]
 mod windows;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cached_regular_file_opens_on_the_calling_thread() {
+    use crate::fs::open_cached::took::took;
+    let rt = runtime();
+    let tmp = Temp::new("open-cached");
+    let path = tmp.file("data");
+    let data = pattern(70_000);
+    std::fs::write(&path, &data).unwrap();
+    // Looked up once, so the kernel's caches hold every part of the path.
+    std::fs::metadata(&path).unwrap();
+    rt.block_on(async {
+        let mut file = within(Handle::<File>::open(&path)).await.unwrap();
+        assert!(took(&path), "the open went to the blocking pool");
+        assert_eq!(within(read_to_end(&mut file)).await.unwrap(), data);
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_long_path_opens_on_the_calling_thread_too() {
+    use crate::fs::open_cached::took::took;
+    let rt = runtime();
+    let tmp = Temp::new("open-long");
+    let mut dir = tmp.0.clone();
+    while dir.as_os_str().len() < 600 {
+        dir.push("a-directory-name-of-some-length");
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("data");
+    std::fs::write(&path, b"long").unwrap();
+    std::fs::metadata(&path).unwrap();
+    rt.block_on(async {
+        let mut file = within(Handle::<File>::open(&path)).await.unwrap();
+        assert!(took(&path), "the open went to the blocking pool");
+        assert_eq!(within(read_to_end(&mut file)).await.unwrap(), b"long");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_opens_on_the_pool_and_waits_for_its_writer() {
+    use crate::fs::open_cached::took::took;
+    use std::io::Write;
+    let rt = runtime();
+    let tmp = Temp::new("open-fifo");
+    let path = tmp.file("fifo");
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path of our own.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let at = path.clone();
+    let writer = std::thread::spawn(move || {
+        // Opening for writing waits until the reader's open is under way.
+        let mut fifo = OpenOptions::new().write(true).open(&at).unwrap();
+        fifo.write_all(b"through the fifo").unwrap();
+    });
+    rt.block_on(async {
+        let mut file = within(Handle::<File>::open(&path)).await.unwrap();
+        assert!(
+            !took(&path),
+            "a FIFO was opened without waiting for its writer"
+        );
+        assert_eq!(
+            within(read_to_end(&mut file)).await.unwrap(),
+            b"through the fifo"
+        );
+    });
+    writer.join().unwrap();
+}
+
+#[test]
+fn opening_a_missing_file_or_a_path_with_a_nul_fails_as_std_does() {
+    let rt = runtime();
+    let tmp = Temp::new("open-errors");
+    let missing = tmp.file("missing");
+    rt.block_on(async {
+        let err = within(Handle::<File>::open(&missing)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let err = within(Handle::<File>::open("a\0b")).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    });
+}
