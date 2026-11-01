@@ -254,8 +254,8 @@ impl<G: Grain> Timer<G> {
         {
             let key = *key;
             let mut wheel = shard.wheel_of(G::PRECISE).borrow_mut();
+            // A fired timer let go of its entry as it fired.
             if wheel.is_fired(key) {
-                wheel.remove(key);
                 drop(wheel);
                 // The state is `Local`: its owner goes, and nothing else.
                 if let State::Local { owner, .. } =
@@ -283,7 +283,6 @@ impl<G: Grain> Timer<G> {
         let mut wheel = shard.wheel_of(G::PRECISE).borrow_mut();
         let key = wheel.insert(at, cx.waker());
         if wheel.is_fired(key) {
-            wheel.remove(key);
             drop(wheel);
             *self.state = State::Done;
             return Poll::Ready(());
@@ -393,16 +392,10 @@ unsafe impl Sync for RemoteTimer {}
 
 impl RemoteTimer {
     /// Fires the timer: called by the firing shard once the wheel let go of
-    /// it. The fired entry is removed here, as nobody else holds its key.
+    /// it, its entry gone with the fire.
     fn fire(&self) {
         // SAFETY: on the firing shard's thread (see `key`).
-        if let Some(key) = unsafe { (*self.key.get()).take() } {
-            context::current(|current| {
-                if let Some(shard) = current {
-                    shard.wheel_of(self.precise).borrow_mut().remove(key);
-                }
-            });
-        }
+        unsafe { *self.key.get() = None };
         self.fired.store(true, Ordering::Release);
         self.waker.wake();
     }
@@ -514,13 +507,8 @@ impl TimerOp {
 }
 
 /// Arms a timer for `at` in `wheel`: its key, or `None` when the deadline
-/// passed already (the entry is gone again).
+/// passed already (it took no entry).
 fn arm(wheel: &mut Wheel, at: u64, waker: &Waker) -> Option<TimerKey> {
     let key = wheel.insert(at, waker);
-    if wheel.is_fired(key) {
-        wheel.remove(key);
-        None
-    } else {
-        Some(key)
-    }
+    (!wheel.is_fired(key)).then_some(key)
 }

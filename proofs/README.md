@@ -473,7 +473,7 @@ and of a burst of swaps of the raised flag exactly the first reads it up.
 by a nuclei shard (`src/time/sleep.rs`). The sleep cannot touch the shard's wheel, so it posts
 an arm request into the shard's mailbox and waits on a small shared cell (a fired flag and a
 waker slot). The shard applies its mailbox in order, arms the timer, and when the deadline
-passes sets the flag, wakes the waker and removes the entry. Dropping the sleep marks the cell
+passes lets go of the entry as it fires, then sets the flag and wakes the waker. Dropping the sleep marks the cell
 cancelled, takes the waker out and posts a cancel; the shard removes the entry if it has it. The
 shard may go before the deadline (its runtime dropped, a worker stopped): as it goes it drains
 its mailbox and lets go of its wheel, and every timer it held for a cell, armed or only asked

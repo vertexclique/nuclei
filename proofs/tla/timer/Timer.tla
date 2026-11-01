@@ -207,7 +207,8 @@ S_apply:
     mailbox[self] := Tail(mailbox[self]);
     goto S_loop;
 S_fire:
-    \* The wheel fires the entry; the cell's wake removes it, sets `fired`, wakes the waker.
+    \* The wheel fires the entry and lets go of it as it fires (`Wheel::advance`); the cell's
+    \* wake sets `fired` and wakes the waker.
     \* MUTATION fire_keeps_entry: the fired entry stays in the wheel.
     if Mutation = "fire_keeps_entry" then
         entry[self] := "fired";
