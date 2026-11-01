@@ -30,7 +30,7 @@
 use crate::io::raw::{AtomicRaw, Raw};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use core::task::Poll;
 use std::io;
 use std::sync::Arc;
@@ -95,8 +95,11 @@ pub(crate) fn is_stopped_shard(err: &io::Error) -> bool {
 /// before the request's bit is raised (Release) and read by the performer
 /// after the bit is taken (Acquire).
 pub(crate) struct Ask {
-    /// The shard and token of an attach.
-    attach: AtomicPtr<(Arc<Shared>, u64)>,
+    /// The shard of an attach (a count of it, from `Arc::into_raw`), and its token, stored
+    /// before it: one attach is asked at a time, by the registration that moved the state to
+    /// registering, so the pair is never torn.
+    attach: AtomicPtr<Shared>,
+    attach_token: AtomicU64,
     /// The failure of a registration.
     failure: AtomicPtr<Failure>,
     /// The descriptor a linger goes on with.
@@ -129,6 +132,7 @@ impl Default for Ask {
     fn default() -> Self {
         Self {
             attach: AtomicPtr::default(),
+            attach_token: AtomicU64::new(0),
             failure: AtomicPtr::default(),
             linger_fd: AtomicRaw::new(NO_FD),
             keep: Keep::new(),
@@ -145,8 +149,8 @@ impl Drop for Ask {
     fn drop(&mut self) {
         let attach = core::mem::replace(self.attach.get_mut(), core::ptr::null_mut());
         if !attach.is_null() {
-            // SAFETY: made by `Box::into_raw` and taken from the field once.
-            drop(unsafe { Box::from_raw(attach) });
+            // SAFETY: made by `Arc::into_raw` and taken from the field once.
+            drop(unsafe { Arc::from_raw(attach) });
         }
         let failure = core::mem::replace(self.failure.get_mut(), core::ptr::null_mut());
         if !failure.is_null() {
@@ -500,8 +504,10 @@ impl Source {
         if ask.is_null() {
             return Ok(());
         }
-        // SAFETY: made by `Box::into_raw` and taken from the field once.
-        let (shard, token) = *unsafe { Box::from_raw(ask) };
+        // SAFETY: made by `Arc::into_raw` and taken from the field once.
+        let shard = unsafe { Arc::from_raw(ask) };
+        // Stored before the shard, which the swap above acquired.
+        let token = self.ask.attach_token.load(Ordering::Relaxed);
         let result = match self.fd.load(Ordering::Acquire) {
             NO_FD => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -594,11 +600,13 @@ impl Source {
         shard: &Arc<Shared>,
         token: u64,
     ) -> Option<io::Result<()>> {
-        let ask = Box::into_raw(Box::new((Arc::clone(shard), token)));
+        self.ask.attach_token.store(token, Ordering::Relaxed);
+        let ask = Arc::into_raw(Arc::clone(shard)).cast_mut();
+        // Release: the performer that takes the shard reads the token stored before it.
         let old = self.ask.attach.swap(ask, Ordering::AcqRel);
         if !old.is_null() {
-            // SAFETY: made by `Box::into_raw`; swapped out, so ours alone.
-            drop(unsafe { Box::from_raw(old) });
+            // SAFETY: made by `Arc::into_raw`; swapped out, so ours alone.
+            drop(unsafe { Arc::from_raw(old) });
         }
         let mut after = After::default();
         // Called on the shard's own thread, inside it: the owner of the
