@@ -17,6 +17,13 @@
   the worker ran, and a poll of it that blocked then waited for its end instead of a handoff (found
   in the protocol and its model, not seen in a run). The back-out now rings a monitor that sleeps,
   as a park's end does (`proofs/tla/handoff/Asleep.tla`).
+- **The monitor's ticks on macOS are as short as they say.** The monitor reads each worker's word
+  every quarter of the handoff threshold with a timed park, which macOS coalesces with other
+  timers: on a CI runner a 2.5 ms park took 18 ms at the median and up to 119 ms, so a blocked
+  poll waited 70 ms or more for its handoff instead of 10 ms, and in the cadence test the first
+  handoff came up to 800 ms after the runtime started. The monitor now waits on a kqueue
+  there, its ring a user event and its tick a timer marked critical, which is not coalesced (as a
+  shard's precise sleep's is): 2.5 ms take 3.8 ms at the median and 8.6 ms at most.
 - **A read on io_uring gets a stream's end that came with its last bytes.** Linux's multishot
   receive stops trying once the socket's count of what is left says none, a count that leaves out
   a Unix stream's every end and a TCP reset, and waits for a wake. Bytes and the end that came
