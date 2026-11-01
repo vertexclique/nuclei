@@ -48,7 +48,9 @@ impl Spin {
 
     /// With `expecting` work, spins until `found` says it is there (true) or
     /// the budget is spent (false). `expecting` is asked only of a shard that
-    /// is not hot, the one that needs it.
+    /// is not hot, the one that needs it. Inlined into the run loop, whichever
+    /// codegen unit holds it.
+    #[inline(always)]
     pub(super) fn run(
         &self,
         expecting: impl FnOnce() -> bool,
