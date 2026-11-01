@@ -435,6 +435,12 @@ impl<S> Side<S> {
             && self.owner.load(Ordering::Relaxed) == who
     }
 
+    /// Whether the shard whose address is `who` claimed the side as its owner.
+    #[inline]
+    pub(crate) fn claimed_by(&self, who: usize) -> bool {
+        self.owner.load(Ordering::Relaxed) == who
+    }
+
     /// Whether a poll of the thread whose shard's address is `who` takes the side as its owner,
     /// as [`role`](Self::role) finds it for a caller whose [`Hooks::owner`] is `who`: the side is
     /// not shared, `who` claimed it, and the owner does not hold it now.
@@ -473,6 +479,31 @@ impl<S> Side<S> {
         // word does it.
         held.bits = (held.bits & !(BIASED | EXPECT)) | u32::from(BUSY);
         OwnerPoll::Left(held, out)
+    }
+
+    /// The owner's hold for `f`, for a caller [`owned_by`](Self::owned_by) said is the side's
+    /// owner: the biased take, `f`, and the biased release, with none of the hooks of letting go
+    /// on the way that finds nothing left, so `f` changes nothing they publish. `None` when a
+    /// foreign thread came and the biased take was refused, with `f` not run. Work others left
+    /// as `f` ran is done as a holder of the word does it.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub(crate) fn with_owner<R>(
+        &self,
+        after: &mut After,
+        hooks: &impl Hooks<S>,
+        f: impl FnOnce(&mut S) -> R,
+    ) -> Option<R> {
+        let mut held = self.try_biased()?;
+        hooks.taken(held.get(), after);
+        let out = f(held.get());
+        if !self.release_biased() {
+            core::mem::forget(held);
+            return Some(out);
+        }
+        held.bits = (held.bits & !(BIASED | EXPECT)) | u32::from(BUSY);
+        held.release(after, hooks);
+        Some(out)
     }
 
     /// Whether the side went to shared mode.

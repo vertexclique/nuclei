@@ -199,6 +199,16 @@ mod tests {
 
 impl Drop for Shard {
     fn drop(&mut self) {
+        // This thread runs the shard and no other does: what its sources are
+        // asked as it goes is asked as their owner (`context::letting_go`).
+        let shared = Arc::clone(&self.shared);
+        crate::rt::context::letting_go(&shared, || self.go());
+    }
+}
+
+impl Shard {
+    /// [`Drop`]'s work: the shard goes for good.
+    fn go(&mut self) {
         self.shared.counters.went();
         // Every task still queued here is dropped on this thread, the one its
         // future may be dropped on.

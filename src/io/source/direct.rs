@@ -33,6 +33,20 @@ const READ_RING: usize = 16 << 10;
 #[cfg(ring)]
 const WRITE_RING: usize = 0;
 
+/// Whether a borrowed buffer of `len` bytes is written directly, by a poller's side
+/// (`poller`) or a ring's.
+#[inline(always)]
+pub(super) fn worth_write(poller: bool, len: usize) -> bool {
+    #[cfg(ring)]
+    let least = if poller { WRITE_READINESS } else { WRITE_RING };
+    #[cfg(not(ring))]
+    let least = {
+        let _ = poller;
+        WRITE_READINESS
+    };
+    len >= least
+}
+
 /// Whether a borrowed buffer of `len` bytes is read or written directly.
 #[inline]
 pub(super) fn worth(io: Io<'_>, len: usize, write: bool) -> bool {
