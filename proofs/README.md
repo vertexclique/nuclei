@@ -275,8 +275,10 @@ analysis.
 
 `park` (`tla/park/Park.tla`) checks how a shard goes to sleep without losing a wake
 (`src/rt/handshake.rs`, `src/rt/shard.rs`). A shard with nothing to run (after a short spin that
-only looks at its inbox, first look before its clock starts: `Spin::run`, `src/rt/shard/spin.rs`) publishes that it parks, looks at its inbox once more, and only then
-sleeps until its poller is notified. A
+only looks at its inbox, first look before its clock starts: `Spin::run`, `src/rt/shard/spin.rs`;
+the inbox from the spin's second look on, the run queue's own pop having just found it empty)
+publishes that it parks, looks at its inbox once more, and only then sleeps until its poller is
+notified. A
 thread that gives it work pushes the work, then looks whether the shard parks; if it does, it
 swaps the flag back and notifies, so only the first of a burst of wakes notifies. Every access
 of the pair is sequentially consistent, so whichever publication comes second, the look after
@@ -986,8 +988,8 @@ socket, a big read's stop, and a receive armed again after it). The reader makes
 big reads, so a reader that keeps switching between sizes cannot spin the model.
 
 `tla/ring/RingInc.tla` checks the same receives on a group filled in pieces (`IOU_PBUF_RING_INC`;
-`RecvGroup::hand_out`, `settle`, `take_back` and `charge` in `src/rt/shard/recv.rs`, `arrived` in
-`src/rt/shard/ring.rs`). The kernel keeps a buffer while it has room: each message goes after the
+`RecvGroup::hand_out`, `settle`, `take_back`, `take_in_now` and `charge` in `src/rt/shard/recv.rs`,
+`arrived` and `take_in_now` in `src/rt/shard/ring.rs`). The kernel keeps a buffer while it has room: each message goes after the
 bytes already there, and its completion carries BUF_MORE until the one that fills the buffer; a
 receive that ends leaves the buffer partly filled for the next. For each buffer the ring's thread
 counts where the next piece starts, the chunks of it out and whether the kernel is done with it,
@@ -1853,6 +1855,40 @@ room not filled is the last that takes anything (`fill_in_order`), with `fill_le
 bytes themselves, and the kernel's rule that a vectored read fills its descriptors in order, are
 left out. The property test `buf::tests::vectored::a_read_fills_rooms_in_order` checks the Rust
 code against the same rules.
+
+## A queue with a count
+
+`counted` (`tla/counted/Counted.tla`) checks the queue a ring's thread takes items from without
+a look at the queue's words when nothing waits (`Counted` in `src/rt/shard/counted.rs`), in its
+two uses: the chunks of a receive group given back on other threads, which the ring's thread
+takes in before each wait (`RecvGroup::take_back` and `has_returns` in `src/rt/shard/recv.rs`,
+`ShardRing::take_back` in `src/rt/shard/ring.rs`), the registration changes and timer work other
+threads post a shard (`Shared::post_io`, `post_timer`, `drain_io_ops`, `drain_timer_ops`,
+`Shard::apply_io_ops` and `has_posted_ops` in `src/rt/shard.rs`, `fire_timers` in
+`src/rt/shard/timers.rs`, `apply_mailbox` in `src/rt/shard/ring/keeper.rs`), and the arrivals a
+ring's thread queues for the holder of a source's read side (`Source::ring_arrival` in
+`src/io/source/ring.rs`, the deferred ARRIVALS in `src/io/source/hooks.rs`). A push claims the queue's next cell, writes its
+item there, and only then counts it; a consumer reads the count once, pops at most that many,
+stops at a cell still being written, and takes off the count what it popped; a count of zero
+skips the queue. In the arrivals' use the ring's thread alone pushes: holding the side, it takes
+what the queue holds before its own arrival; not holding it (another thread holds it, or its take
+failed on a fence), it queues the arrival and leaves ARRIVALS for the side's holder, or for the
+side's owner, which it nudges. Once a shard stopped, the threads that post to it drain its queues
+too, at once with each other: two passes may then read one count, and the count goes below zero
+for a moment, until the push whose item a pass took before it was counted counts it, so a look
+finds work that is not there, never the reverse. A look that must not miss a push whose count is
+not in yet (another thread's look at the shard, its last applies as it goes) looks at the queue's
+words. 10 configurations: 3 that must pass (two threads giving two chunks back each; three
+arrivals with another thread holding the side twice, failed takes and nudges; two threads posting
+two items each while the shard takes them and a drainer drains at once with it), with `InOrder`
+(none taken twice or before an item its producer pushed earlier), `NoPastEnd` (with one consumer,
+a pop made on the count always finds a cell) and `AllTaken` (every item taken in the end); 4
+mutations (a push counted before its cell is claimed breaks `NoPastEnd`; a pass that takes off
+the count it read rather than what it popped, and an arrival counted after ARRIVALS is left, each
+leave an item for good and break `AllTaken`; a held side whose arrival goes in with no look at
+the queue breaks `InOrder`); and 3 witnesses (a pass stopped at a push still writing its cell, a
+direct arrival behind queued ones, a count below zero with a drainer). TLA+ is sequentially consistent: the count's Release and
+Acquire are what make a counted cell written for the consumer that read the count.
 
 ## A ring's overflow count
 

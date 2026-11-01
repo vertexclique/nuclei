@@ -890,8 +890,10 @@ impl Source {
         // arrival and goes in first: the order holds.
         if let Some(mut held) = self.read.try_hold_for(&hooks) {
             hooks.taken(held.get(), after);
-            while let Ok((queued, at)) = self.read_arrivals.try_pop() {
-                held.get().take_arrival(queued, at, after);
+            if !self.read_arrivals.is_empty() {
+                let st = held.get();
+                self.read_arrivals
+                    .take_all(|(queued, at)| st.take_arrival(queued, at, after));
             }
             held.get().take_arrival(arrival, epoch, after);
             held.release(after, &hooks);

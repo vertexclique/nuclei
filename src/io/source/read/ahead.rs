@@ -149,9 +149,11 @@ impl Ahead {
         after: &mut After,
         shard: Option<&Shard>,
     ) -> usize {
-        // One piece, the usual case: one look at its bytes.
-        if self.pieces.len() == 1
-            && let Some(piece) = self.pieces.front_mut()
+        // One piece, or a first piece that holds the whole read, the usual cases: one look at
+        // its bytes.
+        let one = self.pieces.len() == 1;
+        if let Some(piece) = self.pieces.front_mut()
+            && (one || piece.filled().len() >= out.len())
         {
             let src = piece.filled();
             let (all, n) = (src.len(), src.len().min(out.len()));

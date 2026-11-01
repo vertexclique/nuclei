@@ -246,16 +246,26 @@ impl ShardRing {
         self.in_kernel.get() > 0 || self.writes.get() > 0 || !self.room.borrow().is_empty()
     }
 
-    /// Keeps the buffer `bid` of the group `back` for the next take-in, if the ring's group is
-    /// that; `false` when it is not or the group is borrowed (the buffer then goes the long way).
-    pub(crate) fn keep_local(
+    /// Takes in the chunk `item` of the group `back` at once, if the ring's group is that, or
+    /// keeps it for the next take-in while the operations are borrowed; `false` when the group
+    /// is another or borrowed (the chunk then goes the long way).
+    pub(crate) fn take_in_now(
         &self,
         back: &Arc<super::recv::Returns>,
         item: super::recv::Back,
     ) -> bool {
-        self.recv
-            .try_borrow_mut()
-            .is_ok_and(|mut group| group.as_mut().is_some_and(|g| g.keep_local(back, item)))
+        let Ok(mut recv) = self.recv.try_borrow_mut() else {
+            return false;
+        };
+        let Some(group) = recv.as_mut() else {
+            return false;
+        };
+        match self.ops.try_borrow_mut() {
+            Ok(mut ops) => group.take_in_now(back, item, |user_data, charged| {
+                release_charge(&mut ops, user_data, charged);
+            }),
+            Err(_) => group.keep_local(back, item),
+        }
     }
 
     /// The group id multishot receives draw from, if the ring has a group.
@@ -804,17 +814,11 @@ impl ShardRing {
     /// again, counting each off the receive it went to.
     fn take_back(&self) {
         let mut recv = self.recv.borrow_mut();
-        let Some(group) = recv.as_mut() else {
+        let Some(group) = recv.as_mut().filter(|group| group.has_returns()) else {
             return;
         };
         let mut ops = self.ops.borrow_mut();
-        group.take_back(|user_data, charged| {
-            if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
-                ops.get_mut(user_data).map(|op| &mut op.mem)
-            {
-                *held = held.saturating_sub(charged);
-            }
-        });
+        group.take_back(|user_data, charged| release_charge(&mut ops, user_data, charged));
     }
 
     #[cfg(feature = "io-stats")]
@@ -980,6 +984,16 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
     }
     let fit = 1u32 << half.ilog2();
     configured.min(u16::try_from(fit.min(1 << 15)).unwrap_or(1 << 15))
+}
+
+/// Counts `charged` bytes of a chunk given back off the multishot receive of `user_data`, if it
+/// is still in flight.
+fn release_charge(ops: &mut Ops<RingOp>, user_data: u64, charged: usize) {
+    if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
+        ops.get_mut(user_data).map(|op| &mut op.mem)
+    {
+        *held = held.saturating_sub(charged);
+    }
 }
 
 /// Whether `op` is one of the write sides' operations counted in `writes`: a

@@ -169,9 +169,12 @@ R_loop:
                 if c.why = "dry" then dryEnds := dryEnds + 1; end if;
             end if;
         or
-            \* `take_back`, before the ring's next wait. `returned` counts the buffers
-            \* of the queue and of the ring thread's own local list alike: a chunk
-            \* dropped on the ring's thread joins the list, any other the queue.
+            \* `take_back`, before the ring's next wait, or `take_in_now`, as a chunk is
+            \* dropped on the ring's own thread. `returned` counts the buffers of the
+            \* queue, of the ring thread's own local list and of a chunk taken in at once
+            \* alike: a chunk dropped on the ring's thread is taken in as it drops (or
+            \* joins the list while the ring's operations are borrowed), any other goes
+            \* on the queue.
             await returned > 0;
             free := free + returned;
             held := IF held >= returned THEN held - returned ELSE 0;

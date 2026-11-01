@@ -75,20 +75,17 @@ unsafe impl Send for BufMem {}
 unsafe impl Sync for BufMem {}
 
 impl BufMem {
-    /// Bytes `start..end` of buffer `bid`, or `None` when they are out of range.
-    ///
-    /// # Safety
-    ///
-    /// The buffer is not queued in its ring (a completion handed it out and it was not re-added
-    /// yet), so the kernel does not write it while the slice lives.
-    pub(crate) unsafe fn bytes(&self, bid: u16, start: u32, end: u32) -> Option<&[u8]> {
-        if bid >= self.entries || start > end || end > self.buf_size {
+    /// The first byte of buffer `bid`, or `None` when there is no such buffer. Its `buf_size`
+    /// bytes stay mapped as long as `self`; they may be read only while the buffer is not queued
+    /// in its ring (a completion handed it out and it was not re-added yet), so the kernel does
+    /// not write them meanwhile.
+    pub(crate) fn base(&self, bid: u16) -> Option<core::ptr::NonNull<u8>> {
+        if bid >= self.entries {
             return None;
         }
-        let at = usize::from(bid) * self.buf_size as usize + start as usize;
-        // SAFETY: the range lies inside the mapping (checked above), which lives as long as
-        // `self`; the caller's: the kernel does not write it now.
-        Some(unsafe { slice::from_raw_parts(self.map.as_ptr().add(at), (end - start) as usize) })
+        let at = usize::from(bid) * self.buf_size as usize;
+        // SAFETY: buffer `bid` lies inside the mapping, so the offset stays in it.
+        core::ptr::NonNull::new(unsafe { self.map.as_ptr().add(at) })
     }
 }
 
