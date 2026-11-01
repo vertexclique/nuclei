@@ -9,18 +9,23 @@
 //! leaves the waker to it. [`AWAITER`] says a waker is stored, so a
 //! completion with nobody waiting reads one bit and moves on.
 
-use core::task::Waker;
+use core::task::{RawWakerVTable, Waker};
 
 use super::abort_on_panic;
 use super::raw::TaskVTable;
 use super::state::{AWAITER, NOTIFYING, REFERENCE, REGISTERING, SCHEDULED, TASK};
-use crate::sync::internal::{AtomicUsize, Ordering, UnsafeCell};
+use crate::sync::internal::{AtomicPtr, AtomicUsize, Ordering, UnsafeCell};
 
 /// The type-erased head of a task's memory; the task pointer points at it.
 pub(super) struct Header {
     pub(super) state: AtomicUsize,
     /// The waker of the handle's awaiter; see the module docs.
     awaiter: UnsafeCell<Option<Waker>>,
+    /// The data and table of the waker last stored as the awaiter, written
+    /// under REGISTERING: while AWAITER is set they name the waker the cell
+    /// holds, or that the notifier holding NOTIFYING took and wakes.
+    awaiter_data: AtomicPtr<()>,
+    awaiter_table: AtomicPtr<RawWakerVTable>,
     pub(super) vtable: &'static TaskVTable,
     /// The task's id, unique in the process.
     pub(super) id: super::Id,
@@ -43,6 +48,8 @@ impl Header {
         Self {
             state: AtomicUsize::new(SCHEDULED | TASK | REFERENCE),
             awaiter: UnsafeCell::new(None),
+            awaiter_data: AtomicPtr::new(core::ptr::null_mut()),
+            awaiter_table: AtomicPtr::new(core::ptr::null_mut()),
             vtable,
             id: super::Id(core::num::NonZeroU64::new(id).unwrap_or(core::num::NonZeroU64::MIN)),
             link: crate::rt::inbox::Link::new(),
@@ -99,6 +106,14 @@ impl Header {
         (waker, true, state | NOTIFYING)
     }
 
+    /// Whether the waker last stored wakes as `waker` does (`will_wake`):
+    /// read while AWAITER is set, which publishes it.
+    #[inline]
+    fn stored_wakes_as(&self, waker: &Waker) -> bool {
+        core::ptr::eq(self.awaiter_data.load(Ordering::Relaxed), waker.data())
+            && core::ptr::eq(self.awaiter_table.load(Ordering::Relaxed), waker.vtable())
+    }
+
     /// Stores `waker` as the awaiter. A notification that raced the store is
     /// handled here: the waker is woken at once instead of being left behind.
     #[inline(always)]
@@ -108,9 +123,13 @@ impl Header {
         loop {
             debug_assert!(state & REGISTERING == 0, "one awaiter registers at a time");
             if state & NOTIFYING != 0 {
-                // A notification is taking the old waker: this one would
-                // miss it, so it is woken now and polls again.
-                abort_on_panic(|| waker.wake_by_ref());
+                // A notification holds the cell. With a waker stored that
+                // wakes this one's task, its wake is this registration's;
+                // otherwise this waker would miss it, so it is woken now and
+                // polls again.
+                if state & AWAITER == 0 || !self.stored_wakes_as(waker) {
+                    abort_on_panic(|| waker.wake_by_ref());
+                }
                 return;
             }
             match self.state.compare_exchange_weak(
@@ -132,6 +151,13 @@ impl Header {
         let old = self
             .awaiter
             .with_mut(|cell| unsafe { (*cell).replace(waker.clone()) });
+        // Published by the exchange below that sets AWAITER.
+        self.awaiter_data
+            .store(waker.data().cast_mut(), Ordering::Relaxed);
+        self.awaiter_table.store(
+            core::ptr::from_ref(waker.vtable()).cast_mut(),
+            Ordering::Relaxed,
+        );
         abort_on_panic(|| drop(old));
 
         let mut missed = None;

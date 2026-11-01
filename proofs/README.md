@@ -249,7 +249,11 @@ waker taken just before it with the notifier's flag held across the exchange (`H
 `RawTask::run`): a handle that sees the completion holds the last reference, so its drop frees
 the task on the handle's thread, and the task's memory is back in the cache of the thread that
 awaits it before that thread goes on. An output no handle takes is taken out before that
-exchange and dropped after it, the task let go of, before the awaiter's wake. A run that ends Pending, neither woken nor closed, drops its
+exchange and dropped after it, the task let go of, before the awaiter's wake. A registration of
+the handle's waker that meets a notification while a waker is stored leaves the wake to the
+notifier, which took that waker, when it wakes the same task (`Header::register` keeps the stored
+waker's data and table to tell): it does not wake itself and poll again for as long as the
+completion takes. A run that ends Pending, neither woken nor closed, drops its
 reference in the exchange that clears RUNNING, so no later run of the task, woken meanwhile on
 another runner, is followed by that drop. `RunnerFreesNoAwaited` checks both: the run never
 frees a task whose handle held it as it completed.

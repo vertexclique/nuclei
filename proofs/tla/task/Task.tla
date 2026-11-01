@@ -201,10 +201,13 @@ end procedure;
 procedure Register()
 begin
 G_try:
-    \* A notification in progress would miss the waker: wake it at once instead.
+    \* A notification in progress holds the cell. With the handle's waker stored (AWAITER), the
+    \* notifier took it or takes it, and wakes it: that wake is this registration's (the code
+    \* checks the stored waker wakes the same task; the model's handle has one waker). With
+    \* none stored, the notification would miss this waker: it is woken at once instead.
     touch();
     if ntf then
-        handleWoken := TRUE;
+        if ~awt then handleWoken := TRUE; end if;
         registerMetNotify := TRUE;         \* (record)
         return;
     else
