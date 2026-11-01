@@ -84,10 +84,16 @@ impl Shard {
     /// The waker of a `block_on` future on this shard: the one the last call
     /// here left, if nothing else holds it any more, else a new one.
     pub(super) fn signal(&self) -> Arc<Signal> {
-        if let Some(mut signal) = self.signal.take()
-            && Arc::get_mut(&mut signal).is_some_and(Signal::reset)
+        // No `Weak` of a signal is made, so a count of one is the only
+        // holder: a waker another thread dropped last did so before the
+        // acquire, and none is left to wake the next future.
+        if let Some(signal) = self.signal.take()
+            && Arc::strong_count(&signal) == 1
         {
-            return signal;
+            crate::sync::internal::fence(Ordering::Acquire);
+            if signal.reset() {
+                return signal;
+            }
         }
         Arc::new(Signal::new(&self.shared))
     }

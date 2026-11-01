@@ -31,7 +31,7 @@ impl Signal {
     /// Makes the signal, which nothing else holds, a new future's: woken once,
     /// as [`new`](Self::new) makes it. False for one whose target moved,
     /// which stays its first shard's no more.
-    pub(super) fn reset(&mut self) -> bool {
+    pub(super) fn reset(&self) -> bool {
         if self.target.moved() {
             return false;
         }
