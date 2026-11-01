@@ -11,7 +11,7 @@
 
 use core::future::Future;
 use core::pin::{Pin, pin};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -128,7 +128,7 @@ impl Shard {
         mut future: Pin<&mut F>,
         signal: &Arc<Signal>,
     ) -> Result<F::Output, Detached> {
-        let waker = Waker::from(Arc::clone(signal));
+        let waker = Signal::waker(signal);
         let mut cx = Context::from_waker(&waker);
         // Turns in which the future woke itself and no task ran.
         let mut self_woken = 0u32;
