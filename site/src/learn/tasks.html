@@ -45,7 +45,7 @@
 <li>The blocked thread still shares the core, so a handoff is a rescue, not a place to run work: give long work to <code>spawn_blocking</code> or break it up with yields.</li>
 <li>Tasks that <code>spawn_local</code> keeps on the blocked thread, and a nested <code>block_on</code> there, wait for it and finish on that thread.</li>
 <li><a href="api:nuclei::Builder::on_long_poll"><code>on_long_poll</code></a> names the task that blocked (<a href="production.html#hooks">Production</a>), and <code>stats()</code> counts each worker's <code>handoffs</code> and its <code>longest_poll</code>.</li>
-<li>Watching costs each poll two plain stores and a load, and each call a task makes into its worker (a wake, a spawn, a send or a receive) two loads and two stores: on io_uring a 64-byte TCP round trip runs 12% more instructions with it, a spawn and its join 25% more. <code>handoff_after(None)</code> turns it off.</li>
+<li>Watching costs each poll two plain stores and a load, and each call a task makes into its worker (a wake, a spawn, a send or a receive) two loads and two stores: on io_uring a 64-byte TCP round trip runs 9.5% more instructions with it, a spawn and its join 25% more. <code>handoff_after(None)</code> turns it off.</li>
 </ul>
 
 <h2 id="task-local">Task-local values</h2>

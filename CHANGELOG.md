@@ -20,6 +20,26 @@
   io_uring runs 3 fewer instructions per operation (401 of 404 under fat LTO). CI's budgets in
   `ci/op_budget.txt` were lowered to match these and the change above.
 
+- **An owner's read or write on a watched worker marks its own call, and ends it as it settles.**
+  A stream's poll and send as its side's owner, from a task's code on a worker the handoff watch
+  follows, went out of line into a bracket around the path a worker with no watch takes. The step
+  now marks the call itself (`context::mark_call`, as `After::enter` makes it) and keeps the mark
+  in what it leaves, and its settle ends the call before it wakes or drops anything the step left
+  (`After::settle_light_owned`, `Source::settle_rest`); a shard taken before the mark is left to
+  the poll of any thread. The mark is the bracket's, as `proofs/tla/handoff` models it. Both
+  sides of a stream also take the poll's waker once and hand it, not the context, to the owner's
+  path and the general one, and the budget reads the waker only once it is spent. With the default
+  watch on io_uring, default release build, user instructions per operation: a 64-byte TCP round
+  trip 3788 before, 3682 now (3362 with the watch off, 3375 before); a 64 KiB chunk of a bulk
+  stream 1220, 1179 (1059 off, 1067 before); a request read in pieces (`tcp_split`) 601, 553 (460
+  off, 466 before); on epoll the TCP round trip 3045, 2959, and under fat LTO on io_uring 3535,
+  3405. With the watch off each row costs what it did or less, but a few by a handful of
+  instructions: the stream rows on epoll in the default build (2 more, of 2637: the read keeps its
+  context where it kept its waker), the file read (2 more in its own code, which calls
+  `After::run` where it inlined it; its count moves by ten from run to run), and `tcp_many` under
+  fat LTO (1 more, in the general read's frame). Counted as the ops gate counts them, every row is
+  at or below what it was.
+
 ## 0.5.3
 
 ### Fixed
