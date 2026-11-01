@@ -38,10 +38,28 @@ fn tmp_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("vs-tokio-count-{}-{tag}", std::process::id()))
 }
 
+/// The file_read row's file, beside the program under the build's target directory, on the
+/// disk the build is on, for every runtime alike; a memory filesystem (tmpfs, ramfs) is
+/// refused, so a tmpfs /tmp never decides the row.
 fn bench_file() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join("vs-tokio-count-file-16MiB");
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .expect("the program knows its directory");
+    let path = dir.join("vs-tokio-count-file-16MiB");
     if std::fs::metadata(&path).map_or(true, |m| m.len() != FILE_SIZE as u64) {
         std::fs::write(&path, vec![5u8; FILE_SIZE]).expect("the file is written");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: plain data, filled by the call for the path named.
+        let mut fs: libc::statfs = unsafe { core::mem::zeroed() };
+        // SAFETY: `name` is a C string and `fs` is the call's to fill.
+        assert_eq!(unsafe { libc::statfs(name.as_ptr(), &mut fs) }, 0);
+        let memory = matches!(fs.f_type as u32, 0x0102_1994 | 0x8584_58f6);
+        assert!(!memory, "the file_read row's file is on a memory filesystem; build on a disk");
     }
     path
 }
@@ -402,6 +420,34 @@ fn nuclei_run(row: &str) -> u64 {
                         .send(&chunk[..BULK_CHUNK.min(BULK - sent)])
                         .await
                         .unwrap();
+                }
+                receiver.await
+            });
+            assert_eq!(rt.block_on(sink), BULK);
+            (BULK / BULK_CHUNK) as u64
+        }
+        // Prototype: the bulk row with each chunk lent to the side (`write_owned`), sent by the
+        // ring from the task's own buffer with no copy, as an owned-buffer runtime sends.
+        "bulk_lent" => {
+            let sink = rt.spawn(async move {
+                let listener = nuclei::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let receiver = nuclei::spawn(async move {
+                    let (conn, _) = listener.accept().await.unwrap();
+                    let mut buf = vec![0u8; BULK_CHUNK];
+                    let mut total = 0;
+                    while total < BULK {
+                        total += conn.recv(&mut buf).await.unwrap();
+                    }
+                    total
+                });
+                let conn = NTcp::connect(addr).await.unwrap();
+                let mut chunk = vec![1u8; BULK_CHUNK];
+                let mut sent = 0;
+                while sent < BULK {
+                    let (n, back) = conn.write_owned(chunk).await;
+                    sent += n.unwrap();
+                    chunk = back;
                 }
                 receiver.await
             });
