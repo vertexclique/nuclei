@@ -88,6 +88,7 @@ impl SleepPrecise {
 impl Future for SleepPrecise {
     type Output = ();
 
+    #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.get_mut().timer.poll(cx)
     }

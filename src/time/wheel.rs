@@ -175,6 +175,7 @@ impl Wheel {
     /// Arms a timer for `when`, waking `waker` once the wheel passes it. A
     /// deadline the wheel has passed already is fired at once, without a
     /// wake: the caller sees it fired when it looks.
+    #[inline(always)]
     pub(crate) fn insert(&mut self, when: u64, waker: &Waker) -> TimerKey {
         if when <= self.elapsed {
             return TimerKey::FIRED;
@@ -379,12 +380,19 @@ impl Wheel {
     }
 
     /// A free entry, from the free list or a new one.
+    #[inline]
     fn alloc(&mut self) -> usize {
         if self.free != NIL {
             let index = self.free;
             self.free = self.entries[index].next;
             return index;
         }
+        self.grow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) -> usize {
         let index = self.entries.len();
         self.entries.push(Entry {
             when: 0,

@@ -28,7 +28,7 @@ use crate::sync::internal::{AtomicBool, Ordering};
 /// millisecond; a busy shard may let it run later by the time its current
 /// task takes to yield. [`sleep_precise`](super::sleep_precise) waits to the
 /// microsecond instead.
-#[inline]
+#[inline(always)]
 pub fn sleep(duration: Duration) -> Sleep {
     Sleep {
         timer: Timer::after(duration),
@@ -79,6 +79,7 @@ impl Sleep {
 impl Future for Sleep {
     type Output = ();
 
+    #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.get_mut().timer.poll(cx)
     }
@@ -164,12 +165,14 @@ impl<G: Grain> Timer<G> {
     /// instant would be.
     #[inline(always)]
     pub(super) fn after(duration: Duration) -> Self {
-        let at = duration
+        let span = duration
             .as_secs()
             .checked_mul(1_000_000_000)
-            .and_then(|whole| whole.checked_add(u64::from(duration.subsec_nanos())))
-            .and_then(|span| clock::now_nanos().checked_add(span));
-        match at {
+            .and_then(|whole| whole.checked_add(u64::from(duration.subsec_nanos())));
+        // Read outside a closure, which the clock's read would keep from
+        // being inlined.
+        let now = clock::now_nanos();
+        match span.and_then(|span| now.checked_add(span)) {
             Some(at) => Self {
                 deadline: Deadline::Nanos(at),
                 state: ManuallyDrop::new(State::Idle),
@@ -257,12 +260,7 @@ impl<G: Grain> Timer<G> {
             // A fired timer let go of its entry as it fired.
             if wheel.is_fired(key) {
                 drop(wheel);
-                // The state is `Local`: its owner goes, and nothing else.
-                if let State::Local { owner, .. } =
-                    core::mem::replace(&mut *self.state, State::Done)
-                {
-                    drop(owner);
-                }
+                self.end_local();
                 return Poll::Ready(());
             }
             wheel.set_waker(key, cx.waker());
@@ -323,7 +321,32 @@ impl<G: Grain> Timer<G> {
         Poll::Pending
     }
 
+    /// Ends a timer armed here that fired.
+    #[inline(always)]
+    fn end_local(&mut self) {
+        // The state is `Local`: its owner goes, and nothing else.
+        if let State::Local { owner, .. } = core::mem::replace(&mut *self.state, State::Done) {
+            drop(owner);
+        }
+    }
+
+    #[inline(always)]
     pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        // A sleep's usual end: armed on the shard this thread runs, and
+        // fired.
+        if let State::Local { owner, key } = &*self.state
+            && let Some(shard) = context::running_inside(context::local())
+            && shard.is(owner)
+            && shard.wheel_of(G::PRECISE).borrow().is_fired(*key)
+        {
+            self.end_local();
+            return Poll::Ready(());
+        }
+        self.poll_any(cx)
+    }
+
+    #[inline(never)]
+    fn poll_any(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if let State::Done = *self.state {
             return Poll::Ready(());
         }
