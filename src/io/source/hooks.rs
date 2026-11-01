@@ -216,8 +216,11 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     }
 
     fn releasing(&self, st: &mut WriteState) {
-        // Release: a drop on another thread reads it.
-        self.src.unsent.store(st.has_unsent(), Ordering::Release);
+        // Release: a drop on another thread reads the unsent bit; this thread's driver reads the
+        // idle bit, only while no other thread ever held the side.
+        self.src
+            .unsent
+            .store(st.published(self.src.on_ring()), Ordering::Release);
         // What a datagram send made with no guard, and the driver's edge, read (`quick`).
         #[cfg(unix)]
         if self.src.quick.on() {

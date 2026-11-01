@@ -6,14 +6,23 @@
 (* the step `Source::submit_if_registered`, `ensure_registered`,           *)
 (* `ops_registered`; the side's `submit_wanted` in                         *)
 (* src/io/source/read/ops.rs; `RingIo::issuer` in                         *)
-(* src/io/source/ring.rs), at the grain of the read side's holds.          *)
+(* src/io/source/ring.rs), at the grain of the read side's holds; and the *)
+(* route's one fast check, `Source::via` with the registration's `here`,  *)
+(* published by `Source::attach_ring` and `install_ring` once the source  *)
+(* is registered with its ring, cleared by `detach` and `evict_now` before *)
+(* the registration goes (src/io/source.rs, ring.rs, requests.rs).        *)
 (*                                                                          *)
-(* Who acts. The reader, a task on a thread that runs no shard. The ring's *)
+(* Who acts. The reader, a task on a thread that runs no shard, or on the *)
+(* thread of another shard, which runs a ring of its own. The ring's       *)
 (* thread, which finishes the registration (the install, a request done   *)
 (* with both sides held, then `ops_registered`) and submits what a kick    *)
 (* asks for.                                                               *)
 (*                                                                          *)
-(* What can happen. `with_io` reads the route before the side is taken:   *)
+(* What can happen. `with_io` reads the route before the side is taken.   *)
+(* Its fast check comes first: the registration's `here` names the shard *)
+(* whose thread reaches the source on its own ring (the source's home),   *)
+(* and only a thread of that shard takes the Here route from it, issuing  *)
+(* on its own ring; any other thread reads the route as it always did:   *)
 (* NotYet while the registration is under way, Elsewhere once it is in    *)
 (* place (the ring's thread submits, after a kick). The reader takes the  *)
 (* read side; its step finds nothing to read, leaves a waiter and asks    *)
@@ -31,7 +40,8 @@
 (*                                                                          *)
 (* What must never happen. A step leaves a waiter and no operation is ever *)
 (* submitted for it (the read waits for good). An operation is submitted  *)
-(* twice for one waiter.                                                   *)
+(* twice for one waiter. A thread issues the source's operation on a ring *)
+(* that is not the source's home (its ring's table has no such file).     *)
 (*                                                                          *)
 (* What is abstract. The side's word is one holder and its left flags     *)
 (* (`side` checks it); the request needs both sides, of which the read    *)
@@ -42,6 +52,7 @@ EXTENDS Integers, Sequences, TLC                                             \* 
 
 CONSTANTS                                                                    \* what each configuration sets:
     Registered,                                                              \* TRUE: the registration is in place before the read
+    Reader,                                                                  \* "none": the reader's thread runs no shard; "other": another ring shard's
     Mutation                                                                 \* "none", or the name of the one rule this run takes away
 
 (* --algorithm Route                                                           \* the algorithm, in PlusCal
@@ -55,7 +66,9 @@ variables                                                                    \* 
     woken = FALSE,                                              \* the reader was woken and has not polled again
     waiter = FALSE,                                             \* the reader's step left a waiter
     submits = 0,                                                \* operations submitted for the waiter
-    lateResubmit = FALSE;                                       \* (record) the look after the step asked for a submit
+    lateResubmit = FALSE,                                       \* (record) the look after the step asked for a submit
+    here = IF Registered THEN "ring" ELSE "none",               \* the registration's `here`: the shard that reaches it Here
+    wrongRing = FALSE;                                          \* (record) an operation issued on a ring not the home
 
 define                                                                       \* names the code and the properties use:
     \* What the route says once the registration is in place, for the reader: the ring's thread submits.
@@ -69,8 +82,14 @@ fair process reader = "reader"                                               \* 
 variables route = "notyet", wasNotYet = FALSE;                               \* the route it read; that it read NotYet
 begin                                                                        \* the reader's steps:
 R_route:                                                                     \* the route, read before the side is taken
-    route := Fresh;                                                          \* NotYet while under way, else Elsewhere
-    wasNotYet := (reg # "registered");                                       \* it read NotYet
+    \* MUTATION here_any: the fast check takes any published home for its own shard.
+    if here # "none" /\ (here = Reader \/ Mutation = "here_any") then       \* `here` names this thread's shard:
+        route := "here";                                                     \* the Here route, on this thread's ring
+        wasNotYet := FALSE;                                                  \* registered, so no look after the step
+    else                                                                     \* any other thread:
+        route := Fresh;                                                      \* NotYet while under way, else Elsewhere
+        wasNotYet := (reg # "registered");                                   \* it read NotYet
+    end if;                                                                  \* the route is read
 R_take:                                                                      \* the read side
     if holder = "none" then holder := "reader";                              \* free: the reader holds it
     else                                                                     \* held: the poll leaves its waker,
@@ -81,9 +100,12 @@ R_step:                                                                      \* 
     waiter := TRUE;                                                          \* a waiter is left,
     if route = "elsewhere" /\ submits = 0 then                               \* and `submit_wanted` with its route:
         mailbox := Append(mailbox, "kick");                                  \* Elsewhere kicks the ring's thread
+    elsif route = "here" /\ submits = 0 then                                 \* Here issues on this thread's ring:
+        submits := submits + 1;                                              \* the operation goes in now,
+        if Reader # "ring" then wrongRing := TRUE; end if;                   \* (record) on a ring not the home
     end if;                                                                  \* NotYet issues nothing
 R_rel:                                                                       \* the reader lets go, doing what was left
-    if reqFlag then reg := "registered"; end if;                             \* the request: done here (`perform`, `attach_now`)
+    if reqFlag then reg := "registered"; here := "ring"; end if;             \* the request: done here (`perform`, `attach_now`), `here` last
     \* `ops_registered` after the request, or a submit a kick left (only ever once registered), asks with a fresh
     \* route, which is Elsewhere for this thread: a kick.
     if (reqFlag \/ submitFlag) /\ Wants then                                \* something asks, and the side wants an operation:
@@ -125,7 +147,7 @@ G_loop:                                                                      \* 
 G_take:                                                                      \* the side, for that work
     if holder = "none" then                                                  \* free: the ring's thread holds it
         holder := "ring";                                                    \* held,
-        if msg = "install" then reg := "registered"; end if;                 \* the registration done with the sides held,
+        if msg = "install" then reg := "registered"; here := "ring"; end if; \* the registration done with the sides held, `here` last,
         if Wants then submits := submits + 1; end if;                        \* and the side's want submitted here (Here)
     elsif msg = "install" then                                               \* held, the registration:
         reqFlag := TRUE;                                                     \* left as a request for the holder
@@ -162,6 +184,8 @@ Served == waiter ~> (submits > 0)                                            \* 
 
 \* An operation is submitted once for the waiter.
 OneSubmit == submits <= 1                                                    \* never twice
+\* Only a thread of the source's home issues on its own ring: the fast check's compare holds.
+OnlyHomeIssues == ~wrongRing                                                 \* never on another ring
 
 \* `Termination` (every process ends, so the read was served) is the one the translator writes for the fair processes.
 

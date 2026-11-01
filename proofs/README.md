@@ -1390,7 +1390,7 @@ ring's look and its install, which puts a closed number's file into the table,
 `NoClosedInstall`), and 4 witnesses.
 
 `tla/attach/Route.tla`, in the same family, checks a read of a ring source from a thread that
-runs no shard while the source's registration finishes (`Source::with_io` with `Source::via`
+runs no shard, or another shard, while the source's registration finishes (`Source::with_io` with `Source::via`
 and `Source::submit_if_registered`, `ensure_registered`, `ops_registered`, the side's
 `submit_wanted`). `with_io` reads the route before the side is
 taken: NotYet while the registration is under way, which issues nothing, Elsewhere once it is in
@@ -1399,11 +1399,18 @@ thread, where `ops_registered` submits for a waiter it finds, or by the side's h
 go. After its step, a read whose route was NotYet looks once more and, finding the source
 registered, asks the side to submit through the same path (the fix of commit 4bc2518): without
 it a registration that lands between the route and the step finds no waiter, the step leaves one
-and asks with NotYet, and nothing ever submits. 6 configurations: 4 that must pass (the read
-during the registration and after it, each with `OneSubmit`, one submit for the waiter, and no
-deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`), 1
-mutation (no look after the step breaks `Served`), and 1 witness (the late look asks for the
-submit).
+and asks with NotYet, and nothing ever submits. The route's fast check comes first: the
+registration's `here`, published last as the source is registered with its ring and cleared
+first as the registration goes (`attach_ring`, `install_ring`, `detach`, `evict_now`), names the
+shard whose thread reaches the source Here, and only a thread of that shard takes the Here route
+from it; the model reads it from a thread that runs no shard and from another ring shard's
+thread. 9 configurations: 6 that must pass (the read during the registration and after it, from
+no shard and from another shard, each with `OneSubmit`, one submit for the waiter, and no
+deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`,
+the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the home), 2
+mutations (no look after the step breaks `Served`; a fast check that drops its compare with the
+thread's own shard issues on the other shard's ring and breaks `OnlyHomeIssues`), and 1 witness
+(the late look asks for the submit).
 
 ## A shard that goes
 
@@ -1943,6 +1950,26 @@ room not filled is the last that takes anything (`fill_in_order`), with `fill_le
 bytes themselves, and the kernel's rule that a vectored read fills its descriptors in order, are
 left out. The property test `buf::tests::vectored::a_read_fills_rooms_in_order` checks the Rust
 code against the same rules.
+
+## A write edge nobody waits for
+
+`edgeskip` (`tla/edgeskip/EdgeSkip.tla`) checks the epoll driver passing over a write edge
+(`Source::on_event` and `write_wants_no_edge` in `src/io/source.rs`, `Side::biased_to` in
+`src/io/side.rs`, the write side's `releasing` hook in `src/io/source/hooks.rs`, `WriteState::idle`
+and `published` in `src/io/source/write.rs`, which after a hold whose step only wrote directly
+publishes idle without a look, a direct write needing that state) on a machine whose stores wait in a store buffer. Every holder of the
+write side publishes, as it lets go, whether the side waits for nothing an edge brings (no write
+blocked, nothing written behind, no connect, no lent buffer, no caller's own calls); the driver
+passes over a write edge only when the side was only ever held by its own thread (biased to it, not
+shared, no foreign thread came) and that thread's last release said idle. A foreign writer makes
+the side shared with a plain store before its locked take of the word, so once it holds, the
+driver's look sees the side shared, even while its own not-idle store still waits in its buffer.
+5 configurations: 2 that must pass (a biased side and a side made shared, each with an edge for
+nobody first and a foreign write the socket may refuse, with `WriteGoes`, the write goes out in the
+end, and no deadlock), 2 mutations that must deadlock (a look at `write_idle` alone passes over
+the edge a refused write waits for while its writer still holds the side; a look that leaves out
+the side's mode passes over it on a side made shared, which has no `intent` to raise), and 1
+witness (the edge for nobody is passed over).
 
 ## A queue with a count
 
