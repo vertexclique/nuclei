@@ -24,10 +24,17 @@ use crate::io::source::route::Route;
 use crate::io::sys;
 
 impl ReadState {
+    /// Whether [`submit_wanted`](Self::submit_wanted) has anything to do: a task waits, or a lent
+    /// buffer does.
+    #[inline(always)]
+    pub(crate) fn wants_ops(&self) -> bool {
+        !self.waiters.is_empty() || self.lent_waits()
+    }
+
     /// Issues the read the waiting tasks want, if any wait, where this
     /// thread reaches the driver.
     pub(crate) fn submit_wanted(&mut self, io: Io<'_>, kind: Kind, after: &mut After) {
-        if !self.waiters.is_empty() || self.lent_waits() {
+        if self.wants_ops() {
             self.complete(io, kind, self.want, after);
             // Bytes came and the pool has no buffer for them: the tasks read
             // them into their own (`read_starved`).

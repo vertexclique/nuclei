@@ -362,8 +362,26 @@ impl Source {
         let mut after = After::default();
         let hooks = self.hooks_in(shard);
         if done.read {
-            self.read_done.put(done);
-            self.read.defer(super::read_work::DONE, &mut after, &hooks);
+            if let Some(mut held) = self.read.try_hold_for(&hooks) {
+                // The side free: what the deferred `DONE` does is done now, the operation's
+                // arrivals still queued first and its end after them, with no trip through the
+                // mailbox or the deferred bits.
+                hooks.taken(held.get(), &mut after);
+                let st = held.get();
+                #[cfg(ring)]
+                if !self.read_arrivals.is_empty() {
+                    self.read_arrivals
+                        .take_all(|(arrival, epoch)| st.take_arrival(arrival, epoch, &mut after));
+                }
+                st.op_done(done, self.serving_fd(None), &mut after);
+                if st.wants_ops() {
+                    self.with_route(shard, |io| st.submit_wanted(io, self.kind, &mut after));
+                }
+                held.release(&mut after, &hooks);
+            } else {
+                self.read_done.put(done);
+                self.read.defer(super::read_work::DONE, &mut after, &hooks);
+            }
         } else if let Some(mut held) = self.write.try_hold_for(&hooks) {
             // The side free: the end is applied now, with no trip through the mailbox or the
             // deferred bits.
