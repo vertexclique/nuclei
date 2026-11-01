@@ -62,7 +62,10 @@ fn bench_file() -> std::path::PathBuf {
         // SAFETY: `name` is a C string and `fs` is the call's to fill.
         assert_eq!(unsafe { libc::statfs(name.as_ptr(), &mut fs) }, 0);
         let memory = matches!(fs.f_type as u32, 0x0102_1994 | 0x8584_58f6);
-        assert!(!memory, "the file_read row's file is on a memory filesystem; build on a disk");
+        assert!(
+            !memory,
+            "the file_read row's file is on a memory filesystem; build on a disk"
+        );
     }
     path
 }
