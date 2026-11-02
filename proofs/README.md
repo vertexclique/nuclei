@@ -2113,6 +2113,18 @@ has no `intent` to raise; a send with no look at the bit goes out ahead of a byt
 the side; a release that says the side holds nothing while a byte waits there does the same),
 and 1 witness (the owner sends on the bit).
 
+`tla/sendsnow/TakenFull.tla` checks that send when it finds the socket full and the shard is taken
+from its thread before the rest of the same poll (`Source::poll_write_bufs` and `poll_write_any`
+in `src/io/source/write/calls.rs`, `WriteState::found_full` in `src/io/source/write.rs`). The
+send's hold publishes nothing, so the side still says it was only ever its owner's and idle, and
+the shard's driver on its new thread may pass over the write edge the refusal owed, while the old
+thread's poll goes the way of any other thread (its call finds the shard taken). That way asks the
+kernel again under its own hold, which made the side shared, rather than block the side on the
+send's answer. 4 configurations: 2 that must pass (no take; a take between the poll's calls; with
+`BlockedOwed`, a blocked side has an edge owed, queued or left for its holder, and `Sent`), 1
+mutation (the foreign way blocking on the send's answer waits for an edge nothing owes, breaking
+`BlockedOwed`), and 1 witness (the new thread's driver passing over the edge).
+
 ## A queue with a count
 
 `counted` (`tla/counted/Counted.tla`) checks the queue a ring's thread takes items from without
