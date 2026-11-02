@@ -1370,21 +1370,29 @@ ends the stream. On macOS an accept that fails for want of a descriptor closes t
 took off the backlog (`Drops`), so after one the side first copies the listener's descriptor and
 closes the copy: none free, it answers EMFILE and takes nothing; one free, it accepts, though the
 rest of the process may take the last descriptor in between. The side hands an error over once and
-the connections queued before it first, so a retry asks the listener afresh. Time is the ticks left
-on the timer. 17 configurations: 7 that must pass (two and three connections across two outages,
+the connections queued before it first, so a retry asks the listener afresh. With `Ahead` the side
+takes connections ahead of the stream's polls into a queue of two, as a ring's multishot accept does
+for every connection that comes, and keeps the error it meets after them: running out of
+descriptors ends the ring's accept with EMFILE, and the stream yields the queued connections, then
+pauses, and its next poll asks for another accept. Time is the ticks left on the timer. 20
+configurations: 9 that must pass (two and three connections across two outages,
 with `NoBusyLoop`, at most one EMFILE between two ticks, `FirstWaitLeast`, the first pause after an
 accept the least, `LostPerOutage`, no more connections closed than outages began,
 `EndsOnlyForOther`, only the listener's own error ends the stream, and `AllServed`, every kept
 connection accepted once descriptors are free again or closed by a failed accept; the same on
 macOS, where a failed accept closes the connection it took; an outage followed by another error of
 the listener, with `OtherEnds`, the stream ends, and `NothingAfterEnd`; and the same three with
-connections reset in the backlog among the kept ones), 7 mutations (the stream that ended on
+connections reset in the backlog among the kept ones; a ring's multishot accept across an outage,
+with `NoneLeftQueued`, the stream never ends with connections taken ahead still queued, and
+`AllServed`; connections taken ahead and then the listener's other error, with `NoneLeftQueued`
+and `OtherEnds`), 8 mutations (the stream that ended on
 EMFILE, as it did before, breaks `AllServed`; a retry with no timer breaks `NoBusyLoop`; a pause
 that does not start over after an accept breaks `FirstWaitLeast`; on macOS a retry with no check
 for a free descriptor, as before, and a failed accept that does not mark the side for that check,
 break `LostPerOutage`; a reset connection's error that ends the stream, as WSAECONNRESET did on
 Windows, breaks `EndsOnlyForOther`; a skip that asks the listener nothing more until another
-connection comes breaks `AllServed`), and 3 witnesses (a retry after a pause that accepts a
+connection comes breaks `AllServed`; an error handed over before the connections taken ahead of
+it breaks `NoneLeftQueued`), and 3 witnesses (a retry after a pause that accepts a
 connection; a check that found a descriptor free and an accept that still closed a connection, the
 race the check cannot close; a kept connection accepted after a skip).
 

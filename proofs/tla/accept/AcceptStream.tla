@@ -37,6 +37,18 @@
 (* queued before it come first (`ReadState::accept_stream`), so a retry    *)
 (* asks the listener afresh.                                               *)
 (*                                                                          *)
+(* With `Ahead` set, the side takes connections ahead of the stream's      *)
+(* polls, as a ring's multishot accept does for every connection that      *)
+(* comes (and a readiness side for the polls that wait), into a queue of   *)
+(* at most two, and keeps the error it meets after them: the process out  *)
+(* of descriptors (the ring's multishot accept then ends with EMFILE), or  *)
+(* the listener's other error. The stream takes the queued connections     *)
+(* first and the error once they are gone (`accept_stream`); an EMFILE     *)
+(* handed over pauses the stream, whose next poll asks the side to accept *)
+(* again (a new multishot accept on the ring). A side that handed the      *)
+(* error first would end the stream with connections it took and never   *)
+(* yielded, which close when the stream drops.                             *)
+(*                                                                          *)
 (* What must never happen. A connection stays in the backlog for good once *)
 (* descriptors are free again. More connections are closed than the      *)
 (* outages that began (one each at most: the first accept that met it).   *)
@@ -44,7 +56,8 @@
 (* loop). The stream ends for anything but the listener's own error: a    *)
 (* reset connection or running out of descriptors. An error other than    *)
 (* those leaves the stream going. The first pause after an accept is      *)
-(* longer than the least.                                                  *)
+(* longer than the least. The stream ends with connections the side took  *)
+(* ahead still queued (`NoneLeftQueued`).                                  *)
 (*                                                                          *)
 (* What is abstract. Time is the ticks left on the timer (10 ms is one     *)
 (* tick, so the pause doubles from 1 up to `MaxDelay`); the descriptors   *)
@@ -63,6 +76,7 @@ CONSTANTS                                                                    \* 
     Resets,     \* connections the peers make and reset while they wait in the backlog
     Other,      \* TRUE: the listener fails once with an error other than running out of descriptors
     Drops,      \* TRUE: an accept that fails for want of a descriptor closes the connection it took (macOS)
+    Ahead,      \* TRUE: the side takes connections ahead into its queue, then keeps the error it meets (a ring's multishot accept)
     Mutation    \* "none", or the name of the one rule this run takes away
 
 MinDelay == 1                                                                \* the stream's least pause: one tick
@@ -93,7 +107,9 @@ variables                                                                    \* 
     skipped = 0,          \* reset connections whose error the side skipped
     skipServed = FALSE,   \* (record) an accept came after a skip
     stalled = FALSE,      \* (mutated) a skip left the stream waiting for the next connection to come
-    stallAt = 0;          \* how many connections the peers had made then
+    stallAt = 0,          \* how many connections the peers had made then
+    queued = 0,           \* connections the side took ahead, not handed to the stream yet
+    pendErr = "none";     \* the error the side met after them: "none", "emfile" or "other"
 
 define                                                                       \* names the properties use:
     AllIn == connected = N                                                   \* every peer connected
@@ -159,6 +175,23 @@ C_tick:                                                                      \* 
     end while;                                                               \* the stream ended
 end process;                                                                 \* end of the clock
 
+\* The side's accept ahead (`Ahead`): a ring's multishot accept, or a readiness side for its waiting polls.
+fair process side = "side"                                                   \* weakly fair, like every process
+begin                                                                        \* the side's steps:
+A_loop:                                                                      \* the next connection or error
+    while Ahead /\ ~done do                                                  \* only with `Ahead`, while the stream runs
+        await pendErr = "none" /\ (otherErr \/ (backlog > 0 /\ queued < 2));  \* something to take, and room to keep it
+        if otherErr then                                                     \* the listener's other error:
+            pendErr := "other";                                              \* kept after the queued ones
+        elsif out then                                                       \* no descriptor for the connection:
+            pendErr := "emfile";                                             \* the accept ends with EMFILE, the backlog left
+        else                                                                 \* a connection and a descriptor:
+            backlog := backlog - 1;                                          \* taken off the backlog
+            queued := queued + 1;                                            \* into the side's queue
+        end if;                                                              \* one of the three
+    end while;                                                               \* the stream ended
+end process;                                                                 \* end of the side
+
 \* The stream (`TcpStreamGenerator::poll_next`).
 fair process stream = "stream"                                               \* weakly fair, like every process
 begin                                                                        \* the stream's steps:
@@ -177,7 +210,21 @@ S_check:                                                                     \* 
             end if;                                                          \* else the copy closes and the accept goes on
         end if;                                                              \* the rest of the process may act now
 S_accept:                                                                    \* `poll_accept_stream`
-        if otherErr then                                                     \* another error:
+        \* MUTATION error_first: the side hands its error over before the connections it took ahead.
+        if Ahead /\ queued > 0 /\ ~(Mutation = "error_first" /\ pendErr # "none") then \* one taken ahead:
+            queued := queued - 1;                                            \* handed over first
+            got := got + 1;
+            retryServed := retryServed \/ paused;                            \* (record) after a pause
+            paused := FALSE;                                                 \* no pause since,
+            delay := MinDelay;                                               \* and the pause starts over at its least
+        elsif Ahead /\ pendErr = "other" then                                \* the listener's other error, once none is queued:
+            done := TRUE;                                                    \* the stream ends
+        elsif Ahead /\ pendErr = "emfile" then                               \* EMFILE, once none is queued:
+            pendErr := "none";                                               \* handed over once: the next poll accepts again
+            pause();                                                         \* the stream pauses
+        elsif Ahead then                                                     \* nothing taken ahead yet:
+            await queued > 0 \/ pendErr # "none";                            \* Pending until the side brings something
+        elsif otherErr then                                                  \* another error:
             done := TRUE;                                                    \* the stream ends (`take_error` says why)
         elsif stalled then                                                   \* (mutated) a skip left the poll waiting:
             await Made > stallAt;                                            \* Pending until another connection comes
@@ -259,6 +306,9 @@ EndsOnlyForOther == done => otherErr                                         \* 
 
 \* The first pause after an accept is the least.
 FirstWaitLeast == ~badFirst                                                  \* never a long first pause
+
+\* The stream never ends with connections the side took ahead still queued: they come before its error.
+NoneLeftQueued == done => queued = 0                                         \* none left behind
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)
