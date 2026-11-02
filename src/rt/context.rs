@@ -344,12 +344,19 @@ where
     O: FnOnce(&Shard) -> bool,
 {
     let here = local();
-    debug_assert!(core::ptr::eq(here.out.get(), here.slot.get()));
+    let out = here.out.get();
+    // `out` is the thread's slot, or the one its shard was taken from under a call that has
+    // ended since (`Bracket`'s drop), whose claim stays taken (proofs/tla/handoff, `D_safe`).
+    debug_assert!(core::ptr::eq(out, here.slot.get()) || here.slot.get().is_null());
     // SAFETY: as in `Bracket::take`.
-    let slot = unsafe { &*here.out.get() };
+    let slot = unsafe { &*out };
     let Some(word) = slot.mark_unless_claimed() else {
         return Err(runnable);
     };
+    debug_assert!(
+        core::ptr::eq(out, here.slot.get()),
+        "the leaf marked a taken slot"
+    );
     let pushed = match running(here) {
         Some(current) if ours(current) => {
             current.push_lifo_alone(runnable, info, here.in_task.get())
