@@ -292,6 +292,27 @@ again (every operation needs a reference or the handle, and none is left); and m
 refers to is freed. The loom models in `src/rt/task/loom_tests.rs` run the real code under
 weak memory orderings, with a calibration that loses a wake and must fail.
 
+The task's own code that panics outside its poll's catch is in the TLA+ model too (`Panics`):
+the future's drop (and the terminate hook after it), an output nobody takes, what the memory holds
+as it is freed, a hook around the poll, and the shutdown on a task's panic. Each panic is caught
+where it happens. A panic of a hook or of the future's drop is the task's outcome for its handle,
+even one that cancelled: a cancel whose future's drop panicked ends as a completion with that
+panic, closed no more (`RawTask::settle_panicked`), and a completion with a panic keeps it for a
+handle that cancelled during the poll; a handle that waited for a closed task's future looks again
+once it is gone. With no handle left, a panic is logged. With `Shutdown`, a runner may drop a
+runnable instead of running it (`drop_runnable`). 22 more configurations: 8 that must pass
+(awaiting, cancelling, dropping and detaching handles with every kind of panic, hooks, the
+shutdown dropping the runnable, and liveness), checking besides the properties above that no panic
+aborts (`NoAbort`), that every panic is told (`PanicTold`), and that a handle that awaits or
+cancels and waits gets the panic (`AwaiterGetsPanic`); 12 mutations (each abort the code once made
+on a panic of the future's drop, an output's drop, the free, a hook and the shutdown, `NoAbort`; a
+free whose panic skips the free, `CleanEnd`; a cancel that logs the panic though the handle waits,
+a handle that answers "no output" without looking again, and a completion that keeps the value
+over the drop's panic, `AwaiterGetsPanic`; a completion with the panic for no handle,
+`FreedAfterFuture`; an unclaimed panic, and one a handle let go of, dropped unlogged,
+`PanicTold`); and 2 witnesses (a cancel ending as a completion with a panic; the shutdown dropping
+a runnable).
+
 What the models leave out: the Lean model runs one whole operation at a time, so a poll is
 never seen in progress (that is TLA+'s part); the TLA+ model treats the future as one step per
 poll and the run queue as a count; the awaiter's waker cell is modelled by TLA+ only. The task

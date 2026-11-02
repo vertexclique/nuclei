@@ -28,6 +28,20 @@
 (* thread (and, with SelfWake, waking itself once first). The run queue is *)
 (* a count of runnables: their order does not matter to one task.          *)
 (*                                                                          *)
+(* The task's own code may panic outside the poll's catch (`Panics`): the *)
+(* future's drop (and the terminate hook after it), the drop of an output  *)
+(* nobody takes, the drop of what the memory holds as it is freed, a hook  *)
+(* around the poll, the runtime's shutdown on a task's panic. Each panic   *)
+(* is caught where it happens. A panic of the poll or of the future's drop *)
+(* becomes the task's outcome for its handle, even a handle that           *)
+(* cancelled: a cancel whose future's drop panicked ends as a completion   *)
+(* with that panic. With no handle left, a panic is logged. What must      *)
+(* never happen: a panic that aborts, a panic nobody is told of, a handle  *)
+(* that awaits and misses the panic.                                       *)
+(*                                                                          *)
+(* With `Shutdown`, a runner may drop a runnable instead of running it, as *)
+(* the runtime's shutdown does (`Runnable::drop`).                          *)
+(*                                                                          *)
 (* `Mutation` names one rule taken away, so that a configuration can show *)
 (* the property that rule protects really is checked (see README).         *)
 (***************************************************************************)
@@ -39,6 +53,10 @@ CONSTANTS
     WakeKind,  \* how the waker thread uses its waker: "by_value", "by_ref" or "drop"
     SelfWake,  \* TRUE: the future wakes itself once during its first poll
     Spurious,  \* how often the handle's executor may poll it again without a wake
+    Panics,    \* the task's own code that panics: a subset of "future" (its drop), "output"
+               \* (an output's drop), "free" (the drop as the memory goes), "hook" (around the
+               \* first poll) and "shutdown" (the shutdown on a task's panic)
+    Shutdown,  \* TRUE: a runner may drop a runnable instead of running it
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The waker thread's and the handle's numbers: no runner uses them.
@@ -88,11 +106,27 @@ variables
     parkWoken = FALSE,         \* the handle slept and was woken
     freer = "nobody",          \* who freed the memory: "runner", "waker" or "handle"
     awaitedAtComplete = FALSE, \* the handle still held the task as it completed
-    spurious = Spurious;       \* polls without a wake the handle's executor has left
+    spurious = Spurious,       \* polls without a wake the handle's executor has left
+    \* ---- where each panic of the task's own code went: "none" (it did not panic), "raised"
+    \* (caught, held by the thread that caught it), "outcome" (it is the task's stored outcome),
+    \* "told" (resumed in the handle, or logged), "silent" (dropped untold) or "aborted" ----
+    hookFate = "none",         \* a hook around the poll
+    dropFate = "none",         \* the future's drop
+    valueFate = "none",        \* the drop of an output (a value) the runtime lets go of
+    freeFate = "none",         \* the drop of what the memory holds, as it is freed
+    shutFate = "none",         \* the runtime's shutdown on the task's panic
+    unclosed = FALSE,          \* (record) a cancel ended as a completion with a panic, for the handle
+    shutDropped = FALSE;       \* (record) a runner dropped a runnable without running it
 
 define
     \* Every thread is done.
     AllDone == \A p \in Runners \cup {WakerT, HandleT} : pc[p] = "Done"
+    \* The stored outcome is a panic (of a hook or of the future's drop), not the future's value.
+    OutcomePanic == hookFate = "outcome" \/ dropFate = "outcome"
+    \* The output the run takes out of the task and drops itself: any, with no handle left; a
+    \* value of a handle that cancelled. A panic stays for a handle, even one that cancelled.
+    \* MUTATION cancel_panic_logged: a cancelled task's panic is dropped (and logged) too.
+    Unclaimed == ~tsk \/ (clo /\ (~OutcomePanic \/ Mutation = "cancel_panic_logged"))
 end define;
 
 \* Any step that touches the task's memory records it if the memory is gone.
@@ -100,11 +134,48 @@ macro touch() begin
     if freed then touchedFreed := TRUE; end if;
 end macro;
 
-\* Frees the memory; `by` is who did.
+\* Frees the memory; `by` is who did. The drop of what it holds (the schedule, a stored waker)
+\* may panic ("free"): caught and logged, and the memory freed all the same.
+\* MUTATION free_skips: a free whose drop panicked skips the free itself.
+\* MUTATION free_aborts: the drop's panic aborts the process, as it once did.
 macro destroy(by) begin
-    freed := TRUE;
-    frees := frees + 1;
-    freer := by;
+    if ~("free" \in Panics /\ Mutation = "free_skips") then
+        freed := TRUE;                       \* the memory goes back
+        frees := frees + 1;                  \* (record) once more
+        freer := by;                         \* (record) by whom
+    end if;
+    if "free" \in Panics then
+        freeFate := IF Mutation = "free_aborts" THEN "aborted" ELSE "told";
+    end if;
+end macro;
+
+\* The future's drop (with the terminate hook after it) panics, if this run says so ("future"):
+\* the dropper catches the panic and holds it until the task is settled.
+\* MUTATION drop_aborts: the panic aborts the process, as it once did.
+macro futurePanics() begin
+    if "future" \in Panics then
+        dropFate := IF Mutation = "drop_aborts" THEN "aborted" ELSE "raised";
+    end if;
+end macro;
+
+\* The exchange that ends a cancel after the future's drop (`settle`): with the drop's panic
+\* held and the handle there, the task completes with that panic for the handle, closed no
+\* more (`settle_panicked`); with no handle, the panic is logged. Without a panic it only
+\* clears the run's flags, which the step that uses it does.
+\* MUTATION cancel_panic_logged: the panic is logged though the handle is there.
+\* MUTATION unclose_ignores_handle: the task completes with the panic though no handle is left.
+macro unclose() begin
+    if dropFate = "raised" then
+        if (tsk /\ Mutation # "cancel_panic_logged") \/ Mutation = "unclose_ignores_handle" then
+            clo := FALSE;                    \* closed no more
+            comp := TRUE;                    \* completed, its outcome stored
+            output := "stored";              \* the outcome is there for the handle
+            dropFate := "outcome";           \* and it is the drop's panic
+            unclosed := TRUE;                \* (record)
+        else
+            dropFate := "told";              \* nobody to hand it to: logged
+        end if;
+    end if;
 end macro;
 
 \* Drops the future; `by` is who did.
@@ -127,7 +198,13 @@ macro releaseRef() begin
     if refs = 1 /\ (~tsk \/ Mutation = "free_ignores_handle") then
         \* MUTATION pending_leaks_future: the future of a task still open is left behind
         \* (what the established task crate does).
-        if ~(comp \/ clo) /\ Mutation # "pending_leaks_future" then dropFuture("runner"); end if;
+        if ~(comp \/ clo) /\ Mutation # "pending_leaks_future" then
+            dropFuture("runner");
+            \* Nobody can await the task: a panic of the drop is logged (`drop_unawaited`).
+            if "future" \in Panics then
+                dropFate := IF Mutation = "drop_aborts" THEN "aborted" ELSE "told";
+            end if;
+        end if;
         refs := 0;
         destroy("runner");
     else
@@ -249,6 +326,14 @@ R_pop:
     else
         queue := queue - 1;
         dropped := FALSE;
+        \* At the runtime's shutdown a runnable may be dropped instead of run.
+        if Shutdown then
+            either
+                goto R_start;
+            or
+                goto D_close;
+            end either;
+        end if;
     end if;
 R_start:
     \* The first exchange of the run, one addition: SCHEDULED, which the task of every runnable
@@ -267,7 +352,12 @@ R_poll:
     \* The future's poll.
     touch();
     if future = "dropped" then pollDropped := TRUE; end if;
-    if fired then
+    if "hook" \in Panics /\ hookFate = "none" then
+        \* A hook before or after the first poll panics, inside the poll's catch: the poll's
+        \* outcome is that panic. MUTATION hook_aborts: it aborts the process, as it once did.
+        hookFate := IF Mutation = "hook_aborts" THEN "aborted" ELSE "raised";
+        ready := TRUE;
+    elsif fired then
         ready := TRUE;
     else
         ready := FALSE;
@@ -286,9 +376,11 @@ R_poll:
 R_branch:
     if ready then goto R_store; else goto R_pend_drop; end if;
 R_store:
-    \* Ready: the future is dropped and its output written where it was.
+    \* Ready: the future is dropped (its drop may panic: caught, held) and its output written
+    \* where it was.
     touch();
     dropFuture("runner");
+    futurePanics();
     output := "stored";
     outDropped := FALSE;
     claimed := FALSE;
@@ -296,7 +388,29 @@ R_store:
     \* MUTATION release_after_complete: the run lets go of its reference after the
     \* completion's exchange, as it once did: the exchange, then the awaiter's take, then the
     \* drop. A handle polled in between takes the output and goes, and the run frees the task.
-    if Mutation = "release_after_complete" then goto R_complete_old; end if;
+    if Mutation = "release_after_complete" then
+        goto R_complete_old;
+    elsif hookFate # "raised" /\ "future" \notin Panics then
+        goto R_claim;                        \* no panic: the outcome is the value
+    end if;
+R_outcome:
+    \* The outcome is a panic: the poll's own (a hook's) if it had one, the drop's panic then
+    \* logged; else the drop's, and the value is dropped, a panic of its drop caught and logged.
+    \* The runtime's shutdown on a task's panic may panic too (`Sched::panicked`): caught, logged.
+    \* MUTATION complete_keeps_value: the value stays the outcome; the drop's panic is let go of.
+    \* MUTATION shutdown_aborts: the shutdown's panic aborts the process, as it once did.
+    if hookFate = "raised" then
+        hookFate := "outcome";               \* the poll's panic is the outcome
+        if dropFate = "raised" then dropFate := "told"; end if;   \* the drop's is logged
+    elsif Mutation = "complete_keeps_value" then
+        dropFate := "silent";                \* the value stays; the drop's panic goes untold
+    else
+        dropFate := "outcome";               \* the drop's panic is the outcome
+        if "output" \in Panics then valueFate := "told"; end if;   \* the value's drop: logged
+    end if;
+    if "shutdown" \in Panics /\ Mutation # "complete_keeps_value" then
+        shutFate := IF Mutation = "shutdown_aborts" THEN "aborted" ELSE "told";
+    end if;
 R_claim:
     \* `Header::claim`, when the word shows a stored waker the run has not claimed:
     \* fetch_or(NOTIFYING). A registration or a notification in progress keeps the cell and
@@ -318,14 +432,25 @@ R_claim_cell:
         claimNow := FALSE;
     end if;
 R_out:
-    \* With no handle, or a handle that cancelled during the poll, the run takes the output
-    \* out of the task, while its reference still holds it (the code drops it once the task
-    \* is let go of, before the awaiter's wake: what the model leaves in this step).
+    \* With no handle, or a handle that cancelled during the poll and an outcome that is a
+    \* value, the run takes the output out of the task, while its reference still holds it (the
+    \* code drops it once the task is let go of, before the awaiter's wake: what the model
+    \* leaves in this step). A panic outcome is logged; a value whose drop panics has that
+    \* panic caught and logged (`drop_unclaimed`).
     \* MUTATION complete_leaks_output: it leaves the output behind.
+    \* MUTATION unclaimed_silent: a panic outcome is dropped unlogged.
+    \* MUTATION output_drop_aborts: a value's drop that panics aborts, as it once did.
     touch();
-    if (~tsk \/ clo) /\ ~outDropped /\ Mutation # "complete_leaks_output" then
+    if Unclaimed /\ ~outDropped /\ Mutation # "complete_leaks_output" then
         useOutput("dropped");
         outDropped := TRUE;
+        if hookFate = "outcome" then
+            hookFate := IF Mutation = "unclaimed_silent" THEN "silent" ELSE "told";
+        elsif dropFate = "outcome" then
+            dropFate := IF Mutation = "unclaimed_silent" THEN "silent" ELSE "told";
+        elsif "output" \in Panics then
+            valueFate := IF Mutation = "output_drop_aborts" THEN "aborted" ELSE "told";
+        end if;
     end if;
 R_complete:
     \* One exchange: not running, not scheduled, completed (closed too with no handle left),
@@ -337,7 +462,7 @@ R_complete:
         \* A waker was stored since, its cell free: the exchange fails on the new word, and
         \* the run claims the waker first.
         goto R_claim;
-    elsif (~tsk \/ clo) /\ ~outDropped /\ Mutation # "complete_leaks_output" then
+    elsif Unclaimed /\ ~outDropped /\ Mutation # "complete_leaks_output" then
         \* The word changed to one that leaves the output to the run: drop it first.
         goto R_out;
     else
@@ -345,7 +470,13 @@ R_complete:
         run := FALSE;
         sch := FALSE;
         comp := TRUE;
-        if ~tsk then clo := TRUE; end if;
+        if ~tsk then
+            clo := TRUE;
+        elsif clo /\ OutcomePanic then
+            \* A panic kept for a handle that cancelled: closed no more, so the handle takes it.
+            clo := FALSE;
+            unclosed := TRUE;                \* (record)
+        end if;
         if claimed then
             ntf := FALSE;
             awt := FALSE;
@@ -381,10 +512,12 @@ R_out_old:
     end if;
     goto R_finish;
 R_pend_drop:
-    \* Pending, and found closed: the canceller left the future to this run.
+    \* Pending, and found closed: the canceller left the future to this run (its drop may
+    \* panic: caught, held).
     touch();
     if clo /\ ~dropped then
         dropFuture("runner");
+        futurePanics();
         dropped := TRUE;
     end if;
 R_pending:
@@ -396,6 +529,7 @@ R_pending:
         prevAwt := awt;
         run := FALSE;
         sch := FALSE;
+        unclose();                           \* the drop's panic, if any, settled with them
         goto R_finish;
     elsif sch then
         run := FALSE;
@@ -436,12 +570,14 @@ R_closed:
     \* first exchange set.
     touch();
     dropFuture("runner");
+    futurePanics();                          \* the drop may panic: caught, held
     cancelledQueued := TRUE;                 \* (record)
 R_closed_clear:
     touch();
     prevAwt := awt;
     \* MUTATION closed_keeps_running: RUNNING stays set, so the task looks polled for ever.
     if Mutation # "closed_keeps_running" then run := FALSE; end if;
+    unclose();                               \* the drop's panic, if any, settled with it
 R_finish:
     \* `finish`: take the awaiter, drop the run's reference, then wake the awaiter.
     if prevAwt then call Take(FALSE); end if;
@@ -449,6 +585,33 @@ R_finish_ref:
     dropRef();
 R_finish_wake:
     if took[self] then handleWoken := TRUE; took[self] := FALSE; end if;
+    goto R_pop;
+D_close:
+    \* `Runnable::drop` (`drop_runnable`), at the runtime's shutdown: close the task unless it
+    \* completed or is closed already.
+    touch();
+    if ~(comp \/ clo) then clo := TRUE; end if;
+    shutDropped := TRUE;                     \* (record)
+D_future:
+    \* The runnable owns the future: it drops it (the drop may panic: caught, held).
+    touch();
+    dropFuture("runner");
+    futurePanics();
+D_clear:
+    \* One exchange clears SCHEDULED, settling the drop's panic with it (`settle`).
+    touch();
+    sch := FALSE;
+    prevAwt := awt;
+    unclose();
+D_notify:
+    \* A stored waker is taken (`notify(None)`) ...
+    if prevAwt then call Take(FALSE); end if;
+D_wake:
+    \* ... and woken.
+    if took[self] then handleWoken := TRUE; took[self] := FALSE; end if;
+D_ref:
+    \* The runnable's reference goes.
+    dropRef();
     goto R_pop;
 end process;
 
@@ -568,9 +731,15 @@ H_poll:
         goto H_take;
     end if;
 H_closed_recheck:
-    \* Closed: wait until the future is gone.
+    \* Closed: wait until the future is gone. A cancel that ended as a completion with a panic
+    \* (closed no more) is looked at again, so the handle takes the panic (`poll_raw`).
+    \* MUTATION closed_no_recheck: the handle answers "no output" without looking again.
     touch();
-    if sch \/ run then goto H_park; end if;
+    if sch \/ run then
+        goto H_park;
+    elsif ~clo /\ Mutation # "closed_no_recheck" then
+        goto H_poll;
+    end if;
 H_closed_notify:
     call Take(TRUE);
 H_none:
@@ -593,9 +762,18 @@ H_take:
 H_take_notify:
     if tPrevAwt then call Take(TRUE); end if;
 H_take_out:
+    \* The output is the handle's: a panic outcome is resumed in the awaiter, so it is told.
     touch();
     useOutput("taken");
-    handleGot := "output";
+    if hookFate = "outcome" then
+        hookFate := "told";
+        handleGot := "panic";
+    elsif dropFate = "outcome" then
+        dropFate := "told";
+        handleGot := "panic";
+    else
+        handleGot := "output";
+    end if;
     goto H_detach;
 H_park:
     \* Pending: the handle's executor sleeps until its waker is woken, or polls it again
@@ -646,9 +824,16 @@ H_det_loop:
         goto H_det_push;
     end if;
 H_det_read:
-    \* The output is read out, to be dropped once the handle is gone.
+    \* The output is read out, to be dropped once the handle is gone (`cancel_and_let_go`): a
+    \* panic outcome is logged there; a value goes to the handle's dropper, whose own panic, if
+    \* its drop panics, is theirs. MUTATION detach_panic_silent: the panic goes unlogged.
     touch();
     useOutput("dropped");
+    if hookFate = "outcome" then
+        hookFate := IF Mutation = "detach_panic_silent" THEN "silent" ELSE "told";
+    elsif dropFate = "outcome" then
+        dropFate := IF Mutation = "detach_panic_silent" THEN "silent" ELSE "told";
+    end if;
     goto H_det_loop;
 H_det_push:
     if dPush then touch(); queue := queue + 1; end if;
@@ -687,8 +872,10 @@ FreedAfterFuture == freed => (futureDrops = 1 /\ output # "stored")
 \* left behind.
 CleanEnd == AllDone => (freed /\ futureDrops = 1 /\ output # "stored")
 
-\* A handle that awaits a task nobody cancels gets its output.
-AwaitGetsOutput == (HandleOp = "await" /\ pc[HandleT] = "Done") => handleGot = "output"
+\* A handle that awaits a task nobody cancels (the shutdown did not drop its runnable) gets its
+\* output: the value, or the panic of the task's own code.
+AwaitGetsOutput == (HandleOp = "await" /\ pc[HandleT] = "Done" /\ ~shutDropped)
+                       => handleGot \in {"output", "panic"}
 
 \* The run never frees a task whose handle held it as it completed: the handle's drop does,
 \* on the handle's thread, so a task's memory goes back where its awaiter runs before the
@@ -699,6 +886,24 @@ RunnerFreesNoAwaited == freer = "runner" => ~awaitedAtComplete
 \* A runner starts a run only on a task that is scheduled and not running: what lets the
 \* run's first exchange be one addition that turns SCHEDULED into RUNNING.
 RunnableScheduled == \A r \in Runners : pc[r] = "R_start" => (sch /\ ~run)
+
+\* Where every panic of the task's own code went, one entry each.
+Fates == <<hookFate, dropFate, valueFate, freeFate, shutFate>>
+
+\* No panic of the task's own code aborts the process.
+NoAbort == \A i \in 1..5 : Fates[i] # "aborted"
+
+\* Once every thread is done, every panic of the task's own code was told: resumed in the
+\* handle that awaited the task, or logged.
+PanicTold == AllDone => \A i \in 1..5 : Fates[i] \in {"none", "told"}
+
+\* The task's own code panicked: a hook around its poll, or its future's drop.
+TaskPanicked == hookFate # "none" \/ dropFate # "none"
+
+\* A handle that awaits the task, or cancels it and waits for its future to go, gets the panic
+\* of the task's own code as the task's outcome.
+AwaiterGetsPanic == (HandleOp \in {"await", "cancel"} /\ pc[HandleT] = "Done" /\ TaskPanicked)
+                        => handleGot = "panic"
 
 \* All the safety properties together.
 Safe == OnePoll /\ FutureOnce /\ NoPollAfterDrop /\ NothingAfterFree /\ OutputOnce
@@ -723,4 +928,8 @@ NoRegisterMeetsNotify == ~registerMetNotify
 NoLastWakerClose == ~lastWakerClosed
 \* The handle sleeps and is woken by the completion.
 NoParkWoken == ~parkWoken
+\* A cancel ends as a completion with a panic, for the handle.
+NoUnclose == ~unclosed
+\* A runner drops a runnable without running it.
+NoShutDrop == ~shutDropped
 =============================================================================
