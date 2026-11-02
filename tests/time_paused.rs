@@ -237,3 +237,116 @@ fn the_tasks_an_advance_makes_due_run_before_it_returns() {
         assert_eq!(*order.lock().unwrap(), [10, 20, 30]);
     });
 }
+
+/// How long a test waits for what must happen at once, before it fails.
+const SAFETY: Duration = Duration::from_secs(20);
+
+/// Whether `done` came true within `within` of real time, looked at again
+/// after a pause that doubles up to 5 ms.
+fn within(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = real() + within;
+    let mut pause = Duration::from_micros(10);
+    while !done() {
+        if real() >= deadline {
+            return false;
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(5));
+    }
+    true
+}
+
+/// `rt.block_on(future)` on a thread of its own, its output if it came
+/// within [`SAFETY`].
+fn block_on_within<F>(rt: &Runtime, future: F) -> Option<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = rt.handle();
+    let (done, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(handle.block_on(future));
+    });
+    ended.recv_timeout(SAFETY).ok()
+}
+
+/// A paused runtime of one worker whose poll the handoff takes after 10 ms.
+fn handed_on() -> Runtime {
+    Runtime::builder()
+        .worker_threads(1)
+        .pin_workers(false)
+        .handoff_after(Some(Duration::from_millis(10)))
+        .start_paused(true)
+        .build()
+        .expect("the runtime starts")
+}
+
+/// Holds the poll that calls it until `open`, which only the new runner of
+/// the poll's shard can set while the poll holds.
+fn hold_until_handed_on(open: &AtomicBool) {
+    assert!(
+        within(SAFETY, || open.load(Ordering::SeqCst)),
+        "the shard was never handed on"
+    );
+}
+
+#[test]
+fn a_local_task_left_on_a_thread_whose_shard_was_handed_on_sleeps_on_paused_time() {
+    let rt = handed_on();
+    let open = Arc::new(AtomicBool::new(false));
+    let gate = Arc::clone(&open);
+    let task = rt.spawn(async move {
+        let start = Instant::now();
+        // Bound to this thread; it first runs once the thread's shard went.
+        let local = nuclei::spawn_local(async move {
+            time::sleep(Duration::from_secs(3600)).await;
+            Instant::now() - start
+        });
+        hold_until_handed_on(&gate);
+        local.await
+    });
+    rt.block_on(rt.spawn(async {}));
+    open.store(true, Ordering::SeqCst);
+    assert_eq!(
+        block_on_within(&rt, task),
+        Some(Duration::from_secs(3600)),
+        "the local task's sleep never ended: the shard it runs on is not counted by the paused clock"
+    );
+}
+
+#[test]
+fn a_paused_clock_stands_still_while_a_poll_the_handoff_took_still_runs() {
+    let rt = handed_on();
+    let poll = rt.spawn(async move {
+        let start = Instant::now();
+        let (armed, slept) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (is_armed, has_slept) = (Arc::clone(&armed), Arc::clone(&slept));
+        // Queued behind this poll on its shard: it runs, and arms its sleep,
+        // only once the shard was taken from this thread and runs on another.
+        let sleeper = nuclei::spawn(async move {
+            let sleep = time::sleep(Duration::from_secs(1));
+            is_armed.store(true, Ordering::SeqCst);
+            sleep.await;
+            has_slept.store(true, Ordering::SeqCst);
+        });
+        hold_until_handed_on(&armed);
+        // The shard's new runner parks with the sleep armed: a jump now
+        // would come while this poll still runs.
+        let jumped = within(Duration::from_secs(2), || slept.load(Ordering::SeqCst));
+        (jumped, Instant::now() - start, sleeper)
+    });
+    let (jumped, elapsed, sleeper) = block_on_within(&rt, poll).expect("the poll ended");
+    assert!(
+        !jumped,
+        "the paused clock jumped while a poll the handoff took still ran"
+    );
+    assert_eq!(elapsed, Duration::ZERO, "the clock moved under the poll");
+    assert!(
+        block_on_within(&rt, sleeper).is_some(),
+        "the clock never jumped once the poll ended"
+    );
+}

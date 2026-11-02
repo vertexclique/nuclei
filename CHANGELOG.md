@@ -10,6 +10,14 @@
   jumps only while every shard is, so a removal posted to a parked shard held every jump of the
   runtime, and every sleeper on it waited for good. While a clock is paused or advanced every
   timer op now wakes its shard (`proofs/tla/clock`, the `post_no_wake` mutation).
+- **A paused clock counts a thread whose shard the handoff took.** The thread's bound tasks
+  finish on its own shard, which no paused clock looked at, so a sleep one of them armed there
+  never came due; and the rest of the poll the shard was taken from still ran on the thread, on
+  no shard, while the clock could jump past what it was about to do. The own shard is now a guest
+  of the paused clock, as a `block_on`'s is, and the rest of a taken poll is work in flight, as a
+  blocking job is: counted from the take until the thread runs it on its own shard, a guest
+  first, and again from when it leaves that shard (`proofs/tla/clock`, the
+  `M_uncounted_shard` and `detached_uncounted` runs).
 
 ### Changed
 

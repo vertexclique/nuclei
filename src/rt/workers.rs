@@ -126,6 +126,23 @@ impl Workers {
         }
     }
 
+    /// Polls the handoff took from their thread that run there still, on no
+    /// shard a paused clock counts.
+    pub(crate) fn detached(&self) -> usize {
+        self.monitor
+            .as_ref()
+            .map_or(0, |monitor| monitor.detached())
+    }
+
+    /// A taken poll's thread runs the rest of it on its own shard, counted
+    /// as a guest, until the guard goes, which counts it in flight again.
+    pub(crate) fn on_own(&self) -> Option<OnOwn<'_>> {
+        self.monitor.as_deref().map(|monitor| {
+            monitor.count_out();
+            OnOwn(monitor)
+        })
+    }
+
     /// Workers taking tasks.
     pub(crate) fn running(&self) -> usize {
         self.running.load(Ordering::Relaxed)
@@ -424,6 +441,15 @@ impl Drop for Exit {
     }
 }
 
+/// A taken poll run on its thread's own shard (`Workers::on_own`).
+pub(crate) struct OnOwn<'a>(&'a Monitor);
+
+impl Drop for OnOwn<'_> {
+    fn drop(&mut self) {
+        self.0.count_in();
+    }
+}
+
 /// A run handed to a thread that may not start.
 struct Handed(AtomicPtr<Run>);
 
@@ -503,16 +529,24 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
     worked
 }
 
-/// A thread whose shard was taken: its bound tasks finish on its own shard,
-/// their home's target moved there first.
+/// A thread whose shard was taken, its poll over: its bound tasks finish on
+/// its own shard, their home's target moved there first, and the shard
+/// counted by a paused clock before the poll is counted out of flight
+/// (proofs/tla/clock, `M_uncounted_shard`, `M_detached_uncounted`).
 #[expect(
     clippy::panic,
     reason = "a thread whose shard cannot start cannot run its bound tasks, which would wait forever"
 )]
 fn finish_home(monitor: &Monitor, home: &Home) {
+    let inner = context::runtime();
     // No bound task, nothing to finish: no own shard is made for it. None
-    // can begin meanwhile: only this thread spawns onto its home.
+    // can begin meanwhile: only this thread spawns onto its home. The poll
+    // may have been all a paused clock waited for.
     if home.is_idle() {
+        monitor.count_out();
+        if let Some(inner) = &inner {
+            super::paused::try_advance(inner, None);
+        }
         return;
     }
     let own = match context::own_shard() {
@@ -521,6 +555,12 @@ fn finish_home(monitor: &Monitor, home: &Home) {
     };
     home.target().move_to(&own.shared);
     let _current = context::enter(&own);
+    // Counted among the runtime's shards while its clock is paused, as a
+    // `block_on`'s own shard is: the bound tasks' timers are on it.
+    let _guest = inner
+        .as_ref()
+        .map(|inner| super::paused::Guest::enter(inner, &own.shared));
+    monitor.count_out();
     #[cfg(port)]
     own.take_port_back();
     own.block_on_then_leave(monitor.home_done(home));

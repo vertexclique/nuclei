@@ -3,8 +3,9 @@
 //!
 //! A paused clock jumps to the earliest armed timer when the runtime has
 //! nothing else to do: every shard of it (its workers, and the shards of the
-//! threads inside its `block_on`) is parked with nothing pushed to it, and
-//! no blocking job is queued or running. Each shard publishes the deadline of
+//! threads inside its `block_on`) is parked with nothing pushed or posted to
+//! it, no blocking job is queued or running, and no poll the handoff took
+//! from its thread runs there still. Each shard publishes the deadline of
 //! its earliest timer before it parks, and tries the jump itself (as does
 //! the blocking pool when its last job ends, and a thread leaving `block_on`):
 //!
@@ -89,10 +90,16 @@ pub(crate) fn try_advance(inner: &Inner, me: Option<&Shared>) -> bool {
     due
 }
 
+/// Work in flight on no shard a paused clock looks at: a blocking job, or a
+/// poll the handoff took from its thread.
+fn in_flight(inner: &Inner) -> bool {
+    inner.pool.jobs() != 0 || inner.workers.detached() != 0
+}
+
 fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
     let clock = &inner.clock;
     let members = clock.members();
-    if inner.pool.jobs() != 0 {
+    if in_flight(inner) {
         return false;
     }
     let mut seen: Vec<(Arc<Shared>, u64)> = Vec::new();
@@ -111,7 +118,7 @@ fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
         return false;
     }
     let unchanged = clock.members() == members
-        && inner.pool.jobs() == 0
+        && !in_flight(inner)
         && seen
             .iter()
             .all(|(shard, parks)| shard.idle() && shard.parks() == *parks);

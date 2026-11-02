@@ -401,6 +401,9 @@ fn finish_on_own<F: Future>(future: Pin<&mut F>, signal: &Arc<Signal>) -> F::Out
     let _guest = inner
         .as_ref()
         .map(|inner| crate::rt::paused::Guest::enter(inner, &own.shared));
+    // Out of flight while the shard, a guest, counts the work; in flight
+    // again before the guest leaves (proofs/tla/clock, `M_detached_uncounted`).
+    let _on_own = inner.as_ref().and_then(|inner| inner.workers.on_own());
     #[cfg(port)]
     own.take_port_back();
     own.run_then_leave(future, signal)
