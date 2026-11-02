@@ -22,6 +22,14 @@
 (* shard's poller whether the shard parks yet or not, so a wait that has  *)
 (* not begun ends as soon as it does.                                      *)
 (*                                                                          *)
+(* A notification is a kernel call that may fail (kqueue's `kevent`, the  *)
+(* port's `PostQueuedCompletionStatus`; an eventfd's write cannot):        *)
+(* src/rt/park/kqueue.rs and iocp.rs `Notifier::notify`. The waker that   *)
+(* took the flag back is the only one that will notify, so it tries again *)
+(* until the kernel takes the notification. The code gives up after       *)
+(* `NOTIFY_TRIES` failures in a row and reports the error; the model's    *)
+(* failures (`NotifyFails`) stay below that.                               *)
+(*                                                                          *)
 (* What is abstract: the inbox is a count (the order of work does not     *)
 (* matter here), which the shard's look reads exactly: that its look at   *)
 (* the real queue does (both ends, not the head alone) is checked in      *)
@@ -56,6 +64,7 @@ CONSTANTS
                \* its waker wakes the shard through the handshake, not its run queue
     FullQueue, \* TRUE: the shard's operations fill its ring's submission queue before it
                \* parks, so the wake's read waits behind them, outside the kernel
+    NotifyFails, \* how many notifications' kernel calls fail, in all
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* The shard's thread number: no waker uses it.
@@ -84,6 +93,7 @@ variables
     futureDue = FALSE, \* its deadline passed
     futureWoken = FALSE, \* the future's signal says it was woken, so the loop polls it
     wakeIn = ~FullQueue, \* the wake's read is in the kernel, where a notification ends a wait
+    failed = 0,        \* notifications whose kernel call failed so far
     outFired = FALSE;  \* (record) the drive fired the future's timer while the wake's read was out
 
 define
@@ -237,9 +247,29 @@ W_swap:
     if parked then
         parked := FALSE;
         if pc[ShardT] # "S_sleep" then spurious := TRUE; end if;   \* (record)
+    else
+        goto W_end;
+    end if;
+W_notify:
+    \* The notification's kernel call. While failures are left it may fail: the waker
+    \* tries again, as no other waker will notify the shard it took the flag back from.
+    if failed < NotifyFails then
+        either
+            failed := failed + 1;
+            \* MUTATION notify_swallowed: a failed notification is dropped and the waker
+            \* goes on, the shard asleep with nobody left to wake it.
+            if Mutation = "notify_swallowed" then goto W_end; else goto W_notify; end if;
+        or
+            pending := TRUE;
+            notifies := notifies + 1;
+        end either;
+    else
+        \* No failure left: the kernel takes it.
         pending := TRUE;
         notifies := notifies + 1;
     end if;
+W_end:
+    \* (check_first) The waker pushes its work only now.
     if Mutation = "check_first" then goto W_push; end if;
 end process;
 end algorithm; *)

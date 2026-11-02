@@ -481,7 +481,7 @@ impl Notifier {
     pub(crate) fn notify(&self) {
         // A full queue only drops a wake while another is pending, which
         // wakes the shard all the same.
-        let _ = super::post_notification(|| {
+        super::notify_until_taken(|| {
             // SAFETY: a packet with no operation, on a port that lives as
             // long as this notifier.
             let posted = unsafe {

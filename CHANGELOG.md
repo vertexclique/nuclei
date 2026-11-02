@@ -35,6 +35,12 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
+- **A notification of a sleeping worker that fails is tried again** (macOS, the BSDs, Windows).
+  `kevent` and `PostQueuedCompletionStatus` can fail for want of a resource, and the failure was
+  dropped. The waker that takes a sleeping shard's flag back is the only one that notifies it, so
+  the shard slept on with its new work. The notification is now tried again until the kernel
+  takes it, and after 64 failures in a row reported as an error (`proofs/tla/park/Park.tla`,
+  `notify_swallowed`).
 
 ### Changed
 

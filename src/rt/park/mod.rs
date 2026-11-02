@@ -56,6 +56,33 @@ pub(crate) fn fail_notifies(n: u32) -> u32 {
     FAIL_NOTIFIES.replace(n)
 }
 
+/// Notifications that fail in a row before the failure is reported.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const NOTIFY_TRIES: u32 = 64;
+
+/// Makes a notification's kernel call, `post`, until the kernel takes it.
+/// The waker that took a shard's flag back is the only one that notifies it
+/// (`ParkState::wake`): a failed call left at that would leave the shard
+/// asleep with its work for good (proofs/tla/park/Park.tla
+/// `notify_swallowed`). kqueue's `kevent` and the port's
+/// `PostQueuedCompletionStatus` fail only for want of a resource, which a
+/// try a moment later finds; after [`NOTIFY_TRIES`] in a row the failure is
+/// reported.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn notify_until_taken(post: impl Fn() -> std::io::Result<()>) {
+    let mut tries = 1;
+    while let Err(err) = post_notification(&post) {
+        if tries == NOTIFY_TRIES {
+            log::error!(
+                "a sleeping worker could not be woken ({err}): it runs its new work at its next timer or IO"
+            );
+            return;
+        }
+        tries += 1;
+        std::thread::yield_now();
+    }
+}
+
 /// A notification's kernel call, `post`, or the failure a test asked for
 /// in its place (kqueue's and the port's: an eventfd's write cannot fail).
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
