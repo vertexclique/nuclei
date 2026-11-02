@@ -7,6 +7,7 @@
 <li><code>bind</code> and <code>connect</code> are async, since a name may need looking up. Each takes the first address that works.</li>
 <li><code>recv</code> and <code>send</code> work on a shared reference; the stream is also <code>AsyncRead</code> and <code>AsyncWrite</code>, on the handle and on <code>&amp;</code> the handle, so one task can read while another writes.</li>
 <li><code>incoming()</code> gives the connections as a stream. <code>accept_multi()</code> gives a stream that owns a copy of the listener, so it may outlive the handle; on io_uring one accept stays armed for every connection that comes.</li>
+<li>An accept skips a connection its peer reset while it waited in the backlog, and takes the next one: the error (<code>ECONNABORTED</code>, on Windows <code>WSAECONNRESET</code> or <code>ERROR_NETNAME_DELETED</code>) is that connection's, not the listener's. Linux hands such a connection over as it is, and its first read reports the reset. The listener's own errors, such as running out of descriptors, still come back from <code>accept</code> and end <code>accept_multi</code>'s stream.</li>
 <li><code>read_owned</code> and <code>write_owned</code> lend the driver a buffer of yours, and <code>read_vectored_owned</code> and <code>write_vectored_owned</code> lend several in one call (<a href="io.html#vectored">IO utilities</a>).</li>
 </ul>
 

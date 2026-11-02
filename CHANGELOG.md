@@ -2,6 +2,24 @@
 
 ## 0.5.4
 
+### Fixed
+
+- **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
+  `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
+  for a connection its peer reset in the backlog before or while the accept took it. That error is
+  the connection's, but the side kept it for the listener's task: `accept` returned it, and
+  `accept_multi`'s stream ended with it, so the soak's server, whose peers reset with zero linger,
+  stopped serving within its first seconds on Windows. Every backend now tells such an error from
+  the listener's own (`lost_before_accept`) and skips the connection: a readiness side accepts the
+  next one at once, a completion side keeps nothing and its task's poll sends the next accept, and a
+  plain accept on io_uring that finds a connection a multishot accept brought gone (`ENOTCONN` from
+  its peer) takes the next one. `accept`, `incoming` and `UnixListener::accept` skip `ECONNABORTED`
+  as well, which they returned before (on macOS and the BSDs, for a connection reset in the
+  backlog), as `accept_multi` already skipped it on unix; Linux hands such a connection over as it
+  is, unchanged. The listener's own errors (out of descriptors or memory, not listening) still reach
+  `accept` and end the stream (`proofs/tla/accept/AcceptReset.tla`, and `AcceptStream.tla` with
+  reset connections).
+
 ### Changed
 
 - **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix
