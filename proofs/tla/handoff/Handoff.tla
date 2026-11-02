@@ -122,7 +122,10 @@ variables
     runnerCancels = 0,                   \* (record) a runner cancelled a pending claim
     leafBacks = 0,                       \* (record) a leaf push backed out on a claim
     gone = {},                           \* threads detached, not handed a shard since
-    staleBacks = 0;                      \* (record) a detached thread's leaf push backed out
+    staleBacks = 0,                      \* (record) a detached thread's leaf push backed out
+    runs = {1},                          \* threads whose context names a shard they run (`context::running`)
+    ownerDetached = 0,                   \* (record) a detached thread's IO owner step went the foreign way
+    markNoSlot = FALSE;                  \* an IO owner's mark read a thread's own slot the detach cleared
 
 define
     \* At most one actor is inside the shard's owned part.
@@ -143,6 +146,9 @@ define
     NoRunnerCancel == runnerCancels = 0
     NoLeafBack == leafBacks = 0
     NoStaleBack == staleBacks = 0
+    NoOwnerDetached == ownerDetached = 0
+    \* An IO owner's mark (`mark_call`) is made only by a thread that runs its shard, through its own slot.
+    NoMarkWithoutSlot == ~markNoSlot
     \* The leaf push is part of the algorithm under these modes: the leaf and its mutations.
     Leaf == Mode \in {"leaf", "leaf_no_check", "leaf_keeps_mark", "taken_cleared"}
 end define;
@@ -194,6 +200,7 @@ Spare:
     sl := assign[self];
     assign[self] := 0;
     gone := gone \ {self};
+    runs := runs \cup {self};
     e := 0;
     polls := 0;
     inS := inS \cup {self};
@@ -264,6 +271,8 @@ B_cas:
         end if;
         detachedCalls := 1;
         gone := gone \cup {self};
+        \* `Here::detach`: the thread's context names no shard, and its own slot is cleared.
+        runs := runs \ {self};
         goto D_unwind;
     else
         if claim[sl] = PENDING then
@@ -301,6 +310,7 @@ E_cas:
             claim[sl] := NONE;
         end if;
         gone := gone \cup {self};
+        runs := runs \ {self};
         goto D_unwind;
     else
         if claim[sl] = PENDING then
@@ -358,8 +368,9 @@ Blocked:
     await FALSE;
 D_unwind:
     \* Detached: the rest of the stack unwinds, and its code may call into the runtime again on the
-    \* slot it was taken from (`Bracket`'s drop put it back): a leaf push or a bracket, each of
-    \* which reads that slot's claim, taken for good, and stays out (see the opening story).
+    \* slot it was taken from (`Bracket`'s drop put it back): a leaf push, a bracket or an IO owner's
+    \* step, each of which reads that slot's claim, taken for good, and stays out (see the opening
+    \* story).
     if dc < DetachedCalls then
         dc := dc + 1;
         either
@@ -367,8 +378,27 @@ D_unwind:
             goto L_store;
         or
             goto B_store;
+        or
+            goto O_io;
         end either;
+    else
+        goto D_bound;
     end if;
+O_io:
+    \* An IO owner's step: it looks at the shard this thread runs (`context::running`) before it marks
+    \* its call (`mark_call`, through the thread's own slot). A detached thread runs none, so the step
+    \* marks nothing and goes the way of any other thread: a bracket on the slot `out` names, whose
+    \* claim is taken, so it stays out.
+    \* (MUTATION owner_skips_running: the step marks its call with no look at the shard the thread runs.)
+    if self \in runs \/ Mode = "owner_skips_running" then
+        \* `mark_call` reads the thread's own slot, which the detach cleared on a detached thread.
+        if self \notin runs then
+            markNoSlot := TRUE;
+        end if;
+    else
+        ownerDetached := 1;
+    end if;
+    goto B_store;
 D_bound:
     \* The creator runs its bound tasks on a shard of its own.
     if self = Creator then
