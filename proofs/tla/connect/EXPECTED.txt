@@ -6,3 +6,6 @@ M_no_retry        Connect   violated:NoWouldBlock
 M_fresh           Connect   violated:OwnSocket
 M_no_restart      Connect   violated:OkMeansQueued
 W_retried         Connect   violated:NeverRetried
+CP_reuse          MC_ConnectPort pass
+MCP_no_reuse      MC_ConnectPort violated:AsStd
+WCP_full          MC_ConnectPort violated:NoFailure
