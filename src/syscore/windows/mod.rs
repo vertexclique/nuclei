@@ -275,8 +275,6 @@ pub(crate) const SO_KEEPALIVE: i32 = 0x0008;
 pub(crate) const SO_LINGER: i32 = 0x0080;
 pub(crate) const SO_SNDBUF: i32 = 0x1001;
 pub(crate) const SO_RCVBUF: i32 = 0x1002;
-/// A bind to port 0 picks a port as a connect's own bind does: one other destinations may share.
-pub(crate) const SO_REUSE_UNICASTPORT: i32 = 0x3007;
 pub(crate) const IPPROTO_IP: i32 = 0;
 pub(crate) const IP_TOS: i32 = 3;
 
@@ -346,7 +344,6 @@ pub(crate) const WAIT_OBJECT_0: DWORD = 0;
 pub(crate) const WSAEINVAL: i32 = 10022;
 pub(crate) const WSAEMFILE: i32 = 10024;
 pub(crate) const WSAEMSGSIZE: i32 = 10040;
-pub(crate) const WSAENOPROTOOPT: i32 = 10042;
 pub(crate) const WSAEADDRINUSE: i32 = 10048;
 pub(crate) const WSAENETUNREACH: i32 = 10051;
 pub(crate) const WSAECONNABORTED: i32 = 10053;

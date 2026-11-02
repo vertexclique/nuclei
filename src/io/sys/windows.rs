@@ -343,33 +343,8 @@ pub(crate) fn family(raw: Raw) -> io::Result<u16> {
 }
 
 /// Binds a socket to the unspecified address of `family` and any port, as
-/// `ConnectEx` needs; a socket bound already stays as it is. The port is
-/// picked as a connect's own bind picks it, as std's connect does: one that
-/// connections to other destinations may share (`SO_REUSE_UNICASTPORT`),
-/// not one of its own, which a client that makes many connections runs out
-/// of while they wait out TIME_WAIT (proofs/tla/connect/ConnectPort.tla).
+/// `ConnectEx` needs; a socket bound already stays as it is.
 pub(crate) fn bind_any(raw: Raw, family: u16) -> io::Result<()> {
-    let on: i32 = 1;
-    // SAFETY: the option is an int, read from our own.
-    match check(unsafe {
-        setsockopt(
-            socket_of(raw),
-            SOL_SOCKET,
-            crate::syscore::windows::SO_REUSE_UNICASTPORT,
-            core::ptr::from_ref(&on).cast(),
-            size_of::<i32>() as i32,
-        )
-    }) {
-        // A system older than the option binds as it did; a socket bound
-        // already refuses it, and stays as it is below.
-        Err(err)
-            if matches!(
-                err.raw_os_error(),
-                Some(crate::syscore::windows::WSAENOPROTOOPT | crate::syscore::windows::WSAEINVAL)
-            ) => {}
-        Err(err) => return Err(err),
-        Ok(()) => {}
-    }
     let any = if family == AF_INET6 {
         SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
     } else {

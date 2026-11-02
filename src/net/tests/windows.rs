@@ -154,45 +154,6 @@ fn a_stream_left_with_a_send_out_goes_on_from_another_thread() {
     );
 }
 
-/// A stream nuclei connects binds its port as std's connect binds it: one that connections to
-/// other destinations may share (`SO_REUSE_UNICASTPORT`), so a client that makes many does not
-/// run out of ports while they wait out TIME_WAIT. Each of two listeners takes a connection from
-/// the same client, and both work.
-#[test]
-fn a_connect_binds_a_port_other_destinations_may_share() {
-    use crate::syscore::windows::{SO_REUSE_UNICASTPORT, SOCKET, SOL_SOCKET, getsockopt};
-    let rt = runtime();
-    rt.block_on(async {
-        for _ in 0..2 {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let stream = within(Handle::<TcpStream>::connect(listener.local_addr().unwrap()))
-                .await
-                .unwrap();
-            let (mut on, mut len) = (0i32, size_of::<i32>() as i32);
-            // SAFETY: the option is an int, written into our own.
-            let ret = unsafe {
-                getsockopt(
-                    stream.as_raw_socket() as SOCKET,
-                    SOL_SOCKET,
-                    SO_REUSE_UNICASTPORT,
-                    core::ptr::from_mut(&mut on).cast(),
-                    &mut len,
-                )
-            };
-            assert_eq!(ret, 0, "{}", io::Error::last_os_error());
-            assert_eq!(on, 1, "the connect's port is one of its own");
-            let (peer, _) = listener.accept().unwrap();
-            (&peer).write_all(b"ok").unwrap();
-            let mut buf = [0u8; 2];
-            let mut got = 0;
-            while got < 2 {
-                got += within(stream.recv(&mut buf[got..])).await.unwrap();
-            }
-            assert_eq!(&buf, b"ok");
-        }
-    });
-}
-
 /// A socket nuclei takes over answers `WouldBlock` where it would block, as a unix descriptor
 /// does: std's own calls through `get_ref` never block the shard.
 #[test]
