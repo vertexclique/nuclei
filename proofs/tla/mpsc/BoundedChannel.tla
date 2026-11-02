@@ -22,21 +22,27 @@
 (*                                                                          *)
 (* The message queue is a FIFO sequence of cells in the order sends       *)
 (* claimed them. A send claims its cell in one step and writes its value   *)
-(* in a later one, as in the channel's segment queue, so the receiver can  *)
-(* find the oldest cell claimed and not written yet. The queue answers     *)
-(* that nothing is there, as for an empty queue, so the receiver reads the *)
-(* sender count, which the send still writing keeps above zero, takes      *)
-(* nothing and waits for that send's wake.                                 *)
+(* in a later one, so the receiver can find the oldest cell claimed and    *)
+(* not written yet. The queue answers that nothing is there, as for an     *)
+(* empty queue, so the receiver reads the sender count, which the send     *)
+(* still writing keeps above zero, takes nothing and waits for that send's *)
+(* wake. This is the ring's order (src/sync/mpsc/queue/ring.rs, a channel  *)
+(* of at most `ring::MAX_CELLS` slots). Past that the channel uses the     *)
+(* radix queue (src/sync/mpsc/queue/radix.rs), whose receiver may take a   *)
+(* written cell ahead of a stalled one: claim order is then not take       *)
+(* order across senders, only each sender's own order is kept (Radix.tla   *)
+(* checks that take-ahead; the `skip_busy` mutation here is the unbounded  *)
+(* take-ahead that breaks a sender's order).                               *)
 (*                                                                          *)
-(* What is abstract: the queue's wait-free implementation, checked in       *)
-(* `chanring` and `radix` (its claim order is this sequence's order); the   *)
-(* receiver's waker cell is one flag that a wake empties (its handshake is *)
-(* checked by the loom models); a pass's look at the head of the waiting   *)
-(* list, which skips withdrawn waiters, is one step (a waiter never comes  *)
-(* back from withdrawn, so this is one of the orders the real loads can    *)
-(* take); and the receiver's look at the queue, the sender count and the   *)
-(* queue again (`Chan::pop`) is one step too, as the queue is abstract     *)
-(* anyway.                                                                 *)
+(* What is abstract: the queues' wait-free implementations, checked in      *)
+(* `chanring` and `radix`; the receiver's waker cell is one flag that a    *)
+(* wake empties (its handshake is checked by the loom models); a pass's    *)
+(* look at the head of the waiting list, which skips withdrawn waiters, is *)
+(* one step (a waiter never comes back from withdrawn, so this is one of  *)
+(* the orders the real loads can take); and the receiver's look at the     *)
+(* queue, the sender count and the queue again (`Chan::pop`) is one step   *)
+(* too: the three steps, and the second look's guard, are checked in       *)
+(* proofs/tla/unbounded on the same `Chan` code (MU_pop_no_second_look).   *)
 (*                                                                          *)
 (* `Mutation` names one rule taken away, so that a configuration can show *)
 (* the property that rule protects really is checked (see README).         *)
@@ -305,7 +311,9 @@ D_exit:
     \* The compare-and-swap that gives the role up: it fails, and the drain passes again,
     \* when the queue changed meanwhile, or when a release asked and somebody waits.
     \* MUTATION exit_ignores_release: the role is given up over a release's request.
-    if dirty \/ (found /\ wakeFront /\ Mutation # "exit_ignores_release") then
+    \* MUTATION exit_ignores_dirty: the role is given up over a dirty mark.
+    if (dirty /\ Mutation # "exit_ignores_dirty")
+       \/ (found /\ wakeFront /\ Mutation # "exit_ignores_release") then
         goto D_clear;
     else
         draining := FALSE;                  \* the role is free again
@@ -382,12 +390,16 @@ variables
     left = 0,           \* values still to put in, or slots still to give back
     sq = 0,             \* how many values this sender has put in so far
     wasGranted = FALSE, \* the cancelled request had been granted first
-    refusedOnce = FALSE; \* this "refused" operation was refused already: it is a "reserve" now
+    refusedOnce = FALSE, \* this "refused" operation was refused already: it is a "reserve" now
+    spurious = FALSE;   \* a "late_cancel" request was polled with no wake
 begin
 S_next:
-    \* The next operation, or the end of the program.
+    \* The next operation, or the end of the program. "hold" keeps the sender's handle
+    \* until the receiver's program is over.
     if i > Len(Prog[self]) then
         goto S_drop_sender;
+    elsif Prog[self][i].op = "hold" then
+        goto S_hold;
     else
         req := <<self, i>>;                 \* this operation's request
         refusedOnce := FALSE;               \* not refused yet
@@ -401,7 +413,9 @@ S_fresh:
     if closedBit /\ Mutation # "try_ignores_close" then
         status[req] := "failed";            \* closed: the operation fails at once
         goto S_failed;
-    elsif (~queuedBit \/ Mutation = "try_ignores_queue") /\ free >= OpOf(req).n then
+    \* A request for no slot succeeds unless the channel is closed, queue or not
+    \* (`FairSemaphore::try_acquire`'s `n == 0`).
+    elsif (~queuedBit \/ OpOf(req).n = 0 \/ Mutation = "try_ignores_queue") /\ free >= OpOf(req).n then
         free := free - OpOf(req).n;         \* the slots are free and nobody waits: take them
         if OpOf(req).op = "refused" /\ ~refusedOnce then
             inHand[self] := inHand[self] + OpOf(req).n;   \* the budget refuses: they go back
@@ -451,9 +465,19 @@ S_park:
         goto S_wait;
     end if;
 S_wait:
-    \* The task sleeps until its waker is called.
-    await woken[req];                       \* nothing happens to it until then
-    woken[req] := FALSE;                    \* the wake is used up
+    \* The task sleeps until its waker is called. A "late_cancel" request may also be polled
+    \* once with no wake (a combinator's poll), and is dropped while it waits, its waker
+    \* armed (a late cancel).
+    either
+        await woken[req];                   \* nothing happens to it until then
+        woken[req] := FALSE;                \* the wake is used up
+    or
+        await OpOf(req).op = "late_cancel" /\ ~spurious;
+        spurious := TRUE;                   \* a poll nobody's wake asked for
+    or
+        await OpOf(req).op = "late_cancel";
+        goto S_cancel;                      \* dropped while it waits
+    end either;
 S_repoll:
     \* `park(Some(waker))`: the grant is there, or the waker is armed again.
     if nodeState[req] = "granted" then
@@ -464,7 +488,8 @@ S_repoll:
     end if;
 S_granted:
     \* The future looks at the grant: the close (an error) or its slots.
-    if closedG[req] then
+    \* MUTATION close_grant_as_ok: the close's grant is taken for slots.
+    if closedG[req] /\ Mutation # "close_grant_as_ok" then
         status[req] := "failed";            \* the close: the operation fails
         goto S_failed;
     else
@@ -475,14 +500,21 @@ S_granted:
     end if;
 S_failed:
     \* The failed wait's drop (`Reserve`'s drop): wake a receiver that waits for a closed
-    \* channel to go idle.
-    if Finished then wake_rx(); end if;
+    \* channel to go idle (`wake_if_finished`).
+    \* MUTATION no_idle_wake: none of `wake_if_finished`'s calls wakes anybody.
+    if Finished /\ Mutation # "no_idle_wake" then wake_rx(); end if;
     goto S_op_done;
 S_cancel:
     \* `Wait::cancel`: withdraw the node, unless a grant got there first.
     if nodeState[req] = "granted" then
         wasGranted := TRUE;                 \* too late to withdraw: a grant came first
-        if closedG[req] then
+        \* MUTATION release_close_grant: the close's grant is given back as the slots
+        \* asked for, which it never carried.
+        if closedG[req] /\ Mutation = "release_close_grant" then
+            inHand[self] := inHand[self] + OpOf(req).n;
+            left := OpOf(req).n;
+            status[req] := "returned";
+        elsif closedG[req] then
             status[req] := "failed";        \* granted the close: nothing to give back
         else
             inHand[self] := inHand[self] + owned[req];   \* granted slots: give them back
@@ -525,7 +557,7 @@ S_cancel_wake:
     \* The cancelled wait's drop wakes a receiver whose closed channel just went idle.
     left := 0;                              \* nothing left to give back
     wasGranted := FALSE;                    \* and whether a grant came first is no longer asked
-    if Finished then wake_rx(); end if;
+    if Finished /\ Mutation # "no_idle_wake" then wake_rx(); end if;
     goto S_op_done;
 S_refuse:
     \* The refused attempt gives its slots back (`Chan::give_back`): one release, which hands
@@ -590,17 +622,23 @@ S_give_back:
 S_give_wake:
     \* `Chan::give_back`: wake a receiver whose closed channel just went idle.
     left := 0;                              \* nothing left to give back
-    if Finished then wake_rx(); end if;
+    if Finished /\ Mutation # "no_idle_wake" then wake_rx(); end if;
 S_op_done:
     \* On to the next operation.
     i := i + 1;                             \* the next position in the program
     goto S_next;
+S_hold:
+    \* "hold": the handle is kept until the receiver's program is over, so only the close
+    \* can end the channel meanwhile.
+    await pc[Rx] = "Done";
+    goto S_op_done;
 S_drop_sender:
     \* The sender handle's drop: one fetch_sub on the sender count ...
     txCount := txCount - 1;
 S_drop_wake:
     \* ... and the last sender wakes the receiver, whose channel has ended.
-    if txCount = 0 then wake_rx(); end if;
+    \* MUTATION last_drop_no_wake: it goes without waking it.
+    if txCount = 0 /\ Mutation # "last_drop_no_wake" then wake_rx(); end if;
 end process;
 
 (***************************************************************************)
@@ -740,12 +778,13 @@ Conservation ==
     /\ Len(mq) <= Cap
 
 \* First come, first served: a request that was already in line when another began is never
-\* still waiting once that other one has its slots, a `try_` that took slots included.
+\* still waiting once that other one has its slots, a `try_` that took slots included (a
+\* request for no slot takes nothing from anybody, so it does not count).
 \* `ahead` forgets a request once it leaves the line. That changes no answer: a request that
 \* left the line never waits again, so it could never break this check. It only lets two runs
 \* that differ in nothing but who has left the line count as one state.
 FifoFair ==
-    \A r \in Reqs : status[r] \in {"granted", "done", "returned"} =>
+    \A r \in Reqs : status[r] \in {"granted", "done", "returned"} /\ OpOf(r).n > 0 =>
         \A q \in ahead[r] : status[q] # "waiting"
 
 \* After the close nothing new is admitted: no slot leaves the word, and every operation that
@@ -779,6 +818,9 @@ ExactlyOnce ==
 PerSenderOrder ==
     \A j, m \in DOMAIN received :
         j < m /\ received[j][1] = received[m][1] => received[j][2] < received[m][2]
+
+\* A value is pushed only through a permit a sender holds: no sender's permits go below zero.
+PermitsSound == \A s \in Senders : held[s] >= 0
 
 \* All the safety properties together.
 Safe == Conservation /\ FifoFair /\ CloseSemantics /\ CloseReturnsShare

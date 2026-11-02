@@ -49,3 +49,12 @@ W_end_by_idle                  MC_BoundedChannel    violated:NoEndByIdle
 W_grant_before_park            MC_BoundedChannel    violated:NoGrantBeforePark
 W_park_on_busy                 MC_BoundedChannel    violated:NoParkOnBusy
 W_skip_registered              MC_BoundedChannel    violated:NoSkipRegistered
+BC_live_give_hold              MC_BoundedChannel   pass
+ML_no_idle_wake                MC_BoundedChannel   violated:Termination
+ML_last_drop_no_wake           MC_BoundedChannel   violated:Termination
+ML_exit_ignores_dirty          MC_BoundedChannel   violated:Termination
+M_release_close_grant          MC_BoundedChannel   violated:Conservation
+M_close_grant_as_ok            MC_BoundedChannel   violated:PermitsSound
+BC_late_cancel                 MC_BoundedChannel   pass
+BC_live_late_cancel            MC_BoundedChannel   pass
+BC_try_zero                    MC_BoundedChannel   pass

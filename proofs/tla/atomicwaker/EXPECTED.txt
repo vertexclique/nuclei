@@ -1,0 +1,7 @@
+# configuration                spec                 expected
+A_register                     MC_AtomicWaker       pass
+A_displacing                   MC_AtomicWaker       pass
+A_two_wakers_displacing        MC_AtomicWaker       pass
+M_no_self_wake                 MC_AtomicWaker       violated:SelfWoken
+M_no_wake_taken                MC_AtomicWaker       violated:SelfWoken
+M_failure_path_drops_displaced MC_AtomicWaker       violated:AllEnd

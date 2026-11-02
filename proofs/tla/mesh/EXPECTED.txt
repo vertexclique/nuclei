@@ -5,3 +5,6 @@ M_fixed_start                  MC_Mesh              violated:QuietServed
 M_register_first_only          MC_Mesh              violated:Termination
 W_sleep                        MC_Mesh              violated:NoSleep
 W_overtake                     MC_Mesh              violated:NoOvertake
+E_three                        MC_MeshEnd           pass
+ME_refuse_no_wake              MC_MeshEnd           violated:Ends
+ME_end_on_one                  MC_MeshEnd           violated:NoEarlyEnd

@@ -10,3 +10,10 @@ WB_superseded                  MC_Broadcast         violated:NoSuperseded
 MB_upgrade_closed              MC_Broadcast         violated:Counted
 WB_upgraded                    MC_Broadcast         violated:NoUpgrade
 WB_refused                     MC_Broadcast         violated:NoRefused
+BW_safe                        MC_BroadcastWait     pass
+BW_subscribe                   MC_BroadcastWait     pass
+MBW_notified_after_look        MC_BroadcastWait     violated:AllEnd
+MBW_tail_before_closed         MC_BroadcastWait     violated:EndAfterAll
+MBW_close_no_notify            MC_BroadcastWait     violated:AllEnd
+MBW_last_rx_no_notify          MC_BroadcastWait     violated:AllEnd
+MBW_closed_no_recount          MC_BroadcastWait     violated:AllEnd

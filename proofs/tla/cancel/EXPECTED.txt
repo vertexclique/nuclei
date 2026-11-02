@@ -9,3 +9,6 @@ M_no_detach                    MC_Cancel            violated:RegistryHoldsTheLiv
 M_no_walk_up                   MC_Cancel            violated:NoLeak
 W_self_cancel                  MC_Cancel            violated:NoSelfCancel
 W_found_marked                 MC_Cancel            violated:NoFoundMarked
+CR_two_children                MC_CancelRegistry    pass
+MCR_flag_after_walk            MC_CancelRegistry    violated:AllChildrenCancelled
+MCR_walk_misses_present        MC_CancelRegistry    violated:AllChildrenCancelled

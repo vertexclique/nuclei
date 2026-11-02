@@ -21,3 +21,4 @@ M_permit_not_converted         MC_Notify            violated:EveryAwaiterEnds
 M_leftover_lost                MC_Notify            violated:OneIsKept
 M_count_withdrawn_grant        MC_Notify            violated:EveryAwaiterEnds
 W_owed_to_woken                MC_Notify            violated:LateAwaiterEnds
+S_two_broadcasts               MC_Notify            pass

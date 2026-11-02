@@ -113,8 +113,9 @@ code (a compare-and-swap, a fetch-and-add, a load), named after the Rust functio
 for, with two exceptions the spec's header explains: the pass's look past withdrawn waiters at
 the head of the line is one step, and so is the receiver's look at the queue and the sender
 count. The message queue is a sequence of cells in the order sends claimed them: a send claims
-its cell in one step and writes its value in a later one, as in kovan's segment queue, so the
-receiver can find the oldest cell claimed and not written yet. It then takes nothing, reads the
+its cell in one step and writes its value in a later one, as the channel's ring and radix queues
+do (src/sync/mpsc/queue/ring.rs and radix.rs), so the receiver can find the oldest cell claimed
+and not written yet. It then takes nothing, reads the
 sender count, which that send keeps above zero, and waits for that send's wake, which comes
 after the write. Every line carries a comment.
 
@@ -3210,6 +3211,51 @@ with it; it is caught, and the runner takes the default name. 6 configurations: 
 name's and the start, park and unpark hooks' panics left uncaught, each breaking `NoLoss`), and a
 witness (a caught panic). A blocking-pool thread's start hook and name are `tla/pool/Start.tla`'s.
 
+## More sync and time models
+
+Each family below has GREEN configurations and a RED one per guard, listed in its
+`EXPECTED.txt`; each `.tla` header names the Rust it stands for.
+
+- **`tla/atomicwaker`**: the waker cell's register, displacing register and take. A
+  registration that found the cell in use, or that a wake met, has its own waker woken
+  (`SelfWoken`); a displacing registration wakes the waker it replaced, even when a wake met it;
+  a take only ever lowers its own bit, so its `fetch_and` is the same as a store.
+- **`tla/localchan`**: the single-shard bounded channel (`LocalChan.tla`: slots, reservations,
+  `closed()`, the receiver's end only with no slot reserved) and one-shot channel
+  (`LocalOneshot.tla`), one task step at a time.
+- **`tla/oncecell/SetOnce.tla`**: `SetOnce`'s set (publish, then the event) and wait (look,
+  wait for the event, look again); `M_close_before_publish` is the once-cell's own order.
+- **`tla/watch`** also runs `send_replace` (published before the clone, which may panic),
+  `wait_for`, `subscribe` and the sender's clone.
+- **`tla/broadcast/BroadcastWait.tla`**: a receive's `Notified` made before its look, the
+  closed flag read before the tail, `Sender::closed` and the last receiver's wake, and
+  `subscribe`.
+- **`tla/notify`** now passes in the code's order (expiry from the front, arrivals checked one
+  by one, withdrawn nodes swept only now and then, QUEUED cleared only with the list empty) and
+  runs two notifiers at once.
+- **`tla/unbounded`**: see the channel above.
+- **`tla/waiter/WakeList.tla`**: a pass's wake list, its walk and the `WakeRest` that wakes
+  the rest after a waker panics; `Waiter.tla`'s cancel no longer takes an owed mark back, as
+  `Wait::cancel` never does.
+- **`tla/blocking`**: a blocking wait's park loop on a plain thread, and wasm32's error for a
+  wait that would park its only thread.
+- **`tla/wheel`**: the timer wheel as a data structure, shrunk to two slots and two levels:
+  placement, the advance and its cascade, the span's edge, and keys whose generation keeps a
+  stale removal off the entry's next timer (the generation is unbounded here: its `u32` wrap is
+  a stated ceiling).
+- **`tla/interval`** and **`tla/timeout`**: an interval's three ways to treat a late tick and
+  a deadline past the clock's range, and a timeout's race of its future against its sleep.
+- **`tla/timer`** also checks a post against a shard that stopped (the fence between the push
+  and the look at `stopped`) and a drop's cancel against an orphan; **`tla/clock`** adds a
+  guest joining while a jump is decided (`ClockJoin.tla`).
+- **`tla/reentrant/ReentrantRaw.tla`**: a nested read never queues behind the plain lock's
+  owed handoff, and a dropped read's share goes back.
+- **`tla/rwlock`** adds a dropped upgrade, a dropped upgradable read, the reader bound, an
+  upgrade with a queued writer and a downgrade held until a reader joins it; **`tla/semaphore`**
+  adds the close with an owed waiter, a dropped weighted wait and a sweep that runs only now
+  and then; **`tla/mpsc`** adds a sender that holds its handle, so the idle wake of a closed
+  channel is checked on its own.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the
@@ -3218,16 +3264,20 @@ witness (a caught panic). A blocking-pool thread's start hook and name are `tla/
   Lean covers every size, but only one whole operation at a time.
 - **The message queue.** The TLA+ model treats it as a sequence of cells in claim order, each
   claimed by a send before it is written, so `PerSenderOrder` is proved for a queue that hands
-  cells out in claim order. Its lock-free implementation is kovan's, checked there (kovan's
-  own TLA+ model of the segment queue checks that order).
+  cells out in claim order: the ring's (src/sync/mpsc/queue/ring.rs), checked in `tla/chanring`.
+  A channel past the ring's size uses the radix queue (src/sync/mpsc/queue/radix.rs), whose
+  receiver may take a written cell ahead of a stalled one; `tla/radix` checks that take-ahead
+  and that each sender's order survives it.
 - **The receiver's waker cell.** The TLA+ model treats it as one flag that a wake empties; its
   own handshake is covered by the loom models.
 - **Memory ordering.** A TLA+ step is atomic and seen by every thread at once. Whether the
   orderings the Rust code gives its atomics are strong enough is what the loom models check,
   for small cases; neither TLA+ nor Lean says anything about it.
-- **The rest of the channel.** The unbounded channel, weak senders and their upgrade,
-  `Sender::closed`, `recv_many`, the waiter nodes' recycling, the waiting list's sweep of
-  withdrawn nodes, and the destructors of values are not in these models.
+- **The rest of the channel.** `tla/unbounded` checks the unbounded channel's admission,
+  senders, clone, weak upgrade, `Chan::pop` with its second look, `recv_many`, `try_recv` and
+  the receiver's drop, on the `Chan` code the bounded channel shares. `Sender::closed` (an
+  `Event`), the waiter nodes' recycling (`tla/waiter`) and the destructors of values are not
+  in the bounded channel's model.
 - **The newer families' abstractions.** The signal model leaves out the handler's
   async-signal-safety and its errno (code review and the signal tests' part); the process
   models abstract the kernel's reap to one step; the port model abstracts Windows'

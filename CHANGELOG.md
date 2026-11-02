@@ -497,8 +497,27 @@
   once. It now takes what is left of the period now falls in, so the next tick is the next one
   of the schedule after now (`proofs/tla/interval/Interval.tla`).
 
+- **An interval never panics on a tick past the clock's range, and a skip lands after now
+  however far behind it is.** The next tick was the last one plus the period with `+`, which
+  panics past the clock's range: `interval(Duration::MAX)` panicked in its first tick, and
+  `reset` did the same. Such a tick now waits in the far future, as a timeout's deadline does,
+  so a period too large ticks once. `Skip` counted the periods it missed in a `u32`: late by more
+  than 2^32 periods (49 days at a millisecond), its next tick was still in the past and fired at
+  once. It now takes what is left of the period now falls in, so the next tick is the next one
+  of the schedule after now (`proofs/tla/interval/Interval.tla`).
+
 ### Changed
 
+- **Every sync primitive and timer path has a model.** The waker cell, the single-shard
+  channel and one-shot channel, `SetOnce`, the broadcast channel's waits, a blocking wait's park
+  loop, the wake list, the timer wheel, intervals, timeouts and the clock's read path now have
+  TLA+ models, and the unbounded channel's model covers its senders, weak upgrade, pop and
+  receives. Notify's model passes in the code's order with two notifiers, the waiter model's
+  cancel no longer takes back an owed mark the code keeps, and each guard the audit found
+  without one (in the bounded channel, the semaphore, the reader-writer lock, Notify, the
+  one-shot channel, the remote timer and the paused clock) has a configuration that removes it
+  and must fail. The owner-named lock, which nothing used, is gone (`proofs/README.md`, "More
+  sync and time models").
 - **A stream read the kernel's last count covers asks for no new count** (Linux, epoll). A read
   into the task's own buffer asks the kernel how many bytes it leaves (`TCP_INQ`, `SO_INQ`), with
   `recvmsg` and its control message, to know without another call whether the socket is empty.
