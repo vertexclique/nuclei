@@ -23,7 +23,9 @@
 (*                                                                          *)
 (* What is abstract. One spawn, one worker, one start. The spawn's looks,  *)
 (* count and push are one step (tla/placement/Placement.tla checks them    *)
-(* against a drain and a handoff).                                         *)
+(* against a drain and a handoff). The publish runs under the lock of the  *)
+(* list a shutdown joins, in `spawn_thread`'s `started`, once the thread   *)
+(* is on the list (tla/teardown/Grow.tla checks that against a drop).      *)
 (***************************************************************************)
 EXTENDS TLC                                                                  \* TLC's helpers
 

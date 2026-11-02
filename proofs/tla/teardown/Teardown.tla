@@ -40,7 +40,9 @@
 (* one step. A spare is P: T1 and T2 waiting as spares get no gift (the   *)
 (* one gift goes to P or T2) and leave at the close. Thread starts never   *)
 (* fail (a failed one leaves the gift with the monitor, which drops it     *)
-(* inside the runtime at its end).                                         *)
+(* inside the runtime at its end). A worker a task starts as the drop runs *)
+(* (the take's second stop, the list's close, a monitor started late) is   *)
+(* tla/teardown/Grow.tla's.                                                *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC                                            \* numbers, set sizes, TLC's helpers
 

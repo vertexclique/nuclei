@@ -16,3 +16,11 @@ MJ_count_messages        Join       violated:WaitsForAll
 MJ_finished_only         Join       violated:Returns
 MJ_forget_exits          Join       violated:Returns
 WJ_message_first         Join       violated:NoMessageFirst
+G_safe                   Grow       pass
+MG_no_restop             Grow       violated:DropReturns
+MG_publish_unlocked      Grow       violated:DropReturns
+MG_start_ignores_close   Grow       violated:StartedJoined
+MG_monitor_ignores_close Grow       violated:StartedJoined
+MG_monitor_untaken       Grow       violated:StartedJoined
+WG_between               Grow       violated:NoBetween
+WG_refused               Grow       violated:NoRefused

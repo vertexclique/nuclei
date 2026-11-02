@@ -2652,6 +2652,21 @@ that may never pass), 3 mutations (today's count of messages, breaking `WaitsFor
 counting for nothing, and the monitor's messages forgotten, each a wait for good, breaking
 `Returns`), and a witness (a message received before its thread reads as finished).
 
+`tla/teardown/Grow.tla`, in the same family, checks a worker a task starts as the runtime drops
+(`start_one`, `spawn_thread`, `start_monitor`, `take_monitor` and `take_threads` in
+`src/rt/workers.rs`; `stop_and_join` in `src/rt/runtime.rs`; `shutdown_background` in
+`src/rt/runtime/enter.rs`). The drop stopped every shard before it took its list of threads, and a
+start in between published its shard after that stop: on the list, the drop waited on its thread
+for good; after the take, the thread ran on, never stopped or joined. A start now, under the
+list's lock, looks at the list's close, starts its thread, puts it on the list and publishes its
+shard; the take closes the list and stops every shard again, and takes a monitor a first start
+began since the drop took the monitor's thread, which starts only while the list is open. 8
+configurations: one that must pass (`StartedJoined`, `DropReturns`, no deadlock), 5 mutations (no
+second stop, and the publish after the lock is let go, each breaking `DropReturns`; the start's
+look at the close left out, the monitor's look left out, and the late monitor left untaken, each
+breaking `StartedJoined`), and 2 witnesses (a publish between the stop and the take; a start that
+finds the list closed).
+
 ## A thread hook that panics
 
 `hooks` (`tla/hooks/Hooks.tla`) checks the hooks a runner thread calls (`ThreadHooks::started`,
