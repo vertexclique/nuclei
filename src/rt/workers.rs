@@ -134,13 +134,31 @@ impl Workers {
             .map_or(0, |monitor| monitor.detached())
     }
 
-    /// A taken poll's thread runs the rest of it on its own shard, counted
-    /// as a guest, until the guard goes, which counts it in flight again.
-    pub(crate) fn on_own(&self) -> Option<OnOwn<'_>> {
-        self.monitor.as_deref().map(|monitor| {
-            monitor.count_out();
-            OnOwn(monitor)
-        })
+    /// Counts out of flight the poll this thread runs that the handoff took
+    /// from one of these workers, if it runs one: its thread's shard just
+    /// joined the paused clock's guests, which count its work from now on.
+    pub(crate) fn count_out_taken_here(&self) -> bool {
+        let from = context::detached_from();
+        match &self.monitor {
+            Some(monitor)
+                if from != 0
+                    && self
+                        .shards()
+                        .any(|shard| Arc::as_ptr(shard) as usize == from) =>
+            {
+                monitor.count_out();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Counts a poll [`count_out_taken_here`](Self::count_out_taken_here)
+    /// counted out in flight again, before its guest leaves.
+    pub(crate) fn count_in_taken(&self) {
+        if let Some(monitor) = &self.monitor {
+            monitor.count_in();
+        }
     }
 
     /// Workers taking tasks.
@@ -441,15 +459,6 @@ impl Drop for Exit {
     }
 }
 
-/// A taken poll run on its thread's own shard (`Workers::on_own`).
-pub(crate) struct OnOwn<'a>(&'a Monitor);
-
-impl Drop for OnOwn<'_> {
-    fn drop(&mut self) {
-        self.0.count_in();
-    }
-}
-
 /// A run handed to a thread that may not start.
 struct Handed(AtomicPtr<Run>);
 
@@ -526,27 +535,30 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
     // goes (a port's keeper) goes there. Its last drop runs where its last
     // holder lets go.
     drop(shard);
+    // The taken poll and all it led to on this thread are over, its bound
+    // tasks too: out of flight, which may be all a paused clock waited for
+    // (proofs/tla/clock, `M_detached_uncounted`).
+    if worked == Worked::Detached
+        && let Some(monitor) = &workers.monitor
+    {
+        monitor.count_out();
+        super::paused::try_advance(inner, None);
+    }
     worked
 }
 
-/// A thread whose shard was taken, its poll over: its bound tasks finish on
-/// its own shard, their home's target moved there first, and the shard
-/// counted by a paused clock before the poll is counted out of flight
-/// (proofs/tla/clock, `M_uncounted_shard`, `M_detached_uncounted`).
+/// A thread whose shard was taken: its bound tasks finish on its own shard,
+/// their home's target moved there first, and the shard a guest of a paused
+/// clock, as a `block_on`'s own shard is (proofs/tla/clock,
+/// `M_uncounted_shard`).
 #[expect(
     clippy::panic,
     reason = "a thread whose shard cannot start cannot run its bound tasks, which would wait forever"
 )]
 fn finish_home(monitor: &Monitor, home: &Home) {
-    let inner = context::runtime();
     // No bound task, nothing to finish: no own shard is made for it. None
-    // can begin meanwhile: only this thread spawns onto its home. The poll
-    // may have been all a paused clock waited for.
+    // can begin meanwhile: only this thread spawns onto its home.
     if home.is_idle() {
-        monitor.count_out();
-        if let Some(inner) = &inner {
-            super::paused::try_advance(inner, None);
-        }
         return;
     }
     let own = match context::own_shard() {
@@ -557,10 +569,10 @@ fn finish_home(monitor: &Monitor, home: &Home) {
     let _current = context::enter(&own);
     // Counted among the runtime's shards while its clock is paused, as a
     // `block_on`'s own shard is: the bound tasks' timers are on it.
+    let inner = context::runtime();
     let _guest = inner
         .as_ref()
         .map(|inner| super::paused::Guest::enter(inner, &own.shared));
-    monitor.count_out();
     #[cfg(port)]
     own.take_port_back();
     own.block_on_then_leave(monitor.home_done(home));

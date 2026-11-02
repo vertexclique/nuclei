@@ -166,14 +166,14 @@ impl Monitor {
         self.detached.load(Ordering::SeqCst)
     }
 
-    /// A taken poll's thread runs it on a shard a paused clock counts from
-    /// here on (its own, a guest): the poll is in flight no more.
+    /// A taken poll is over on its thread, or its thread runs it on a shard
+    /// a paused clock counts (its own, a guest): in flight no more.
     pub(crate) fn count_out(&self) {
         self.detached.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// A taken poll's thread leaves its own shard and runs the rest of the
-    /// poll on none again: in flight once more, before the shard is let go.
+    /// A poll is taken from its thread, or its thread's guest shard leaves
+    /// with the poll still running: in flight.
     pub(crate) fn count_in(&self) {
         self.detached.fetch_add(1, Ordering::SeqCst);
     }

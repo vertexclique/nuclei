@@ -140,10 +140,13 @@ fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
 }
 
 /// A thread's shard counted among a runtime's shards while the thread is
-/// inside its `block_on` and its clock is paused.
+/// inside its `block_on` and its clock is paused. A poll the handoff took
+/// from one of the runtime's workers, still running on the thread, is
+/// counted by the guest meanwhile and not as work in flight (`taken`).
 pub(crate) struct Guest<'a> {
     inner: &'a Arc<Inner>,
     key: usize,
+    taken: bool,
 }
 
 impl<'a> Guest<'a> {
@@ -152,16 +155,18 @@ impl<'a> Guest<'a> {
     #[inline]
     pub(crate) fn enter(inner: &'a Arc<Inner>, shard: &Arc<Shared>) -> Guest<'a> {
         let key = Arc::as_ptr(shard) as usize;
-        if inner.clock.is_paused() {
-            Self::join(inner, key, shard);
-        }
-        Guest { inner, key }
+        let taken = inner.clock.is_paused() && Self::join(inner, key, shard);
+        Guest { inner, key, taken }
     }
 
+    /// Joins `shard`; answers whether a taken poll was counted out of flight,
+    /// which comes after the join, so its work is seen in one count or the
+    /// other at every moment (proofs/tla/clock, `M_detached_uncounted`).
     #[inline(never)]
-    fn join(inner: &Inner, key: usize, shard: &Arc<Shared>) {
+    fn join(inner: &Inner, key: usize, shard: &Arc<Shared>) -> bool {
         inner.guests().insert(key, Arc::clone(shard));
         inner.clock.member_changed();
+        inner.workers.count_out_taken_here()
     }
 
     /// Counts the calling thread's own shard in `inner`, if the thread is
@@ -198,6 +203,10 @@ impl Drop for Guest<'_> {
 impl Guest<'_> {
     #[inline(never)]
     fn leave(&self) {
+        // In flight again before the shard stops counting it.
+        if self.taken {
+            self.inner.workers.count_in_taken();
+        }
         if self
             .inner
             .guests_made()

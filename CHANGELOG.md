@@ -15,8 +15,8 @@
   never came due; and the rest of the poll the shard was taken from still ran on the thread, on
   no shard, while the clock could jump past what it was about to do. The own shard is now a guest
   of the paused clock, as a `block_on`'s is, and the rest of a taken poll is work in flight, as a
-  blocking job is: counted from the take until the thread runs it on its own shard, a guest
-  first, and again from when it leaves that shard (`proofs/tla/clock`, the
+  blocking job is: counted from the take until the thread's bound tasks ended, except while the
+  thread runs it on its own shard as a guest, which counts it then (`proofs/tla/clock`, the
   `M_uncounted_shard` and `detached_uncounted` runs).
 - **A sleep moved to another task as its shard goes is armed again.** A sleep polled on a thread
   that runs no shard waits on a cell its shard fires; a shard that goes marks the cell orphaned

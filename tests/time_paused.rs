@@ -350,3 +350,48 @@ fn a_paused_clock_stands_still_while_a_poll_the_handoff_took_still_runs() {
         "the clock never jumped once the poll ended"
     );
 }
+
+#[test]
+fn a_block_on_in_a_poll_the_handoff_took_sleeps_on_paused_time() {
+    let rt = handed_on();
+    let poll = rt.spawn(async move {
+        let on_new = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&on_new);
+        // Queued behind this poll: it runs only on the shard's new runner.
+        nuclei::spawn(async move { ran.store(true, Ordering::SeqCst) }).detach();
+        hold_until_handed_on(&on_new);
+        // Taken from its shard, the poll's `block_on` runs on the thread's
+        // own shard, a guest of the paused clock.
+        let start = Instant::now();
+        nuclei::block_on(time::sleep(Duration::from_secs(3600)));
+        Instant::now() - start
+    });
+    assert_eq!(
+        block_on_within(&rt, poll),
+        Some(Duration::from_secs(3600)),
+        "the sleep of a block_on in a poll the handoff took never ended"
+    );
+}
+
+#[test]
+fn a_nested_block_on_whose_shard_the_handoff_took_sleeps_on_paused_time() {
+    let rt = handed_on();
+    let poll = rt.spawn(async move {
+        let on_new = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&on_new);
+        nuclei::spawn(async move { ran.store(true, Ordering::SeqCst) }).detach();
+        // Nested on the worker's shard, which is taken during its poll: the
+        // rest of the call runs on the thread's own shard, a guest.
+        nuclei::block_on(async move {
+            hold_until_handed_on(&on_new);
+            let start = Instant::now();
+            time::sleep(Duration::from_secs(3600)).await;
+            Instant::now() - start
+        })
+    });
+    assert_eq!(
+        block_on_within(&rt, poll),
+        Some(Duration::from_secs(3600)),
+        "the sleep of a nested block_on whose shard was taken never ended"
+    );
+}
