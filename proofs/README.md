@@ -1840,19 +1840,19 @@ semaphore model. 15 configurations: 7 that must pass (two waiters and a `notify_
 `notify_waiters` ends; two queued waiters and two `notify_one` calls, and a `notify_last` then a
 `notify_one`, where both end; the same calls in any order, safety only, since two calls before
 anybody waits store one permit; a waiter dropped beside one that awaits, which ends; a waiter
-made before a `notify_waiters` and a `notify_one` beside one made after both, which ends and finds
-the permit, `LateAwaiterEnds`, with no waiter the broadcast owed keeping the permit,
-`NoPermitEatenByOwed`), with no
+made before a `notify_waiters` and a `notify_one` beside one made after both, with no waiter the
+broadcast owed keeping the permit it took, `NoPermitEatenByOwed`), with no
 waiter done without a notification made since its `Notified` was (`NoSpuriousWake`), no
 `notify_one` serving more than one waiter, and no waiter left on the arrival stack once the role
-is free; 6 mutation runs (a `notify_waiters` that asks for no pass leaves its waiters,
+is free; 5 mutations (a `notify_waiters` that asks for no pass leaves its waiters,
 `AwaitersMadeBeforeAWaitersCallEnd`; a pass that reads the generation before it takes the
 arrivals wakes a newer arrival, `NoSpuriousWake`; a dropped waiter keeping a `notify_one`'s grant
 leaves the other waiting, `EveryAwaiterEnds`; a drain giving up its role over a change made
 during its pass strands an arrival, `NoStrandedArrival`; a waiter that does not look at the
 generation again after its take keeps a permit the broadcast between its look and its take made
-someone else's, `NoPermitEatenByOwed`, and the waiter made after the calls waits for good,
-`LateAwaiterEnds`); and 2 witnesses (a permit stored; a
+someone else's, `NoPermitEatenByOwed`); and 3 witnesses (a gap the code leaves open: a pass that
+read the generation before a broadcast serves the `notify_one` after it to a waiter the broadcast
+woke, so the waiter made after both calls waits for good, `LateAwaiterEnds`; a permit stored; a
 grant passed on). `lean/Nuclei/Notify.lean` proves the pass's accounting of owed wakes for every
 line and count (each served or left over for the permit, no more served than wait, something
 left over only once every waiter was served) and that a masked generation is never one of the two

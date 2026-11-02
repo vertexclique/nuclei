@@ -11,6 +11,6 @@ M_generation_first             MC_Notify            violated:NoSpuriousWake
 M_drop_keeps_grant             MC_Notify            violated:EveryAwaiterEnds
 M_exit_ignores_dirty           MC_Notify            violated:NoStrandedArrival
 M_no_recheck                   MC_Notify            violated:NoPermitEatenByOwed
-ML_no_recheck                  MC_Notify            violated:LateAwaiterEnds
 W_permit_stored                MC_Notify            violated:NoPermitStored
 W_pass_on                      MC_Notify            violated:NoPassOn
+W_owed_to_woken                MC_Notify            violated:LateAwaiterEnds
