@@ -1654,6 +1654,18 @@ registration with the shard whose port the handle is bound to already (its threa
 `block_on`) moves nothing and binds nothing; a bind there all the same fails with the send out and
 waits for good (`MK_no_here`, `ReadServed` broken).
 
+`tla/port/PortFile.tla` checks a Windows disk file's reads and writes, made by threads of the
+blocking pool (`read_at`, `write_all_at`, `at` and `finished` in `src/io/sys/windows.rs`), on a
+handle opened for overlapped IO (as a database opens its log, with `FILE_FLAG_NO_BUFFERING` and
+`FILE_FLAG_WRITE_THROUGH`) or for synchronous IO. A cursor write and a positional write run at once;
+each names an `OVERLAPPED` in its own frame, and on an overlapped handle may come back pending. The
+call then waits on its own event (the calling thread's, its low bit set so no completion goes to a
+port) for its own end, and answers what the kernel said of it. 5 configurations: 2 that must pass
+(both kinds of handle, with `NoDeadWrite`, the kernel never writes into a frame its call left,
+`OwnResult` and `Returns`), 2 mutations (a pending call that answers ERROR_IO_PENDING as its error
+and returns, as it did, and one that waits on the handle's own signal, which the other call's end
+sets, break `NoDeadWrite`), and a witness (a call that waits for its own end).
+
 `tla/port/PortLook.tla` checks a read on a port whose pool has no buffer for it, made by the task
 straight from the socket once a zero-byte look said bytes came (`read_starved`, `receive_starved`
 and `taken_by_another` in `src/io/source/read.rs`), when a call outside the side (std's own read

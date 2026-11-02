@@ -50,3 +50,8 @@ PL_look                        MC_PortLook          pass
 MPL_errors                     MC_PortLook          violated:NoSpuriousError
 MPL_waits                      MC_PortLook          violated:Served
 WPL_taken                      MC_PortLook          violated:NoTaken
+PF_overlapped                  MC_PortFile          pass
+PF_sync                        MC_PortFile          pass
+MPF_no_wait                    MC_PortFile          violated:NoDeadWrite
+MPF_handle_wait                MC_PortFile          violated:NoDeadWrite
+WPF_pending                    MC_PortFile          violated:NoPendingWait
