@@ -17,6 +17,8 @@ mod drops;
 #[cfg(unix)]
 mod emfile;
 mod half_close;
+#[path = "../handles_support/mod.rs"]
+mod handles_support;
 mod reset;
 mod short_io;
 mod shut;

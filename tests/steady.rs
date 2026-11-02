@@ -7,11 +7,14 @@
 //! One test runs every workload in turn, so no other test moves the counts
 //! meanwhile.
 
+mod handles_support;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Duration;
 
+use handles_support::open_handles;
 use nuclei::io::{AsyncReadExt, AsyncWriteExt};
 use nuclei::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -74,30 +77,6 @@ const SLACK: isize = 16 * 1024;
 
 /// How long the live bytes get to come down to the slack after the rounds.
 const SETTLE: Duration = Duration::from_secs(5);
-
-/// The descriptors this process holds open.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn open_handles() -> usize {
-    std::fs::read_dir("/proc/self/fd").unwrap().count()
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn open_handles() -> usize {
-    std::fs::read_dir("/dev/fd").unwrap().count()
-}
-
-#[cfg(windows)]
-fn open_handles() -> usize {
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
-    }
-    let mut count = 0u32;
-    // SAFETY: the pseudo handle of this process, and a place for the count.
-    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
-    assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
-    count as usize
-}
 
 /// The runtime whose workers hold retired nodes, if any, and how many.
 struct Watch<'a> {

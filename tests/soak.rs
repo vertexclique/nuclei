@@ -15,6 +15,8 @@
 //! `NUCLEI_SOAK_SECS=3600 cargo test --release --test soak -- --ignored --nocapture`
 //! (the length defaults to an hour; `NUCLEI_BACKEND` picks the backend).
 
+mod handles_support;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -483,31 +485,12 @@ fn count(dir: &str) -> Option<usize> {
     std::fs::read_dir(dir).ok().map(|d| d.count())
 }
 
-/// The descriptors open: from `/proc` on Linux, `/dev/fd` on macOS and the
-/// BSDs; on Windows the process's handles.
-#[cfg(unix)]
-fn fds() -> Option<usize> {
-    count("/proc/self/fd").or_else(|| count("/dev/fd"))
-}
-
-#[cfg(windows)]
-fn fds() -> Option<usize> {
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
-    }
-    let mut n = 0u32;
-    // SAFETY: the pseudo handle of this process, and a place for the count.
-    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
-    (ok != 0).then_some(n as usize)
-}
-
 fn sample(start: Instant, totals: &Totals) -> Sample {
     Sample {
         secs: start.elapsed().as_secs(),
         rss: rss(),
         heap: LIVE.load(Ordering::Relaxed),
-        fds: fds(),
+        fds: Some(handles_support::open_handles()),
         threads: count("/proc/self/task"),
         bytes: totals.bytes.load(Ordering::Relaxed),
     }

@@ -860,29 +860,7 @@ async fn woken(what: &str, count: &Arc<Counting>, seen: usize) {
     .await;
 }
 
-/// The descriptors (on Windows the handles) this process holds open.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn open_handles() -> usize {
-    std::fs::read_dir("/proc/self/fd").unwrap().count()
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-pub fn open_handles() -> usize {
-    std::fs::read_dir("/dev/fd").unwrap().count()
-}
-
-#[cfg(windows)]
-pub fn open_handles() -> usize {
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
-    }
-    let mut count = 0u32;
-    // SAFETY: the pseudo handle of this process, and a place for the count.
-    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
-    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
-    count as usize
-}
+pub use crate::handles_support::open_handles;
 
 /// The threads of this process, where the system lists them.
 #[cfg(any(target_os = "linux", target_os = "android"))]
