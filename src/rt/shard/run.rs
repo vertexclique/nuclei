@@ -24,9 +24,8 @@ use crate::rt::task::Runnable;
 use crate::rt::tuning::QUARTZ_EVERY;
 use crate::sync::internal::Ordering;
 
-/// The shard was taken from this thread while the loop ran; the future's output, when the poll
-/// that found the take finished it.
-pub(crate) struct Detached<T>(Option<T>);
+/// The shard was taken from this thread while the loop ran.
+pub(crate) struct Detached;
 
 /// How a worker's loop ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,12 +55,14 @@ impl Shard {
             let signal = self.signal();
             match self.run_loop(future.as_mut(), &signal) {
                 Ok(output) => {
-                    self.keep_signal(signal);
+                    // The poll that finished the future may have found the shard taken: it is
+                    // another thread's then, and its cell keeps no waker of this call.
+                    if !context::detached_from(&self.shared) {
+                        self.keep_signal(signal);
+                    }
                     output
                 }
-                // The shard is another thread's now: its cell keeps no waker of this call.
-                Err(Detached(Some(output))) => output,
-                Err(Detached(None)) => finish_on_own(future, &signal),
+                Err(Detached) => finish_on_own(future, &signal),
             }
         })
     }
@@ -79,9 +80,10 @@ impl Shard {
         let stopped = pin!(self.shared.stopped());
         let signal = self.signal();
         match self.run_loop(stopped, &signal) {
-            Ok(()) => Worked::Stopped,
-            // Stopped in the poll that found the take or not, the thread lost the shard.
-            Err(Detached(_)) => Worked::Detached,
+            // Stopped in the very poll that found the take, the thread lost the shard all the
+            // same: its bound tasks and its life are seen to as a detached thread's.
+            Ok(()) if !context::detached_from(&self.shared) => Worked::Stopped,
+            Ok(()) | Err(Detached) => Worked::Detached,
         }
     }
 
@@ -124,8 +126,7 @@ impl Shard {
         let _leaving = Leaving(self);
         loop {
             // A thread's own shard is never taken: nobody watches it.
-            if let Ok(output) | Err(Detached(Some(output))) = self.run_loop(future.as_mut(), signal)
-            {
+            if let Ok(output) = self.run_loop(future.as_mut(), signal) {
                 return output;
             }
         }
@@ -133,14 +134,15 @@ impl Shard {
 
     /// The loop: polls `future` when it is woken and, between its polls, runs
     /// the shard's tasks, timers and poller, until `future` is ready or the
-    /// shard is taken from this thread. A poll that finished `future` and found
-    /// the take answers [`Detached`] with the output: the caller touches the
-    /// shard no more either way.
+    /// shard is taken from this thread. A poll may do both: it answers the
+    /// output, and a caller on a shard that can be taken (`block_on`,
+    /// `run_worker`, not the thread's own) looks at the take before it touches
+    /// the shard ([`context::detached_from`]).
     fn run_loop<F: Future>(
         &self,
         mut future: Pin<&mut F>,
         signal: &Arc<Signal>,
-    ) -> Result<F::Output, Detached<F::Output>> {
+    ) -> Result<F::Output, Detached> {
         let waker = Signal::waker(signal);
         let mut cx = Context::from_waker(&waker);
         // Turns in which the future woke itself and no task ran.
@@ -161,13 +163,10 @@ impl Shard {
                     poll
                 });
                 if let Poll::Ready(output) = poll {
-                    if polled == Polled::Detached {
-                        return Err(Detached(Some(output)));
-                    }
                     return Ok(output);
                 }
                 if polled == Polled::Detached {
-                    return Err(Detached(None));
+                    return Err(Detached);
                 }
                 if signal.woken.load(Ordering::Relaxed) {
                     owed = self.queued();
@@ -176,7 +175,7 @@ impl Shard {
             if let Some(runnable) = self.next() {
                 owed = owed.saturating_sub(1);
                 if self.run(runnable) == Polled::Detached {
-                    return Err(Detached(None));
+                    return Err(Detached);
                 }
                 // One decrement a run; the runs that weigh a look are the
                 // count's stops.

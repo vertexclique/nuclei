@@ -670,6 +670,15 @@ fn run_task_watched(here: &'static Here, run: impl FnOnce()) {
     here.in_task.set(in_task);
 }
 
+/// Whether this thread was detached from the shard of `shared`: a poll on it found it taken, and
+/// the shard was not handed back to the thread since (`enter_watched`). For a caller whose loop
+/// on a watched shard ended with its future's output, which the poll that found the take may have
+/// made.
+#[inline]
+pub(crate) fn detached_from(shared: &Shared) -> bool {
+    polled(local(), shared) == Polled::Detached
+}
+
 /// What a poll on the shard of `shared` found as it ended.
 #[inline(always)]
 fn polled(here: &Here, shared: &Shared) -> Polled {

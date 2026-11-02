@@ -55,14 +55,15 @@
 (* slot (`Shard::block_on` in src/rt/shard/run.rs, from `block_on_here` in *)
 (* src/rt/runtime.rs): its loop polls the nested future outside the shard  *)
 (* in a new epoch and comes back as any poll's end does. A future may      *)
-(* finish in the very poll that found its shard taken: the loop then       *)
-(* answers "detached" with the output (`run_loop`'s                        *)
-(* `Detached(Some(output))`), so `block_on` keeps no waker on the shard it *)
-(* lost (`keep_signal`) and a worker's loop never answers "stopped" for a  *)
-(* shard that was taken (`run_worker`). With `Fence = "full"` the process  *)
-(* has no heavy fence (`Monitor::full_fence` in src/rt/handoff/monitor.rs: *)
-(* macOS, the BSDs, a Linux without membarrier): both sides take a         *)
-(* sequentially consistent fence instead, the runner between its word and *)
+(* finish in the very poll that found its shard taken: the loop answers    *)
+(* its output, and its caller looks at the take before it touches the      *)
+(* shard (`context::detached_from`), so `block_on` keeps no waker on the   *)
+(* shard it lost (`keep_signal`) and a worker's loop never answers         *)
+(* "stopped" for a shard that was taken (`run_worker`). With               *)
+(* `Fence = "full"` the process has no heavy fence (`Monitor::full_fence`  *)
+(* in src/rt/handoff/monitor.rs: macOS, the BSDs, a Linux without          *)
+(* membarrier): both sides take a sequentially consistent fence instead,  *)
+(* the runner between its word and                                         *)
 (* its claim (`Slot::enter`, `Slot::mark_unless_claimed` in                *)
 (* src/rt/handoff/slot.rs), the monitor between its claim and its look at  *)
 (* the word (`take`). With `Fence = "failing"` the heavy fence may fail    *)
@@ -385,15 +386,16 @@ N_cas:
     end if;
 N_after:
     \* The nested poll found the shard taken. Its future either waits on (it finishes on the
-    \* thread's own shard, `finish_on_own`) or finished in that poll; either way the loop answers
-    \* "detached" and `block_on` touches the lost shard no more.
+    \* thread's own shard, `finish_on_own`) or finished in that poll, its output answered; either
+    \* way `block_on` looks at the take (`context::detached_from`) and touches the lost shard no
+    \* more.
     either
         skip;
     or
         \* The future finished in the poll that found the take.
-        \* (MUTATION ready_first: the loop answers the future's output before it looks at the
-        \* take, as `run_loop` did: `block_on` keeps its waker in the lost shard's cell, a write
-        \* into the shard another thread now runs.)
+        \* (MUTATION ready_first: `block_on` takes the output for a poll still in the shard and
+        \* keeps its waker with no look at the take, as it did: a write into the lost shard's
+        \* cell, the shard another thread now runs.)
         if Mode = "ready_first" then
             inS := inS \cup {self};
         end if;
@@ -421,11 +423,12 @@ E_cas:
         end if;
         gone := gone \cup {self};
         \* With `Nested`, the poll that found the take may be the worker loop's own future
-        \* (`Shared::stopped`), finished in it. The loop answers "detached" all the same
-        \* (`run_worker`), so the thread's bound tasks and its life are seen to: the same step as
-        \* any poll's, so only the mutation needs a branch of its own.
-        \* (MUTATION stopped_on_take: the loop answers the future's "stopped" first, as it did:
-        \* the runner skips what a detached thread does and waits as a spare.)
+        \* (`Shared::stopped`), finished in it. The worker's loop looks at the take and answers
+        \* "detached" all the same (`run_worker`), so the thread's bound tasks and its life are
+        \* seen to: the same step as any poll's, so only the mutation needs a branch of its own.
+        \* (MUTATION stopped_on_take: the worker's loop answers "stopped" for the output with no
+        \* look at the take, as it did: the runner skips what a detached thread does and waits as
+        \* a spare.)
         if Nested /\ Mode = "stopped_on_take" then
             either
                 goto D_unwind;

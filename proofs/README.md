@@ -2187,8 +2187,9 @@ ends (`Bracket`'s drop puts that slot back): each such call, a leaf push or a br
 slot's claim, which stays taken for good (`Slot::take` is its last write, `Slot::contest` swaps
 only from pending, and the monitor never claims the old slot again), and stays out. A call may run
 a nested `block_on` on the same shard and slot (`Nested`), whose future may finish in the very poll
-that found the take: the loop answers detached with the output (`run_loop`), so `block_on` keeps
-no waker on the lost shard and a worker's loop never answers stopped for it. With no heavy fence
+that found the take: its caller looks at the take before it touches the shard
+(`context::detached_from`), so `block_on` keeps no waker on the lost shard and a worker's loop
+never answers stopped for it. With no heavy fence
 (`Fence = "full"`: macOS, the BSDs, a Linux without membarrier) both sides take a full fence, the
 runner between its word and its claim, the monitor between its claim and its look; a heavy fence
 may also fail (`Fence = "failing"`), and the take is then cancelled and counted. A call that
