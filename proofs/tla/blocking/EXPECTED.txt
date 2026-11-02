@@ -1,0 +1,6 @@
+# configuration                spec                 expected
+B_park                         MC_Blocking          pass
+B_wasm_pending                 MC_Blocking          pass
+B_wasm_ready                   MC_Blocking          pass
+MB_unpark_lost                 MC_Blocking          violated:Ends
+MB_wasm_parks                  MC_Blocking          violated:Ends
