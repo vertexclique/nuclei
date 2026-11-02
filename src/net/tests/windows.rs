@@ -192,3 +192,79 @@ fn a_connect_binds_a_port_other_destinations_may_share() {
         }
     });
 }
+
+/// A socket nuclei takes over answers `WouldBlock` where it would block, as a unix descriptor
+/// does: std's own calls through `get_ref` never block the shard.
+#[test]
+fn an_adopted_socket_does_not_block() {
+    let rt = runtime();
+    rt.block_on(async {
+        let udp = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let err = udp.get_ref().recv_from(&mut [0u8; 16]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
+        let err = listener.get_ref().accept().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    });
+}
+
+/// Each datagram's send answers what the kernel says of that datagram: a refused one (a
+/// broadcast with `SO_BROADCAST` off) fails its own call, and the calls around it succeed.
+#[test]
+fn a_datagram_send_answers_its_own_verdict() {
+    let rt = runtime();
+    rt.block_on(async {
+        let a = Handle::<UdpSocket>::bind("0.0.0.0:0").await.unwrap();
+        let b = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let to = b.local_addr().unwrap();
+        let port = a.local_addr().unwrap().port();
+        assert_eq!(within(a.send_to(b"one", to)).await.unwrap(), 3);
+        let refused = within(a.send_to(b"all", ("255.255.255.255", port))).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(within(a.send_to(b"two", to)).await.unwrap(), 3);
+        let mut buf = [0u8; 8];
+        for want in [&b"one"[..], b"two"] {
+            let (n, _) = within(b.recv_from(&mut buf)).await.unwrap();
+            assert_eq!(&buf[..n], want);
+        }
+    });
+}
+
+/// A burst of datagrams through a socket with no send buffer: each send from the task either
+/// goes or, finding no room, waits for the port's poll of the socket and tries again; every one
+/// arrives, whole and in order.
+#[test]
+fn a_burst_of_datagram_sends_waits_for_room_and_loses_none() {
+    const COUNT: usize = 400;
+    const LEN: usize = 1200;
+    let rt = runtime();
+    rt.block_on(async {
+        let a = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let b = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let raw = |s: &Handle<UdpSocket>| s.get_ref().as_raw_socket();
+        crate::net::opt::set_size(
+            raw(&a),
+            crate::net::opt::SOL_SOCKET,
+            crate::net::opt::SO_SNDBUF,
+            0,
+        )
+        .unwrap();
+        crate::net::opt::set_size(
+            raw(&b),
+            crate::net::opt::SOL_SOCKET,
+            crate::net::opt::SO_RCVBUF,
+            8 << 20,
+        )
+        .unwrap();
+        let to = b.local_addr().unwrap();
+        let datagram = |i: usize| -> Vec<u8> { (0..LEN).map(|j| (i * 7 + j) as u8).collect() };
+        for i in 0..COUNT {
+            assert_eq!(within(a.send_to(&datagram(i), to)).await.unwrap(), LEN);
+        }
+        let mut buf = vec![0u8; 2 * LEN];
+        for i in 0..COUNT {
+            let (n, _) = within(b.recv_from(&mut buf)).await.unwrap();
+            assert!(buf[..n] == datagram(i)[..], "datagram {i} differs");
+        }
+    });
+}

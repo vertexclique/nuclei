@@ -24,12 +24,12 @@ use crate::syscore::windows::{
     FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA, GetFileInformationByHandle,
     GetFileInformationByHandleEx, GetFileSizeEx, GetFileType, HANDLE, IN_ADDR, INVALID_SOCKET,
     IO_STATUS_BLOCK, IPPROTO_TCP, MSG_PEEK, NtQueryInformationFile, OVERLAPPED, ReadFile, SD_BOTH,
-    SD_RECEIVE, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_MAX_MSG_SIZE, SO_TYPE,
-    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM,
-    SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, STATUS_SUCCESS, SetFileInformationByHandle, SetFilePointerEx, ULONG,
-    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile,
-    bind, getsockname, getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, wsa_error,
+    SD_RECEIVE, SD_SEND, SIO_UDP_CONNRESET, SO_ACCEPTCONN, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT,
+    SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, STATUS_SUCCESS,
+    SetFileInformationByHandle, SetFilePointerEx, ULONG, WSA_FLAG_NO_HANDLE_INHERIT,
+    WSA_FLAG_OVERLAPPED, WSAEMSGSIZE, WSAIoctl, WSASocketW, WriteFile, bind, getsockname,
+    getsockopt, last_error, recv, recvfrom, send, sendto, setsockopt, wsa_error,
 };
 
 fn socket_of(raw: Raw) -> SOCKET {
@@ -278,6 +278,21 @@ pub(crate) fn adopt_connected(raw: Raw) -> io::Result<()> {
     })
 }
 
+/// Makes the socket's calls answer `WSAEWOULDBLOCK` where they would block, as a unix
+/// descriptor's are made `O_NONBLOCK`: a task's own call on it never blocks its shard. The
+/// socket's overlapped operations are as they were.
+pub(crate) fn set_nonblocking(raw: Raw) -> io::Result<()> {
+    let mut on: u32 = 1;
+    // SAFETY: the command takes a u32 of our own.
+    check(unsafe {
+        crate::syscore::windows::ioctlsocket(
+            socket_of(raw),
+            crate::syscore::windows::FIONBIO,
+            &mut on,
+        )
+    })
+}
+
 /// A new overlapped TCP socket of address family `family`, not inherited.
 pub(crate) fn tcp_socket(family: u16) -> io::Result<OwnedSocket> {
     socket(family, SOCK_STREAM, IPPROTO_TCP)
@@ -307,7 +322,9 @@ fn socket(family: u16, ty: i32, protocol: i32) -> io::Result<OwnedSocket> {
         return Err(wsa_error());
     }
     // SAFETY: a new socket nobody else owns.
-    Ok(unsafe { OwnedSocket::from_raw_socket(socket as u64) })
+    let socket = unsafe { OwnedSocket::from_raw_socket(socket as u64) };
+    set_nonblocking(std::os::windows::io::AsRawSocket::as_raw_socket(&socket))?;
+    Ok(socket)
 }
 
 /// The address family of the socket `raw` (that of its local address).
@@ -363,18 +380,6 @@ pub(crate) fn bind_any(raw: Raw, family: u16) -> io::Result<()> {
     match check(unsafe { bind(socket_of(raw), core::ptr::from_ref(&storage).cast(), len) }) {
         Err(err) if err.raw_os_error() == Some(crate::syscore::windows::WSAEINVAL) => Ok(()),
         other => other,
-    }
-}
-
-/// The error Winsock's own check gives a datagram of `len` bytes on the
-/// socket `raw` before it sends it: longer than the socket's
-/// `SO_MAX_MSG_SIZE`.
-pub(crate) fn datagram_too_long(raw: Raw, len: usize) -> Option<io::Error> {
-    match int_option(raw, SO_MAX_MSG_SIZE) {
-        Ok(max) => usize::try_from(max)
-            .is_ok_and(|max| len > max)
-            .then(|| io::Error::from_raw_os_error(crate::syscore::windows::WSAEMSGSIZE)),
-        Err(err) => Some(err),
     }
 }
 

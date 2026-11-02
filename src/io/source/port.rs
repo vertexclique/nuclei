@@ -48,12 +48,13 @@ use crate::io::sys;
 use crate::rt::counters::{IoKind, tally};
 use crate::rt::park::iocp::{JOB, Port};
 use crate::syscore::windows::{
-    CancelIoEx, CancelSynchronousIo, DUPLICATE_SAME_ACCESS, DWORD, DuplicateHandle,
-    ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, GetCurrentProcess,
-    GetCurrentThread, GetLastError, HANDLE, MSG_PEEK, OVERLAPPED, OVERLAPPED_ENTRY,
-    PostQueuedCompletionStatus, ReadFile, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
-    WSA_OPERATION_ABORTED, WSABUF, WSAESHUTDOWN, WSARecv, WSARecvFrom, WSASend, WSASendTo,
-    WriteFile, status_error, winsock,
+    AFD_POLL_HANDLE_INFO, AFD_POLL_INFO, AFD_POLL_LOCAL_CLOSE, AFD_POLL_SEND, CancelIoEx,
+    CancelSynchronousIo, DUPLICATE_SAME_ACCESS, DWORD, DuplicateHandle, ERROR_BROKEN_PIPE,
+    ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, GetCurrentProcess, GetCurrentThread,
+    GetLastError, HANDLE, IO_STATUS_BLOCK, IOCTL_AFD_POLL, MSG_PEEK, NtDeviceIoControlFile,
+    OVERLAPPED, OVERLAPPED_ENTRY, PostQueuedCompletionStatus, ReadFile, SOCKADDR, SOCKADDR_STORAGE,
+    SOCKET, SOCKET_ERROR, STATUS_PENDING, STATUS_SUCCESS, WSA_OPERATION_ABORTED, WSABUF,
+    WSAESHUTDOWN, WSARecv, WSARecvFrom, WSASend, WSASendTo, WriteFile, status_error, winsock,
 };
 
 /// Room for one address in an `AcceptEx` buffer: the largest address and
@@ -77,6 +78,8 @@ enum PortMem {
     /// A zero-byte receive: it ends once bytes or the end came, and holds
     /// nothing.
     Ready,
+    /// An AFD poll of the socket for room to send: it ends once there is, and holds nothing.
+    PollSend,
     /// A read into the slot's own room.
     RecvRoom,
     /// A send of the bytes `from..to` of the slot's own room.
@@ -136,6 +139,9 @@ struct Inner {
     accept: [u8; 2 * ACCEPT_ADDR],
     /// How a blocking job's call ended, for its packet.
     job_code: Option<i32>,
+    /// The AFD poll of a send that found no room, which the driver reads and writes until its
+    /// packet.
+    poll: AFD_POLL_INFO,
 }
 
 // SAFETY: a slot is touched by the side's holder before the call, by the
@@ -174,6 +180,16 @@ impl Default for Slot {
                 addr_len: 0,
                 accept: [0; 2 * ACCEPT_ADDR],
                 job_code: None,
+                poll: AFD_POLL_INFO {
+                    Timeout: 0,
+                    NumberOfHandles: 0,
+                    Exclusive: 0,
+                    Handles: [AFD_POLL_HANDLE_INFO {
+                        Handle: core::ptr::null_mut(),
+                        Events: 0,
+                        Status: 0,
+                    }],
+                },
             }),
             job: Job::default(),
         }
@@ -469,6 +485,9 @@ fn start(
     want: Want,
     datagrams: bool,
 ) -> Result<(), i32> {
+    if let Want::Ready { read: false } = want {
+        return start_poll(inner, ov, socket);
+    }
     let null = core::ptr::null();
     let fail = |inner: &mut Inner, mem: PortMem, err: io::Error| -> Result<(), i32> {
         inner.mem = Some(mem);
@@ -709,6 +728,48 @@ fn start(
                 }
             }
         }
+    }
+}
+
+/// An AFD poll of `socket` for room to send, with `ov`: what a datagram's send from the task that
+/// found no room (`WSAEWOULDBLOCK`) waits on, as a unix one waits for its edge. The poll's
+/// status lands in the `OVERLAPPED` (an `IO_STATUS_BLOCK` in its first two fields), and the
+/// packet names it, so it comes back as any other operation of the slot does. `Ok`: a packet
+/// will come (the call completes on the socket's port, at once or later).
+fn start_poll(inner: &mut Inner, ov: *mut OVERLAPPED, socket: SOCKET) -> Result<(), i32> {
+    inner.poll = AFD_POLL_INFO {
+        Timeout: i64::MAX,
+        NumberOfHandles: 1,
+        Exclusive: 0,
+        Handles: [AFD_POLL_HANDLE_INFO {
+            Handle: socket as HANDLE,
+            Events: AFD_POLL_SEND | AFD_POLL_LOCAL_CLOSE,
+            Status: 0,
+        }],
+    };
+    inner.mem = Some(PortMem::PollSend);
+    let info = core::ptr::from_mut(&mut inner.poll).cast::<c_void>();
+    let len = size_of::<AFD_POLL_INFO>() as u32;
+    // SAFETY: the poll's memory and the OVERLAPPED live in the slot until the packet; the
+    // kernel reads and writes the poll there and its status into the OVERLAPPED.
+    let status = unsafe {
+        NtDeviceIoControlFile(
+            socket as HANDLE,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            ov.cast::<c_void>(),
+            ov.cast::<IO_STATUS_BLOCK>(),
+            IOCTL_AFD_POLL,
+            info,
+            len,
+            info,
+            len,
+        )
+    };
+    match status {
+        STATUS_SUCCESS | STATUS_PENDING => Ok(()),
+        other => Err(crate::syscore::windows::status_error(other)
+            .unwrap_or(crate::syscore::windows::WSAEINVAL)),
     }
 }
 
@@ -1024,7 +1085,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize, cut
     #[cfg(feature = "io-stats")]
     tally_of(&mem, &answer);
     match mem {
-        PortMem::Ready => Outcome::Ready(match answer {
+        PortMem::Ready | PortMem::PollSend => Outcome::Ready(match answer {
             Answer::Done(result) => Answer::Done(result.map(drop)),
             Answer::Undone { not_ready } => Answer::Undone { not_ready },
         }),
@@ -1127,7 +1188,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize, cut
 #[cfg(feature = "io-stats")]
 fn io_kind(mem: &PortMem) -> Option<IoKind> {
     match mem {
-        PortMem::Ready => None,
+        PortMem::Ready | PortMem::PollSend => None,
         PortMem::RecvRoom
         | PortMem::Recv(_)
         | PortMem::RecvLent(_)

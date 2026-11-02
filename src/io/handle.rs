@@ -199,6 +199,11 @@ impl<T: IoObject> Handle<T> {
                 sys::set_nosigpipe(fd);
             }
         }
+        // A socket's own calls (a datagram's send from the task) answer at once, as on unix.
+        #[cfg(windows)]
+        if !matches!(kind, Kind::Bytes | Kind::File) {
+            sys::set_nonblocking(io.raw_io())?;
+        }
         Ok(Self::from_nonblocking(io, kind))
     }
 

@@ -916,7 +916,7 @@ impl ReadState {
             }
             None => {
                 #[cfg(port)]
-                if let Some(result) = self.read_starved(io, out, peek) {
+                if let Some(result) = self.read_starved(io, kind, out, peek, after) {
                     return Poll::Ready(result);
                 }
                 self.wait(waker, out.len());
@@ -934,8 +934,10 @@ impl ReadState {
     fn read_starved(
         &mut self,
         io: Io<'_>,
+        kind: Kind,
         out: &mut [u8],
         peek: bool,
+        after: &mut After,
     ) -> Option<io::Result<usize>> {
         if !self.starved
             || !self.readable
@@ -949,6 +951,9 @@ impl ReadState {
         }
         let Via::Ops(route) = io.via;
         let result = crate::io::sys::recv_ready(route.socket()?, out, peek);
+        if self.taken_by_another(&result, io, kind, out.len(), after) {
+            return None;
+        }
         if !peek {
             tally::reading(&result);
         }
@@ -979,7 +984,7 @@ impl ReadState {
             None => {
                 #[cfg(port)]
                 if let Some(first) = bufs.iter_mut().find(|b| !b.is_empty())
-                    && let Some(result) = self.read_starved(io, first, false)
+                    && let Some(result) = self.read_starved(io, kind, first, false, after)
                 {
                     return Poll::Ready(result);
                 }
@@ -1338,7 +1343,7 @@ impl ReadState {
             }
             None => {
                 #[cfg(port)]
-                if let Some(result) = self.receive_starved(io, out, peek) {
+                if let Some(result) = self.receive_starved(io, kind, out, peek, after) {
                     return Poll::Ready(result);
                 }
                 self.wait(waker, out.len());
@@ -1356,8 +1361,10 @@ impl ReadState {
     fn receive_starved(
         &mut self,
         io: Io<'_>,
+        kind: Kind,
         out: &mut [u8],
         peek: bool,
+        after: &mut After,
     ) -> Option<io::Result<(usize, Addr)>> {
         if !self.starved
             || !self.readable
@@ -1370,11 +1377,35 @@ impl ReadState {
         }
         let Via::Ops(route) = io.via;
         let result = crate::io::sys::recv_from_ready(route.socket()?, out, peek);
+        if self.taken_by_another(&result, io, kind, out.len(), after) {
+            return None;
+        }
         if !peek {
             tally::received(&result);
         }
         self.readable = peek && result.is_ok();
         Some(result.map(|(n, from)| (n, Addr::Inet(from))))
+    }
+
+    /// On a port, whether a call made once a zero-byte look said bytes came found none
+    /// (`WSAEWOULDBLOCK`: another took them first, the socket being non-blocking): the side then
+    /// looks again, and the call waits for that look as for the first.
+    #[cfg(port)]
+    #[cold]
+    fn taken_by_another<T>(
+        &mut self,
+        result: &io::Result<T>,
+        io: Io<'_>,
+        kind: Kind,
+        len: usize,
+        after: &mut After,
+    ) -> bool {
+        if !matches!(result, Err(err) if err.kind() == io::ErrorKind::WouldBlock) {
+            return false;
+        }
+        self.readable = false;
+        self.complete(io, kind, len, after);
+        true
     }
 
     /// What the side holds, as a line, for a test that failed.

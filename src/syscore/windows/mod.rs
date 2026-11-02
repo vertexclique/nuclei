@@ -186,6 +186,37 @@ impl SOCKADDR_STORAGE {
     }
 }
 
+/// `ioctlsocket` command: the socket's calls do not block (`u32` 1) or do.
+pub(crate) const FIONBIO: i32 = 0x8004_667Eu32 as i32;
+
+/// The AFD driver's poll of sockets, which completes once one of the events it asks for is
+/// there: how a socket says it has room to send, which no overlapped call tells.
+pub(crate) const IOCTL_AFD_POLL: ULONG = 0x0001_2024;
+/// Room to send.
+pub(crate) const AFD_POLL_SEND: ULONG = 0x0004;
+/// The socket was closed under the poll.
+pub(crate) const AFD_POLL_LOCAL_CLOSE: ULONG = 0x0020;
+pub(crate) const STATUS_PENDING: NTSTATUS = 0x0000_0103;
+
+/// One socket of an AFD poll: the events asked for, and those that came.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct AFD_POLL_HANDLE_INFO {
+    pub(crate) Handle: HANDLE,
+    pub(crate) Events: ULONG,
+    pub(crate) Status: NTSTATUS,
+}
+
+/// An AFD poll of one socket.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct AFD_POLL_INFO {
+    pub(crate) Timeout: i64,
+    pub(crate) NumberOfHandles: ULONG,
+    pub(crate) Exclusive: ULONG,
+    pub(crate) Handles: [AFD_POLL_HANDLE_INFO; 1],
+}
+
 #[repr(C)]
 pub(crate) struct IO_STATUS_BLOCK {
     pub(crate) Status: ULONG_PTR,
@@ -216,6 +247,7 @@ const _: () = {
     assert!(align_of::<SOCKADDR_STORAGE>() == 8);
     assert!(size_of::<IO_STATUS_BLOCK>() == 2 * p);
     assert!(size_of::<FILE_COMPLETION_INFORMATION>() == 2 * p);
+    assert!(size_of::<AFD_POLL_INFO>() == 16 + if p == 8 { 16 } else { 12 });
 };
 
 pub(crate) const AF_INET: u16 = 2;
@@ -243,7 +275,6 @@ pub(crate) const SO_KEEPALIVE: i32 = 0x0008;
 pub(crate) const SO_LINGER: i32 = 0x0080;
 pub(crate) const SO_SNDBUF: i32 = 0x1001;
 pub(crate) const SO_RCVBUF: i32 = 0x1002;
-pub(crate) const SO_MAX_MSG_SIZE: i32 = 0x2003;
 /// A bind to port 0 picks a port as a connect's own bind does: one other destinations may share.
 pub(crate) const SO_REUSE_UNICASTPORT: i32 = 0x3007;
 pub(crate) const IPPROTO_IP: i32 = 0;
@@ -515,6 +546,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     pub(crate) fn WSAStartup(wVersionRequested: u16, lpWSAData: *mut WSADATA) -> i32;
     pub(crate) fn WSAGetLastError() -> i32;
+    pub(crate) fn ioctlsocket(s: SOCKET, cmd: i32, argp: *mut u32) -> i32;
     pub(crate) fn WSASocketW(
         af: i32,
         r#type: i32,
@@ -633,6 +665,18 @@ unsafe extern "system" {
     pub(crate) fn NtCancelWaitCompletionPacket(
         WaitCompletionPacketHandle: HANDLE,
         RemoveSignaledPacket: BOOLEAN,
+    ) -> NTSTATUS;
+    pub(crate) fn NtDeviceIoControlFile(
+        FileHandle: HANDLE,
+        Event: HANDLE,
+        ApcRoutine: *mut c_void,
+        ApcContext: *mut c_void,
+        IoStatusBlock: *mut IO_STATUS_BLOCK,
+        IoControlCode: ULONG,
+        InputBuffer: *mut c_void,
+        InputBufferLength: ULONG,
+        OutputBuffer: *mut c_void,
+        OutputBufferLength: ULONG,
     ) -> NTSTATUS;
     pub(crate) fn NtQueryInformationFile(
         FileHandle: HANDLE,
