@@ -6,7 +6,13 @@
 //! waits for this owner's read anyway; an owner that writes may also read.
 //! An owner that reads without writing and asks to write is refused with
 //! [`ReadHeldByOwner`]: the write would wait for its own read. So an owner
-//! never deadlocks on itself.
+//! never deadlocks on itself in a request it polls: every poll looks at the
+//! owner's write and reads first, queued or not, so a request that queued
+//! before its owner came to hold the lock through another one (two requests
+//! in one `join!`) completes at its next poll. Nothing wakes it for that: a
+//! request last polled before the other one entered (the `join!` polls it
+//! first, or it is in another task of the same owner) waits as another
+//! owner's would, so holding the lock until it completes waits on itself.
 //!
 //! Each reading owner has a record (owner id, read depth) in a lock-free
 //! list that only grows: a record is reused once its owner stops reading,
@@ -386,9 +392,13 @@ impl<'a, T: ?Sized> Future for ReentrantRead<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReentrantReadGuard<'a, T>> {
         let this = self.get_mut();
-        if !this.wait.is_queued()
-            && let Some(record) = this.lock.reenter_read(this.owner)
-        {
+        if let Some(record) = this.lock.reenter_read(this.owner) {
+            // The owner came to read or write through another request since
+            // this one queued: this one leaves the queue, passing on a share
+            // it was granted meanwhile, so the owner keeps one record.
+            if this.wait.is_queued() {
+                this.wait.cancel(&this.lock.raw, READ);
+            }
             // Completed at once: it spends one operation of the poll's
             // budget, or, the budget spent, the read goes and it yields.
             let guard = ReentrantReadGuard::new(this.lock, this.owner, record);
@@ -447,24 +457,30 @@ impl<'a, T: ?Sized> Future for ReentrantWrite<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if !this.wait.is_queued() {
-            // Either completes at once: it spends one operation of the poll's
-            // budget, or, the budget spent, the level goes and it yields.
-            if this.lock.reenter_write(this.owner) {
-                let guard = ReentrantWriteGuard::new(this.lock, this.owner);
-                if crate::coop::spend(cx.waker()) {
-                    return Poll::Ready(Ok(guard));
-                }
-                drop(guard);
-                return Poll::Pending;
+        // Either completes at once: it spends one operation of the poll's
+        // budget, or, the budget spent, the level goes and it yields. A request
+        // that queued before its owner came to write or read through another
+        // one leaves the queue first, which cannot have granted it the write.
+        if this.lock.reenter_write(this.owner) {
+            if this.wait.is_queued() {
+                this.wait.cancel(&this.lock.raw, WRITE);
             }
-            if this.lock.readers.find(this.owner.id()).is_some() {
-                return if crate::coop::spend(cx.waker()) {
-                    Poll::Ready(Err(ReadHeldByOwner))
-                } else {
-                    Poll::Pending
-                };
+            let guard = ReentrantWriteGuard::new(this.lock, this.owner);
+            if crate::coop::spend(cx.waker()) {
+                return Poll::Ready(Ok(guard));
             }
+            drop(guard);
+            return Poll::Pending;
+        }
+        if this.lock.readers.find(this.owner.id()).is_some() {
+            if this.wait.is_queued() {
+                this.wait.cancel(&this.lock.raw, WRITE);
+            }
+            return if crate::coop::spend(cx.waker()) {
+                Poll::Ready(Err(ReadHeldByOwner))
+            } else {
+                Poll::Pending
+            };
         }
         this.wait.poll(&this.lock.raw, WRITE, cx.waker()).map(|()| {
             this.lock.enter_write(this.owner);

@@ -86,6 +86,14 @@ impl<T: ?Sized> ReentrantMutex<T> {
     /// Waits for the lock, at once if `owner` already holds it. A
     /// contended wait is lock-free, not wait-free: see
     /// [Progress](super#progress).
+    ///
+    /// Every poll looks for `owner` first, so a wait that queued before
+    /// `owner` took the lock through another of its requests (two locks in
+    /// one `join!`) leaves the queue and enters at its next poll. Nothing
+    /// wakes it for that: a wait last polled before the other request
+    /// entered (the `join!` polls it first, or it is in another task of the
+    /// same owner) waits as another owner's would, so holding the lock until
+    /// it completes waits on itself.
     pub fn lock<'a>(&'a self, owner: &'a Owner) -> ReentrantMutexLock<'a, T> {
         ReentrantMutexLock {
             mutex: self,
@@ -208,7 +216,11 @@ impl<'a, T: ?Sized> Future for ReentrantMutexLock<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReentrantMutexGuard<'a, T>> {
         let this = self.get_mut();
-        if !this.wait.is_queued() && this.mutex.reenter(this.owner) {
+        if this.mutex.reenter(this.owner) {
+            // The owner took the lock through another request since this one
+            // queued: this one leaves the queue, which cannot have granted it
+            // the permit the owner holds.
+            this.wait.cancel(&this.mutex.sem, 1);
             // Completed at once: it spends one operation of the poll's
             // budget, or, the budget spent, the level goes and it yields.
             let guard = ReentrantMutexGuard::new(this.mutex);
