@@ -1058,36 +1058,8 @@ mutations (withdrawing a write part of which went out breaks `WholeOrNothing`; l
 of an abandoned write unsent keeps it from ending), and 2 witnesses (a withdrawn write; an
 abandoned write finished after part of it went out).
 
-`tla/ring/RingPoll.tla` checks a stream read by readiness on a ring, and the switch between that
-and the multishot receive (`read_direct` and `poll_first` in `src/io/source/read/direct.rs`,
-`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `take_arrival` in
-`src/io/source/read.rs`). The side's multishot poll says when the socket may hold bytes, and the
-task reads them straight into its own buffer, as on epoll: with the kernel's count of what a read
-leaves, a count of none has the next read wait for the poll; without it, a read that took less
-than it asked for emptied the socket. A task that waits arms the poll, and the kernel looks at the
-socket as it arms it; a poll that ends (a cancel, or the kernel's own end) is armed again by the
-next wait. A switch to the multishot receive cancels the poll and arms the receive once the poll
-ended; a switch back cancels the receive and reads from the socket again only once every chunk it
-brought was read and its end came, its first read looking at the socket. A peer that closes after
-its messages leaves an end the kernel's count may not tell (a Unix stream's leaves it out): the
-poll reports the hangup (`POLLRDHUP` is asked for, and `Arrival::Ready` carries it), which marks
-the side unsure, as a poller's hangup edge does, and an unsure side reads again
-on a count of none and finds the end. 11 configurations: 4 that
-must pass (three messages read one at a time with the kernel's count, two at a time by length,
-with switches both ways, and two messages before the peer closes, each with the kernel ending the
-poll once on its own but the last; with
-`InOrder`, no message lost, doubled or reordered, `OneOut`, never a poll and a receive in the
-kernel at once, and `Termination`), 5 mutations (a poll armed once and never again after it
-ended, a read that took all it asked for taken as having emptied the socket after the poll fired
-for it, a receive's end past a switch back taken as the socket found empty with its poll still
-armed, and a hangup the poll reported that does not mark the side unsure, each break
-`Termination`; a read from the socket past a switch back while the receive's
-chunks wait breaks `InOrder`), and 2 witnesses (a poll armed again after one ended; a switch each
-way).
-
 `tla/ring/RingMulti.tla` checks a stream's read side with multishot receives
-(`src/io/source/read/ops.rs`, `src/io/source/read.rs`, `src/rt/shard/ring.rs`), as a side reads
-once it switched to the receive (`tla/ring/RingPoll.tla` checks the switch): the reader's
+(`src/io/source/read/ops.rs`, `src/io/source/read.rs`, `src/rt/shard/ring.rs`): the reader's
 first read arms one receive, the kernel fills a buffer of the shard's group per message and
 posts an arrival, the ring's thread hands each arrival to the side in order and stops the
 receive past its cap, and the receive ends (cancelled, dry, at the stream's end) with one last
@@ -1212,8 +1184,7 @@ copied into the write-behind).
 `datagram_ready` in `src/io/source/read/datagram.rs`, the bound in `datagram_want` and the ring's
 poll armed in `submit_ops`, `src/io/source/read/ops.rs`, its arrivals in `take_arrival`, the edge
 in `serve`; on a port `receive`, `receive_starved` and `PortMem::RecvFrom` in
-`src/io/source/port.rs`), on epoll or kqueue, on a ring and on a Windows completion port. The same
-multishot poll serves a stream read by readiness on a ring, which `tla/ring/RingPoll.tla` checks.
+`src/io/source/port.rs`), on epoll or kqueue, on a ring and on a Windows completion port.
 A peer sends a small datagram and then the largest the socket carries, which for a Unix socket
 is more than the pool's largest buffer holds; the task receives each into a buffer that holds
 it, maybe asking first whether the socket is readable. The task receives a datagram itself into
@@ -1306,14 +1277,9 @@ one read): a read it covers with more to spare asks for no count (a plain `read`
 kernel and in the task than the `recvmsg` and its control message), and the read that would take
 the floor's last piece asks again, since more may have come after the count. A read that finds
 the socket empty forgets the floor. The model's `Exact` runs it on a request of four pieces, one
-read each, three sent first and the last after. Its `RingPoll` runs the exact reads on an io_uring
-ring, whose readiness comes from the ring's multishot poll (`poll_first` in `read_direct`, the
-poll armed in `submit_ops`): it reports bytes only while armed, a task that waits arms it, the
-kernel looks at the socket as it arms it, and the kernel may end it on its own, its end waking
-the task to arm another. 15 configurations: 5 that must pass (`Buffers`,
+read each, three sent first and the last after. 13 configurations: 4 that must pass (`Buffers`,
 every buffer free or holding a request read ahead; and `Read`, every task that reads gets its
-request, with a task that stops, with none, with exact reads, and with exact reads on a ring's
-poll), 7 mutations (a task on a ring that waits for a poll it never armed breaks `Read`; a starved reader
+request, with a task that stops, with none, and with exact reads), 6 mutations (a starved reader
 that waits for a buffer to come back, an edge that starves the side and wakes nobody, a reader
 that waits for the next edge after the pool turned it away, a peek taken as having emptied the
 socket, an exact read taken as having emptied it whatever the kernel counts, and a floor that

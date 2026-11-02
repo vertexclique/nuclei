@@ -50,13 +50,6 @@
 (* count. The reader that lets the floor cover that read too, and takes it *)
 (* as having emptied the socket, misses the piece that came after the      *)
 (* count.                                                                  *)
-(* With `RingPoll` set as well, the poller is an io_uring ring's multishot *)
-(* poll (`poll_first` in src/io/source/read/direct.rs, `submit_ops` in     *)
-(* src/io/source/read/ops.rs): it says that bytes came only while it is    *)
-(* armed, a task that waits arms it, and the kernel looks at the socket as *)
-(* it does, so bytes already there say so at once. The kernel may end the *)
-(* poll on its own; its end wakes the task that waits, which arms another. *)
-(* The reader that waits on a poll it never armed misses its request.      *)
 (*                                                                         *)
 (* What is abstract: the guards (each step runs whole under its side's),   *)
 (* the driver's thread (each edge is served as one step), and the bytes:   *)
@@ -67,8 +60,7 @@ EXTENDS Integers, FiniteSets, TLC
 CONSTANTS
     Holders,   \* how many of the connections have tasks that peek and then never read
     Mutation,  \* "none", or the name of the one rule this run takes away
-    Exact,     \* TRUE: tasks read straight into their own buffers, in pieces of a request
-    RingPoll   \* TRUE (with `Exact`): the edges come from a ring's multishot poll, armed by the task that waits
+    Exact      \* TRUE: tasks read straight into their own buffers, in pieces of a request
 
 \* The connections, and the buffers the pool holds: fewer than the connections.
 Conns == 1..2
@@ -98,7 +90,6 @@ variables
     phase = [c \in Conns |-> "peek"],   \* the task's next call: "peek", "read"; then "done" or "hold"
     got = [c \in Conns |-> 0],          \* the pieces of its request the task has read
     floor = [c \in Conns |-> 0],        \* the floor: the pieces the kernel last counted as left, less the reads since
-    armed = [c \in Conns |-> FALSE],    \* on a ring, the side's multishot poll is in the kernel
     direct = FALSE,                     \* (record) a starved reader called on the socket itself
     countless = FALSE,                  \* (record) a read the floor covered asked for no count
     starvedOnce = FALSE;                \* (record) a reader found the pool empty
@@ -117,10 +108,10 @@ P_send:
             if sent[c] + n = Pieces then
                 left := left \ {c};
             end if;
-            \* The part is in the socket, and the poller reports it: a ring's poll only while armed.
+            \* The part is in the socket, and the poller reports it.
             sock[c] := sock[c] + n;
             sent[c] := sent[c] + n;
-            edge[c] := edge[c] \/ ~RingPoll \/ armed[c];
+            edge[c] := TRUE;
         end with;
     end while;
 end process;
@@ -164,21 +155,6 @@ D_loop:
             end if;
         end with;
     end while;
-end process;
-
-\* On a ring, the kernel may end a side's poll on its own (a completion with no MORE): its end wakes the
-\* task that waits, which looks again and arms another. Not fair: the poll may also never end.
-process kernel = 5
-begin
-K_end:
-    while RingPoll do                                                       \* only a ring's poll ends so
-        with c \in {d \in Conns : armed[d]} do                              \* an armed one
-            armed[c] := FALSE;                                              \* is over
-            if waits[c] then                                                \* its task waits:
-                woken[c] := TRUE;                                           \* it is woken to look again
-            end if;                                                         \* the end is applied
-        end with;                                                           \* one end
-    end while;                                                              \* as often as it comes
 end process;
 
 \* Each connection's task: its peek and its read, each polled again whenever it is woken.
@@ -236,12 +212,6 @@ R_poll:
                 floor[self] := 0;
                 waits[self] := TRUE;
                 woken[self] := FALSE;
-                \* On a ring the task that waits arms the poll, and the kernel looks as it arms it.
-                \* MUTATION no_arm: the task waits on a ring's poll it never armed.
-                if RingPoll /\ ~armed[self] /\ Mutation # "no_arm" then   \* no poll in the kernel:
-                    armed[self] := TRUE;                                    \* the task arms one
-                    if sock[self] > 0 then edge[self] := TRUE; end if;      \* bytes there say so at once
-                end if;                                                     \* the poll is armed
             end if;
         elsif ahead[self] then
             if phase[self] = "peek" then
@@ -284,11 +254,6 @@ R_poll:
             \* The socket was found empty and no edge came since: the task waits for the next one.
             waits[self] := TRUE;
             woken[self] := FALSE;
-            \* On a ring the task that waits arms the poll, and the kernel looks as it arms it.
-            if RingPoll /\ ~armed[self] /\ Mutation # "no_arm" then       \* no poll in the kernel:
-                armed[self] := TRUE;                                        \* the task arms one
-                if sock[self] > 0 then edge[self] := TRUE; end if;          \* bytes there say so at once
-            end if;                                                         \* the poll is armed
         end if;
 R_wait:
         \* A task that waits goes on once it is woken.
