@@ -24,6 +24,13 @@
 (* again. With the count at zero and the flag taken back, the task binds   *)
 (* once more.                                                              *)
 (*                                                                          *)
+(* With `Duplex` the operation out is that TCP send into a full socket,  *)
+(* whose peer reads only once it got what it waits for from us: the send *)
+(* ends only after the task's first read on the other port, which needs   *)
+(* the registration, which waits for the send (`may_cancel` never cancels *)
+(* it; `attach_port`, `waits_for_ops`). Both ends wait for good: a defect *)
+(* `MK_duplex` pins until the design changes.                             *)
+(*                                                                          *)
 (* What is modelled step by step: the kernel's completions, each packet's *)
 (* delivery (its dequeue, the source's count and the flag's look as one   *)
 (* step, as one thread makes them), the hand-off, the take-back's two     *)
@@ -36,6 +43,7 @@ EXTENDS Integers, TLC
 CONSTANTS
     Ops,       \* the source's operations out on the port at the start
     Back,      \* TRUE: the shard may run again
+    Duplex,    \* TRUE: they are a TCP send the peer takes only after the task's first read
     Mutation   \* "none", or the name of the one rule this run takes away
 
 (* --algorithm PortKeep
@@ -53,7 +61,9 @@ variables
     waited = FALSE,       \* (record) a registration waited
     stopped = FALSE,      \* (record) a keeper that kept was stopped
     kept = FALSE,         \* (record) the keeper delivered a packet
-    evicted = FALSE;      \* the holder of a side performed the source's eviction
+    evicted = FALSE,      \* the holder of a side performed the source's eviction
+    readDone = FALSE,     \* (Duplex) the task's first read on the other port completed
+    peerRead = FALSE;     \* (Duplex) the peer reads, so the socket has room for the send
 
 define
     \* The source's operations not delivered: the port's count, and the source's.
@@ -77,10 +87,19 @@ fair process kernel = "kernel"
 begin
 K_loop:
     while TRUE do
-        await inKernel > 0;
+        \* A send into a full socket ends only once its peer reads.
+        await inKernel > 0 /\ (~Duplex \/ peerRead);
         inKernel := inKernel - 1;
         queued := queued + 1;
     end while;
+end process;
+
+\* The peer: it waits for the task's bytes before it reads ours.
+fair process peer \in (IF Duplex THEN {"peer"} ELSE {})
+begin
+X_read:
+    await readDone;
+    peerRead := TRUE;
 end process;
 
 \* A side's holder on another thread: it may hand the port one more
@@ -186,7 +205,7 @@ T_bind:
     \* The bind fails while the kernel holds an operation of the handle.
     if inKernel = 0 then
         registered := TRUE;
-        goto Done;
+        goto T_read;
     elsif Mutation = "fail_on_ops" then
         \* MUTATION fail_on_ops: a failed bind fails the registration.
         failed := TRUE;
@@ -220,6 +239,11 @@ T_retry:
     else
         failed := TRUE;
     end if;
+T_read:
+    \* Registered, the task's read goes to the other port and completes.
+    if registered then
+        readDone := TRUE;
+    end if;
 end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
@@ -244,6 +268,9 @@ AllDelivered == <>[](Out = 0)
 
 \* The source ends registered with the other port.
 Registers == <>registered
+
+\* The task's read on the other port is served.
+ReadServed == <>readDone
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)

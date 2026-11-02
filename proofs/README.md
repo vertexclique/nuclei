@@ -1638,7 +1638,12 @@ drainer and no failed registration, every packet delivered and the source regist
 whether the shard runs again or not), 6 mutations (no keeper and no wait for the evictions
 strand packets, `AllDelivered`; no wait for the keeper and a keeper that ignores being called
 off break `OneDrainer`; no look at the count after the flag breaks `Registers`; a bind failure
-that fails the registration breaks `NoFailure`), and 4 witnesses.
+that fails the registration breaks `NoFailure`), and 4 witnesses. With `Duplex` the operation out is a TCP
+send into a full socket whose peer reads only after it got what it waits for from us: the send is
+never cancelled (`may_cancel`), the registration waits for it, and the task's read on the other
+port waits for the registration, so both ends wait for good. `PK_read` (a move whose operation ends
+on its own: the read is served, `ReadServed`) passes, and `MK_duplex` pins the defect
+(`ReadServed` broken) until a moved source's reads go on with its send still out.
 
 ## Idle peers on a completion port
 
