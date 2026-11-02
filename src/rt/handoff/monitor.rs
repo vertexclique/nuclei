@@ -106,7 +106,9 @@ impl Spare {
 
 impl Drop for Spare {
     /// A gift handed to a spare that had seen the close and gone: its shard
-    /// goes with the spare, never kept for good.
+    /// goes with the spare, never kept for good, inside its runtime (the
+    /// spare's thread runs inside it, and the monitor lets go of the one it
+    /// pops through `let_go`).
     fn drop(&mut self) {
         drop(self.take_gift());
     }
@@ -217,6 +219,12 @@ impl Monitor {
     /// The time between the monitor's reads of a word.
     pub(crate) fn tick(&self) -> Duration {
         (self.after / STREAK).max(Duration::from_micros(100))
+    }
+
+    /// The life of the first runner of place `index`.
+    #[cfg(test)]
+    pub(crate) fn first_life(&self, index: usize) -> Option<Arc<Life>> {
+        Some(Arc::clone(&self.places.get(index)?.get()?.first.life))
     }
 
     /// Waits, as spare `me`, for a shard to run: `None` once the runtime
@@ -455,6 +463,11 @@ fn give(monitor: &Monitor, runtime: &Weak<Inner>, gift: Gift) -> Result<(usize, 
             .gift
             .store(Box::into_raw(Box::new(gift)), Ordering::Release);
         spare.thread.unpark();
+        // A spare that saw the close and left before this pop holds no
+        // reference of its own: this one is the last, and the gift goes with
+        // it, inside the shard's runtime (proofs/tla/teardown,
+        // `LastDropInRuntime`).
+        let_go(runtime, spare);
         return Ok((place, life));
     }
     let Some(inner) = runtime.upgrade() else {
@@ -792,6 +805,71 @@ mod tests {
         assert!(
             matches!(b.read(&mut one), Ok(1)) && one == *b"y",
             "the byte waits behind a side blocked on an edge its driver passed over"
+        );
+    }
+
+    /// A spare that came after the close looked, saw it and left, its
+    /// reference still on the queue: the last pass's hand-off pops it, and the
+    /// popped reference is the last, so the gift, and the shard, go with it.
+    /// That drop was the monitor's plain one, outside any runtime, and what
+    /// the shard's going handed on went elsewhere; it goes through `let_go`,
+    /// inside the shard's runtime (proofs/tla/teardown).
+    #[test]
+    fn a_gift_to_a_spare_that_left_goes_inside_its_runtime() {
+        use std::sync::atomic::AtomicU64;
+        static DROPPED_IN: AtomicU64 = AtomicU64::new(0);
+        struct Marks;
+        impl Drop for Marks {
+            fn drop(&mut self) {
+                let id = crate::rt::context::runtime().map_or(u64::MAX, |inner| inner.id());
+                DROPPED_IN.store(id, Ordering::SeqCst);
+            }
+        }
+        static LOCAL: crate::runtime::ShardLocal<Marks> =
+            crate::runtime::ShardLocal::__new(|| Marks);
+        let rt = crate::runtime::Builder::new()
+            .worker_threads(0)
+            .build()
+            .unwrap();
+        let inner = Arc::clone(rt.inner());
+        let monitor = Arc::new(Monitor::new(Duration::from_millis(10), 1, Vec::new(), None));
+        let shard = Shard::worker(
+            Limits {
+                max_nesting: 8,
+                buffer_cap: crate::buf::DEFAULT_CAP,
+                backend: crate::rt::backend::chosen().unwrap(),
+            },
+            crate::rt::tuning::Tuning::default(),
+            inner.id(),
+            0,
+            Some(Arc::clone(&monitor)),
+        )
+        .unwrap();
+        {
+            let _in = crate::rt::context::enter(&shard);
+            LOCAL.with(|_| ());
+        }
+        monitor.close();
+        let waits = Arc::clone(&monitor);
+        std::thread::spawn(move || {
+            assert!(
+                waits
+                    .wait_for_shard(&Spare::here(Arc::new(Life::new())))
+                    .is_none()
+            );
+        })
+        .join()
+        .unwrap();
+        let gift = Gift {
+            place: 0,
+            shard: Owned(shard),
+            slot: monitor.slot(),
+        };
+        assert!(give(&monitor, &Arc::downgrade(&inner), gift).is_ok());
+        assert_eq!(
+            DROPPED_IN.load(Ordering::SeqCst),
+            inner.id(),
+            "the shard went outside its runtime"
         );
     }
 

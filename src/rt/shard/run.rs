@@ -234,15 +234,11 @@ impl Shard {
             let pool_out = self.blocking_out();
             if self.begin_park(|| self.has_remote_work() || signal.woken.load(Ordering::SeqCst)) {
                 let slept = Instant::now();
-                if let Some(park) = &self.tuning.hooks.park {
-                    park();
-                }
+                self.tuning.hooks.parked();
                 self.drive_or_report(None);
                 shared.park.end_park();
                 self.parked_ended();
-                if let Some(unpark) = &self.tuning.hooks.unpark {
-                    unpark();
-                }
+                self.tuning.hooks.unparked();
                 self.slept_for(slept.elapsed(), !pool_out);
             }
             self.after_park();

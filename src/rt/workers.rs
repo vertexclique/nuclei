@@ -3,10 +3,18 @@
 //!
 //! A runtime has room for a set number of workers over its life, fixed when
 //! it is built (four times the workers it starts with unless set
-//! otherwise). Slots fill in order as workers start, and a slot once filled
-//! keeps its shard, so placement reads them without a lock. A worker asked
+//! otherwise). Slots are claimed in order as workers start, and filled once
+//! a worker's thread started, so placement never finds a shard no thread
+//! will run; a slot once filled keeps its shard, so placement reads them
+//! without a lock. A worker asked
 //! to stop takes no new task from then on, runs the ones it has to their
 //! end, and exits; its slot is not filled again.
+//!
+//! A thread starts, goes on the list a shutdown joins and has its shard
+//! published under the list's lock, unless a shutdown took the list: from
+//! then on no thread starts, and a worker started before the take is
+//! stopped by the take, its shard in its slot by then
+//! (proofs/tla/teardown/Grow.tla).
 //!
 //! With the handoff on (`rt::handoff`), a worker's thread is a runner: it
 //! runs the shard it is given until the shard stops, or is taken from it
@@ -21,7 +29,7 @@ use super::rng::random_below;
 use core::cell::Cell;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use super::context;
@@ -37,6 +45,14 @@ thread_local! {
     /// The runtime and the shard the spawns of this thread (one that is not
     /// that runtime's worker) went to last.
     static HOME: Cell<Option<(u64, usize)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The next runtime thread this thread asks for does not start, as when
+    /// the system has no room for one, once what is set here ran in its place.
+    pub(crate) static THREAD_FAILS: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::RefCell::new(None) };
 }
 
 /// How a worker is started.
@@ -69,13 +85,22 @@ pub(crate) struct Workers {
     /// The fewest workers a stop leaves running.
     min: usize,
     start: Start,
-    /// Every thread the runtime started for its workers (and its monitor),
-    /// with its life.
-    threads: Mutex<Vec<(JoinHandle<()>, Arc<Life>)>>,
-    exits: kovan_channel::unbounded::Sender<()>,
+    threads: Mutex<Threads>,
+    exits: kovan_channel::unbounded::Sender<ThreadId>,
     /// The watch over the workers, with the handoff on.
     monitor: Option<Arc<Monitor>>,
     monitor_started: OnceLock<()>,
+}
+
+/// The threads a shutdown joins.
+#[derive(Default)]
+struct Threads {
+    /// Every thread the runtime started for its workers, with its life.
+    list: Vec<(JoinHandle<()>, Arc<Life>)>,
+    /// The monitor's thread, joined apart from the others: before them.
+    monitor: Option<JoinHandle<()>>,
+    /// A shutdown took the list: no thread starts from then on.
+    closed: bool,
 }
 
 /// A shard for a runner to run: worker place `place`, watched through
@@ -104,7 +129,7 @@ impl Workers {
         capacity: usize,
         min: usize,
         start: Start,
-        exits: kovan_channel::unbounded::Sender<()>,
+        exits: kovan_channel::unbounded::Sender<ThreadId>,
     ) -> Self {
         let monitor = start
             .handoff_after
@@ -123,7 +148,7 @@ impl Workers {
             running: AtomicUsize::new(0),
             min,
             start,
-            threads: Mutex::new(Vec::new()),
+            threads: Mutex::new(Threads::default()),
             exits,
             monitor,
             monitor_started: OnceLock::new(),
@@ -224,16 +249,23 @@ impl Workers {
         Ok(started)
     }
 
-    /// Starts a worker in the next free slot; `false` when none is left.
+    /// Starts a worker in the next free slot; `false` when none is left, or
+    /// once a shutdown took the threads.
     fn start_one(inner: &Arc<Inner>) -> io::Result<bool> {
         let workers = &inner.workers;
+        // Named only while a slot is free, and before anything is claimed: a
+        // name function that panics reaches the caller with nothing held.
+        if workers.claimed.load(Ordering::Acquire) >= workers.slots.len() {
+            return Ok(false);
+        }
+        let name = super::tuning::spawnable((workers.start.name)());
         let index = workers.claimed.fetch_add(1, Ordering::AcqRel);
         if index >= workers.slots.len() {
             workers.claimed.fetch_sub(1, Ordering::AcqRel);
             return Ok(false);
         }
-        // A shard that cannot be made leaves its slot empty; placement
-        // skips it.
+        // A shard that cannot be made, or whose thread cannot start, leaves
+        // its slot empty; placement skips it.
         let mut limits = workers.start.limits;
         if workers.monitor.is_some() {
             limits.backend = limits.backend.handed_over();
@@ -247,8 +279,6 @@ impl Workers {
         )?;
         let shared = Arc::clone(&shard.shared);
         shared.set_runtime(Arc::downgrade(inner));
-        let _ = workers.slots[index].set(Arc::clone(&shared));
-        workers.running.fetch_add(1, Ordering::AcqRel);
         let life = Arc::new(Life::new());
         let slot = workers.monitor.as_ref().map(|monitor| {
             let slot = monitor.slot();
@@ -268,18 +298,21 @@ impl Workers {
             slot,
             handed: false,
         };
-        match Self::spawn_thread(inner, run, life) {
-            Ok(()) => {
-                Self::start_monitor(inner)?;
-                Ok(true)
-            }
-            Err((err, _)) => {
-                // The shard went with the run; its slot takes no tasks.
-                shared.stop();
-                workers.running.fetch_sub(1, Ordering::AcqRel);
-                Err(err)
-            }
+        // Published once its thread started, so a task placed on the shard
+        // always has a thread to run it: a shard whose thread could not start
+        // goes with its run, holding no task (proofs/tla/placement/Publish.tla,
+        // `NoSilentLoss`).
+        let publish = || {
+            let _ = workers.slots[index].set(shared);
+            workers.running.fetch_add(1, Ordering::AcqRel);
+        };
+        match Self::spawn_thread(inner, name, run, life, publish) {
+            Ok(()) => {}
+            Err((None, _)) => return Ok(false),
+            Err((Some(err), _)) => return Err(err),
         }
+        Self::start_monitor(inner)?;
+        Ok(true)
     }
 
     /// Starts the monitor's thread, with the handoff on, once.
@@ -288,7 +321,13 @@ impl Workers {
         let Some(monitor) = &workers.monitor else {
             return Ok(());
         };
-        if workers.monitor_started.set(()).is_err() {
+        if workers.monitor_started.get().is_some() {
+            return Ok(());
+        }
+        // Under the list's lock: one a shutdown took starts no monitor, and
+        // one started before the take is taken with it.
+        let mut threads = lock(&workers.threads);
+        if threads.closed || workers.monitor_started.set(()).is_err() {
             return Ok(());
         }
         let (monitor, runtime) = (Arc::clone(monitor), Arc::downgrade(inner));
@@ -299,7 +338,7 @@ impl Workers {
                 let _exit = exit;
                 super::handoff::run(&monitor, &runtime);
             })?;
-        lock(&workers.threads).push((thread, Arc::new(Life::new())));
+        threads.monitor = Some(thread);
         Ok(())
     }
 
@@ -310,7 +349,8 @@ impl Workers {
         gift: Gift,
         life: Arc<Life>,
     ) -> Result<(), Gift> {
-        Self::spawn_thread(inner, Run::from(gift), life).map_err(|(_, run)| Gift {
+        let name = super::tuning::name_caught(&*inner.workers.start.name, "nuclei-worker");
+        Self::spawn_thread(inner, name, Run::from(gift), life, || {}).map_err(|(_, run)| Gift {
             place: run.place,
             shard: run.shard,
             slot: run.slot.unwrap_or_else(|| inner.workers.monitor_slot()),
@@ -324,29 +364,55 @@ impl Workers {
             .map_or_else(|| Arc::new(Slot::new(true)), |monitor| monitor.slot())
     }
 
-    /// Starts a runner thread for `run`; on failure the error and the run.
-    fn spawn_thread(inner: &Arc<Inner>, run: Run, life: Arc<Life>) -> Result<(), (io::Error, Run)> {
+    /// Starts a runner thread named `name` for `run`, and once it is on the
+    /// list a shutdown joins, calls `started`; on failure the error and the
+    /// run, with no error once a shutdown took the list.
+    fn spawn_thread(
+        inner: &Arc<Inner>,
+        name: String,
+        run: Run,
+        life: Arc<Life>,
+        started: impl FnOnce(),
+    ) -> Result<(), (Option<io::Error>, Run)> {
         let workers = &inner.workers;
+        // Held until `started` ran: a shutdown takes the list either before
+        // the look below, or after the thread is on it and `started` ran.
+        let mut threads = lock(&workers.threads);
+        if threads.closed {
+            return Err((None, run));
+        }
         // The run waits here until the thread takes it, so a thread that
         // cannot start hands it back.
         let handed = Arc::new(Handed(AtomicPtr::new(Box::into_raw(Box::new(run)))));
         let (taken, thread_inner, thread_life) =
             (Arc::clone(&handed), Arc::clone(inner), Arc::clone(&life));
-        let spawned = std::thread::Builder::new()
-            .name((workers.start.name)())
-            .stack_size(workers.start.stack)
-            .spawn(move || {
-                if let Some(run) = taken.take() {
-                    runner(&thread_inner, run, &thread_life);
-                }
-            });
+        let thread = std::thread::Builder::new()
+            .name(name)
+            .stack_size(workers.start.stack);
+        let body = move || {
+            if let Some(run) = taken.take() {
+                runner(&thread_inner, run, &thread_life);
+            }
+        };
+        #[cfg(test)]
+        let spawned = match THREAD_FAILS.with(|fails| fails.borrow_mut().take()) {
+            Some(meanwhile) => {
+                meanwhile();
+                drop(body);
+                Err(io::Error::other("no thread could start"))
+            }
+            None => thread.spawn(body),
+        };
+        #[cfg(not(test))]
+        let spawned = thread.spawn(body);
         match spawned {
             Ok(thread) => {
-                lock(&workers.threads).push((thread, life));
+                threads.list.push((thread, life));
+                started();
                 Ok(())
             }
             Err(err) => match handed.take() {
-                Some(run) => Err((err, run)),
+                Some(run) => Err((Some(err), run)),
                 // Never: the closure did not run.
                 None => Ok(()),
             },
@@ -407,25 +473,56 @@ impl Workers {
         self.shards().for_each(|s| s.stop());
     }
 
-    /// The runtime's threads started so far, taken for joining: every one
-    /// but a thread still blocked in the poll its shard was taken in, which
-    /// is left to exit on its own.
+    /// The monitor's thread, taken for joining, if it started. Once it ended,
+    /// no take marks a thread detached and no runner starts: a shutdown joins
+    /// it before it takes the other threads (proofs/tla/teardown).
+    pub(crate) fn take_monitor(&self) -> Option<JoinHandle<()>> {
+        lock(&self.threads).monitor.take()
+    }
+
+    /// The threads listed for a shutdown to join, for a test to see the
+    /// list taken.
+    #[cfg(test)]
+    pub(crate) fn threads_listed(&self) -> usize {
+        lock(&self.threads).list.len()
+    }
+
+    /// The life of the first runner of place `index`, as the monitor knows it.
+    #[cfg(test)]
+    pub(crate) fn monitor_first_life(&self, index: usize) -> Option<Arc<Life>> {
+        self.monitor.as_ref()?.first_life(index)
+    }
+
+    /// The runtime's threads started so far, taken for joining once
+    /// [`stop_all`](Self::stop_all) ran: every one but a thread still blocked
+    /// in the poll its shard was taken in, which is left to exit on its own,
+    /// and a monitor started since [`take_monitor`](Self::take_monitor),
+    /// which ends at its first look at the close. No thread starts from then
+    /// on, and a worker started since the stop is stopped here: its shard was
+    /// in its slot before the take (proofs/tla/teardown/Grow.tla).
     pub(crate) fn take_threads(&self) -> Vec<JoinHandle<()>> {
-        core::mem::take(&mut *lock(&self.threads))
-            .into_iter()
+        let (list, monitor) = {
+            let mut threads = lock(&self.threads);
+            threads.closed = true;
+            (core::mem::take(&mut threads.list), threads.monitor.take())
+        };
+        self.stop_all();
+        list.into_iter()
             .filter(|(_, life)| !life.is_detached())
             .map(|(thread, _)| thread)
+            .chain(monitor)
             .collect()
     }
 }
 
-/// Reports a runtime thread's exit, once what it held is dropped, even when
-/// it ends by a panic.
-struct Exit(kovan_channel::unbounded::Sender<()>);
+/// Reports a runtime thread's exit, naming it, once what it held is dropped,
+/// even when it ends by a panic: the last the thread does before it reads as
+/// finished.
+struct Exit(kovan_channel::unbounded::Sender<ThreadId>);
 
 impl Drop for Exit {
     fn drop(&mut self) {
-        self.0.send(());
+        self.0.send(std::thread::current().id());
     }
 }
 

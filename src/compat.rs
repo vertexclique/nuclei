@@ -119,7 +119,8 @@ pub fn init_with_config(config: GlobalExecutorConfig) {
 }
 
 /// Starts up to `count` more workers on the runtime this thread is inside
-/// (or the default one), within its maximum; returns how many started.
+/// (or the default one), within its maximum; returns how many started, none
+/// once the runtime's drop or shutdown took its threads to join.
 ///
 /// # Errors
 ///

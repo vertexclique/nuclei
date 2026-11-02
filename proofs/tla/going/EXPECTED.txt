@@ -47,3 +47,9 @@ PW_late_release   Pending violated:NoLateRelease
 B_deaf            Behind  pass
 MB_no_drain_time  Behind  violated:DrainEnds
 W_drain_timeout   Behind  violated:NoDrainTimeout
+U_alive           Unworked pass
+U_drop            Unworked pass
+MU_own_shard      Unworked violated:AllSent
+MU_list_first     Unworked violated:AllSent
+MU_thread_uncounted Unworked violated:DropWaits
+WU_waited         Unworked violated:NoWaited

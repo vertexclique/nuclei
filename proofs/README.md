@@ -432,6 +432,20 @@ bit cleared after the slot is freed erases another thread's bit, breaking `Index
 whose compare-and-swap loses, a wake through the bitmap). The model reads the bitmap one slot's
 bit per step, which covers a scan over several words, each word with its own load.
 
+`tla/pool/Start.tla`, in the same family, checks a thread start that fails and a start hook or a
+name function that panics (`Pool::submit`, `start_thread`, `count_thread`, `cannot_start` and
+`work`, and `ThreadHooks::started` and `name_caught` in `src/rt/tuning.rs`): a submitter counts its
+thread, names it, then asks the system for one; if the start fails it takes its count back and
+then, with no thread counted, runs the queued jobs itself. A thread calls the user's start hook
+first; its panic is caught where the hook is called, and the thread goes on. Before, the panic
+left `work` with the thread still counted, so a pool at its cap started no other and the job
+waited for good; a panic of the name function left `start_thread` the same way, the thread counted
+and never asked for. It is caught too, and the thread takes the default name. 7 configurations: 2
+that must pass (two submitters with a pool of one thread and of two, every start able to fail and
+every hook and name to panic: `RunOnce`, `Bounded`, `AllRan`), 3 mutations that break `AllRan` (the
+look at the count before its own count goes; the hook's panic left uncaught; the name's panic left
+uncaught), and 2 witnesses (jobs run on the submitter after a failed start; a caught panic).
+
 ## Task blocks given back to their thread
 
 `remote` (`tla/remote/RemoteFree.tla`) checks how a task's block freed on another thread than
@@ -1883,6 +1897,17 @@ holds it; a slow one that completes after the shard gave up on it).
 once, `src/rt/park/ring.rs` that a wake after the poller went writes no freed memory, and
 `src/rt/shard/ring/tests.rs` that a read and a file's call given up on end with an error and let a
 retire return.
+`Unworked` (`tla/going/Unworked.tla`) checks a linger handed to a runtime with no worker taking
+tasks (none built, or every one stopping): `spawn_linger` in `src/rt/runtime.rs`, `route_linger`,
+`OnThread`, `alone` and `linger_thread` in `src/rt/linger.rs`. Such a linger went to the handing
+thread's own shard, which runs only at that thread's next `block_on`, or, the thread having none,
+to the runtime's list, which only a drop runs: with neither coming, the bytes never reached the
+peer and the handle's socket stayed open. It goes to the linger thread, one for the process,
+still counted by its runtime until it ends, so a drop that comes waits for it. 6 configurations:
+2 that must pass (`AllSent` with a runtime never dropped and the handing thread never running its
+shard again; the same with a drop, and `DropWaits` for a linger handed before the drop began), 3
+mutations (the own shard and the list, each breaking `AllSent`; the linger thread's linger left
+uncounted, breaking `DropWaits`), and a witness (a drop that waited for such a linger).
 
 ## A blocking job of a Windows handle
 
@@ -2796,6 +2821,14 @@ drops every task by design, is not modelled.
 A handoff is one step (its claim, fence and take are `handoff`'s), and the spawners run on
 threads that run no shard.
 
+`tla/placement/Publish.tla`, in the same family, checks a worker's start racing a spawn while the
+worker's thread may fail to start (`Workers::start_one` and `spawn_thread` in `src/rt/workers.rs`):
+the shard used to be published in its slot before its thread was asked for, so a spawn in between
+queued its task there, and a failed start stopped the shard and dropped it with that task. The
+slot is published only once the thread took its run. 3 configurations: one that must pass
+(`NoSilentLoss` and the task's run), the mutation that publishes first (breaking `NoSilentLoss`),
+and a witness (the start fails).
+
 ## A shard-local value across a handoff
 
 `shardlocal` (`tla/shardlocal/ShardLocal.tla`) checks a shard-local value
@@ -2979,6 +3012,74 @@ run on every core of the machine. The lock that lets one free function start the
 time is not modelled (one caller makes that start here). The spec is written from each setter's
 documentation, and most of the code's checks agree with it by construction: the mutations are what
 shows each check is needed and in its place.
+
+## A runtime's drop and its monitor
+
+`teardown` (`tla/teardown/Teardown.tla`) checks a runtime's drop while its monitor may still take
+a shard and hand it on (`Runtime::drop`, `stop_and_join` and `join` in `src/rt/runtime.rs`;
+`stop_all`, `take_monitor`, `take_threads` and `runner` in `src/rt/workers.rs`; `run`, `take`,
+`give`, `let_go`, `close` and `wait_for_shard` in `src/rt/handoff/monitor.rs`). The monitor's loop
+looks at the close only at its head, so a pass under way as the close comes may still take a
+shard from a thread blocked in one poll and start a runner for it. The drop took its list of
+threads first: it then waited on the thread blocked in the taken poll (which may never return),
+and never joined the runner it started. It joins the monitor's thread first, and takes the list
+after: every thread started but one detached by then, and never the dropping thread's own (a
+runtime dropped in one of its own tasks joined itself, a failed join that panics, or a wait for
+good on Windows). A spare that saw the close and left may still be on the queue for the last
+pass's hand-off, whose reference to it is then the last: it is let go of inside the runtime. 12
+configurations: 2 that must pass (the drop on a user's thread and on a runner of the runtime's
+own: `JoinsNoDetached`, `StartedJoined`, `NoSelfJoin`, `LastDropInRuntime`, `DropReturns` and no
+deadlock), 6 mutations (the list taken while the monitor runs, breaking `JoinsNoDetached` and, run
+again, `StartedJoined`; a detached thread kept in the list, breaking `JoinsNoDetached`; the
+dropping thread's own kept, breaking `NoSelfJoin`; a spare that parks before its first look at the
+close, a deadlock; a popped spare dropped plainly, breaking `LastDropInRuntime`), 2 witnesses (a
+take after the close; a gift to a spare that had left), and 2 that state today's design for the
+operator to settle: the drop returns while a detached thread still holds the taken shard, whose
+tasks it drops only when its poll returns (`DropDropsTasks`), and the detached thread's bound
+tasks are left live at the close (`BoundNeverLost`).
+
+`tla/teardown/Join.tla`, in the same family, checks the wait of `Runtime::shutdown_timeout`
+(`stop_and_join` and `join`, and `Exit` in `src/rt/workers.rs`): every runtime thread sends its
+exit message, naming itself, just before it reads as finished, and threads outside the list (a
+detached one, one that exited earlier) send theirs too. The wait took one message for each thread
+not finished as it reached it, whoever sent it, and returned while a worker still ran. It waits,
+for the monitor and then for the workers, until each listed thread read as finished or its
+message came (one that came during the monitor's wait counts too), messages only waking it, or
+until the deadline. 5 configurations: one that must pass (`WaitsForAll`, `Returns` with a deadline
+that may never pass), 3 mutations (today's count of messages, breaking `WaitsForAll`; a message
+counting for nothing, and the monitor's messages forgotten, each a wait for good, breaking
+`Returns`), and a witness (a message received before its thread reads as finished).
+
+`tla/teardown/Grow.tla`, in the same family, checks a worker a task starts as the runtime drops
+(`start_one`, `spawn_thread`, `start_monitor`, `take_monitor` and `take_threads` in
+`src/rt/workers.rs`; `stop_and_join` in `src/rt/runtime.rs`; `shutdown_background` in
+`src/rt/runtime/enter.rs`). The drop stopped every shard before it took its list of threads, and a
+start in between published its shard after that stop: on the list, the drop waited on its thread
+for good; after the take, the thread ran on, never stopped or joined. A start now, under the
+list's lock, looks at the list's close, starts its thread, puts it on the list and publishes its
+shard; the take closes the list and stops every shard again, and takes a monitor a first start
+began since the drop took the monitor's thread, which starts only while the list is open. 8
+configurations: one that must pass (`StartedJoined`, `DropReturns`, no deadlock), 5 mutations (no
+second stop, and the publish after the lock is let go, each breaking `DropReturns`; the start's
+look at the close left out, the monitor's look left out, and the late monitor left untaken, each
+breaking `StartedJoined`), and 2 witnesses (a publish between the stop and the take; a start that
+finds the list closed).
+
+## A thread hook that panics
+
+`hooks` (`tla/hooks/Hooks.tla`) checks the hooks a runner thread calls (`ThreadHooks::started`,
+`parked` and `unparked`, `call_caught` and `Stopping` in `src/rt/tuning.rs`; `runner` in
+`src/rt/workers.rs`; the park of `Shard::run_loop` in `src/rt/shard/run.rs`): a runner holding a
+shard's only strong reference (the monitor's gift, or a worker's first run) calls the start hook,
+runs what the shard queues, and parks with the park hook, then the unpark hook. A hook's panic
+used to leave `runner`, and the shard went with its tasks while the runtime ran; it is caught
+where the hook is called, once the panic hook reported it, and the thread goes on. Before the
+runner exists, the monitor names its thread (`spawn_runner`, `name_caught`) with the gift handed
+to it: a panic of the name function left the monitor's `give`, the gift and the monitor's thread
+with it; it is caught, and the runner takes the default name. 6 configurations: one that must pass
+(every hook call and the name able to panic: `NoLoss`, `RunOnce`, `AllRan`), 4 mutations (the
+name's and the start, park and unpark hooks' panics left uncaught, each breaking `NoLoss`), and a
+witness (a caught panic). A blocking-pool thread's start hook and name are `tla/pool/Start.tla`'s.
 
 ## What is not checked
 

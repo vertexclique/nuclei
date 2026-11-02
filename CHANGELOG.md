@@ -306,6 +306,63 @@
   BSDs and a Linux without `membarrier` (`F_safe`, with a mutation for each side's fence), both
   compare-and-swaps of the claim (the `blind_take` and `blind_contest` mutations), and two calls
   into the runtime in one poll (`L_two`, `D_two`).
+- **A runtime's drop never waits on a thread its monitor takes as it closes, and joins every runner
+  it starts.** The monitor's loop looked at the close only at its head, so a pass under way as a
+  drop closed it could still take a blocked worker's shard and start a runner for it, after the drop
+  had taken its list of threads: the drop then waited on the thread blocked in the taken poll, which
+  may never return, and never joined the runner, which dropped the shard's tasks after the drop
+  returned. The drop now joins the monitor's thread first, then takes the list
+  (`proofs/tla/teardown/Teardown.tla`).
+- **A runtime dropped in one of its own tasks no longer joins its own thread.** The drop joined
+  every runtime thread, the dropping one too: a failed join that panicked on Linux, macOS and
+  FreeBSD, and a wait for good on Windows. It joins every other thread, and the dropping one goes on
+  once the drop returned.
+- **`shutdown_timeout` waits for each worker until it exits or the deadline passes.** It took one
+  exit message for each worker not finished, from whichever thread sent it (the monitor, a worker
+  stopped earlier, a detached thread), so it could return while a worker still ran its task, and
+  the wait for what dropped handles left then started early. Each message now names its thread and
+  only wakes the wait, which goes on until every thread it waits for read as finished or sent its
+  own (`proofs/tla/teardown/Join.tla`).
+- **A gift handed to a spare that left is dropped inside its runtime.** A spare that saw the close
+  and left could still be popped by the monitor's last hand-off, whose reference was then the last:
+  the shard went with it on the monitor's thread outside the runtime, and what its going handed on
+  (a source's bytes behind, a shard-local value's drop) went to another runtime. The popped spare is
+  now let go of inside the shard's runtime.
+- **A thread hook or thread name function that panics loses no shard, task or blocking job.** A
+  panic in `on_thread_start` left the thread: on a runner the monitor started for a blocked
+  worker's shard it dropped that shard with its tasks, and on a blocking-pool thread it left the
+  thread counted, so a pool at its cap never ran the job. A panic in `on_thread_park` or
+  `on_thread_unpark` ended the worker the same way, its shard still marked parked. Every thread
+  hook's panic is now caught where the runtime calls it, once the panic hook reported it, and the
+  thread goes on. `thread_name_fn` lost the same: its panic as the monitor named a runner dropped
+  the shard handed to it, on the monitor's thread, and ended the monitor; one as the pool named a
+  thread left it counted and never started; one as a worker started left that worker's place
+  claimed and empty for good. Where the runtime starts a thread of its own accord (a runner, a
+  pool thread) the panic is caught and the thread takes the default name; as a worker starts
+  (`build`, `spawn_more_threads`) the name now comes first, so the panic reaches the caller with
+  nothing claimed. A name with a NUL byte, on which every thread's spawn panicked, is taken up to
+  it (`proofs/tla/hooks/Hooks.tla`, `proofs/tla/pool/Start.tla`, which also checks a pool thread
+  that fails to start).
+- **A runtime's drop stops and joins a worker a task starts meanwhile, and none starts once it
+  took its threads.** A worker started by `spawn_more_threads` as the runtime dropped was published
+  after the drop stopped every shard: put on the list in time, the drop waited on its thread for
+  good; put on it after the drop took the list, it ran on, never stopped or joined, once the drop
+  returned (as did a monitor a first start began). A thread now starts, goes on the list and has
+  its shard published under the list's lock unless the drop took the list, and the take stops every
+  shard again, so a worker started before it is stopped and joined; `spawn_more_threads` starts
+  none after it (`proofs/tla/teardown/Grow.tla`).
+- **A worker whose thread cannot start drops no task placed on it.** `spawn_more_threads` published
+  the new worker's shard to placement before it asked for the thread: a spawn in between queued its
+  task there, and a failed start stopped the shard and dropped it with the task. The shard is
+  published only once its thread started (`proofs/tla/placement/Publish.tla`).
+- **What a handle dropped with no worker wrote behind reaches the peer without another `block_on`.**
+  With no worker taking tasks, a linger (the bytes a socket's write-behind holds, a file's writes
+  behind) went to the dropping thread's own shard, which runs only at that thread's next
+  `block_on`, or to the runtime's list, which only its drop runs: with neither coming, the bytes
+  never went and the socket stayed open. It runs on the linger thread, one for the process, inside
+  its runtime and counted by it, so a drop waits for it; that thread also takes the lingers handed
+  where no runtime runs, which each started a thread and a runtime of their own
+  (`proofs/tla/going/Unworked.tla`).
 
 ### Changed
 

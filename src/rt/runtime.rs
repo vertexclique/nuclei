@@ -23,6 +23,7 @@ use core::future::Future;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, OnceLock};
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use kovan_channel::flavors::RecvDeadline;
@@ -87,13 +88,15 @@ pub(crate) struct Inner {
 
 /// A runtime: worker shards and a blocking pool. Dropping it stops the
 /// workers, drops the tasks they still hold, and waits for the threads to
-/// exit; then, on the dropping thread, for what the handles those tasks held
-/// left behind (the bytes a socket's write-behind holds, a file's writes) to
-/// land, each for at most a minute, so nothing they accepted is lost.
+/// exit (every one but the dropping thread, when a task of the runtime drops
+/// it, which goes on once the drop returns); then, on the dropping thread,
+/// for what the handles those tasks held left behind (the bytes a socket's
+/// write-behind holds, a file's writes) to land, each for at most a minute,
+/// so nothing they accepted is lost.
 pub struct Runtime {
     inner: Arc<Inner>,
-    /// One message per worker that exited.
-    exits: kovan_channel::unbounded::Receiver<()>,
+    /// One message per runtime thread that exited, naming it.
+    exits: kovan_channel::unbounded::Receiver<ThreadId>,
 }
 
 /// A cloneable handle to a [`Runtime`], to spawn on it from anywhere. It
@@ -183,29 +186,67 @@ impl Runtime {
     }
 
     fn stop_and_join(&mut self, timeout: Option<Duration>) {
+        let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
         // Lingers handed from now on wait for this drop, never for a worker.
         self.inner.lingering.close();
         self.inner.workers.stop_all();
+        // The monitor first: a pass under way as it closed may still take a
+        // shard and start a runner for it. Once it ended, the list taken next
+        // holds every thread to wait for, a detached one marked so
+        // (proofs/tla/teardown, `JoinsNoDetached`, `StartedJoined`); the take
+        // stops a worker started since the stop above, and none starts after
+        // it (proofs/tla/teardown/Grow.tla).
+        let mut exited = Vec::new();
+        if let Some(monitor) = self.inner.workers.take_monitor() {
+            self.join(vec![monitor], deadline, &mut exited);
+        }
+        #[cfg(test)]
+        teardown_pause(false);
         let threads = self.inner.workers.take_threads();
-        if let Some(timeout) = timeout {
-            let deadline = std::time::Instant::now() + timeout;
-            // Workers that exited already sent theirs; one message each.
-            for thread in &threads {
-                if thread.is_finished() {
-                    continue;
-                }
-                if !matches!(self.exits.recv_deadline(deadline), RecvDeadline::Msg(())) {
-                    break;
-                }
-            }
-            // A worker that did not exit in time is left to exit on its own.
+        #[cfg(test)]
+        teardown_pause(true);
+        self.join(threads, deadline, &mut exited);
+    }
+
+    /// Waits for `threads` to exit, never for the calling thread's own (a
+    /// runtime dropped in one of its own tasks would join itself:
+    /// proofs/tla/teardown, `NoSelfJoin`); with a `deadline`, until it
+    /// passes, a thread still running then left to exit on its own, and
+    /// `exited` the threads whose exit came, kept from one call to the next.
+    fn join(
+        &self,
+        threads: Vec<JoinHandle<()>>,
+        deadline: Option<std::time::Instant>,
+        exited: &mut Vec<ThreadId>,
+    ) {
+        let me = std::thread::current().id();
+        let threads = threads
+            .into_iter()
+            .filter(|thread| thread.thread().id() != me);
+        let Some(deadline) = deadline else {
             for thread in threads {
-                if thread.is_finished() {
-                    let _ = thread.join();
-                }
+                let _ = thread.join();
             }
-        } else {
-            for thread in threads {
+            return;
+        };
+        let threads: Vec<_> = threads.collect();
+        // Until each thread read as finished or its exit came, which it sends
+        // just before: a message only wakes the wait, as it may be another
+        // thread's (a detached one's, one that exited before), and one that
+        // came while an earlier list was waited for counts too
+        // (proofs/tla/teardown/Join.tla, `WaitsForAll`, `Returns`).
+        while threads
+            .iter()
+            .any(|thread| !thread.is_finished() && !exited.contains(&thread.thread().id()))
+        {
+            match self.exits.recv_deadline(deadline) {
+                RecvDeadline::Msg(id) => exited.push(id),
+                _ => break,
+            }
+        }
+        // A thread that did not exit in time is left to exit on its own.
+        for thread in threads {
+            if thread.is_finished() {
                 let _ = thread.join();
             }
         }
@@ -218,6 +259,32 @@ impl Runtime {
         &self.inner
     }
 }
+
+/// What a teardown runs at one moment, and whether that is after its take.
+#[cfg(test)]
+type Pause = (bool, Box<dyn FnOnce()>);
+
+#[cfg(test)]
+thread_local! {
+    /// What a drop on this thread runs at one moment of its teardown, for a
+    /// test to start a worker there: just before its take of the threads, or
+    /// (`true`) just after.
+    pub(crate) static TEARDOWN_PAUSE: core::cell::RefCell<Option<Pause>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Runs what [`TEARDOWN_PAUSE`] holds for this moment of a teardown.
+#[cfg(test)]
+fn teardown_pause(after_take: bool) {
+    let pause =
+        TEARDOWN_PAUSE.with(|pause| pause.borrow_mut().take_if(|(at, _)| *at == after_take));
+    if let Some((_, run)) = pause {
+        run();
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests_drop;
 
 impl Drop for Runtime {
     fn drop(&mut self) {
@@ -336,27 +403,15 @@ pub(crate) fn running_inner() -> Option<Arc<Inner>> {
     running()
 }
 
-/// Spawns a linger on `inner`: on a worker that takes tasks, else (with
-/// `here`) on the shard of this thread (which runs it at its next
-/// `block_on`); the linger back where neither can take it.
-pub(crate) fn spawn_linger(
-    inner: &Arc<Inner>,
-    linger: super::linger::Guarded,
-    here: bool,
-) -> Result<(), super::linger::Guarded> {
-    if let Some(shard) = inner.workers.place(inner.id, inner.local_margin) {
-        spawn_on(inner, shard, linger).detach();
-        return Ok(());
+/// Spawns a linger on `inner`: on a worker that takes tasks, else on the
+/// linger thread, still counted by `inner` until it ends; never on this
+/// thread's own shard, which runs only at the thread's next `block_on`, if
+/// one ever comes (proofs/tla/going/Unworked.tla).
+pub(crate) fn spawn_linger(inner: &Arc<Inner>, linger: super::linger::Guarded) {
+    match inner.workers.place(inner.id, inner.local_margin) {
+        Some(shard) => spawn_on(inner, shard, linger).detach(),
+        None => super::linger::on_thread(linger),
     }
-    // With no workers, the thread's own shard, if it has one: one is never
-    // made here (a thread on its way out may hand a linger).
-    let running = context::current(|current| current.is_some());
-    if here && (running || context::own_shard_if_made().is_some()) {
-        let _runtime = context::set_runtime(inner);
-        spawn_here(linger, false).detach();
-        return Ok(());
-    }
-    Err(linger)
 }
 
 /// A shard to serve a thread that runs none, of the runtime this thread is

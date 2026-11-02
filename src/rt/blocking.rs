@@ -326,7 +326,8 @@ impl Pool {
             return;
         }
         let pool = Arc::clone(self);
-        let mut builder = std::thread::Builder::new().name((self.config.name)());
+        let name = super::tuning::name_caught(&*self.config.name, "nuclei-blocking");
+        let mut builder = std::thread::Builder::new().name(name);
         if let Some(size) = self.config.stack_size {
             builder = builder.stack_size(size);
         }

@@ -1,7 +1,7 @@
 //! Bytes a stream's writes took into its write-behind reach the peer though
 //! the thread whose `block_on` wrote them returned and no task polls that
-//! handle's writes again: on a worker, or with none at the thread's next
-//! `block_on`.
+//! handle's writes again: on a worker, or with none on the linger thread,
+//! whether or not that thread runs `block_on` again.
 
 use core::future::{Future, poll_fn};
 use core::pin::pin;
@@ -85,4 +85,33 @@ fn bytes_behind_reach_the_peer_at_the_next_block_on_with_no_worker() {
     });
     rt.block_on(recv_all(&server, sent));
     drop(client);
+}
+
+/// With no worker, a dropped stream's linger went to the dropping thread's own
+/// shard, which ran it only at that thread's next `block_on`: one that never
+/// came left the bytes behind and the socket open. The linger thread runs it.
+#[test]
+fn bytes_behind_a_stream_dropped_with_no_worker_reach_the_peer_with_no_later_block_on() {
+    let rt = Builder::new().worker_threads(0).build().unwrap();
+    let (server, sent) = rt.block_on(async {
+        let (client, server) = pair().await;
+        let sent = fill(&client).await;
+        drop(client);
+        (server, sent)
+    });
+    // This thread runs no `block_on` of the runtime again: another thread reads.
+    std::thread::spawn(move || {
+        nuclei::block_on(async {
+            recv_all(&server, sent).await;
+            let mut buf = [0u8; 16];
+            let n = nuclei::time::timeout(Duration::from_secs(10), server.recv(&mut buf))
+                .await
+                .expect("the stream never ended")
+                .unwrap();
+            assert_eq!(n, 0, "the stream went on past its bytes");
+        });
+    })
+    .join()
+    .unwrap();
+    drop(rt);
 }

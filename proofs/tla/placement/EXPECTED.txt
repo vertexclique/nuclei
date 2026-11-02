@@ -12,3 +12,6 @@ M_bound               Placement   violated:RunsOnItsWorker
 W_late_refusal        Placement   violated:NoLateRefusal
 W_handoff_waiting     Placement   violated:NoHandoffWhileWaiting
 W_drain_runs          Placement   violated:NoDrainedRun
+PP_start              Publish     pass
+MP_publish_first      Publish     violated:NoSilentLoss
+WP_start_fails        Publish     violated:NoStartFails

@@ -28,3 +28,10 @@ MI_clear_after_free            MC_PoolIndex         violated:IndexComplete
 WI_stale_start                 MC_PoolIndex         violated:NoStaleStart
 WI_stale_cas                   MC_PoolIndex         violated:NoStaleCas
 WI_wake                        MC_PoolIndex         violated:NoWake
+PS_fails_1                     Start                pass
+PS_fails_2                     Start                pass
+MS_check_before_decrement      Start                violated:AllRan
+MS_hook_unwinds                Start                violated:AllRan
+MS_name_unwinds                Start                violated:AllRan
+WS_inline                      Start                violated:NoInline
+WS_caught                      Start                violated:NoCaught

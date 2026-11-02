@@ -37,7 +37,8 @@
 (*                                                                          *)
 (* What is abstract. The claim's fence and the second read of the word are *)
 (* one step (proofs/tla/handoff/Handoff.tla checks them); the runner makes *)
-(* one poll; the spare is one step that takes the gift and runs for good.  *)
+(* one poll; the spare is one step that takes the gift and runs for good   *)
+(* (its start hook's panic is caught, tla/hooks/Hooks.tla).                *)
 (***************************************************************************)
 EXTENDS Integers, TLC                                                        \* numbers and TLC's helpers
 
