@@ -117,3 +117,14 @@ RE_sqpoll_live                 MC_RingEnd           pass
 MRE_no_look                    MC_RingEnd           violated:Termination
 MRE_look_unissued              MC_RingEnd           violated:Termination
 WRE_end_stop                   MC_RingEnd           violated:NoEndStop
+RP_exact                       MC_RingPoll          pass
+RP_length                      MC_RingPoll          pass
+RP_switch                      MC_RingPoll          pass
+RP_close                       MC_RingPoll          pass
+MRP_no_rearm                   MC_RingPoll          violated:Termination
+MRP_drained_after_fire         MC_RingPoll          violated:Termination
+MRP_direct_before_ahead        MC_RingPoll          violated:InOrder
+MRP_edge_in_switch             MC_RingPoll          violated:Termination
+MRP_hangup_ignored             MC_RingPoll          violated:Termination
+WRP_rearm                      MC_RingPoll          violated:NoRearm
+WRP_switch                     MC_RingPoll          violated:NoSwitchBack

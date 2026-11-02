@@ -1,6 +1,8 @@
 ----------------------------- MODULE RingMulti -----------------------------
 (***************************************************************************)
-(* A stream's read side on its shard's ring with multishot receives       *)
+(* A stream's read side on its shard's ring with multishot receives, as a *)
+(* side reads once it switched to the receive (RingPoll.tla checks the    *)
+(* reads by readiness and the switch)                                     *)
 (* (src/io/source/read/ops.rs, src/io/source/read.rs, src/rt/shard/ring.rs, *)
 (* src/rt/shard/recv.rs), at the grain of the kernel's arrivals, the ring  *)
 (* thread's completions and the reader's polls.                          *)
