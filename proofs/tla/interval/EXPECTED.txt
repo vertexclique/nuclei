@@ -1,0 +1,10 @@
+# configuration                spec                 expected
+I_burst                        MC_Interval          pass
+I_delay                        MC_Interval          pass
+I_skip                         MC_Interval          pass
+I_far_burst                    MC_Interval          pass
+I_far_delay                    MC_Interval          pass
+I_far_skip                     MC_Interval          pass
+M_unchecked_add                MC_Interval          violated:InRange
+M_unchecked_reset              MC_Interval          violated:InRange
+M_skip_clamp                   MC_Interval          violated:SkipAhead
