@@ -64,7 +64,7 @@ W_defer               HandBack    violated:NoDefer
 W_lend_taken          HandBack    violated:NoLendTaken
 W_gone                HandBack    violated:NoGone
 W_cas_lost            HandBack    violated:NoCasLost
-W_hb_leaf_back        HandBack    violated:NoLeafBack
+W_hb_stale_back       HandBack    violated:NoStaleBack
 W_hb_detached_call    HandBack    violated:NoDetachedCall
 W_nested_detach       HandBack    violated:NoNestedDetach
 W_nested_loan         HandBack    violated:NoNestedLoan

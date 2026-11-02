@@ -4,7 +4,7 @@
 (* that then calls into the shard (a `ShardLocal::with`), gets the shard   *)
 (* back for that call from whichever thread runs it now, instead of an     *)
 (* error. The design this checks, before any of its code is written:       *)
-(*                                                                          *)
+(*                                                                         *)
 (* - The detached thread's call is where it starts: `current_pinned`'s     *)
 (*   bracket (`Bracket::take`, `Slot::mark` in src/rt/handoff/slot.rs)     *)
 (*   marks the thread's old slot and finds its claim taken, or the thread  *)
@@ -34,8 +34,8 @@
 (*   and gives the shard back, by return or by unwind.                     *)
 (* - The runtime shuts down: a waiting borrower is woken, and a            *)
 (*   compare-and-swap from asked to gone settles it against a lend that    *)
-(*   came first; its call then answers that the runtime is gone.          *)
-(*                                                                          *)
+(*   came first; its call then answers that the runtime is gone.           *)
+(*                                                                         *)
 (* In plain words. Who acts: up to three threads that each run the shard   *)
 (* in turn (thread 1 first, the others spares the monitor hands it to);    *)
 (* the monitor; a thread that pushes work to the shard; the runtime's      *)
@@ -45,7 +45,7 @@
 (* (its future's drop, after a cancel, included), whose calls find no      *)
 (* shard; a `with` among them asks for the shard back and waits; the       *)
 (* waiting task may be cancelled meanwhile; the closure on the lent shard  *)
-(* may panic, or block for good; any runner may block in one poll for     *)
+(* may panic, or block for good; any runner may block in one poll for      *)
 (* good, so the monitor takes the shard again; a runner may poll the lend  *)
 (* task in a nested `block_on`'s loop, or in the loop of a nested          *)
 (* `block_on` inside its own `with`; a borrower's closure may run such a   *)
@@ -63,7 +63,7 @@
 (* removes). What must happen: every request ends, served or told the      *)
 (* runtime is gone (`HandBackDone`), and every remote push runs            *)
 (* (`Rescued`), whichever runner blocks for good.                          *)
-(*                                                                          *)
+(*                                                                         *)
 (* What is abstract. Every load, store and compare-and-swap is one         *)
 (* sequentially consistent step: the store buffer that the heavy fence and *)
 (* the runner's compiler fence exist for is Handoff.tla's, which checks    *)
@@ -71,8 +71,10 @@
 (* store order. The hand-back adds no pair of a store and a later load of  *)
 (* another word but the runtime's close against a waiter, which is         *)
 (* `Notify`'s (proofs/tla/notify); its lend is a message passed with a     *)
-(* release store and an acquire load. A poll makes at most `Calls` calls;  *)
-(* a task's work is a step; a remote push runs in one step of the loop. A  *)
+(* release store and an acquire load. A poll makes at most `Calls` calls   *)
+(* on the shard it runs, and its code, once detached, `DetachedCalls` more *)
+(* on the slot it was taken from (Handoff.tla's D_unwind); a task's work   *)
+(* is a step; a remote push runs in one step of the loop. A                *)
 (* call that needs the shard but lends no value (a spawn onto it with no   *)
 (* worker taking tasks) is a `with` without the value. The nested loop     *)
 (* inside a `with` is the one step that polls a lend task while the value  *)
@@ -93,7 +95,8 @@ CONSTANTS                                                                   \* w
     MaxPolls,     \* the polls of the shard's own tasks each runner makes per turn
     MaxHandoffs,  \* the handoffs the monitor may make
     Pushes,       \* the work other threads push to the shard
-    Calls,        \* the calls into the runtime one poll makes
+    Calls,        \* the calls into the runtime one poll makes on the shard it runs
+    DetachedCalls,                                                           \* the calls a detached thread's code still makes, as Handoff.tla's D_unwind
     Withs,        \* the threads whose tasks' code may call `with`
     Nested,       \* a runner's `with` may run the shard's queues (a nested `block_on`)
     NestedLoan,   \* a borrower's `with` may run them too, on the lent shard
@@ -139,13 +142,13 @@ variables
     runnerSlot = 1,                   \* the slot of the shard's runner, the one the monitor watches
     nextSlot = 2,                     \* the fresh slot the next handoff gives
     assign = [t \in Threads |-> 0],   \* the slot a spare is handed, with the shard
-    det = [t \in Threads |-> FALSE],  \* the thread found the shard taken: it runs no shard
+    gone = {},                                                               \* threads detached: they found the shard taken, and run no shard
     inbox = 0,                        \* remote pushes waiting in the shard's queues
     pushed = 0,                       \* remote pushes made
     ran = 0,                          \* remote pushes run
     lends = {},                       \* the borrowers whose lend task waits in the shard's queues
     lendOf = [t \in Threads |-> 0],   \* the borrower whose lend task thread t polls now, 0 for none
-    loan = [u \in Borrowers |-> "none"], \* each borrower's request: none, asked, lent, back or gone
+    loan = [u \in Borrowers |-> "none"],                                     \* each borrower's request: none, asked, lent, back or gone
     cancelled = [u \in Borrowers |-> FALSE], \* the waiting request's task was cancelled
     closed = FALSE,                   \* the runtime shut down
     draining = FALSE,                 \* the worker was stopped: it takes no new work
@@ -153,7 +156,7 @@ variables
     failed = FALSE,                   \* (record) a `with` was answered with an error
     defers = 0,                       \* (record) a lend task was deferred: the value was lent
     lendTaken = 0,                    \* (record) a lend task's bracket found the shard taken
-    leafBacks = 0,                    \* (record) a leaf push backed out on a claim
+    staleBacks = 0,                                                          \* (record) a detached thread's leaf push backed out
     detachedCalls = 0,                \* (record) a call found its thread's shard taken
     nestedDetach = 0,                 \* (record) a poll lost the shard during a nested `block_on`'s poll
     nestedLoans = 0,                  \* (record) a nested `block_on`'s loop lent the shard
@@ -185,7 +188,7 @@ define                                                                       \* 
     NoDefer == defers = 0                                                    \* no lend task deferred
     NoLendTaken == lendTaken = 0                                             \* no lend task found the shard taken
     NoGone == \A u \in Borrowers : loan[u] # "gone"                          \* no borrower told of a shutdown
-    NoLeafBack == leafBacks = 0                                              \* no leaf push backed out
+    NoStaleBack == staleBacks = 0                                            \* no stale leaf push backed out
     NoDetachedCall == detachedCalls = 0                                      \* no call found its shard taken
     NoNestedDetach == nestedDetach = 0                                       \* no shard lost in a nested poll
     NoNestedLoan == nestedLoans = 0                                          \* no loan from a nested loop
@@ -195,6 +198,15 @@ define                                                                       \* 
     NoDrainLoan == drainLoans = 0                                            \* no loan while draining
     NoBoundLoan == boundLoans = 0                                            \* no bound task served
 end define;
+
+\* One more call of this thread's code: on the shard it runs, or detached.
+macro CountCall() begin
+    if self \in gone then
+        dc := dc + 1;
+    else
+        calls := calls + 1;
+    end if;
+end macro;
 
 \* Another thread pushes work to the shard (its `Shared`), whoever runs it; a stopped worker
 \* takes no new work.
@@ -226,13 +238,13 @@ D_drain:
 end process;
 
 fair process thread \in Threads
-\* sl: the slot this thread runs with; e: its last epoch begun; ep: its task's poll's epoch;
-\* polls: its own polls this turn; calls: the calls its poll made; saved: the word a call read
+\* sl: the slot this thread runs with; e: its last epoch begun; polls: its own polls this turn;
+\* calls: the calls its poll made; dc: the calls its code made detached; saved: the word a call read
 \* at its start, put back at its end; nsaved: the same for a nested `block_on`'s bracket; b: the
 \* borrower whose lend task it polls; nret: where that lend task's poll returns.
 \* nb: the polls of a nested `block_on`'s future; wret: whose call asks for the shard, the poll's
 \* ("task") or, after the poll, a bound task's ("bound").
-variables sl = 0, e = 0, ep = 0, polls = 0, calls = 0, saved = 0, nsaved = 0, b = 0, nret = "loop",
+variables sl = 0, e = 0, polls = 0, calls = 0, dc = 0, saved = 0, nsaved = 0, b = 0, nret = "loop",
           nb = 0, wret = "task";
 begin
 T_begin:
@@ -268,8 +280,7 @@ R_loop:
             lends := lends \ {u};                                            \* out of the queue
             lendOf[self] := u;                                               \* polled by this thread now
         end with;
-        ep := e + 1;                                                         \* its poll's epoch,
-        e := e + 1;                                                          \* a new one
+        e := e + 1;                                                          \* its poll's epoch
         nret := "loop";                                                      \* polled by the worker loop
         goto N_poll;                                                         \* polled as any task
     elsif inbox > 0 then                                                     \* pushed work waits:
@@ -278,42 +289,45 @@ R_loop:
         goto R_loop;                                                         \* the loop again
     elsif polls < MaxPolls then                                              \* a poll of its own is left:
         polls := polls + 1;                                                  \* one more
-        ep := e + 1;                                                         \* its poll's epoch,
-        e := e + 1;                                                          \* a new one
+        e := e + 1;                                                          \* its epoch
     else                                                                     \* nothing to do:
         await closed \/ inbox > 0 \/ lends # {} \/ draining;                 \* asleep until work comes
         goto R_loop;                                                         \* then the loop again
     end if;
 R_poll:
     \* `go_out`: the word says outside, in the poll's epoch; the task's code runs.
-    word[sl] := ep;                                                          \* outside
+    word[sl] := e;                                                           \* outside, epoch e
     inS := inS \ {self};                                                     \* out of the shard
     calls := 0;                                                              \* no call made yet
 R_task:
     \* The task's code (its future's poll, or its drop after a cancel): a call into the runtime (a
     \* full bracket, or the push of a task into the LIFO slot, tried first as a leaf), a `with`, a
     \* `block_on`, the poll's end, or (the second runner's first poll of its own, where allowed) a
-    \* block that never returns. A detached thread's code goes on too.
+    \* block that never returns. A detached thread's code goes on too, with `DetachedCalls` calls
+    \* left, each on the slot it was taken from, as Handoff.tla's D_unwind; it asks for the shard at
+    \* most once a poll (each request is a fresh loan in the code: a second is as the first).
     either
-        await calls < Calls;                                                 \* a call is left
-        calls := calls + 1;                                                  \* one more
+        await IF self \in gone THEN dc < DetachedCalls ELSE calls < Calls;   \* a call is left
+        CountCall();                                                         \* one more
         goto B_store;                                                        \* a full bracket
     or
-        await calls < Calls;                                                 \* a call is left
-        calls := calls + 1;                                                  \* one more
+        await IF self \in gone THEN dc < DetachedCalls ELSE calls < Calls;   \* a call is left
+        CountCall();                                                         \* one more
         goto L_store;                                                        \* the leaf push first
     or
-        await calls < Calls /\ self \in Withs;                               \* a `with` may be called
-        calls := calls + 1;                                                  \* one more
+        await self \in Withs /\ IF self \in gone                             \* a `with` may be called
+                                 THEN dc < DetachedCalls /\ loan[Req(self, wret)] = "none"
+                                 ELSE calls < Calls;
+        CountCall();                                                         \* one more
         goto WB_store;                                                       \* `current_pinned`'s bracket
     or
-        await calls < Calls /\ self \in NestedBlockOn /\ ~det[self];          \* a `block_on` on the worker
+        await calls < Calls /\ self \in NestedBlockOn /\ self \notin gone;   \* a `block_on` on the worker
         calls := calls + 1;                                                  \* one more
         goto NB_store;                                                       \* its bracket, then the loop
     or
         goto E_store;                                                        \* the poll ends
     or
-        await BlockSecond /\ sl = 2 /\ polls = 1 /\ ~det[self];              \* slot 2's first own poll
+        await BlockSecond /\ sl = 2 /\ polls = 1 /\ self \notin gone;        \* slot 2's first own poll
         goto Blocked;                                                        \* blocks for good
     end either;
 B_store:
@@ -325,7 +339,7 @@ B_check:
     \* Its claim: taken, and the thread is detached (the call takes the remote paths: it needs no
     \* shard); pending, cancelled; none, in.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
-        det[self] := TRUE;                                                   \* detached
+        gone := gone \cup {self};                                            \* detached
         detachedCalls := 1;                                                  \* (record)
         goto R_task;                                                         \* the call goes elsewhere
     else
@@ -348,7 +362,9 @@ L_check:
         inS := inS \cup {self};                                              \* inside
         goto L_in;                                                           \* for the push
     else                                                                     \* a claim:
-        leafBacks := 1;                                                      \* (record)
+        if self \in gone then                                                \* on the slot it was taken from:
+            staleBacks := 1;                                                 \* (record)
+        end if;
         goto L_back;                                                         \* backs out
     end if;
 L_in:
@@ -371,7 +387,7 @@ WB_store:
 WB_check:
     \* Taken: the thread is detached, and this is where the hand-back starts. Otherwise in.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
-        det[self] := TRUE;                                                   \* detached
+        gone := gone \cup {self};                                            \* detached
         detachedCalls := 1;                                                  \* (record)
         goto W_ask;                                                          \* it asks for the shard back
     else
@@ -431,7 +447,7 @@ NB_store:
 NB_check:
     \* Taken: detached (its future runs on the thread's own shard, as the poll's code). Else in.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
-        det[self] := TRUE;                                                   \* detached
+        gone := gone \cup {self};                                            \* detached
         detachedCalls := 1;                                                  \* (record)
         goto R_task;                                                         \* the code goes on, detached
     else
@@ -474,7 +490,7 @@ NB_bcheck:
     \* Taken during the nested poll: detached; the nested future goes to the thread's own shard,
     \* and the poll's code goes on, detached. Else back in the nested loop.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
-        det[self] := TRUE;                                                   \* detached
+        gone := gone \cup {self};                                            \* detached
         nestedDetach := 1;                                                   \* (record)
         goto R_task;                                                         \* the code goes on, detached
     else
@@ -619,7 +635,7 @@ N_check:
     \* lend task goes back into the shard's queues for its next runner (MUTATION lend_lost_on_take:
     \* it is dropped). Otherwise in.
     if claim[sl] = TAKEN /\ Mode # "lend_no_check" then                      \* the shard was taken:
-        det[self] := TRUE;                                                   \* detached
+        gone := gone \cup {self};                                            \* detached
         lendTaken := 1;                                                      \* (record)
         lendOf[self] := 0;                                                   \* polled no more
         if Mode # "lend_lost_on_take" then                                   \* the code:
@@ -674,7 +690,7 @@ E_store:
 E_check:
     \* Its claim: taken, and the thread is detached for good; else back in its loop.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
-        det[self] := TRUE;                                                   \* detached
+        gone := gone \cup {self};                                            \* detached
         goto D_bound;                                                        \* it runs no shard
     else
         claim[sl] := NONE;                                                   \* a pending claim cancelled
@@ -750,22 +766,17 @@ end algorithm; *)
 \* BEGIN TRANSLATION
 \* END TRANSLATION
 
-\* A poll that ends on a thread still running the shard finds its word the poll's outside word:
-\* every call of the poll put back the word it left, a nested `block_on`'s bracket included. (Here,
-\* past the translation, since it reads each thread's own variables.)
-OutsideWordAtPollEnd ==
-    \A t \in Threads : (pc[t] = "E_store" /\ ~det[t]) => word[sl[t]] = ep[t]
-
-\* A runner waiting for the shard back waits on a loan that was made. (Here for the same reason.)
+\* A runner waiting for the shard back waits on a loan that was made. (Here, past the translation,
+\* since it reads each thread's own variables.)
 LenderHasLoan == \A r \in Threads : pc[r] = "N_wait" => loan[b[r]] \in {"lent", "back"}
 
 \* A detached thread is inside the shard only while the shard is lent to its call.
 DetachedStaysOut ==
-    \A t \in Threads : (det[t] /\ t \in inS) => loan[Req(t, wret[t])] = "lent"
+    \A t \in Threads : (t \in gone /\ t \in inS) => loan[Req(t, wret[t])] = "lent"
 
 \* A detached thread holds the value only while the shard is lent to its call.
 DetachedHoldsOnlyLent ==
-    \A t \in Threads : (det[t] /\ t \in holders) => loan[Req(t, wret[t])] = "lent"
+    \A t \in Threads : (t \in gone /\ t \in holders) => loan[Req(t, wret[t])] = "lent"
 
 \* A shard lent to a request finds its call in its loan, on its thread.
 LentHasBorrower ==
