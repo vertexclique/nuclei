@@ -2,9 +2,9 @@
 //! [`WeakUnboundedSender`] and [`UnboundedReceiver`].
 //!
 //! The channel's admission control is one word: the number of values in flight
-//! above a closed bit. A send adds one with a compare-and-swap that refuses
-//! once the closed bit is up, the receiver subtracts one per value it takes,
-//! and the receiver closing sets the bit. The word is idle when no value is
+//! above a closed bit. A send adds one with a fetch-add and, when the closed
+//! bit was up, takes it back with a fetch-sub; the receiver subtracts one per
+//! value it takes, and the receiver closing sets the bit. The word is idle when no value is
 //! queued or on its way, which is what a closed receiver waits for before it
 //! reports the end.
 
@@ -118,17 +118,16 @@ pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
 /// # Progress
 ///
 /// Wait-free (a bounded number of the caller's own atomic steps):
-/// [`is_closed`](Self::is_closed), [`same_channel`](Self::same_channel),
-/// [`strong_count`](Self::strong_count), [`weak_count`](Self::weak_count),
-/// [`downgrade`](Self::downgrade), `clone` and `drop`. The drop of the last
-/// sender ends with a wake of the receiver's waker cell, which is two atomic
-/// steps; what the waker then does belongs to the executor.
+/// [`send`](Self::send), [`is_closed`](Self::is_closed),
+/// [`same_channel`](Self::same_channel), [`strong_count`](Self::strong_count),
+/// [`weak_count`](Self::weak_count), [`downgrade`](Self::downgrade), `clone`
+/// and `drop`. A send admits its value with one fetch-add (and on a closed
+/// channel one fetch-sub that takes it back), then pushes onto the radix
+/// queue, which claims its position with one fetch-add and may allocate a
+/// leaf; neither step retries. A send and the drop of the last sender end
+/// with a wake of the receiver's waker cell, which is two atomic steps; what
+/// the waker then does belongs to the executor.
 ///
-/// Lock-free, not wait-free: [`send`](Self::send). It admits the value with a
-/// compare-and-swap that retries when another sender or the receiver changed
-/// the count first, and then pushes onto the message queue, which retries when
-/// it loses a slot to another sender and allocates a segment when the last one
-/// is full. Some thread's call completes whenever any retries.
 /// [`closed`](Self::closed) is lock-free: a poll may queue a waiter.
 pub struct UnboundedSender<T> {
     chan: Arc<Chan<T, Unbounded>>,
