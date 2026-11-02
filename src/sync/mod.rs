@@ -169,9 +169,6 @@ mod mutex;
 mod notify;
 mod once_cell;
 pub mod oneshot;
-// See the note on its re-export below.
-#[allow(dead_code)]
-mod owned_lock;
 mod owner;
 mod queue;
 mod raw_rwlock;
@@ -202,11 +199,6 @@ pub use mutex::{
 };
 pub use notify::{Notified, Notify, OwnedNotified};
 pub use once_cell::{OnceCell, SetError};
-// vertexia: the owner-named lock has no consumer in this crate yet; its
-// tests run in `owned_lock`. Trim it if it stays unused.
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use owned_lock::between_take_and_grant;
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};
 pub use reentrant_rwlock::{
