@@ -266,8 +266,8 @@ impl<G: Grain> Timer<G> {
             wheel.set_waker(key, cx.waker());
             return Poll::Pending;
         }
-        if let State::Remote { cell, .. } = &*self.state {
-            return poll_cell(cell, cx).map(|()| *self.state = State::Done);
+        if let Some(polled) = self.poll_remote_cell(cx) {
+            return polled;
         }
         // Not armed here: armed now (after letting go of an arming on
         // another shard, if it moved).
@@ -294,8 +294,8 @@ impl<G: Grain> Timer<G> {
     }
 
     fn poll_remote(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let State::Remote { cell, .. } = &*self.state {
-            return poll_cell(cell, cx).map(|()| *self.state = State::Done);
+        if let Some(polled) = self.poll_remote_cell(cx) {
+            return polled;
         }
         self.release();
         let at = self.nanos();
@@ -319,6 +319,27 @@ impl<G: Grain> Timer<G> {
         });
         *self.state = State::Remote { shard, cell };
         Poll::Pending
+    }
+
+    /// Polls the cell of a timer armed by another shard, if it is one: `None`
+    /// when it is not, or when its shard let go of it unfired (it is idle
+    /// then, to be armed again where this poll runs).
+    #[inline]
+    fn poll_remote_cell(&mut self, cx: &mut Context<'_>) -> Option<Poll<()>> {
+        let State::Remote { cell, .. } = &*self.state else {
+            return None;
+        };
+        match poll_cell(cell, cx) {
+            Found::Fired => {
+                *self.state = State::Done;
+                Some(Poll::Ready(()))
+            }
+            Found::Pending => Some(Poll::Pending),
+            Found::Orphaned => {
+                *self.state = State::Idle;
+                None
+            }
+        }
     }
 
     /// Ends a timer armed here that fired.
@@ -350,13 +371,6 @@ impl<G: Grain> Timer<G> {
         if let State::Done = *self.state {
             return Poll::Ready(());
         }
-        if let State::Remote { cell, .. } = &*self.state
-            && cell.orphaned.load(Ordering::Acquire)
-        {
-            // The shard that held the timer went without firing it, and holds
-            // it no more: it is armed again where this poll runs.
-            *self.state = State::Idle;
-        }
         // On the shard this thread runs with no bracket to take, as `current`
         // would hand it over.
         if let Some(shard) = context::running_inside(context::local()) {
@@ -378,15 +392,48 @@ impl<G: Grain> Drop for Timer<G> {
     }
 }
 
-fn poll_cell(cell: &RemoteTimer, cx: &mut Context<'_>) -> Poll<()> {
+/// What a poll found in a remote timer's cell.
+enum Found {
+    /// The timer fired.
+    Fired,
+    /// It is armed, and the poll's waker is the one its fire wakes.
+    Pending,
+    /// Its shard let go of it unfired: nothing will fire it.
+    Orphaned,
+}
+
+/// Registers the poll's waker in `cell`, then looks at both marks: a fire,
+/// or an orphaning, that came before the register woke the waker the cell
+/// held until then, which may be another task's (the sleep moved), and this
+/// one would be woken by nothing (proofs/tla/timer, `M_recheck_fired_only`).
+fn poll_cell(cell: &RemoteTimer, cx: &mut Context<'_>) -> Found {
     if cell.fired.load(Ordering::Acquire) {
-        return Poll::Ready(());
+        return Found::Fired;
     }
+    #[cfg(test)]
+    before_register();
     cell.waker.register(cx.waker());
     if cell.fired.load(Ordering::Acquire) {
-        Poll::Ready(())
+        Found::Fired
+    } else if cell.orphaned.load(Ordering::Acquire) {
+        Found::Orphaned
     } else {
-        Poll::Pending
+        Found::Pending
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test runs in a poll of a remote timer's cell right before it
+    /// registers its waker, once: the moment a shard going meets a poll in.
+    pub(super) static BEFORE_REGISTER: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_register() {
+    if let Some(hook) = BEFORE_REGISTER.with(|hook| hook.borrow_mut().take()) {
+        hook();
     }
 }
 

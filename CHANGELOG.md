@@ -18,6 +18,13 @@
   blocking job is: counted from the take until the thread runs it on its own shard, a guest
   first, and again from when it leaves that shard (`proofs/tla/clock`, the
   `M_uncounted_shard` and `detached_uncounted` runs).
+- **A sleep moved to another task as its shard goes is armed again.** A sleep polled on a thread
+  that runs no shard waits on a cell its shard fires; a shard that goes marks the cell orphaned
+  and wakes the waker it held. A poll looked at that mark before it registered its waker, and
+  after it only at whether the timer fired: a shard going in between woke the waker of the task
+  that held the sleep before, and the task that held it now was never woken. The poll now looks
+  at the mark after it registers (`proofs/tla/timer`, the `recheck_fired_only` mutation), and no
+  more before it.
 
 ### Changed
 
