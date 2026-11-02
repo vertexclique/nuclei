@@ -1193,7 +1193,7 @@ its own call, a call that waits behind the lent send of a task that went). A Win
 (`Backend = "port"`) sends from the task too (`send_now_port` in `src/io/source/write/datagram.rs`),
 on a socket made non-blocking, and a call that finds no room waits for the port's poll of the socket
 (an AFD poll for room to send, `start_poll` in `src/io/source/port.rs`). Its datagrams include one
-the kernel refuses only as it sends it (no route), which a call of the task's own hears at once. 3
+the kernel refuses only as it sends it (no route), which a call of the task's own hears at once. 4
 more configurations: 2 that must pass (`OwnResult` and `InOrder`; `Termination` and `Delivered`),
 and 2 mutations (the port's old copy, queue and answer breaks `OwnResult`, as a refusal reaches the
 next call; a poll for room that wakes nobody breaks `Termination`).
