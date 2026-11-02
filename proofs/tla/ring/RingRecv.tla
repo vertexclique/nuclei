@@ -3,8 +3,11 @@
 (* A datagram socket's receives (src/io/source/read/datagram.rs           *)
 (* `receive_now` and `datagram_ready`, the bound in `read/ops.rs`          *)
 (* `datagram_want`; the ring's poll armed in `submit_ops` and its arrivals *)
-(* in `take_arrival` of read.rs, the edge in `serve`), on epoll or kqueue  *)
-(* and on an io_uring ring, at the grain of a step under the side's guard. *)
+(* in `take_arrival` of read.rs, the edge in `serve`; on a port the        *)
+(* receive into the pool, `receive` and `receive_starved` of read.rs, and  *)
+(* `PortMem::RecvFrom` in port.rs), on epoll or kqueue, on an io_uring     *)
+(* ring and on a Windows completion port, at the grain of a step under the *)
+(* side's guard.                                                           *)
 (*                                                                          *)
 (* In plain words: a peer sends datagrams, and the socket holds them in    *)
 (* order. A task receives them one call after another, into a buffer that  *)
@@ -20,28 +23,41 @@
 (* has the ring receive ahead into a buffer of the pool, one that holds    *)
 (* the largest datagram UDP carries, and the task takes from what came     *)
 (* ahead, on a ring whose group holds any UDP datagram whole; elsewhere   *)
-(* the task receives UDP itself too. Asking whether the socket is          *)
-(* readable looks, and takes nothing.                                      *)
+(* the task receives UDP itself too. A port receives UDP ahead too, into a *)
+(* buffer of the pool that holds the largest datagram, whatever the call   *)
+(* that waits asked for (a look at the sender asks for none); with no such *)
+(* buffer in the pool it looks with a zero-byte receive that leaves the    *)
+(* datagram queued, and the task receives it itself once the look said    *)
+(* one came. Asking whether the socket is readable looks, and takes        *)
+(* nothing.                                                                *)
 (*                                                                          *)
 (* What must never happen: a datagram cut although the task's buffer holds *)
 (* it (the bug the size sweep found: a datagram read ahead into a buffer   *)
-(* of the pool's largest class, smaller than it); datagrams received out   *)
+(* of the pool's largest class, smaller than it; and on a port, one        *)
+(* received ahead into a buffer as small as the look that asked for it,    *)
+(* whose cut came back as a success); datagrams received out               *)
 (* of order; a call that waits forever.                                    *)
 (*                                                                          *)
 (* What is abstract: the guard (a step runs whole under it; RingOp.tla      *)
 (* checks the hand-off to the ring's thread), and sizes, counted in units: *)
-(* the pool's largest buffer holds Largest units.                          *)
+(* the pool's largest buffer holds Largest units, its smallest Small.      *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, TLC
 
 CONSTANTS
-    Ring,      \* TRUE: an io_uring ring; FALSE: epoll or kqueue
+    Backend,   \* "poller" (epoll, kqueue), "ring" (io_uring) or "port" (a Windows completion port)
     Unix,      \* TRUE: a Unix datagram socket, whose datagrams may outgrow the pool; FALSE: UDP
-    Ahead,     \* TRUE: a ring whose group holds any UDP datagram whole receives UDP ahead
+    Ahead,     \* TRUE: UDP is received ahead: a ring whose group holds any UDP datagram whole, a port
+               \* the pool has a buffer for; FALSE on a port: the pool has none, so the port looks
     Mutation   \* "none", or the name of the one rule this run takes away
 
+\* The backend the run is of.
+Ring == Backend = "ring"
+Port == Backend = "port"
 \* The units the pool's largest buffer holds.
 Largest == 2
+\* The units its smallest buffer holds (512 B, less than a datagram of the largest size).
+Small == 1
 \* The datagrams the peer sends, by size in order: a small one, then the largest the socket
 \* carries, which for a Unix socket is more than the pool's largest buffer holds.
 Sizes == IF Unix THEN <<1, 3>> ELSE <<1, Largest>>
@@ -49,7 +65,7 @@ Sizes == IF Unix THEN <<1, 3>> ELSE <<1, Largest>>
 N == Len(Sizes)
 \* Whether the task receives straight into its own buffer, or takes what the ring read ahead:
 \* only a ring's UDP side receives ahead, and only on a ring that does (`datagrams_ahead`).
-Direct == ~Ring \/ Unix \/ ~Ahead
+Direct == Backend = "poller" \/ Unix \/ ~Ahead
 \* The buffer of the pool a ring's UDP receive ahead takes: one that holds the largest datagram.
 \* MUTATION bound_small: a buffer bound below the largest datagram UDP carries.
 Bound == IF Mutation = "bound_small" THEN Largest - 1 ELSE Largest
@@ -64,6 +80,9 @@ variables
     out = "none",          \* the ring's operation for the side: "none", "recv" or "poll" (armed)
     edge = FALSE,          \* the armed poll has a datagram's arrival to tell the side
     waits = FALSE,         \* the task waits for an edge, the ring's poll or what comes ahead
+    asked = "recv",        \* what the call that waits asked for: a receive, or a look ("look")
+    cap = Largest,         \* the units the buffer of the receive out holds
+    readable = FALSE,      \* a port's zero-byte look said a datagram came, and none was taken since
     woken = FALSE,         \* the waiting task was woken
     got = <<>>,            \* what the task received, as <<number, units>>
     waited = FALSE;        \* (record) a call waited for an edge or a poll
@@ -78,7 +97,7 @@ P_send:
         socket := Append(socket, sent);
         \* On epoll and kqueue it brings an edge, which wakes a task that waits.
         \* MUTATION no_wake: the edge wakes nobody.
-        if ~Ring /\ waits /\ Mutation # "no_wake" then
+        if Backend = "poller" /\ waits /\ Mutation # "no_wake" then
             woken := TRUE;
         end if;
         \* On a ring the armed poll sees it, and has it to tell the side.
@@ -88,8 +107,8 @@ P_send:
     end while;
 end process;
 
-\* The ring: it gives the side the operation a waiting task needs, and applies each end.
-fair process ring \in (IF Ring THEN {"ring"} ELSE {})
+\* The ring or the port: it gives the side the operation a waiting task needs, and applies each end.
+fair process ring \in (IF Backend = "poller" THEN {} ELSE {"ring"})
 begin
 R_loop:
     while TRUE do
@@ -100,19 +119,35 @@ R_loop:
             \* into the smallest buffer.
             await waits /\ out = "none";
             if Direct /\ Mutation # "ahead_after_poll" then
-                \* The poll is armed, and at once has a datagram to tell if one is there.
-                out := "poll";
-                edge := socket # <<>>;
+                if Port then
+                    \* A port looks with a zero-byte receive, MSG_PEEK, which takes nothing.
+                    out := "look";
+                else
+                    \* The poll is armed, and at once has a datagram to tell if one is there.
+                    out := "poll";
+                    edge := socket # <<>>;
+                end if;
             else
                 out := "recv";
+                \* The buffer of the pool it takes holds the largest datagram (`datagram_want`).
+                \* MUTATION task_sized: one as large as the call that waits asked for, as it was: a
+                \* look at the sender asks for none, and gets the pool's smallest buffer.
+                cap := IF Mutation = "task_sized" /\ asked = "look" THEN Small ELSE Bound;
             end if;
         or
-            \* A receive ahead ends once a datagram came: what its buffer holds is kept.
+            \* A receive ahead ends once a datagram came: what its buffer holds is kept, a cut one
+            \* as a success (a port's STATUS_BUFFER_OVERFLOW, as unix's MSG_TRUNC).
             await out = "recv" /\ socket # <<>>;
             ahead := Append(ahead, <<Head(socket),
-                Min(Sizes[Head(socket)], IF Unix THEN 1 ELSE Bound)>>);
+                Min(Sizes[Head(socket)], IF Unix THEN 1 ELSE cap)>>);
             socket := Tail(socket);
             out := "none";
+            woken := TRUE;
+        or
+            \* A port's look ends once a datagram came, and leaves it queued: the task receives it.
+            await out = "look" /\ socket # <<>>;
+            out := "none";
+            readable := TRUE;
             woken := TRUE;
         or
             \* The armed poll tells the side a datagram came, and stays armed; it takes nothing.
@@ -142,20 +177,22 @@ T_look:
             if ~Direct \/ Mutation = "ahead_largest" then
                 if ahead # <<>> then
                     skip;
-                elsif ~Ring /\ socket # <<>> then
+                elsif Backend = "poller" /\ socket # <<>> then
                     \* epoll and kqueue receive ahead at once.
                     ahead := Append(ahead, <<Head(socket), Min(Sizes[Head(socket)], Largest)>>);
                     socket := Tail(socket);
                 else
                     waits := TRUE;
                     woken := FALSE;
+                    asked := "look";
 T_look_wait:
                     await woken;
                     waits := FALSE;
                     goto T_look;
                 end if;
-            elsif socket = <<>> then
-                \* It looks without taking: with nothing there it waits, and looks again.
+            elsif socket = <<>> \/ (Port /\ ~readable) then
+                \* It looks without taking: with nothing there it waits, and looks again (on a
+                \* port, until its zero-byte look said a datagram came).
                 waits := TRUE;
                 woken := FALSE;
 T_peek_wait:
@@ -170,17 +207,21 @@ T_recv:
             got := Append(got, Head(ahead));
             ahead := Tail(ahead);
             at := at + 1;
-        elsif Direct /\ socket # <<>> /\ ~(Mutation = "armed_waits" /\ out = "poll") then
-            \* The task's own receive takes the oldest datagram whole, the armed poll staying.
+        elsif Direct /\ socket # <<>> /\ ~(Mutation = "armed_waits" /\ out = "poll")
+              /\ (readable \/ ~Port) then
+            \* The task's own receive takes the oldest datagram whole, the armed poll staying (on
+            \* a port once its look said one came, `receive_starved`; the next waits for another).
             \* MUTATION armed_waits: the armed poll counts as an operation out, which the call
             \* waits behind, so it never asks the kernel again.
             got := Append(got, <<Head(socket), Sizes[Head(socket)]>>);
             socket := Tail(socket);
+            readable := FALSE;
             at := at + 1;
         else
             \* Nothing there: the call waits for an edge, the poll or a receive ahead.
             waits := TRUE;
             woken := FALSE;
+            asked := "recv";
             waited := TRUE;
 T_wait:
             await woken;
@@ -217,4 +258,6 @@ Termination == <>(pc["task"] = "Done")
 NoWait == ~waited
 \* A datagram the ring received ahead was taken by a receive.
 NoAheadTaken == Len(got) = 0 \/ Direct
+\* A port's zero-byte look said a datagram came, for the task to receive itself.
+NoLook == ~readable
 =============================================================================
