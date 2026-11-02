@@ -20,8 +20,9 @@ use super::ops::blocking;
 ///
 /// On Windows the directory is opened with backup semantics for reading and
 /// writing and flushed (`FlushFileBuffers`). On Apple's systems the entries go
-/// through with `F_FULLFSYNC`, which flushes the drive's cache too; a file
-/// system that refuses it gets `F_BARRIERFSYNC`, or, refusing that as well,
+/// through with `F_FULLFSYNC`, which flushes the drive's cache too: APFS,
+/// HFS+ and FAT take it for a directory (macOS 15 and 26). A file system
+/// that refuses it gets `F_BARRIERFSYNC`, or, refusing that as well,
 /// `fsync`. Neither of those flushes the drive's cache, so there the call
 /// answers `Ok` once the entries reached the drive, and a power loss may
 /// still lose them.
