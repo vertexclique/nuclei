@@ -43,6 +43,8 @@ HB_block_loan         HandBack    pass
 HB_close              HandBack    pass
 HB_drain              HandBack    pass
 HB_two                HandBack    pass
+HB_two_done           HandBack    pass
+HB_chain_done         HandBack    pass
 M_no_handback         HandBack    violated:NoFailedWith
 M_lend_no_mark        HandBack    violated:Exclusive
 M_lend_no_check       HandBack    violated:Exclusive

@@ -64,29 +64,31 @@
 (* runtime is gone (`HandBackDone`), and every remote push runs            *)
 (* (`Rescued`), whichever runner blocks for good.                          *)
 (*                                                                         *)
-(* What is abstract. Every load, store and compare-and-swap is one         *)
-(* sequentially consistent step: the store buffer that the heavy fence and *)
-(* the runner's compiler fence exist for is Handoff.tla's, which checks    *)
-(* the bracket, the leaf push and the come-back of a poll under x86's      *)
-(* store order. The hand-back adds no pair of a store and a later load of  *)
-(* another word but the runtime's close against a waiter, which is         *)
-(* `Notify`'s (proofs/tla/notify); its lend is a message passed with a     *)
-(* release store and an acquire load. A poll makes at most `Calls` calls   *)
-(* on the shard it runs, and its code, once detached, `DetachedCalls` more *)
-(* on the slot it was taken from (Handoff.tla's D_unwind); a task's work   *)
-(* is a step; a remote push runs in one step of the loop. A                *)
-(* call that needs the shard but lends no value (a spawn onto it with no   *)
-(* worker taking tasks) is a `with` without the value. The nested loop     *)
-(* inside a `with` is the one step that polls a lend task while the value  *)
-(* is lent (a value lent keeps the monitor off that loop's polls,          *)
-(* ShardLocal.tla). A cancel changes only the task's state: its poll and   *)
-(* its future's drop run as the poll's code. A thread's bound task is a    *)
-(* borrower of its own (`BT`, thread 1's), run on its stack only when its  *)
-(* wait runs tasks (a mutation). After its poll, a detached thread         *)
-(* finishes its bound tasks, one of which may ask for the shard as its     *)
-(* poll did (`BoundOf`, a request of its own), then it ends (in the code   *)
-(* it waits as a spare); a spare that runs the shard is a fresh thread     *)
-(* with a fresh slot.                                                      *)
+(* What is abstract. A thread's locals go back to their first values once  *)
+(* read for the last time, and the witnesses' records are kept only where  *)
+(* a witness reads them (`Records`): both merge only states with the same  *)
+(* future. Every load, store and compare-and-swap is one sequentially      *)
+(* consistent step: the store buffer that the heavy fence and the runner's *)
+(* compiler fence exist for is Handoff.tla's, which checks the bracket,    *)
+(* the leaf push and the come-back of a poll under x86's store order. The  *)
+(* hand-back adds no pair of a store and a later load of another word but  *)
+(* the runtime's close against a waiter, which is `Notify`'s               *)
+(* (proofs/tla/notify); its lend is a message passed with a release store  *)
+(* and an acquire load. A poll makes at most `Calls` calls on the shard it *)
+(* runs, and its code, once detached, `DetachedCalls` more on the slot it  *)
+(* was taken from (Handoff.tla's D_unwind); a task's work is a step; a     *)
+(* remote push runs in one step of the loop. A call that needs the shard   *)
+(* but lends no value (a spawn onto it with no worker taking tasks) is a   *)
+(* `with` without the value. The nested loop inside a `with` is the one    *)
+(* step that polls a lend task while the value is lent (a value lent keeps *)
+(* the monitor off that loop's polls, ShardLocal.tla). A cancel changes    *)
+(* only the task's state: its poll and its future's drop run as the poll's *)
+(* code. A thread's bound task is a borrower of its own (`BT`, thread      *)
+(* 1's), run on its stack only when its wait runs tasks (a mutation).      *)
+(* After its poll, a detached thread finishes its bound tasks, one of      *)
+(* which may ask for the shard as its poll did (`BoundOf`, a request of    *)
+(* its own), then it ends (in the code it waits as a spare); a spare that  *)
+(* runs the shard is a fresh thread with a fresh slot.                     *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC                                           \* numbers, sets, TLC's helpers
 
@@ -107,6 +109,7 @@ CONSTANTS                                                                   \* w
     Cancels,      \* a waiting borrower's task may be cancelled meanwhile
     Close,        \* the runtime may shut down
     Drain,        \* the worker may be stopped: it takes no new work and exits once drained
+    Records,      \* the witnesses' records are kept (a witness reads them; nothing else does)
     Mode          \* "ok", or the one rule this run breaks (see the configurations)
 
 Threads == 1..NThreads                \* the threads that run the shard, in turn
@@ -123,6 +126,9 @@ WretOf(u) == IF u > 100 THEN "bound" ELSE "task" \* whose call the request is
 Borrowers == Threads \cup {BT} \cup {BoundOf(t) : t \in Threads}  \* every request, each its own
 Slots == 1..(1 + MaxHandoffs)         \* slot 1 is thread 1's; each handoff makes a fresh one
 
+\* What a record is set to when something it records happens: 1 where a witness reads the records,
+\* else 0, so a run that reads none keeps one state where a record would make two.
+Rec == IF Records THEN 1 ELSE 0
 NONE == 0                             \* no claim: the shard is its runner's
 PENDING == 1                          \* the monitor is about to take the shard
 TAKEN == 2                            \* the monitor took the shard
@@ -340,7 +346,8 @@ B_check:
     \* shard); pending, cancelled; none, in.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
         gone := gone \cup {self};                                            \* detached
-        detachedCalls := 1;                                                  \* (record)
+        detachedCalls := Rec;                                                \* (record)
+        saved := 0;                                                          \* the word is put back nowhere
         goto R_task;                                                         \* the call goes elsewhere
     else
         claim[sl] := NONE;                                                   \* a pending claim cancelled
@@ -350,6 +357,7 @@ B_in:
     \* The call's work inside the shard; then it ends (`Slot::unmark`): the word it left, back.
     inS := inS \ {self};                                                     \* out again
     word[sl] := saved;                                                       \* outside, as before the call
+    saved := 0;                                                              \* read for the last time
     goto R_task;                                                             \* the task's code goes on
 L_store:
     \* The leaf push (`Slot::mark_unless_claimed`): the mark, as a bracket's.
@@ -363,7 +371,7 @@ L_check:
         goto L_in;                                                           \* for the push
     else                                                                     \* a claim:
         if self \in gone then                                                \* on the slot it was taken from:
-            staleBacks := 1;                                                 \* (record)
+            staleBacks := Rec;                                               \* (record)
         end if;
         goto L_back;                                                         \* backs out
     end if;
@@ -372,6 +380,7 @@ L_in:
     inS := inS \ {self};                                                     \* out at once
     either
         word[sl] := saved;                                                   \* pushed: the word back
+        saved := 0;                                                          \* read for the last time
         goto R_task;                                                         \* the call is done
     or
         goto L_back;                                                         \* not its push
@@ -379,6 +388,7 @@ L_in:
 L_back:
     \* The word back, as before the leaf; then the full bracket.
     word[sl] := saved;                                                       \* the word it left
+    saved := 0;                                                              \* read again by the bracket
     goto B_store;                                                            \* the full bracket
 WB_store:
     \* `with` (`ShardLocal::try_with`, `current_pinned`): first its bracket's mark.
@@ -388,7 +398,8 @@ WB_check:
     \* Taken: the thread is detached, and this is where the hand-back starts. Otherwise in.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
         gone := gone \cup {self};                                            \* detached
-        detachedCalls := 1;                                                  \* (record)
+        detachedCalls := Rec;                                                \* (record)
+        saved := 0;                                                          \* the word is put back nowhere
         goto W_ask;                                                          \* it asks for the shard back
     else
         claim[sl] := NONE;                                                   \* a pending claim cancelled
@@ -406,16 +417,16 @@ WP_in:
     either
         await Nested /\ lends # {};                                          \* a lend task waits
         with u \in lends do                                                  \* this one
-            b := u;                                                          \* its borrower
             if Mode = "lend_pinned" then                                     \* MUTATION lend_pinned:
+                b := u;                                                      \* its borrower
                 lends := lends \ {u};                                        \* taken out
                 loan[u] := "lent";                                           \* the shard lent anyway
                 inS := inS \ {self};                                         \* this thread parks
             elsif Mode = "defer_drops" then                                  \* MUTATION defer_drops:
                 lends := lends \ {u};                                        \* the lend task lost
-                defers := 1;                                                 \* (record)
+                defers := Rec;                                               \* (record)
             else                                                             \* the code:
-                defers := 1;                                                 \* deferred, still queued
+                defers := Rec;                                               \* deferred, still queued
             end if;
         end with;
         if Mode = "lend_pinned" then                                         \* lent:
@@ -432,11 +443,13 @@ WP_out:
     \* The bracket ends: the word it left, back.
     inS := inS \ {self};                                                     \* out
     word[sl] := saved;                                                       \* outside again
+    saved := 0;                                                              \* read for the last time
     goto R_task;                                                             \* the task's code goes on
 WP_nwait:
     \* (MUTATION lend_pinned) The runner waits for the shard to come back.
     await loan[b] = "back";                                                  \* given back
     inS := inS \cup {self};                                                  \* inside again
+    b := 0;                                                                  \* read for the last time
     goto WP_release;                                                         \* the closure goes on
 NB_store:
     \* `block_on` from a task on the worker: its bracket (`current`) marks the call, and the nested
@@ -448,7 +461,8 @@ NB_check:
     \* Taken: detached (its future runs on the thread's own shard, as the poll's code). Else in.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
         gone := gone \cup {self};                                            \* detached
-        detachedCalls := 1;                                                  \* (record)
+        detachedCalls := Rec;                                                \* (record)
+        nsaved := 0;                                                         \* the word is put back nowhere
         goto R_task;                                                         \* the code goes on, detached
     else
         claim[sl] := NONE;                                                   \* a pending claim cancelled
@@ -491,7 +505,9 @@ NB_bcheck:
     \* and the poll's code goes on, detached. Else back in the nested loop.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
         gone := gone \cup {self};                                            \* detached
-        nestedDetach := 1;                                                   \* (record)
+        nestedDetach := Rec;                                                 \* (record)
+        nsaved := 0;                                                         \* the word is put back nowhere
+        nb := 0;                                                             \* the nested loop is left
         goto R_task;                                                         \* the code goes on, detached
     else
         claim[sl] := NONE;                                                   \* a pending claim cancelled
@@ -502,6 +518,8 @@ NB_out:
     \* The nested future is done: `block_on`'s bracket ends, the outer poll's word back.
     inS := inS \ {self};                                                     \* out
     word[sl] := nsaved;                                                      \* outside again
+    nsaved := 0;                                                             \* read for the last time
+    nb := 0;                                                                 \* the nested loop is left
     goto R_task;                                                             \* the task's code goes on
 W_ask:
     \* The hand-back: the call puts a lend task into the shard's queues, which a draining shard
@@ -528,7 +546,7 @@ W_wait:
         inS := inS \cup {self};                                              \* inside the shard
         holders := holders \cup {self};                                      \* the value lent to it
         if draining then                                                     \* while the worker drains:
-            drainLoans := 1;                                                 \* (record)
+            drainLoans := Rec;                                               \* (record)
         end if;
     or
         await closed /\ Mode # "close_no_wake"                               \* woken by the close,
@@ -554,13 +572,13 @@ W_in:
     either
         await NestedLoan /\ lends # {};                                      \* a lend task waits
         with u \in lends do                                                  \* this one
-            b := u;                                                          \* its borrower
             if Mode = "lend_from_borrower" then                              \* MUTATION lend_from_borrower:
+                b := u;                                                      \* its borrower
                 lends := lends \ {u};                                        \* taken out
                 loan[u] := "lent";                                           \* the shard lent on
                 inS := inS \ {self};                                         \* this thread parks
             else                                                             \* the code:
-                defers := 1;                                                 \* deferred, still queued
+                defers := Rec;                                               \* deferred, still queued
             end if;
         end with;
         if Mode = "lend_from_borrower" then                                  \* lent on:
@@ -580,9 +598,9 @@ W_back:
     holders := holders \ {self};                                             \* the value let go of
     inS := inS \ {self};                                                     \* out of the shard
     loan[Req(self, wret)] := "back";                                         \* given back
-    loansServed := 1;                                                        \* (record)
+    loansServed := Rec;                                                      \* (record)
     if wret = "bound" then                                                   \* a bound task's call:
-        boundLoans := 1;                                                     \* (record)
+        boundLoans := Rec;                                                   \* (record)
     end if;
     goto W_done;                                                             \* the code goes on
 W_panic:
@@ -593,7 +611,7 @@ W_panic:
     if Mode # "panic_keeps_loan" then                                        \* the guard:
         loan[Req(self, wret)] := "back";                                     \* given back
     end if;
-    panics := 1;                                                             \* (record)
+    panics := Rec;                                                           \* (record)
     if wret = "bound" then                                                   \* a bound task's poll:
         goto D_bound;                                                        \* it ends, the thread goes on
     else
@@ -613,6 +631,7 @@ W_nwait:
     \* (MUTATION lend_from_borrower) The borrower waits for the shard to come back.
     await loan[b] = "back";                                                  \* given back
     inS := inS \cup {self};                                                  \* inside again
+    b := 0;                                                                  \* read for the last time
     goto W_back;                                                             \* the closure goes on
 BT_wait:
     \* (MUTATION wait_runs_tasks) The bound task's call waits on this thread, inside the wait of
@@ -636,12 +655,17 @@ N_check:
     \* it is dropped). Otherwise in.
     if claim[sl] = TAKEN /\ Mode # "lend_no_check" then                      \* the shard was taken:
         gone := gone \cup {self};                                            \* detached
-        lendTaken := 1;                                                      \* (record)
+        lendTaken := Rec;                                                    \* (record)
         lendOf[self] := 0;                                                   \* polled no more
         if Mode # "lend_lost_on_take" then                                   \* the code:
             lends := lends \cup {b};                                         \* back in the queue
         end if;
+        saved := 0;                                                          \* the word is put back nowhere
+        b := 0;                                                              \* polled no more
         if nret = "nested" then                                              \* in a nested loop:
+            nret := "loop";                                                  \* read for the last time
+            nsaved := 0;                                                     \* the nested loop is left
+            nb := 0;                                                         \* (its future goes elsewhere)
             goto R_task;                                                     \* the outer code, detached
         else
             goto E_store;                                                    \* the poll ends
@@ -660,13 +684,13 @@ N_lend:
     if loan[b] = "asked" \/ Mode = "lend_no_cas" then                        \* still asked:
         loan[b] := "lent";                                                   \* lent
         if nret = "nested" then                                              \* from a nested loop:
-            nestedLoans := 1;                                                \* (record)
+            nestedLoans := Rec;                                              \* (record)
         end if;
         if Mode # "lend_no_wait" then                                        \* the code:
             inS := inS \ {self};                                             \* parked, outside the cells
         end if;
     else                                                                     \* gone first:
-        casLost := 1;                                                        \* (record)
+        casLost := Rec;                                                      \* (record)
         goto N_unmark;                                                       \* nothing lent
     end if;
 N_wait:
@@ -679,7 +703,10 @@ N_unmark:
     \* The bracket ends, then the poll.
     inS := inS \ {self};                                                     \* out
     word[sl] := saved;                                                       \* the poll's word back
+    saved := 0;                                                              \* read for the last time
+    b := 0;                                                                  \* the loan is over
     if nret = "nested" then                                                  \* in a nested loop:
+        nret := "loop";                                                      \* read for the last time
         goto NB_back;                                                        \* its come-back
     else
         goto E_store;                                                        \* the poll ends
@@ -691,10 +718,16 @@ E_check:
     \* Its claim: taken, and the thread is detached for good; else back in its loop.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
         gone := gone \cup {self};                                            \* detached
+        sl := 0;                                                             \* its slot, read no more
+        e := 0;                                                              \* its epochs, read no more
+        polls := 0;                                                          \* its polls, read no more
+        calls := 0;                                                          \* its calls, read no more
+        dc := 0;                                                             \* its detached calls too
         goto D_bound;                                                        \* it runs no shard
     else
         claim[sl] := NONE;                                                   \* a pending claim cancelled
         inS := inS \cup {self};                                              \* inside
+        calls := 0;                                                          \* the poll's calls, read no more
         goto R_loop;                                                         \* the loop again
     end if;
 Blocked:
@@ -708,7 +741,9 @@ D_bound:
         goto W_ask;                                                          \* asks for the shard
     end if;
 Gone:
-    skip;                                                                    \* this thread runs the shard no more
+    \* This thread runs the shard no more: what it held is read no more.
+    sl := 0; e := 0; polls := 0; calls := 0; dc := 0; saved := 0;            \* every local back
+    nsaved := 0; b := 0; nret := "loop"; nb := 0; wret := "task";            \* to its first value
 end process;
 
 \* The monitor: sees the runner's word outside the shard, claims, reads the word and the pins again,
@@ -734,6 +769,8 @@ M_check:
         \* The word again, then the pins: changed or pinned, and it cancels.
         if word[ms] # mv \/ pins[ms] # 0 then                                \* back in, or a value lent:
             claim[ms] := NONE;                                               \* cancelled
+            ms := 0;                                                         \* the slot and the word,
+            mv := 0;                                                         \* read no more
             goto M_tick;                                                     \* watch again
         end if;
 M_take:
@@ -742,6 +779,8 @@ M_take:
             claim[ms] := TAKEN;                                              \* taken
             inS := inS \cup {Mon};                                           \* the shard is the monitor's
         else
+            ms := 0;                                                         \* the slot and the word,
+            mv := 0;                                                         \* read no more
             goto M_tick;                                                     \* the runner came back first
         end if;
 M_give:
@@ -752,6 +791,8 @@ M_give:
             nextSlot := nextSlot + 1;                                        \* the next fresh slot
             inS := inS \ {Mon};                                              \* the monitor lets go
             handoffs := handoffs + 1;                                        \* one more handoff
+            ms := 0;                                                         \* the slot and the word,
+            mv := 0;                                                         \* read no more
         else
             inS := inS \ {Mon};                                              \* the shard goes
             goto M_done;                                                     \* the watch ends
