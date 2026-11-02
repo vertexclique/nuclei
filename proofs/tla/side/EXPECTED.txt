@@ -17,6 +17,8 @@ W_holder_wake                  MC_Side              violated:NoHolderWake
 W_retake                       MC_Side              violated:NoRetake
 P_defer                        MC_Side              pass
 M_flag_before_bits             MC_Side              violated:DeferDone
+P_panic                        MC_Side              pass
+M_unwind_clears                MC_Side              violated:DeferDone
 RQ_close                       MC_Requests          pass
 RQ_live                        MC_Requests          pass
 MQ_release_ignores_req         MC_Requests          violated:Closed

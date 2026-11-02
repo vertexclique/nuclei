@@ -32,6 +32,12 @@
 (* finds in the deferred word (`Held::run_deferred`). Bits written after   *)
 (* the flag could land after the holder looked, and nobody would do them. *)
 (*                                                                          *)
+(* With `Panics` set, the reader's step panics once as it registers its    *)
+(* waker (a user's waker clone, under the guard). The guard's drop         *)
+(* (`Held::drop`) lets the side go and wakes the contended polls, and      *)
+(* leaves the work others left in the word (READY, DEFER): the next holder *)
+(* does it, here the reader's task polling again.                          *)
+(*                                                                          *)
 (* What is modelled step by step: every access to the word (the fetch_or  *)
 (* takes, the release's compare-and-swap and swap), the read system call  *)
 (* apart from what the holder does with its answer, the arrival of bytes, *)
@@ -48,6 +54,7 @@ EXTENDS Integers, TLC
 CONSTANTS
     Total,     \* the bytes that arrive, one at a time
     Defers,    \* TRUE: another thread leaves side-local work once
+    Panics,    \* TRUE: the reader's step panics once under the guard
     Mutation   \* "none", or the name of the one rule this run takes away
 
 (* --algorithm Side
@@ -73,7 +80,8 @@ variables
     driverRead = FALSE, \* (record) the driver read for the reader
     submitRead = FALSE, \* (record) a reader's submit ran the driver's read
     wokenByHolder = FALSE, \* (record) the holder woke a contended reader
-    retook = FALSE;     \* (record) a contended reader found the side free and took it
+    retook = FALSE,     \* (record) a contended reader found the side free and took it
+    panicked = FALSE;   \* the reader's step panicked
 
 define
     AllDone == pc["reader"] = "Done" /\ pc["kernel"] = "Done"
@@ -208,7 +216,10 @@ R_park:
         contendWoken := FALSE;
         goto R_try;
 R_step:
-        if ahead > 0 then
+        if Panics /\ ~panicked /\ ahead = 0 then                              \* its waker's clone panics:
+            panicked := TRUE;
+            goto R_unwind;
+        elsif ahead > 0 then
             got := got + ahead; ahead := 0; out := "ready";
             goto R_cas;
         elsif blocked then
@@ -265,6 +276,21 @@ R_sleep:
             readerWoken := FALSE;
         end if;
     end while;
+    goto Done;
+R_unwind:
+    \* `Held::drop` as the panic unwinds: the side goes free and the contended polls are woken; the
+    \* work others left stays in the word for the next holder.
+    \* MUTATION unwind_clears: the drop swaps the whole word to zero, as it did, and the work is lost.
+    busy := FALSE;
+    if waiting then
+        waiting := FALSE;
+        if contended then contendWoken := TRUE; contended := FALSE; end if;
+    end if;
+    if Mutation = "unwind_clears" then
+        ready := FALSE;
+        defer := FALSE;
+    end if;
+    goto R_loop;                                                             \* the task polls again
 end process;
 
 \* Another thread leaves side-local work once (`Side::defer`): its bits, then the flag.
@@ -302,7 +328,7 @@ Conservation == got + ahead + kernel = arrived
 
 \* One holder at a time, and the word says so.
 DriverHolds == pc["driver"] \in {"D_serve", "D_cas", "D_wake"}
-ReaderHolds == pc["reader"] \in {"R_step", "R_read", "R_mark", "R_take", "R_cas", "R_ready", "R_wake"}
+ReaderHolds == pc["reader"] \in {"R_step", "R_read", "R_mark", "R_take", "R_cas", "R_ready", "R_wake", "R_unwind"}
 Exclusive == ~(DriverHolds /\ ReaderHolds) /\ ((DriverHolds \/ ReaderHolds) => busy)
 
 \* Work left in the deferred word is done in the end.

@@ -961,8 +961,10 @@ impl<S> Held<'_, S> {
 }
 
 impl<S> Drop for Held<'_, S> {
-    /// Only a panic under the guard gets here: the side goes free, and the
-    /// polls waiting on it are woken to look again.
+    /// Only a panic under the guard gets here (a user's waker clone, as a
+    /// step registers it): the side goes free, the polls waiting on it are
+    /// woken to look again, and the work others left for the holder stays
+    /// in the word for the next one (proofs/tla/side/Side.tla, `Panics`).
     fn drop(&mut self) {
         if self.biased() {
             // Own goes down; work others left stays in the word for the next
@@ -977,7 +979,11 @@ impl<S> Drop for Held<'_, S> {
             }
             return;
         }
-        let flags = self.side.state.swap(0, Ordering::AcqRel);
+        // READY, DEFER and REQ stay: the next holder's release fails on them and does the work.
+        let flags = self
+            .side
+            .state
+            .fetch_and(!(BUSY | WAITING), Ordering::AcqRel);
         if flags & WAITING != 0 {
             // Dropped, not run: during unwinding the wakes are parked.
             let mut after = After::default();

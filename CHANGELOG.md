@@ -45,6 +45,14 @@
   ticks left at once the newest is kept, the only one that can still clear. A free side costs
   what it did (`proofs/tla/asyncfd/AsyncFd.tla`, the `drop_held_clear` and `clear_last_wins`
   mutations).
+- **Work left for a socket's holder whose poll panicked is done by the next holder.** A poll
+  registers its task's waker while it holds the side, which clones the waker: a clone that
+  panicked unwound the guard, whose drop swapped the side's word to zero, and the edge, the
+  completion or the request another thread had left for that holder was lost (a read waited for
+  an edge that had come, a ring completion went unapplied, a dropped handle's close never ran).
+  The drop now lets the side go and wakes the polls waiting on it as before, and leaves that work
+  in the word, where the next holder does it (`proofs/tla/side/Side.tla`, `Panics`, the
+  `unwind_clears` mutation).
 - **The IO buffers of a thread that runs no shard hold no more than its runtime's
   `io_buffer_cap`.** A thread of the blocking pool, one inside a runtime with `enter`, and a
   worker whose shard was handed over take their buffers from a pool of their own, which held up

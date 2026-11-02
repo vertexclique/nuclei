@@ -122,3 +122,48 @@ fn unwinding_outside_a_view_wakes_at_once() {
     super::run_unwound();
     assert_eq!(count.0.load(Ordering::SeqCst), 1, "nothing was parked");
 }
+
+/// A side's state that records the work its holders did for others.
+#[derive(Default)]
+struct Done {
+    deferred: u8,
+}
+
+struct Records;
+
+impl super::Hooks<Done> for Records {
+    fn serve(&self, _: &mut Done, _: &mut After) {}
+
+    fn deferred(&self, st: &mut Done, bits: u8, _: &mut After) {
+        st.deferred |= bits;
+    }
+}
+
+/// Work another thread left for a holder whose step panicked (a user's waker clone under the
+/// guard) stays in the word, and the next holder does it (proofs/tla/side/Side.tla, the
+/// `unwind_clears` mutation).
+#[test]
+fn work_left_for_a_holder_that_panics_is_done_by_the_next() {
+    let mut side = Side::new(Done::default());
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut after = After::default();
+        let _: core::task::Poll<()> = side.poll(&mut after, Waker::noop(), &Records, |_, _| {
+            // While the step holds the side, another call leaves work for its holder.
+            let mut other = After::default();
+            side.defer(0b100, &mut other, &Records);
+            panic!("a waker's clone panicked under the guard");
+        });
+    }));
+    assert!(unwound.is_err());
+    let mut after = After::default();
+    let polled = side.poll(&mut after, Waker::noop(), &Records, |_, _| {
+        core::task::Poll::Ready(())
+    });
+    after.run();
+    assert!(polled.is_ready(), "the side was left held");
+    assert_eq!(
+        side.get_mut().deferred,
+        0b100,
+        "the work left for the holder that panicked was lost"
+    );
+}

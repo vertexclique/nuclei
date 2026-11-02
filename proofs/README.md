@@ -588,17 +588,22 @@ ready bit, it does the driver's part (and its own step again if it waited); the 
 takes the contended wakers, which it wakes once it has let go. Another thread may leave
 side-local work (`Side::defer`, a buffer that came back or a ring's completion): its bits go into
 the side's deferred word first, then the deferred bit with its fetch-or of busy, and a holder
-whose release fails on that bit does the work it finds in the word (`Held::run_deferred`).
+whose release fails on that bit does the work it finds in the word (`Held::run_deferred`). A
+step may panic under the guard as it registers its waker (a user's waker clone): the guard's
+drop lets the side go, wakes the contended polls and leaves the work others left in the word for
+the next holder (`Held::drop`).
 
-18 configurations: 4 that must pass (two and three bytes with `Conservation`, no byte lost or
-made up, and `Exclusive`, one holder at a time; liveness under weak fairness; and two bytes with
-work deferred once, with `DeferDone`, the work is done whoever holds the side), 8 mutations
+20 configurations: 5 that must pass (two and three bytes with `Conservation`, no byte lost or
+made up, and `Exclusive`, one holder at a time; liveness under weak fairness; two bytes with
+work deferred once, with `DeferDone`, the work is done whoever holds the side; and the same with
+the reader's step panicking once), 9 mutations
 (a driver that drops an edge on a held side, one that flags in a step of its own after looking,
 a holder that lets go without serving the ready bit, an edge that leaves the cache blocked, a
 holder that wakes nobody for the waiting bit, and a contended reader that sleeps without looking
 whether the side came free each end in a deadlock; a take that refuses a free side carrying a
-flag breaks `Termination`; a deferrer that raises its bit before its work is in the word breaks
-`DeferDone`), and 6 witnesses (a flag, a reader doing the driver's part, a read
+flag breaks `Termination`; a deferrer that raises its bit before its work is in the word, and a
+guard's drop that swaps the whole word to zero as a panic unwinds, as it did, break `DeferDone`),
+and 6 witnesses (a flag, a reader doing the driver's part, a read
 the driver completes on an edge, a reader's submit that runs the driver's read at once, a
 contended reader woken by the holder, and a contended reader that finds the side free and takes
 it). Bytes are a count and there is one reader: several tasks waiting on one side share its
