@@ -36,13 +36,13 @@
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
 
-- **A Windows connect binds a port other destinations may share, as std's connect does.** A
-  connect binds its socket to port 0 before `ConnectEx`, and an explicit bind gets a port no other
-  connection holds at all, where the bind a connect makes itself (std's) shares a port with
-  connections to other destinations. A client that made many short connections ran out of ports
-  while they waited out TIME_WAIT, and its connect failed with `WSAEADDRINUSE` (the soak, after
-  552 seconds). The bind now sets `SO_REUSE_UNICASTPORT` first; a system without the option binds
-  as before (`proofs/tla/connect/ConnectPort.tla`).
+- **A Windows connect binds its port as before: `SO_REUSE_UNICASTPORT` is not set.** The option
+  would have had a connect's explicit bind (which `ConnectEx` needs) share a port across
+  destinations, as the bind std's connect makes itself does. On the CI runners' Windows it reads
+  back unset after a set of either width, and a bind made with it still takes its port at once
+  rather than leave it to the connect, so nothing shows it taking effect, and it was taken out. The
+  soak's `WSAEADDRINUSE` it was meant for was TIME_WAIT toward the soak's one server (13455 of the
+  16384 ephemeral ports), which no sharing across destinations helps.
 - **A Windows datagram send answers what the kernel says of its own datagram.** A `send_to` on
   Windows copied its datagram, queued it for the completion port and answered taken at once, so a
   refusal the kernel made as it sent it (no route) reached the next call, whose own datagram was
