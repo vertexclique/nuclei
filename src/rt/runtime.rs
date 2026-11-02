@@ -190,12 +190,18 @@ impl Runtime {
         // The monitor first: a pass under way as it closed may still take a
         // shard and start a runner for it. Once it ended, the list taken next
         // holds every thread to wait for, a detached one marked so
-        // (proofs/tla/teardown, `JoinsNoDetached`, `StartedJoined`).
+        // (proofs/tla/teardown, `JoinsNoDetached`, `StartedJoined`); the take
+        // stops a worker started since the stop above, and none starts after
+        // it (proofs/tla/teardown/Grow.tla).
         let mut exited = Vec::new();
         if let Some(monitor) = self.inner.workers.take_monitor() {
             self.join(vec![monitor], deadline, &mut exited);
         }
+        #[cfg(test)]
+        teardown_pause(false);
         let threads = self.inner.workers.take_threads();
+        #[cfg(test)]
+        teardown_pause(true);
         self.join(threads, deadline, &mut exited);
     }
 
@@ -248,6 +254,29 @@ impl Runtime {
 impl Runtime {
     pub(crate) fn inner(&self) -> &Arc<Inner> {
         &self.inner
+    }
+}
+
+/// What a teardown runs at one moment, and whether that is after its take.
+#[cfg(test)]
+type Pause = (bool, Box<dyn FnOnce()>);
+
+#[cfg(test)]
+thread_local! {
+    /// What a drop on this thread runs at one moment of its teardown, for a
+    /// test to start a worker there: just before its take of the threads, or
+    /// (`true`) just after.
+    pub(crate) static TEARDOWN_PAUSE: core::cell::RefCell<Option<Pause>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Runs what [`TEARDOWN_PAUSE`] holds for this moment of a teardown.
+#[cfg(test)]
+fn teardown_pause(after_take: bool) {
+    let pause =
+        TEARDOWN_PAUSE.with(|pause| pause.borrow_mut().take_if(|(at, _)| *at == after_take));
+    if let Some((_, run)) = pause {
+        run();
     }
 }
 

@@ -10,6 +10,12 @@
 //! to stop takes no new task from then on, runs the ones it has to their
 //! end, and exits; its slot is not filled again.
 //!
+//! A thread starts, goes on the list a shutdown joins and has its shard
+//! published under the list's lock, unless a shutdown took the list: from
+//! then on no thread starts, and a worker started before the take is
+//! stopped by the take, its shard in its slot by then
+//! (proofs/tla/teardown/Grow.tla).
+//!
 //! With the handoff on (`rt::handoff`), a worker's thread is a runner: it
 //! runs the shard it is given until the shard stops, or is taken from it
 //! while it is blocked in one poll; it then finishes its bound tasks on its
@@ -78,14 +84,22 @@ pub(crate) struct Workers {
     /// The fewest workers a stop leaves running.
     min: usize,
     start: Start,
-    /// Every thread the runtime started for its workers, with its life.
-    threads: Mutex<Vec<(JoinHandle<()>, Arc<Life>)>>,
-    /// The monitor's thread, joined apart from the others: before them.
-    monitor_thread: Mutex<Option<JoinHandle<()>>>,
+    threads: Mutex<Threads>,
     exits: kovan_channel::unbounded::Sender<ThreadId>,
     /// The watch over the workers, with the handoff on.
     monitor: Option<Arc<Monitor>>,
     monitor_started: OnceLock<()>,
+}
+
+/// The threads a shutdown joins.
+#[derive(Default)]
+struct Threads {
+    /// Every thread the runtime started for its workers, with its life.
+    list: Vec<(JoinHandle<()>, Arc<Life>)>,
+    /// The monitor's thread, joined apart from the others: before them.
+    monitor: Option<JoinHandle<()>>,
+    /// A shutdown took the list: no thread starts from then on.
+    closed: bool,
 }
 
 /// A shard for a runner to run: worker place `place`, watched through
@@ -130,8 +144,7 @@ impl Workers {
             running: AtomicUsize::new(0),
             min,
             start,
-            threads: Mutex::new(Vec::new()),
-            monitor_thread: Mutex::new(None),
+            threads: Mutex::new(Threads::default()),
             exits,
             monitor,
             monitor_started: OnceLock::new(),
@@ -232,7 +245,8 @@ impl Workers {
         Ok(started)
     }
 
-    /// Starts a worker in the next free slot; `false` when none is left.
+    /// Starts a worker in the next free slot; `false` when none is left, or
+    /// once a shutdown took the threads.
     fn start_one(inner: &Arc<Inner>) -> io::Result<bool> {
         let workers = &inner.workers;
         // Before anything is claimed: a name function that panics reaches the
@@ -280,9 +294,15 @@ impl Workers {
         // always has a thread to run it: a shard whose thread could not start
         // goes with its run, holding no task (proofs/tla/placement/Publish.tla,
         // `NoSilentLoss`).
-        Self::spawn_thread(inner, name, run, life).map_err(|(err, _)| err)?;
-        let _ = workers.slots[index].set(shared);
-        workers.running.fetch_add(1, Ordering::AcqRel);
+        let publish = || {
+            let _ = workers.slots[index].set(shared);
+            workers.running.fetch_add(1, Ordering::AcqRel);
+        };
+        match Self::spawn_thread(inner, name, run, life, publish) {
+            Ok(()) => {}
+            Err((None, _)) => return Ok(false),
+            Err((Some(err), _)) => return Err(err),
+        }
         Self::start_monitor(inner)?;
         Ok(true)
     }
@@ -293,7 +313,13 @@ impl Workers {
         let Some(monitor) = &workers.monitor else {
             return Ok(());
         };
-        if workers.monitor_started.set(()).is_err() {
+        if workers.monitor_started.get().is_some() {
+            return Ok(());
+        }
+        // Under the list's lock: one a shutdown took starts no monitor, and
+        // one started before the take is taken with it.
+        let mut threads = lock(&workers.threads);
+        if threads.closed || workers.monitor_started.set(()).is_err() {
             return Ok(());
         }
         let (monitor, runtime) = (Arc::clone(monitor), Arc::downgrade(inner));
@@ -304,7 +330,7 @@ impl Workers {
                 let _exit = exit;
                 super::handoff::run(&monitor, &runtime);
             })?;
-        *lock(&workers.monitor_thread) = Some(thread);
+        threads.monitor = Some(thread);
         Ok(())
     }
 
@@ -316,7 +342,7 @@ impl Workers {
         life: Arc<Life>,
     ) -> Result<(), Gift> {
         let name = super::tuning::name_caught(&*inner.workers.start.name, "nuclei-worker");
-        Self::spawn_thread(inner, name, Run::from(gift), life).map_err(|(_, run)| Gift {
+        Self::spawn_thread(inner, name, Run::from(gift), life, || {}).map_err(|(_, run)| Gift {
             place: run.place,
             shard: run.shard,
             slot: run.slot.unwrap_or_else(|| inner.workers.monitor_slot()),
@@ -330,15 +356,23 @@ impl Workers {
             .map_or_else(|| Arc::new(Slot::new(true)), |monitor| monitor.slot())
     }
 
-    /// Starts a runner thread named `name` for `run`; on failure the error
-    /// and the run.
+    /// Starts a runner thread named `name` for `run`, and once it is on the
+    /// list a shutdown joins, calls `started`; on failure the error and the
+    /// run, with no error once a shutdown took the list.
     fn spawn_thread(
         inner: &Arc<Inner>,
         name: String,
         run: Run,
         life: Arc<Life>,
-    ) -> Result<(), (io::Error, Run)> {
+        started: impl FnOnce(),
+    ) -> Result<(), (Option<io::Error>, Run)> {
         let workers = &inner.workers;
+        // Held until `started` ran: a shutdown takes the list either before
+        // the look below, or after the thread is on it and `started` ran.
+        let mut threads = lock(&workers.threads);
+        if threads.closed {
+            return Err((None, run));
+        }
         // The run waits here until the thread takes it, so a thread that
         // cannot start hands it back.
         let handed = Arc::new(Handed(AtomicPtr::new(Box::into_raw(Box::new(run)))));
@@ -365,11 +399,12 @@ impl Workers {
         let spawned = thread.spawn(body);
         match spawned {
             Ok(thread) => {
-                lock(&workers.threads).push((thread, life));
+                threads.list.push((thread, life));
+                started();
                 Ok(())
             }
             Err(err) => match handed.take() {
-                Some(run) => Err((err, run)),
+                Some(run) => Err((Some(err), run)),
                 // Never: the closure did not run.
                 None => Ok(()),
             },
@@ -434,14 +469,14 @@ impl Workers {
     /// no take marks a thread detached and no runner starts: a shutdown joins
     /// it before it takes the other threads (proofs/tla/teardown).
     pub(crate) fn take_monitor(&self) -> Option<JoinHandle<()>> {
-        lock(&self.monitor_thread).take()
+        lock(&self.threads).monitor.take()
     }
 
     /// The threads listed for a shutdown to join, for a test to see the
     /// list taken.
     #[cfg(test)]
     pub(crate) fn threads_listed(&self) -> usize {
-        lock(&self.threads).len()
+        lock(&self.threads).list.len()
     }
 
     /// The life of the first runner of place `index`, as the monitor knows it.
@@ -450,14 +485,24 @@ impl Workers {
         self.monitor.as_ref()?.first_life(index)
     }
 
-    /// The runtime's threads started so far, taken for joining: every one
-    /// but a thread still blocked in the poll its shard was taken in, which
-    /// is left to exit on its own.
+    /// The runtime's threads started so far, taken for joining once
+    /// [`stop_all`](Self::stop_all) ran: every one but a thread still blocked
+    /// in the poll its shard was taken in, which is left to exit on its own,
+    /// and a monitor started since [`take_monitor`](Self::take_monitor),
+    /// which ends at its first look at the close. No thread starts from then
+    /// on, and a worker started since the stop is stopped here: its shard was
+    /// in its slot before the take (proofs/tla/teardown/Grow.tla).
     pub(crate) fn take_threads(&self) -> Vec<JoinHandle<()>> {
-        core::mem::take(&mut *lock(&self.threads))
-            .into_iter()
+        let (list, monitor) = {
+            let mut threads = lock(&self.threads);
+            threads.closed = true;
+            (core::mem::take(&mut threads.list), threads.monitor.take())
+        };
+        self.stop_all();
+        list.into_iter()
             .filter(|(_, life)| !life.is_detached())
             .map(|(thread, _)| thread)
+            .chain(monitor)
             .collect()
     }
 }

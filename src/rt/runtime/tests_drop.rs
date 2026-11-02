@@ -212,3 +212,95 @@ fn a_drop_never_waits_on_a_thread_its_monitor_takes_as_it_closes() {
     }
     panic!("no round took a shard after the close");
 }
+
+/// Drops `rt` on a thread of its own, after `pause` set what the drop runs
+/// at one moment of its teardown (`after_take`); the dropping thread.
+fn drop_with_pause(
+    rt: super::Runtime,
+    after_take: bool,
+    pause: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        super::TEARDOWN_PAUSE.with(|slot| *slot.borrow_mut() = Some((after_take, Box::new(pause))));
+        drop(rt);
+    })
+}
+
+/// A worker started as its runtime dropped, once the drop stopped every shard
+/// and before it took its list of threads: the drop took the new worker's
+/// thread and waited on it, its shard never stopped, for good. The drop stops
+/// every shard again once it took its list, and the new worker's shard was in
+/// its slot by then.
+#[test]
+fn a_drop_never_waits_for_good_on_a_worker_started_as_it_stopped_the_shards() {
+    let rt = Builder::new()
+        .worker_threads(1)
+        .max_worker_threads(2)
+        .pin_workers(false)
+        .build()
+        .unwrap();
+    let inner = Arc::clone(rt.inner());
+    let starter = Arc::clone(&inner);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let dropper = drop_with_pause(rt, false, move || {
+        started_tx.send(Workers::start(&starter, 1).ok()).unwrap();
+    });
+    let started = started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the drop never came to its take");
+    let returned = within(Duration::from_secs(3), || dropper.is_finished());
+    if !returned {
+        // Lets the drop go before the test fails.
+        inner.workers.stop_all();
+    }
+    assert!(
+        returned,
+        "the drop waits for good on a worker started as it stopped the shards"
+    );
+    dropper.join().unwrap();
+    assert_eq!(
+        started,
+        Some(1),
+        "the start in the drop's window started no worker"
+    );
+}
+
+/// A worker started as its runtime dropped, once the drop took its list of
+/// threads: the thread went on a list nobody took again, its shard published
+/// after the drop's stop, and the drop returned while that worker ran on,
+/// never stopped or joined. A start once the list is taken starts nothing.
+#[test]
+fn a_worker_start_after_a_drop_took_its_threads_starts_nothing() {
+    let rt = Builder::new()
+        .worker_threads(1)
+        .max_worker_threads(2)
+        .pin_workers(false)
+        .build()
+        .unwrap();
+    let inner = Arc::clone(rt.inner());
+    let starter = Arc::clone(&inner);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let dropper = drop_with_pause(rt, true, move || {
+        started_tx.send(Workers::start(&starter, 1).ok()).unwrap();
+    });
+    let started = started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the drop never took its list");
+    assert!(
+        within(Duration::from_secs(10), || dropper.is_finished()),
+        "the drop never returned"
+    );
+    dropper.join().unwrap();
+    let listed = inner.workers.threads_listed();
+    // Lets a worker the start left behind go before the test fails.
+    inner.workers.stop_all();
+    assert_eq!(
+        started,
+        Some(0),
+        "a start after the drop took its threads started a worker"
+    );
+    assert_eq!(
+        listed, 0,
+        "a thread went on the list after the drop took it"
+    );
+}
