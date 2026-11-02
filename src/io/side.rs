@@ -424,12 +424,14 @@ impl<S> Side<S> {
     }
 
     /// For a call whose heavy fence failed and that left its work: the side, held through the
-    /// word, if the claimant gave its claim up meanwhile. Its look for work came either after the
-    /// work was left, and it does it, or before this look, which then sees the claim given up
-    /// (both sides fence between their store and their load).
+    /// word, if the claimant gave its claim up meanwhile (`give_up`), or switched the side to
+    /// shared as it let go (`switch_if_unfenced`). Either look for work of the claimant's came
+    /// after the work was left, and it does it, or before this look, which then sees what it
+    /// stored (both sides fence between their store and their load). In shared mode no thread
+    /// holds biased, so the call may take the word as any other.
     fn claim_given_up(&self) -> Option<Held<'_, S>> {
         full_fence(Ordering::SeqCst);
-        if self.owner.load(Ordering::SeqCst) & LEFT == 0 {
+        if self.owner.load(Ordering::SeqCst) & LEFT == 0 && !self.shared.load(Ordering::SeqCst) {
             return None;
         }
         self.shared.store(true, Ordering::Relaxed);
@@ -445,11 +447,12 @@ impl<S> Side<S> {
     /// left before it saw the claim go is done here, through the word, the side shared first. The
     /// shard claims the side again at its next take as its owner.
     pub(crate) fn give_up(&self, who: usize, after: &mut After, hooks: &impl Hooks<S>) {
-        if self.shared.load(Ordering::Acquire)
-            || self
-                .owner
-                .compare_exchange(who, who | LEFT, Ordering::SeqCst, Ordering::Relaxed)
-                .is_err()
+        // A side gone shared still has its look: a fenceless call may have left work before the
+        // switch it then missed.
+        if self
+            .owner
+            .compare_exchange(who, who | LEFT, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
         {
             return;
         }
