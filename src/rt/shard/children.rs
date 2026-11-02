@@ -143,8 +143,7 @@ impl Shard {
             }
             #[cfg(port)]
             crate::rt::park::iocp::Port::unwatch_exit(watched.packet.0);
-            let orphan = Arc::strong_count(&watched.exit) == 1;
-            watched.exit.unwatched(orphan);
+            watched.exit.unwatched();
         }
     }
 }

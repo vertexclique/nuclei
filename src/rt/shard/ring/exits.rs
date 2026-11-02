@@ -88,8 +88,7 @@ impl ShardRing {
     /// child let go.
     fn end_exit(&self, op: ExitOp, res: i32) {
         if res == -libc::ECANCELED {
-            let orphan = Arc::strong_count(&op.exit) == 1;
-            op.exit.unwatched(orphan);
+            op.exit.unwatched();
             return;
         }
         if res < 0 {

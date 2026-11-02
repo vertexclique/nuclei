@@ -199,10 +199,7 @@ impl IoOp {
     fn gone(self) {
         match self {
             IoOp::Register(source) => source.registration_orphaned(),
-            IoOp::Watch(exit) => {
-                let orphan = Arc::strong_count(&exit) == 1;
-                exit.unwatched(orphan);
-            }
+            IoOp::Watch(exit) => exit.unwatched(),
             other => drop(other),
         }
     }

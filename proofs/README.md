@@ -1709,10 +1709,16 @@ watch is a `WAITID` that reaps the child itself, so a second watch would find EC
 that stops running cancels its watch and lets the child go only at that watch's completion; a
 waiter registers its waker, has its shard watch the child unless one does (a `try_wait` before
 may have, with no waker), and looks again before it sleeps; a dropped `Child`'s child is
-watched elsewhere. `KillReap`: a kill by pid and a reap by pid exclude each other through the
-child's state, so no signal goes by pid after the reap. 12 configurations: 4 that must pass, 4
-mutations (letting go at the cancel breaks `OneWatch`; no second look and an unwatched orphan
-break `Settles`; a killer that only looks breaks `NoKillAfterReap`), and 4 witnesses.
+watched elsewhere. A `try_wait` peeks: it stores the status of a child that exited, unreaped,
+so only the watcher's own outcome ends the need for a watch. The `Child` goes in steps (it says
+it is gone, claims the watch if none is held, lets go of its reference); a shard that lets the
+child go clears its watch, then looks whether the `Child` went and claims the watch if so.
+`KillReap`: a kill by pid and a reap by pid exclude each other through the child's state, so no
+signal goes by pid after the reap. 15 configurations: 4 that must pass, 6 mutations (letting go
+at the cancel breaks `OneWatch`; no second look, an unwatched orphan, an orphan read off the
+count of the exit's holders before the watch is cleared, and a peeked status counted as the
+watcher's own break `Settles`; a killer that only looks breaks `NoKillAfterReap`), and 5
+witnesses (the last a waiter that takes a peeked status).
 
 ## The broadcast channel
 

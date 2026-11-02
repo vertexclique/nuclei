@@ -381,8 +381,7 @@ impl Drop for Child {
             let _ = self.exit.kill();
         }
         // A child that runs on is still reaped once it exits.
-        #[cfg(unix)]
-        self.exit.watch_orphan();
+        self.exit.went();
     }
 }
 

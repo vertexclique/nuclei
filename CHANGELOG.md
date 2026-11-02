@@ -35,6 +35,18 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
+- **A child whose exit a `try_wait` saw is still reaped** (unix). `try_wait` stores the status of
+  a child that exited without reaping it, but that status counted as the watcher's own: once the
+  shard watching the child let it go (the thread's own shard at the end of its `block_on`) before
+  its driver reported the exit, neither the waiter nor the `Child`'s drop had it watched again,
+  and the child stayed a zombie. Only the watcher's outcome now ends the need for a watch, and a
+  wait or `try_wait` that takes a peeked status has the child watched, so it is reaped. A `Child`
+  dropped while its shard let the child go could also leave it unwatched: the shard read whether
+  the `Child` was gone off the count of the exit's holders before clearing its watch, the
+  `Child` found the watch held and let go. The `Child` now says it is gone before it claims the
+  watch, and the shard clears its watch before it looks, so one of the two always has the child
+  watched (`proofs/tla/process/ExitWatch.tla`, the `count_orphan` and `outcome_settles`
+  mutations).
 - **`Proactor::wake` ends a `Proactor::wait` made inside a task or a `block_on`.** The wake reaches
   the shards waiting in `Proactor::wait`, but only a wait on a thread that runs no shard entered
   its shard among them: a wait on a thread that runs one (a task's, a `block_on`'s) ran its turn

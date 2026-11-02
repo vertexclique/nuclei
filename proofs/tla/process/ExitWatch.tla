@@ -1,8 +1,11 @@
 ----------------------------- MODULE ExitWatch -----------------------------
 (***************************************************************************)
 (* A child's exit watched by one shard at a time, which hands it on as it *)
-(* stops running (src/process/exit.rs; src/rt/shard/children.rs;          *)
-(* src/rt/shard/ring/exits.rs), at the grain of each atomic step.         *)
+(* stops running (src/process/exit.rs: `Exit::poll_wait`, `try_wait`,     *)
+(* `ensure_watched`, `went`, `unwatched`, `finish`; src/process/mod.rs:   *)
+(* `Child::drop`; src/rt/shard/children.rs `let_go_of_children`;          *)
+(* src/rt/shard/ring/exits.rs `end_exit`), at the grain of each atomic    *)
+(* step.                                                                   *)
 (*                                                                          *)
 (* In plain words: the waiter looks for the outcome, registers its waker, *)
 (* has the shard it runs on watch the child unless one does (a `try_wait` *)
@@ -14,6 +17,16 @@
 (* then polls on shard B, never makes a second watch while the first is   *)
 (* out. The waiter may instead drop its `Child`: a child no shard watches *)
 (* is watched then, and one let go with its `Child` gone is watched on B. *)
+(*                                                                          *)
+(* A `try_wait` peeks: it stores the status of a child that exited without *)
+(* reaping it, so a stored outcome does not mean the child was reaped. The *)
+(* watcher's own outcome says so (`settled`), and only that ends the need  *)
+(* for a watch. The `Child` goes in steps: it says it is gone, then claims *)
+(* the watch if none is held (a swap of `watched`), then lets go of its    *)
+(* reference. A shard that lets the child go clears `watched`, then looks  *)
+(* whether the `Child` is gone, and if so claims the watch itself: each    *)
+(* side publishes, then looks, so whichever looks second sees the other,   *)
+(* and the swap leaves the watch to one of them.                           *)
 (*                                                                          *)
 (* What is abstract: a shard is its watch and its completion queue; the   *)
 (* waker is a flag (`AtomicWaker`: a wake takes it).                       *)
@@ -37,17 +50,24 @@ variables
     outcome = "none",     \* "none", "status", or "echild" (wrong)
     waker = FALSE,
     woken = FALSE,
-    orphan = FALSE,       \* the `Child` is gone
+    gone = FALSE,         \* the `Child` said it is gone (`Exit::went`)
+    holds = TRUE,         \* the `Child` still holds its reference to the exit
+    settled = FALSE,      \* the watcher stored its outcome (`Exit::finish`)
     seen = FALSE,         \* the waiter took the outcome
     rewatched = FALSE;    \* (record) a watch let go was made again on B
 
 define
     Here == IF aRuns THEN "A" ELSE "B"
+    \* What tells that no watch is needed any more.
+    \* MUTATION outcome_settles: any stored outcome does, a peeked one too (before the fix).
+    Settled == IF Mutation = "outcome_settles" THEN outcome # "none" ELSE settled
 end define;
 
-\* The outcome is stored, the first one standing, and the waiter woken.
+\* The watcher's outcome is stored, the first one standing, the watcher done, and the waiter
+\* woken.
 macro Finish(o) begin
     if outcome = "none" then outcome := o; end if;
+    settled := TRUE;
     if waker then waker := FALSE; woken := TRUE; end if;
 end macro;
 
@@ -81,7 +101,7 @@ end process;
 
 \* A shard takes its completions; A may stop running at any point.
 fair process shard \in Shards
-variables c = "none";
+variables c = "none", counted = FALSE;
 begin
 S_loop:
     while TRUE do
@@ -91,12 +111,24 @@ S_loop:
             cq[self] := "none";
 S_take:
             if c = "cancelled" then
-                \* Its watch ended: the child is let go now (an orphan's to
-                \* be watched on B).
-                watched := orphan;
-                if orphan then
-                    armed["B"] := TRUE;
-                    rewatched := TRUE;
+                \* Its watch ended: the child is let go now.
+                \* MUTATION count_orphan: whether the `Child` is gone is read off the count of
+                \* the exit's holders, before `watched` is cleared (before the fix): the
+                \* `Child` may still hold its reference, then claim nothing and let go.
+                if Mutation = "count_orphan" then counted := ~holds; end if;
+S_unwatch:
+                watched := FALSE;
+S_look:
+                \* Then a look whether the `Child` went: if so the shard claims the watch,
+                \* unless the `Child` did, and has B watch the child; else the waiter, if one
+                \* waits, is woken to watch it where it polls next.
+                if (Mutation = "count_orphan" /\ counted)
+                    \/ (Mutation # "count_orphan" /\ gone) then
+                    if ~Settled /\ ~watched then
+                        watched := TRUE;
+                        armed["B"] := TRUE;
+                        rewatched := TRUE;
+                    end if;
                 elsif waker then
                     waker := FALSE;
                     woken := TRUE;
@@ -123,21 +155,28 @@ end process;
 fair process waiter = "waiter"
 begin
 W_try:
-    \* A `try_wait` first, or not: it has a shard watch the child, with no
-    \* waker registered.
+    \* A `try_wait` first, or not: it has a shard watch the child unless one does, with no
+    \* waker registered ...
     either
-        skip;
+        goto W_check;
     or
-        watched := TRUE;
-        armed[Here] := TRUE;
+        if ~Settled /\ ~watched then
+            watched := TRUE;
+            armed[Here] := TRUE;
+        end if;
     end either;
+W_peek:
+    \* ... then peeks: the status of a child that exited is stored, the child unreaped.
+    if exited /\ ~reaped /\ outcome = "none" then
+        outcome := "status";
+    end if;
 W_check:
     while outcome = "none" do
         either
 W_register:
             waker := TRUE;
 W_watch:
-            if ~watched then
+            if ~Settled /\ ~watched then
                 watched := TRUE;
                 armed[Here] := TRUE;
             end if;
@@ -150,17 +189,32 @@ W_sleep:
                 woken := FALSE;
             end if;
         or
-            \* The `Child` goes: a child no shard watches is watched now.
-            orphan := TRUE;
-            \* MUTATION unwatched_orphan: a dropped `Child`'s child is left.
-            if ~watched /\ Mutation # "unwatched_orphan" then
-                watched := TRUE;
-                armed[Here] := TRUE;
-            end if;
-            goto Done;
+            \* The `Child` goes before the outcome came.
+            goto W_gone;
         end either;
     end while;
+W_seen:
+    \* The waiter takes the outcome ...
     seen := TRUE;
+W_ensure:
+    \* ... and one a peek stored has the child watched, so it is reaped.
+    if ~Settled /\ ~watched then
+        watched := TRUE;
+        armed[Here] := TRUE;
+    end if;
+W_gone:
+    \* The `Child` goes: it says so (`Exit::went`) ...
+    gone := TRUE;
+W_claim:
+    \* ... then claims the watch: a child no shard watches is watched now.
+    \* MUTATION unwatched_orphan: a dropped `Child`'s child is left.
+    if ~Settled /\ ~watched /\ Mutation # "unwatched_orphan" then
+        watched := TRUE;
+        armed[Here] := TRUE;
+    end if;
+W_release:
+    \* ... then lets go of its reference.
+    holds := FALSE;
 end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
@@ -179,16 +233,19 @@ OneWatch == ~(armed["A"] /\ armed["B"])
 \* The outcome is never the ECHILD a second reaper would find.
 NoEchild == outcome # "echild"
 
-\* The child is reaped, and a waiter that stays sees the outcome.
-Settles == <>(reaped /\ (orphan \/ seen))
+\* The child is reaped once its `Child` is gone, whether the waiter took the outcome first or
+\* not.
+Settles == <>(reaped /\ gone)
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)
 (* proved wrong.                                                           *)
 (***************************************************************************)
 
-\* A watch cancelled as A stopped is made again on B for an orphan.
+\* A watch cancelled as A stopped is made again on B for a child whose `Child` went.
 NoRewatch == ~rewatched
 \* The waiter sees the outcome after A stopped running.
 NoSeenOnB == ~(seen /\ ~aRuns)
+\* The waiter takes the status a `try_wait` peeked before the watcher stored its own.
+NoPeekTaken == ~(seen /\ ~settled)
 =============================================================================

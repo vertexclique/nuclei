@@ -11,6 +11,16 @@
 //! one child ever run at once. Where Linux has no pidfd (before 5.3, or a
 //! filter denies it), a reaper on `SIGCHLD` takes those children instead.
 //!
+//! A `try_wait` stores the status of a child that exited without reaping it,
+//! so a stored outcome is not a reap: only the watcher's own (`settled`)
+//! ends the need for a watch. The `Child` goes in two steps, saying it is
+//! gone and then claiming the watch if none is held; a shard that lets the
+//! child go clears its watch and then looks whether the `Child` went,
+//! claiming the watch itself if so. Whichever side looks second sees the
+//! other, and the claim leaves the watch to one of them, so a child whose
+//! `Child` went is always watched and reaped (`proofs/tla/process/
+//! ExitWatch.tla`).
+//!
 //! A pid stays the child's until the child is reaped, and may name another
 //! process after: so no signal goes by pid once the child is reaped. On
 //! Linux signals go through the pidfd, which names the process itself;
@@ -39,9 +49,14 @@ pub(crate) struct Exit {
     state: core::sync::atomic::AtomicU8,
     /// The status, or the errno of a wait that failed; set once.
     result: OnceLock<Result<ExitStatus, i32>>,
+    /// The watcher stored its outcome: the child was reaped, or no reap can
+    /// follow. A status a `try_wait` peeked is in `result` before this.
+    settled: AtomicBool,
     waker: AtomicWaker,
     /// A shard watches the child, or is about to.
     watched: AtomicBool,
+    /// The `Child` went: nobody waits for the exit any more.
+    gone: AtomicBool,
 }
 
 /// The child may be reaped or signalled.
@@ -73,8 +88,10 @@ impl Exit {
             #[cfg(unix)]
             state: core::sync::atomic::AtomicU8::new(ALIVE),
             result: OnceLock::new(),
+            settled: AtomicBool::new(false),
             waker: AtomicWaker::new(),
             watched: AtomicBool::new(false),
+            gone: AtomicBool::new(false),
         }))
     }
 
@@ -101,15 +118,22 @@ impl Exit {
             .map(|r| r.map_err(io::Error::from_raw_os_error))
     }
 
-    /// Stores the outcome (the first one stands) and wakes the waiter.
+    /// The watcher's outcome: stores it (the first one stands), says the
+    /// watcher is done, and wakes the waiter.
     pub(crate) fn finish(&self, result: Result<ExitStatus, i32>) {
         let _ = self.result.set(result);
+        self.settled.store(true, Ordering::SeqCst);
         self.waker.wake();
     }
 
-    /// Whether the outcome is known.
-    pub(crate) fn finished(&self) -> bool {
+    /// Whether the outcome is known, a peeked status's included.
+    fn finished(&self) -> bool {
         self.result.get().is_some()
+    }
+
+    /// Whether the watcher is done with the child.
+    fn settled(&self) -> bool {
+        self.settled.load(Ordering::SeqCst)
     }
 
     /// Ready with the child's status once it exited.
@@ -118,6 +142,8 @@ impl Exit {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<ExitStatus>> {
         if let Some(outcome) = self.outcome() {
+            // A status a `try_wait` peeked: the child is reaped all the same.
+            self.ensure_watched();
             return Poll::Ready(outcome);
         }
         self.waker.register(cx.waker());
@@ -129,9 +155,9 @@ impl Exit {
     }
 
     /// Has a shard (or the `SIGCHLD` reaper) watch the child, unless one
-    /// does.
+    /// does or the watcher is done with it.
     pub(crate) fn ensure_watched(self: &Arc<Self>) {
-        if self.finished() || self.watched.swap(true, Ordering::SeqCst) {
+        if self.settled() || self.watched.swap(true, Ordering::SeqCst) {
             return;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -143,27 +169,39 @@ impl Exit {
     }
 
     /// Its watching shard let the child go, its registration ended: the
-    /// waiter's next poll watches it again, wherever it runs; with no
-    /// waiter (the `Child` is gone), a runtime worker watches it now.
-    pub(crate) fn unwatched(self: &Arc<Self>, orphan: bool) {
+    /// watch is cleared, then, if the `Child` went, claimed again and made on
+    /// a runtime worker (unless the `Child`'s drop claimed it first); else
+    /// the waiter's next poll watches it again, wherever it runs.
+    pub(crate) fn unwatched(self: &Arc<Self>) {
+        self.watched.store(false, Ordering::SeqCst);
         #[cfg(test)]
         at_let_go();
-        self.watched.store(false, Ordering::SeqCst);
-        if orphan {
-            if !crate::rt::shard::watch_exit_elsewhere(self) {
-                self.watched.store(false, Ordering::SeqCst);
-            }
-        } else {
+        if !self.gone.load(Ordering::SeqCst) {
             self.waker.wake();
+            return;
+        }
+        if self.settled() || self.watched.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if !crate::rt::shard::watch_exit_elsewhere(self) {
+            self.watched.store(false, Ordering::SeqCst);
         }
     }
 
-    /// The `Child` goes: a child still running is watched, by the shard
-    /// running here or a running runtime's, so it is reaped once it exits.
-    /// With no runtime running it is left to the system, as std leaves it.
+    /// The `Child` goes: it says so, before it claims a watch (see the
+    /// module), and on unix a child still running is watched.
+    pub(crate) fn went(self: &Arc<Self>) {
+        self.gone.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        self.watch_orphan();
+    }
+
+    /// A child whose `Child` went is watched, by the shard running here or a
+    /// running runtime's, so it is reaped once it exits. With no runtime
+    /// running it is left to the system, as std leaves it.
     #[cfg(unix)]
-    pub(crate) fn watch_orphan(self: &Arc<Self>) {
-        if self.finished() || self.watched.swap(true, Ordering::SeqCst) {
+    fn watch_orphan(self: &Arc<Self>) {
+        if self.settled() || self.watched.swap(true, Ordering::SeqCst) {
             return;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -183,6 +221,7 @@ impl Exit {
     /// shard does); a shard is set to watch it, so it is reaped.
     pub(crate) fn try_wait(self: &Arc<Self>) -> io::Result<Option<ExitStatus>> {
         if let Some(outcome) = self.outcome() {
+            self.ensure_watched();
             return outcome.map(Some);
         }
         self.ensure_watched();
