@@ -35,9 +35,10 @@
 - **A precise sleep ends on time after the running clock is advanced** (epoll, kqueue). The
   poller's own timer counts the system's time but was armed again only when the deadline on the
   clock changed: after `time::advance` on a running clock it stayed at the deadline as the system
-  saw it before, up to a millisecond late, or the advance late. It is now armed for the deadline
-  as the system sees it (`proofs/tla/precise`, the `key_on_clock` mutation). A clock nobody
-  paused or advanced pays nothing for it.
+  saw it before, and the sleep ended on the wait's own millisecond timeout instead, up to a
+  millisecond late. It is now armed for the deadline as the system sees it
+  (`proofs/tla/precise`, the `key_on_clock` mutation). A clock nobody paused or advanced pays
+  nothing for it.
 - **A timer's key never reaches a later timer in its place.** Each entry of a timer wheel counts
   its reuses in a generation a key carries, which was 32 bits: a key held while its entry was
   let go of and taken again 2^32 times reached the timer in the entry then, as a sleep that fired
