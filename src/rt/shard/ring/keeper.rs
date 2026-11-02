@@ -18,15 +18,22 @@
 //! On a single-issuer ring with deferred task work the kernel runs an operation's completion
 //! only when the ring's own thread enters it, and refuses any other thread's enter, so no keeper
 //! can take such a ring. It sends no zero-copy, and its shard waits a bounded time for what it
-//! cancelled ([`ShardRing::shut_down`]): an operation still out after that keeps its memory for
-//! good, and is counted. `proofs/tla/lent/LentZc.tla` checks the keeper's completions and
-//! `proofs/tla/keeper/Kept.tla` its mailbox.
+//! cancelled ([`ShardRing::shut_down`]): an operation still out after that is given up on. It
+//! ends for whoever waits on it with an error and no longer counts as out, so neither its task
+//! nor a retire of its source waits for good, while the memory the kernel may still write is kept
+//! for good, and counted. `proofs/tla/lent/LentZc.tla` checks the keeper's completions,
+//! `proofs/tla/keeper/Kept.tla` its mailbox and `proofs/tla/keeper/Forgot.tla` what is given up
+//! on.
 
-use std::sync::Arc;
+use std::io;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use kovan_queue::seg_queue::SegQueue;
+
 use super::super::{IoOp, Shared};
-use super::{ExitOp, FILE_TAG, FileOp, IGNORED, RecvGroup, RingOp, ShardRing, Sqe};
+use super::{FILE_TAG, FileOp, IGNORED, RecvGroup, RingMem, RingOp, ShardRing, Sqe};
+use crate::io::source::ops::{Done, Outcome};
 use crate::sync::oneshot;
 
 /// How long a shard that goes waits for its ring's cancelled operations, when it keeps them.
@@ -38,6 +45,45 @@ static LEAKED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize
 #[cfg(test)]
 pub(crate) fn leaked() -> usize {
     LEAKED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Memory the kernel may still write after its ring gave up on it: kept for the process's life,
+/// and reachable, so a leak check sees it kept rather than lost.
+struct KeptForGood(#[expect(dead_code, reason = "only kept, never read")] Box<dyn core::any::Any>);
+
+// SAFETY: nothing reads, moves out of or drops what it holds once it is kept: it only stays.
+unsafe impl Send for KeptForGood {}
+
+static KEPT: OnceLock<SegQueue<KeptForGood>> = OnceLock::new();
+
+fn keep_for_good(what: Box<dyn core::any::Any>) {
+    KEPT.get_or_init(SegQueue::new).push(KeptForGood(what));
+}
+
+/// What an operation given up on ends with.
+fn given_up() -> io::Error {
+    io::Error::other("the shard went before the kernel ended the operation")
+}
+
+/// An operation of a source given up on: its side gets [`given_up`] for its end, and the
+/// operation counts out, while its memory is kept for good.
+fn forsake(op: RingOp) {
+    let RingOp {
+        source,
+        epoch,
+        read,
+        mem,
+        ..
+    } = op;
+    keep_for_good(Box::new(mem));
+    source.op_done(
+        Done {
+            outcome: Outcome::Forsaken(given_up()),
+            epoch,
+            read,
+        },
+        None,
+    );
 }
 
 impl ShardRing {
@@ -61,7 +107,8 @@ impl ShardRing {
 
     /// The shard of a ring no keeper can take is going, its sources detached: every operation
     /// still out is cancelled and its completion waited for, for at most [`SHUTDOWN_WAIT`]. One
-    /// that never completes keeps its memory for good (the kernel may still write it), and is
+    /// that has not completed by then is given up on ([`forget_stuck`](Self::forget_stuck)): it
+    /// ends with an error, keeps its memory for good (the kernel may still write it), and is
     /// counted (`leaked`). Returns the memory of the receive group it let go, for the shard's
     /// ledger.
     pub(crate) fn shut_down(&self) -> usize {
@@ -92,33 +139,41 @@ impl ShardRing {
         }
     }
 
-    /// What is still out keeps its memory for good, the kernel may still write it, and is
-    /// counted. Returns the memory of the receive group let go: none while a receive is stuck.
-    fn forget_stuck(&self) -> usize {
+    /// What is still out is given up on, and counted: a source's operation ends for its side
+    /// with an error and counts out, a file's call fills its slot with one, and the memory the
+    /// kernel may still write is kept for good (a zero-copy write's buffer with it, so its
+    /// `Released` never resolves). A child's wait keeps its info and its pidfd for good. Returns
+    /// the memory of the receive group let go: none while a receive that draws from it is out.
+    pub(super) fn forget_stuck(&self) -> usize {
         let stuck: Vec<RingOp> = self.ops.borrow_mut().drain().collect();
-        let mut stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
-        stuck_files.iter_mut().for_each(FileOp::give_up);
-        let stuck_exits: Vec<ExitOp> = self.exit_ops.borrow_mut().drain().collect();
+        let stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
+        let stuck_exits: Vec<_> = self.exit_ops.borrow_mut().drain().collect();
         LEAKED.fetch_add(
             stuck.len() + stuck_files.len() + stuck_exits.len(),
             core::sync::atomic::Ordering::Relaxed,
         );
-        // A file's call still in the kernel keeps its buffer and its
-        // descriptor for good, a child's wait its info and its pidfd.
-        core::mem::forget(stuck_files);
-        core::mem::forget(stuck_exits);
+        let receiving = stuck.iter().any(|op| {
+            matches!(
+                op.mem,
+                RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. }
+            )
+        });
+        stuck.into_iter().for_each(forsake);
+        for file in stuck_files {
+            keep_for_good(Box::new(file.forsake(given_up())));
+        }
+        if !stuck_exits.is_empty() {
+            keep_for_good(Box::new(stuck_exits));
+        }
         let group = self.recv.borrow_mut().take();
-        let freed = if stuck.is_empty() {
-            let freed = group.as_ref().map_or(0, RecvGroup::reservation);
-            drop(group);
-            freed
-        } else {
-            // A receive still in the kernel may write the group's buffers:
-            // they stay registered and mapped for good.
-            core::mem::forget(group);
-            0
-        };
-        core::mem::forget(stuck);
+        if receiving {
+            // A receive still in the kernel may write the group's buffers: they stay registered
+            // and mapped for good.
+            keep_for_good(Box::new(group));
+            return 0;
+        }
+        let freed = group.as_ref().map_or(0, RecvGroup::reservation);
+        drop(group);
         freed
     }
 }
@@ -184,7 +239,7 @@ impl Kept {
             let waited = ring.wait(None, None);
             shared.park.end_park();
             if waited.is_err() {
-                // A ring that cannot be waited on: what is still out keeps its memory for good.
+                // A ring that cannot be waited on: what is still out is given up on.
                 ring.forget_stuck();
                 break;
             }

@@ -187,6 +187,88 @@ fn a_retire_returns_only_once_the_rings_read_is_cancelled() {
     assert_eq!(shard.ring().unwrap().files_in_use(), (0, 0));
 }
 
+/// A read the kernel still holds as its shard's bounded wait for the cancel ran out: the shard
+/// gives up on it (`ShardRing::shut_down`'s last step), and it ends for its task with an error and
+/// counts out, so a retire of its source returns. Before, it was forgotten with no end, and the
+/// task and any later retire waited for good (`proofs/tla/keeper/Forgot.tla`).
+#[test]
+fn a_read_its_shard_gives_up_on_ends_with_an_error_and_a_retire_returns() {
+    let Some(shard) = ring_shard(4) else { return };
+    let (_mine, src, _peer) = source_pair();
+    let reader = Arc::clone(&src);
+    let mut buf = [0u8; 8];
+    let mut read = Box::pin(poll_fn(move |cx| reader.poll_read(cx, &mut buf, false)));
+    {
+        let _current = context::enter(&shard);
+        shard.block_on(async {
+            let polled = poll_fn(|cx| core::task::Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(polled.is_pending(), "the peer wrote nothing yet");
+            // A write that completes through the ring takes the queued read to the kernel with it.
+            poll_fn(|cx| src.poll_write(cx, b"!")).await.unwrap();
+            poll_fn(|cx| src.poll_flush(cx)).await.unwrap();
+        });
+        let ring = shard.ring().unwrap();
+        assert!(ring.in_flight() > 0, "the read is not in the kernel");
+        let before = super::leaked();
+        ring.forget_stuck();
+        assert!(super::leaked() > before, "nothing was given up on");
+        let end = shard.block_on(poll_fn(|cx| {
+            core::task::Poll::Ready(read.as_mut().poll(cx))
+        }));
+        assert!(
+            matches!(end, core::task::Poll::Ready(Err(_))),
+            "the read given up on did not end with an error: {end:?}"
+        );
+    }
+    // The shard goes, as `shut_down` lets go of the ring right after it gives up.
+    drop(shard);
+    let (done, retired) = std::sync::mpsc::channel();
+    let retiring = {
+        let src = Arc::clone(&src);
+        std::thread::spawn(move || {
+            src.retire();
+            let _ = done.send(());
+        })
+    };
+    assert!(
+        retired.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the retire waits for a read its shard gave up on: {}",
+        src.write_report()
+    );
+    retiring.join().unwrap();
+}
+
+/// A file's call the kernel still holds as its shard's bounded wait for the cancel ran out: its
+/// slot gets an error, so its task does not wait for good, and its buffer stays with the kernel,
+/// which may still write it (`proofs/tla/keeper/Forgot.tla`).
+#[test]
+fn a_file_call_its_shard_gives_up_on_ends_with_an_error() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let Some(shard) = ring_shard(4) else { return };
+    let _current = context::enter(&shard);
+    let mut fds = [0; 2];
+    // SAFETY: the kernel fills the two descriptors of our array, owned at once below.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: just made, owned once each.
+    let (read_end, _write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let file = Source::new(read_end.as_raw_fd(), Kind::File);
+    let lease = file.lease().unwrap();
+    let mut held = Some(crate::buf::owned::OwnedBuf::Vec(Vec::with_capacity(8)));
+    let waker = std::task::Waker::noop();
+    let mut job = crate::fs::ring::read_lent(&lease, u64::MAX, &mut held, waker)
+        .expect("the call goes on the ring");
+    // The shard's next look hands the read to the kernel, where it waits for the pipe's bytes.
+    shard.block_on(async {});
+    let ring = shard.ring().unwrap();
+    assert!(ring.in_flight() > 0, "the read is not in the kernel");
+    ring.forget_stuck();
+    assert!(
+        matches!(job.poll(waker), core::task::Poll::Ready((Err(_), _))),
+        "the call given up on left its slot empty"
+    );
+}
+
 /// A shard that goes with a read out on its ring cancels it and waits for
 /// its completion: no operation is left with memory the kernel may write.
 #[test]

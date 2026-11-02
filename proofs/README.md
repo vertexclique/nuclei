@@ -1633,8 +1633,23 @@ freed with the poller, as before, breaks `NoWriteAfterFree`, through the handsha
 through a stray one); and 2 witnesses (a post wakes the keeper while the operation is out; the
 wake's read completes after the poller went).
 
+`Forgot` (`tla/keeper/Forgot.tla`) checks an operation a going shard gives up on, on a ring no
+keeper can take (`ShardRing::shut_down`, `settle` and `forget_stuck` in
+`src/rt/shard/ring/keeper.rs`, `Source::op_done` in `src/io/source/ops.rs`, `FileOp::forsake` in
+`src/fs/ring.rs`, `Source::retire`). The shard cancels the operation and waits a bounded time; the
+kernel may end it in time, late, or never. One still out when the wait ends is given up on: it ends
+with an error and counts out, its memory kept for good. A task waits for its end, and another
+thread retires its source. 6 configurations: 2 that must pass (an operation that ignores the
+cancel, and one the kernel ends in time or late), with `NoScribble`, the kernel never writes the
+operation's memory after it was freed, `EndsOnce`, and `Ends`, the task and the retire both end; 2
+mutations (an operation forgotten with no end, as before, breaks `Ends`; one whose end lets go of
+its memory breaks `NoScribble`); and 2 witnesses (an operation that ended while the kernel still
+holds it; a slow one that completes after the shard gave up on it).
+
 `src/rt/shard/ring/tests_zc.rs` checks that a registration posted to a kept ring is let go of at
-once, and `src/rt/park/ring.rs` that a wake after the poller went writes no freed memory.
+once, `src/rt/park/ring.rs` that a wake after the poller went writes no freed memory, and
+`src/rt/shard/ring/tests.rs` that a read and a file's call given up on end with an error and let a
+retire return.
 
 ## A blocking job of a Windows handle
 

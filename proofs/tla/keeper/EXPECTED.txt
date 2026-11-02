@@ -9,3 +9,9 @@ KM_buf_with_poller             MC_Kept              violated:NoWriteAfterFree
 KM_buf_stray                   MC_Kept              violated:NoWriteAfterFree
 KW_post_wake                   MC_Kept              violated:NoPostWake
 KW_late_read                   MC_Kept              violated:NoLateRead
+F_stuck                        MC_Forgot            pass
+F_slow                         MC_Forgot            pass
+FM_forget_silent               MC_Forgot            violated:Ends
+FM_forget_frees                MC_Forgot            violated:NoScribble
+FW_given_up                    MC_Forgot            violated:NoGivenUp
+FW_late                        MC_Forgot            violated:NoLate

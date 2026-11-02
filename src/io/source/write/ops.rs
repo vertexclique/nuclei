@@ -281,10 +281,41 @@ impl WriteState {
                     }
                 }
             }
+            #[cfg(ring)]
+            Outcome::Forsaken(_) if stale => {}
+            #[cfg(ring)]
+            Outcome::Forsaken(err) => self.forsaken(err, after),
             // The read side's.
             other => other.release(after),
         }
         after.wake(&mut self.waiters);
+    }
+
+    /// The side's operation was given up on as its shard went, the kernel still holding it: a
+    /// connect under way fails with `err`, a lent buffer's write ends with it (the buffer stays
+    /// with the kernel), and any other write fails the side, its bytes behind dropped, as a send
+    /// that failed does: what reached the peer is unknown.
+    #[cfg(ring)]
+    #[cold]
+    #[inline(never)]
+    fn forsaken(&mut self, err: io::Error, after: &mut After) {
+        if self.connecting {
+            self.connected(Err(err));
+            return;
+        }
+        match self.lent.as_mut().filter(|l| l.out) {
+            Some(lent) => {
+                lent.out = false;
+                lent.done = Some(Err(err));
+                self.lent_finished(after);
+            }
+            None => {
+                self.failed = Some(Failure::of(&err));
+                if let Some(behind) = self.behind.take() {
+                    after.drop_buf(behind);
+                }
+            }
+        }
     }
 
     /// The operation to cancel for a lent buffer whose task went before

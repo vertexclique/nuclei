@@ -272,6 +272,30 @@ impl ReadState {
         let _ = not_ready;
     }
 
+    /// The side's operation was given up on as its shard went, the kernel still holding it: it
+    /// ends with `err`, for the task of a lent buffer out with it (the buffer stays with the
+    /// kernel), else for the next read.
+    #[cfg(ring)]
+    #[cold]
+    #[inline(never)]
+    fn forsaken(&mut self, err: std::io::Error, after: &mut After) {
+        self.multi = false;
+        self.multi_stopping = false;
+        self.armed = false;
+        match self.lent.as_mut().filter(|l| l.out) {
+            Some(lent) => {
+                lent.out = false;
+                lent.done = Some(Err(err));
+                if lent.orphan {
+                    self.abandon_lent(after);
+                } else if let Some(w) = lent.waker.take() {
+                    after.wake_one(w);
+                }
+            }
+            None => self.error = Some(err),
+        }
+    }
+
     /// The side's operation completed: what it brought goes where the tasks
     /// take it, and they are woken. One given back undone brought nothing,
     /// and is asked again, as is an accept that met a connection its peer
@@ -479,6 +503,10 @@ impl ReadState {
                     }
                 }
             }
+            #[cfg(ring)]
+            Outcome::Forsaken(_) if stale => {}
+            #[cfg(ring)]
+            Outcome::Forsaken(err) => self.forsaken(err, after),
             // The write side's.
             other => other.release(after),
         }

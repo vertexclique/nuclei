@@ -20,6 +20,14 @@
   a waker that saw the shard parked just before, or a thread that kept its notifier, could have
   the kernel write 8 bytes into freed memory. The read now lands in memory that lives as long as
   the process (`proofs/tla/keeper/Kept.tla`).
+- **An operation a going shard gives up on ends, with an error** (io_uring). A thread's own shard,
+  on a ring only that thread can reap, waits a bounded time for what it cancelled as it goes. An
+  operation still out then was forgotten with no end: its task waited for good, a later `get_mut`
+  or `into_inner` of its handle waited for good for it to count out, and a file call's task never
+  heard of it. It now ends with an error ("the shard went before the kernel ended the operation")
+  and counts out, while the memory the kernel may still write is kept for good, as before; the
+  receive group is kept only when a receive that draws from it is out
+  (`proofs/tla/keeper/Forgot.tla`).
 - **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
   `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
   for a connection its peer reset in the backlog before or while the accept took it. That error is
