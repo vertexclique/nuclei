@@ -6,6 +6,7 @@ G_live_coarse                  MC_Precise           pass
 G_live_paused                  MC_Precise           pass
 M_no_arm                       MC_Precise           violated:OnTime
 M_stale_arm                    MC_Precise           violated:OnTime
+M_timer_leeway                 MC_Precise           violated:OnTime
 M_wait_tick_only               MC_Precise           violated:OnTime
 M_fire_tick_only               MC_Precise           violated:Termination
 M_publish_tick_only            MC_Precise           violated:OnTime
