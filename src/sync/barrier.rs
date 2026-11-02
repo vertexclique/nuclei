@@ -84,7 +84,7 @@ impl Barrier {
     pub fn wait(&self) -> BarrierWait<'_> {
         BarrierWait {
             barrier: self,
-            generation: None,
+            arrival: Arrival::Before,
             wait: Wait::new(),
         }
     }
@@ -174,12 +174,25 @@ impl BarrierWaitResult {
     }
 }
 
+/// Where a [`BarrierWait`] stands.
+#[derive(Clone, Copy, Debug)]
+enum Arrival {
+    /// Not arrived yet.
+    Before,
+    /// Arrived, waiting in this generation.
+    In(usize),
+    /// Arrived and completed its generation as its leader.
+    Led,
+}
+
 /// The future [`Barrier::wait`] returns.
+///
+/// It is fused: once it completes, polling it again is ready at once with the
+/// same result, and counts no second arrival.
 #[must_use = "futures do nothing unless polled"]
 pub struct BarrierWait<'a> {
     barrier: &'a Barrier,
-    /// The generation this wait arrived in, once it has.
-    generation: Option<usize>,
+    arrival: Arrival,
     wait: Wait,
 }
 
@@ -189,9 +202,10 @@ impl Future for BarrierWait<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<BarrierWaitResult> {
         let this = self.get_mut();
         let barrier = this.barrier;
-        if this.generation.is_none() {
-            match barrier.arrive() {
+        match this.arrival {
+            Arrival::Before => match barrier.arrive() {
                 Ok(()) => {
+                    this.arrival = Arrival::Led;
                     barrier.transition(|state| {
                         if state & QUEUED != 0 {
                             Step::Drain(state)
@@ -199,21 +213,22 @@ impl Future for BarrierWait<'_> {
                             Step::Set(state)
                         }
                     });
-                    return Poll::Ready(BarrierWaitResult { leader: true });
+                    Poll::Ready(BarrierWaitResult { leader: true })
                 }
                 Err(generation) => {
-                    this.generation = Some(generation);
+                    this.arrival = Arrival::In(generation);
                     barrier.enqueue(&mut this.wait, generation, cx.waker());
-                    return this
-                        .wait
+                    this.wait
                         .poll(&barrier.queue, None)
-                        .map(|_| BarrierWaitResult { leader: false });
+                        .map(|_| BarrierWaitResult { leader: false })
                 }
-            }
+            },
+            Arrival::In(_) => this
+                .wait
+                .poll(&barrier.queue, Some(cx.waker()))
+                .map(|_| BarrierWaitResult { leader: false }),
+            Arrival::Led => Poll::Ready(BarrierWaitResult { leader: true }),
         }
-        this.wait
-            .poll(&barrier.queue, Some(cx.waker()))
-            .map(|_| BarrierWaitResult { leader: false })
     }
 }
 
@@ -229,7 +244,7 @@ impl Drop for BarrierWait<'_> {
 impl fmt::Debug for BarrierWait<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BarrierWait")
-            .field("generation", &self.generation)
+            .field("arrival", &self.arrival)
             .finish_non_exhaustive()
     }
 }
