@@ -98,6 +98,11 @@ pub struct ShardStats {
     /// Times the shard went to another thread because the thread running it
     /// stayed in one poll past [`Builder::handoff_after`](crate::Builder::handoff_after).
     pub handoffs: u64,
+    /// Times the shard's thread stayed in one poll past the threshold but the shard could not go
+    /// to another thread, because the kernel refused the memory fence the handoff needs (Linux's
+    /// `membarrier`): the poll went on holding up the shard. Zero on other systems, whose
+    /// handoff takes no fence that can fail.
+    pub handoffs_failed: u64,
     /// The longest poll the runtime saw on the shard, at the resolution of
     /// its watch (a quarter of the handoff threshold); zero when no poll
     /// lasted that long, or with the handoff off.

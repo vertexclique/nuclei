@@ -120,6 +120,8 @@ pub(crate) struct Counters {
     cq_overflows: AtomicU64,
     /// Times the shard was handed to another thread, its runner blocked.
     handoffs: AtomicU64,
+    /// Times a handoff of the shard was given up because the heavy fence failed.
+    handoffs_failed: AtomicU64,
     /// The longest poll the runtime's monitor saw, in nanoseconds.
     longest_poll_nanos: AtomicU64,
     /// Times a task's poll spent its budget and yielded.
@@ -175,6 +177,7 @@ impl Counters {
             ops_in_flight: AtomicUsize::new(0),
             cq_overflows: AtomicU64::new(0),
             handoffs: AtomicU64::new(0),
+            handoffs_failed: AtomicU64::new(0),
             longest_poll_nanos: AtomicU64::new(0),
             budget_yields: AtomicU64::new(0),
             poll_times: OnceLock::new(),
@@ -226,6 +229,11 @@ impl Counters {
     /// The shard was handed to another thread, its runner blocked.
     pub(crate) fn handed_off(&self) {
         self.handoffs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A handoff of the shard was given up: the heavy fence it needs failed.
+    pub(crate) fn handoff_failed(&self) {
+        self.handoffs_failed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The monitor saw a poll of at least `length`.
@@ -309,6 +317,7 @@ impl Counters {
             buffer_exhausted: self.buffer_exhausted.load(Ordering::Relaxed),
             timers: self.timers.load(Ordering::Relaxed),
             handoffs: self.handoffs.load(Ordering::Relaxed),
+            handoffs_failed: self.handoffs_failed.load(Ordering::Relaxed),
             longest_poll: std::time::Duration::from_nanos(
                 self.longest_poll_nanos.load(Ordering::Relaxed),
             ),

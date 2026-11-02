@@ -392,8 +392,10 @@ fn take(
         fence(Ordering::SeqCst);
     } else if !super::fence::heavy() {
         // The heavy fence failed, which `available` said it would not: no
-        // take may rely on it.
+        // take may rely on it. Counted, so a watch that cannot rescue a
+        // blocked poll shows (proofs/tla/handoff, `F_fail`).
         old.slot.cancel();
+        place.shared.counters.handoff_failed();
         let_go(runtime, shard);
         return None;
     }
@@ -680,6 +682,30 @@ mod tests {
             drop(gift);
         });
         assert_eq!(polled, context::Polled::Detached);
+    }
+
+    /// A take whose heavy fence fails relies on nothing the fence was to order: it cancels its
+    /// claim, takes nothing, and counts the failure on the shard, so a watch that can no longer
+    /// rescue a blocked poll is seen in the stats (proofs/tla/handoff, `F_fail`).
+    #[test]
+    fn a_take_whose_heavy_fence_fails_cancels_its_claim_and_is_counted() {
+        let shard = worker_shard();
+        let (mut monitor, slot, mut watch) = watched(&shard);
+        // The heavy fence's path on every platform: one that has none takes a full fence instead.
+        monitor.full_fence = false;
+        super::super::fence::inject_failure(true);
+        let gift = take_outside(&monitor, &mut watch);
+        super::super::fence::inject_failure(false);
+        assert!(gift.is_none(), "a take relied on a failed fence");
+        assert_eq!(slot.come_back(1), slot::Back::In, "the claim was left up");
+        let stats = shard.shared.counters.read(0);
+        assert_eq!(stats.handoffs_failed, 1, "the failed take was not counted");
+        assert_eq!(stats.handoffs, 0);
+        slot.go_out(1);
+        let gift = take_outside(&monitor, &mut watch).expect("the poll was not taken");
+        let stats = shard.shared.counters.read(0);
+        assert_eq!((stats.handoffs, stats.handoffs_failed), (1, 1));
+        drop(gift);
     }
 
     /// A take that succeeds holds the shard in its gift, so the runner's
