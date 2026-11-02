@@ -1,7 +1,9 @@
 //! A stress of the shard handoff and its watch, through the public surface: in every round,
 //! tasks block their thread past the watch while others spawn and join, wake one another, send
 //! and receive through channels, run a nested `block_on` that blocks, and hold a `shard_local!`
-//! value across a nested `block_on` that blocks under its `with`.
+//! value across a nested `block_on` that blocks under its `with`. Under the default watch, the
+//! first round blocks nowhere, so its calls from tasks' code take the leaf push and the bracket
+//! on shards nobody takes.
 //!
 //! Every check is on what the tasks computed, never on timing: each task's result, every message
 //! received once and in order, each nested `block_on`'s output, and a shard-local value its
@@ -13,7 +15,7 @@ use std::cell::Cell;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
-use nuclei::runtime::{Builder, Runtime, RuntimeHandle};
+use nuclei::runtime::{Builder, RuntimeHandle};
 use nuclei::sync::{mpsc, oneshot};
 
 nuclei::shard_local! { static TALLY: Cell<u64> = Cell::new(0) }
@@ -58,21 +60,25 @@ impl Progress {
     }
 }
 
-fn runtime(workers: usize) -> Runtime {
-    Builder::new()
-        .worker_threads(workers)
-        .pin_workers(false)
-        .handoff_after(Some(WATCH))
-        .build()
-        .expect("the runtime starts")
+fn runtime(workers: usize) -> Builder {
+    Builder::new().worker_threads(workers).pin_workers(false)
 }
 
-/// One round on `h`'s runtime, with `workers` workers: every task's result, summed in the
-/// order the round awaits them, against what the round expects.
-async fn round(h: &RuntimeHandle, workers: usize, progress: &Progress, r: usize) {
+/// Holds the thread past the watch, in a round that blocks.
+fn hold(blocking: bool) {
+    if blocking {
+        std::thread::sleep(BLOCK);
+    }
+}
+
+/// One round on `h`'s runtime, with `workers` workers, `blocking` its tasks past the watch or
+/// not at all: every task's result, summed in the order the round awaits them, against what the
+/// round expects.
+async fn round(h: &RuntimeHandle, workers: usize, blocking: bool, progress: &Progress, r: usize) {
     progress.at(r, 1);
     // Tasks that block their thread past the watch, on every worker.
-    let blockers: Vec<_> = (0..workers)
+    let blocked_workers = if blocking { workers } else { 0 };
+    let blockers: Vec<_> = (0..blocked_workers)
         .map(|k| {
             h.spawn_on_worker(k, async move {
                 std::thread::sleep(BLOCK);
@@ -154,7 +160,7 @@ async fn round(h: &RuntimeHandle, workers: usize, progress: &Progress, r: usize)
         nuclei::block_on(async move {
             nuclei::time::sleep(Duration::from_millis(1)).await;
             let got = at_nested.await.expect("the feeder sends");
-            std::thread::sleep(BLOCK);
+            hold(blocking);
             got * 2
         })
     });
@@ -166,8 +172,8 @@ async fn round(h: &RuntimeHandle, workers: usize, progress: &Progress, r: usize)
         TALLY.with(|t| {
             let mine = t.get() + 1;
             t.set(mine);
-            let got = nuclei::block_on(async {
-                std::thread::sleep(BLOCK);
+            let got = nuclei::block_on(async move {
+                hold(blocking);
                 1u64
             });
             (t.get() == mine, got)
@@ -175,8 +181,8 @@ async fn round(h: &RuntimeHandle, workers: usize, progress: &Progress, r: usize)
     });
     let free = h.spawn(async move {
         TALLY.with(|t| t.set(t.get() + 1));
-        let got = nuclei::block_on(async {
-            std::thread::sleep(BLOCK);
+        let got = nuclei::block_on(async move {
+            hold(blocking);
             1u64
         });
         // The block may have let the shard go, leaving this poll on a thread that runs none:
@@ -193,7 +199,7 @@ async fn round(h: &RuntimeHandle, workers: usize, progress: &Progress, r: usize)
     }
     assert_eq!(
         blocked,
-        (0..workers as u64).sum::<u64>(),
+        (0..blocked_workers as u64).sum::<u64>(),
         "a blocker's result"
     );
     progress.at(r, 3);
@@ -223,12 +229,15 @@ async fn round(h: &RuntimeHandle, workers: usize, progress: &Progress, r: usize)
     assert_eq!(free.await, 1);
 }
 
-fn stress(name: &'static str, workers: usize) {
+/// [`ROUNDS`] rounds on a runtime `builder` makes with `workers` workers, every one blocking
+/// but the first when `quiet_first`.
+fn stress(name: &'static str, builder: Builder, workers: usize, quiet_first: bool) {
     let progress = Progress::watched(name);
-    let rt = runtime(workers);
+    let rt = builder.build().expect("the runtime starts");
     let h = rt.handle();
     for r in 0..ROUNDS {
-        rt.block_on(round(&h, workers, &progress, r));
+        let blocking = !(quiet_first && r == 0);
+        rt.block_on(round(&h, workers, blocking, &progress, r));
     }
     progress.at(ROUNDS, 0);
     drop(rt);
@@ -236,10 +245,25 @@ fn stress(name: &'static str, workers: usize) {
 
 #[test]
 fn one_worker_keeps_every_task_and_message_through_handoffs() {
-    stress("one worker", 1);
+    stress(
+        "one worker",
+        runtime(1).handoff_after(Some(WATCH)),
+        1,
+        false,
+    );
 }
 
 #[test]
 fn two_workers_keep_every_task_and_message_through_handoffs() {
-    stress("two workers", 2);
+    stress(
+        "two workers",
+        runtime(2).handoff_after(Some(WATCH)),
+        2,
+        false,
+    );
+}
+
+#[test]
+fn the_default_watch_keeps_every_task_and_message_with_and_without_blocks() {
+    stress("the default watch", runtime(2), 2, true);
 }
