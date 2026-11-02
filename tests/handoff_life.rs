@@ -8,7 +8,6 @@
 //! needs.
 
 use core::cell::RefCell;
-use core::task::Poll;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -17,6 +16,9 @@ use nuclei::runtime::Builder;
 
 /// How long a wait holds at most: far past anything a working handoff needs.
 const SAFETY: Duration = Duration::from_secs(10);
+/// How long the bound task keeps its thread busy once the runtime's drop may have begun: far
+/// past what a drop that does not wait for that thread takes to return.
+const BUSY: Duration = Duration::from_millis(300);
 
 /// Waits for `done`, with a deadline and a backoff that starts at once.
 fn eventually(what: &str, mut done: impl FnMut() -> bool) {
@@ -29,20 +31,18 @@ fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Sets its flag as it drops, a while after its drop began: dropped as its thread exits, it has
-/// not set it yet when a runtime drop that did not wait for that thread returns.
-struct SlowDrop(Arc<AtomicBool>);
+/// Sets its flag as it drops: as the thread that holds it exits.
+struct OnExit(Arc<AtomicBool>);
 
-impl Drop for SlowDrop {
+impl Drop for OnExit {
     fn drop(&mut self) {
-        std::thread::sleep(Duration::from_millis(200));
         self.0.store(true, Ordering::SeqCst);
     }
 }
 
 thread_local! {
     /// Dropped as the thread that set it exits.
-    static AT_EXIT: RefCell<Option<SlowDrop>> = const { RefCell::new(None) };
+    static AT_EXIT: RefCell<Option<OnExit>> = const { RefCell::new(None) };
 }
 
 #[test]
@@ -56,22 +56,19 @@ fn a_drop_waits_for_a_thread_back_from_its_blocked_poll_running_its_bound_tasks(
     let open = Arc::new(AtomicBool::new(false));
     let exited = Arc::new(AtomicBool::new(false));
     let (blocking_tx, blocking_rx) = std::sync::mpsc::channel::<()>();
-    let (bound_tx, bound_rx) = std::sync::mpsc::channel::<core::task::Waker>();
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel::<()>();
     let gate = Arc::clone(&open);
     let flag = Arc::clone(&exited);
     rt.spawn(async move {
         let (wake, woken) = nuclei::sync::oneshot::channel::<()>();
         // Bound to this thread. Woken only once the blocked poll below returns, it runs then on
-        // the thread's own shard, the worker's having gone to another thread, and stays live:
-        // the test holds its waker.
+        // the thread's own shard, the worker's having gone to another thread, and keeps the
+        // thread busy while the test drops the runtime.
         nuclei::spawn_local(async move {
             let _ = woken.await;
-            AT_EXIT.with(|at_exit| *at_exit.borrow_mut() = Some(SlowDrop(flag)));
-            core::future::poll_fn(|cx| {
-                bound_tx.send(cx.waker().clone()).unwrap();
-                Poll::<()>::Pending
-            })
-            .await;
+            AT_EXIT.with(|at_exit| *at_exit.borrow_mut() = Some(OnExit(flag)));
+            bound_tx.send(()).unwrap();
+            std::thread::sleep(BUSY);
         })
         .detach();
         blocking_tx.send(()).unwrap();
@@ -87,7 +84,7 @@ fn a_drop_waits_for_a_thread_back_from_its_blocked_poll_running_its_bound_tasks(
         rt.stats().shards.iter().any(|shard| shard.handoffs >= 1)
     });
     open.store(true, Ordering::SeqCst);
-    let bound = bound_rx
+    bound_rx
         .recv_timeout(SAFETY)
         .expect("the bound task never ran on its thread after the poll returned");
     drop(rt);
@@ -95,6 +92,4 @@ fn a_drop_waits_for_a_thread_back_from_its_blocked_poll_running_its_bound_tasks(
         exited.load(Ordering::SeqCst),
         "the drop returned before the thread back from its blocked poll exited"
     );
-    // The bound task's future is not `Send`: its last waker is not dropped off its thread.
-    core::mem::forget(bound);
 }
