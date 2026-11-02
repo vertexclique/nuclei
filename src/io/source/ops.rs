@@ -358,8 +358,6 @@ impl Source {
         // SeqCst, with the flags after it: against a retire, or a registration, that raises its
         // flag and then looks at the count (see `retire`, `waits_for_ops`).
         let idle = self.ops_out.fetch_sub(1, Ordering::SeqCst) == 1;
-        #[cfg(port)]
-        let read = done.read;
         if idle
             && self.ask.awaits_ops.load(Ordering::SeqCst)
             && let Some(waker) = self.ask.retire_waker.take()
@@ -383,6 +381,8 @@ impl Source {
         let idle = self.op_ended();
         #[cfg(not(port))]
         self.op_ended();
+        #[cfg(port)]
+        let read = done.read;
         let mut after = After::default();
         let hooks = self.hooks_in(shard);
         if done.read {
