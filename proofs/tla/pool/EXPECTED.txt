@@ -32,5 +32,6 @@ PS_fails_1                     Start                pass
 PS_fails_2                     Start                pass
 MS_check_before_decrement      Start                violated:AllRan
 MS_hook_unwinds                Start                violated:AllRan
+MS_name_unwinds                Start                violated:AllRan
 WS_inline                      Start                violated:NoInline
 WS_caught                      Start                violated:NoCaught

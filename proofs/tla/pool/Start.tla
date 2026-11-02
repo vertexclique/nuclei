@@ -1,30 +1,32 @@
 -------------------------------- MODULE Start --------------------------------
 (***************************************************************************)
-(* A blocking pool's thread start that fails, and a start hook that panics *)
-(* (src/rt/blocking.rs: `Pool::submit`, `start_thread`, `count_thread`,    *)
-(* `cannot_start`, `work`; src/rt/tuning.rs: `ThreadHooks::started`,       *)
-(* `call_caught`).                                                         *)
-(*                                                                          *)
+(* A blocking pool's thread start that fails, and a start hook or a name   *)
+(* function that panics (src/rt/blocking.rs: `Pool::submit`,               *)
+(* `start_thread`, `count_thread`, `cannot_start`, `work`;                 *)
+(* src/rt/tuning.rs: `ThreadHooks::started`, `call_caught`,                *)
+(* `name_caught`).                                                         *)
+(*                                                                         *)
 (* Who acts. Two submitters, each sending one job, and the pool's threads, *)
 (* at most `Max`. A submitter pushes its job, then starts a thread while   *)
-(* the pool has room: it counts the thread first (a compare-and-swap       *)
-(* below the cap), then asks the system for it. The start may fail: the    *)
-(* submitter takes its count back, and, if no thread is counted then, runs *)
-(* the queued jobs itself, as a last resort, for with no thread they would *)
-(* wait for good. A thread that starts calls the user's start hook, then   *)
-(* takes jobs until the queue is empty, leaves the count and looks at the  *)
-(* queue once more, taking a job back (counted again, below the cap) that  *)
-(* came while it still counted.                                            *)
-(*                                                                          *)
-(* What can happen. Any start may fail, and any start hook may panic. The  *)
-(* hook's panic is caught where it is called (after the panic hook         *)
-(* reported it), and the thread goes on.                                   *)
-(*                                                                          *)
+(* the pool has room: it counts the thread first (a compare-and-swap below *)
+(* the cap), names it with the user's name function, then asks the system  *)
+(* for it. The start may fail: the submitter takes its count back, and, if *)
+(* no thread is counted then, runs the queued jobs itself, as a last       *)
+(* resort, for with no thread they would wait for good. A thread that      *)
+(* starts calls the user's start hook, then takes jobs until the queue is  *)
+(* empty, leaves the count and looks at the queue once more, taking a job  *)
+(* back (counted again, below the cap) that came while it still counted.   *)
+(*                                                                         *)
+(* What can happen. Any start may fail, and any start hook or name may     *)
+(* panic. The hook's panic is caught where it is called (after the panic   *)
+(* hook reported it), and the thread goes on; the name's is caught the     *)
+(* same way, and the thread takes the default name.                        *)
+(*                                                                         *)
 (* What must never happen. A job never runs: no thread will take it, and   *)
-(* nobody runs it. A job runs twice. The pool counts past its cap.        *)
-(*                                                                          *)
-(* What is abstract. The idle wait and its wakes (tla/pool/Pool.tla and   *)
-(* PoolIndex.tla check them): a thread with nothing to take leaves at     *)
+(* nobody runs it. A job runs twice. The pool counts past its cap.         *)
+(*                                                                         *)
+(* What is abstract. The idle wait and its wakes (tla/pool/Pool.tla and    *)
+(* PoolIndex.tla check them): a thread with nothing to take leaves at      *)
 (* once. The slots are left out.                                           *)
 (***************************************************************************)
 EXTENDS Integers, TLC                                                        \* numbers and TLC's helpers
@@ -44,7 +46,7 @@ variables                                                                    \* 
     threads = 0,        \* the pool's count of its threads
     tokens = 0,         \* threads the system started that have not run yet
     inline = FALSE,     \* (record) a submitter ran jobs itself after a failed start
-    caught = FALSE;     \* (record) a start hook's panic was caught
+    caught = FALSE;     \* (record) a start hook's or a name's panic was caught
 
 define                                                                       \* names the properties use:
     \* No job runs twice: runs and queued never pass the jobs sent.
@@ -55,7 +57,7 @@ define                                                                       \* 
     AllRan == <>(ran = Total)                                                \* both of them
     \* Witness: a submitter runs jobs itself after a failed start.
     NoInline == ~inline                                                      \* claims to: never
-    \* Witness: a start hook panics and the thread goes on.
+    \* Witness: a start hook or a name panics and the thread goes on.
     NoCaught == ~caught                                                      \* claims to: never
 end define;                                                                  \* end of the names
 
@@ -69,6 +71,14 @@ S_count:                                                                     \* 
     if threads < Max then threads := threads + 1;                            \* counted
     else goto Done;                                                          \* no room: the threads there take it
     end if;                                                                  \* counted
+S_name:                                                                      \* the thread's name, from the user's function
+    either skip;                                                             \* it returns
+    or                                                                       \* it panics:
+        \* MUTATION name_unwinds: the panic leaves `start_thread`, as before the fix: the count held, no thread asked for.
+        if Mutation = "name_unwinds" then goto Done;                         \* (mutated) the submit is over
+        else caught := TRUE;                                                 \* `name_caught`: the default name
+        end if;                                                              \* one of the two
+    end either;                                                              \* now the start
 S_spawn:                                                                     \* the system's start
     either tokens := tokens + 1; goto Done;                                  \* the thread starts
     or skip;                                                                 \* the start fails

@@ -1,5 +1,6 @@
 # configuration          spec    expected
 H_safe                   Hooks   pass
+MH_name_unwinds          Hooks   violated:NoLoss
 MH_start_unwinds         Hooks   violated:NoLoss
 MH_park_unwinds          Hooks   violated:NoLoss
 MH_unpark_unwinds        Hooks   violated:NoLoss

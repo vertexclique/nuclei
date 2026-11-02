@@ -432,17 +432,19 @@ bit cleared after the slot is freed erases another thread's bit, breaking `Index
 whose compare-and-swap loses, a wake through the bitmap). The model reads the bitmap one slot's
 bit per step, which covers a scan over several words, each word with its own load.
 
-`tla/pool/Start.tla`, in the same family, checks a thread start that fails and a start hook that
-panics (`Pool::submit`, `start_thread`, `count_thread`, `cannot_start` and `work`, and
-`ThreadHooks::started` in `src/rt/tuning.rs`): a submitter counts its thread before it asks the
-system for one; if the start fails it takes its count back and then, with no thread counted, runs
-the queued jobs itself. A thread calls the user's start hook first; its panic is caught where the
-hook is called, and the thread goes on. Before, the panic left `work` with the thread still
-counted, so a pool at its cap started no other and the job waited for good. 6 configurations: 2
+`tla/pool/Start.tla`, in the same family, checks a thread start that fails and a start hook or a
+name function that panics (`Pool::submit`, `start_thread`, `count_thread`, `cannot_start` and
+`work`, and `ThreadHooks::started` and `name_caught` in `src/rt/tuning.rs`): a submitter counts its
+thread, names it, then asks the system for one; if the start fails it takes its count back and
+then, with no thread counted, runs the queued jobs itself. A thread calls the user's start hook
+first; its panic is caught where the hook is called, and the thread goes on. Before, the panic
+left `work` with the thread still counted, so a pool at its cap started no other and the job
+waited for good; a panic of the name function left `start_thread` the same way, the thread counted
+and never asked for. It is caught too, and the thread takes the default name. 7 configurations: 2
 that must pass (two submitters with a pool of one thread and of two, every start able to fail and
-every hook to panic: `RunOnce`, `Bounded`, `AllRan`), 2 mutations that break `AllRan` (the look at
-the count before its own count goes; the hook's panic left uncaught), and 2 witnesses (jobs run on
-the submitter after a failed start; a caught panic).
+every hook and name to panic: `RunOnce`, `Bounded`, `AllRan`), 3 mutations that break `AllRan` (the
+look at the count before its own count goes; the hook's panic left uncaught; the name's panic left
+uncaught), and 2 witnesses (jobs run on the submitter after a failed start; a caught panic).
 
 ## Task blocks given back to their thread
 
@@ -2658,10 +2660,13 @@ counting for nothing, and the monitor's messages forgotten, each a wait for good
 shard's only strong reference (the monitor's gift, or a worker's first run) calls the start hook,
 runs what the shard queues, and parks with the park hook, then the unpark hook. A hook's panic
 used to leave `runner`, and the shard went with its tasks while the runtime ran; it is caught
-where the hook is called, once the panic hook reported it, and the thread goes on. 5
-configurations: one that must pass (every hook call able to panic: `NoLoss`, `RunOnce`, `AllRan`),
-3 mutations (the start, park and unpark hooks' panics left uncaught, each breaking `NoLoss`), and
-a witness (a caught panic). A blocking-pool thread's start hook is `tla/pool/Start.tla`'s.
+where the hook is called, once the panic hook reported it, and the thread goes on. Before the
+runner exists, the monitor names its thread (`spawn_runner`, `name_caught`) with the gift handed
+to it: a panic of the name function left the monitor's `give`, the gift and the monitor's thread
+with it; it is caught, and the runner takes the default name. 6 configurations: one that must pass
+(every hook call and the name able to panic: `NoLoss`, `RunOnce`, `AllRan`), 4 mutations (the
+name's and the start, park and unpark hooks' panics left uncaught, each breaking `NoLoss`), and a
+witness (a caught panic). A blocking-pool thread's start hook and name are `tla/pool/Start.tla`'s.
 
 ## What is not checked
 
