@@ -913,25 +913,28 @@ hold on it let go: the lent write's, and each send's until its notification. The
 `Released`, go away while its first buffer is lent, or see a send fail. The shard may go once both
 writes ended, with notifications still out: its ring goes to a keeper, which applies the ring's
 completions until none is out. Only a ring another thread can reap sends zero-copy; on any other
-every chunk is copied, and lets go of the buffer at its completion. 27 configurations: 10 that
+every chunk is copied, and lets go of the buffer at its completion. The peer is assumed to read
+in the end; the keeper has no bound of its own. 28 configurations: 10 that
 must pass (both ends writing before they read with the bytes fitting the socket; a socket of one
 unit, so every chunk is cut short, with dropped `Released`s and failures; a task that may go away;
 a shard that may go; and a ring only its own thread may reap; with `WireOrder`, the units in
 order, each once, and a withdrawn write not at all; `Delivered`, the stream whole at the end, or
 for a task that went the first buffer whole or not at all; `NoScribble`, no buffer handed back or
 freed while the kernel may read it; and `Finishes`, every write ends and every buffer comes back,
-for each), 9 mutations (a side that gets the first completion only with the notification, the bug
+for each, with `KeeperLetsGo`, a keeper that took the ring lets go of it, where the shard may go), 9
+mutations (a side that gets the first completion only with the notification, the bug
 that shipped in `write_owned`, keeps the exchange from finishing; a shard that goes with no
 keeper, its sends keeping what they hold for good (the bounded wait and forget the keeper
 replaced), and a ring only its own thread may reap sending zero-copy, keep a `Released` from
 resolving, breaking `Finishes`; a buffer handed back as the write ends, a dropped `Released` that
 frees the buffer at once, and sends that let go of their buffers as the shard goes break
 `NoScribble`; a short count sent again from the start, a chunk sent before the previous one
-completed, and a started write withdrawn when its task goes break `WireOrder`), and 8 witnesses (a
+completed, and a started write withdrawn when its task goes break `WireOrder`), and 9 witnesses (a
 write that pipelines behind a pinned buffer, a short count, a buffer freed at its last
 notification after its `Released` was dropped, a withdrawn write, an abandoned write finished, a
 send still holding its buffer as the shard went, a notification the keeper applied, a failed send
-whose buffer waits for its notification).
+whose buffer waits for its notification, and a keeper that waits for good for a peer that never
+reads, `KeeperLetsGo` broken under `SpecIdlePeer`).
 
 `src/net/tests/zero_copy.rs` and `src/rt/shard/ring/tests_zc.rs` check the zero-copy write on real
 sockets: both ends that write before they read finish, the buffer comes back whole only after the

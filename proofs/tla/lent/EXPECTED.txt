@@ -74,6 +74,7 @@ WZ_orphan_done                 MC_LentZc            violated:NoOrphanDone
 WZ_kept                        MC_LentZc            violated:NoKept
 WZ_keeper_notif                MC_LentZc            violated:NoKeeperNotif
 WZ_failed                      MC_LentZc            violated:NoFailed
+WZ_keeper_forever              MC_LentZc            violated:KeeperLetsGo
 PD_ahead                       MC_LentDatagram      pass
 PD_lent                        MC_LentDatagram      pass
 PD_ahead_live                  MC_LentDatagram      pass

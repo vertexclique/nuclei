@@ -13,7 +13,8 @@
 //! what it cannot apply goes as `IoOp::gone` lets it (a registration asked of the shard is made
 //! where its task polls next). It takes the shard's part in the park handshake, so a post finds it
 //! parked and wakes it at once, not at the ring's next completion. Nothing takes the ring back:
-//! its shard is gone.
+//! its shard is gone. The keeper waits with no bound of its own: a peer that never reads keeps a
+//! zero-copy send's notification, and so the keeper and the ring's memory, for good.
 //!
 //! On a single-issuer ring with deferred task work the kernel runs an operation's completion
 //! only when the ring's own thread enters it, and refuses any other thread's enter, so no keeper

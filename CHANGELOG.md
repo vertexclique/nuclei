@@ -13,7 +13,9 @@
   could not apply it dropped: a source's registration posted by a thread that runs no shard
   stayed claimed, so no later wait registered it and its task waited for good, and a child's exit
   watch was never made. It now goes as for a shard that went: the registration is made where the
-  task polls next, the watch where its user polls next. (`proofs/tla/keeper/Kept.tla`).
+  task polls next, the watch where its user polls next. The keeper waits with no bound of its own
+  for a peer that never reads; that is the kernel's to end (`proofs/tla/keeper/Kept.tla`, and
+  `WZ_keeper_forever` in `LentZc.tla`).
 - **A ring's wake never writes memory its shard freed** (io_uring). The read of the eventfd that
   wakes a ring stayed armed as its shard went, and landed in a buffer the shard freed; the kernel
   keeps the ring past its shard while a receive group's copy of the ring's descriptor holds it, so
