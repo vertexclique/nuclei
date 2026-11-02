@@ -47,6 +47,7 @@ CONSTANTS
     Prog,       \* per task, its operations in order: [op |-> "lock" or "cancel", n |-> permits]
     Closer,     \* a closer thread closes the semaphore at some point
     MaxBypass,  \* MAX_BYPASS (2 under loom; 16 in a build)
+    TidyMaybe,  \* a pass may leave withdrawn nodes linked (the sweep runs only past half)
     Mutation    \* "none", or the name of the one rule this run takes away
 
 \* The tasks are the names Prog gives programs to: 1, 2, ... for a sequence, or
@@ -167,12 +168,19 @@ D_absorb:
         forget(gone);    \* their futures left them, and now the queue lets them go
     end with;
 D_tidy:
-    \* The sweep: every withdrawn waiter on the list goes.
-    with gone = {r \in Range(list) : phase[r] = "cancelled"} do   \* the withdrawn ones
-        list := Without(list, gone);
-        owedCount := owedCount - Cardinality({r \in gone : owed[r]});
-        forget(gone);    \* their futures left them, and now the queue lets them go
-    end with;
+    \* The sweep: every withdrawn waiter on the list goes. `List::tidy` sweeps only once the
+    \* withdrawals since its last sweep pass half the list: with TidyMaybe the pass may sweep
+    \* or not, so a withdrawn node (an owed one too, keeping HANDOFF up) can stay linked.
+    either
+        with gone = {r \in Range(list) : phase[r] = "cancelled"} do   \* the withdrawn ones
+            list := Without(list, gone);
+            owedCount := owedCount - Cardinality({r \in gone : owed[r]});
+            forget(gone);    \* their futures left them, and now the queue lets them go
+        end with;
+    or
+        await TidyMaybe;
+        skip;
+    end either;
 D_closed:
     \* MUTATION close_grants_none: the close's pass grants no waiter, and keeps them queued.
     if closedBit /\ Mutation = "close_grants_none" then

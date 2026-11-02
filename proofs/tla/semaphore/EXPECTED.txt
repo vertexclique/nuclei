@@ -25,3 +25,4 @@ M_exit_clears_owed_handoff     MC_Semaphore         violated:BypassBounded
 M_handoff_keeps_withdrawn      MC_Semaphore         violated:Conservation
 M_close_grants_none            MC_Semaphore         violated:AllTasksEnd
 M_enqueue_no_drain             MC_Semaphore         violated:NoStrandedArrival
+L_cancel_tidy                  MC_Semaphore         pass
