@@ -462,12 +462,15 @@
   first, or another task of the same owner) still waits as another owner's would
   (`proofs/tla/reentrant`, `L_join`, `RW_join_write_read`, `RW_join_reads`,
   `RW_write_queued_read`, and the witness `W_join_young_first`).
-- **A `Notify` permit is never kept by a waiter a broadcast already owed.** A `Notified` looks at
-  the generation, then takes a stored permit, in two steps. A `notify_waiters` and a `notify_one`
-  between them left a waiter the broadcast had served holding the permit too, so a waiter made
-  after the `notify_one` found none and waited for good. A waiter that took the permit looks at
-  the generation again and passes the permit on when it moved (`proofs/tla/notify/Notify.tla`,
-  `L_owed_permit`; one load more on the path that takes a permit).
+- **A `Notified` that takes a stored permit after a broadcast it was owed passes the permit on.**
+  A `Notified` looks at the generation, then takes a stored permit, in two steps. A
+  `notify_waiters` and a `notify_one` between them left a waiter the broadcast had served holding
+  the permit too, so a waiter made after the `notify_one` found none and waited for good. A waiter
+  that took the permit looks at the generation again and passes the permit on when it moved
+  (`proofs/tla/notify/Notify.tla`, `L_owed_permit` and the `no_recheck` mutation; one load more on
+  the path that takes a permit). The queue's pass reads the generation once as well, and a
+  broadcast and a `notify_one` that land while it runs still lose the permit to a waiter the
+  broadcast woke; that path is open (the witness `W_owed_to_woken`).
 - **A barrier leader's wait polled again after it completed counts no second arrival.** The
   leader's `BarrierWait` kept no mark that it led, so a poll after its `Ready` arrived again: the
   phantom stood in for a real arrival, the next generation completed one task short, and a wait

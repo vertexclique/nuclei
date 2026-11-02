@@ -56,8 +56,9 @@ variables
     early = FALSE;       \* a wait completed before its generation had every real arrival
 
 define
-    \* Generation g has every real arrival: N of them per generation, made by waits.
-    RealComplete(g) == count - phantom >= (g + 1) * N
+    \* With c arrivals counted, ph of them phantoms, generation g has every real arrival: N of
+    \* them per generation, made by waits. (A step passes the count it just wrote.)
+    RealComplete(g, c, ph) == c - ph >= (g + 1) * N
     \* A wait completes only once its generation has every arrival.
     NoEarlyRelease == ~early
     \* One leader per generation.
@@ -137,7 +138,7 @@ T_arrive:
             leader[me] := TRUE;
             done[me] := TRUE;
             \* A leader completes its generation: early only if a phantom stands in for a real arrival.
-            early := early \/ ~RealComplete(GenOf(a));
+            early := early \/ ~RealComplete(GenOf(a), count, phantom);
             goto T_leadTr;
         end if;
 T_enqueue:
@@ -157,7 +158,7 @@ T_park:
         end if;
 T_sleep:
         await phase[me] = "granted";
-        early := early \/ ~RealComplete(gen[me]);
+        early := early \/ ~RealComplete(gen[me], count, phantom);
         done[me] := TRUE;
         goto T_next;
 T_drop:

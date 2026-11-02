@@ -16,6 +16,10 @@
 (* the take of the permit are two steps (`Core::drive`): a broadcast can   *)
 (* land between them, and a permit taken after it is passed on with a      *)
 (* `notify_one`, since the broadcast already owed this waiter its wake.    *)
+(* A pass reads the generation once, too: a broadcast and then a           *)
+(* `notify_one` that land while it runs are seen as an owed wake for a     *)
+(* waiter the broadcast already woke, so the permit is lost (the witness  *)
+(* `W_owed_to_woken`; the fix waits on a design choice).                   *)
 (* A pass reads the generation after it took the arrivals, grants the      *)
 (* queued waiters and the arrivals of an                                   *)
 (* older generation, turns a stored permit into a wake for the front, and  *)
@@ -126,7 +130,8 @@ define
     \* already owes it its wake, never keeps a permit for itself.
     NoPermitEatenByOwed == ~eaten
     \* Every waiter made after the notifier's last call ends: the permit a notify_one left
-    \* stored is still there for it.
+    \* stored is still there for it. (Broken today by a pass that read the generation
+    \* before a broadcast and serves a later notify_one to a waiter that broadcast woke.)
     LateAwaiterEnds == <>[](\A w \in W : Waiters[w] = "after" => done[w])
     \* Witnesses.
     NoPermitStored == ~permit
