@@ -17,3 +17,6 @@ M_drop_on_linux   ShutRead  violated:AsStd
 M_drop_first      ShutRead  violated:AsStd
 W_dropped         ShutRead  violated:NothingDropped
 W_port_filled     ShutRead  violated:AsStd
+A_wait            AbortAcks pass
+M_close_at_drain  AbortAcks violated:ResetOrDeadline
+W_deadline_loss   AbortAcks violated:NoDeadlineLoss

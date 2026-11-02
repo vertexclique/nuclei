@@ -1657,6 +1657,19 @@ of the read-ahead drops a byte; on Windows a completion port's receive that took
 shutdown, its completion reaching the side after the drop, makes it read-ahead after the shut,
 which `AsStd` fails: the code as it is, how the shut is to drop it being an open decision).
 
+`AbortAcks` (`tla/close/AbortAcks.tla`) checks a TCP stream set to zero linger and dropped with
+bytes still behind (`linger` and `wait_for_acks` in `src/io/handle.rs`, `sys::unacked`): the
+linger task drains the write-behind into the kernel, which sends it a segment at a time, and then
+closes with no linger, which resets the connection. On a loopback the reset may overtake the data
+still on the wire (macOS's does): the reader takes it for a stale one and answers with a challenge
+ACK that the writer's closed port never answers, and the stream stays open for good. So after the
+drain the linger waits until the kernel holds no byte the peer has not acknowledged, or its time
+ran out, and only then closes. 3 configurations: 1 that must pass (two bytes behind, a queue of
+two, with `ResetOrDeadline`, the reader takes the reset unless the linger's time ran out, and
+`WholeBeforeReset`, a reset with time left comes after every byte); 1 mutation (the close as the
+drain ends, as before, breaks `ResetOrDeadline`); and 1 witness (the time runs out with a byte on
+the wire and the reset is lost, the one way left, bounded by the linger's time).
+
 The Rust tests `shut::*` in `tests/faults/shut.rs` hold a real stream to the same rules: the peer
 reads every byte behind before the end, reads after a shut answer as std's, writes go on after a
 shut of the reading half, and an abort and an expired linger reset the connection.
