@@ -3,11 +3,10 @@
 //! handed it, the inbox's and the home's.
 //!
 //! Every `tuning.inbox_interval` runs the remote work comes first, so a busy
-//! local queue does not starve it; every other such run the home's comes
-//! before the inbox's, so neither starves the other: a home looked at only
-//! when the inbox is empty never runs while other threads keep the inbox
-//! full. `proofs/tla/sched/Sched.tla` checks that every place that holds
-//! work is served within a bound of runs.
+//! local queue does not starve it. The home is looked at only once the
+//! inbox is empty, so other threads that keep the inbox full hold the bound
+//! tasks off: `proofs/tla/sched/Sched.tla` checks the order, today's as its
+//! `home_after_empty` mutation, which breaks `Served`.
 
 use super::Shard;
 use crate::rt::inbox::Pop;
@@ -20,7 +19,7 @@ impl Shard {
         let left = self.until_inbox.get().wrapping_sub(1);
         if left == 0 {
             self.until_inbox.set(self.tuning.inbox_interval);
-            if let Some(r) = self.pop_remote() {
+            if let Some(r) = self.pop_inbox() {
                 return Some(r);
             }
         } else {
@@ -48,19 +47,6 @@ impl Shard {
             Some(r) => Some(r),
             None => self.pop_inbox(),
         }
-    }
-
-    /// The interval's look at the remote work: the inbox first, or every
-    /// other time the home first.
-    #[inline(always)]
-    fn pop_remote(&self) -> Option<Runnable> {
-        let homes_first = !self.homes_first.get();
-        self.homes_first.set(homes_first);
-        if homes_first && let Some(runnable) = self.pop_home() {
-            self.remote_wakes.set(self.remote_wakes.get() + 1);
-            return Some(runnable);
-        }
-        self.pop_inbox()
     }
 
     // Inlined into the run loop's `next`, whichever codegen unit holds it: it is looked at on

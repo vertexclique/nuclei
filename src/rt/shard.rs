@@ -14,9 +14,8 @@
 //! [`Shard::block_on`] polls one future and, between its polls, runs the
 //! shard's tasks: the LIFO slot first (a task woken by the task that just
 //! ran, at most [`LIFO_MAX`] times in a row), then the local queue, then the
-//! inbox, then the home (the tasks bound to the thread that runs it). Every
-//! [`INBOX_INTERVAL`] runs the remote work comes first, every other time the
-//! home's before the inbox's, so neither starves the other or is starved
+//! inbox (first every [`INBOX_INTERVAL`] runs, so remote work is not
+//! starved), then the home, the tasks bound to the thread that runs it
 //! (`order`). Every [`DRIVER_INTERVAL`] runs, and every [`DRIVER_INTERVAL`]
 //! turns in which only the future ran (it keeps waking itself), it fires
 //! due timers and polls the poller without waiting, as does every
@@ -606,8 +605,6 @@ pub(crate) struct Shard {
     lifo_streak: Cell<u32>,
     /// Runs left before the inbox is looked at first (`tuning.inbox_interval` at the start).
     until_inbox: Cell<u32>,
-    /// The last of those turns looked at the home first (`order`).
-    homes_first: Cell<bool>,
     /// The runs since timers and the poller were last looked at, as a count
     /// down to the next run that weighs a look (`drive_at`, the next multiple
     /// of `QUARTZ_EVERY` or `tuning.driver_interval`): `drive_at - drive_left`

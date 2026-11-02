@@ -33,7 +33,7 @@ nuclei::runtime::Builder::backend
 nuclei::runtime::Builder::io_uring
 nuclei::runtime::Builder::record_latencies
 -->
-<p>A busy worker looks at its timers and IO every <code>event_interval</code> task runs, and also, checked every 16 runs, whenever its last look is more than a millisecond old, so a run of slow tasks cannot keep IO waiting for long. Every <code>global_queue_interval</code> runs it takes work other threads woke before its own queue, every other time the tasks bound to its thread first, so a full inbox does not hold them off.</p>
+<p>A busy worker looks at its timers and IO every <code>event_interval</code> task runs, and also, checked every 16 runs, whenever its last look is more than a millisecond old, so a run of slow tasks cannot keep IO waiting for long.</p>
 
 <h2 id="hooks">Hooks</h2>
 <p>A runtime calls hooks of yours on its threads and around its tasks: for metrics, tracing or thread setup. Each task hook is given the task's <code>Id</code>.</p>

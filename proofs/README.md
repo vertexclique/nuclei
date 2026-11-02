@@ -2049,16 +2049,23 @@ the `owed` rule of `Shard::run_loop` (`src/rt/shard/run.rs`). Work waits in five
 LIFO slot (the task the running task woke last), the local queue, the inbox (tasks other
 threads woke), the home (tasks bound to the thread that runs the shard, which other threads
 woke) and a `block_on` future. Each turn the future is polled if it was woken and owes the
-tasks nothing; then one runnable is taken: every `I`th turn first from the inbox, or every other
-such turn first from the home; otherwise the slot (at most `L` times in a row while others
-wait), the local queue, the inbox, the home. A future that yields owes the tasks queued at that
-moment one run each. Other threads keep the inbox and the home full as they like and the tasks
-wake each other and yield as they like; every place that holds work is served within `2I - 1`
-turns (`Served`). 7 configurations: 2 that must pass (with and without a `block_on` future), 4
-mutations that break `Served` (no cap on the slot's runs starves the local queue; no interval
-turn starves the inbox; the home looked at only once the inbox is empty, as before the fix,
-starves the home; a future that owes a run for each runnable a run pushes starves the future),
-and 1 witness (a home served while the inbox holds work).
+tasks nothing; then one runnable is taken: every `I`th turn first from the inbox (the home if
+the inbox is empty); otherwise the slot (at most `L` times in a row while others wait), the
+local queue, the inbox, the home. A future that yields owes the tasks queued at that moment one
+run each. Other threads keep the inbox and the home full as they like and the tasks wake each
+other and yield as they like; every place that holds work must be served within `2I - 1`
+turns (`Served`).
+
+Today's code looks at the home only once the inbox is empty, and starves it while other threads
+keep the inbox full: the `home_after_empty` mutation is today's code. The GREEN configurations
+check a proposed fix that is not in the code (an interval turn that finds inbox work, every
+other time, runs a home's runnable first and puts the inbox's at the local queue's front): it
+waits for a decision, as every variant measured moved a row of the op-count gate. 7
+configurations: 2 that must pass (with and without a `block_on` future), 4 mutations that break
+`Served` (no cap on the slot's runs starves the local queue; no interval turn starves the inbox;
+the home looked at only once the inbox is empty starves the home; a future that owes a run for
+each runnable a run pushes starves the future), and 1 witness (a home served while the inbox
+holds work).
 
 ## How long queued IO waits on a busy shard
 

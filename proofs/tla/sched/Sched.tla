@@ -1,7 +1,7 @@
 ------------------------------- MODULE Sched -------------------------------
 (***************************************************************************)
 (* The order a shard takes its runnables in (src/rt/shard/order.rs:       *)
-(* `Shard::next`, `pop_remote`, `pop_inbox`, `pop_home`; src/rt/shard/    *)
+(* `Shard::next`, `pop_inbox`, `pop_home`; src/rt/shard/                  *)
 (* run.rs: the `owed` rule of `Shard::run_loop`), one turn of the run loop *)
 (* per pass.                                                               *)
 (*                                                                          *)
@@ -12,15 +12,23 @@
 (* threads woke; and a `block_on` future may wait to be polled again. Each *)
 (* turn the loop polls the future if it was woken and owes the tasks       *)
 (* nothing, then takes one runnable: every `I`th turn first from the       *)
-(* inbox, or, every other such turn, first from the home; otherwise the    *)
-(* slot (at most `L` times in a row while other tasks wait), then the      *)
-(* local queue, then the inbox, then the home. A future that woke itself   *)
-(* owes the tasks queued at that moment their runs before its next poll.   *)
-(* Other threads may keep the inbox and the home full, and the tasks may   *)
-(* keep waking each other: whatever they do, every place that holds work  *)
-(* is served within `Bound` turns. Before the fix the home was looked at   *)
-(* only when the inbox was empty, so a home starved while other threads    *)
-(* kept the inbox full.                                                    *)
+(* inbox (the home if the inbox is empty); otherwise the slot (at most `L` *)
+(* times in a row while other tasks wait), then the local queue, then the  *)
+(* inbox, then the home. A future that woke itself owes the tasks queued   *)
+(* at that moment their runs before its next poll. Other threads may keep *)
+(* the inbox and the home full, and the tasks may keep waking each other: *)
+(* whatever they do, every place that holds work must be served within    *)
+(* `Bound` turns.                                                          *)
+(*                                                                          *)
+(* The code today looks at the home only once the inbox is empty, so a     *)
+(* home starves while other threads keep the inbox full: that is the       *)
+(* `home_after_empty` mutation, which breaks `Served`. The GREEN           *)
+(* configurations check the proposed fix, which is not in the code: an    *)
+(* interval turn that finds work in the inbox, every other time, runs a    *)
+(* runnable of the home's instead and puts the inbox's at the front of the *)
+(* local queue. Every variant of it measured moves a counted row of the    *)
+(* op-count gate (`block_on` by two instructions in the best), so it waits *)
+(* for the operator's call.                                                *)
 (*                                                                          *)
 (* What is abstract: a place is a count of its runnables (their order      *)
 (* inside one place is the place's own, FIFO or one slot); a run is what   *)
@@ -48,11 +56,11 @@ Bound == 2 * I - 1
 variables
     lifo = 0,           \* the LIFO slot holds a runnable (1) or not (0)
     streak = 0,         \* runs of the slot in a row (`lifo_streak`)
-    local = 0,          \* runnables in the local queue
+    local = 0,          \* runnables in the local queue (at most Cap + 1)
     inbox = 0,          \* the inbox holds runnables (1) or not (0)
     home = 0,           \* the home holds runnables (1) or not (0)
     until = I,          \* turns left to the interval's turn (`until_inbox`)
-    homesFirst = FALSE, \* the last interval's turn looked at the home first (`homes_first`)
+    homesFirst = FALSE, \* the last such turn with inbox work ran the home's (the fix)
     woken = FALSE,      \* the future was woken
     owed = 0,           \* runs the future owes the tasks before its next poll
     age = [p \in Places |-> 0], \* turns each place held work and was not served
@@ -103,23 +111,27 @@ T_interval:
         \* MUTATION no_inbox_interval: no turn looks at them first.
         if until = 1 /\ Mutation # "no_inbox_interval" then
             until := I;
-            \* `pop_remote`: every other such turn the home first, then the inbox (and the
-            \* home once more, as `pop_inbox` falls back to it).
-            \* MUTATION home_after_empty: always the inbox first, the home only once it is
-            \* empty (before the fix).
-            with first = (Mutation # "home_after_empty" /\ ~homesFirst) do
-                homesFirst := first;
-                if first /\ home > 0 then
-                    home := home - 1;
-                    took := "home";
-                elsif inbox > 0 then
-                    inbox := inbox - 1;
-                    took := "inbox";
-                elsif home > 0 then
-                    home := home - 1;
-                    took := "home";
-                end if;
-            end with;
+            if inbox > 0 then
+                \* The inbox has work. Every other such turn (the proposed fix) a home's
+                \* runnable runs first and the inbox's goes to the local queue's front.
+                \* MUTATION home_after_empty: the inbox's always runs, as the code does today.
+                with first = (Mutation # "home_after_empty" /\ ~homesFirst) do
+                    homesFirst := first;
+                    if first /\ home > 0 then
+                        home := home - 1;
+                        inbox := inbox - 1;
+                        local := local + 1;
+                        took := "home";
+                    else
+                        inbox := inbox - 1;
+                        took := "inbox";
+                    end if;
+                end with;
+            elsif home > 0 then
+                \* The inbox is empty: the home's (`pop_inbox` falls back to it).
+                home := home - 1;
+                took := "home";
+            end if;
         elsif Mutation # "no_inbox_interval" then
             until := until - 1;
         end if;

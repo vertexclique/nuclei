@@ -177,7 +177,6 @@ impl Shard {
             lifo: Cell::new(None),
             lifo_streak: Cell::new(0),
             until_inbox: Cell::new(tuning.inbox_interval),
-            homes_first: Cell::new(false),
             drive_left: Cell::new(1),
             drive_at: Cell::new(1),
             last_drive: Cell::new(Quartz::now()),
