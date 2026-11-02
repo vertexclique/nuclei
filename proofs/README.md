@@ -1496,6 +1496,22 @@ mutations (no look after the step breaks `Served`; a fast check that drops its c
 thread's own shard issues on the other shard's ring and breaks `OnlyHomeIssues`), and 1 witness
 (the late look asks for the submit).
 
+`tla/attach/Merged.tla`, in the same family, checks requests that wait for the sides together
+and are performed in one go (`perform`, `attach_now`, `is_refused_for_now` in
+`src/io/source/requests.rs`; `Source::register` and `revive` in `src/io/source.rs`;
+`Shard::register_source` and `apply_io_ops` in `src/rt/shard.rs`). A task's poll registers a
+source and asks the attach, at once on its own shard or by posting it to a shard from a thread
+that runs none; its future is dropped, and `get_mut` asks the retire. A holder of the read side
+performs every request pending as it lets go, the retire first, so an attach it performs with
+the retire finds no descriptor; a posted attach the shard makes after the retire finds none
+either. Such a refusal fails nothing, as one for a shard that stopped: the registration is back
+to none, and the first read after `get_mut`, on the same descriptor, registers the source again
+and reads. 8 configurations: 4 that must pass (an attach left to the holder, and one posted,
+each with `NoSpuriousError`, that read answers no error, and with `Termination`), 2 mutations (a
+holder's refusal that fails the sides, and a shard that takes its own refusal for a registration's
+failure, each break `NoSpuriousError`), and 2 witnesses (the retire and the attach performed
+together; a posted attach refused after the retire).
+
 ## A shard that goes
 
 `going` (`tla/going/Going.tla`) checks how a shard that goes waits for the evictions of its
