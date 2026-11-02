@@ -36,6 +36,15 @@
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
 
+- **An interval never panics on a tick past the clock's range, and a skip lands after now
+  however far behind it is.** The next tick was the last one plus the period with `+`, which
+  panics past the clock's range: `interval(Duration::MAX)` panicked in its first tick, and
+  `reset` did the same. Such a tick now waits in the far future, as a timeout's deadline does,
+  so a period too large ticks once. `Skip` counted the periods it missed in a `u32`: late by more
+  than 2^32 periods (49 days at a millisecond), its next tick was still in the past and fired at
+  once. It now takes what is left of the period now falls in, so the next tick is the next one
+  of the schedule after now (`proofs/tla/interval/Interval.tla`).
+
 ### Changed
 
 - **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix

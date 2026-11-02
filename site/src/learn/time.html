@@ -23,7 +23,7 @@
 </ul>
 
 <h2 id="interval">Intervals</h2>
-<p><code>interval(period)</code> ticks every period, the first tick at once; <code>interval_at(start, period)</code> starts at <code>start</code>. <code>tick().await</code> gives the instant the tick was due, and <code>poll_tick</code> is the same wait for a hand-written future. A period of zero panics.</p>
+<p><code>interval(period)</code> ticks every period, the first tick at once; <code>interval_at(start, period)</code> starts at <code>start</code>. <code>tick().await</code> gives the instant the tick was due, and <code>poll_tick</code> is the same wait for a hand-written future. A period of zero panics. A tick that would fall past the clock's range waits in the far future instead, so a period too large for the clock ticks once.</p>
 <!--example time_interval-->
 <table class="table">
 <thead><tr><th>MissedTickBehavior</th><th>When the interval was polled late</th></tr></thead>
