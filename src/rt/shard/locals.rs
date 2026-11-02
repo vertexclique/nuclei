@@ -28,8 +28,23 @@ pub(crate) enum Missing {
 }
 
 impl Locals {
-    /// The value of `key`, made with `init` on its first use here.
+    /// The value of `key`, made with `init` on its first use here. Its look at a value made
+    /// already is inlined at each `with`, the hand-back's too, the making out of line.
+    #[inline(always)]
     pub(crate) fn get_or_init<T>(&self, key: usize, init: fn() -> T) -> Result<&T, Missing>
+    where
+        T: Send + 'static,
+    {
+        if let Some(Place::Made(value)) = self.0.borrow().get(key) {
+            // SAFETY: see `lend`.
+            return Ok(unsafe { &*Self::lend(value) });
+        }
+        self.make(key, init)
+    }
+
+    /// [`get_or_init`](Self::get_or_init) for a key with no value made yet.
+    #[inline(never)]
+    fn make<T>(&self, key: usize, init: fn() -> T) -> Result<&T, Missing>
     where
         T: Send + 'static,
     {

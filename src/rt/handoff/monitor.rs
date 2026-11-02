@@ -208,6 +208,17 @@ impl Monitor {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Ready once the runtime shuts down, for a waiter that enables it before it looks at
+    /// [`is_closed`](Self::is_closed).
+    pub(crate) fn closing(&self) -> crate::sync::Notified<'_> {
+        self.closing.notified()
+    }
+
+    /// The time between the monitor's reads of a word.
+    pub(crate) fn tick(&self) -> Duration {
+        (self.after / STREAK).max(Duration::from_micros(100))
+    }
+
     /// Waits, as spare `me`, for a shard to run: `None` once the runtime
     /// shuts down.
     pub(crate) fn wait_for_shard(&self, me: &Arc<Spare>) -> Option<Gift> {
@@ -265,7 +276,7 @@ struct Watch {
 /// until it shuts down.
 pub(crate) fn run(monitor: &Arc<Monitor>, runtime: &Weak<Inner>) {
     monitor.bell.bind();
-    let tick = (monitor.after / STREAK).max(Duration::from_micros(100));
+    let tick = monitor.tick();
     let mut watches: Vec<Option<Watch>> = (0..monitor.places.len()).map(|_| None).collect();
     let mut waiting: Option<Gift> = None;
     // Hands a gift on, the place's watch following its new runner.

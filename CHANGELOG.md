@@ -262,6 +262,21 @@
   to the 64 MiB default whatever the runtime's `io_buffer_cap` said. That pool now takes the cap
   of the runtime the thread serves, and a thread that serves none the default runtime's
   (`proofs/tla/bufcap/BufCap.tla`).
+- **A `with` in a poll that lost its shard to a handoff runs on that shard.** Once the handoff
+  watch took a worker's shard from a poll that ran past `handoff_after`, every
+  `ShardLocal::with` in the rest of that poll, in a nested `block_on` in it, and in the tasks
+  `spawn_local` kept on its thread panicked with "this code runs on no worker", and `try_with`
+  answered that error. The watch reads wall time, so a poll that never blocked met it too: a
+  thread preempted, or throttled by a CPU quota, for 10 ms before its `with` (seen on macOS CI).
+  Such a call now asks the thread that runs the shard for it: that thread lends it between two of
+  its polls, hands its own queued tasks back to their schedules first (a task bound to a thread
+  stays on it), and waits parked while the call runs on the shard's value; the shard comes back
+  as the call returns or unwinds, and a call still waiting as the runtime shuts down answers that
+  the runtime shut down (`proofs/tla/handoff/HandBack.tla`). Each such call is a round trip
+  between two threads. A `with` that keeps its shard costs fewer instructions than before: its
+  look at a value made already is inlined and the making is out of line, 16.9 to 13.9 user
+  instructions per call with the watch off and 22.3 to 19.1 with it on (io_uring, default release
+  build with one codegen unit, `ci/op_count`'s `with` row under `perf stat`).
 
 ### Changed
 

@@ -57,7 +57,7 @@ worker 4 does not exist: the runtime has started 4 workers
 <!--code text panic-->
 this code runs on no worker, so it has no shard-local value: use it in a task
 <!--/code-->
-<p>A <code>shard_local!</code> value was used off the workers: in <code>block_on</code>'s own future, on the blocking pool, or on a thread of its own. Each worker has its own value and these places have none. <code>with</code> panics with this message; <code>try_with</code> answers it as a <code>ShardAccessError</code>.</p>
+<p>A <code>shard_local!</code> value was used off the workers: in <code>block_on</code>'s own future, on the blocking pool, or on a thread of its own. Each worker has its own value and these places have none. <code>with</code> panics with this message; <code>try_with</code> answers it as a <code>ShardAccessError</code>. Code whose poll lost the shard to a handoff gets the shard lent back instead; once the runtime has shut down, such a call answers <code>the runtime shut down, so this worker's shard-local value is gone</code>.</p>
 <p><strong>Fix:</strong> use the value in a task spawned on the runtime, or handle the error of <code>try_with</code>. See <a href="runtime.html#shard-local">Runtime</a>.</p>
 
 <h2 id="nesting">block_on is nested too deep</h2>

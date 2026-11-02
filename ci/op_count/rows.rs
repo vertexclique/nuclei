@@ -196,7 +196,10 @@ pub fn runtime(row: &str) -> nuclei::runtime::Runtime {
     nuclei::runtime::Builder::new()
         .worker_threads(if row == "tcp_2w" { 2 } else { 1 })
         .pin_workers(false)
-        .handoff_after((row == "tcp_watched").then_some(Duration::from_secs(3600)))
+        .handoff_after(
+            (row == "tcp_watched" || std::env::var_os("OPC_WATCH").is_some())
+                .then_some(Duration::from_secs(3600)),
+        )
         .build()
         .expect("the runtime starts")
 }
@@ -481,6 +484,15 @@ pub fn run(rt: &nuclei::runtime::Runtime, row: &str, n: u64) -> Option<u64> {
                 }
             }));
             SLEEP_TASKS * n
+        }
+        "with" => {
+            nuclei::shard_local! { static N: core::cell::Cell<u64> = core::cell::Cell::new(0) }
+            rt.block_on(rt.spawn(async move {
+                for _ in 0..n {
+                    N.with(|c| c.set(std::hint::black_box(c.get() + 1)));
+                }
+            }));
+            n
         }
         "oneshot" => {
             rt.block_on(rt.spawn(async move {

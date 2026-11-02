@@ -1,9 +1,10 @@
 //! A stress of the shard handoff and its watch, through the public surface: in every round,
 //! tasks block their thread past the watch while others spawn and join, wake one another, send
-//! and receive through channels, run a nested `block_on` that blocks, and hold a `shard_local!`
-//! value across a nested `block_on` that blocks under its `with`. Under the default watch, the
-//! first round blocks nowhere, so its calls from tasks' code take the leaf push and the bracket
-//! on shards nobody takes.
+//! and receive through channels, run a nested `block_on` that blocks, hold a `shard_local!`
+//! value across a nested `block_on` that blocks under its `with`, and call `with` in the poll
+//! that blocked, after its shard was taken. Under the default watch, the first round blocks
+//! nowhere, so its calls from tasks' code take the leaf push and the bracket on shards nobody
+//! takes.
 //!
 //! Every check is on what the tasks computed, never on timing: each task's result, every message
 //! received once and in order, each nested `block_on`'s output, and a shard-local value its
@@ -191,6 +192,16 @@ async fn round(h: &RuntimeHandle, workers: usize, blocking: bool, progress: &Pro
         TALLY.with(|t| t.set(t.get() + 1));
         got
     });
+    // A `with` in the same poll as a block past the watch, which lets the shard go: the shard
+    // is lent back to the call, with its value, which the call sees and changes alone.
+    let after_take = h.spawn(async move {
+        hold(blocking);
+        TALLY.with(|t| {
+            let mine = t.get() + 1;
+            t.set(mine);
+            t.get() == mine
+        })
+    });
 
     progress.at(r, 2);
     let mut blocked = 0u64;
@@ -227,6 +238,11 @@ async fn round(h: &RuntimeHandle, workers: usize, blocking: bool, progress: &Pro
     );
     progress.at(r, 10);
     assert_eq!(free.await, 1);
+    progress.at(r, 11);
+    assert!(
+        after_take.await,
+        "the shard-local value changed under a with after a take"
+    );
 }
 
 /// [`ROUNDS`] rounds on a runtime `builder` makes with `workers` workers, every one blocking

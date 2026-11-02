@@ -1,14 +1,17 @@
-//! Shard-local values: [`shard_local!`](crate::shard_local) declares a
+//! Shard-local values: [`shard_local!`](crate::shard_local!) declares a
 //! [`ShardLocal`], which holds one value per worker shard, made on its first
 //! use there. The value lives in the shard, not in the thread: when a
 //! worker's shard is handed to another thread (its runner blocked in one
 //! poll, see [`Builder::handoff_after`](crate::Builder::handoff_after)), the
-//! value goes with it, and the shard's tasks keep seeing it there.
+//! value goes with it, and the shard's tasks keep seeing it there. Code that
+//! still runs on the old thread (the rest of the poll that lost the shard)
+//! gets the shard lent back for each call (`rt::handoff::loan`).
 
 use core::fmt;
 
-use crate::rt::context;
-use crate::rt::shard::locals::Missing;
+use crate::rt::context::{self, Unlent};
+use crate::rt::shard::Shard;
+use crate::rt::shard::locals::{Locals, Missing};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Declares shard-local statics, each a [`ShardLocal`] made with the
@@ -45,7 +48,7 @@ macro_rules! shard_local {
 }
 
 /// A value per worker shard, declared with
-/// [`shard_local!`](crate::shard_local).
+/// [`shard_local!`](crate::shard_local!).
 ///
 /// Each worker of each runtime has its own value, made by the declaration's
 /// expression the first time code running on that worker uses it, and
@@ -54,10 +57,12 @@ macro_rules! shard_local {
 /// shard in `block_on`, the blocking pool and any other thread have none.
 ///
 /// A task spawned on a worker stays on that worker's shard, and a handoff
-/// moves the shard with its values, so the task always sees one value. A
-/// task kept on a thread by `spawn_local` whose worker's shard was handed
-/// on runs on that thread's own shard, off the worker: it gets
-/// [`ShardAccessError`] there.
+/// moves the shard with its values, so the task always sees one value. The
+/// rest of a poll that lost its worker's shard to a handoff (a nested
+/// `block_on` in it too), and the tasks `spawn_local` kept on its thread,
+/// run on that thread, off the worker: each [`with`](Self::with) there
+/// borrows the worker's shard back from the thread that runs it now, for
+/// the length of the call, and so sees the same value.
 pub struct ShardLocal<T: Send + 'static> {
     init: fn() -> T,
     /// The static's place among every shard's values, plus one; 0 until its
@@ -100,9 +105,17 @@ impl<T: Send + 'static> ShardLocal<T> {
     /// `block_on` inside `f`: keep `f` short, as a blocking `f` holds the
     /// whole worker up.
     ///
+    /// Called from code whose poll lost its worker's shard to a handoff, it
+    /// waits, its thread parked, until the thread that runs the shard now
+    /// lends it between two of its polls (after the `with` that thread's code
+    /// may hold), runs `f` on the shard's value, and gives the shard back as
+    /// `f` returns or unwinds: a round trip between the two threads for each
+    /// call, and the lender's thread waits while `f` runs.
+    ///
     /// # Panics
     ///
-    /// Off a worker, or when the value's own initializer uses it;
+    /// Off a worker, when the value's own initializer uses it, or from code
+    /// whose poll lost the shard once the runtime shut down;
     /// [`try_with`](Self::try_with) answers the error instead.
     #[expect(
         clippy::panic,
@@ -116,19 +129,34 @@ impl<T: Send + 'static> ShardLocal<T> {
     }
 
     /// Runs `f` on this worker's value, as [`with`](Self::with) does, or
-    /// answers a [`ShardAccessError`] off a worker or while the value's own
-    /// initializer runs.
+    /// answers a [`ShardAccessError`] off a worker, while the value's own
+    /// initializer runs, or from code whose poll lost the shard once the
+    /// runtime shut down.
     pub fn try_with<R>(&'static self, f: impl FnOnce(&T) -> R) -> Result<R, ShardAccessError> {
         let key = self.key();
-        context::current_pinned(|shard| {
-            let locals = shard
-                .and_then(|shard| shard.locals())
-                .ok_or(ShardAccessError { making: false })?;
-            match locals.get_or_init(key, self.init) {
-                Ok(value) => Ok(f(value)),
-                Err(Missing::Making) => Err(ShardAccessError { making: true }),
-            }
+        context::current_pinned(|shard| match shard.and_then(Shard::locals) {
+            Some(locals) => self.lend(locals, key, f),
+            // The shard this code's poll lost, lent back for the call; else none.
+            None => context::lent_back(|lent| match lent.map(Shard::locals) {
+                Ok(Some(locals)) => self.lend(locals, key, f),
+                Ok(None) | Err(Unlent::Off) => Err(ShardAccessError { why: Why::Off }),
+                Err(Unlent::Gone) => Err(ShardAccessError { why: Why::Gone }),
+            }),
         })
+    }
+
+    /// Runs `f` on the value of the key `key` among `locals`, made now if it has none.
+    #[inline(always)]
+    fn lend<R>(
+        &self,
+        locals: &Locals,
+        key: usize,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, ShardAccessError> {
+        match locals.get_or_init(key, self.init) {
+            Ok(value) => Ok(f(value)),
+            Err(Missing::Making) => Err(ShardAccessError { why: Why::Making }),
+        }
     }
 }
 
@@ -138,26 +166,37 @@ impl<T: Send + 'static> fmt::Debug for ShardLocal<T> {
     }
 }
 
-/// A [`ShardLocal`] was used where it has no value: off a worker, or by its
-/// own initializer.
+/// A [`ShardLocal`] was used where it has no value: off a worker, by its own
+/// initializer, or from a task whose poll lost its worker's shard once the
+/// runtime had shut down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShardAccessError {
-    making: bool,
+    why: Why,
+}
+
+/// Why a [`ShardAccessError`] has no value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    Off,
+    Making,
+    Gone,
 }
 
 impl ShardAccessError {
     /// Whether the value was being made: its initializer used it.
     pub fn is_initializing(&self) -> bool {
-        self.making
+        self.why == Why::Making
     }
 }
 
 impl fmt::Display for ShardAccessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.making {
-            "the shard-local value was used by its own initializer"
-        } else {
-            "this code runs on no worker, so it has no shard-local value: use it in a task"
+        f.write_str(match self.why {
+            Why::Off => {
+                "this code runs on no worker, so it has no shard-local value: use it in a task"
+            }
+            Why::Making => "the shard-local value was used by its own initializer",
+            Why::Gone => "the runtime shut down, so this worker's shard-local value is gone",
         })
     }
 }
