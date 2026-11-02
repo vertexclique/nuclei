@@ -15,6 +15,7 @@ OneAwait == <<"await">>
 \* One waiter, dropped after one poll.
 OneDrop == <<"drop">>
 \* Calls.
+NoCalls == <<>>
 Broadcast == <<"waiters">>
 OneThenBroadcast == <<"one", "waiters">>
 TwoOnes == <<"one", "one">>
