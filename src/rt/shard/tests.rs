@@ -450,3 +450,55 @@ fn a_leaf_push_after_a_take_under_a_call_backs_out_to_no_shard() {
     });
     assert_eq!(polled, context::Polled::Detached);
 }
+
+/// The time to the precise deadline a shard's poller has its own timer armed
+/// for: epoll's timerfd, or the `EVFILT_TIMER` the next wait submits.
+#[cfg(any(target_os = "linux", target_os = "android", precise_timer))]
+fn precise_armed_in(shard: &Shard) -> Option<Duration> {
+    match &shard.driver {
+        super::Driver::Poll(poller) => poller.borrow().precise_armed_in(),
+        #[cfg(ring)]
+        _ => None,
+    }
+}
+
+// The pollers that arm a timer of their own for a precise deadline: epoll and
+// kqueue's. A ring's timeout and a completion port's timer end the wait to
+// the microsecond by themselves, so they keep no armed deadline to go stale.
+#[cfg(any(target_os = "linux", target_os = "android", precise_timer))]
+#[test]
+fn an_advance_of_a_running_clock_moves_the_pollers_precise_timer() {
+    let rt = crate::runtime::Builder::new()
+        .worker_threads(0)
+        .build()
+        .unwrap();
+    let inner = rt.inner();
+    // Altered, and running.
+    inner.clock.advance(Duration::from_millis(1));
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::Backend::Poll,
+    })
+    .unwrap();
+    let _runtime = context::set_runtime(inner);
+    let _current = context::enter(&shard);
+    let at = inner.clock.now_nanos() + 10_000_000_000;
+    let key = shard
+        .wheel_of(true)
+        .borrow_mut()
+        .insert(shard.time_of(true, at), Waker::noop());
+    assert!(shard.timer_wait(true).is_some());
+    let first = precise_armed_in(&shard).expect("the poller armed its timer");
+    assert!(first <= Duration::from_secs(10), "{first:?}");
+    inner.clock.advance(Duration::from_secs(5));
+    assert!(shard.timer_wait(true).is_some());
+    let second = precise_armed_in(&shard).expect("the poller's timer is armed");
+    // Moved by the advance it is five seconds nearer than it was, less the
+    // time between the two looks, however long that took on a loaded host.
+    assert!(
+        second + Duration::from_secs(4) < first,
+        "the poller's timer stayed at the deadline as the system saw it before the advance: {first:?} left before, {second:?} after"
+    );
+    shard.wheel_of(true).borrow_mut().remove(key);
+}

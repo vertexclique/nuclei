@@ -15,8 +15,11 @@
 //! Timers live in a slab of entries linked into their slot's list by index,
 //! so arming and cancelling are O(1) and allocate nothing once the slab has
 //! grown to the most timers alive at once. A [`TimerKey`] carries the
-//! entry's generation: a key whose timer is gone never reaches the entry
-//! that reuses its place. A timer that fires lets go of its entry as it
+//! entry's generation, which each release of the entry moves on by one: a
+//! key whose timer is gone reaches no entry that reuses its place until that
+//! place was let go of 2^64 times, which at one reuse a nanosecond takes
+//! over 580 years (`proofs/lean/Nuclei/Wheel.lean`, `stale_key_stays_stale`).
+//! A timer that fires lets go of its entry as it
 //! fires, and one armed for a time the wheel passed already takes none: a
 //! key that reaches no entry reads as fired, so its owner has nothing to
 //! remove.
@@ -48,7 +51,7 @@ const NIL: usize = usize::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TimerKey {
     index: usize,
-    generation: u32,
+    generation: u64,
 }
 
 impl TimerKey {
@@ -76,7 +79,7 @@ struct Entry {
     /// next free one).
     prev: usize,
     next: usize,
-    generation: u32,
+    generation: u64,
     place: Place,
 }
 
@@ -403,6 +406,15 @@ impl Wheel {
             place: Place::Free,
         });
         index
+    }
+
+    /// Moves the generation of the free entry `key` named on by `releases`,
+    /// as that many timers armed in its place and let go of would.
+    #[cfg(test)]
+    fn age(&mut self, key: TimerKey, releases: u64) {
+        let entry = &mut self.entries[key.index];
+        assert_eq!(entry.place, Place::Free, "only a free entry ages");
+        entry.generation = entry.generation.wrapping_add(releases as _);
     }
 
     /// The entry of a key that is not stale.

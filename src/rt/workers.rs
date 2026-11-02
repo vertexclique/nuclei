@@ -155,6 +155,41 @@ impl Workers {
         }
     }
 
+    /// Polls the handoff took from their thread that run there still, on no
+    /// shard a paused clock counts.
+    pub(crate) fn detached(&self) -> usize {
+        self.monitor
+            .as_ref()
+            .map_or(0, |monitor| monitor.detached())
+    }
+
+    /// Counts out of flight the poll this thread runs that the handoff took
+    /// from one of these workers, if it runs one: its thread's shard just
+    /// joined the paused clock's guests, which count its work from now on.
+    pub(crate) fn count_out_taken_here(&self) -> bool {
+        let from = context::detached_from_addr();
+        match &self.monitor {
+            Some(monitor)
+                if from != 0
+                    && self
+                        .shards()
+                        .any(|shard| Arc::as_ptr(shard) as usize == from) =>
+            {
+                monitor.count_out();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Counts a poll [`count_out_taken_here`](Self::count_out_taken_here)
+    /// counted out in flight again, before its guest leaves.
+    pub(crate) fn count_in_taken(&self) {
+        if let Some(monitor) = &self.monitor {
+            monitor.count_in();
+        }
+    }
+
     /// Workers taking tasks.
     pub(crate) fn running(&self) -> usize {
         self.running.load(Ordering::Relaxed)
@@ -603,7 +638,8 @@ fn run_shard(inner: &Arc<Inner>, run: Run, life: &Life) {
     if worked == Worked::Detached {
         life.back();
         if let Some(monitor) = &workers.monitor {
-            finish_home(monitor, &home);
+            finish_taken(inner, monitor, &home, shard);
+            return;
         }
     }
     // While the runtime is still this thread's: what the shard hands on as it
@@ -613,8 +649,24 @@ fn run_shard(inner: &Arc<Inner>, run: Run, life: &Life) {
     drop(shard);
 }
 
+/// The end of a thread whose shard was taken, out of the worker's loop: its
+/// bound tasks finish, its reference to the shard goes as `run_shard`'s
+/// would, and then the taken poll and all it led to on this thread are over,
+/// out of flight, which may be all a paused clock waited for
+/// (proofs/tla/clock, `M_detached_uncounted`).
+#[cold]
+#[inline(never)]
+fn finish_taken(inner: &Arc<Inner>, monitor: &Monitor, home: &Home, shard: Arc<Shard>) {
+    finish_home(monitor, home);
+    drop(shard);
+    monitor.count_out();
+    super::paused::try_advance(inner, None);
+}
+
 /// A thread whose shard was taken: its bound tasks finish on its own shard,
-/// their home's target moved there first.
+/// their home's target moved there first, and the shard a guest of a paused
+/// clock, as a `block_on`'s own shard is (proofs/tla/clock,
+/// `M_uncounted_shard`).
 #[expect(
     clippy::panic,
     reason = "a thread whose shard cannot start cannot run its bound tasks, which would wait forever"
@@ -631,6 +683,12 @@ fn finish_home(monitor: &Monitor, home: &Home) {
     };
     home.target().move_to(&own.shared);
     let _current = context::enter(&own);
+    // Counted among the runtime's shards while its clock is paused, as a
+    // `block_on`'s own shard is: the bound tasks' timers are on it.
+    let inner = context::runtime();
+    let _guest = inner
+        .as_ref()
+        .map(|inner| super::paused::Guest::enter(inner, &own.shared));
     #[cfg(port)]
     own.take_port_back();
     own.block_on_then_leave(monitor.home_done(home));

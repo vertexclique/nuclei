@@ -195,6 +195,31 @@ fn a_deadline_beyond_the_span_fires_on_time() {
     assert_eq!(count.0.load(Ordering::SeqCst), 1);
 }
 
+/// A key held while its entry is let go of and taken again 2^32 times, as a
+/// sleep that fired and is not polled for minutes on a shard arming and
+/// cancelling millions of timeouts a second may be, never reaches the timer
+/// that holds the entry then (`proofs/lean/Nuclei/Wheel.lean`,
+/// `stale_key_stays_stale`).
+#[test]
+fn a_key_stays_stale_however_often_its_entry_is_reused() {
+    let mut wheel = Wheel::new();
+    let (w, _) = waker();
+    let old = wheel.insert(10, &w);
+    wheel.remove(old);
+    wheel.age(old, (1 << 32) - 1);
+    let (w2, count2) = waker();
+    let new = wheel.insert(10, &w2);
+    assert_eq!(new.index, old.index, "the entry is taken again");
+    assert!(
+        wheel.is_fired(old),
+        "a key whose timer is gone reaches the timer that took its entry"
+    );
+    wheel.remove(old);
+    assert_eq!(wheel.armed(), 1, "the stale key removed another timer");
+    assert_eq!(advance(&mut wheel, 20), 1);
+    assert_eq!(count2.0.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn a_removed_timer_never_fires_and_its_key_goes_stale() {
     let mut wheel = Wheel::new();

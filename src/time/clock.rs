@@ -191,17 +191,31 @@ impl Clock {
 
     /// The clock's time now.
     pub(crate) fn now(&self) -> Instant {
+        self.now_from(Instant::now())
+    }
+
+    /// The clock's time now, `system` being the system's time read before
+    /// the call. Read before the look at the mark: a reading that finds the
+    /// clock unaltered took it before a pause marked it, and so before the
+    /// time that pause stops at (`pause`).
+    fn now_from(&self, system: Instant) -> Instant {
         if !self.altered.load(Ordering::Acquire) {
-            return Instant::now();
+            return system;
         }
-        instant(self.now_nanos())
+        instant(self.now_nanos_from(|| nanos(system)))
     }
 
     pub(crate) fn now_nanos(&self) -> u64 {
+        self.now_nanos_from(system_nanos)
+    }
+
+    /// [`now_nanos`](Self::now_nanos), the system's time from `system`, asked
+    /// only while the clock runs.
+    fn now_nanos_from(&self, system: impl FnOnce() -> u64) -> u64 {
         let read = if self.paused.load(Ordering::Acquire) {
             self.base.load(Ordering::Acquire)
         } else {
-            system_nanos().saturating_add_signed(self.skew.load(Ordering::Acquire))
+            system().saturating_add_signed(self.skew.load(Ordering::Acquire))
         };
         let last = self.last.fetch_max(read, Ordering::AcqRel);
         read.max(last)
@@ -254,12 +268,16 @@ impl Clock {
 
     /// Stops the clock where it is; a paused clock stays as it is.
     pub(crate) fn pause(&self) {
-        let now = if self.altered.load(Ordering::Acquire) {
-            self.now_nanos()
-        } else {
-            nanos(Instant::now())
-        };
+        // Marked before the time it stops at is read, a fence between: a
+        // reading that found the clock unmarked left no trace in `last`, and
+        // took the system's time before it looked (`now`), so before this
+        // mark and before the time read here (proofs/tla/clock/ClockRead.tla,
+        // `M_pause_reads_first`).
         self.alter();
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let now = self.now_nanos();
+        #[cfg(test)]
+        tests::after_pause_reads();
         if self.paused.load(Ordering::Acquire) {
             return;
         }
@@ -308,6 +326,19 @@ impl Clock {
         }
     }
 
+    /// The system's instant at which a running clock reads `at`: where a
+    /// timer the system counts (a poller's own) ends for that deadline.
+    /// `None` past what an instant holds.
+    pub(crate) fn system_instant(&self, at: Instant) -> Option<Instant> {
+        let skew = self.skew.load(Ordering::Acquire);
+        let by = Duration::from_nanos(skew.unsigned_abs());
+        if skew >= 0 {
+            at.checked_sub(by)
+        } else {
+            at.checked_add(by)
+        }
+    }
+
     /// Moves a paused clock forward to `at` (nanoseconds after the origin),
     /// if it is behind it.
     pub(crate) fn advance_to_nanos(&self, at: u64) {
@@ -339,27 +370,86 @@ pub(crate) fn to_nanos(at: Instant) -> u64 {
 
 /// [`now`] in nanoseconds after the origin: what the timers and the wheels
 /// read.
+///
+/// The system's time is read before the look at [`ALTERED`], as in
+/// [`Clock::now`]: a reading that finds no clock altered took it before any
+/// pause marked its clock.
 #[inline]
 pub(crate) fn now_nanos() -> u64 {
+    let system = system_nanos();
     if ALTERED.load(Ordering::Relaxed) == 0 {
-        return system_nanos();
+        return system;
     }
-    crate::rt::runtime::with_clock(|clock| clock.map_or_else(system_nanos, Clock::now_nanos))
+    altered_now_nanos(system)
+}
+
+/// [`now_nanos`] while some clock is altered, `system` read before the look:
+/// out of line, so the common read keeps its frame as small as it was.
+#[cold]
+#[inline(never)]
+fn altered_now_nanos(system: u64) -> u64 {
+    crate::rt::runtime::with_clock(|clock| {
+        clock.map_or(system, |clock| clock.now_nanos_from(|| system))
+    })
 }
 
 /// The time now on the clock of the runtime this thread is inside (or of the
-/// default runtime, if one runs), or the system's.
+/// default runtime, if one runs), or the system's; read as [`now_nanos`].
 #[inline]
 pub(crate) fn now() -> Instant {
+    let system = Instant::now();
     if ALTERED.load(Ordering::Relaxed) == 0 {
-        return Instant::now();
+        return system;
     }
-    crate::rt::runtime::with_clock(|clock| clock.map_or_else(Instant::now, Clock::now))
+    altered_now(system)
+}
+
+/// [`now`] while some clock is altered, as [`altered_now_nanos`].
+#[cold]
+#[inline(never)]
+fn altered_now(system: Instant) -> Instant {
+    crate::rt::runtime::with_clock(|clock| clock.map_or(system, |clock| clock.now_from(system)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        /// What a test runs in a pause right after it read the time it
+        /// stops at, once.
+        static AFTER_PAUSE_READS: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { core::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_pause_reads() {
+        if let Some(hook) = AFTER_PAUSE_READS.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[test]
+    fn a_reading_taken_as_a_pause_begins_is_never_gone_back_on() {
+        let clock = std::sync::Arc::new(Clock::new(false));
+        let seen = std::sync::Arc::new(AtomicU64::new(0));
+        let (reader, read) = (std::sync::Arc::clone(&clock), std::sync::Arc::clone(&seen));
+        // A reading of the clock between the time the pause read and its
+        // first store: later than that time by more than the millisecond
+        // the pause rounds up to.
+        AFTER_PAUSE_READS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::thread::sleep(Duration::from_millis(3));
+                read.store(to_nanos(reader.now()), Ordering::SeqCst);
+            }));
+        });
+        clock.pause();
+        let before = seen.load(Ordering::SeqCst);
+        assert_ne!(before, 0, "the reading ran inside the pause");
+        assert!(
+            to_nanos(clock.now()) >= before,
+            "the paused clock reads earlier than a reading it gave before"
+        );
+    }
 
     #[test]
     fn a_paused_clock_stands_still_until_advanced() {

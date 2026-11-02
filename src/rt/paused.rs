@@ -3,8 +3,9 @@
 //!
 //! A paused clock jumps to the earliest armed timer when the runtime has
 //! nothing else to do: every shard of it (its workers, and the shards of the
-//! threads inside its `block_on`) is parked with nothing pushed to it, and
-//! no blocking job is queued or running. Each shard publishes the deadline of
+//! threads inside its `block_on`) is parked with nothing pushed or posted to
+//! it, no blocking job is queued or running, and no poll the handoff took
+//! from its thread runs there still. Each shard publishes the deadline of
 //! its earliest timer before it parks, and tries the jump itself (as does
 //! the blocking pool when its last job ends, and a thread leaving `block_on`):
 //!
@@ -89,10 +90,16 @@ pub(crate) fn try_advance(inner: &Inner, me: Option<&Shared>) -> bool {
     due
 }
 
+/// Work in flight on no shard a paused clock looks at: a blocking job, or a
+/// poll the handoff took from its thread.
+fn in_flight(inner: &Inner) -> bool {
+    inner.pool.jobs() != 0 || inner.workers.detached() != 0
+}
+
 fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
     let clock = &inner.clock;
     let members = clock.members();
-    if inner.pool.jobs() != 0 {
+    if in_flight(inner) {
         return false;
     }
     let mut seen: Vec<(Arc<Shared>, u64)> = Vec::new();
@@ -111,7 +118,7 @@ fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
         return false;
     }
     let unchanged = clock.members() == members
-        && inner.pool.jobs() == 0
+        && !in_flight(inner)
         && seen
             .iter()
             .all(|(shard, parks)| shard.idle() && shard.parks() == *parks);
@@ -133,28 +140,40 @@ fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
 }
 
 /// A thread's shard counted among a runtime's shards while the thread is
-/// inside its `block_on` and its clock is paused.
+/// inside its `block_on` and its clock is paused. A poll the handoff took
+/// from one of the runtime's workers, still running on the thread, is
+/// counted by the guest meanwhile and not as work in flight ([`TAKEN`]).
 pub(crate) struct Guest<'a> {
     inner: &'a Arc<Inner>,
+    /// The shard's address, with [`TAKEN`] set if the join counted a taken
+    /// poll out.
     key: usize,
 }
+
+/// The low bit of a guest's key, free in a shard's address: its join
+/// counted a taken poll out of flight.
+const TAKEN: usize = 1;
 
 impl<'a> Guest<'a> {
     /// Counts `shard` in `inner` if its clock is paused (or was ever
     /// altered, so a pause during the call is seen when it ends).
     #[inline]
     pub(crate) fn enter(inner: &'a Arc<Inner>, shard: &Arc<Shared>) -> Guest<'a> {
-        let key = Arc::as_ptr(shard) as usize;
+        let mut key = Arc::as_ptr(shard) as usize;
         if inner.clock.is_paused() {
-            Self::join(inner, key, shard);
+            key |= usize::from(Self::join(inner, key, shard));
         }
         Guest { inner, key }
     }
 
+    /// Joins `shard`; answers whether a taken poll was counted out of flight,
+    /// which comes after the join, so its work is seen in one count or the
+    /// other at every moment (proofs/tla/clock, `M_detached_uncounted`).
     #[inline(never)]
-    fn join(inner: &Inner, key: usize, shard: &Arc<Shared>) {
+    fn join(inner: &Inner, key: usize, shard: &Arc<Shared>) -> bool {
         inner.guests().insert(key, Arc::clone(shard));
         inner.clock.member_changed();
+        inner.workers.count_out_taken_here()
     }
 
     /// Counts the calling thread's own shard in `inner`, if the thread is
@@ -191,10 +210,14 @@ impl Drop for Guest<'_> {
 impl Guest<'_> {
     #[inline(never)]
     fn leave(&self) {
+        // In flight again before the shard stops counting it.
+        if self.key & TAKEN != 0 {
+            self.inner.workers.count_in_taken();
+        }
         if self
             .inner
             .guests_made()
-            .is_some_and(|guests| guests.remove(&self.key).is_some())
+            .is_some_and(|guests| guests.remove(&(self.key & !TAKEN)).is_some())
         {
             self.inner.clock.member_changed();
             // The shards left may all be idle now.
@@ -202,3 +225,6 @@ impl Guest<'_> {
         }
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod tests;

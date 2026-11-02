@@ -398,6 +398,48 @@
   the shard slept on with its new work. The notification is now tried again until the kernel
   takes it, and after 64 failures in a row reported as an error (`proofs/tla/park/Park.tla`,
   `notify_swallowed`).
+- **A timer cancelled from another thread no longer stops a paused clock.** A sleep armed on a
+  shard and dropped, or polled again, on another thread posts its removal to the shard, and only
+  an arm request woke a parked shard; a shard holding a posted op is not idle, and a paused clock
+  jumps only while every shard is, so a removal posted to a parked shard held every jump of the
+  runtime, and every sleeper on it waited for good. While a clock is paused or advanced every
+  timer op now wakes its shard (`proofs/tla/clock`, the `post_no_wake` mutation).
+- **A paused clock counts a thread whose shard the handoff took.** The thread's bound tasks
+  finish on its own shard, which no paused clock looked at, so a sleep one of them armed there
+  never came due; and the rest of the poll the shard was taken from still ran on the thread, on
+  no shard, while the clock could jump past what it was about to do. The own shard is now a guest
+  of the paused clock, as a `block_on`'s is, and the rest of a taken poll is work in flight, as a
+  blocking job is: counted from the take until the thread's bound tasks ended, except while the
+  thread runs it on its own shard as a guest, which counts it then (`proofs/tla/clock`, the
+  `M_uncounted_shard` and `detached_uncounted` runs).
+- **A sleep moved to another task as its shard goes is armed again.** A sleep polled on a thread
+  that runs no shard waits on a cell its shard fires; a shard that goes marks the cell orphaned
+  and wakes the waker it held. A poll looked at that mark before it registered its waker, and
+  after it only at whether the timer fired: a shard going in between woke the waker of the task
+  that held the sleep before, and the task that held it now was never woken. The poll now looks
+  at the mark after it registers (`proofs/tla/timer`, the `recheck_fired_only` mutation), and no
+  more before it.
+- **A clock read as it is paused never goes back.** A reading of a clock nobody paused yet
+  leaves no trace, and read the system's time after it found the clock unpaused, while a pause
+  read the time it stops at before it marked the clock: a reading taken between the two could be
+  later than the paused time, and the next reading earlier than it. A reading now takes the
+  system's time before it looks at the mark, and a pause marks the clock before it reads its time
+  (`proofs/tla/clock/ClockRead.tla`); a clock that was paused or advanced reads the system's time
+  once per reading, as before.
+- **A precise sleep ends on time after the running clock is advanced** (epoll, kqueue). The
+  poller's own timer counts the system's time but was armed again only when the deadline on the
+  clock changed: after `time::advance` on a running clock it stayed at the deadline as the system
+  saw it before, and the sleep ended on the wait's own millisecond timeout instead, up to a
+  millisecond late. It is now armed for the deadline as the system sees it
+  (`proofs/tla/precise`, the `key_on_clock` mutation). A clock nobody paused or advanced pays
+  nothing for it.
+- **A timer's key never reaches a later timer in its place.** Each entry of a timer wheel counts
+  its reuses in a generation a key carries, which was 32 bits: a key held while its entry was
+  let go of and taken again 2^32 times reached the timer in the entry then, as a sleep that fired
+  and was not polled for minutes might on a shard cancelling millions of timeouts a second, and
+  set that timer's waker or removed it. The generation is now 64 bits, which takes centuries to
+  come round at one reuse a nanosecond (`proofs/lean/Nuclei/Wheel.lean`,
+  `stale_key_stays_stale`). An entry of the wheel takes 56 bytes instead of 48.
 
 ### Changed
 

@@ -34,7 +34,7 @@ use super::life::Life;
 use super::slot::{self, Slot};
 use crate::rt::runtime::Inner;
 use crate::rt::shard::{Shard, Shared};
-use crate::sync::internal::{AtomicBool, AtomicPtr, Ordering, fence};
+use crate::sync::internal::{AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
 
 /// Reads of one word in a row that make a blocked poll.
 const STREAK: u32 = 4;
@@ -132,6 +132,10 @@ pub(crate) struct Monitor {
     cores: Vec<usize>,
     /// Told of each poll seen past the threshold.
     long_poll: Option<crate::rt::tuning::TaskHook>,
+    /// Polls taken from their thread that still run there on no shard a
+    /// paused clock looks at: work in flight it waits for, as for a blocking
+    /// job (proofs/tla/clock, `M_detached_uncounted`).
+    detached: AtomicUsize,
 }
 
 impl Monitor {
@@ -154,7 +158,26 @@ impl Monitor {
             closing: crate::sync::Notify::new(),
             cores,
             long_poll,
+            detached: AtomicUsize::new(0),
         }
+    }
+
+    /// Polls taken from their thread that run there still, on no counted
+    /// shard.
+    pub(crate) fn detached(&self) -> usize {
+        self.detached.load(Ordering::SeqCst)
+    }
+
+    /// A taken poll is over on its thread, or its thread runs it on a shard
+    /// a paused clock counts (its own, a guest): in flight no more.
+    pub(crate) fn count_out(&self) {
+        self.detached.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// A poll is taken from its thread, or its thread's guest shard leaves
+    /// with the poll still running: in flight.
+    pub(crate) fn count_in(&self) {
+        self.detached.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Tells the long-poll hook of the poll of task `task` (0: a poll that
@@ -412,6 +435,9 @@ fn take(
     } else if !super::fence::heavy() {
         // The heavy fence failed, which `available` said it would not: no
         // take may rely on it. Counted, so a watch that cannot rescue a
+    // The rest of the poll runs on its thread on no shard: in flight, before
+    // the shard's next runner can park it idle.
+    monitor.count_in();
         // blocked poll shows (proofs/tla/handoff, `F_fail`).
         old.slot.cancel();
         place.shared.counters.handoff_failed();

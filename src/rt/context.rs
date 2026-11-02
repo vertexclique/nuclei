@@ -524,6 +524,12 @@ pub(crate) fn own_shard_if_made() -> Option<Rc<Shard>> {
     }
 }
 
+/// The address of the `Shared` of the shard this thread was detached from,
+/// compared, never followed; 0 for none.
+pub(crate) fn detached_from_addr() -> usize {
+    local().detached.get()
+}
+
 /// Marks `shard` as the one this thread runs, its own code running, until
 /// the guard drops.
 pub(crate) fn enter(shard: &Shard) -> Entered<'_> {

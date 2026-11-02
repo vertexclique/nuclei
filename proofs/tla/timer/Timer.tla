@@ -1,9 +1,11 @@
 ------------------------------- MODULE Timer -------------------------------
 (***************************************************************************)
 (* A timer a shard fires for a thread that runs no shard                  *)
-(* (src/time/sleep.rs: `RemoteTimer`, `Armed`, `TimerOp`, `Sleep::poll`;   *)
-(* src/rt/shard.rs: `Shared::post_timer`; src/rt/shard/going.rs: the       *)
-(* shard's drop), at the grain of its atomic steps.                        *)
+(* (src/time/sleep.rs: `RemoteTimer`, `Armed`, `TimerOp`, `Timer::poll`,   *)
+(* `poll_any`, `poll_remote`, `poll_remote_cell`, `poll_cell`;             *)
+(* src/rt/shard.rs: `Shared::post_timer`; src/rt/runtime.rs:               *)
+(* `service_shard`; src/rt/shard/going.rs: the shard's drop), at the grain *)
+(* of its atomic steps.                                                    *)
 (*                                                                          *)
 (* In plain words: a sleep polled on another runtime's thread cannot touch *)
 (* a shard's timer wheel, so it posts an arm request into the shard's      *)
@@ -25,23 +27,37 @@
 (* go and arms the timer again where it is polled: here, on the second     *)
 (* shard, which never goes.                                                *)
 (*                                                                          *)
+(* The sleep may move to another task between two polls (`Moves`): the    *)
+(* cell then holds the first task's waker until the second task's poll     *)
+(* registers its own. A poll looks at `fired`, registers, then looks at    *)
+(* both marks: the orphan mark is looked at only after the register, since *)
+(* a shard that went before it woke the waker the cell held then, the      *)
+(* first task's, and nothing would wake the second.                        *)
+(*                                                                          *)
+(* The first shard may be one nobody drives (`Driven` FALSE): the own      *)
+(* shard of a thread outside `block_on`, which `service_shard` falls back  *)
+(* to when no worker takes work. A witness of an open question, not fixed: *)
+(* its mailbox is never applied, and the sleep never ends.                 *)
+(*                                                                          *)
 (* What is modelled step by step: the post of each op, the shard's apply   *)
 (* of each op, the fire, the cell's flags, the waker slot (register, look   *)
-(* again, take, wake), the poll's register-then-look-again, the drop, the  *)
-(* first shard's going and the sleep's arming again. What is abstract:     *)
+(* again, take, wake), the poll's looks and register, the drop, the move, *)
+(* the first shard's going and the sleep's arming again. What is abstract: *)
 (* time is one flag that turns on when the deadline passes (or, for a      *)
-(* dropped sleep, may never within the run); the waker slot is one cell    *)
-(* with one task's waker; a new cell after an orphan reuses the old cell's *)
-(* variables, the old one being gone. Its register-then-look-again         *)
-(* handshake guards a waker that changed between polls, which one task     *)
-(* cannot show: that handshake is checked by the loom models of            *)
-(* nuclei::sync's waker cell.                                              *)
+(* dropped sleep, may never within the run); the waker slot names which of *)
+(* two tasks' wakers it holds; a task that is woken is polled again, and a *)
+(* wake that comes during its poll is kept for its next one; a new cell    *)
+(* after an orphan reuses the old cell's variables, the old one being      *)
+(* gone. The register-then-look-again handshake of the waker slot itself   *)
+(* is checked by the loom models of nuclei::sync's waker cell.             *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, TLC
 
 CONSTANTS
     DropIt,    \* TRUE: the sleep is dropped (at some point); FALSE: it is awaited to the end
     Goes,      \* TRUE: the first shard may go before it fires the timer
+    Moves,     \* TRUE: the sleep may move to a second task once, between two polls
+    Driven,    \* TRUE: the first shard runs its loop; FALSE: no thread drives it
     Mutation   \* "none", or the name of the one rule this run takes away
 
 ForeignT == 1   \* the thread that runs no shard, polling the sleep
@@ -49,6 +65,8 @@ ShardT == 2     \* the first shard, the one the sleep asks first; it may go
 ClockT == 3     \* time, which passes the deadline
 OtherT == 4     \* the second shard, where an orphaned timer is armed again; it never goes
 Shards == {ShardT, OtherT}
+\* The two tasks that may hold the sleep, by their wakers, and "none" for an empty slot.
+Wakers == {"w1", "w2"}
 
 (* --algorithm Timer
 variables
@@ -59,9 +77,10 @@ variables
     fired = FALSE,      \* the cell's `fired` flag
     cancelled = FALSE,  \* the cell's `cancelled` flag
     orphaned = FALSE,   \* the cell's `orphaned` flag: its shard let go of it unfired
-    slot = FALSE,       \* the cell's waker slot holds the foreign task's waker
+    slot = "none",      \* the waker the cell's slot holds: a task's, or none
+    holder = "w1",      \* the task that holds the sleep now, by its waker
     passed = FALSE,     \* the deadline has passed
-    woken = FALSE,      \* the foreign task's waker was woken
+    woken = [w \in Wakers |-> FALSE], \* the task was woken and not polled since
     alive = TRUE,       \* the sleep exists
     gone = FALSE,       \* the first shard went
     \* records
@@ -75,16 +94,22 @@ define
                    \/ \E i \in 1..Len(mailbox[ShardT]) : mailbox[ShardT][i] = "insert"
 end define;
 
+\* Wakes the waker the cell's slot holds, taking it out of the slot: the task it belongs to is
+\* polled again. A task woken after its sleep was dropped is recorded.
+macro WakeSlot() begin
+    if slot # "none" then
+        woken[slot] := TRUE;
+        if ~alive then wokeDead := TRUE; end if;
+        slot := "none";
+    end if;
+end macro;
+
 \* `RemoteTimer::orphan`: the cell's shard let go of it unfired. Unless it fired or was cancelled,
 \* it is marked orphaned and its waker taken and woken.
 macro Orphan() begin
     if ~fired /\ ~cancelled then
         orphaned := TRUE;
-        if slot then
-            slot := FALSE;
-            woken := TRUE;
-            if ~alive then wokeDead := TRUE; end if;
-        end if;
+        WakeSlot();
     end if;
 end macro;
 
@@ -107,49 +132,55 @@ F_poll:
     \* One that went drains what is posted to it at once: the arm request orphans the cell.
     if gone /\ Mutation # "no_orphan" then
         \* The waker registered, then taken and woken by the drain.
-        orphaned := TRUE || woken := TRUE;
+        orphaned := TRUE || woken[holder] := TRUE;
     elsif gone then
         \* MUTATION no_orphan: the drain lets the request go and wakes nobody.
-        slot := TRUE;
+        slot := holder;
     else
-        slot := TRUE || mailbox[ShardT] := Append(mailbox[ShardT], "insert");
+        slot := holder || mailbox[ShardT] := Append(mailbox[ShardT], "insert");
     end if;
 F_wait:
-    \* Await the fire, or drop the sleep.
+    \* Await the fire (a wake of the task that holds the sleep), move the sleep to the second
+    \* task, whose poll comes at once, or drop the sleep.
     either
         await DropIt;
         goto F_drop;
     or
-        await woken \/ (DropIt = FALSE /\ fired);
-        goto F_poll_again;
+        await woken[holder] \/ (DropIt = FALSE /\ fired);
+    or
+        await Moves /\ holder = "w1";
+        holder := "w2";
     end either;
-F_poll_again:
-    \* `Sleep::poll`: an orphaned cell is let go and the timer armed again; else
-    \* `poll_cell`: look at `fired`; if not set, register and look again.
+F_look:
+    \* A poll: it consumes the task's wake, and `poll_cell` looks at `fired`.
+    woken[holder] := FALSE;
     if fired then
         goto F_done;
-    elsif orphaned then
+    end if;
+F_register:
+    \* Register the poll's waker: the slot holds the task's waker from now on.
+    slot := holder;
+F_recheck:
+    \* Look again after registering, at both marks: a fire or an orphaning before the register
+    \* woke the waker the slot held then, which may be the other task's. An orphaned cell is let
+    \* go and the timer armed again where the poll runs.
+    \* MUTATION recheck_fired_only: the look after the register is at `fired` alone.
+    if fired then
+        goto F_done;
+    elsif orphaned /\ Mutation # "recheck_fired_only" then
         goto F_rearm;
     else
-        slot := TRUE;
-        woken := FALSE;
-    end if;
-F_recheck:
-    \* Look again after registering: a fire in between found the old waker.
-    if fired then
-        goto F_done;
-    else
-        await woken;
-        goto F_poll_again;
+        await woken[holder];
+        goto F_look;
     end if;
 F_rearm:
     \* MUTATION no_rearm: the sleep waits on the orphaned cell, which nothing will fire.
     if Mutation = "no_rearm" then
-        slot := TRUE || woken := FALSE;
+        slot := holder;
     else
         \* The old cell goes (`State::Idle`), and a new one is armed where the sleep is polled:
         \* its waker registered, its request posted to the second shard.
-        orphaned := FALSE || armedOn := OtherT || slot := TRUE || woken := FALSE
+        orphaned := FALSE || armedOn := OtherT || slot := holder
             || rearmed := TRUE || mailbox[OtherT] := Append(mailbox[OtherT], "insert");
     end if;
     goto F_wait;
@@ -158,7 +189,7 @@ F_drop:
     \* shard that went).
     cancelled := TRUE;
     \* MUTATION drop_keeps_waker: the drop leaves the waker in the cell.
-    if Mutation # "drop_keeps_waker" then slot := FALSE; end if;
+    if Mutation # "drop_keeps_waker" then slot := "none"; end if;
     alive := FALSE;
     if ~(armedOn = ShardT /\ gone) then
         mailbox[armedOn] := Append(mailbox[armedOn], "cancel");
@@ -172,11 +203,12 @@ begin
 S_loop:
     \* The shard's look at its timers: apply the mailbox, then fire what is due. It stops
     \* once the sleep and the clock are done and nothing is left to do (the model's end).
-    \* The first shard may go instead, at any look.
+    \* The first shard may go instead, at any look. A first shard nobody drives never looks.
     either
         await self = ShardT /\ Goes /\ ~gone;
         goto S_go;
     or
+        await self # ShardT \/ Driven;
         if mailbox[self] # <<>> then
             goto S_apply;
         elsif entry[self] = "armed" /\ passed then
@@ -218,11 +250,7 @@ S_fire:
     keyStored[self] := FALSE;
     fired := TRUE;
 S_wake:
-    if slot then
-        slot := FALSE;
-        woken := TRUE;
-        if ~alive then wokeDead := TRUE; end if;
-    end if;
+    WakeSlot();
     goto S_loop;
 S_go:
     \* The first shard goes (its drop): its mailbox is drained and its wheel lets go of its
@@ -255,7 +283,7 @@ NoWakeAfterDrop == ~wokeDead
 
 \* Once the first shard went, no cell of a timer it held keeps the task's waker unwoken: the
 \* task and the cell never keep each other for good.
-NoStrandedWaker == ~(gone /\ armedOn = ShardT /\ slot /\ ~orphaned /\ ~fired /\ ~cancelled)
+NoStrandedWaker == ~(gone /\ armedOn = ShardT /\ slot # "none" /\ ~orphaned /\ ~fired /\ ~cancelled)
 
 Safe == NothingLeft /\ NoWakeAfterDrop /\ NoStrandedWaker
 
@@ -268,7 +296,15 @@ NoCancelOfArmed == ~(cancelled /\ entry[ShardT] = "armed")
 \* The sleep is dropped before the shard applied the arm request.
 NoCancelBeforeArm == ~(cancelled /\ mailbox[ShardT] = <<"insert", "cancel">>)
 \* The timer fires and wakes the waiting task.
-NoFireWake == ~(fired /\ woken)
+NoFireWake == ~(fired /\ \E w \in Wakers : woken[w])
 \* The first shard goes, and the sleep arms its timer again on the second.
 NoRearm == ~rearmed
+
+(***************************************************************************)
+(* Liveness.                                                               *)
+(***************************************************************************)
+
+\* The awaited sleep ends: the thread that polls it gets to its end. (`Termination`, which the
+\* translation defines, asks every thread to end, a shard that nobody drives too.)
+SleepEnds == <>(pc[ForeignT] = "Done")
 =============================================================================
