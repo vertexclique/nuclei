@@ -49,49 +49,14 @@ impl FileIo {
         let hooks = FileHooks { io: self };
         let out = self.state.poll(&mut after, waker, &hooks, |st, after| {
             loop {
-                if let Some(lent) = job.as_mut() {
-                    let pooled = lent.task.pooled();
-                    let (result, mut buf) = match lent.task.poll(waker) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(out) => out,
-                    };
-                    tally_read(pooled, &result, |n| *n);
-                    let (at, epoch, generation, from) =
-                        (lent.at, lent.epoch, lent.generation, lent.from);
-                    *job = None;
-                    if !st.counts(self, at, epoch, generation) {
-                        // Another read, a write, a seek or a positional
-                        // write's end moved on meanwhile: read again where
-                        // the cursor is.
-                        buf.truncate(from);
-                        *held = Some(buf);
-                        continue;
+                if job.is_some() {
+                    match self.poll_read_job(st, waker, after, held, job) {
+                        Some(poll) => return poll,
+                        None => continue,
                     }
-                    *held = Some(buf);
-                    if let Ok(n) = result {
-                        st.cursor += n as u64;
-                        // Bytes read ahead at the old cursor.
-                        if let Some(ahead) = st.ahead.take() {
-                            after.drop_buf(ahead);
-                        }
-                        // The job read ahead into the cache: the next read
-                        // tries it again.
-                        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-                        if st.cache == super::cached::Cache::Cold {
-                            st.cache = super::cached::Cache::Try;
-                        }
-                    }
-                    return Poll::Ready(result);
                 }
-                // A read sees every byte written before it: a write in flight
-                // wakes the file's waiters as it ends, and the task waits with
-                // them, registered before the write is looked at.
-                if !st.writes_idle() {
-                    self.waiters.register(waker);
-                    let file = Waker::from(Arc::clone(self));
-                    if st.poll_writes(self, &file, after).is_pending() {
-                        return Poll::Pending;
-                    }
+                if !st.writes_idle() && self.wait_writes(st, waker, after) {
+                    return Poll::Pending;
                 }
                 let Some(buf) = held.as_mut() else {
                     return Poll::Ready(Err(io::Error::other("the read lost its buffer")));
@@ -126,24 +91,108 @@ impl FileIo {
                     }
                     return Poll::Ready(result);
                 }
-                let task = self.submit_read_owned(held, at, waker);
-                let pooled = task.pooled();
-                *job = Some(LentRead {
-                    task,
-                    at,
-                    epoch: st.epoch,
-                    generation,
-                    from,
-                });
                 // A ring's call has its waker already, which its end wakes
                 // however soon it comes: only the pool's job is polled now.
-                if !pooled {
+                if !self.submit_read_job(st, waker, held, job, at, from, generation) {
                     return Poll::Pending;
                 }
             }
         });
         after.run();
         out
+    }
+
+    // The read's rarer steps, out of line so that the read the page cache serves at once
+    // keeps its own registers.
+
+    /// The read's job in flight, polled: `None` to read again where the cursor is now, else the
+    /// read's result.
+    #[cold]
+    #[inline(never)]
+    fn poll_read_job(
+        self: &Arc<Self>,
+        st: &mut super::FileState,
+        waker: &Waker,
+        after: &mut After,
+        held: &mut Option<OwnedBuf>,
+        job: &mut Option<LentRead>,
+    ) -> Option<Poll<io::Result<usize>>> {
+        let lent = job.as_mut()?;
+        let pooled = lent.task.pooled();
+        let (result, mut buf) = match lent.task.poll(waker) {
+            Poll::Pending => return Some(Poll::Pending),
+            Poll::Ready(out) => out,
+        };
+        tally_read(pooled, &result, |n| *n);
+        let (at, epoch, generation, from) = (lent.at, lent.epoch, lent.generation, lent.from);
+        *job = None;
+        if !st.counts(self, at, epoch, generation) {
+            // Another read, a write, a seek or a positional write's end moved on meanwhile: read
+            // again where the cursor is.
+            buf.truncate(from);
+            *held = Some(buf);
+            return None;
+        }
+        *held = Some(buf);
+        if let Ok(n) = result {
+            st.cursor += n as u64;
+            // Bytes read ahead at the old cursor.
+            if let Some(ahead) = st.ahead.take() {
+                after.drop_buf(ahead);
+            }
+            // The job read ahead into the cache: the next read tries it again.
+            #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+            if st.cache == super::cached::Cache::Cold {
+                st.cache = super::cached::Cache::Try;
+            }
+        }
+        Some(Poll::Ready(result))
+    }
+
+    /// A read sees every byte written before it: a write in flight wakes the file's waiters as it
+    /// ends, and the task waits with them, registered before the write is looked at. Whether the
+    /// read waits.
+    #[cold]
+    #[inline(never)]
+    fn wait_writes(
+        self: &Arc<Self>,
+        st: &mut super::FileState,
+        waker: &Waker,
+        after: &mut After,
+    ) -> bool {
+        self.waiters.register(waker);
+        let file = Waker::from(Arc::clone(self));
+        st.poll_writes(self, &file, after).is_pending()
+    }
+
+    /// The read's job, submitted to read `held` at `at` (`from` its length then, `generation` the
+    /// file's as the read began): whether the pool runs it, so the read polls it now.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the read's own state, kept out of the read's hot path"
+    )]
+    #[cold]
+    #[inline(never)]
+    fn submit_read_job(
+        self: &Arc<Self>,
+        st: &mut super::FileState,
+        waker: &Waker,
+        held: &mut Option<OwnedBuf>,
+        job: &mut Option<LentRead>,
+        at: u64,
+        from: usize,
+        generation: u64,
+    ) -> bool {
+        let task = self.submit_read_owned(held, at, waker);
+        let pooled = task.pooled();
+        *job = Some(LentRead {
+            task,
+            at,
+            epoch: st.epoch,
+            generation,
+            from,
+        });
+        pooled
     }
 
     /// Writes all of `buf` at the cursor, after the writes before it, and

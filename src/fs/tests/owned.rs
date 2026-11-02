@@ -382,3 +382,67 @@ fn a_pipe_opened_as_a_file_reads_and_writes_lent_buffers() {
         assert_eq!(n.unwrap(), 16);
     });
 }
+
+/// A lent read takes what is left before the end, fewer bytes than its room, and at the end
+/// reads nothing and gives its buffer back as it was.
+#[test]
+fn a_lent_read_reads_what_is_left_then_nothing_at_the_end() {
+    let rt = runtime();
+    let tmp = Temp::new("lent-end");
+    let path = tmp.file("data");
+    std::fs::write(&path, b"abc").unwrap();
+    rt.block_on(async {
+        let file = Handle::new(File::open(&path).unwrap()).unwrap();
+        let (n, got) = within(file.read_owned(Vec::with_capacity(8))).await;
+        assert_eq!((n.unwrap(), &got[..]), (3, &b"abc"[..]));
+        let mut kept = Vec::with_capacity(8);
+        kept.extend_from_slice(b"x");
+        let (n, back) = within(file.read_owned(kept)).await;
+        assert_eq!((n.unwrap(), &back[..]), (0, &b"x"[..]));
+    });
+}
+
+/// A lent read of a file opened only to write fails and gives its buffer back, its bytes as
+/// they were.
+#[test]
+fn a_lent_read_of_a_file_open_only_to_write_fails_and_gives_its_buffer_back() {
+    let rt = runtime();
+    let tmp = Temp::new("lent-read-fails");
+    let path = tmp.file("data");
+    std::fs::write(&path, b"bytes").unwrap();
+    rt.block_on(async {
+        let open = OpenOptions::new().write(true).open(&path);
+        let file = Handle::new(open.unwrap()).unwrap();
+        let mut kept = Vec::with_capacity(16);
+        kept.extend_from_slice(b"kept");
+        let (n, back) = within(file.read_owned(kept)).await;
+        assert!(n.is_err(), "a read of a write-only file went through");
+        assert_eq!(back, b"kept");
+    });
+}
+
+/// A lent read dropped while it waits for a write in flight before it moves the cursor
+/// nowhere: the next read starts where the write ended.
+#[test]
+fn a_lent_read_dropped_while_a_write_is_in_flight_moves_the_cursor_nowhere() {
+    let rt = one_blocking_thread();
+    let tmp = Temp::new("lent-drop-write");
+    let path = tmp.file("data");
+    std::fs::write(&path, b"overwrittenthe rest").unwrap();
+    rt.block_on(async {
+        let open = OpenOptions::new().read(true).write(true).open(&path);
+        let mut file = Handle::new(open.unwrap()).unwrap();
+        // The test holds the pool: the write's call waits in its queue.
+        file.file().unwrap().keep_on_pool();
+        let (release, busy) = hold_the_pool();
+        within(write_all(&mut file, b"landed here")).await.unwrap();
+        let mut read = Box::pin(file.read_owned(Vec::with_capacity(32)));
+        pends(&mut read).await;
+        drop(read);
+        release.send(()).unwrap();
+        within(busy).await;
+        let got = within(read_to_end(&mut file)).await.unwrap();
+        assert_eq!(got, b"the rest");
+    });
+    assert_eq!(std::fs::read(&path).unwrap(), b"landed herethe rest");
+}
