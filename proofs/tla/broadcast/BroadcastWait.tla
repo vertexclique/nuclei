@@ -68,7 +68,7 @@ define
 end define;
 
 \* One receive, by receiver `r` from its next position `nx`: the answer goes to `res`.
-procedure Recv(r)
+procedure Recv(r = RxT)
 variables myGen = 0, nx = 0, sawClosed = FALSE;
 begin
 V_make:

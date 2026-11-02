@@ -34,7 +34,7 @@ CONSTANTS
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Nodes == 1..K
-ListT == "list"
+ListT == 0
 \* The end of the list.
 Nil == 0
 
