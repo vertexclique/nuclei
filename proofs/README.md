@@ -2410,6 +2410,14 @@ drops every task by design, is not modelled.
 A handoff is one step (its claim, fence and take are `handoff`'s), and the spawners run on
 threads that run no shard.
 
+`tla/placement/Publish.tla`, in the same family, checks a worker's start racing a spawn while the
+worker's thread may fail to start (`Workers::start_one` and `spawn_thread` in `src/rt/workers.rs`):
+the shard used to be published in its slot before its thread was asked for, so a spawn in between
+queued its task there, and a failed start stopped the shard and dropped it with that task. The
+slot is published only once the thread took its run. 3 configurations: one that must pass
+(`NoSilentLoss` and the task's run), the mutation that publishes first (breaking `NoSilentLoss`),
+and a witness (the start fails).
+
 ## A shard-local value across a handoff
 
 `shardlocal` (`tla/shardlocal/ShardLocal.tla`) checks a shard-local value
