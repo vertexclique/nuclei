@@ -686,7 +686,8 @@ mod tests {
     /// held by its owner and idle. The rest of the poll then goes the way of any other thread, and
     /// must ask the kernel again: told the socket was full, it would block the side on an edge
     /// that already passed, and the byte would wait for good (proofs/tla/sendsnow/TakenFull.tla).
-    /// A readiness driver's: on a ring a side never blocks on an edge.
+    /// A readiness driver's with biased sides: on a ring a side never blocks on an edge, and with
+    /// no heavy fence every side starts shared, whose edges are never passed over.
     #[cfg(unix)]
     #[test]
     fn an_owners_full_send_whose_shard_is_taken_before_the_rest_of_its_poll_asks_again() {
@@ -696,6 +697,10 @@ mod tests {
         use std::task::{Context, Poll};
 
         use crate::rt::context;
+        if !super::super::fence::available() {
+            eprintln!("skipping: no heavy fence here, so every side starts shared");
+            return;
+        }
         let shard = worker_shard();
         #[cfg(ring)]
         if shard.shared.is_ring() {
