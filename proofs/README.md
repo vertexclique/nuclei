@@ -945,25 +945,28 @@ hold on it let go: the lent write's, and each send's until its notification. The
 `Released`, go away while its first buffer is lent, or see a send fail. The shard may go once both
 writes ended, with notifications still out: its ring goes to a keeper, which applies the ring's
 completions until none is out. Only a ring another thread can reap sends zero-copy; on any other
-every chunk is copied, and lets go of the buffer at its completion. 27 configurations: 10 that
+every chunk is copied, and lets go of the buffer at its completion. The peer is assumed to read
+in the end; the keeper has no bound of its own. 28 configurations: 10 that
 must pass (both ends writing before they read with the bytes fitting the socket; a socket of one
 unit, so every chunk is cut short, with dropped `Released`s and failures; a task that may go away;
 a shard that may go; and a ring only its own thread may reap; with `WireOrder`, the units in
 order, each once, and a withdrawn write not at all; `Delivered`, the stream whole at the end, or
 for a task that went the first buffer whole or not at all; `NoScribble`, no buffer handed back or
 freed while the kernel may read it; and `Finishes`, every write ends and every buffer comes back,
-for each), 9 mutations (a side that gets the first completion only with the notification, the bug
+for each, with `KeeperLetsGo`, a keeper that took the ring lets go of it, where the shard may go), 9
+mutations (a side that gets the first completion only with the notification, the bug
 that shipped in `write_owned`, keeps the exchange from finishing; a shard that goes with no
 keeper, its sends keeping what they hold for good (the bounded wait and forget the keeper
 replaced), and a ring only its own thread may reap sending zero-copy, keep a `Released` from
 resolving, breaking `Finishes`; a buffer handed back as the write ends, a dropped `Released` that
 frees the buffer at once, and sends that let go of their buffers as the shard goes break
 `NoScribble`; a short count sent again from the start, a chunk sent before the previous one
-completed, and a started write withdrawn when its task goes break `WireOrder`), and 8 witnesses (a
+completed, and a started write withdrawn when its task goes break `WireOrder`), and 9 witnesses (a
 write that pipelines behind a pinned buffer, a short count, a buffer freed at its last
 notification after its `Released` was dropped, a withdrawn write, an abandoned write finished, a
 send still holding its buffer as the shard went, a notification the keeper applied, a failed send
-whose buffer waits for its notification).
+whose buffer waits for its notification, and a keeper that waits for good for a peer that never
+reads, `KeeperLetsGo` broken under `SpecIdlePeer`).
 
 `src/net/tests/zero_copy.rs` and `src/rt/shard/ring/tests_zc.rs` check the zero-copy write on real
 sockets: both ends that write before they read finish, the buffer comes back whole only after the
@@ -1651,6 +1654,27 @@ holder that clears the token and the shard with the state, before its detach, wh
 then misses, `NoStrandedDetach`); and 2 witnesses (the other shard's registration under the
 same number while the shard waits; a holder's eviction).
 
+`Pending` (`tla/going/Pending.tla`) checks a thread's own shard that leaves while the attach of a
+source it registered is still a request another thread holds (`Shard::leave` and
+`wait_for_evictions` in `src/rt/shard/going.rs`, `attach_now`, `attach_asked_of`, `evict_now`
+and `abandon_ring_attach` in `src/io/source/requests.rs`, `attach_ring` and `ring_attach_failed`
+in `src/io/source/ring.rs`, `Tokens::drain_tokens` in `src/rt/sources.rs`). The holder performs the attach and then the eviction as it lets go: on a ring,
+off the shard's thread, the attach posts the file's install with a lease that keeps the handle's
+object open, and the eviction abandons it with a release of the slot; elsewhere the holder
+registers the source itself; an attach that finds the handle closed posts a release. The shard
+empties its table, waits while the attach is still asked of it and while the source is registered
+with it under its token, looking in that order, applies its mailbox and leaves; its next
+`block_on` registers another source in the slot and applies the mailbox again. A ring's attach
+names its shard and token before it takes the ask, and every end clears them after its posts; a
+drain lets the table's generations go on. 8 configurations: 4 that must pass (a ring and a
+readiness poller, each with an attach that works and one that fails), with `NoForeignRelease`, no
+release removes the next registration, `NoLeaseLeft`, no install's lease waits in the mailbox while
+the shard is away, and `AllEnd`; 3 mutations (no wait for the attach still asked, and an attach
+that takes the ask before it names its shard, which leave the lease behind, `NoLeaseLeft`; a drain
+that starts the generations over, which lets a late release remove the next registration,
+`NoForeignRelease`); and 1 witness (a failed attach's release that reaches the shard only at its
+next `block_on`).
+
 `Behind` (`tla/going/Behind.tla`) checks the bytes a source's writes took into its write-behind
 when the shard that drove them goes (`Shard::leave`, its `let_go_of_sources`, and `drain_unsent`
 in `src/rt/shard/going.rs`, `Source::poll_drain`, `WriteState::submit_ops` and `op_done`,
@@ -1701,6 +1725,52 @@ task handed back as its worker stops; one held by the write and handed back late
 running a linger of its list; the task with the handle held by the write as its worker stops;
 another thread draining its wake after the write counted itself out; the drop's bound running
 out before every byte went).
+
+## A ring kept past its shard
+
+`keeper` (`tla/keeper/`) checks what happens to a shard's ring after the shard went.
+
+`Kept` (`tla/keeper/Kept.tla`) checks the keeper's mailbox (`Shard::go` and `keep_ring` in
+`src/rt/shard/going.rs`, `hand_off`, `Kept::keep` and `apply_mailbox` in
+`src/rt/shard/ring/keeper.rs`, `Shared::post_io`, `close_io` and `IoOp::gone` in `src/rt/shard.rs`,
+`ParkState` in `src/rt/handshake.rs`, and the wake's read of the ring's eventfd in
+`src/rt/park/ring.rs`). A shard goes with one operation in the kernel; it applies its mailbox once
+and hands its ring to a keeper, which applies the ring's completions and the mailbox until nothing
+is out, then lets go of the ring and closes the mailbox. Another thread posts a registration it
+claimed, or a ring source's detach whose cancel is what ends the operation out: it pushes, looks
+whether the mailbox closed (then it lets go of the post itself), and wakes the shard only if the
+park handshake's flag is up. The keeper says it sleeps and looks once more before each wait. The
+wake writes the ring's eventfd, whose read stays armed in a ring the kernel may keep past its
+poller, and a waker that saw the flag up, or a thread that kept the notifier, may write it after the
+keeper let go. 10 configurations: 2 that must pass (a registration and a detach posted at any
+moment, each with a stray waker), with `NoWriteAfterFree`, the wake's read never writes freed
+memory, `NoStuckRegistration`, no registration is left claimed, `NoStranded`, nothing is left in
+the mailbox, and `Ends`; 6 mutations (a keeper that drops a registration, as before, and a poster
+that never looks whether the mailbox closed break `NoStuckRegistration`; a keeper that never says
+it sleeps, as before, and one that does not look after it says so break `Ends`; the read's memory
+freed with the poller, as before, breaks `NoWriteAfterFree`, through the handshake's late waker and
+through a stray one); and 2 witnesses (a post wakes the keeper while the operation is out; the
+wake's read completes after the poller went).
+
+`Forgot` (`tla/keeper/Forgot.tla`) checks an operation a going shard gives up on, on a ring no
+keeper can take (`ShardRing::shut_down`, `settle` and `forget_stuck` in
+`src/rt/shard/ring/keeper.rs`, `Source::op_done` in `src/io/source/ops.rs`, `FileOp::forsake` in
+`src/fs/ring.rs`, `Source::retire`). The shard cancels the operation and waits a bounded time; the
+kernel may end it in time, late, or never. One still out when the wait ends is given up on: it ends
+with an error and counts out, its memory kept for good; a zero-copy send that waits only for its
+notification ended for its side already, and only keeps its buffer. A task waits for its end, and
+another thread retires its source. 8 configurations: 3 that must pass (an operation that ignores
+the cancel, one the kernel ends in time or late, and a held send), with `NoScribble`, the kernel
+never writes the operation's memory after it was freed, `EndsOnce`, an operation ends once and its
+count never goes below zero, and `Ends`, the task and the retire both end; 3 mutations (an
+operation forgotten with no end, as before, breaks `Ends`; one whose end lets go of its memory
+breaks `NoScribble`; a held send that ends again breaks `EndsOnce`); and 2 witnesses (an operation that ended while the kernel still
+holds it; a slow one that completes after the shard gave up on it).
+
+`src/rt/shard/ring/tests_zc.rs` checks that a registration posted to a kept ring is let go of at
+once, `src/rt/park/ring.rs` that a wake after the poller went writes no freed memory, and
+`src/rt/shard/ring/tests.rs` that a read and a file's call given up on end with an error and let a
+retire return.
 
 ## A blocking job of a Windows handle
 

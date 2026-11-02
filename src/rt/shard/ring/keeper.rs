@@ -9,20 +9,32 @@
 //! is what needs it most: its notification frees it only once the peer acknowledged the bytes,
 //! which may be long after its shard went, and every `Released` still resolves. The keeper also
 //! applies what the shard's mailbox still gets (a source's holder on another thread leaves its
-//! detach or cancel there), so a closed socket's file leaves the ring's table and its sends end.
-//! Nothing takes the ring back: its shard is gone.
+//! detach or cancel there), so a closed socket's file leaves the ring's table and its sends end;
+//! what it cannot apply goes as `IoOp::gone` lets it (a registration asked of the shard is made
+//! where its task polls next). It takes the shard's part in the park handshake, so a post finds it
+//! parked and wakes it at once, not at the ring's next completion. Nothing takes the ring back:
+//! its shard is gone. The keeper waits with no bound of its own: a peer that never reads keeps a
+//! zero-copy send's notification, and so the keeper and the ring's memory, for good.
 //!
 //! On a single-issuer ring with deferred task work the kernel runs an operation's completion
 //! only when the ring's own thread enters it, and refuses any other thread's enter, so no keeper
 //! can take such a ring. It sends no zero-copy, and its shard waits a bounded time for what it
-//! cancelled ([`ShardRing::shut_down`]): an operation still out after that keeps its memory for
-//! good, and is counted. `proofs/tla/lent/LentZc.tla` checks the keeper's part.
+//! cancelled ([`ShardRing::shut_down`]): an operation still out after that is given up on. It
+//! ends for whoever waits on it with an error and no longer counts as out, so neither its task
+//! nor a retire of its source waits for good, while the memory the kernel may still write is kept
+//! for good, and counted. `proofs/tla/lent/LentZc.tla` checks the keeper's completions,
+//! `proofs/tla/keeper/Kept.tla` its mailbox and `proofs/tla/keeper/Forgot.tla` what is given up
+//! on.
 
-use std::sync::Arc;
+use std::io;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use kovan_queue::seg_queue::SegQueue;
+
 use super::super::{IoOp, Shared};
-use super::{ExitOp, FILE_TAG, FileOp, IGNORED, RecvGroup, RingOp, ShardRing, Sqe};
+use super::{FILE_TAG, FileOp, IGNORED, RecvGroup, RingMem, RingOp, ShardRing, Sqe};
+use crate::io::source::ops::{Done, Outcome};
 use crate::sync::oneshot;
 
 /// How long a shard that goes waits for its ring's cancelled operations, when it keeps them.
@@ -34,6 +46,51 @@ static LEAKED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize
 #[cfg(test)]
 pub(crate) fn leaked() -> usize {
     LEAKED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Memory the kernel may still write after its ring gave up on it: kept for the process's life,
+/// and reachable, so a leak check sees it kept rather than lost.
+struct KeptForGood(#[expect(dead_code, reason = "only kept, never read")] Box<dyn core::any::Any>);
+
+// SAFETY: nothing reads, moves out of or drops what it holds once it is kept: it only stays.
+unsafe impl Send for KeptForGood {}
+
+static KEPT: OnceLock<SegQueue<KeptForGood>> = OnceLock::new();
+
+fn keep_for_good(what: Box<dyn core::any::Any>) {
+    KEPT.get_or_init(SegQueue::new).push(KeptForGood(what));
+}
+
+/// What an operation given up on ends with.
+fn given_up() -> io::Error {
+    io::Error::other("the shard went before the kernel ended the operation")
+}
+
+/// An operation of a source given up on: its side gets [`given_up`] for its end, and the
+/// operation counts out, while its memory is kept for good. A zero-copy send that waits only for
+/// its notification ended for its side, and counted out, at its first completion: it only keeps
+/// its buffer.
+fn forsake(op: RingOp) {
+    let RingOp {
+        source,
+        epoch,
+        read,
+        mem,
+        ..
+    } = op;
+    let ended = matches!(mem, RingMem::ZcHeld(_));
+    keep_for_good(Box::new(mem));
+    if ended {
+        return;
+    }
+    source.op_done(
+        Done {
+            outcome: Outcome::Forsaken(given_up()),
+            epoch,
+            read,
+        },
+        None,
+    );
 }
 
 impl ShardRing {
@@ -57,7 +114,8 @@ impl ShardRing {
 
     /// The shard of a ring no keeper can take is going, its sources detached: every operation
     /// still out is cancelled and its completion waited for, for at most [`SHUTDOWN_WAIT`]. One
-    /// that never completes keeps its memory for good (the kernel may still write it), and is
+    /// that has not completed by then is given up on ([`forget_stuck`](Self::forget_stuck)): it
+    /// ends with an error, keeps its memory for good (the kernel may still write it), and is
     /// counted (`leaked`). Returns the memory of the receive group it let go, for the shard's
     /// ledger.
     pub(crate) fn shut_down(&self) -> usize {
@@ -88,33 +146,41 @@ impl ShardRing {
         }
     }
 
-    /// What is still out keeps its memory for good, the kernel may still write it, and is
-    /// counted. Returns the memory of the receive group let go: none while a receive is stuck.
-    fn forget_stuck(&self) -> usize {
+    /// What is still out is given up on, and counted: a source's operation ends for its side
+    /// with an error and counts out, a file's call fills its slot with one, and the memory the
+    /// kernel may still write is kept for good (a zero-copy write's buffer with it, so its
+    /// `Released` never resolves). A child's wait keeps its info and its pidfd for good. Returns
+    /// the memory of the receive group let go: none while a receive that draws from it is out.
+    pub(super) fn forget_stuck(&self) -> usize {
         let stuck: Vec<RingOp> = self.ops.borrow_mut().drain().collect();
-        let mut stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
-        stuck_files.iter_mut().for_each(FileOp::give_up);
-        let stuck_exits: Vec<ExitOp> = self.exit_ops.borrow_mut().drain().collect();
+        let stuck_files: Vec<FileOp> = self.file_ops.borrow_mut().drain().collect();
+        let stuck_exits: Vec<_> = self.exit_ops.borrow_mut().drain().collect();
         LEAKED.fetch_add(
             stuck.len() + stuck_files.len() + stuck_exits.len(),
             core::sync::atomic::Ordering::Relaxed,
         );
-        // A file's call still in the kernel keeps its buffer and its
-        // descriptor for good, a child's wait its info and its pidfd.
-        core::mem::forget(stuck_files);
-        core::mem::forget(stuck_exits);
+        let receiving = stuck.iter().any(|op| {
+            matches!(
+                op.mem,
+                RingMem::RecvMulti { .. } | RingMem::RecvFromMulti { .. }
+            )
+        });
+        stuck.into_iter().for_each(forsake);
+        for file in stuck_files {
+            keep_for_good(Box::new(file.forsake(given_up())));
+        }
+        if !stuck_exits.is_empty() {
+            keep_for_good(Box::new(stuck_exits));
+        }
         let group = self.recv.borrow_mut().take();
-        let freed = if stuck.is_empty() {
-            let freed = group.as_ref().map_or(0, RecvGroup::reservation);
-            drop(group);
-            freed
-        } else {
-            // A receive still in the kernel may write the group's buffers:
-            // they stay registered and mapped for good.
-            core::mem::forget(group);
-            0
-        };
-        core::mem::forget(stuck);
+        if receiving {
+            // A receive still in the kernel may write the group's buffers: they stay registered
+            // and mapped for good.
+            keep_for_good(Box::new(group));
+            return 0;
+        }
+        let freed = group.as_ref().map_or(0, RecvGroup::reservation);
+        drop(group);
         freed
     }
 }
@@ -167,13 +233,20 @@ pub(crate) fn hand_off(ring: ShardRing, shared: Arc<Shared>) {
 
 impl Kept {
     /// Applies the ring's completions, and what the shard's mailbox still gets, until no
-    /// operation is out; then lets go of the ring.
+    /// operation is out; then lets go of the ring. Before each wait it says it sleeps and looks at
+    /// the mailbox once more (`ParkState::begin_park`): a post then either is seen here, or finds
+    /// the flag up and notifies the ring's wake, which ends the wait.
     fn keep(self) {
         let Kept { ring, shared } = self;
         while ring.in_flight() > 0 {
             apply_mailbox(&ring, &shared);
-            if ring.wait(None, None).is_err() {
-                // A ring that cannot be waited on: what is still out keeps its memory for good.
+            if !shared.park.begin_park(|| shared.io_ops.holds_any()) {
+                continue;
+            }
+            let waited = ring.wait(None, None);
+            shared.park.end_park();
+            if waited.is_err() {
+                // A ring that cannot be waited on: what is still out is given up on.
                 ring.forget_stuck();
                 break;
             }
@@ -187,13 +260,14 @@ impl Kept {
 
 /// What the shard's mailbox got for its ring after the shard went: a source's holder on another
 /// thread leaves its detach or its cancel there. Nothing registers with a shard that went, nor
-/// runs on it, so the rest only goes.
+/// runs on it, so the rest goes as `IoOp::gone` lets it: a registration asked of the shard is
+/// made where its task polls next, a child's watch where its user polls next.
 fn apply_mailbox(ring: &ShardRing, shared: &Shared) {
     shared.io_ops.take_all(|op| match op {
         IoOp::RingDetach(slot, out, lease) => ring.detach(slot, out, lease),
         IoOp::RingCancel(user_data) => {
             ring.cancel(user_data);
         }
-        other => drop(other),
+        other => other.gone(),
     });
 }

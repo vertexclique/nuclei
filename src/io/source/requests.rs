@@ -526,24 +526,43 @@ impl Source {
     }
 
     /// Registers the source with the shard and token the attach carries;
-    /// both sides are held. A failure hands the slot back to the shard.
+    /// both sides are held. A failure hands the slot back to the shard, and
+    /// only then clears the shard it named.
+    ///
+    /// An attach to a ring names its shard and token before it takes the
+    /// ask, and its end clears them only after what it posts to that shard:
+    /// so a shard that waits for its sources (`wait_for_evictions`), looking
+    /// at the ask first and then at the registration, sees one of the two
+    /// until its mailbox holds what the attach left there
+    /// (`proofs/tla/going/Pending.tla`).
     fn attach_now(self: &Arc<Self>) -> io::Result<()> {
-        let ask = self
-            .ask
-            .attach
-            .swap(core::ptr::null_mut(), Ordering::Acquire);
+        let ask = self.ask.attach.load(Ordering::Acquire);
         if ask.is_null() {
             return Ok(());
         }
-        // SAFETY: made by `Arc::into_raw` and taken from the field once.
-        let shard = unsafe { Arc::from_raw(ask) };
-        // Stored before the shard, which the swap above acquired.
+        // Stored before the shard, which the load above acquired.
         let token = self.ask.attach_token.load(Ordering::Relaxed);
+        // SAFETY: the ask holds a count of its shard until the store below takes it.
+        #[cfg(ring)]
+        let ring = unsafe { (*ask).is_ring() };
+        #[cfg(ring)]
+        if ring {
+            self.reg.token.store(token, Ordering::Release);
+            self.reg.home.store(ask as usize, Ordering::Release);
+        }
+        // Release: a shard that finds the ask taken finds the name above. No other attach is
+        // asked meanwhile: one is asked only by the registration that moved the state to
+        // registering, which stays so until a holder of both sides, this one, moves it on.
+        self.ask
+            .attach
+            .store(core::ptr::null_mut(), Ordering::Release);
+        // SAFETY: made by `Arc::into_raw` and taken from the field once, above.
+        let shard = unsafe { Arc::from_raw(ask) };
         let result = match self.fd.load(Ordering::Acquire) {
             NO_FD => Err(io::Error::new(io::ErrorKind::NotConnected, NoDescriptor)),
             _ if shard.is_stopped() => Err(stopped_shard()),
             #[cfg(ring)]
-            fd if shard.is_ring() => return self.attach_ring(shard, token, fd),
+            fd if ring => return self.attach_ring(shard, token, fd),
             #[cfg(port)]
             fd => return self.attach_port(shard, token, fd),
             #[cfg(readiness)]
@@ -567,9 +586,16 @@ impl Source {
             Err(_) => {
                 self.reg.state.store(UNREGISTERED, Ordering::Release);
                 shard.release_source(token);
+                self.reg.home.store(0, Ordering::Release);
             }
         }
         result
+    }
+
+    /// Whether an attach to the shard at `home` is asked and not taken yet:
+    /// a shard that leaves waits for it, looking before `registered_with`.
+    pub(crate) fn attach_asked_of(&self, home: usize) -> bool {
+        self.ask.attach.load(Ordering::Acquire) as usize == home
     }
 
     /// The registration goes, and every task waiting on the source is

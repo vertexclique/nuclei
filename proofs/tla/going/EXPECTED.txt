@@ -36,3 +36,11 @@ L_background      Linger  pass
 L_bound           Linger  pass
 LM_bound_drops    Linger  violated:AllSent
 LW_bound          Linger  violated:NoBoundOut
+P_ring            Pending pass
+P_ring_fails      Pending pass
+P_poller          Pending pass
+P_poller_fails    Pending pass
+PM_no_attach_wait Pending violated:NoLeaseLeft
+PM_take_first     Pending violated:NoLeaseLeft
+PM_gen_reset      Pending violated:NoForeignRelease
+PW_late_release   Pending violated:NoLateRelease

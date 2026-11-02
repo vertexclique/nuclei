@@ -500,6 +500,94 @@ fn a_shard_that_goes_leaves_its_notifications_to_a_keeper() {
     assert!(read.join().unwrap() == data);
 }
 
+/// A registration another thread posts to a shard that went, while its ring's keeper waits for a
+/// notification the peer holds back: the keeper wakes for it and lets it go at once, so the
+/// source's tasks register it where they poll next. Before, the keeper slept through the post
+/// until the ring's next completion and then dropped it, the source claimed for good
+/// (`proofs/tla/keeper/Kept.tla`).
+#[test]
+fn a_registration_posted_to_a_kept_ring_is_let_go_of_at_once() {
+    let Some(shard) = ring_shard() else { return };
+    if !zc_available(&shard) {
+        return;
+    }
+    let (_mine, src, peer) = held_back_source();
+    let data = pattern(SEND_ZC_MIN);
+    let mut released = {
+        let _current = context::enter(&shard);
+        let (result, released) = shard.block_on(src.write_zero_copy(data.clone()));
+        assert_eq!(result.unwrap(), data.len());
+        released
+    };
+    let shared = Arc::clone(&shard.shared);
+    drop(shard);
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pause = Duration::from_micros(50);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}: {}", shared.state_line());
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(5));
+        }
+    };
+    until("the keeper never waits where a post wakes it", &|| {
+        shared.is_parked()
+    });
+    let (late, _late_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let posted = Source::new(late.as_raw_fd(), Kind::Bytes);
+    assert!(posted.claim_registration());
+    shared.post_io(super::super::IoOp::Register(Arc::clone(&posted)));
+    until("the keeper never let go of the registration", &|| {
+        !posted.is_registering()
+    });
+    assert!(
+        poll_once(&mut released).is_pending(),
+        "the notification came, not the post's wake"
+    );
+    let read = reader(peer, data.len());
+    assert!(wait_released(released) == data);
+    assert!(read.join().unwrap() == data);
+}
+
+/// A zero-copy send that waits only for its notification, given up on as its shard goes (no
+/// keeper could be had for its ring): it ended for its side at its first completion and counted
+/// out then, so it ends nothing again and a retire of its source returns, while its buffer stays
+/// with the kernel for good (`proofs/tla/keeper/Forgot.tla`, `F_held`).
+#[test]
+fn a_held_zero_copy_send_given_up_on_ends_nothing_twice() {
+    let Some(shard) = ring_shard() else { return };
+    if !zc_available(&shard) {
+        return;
+    }
+    let (_mine, src, _peer) = held_back_source();
+    let data = pattern(SEND_ZC_MIN);
+    let released = {
+        let _current = context::enter(&shard);
+        let (result, released) = shard.block_on(src.write_zero_copy(data.clone()));
+        assert_eq!(result.unwrap(), data.len());
+        let ring = shard.ring().expect("a ring shard");
+        assert!(ring.in_flight() > 0, "no send waits for its notification");
+        ring.forget_stuck();
+        released
+    };
+    drop(shard);
+    drop(released);
+    let (done, retired) = std::sync::mpsc::channel();
+    let retiring = {
+        let src = Arc::clone(&src);
+        std::thread::spawn(move || {
+            src.retire();
+            let _ = done.send(());
+        })
+    };
+    assert!(
+        retired.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the retire waits: the held send counted out twice: {}",
+        src.write_report()
+    );
+    retiring.join().unwrap();
+}
+
 /// A ring only its own thread may reap copies a zero-copy write: no keeper could take its
 /// notifications, so the buffer is back at once.
 #[test]

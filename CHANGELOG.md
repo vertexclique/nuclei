@@ -4,6 +4,44 @@
 
 ### Fixed
 
+- **A shard's ring kept past its shard wakes for what is posted to it, and lets go of every post**
+  (io_uring). A worker that goes with a zero-copy notification still out hands its ring to a
+  keeper, which waited for the ring's next completion without saying it sleeps, so a post from
+  another thread woke nothing: a holder's detach, whose cancel is what ends the operation out,
+  could wait for good, keeping a pool thread, the socket and the ring's memory. The keeper now
+  takes part in the park handshake, so a post finds it parked and its wake ends the wait. What it
+  could not apply it dropped: a source's registration posted by a thread that runs no shard
+  stayed claimed, so no later wait registered it and its task waited for good, and a child's exit
+  watch was never made. It now goes as for a shard that went: the registration is made where the
+  task polls next, the watch where its user polls next. The keeper waits with no bound of its own
+  for a peer that never reads; that is the kernel's to end (`proofs/tla/keeper/Kept.tla`, and
+  `WZ_keeper_forever` in `LentZc.tla`).
+- **A ring's wake never writes memory its shard freed** (io_uring). The read of the eventfd that
+  wakes a ring stayed armed as its shard went, and landed in a buffer the shard freed; the kernel
+  keeps the ring past its shard while a receive group's copy of the ring's descriptor holds it, so
+  a waker that saw the shard parked just before, or a thread that kept its notifier, could have
+  the kernel write 8 bytes into freed memory. The read now lands in memory that lives as long as
+  the process (`proofs/tla/keeper/Kept.tla`).
+- **An operation a going shard gives up on ends, with an error** (io_uring). A thread's own shard,
+  on a ring only that thread can reap, waits a bounded time for what it cancelled as it goes. An
+  operation still out then was forgotten with no end: its task waited for good, a later `get_mut`
+  or `into_inner` of its handle waited for good for it to count out, and a file call's task never
+  heard of it. It now ends with an error ("the shard went before the kernel ended the operation")
+  and counts out, while the memory the kernel may still write is kept for good, as before (a
+  zero-copy send that waits only for its notification ended at its first completion, and only
+  keeps its buffer); the receive group is kept only when a receive that draws from it is out
+  (`proofs/tla/keeper/Forgot.tla`).
+- **A thread's own shard that leaves waits for an attach another thread still has to perform**
+  (io_uring; every backend for the stale token). A source registered in a thread's `block_on`
+  while another thread held one of its sides has its attach left to that holder. Once the
+  `block_on` returned, its shard left at once; the holder then posted the file's install, with a
+  lease that kept the handle's descriptor open until the thread's next `block_on`, and the slot's
+  release, which that `block_on` applied after its first registration took the slot under the
+  same token: that source was then in no table, never evicted, and its IO stalled once the shard
+  left again. The shard now waits for an attach still asked of it as for an eviction, and applies
+  what it posts before it leaves; and a drain of the shard's table starts its generations past
+  every token it handed out, so a release that comes late names nothing
+  (`proofs/tla/going/Pending.tla`).
 - **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
   `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
   for a connection its peer reset in the backlog before or while the accept took it. That error is

@@ -1238,6 +1238,11 @@ impl Source {
     }
 }
 
+/// Looks of a shard that leaves which found an attach still asked of it, for a test.
+#[cfg(test)]
+pub(crate) static ATTACH_WAITS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 impl Source {
     /// Whether the read side and the write side went to shared mode.
@@ -1251,6 +1256,33 @@ impl Source {
             self.reg.home.load(Ordering::SeqCst),
             self.reg.token.load(Ordering::SeqCst),
         )
+    }
+
+    /// Claims the registration, as `register` does before it posts it: for a test that posts it
+    /// by hand.
+    #[cfg(ring)]
+    pub(crate) fn claim_registration(&self) -> bool {
+        self.reg
+            .state
+            .compare_exchange(
+                UNREGISTERED,
+                REGISTERING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Whether the registration is claimed and not made yet.
+    #[cfg(ring)]
+    pub(crate) fn is_registering(&self) -> bool {
+        self.reg.state.load(Ordering::SeqCst) == REGISTERING
+    }
+
+    /// Whether a lease on the handle's object is out (a ring's mailbox may hold it).
+    #[cfg(ring)]
+    pub(crate) fn is_leased(&self) -> bool {
+        self.ask.keep.leased()
     }
 
     /// The read side as a line, for a test that failed: its guard's words,

@@ -240,6 +240,10 @@ pub(crate) enum Outcome {
         to: usize,
         answer: Answer<usize>,
     },
+    /// The operation's shard went before the kernel ended it, and gave up on it: it ends with
+    /// this error, and its memory stays with the kernel for good.
+    #[cfg(ring)]
+    Forsaken(io::Error),
 }
 
 impl Outcome {

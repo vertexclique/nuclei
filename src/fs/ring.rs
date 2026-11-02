@@ -398,10 +398,31 @@ impl FileOp {
         }
     }
 
-    /// The operation is kept for good, its completion never to come: a
-    /// runtime's drop does not wait for it.
-    pub(crate) fn give_up(&mut self) {
-        self.write = None;
+    /// The operation is given up on, its completion never to come: its slot gets `err`, so its
+    /// task does not wait for good, and a runtime's drop does not wait for a write's count.
+    /// Returns what the kernel may still read or write, for the caller to keep for good. The
+    /// lease goes: the kernel holds the file itself while the call is out.
+    pub(crate) fn forsake(self, err: io::Error) -> FileMem {
+        let FileOp {
+            mem, slot, write, ..
+        } = self;
+        let outcome = match &mem {
+            FileMem::Read { .. } => FileOutcome::Read(Err(err)),
+            FileMem::ReadLent(_) => FileOutcome::ReadLent(Err(err), OwnedBuf::Vec(Vec::new())),
+            FileMem::WriteLent { .. } => {
+                FileOutcome::WriteLent(Err(err), OwnedBuf::Vec(Vec::new()))
+            }
+            FileMem::Call(Call::Sync { .. } | Call::SyncRange { .. }) => {
+                FileOutcome::Sync(Err(err))
+            }
+            FileMem::Write { .. } | FileMem::Call(Call::Allocate { .. }) | FileMem::Shutdown(_) => {
+                FileOutcome::Write(Err(err))
+            }
+        };
+        slot.put(outcome);
+        // Once the slot is full: as `complete` lets go of it.
+        drop(write);
+        mem
     }
 
     /// Makes what is left of the call on the blocking pool of the runtime

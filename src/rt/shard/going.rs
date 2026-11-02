@@ -136,13 +136,26 @@ async fn drain(source: Arc<Source>) {
 }
 
 /// Waits until no source of `gone` is registered under its token with the
-/// shard at `home`. A source evicted from here may register with another
-/// shard at once, under a token of the same number: that registration is
-/// not waited for, or this shard would wait for as long as it lasts, with
-/// the eviction's cancel of the source's operations still in its mailbox.
+/// shard at `home`, nor has an attach to it still asked (a holder performs
+/// it as it lets go, and posts here what it leaves: a ring's install of the
+/// file with the lease that keeps the handle's object open, a release of the
+/// slot). The ask is looked at first: a ring's attach names its shard and
+/// token before it takes the ask (`proofs/tla/going/Pending.tla`). A source
+/// evicted from here may register with another shard at once, under a token
+/// of the same number: that registration is not waited for, or this shard
+/// would wait for as long as it lasts, with the eviction's cancel of the
+/// source's operations still in its mailbox.
 fn wait_for_evictions(gone: &[(u64, Arc<Source>)], home: usize) {
     for (token, source) in gone {
-        while source.registered_with(home, *token) {
+        loop {
+            let asked = source.attach_asked_of(home);
+            if !asked && !source.registered_with(home, *token) {
+                break;
+            }
+            #[cfg(test)]
+            if asked {
+                crate::io::source::ATTACH_WAITS.fetch_add(1, Ordering::SeqCst);
+            }
             std::thread::yield_now();
         }
     }
