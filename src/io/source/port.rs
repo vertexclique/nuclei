@@ -109,6 +109,14 @@ pub(crate) struct PortState {
     /// the jobs making its calls hold. Set as the source registers, with
     /// both sides held; read with one.
     sync: UnsafeCell<Option<Arc<OwnedHandle>>>,
+    /// The port the handle's completions go to, where its operations are issued: its shard's,
+    /// or, while it waits to move (`moving`), the port it could not move off. Written with both
+    /// sides held; read with one.
+    bound: UnsafeCell<Option<Arc<Port>>>,
+    /// The source is registered with a shard whose port its handle could not move to, with an
+    /// operation out that is never cancelled (a TCP send): its operations go to `bound`, whose
+    /// keeper drains it, until none is out and the move is made again (`attach_port`).
+    moving: core::sync::atomic::AtomicBool,
 }
 
 /// A side's operation slot.
@@ -345,7 +353,9 @@ impl<'a> PortIo<'a> {
         match self {
             PortIo::Here { source } => source.home_held().map(|home| PortIssuer {
                 source,
-                port: Arc::clone(home.port()),
+                // SAFETY: a side is held, so no writer (which holds both) is at work.
+                port: unsafe { (*source.port.bound.get()).clone() }
+                    .unwrap_or_else(|| Arc::clone(home.port())),
             }),
             PortIo::NotYet => None,
         }
@@ -1293,9 +1303,16 @@ impl Source {
     /// Registers the source with port shard `shard` under `token`, with
     /// both sides held: its socket's completions go to the shard's port
     /// from now on (moved from a port it had, whose shard went). A handle
-    /// with operations still out cannot move: the registration then waits
-    /// for them to end, and is made again by the tasks they wake (see
-    /// [`waits_for_ops`](Self::waits_for_ops)).
+    /// with operations still out cannot move. If it has a port it is bound
+    /// to, the source is registered with `shard` all the same and its
+    /// operations go on to that port, whose keeper drains it while the
+    /// source waits to move (`moving`): a TCP send there, never cancelled,
+    /// may wait for its peer, and the peer for a read of this source. Once
+    /// none of its operations is out, or its send ended, the source is
+    /// evicted and registered again, and the move is made
+    /// (proofs/tla/port/PortKeep.tla, `Duplex`). With no port yet, the
+    /// registration waits for the operations to end, and is made again by
+    /// the tasks they wake (see [`waits_for_ops`](Self::waits_for_ops)).
     pub(super) fn attach_port(
         &self,
         shard: Arc<crate::rt::shard::Shared>,
@@ -1316,12 +1333,27 @@ impl Source {
                 .map(|()| None),
             _ => shard.port().bind(fd as usize as HANDLE).map(|()| None),
         };
-        let bound = match bind() {
-            Err(_) if self.waits_for_ops() => {
-                self.reg.state.store(super::UNREGISTERED, Ordering::Release);
-                shard.release_source(token);
-                return Ok(());
-            }
+        // SAFETY: both sides are held.
+        let old = unsafe { (*self.port.bound.get()).clone() };
+        // Bound to this shard's port already (its thread's `block_on` again): nothing moves, and
+        // a bind would fail with a send of the handle's still out.
+        let here = old
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, shard.port()));
+        let bound = match if here { Ok(None) } else { bind() } {
+            Err(_) if self.waits_for_ops() => match old {
+                Some(old) if !Arc::ptr_eq(&old, shard.port()) => {
+                    if !self.port.moving.swap(true, Ordering::AcqRel) {
+                        old.wait_for_move();
+                    }
+                    Ok(None)
+                }
+                _ => {
+                    self.reg.state.store(super::UNREGISTERED, Ordering::Release);
+                    shard.release_source(token);
+                    return Ok(());
+                }
+            },
             // None is out (any more): once more, and that answer stands.
             Err(_) => bind(),
             bound => bound,
@@ -1336,7 +1368,18 @@ impl Source {
             }
         };
         // SAFETY: both sides are held.
-        unsafe { *self.port.sync.get() = sync };
+        unsafe {
+            if !self.port.moving.load(Ordering::Acquire) {
+                // The handle's completions go to this shard's port now (a byte stream's calls
+                // made on the pool, to whichever port its packets are posted).
+                let old = (*self.port.bound.get()).replace(Arc::clone(shard.port()));
+                if sync.is_some() {
+                    *self.port.bound.get() = None;
+                }
+                drop(old);
+            }
+            *self.port.sync.get() = sync;
+        }
         self.reg.ops.store(true, Ordering::Release);
         self.reg
             .home
@@ -1348,11 +1391,25 @@ impl Source {
         Ok(())
     }
 
+    /// Whether the source waits to move off the port its handle is bound to (see
+    /// [`attach_port`](Self::attach_port)).
+    pub(super) fn moving(&self) -> bool {
+        self.port.moving.load(Ordering::Acquire)
+    }
+
     /// The source's registration with a port goes: every operation it has
     /// out that may be cancelled is (its packet still comes, wherever the
     /// socket's completions go then); a TCP send goes on (see
     /// [`may_cancel`](Self::may_cancel)). Both sides are held.
     pub(super) fn detach_port(&self) {
+        // A source that waited to move goes: the port it waited on waits for it no more (its
+        // handle stays bound there until a registration moves it).
+        if self.port.moving.swap(false, Ordering::AcqRel)
+            // SAFETY: both sides are held.
+            && let Some(old) = unsafe { (*self.port.bound.get()).as_ref() }
+        {
+            old.moved();
+        }
         // SAFETY: both sides are held; the jobs keep their own copies.
         if unsafe { (*self.port.sync.get()).take() }.is_some() {
             for slot in &self.port.slots {

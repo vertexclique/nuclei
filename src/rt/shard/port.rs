@@ -4,7 +4,9 @@
 //! `block_on` returns, or when the shard goes, may stay out for long: a TCP
 //! send is never cancelled (see `io::source::port`), and ends only once its
 //! peer reads. Their packets are a keeper's to deliver: a job of the
-//! blocking pool that drains the port until none is out. The shard takes
+//! blocking pool that drains the port until none is out and no source waits
+//! to move off it (one whose handle could not move with a send out stays on
+//! this port, see `io::source::port`). The shard takes
 //! the port back when it runs again; a keeper that has not started then
 //! never touches the port, and one that keeps is stopped and waited for, so
 //! one thread at most drains the port at any time. `proofs/tla/port/`
@@ -46,7 +48,7 @@ impl Shard {
                 .poll_io(usize::MAX, Some(Duration::ZERO))
                 .is_ok_and(|events| events > 0)
         {}
-        if port.out() == 0 {
+        if !port.kept() {
             return true;
         }
         let keeper = Arc::new(Keeper {
