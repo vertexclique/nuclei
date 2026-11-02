@@ -1,8 +1,9 @@
 //! User code that panics where nobody polls it: a task's future as it is
-//! dropped, a task hook. The panic goes to the task's handle where one
-//! awaits it and is logged at error where none does; the runtime and every
-//! other task go on.
+//! dropped, a task hook, a `shard_local!` value as its worker stops. The
+//! panic goes to the task's handle where one awaits it and is logged at error
+//! where none does; the worker, the runtime and every other task go on.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -186,4 +187,71 @@ fn a_spawn_hook_that_panics_unwinds_out_of_the_spawn_and_the_task_never_runs() {
     assert_eq!(dropped.load(Ordering::SeqCst), 1, "the future was dropped");
     rt.block_on(async { assert_eq!(h.spawn(async { 8 }).await, 8, "the runtime runs on") });
     assert!(!ran.load(Ordering::SeqCst), "the task never ran");
+}
+
+static SURVIVED: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts its drop.
+struct Survivor;
+
+impl Drop for Survivor {
+    fn drop(&mut self) {
+        SURVIVED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+nuclei::shard_local! { static BRITTLE: Bomb = Bomb("shard-local value dropped") }
+nuclei::shard_local! { static STURDY: Survivor = Survivor }
+
+#[test]
+fn a_shard_local_value_that_panics_as_its_worker_stops_is_logged_and_the_worker_goes_on() {
+    capture();
+    let unwound = Arc::new(AtomicUsize::new(0));
+    let u = Arc::clone(&unwound);
+    let rt = runtime(move |b| {
+        b.on_thread_stop(move || {
+            if std::thread::panicking() {
+                u.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    });
+    let h = rt.handle();
+    rt.block_on(async {
+        // A receive out as the worker stops: the shard's driver holds it,
+        // and lets go of it only as the shard goes.
+        let socket = h
+            .spawn(async { nuclei::net::UdpSocket::bind("127.0.0.1:0").await })
+            .await
+            .expect("bound");
+        let (out_tx, out_rx) = nuclei::sync::oneshot::channel::<()>();
+        h.spawn(async move {
+            BRITTLE.with(|_| ());
+            STURDY.with(|_| ());
+            let mut buf = [0u8; 64];
+            let mut receive = std::pin::pin!(socket.recv(&mut buf));
+            core::future::poll_fn(|cx| {
+                let _ = receive.as_mut().poll(cx);
+                core::task::Poll::Ready(())
+            })
+            .await;
+            let _ = out_tx.send(());
+            let _ = receive.await;
+        })
+        .detach();
+        out_rx.await.expect("the receive is out");
+    });
+    drop(h);
+    drop(rt);
+    assert_eq!(
+        unwound.load(Ordering::SeqCst),
+        0,
+        "the panic unwound out of the worker"
+    );
+    assert_eq!(
+        SURVIVED.load(Ordering::SeqCst),
+        1,
+        "the other value was dropped too"
+    );
+    let line = logged("shard-local value dropped");
+    assert!(line.contains("shard-local"), "{line}");
 }

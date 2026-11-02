@@ -1,7 +1,8 @@
 //! A shard that stops running: for now (the outermost `block_on` of its
 //! thread returned) or for good (dropped). What it watches goes, each to be
 //! watched where its user polls next: the sources, each told; the
-//! children, each once its registration ended. A port hands the operations
+//! children, each once its registration ended. Its `shard_local!` values go
+//! once its operations are settled, each in a catch of its own. A port hands the operations
 //! still out to a keeper; so does a ring another thread can reap, as its
 //! shard is dropped (`ring::keeper`), and any other ring waits for them a
 //! bounded time. A source whose writes left bytes behind that the kernel has
@@ -91,6 +92,19 @@ impl Shard {
         #[cfg(port)]
         if !self.hand_off_port() {
             self.settle_port();
+        }
+    }
+}
+
+/// Drops each shard-local value in a catch of its own: one that panics is
+/// logged, and the rest of the values, and of the shard's going, go on.
+fn drop_locals(values: Vec<Box<dyn core::any::Any + Send>>) {
+    for value in values {
+        if let Some(panic) = crate::rt::caught::catch(|| drop(value)) {
+            crate::rt::caught::lost(
+                format_args!("a shard-local value panicked as its worker stopped"),
+                panic,
+            );
         }
     }
 }
@@ -217,10 +231,6 @@ impl Shard {
         // The waker a worker's loop leaves when its look after registering
         // finds it may exit: it holds the shard's `Shared`, which holds it.
         drop(self.shared.stop_waker.take());
-        // The shard-local values go while the shard can still take what they
-        // hand on: a task one wakes is dropped below, a handle's sources
-        // are let go of as any other's.
-        drop(self.locals.take());
         // The sources registered here lose their driver: each is told, and
         // registers where it is polled next.
         let gone: Vec<(u64, Arc<Source>)> = self.sources.get_mut().drain_tokens().collect();
@@ -248,6 +258,12 @@ impl Shard {
         if !self.port_kept() && !self.hand_off_port() {
             self.settle_port();
         }
+        // The shard-local values go once the operations are settled, so their
+        // drops, which are user code, run while nothing the kernel may still
+        // write into hangs on the rest of this going; and before the tasks, so a
+        // task one wakes is dropped below. A handle's sources were let go of as
+        // any other's (`tla/going/Locals.tla`).
+        drop_locals(self.locals.take());
         // No timer fires here again: the arm requests never applied orphan
         // their timers now, and those in the wheel as the loop below lets go
         // of them (`sleep::Armed`), so each sleep arms again where it is

@@ -15,6 +15,13 @@
   (the poll's own panic, if it had one, stays the outcome). A panic nobody can take is logged at
   error. A spawn hook's panic unwinds out of the spawn, and the task is cancelled before it runs
   (`proofs/tla/task/Task.tla`, `Panics` and `Shutdown`).
+- **A `shard_local!` value that panics as its worker stops no longer cuts the worker's going
+  short.** The values were dropped before the shard settled its ring, outside any catch: a panic
+  skipped the rest of the going, and the ring was dropped with its file operations still in the
+  kernel, which could then write into their freed buffers. The values now go once the ring is
+  settled (or its operations cancelled for its keeper), each in a catch of its own: a panic is
+  logged at error, the other values are still dropped, and the worker goes to its end
+  (`proofs/tla/going/Locals.tla`).
 - **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
   `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
   for a connection its peer reset in the backlog before or while the accept took it. That error is

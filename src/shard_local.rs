@@ -49,7 +49,9 @@ macro_rules! shard_local {
 ///
 /// Each worker of each runtime has its own value, made by the declaration's
 /// expression the first time code running on that worker uses it, and
-/// dropped with the worker's shard. Only code running on a worker (its
+/// dropped with the worker's shard, once the shard's IO is settled. A value
+/// that panics as it is dropped is logged at error, and the shard's other
+/// values and the rest of its going go on. Only code running on a worker (its
 /// tasks, and `block_on` called from them) reaches a value: a thread's own
 /// shard in `block_on`, the blocking pool and any other thread have none.
 ///
