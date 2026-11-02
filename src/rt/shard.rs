@@ -807,6 +807,27 @@ impl Shard {
         }
     }
 
+    /// [`push_local_from`](Self::push_local_from) when it puts `runnable` in an empty LIFO slot and
+    /// moves nothing else; `Err` gives `runnable` back for any other push.
+    #[inline(always)]
+    pub(crate) fn push_lifo_alone(
+        &self,
+        runnable: Runnable,
+        info: ScheduleInfo,
+        in_task: bool,
+    ) -> Result<(), Runnable> {
+        if self.tuning.lifo && !info.woken_while_running && in_task {
+            match self.lifo.take() {
+                None => {
+                    self.lifo.set(Some(runnable));
+                    return Ok(());
+                }
+                held => self.lifo.set(held),
+            }
+        }
+        Err(runnable)
+    }
+
     /// The next runnable, in the loop's order.
     #[inline(always)]
     fn next(&self) -> Option<Runnable> {

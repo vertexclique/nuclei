@@ -26,7 +26,7 @@ use super::handoff::home::Home;
 use super::handoff::slot::{Back, Slot};
 use super::runtime::Inner;
 use super::shard::{Limits, Shard, Shared};
-use super::task::Runnable;
+use super::task::{Runnable, ScheduleInfo};
 
 /// The nesting a thread's own shard allows unless its runtime says
 /// otherwise.
@@ -326,6 +326,38 @@ pub(crate) fn mark_call() -> Marked {
             Marked::Taken
         }
     }
+}
+
+/// Pushes `runnable` into the empty LIFO slot of the shard this thread runs, when `ours` says
+/// the task is that shard's, from a task's code on a shard the monitor watches (`out` is set),
+/// as a leaf: the call marked with no contest of a claim (`Slot::mark_unless_claimed`), and
+/// nothing of a bracket's but its mark. `Err` gives `runnable` back, the poll's word put back,
+/// when a claim is up or the push is another (the slot holds a task, the task is another
+/// shard's, it woke itself), for the full bracket (proofs/tla/handoff, the leaf push).
+#[inline(always)]
+pub(crate) fn push_lifo_marked<O>(
+    runnable: Runnable,
+    info: ScheduleInfo,
+    ours: O,
+) -> Result<(), Runnable>
+where
+    O: FnOnce(&Shard) -> bool,
+{
+    let here = local();
+    debug_assert!(core::ptr::eq(here.out.get(), here.slot.get()));
+    // SAFETY: as in `Bracket::take`.
+    let slot = unsafe { &*here.out.get() };
+    let Some(word) = slot.mark_unless_claimed() else {
+        return Err(runnable);
+    };
+    let pushed = match running(here) {
+        Some(current) if ours(current) => {
+            current.push_lifo_alone(runnable, info, here.in_task.get())
+        }
+        _ => Err(runnable),
+    };
+    slot.unmark(word);
+    pushed
 }
 
 /// [`Here::detach`] of this thread, out of line: a caller that reaches it only rarely keeps no

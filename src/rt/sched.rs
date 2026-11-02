@@ -160,10 +160,22 @@ pub(crate) fn queue_here(
     }
 }
 
-/// [`queue_here`] from a task's code on a shard the monitor watches.
+/// [`queue_here`] from a task's code on a shard the monitor watches: the leaf push into an empty
+/// LIFO slot (`context::push_lifo_marked`), else the full bracket. Its one call is the full
+/// bracket's, in tail position, so the push saves only the registers that call's arguments keep.
 #[cold]
 #[inline(never)]
 fn queue_here_bracketed(shard: usize, runnable: Runnable, info: ScheduleInfo) -> Option<Runnable> {
+    match context::push_lifo_marked(runnable, info, |current| current.shared_addr() == shard) {
+        Ok(()) => None,
+        Err(runnable) => queue_here_held(shard, runnable, info),
+    }
+}
+
+/// [`queue_here_bracketed`] for any push but the leaf's, in a full bracket.
+#[cold]
+#[inline(never)]
+fn queue_here_held(shard: usize, runnable: Runnable, info: ScheduleInfo) -> Option<Runnable> {
     let held = context::bracketed();
     queue_on(held.shard(), shard, runnable, info)
 }

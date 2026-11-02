@@ -4,7 +4,9 @@
 (* src/rt/context.rs: `poll_watched`, `run_task_watched`, the bracket of   *)
 (* `bracketed`, which `current`, `current_held` and the wake and spawn a   *)
 (* task's code makes on a watched shard go through, `queue_here_bracketed` *)
-(* in src/rt/sched.rs; and the same mark kept by an IO owner's step,       *)
+(* in src/rt/sched.rs, which first tries the leaf push of                  *)
+(* `context::push_lifo_marked` (`Slot::mark_unless_claimed`), backing out  *)
+(* to the full bracket; and the same mark kept by an IO owner's step,      *)
 (* `mark_call` as `After::enter` makes it, ended by `unmark_call` as the   *)
 (* step is settled, `After::settle_light_owned` and `Source::settle_rest`  *)
 (* in src/io/) on a machine whose stores wait in a store buffer, as x86's  *)
@@ -22,17 +24,23 @@
 (* with a compare-and-swap (pending to none) and goes in, a claim taken it *)
 (* leaves the shard. A call reads the word it left first (its own last     *)
 (* store) and writes it back as it ends, so the poll is outside again and  *)
-(* can still be taken if it blocks after the call. The monitor,            *)
-(* seeing a runner in one poll too long, writes "pending", runs the heavy  *)
-(* fence (membarrier: every thread's buffered stores reach memory), then   *)
-(* reads the runner's word again: still the same "task", and the runner is *)
-(* outside the shard and will see the claim before it goes back in, so the *)
-(* monitor takes the shard with a compare-and-swap (pending to taken),     *)
-(* unless the runner cancelled first, and hands it to a spare thread with  *)
-(* a fresh slot; anything else, and it cancels. Neither side waits for the *)
-(* other: one of the two swaps wins. A runner that sees "taken" never      *)
-(* touches the shard again (it is detached), drains the bound tasks it     *)
-(* created, then waits as a spare itself.                                  *)
+(* can still be taken if it blocks after the call. One call, the push of a *)
+(* task into the shard's empty LIFO slot, first tries a leaf push that     *)
+(* never contests: it marks the call and reads its claim as a bracket      *)
+(* does; with the claim none it goes in, pushes or finds it cannot (the    *)
+(* slot is taken, the shard another), and leaves; then, or at once when a  *)
+(* claim is up, it writes its word back. When it did not push, the call    *)
+(* takes the full bracket. The monitor, seeing a runner in one poll too    *)
+(* long, writes "pending", runs the heavy fence (membarrier: every         *)
+(* thread's buffered stores reach memory), then reads the runner's word    *)
+(* again: still the same "task", and the runner is outside the shard and   *)
+(* will see the claim before it goes back in, so the monitor takes the     *)
+(* shard with a compare-and-swap (pending to taken), unless the runner     *)
+(* cancelled first, and hands it to a spare thread with a fresh slot;      *)
+(* anything else, and it cancels. Neither side waits for the other: one of *)
+(* the two swaps wins. A runner that sees "taken" never touches the shard  *)
+(* again (it is detached), drains the bound tasks it created, then waits   *)
+(* as a spare itself.                                                      *)
 (*                                                                          *)
 (* What is modelled step by step: each thread's store buffer (in order),   *)
 (* the flush of a buffer's oldest store at any time, the heavy fence as    *)
@@ -101,7 +109,8 @@ variables
     handoffs = 0,
     cancels = 0,
     detachedCalls = 0,
-    runnerCancels = 0;                   \* (record) a runner cancelled a pending claim
+    runnerCancels = 0,                   \* (record) a runner cancelled a pending claim
+    leafBacks = 0;                       \* (record) a leaf push backed out on a claim
 
 define
     \* At most one actor is inside the shard's owned part.
@@ -118,6 +127,9 @@ define
     NoCancel == cancels = 0
     NoDetachedCall == detachedCalls = 0
     NoRunnerCancel == runnerCancels = 0
+    NoLeafBack == leafBacks = 0
+    \* The leaf push is part of the algorithm under these modes: the leaf and its mutations.
+    Leaf == Mode \in {"leaf", "leaf_no_check", "leaf_keeps_mark"}
 end define;
 
 \* The memory: a buffer's oldest store reaches memory, at any time.
@@ -197,6 +209,11 @@ R_task:
         br := br + 1;
         goto B_store;
     or
+        \* The call is the push of a task into the shard's LIFO slot: the leaf first.
+        await Leaf /\ br < MaxBrackets;
+        br := br + 1;
+        goto L_store;
+    or
         goto E_store;
     or
         await BlockForever /\ self = 1 /\ sl = 1 /\ e = 1;
@@ -266,6 +283,47 @@ E_cas:
         inS := inS \cup {self};
         goto R_loop;
     end if;
+L_store:
+    \* The leaf push (`push_lifo_marked`, `Slot::mark_unless_claimed`): it reads the word it left,
+    \* its own newest store, and marks the call as a bracket does: word := loop, a compiler fence.
+    await Len(buf[self]) < BufCap;
+    saved := ReadAt(word, buf[self], "word", sl);
+    buf[self] := Append(buf[self], <<"word", sl, 0>>);
+L_check:
+    \* It reads its claim: none, and it goes in.
+    \* (MUTATION leaf_no_check: it goes in without reading the claim.)
+    c := ReadAt(claim, buf[self], "claim", sl);
+    if c = NONE \/ Mode = "leaf_no_check" then
+        inS := inS \cup {self};
+        goto L_in;
+    end if;
+L_claimed:
+    \* A claim is up: the leaf never contests one, it backs out.
+    leafBacks := 1;
+    goto L_back;
+L_in:
+    \* Inside: the push into the empty slot, or none (the slot holds a task, the shard is
+    \* another); either way the leaf leaves the shard at once.
+    inS := inS \ {self};
+    either
+        \* Pushed: word := the word it read, a release store, and the call is done.
+        await Len(buf[self]) < BufCap;
+        buf[self] := Append(buf[self], <<"word", sl, saved>>);
+        goto R_task;
+    or
+        \* Not its push: it backs out, and the call takes the full bracket.
+        goto L_back;
+    end either;
+L_back:
+    \* word := the word it read, a release store: outside again, as before the leaf. Then the
+    \* full bracket, which reads that word as its own and puts it back as it ends.
+    \* (MUTATION leaf_keeps_mark: it backs out with its mark still up, so the bracket reads
+    \* "loop" as the word to put back, and the rest of the poll says loop.)
+    if Mode # "leaf_keeps_mark" then
+        await Len(buf[self]) < BufCap;
+        buf[self] := Append(buf[self], <<"word", sl, saved>>);
+    end if;
+    goto B_store;
 Blocked:
     await FALSE;
 D_unwind:
