@@ -12,4 +12,10 @@ DowngradeNested == <<<<"W", "R", "w", "r">>, <<"R", "R", "r", "r">>>>
 ReadInWriteRefused == <<<<"W", "R", "r", "w">>, <<"R", "W", "w", "r">>>>
 \* Two owners that each read, let go and read again: claims race for a freed record.
 ClaimRace == <<<<"R", "r", "R", "r">>, <<"R", "r", "R", "r">>>>
+\* An owner that joins a write and a read beside one that writes; and one that joins two
+\* reads beside it.
+JoinWriteRead == <<<<"JWR", "r", "w">>, <<"W", "w">>>>
+JoinReads == <<<<"JRR", "r", "r">>, <<"W", "w">>>>
+\* An owner whose write waits while it reads, beside one that reads.
+WriteQueuedRead == <<<<"WQR", "r">>, <<"R", "r">>>>
 =============================================================================

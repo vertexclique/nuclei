@@ -1,7 +1,8 @@
 --------------------------- MODULE ReentrantMutex ---------------------------
 (***************************************************************************)
-(* The reentrant mutex (src/sync/reentrant_mutex.rs, src/sync/owner.rs),  *)
-(* at the grain of its atomic steps.                                       *)
+(* The reentrant mutex (src/sync/reentrant_mutex.rs: `reenter`, `enter`,  *)
+(* `unlock` and `ReentrantMutexLock::poll`; src/sync/owner.rs), at the     *)
+(* grain of its atomic steps.                                              *)
 (*                                                                          *)
 (* In plain words: the lock is a one-permit semaphore, a holder id (an     *)
 (* owner's, or none) and a depth only the holder touches. An owner that    *)
@@ -11,6 +12,16 @@
 (* clears the holder and then gives the permit back. Owner ids are unique, *)
 (* so an owner finds its own id only while it holds the lock.              *)
 (*                                                                          *)
+(* One owner may have two lock requests out at once (`join!` of two         *)
+(* `lock(&me)`): both queue while another owner holds the lock, the older  *)
+(* is handed the permit, and the owner keeps that guard until the younger  *)
+(* completes too. Every poll of a request looks for its own id first,       *)
+(* queued or not, so the younger, polled after the older entered, leaves   *)
+(* the queue and enters at once. A younger request polled before the older *)
+(* entered (the join polls it first, or it is in another task of the same  *)
+(* owner) is polled again only when it is woken, and nothing wakes it: the *)
+(* owner waits on itself (the witness of a gap the code leaves open).      *)
+(*                                                                          *)
 (* What is modelled step by step: the holder's loads and stores, the       *)
 (* depth, and the permit's take, wait and release. What is abstract: the  *)
 (* semaphore is one permit with waits that end when it is free; its own   *)
@@ -19,7 +30,9 @@
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
 CONSTANTS
-    Progs,     \* per owner, its steps in order: "L" locks (again, or for the first time), "U" unlocks
+    Progs,     \* per owner, its steps in order: "L" locks (again, or for the first time), "U" unlocks,
+               \* "J" joins two locks polled older first, "JR" the same polled younger first
+               \* (each leaves the owner holding two guards)
     Mutation   \* "none", or the name of the one rule this run takes away
 
 Owners == 1..Len(Progs)
@@ -54,7 +67,67 @@ variables i = 1;
 begin
 O_step:
     while i <= Len(Progs[self]) do
-        if Progs[self][i] = "L" then
+        if Progs[self][i] \in {"J", "JR"} then
+J_look:
+            \* The join's first pass polls the older request: its own id (not here: a join begins
+            \* with nothing held), or the free permit, taken at once.
+            if permit then
+                permit := FALSE;                    \* the older takes the free permit ...
+                depth := 1;                         \* ... sets the depth to one ...
+                guards[self] := guards[self] + 1;   \* ... and has its guard
+                goto J_storeNow;
+            else
+                goto J_wait;                        \* another owner holds it: both requests queue
+            end if;
+J_storeNow:
+            \* The older stores the owner's id ...
+            holder := self;                         \* the older's store of the id
+J_youngNow:
+            \* ... and the same pass then polls the younger, which finds that id and enters at
+            \* once, one level deeper.
+            depth := depth + 1;                     \* the younger's level
+            guards[self] := guards[self] + 1;       \* and its guard
+            goto O_next;
+J_wait:
+            \* The task sleeps until the permit is handed to the older request, queued first.
+            await permit;                           \* the older's grant
+            permit := FALSE;                        \* the permit is the owner's now
+            if Progs[self][i] = "JR" then
+                goto J_youngFirst;                  \* the waking pass polls the younger first
+            else
+                goto J_enter;                       \* the waking pass polls the older first
+            end if;
+J_youngFirst:
+            \* (JR) The younger is polled while the older has not stored the id: another holder,
+            \* as far as it can tell, so it stays queued.
+            skip;                                   \* its look finds no id of its own
+J_enter:
+            \* The older's `enter`: the depth is one ...
+            depth := 1;                             \* one level
+            guards[self] := guards[self] + 1;       \* and the older's guard
+J_store:
+            \* ... then the id.
+            holder := self;                         \* the owner holds the lock now
+            if Progs[self][i] = "JR" then
+                goto J_youngWait;                   \* the younger was polled already: it sleeps on
+            end if;
+J_young:
+            \* The same pass polls the younger: queued, it still looks for its own id first and,
+            \* finding it, leaves the queue and enters. MUTATION queued_skips_reenter: a queued
+            \* request only looks at its node, and sleeps on.
+            if holder = self /\ Mutation # "queued_skips_reenter" then
+                depth := depth + 1;                 \* one level deeper
+                guards[self] := guards[self] + 1;   \* the younger's guard
+                goto O_next;
+            end if;
+J_youngWait:
+            \* The younger waits for the permit to be handed to it, which only the owner's last
+            \* unlock does; the join keeps the older's guard until the younger ends.
+            await permit;                           \* never, while the owner holds it
+            permit := FALSE;                        \* (unreachable) the younger's grant
+            depth := 1;                             \* (unreachable) its depth
+            guards[self] := guards[self] + 1;       \* (unreachable) its guard
+        elsif Progs[self][i] = "L" then
 O_look:
             \* `reenter`: a relaxed load of the holder.
             if holder = self then
