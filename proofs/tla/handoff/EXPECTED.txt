@@ -45,6 +45,7 @@ HB_drain              HandBack    pass
 HB_two                HandBack    pass
 HB_two_done           HandBack    pass
 HB_chain_done         HandBack    pass
+HB_bound              HandBack    pass
 M_no_handback         HandBack    violated:NoFailedWith
 M_lend_no_mark        HandBack    violated:Exclusive
 M_lend_no_check       HandBack    violated:Exclusive
@@ -61,6 +62,8 @@ M_panic_keeps_loan    HandBack    violated:LentHasBorrower
 M_drain_early         HandBack    violated:HandBackDone
 M_drain_refuses       HandBack    violated:NoFailedWith
 M_wait_runs_tasks     HandBack    violated:LentHasBorrower
+M_lend_keeps_queues   HandBack    violated:BoundOnCreator
+M_back_keeps_queues   HandBack    violated:BoundOnCreator
 W_loan                HandBack    violated:NoLoan
 W_defer               HandBack    violated:NoDefer
 W_lend_taken          HandBack    violated:NoLendTaken

@@ -3,35 +3,51 @@
 (* The hand-back: a task whose poll lost its shard to the monitor, and     *)
 (* that then calls into the shard (a `ShardLocal::with`), gets the shard   *)
 (* back for that call from whichever thread runs it now, instead of an     *)
-(* error. The design this checks, before any of its code is written:       *)
+(* error. The code it checks:                                              *)
 (*                                                                         *)
 (* - The detached thread's call is where it starts: `current_pinned`'s     *)
 (*   bracket (`Bracket::take`, `Slot::mark` in src/rt/handoff/slot.rs)     *)
 (*   marks the thread's old slot and finds its claim taken, or the thread  *)
-(*   already knows it is detached; either way it finds no shard            *)
-(*   (src/rt/context.rs). A leaf push from the same thread                 *)
-(*   (`push_lifo_marked`, `Slot::mark_unless_claimed`) backs out on that   *)
-(*   claim to the full bracket, which finds no shard either and takes the  *)
-(*   remote path: a push needs no hand-back.                               *)
-(* - The call that needs the shard asks for it: a lend task, put into the  *)
-(*   queues of the shard the thread was detached from (kept alive by       *)
-(*   `run_shard`'s frame in src/rt/workers.rs while the poll runs), taken  *)
-(*   by a draining shard too. Then it waits, its thread parked, running    *)
-(*   nothing, until the shard is lent to it or the runtime shuts down.     *)
-(* - A runner polls the lend task as any task, between its other polls     *)
-(*   (`run_loop` in src/rt/shard/run.rs), in its worker loop or in a       *)
-(*   nested `block_on`'s loop. The task's code makes a full bracket, so    *)
-(*   the runner's word says inside for the whole loan and the monitor      *)
-(*   takes nothing. With the bracket in, and no shard-local value lent on  *)
-(*   this thread (its slot unpinned, the thread not itself in a loan), it  *)
-(*   lends: a compare-and-swap from asked to lent; then the runner parks   *)
-(*   until the shard is given back, ends its bracket and its poll. A       *)
-(*   bracket that finds the shard taken puts the lend task back into the   *)
-(*   shard's queues for its next runner. A value lent on this thread       *)
-(*   defers the loan, the lend task still the shard's.                     *)
-(* - The borrower, lent the shard, enters it (no slot: nobody watches it,  *)
-(*   the runner's bracket keeps the monitor off), runs the call, leaves    *)
-(*   and gives the shard back, by return or by unwind.                     *)
+(*   already knows it is detached; either way `ShardLocal::try_with`       *)
+(*   (src/shard_local.rs) finds no shard with values and calls             *)
+(*   `context::lent_back` (src/rt/context/lent.rs). A leaf push from the   *)
+(*   same thread (`push_lifo_marked`, `Slot::mark_unless_claimed`) backs   *)
+(*   out on that claim to the full bracket, which finds no shard either    *)
+(*   and takes the remote path: a push needs no hand-back.                 *)
+(* - The call asks (`loan::borrow`, src/rt/handoff/loan.rs): a lend task,  *)
+(*   pushed to the shard the thread was detached from (`Here::lost`, kept  *)
+(*   alive by `run_shard`'s frame in src/rt/workers.rs while the poll and  *)
+(*   its bound tasks run, cleared by `ForgetLost` before it lets go),      *)
+(*   which a draining shard takes too: its worker stays up while a thread  *)
+(*   that lost it still runs what it ran of it (`Shared::detached_began`   *)
+(*   in src/rt/shard/detached.rs at the detach, `detached_ended` in        *)
+(*   `ForgetLost`). Then it waits in `sync::internal::block_on`, its       *)
+(*   thread parked, running nothing, until the shard is lent to it or the  *)
+(*   runtime shuts down (the monitor's `closing`).                         *)
+(* - A runner polls the lend task (`Lend::poll`) as any task, between its  *)
+(*   other polls (`run_loop` in src/rt/shard/run.rs), in its worker loop   *)
+(*   or in a nested `block_on`'s loop. The task's code makes a full        *)
+(*   bracket (`current_held`), held for the whole loan, so the runner's    *)
+(*   word says inside and the monitor takes nothing. With the bracket in,  *)
+(*   and no shard-local value lent on this thread (`lends_a_value`: its    *)
+(*   slot unpinned, the thread not itself in a loan), it hands the shard's *)
+(*   own queues back to their schedules (`hand_over_queues`, run as a      *)
+(*   thread that runs no shard, `context::without_shard`), as a take does: *)
+(*   a task bound to the runner goes to its home, so the borrower finds    *)
+(*   none of them to run. Then it lends (`Loan::lend`): a compare-and-swap *)
+(*   from asked to lent; then the runner parks until the shard is given    *)
+(*   back (`Loan::wait_back`), ends its bracket and its poll. A bracket    *)
+(*   that finds the shard taken wakes the lend task, whose schedule then   *)
+(*   takes the remote path into the shard's queues for its next runner. A  *)
+(*   value lent on this thread defers the loan a tick, the lend task still *)
+(*   the shard's.                                                          *)
+(* - The borrower, lent the shard, enters it (`Lent::enter`: no slot,      *)
+(*   nobody watches it, the runner's bracket keeps the monitor off), runs  *)
+(*   the call, leaves, hands the shard's own queues back to their          *)
+(*   schedules (a task bound to the borrower, woken in the call, goes to   *)
+(*   its home, so the runner finds none of them to run), and gives the     *)
+(*   shard back (`Lent`'s drop, `Loan::give_back`), by return or by        *)
+(*   unwind.                                                               *)
 (* - The runtime shuts down: a waiting borrower is woken, and a            *)
 (*   compare-and-swap from asked to gone settles it against a lend that    *)
 (*   came first; its call then answers that the runtime is gone.           *)
@@ -50,19 +66,22 @@
 (* task in a nested `block_on`'s loop, or in the loop of a nested          *)
 (* `block_on` inside its own `with`; a borrower's closure may run such a   *)
 (* loop too; a poll may lose the shard during a nested `block_on`'s poll;  *)
-(* the worker may be stopped, or the runtime shut down, while a request    *)
-(* waits. What must never happen: two actors inside the shard at once      *)
-(* (`Exclusive`); two threads holding the shard's value at once            *)
-(* (`ExclusiveValue`); a detached thread inside the shard, or holding its  *)
-(* value, outside a loan made to it (`DetachedStaysOut`,                   *)
-(* `DetachedHoldsOnlyLent`); a request lost, neither waiting in the        *)
-(* shard's queues nor being served (`LendHeld`); a shard lent to a thread  *)
-(* that is not in its loan (`LentHasBorrower`), or a runner waiting for a  *)
-(* loan nobody holds (`LenderHasLoan`); a `with` answered with an error    *)
-(* while the runtime runs (`NoFailedWith`, the failure this design         *)
-(* removes). What must happen: every request ends, served or told the      *)
-(* runtime is gone (`HandBackDone`), and every remote push runs            *)
-(* (`Rescued`), whichever runner blocks for good.                          *)
+(* a thread inside the shard, a runner in a call or a borrower in its      *)
+(* closure, may wake a task bound to it, which waits in the shard's own    *)
+(* queues until a thread inside runs it; the worker may be stopped, or the *)
+(* runtime shut down, while a request waits. What must never happen: two   *)
+(* actors inside the shard at once (`Exclusive`); two threads holding the  *)
+(* shard's value at once (`ExclusiveValue`); a detached thread inside the  *)
+(* shard, or holding its value, outside a loan made to it                  *)
+(* (`DetachedStaysOut`, `DetachedHoldsOnlyLent`); a request lost, neither  *)
+(* waiting in the shard's queues nor being served (`LendHeld`); a shard    *)
+(* lent to a thread that is not in its loan (`LentHasBorrower`), or a      *)
+(* runner waiting for a loan nobody holds (`LenderHasLoan`); a `with`      *)
+(* answered with an error while the runtime runs (`NoFailedWith`, the      *)
+(* failure the hand-back removes); a task bound to one thread run by       *)
+(* another (`BoundOnCreator`). What must happen: every request ends,       *)
+(* served or told the runtime is gone (`HandBackDone`), and every remote   *)
+(* push runs (`Rescued`), whichever runner blocks for good.                *)
 (*                                                                         *)
 (* What is abstract. A thread's locals go back to their first values once  *)
 (* read for the last time, and the witnesses' records are kept only where  *)
@@ -88,7 +107,11 @@
 (* After its poll, a detached thread finishes its bound tasks, one of      *)
 (* which may ask for the shard as its poll did (`BoundOf`, a request of    *)
 (* its own), then it ends (in the code it waits as a spare); a spare that  *)
-(* runs the shard is a fresh thread with a fresh slot.                     *)
+(* runs the shard is a fresh thread with a fresh slot. A bound task handed *)
+(* to its home is run there by its own thread, which is not modelled: only *)
+(* a run from the shard's own queues, by whichever thread is inside, can   *)
+(* be on another thread (`Bound`, `bq`); a take hands those queues over as *)
+(* the lend does, which Handoff.tla checks (`BoundOnCreator`).             *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC                                           \* numbers, sets, TLC's helpers
 
@@ -110,6 +133,7 @@ CONSTANTS                                                                   \* w
     Close,        \* the runtime may shut down
     Drain,        \* the worker may be stopped: it takes no new work and exits once drained
     Records,      \* the witnesses' records are kept (a witness reads them; nothing else does)
+    Bound,        \* a thread inside the shard may wake a task bound to it, into the shard's own queues
     Mode          \* "ok", or the one rule this run breaks (see the configurations)
 
 Threads == 1..NThreads                \* the threads that run the shard, in turn
@@ -170,7 +194,9 @@ variables
     panics = 0,                       \* (record) a closure on a lent shard panicked
     drainLoans = 0,                   \* (record) a loan served while the worker drained
     boundLoans = 0,                   \* (record) a bound task's call ran on a lent shard
-    loansServed = 0;                  \* (record) a borrower's call ran on the shard lent to it
+    loansServed = 0,                  \* (record) a borrower's call ran on the shard lent to it
+    bq = {},                          \* the threads whose bound task waits in the shard's own queues (LIFO slot, run queue)
+    misrun = FALSE;                   \* a bound task was run by a thread not its own
 
 define                                                                       \* the properties:
     \* At most one actor is inside the shard.
@@ -182,6 +208,8 @@ define                                                                       \* 
                     loan[u] = "asked" => (u \in lends \/ \E r \in Threads : lendOf[r] = u)
     \* No `with` is answered with an error while the runtime runs.
     NoFailedWith == ~failed                                                  \* never
+    \* A task bound to a thread runs only on that thread.
+    BoundOnCreator == ~misrun                                                \* never on another
     \* Every request ends: the call ran on the shard, or the runtime shut down.
     HandBackDone == \A u \in Borrowers \ {BT} : loan[u] = "asked" ~> loan[u] \in {"back", "gone"}
     \* Every remote push runs.
@@ -272,11 +300,12 @@ T_take:
 R_loop:
     \* Inside the shard: its queues first (a lend task, then the pushed work), then a poll of its
     \* own, else asleep until work comes. A stopped runtime ends the loop; so does a drained worker
-    \* (MUTATION drain_early: a detached thread's task, its poll still running, is not counted live).
+    \* (`may_exit`, `Shared::nothing_live`: no live task, and no thread that lost the shard still
+    \* running what it ran of it; MUTATION drain_early: such a thread is not counted).
     if closed then                                                           \* the runtime shut down:
         inS := inS \ {self};                                                 \* the runner leaves
         goto Gone;                                                           \* for good
-    elsif draining /\ inbox = 0 /\ lends = {} /\ polls >= MaxPolls             \* drained, no other thread
+    elsif draining /\ inbox = 0 /\ lends = {} /\ bq = {} /\ polls >= MaxPolls  \* drained, no other thread
           /\ (Mode = "drain_early" \/ \A t \in Threads \ {self} : pc[t] \in Idle) then  \* in a poll of its tasks:
         inS := inS \ {self};                                                 \* the worker exits
         goto Gone;                                                           \* for good
@@ -289,6 +318,14 @@ R_loop:
         e := e + 1;                                                          \* its poll's epoch
         nret := "loop";                                                      \* polled by the worker loop
         goto N_poll;                                                         \* polled as any task
+    elsif bq # {} then                                                       \* a bound task queued here:
+        with u \in bq do                                                     \* any of them
+            bq := bq \ {u};                                                  \* out of the queue, and run
+            if u # self then                                                 \* bound to another thread:
+                misrun := TRUE;                                              \* run on the wrong one
+            end if;
+        end with;
+        goto R_loop;                                                         \* the loop again
     elsif inbox > 0 then                                                     \* pushed work waits:
         inbox := inbox - 1;                                                  \* out of the queue
         ran := ran + 1;                                                      \* and run
@@ -354,7 +391,16 @@ B_check:
         inS := inS \cup {self};                                              \* inside, for the call
     end if;
 B_in:
-    \* The call's work inside the shard; then it ends (`Slot::unmark`): the word it left, back.
+    \* The call's work inside the shard, which may wake a task bound to this thread: it goes into
+    \* the shard's own queues (`queue_home_on` in src/rt/sched.rs). Then the call ends
+    \* (`Slot::unmark`): the word it left, back.
+    if Bound then                                                            \* where bound tasks are woken:
+        either
+            skip;                                                            \* no wake of one
+        or
+            bq := bq \cup {self};                                            \* its bound task queued here
+        end either;
+    end if;
     inS := inS \ {self};                                                     \* out again
     word[sl] := saved;                                                       \* outside, as before the call
     saved := 0;                                                              \* read for the last time
@@ -585,6 +631,20 @@ W_in:
             goto W_nwait;                                                    \* wait to get it back
         end if;
     or
+        \* The closure wakes a task bound to this thread: into the lent shard's own queues.
+        await Bound;                                                         \* where bound tasks are woken
+        bq := bq \cup {self};                                                \* queued here, then it returns
+    or
+        \* A nested `block_on` in the closure runs a bound task from the lent shard's own queues.
+        await NestedLoan /\ bq # {};                                         \* one waits there
+        with u \in bq do                                                     \* any of them
+            bq := bq \ {u};                                                  \* out of the queue, and run
+            if u # self then                                                 \* bound to another thread:
+                misrun := TRUE;                                              \* run on the wrong one
+            end if;
+        end with;
+        goto W_in;                                                           \* the closure goes on
+    or
         await "panic" \in Ends;                                              \* the closure panics
         goto W_panic;                                                        \* and unwinds
     or
@@ -594,9 +654,14 @@ W_in:
         skip;                                                                \* the closure returns
     end either;
 W_back:
-    \* The closure returns; the borrower leaves the shard and gives it back.
+    \* The closure returns; the borrower leaves the shard, hands its own queues back to their
+    \* schedules (`hand_over_queues` in `Lent`'s drop: a task bound to this thread goes to its home;
+    \* MUTATION back_keeps_queues: they stay, for the runner to run), and gives it back.
     holders := holders \ {self};                                             \* the value let go of
     inS := inS \ {self};                                                     \* out of the shard
+    if Mode # "back_keeps_queues" then                                       \* the code:
+        bq := {};                                                            \* the queues handed over
+    end if;
     loan[Req(self, wret)] := "back";                                         \* given back
     loansServed := Rec;                                                      \* (record)
     if wret = "bound" then                                                   \* a bound task's call:
@@ -604,10 +669,14 @@ W_back:
     end if;
     goto W_done;                                                             \* the code goes on
 W_panic:
-    \* The unwind: the loan's guard leaves the shard and gives it back (MUTATION panic_keeps_loan:
-    \* it leaves, and never gives it back). The panic ends the poll, caught by the task's run.
+    \* The unwind: the loan's guard leaves the shard, hands its own queues over as a return does,
+    \* and gives it back (MUTATION panic_keeps_loan: it leaves, and never gives it back). The panic
+    \* ends the poll, caught by the task's run.
     holders := holders \ {self};                                             \* the value let go of
     inS := inS \ {self};                                                     \* out of the shard
+    if Mode # "back_keeps_queues" then                                       \* the code:
+        bq := {};                                                            \* the queues handed over
+    end if;
     if Mode # "panic_keeps_loan" then                                        \* the guard:
         loan[Req(self, wret)] := "back";                                     \* given back
     end if;
@@ -677,10 +746,16 @@ N_check:
         inS := inS \cup {self};                                              \* inside
     end if;
 N_lend:
-    \* The loan: a compare-and-swap from asked to lent (MUTATION lend_no_cas: lent over gone). Lost
-    \* to a shutdown, it lends nothing. Lent, the shard is the borrower's, and this thread touches
-    \* nothing of it, its bracket keeping the monitor off (MUTATION lend_no_wait: it stays inside).
+    \* First the shard's own queues back to their schedules, as a take does (`hand_over_queues` in
+    \* `without_shard`): a task bound to this thread goes to its home (MUTATION lend_keeps_queues:
+    \* they stay, for the borrower to run). Then the loan: a compare-and-swap from asked to lent
+    \* (MUTATION lend_no_cas: lent over gone). Lost to a shutdown, it lends nothing. Lent, the shard
+    \* is the borrower's, and this thread touches nothing of it, its bracket keeping the monitor
+    \* off (MUTATION lend_no_wait: it stays inside).
     lendOf[self] := 0;                                                       \* polled no more
+    if Mode # "lend_keeps_queues" then                                       \* the code:
+        bq := {};                                                            \* the queues handed over
+    end if;
     if loan[b] = "asked" \/ Mode = "lend_no_cas" then                        \* still asked:
         loan[b] := "lent";                                                   \* lent
         if nret = "nested" then                                              \* from a nested loop:
@@ -734,8 +809,8 @@ Blocked:
     await FALSE;                                                             \* never returns
 D_bound:
     \* A detached thread finishes its bound tasks on its own shard (`finish_home`): one of them may
-    \* call `with`, which asks for the shard back as the poll's call did (the shard counts the bound
-    \* task among its live ones, so a stopped worker waits for it).
+    \* call `with`, which asks for the shard back as the poll's call did (the shard counts the thread
+    \* until it is done, `ForgetLost`, so a stopped worker waits for it).
     if self \in BoundWiths /\ wret = "task" then                             \* a bound task's `with`:
         wret := "bound";                                                     \* its call
         goto W_ask;                                                          \* asks for the shard
@@ -778,6 +853,7 @@ M_take:
         if claim[ms] = PENDING then                                          \* still pending:
             claim[ms] := TAKEN;                                              \* taken
             inS := inS \cup {Mon};                                           \* the shard is the monitor's
+            bq := {};                                                        \* its own queues handed over
         else
             ms := 0;                                                         \* the slot and the word,
             mv := 0;                                                         \* read no more
