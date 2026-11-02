@@ -182,6 +182,10 @@ fn a_tcp_round_trip_allocates_nothing() {
             .await
             .unwrap();
         let (server, _) = listener.accept().await.unwrap();
+        // Each round's four bytes go at once: with Nagle's rule FreeBSD holds them until the
+        // last round's are acknowledged, which the peer, sending nothing back, delays 40 ms
+        // (`net.inet.tcp.delacktime`), and the rounds took 440 s.
+        client.set_nodelay(true).unwrap();
         (client, server)
     });
     drop(rt);
