@@ -1002,6 +1002,8 @@ mod datagram_owned;
 #[cfg(unix)]
 mod emfile;
 
+mod reset;
+
 mod send_file;
 
 mod zero_copy;

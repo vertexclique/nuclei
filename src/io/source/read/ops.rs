@@ -22,6 +22,7 @@ use crate::io::source::Io;
 use crate::io::source::ops::{Answer, Done, Outcome, Want};
 use crate::io::source::route::Route;
 use crate::io::sys;
+use crate::rt::counters::lost_before_accept;
 
 impl ReadState {
     /// Whether [`submit_wanted`](Self::submit_wanted) has anything to do: a task waits, or a lent
@@ -272,7 +273,8 @@ impl ReadState {
 
     /// The side's operation completed: what it brought goes where the tasks
     /// take it, and they are woken. One given back undone brought nothing,
-    /// and is asked again. `fd` is the source's descriptor (a listener's,
+    /// and is asked again, as is an accept that met a connection its peer
+    /// reset in the backlog. `fd` is the source's descriptor (a listener's,
     /// for the accepted connection to take its context from).
     pub(crate) fn op_done(&mut self, done: Done, fd: Option<Raw>, after: &mut After) {
         self.out = None;
@@ -431,7 +433,12 @@ impl ReadState {
                     match answer {
                         // Its connections came as arrivals.
                         Answer::Done(Ok(())) => {}
-                        Answer::Done(Err(err)) => self.error = Some(err),
+                        Answer::Done(Err(err)) if !lost_before_accept(&err) => {
+                            self.error = Some(err);
+                        }
+                        // A connection reset in the backlog ended it: the tasks woken below ask
+                        // for the next one.
+                        Answer::Done(Err(_)) => {}
                         Answer::Undone { not_ready } => self.not_ready(not_ready),
                     }
                 }
@@ -444,7 +451,12 @@ impl ReadState {
                     Err(err) => self.error = Some(err),
                 }
             }
-            Outcome::Accept(Answer::Done(Err(err))) => self.error = Some(err),
+            Outcome::Accept(Answer::Done(Err(err))) if !lost_before_accept(&err) => {
+                self.error = Some(err);
+            }
+            // A connection reset in the backlog, closed already: the tasks woken below ask for
+            // the next one (proofs/tla/accept).
+            Outcome::Accept(Answer::Done(Err(_))) => {}
             Outcome::RecvFrom(buf, _) if stale => after.drop_buf(buf),
             Outcome::RecvFrom(buf, answer) => {
                 // The group may have buffers again: the next receive tries.

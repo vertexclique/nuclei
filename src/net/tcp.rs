@@ -40,6 +40,12 @@ impl Handle<TcpListener> {
 
     /// The next connection, with its peer's address.
     ///
+    /// A connection its peer reset or aborted while it waited in the
+    /// backlog is skipped, and the next one taken: the listener is fine, and
+    /// the error (`ECONNABORTED`, or on Windows `WSAECONNRESET` or
+    /// `ERROR_NETNAME_DELETED`) is that connection's. Linux hands such a
+    /// connection over as it is, and its first read reports the reset.
+    ///
     /// On macOS an accept that finds the process out of descriptors closes
     /// the connection it took off the backlog, as the system's own does; the
     /// next ones fail with the same error and take none until a descriptor
@@ -47,8 +53,8 @@ impl Handle<TcpListener> {
     ///
     /// # Errors
     ///
-    /// As `accept(2)`: a connection reset before it was taken, or the
-    /// process out of descriptors.
+    /// As `accept(2)` for the listener itself, such as the process out of
+    /// descriptors.
     pub async fn accept(&self) -> io::Result<(Handle<TcpStream>, SocketAddr)> {
         poll_fn(|cx| self.poll_accept(cx)).await
     }
@@ -81,7 +87,9 @@ impl Handle<TcpListener> {
     }
 
     /// The connections as they come, without their addresses; the stream
-    /// never ends, and an error is one of its items.
+    /// never ends, and an error of the listener's is one of its items (a
+    /// connection reset before it was taken is skipped, as
+    /// [`accept`](Self::accept) skips it).
     pub fn incoming(
         &self,
     ) -> impl Stream<Item = io::Result<Handle<TcpStream>>> + Send + Unpin + '_ {
@@ -90,12 +98,12 @@ impl Handle<TcpListener> {
 
     /// The connections as they come, from a stream that owns its own copy of
     /// the listener, so it may outlive this handle. A connection reset before
-    /// it was taken is skipped, and so is the process having no descriptor
-    /// left to accept into: the stream waits, with a growing pause, until
-    /// there is one, and the connections wait in the listener's backlog (on
-    /// macOS but for the one the first accept to find none took, which the
-    /// system closes, as [`accept`](Self::accept) says).
-    /// Any other error ends the stream, and
+    /// it was taken is skipped, as [`accept`](Self::accept) skips it, and so
+    /// is the process having no descriptor left to accept into: the stream
+    /// waits, with a growing pause, until there is one, and the connections
+    /// wait in the listener's backlog (on macOS but for the one the first
+    /// accept to find none took, which the system closes, as
+    /// [`accept`](Self::accept) says). Any other error ends the stream, and
     /// [`TcpStreamGenerator::take_error`] says what it was.
     ///
     /// On io_uring the stream keeps one accept armed for every connection
@@ -194,7 +202,6 @@ impl Stream for TcpStreamGenerator {
                     this.delay = OUT_OF_DESCRIPTORS_DELAY;
                     return Poll::Ready(Some(stream));
                 }
-                Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::ConnectionAborted => {}
                 Poll::Ready(Err(err)) if out_of_descriptors(&err) => {
                     this.backoff = Some(sleep(this.delay));
                     this.delay = (this.delay * 2).min(OUT_OF_DESCRIPTORS_DELAY_MAX);

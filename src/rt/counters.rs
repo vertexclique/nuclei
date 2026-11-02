@@ -525,6 +525,27 @@ pub(crate) fn out_of_descriptors(err: &io::Error) -> bool {
     err.raw_os_error().is_some_and(|code| codes.contains(&code))
 }
 
+/// Whether `err`, an accept's, is the error of the connection it took and not the listener's: its
+/// peer reset or aborted it while it waited in the backlog. The listener is as it was, so every
+/// accept skips the connection and takes the next one (proofs/tla/accept). On unix that is
+/// `ECONNABORTED` (macOS and the BSDs, and Linux when the connection's peer address is gone);
+/// `AcceptEx` ends with the reset's status, or with the Win32 error that status maps to.
+pub(crate) fn lost_before_accept(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    let lost = err.kind() == io::ErrorKind::ConnectionAborted;
+    #[cfg(windows)]
+    let lost = {
+        use crate::syscore::windows::{ERROR_NETNAME_DELETED, WSAECONNABORTED, WSAECONNRESET};
+        err.raw_os_error().is_some_and(|code| {
+            matches!(
+                code,
+                WSAECONNRESET | WSAECONNABORTED | ERROR_NETNAME_DELETED
+            )
+        })
+    };
+    lost
+}
+
 /// Every shard made and not taken out yet, by the address of its `Shared`
 /// (which the entry's allocation keeps from reuse). Weak: a shard's
 /// `Shared` (its descriptors) goes with the shard and its last holder, not
