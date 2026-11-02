@@ -36,3 +36,13 @@ L_background      Linger  pass
 L_bound           Linger  pass
 LM_bound_drops    Linger  violated:AllSent
 LW_bound          Linger  violated:NoBoundOut
+L_exit            Linger  pass
+L_exit_live       Linger  pass
+LM_no_exit_wait   Linger  violated:ExitDelivers
+LW_exit_wait      Linger  violated:NoExitWait
+L_off_worker      Linger  pass
+L_off_worker_live Linger  pass
+LM_off_worker_hands Linger violated:OffWorkerDelivers
+L_exit_fail       Linger  pass
+L_exit_fail_live  Linger  pass
+LM_silent_give_up Linger  violated:GiveUpSaid

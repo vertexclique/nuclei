@@ -1634,18 +1634,30 @@ shutdown waits for nothing, and its lingers all run on threads of their own. A s
 is blocked in a task's poll after the shard was handed on drops what its inbox holds only once
 that poll returns, which the drop does not wait for. The drop's run has a bound of its own (the
 runtime's linger time): once it runs out, a linger the run was still running goes on on a thread
-of its own (`RunAll`'s drop). 20 configurations: 4 that must pass
+of its own (`RunAll`'s drop). The process default runtime is never dropped: the process exits
+instead, which kills its workers and their lingers, so a file's linger is counted from its hand
+to its end wherever it runs (`Tracked`), and the exit (an `atexit` hook, `wait_at_exit`) waits
+until none is left, or its own bound ran out, which it says. A file dropped on a thread that is
+no worker delivers its write-behind before its drop returns (`deliver_file`). A linger whose
+write fails or whose time runs out gives the rest up and says so, at warn and in `stats`. 30
+configurations: 10 that must pass
 (`DropWaits`, the drop returns only once every byte reached the peer, `NoDefault`, no runtime is
 started for a linger, and `TypeOK`; liveness, `AllSent` and `Termination`; a background
 shutdown, with `NoDefault`, `AllSent` and `Termination`; and a drop whose bound runs out, with the
-same), 10 mutations (a drop whose bound drops the linger it was running, as `RunAll` did, breaks
+same; at the exit, `ExitDelivers`, the process exits with every byte delivered or said lost, and
+liveness; a drop off a worker, with `OffWorkerDelivers`, the drop returns once every byte went,
+and liveness; a linger that may give up, with `GiveUpSaid`, and liveness), 13 mutations (an exit
+that waits for no linger breaks `ExitDelivers`; a drop off a worker that hands its linger to a
+worker and returns breaks `OffWorkerDelivers`; a linger that gives up without a word breaks
+`GiveUpSaid`; a drop whose bound drops the linger it was running, as `RunAll` did, breaks
 `AllSent`; a drop that does not run its list; one that runs only what its list
 holds as it looks (the fix's first form, which left a file's last writes unlanded); a linger's
 task lost as its worker stops; a linger handed to the stopping shard of its thread, which never
 runs it; the held task dropped outside its runtime, its linger to a thread of its own; a write
 counted out before its wake went; a drop that does not wait for its workers' writes; and one that
 does not wait for a stopped inbox to be drained: all break `DropWaits`; a linger handed to the
-process default runtime, which starts for it, breaks `NoDefault`), and 6 witnesses (a linger's
+process default runtime, which starts for it, breaks `NoDefault`), and 7 witnesses (the exit
+waiting for a linger still out as main returned, which then delivers; a linger's
 task handed back as its worker stops; one held by the write and handed back later; the drop
 running a linger of its list; the task with the handle held by the write as its worker stops;
 another thread draining its wake after the write counted itself out; the drop's bound running
