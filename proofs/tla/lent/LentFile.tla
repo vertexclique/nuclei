@@ -4,7 +4,8 @@
 (* `read_owned`, `write_owned`, `fill`, `write`, `write_direct`,           *)
 (* `poll_writes`, `poll_orphans`, `counts`, `seek`; src/fs/file/           *)
 (* positional.rs: `read_at`, `write_at`, `poll_ordered`, `Out`, `orphan`;  *)
-(* src/fs/file/orphans.rs: `Orphans`; src/fs/file/durable.rs: `sync`;     *)
+(* src/fs/file/orphans.rs: `Orphans`; src/fs/file/durable.rs: `sync`,    *)
+(* `Syncs::poll`, `Syncs::take`, `sync_call`;                              *)
 (* src/fs/file/work.rs: `bounce`, `pwrite_owned`), on the file's jobs,    *)
 (* made on the blocking pool or on the ring of the task's shard            *)
 (* (src/fs/ring.rs). A vectored write at the cursor (src/fs/mod.rs:        *)
@@ -57,11 +58,20 @@
 (* not counted.                                                            *)
 (*                                                                          *)
 (* Scenario "sync": the cursor writer's second copied write waits in the   *)
-(* write-behind while the first is in flight; a sync task syncs twice once *)
-(* both were accepted. A sync waits until the                              *)
-(* write-behind went out and every write in flight landed, then its job    *)
-(* makes what the file holds durable, or fails; a failed sync makes every  *)
-(* later one fail.                                                         *)
+(* write-behind while the first is in flight; two sync tasks each sync     *)
+(* once both were accepted (src/fs/file/durable.rs: `FileIo::sync`,        *)
+(* `Syncs::poll`). A sync waits until the write-behind went out and every  *)
+(* write in flight landed. The handle makes one sync call at a time: a     *)
+(* sync whose call would go beside another's waits for that one's end.     *)
+(* Each call is the file state's, not its task's: a task may go away with  *)
+(* its call out, and the call stays in the state, whose next sync takes    *)
+(* its end. The state keeps the number of the first call that failed;     *)
+(* a sync answers a failure if that call came before or was its own, and *)
+(* one called after it fails at once, with no call. The kernel's call      *)
+(* runs in two steps: it writes back and looks for an error, then its end  *)
+(* reaches the slot. A write-back the device fails loses every cell not   *)
+(* yet durable for good, and the kernel reports the error to the first    *)
+(* call that looks after it, to that call alone, as Linux does.           *)
 (*                                                                          *)
 (* Scenario "direct": the file is opened for direct IO: a read job reads   *)
 (* exactly the cell asked for (no read-ahead), and a copied write is one   *)
@@ -119,8 +129,8 @@ BReads == IF Scenario = "generation" THEN 2 ELSE 1
 PWriters == IF Scenario \in {"positional", "generation"} THEN {"pw"} ELSE {}
 \* The task that reads at an offset of its own.
 PReaders == IF Scenario = "positional" THEN {"pr"} ELSE {}
-\* The task that syncs.
-Syncers == IF Scenario = "sync" THEN {"sy"} ELSE {}
+\* The tasks that sync, once each.
+Syncers == IF Scenario = "sync" THEN {"sy1", "sy2"} ELSE {}
 \* Whether the file is opened for direct IO.
 Direct == Scenario = "direct"
 \* The cells the positional writer writes, one after the other, and their values.
@@ -163,12 +173,18 @@ variables
     prjob = NoJob,                     \* the positional read's job: [at, ran, val, on]
     prBefore = FALSE,                  \* (record) a cursor write to its cell came before the positional read
     prGot = None,                      \* (record) what the positional read returned
-    sjob = NoJob,                      \* the sync's job: [ran, ok, on, drain]
-    durable = [c \in Cells |-> 0],     \* what the device holds for sure: the file as the last good sync saw it
+    sjobs = [s \in Syncers |-> NoJob], \* each sync's call: [seq, checked, ran, ok, taken, on, drain]; it outlives its task
+    made = 0,                          \* how many sync calls the handle made: the next one's number is one more
+    sfailed = 0,                       \* the number of the first call whose failure the state took (0: none)
+    kerr = FALSE,                      \* the kernel holds a write-back error no call reported yet
+    devFailed = FALSE,                 \* the device failed a write-back (once at most)
+    lost = [c \in Cells |-> FALSE],    \* the cells whose write-back failed: the device never gets them
+    durable = [c \in Cells |-> 0],     \* what the device holds for sure
     okClaims = {},                     \* (record) the writes a sync that succeeded says are durable
-    syncFailed = FALSE,                \* the handle's syncs failed once: every later one fails
     failedOnce = FALSE,                \* (record) a sync returned a failure
-    okAfterFail = FALSE,               \* (record) a sync returned success after one returned a failure
+    okAfterFail = FALSE,               \* (record) a sync called after one returned a failure returned success
+    falseFail = FALSE,                 \* (record) a sync whose own call succeeded, none before it failing, returned a failure
+    leftTaken = FALSE,                 \* (record) a sync took the end of another's call whose task went away
     creads = {},                       \* (record) the reads callers asked for: <<cell, cells>>
     kreads = {},                       \* (record) the reads the kernel was asked for
     cwrites = {},                      \* (record) the writes callers made
@@ -232,8 +248,28 @@ define
               + (IF djob # NoJob /\ ~djob.ran THEN 1 ELSE 0)
               + (IF PosOut /\ ~pjob.ran THEN 1 ELSE 0)
               + (IF prjob # NoJob /\ ~prjob.ran THEN 1 ELSE 0)
-              + (IF sjob # NoJob /\ ~sjob.ran THEN 1 ELSE 0)
+              + Cardinality({q \in Syncers : sjobs[q] # NoJob /\ ~sjobs[q].ran})
+    \* A sync's call is out: made, its end not taken by the state yet.
+    SyncOut(q) == sjobs[q] # NoJob /\ ~sjobs[q].taken
+    \* The sync calls whose ends reached their slots and the state has not taken.
+    SyncEnded == {q \in Syncers : sjobs[q] # NoJob /\ sjobs[q].ran /\ ~sjobs[q].taken}
 end define;
+
+\* What a sync takes under the guard, before anything else (`Syncs::poll`): the end of every sync
+\* call that reached its slot, its own or another's, a task's that went away among them. The first
+\* failed one's number stays: every sync it came before or was its own fails.
+\* MUTATION sync_task_records: a call's failure counts only for its own task, as when the task
+\* kept its call's result: the end of one whose task went away is taken and its failure dropped.
+macro TakeSyncEnds() begin
+    with counted = {q \in SyncEnded : q = self \/ Mutation # "sync_task_records"},
+         failed = {q \in counted : ~sjobs[q].ok} do
+        if sfailed = 0 /\ failed # {} then
+            sfailed := (CHOOSE q \in failed : \A r \in failed : sjobs[q].seq <= sjobs[r].seq).seq;
+        end if;
+        if \E q \in SyncEnded : q # self /\ pc[q] = "Done" then leftTaken := TRUE; end if;
+        sjobs := [q \in Syncers |-> IF q \in SyncEnded THEN [sjobs[q] EXCEPT !.taken = TRUE] ELSE sjobs[q]];
+    end with;
+end macro;
 
 \* `poll_writes`, under the guard: a cursor write that ran is taken out of flight (the lent one's
 \* buffer goes back to its task, or with the job if the task went away); a positional write whose
@@ -316,7 +352,7 @@ P_loop:
     while ~(/\ AllDone /\ ~InFlight
             /\ \A r \in Readers : jobs[r] = NoJob \/ jobs[r].ran
             /\ (djob = NoJob \/ djob.ran) /\ (pjob = NoJob \/ pjob.ran)
-            /\ (prjob = NoJob \/ prjob.ran) /\ (sjob = NoJob \/ sjob.ran)) do
+            /\ (prjob = NoJob \/ prjob.ran) /\ \A q \in Syncers : sjobs[q] = NoJob \/ sjobs[q].ran) do
         either
             await InFlight /\ Runs(writing);
             either
@@ -377,15 +413,36 @@ P_loop:
                 pjob.part := 1;
             end either;
         or
-            \* The sync's job: the device keeps what the file holds now, or the call fails. A sync
-            \* put on the ring with a drain (the mutation) starts only once the ring's writes ended.
-            await sjob # NoJob /\ ~sjob.ran /\ Runs(sjob);
-            await sjob.drain /\ sjob.on = "ring" => ~(InFlight /\ writing.on = "ring");
-            if ~objOpen then usedClosed := TRUE; end if;
-            with ok \in IF SyncMayFail THEN {TRUE, FALSE} ELSE {TRUE} do
-                durable := IF ok THEN file ELSE durable;
-                sjob.ok := ok || sjob.ran := TRUE;
+            \* A sync's call in the kernel, its first step: it writes back what the file holds and
+            \* looks for an error. An error the kernel holds goes to this call alone, which fails,
+            \* and is cleared; else the device keeps every cell but a lost one. A call put on the
+            \* ring with a drain (the mutation) starts only once the ring's writes ended.
+            with q \in {r \in Syncers : /\ sjobs[r] # NoJob /\ ~sjobs[r].checked /\ Runs(sjobs[r])
+                                        /\ (sjobs[r].drain /\ sjobs[r].on = "ring"
+                                              => ~(InFlight /\ writing.on = "ring"))} do
+                if ~objOpen then usedClosed := TRUE; end if;
+                if kerr then
+                    sjobs[q].ok := FALSE || sjobs[q].checked := TRUE;
+                    kerr := FALSE;
+                else
+                    sjobs[q].checked := TRUE;
+                    durable := [c \in Cells |-> IF lost[c] THEN durable[c] ELSE file[c]];
+                end if;
             end with;
+        or
+            \* Its second step: the call's end reaches its slot (`FileOp::complete`, or the pool's
+            \* job's end), whose waker wakes the file's tasks.
+            with q \in {r \in Syncers : sjobs[r] # NoJob /\ sjobs[r].checked /\ ~sjobs[r].ran} do
+                sjobs[q].ran := TRUE;
+            end with;
+        or
+            \* The device fails a write-back while a sync call is out: every cell not durable yet is
+            \* lost, and the kernel keeps the error for the next call that looks.
+            await /\ SyncMayFail /\ ~devFailed
+                  /\ \E q \in Syncers : sjobs[q] # NoJob /\ ~sjobs[q].checked;
+            devFailed := TRUE;
+            kerr := TRUE;
+            lost := [c \in Cells |-> lost[c] \/ file[c] # durable[c]];
         or
             \* The shard goes: every call its ring has out is made on the pool.
             await ~shut;
@@ -396,7 +453,9 @@ P_loop:
             djob := IF djob # NoJob /\ ~djob.ran THEN [djob EXCEPT !.on = "pool"] ELSE djob;
             prjob := IF prjob # NoJob /\ ~prjob.ran THEN [prjob EXCEPT !.on = "pool"] ELSE prjob;
             pjob := IF PosOut /\ ~pjob.ran THEN [pjob EXCEPT !.on = "pool"] ELSE pjob;
-            sjob := IF sjob # NoJob /\ ~sjob.ran THEN [sjob EXCEPT !.on = "pool"] ELSE sjob;
+            sjobs := [q \in Syncers |->
+                         IF sjobs[q] # NoJob /\ ~sjobs[q].checked THEN [sjobs[q] EXCEPT !.on = "pool"]
+                         ELSE sjobs[q]];
             if InFlight /\ writing.on = "ring" then
                 \* MUTATION cancel_ends: a write cancelled as its shard went ends there.
                 if Mutation = "cancel_ends" then
@@ -602,64 +661,90 @@ PR_wait:
     prjob := NoJob;
 end process;
 
-\* A task that syncs twice (`sync_all`, `sync_data`), once the cursor writer's writes it covers
-\* were accepted.
+\* A task that syncs once (`sync_all`, `sync_data` or `sync_range`), once the cursor writer's
+\* writes it covers were accepted (src/fs/file/durable.rs: `FileIo::sync`, `Syncs::poll`).
 fair process syncer \in Syncers
-variables round = 1,     \* which of its two syncs it makes
-          claimed = {},  \* the writes this sync must make durable
-          refused = FALSE; \* the sync failed without a call: one before it failed
+variables claimed = {},     \* the writes this sync must make durable
+          afterFail = FALSE; \* it was called after a sync returned a failure
 begin
 S_call:
     \* Called once the writer accepted its copied writes: what was accepted, and the positional
     \* writes that returned, are what it covers.
     await pc["writer"] \notin {"W_copy", "W_b_hold", "W_b_accept", "W_b_wait"};
     claimed := written \cup {<<PCells[j], PVals[j]>> : j \in preturned};
+    afterFail := failedOnce;
 S_hold:
     await holder = "none";
     holder := self;
     PollWrites(-1);
+    TakeSyncEnds();
 S_go:
-    if syncFailed then
-        \* The handle's syncs failed before: this one fails too, with no call.
-        refused := TRUE;
+    if sjobs[self] # NoJob /\ sjobs[self].taken then
+        \* Its call ended: it fails if the first failed call came before it or was its own.
+        \* MUTATION sync_any_failure: it fails if any call failed, one made after its own too.
         holder := "none";
-        goto S_end;
-    elsif \/ ~Pending
+        if sfailed # 0 /\ (sfailed <= sjobs[self].seq \/ Mutation = "sync_any_failure") then
+            if sjobs[self].ok /\ sfailed > sjobs[self].seq then falseFail := TRUE; end if;
+            goto S_failed;
+        else
+            goto S_ok;
+        end if;
+    elsif sjobs[self] # NoJob then
+        \* Its call is out: it waits for the end.
+        holder := "none";
+        goto S_wait;
+    elsif sfailed # 0 then
+        \* A sync failed before: this one fails too, with no call.
+        holder := "none";
+        goto S_failed;
+    elsif /\ Pending
           \* MUTATION sync_no_flush: the sync goes with writes still behind or in flight.
-          \/ Mutation = "sync_no_flush"
+          /\ Mutation # "sync_no_flush"
           \* MUTATION sync_drain: the sync goes once the write-behind went out, its order left to
           \* the ring's drain.
-          \/ (Mutation = "sync_drain" /\ behind = NoBehind) then
-        with where \in Wheres do
-            sjob := [ran |-> FALSE, ok |-> TRUE, on |-> where, drain |-> Mutation = "sync_drain"];
-        end with;
-        holder := "none";
-    else
+          /\ ~(Mutation = "sync_drain" /\ behind = NoBehind) then
         \* It waits for the writes accepted before it to land.
         holder := "none";
 S_wait_writes:
         await Progress;
         goto S_hold;
+    elsif (\E q \in Syncers : SyncOut(q)) /\ Mutation # "sync_unserialized" then
+        \* Another sync's call is out, its task maybe gone: this one waits for that call's end,
+        \* which it then takes.
+        \* MUTATION sync_unserialized: it makes its call beside the other.
+        holder := "none";
+S_wait_other:
+        await \A q \in Syncers : sjobs[q] = NoJob \/ sjobs[q].ran \/ sjobs[q].taken;
+        goto S_hold;
+    else
+        \* Its call goes on the ring of its shard, or to the pool; the state keeps it.
+        with where \in Wheres do
+            made := made + 1;
+            sjobs[self] := [seq |-> made, checked |-> FALSE, ran |-> FALSE, ok |-> TRUE,
+                            taken |-> FALSE, on |-> where, drain |-> Mutation = "sync_drain"];
+        end with;
+        holder := "none";
     end if;
 S_wait:
-    await sjob.ran;
-S_end:
-    if refused \/ ~sjob.ok then
-        \* The sync fails, and the handle keeps the failure for every later sync.
-        \* MUTATION sync_forgets: the failure is forgotten once reported.
-        syncFailed := Mutation # "sync_forgets";
-        failedOnce := TRUE;
-    else
-        okClaims := okClaims \cup claimed;
-        if failedOnce then okAfterFail := TRUE; end if;
-    end if;
-    sjob := NoJob;
-    refused := FALSE;
-    round := round + 1;
-S_again:
-    if round <= 2 then
-        goto S_call;
-    end if;
+    either
+        \* Woken when its call's end reached the slot: it takes the end under the guard.
+        await sjobs[self].ran;
+        goto S_hold;
+    or
+        \* Its task goes away with the call out: the call stays in the file state.
+        await MayLeave;
+        goto Done;
+    end either;
+S_failed:
+    \* It returns the failure; the state keeps it for every sync called later.
+    \* MUTATION sync_forgets: the failure is forgotten once reported.
+    failedOnce := TRUE;
+    if Mutation = "sync_forgets" then sfailed := 0; end if;
+    goto Done;
+S_ok:
+    \* It returns success: every write it covers is said to be durable.
+    okClaims := okClaims \cup claimed;
+    if afterFail then okAfterFail := TRUE; end if;
 end process;
 
 \* The cursor writer: copied writes, a lent write, a seek; then an append or a second write of cell 0.
@@ -882,8 +967,12 @@ PosReadSees == (PReaders # {} /\ pc["pr"] = "Done" /\ prBefore) => prGot # 0
 \* was called) is durable.
 SyncCovers == \A w \in okClaims : w[1] >= 0 => durable[w[1]] = w[2]
 
-\* Once a sync failed, no later sync of the handle says it succeeded.
+\* Once a sync returned a failure, no sync called after it says it succeeded.
 NoSyncAfterFailure == ~okAfterFail
+
+\* A sync whose own call succeeded, and before which no call failed, says it succeeded: a failure
+\* of a call made after it is not its own.
+NoFalseFailure == ~falseFail
 
 \* On a direct file every kernel read and write is exactly one a caller made: no read-ahead, and
 \* no write that joins others.
@@ -919,6 +1008,8 @@ NoReadAhead == kreads \subseteq creads
 NoPosOrphanLanded == ~posOrphanLanded
 \* A sync fails.
 NoSyncFailure == ~failedOnce
+\* A sync takes the end of another's call whose task went away with it out.
+NoLeftTaken == ~leftTaken
 \* A job is still out when the handle was dropped: the job closes its object.
 NoJobAfterDrop == ~(gone /\ Leases > 0)
 =============================================================================

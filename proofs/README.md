@@ -822,10 +822,15 @@ from where they stopped.
   went away), the file's generation moves on, and a cursor read counts a job's result, or hands
   out cells read ahead, only of the generation it began in.
 - **sync**: the cursor writer's second copied write waits in the write-behind while the first is
-  in flight, and a task syncs twice once both were accepted. A sync waits until the write-behind
-  went out and every write in flight landed, then its job makes what the file holds durable, or
-  fails (the device may fail it); a failed sync makes every later one fail, with no call. The
-  sync of a range (`sync_range`) is such a sync with another call.
+  in flight, and two tasks each sync once both were accepted. A sync waits until the write-behind
+  went out and every write in flight landed. The handle makes one sync call at a time, kept by
+  the file state, not by its task: a sync whose call would go beside another's waits for that
+  one's end, and a task may go away with its call out, which the next sync then takes. The
+  kernel's call writes back and looks for an error in one step, and its end reaches the slot in
+  another; a write-back the device fails loses every cell not yet durable, and the kernel reports
+  the error to the first call that looks, to it alone. A sync fails for its own call's failure or
+  one of a call made before its own, and one called after a failure fails with no call. The sync
+  of a range (`sync_range`) is such a sync with another call.
 - **direct**: the file is opened for direct IO: a read job reads exactly the cell asked for, and
   each copied write is one kernel write of exactly its bytes, which waits for the write in
   flight instead of joining the write-behind.
@@ -846,15 +851,17 @@ one, unless a cursor write raced it); `PositionalKeepsCursor`, an action propert
 positional call moves the cursor or the epoch; `PosReadSees`, a positional read made after a
 cursor write to its cell was accepted never reads what the cell held before it; `SyncCovers`,
 every write a good sync covers (accepted, or returned for a positional one, before it was called)
-is durable; `NoSyncAfterFailure`, no sync succeeds after one failed; `DirectExact`, on a direct
+is durable; `NoSyncAfterFailure`, no sync called after one failed succeeds; `NoFalseFailure`, a
+sync whose own call succeeded, none before it failing, does not fail; `DirectExact`, on a direct
 file every kernel read and write is exactly one a caller made; `NoCallOnClosed`, no job's call
 runs on a descriptor that closed; and liveness (`Termination`).
 
-52 configurations. 17 must pass: tasks that may go away and tasks that stay, a file opened to
-append, positional calls, the generation, syncs that may fail and a direct file, each with its
+58 configurations. 19 must pass: tasks that may go away and tasks that stay, a file opened to
+append, positional calls, the generation, syncs that may fail (with their tasks staying, and
+going away with a call out) and a direct file, each with its
 safety properties; a handle dropped or handed back with cursor jobs, and with a positional write
 left by its task, still out, with `NoCallOnClosed` beside them; and liveness for the cursor,
-append, positional, generation, sync and direct scenarios. 23 mutations must break the property
+append, positional, generation, sync (both ways) and direct scenarios. 26 mutations must break the property
 their rule protects: a result that counts on the cursor alone breaks `NoStaleRead`, through the
 seek back; a lent write that goes in flight over the one there, a lent write cancelled when its
 task goes away, a write cut short on the ring that counts as done, and a write on the ring
@@ -870,17 +877,22 @@ break `PositionalOrder`; a positional write that moves the epoch on breaks
 it is out breaks `PosReadSees`; a sync made with a write still in the write-behind or in flight
 (`sync_no_flush`), and one made once the write-behind went out but ordered after the writes only
 by the ring's drain (`sync_drain`: a write the shard handed to the blocking pool is not the
-ring's, so the drain does not order it) break `SyncCovers`; a failed sync forgotten once reported
-breaks `NoSyncAfterFailure`; a direct read through the read-ahead and a direct write that joins
+ring's, so the drain does not order it) break `SyncCovers`, and so do a call's failure that
+counts only for its own task (`sync_task_records`: the next sync takes the end of one whose task
+went away and drops its failure, then makes a call the kernel answers with no error) and a sync
+that makes its call beside another's (`sync_unserialized`: the kernel reports the lost write-back
+to one, and the other's task looks first); a failed sync forgotten once reported breaks
+`NoSyncAfterFailure`; a sync that fails for any failure, a later call's too
+(`sync_any_failure`), breaks `NoFalseFailure`; a direct read through the read-ahead and a direct write that joins
 the write-behind break `DirectExact`; a descriptor closed at the drop with a job out, and an
 `into_inner` that does not wait for the jobs, each with a cursor job and with a positional write
-left by its task, break `NoCallOnClosed`. 12 witnesses must be proved wrong: a read that reads
+left by its task, break `NoCallOnClosed`. 13 witnesses must be proved wrong: a read that reads
 again, the lent write of a task that went away landing, a read after the seek that counts the
 lent write's value, a write on the ring landing in two parts, one cut short whose shard went
 finished on the pool, an append after the seek landing at the end, a read that reads again only
 because a positional write ended, a buffered read asking the kernel for more than its caller (the
 read-ahead the direct rule takes away), the positional write of a task that went away landing, a
-sync that fails, and a cursor job and a positional write still out as their handle drops.
+sync that fails, a sync that takes the end of a call whose task went away, and a cursor job and a positional write still out as their handle drops.
 
 The model shows why a sync waits for the writes before it rather than relying on io_uring's
 `IOSQE_IO_DRAIN` (`MF_sync_drain`): the drain orders an entry after the ring's earlier entries
