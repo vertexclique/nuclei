@@ -269,7 +269,10 @@ impl Builder {
     /// The most bytes each worker's IO buffers hold (default 64 MiB). Reads
     /// that had to wait land in these buffers, and writes that had to wait
     /// are copied into them; at the cap, IO waits for buffers to come back,
-    /// so a worker's IO memory never grows past it. On io_uring the worker's
+    /// so a worker's IO memory never grows past it. A thread that serves the
+    /// runtime and runs no shard (one of its blocking pool, one inside it with
+    /// [`enter`](crate::Runtime::enter), a worker whose shard was handed over)
+    /// holds as much at most in a pool of its own. On io_uring the worker's
     /// receive buffers count against the cap too
     /// ([`recv_buffers`](crate::config::IoUringConfiguration::recv_buffers) of
     /// [`recv_buffer_size`](crate::config::IoUringConfiguration::recv_buffer_size)
@@ -409,6 +412,7 @@ impl Builder {
                 Some(cores) => super::cores::mask_of(cores),
                 None => super::current_mask(),
             },
+            buffer_cap: limits.buffer_cap,
         });
         static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (exit_tx, exits) = kovan_channel::unbounded();
@@ -475,6 +479,7 @@ impl Builder {
                 guests: std::sync::OnceLock::new(),
                 lingering: super::super::linger::Lingering::new(),
                 io: self.io.resolve(),
+                buffer_cap: limits.buffer_cap,
             }
         });
         inner.pool.set_owner(Arc::downgrade(&inner));

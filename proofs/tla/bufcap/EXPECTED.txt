@@ -1,0 +1,4 @@
+# configuration                spec                 expected
+B_cap                          MC_BufCap            pass
+MB_default_cap                 MC_BufCap            violated:PerPool
+MB_late_cap                    MC_BufCap            violated:PerPool

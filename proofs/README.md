@@ -1335,6 +1335,23 @@ has no buffer for goes straight from the task's buffer too (`writes_bytes` in
 `src/io/source/write.rs`), on epoll and kqueue as on a ring, as a socket's always does there; the
 pipe test of `tests/idle_peers.rs` checks it on every backend.
 
+## A thread's IO buffers with no shard
+
+`bufcap` (`tla/bufcap/BufCap.tla`) checks what the IO buffers of a thread that runs no shard may
+hold (`with_pool`, the `FALLBACK` pool and `fallback_cap` in `src/buf/mod.rs`, `serve_with_cap`,
+called first by a blocking pool's thread in `src/rt/blocking.rs`). A runtime's worker and the
+threads that serve it with no shard (its blocking pool's, one inside it with `enter`, a worker
+whose shard was handed over) each take buffers from a pool of their own, which counts every buffer
+it holds, in use, free, handed to another thread or on its way back, and takes none past its cap.
+The pool of such a thread takes the cap of the runtime it serves, as a worker's does; before the
+fix it took the 64 MiB default whatever `io_buffer_cap` said. 3 configurations: 1 that must pass
+(a worker and two threads asking for three buffers each from pools of two, with `PerPool`, no pool
+holds more than the runtime's cap, `Total`, `Counted`, and `AllGiven`, every buffer asked for is
+given in the end), and 2 mutations (a pool made with the default, the code before the fix, and a
+pool thread that needs a buffer before it says which runtime it serves, break `PerPool`). The unit
+tests of `src/buf/tests/fallback.rs` build a runtime with a small cap and look at the pool of a
+blocking pool's thread and of a thread inside the runtime (both fail before the fix).
+
 ## A listener's stream of connections
 
 `accept` (`tla/accept/AcceptStream.tla`) checks the stream `TcpListener::accept_multi` gives

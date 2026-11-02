@@ -335,5 +335,6 @@ fn a_waiter_on_a_pool_holding_only_its_reservation_is_woken_at_once() {
 }
 
 mod aligned;
+mod fallback;
 mod owned;
 mod vectored;

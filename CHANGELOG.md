@@ -45,6 +45,12 @@
   ticks left at once the newest is kept, the only one that can still clear. A free side costs
   what it did (`proofs/tla/asyncfd/AsyncFd.tla`, the `drop_held_clear` and `clear_last_wins`
   mutations).
+- **The IO buffers of a thread that runs no shard hold no more than its runtime's
+  `io_buffer_cap`.** A thread of the blocking pool, one inside a runtime with `enter`, and a
+  worker whose shard was handed over take their buffers from a pool of their own, which held up
+  to the 64 MiB default whatever the runtime's `io_buffer_cap` said. That pool now takes the cap
+  of the runtime the thread serves, and a thread that serves none the default runtime's
+  (`proofs/tla/bufcap/BufCap.tla`).
 
 ### Changed
 
