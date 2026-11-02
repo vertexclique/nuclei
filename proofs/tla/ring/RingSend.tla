@@ -8,11 +8,13 @@
 (* epoll and kqueue the same call waits for the socket's edge instead of   *)
 (* the poll (`serve` wakes it, and writes the write-behind out in          *)
 (* `push_fd`): the poll's end here stands for either. On a Windows         *)
-(* completion port (`Backend = "port"`, `poll_send` in write.rs and        *)
-(* `send_queued` in write/datagram.rs) a datagram is copied and queued for *)
-(* the port and its call answers taken at once; one too large for any      *)
-(* socket is refused at once (`datagram_too_long`), and any other refusal  *)
-(* the kernel makes of it reaches the next call.                           *)
+(* completion port (`Backend = "port"`, `send_now_port` in                 *)
+(* write/datagram.rs) the task hands its datagram to the kernel itself as  *)
+(* well, on a socket made non-blocking, and with no room it waits for the  *)
+(* port's poll of the socket (an AFD poll for room to send, `start_poll`   *)
+(* in port.rs) and tries again. Before, a port's datagram was copied and   *)
+(* queued and its call answered taken at once, so a refusal the kernel     *)
+(* made of it reached the next call (`port_queues`).                       *)
 (*                                                                          *)
 (* In plain words: a task sends datagrams one call after another. The     *)
 (* first may be its own buffer lent to a send the ring makes (`send_owned` *)
@@ -39,8 +41,8 @@
 (* What must never happen: a call answers anything but the kernel's own    *)
 (* verdict on its datagram (the bug the size sweep found: a datagram too   *)
 (* large for the kernel was taken as sent, its error left for the next     *)
-(* call, as a port's refusal still is); the task's datagrams or chunks     *)
-(* reach the peer out of the order                                         *)
+(* call, as a port's did); the task's datagrams or chunks reach the peer   *)
+(* out of the order                                                        *)
 (* it sent them; a call waits forever; a large chunk is copied.            *)
 (*                                                                          *)
 (* What is abstract: the side's guard (a step here runs whole under it;    *)
@@ -78,8 +80,9 @@ N == Len(Sends)
 Big(k) == Sends[k] = "big"
 \* Whether the kernel refuses datagram k: too large, or with no route as it sends it.
 Fails(k) == Sends[k] \in {"big", "unreach"}
-\* Whether the call copies its datagram and queues it, answering taken: a port's, or (mutated) any.
-Queues == Mutation = "behind" \/ Backend = "port"
+\* Whether the call copies its datagram and queues it, answering taken (mutated: any side, as before;
+\* a port's, as before).
+Queues == Mutation = "behind" \/ (Backend = "port" /\ Mutation = "port_queues")
 \* Whether chunk k is large: it waits for the socket rather than being copied.
 Large(k) == Sends[k] = "large"
 \* The kernel's own verdict on datagram or chunk k, which its call must answer.
@@ -281,8 +284,9 @@ T_call:
                 woken := FALSE;
 T_wait:
                 await woken;
-            elsif Big(at) then
-                \* The kernel refuses it at once, before it looks for room.
+            elsif Fails(at) then
+                \* The kernel refuses it at once, before it looks for room: too large, or (a port's)
+                \* with no route, which a call of the task's own hears at once.
                 result[at] := "err";
                 at := at + 1;
             elsif Len(socket) < Room then
@@ -327,7 +331,7 @@ NoLargeCopy == \A i \in 1..Len(Held) : ~Large(Held[i])
 Termination == <>(pc["task"] = "Done")
 
 \* Every datagram the kernel can take reaches the peer, the lent one too.
-Delivered == <>(\A j \in 1..N : ~Big(j) => \E i \in 1..Len(wire) : wire[i] = j)
+Delivered == <>(\A j \in 1..N : ~Fails(j) => \E i \in 1..Len(wire) : wire[i] = j)
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)

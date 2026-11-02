@@ -135,4 +135,7 @@ RR_port_udp_starved_live       MC_RingRecv          pass
 MR_port_task_sized             MC_RingRecv          violated:NoCut
 MRR_ring_task_sized            MC_RingRecv          violated:NoCut
 WRR_port_look                  MC_RingRecv          violated:NoLook
-WRS_port_queued                MC_RingSend          violated:OwnResult
+MRS_port_queued                MC_RingSend          violated:OwnResult
+RS_port                        MC_RingSend          pass
+RS_port_live                   MC_RingSend          pass
+MRS_port_no_wake               MC_RingSend          violated:Termination

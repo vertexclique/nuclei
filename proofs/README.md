@@ -1190,12 +1190,13 @@ mutations (the old queue-and-answer breaks `OwnResult`; a call that goes to the 
 lent send of a task that went still out overtakes it, breaking `InOrder`; a poll that wakes
 nobody breaks `Termination`), and 3 witnesses (a call that waits for room, a refusal answered by
 its own call, a call that waits behind the lent send of a task that went). A Windows completion port
-(`Backend = "port"`, `poll_send` in `src/io/source/write.rs` and `send_queued` in
-`src/io/source/write/datagram.rs`) still copies and queues a datagram and answers taken at once:
-one too large for any socket is refused at once (`datagram_too_long`), but one the kernel refuses
-only as it sends it (no route) has its refusal reach the next call, whose own datagram is never
-sent. A witness of that defect (`WRS_port_queued`, `OwnResult` broken) stands until a port's send
-answers what the kernel says of its own datagram.
+(`Backend = "port"`) sends from the task too (`send_now_port` in `src/io/source/write/datagram.rs`),
+on a socket made non-blocking, and a call that finds no room waits for the port's poll of the socket
+(an AFD poll for room to send, `start_poll` in `src/io/source/port.rs`). Its datagrams include one
+the kernel refuses only as it sends it (no route), which a call of the task's own hears at once. 3
+more configurations: 2 that must pass (`OwnResult` and `InOrder`; `Termination` and `Delivered`),
+and 2 mutations (the port's old copy, queue and answer breaks `OwnResult`, as a refusal reaches the
+next call; a poll for room that wakes nobody breaks `Termination`).
 
 The same model checks a stream's writes (`Stream`: `write_direct`, `wait_for_room` and `write` in
 `src/io/source/write.rs`). The task writes small chunks and large ones (16 KiB or more,
