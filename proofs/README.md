@@ -1556,6 +1556,28 @@ holder that clears the token and the shard with the state, before its detach, wh
 then misses, `NoStrandedDetach`); and 2 witnesses (the other shard's registration under the
 same number while the shard waits; a holder's eviction).
 
+`Pending` (`tla/going/Pending.tla`) checks a thread's own shard that leaves while the attach of a
+source it registered is still a request another thread holds (`Shard::leave` and
+`wait_for_evictions` in `src/rt/shard/going.rs`, `attach_now`, `name_ring_attach`,
+`attach_asked_of`, `evict_now` and `abandon_ring_attach` in `src/io/source/requests.rs`,
+`attach_ring` and `ring_attach_failed` in `src/io/source/ring.rs`, `Tokens::drain_tokens` in
+`src/rt/sources.rs`). The holder performs the attach and then the eviction as it lets go: on a ring,
+off the shard's thread, the attach posts the file's install with a lease that keeps the handle's
+object open, and the eviction abandons it with a release of the slot; elsewhere the holder
+registers the source itself; an attach that finds the handle closed posts a release. The shard
+empties its table, waits while the attach is still asked of it and while the source is registered
+with it under its token, looking in that order, applies its mailbox and leaves; its next
+`block_on` registers another source in the slot and applies the mailbox again. A ring's attach
+names its shard and token before it takes the ask, and every end clears them after its posts; a
+drain lets the table's generations go on. 8 configurations: 4 that must pass (a ring and a
+readiness poller, each with an attach that works and one that fails), with `NoForeignRelease`, no
+release removes the next registration, `NoLeaseLeft`, no install's lease waits in the mailbox while
+the shard is away, and `AllEnd`; 3 mutations (no wait for the attach still asked, and an attach
+that takes the ask before it names its shard, which leave the lease behind, `NoLeaseLeft`; a drain
+that starts the generations over, which lets a late release remove the next registration,
+`NoForeignRelease`); and 1 witness (a failed attach's release that reaches the shard only at its
+next `block_on`).
+
 `Behind` (`tla/going/Behind.tla`) checks the bytes a source's writes took into its write-behind
 when the shard that drove them goes (`Shard::leave`, its `let_go_of_sources`, and `drain_unsent`
 in `src/rt/shard/going.rs`, `Source::poll_drain`, `WriteState::submit_ops` and `op_done`,

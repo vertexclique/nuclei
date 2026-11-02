@@ -34,7 +34,8 @@
 (* cancel and completion, which settle applies in one step (`Shard::leave` *)
 (* settles only while its ring has operations out; or, on a ring           *)
 (* another thread can reap, the ring's keeper: src/rt/shard/ring/keeper.rs; *)
-(* LentZc.tla checks the keeper's part).                                   *)
+(* LentZc.tla checks the keeper's part). An attach of the source still    *)
+(* asked of A, which A's wait also waits for, is Pending.tla's.            *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 

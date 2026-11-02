@@ -28,6 +28,17 @@
   and counts out, while the memory the kernel may still write is kept for good, as before; the
   receive group is kept only when a receive that draws from it is out
   (`proofs/tla/keeper/Forgot.tla`).
+- **A thread's own shard that leaves waits for an attach another thread still has to perform**
+  (io_uring; every backend for the stale token). A source registered in a thread's `block_on`
+  while another thread held one of its sides has its attach left to that holder. Once the
+  `block_on` returned, its shard left at once; the holder then posted the file's install, with a
+  lease that kept the handle's descriptor open until the thread's next `block_on`, and the slot's
+  release, which that `block_on` applied after its first registration took the slot under the
+  same token: that source was then in no table, never evicted, and its IO stalled once the shard
+  left again. The shard now waits for an attach still asked of it as for an eviction, and applies
+  what it posts before it leaves; and a drain of the shard's table starts its generations past
+  every token it handed out, so a release that comes late names nothing
+  (`proofs/tla/going/Pending.tla`).
 - **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
   `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
   for a connection its peer reset in the backlog before or while the accept took it. That error is

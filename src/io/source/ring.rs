@@ -1053,9 +1053,10 @@ impl Source {
     ) -> io::Result<()> {
         shard.counters.refused_registration();
         self.reg.ops.store(false, Ordering::Release);
-        self.reg.home.store(0, Ordering::Release);
         self.reg.state.store(super::UNREGISTERED, Ordering::Release);
         shard.release_source(token);
+        // After the release went to the shard, as every end of a registration.
+        self.reg.home.store(0, Ordering::Release);
         Err(err)
     }
 

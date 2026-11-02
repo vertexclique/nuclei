@@ -1236,6 +1236,11 @@ impl Source {
     }
 }
 
+/// Looks of a shard that leaves which found an attach still asked of it, for a test.
+#[cfg(test)]
+pub(crate) static ATTACH_WAITS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 impl Source {
     /// Has a stream read by readiness on a ring read through the multishot receive from its first
@@ -1284,6 +1289,11 @@ impl Source {
         self.reg.state.load(Ordering::SeqCst) == REGISTERING
     }
 
+    /// Whether a lease on the handle's object is out (a ring's mailbox may hold it).
+    #[cfg(ring)]
+    pub(crate) fn is_leased(&self) -> bool {
+        self.ask.keep.leased()
+    }
 
     /// The read side as a line, for a test that failed: its guard's words,
     /// and what it holds unless it is held.

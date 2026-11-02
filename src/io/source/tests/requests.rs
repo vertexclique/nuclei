@@ -547,6 +547,104 @@ fn a_shard_that_leaves_applies_the_detach_of_a_holders_eviction() {
     shard.join().unwrap();
 }
 
+/// A thread's own shard leaves while the attach of a source it registered is still a request,
+/// left to this thread, which holds a side: letting go performs the attach and the eviction, which
+/// post the file's install (with a lease that keeps the handle's object open) and the slot's
+/// release to the shard. The shard waits for both before it leaves and applies them, so no lease is
+/// left with it while it is away, and the release never reaches the registration its next
+/// `block_on` makes under the same slot. Before, the shard left at once: the lease kept the
+/// descriptor open until its next `block_on`, whose first registration the stale release then took
+/// out of its table, so that source was never evicted (`proofs/tla/going/Pending.tla`).
+#[cfg(ring)]
+#[test]
+fn a_shard_that_leaves_waits_for_an_attach_left_to_a_holder() {
+    use std::sync::mpsc::channel;
+    let (mine, _peer) = stream_pair();
+    let handle = Handle::new(mine).unwrap();
+    let src = Arc::clone(handle.source());
+    let (second, _second_peer) = stream_pair();
+    let second = Handle::new(second).unwrap();
+    let src2 = Arc::clone(second.source());
+    let held = src.write.try_hold().expect("the write side is free");
+    let (polled, has_polled) = channel::<bool>();
+    let (again, go_again) = channel::<()>();
+    let (ended, has_ended) = channel();
+    let left = Arc::new(AtomicBool::new(false));
+    let waits = super::super::ATTACH_WAITS.load(Ordering::SeqCst);
+    let shard = {
+        let left = Arc::clone(&left);
+        std::thread::spawn(move || {
+            crate::block_on(async {
+                let on_ring = crate::proactor::Proactor::backend() == crate::IoBackend::IoUring;
+                if on_ring {
+                    // The read registers the source here; its attach is left to the holder.
+                    let mut buf = [0u8; 1];
+                    let mut read = Box::pin(handle.recv(&mut buf));
+                    assert!(
+                        poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx)))
+                            .await
+                            .is_pending()
+                    );
+                }
+                polled.send(on_ring).unwrap();
+            });
+            left.store(true, Ordering::SeqCst);
+            if go_again.recv().is_ok() {
+                crate::block_on(async {
+                    // The next block_on's first registration takes the slot again.
+                    let mut buf = [0u8; 1];
+                    let mut read = Box::pin(second.recv(&mut buf));
+                    assert!(
+                        poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx)))
+                            .await
+                            .is_pending()
+                    );
+                    drop(read);
+                    // A turn with nothing to run applies what the mailbox holds.
+                    crate::time::sleep(Duration::from_millis(1)).await;
+                });
+            }
+            ended.send((handle, second)).unwrap();
+        })
+    };
+    let on_ring = has_polled.recv().unwrap();
+    let mut after = After::default();
+    if !on_ring {
+        eprintln!("skipping: this thread's shard runs no ring here");
+        held.release(&mut after, &src.hooks());
+        after.run();
+        drop(again);
+        drop(has_ended.recv().unwrap());
+        shard.join().unwrap();
+        return;
+    }
+    // The shard left, or waits in its leave for the attach still asked of it.
+    until_some("the shard neither left nor waited", || {
+        (left.load(Ordering::SeqCst) || super::super::ATTACH_WAITS.load(Ordering::SeqCst) > waits)
+            .then_some(())
+    });
+    held.release(&mut after, &src.hooks());
+    after.run();
+    until_some("the shard never left", || {
+        left.load(Ordering::SeqCst).then_some(())
+    });
+    assert!(
+        !src.is_leased(),
+        "the shard left with the install's lease still in its mailbox"
+    );
+    again.send(()).unwrap();
+    let (handle, second) = has_ended
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the shard's next block_on never ended");
+    assert_eq!(
+        src2.registration().0,
+        0,
+        "a stale release took the next registration out of the shard's table: it was never evicted"
+    );
+    drop((handle, second));
+    shard.join().unwrap();
+}
+
 /// A registration posted to a shard that stops before it makes it fails no IO of the source: the
 /// source is unregistered again (`proofs/tla/attach`: an attach refused leaves it so), and its
 /// next write and read go through where they are polled. Before, the source kept the failure
