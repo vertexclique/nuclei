@@ -12,6 +12,8 @@ TwoAwait == <<"await", "await">>
 DropAwait == <<"drop", "await">>
 \* One waiter that awaits.
 OneAwait == <<"await">>
+\* One waiter, dropped after one poll.
+OneDrop == <<"drop">>
 \* A waiter made before the first call, and one made after the last.
 EarlyAfter == <<"early", "after">>
 \* Calls.

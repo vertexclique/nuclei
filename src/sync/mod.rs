@@ -6,9 +6,9 @@
 //! futures and wakers only: async code awaits it, and any executor polls it
 //! with its own [`Waker`](core::task::Waker). Every primitive also has
 //! `try_` forms that never wait. The core of this module makes no system
-//! call: no futex, no thread park, no sleep and no clock read. The one
-//! exception is inside the lock-free queues the primitives use, which recycle
-//! waiter nodes and yield the thread when they meet contention. The other
+//! call: no futex, no thread park, no sleep and no clock read. A contended
+//! acquire spins briefly with the processor's pause hint before it queues, and
+//! never yields the thread. The one
 //! exception is the
 //! `blocking_*` methods, which exist for threads that may block and park
 //! the calling thread until their wait is over. Called on a nuclei shard
@@ -170,9 +170,6 @@ mod mutex;
 mod notify;
 mod once_cell;
 pub mod oneshot;
-// See the note on its re-export below.
-#[allow(dead_code)]
-mod owned_lock;
 mod owner;
 mod queue;
 mod raw_rwlock;
@@ -203,11 +200,6 @@ pub use mutex::{
 };
 pub use notify::{Notified, Notify, OwnedNotified};
 pub use once_cell::{OnceCell, SetError};
-// vertexia: the owner-named lock has no consumer in this crate yet; its
-// tests run in `owned_lock`. Trim it if it stays unused.
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use owned_lock::between_take_and_grant;
 pub use owner::{Owner, ThreadOwner};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, ReentrantMutexLock};
 pub use reentrant_rwlock::{

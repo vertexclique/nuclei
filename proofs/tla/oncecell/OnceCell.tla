@@ -106,6 +106,11 @@ I_write:
     slotWriters := slotWriters + 1;
     mine := <<"init", self>>;
     slot := mine;
+    \* MUTATION close_before_publish: the turn queue is closed before the value is
+    \* published, so a wait the close ends finds no value.
+    if Mutation = "close_before_publish" then
+        closed := TRUE;
+    end if;
 I_publish:
     if IsNull(ptr) then
         ptr := Inline;

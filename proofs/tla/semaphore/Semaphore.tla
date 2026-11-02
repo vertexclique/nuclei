@@ -145,7 +145,8 @@ macro claimOrDirty(claimed) begin
 end macro;
 
 (***************************************************************************)
-(* The drain role's work (`WaitQueue::drain` and `RawSemaphore::pass`).   *)
+(* The drain role's work (`Policy::drain` in src/sync/queue.rs and       *)
+(* `RawSemaphore::pass` in src/sync/raw_semaphore.rs).                     *)
 (***************************************************************************)
 procedure Drain()
 \* (The withdrawn nodes a sweep takes, and the front a handoff looks at, are

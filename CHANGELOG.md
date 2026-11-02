@@ -478,6 +478,15 @@
   waiting for the last slot, nothing told it until the refused send was polled again or dropped,
   which nothing makes happen. The give-back now wakes it as every other give-back does
   (`proofs/tla/mpsc/BoundedChannel.tla`, `BC_live_refuse` and `ML_refuse_no_idle_wake`).
+- **An interval never panics on a tick past the clock's range, and a skip lands after now
+  however far behind it is.** The next tick was the last one plus the period with `+`, which
+  panics past the clock's range: `interval(Duration::MAX)` panicked in its first tick, and
+  `reset` did the same. Such a tick now waits in the far future, as a timeout's deadline does,
+  so a period too large ticks once. `Skip` counted the periods it missed in a `u32`: late by more
+  than 2^32 periods (49 days at a millisecond), its next tick was still in the past and fired at
+  once. It now takes what is left of the period now falls in, so the next tick is the next one
+  of the schedule after now (`proofs/tla/interval/Interval.tla`).
+
 ### Changed
 
 - **A stream read the kernel's last count covers asks for no new count** (Linux, epoll). A read

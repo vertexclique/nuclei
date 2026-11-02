@@ -31,7 +31,12 @@
 (* new runner's first drive. What is abstract: time is whole units (a run  *)
 (* adds its kind's amount), what a task does, the coarse clock's own       *)
 (* resolution (the bound is whole units), the drive itself (one step that  *)
-(* hands every queued operation to the kernel).                            *)
+(* hands every queued operation to the kernel). The drive                  *)
+(* (src/rt/shard.rs `Shard::drive`) also applies posted registrations and  *)
+(* fires the shard's due timers (`fire_timers`) before it looks at the     *)
+(* poller, so the bound on how long an operation waits is the same bound   *)
+(* on how late a due timer of a busy shard fires; the timers themselves    *)
+(* are the timer and clock families' part.                                 *)
 (***************************************************************************)
 EXTENDS Integers
 

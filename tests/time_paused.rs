@@ -117,6 +117,51 @@ fn an_interval_and_a_timeout_run_on_paused_time() {
 }
 
 #[test]
+fn an_interval_whose_next_tick_is_past_the_clock_ticks_once_then_waits() {
+    let rt = runtime(0, true);
+    rt.block_on(async {
+        for missed in [
+            time::MissedTickBehavior::Burst,
+            time::MissedTickBehavior::Delay,
+            time::MissedTickBehavior::Skip,
+        ] {
+            let start = Instant::now();
+            let mut every = time::interval(Duration::MAX);
+            every.set_missed_tick_behavior(missed);
+            assert_eq!(every.tick().await, start, "the first tick is at once");
+            let next = time::timeout(Duration::from_secs(3600), every.tick()).await;
+            assert!(next.is_err(), "no second tick within the hour ({missed:?})");
+            every.reset();
+            let next = time::timeout(Duration::from_secs(3600), every.tick()).await;
+            assert!(next.is_err(), "no tick within the hour of a reset ({missed:?})");
+        }
+    });
+}
+
+#[test]
+fn a_skipping_interval_lands_after_now_however_many_periods_it_missed() {
+    let rt = runtime(0, true);
+    rt.block_on(async {
+        let start = Instant::now();
+        let period = Duration::from_millis(1);
+        let mut every = time::interval(period);
+        every.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        assert_eq!(every.tick().await, start);
+        // More periods than a u32 counts.
+        let behind = Duration::from_secs(60 * 86_400);
+        time::advance(behind).await;
+        assert_eq!(every.tick().await, start + period, "the late tick");
+        let now = Instant::now();
+        assert_eq!(now, start + behind);
+        assert_eq!(
+            every.tick().await,
+            now + period,
+            "the next tick on the schedule after now"
+        );
+    });
+}
+
+#[test]
 fn a_resumed_clock_runs_on_from_where_it_stood() {
     let rt = runtime(0, true);
     rt.block_on(async {

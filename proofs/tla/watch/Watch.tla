@@ -15,6 +15,15 @@
 (* A sender's `closed` waits for the receivers to go the same way: its     *)
 (* `Notified` first, then the count of receivers.                          *)
 (*                                                                          *)
+(* Also modelled: `send_replace` (`Sender::send_replace`), which swaps the *)
+(* value, publishes it, and only then clones the old one, whose clone may  *)
+(* panic and unwind the sender into its drop; `Receiver::wait_for`, which  *)
+(* takes a snapshot (the version, then the value), judges the value, and   *)
+(* otherwise waits through `changed`, judging nothing more after the close *)
+(* unless the value changed; `Sender::subscribe`, which counts a new       *)
+(* receiver at the version it loads; and `Sender::clone`, which counts the *)
+(* new sender before the handle exists.                                    *)
+(*                                                                          *)
 (* What is modelled step by step: the store or compare-and-swap of the     *)
 (* value, the version bump, each wake, the close, the receiver counts and  *)
 (* their wake, and each read of the state, the value and the count. What   *)
@@ -31,12 +40,19 @@ CONSTANTS
     WithChanged,  \* a receiver waits for changes until the close
     WithBorrower, \* a receiver borrows once, then goes
     WithClosed,   \* one more sender waits until every receiver went, then goes
+    WithWaitFor,  \* a receiver runs wait_for(f) once, then goes
+    FitAt,        \* f accepts a value whose store order is at least this
     Mutation      \* "none", or the name of the one rule this run takes away
 
 Senders == 1..Len(SendOps)
 ChangedT == 10
 BorrowT == 11
 ClosedT == 12
+WaitForT == 13
+SubT == 14
+CloneT == 15
+\* Some sender's operations include `o`.
+HasOp(o) == \E s \in 1..Len(SendOps) : \E k \in 1..Len(SendOps[s]) : SendOps[s][k] = o
 TotalOps == LET Sum[i \in 0..Len(SendOps)] ==
                     IF i = 0 THEN 0 ELSE Sum[i - 1] + Len(SendOps[i])
             IN Sum[Len(SendOps)]
@@ -51,17 +67,35 @@ variables
     ngen = 0,         \* notify_waiters calls on the receivers' Notify
     tgen = 0,         \* notify_waiters calls on the producer's Notify
     txCount = Len(SendOps) + (IF WithClosed THEN 1 ELSE 0),
-    rxCount = (IF WithChanged THEN 1 ELSE 0) + (IF WithBorrower THEN 1 ELSE 0),
+    rxCount = (IF WithChanged THEN 1 ELSE 0) + (IF WithBorrower THEN 1 ELSE 0)
+              + (IF WithWaitFor THEN 1 ELSE 0),
     modifies = 0,     \* modifying sends that published
     \* records
     errUnseen = FALSE,   \* `changed` answered closed with a version it had not seen
     pairedOlder = FALSE, \* a borrow paired a version with an older value
     ahead = FALSE,       \* a borrow's value was newer than its version (harmless)
     retried = FALSE,     \* a compare-and-swap lost to another sender
-    changesSeen = 0;     \* versions `changed` answered with
+    changesSeen = 0,     \* versions `changed` answered with
+    subscribed = FALSE,  \* a sender subscribed the extra receiver
+    subVer = 0,          \* the version that receiver starts from
+    subAt = 0,           \* (record) the version as the subscribe ran
+    subOld = FALSE,      \* (record) its `changed` answered with no publication since it subscribed
+    cloned = FALSE,      \* a sender cloned itself into the extra sender
+    sentPastClose = FALSE, \* (record) a publication after the close
+    wfErrBad = FALSE;    \* (record) wait_for answered closed without judging the newest value
 
 define
     SendersDone == \A s \in Senders : pc[s] = "Done"
+    \* Every sender, the clone included, is done.
+    AllSendersDone == SendersDone /\ (HasOp("clone") => pc[CloneT] = "Done")
+    \* Every value stored was published: a version bump and a wake for each one.
+    StoresAnnounced == AllSendersDone => version = stores
+    \* Nothing is published after the last sender went.
+    NoSendPastClose == ~sentPastClose
+    \* wait_for answers closed only once f turned down the newest value.
+    WaitForErrOnNewest == ~wfErrBad
+    \* A subscribed receiver's `changed` answers only a publication made since it subscribed.
+    SubSeesOnlyNewer == ~subOld
     \* Safety.
     ErrOnlyWhenSeen == ~errUnseen
     PairedNoOlder == ~pairedOlder
@@ -70,6 +104,8 @@ define
     \* Liveness.
     ReceiverEnds == WithChanged => <>(pc[ChangedT] = "Done")
     ProducerEnds == WithClosed => <>(pc[ClosedT] = "Done")
+    WaitForEnds == WithWaitFor => <>(pc[WaitForT] = "Done")
+    SubEnds == HasOp("subscribe") => <>(pc[SubT] = "Done")
     \* Witnesses.
     NoChangeSeen == changesSeen = 0
     NoRetry == ~retried
@@ -92,6 +128,37 @@ S_store:
             stores := stores + 1;
             valIdx := stores;
             valCount := 0;
+        elsif SendOps[self][i] \in {"replace", "replace_panic"} then
+S_swap:
+            \* `send_replace`: one swap of the value; the old one comes back to be cloned.
+            stores := stores + 1;
+            valIdx := stores;
+            valCount := 0;
+            \* MUTATION replace_clone_first: the old value is cloned before the publish, and
+            \* the clone panics there: the sender unwinds into its drop with the new value
+            \* stored and never published.
+            if SendOps[self][i] = "replace_panic" /\ Mutation = "replace_clone_first" then
+                goto S_drop;
+            end if;
+        elsif SendOps[self][i] = "subscribe" then
+S_sub:
+            \* `subscribe`: one load of the state for the new receiver's version, and the
+            \* receiver count up by one.
+            \* MUTATION subscribe_from_zero: the new receiver starts from version zero.
+            subVer := IF Mutation = "subscribe_from_zero" THEN 0 ELSE version;
+            subAt := version;
+            rxCount := rxCount + 1;
+            subscribed := TRUE;
+            goto S_skip;
+        elsif SendOps[self][i] = "clone" then
+S_clone:
+            \* `Sender::clone`: the sender count up by one, then the new handle exists.
+            \* MUTATION clone_counts_late: the new handle counts itself only once it runs.
+            if Mutation # "clone_counts_late" then
+                txCount := txCount + 1;
+            end if;
+            cloned := TRUE;
+            goto S_skip;
         else
 S_load:
             curIdx := valIdx;
@@ -111,9 +178,16 @@ S_cas:
         end if;
 S_bump:
         version := version + 1;
+        sentPastClose := sentPastClose \/ closed;
 S_notify:
         ngen := ngen + 1;
-        i := i + 1;
+        \* A `send_replace` clones the old value now; a clone that panics unwinds the
+        \* sender into its drop, after the publish.
+        if SendOps[self][i] = "replace_panic" then
+            goto S_drop;
+        else
+            i := i + 1;
+        end if;
     end while;
 S_drop:
     last := txCount = 1;
@@ -123,6 +197,136 @@ S_close:
 S_closeNotify:
     if last then
         ngen := ngen + 1;
+    end if;
+    goto Done;
+S_skip:
+    \* An operation that publishes nothing: on to the next one.
+    i := i + 1;
+    goto S_op;
+end process;
+
+\* The sender a `clone` made: once it exists it sends once, then goes.
+fair process clone \in (IF HasOp("clone") THEN {CloneT} ELSE {})
+variables lastC = FALSE;
+begin
+C_wait:
+    await cloned;
+C_count:
+    \* MUTATION clone_counts_late: the count goes up only now.
+    if Mutation = "clone_counts_late" then
+        txCount := txCount + 1;
+    end if;
+C_store:
+    stores := stores + 1;
+    valIdx := stores;
+    valCount := 0;
+C_bump:
+    version := version + 1;
+    sentPastClose := sentPastClose \/ closed;
+C_notify:
+    ngen := ngen + 1;
+C_drop:
+    lastC := txCount = 1;
+    txCount := txCount - 1;
+C_close:
+    closeIfLast(lastC);
+C_closeNotify:
+    if lastC then
+        ngen := ngen + 1;
+    end if;
+end process;
+
+\* The receiver a `subscribe` made: once it exists, one `changed`, then it goes.
+fair process sub \in (IF HasOp("subscribe") THEN {SubT} ELSE {})
+variables uVer = 0, uGen = 0, uV = 0, uC = FALSE, lastU = FALSE;
+begin
+U_wait:
+    await subscribed;
+    uVer := subVer;
+U_create:
+    \* `changed`: the Notified first, then the state.
+    uGen := ngen;
+U_read:
+    uV := version;
+    uC := closed;
+U_decide:
+    if uV # uVer then
+        subOld := subOld \/ uV = subAt;   \* (record) a change answered that is not one
+        goto U_drop;
+    elsif uC then
+        goto U_drop;
+    end if;
+U_sleep:
+    await ngen > uGen;
+    goto U_create;
+U_drop:
+    lastU := rxCount = 1;
+    rxCount := rxCount - 1;
+U_dropNotify:
+    if lastU then
+        tgen := tgen + 1;
+    end if;
+end process;
+
+\* A receiver that runs `wait_for(f)`, f accepting a store order of at least FitAt.
+fair process waitFor \in (IF WithWaitFor THEN {WaitForT} ELSE {})
+variables wVer = 0, wClosed = FALSE, sv = 0, sidx = 0, judged = 0, wGen = 0, wV = 0,
+          wC = FALSE, lastW = FALSE;
+begin
+F_snap:
+    \* `Shared::snapshot`: the version first, then the value.
+    \* MUTATION wait_for_value_first: the value first, then the version.
+    if Mutation = "wait_for_value_first" then
+        sidx := valIdx;
+    else
+        sv := version;
+    end if;
+F_snap2:
+    if Mutation = "wait_for_value_first" then
+        sv := version;
+    else
+        sidx := valIdx;
+    end if;
+F_judge:
+    \* f is called unless the channel closed and nothing changed since f last judged; the
+    \* snapshot's version is marked seen either way.
+    if (~wClosed \/ sv # wVer) /\ sidx >= FitAt then
+        judged := sidx;
+        wVer := sv;
+        goto F_drop;               \* Ok, with the value f accepted
+    elsif wClosed then
+        \* Closed: Err, with the newest value judged (now or before) and turned down.
+        wfErrBad := wfErrBad \/ (IF sv # wVer THEN sidx ELSE judged) # valIdx;
+        judged := IF sv # wVer THEN sidx ELSE judged;
+        wVer := sv;
+        goto F_drop;
+    else
+        judged := sidx;            \* f turned it down: wait for a change
+        wVer := sv;
+    end if;
+F_create:
+    \* `changed`: the Notified first, then the state.
+    wGen := ngen;
+F_read:
+    wV := version;
+    wC := closed;
+F_decide:
+    if wV # wVer then
+        wVer := wV;
+        goto F_snap;               \* a change: judge again
+    elsif wC then
+        wClosed := TRUE;
+        goto F_snap;               \* the close: one last look
+    end if;
+F_sleep:
+    await ngen > wGen;
+    goto F_create;
+F_drop:
+    lastW := rxCount = 1;
+    rxCount := rxCount - 1;
+F_dropNotify:
+    if lastW then
+        tgen := tgen + 1;
     end if;
 end process;
 

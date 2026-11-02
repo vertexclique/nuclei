@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::Instant;
 
-use super::sleep::{Sleep, sleep_until};
+use super::sleep::{Sleep, far_future, sleep_until};
 
 /// What an interval does with ticks it missed because it was polled late.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -23,7 +23,9 @@ pub enum MissedTickBehavior {
     Skip,
 }
 
-/// Ticks every `period`, the first tick at once.
+/// Ticks every `period`, the first tick at once. A tick that would come
+/// past the clock's range comes in the far future instead, so a period too
+/// large for the clock ticks once.
 ///
 /// # Panics
 ///
@@ -73,22 +75,25 @@ impl Interval {
         let due = self.sleep.deadline();
         let now = Instant::now();
         let next = match self.missed {
-            MissedTickBehavior::Burst => due + self.period,
-            MissedTickBehavior::Delay => now + self.period,
+            MissedTickBehavior::Burst => due.checked_add(self.period),
+            MissedTickBehavior::Delay => now.checked_add(self.period),
             MissedTickBehavior::Skip => {
-                let late = now.saturating_duration_since(due);
-                // The next deadline on the schedule after now.
-                let periods = late.as_nanos() / self.period.as_nanos() + 1;
-                due + self.period * u32::try_from(periods).unwrap_or(u32::MAX)
+                // The next deadline on the schedule after now: now, plus what
+                // is left of the period now falls in.
+                let late = now.saturating_duration_since(due).as_nanos();
+                let into = late % self.period.as_nanos();
+                let left = self.period - nanos_duration(into);
+                now.max(due).checked_add(left)
             }
         };
-        Pin::new(&mut self.sleep).reset(next);
+        Pin::new(&mut self.sleep).reset(next.unwrap_or_else(far_future));
         Poll::Ready(due)
     }
 
     /// Restarts the schedule: the next tick is one period from now.
     pub fn reset(&mut self) {
-        Pin::new(&mut self.sleep).reset(Instant::now() + self.period);
+        let next = Instant::now().checked_add(self.period);
+        Pin::new(&mut self.sleep).reset(next.unwrap_or_else(far_future));
     }
 
     /// The period.
@@ -105,4 +110,13 @@ impl Interval {
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.missed = behavior;
     }
+}
+
+/// `nanos` as a duration; `nanos` is below some duration's count, so its
+/// seconds fit.
+fn nanos_duration(nanos: u128) -> Duration {
+    const NANOS: u128 = 1_000_000_000;
+    let secs = u64::try_from(nanos / NANOS).unwrap_or(u64::MAX);
+    // Below a billion: fits.
+    Duration::new(secs, (nanos % NANOS) as u32)
 }
