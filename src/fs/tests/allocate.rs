@@ -212,6 +212,49 @@ fn zeroing_a_range_past_the_end_grows_the_file_as_zeros_would() {
     });
 }
 
+/// A reservation past the end of the file is still the file's once it was
+/// closed and opened again, on APFS (HFS+ frees it at the close, as the
+/// rustdoc of `Allocate::KeepSize` says).
+#[cfg(target_os = "macos")]
+#[test]
+fn keep_size_space_past_the_end_outlives_a_close_on_apfs() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = Temp::new("alloc-keep-close");
+    let path = tmp.file("data");
+    std::fs::write(&path, pattern(100)).unwrap();
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: plain data, all zeroes valid; the kernel fills it.
+    let mut fs: libc::statfs = unsafe { core::mem::zeroed() };
+    // SAFETY: a path we own, and our own struct.
+    assert_eq!(unsafe { libc::statfs(c.as_ptr(), &mut fs) }, 0);
+    let name: Vec<u8> = fs
+        .f_fstypename
+        .iter()
+        .take_while(|&&b| b != 0)
+        .map(|&b| b as u8)
+        .collect();
+    if name != b"apfs" {
+        eprintln!("skipping: {} is not APFS", String::from_utf8_lossy(&name));
+        return;
+    }
+    let rt = runtime();
+    rt.block_on(async {
+        let file = Handle::new(open_rw(&path)).unwrap();
+        within(file.allocate(0, 1 << 20, Allocate::KeepSize))
+            .await
+            .unwrap();
+    });
+    let reopened = open_rw(&path);
+    let meta = reopened.metadata().unwrap();
+    assert_eq!(meta.len(), 100);
+    assert!(
+        meta.blocks() * 512 >= 1 << 20,
+        "{} bytes allocated after the close",
+        meta.blocks() * 512
+    );
+    assert!(std::fs::read(&path).unwrap() == pattern(100));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn zeroing_a_range_is_unsupported_on_macos() {

@@ -6,11 +6,16 @@
 pub enum Allocate {
     /// Reserves disk space for the range, so a later write into it does not
     /// run out of space, and grows the file to cover the range when the range
-    /// ends past its end. The new part reads as zeros.
+    /// ends past its end. The new part reads as zeros. On macOS the space is
+    /// reserved from the end of what the file has allocated
+    /// (`F_PREALLOCATE`): a hole inside the file, as a `set_len` that grew
+    /// it leaves, stays a hole and is not reserved.
     Extend,
     /// Reserves disk space for the range and leaves the file's length as it
     /// is. On FreeBSD only inside the file: a range that ends past its end
-    /// answers `Unsupported`.
+    /// answers `Unsupported`. On macOS as for `Extend`, and HFS+ frees what
+    /// was reserved past the end of the file when the file is closed (APFS
+    /// keeps it).
     KeepSize,
     /// Frees the disk space of the range, which then reads as zeros, and
     /// leaves the file's length as it is. A range that ends past the end of

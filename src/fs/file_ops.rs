@@ -142,7 +142,10 @@ impl Handle<File> {
     /// FreeBSD's ZFS reserves no space, so `Extend` and `KeepSize` answer
     /// `Unsupported` on it. On FreeBSD a file system that cannot free a range
     /// (UFS) writes zeros over it for `PunchHole`: the range reads as zeros
-    /// and keeps its space.
+    /// and keeps its space. On macOS a reservation is made from the end of
+    /// what the file has allocated, so holes inside the file are not
+    /// reserved, and HFS+ frees what was reserved past the end of the file
+    /// when the file is closed.
     ///
     /// # Errors
     ///
