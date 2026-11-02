@@ -33,3 +33,18 @@ M_leaf_keeps_mark                 50242      16526      4  violated:Rescued     
 W_leaf_back                        1986        823      1  violated:NoLeafBack                   violated:NoLeafBack                   yes
 H_safe                         17520147    4903665     44  pass                                  pass                                  yes
 H_rescue                        2278013     619991     49  pass                                  pass                                  yes
+
+Added and rechecked since, as CI ran them: TLA+ run 41431994577 on 7bb522c, 2026-11-02, one
+worker each (the share jobs of .github/workflows/tla.yml), with a detached thread's calls in the
+model. These times replace the ones above.
+
+configuration                 generated   distinct    sec  result                                expected                              match
+D_safe                           834414     215566      4  pass                                  pass                                  yes
+W_stale_back                      10465       4050      1  violated:NoStaleBack                  violated:NoStaleBack                  yes
+M_taken_cleared                    7845       3078      1  violated:DetachedStaysOut             violated:DetachedStaysOut             yes
+M_leaf_no_check                    2737       1125      1  violated:Exclusive                    violated:Exclusive                    yes
+M_leaf_keeps_mark                 52578      17201      5  violated:Rescued                      violated:Rescued                      yes
+L_safe                          3520908     936806     12  pass                                  pass                                  yes
+L_rescue                         433576     120736     12  pass                                  pass                                  yes
+H_safe                         17520147    4903665     28  pass                                  pass                                  yes
+H_rescue                        2278013     619991     51  pass                                  pass                                  yes
