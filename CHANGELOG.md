@@ -19,6 +19,12 @@
   is, unchanged. The listener's own errors (out of descriptors or memory, not listening) still reach
   `accept` and end the stream (`proofs/tla/accept/AcceptReset.tla`, and `AcceptStream.tla` with
   reset connections).
+- **`accept_multi` on Windows pauses for a socket the system has no room for, as for one it has no
+  descriptor for.** Windows answers a socket it cannot make, the one an accept takes its connection
+  into among them, with `WSAENOBUFS` as well as `WSAEMFILE`, and an `AcceptEx` that ends for want of
+  system resources with `ERROR_NO_SYSTEM_RESOURCES`. Only `WSAEMFILE` paused the stream; the other
+  two ended it for good, though the backlog would be served once resources came back. All three
+  now pause it, as `EMFILE` and `ENFILE` do on unix.
 
 ### Changed
 
