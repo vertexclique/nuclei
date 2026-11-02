@@ -292,7 +292,11 @@ NoWakeAfterDrop == ~wokeDead
 
 \* Once the first shard went, no cell of a timer it held keeps the task's waker unwoken: the
 \* task and the cell never keep each other for good.
-NoStrandedWaker == ~(gone /\ armedOn = ShardT /\ slot /\ ~orphaned /\ ~fired /\ ~cancelled)
+\* (Checked once nothing is about to drain: not between a post's push and its look at the
+\* flag, nor while the going shard is letting go of its wheel and draining its mailbox.)
+NoStrandedWaker ==
+    (pc[ForeignT] # "F_post_check" /\ pc[ShardT] \notin {"S_go_wheel", "S_go_drain"})
+        => ~(gone /\ armedOn = ShardT /\ slot /\ ~orphaned /\ ~fired /\ ~cancelled)
 
 \* An orphan never meets a cell that fired: the fired half of `orphan`'s check never decides
 \* anything (the shard that fires a cell is the one that would orphan it).
