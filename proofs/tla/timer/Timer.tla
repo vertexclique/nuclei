@@ -1,7 +1,8 @@
 ------------------------------- MODULE Timer -------------------------------
 (***************************************************************************)
 (* A timer a shard fires for a thread that runs no shard                  *)
-(* (src/time/sleep.rs: `RemoteTimer`, `Armed`, `TimerOp`, `Sleep::poll`;   *)
+(* (src/time/sleep.rs: `RemoteTimer`, `Armed`, `TimerOp`, `Timer::poll`,  *)
+(* `poll_any`, `poll_remote`, `poll_cell`;                                *)
 (* src/rt/shard.rs: `Shared::post_timer`; src/rt/shard/going.rs: the       *)
 (* shard's drop), at the grain of its atomic steps.                        *)
 (*                                                                          *)
@@ -124,7 +125,7 @@ F_wait:
         goto F_poll_again;
     end either;
 F_poll_again:
-    \* `Sleep::poll`: an orphaned cell is let go and the timer armed again; else
+    \* `poll_any`: an orphaned cell is let go and the timer armed again; else
     \* `poll_cell`: look at `fired`; if not set, register and look again.
     if fired then
         goto F_done;
