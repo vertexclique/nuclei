@@ -35,6 +35,15 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
+- **A stream write that found the socket full no longer waits for good when its shard is handed
+  off in the same poll** (epoll, kqueue). The owner's straight send finds the socket full, and the
+  rest of its poll was told so and blocked the side on the next write edge without asking the
+  kernel again. When the monitor took the shard between the two, the shard's driver on its new
+  thread could take the edge that room brought and pass over it, since the send's hold had
+  published nothing and the side still said it was only ever its owner's and idle; the rest of the
+  poll, now on a thread with no shard, then blocked the side on an edge that had already passed,
+  and a write or a flush waited until the peer spoke again. A poll whose shard was taken now asks
+  the kernel itself under its own hold (`proofs/tla/sendsnow/TakenFull.tla`).
 
 ### Changed
 
