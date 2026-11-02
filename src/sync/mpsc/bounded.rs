@@ -758,7 +758,10 @@ impl<T> Future for Sending<'_, T> {
         if this.value.is_none() {
             polled_after_completion();
         }
-        let granted = core::task::ready!(this.wait.poll(&this.chan.limit.sem, 1, cx.waker()));
+        let chan = this.chan;
+        let granted = core::task::ready!(this.wait.poll(&chan.limit.sem, 1, cx.waker(), |n| {
+            chan.give_back(n);
+        }));
         let Some(value) = this.value.take() else {
             polled_after_completion();
         };
@@ -815,8 +818,9 @@ impl<T> Future for Reserve<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        let chan = this.chan;
         this.wait
-            .poll(&this.chan.limit.sem, this.n, cx.waker())
+            .poll(&chan.limit.sem, this.n, cx.waker(), |n| chan.give_back(n))
             .map(|taken| {
                 this.taken = taken.is_ok();
                 taken.map_err(|_| SendError(()))

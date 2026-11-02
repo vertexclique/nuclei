@@ -138,7 +138,7 @@ fn a_send_refused_for_the_budget_hands_its_slot_to_a_queued_send() {
                 thread::spawn(move || {
                     let mut wait = FairWait::new();
                     let taken = block_on(poll_fn(|cx| {
-                        let poll = wait.poll(&sem, 1, cx.waker());
+                        let poll = wait.poll(&sem, 1, cx.waker(), |n| sem.release(n));
                         if poll.is_pending() {
                             waited.store(true, Ordering::SeqCst);
                         }
@@ -149,16 +149,22 @@ fn a_send_refused_for_the_budget_hands_its_slot_to_a_queued_send() {
                 })
             };
             let mut wait = FairWait::new();
-            let refused = wait.poll_admitted(&sem, 1, Waker::noop(), || {
-                // The other thread may run here, between the take and the
-                // budget's answer, as the system's scheduler may stop a thread
-                // anywhere: a point loom can switch at.
-                thread::yield_now();
-                if waited.load(Ordering::SeqCst) {
-                    seen.fetch_add(1, Ordering::SeqCst);
-                }
-                false
-            });
+            let refused = wait.poll_admitted(
+                &sem,
+                1,
+                Waker::noop(),
+                || {
+                    // The other thread may run here, between the take and the
+                    // budget's answer, as the system's scheduler may stop a thread
+                    // anywhere: a point loom can switch at.
+                    thread::yield_now();
+                    if waited.load(Ordering::SeqCst) {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    }
+                    false
+                },
+                |n| sem.release(n),
+            );
             match refused {
                 // Refused, or queued behind the other send: a queued wait leaves the
                 // line, passing on whatever was granted to it.

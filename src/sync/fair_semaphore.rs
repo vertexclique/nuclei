@@ -270,26 +270,29 @@ impl FairWait {
     /// node.
     ///
     /// A first poll that completes spends one operation of the poll's budget
-    /// (see `coop`); with the budget spent, permits it took go back and it
-    /// yields. A grant to a queued wait spends nothing: that wait yielded.
+    /// (see `coop`); with the budget spent, permits it took go back through
+    /// `give_back` and it yields. A grant to a queued wait spends nothing:
+    /// that wait yielded.
     pub(super) fn poll(
         &mut self,
         sem: &FairSemaphore,
         n: usize,
         waker: &Waker,
+        give_back: impl FnOnce(usize),
     ) -> Poll<Result<(), Closed>> {
-        self.poll_admitted(sem, n, waker, || crate::coop::spend(waker))
+        self.poll_admitted(sem, n, waker, || crate::coop::spend(waker), give_back)
     }
 
     /// [`poll`](Self::poll) with `admit` in place of the budget: asked once
-    /// a first poll would complete, and a `false` undoes it and answers
-    /// `Pending`.
+    /// a first poll would complete, and a `false` hands what it got to
+    /// `give_back` and answers `Pending`.
     pub(super) fn poll_admitted(
         &mut self,
         sem: &FairSemaphore,
         n: usize,
         waker: &Waker,
         admit: impl FnOnce() -> bool,
+        give_back: impl FnOnce(usize),
     ) -> Poll<Result<(), Closed>> {
         let granted = if self.wait.is_queued() {
             self.wait.poll(&sem.queue, Some(waker))
@@ -299,7 +302,7 @@ impl FairWait {
                     if admit() {
                         return Poll::Ready(Ok(()));
                     }
-                    sem.release(n);
+                    give_back(n);
                     return Poll::Pending;
                 }
                 Err(seen) if observed_closed(seen) => {
@@ -431,7 +434,8 @@ mod tests {
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
-            this.wait.poll(this.sem, this.n, cx.waker())
+            let sem = this.sem;
+            this.wait.poll(sem, this.n, cx.waker(), |n| sem.release(n))
         }
     }
 
