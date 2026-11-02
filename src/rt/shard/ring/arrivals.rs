@@ -44,10 +44,15 @@ impl ShardRing {
                         looked,
                     } => {
                         look = !*looked;
-                        Some((op.epoch, held, stopping, false, source))
+                        Some((op.epoch, held, Some(stopping), false, source))
                     }
                     RingMem::RecvFromMulti { held, stopping, .. } => {
-                        Some((op.epoch, held, stopping, true, source))
+                        Some((op.epoch, held, Some(stopping), true, source))
+                    }
+                    // Cancelled already, its end looked at by the receive the side has now: what
+                    // it took still goes to the side (`RingMem::RecvZombie`).
+                    RingMem::RecvZombie { held, msg } => {
+                        Some((op.epoch, held, None, msg.is_some(), source))
                     }
                     _ => None,
                 }
@@ -60,7 +65,10 @@ impl ShardRing {
                                 tally::read(len as usize);
                             }
                             *held += chunk.charged(group);
-                            if *held > group.cap() && !*stopping {
+                            if *held > group.cap()
+                                && let Some(stopping) = stopping
+                                && !*stopping
+                            {
                                 *stopping = true;
                                 stop = true;
                             }

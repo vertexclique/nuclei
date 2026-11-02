@@ -216,15 +216,18 @@
   and its wakes** (Linux, io_uring). A watched worker's ring is not single-issuer, so the kernel
   runs the completion of each request as work queued to the thread that submitted it, and a thread
   in a killable wait (a `vfork` parent, a read of a slow disk, a stalled network file system) runs
-  none of it until it comes back. After a handoff, a stream read by readiness, a datagram's poll, a
-  write waiting for room, and the ring's own wake read, all armed by the old thread, then brought
-  nothing: the stream and the write waited, and a task spawned or woken from another thread did not
-  run, for as long as the old thread's wait lasted. The new runner now cancels each poll the old
-  thread armed, before its first drive, and its side arms another of the new runner's; the old one
-  stays until its own end, which goes to no side, and the ring's wake is armed again under an id of
-  its own (`proofs/tla/ring/RingHandoff.tla`). An operation that takes or gives bytes (a receive
-  into the ring's buffers, a send, a connect), a file's call, a child's exit watch and an accept
-  still complete only once the old thread comes back: an accept's poll is the first exclusive
+  none of it until it comes back. After a handoff, a stream's or a datagram's multishot receive, a
+  datagram's poll, a write waiting for room, and the ring's own wake read, all armed by the old
+  thread, then brought nothing: the stream and the write waited, and a task spawned or woken from
+  another thread did not run, for as long as the old thread's wait lasted. The new runner now
+  cancels each poll and multishot receive the old thread armed, before its first drive, and its
+  side arms another of the new runner's; the old one stays until its own end, which goes to no
+  side, and the ring's wake is armed again under an id of its own. What an old receive still takes
+  before its thread sees the cancel goes to the side in the stream's order, since the kernel takes
+  and posts each arrival under the ring's lock (`proofs/tla/ring/RingHandoff.tla`). A one-shot
+  operation that takes or gives bytes (a receive into the task's buffer, a send, a connect), a
+  file's call, a child's exit watch and an accept still complete only once the old thread comes
+  back: an accept's poll is the first exclusive
   waiter of its listener, which takes each connection's wake even once cancelled, so it cannot be
   armed again from the new runner.
 - **A call whose heavy fence fails no longer waits for good on a side whose claimant cannot serve
