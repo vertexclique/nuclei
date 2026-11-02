@@ -9,3 +9,17 @@ W_self_woken_look                   18         10      1  violated:NoSelfWokenLo
 W_gap_reaches_its_bound             24         14      1  violated:GapBelowItsBound             violated:GapBelowItsBound             yes
 
 results matching EXPECTED.txt: 4 of 4
+
+Rechecked as CI ran them: TLA+ run 41460094467 on 569d1418, 2026-11-02, one worker each (the
+share jobs of .github/workflows/tla.yml). These times replace the ones above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_bounded                          145         72      1  pass                                  pass                                  yes
+M_no_self_woken_count               54         31      1  violated:BoundedGap                   violated:BoundedGap                   yes
+W_self_woken_look                   25         17      1  violated:NoSelfWokenLook              violated:NoSelfWokenLook              yes
+W_gap_reaches_its_bound             37         27      1  violated:GapBelowItsBound             violated:GapBelowItsBound             yes
+L_turn                              60         44      0  pass                                  pass                                  yes
+M_turn_unbounded                    32         27      1  violated:TurnGap                      violated:TurnGap                      yes
+W_turn_gap_reaches_its_bound          51         41      1  violated:TurnGapBelowItsBound         violated:TurnGapBelowItsBound         yes
+
+results matching EXPECTED.txt: 7 of 7

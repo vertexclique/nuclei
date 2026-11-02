@@ -17,3 +17,25 @@ WK_kill                              8          7      1  violated:NoKill       
 WK_skip                             16         12      1  violated:NoSkip                       violated:NoSkip                       yes
 
 results matching EXPECTED.txt: 12 of 12
+
+Rechecked as CI ran them: TLA+ run 41460094467 on 569d1418, 2026-11-02, one worker each (the
+share jobs of .github/workflows/tla.yml). These times replace the ones above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+PW_safe                           1236        660      1  pass                                  pass                                  yes
+PW_live                           1236        660      1  pass                                  pass                                  yes
+MW_early_let_go                    257        160      1  violated:OneWatch                     violated:OneWatch                     yes
+MW_no_recheck                     1150        588      1  violated:Settles                      violated:Settles                      yes
+MW_unwatched_orphan               1230        664      1  violated:Settles                      violated:Settles                      yes
+WW_rewatch                         766        402      1  violated:NoRewatch                    violated:NoRewatch                    yes
+WW_seen_on_b                       202        129      1  violated:NoSeenOnB                    violated:NoSeenOnB                    yes
+MW_count_orphan                   1217        654      1  violated:Settles                      violated:Settles                      yes
+MW_outcome_settles                1166        626      1  violated:Settles                      violated:Settles                      yes
+WW_peek_taken                      110         75      1  violated:NoPeekTaken                  violated:NoPeekTaken                  yes
+PK_safe                             31         20      2  pass                                  pass                                  yes
+PK_live                             31         20      1  pass                                  pass                                  yes
+MK_no_busy                          37         23      1  violated:NoKillAfterReap              violated:NoKillAfterReap              yes
+WK_kill                              8          7      1  violated:NoKill                       violated:NoKill                       yes
+WK_skip                             16         12      1  violated:NoSkip                       violated:NoSkip                       yes
+
+results matching EXPECTED.txt: 15 of 15
