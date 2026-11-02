@@ -12,10 +12,13 @@ TwoAwait == <<"await", "await">>
 DropAwait == <<"drop", "await">>
 \* One waiter that awaits.
 OneAwait == <<"await">>
+\* A waiter made before the first call, and one made after the last.
+EarlyAfter == <<"early", "after">>
 \* Calls.
 Broadcast == <<"waiters">>
 OneThenBroadcast == <<"one", "waiters">>
 TwoOnes == <<"one", "one">>
 OneOne == <<"one">>
 LastThenOne == <<"last", "one">>
+BroadcastThenOne == <<"waiters", "one">>
 =============================================================================
