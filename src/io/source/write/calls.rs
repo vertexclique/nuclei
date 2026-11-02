@@ -98,8 +98,8 @@ impl Source {
             #[inline(always)]
             |cx| {
                 let cx_waker = cx.waker();
-                // Whether the owner's send below found the socket full, so the step does not
-                // ask the kernel again.
+                // Whether the owner's send below found the socket full, so the owner's step does
+                // not ask the kernel again.
                 #[cfg(unix)]
                 let mut asked = false;
                 #[cfg(unix)]
@@ -116,7 +116,7 @@ impl Source {
                     owner_poll!(self, self.write, io, cx_waker, |st, after, waker| self
                         .write_step(st, io, waker, after, bufs, wait, asked));
                 }
-                self.poll_write_any(cx_waker, bufs, wait, asked)
+                self.poll_write_any(cx_waker, bufs, wait)
             },
         )
     }
@@ -129,7 +129,8 @@ impl Source {
     /// the poll's own way. The biased hold is refused once a foreign thread came, so every release
     /// since the bit's was this shard's own, and none was since. The hold changes
     /// nothing of the side, so nothing is published as it lets go: a socket found full is the
-    /// poll's to record (`asked`), which then does not ask the kernel again.
+    /// owner's poll's to record (`asked`), which then does not ask the kernel again; a poll whose
+    /// shard was taken since asks it itself (`poll_write_any`).
     #[cfg(unix)]
     #[inline(always)]
     fn send_as_owner(
@@ -185,20 +186,23 @@ impl Source {
     }
 
     /// [`poll_write_bufs`](Self::poll_write_bufs) for every poll [`here`](Self::here) does not
-    /// take, given the poll's waker, all of its context a write looks at.
+    /// take, given the poll's waker, all of its context a write looks at. Its step asks the kernel
+    /// itself, whatever the owner's send found: a poll comes here after that send when its shard
+    /// was taken in between, and the shard's driver on its new thread may have passed over the
+    /// edge the refusal owed, the side still saying it was only ever its owner's and idle
+    /// (proofs/tla/sendsnow/TakenFull.tla).
     #[inline(never)]
     fn poll_write_any(
         self: &Arc<Self>,
         waker: &Waker,
         bufs: &[io::IoSlice<'_>],
         wait: bool,
-        asked: bool,
     ) -> Poll<io::Result<usize>> {
         self.poll_write_side(
             || waker,
             true,
             #[inline(always)]
-            |st, io, waker, after| self.write_step(st, io, waker, after, bufs, wait, asked),
+            |st, io, waker, after| self.write_step(st, io, waker, after, bufs, wait, false),
         )
     }
 
