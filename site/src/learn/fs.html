@@ -44,7 +44,7 @@
 <p>std's own <code>lock</code>, <code>try_lock</code> and <code>unlock</code> stay reachable through <code>Deref</code>; std's <code>lock</code> blocks the worker while it waits.</p>
 
 <h2 id="direct">Direct IO</h2>
-<p>A file opened for direct IO (<code>O_DIRECT</code> on Linux, <code>FILE_FLAG_NO_BUFFERING</code> on Windows) skips the system's page cache. Nuclei reads and writes it with exactly your lengths and offsets, with no read-ahead and no write-behind, so the kernel's alignment rules apply to your calls as they would to your own system calls: the memory's address, the offset and the length are multiples of the device's block size. <a href="api:nuclei::io::AlignedBuf"><code>AlignedBuf</code></a> gives memory at the alignment you ask for.</p>
+<p>A file opened for direct IO (<code>O_DIRECT</code> on Linux, <code>FILE_FLAG_NO_BUFFERING</code> on Windows) skips the system's page cache. Nuclei reads and writes it with exactly your lengths and offsets, with no read-ahead and no write-behind, so the kernel's alignment rules apply to your calls as they would to your own system calls: the memory's address, the offset and the length are multiples of the device's block size. <a href="api:nuclei::io::AlignedBuf"><code>AlignedBuf</code></a> gives memory at the alignment you ask for. On Windows a file opened for overlapped IO as well (<code>FILE_FLAG_OVERLAPPED</code>, as a log often is) works as one opened for synchronous IO: a read or write the system answers pending is waited out before it returns.</p>
 <!--example fs_direct-->
 
 <h2 id="dirs">Directories</h2>

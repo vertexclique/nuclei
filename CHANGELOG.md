@@ -35,7 +35,6 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
-
 - **A Windows connect binds its port as before: `SO_REUSE_UNICASTPORT` is not set.** The option
   would have had a connect's explicit bind (which `ConnectEx` needs) share a port across
   destinations, as the bind std's connect makes itself does. On the CI runners' Windows it reads
@@ -68,6 +67,17 @@
   `ErrorCounts::cut_datagrams_dropped`, and one that came whole, filling the buffer exactly or not,
   goes on as before (`proofs/tla/lent/LentOrphan.tla`). On epoll and kqueue the driver's receive
   into a lent buffer is a `recvmsg`, to read that flag.
+- **A Windows file opened for overlapped IO is read and written as one opened for synchronous
+  IO.** A disk file opened with `FILE_FLAG_OVERLAPPED` (a log's `FILE_FLAG_OVERLAPPED |
+  FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`) was driven as a synchronous one: a `ReadFile`
+  or `WriteFile` the system answered `ERROR_IO_PENDING` returned that as the call's error while the
+  kernel still held it, and the kernel later wrote the call's end into an `OVERLAPPED` on a stack
+  frame that had returned, and moved bytes into or out of a buffer the caller had dropped. Each
+  read and write at an offset, and each `DeviceIoControl` (a sparse file, a zeroed range), now
+  names the calling thread's own event, and one answered pending is waited out on it
+  (`GetOverlappedResult`) before the call returns; the event's low bit keeps the end off the port
+  the handle is bound to (`proofs/tla/port/PortFile.tla`). A test writes such a file at its cursor
+  and at offsets at once, syncs it and reads every byte back.
 
 ### Changed
 
