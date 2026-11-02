@@ -27,4 +27,6 @@ MutexBarge4 == <<<<L(1), L(1), L(1), L(1)>>, <<L(1)>>>>
 PairOneTwo == <<<<L(1), L(1)>>, <<L(1)>>>>
 \* A mutex: one task locks twice, another gives up its wait.
 LockTwiceDrop == <<<<L(1), L(1)>>, <<C(1)>>>>
+\* Two single locks against a weighted wait for both permits that is dropped.
+WeightedDrop == <<<<L(1), L(1)>>, <<C(2)>>>>
 =============================================================================

@@ -15,3 +15,13 @@ M_close_admits                 MC_Semaphore         violated:NoAdmitAfterClose
 W_handoff                      MC_Semaphore         violated:NoHandoff
 W_grant_given_back             MC_Semaphore         violated:NoGrantGivenBack
 W_nudge_pending                MC_Semaphore         violated:NoNudgePending
+L_close_owed                   MC_Semaphore         pass
+L_weighted_cancel              MC_Semaphore         pass
+M_nudge_never_consumed         MC_Semaphore         violated:AllTasksEnd
+M_finish_keeps_marker          MC_Semaphore         violated:AllTasksEnd
+M_release_ignores_handoff      MC_Semaphore         violated:AllTasksEnd
+M_exit_ignores_wake            MC_Semaphore         violated:AllTasksEnd
+M_exit_clears_owed_handoff     MC_Semaphore         violated:BypassBounded
+M_handoff_keeps_withdrawn      MC_Semaphore         violated:Conservation
+M_close_grants_none            MC_Semaphore         violated:AllTasksEnd
+M_enqueue_no_drain             MC_Semaphore         violated:NoStrandedArrival

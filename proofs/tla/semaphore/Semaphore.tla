@@ -174,7 +174,10 @@ D_tidy:
         forget(gone);    \* their futures left them, and now the queue lets them go
     end with;
 D_closed:
-    if closedBit then
+    \* MUTATION close_grants_none: the close's pass grants no waiter, and keeps them queued.
+    if closedBit /\ Mutation = "close_grants_none" then
+        goto D_end;
+    elsif closedBit then
         \* Closed: every waiter is granted the close; the queue lets go of each.
         wl := wl \cup {r \in Range(list) : phase[r] = "waiting"};
         closedG := [r \in Reqs |-> closedG[r] \/ (r \in Range(list) /\ phase[r] = "waiting")];
@@ -212,7 +215,10 @@ D_handoff:
     end if;
 D_handBack:
     \* Withdrawn at the grant: the permits go back, in a fetch_add of their own.
-    free := free + inPass;
+    \* MUTATION handoff_keeps_withdrawn: they are dropped with the withdrawn node.
+    if Mutation # "handoff_keeps_withdrawn" then
+        free := free + inPass;
+    end if;
     inPass := 0;
     goto D_handoff;
 D_nudgeStart:
@@ -258,11 +264,14 @@ D_exit:
     if dirty /\ Mutation # "exit_ignores_dirty" then
         noneLeft := FALSE;    \* read: the next pass computes it again
         goto D_clear;
-    elsif ~noneLeft /\ wakeFront then
+    \* MUTATION exit_ignores_wake: a release's request (WAKE_FRONT) with somebody queued does
+    \* not send the drain round again.
+    elsif ~noneLeft /\ wakeFront /\ Mutation # "exit_ignores_wake" then
         goto D_clear;
     else
         draining := FALSE;
-        if owedCount = 0 then
+        \* MUTATION exit_clears_owed_handoff: HANDOFF comes down with a waiter still owed.
+        if owedCount = 0 \/ Mutation = "exit_clears_owed_handoff" then
             handoffBit := FALSE;
         end if;
         if noneLeft then
@@ -287,7 +296,8 @@ variables wants = FALSE, claimed = FALSE;
 begin
 R_add:
     \* One fetch_add; `wants_drain` of the word it saw.
-    wants := queuedBit /\ (~nudgeOut \/ handoffBit);
+    \* MUTATION release_ignores_handoff: a nudge out skips the pass even with a handoff owed.
+    wants := queuedBit /\ (~nudgeOut \/ (handoffBit /\ Mutation # "release_ignores_handoff"));
     free := free + back;
     if fromReq = NoReq then
         heldBy[self] := heldBy[self] - back;
@@ -337,17 +347,25 @@ Q_enqueue:
     arrivals := Append(arrivals, ar);
 Q_enqTr:
     \* `Step::Drain(state | QUEUED)`.
+    \* MUTATION enqueue_no_drain: QUEUED goes up with no claim of the role and no dirty mark.
     queuedBit := TRUE;
     enqueued[ar] := TRUE;
-    claimOrDirty(claimed);
+    if Mutation # "enqueue_no_drain" then
+        claimOrDirty(claimed);
+    end if;
 Q_enqDrain:
     if claimed then
         claimed := FALSE;    \* read: back to its start
         call Drain();
     end if;
 Q_park:
+    \* A granted or nudged future takes the nudge marker down (`consume_nudge`).
+    \* MUTATION finish_keeps_marker: a granted one leaves it up.
+    \* MUTATION nudge_never_consumed: a nudged one leaves it up.
     if phase[ar] = "granted" then
-        nudgeOut := FALSE;
+        if Mutation # "finish_keeps_marker" then
+            nudgeOut := FALSE;
+        end if;
         if ~closedG[ar] then
             heldBy[self] := heldBy[self] + owned[ar];
             owned[ar] := 0;
@@ -356,7 +374,9 @@ Q_park:
         return;
     elsif nudged[ar] then
         nudged[ar] := FALSE;
-        nudgeOut := FALSE;
+        if Mutation # "nudge_never_consumed" then
+            nudgeOut := FALSE;
+        end if;
         goto Q_retry;
     elsif drop then
         goto Q_withdraw;
