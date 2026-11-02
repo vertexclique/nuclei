@@ -73,14 +73,11 @@ fn an_older_notified_queued_behind_a_newer_one_gets_the_broadcast() {
 /// the broadcast, so the permit is a newer waiter's: a newer `Notified`
 /// made after both calls must find it once the older one is done.
 ///
-/// Ignored, so CI stays a check of what holds: a waiter that took the
-/// permit passes it on now, but the older one may also queue and run the
-/// pass that reads the generation before the broadcast; that pass serves the
-/// `notify_one` to it, the permit is gone, and the model fails here. Its fix
-/// waits on a design choice (the witness `W_owed_to_woken` of
-/// proofs/tla/notify).
+/// Fails today: the older one may queue and run the pass that reads the
+/// generation before the broadcast; that pass serves the `notify_one` to it,
+/// and the permit is gone (the witness `W_owed_to_woken` of
+/// proofs/tla/notify). Kept running until the pass is fixed.
 #[test]
-#[ignore = "a notify_one owed during a pass that read the generation before a broadcast still reaches a waiter the broadcast woke"]
 fn a_permit_stored_after_a_broadcast_is_not_eaten_by_a_waiter_it_owed() {
     explore(
         "a_permit_stored_after_a_broadcast_is_not_eaten_by_a_waiter_it_owed",
