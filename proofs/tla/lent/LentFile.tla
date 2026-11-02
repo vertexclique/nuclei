@@ -120,6 +120,9 @@ NoBehind == [at |-> -1]
 NoAhead == [at |-> -1]
 \* No value recorded.
 None == -99
+\* No sync call made yet: its number is 0 (each call made has one from 1 on).
+NoSync == [seq |-> 0, checked |-> FALSE, ran |-> FALSE, ok |-> TRUE, taken |-> FALSE,
+           on |-> "none", drain |-> FALSE]
 \* The tasks that read one cell at the cursor into their own buffers.
 Readers == CASE Scenario = "cursor" -> {"r1", "r2"} [] Scenario = "generation" -> {"r1"} [] OTHER -> {}
 \* The task that reads at the cursor through the read-ahead, and how many cells it reads.
@@ -173,7 +176,7 @@ variables
     prjob = NoJob,                     \* the positional read's job: [at, ran, val, on]
     prBefore = FALSE,                  \* (record) a cursor write to its cell came before the positional read
     prGot = None,                      \* (record) what the positional read returned
-    sjobs = [s \in Syncers |-> NoJob], \* each sync's call: [seq, checked, ran, ok, taken, on, drain]; it outlives its task
+    sjobs = [s \in Syncers |-> NoSync], \* each sync's call: [seq, checked, ran, ok, taken, on, drain]; it outlives its task
     made = 0,                          \* how many sync calls the handle made: the next one's number is one more
     sfailed = 0,                       \* the number of the first call whose failure the state took (0: none)
     kerr = FALSE,                      \* the kernel holds a write-back error no call reported yet
@@ -248,11 +251,11 @@ define
               + (IF djob # NoJob /\ ~djob.ran THEN 1 ELSE 0)
               + (IF PosOut /\ ~pjob.ran THEN 1 ELSE 0)
               + (IF prjob # NoJob /\ ~prjob.ran THEN 1 ELSE 0)
-              + Cardinality({q \in Syncers : sjobs[q] # NoJob /\ ~sjobs[q].ran})
+              + Cardinality({q \in Syncers : sjobs[q].seq # 0 /\ ~sjobs[q].ran})
     \* A sync's call is out: made, its end not taken by the state yet.
-    SyncOut(q) == sjobs[q] # NoJob /\ ~sjobs[q].taken
+    SyncOut(q) == sjobs[q].seq # 0 /\ ~sjobs[q].taken
     \* The sync calls whose ends reached their slots and the state has not taken.
-    SyncEnded == {q \in Syncers : sjobs[q] # NoJob /\ sjobs[q].ran /\ ~sjobs[q].taken}
+    SyncEnded == {q \in Syncers : sjobs[q].seq # 0 /\ sjobs[q].ran /\ ~sjobs[q].taken}
 end define;
 
 \* What a sync takes under the guard, before anything else (`Syncs::poll`): the end of every sync
@@ -264,7 +267,7 @@ macro TakeSyncEnds() begin
     with counted = {q \in SyncEnded : q = self \/ Mutation # "sync_task_records"},
          failed = {q \in counted : ~sjobs[q].ok} do
         if sfailed = 0 /\ failed # {} then
-            sfailed := (CHOOSE q \in failed : \A r \in failed : sjobs[q].seq <= sjobs[r].seq).seq;
+            sfailed := sjobs[CHOOSE q \in failed : \A r \in failed : sjobs[q].seq <= sjobs[r].seq].seq;
         end if;
         if \E q \in SyncEnded : q # self /\ pc[q] = "Done" then leftTaken := TRUE; end if;
         sjobs := [q \in Syncers |-> IF q \in SyncEnded THEN [sjobs[q] EXCEPT !.taken = TRUE] ELSE sjobs[q]];
@@ -352,7 +355,7 @@ P_loop:
     while ~(/\ AllDone /\ ~InFlight
             /\ \A r \in Readers : jobs[r] = NoJob \/ jobs[r].ran
             /\ (djob = NoJob \/ djob.ran) /\ (pjob = NoJob \/ pjob.ran)
-            /\ (prjob = NoJob \/ prjob.ran) /\ \A q \in Syncers : sjobs[q] = NoJob \/ sjobs[q].ran) do
+            /\ (prjob = NoJob \/ prjob.ran) /\ \A q \in Syncers : sjobs[q].seq = 0 \/ sjobs[q].ran) do
         either
             await InFlight /\ Runs(writing);
             either
@@ -417,7 +420,7 @@ P_loop:
             \* looks for an error. An error the kernel holds goes to this call alone, which fails,
             \* and is cleared; else the device keeps every cell but a lost one. A call put on the
             \* ring with a drain (the mutation) starts only once the ring's writes ended.
-            with q \in {r \in Syncers : /\ sjobs[r] # NoJob /\ ~sjobs[r].checked /\ Runs(sjobs[r])
+            with q \in {r \in Syncers : /\ sjobs[r].seq # 0 /\ ~sjobs[r].checked /\ Runs(sjobs[r])
                                         /\ (sjobs[r].drain /\ sjobs[r].on = "ring"
                                               => ~(InFlight /\ writing.on = "ring"))} do
                 if ~objOpen then usedClosed := TRUE; end if;
@@ -432,14 +435,14 @@ P_loop:
         or
             \* Its second step: the call's end reaches its slot (`FileOp::complete`, or the pool's
             \* job's end), whose waker wakes the file's tasks.
-            with q \in {r \in Syncers : sjobs[r] # NoJob /\ sjobs[r].checked /\ ~sjobs[r].ran} do
+            with q \in {r \in Syncers : sjobs[r].seq # 0 /\ sjobs[r].checked /\ ~sjobs[r].ran} do
                 sjobs[q].ran := TRUE;
             end with;
         or
             \* The device fails a write-back while a sync call is out: every cell not durable yet is
             \* lost, and the kernel keeps the error for the next call that looks.
             await /\ SyncMayFail /\ ~devFailed
-                  /\ \E q \in Syncers : sjobs[q] # NoJob /\ ~sjobs[q].checked;
+                  /\ \E q \in Syncers : sjobs[q].seq # 0 /\ ~sjobs[q].checked;
             devFailed := TRUE;
             kerr := TRUE;
             lost := [c \in Cells |-> lost[c] \/ file[c] # durable[c]];
@@ -454,7 +457,7 @@ P_loop:
             prjob := IF prjob # NoJob /\ ~prjob.ran THEN [prjob EXCEPT !.on = "pool"] ELSE prjob;
             pjob := IF PosOut /\ ~pjob.ran THEN [pjob EXCEPT !.on = "pool"] ELSE pjob;
             sjobs := [q \in Syncers |->
-                         IF sjobs[q] # NoJob /\ ~sjobs[q].checked THEN [sjobs[q] EXCEPT !.on = "pool"]
+                         IF sjobs[q].seq # 0 /\ ~sjobs[q].checked THEN [sjobs[q] EXCEPT !.on = "pool"]
                          ELSE sjobs[q]];
             if InFlight /\ writing.on = "ring" then
                 \* MUTATION cancel_ends: a write cancelled as its shard went ends there.
@@ -679,7 +682,7 @@ S_hold:
     PollWrites(-1);
     TakeSyncEnds();
 S_go:
-    if sjobs[self] # NoJob /\ sjobs[self].taken then
+    if sjobs[self].seq # 0 /\ sjobs[self].taken then
         \* Its call ended: it fails if the first failed call came before it or was its own.
         \* MUTATION sync_any_failure: it fails if any call failed, one made after its own too.
         holder := "none";
@@ -689,7 +692,7 @@ S_go:
         else
             goto S_ok;
         end if;
-    elsif sjobs[self] # NoJob then
+    elsif sjobs[self].seq # 0 then
         \* Its call is out: it waits for the end.
         holder := "none";
         goto S_wait;
@@ -714,7 +717,7 @@ S_wait_writes:
         \* MUTATION sync_unserialized: it makes its call beside the other.
         holder := "none";
 S_wait_other:
-        await \A q \in Syncers : sjobs[q] = NoJob \/ sjobs[q].ran \/ sjobs[q].taken;
+        await \A q \in Syncers : sjobs[q].seq = 0 \/ sjobs[q].ran \/ sjobs[q].taken;
         goto S_hold;
     else
         \* Its call goes on the ring of its shard, or to the pool; the state keeps it.
