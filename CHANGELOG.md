@@ -60,6 +60,11 @@
   lacks. The tests that hold a process's descriptors flat counted three there, since FreeBSD's
   `/dev/fd` lists only the first three without `fdescfs`; they count them with the kernel's own
   count (`kern.proc.nfds`) now, the soak's too.
+- **`allocate` on macOS says what a reservation covers.** `F_PREALLOCATE` reserves from the end
+  of what the file has allocated, so a hole inside the file (as a `set_len` that grew it leaves)
+  is not reserved, and HFS+ frees what was reserved past the end of the file at its close, with
+  `F_ALLOCATEPERSIST` or without; APFS keeps it. The rustdoc and the Learn page say so, and a
+  test pins APFS's reservation past the end across a close and a reopen.
 - **`sync_dir` on Apple's systems says what it made.** A file system that refuses `F_FULLFSYNC`
   for a directory got a plain `fsync`, and an `Ok` that read as a full flush. It now gets
   `F_BARRIERFSYNC` first, which keeps the order of the writes around it, and `fsync` only if
