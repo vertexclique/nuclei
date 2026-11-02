@@ -95,11 +95,13 @@ variables
     raisedHandoff = FALSE,
     nudgePending = FALSE,              \* a nudge found its waiter still carrying the last one
     gaveBackGrant = FALSE,             \* a waiter that took on its own gave back a grant
-    enqueued = [r \in Reqs |-> FALSE];  \* the waiter's enqueue transition happened
+    enqueued = [r \in Reqs |-> FALSE], \* the waiter's enqueue transition happened
+    added = 0,                         \* permits `add_permits` added
+    forgotten = 0;                     \* permits `forget_permits` took away
 
 define
     Conservation ==
-        free + SumOver(heldBy, Tasks) + SumOver(owned, Reqs) + inPass = Permits
+        free + SumOver(heldBy, Tasks) + SumOver(owned, Reqs) + inPass = Permits + added - forgotten
     MutualExclusion == Permits = 1 => SumOver(heldBy, Tasks) <= 1
     NoAdmitAfterClose == ~admittedAfterClose
     BypassBounded == \A r \in Reqs : counted[r] <= MaxBypass
@@ -108,7 +110,7 @@ define
     \* arrival stack: the pass that came after it, or the one its DIRTY forced, took it in.
     NoStrandedArrival == \A r \in Range(arrivals) : enqueued[r] => draining
     AllDone == \A t \in Tasks : pc[t] = "Done"
-    PermitsBackAtEnd == AllDone => free = Permits
+    PermitsBackAtEnd == AllDone => free = Permits + added - forgotten
     \* Every task ends. Once every task is at its end it stays there (an ended
     \* task takes no step, under every mutation too), so "in the end, all are
     \* ended" is the same as "all are ended again and again", which TLC checks
@@ -529,20 +531,58 @@ Q_wdDrain:
     end if;
 end procedure;
 
+\* `RawSemaphore::add(1)` (`add_permits`): one permit more, and with somebody queued a
+\* `Step::Wake(state | WAKE_FRONT)`: the drain role, or only the request.
+\* MUTATION add_no_wake: the permit is added and nobody is told.
+procedure AddPermits()
+begin
+AD_add:
+    free := free + 1;
+    added := added + 1;
+    if queuedBit /\ Mutation # "add_no_wake" then
+        wakeFront := TRUE;
+        if ~draining then
+            draining := TRUE;
+            call Drain();
+            return;
+        else
+            return;
+        end if;
+    else
+        return;
+    end if;
+end procedure;
+
 fair process task \in Tasks
 variables j = 1, before = 0;
 begin
 T_op:
     while j <= Len(Prog[self]) do
         before := heldBy[self];
-        call Acquire(Prog[self][j].n, <<self, j>>, Prog[self][j].op = "cancel");
+        if Prog[self][j].op = "add" then
+            call AddPermits();
+        elsif Prog[self][j].op = "forget" then
+            \* `forget_permits(1)`: one compare-and-swap takes a free permit away, if any.
+            forgotten := forgotten + (IF free >= 1 THEN 1 ELSE 0);
+            free := IF free >= 1 THEN free - 1 ELSE free;
+        else
+            call Acquire(Prog[self][j].n, <<self, j>>, Prog[self][j].op = "cancel");
+        end if;
 T_release:
-        if heldBy[self] > before then
+        \* "split" gives its permits back in two releases: one, then the rest.
+        if heldBy[self] > before /\ Prog[self][j].op = "split" then
+            call Release(1, NoReq);
+            goto T_rest;
+        elsif heldBy[self] > before then
             call Release(Prog[self][j].n, NoReq);
         end if;
 T_next:
         j := j + 1;
     end while;
+    goto Done;
+T_rest:
+    call Release(Prog[self][j].n - 1, NoReq);
+    goto T_next;
 end process;
 
 fair process closer \in (IF Closer THEN {CloserT} ELSE {})
