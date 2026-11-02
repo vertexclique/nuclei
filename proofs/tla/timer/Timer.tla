@@ -170,8 +170,14 @@ F_recheck:
     elsif orphaned /\ Mutation # "recheck_fired_only" then
         goto F_rearm;
     else
-        await woken[holder];
-        goto F_look;
+        \* Pending: polled again once woken, or dropped meanwhile, as at `F_wait`.
+        either
+            await woken[holder];
+            goto F_look;
+        or
+            await DropIt;
+            goto F_drop;
+        end either;
     end if;
 F_rearm:
     \* MUTATION no_rearm: the sleep waits on the orphaned cell, which nothing will fire.
