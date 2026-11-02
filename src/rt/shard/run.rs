@@ -369,6 +369,17 @@ impl Shard {
         }
     }
 
+    /// The shard's new runner, handed it by the monitor, takes its IO over before its first
+    /// drive: on a ring, what the old runner armed to wait for readiness, connections or a wake is
+    /// armed again from this thread (`ShardRing::adopt`). The other backends' pollers serve any
+    /// thread as it is.
+    pub(crate) fn adopt(&self) {
+        #[cfg(ring)]
+        if let Some(ring) = self.ring() {
+            ring.adopt(Some(self));
+        }
+    }
+
     /// The shard was taken from its runner, and is the caller's (the
     /// monitor's): the runnables in its own queues go back to their tasks'
     /// schedules (to the shard's inbox, or a bound task's home), and the run

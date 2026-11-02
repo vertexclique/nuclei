@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::Notifier;
-use crate::syscore::linux::iouring::ops::NOT_AN_OP;
+use crate::syscore::linux::iouring::ops::{NOT_AN_OP, WAKE_LOW};
 use crate::syscore::linux::iouring::ring::sys::IORING_SETUP_SINGLE_ISSUER;
 use crate::syscore::linux::iouring::ring::{IoUringCqe, Ring, RingConfig, SqFull, Sqe};
 
@@ -97,6 +97,9 @@ pub(crate) struct RingPoller {
     /// while the read is out.
     wake_buf: Box<u64>,
     wake_armed: bool,
+    /// The user data of this runner's wake read: [`NOT_AN_OP`], one less for each runner that took
+    /// the ring over since (see [`adopt`](Self::adopt)).
+    wake_id: u64,
     /// Entries that found the submission queue full, in order.
     waiting: VecDeque<Sqe>,
     /// The shard's thread made itself the issuer.
@@ -142,6 +145,7 @@ impl RingPoller {
             wake: Arc::new(wake),
             wake_buf: Box::new(0),
             wake_armed: false,
+            wake_id: NOT_AN_OP,
             waiting: VecDeque::new(),
             enabled: false,
             overflowed: false,
@@ -217,6 +221,25 @@ impl RingPoller {
         }
     }
 
+    /// The calling thread takes the ring over from a runner the monitor took its shard from
+    /// (`ShardRing::adopt`): the wake read that runner armed completes as work queued to it, which
+    /// a thread in a wait no signal ends never runs, so a wake from another thread would end no
+    /// wait of this one. That read is cancelled (the cancel's own completion carries `ignored`), and
+    /// the next wait arms one of this thread's, under the next wake id: the old one's completion,
+    /// whenever its thread runs it, is a wake and no more (proofs/tla/ring/RingHandoff.tla).
+    pub(crate) fn adopt(&mut self, ignored: u64) {
+        if !self.wake_armed {
+            return;
+        }
+        self.push(Sqe::async_cancel(self.wake_id).user_data(ignored));
+        self.wake_id = if self.wake_id == WAKE_LOW {
+            NOT_AN_OP
+        } else {
+            self.wake_id - 1
+        };
+        self.wake_armed = false;
+    }
+
     fn arm_wake(&mut self) {
         if self.wake_armed {
             return;
@@ -227,7 +250,7 @@ impl RingPoller {
             8,
             0,
         )
-        .user_data(NOT_AN_OP);
+        .user_data(self.wake_id);
         // Past a full queue the wake waits first in line, and a wait that may
         // sleep hands it to the kernel before it does (see `wait`).
         if self.ring.push(&sqe).is_err() {
@@ -292,9 +315,12 @@ impl RingPoller {
         let mut woken = false;
         let mut got = 0;
         for cqe in self.ring.completions().take(out.room()) {
-            if cqe.user_data == NOT_AN_OP {
+            if cqe.user_data >= WAKE_LOW {
                 woken = true;
-                self.wake_armed = false;
+                // A wake read an earlier runner armed is only a wake: this runner's stays armed.
+                if cqe.user_data == self.wake_id {
+                    self.wake_armed = false;
+                }
             } else {
                 out.put(cqe);
                 got += 1;

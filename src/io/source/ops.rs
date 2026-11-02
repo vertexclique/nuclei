@@ -349,12 +349,12 @@ impl Source {
         self.ops_out.load(Ordering::SeqCst) == 0
     }
 
-    /// The kernel completed one of the source's operations: its side takes
-    /// the completion at once if free, else its holder does as it lets go.
-    pub(crate) fn op_done(self: &Arc<Self>, done: Done, shard: Option<&crate::rt::shard::Shard>) {
-        // SeqCst, with the flags after it: against a retire, or a
-        // registration, that raises its flag and then looks at the count
-        // (see `retire`, `waits_for_ops`).
+    /// One of the sides' operations left the kernel: whether none is in its hands now. A retire
+    /// that waits for that is woken.
+    #[inline(always)]
+    fn op_ended(&self) -> bool {
+        // SeqCst, with the flags after it: against a retire, or a registration, that raises its
+        // flag and then looks at the count (see `retire`, `waits_for_ops`).
         let idle = self.ops_out.fetch_sub(1, Ordering::SeqCst) == 1;
         if idle
             && self.ask.awaits_ops.load(Ordering::SeqCst)
@@ -362,6 +362,23 @@ impl Source {
         {
             waker.wake();
         }
+        idle
+    }
+
+    /// An operation of the source's that no side has out any more left the kernel (a zombie a
+    /// shard's new runner cancelled, `ShardRing::bury`): it is no longer counted.
+    #[cfg(ring)]
+    pub(crate) fn op_gone(&self) {
+        self.op_ended();
+    }
+
+    /// The kernel completed one of the source's operations: its side takes
+    /// the completion at once if free, else its holder does as it lets go.
+    pub(crate) fn op_done(self: &Arc<Self>, done: Done, shard: Option<&crate::rt::shard::Shard>) {
+        #[cfg(port)]
+        let idle = self.op_ended();
+        #[cfg(not(port))]
+        self.op_ended();
         let mut after = After::default();
         let hooks = self.hooks_in(shard);
         if done.read {

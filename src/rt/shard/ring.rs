@@ -206,7 +206,8 @@ impl ShardRing {
             // Below the file tag's bit, so a source's user data never has it.
             ops: RefCell::new(Ops::new((1 << 31) - 1)),
             file_ops: RefCell::new(Ops::new(1 << 30)),
-            exit_ops: RefCell::new(Ops::new(1 << 30)),
+            // Short of the top 256 indexes, which with both tags would be a wake's (`WAKE_LOW`).
+            exit_ops: RefCell::new(Ops::new((1 << 30) - 256)),
             waitid,
             send_zc,
             zc_denied: Cell::new(false),
@@ -677,6 +678,9 @@ impl ShardRing {
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
             return;
         };
+        if let RingMem::Zombie = op.mem {
+            return self.bury(cqe.user_data, op);
+        }
         if counts_as_write(&op) {
             self.writes.set(self.writes.get().saturating_sub(1));
         }
@@ -685,6 +689,80 @@ impl ShardRing {
             self.timed(cqe.user_data, io_kind(&op.mem), cqe.res);
         }
         self.end(shard, op, cqe.res);
+    }
+
+    /// The calling thread runs this ring from now on, taken over from a runner the monitor took
+    /// its shard from, and calls this before its first drive. A watched worker's ring is not
+    /// single-issuer, so the kernel runs the completion of each request as work queued to the
+    /// thread that submitted it, at its next return from the kernel: a thread in a wait no signal
+    /// ends (a killable wait, a read of a slow disk) runs none of it meanwhile. A poll the old
+    /// runner armed (a stream's or a datagram's multishot poll, a one-shot poll for readiness or
+    /// room), and the ring's wake read, would then bring nothing for as long. Each is cancelled from
+    /// here and its side told it ended, so the side arms another, submitted by this thread; the old
+    /// one stays in the slab as a zombie, which points at no memory, hands its side nothing and is
+    /// buried at its own end (`bury`), whenever its old thread runs it. Everything else is left as
+    /// it is, its completion waiting for that thread: an operation that takes or gives bytes, a
+    /// file's call and a child's exit watch, whose work cannot be done again, and an accept,
+    /// whose poll is an exclusive waiter of its listener, the first of which takes each
+    /// connection's wake (see `RingMem::adopted`; proofs/tla/ring/RingHandoff.tla).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn adopt(&self, shard: Option<&Shard>) {
+        self.poller.borrow_mut().adopt(IGNORED);
+        let mut ended = Vec::new();
+        {
+            let keys: Vec<u64> = self.ops.borrow().keys().collect();
+            let mut ops = self.ops.borrow_mut();
+            for user_data in keys {
+                let Some(op) = ops.get_mut(user_data) else {
+                    continue;
+                };
+                let mem = core::mem::replace(&mut op.mem, RingMem::Ready);
+                let (zombie, outcome) = match mem.adopted(op.source.kind()) {
+                    Ok(adopted) => adopted,
+                    Err(mem) => {
+                        op.mem = mem;
+                        continue;
+                    }
+                };
+                op.mem = zombie;
+                self.poller
+                    .borrow_mut()
+                    .push(Sqe::async_cancel(user_data).user_data(IGNORED));
+                if counts_as_write(op) {
+                    self.writes.set(self.writes.get().saturating_sub(1));
+                }
+                // The zombie counts among the source's operations out until its own end.
+                op.source.op_out();
+                let read = core::mem::replace(&mut op.read, true);
+                ended.push((Arc::clone(&op.source), op.epoch, read, outcome));
+            }
+        }
+        for (source, epoch, read, outcome) in ended {
+            source.op_done(
+                Done {
+                    outcome,
+                    epoch,
+                    read,
+                },
+                shard,
+            );
+        }
+    }
+
+    /// A zombie's end (see [`adopt`](Self::adopt)): its slot is named once less and its source
+    /// counts it no more; its side is told nothing.
+    #[cold]
+    #[inline(never)]
+    fn bury(&self, user_data: u64, op: RingOp) {
+        #[cfg(feature = "io-stats")]
+        if self.timing.get().is_some() {
+            self.timed(user_data, None, 0);
+        }
+        #[cfg(not(feature = "io-stats"))]
+        let _ = user_data;
+        self.files.borrow_mut().done(op.file);
+        op.source.op_gone();
     }
 
     /// A completion of a zero-copy send, handled here; false for any other. The first completion,
@@ -940,6 +1018,7 @@ fn ends_plain(op: &RingOp) -> bool {
             | RingMem::AcceptMulti { .. }
             | RingMem::ReadyMulti
             | RingMem::ReadyStream
+            | RingMem::Zombie
     )
 }
 
