@@ -17,6 +17,9 @@ Try(n, u) == [op |-> "try", n |-> n, use |-> u]
 Cancel(n) == [op |-> "cancel", n |-> n, use |-> 0]
 \* Keep the sender's handle until the receiver's program is over.
 Hold == [op |-> "hold", n |-> 0, use |-> 0]
+\* A request for `n` slots that parks with its waker armed, may be polled once with no
+\* wake, and is dropped while it waits.
+LateCancel(n) == [op |-> "late_cancel", n |-> n, use |-> 0]
 
 \* ---- sender programs: [sender |-> its operations, in order] ----
 \* (P_many, P_cancel_many, P_cancel_one and P_large_small, four operations each, are run
@@ -63,6 +66,8 @@ P_solo_cancel == [s \in {1} |-> <<Send, Cancel(1), Send>>]
 P_solo_many == [s \in {1} |-> <<Send, Res(2, 1)>>]
 \* One sender reserves a slot and gives it back unused, then holds its handle.
 P_give_hold == [s \in {1} |-> <<Res(1, 0), Hold>>]
+\* A late-cancelled request for one slot against two sends, on a full channel.
+P_late_cancel == [s \in {1, 2} |-> IF s = 1 THEN <<LateCancel(1)>> ELSE <<Send, Send>>]
 
 \* ---- receiver programs ----
 

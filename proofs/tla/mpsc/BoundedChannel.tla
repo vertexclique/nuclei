@@ -383,7 +383,8 @@ variables
     req = NoReq,        \* that operation's request
     left = 0,           \* values still to put in, or slots still to give back
     sq = 0,             \* how many values this sender has put in so far
-    wasGranted = FALSE; \* the cancelled request had been granted first
+    wasGranted = FALSE, \* the cancelled request had been granted first
+    spurious = FALSE;   \* a "late_cancel" request was polled with no wake
 begin
 S_next:
     \* The next operation, or the end of the program. "hold" keeps the sender's handle
@@ -447,9 +448,19 @@ S_park:
         goto S_wait;
     end if;
 S_wait:
-    \* The task sleeps until its waker is called.
-    await woken[req];                       \* nothing happens to it until then
-    woken[req] := FALSE;                    \* the wake is used up
+    \* The task sleeps until its waker is called. A "late_cancel" request may also be polled
+    \* once with no wake (a combinator's poll), and is dropped while it waits, its waker
+    \* armed (a late cancel).
+    either
+        await woken[req];                   \* nothing happens to it until then
+        woken[req] := FALSE;                \* the wake is used up
+    or
+        await OpOf(req).op = "late_cancel" /\ ~spurious;
+        spurious := TRUE;                   \* a poll nobody's wake asked for
+    or
+        await OpOf(req).op = "late_cancel";
+        goto S_cancel;                      \* dropped while it waits
+    end either;
 S_repoll:
     \* `park(Some(waker))`: the grant is there, or the waker is armed again.
     if nodeState[req] = "granted" then

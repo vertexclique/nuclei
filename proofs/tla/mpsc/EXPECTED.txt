@@ -53,3 +53,5 @@ ML_last_drop_no_wake           MC_BoundedChannel   violated:Termination
 ML_exit_ignores_dirty          MC_BoundedChannel   violated:Termination
 M_release_close_grant          MC_BoundedChannel   violated:Conservation
 M_close_grant_as_ok            MC_BoundedChannel   violated:PermitsSound
+BC_late_cancel                 MC_BoundedChannel   pass
+BC_live_late_cancel            MC_BoundedChannel   pass
