@@ -2223,12 +2223,18 @@ shard). `tla/handoff/TakeRef.tla` checks who holds the shard while the monitor t
 in `src/rt/handoff/monitor.rs`, `run_shard` in `src/rt/workers.rs`): the monitor holds the shard
 only weakly, so it gets a reference of its own before it claims the runner's slot, lets go of it
 when the take does not happen, and gives it to the spare when it does; a runner that comes back
-to find the shard taken lets go of its own. 5 configurations: 1 that must pass (the shard never
-freed while the runtime runs, `NoLoss`; every reference with its holder, `RefsHeld`; a taken shard
-reaching a spare, `Rescued`); 2 mutations (the reference got only after the take, as before the
-fix: the runner, back in between, lets go of the last one and frees the shard with its queued
-tasks, `NoLoss`, the macOS cadence failure; a failed take forgetting its reference, `RefsHeld`);
-and 2 witnesses (a take, a take that did not happen). `tla/handoff/Asleep.tla` checks how the
+to find the shard taken lets go of its own. It checks the runner's life too (`Life`, which a
+shutdown reads to skip a thread still blocked): the monitor adds one after its take, the runner
+takes one off as soon as its poll returns, before its bound tasks (`run_shard`), in either order.
+8 configurations: 1 that must pass (the shard never freed while the runtime runs, `NoLoss`; every
+reference with its holder, `RefsHeld`; a taken shard reaching a spare, `Rescued`; the life
+detached only while the runner is still in its poll, `LifeMeansBlocked`, and not once both are
+done, `LifeTrue`); 4 mutations (the reference got only after the take, as before the fix: the
+runner, back in between, lets go of the last one and frees the shard with its queued tasks,
+`NoLoss`, the macOS cadence failure; a failed take forgetting its reference, `RefsHeld`; the life a
+flag both sides store, as before the fix, a runner back first left detached for good, `LifeTrue`;
+the runner back only after its bound tasks, as before the fix, `LifeMeansBlocked`); and 3
+witnesses (a take, a take that did not happen, the runner back before the monitor's detach). `tla/handoff/Asleep.tla` checks how the
 monitor sleeps while every worker is parked (`run` in `src/rt/handoff/monitor.rs`) and how a
 worker wakes it (`Shard::begin_park` in `src/rt/shard/run.rs`): the monitor says it sleeps and
 looks at the parks again, a worker says it parks and looks for work again, and a worker whose park

@@ -2,7 +2,11 @@
 (***************************************************************************)
 (* Who holds a shard while the monitor takes it from its runner (`take` in *)
 (* src/rt/handoff/monitor.rs, `Slot::take` and `Slot::come_back` in       *)
-(* src/rt/handoff/slot.rs, `run_shard` in src/rt/workers.rs).              *)
+(* src/rt/handoff/slot.rs, `run_shard` in src/rt/workers.rs), and what    *)
+(* the runner's life says meanwhile (`Life::detach` and `Life::back` in    *)
+(* src/rt/handoff/life.rs, which `Workers::take_threads` reads: a drop    *)
+(* joins every runtime thread but one still blocked in a poll whose shard *)
+(* was taken).                                                              *)
 (*                                                                          *)
 (* Who acts. A runner runs the shard, holding one reference to it, and is  *)
 (* outside the shard in a long poll. The monitor holds the shard only      *)
@@ -22,7 +26,14 @@
 (* awaits an output that never comes. And no reference is lost or kept     *)
 (* past its holder. The bug this model was made for: the monitor got its   *)
 (* reference after the take; a runner that came back in between found the *)
-(* shard taken, let go of the last reference and freed it.                 *)
+(* shard taken, let go of the last reference and freed it. And the life    *)
+(* says the runner is out on a blocked poll only while it is: the monitor  *)
+(* adds one to it after its take, the runner takes one off as soon as its  *)
+(* poll returns, before it runs its bound tasks (`finish_home`), and the   *)
+(* two may come in either order. With two plain stores, as before, a       *)
+(* runner back before the monitor's store left its life detached for good *)
+(* (every later drop skipped joining it), and a runner that said so only   *)
+(* after its bound tasks was skipped by a drop meanwhile.                  *)
 (*                                                                          *)
 (* What is abstract. The claim's fence and the second read of the word are *)
 (* one step (proofs/tla/handoff/Handoff.tla checks them); the runner makes *)
@@ -42,7 +53,9 @@ variables                                                                    \* 
     runnerHolds = TRUE,    \* the runner holds its reference
     monitorHolds = FALSE,  \* the monitor holds a reference of its own
     spareHolds = FALSE,    \* a spare took the shard, with its reference
-    failedTake = FALSE;    \* (record) a take that did not happen let go of its reference
+    failedTake = FALSE,    \* (record) a take that did not happen let go of its reference
+    life = 0,              \* the runner's life: above 0, out on a blocked poll (`Life`)
+    backFirst = FALSE;     \* (record) the runner said it was back before the monitor's detach
 
 define                                                                       \* names the properties use:
     \* The shard is never freed while the runtime runs.
@@ -57,6 +70,14 @@ define                                                                       \* 
     NoTake == claim # "taken"                                                \* claims to: never taken
     \* Witness: a take that does not happen lets go of its reference.
     NoFailedTake == ~failedTake                                              \* claims to: never a failed take
+    \* The runner is still in its poll: not ended yet, or ended on the take and not back.
+    InPoll == pc["runner"] \in {"R_back", "R_out"}                          \* before `Life::back`
+    \* The life says detached only while the runner is still in the poll its shard was taken in.
+    LifeMeansBlocked == life > 0 => InPoll                                   \* never detached past the poll
+    \* Once both are done, the life does not say detached.
+    LifeTrue == (pc["runner"] = "Done" /\ pc["monitor"] = "Done") => life <= 0 \* nothing left over
+    \* Witness: the runner says it is back before the monitor says it was taken.
+    NoBackFirst == ~backFirst                                                \* claims to: never back first
 end define;                                                                  \* end of the names
 
 \* One reference less; the last one drops the shard.
@@ -70,15 +91,26 @@ fair process runner = "runner"                                               \* 
 begin                                                                        \* the runner's steps:
 R_back:                                                                      \* its poll ends: it comes back
     if claim = "taken" then                                                  \* the monitor took the shard:
-        goto R_drop;                                                         \* it is detached
+        goto R_out;                                                          \* it is detached
     else                                                                     \* no claim, or a pending one:
         claim := "none";                                                     \* a pending claim is cancelled
         runnerIn := TRUE;                                                    \* and the runner goes on in
         goto Done;                                                           \* running the shard, holding it
     end if;                                                                  \* one of the two
+R_out:                                                                       \* its poll returned: `Life::back`
+    \* MUTATION life_stored: the life is a flag both sides store, as it was: false here.
+    \* MUTATION back_after_home: the runner says it is back only after its bound tasks, as it did.
+    if Mutation = "life_stored" then life := 0;                              \* a plain store
+    elsif Mutation # "back_after_home" then life := life - 1;                \* one off: back from the poll
+    end if;                                                                  \* (or not yet, under the mutation)
+    backFirst := backFirst \/ pc["monitor"] = "M_life";                      \* (recorded) before the detach
+R_home:                                                                      \* `finish_home`: its bound tasks
+    skip;                                                                    \* run on its own shard, the poll over
 R_drop:                                                                      \* detached: `drop(shard)` in `run_shard`
     runnerHolds := FALSE;                                                    \* its reference goes
     let_go();                                                                \* and may be the last
+R_late:                                                                      \* where the old code said it was back
+    if Mutation = "back_after_home" then life := life - 1; end if;           \* only now, under the mutation
 end process;                                                                 \* end of the runner
 
 \* The monitor (`take`, then `give`).
@@ -103,6 +135,10 @@ M_take:                                                                      \* 
     else                                                                     \* the runner came back first:
         goto M_fail;                                                         \* nothing is taken
     end if;                                                                  \* taken
+M_life:                                                                      \* `Life::detach`, after the take
+    if Mutation = "life_stored" then life := 1;                              \* a plain store, as it was
+    else life := life + 1;                                                   \* one on: out on a blocked poll
+    end if;                                                                  \* the runner may be back already
 M_late:                                                                      \* where the old code held the shard
     if Mutation = "late_ref" then                                            \* only now:
         if refs = 0 then goto Done;                                          \* gone: nothing to give

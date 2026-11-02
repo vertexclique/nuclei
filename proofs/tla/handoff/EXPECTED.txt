@@ -46,6 +46,9 @@ M_late_ref            TakeRef     violated:NoLoss
 M_keep_ref            TakeRef     violated:RefsHeld
 W_take                TakeRef     violated:NoTake
 W_failed_take         TakeRef     violated:NoFailedTake
+M_life_stored         TakeRef     violated:LifeTrue
+M_back_after_home     TakeRef     violated:LifeMeansBlocked
+W_back_first          TakeRef     violated:NoBackFirst
 A_safe                Asleep      pass
 M_no_backout_ring     Asleep      violated:Watched
 M_no_wake_ring        Asleep      violated:Watched
