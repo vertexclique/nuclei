@@ -64,6 +64,7 @@ impl Shard {
     fn let_go_of_sources(&self) {
         let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
         evict_all(&gone, self.shared_addr());
+        give_up_claims(&gone, &self.shared);
         // On a worker, or with none on this thread's shard, which runs it at
         // the thread's next `block_on`, as any task spawned here; a runtime
         // that drops waits for it (`rt::linger`).
@@ -106,6 +107,14 @@ fn evict_all(gone: &[(u64, Arc<Source>)], home: usize) {
         source.evict();
     }
     wait_for_evictions(gone, home);
+}
+
+/// The sides of each source of `gone` that this shard, `home`, claimed give the claim up, once
+/// the shard did all it does with them as their owner (`Source::give_up_claims`).
+fn give_up_claims(gone: &[(u64, Arc<Source>)], home: &Arc<crate::rt::shard::Shared>) {
+    for (_, source) in gone {
+        source.give_up_claims(home);
+    }
 }
 
 /// Hands each source of `gone`, evicted, whose write side holds bytes the
@@ -280,6 +289,9 @@ impl Shard {
         // pusher that saw the flag while the role was held left its
         // runnable to this drain.
         self.shared.release_inbox();
+        // Done with the sources as their owner (the dropped tasks' closes included): what it
+        // claimed of them goes.
+        give_up_claims(&gone, &self.shared);
         // The mailbox closes, unless a keeper applies it from now on (and
         // closes it once it is done).
         #[cfg(ring)]

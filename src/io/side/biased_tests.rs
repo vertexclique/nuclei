@@ -19,9 +19,11 @@ struct State {
     requests: u64,
 }
 
-/// A thread's hooks: `who` is its owner id (0 for a foreign thread).
+/// A thread's hooks: `who` is its owner id (0 for a foreign thread), even as a shard's address
+/// is; `runs`, the shard its thread runs wherever the side's source is homed.
 struct Probe {
     who: usize,
+    runs: usize,
 }
 
 impl Hooks<State> for Probe {
@@ -38,10 +40,14 @@ impl Hooks<State> for Probe {
     fn owner(&self) -> usize {
         self.who
     }
+
+    fn runs(&self) -> usize {
+        self.runs
+    }
 }
 
-const OWNER: Probe = Probe { who: 1 };
-const FOREIGN: Probe = Probe { who: 0 };
+const OWNER: Probe = Probe { who: 2, runs: 2 };
+const FOREIGN: Probe = Probe { who: 0, runs: 0 };
 
 fn biased() -> Option<Side<State>> {
     crate::rt::handoff::fence::available().then(|| Side::biased(State::default()))
@@ -411,6 +417,116 @@ fn a_foreign_call_without_a_fence_on_an_unclaimed_side_goes_shared() {
     crate::rt::handoff::fence::inject_failure(false);
 }
 
+/// A thread whose heavy fence fails, as a hook that counts its nudges and runs the shard `runs`.
+struct FencelessOn<'a>(&'a AtomicUsize, usize);
+
+impl Hooks<State> for FencelessOn<'_> {
+    fn serve(&self, _: &mut State, _: &mut After) {}
+
+    fn runs(&self) -> usize {
+        self.1
+    }
+
+    fn nudge(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The claimant gave its claim up as its shard let go of the source: a foreign call whose fence
+/// fails takes the side itself, shared from then on, and asks nobody.
+#[test]
+fn a_fenceless_call_on_a_side_whose_claimant_gave_it_up_takes_it_itself() {
+    let Some(mut side) = biased() else { return };
+    let (_, waker) = counted();
+    assert!(poll(&side, &waker, &OWNER).is_ready());
+    let mut after = After::default();
+    side.give_up(OWNER.who, &mut after, &OWNER);
+    after.run();
+    assert!(
+        !side.is_shared(),
+        "a claim given up with no work left switched the side"
+    );
+    crate::rt::handoff::fence::inject_failure(true);
+    let nudges = AtomicUsize::new(0);
+    assert!(poll(&side, &waker, &Fenceless(&nudges)).is_ready());
+    crate::rt::handoff::fence::inject_failure(false);
+    assert_eq!(
+        nudges.load(Ordering::SeqCst),
+        0,
+        "a claimant that left was asked"
+    );
+    assert!(side.is_shared());
+    assert_eq!(steps(&mut side), 2);
+}
+
+/// A foreign call whose fence failed left its work and asked the claimant, whose shard then lets
+/// go of the source: giving the claim up, the claimant does that work, and the poll is woken.
+#[test]
+fn a_claimant_giving_its_claim_up_serves_what_a_fenceless_call_left() {
+    let Some(mut side) = biased() else { return };
+    let (_, waker) = counted();
+    assert!(poll(&side, &waker, &OWNER).is_ready());
+    crate::rt::handoff::fence::inject_failure(true);
+    let nudges = AtomicUsize::new(0);
+    let (woke, fwaker) = counted();
+    assert!(poll(&side, &fwaker, &Fenceless(&nudges)).is_pending());
+    assert_eq!(nudges.load(Ordering::SeqCst), 1);
+    crate::rt::handoff::fence::inject_failure(false);
+    let mut after = After::default();
+    side.give_up(OWNER.who, &mut after, &OWNER);
+    after.run();
+    assert_eq!(
+        woke.0.load(Ordering::SeqCst),
+        1,
+        "the poll left was not woken"
+    );
+    assert!(side.is_shared());
+    assert!(poll(&side, &fwaker, &FOREIGN).is_ready());
+    assert_eq!(steps(&mut side), 2);
+}
+
+/// The claimant's own thread, its source homed elsewhere now (its takes are foreign), calls with a
+/// fence that fails: it holds nothing (its own store of `own` says so), so it takes the side
+/// itself, rather than leave its work to itself and nudge itself for good.
+#[test]
+fn the_claimants_own_fenceless_call_on_a_side_homed_elsewhere_takes_it_itself() {
+    let Some(mut side) = biased() else { return };
+    let (_, waker) = counted();
+    assert!(poll(&side, &waker, &OWNER).is_ready());
+    crate::rt::handoff::fence::inject_failure(true);
+    let nudges = AtomicUsize::new(0);
+    assert!(poll(&side, &waker, &FencelessOn(&nudges, OWNER.who)).is_ready());
+    crate::rt::handoff::fence::inject_failure(false);
+    assert_eq!(
+        nudges.load(Ordering::SeqCst),
+        0,
+        "the claimant nudged itself"
+    );
+    assert!(side.is_shared());
+    assert_eq!(steps(&mut side), 2);
+}
+
+/// A claimant that gave its claim up claims the side again at its next take as its owner, and
+/// holds it biased, without the word.
+#[test]
+fn a_claimant_that_gave_its_claim_up_claims_the_side_again() {
+    let Some(mut side) = biased() else { return };
+    let (_, waker) = counted();
+    assert!(poll(&side, &waker, &OWNER).is_ready());
+    let mut after = After::default();
+    side.give_up(OWNER.who, &mut after, &OWNER);
+    after.run();
+    assert!(!side.claimed_by(OWNER.who));
+    assert!(poll(&side, &waker, &OWNER).is_ready());
+    assert!(
+        side.claimed_by(OWNER.who),
+        "the claimant did not claim the side again"
+    );
+    assert!(!side.is_shared());
+    assert_eq!(side.words(), (0, 0), "the take went through the word");
+    assert_eq!(steps(&mut side), 2);
+}
+
 /// After a fence failure, sides made on the thread start shared.
 #[test]
 fn sides_made_after_a_fence_failure_start_shared() {
@@ -510,15 +626,18 @@ fn foreign_polls_without_a_fence_never_share_the_side_and_are_all_served() {
 fn the_owners_poll_runs_its_step_once_without_touching_the_word() {
     let Some(mut side) = biased() else { return };
     let (_, waker) = counted();
-    assert!(!side.owned_by(1), "a side nobody claimed has no owner");
+    assert!(
+        !side.owned_by(OWNER.who),
+        "a side nobody claimed has no owner"
+    );
     assert!(poll(&side, &waker, &OWNER).is_ready());
-    assert!(side.owned_by(1) && !side.owned_by(2));
+    assert!(side.owned_by(OWNER.who) && !side.owned_by(OWNER.who + 2));
     let mut after = After::default();
     let done = matches!(
         side.poll_owner(&mut after, &OWNER, |st, _| {
             assert_eq!(side.words().0, 0, "the word was taken");
             assert!(
-                !side.owned_by(1),
+                !side.owned_by(OWNER.who),
                 "the owner's own hold is not another owner's take"
             );
             st.steps += 1;
@@ -545,7 +664,10 @@ fn the_owners_poll_is_refused_once_a_foreign_thread_came() {
     go.send(()).unwrap();
     owner.join().unwrap();
     let mut side = Arc::into_inner(side).unwrap();
-    assert!(side.owned_by(1), "the foreign thread switched the side");
+    assert!(
+        side.owned_by(OWNER.who),
+        "the foreign thread switched the side"
+    );
     let mut after = After::default();
     let refused = matches!(
         side.poll_owner(&mut after, &OWNER, step),

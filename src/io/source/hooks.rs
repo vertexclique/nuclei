@@ -56,6 +56,16 @@ impl SourceHooks<'_> {
         }
     }
 
+    /// The address of the shard this thread runs, inside it, wherever the source is homed (or of
+    /// the shard whose own thread makes the call as the shard's, `claim`); else 0.
+    fn runs(&self) -> usize {
+        match (self.claim, self.shard) {
+            (Some(claim), _) => Arc::as_ptr(claim) as usize,
+            (None, Some(shard)) => shard.shared_addr(),
+            (None, None) => 0,
+        }
+    }
+
     /// Keeps the shard that claimed a side, for a nudge to reach.
     fn claimed(&self, cell: &super::owner::Owner) {
         if cell.is_set() {
@@ -160,6 +170,10 @@ impl Hooks<ReadState> for SourceHooks<'_> {
         SourceHooks::owner(self)
     }
 
+    fn runs(&self) -> usize {
+        SourceHooks::runs(self)
+    }
+
     fn claimed(&self) {
         SourceHooks::claimed(self, &self.src.read_owner);
     }
@@ -242,6 +256,10 @@ impl Hooks<WriteState> for SourceHooks<'_> {
 
     fn owner(&self) -> usize {
         SourceHooks::owner(self)
+    }
+
+    fn runs(&self) -> usize {
+        SourceHooks::runs(self)
     }
 
     fn claimed(&self) {
