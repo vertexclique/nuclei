@@ -547,6 +547,70 @@ mod tests {
         assert!(lock.try_write(&other).is_some());
     }
 
+    fn records_of(lock: &ReentrantRwLock<()>, owner: &Owner) -> usize {
+        lock.readers
+            .iter()
+            .filter(|record| record.owner.load(Ordering::Relaxed) == owner.id())
+            .count()
+    }
+
+    #[test]
+    fn a_queued_read_of_the_owner_that_took_the_write_meanwhile_reads_at_once() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_write(&other).expect("free");
+        let mut write = Polled::new(lock.write(&me));
+        let mut read = Polled::new(lock.read(&me));
+        write.pending();
+        read.pending();
+        drop(theirs);
+        let written = write.ready().expect("the owner held no read");
+        let reading = read.ready();
+        drop((written, reading));
+        assert!(
+            lock.try_write(&other).is_some(),
+            "the write and the read went"
+        );
+    }
+
+    #[test]
+    fn a_queued_write_of_an_owner_that_reads_meanwhile_is_refused() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_read(&other).expect("free");
+        let mut write = Polled::new(lock.write(&me));
+        write.pending();
+        let mine = lock.try_read(&me).expect("a queued writer is not owed yet");
+        drop(theirs);
+        assert_eq!(write.ready().err(), Some(ReadHeldByOwner));
+        drop((write, mine));
+        assert!(
+            lock.try_write(&other).is_some(),
+            "the refused write left no trace"
+        );
+    }
+
+    #[test]
+    fn two_queued_reads_of_one_owner_share_one_record() {
+        let lock = ReentrantRwLock::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_write(&other).expect("free");
+        let mut first = Polled::new(lock.read(&me));
+        let mut second = Polled::new(lock.read(&me));
+        first.pending();
+        second.pending();
+        drop(theirs);
+        let a = first.ready();
+        let b = second.ready();
+        assert_eq!(
+            records_of(&lock, &me),
+            1,
+            "one record for the owner's two reads"
+        );
+        drop((a, b));
+        assert!(lock.try_write(&other).is_some(), "both reads went");
+    }
+
     #[test]
     fn a_reader_asking_to_write_is_refused_rather_than_deadlocked() {
         let lock = ReentrantRwLock::new(());

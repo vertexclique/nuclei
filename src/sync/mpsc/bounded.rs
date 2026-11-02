@@ -835,6 +835,8 @@ impl<T> Drop for Reserve<'_, T> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+    use core::task::Waker;
+
     use super::*;
     use crate::sync::test_support::Polled;
 
@@ -848,6 +850,130 @@ mod tests {
         assert_eq!(tx.capacity() + rx.len(), 4);
         rx.try_recv().unwrap();
         assert_eq!(tx.capacity() + rx.len(), 4);
+    }
+
+    /// A waker that runs `on_clone` at its first clone and `on_wake` at its
+    /// first wake by reference: what another thread could do at those
+    /// moments of a send's poll.
+    struct Hook {
+        on_clone: core::cell::Cell<Option<Box<dyn FnOnce()>>>,
+        on_wake: core::cell::Cell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    static HOOK: core::task::RawWakerVTable =
+        core::task::RawWakerVTable::new(hook_clone, hook_wake, hook_wake_by_ref, hook_drop);
+
+    // Each of the four functions below is the vtable entry of a waker built
+    // from `Rc::into_raw` of a `Hook`, which is their contract; the tests use
+    // it on their own thread only.
+    unsafe fn hook_clone(data: *const ()) -> core::task::RawWaker {
+        // SAFETY: `data` came from `Rc::into_raw` of a `Hook` and is live.
+        let hook = unsafe { &*(data as *const Hook) };
+        if let Some(run) = hook.on_clone.take() {
+            run();
+        }
+        // SAFETY: `data` is a live `Rc` pointer; this adds the clone's count.
+        unsafe { std::rc::Rc::increment_strong_count(data as *const Hook) };
+        core::task::RawWaker::new(data, &HOOK)
+    }
+
+    unsafe fn hook_wake(data: *const ()) {
+        // SAFETY: `data` is a live `Rc` pointer, whose count this consumes.
+        unsafe { hook_wake_by_ref(data) };
+        // SAFETY: as above.
+        unsafe { hook_drop(data) };
+    }
+
+    unsafe fn hook_wake_by_ref(data: *const ()) {
+        // SAFETY: `data` came from `Rc::into_raw` of a `Hook` and is live.
+        let hook = unsafe { &*(data as *const Hook) };
+        if let Some(run) = hook.on_wake.take() {
+            run();
+        }
+    }
+
+    unsafe fn hook_drop(data: *const ()) {
+        // SAFETY: consumes the count this waker owns.
+        drop(unsafe { std::rc::Rc::from_raw(data as *const Hook) });
+    }
+
+    fn hooked(on_clone: Option<Box<dyn FnOnce()>>, on_wake: Option<Box<dyn FnOnce()>>) -> Waker {
+        let hook = std::rc::Rc::new(Hook {
+            on_clone: core::cell::Cell::new(on_clone),
+            on_wake: core::cell::Cell::new(on_wake),
+        });
+        let data = std::rc::Rc::into_raw(hook) as *const ();
+        // SAFETY: the vtable's contract is met by a pointer from `Rc::into_raw`.
+        unsafe { Waker::from_raw(core::task::RawWaker::new(data, &HOOK)) }
+    }
+
+    /// Runs `poll` inside a poll whose budget is spent.
+    fn with_budget_spent<R>(poll: impl FnOnce() -> R) -> R {
+        let saved = crate::coop::enter();
+        while crate::coop::try_spend() {}
+        let result = poll();
+        crate::coop::leave(saved);
+        result
+    }
+
+    #[test]
+    fn a_send_granted_as_it_queues_spends_the_budget() {
+        let (tx, rx) = channel::<u32>(1);
+        tx.try_send(0).unwrap();
+        let rx = std::rc::Rc::new(core::cell::RefCell::new(rx));
+        let frees = std::rc::Rc::clone(&rx);
+        // The send finds no slot; between that look and its queueing, the
+        // receiver takes the value, so the queueing's own pass grants it.
+        let waker = hooked(
+            Some(Box::new(move || {
+                assert_eq!(frees.borrow_mut().try_recv(), Ok(0));
+            })),
+            None,
+        );
+        let mut send = Box::pin(tx.send(1));
+        let mut cx = Context::from_waker(&waker);
+        let polled = with_budget_spent(|| send.as_mut().poll(&mut cx));
+        assert!(
+            polled.is_pending(),
+            "a send completed past the spent budget"
+        );
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(rx.borrow_mut().try_recv(), Ok(1));
+        assert_eq!(tx.capacity(), 1);
+    }
+
+    #[test]
+    fn a_send_refused_for_the_budget_wakes_a_receiver_its_give_back_finishes() {
+        let (tx, rx) = channel::<u32>(1);
+        let rx = std::rc::Rc::new(core::cell::RefCell::new(rx));
+        let receiver = Polled::new(core::future::pending::<()>());
+        let rx_waker = receiver.waker();
+        let closes = std::rc::Rc::clone(&rx);
+        // The send takes the free slot and is refused for the budget; at the
+        // refusal's wake, the receiver closes and waits for the slot to come
+        // back, which the refusal then gives back.
+        let waker = hooked(
+            None,
+            Some(Box::new(move || {
+                let mut rx = closes.borrow_mut();
+                rx.close();
+                // The receiver's own poll, with a budget of its own.
+                let looked =
+                    crate::coop::outside(|| rx.poll_recv(&mut Context::from_waker(&rx_waker)));
+                assert!(looked.is_pending(), "a slot is still out");
+            })),
+        );
+        let mut send = Box::pin(tx.send(1));
+        let mut cx = Context::from_waker(&waker);
+        let polled = with_budget_spent(|| send.as_mut().poll(&mut cx));
+        assert!(polled.is_pending(), "the send was refused for the budget");
+        assert_eq!(tx.capacity(), 1, "the refused send gave its slot back");
+        assert_eq!(receiver.wakes(), 1, "and the closed receiver was told");
+        let ended = rx
+            .borrow_mut()
+            .poll_recv(&mut Context::from_waker(&receiver.waker()));
+        assert!(matches!(ended, Poll::Ready(None)));
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
     }
 
     #[test]

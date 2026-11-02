@@ -270,6 +270,21 @@ mod tests {
     }
 
     #[test]
+    fn polling_the_leaders_finished_wait_again_arrives_nowhere() {
+        let barrier = Barrier::new(2);
+        let mut first = Polled::new(barrier.wait());
+        first.pending();
+        let mut leader = Polled::new(barrier.wait());
+        assert!(leader.ready().is_leader());
+        assert!(leader.ready().is_leader(), "a finished wait stays finished");
+        assert!(!first.ready().is_leader());
+        let mut next = Polled::new(barrier.wait());
+        next.pending();
+        assert!(Polled::new(barrier.wait()).ready().is_leader());
+        assert!(!next.ready().is_leader());
+    }
+
+    #[test]
     fn a_barrier_of_nothing_acts_as_one() {
         let barrier = Barrier::new(0);
         for _ in 0..3 {

@@ -288,6 +288,23 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_lock_of_the_owner_that_took_the_lock_meanwhile_enters_at_once() {
+        let lock = ReentrantMutex::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_lock(&other).expect("free");
+        let mut first = Polled::new(lock.lock(&me));
+        let mut second = Polled::new(lock.lock(&me));
+        first.pending();
+        second.pending();
+        drop(theirs);
+        let a = first.ready();
+        let b = second.ready();
+        drop((a, b));
+        assert_eq!(lock.sem.linked(), 0, "the second lock left the queue");
+        assert!(lock.try_lock(&other).is_some(), "both levels went");
+    }
+
+    #[test]
     fn a_withdrawn_lock_future_leaves_no_trace() {
         let lock = ReentrantMutex::new(());
         let (me, other) = (Owner::new(), Owner::new());
