@@ -84,9 +84,11 @@ pub(crate) struct Inner {
 
 /// A runtime: worker shards and a blocking pool. Dropping it stops the
 /// workers, drops the tasks they still hold, and waits for the threads to
-/// exit; then, on the dropping thread, for what the handles those tasks held
-/// left behind (the bytes a socket's write-behind holds, a file's writes) to
-/// land, each for at most a minute, so nothing they accepted is lost.
+/// exit (every one but the dropping thread, when a task of the runtime drops
+/// it, which goes on once the drop returns); then, on the dropping thread,
+/// for what the handles those tasks held left behind (the bytes a socket's
+/// write-behind holds, a file's writes) to land, each for at most a minute,
+/// so nothing they accepted is lost.
 pub struct Runtime {
     inner: Arc<Inner>,
     /// One message per worker that exited.
@@ -183,7 +185,16 @@ impl Runtime {
         // Lingers handed from now on wait for this drop, never for a worker.
         self.inner.lingering.close();
         self.inner.workers.stop_all();
-        let threads = self.inner.workers.take_threads();
+        // Never the dropping thread's own: a runtime dropped in one of its own
+        // tasks would join itself (proofs/tla/teardown, `NoSelfJoin`).
+        let me = std::thread::current().id();
+        let threads: Vec<_> = self
+            .inner
+            .workers
+            .take_threads()
+            .into_iter()
+            .filter(|thread| thread.thread().id() != me)
+            .collect();
         if let Some(timeout) = timeout {
             let deadline = std::time::Instant::now() + timeout;
             // Workers that exited already sent theirs; one message each.
