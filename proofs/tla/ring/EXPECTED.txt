@@ -135,3 +135,16 @@ RR_port_udp_starved_live       MC_RingRecv          pass
 MR_port_task_sized             MC_RingRecv          violated:NoCut
 MRR_ring_task_sized            MC_RingRecv          violated:NoCut
 WRR_port_look                  MC_RingRecv          violated:NoLook
+RH_interruptible               MC_RingHandoff       pass
+RH_uninterruptible             MC_RingHandoff       pass
+RH_ends                        MC_RingHandoff       pass
+RH_data_interruptible          MC_RingHandoff       pass
+MRH_uninterruptible            MC_RingHandoff       violated:IoRescued
+MRH_coop_taskrun               MC_RingHandoff       violated:IoRescued
+MRH_zombie_reaches_side        MC_RingHandoff       violated:OwnEnds
+MRH_two_out                    MC_RingHandoff       violated:OneOut
+WRH_old_posts                  MC_RingHandoff       violated:NoOldPost
+WRH_data_waits                 MC_RingHandoff       violated:IoRescued
+RH_accept_ends                 MC_RingHandoff       pass
+MRH_adopt_accepts              MC_RingHandoff       violated:IoRescued
+WRH_accept_waits               MC_RingHandoff       violated:IoRescued

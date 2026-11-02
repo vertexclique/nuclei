@@ -1265,6 +1265,32 @@ poll whose end wakes nobody break `Served`), and 2 witnesses (a reader finds the
 starved side uses its own buffer). `tests/idle_peers.rs` fills the pool of a 512 KiB cap with
 receives of idle peers and checks every other peer is answered.
 
+`tla/ring/RingHandoff.tla` checks a worker's ring handed to a new runner while a request its old
+runner submitted waits in the kernel (`ShardRing::adopt` and `bury` in `src/rt/shard/ring.rs`,
+called by `run_shard` in `src/rt/workers.rs` before the new runner's first drive;
+`RingPoller::adopt` in `src/rt/park/ring.rs` for the ring's wake; `RingMem::adopted` in
+`src/io/source/ring.rs`; `setup_flags` in `src/syscore/linux/iouring/ring/mod.rs`). A watched
+worker's ring is not single-issuer, so the kernel runs a request's completion as work queued to
+the thread that submitted it, which a thread in a wait no signal ends never runs. The new runner
+cancels each poll the old runner armed (a stream's or a datagram's poll, a poll for room, the
+ring's wake read), tells its side it ended so the side arms another of its own, and keeps the old
+one as a zombie whose late completions go nowhere and whose end only frees it; a data operation
+and an accept are left as they are. 13 configurations: 5 that must pass (the old runner asleep
+where a signal wakes it; in a wait no signal ends, for good and until it comes back; a data
+operation with the old runner asleep where a signal wakes it; an accept with the old runner coming
+back; with `OneOut`, the side has one request out as its own, `OwnEnds`, it takes only that
+request's completions, `IoRescued`, the reader gets the datum, and `ZombieFreed`), 5 mutations (no
+adopt, as before the fix, and a ring that runs a thread's completion work only at its next enter,
+`IORING_SETUP_COOP_TASKRUN`, which the new runner asleep in its wait never reaches, each break
+`IoRescued`; a zombie's completions handed to the side break `OwnEnds`; an adopt that does not tell
+the side breaks `OneOut`; an adopt of an accept breaks `IoRescued` even once the old runner is back,
+since the cancelled accept stays its listener's first exclusive waiter until its thread ends it and
+takes the connection's wake), and 3 witnesses (the old runner posting late; a data operation, and an
+accept, waiting for an old runner that never comes back: what the adopt leaves).
+`tests/handoff_uninterruptible.rs` holds the old runner in `clone(CLONE_VFORK)`, which waits
+killable only, and checks a receive, a write waiting for room, a task spawned from another thread
+and a timer go on meanwhile.
+
 `lean/Nuclei/Files.lean` checks the ring's file slots (`src/syscore/linux/iouring/files.rs`,
 `take_out` in `src/rt/shard/ring.rs`): every entry names its source's file by a slot of the
 kernel's fixed-file table, or past a full table by a slot naming the source's own descriptor (the
