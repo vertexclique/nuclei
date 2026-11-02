@@ -1328,7 +1328,8 @@ backlog, some resetting theirs while it waits there; the rest of the process may
 descriptor for a while and gives them back in the end. A poll asks the listener for the next
 connection: one there and a descriptor free, it is accepted and the stream's pause starts over at
 its least; one its peer reset, the listener answers with that connection's error, which the side
-skips, asking again at once; out of descriptors (EMFILE or ENFILE), the stream waits on a timer for
+skips, asking again at once; out of descriptors (EMFILE or ENFILE, on Windows WSAEMFILE,
+WSAENOBUFS or ERROR_NO_SYSTEM_RESOURCES), the stream waits on a timer for
 its pause, which then doubles up to its most, and asks again when the timer fires; any other error
 ends the stream. On macOS an accept that fails for want of a descriptor closes the connection it
 took off the backlog (`Drops`), so after one the side first copies the listener's descriptor and
