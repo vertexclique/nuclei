@@ -29,7 +29,12 @@
 (* What is abstract: time is a count of the finest unit and a tick is four *)
 (* of them; the shard does nothing but its timers, and wakes exactly when *)
 (* its wait ends (no latency); kqueue's timer is the timerfd's twin, so    *)
-(* the model's "coarse" backend stands for both pollers that arm one.      *)
+(* the model's "coarse" backend stands for both pollers that arm one. On   *)
+(* Apple's systems the timer is marked critical (`NOTE_CRITICAL` in        *)
+(* src/rt/park/kqueue.rs `arm_precise`), so the system never fires it late *)
+(* to coalesce it with another (mutation timer_leeway); FreeBSD arms its   *)
+(* `EVFILT_TIMER` with no slop (sys/kern/kern_event.c                      *)
+(* `kqtimer_sched_callout`), so there is nothing to mark.                  *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 
@@ -147,8 +152,13 @@ S_park:
             or
                 \* The wait ends by itself. The poller's own timer, if it ended it, fired and is
                 \* armed no more; else it stays armed for its deadline.
+                \* MUTATION timer_leeway: the poller's own timer is not marked critical, and the
+                \* system fires it a unit late, coalesced with another timer.
                 await ends < Never;
-                now := ends;
+                with late \in (IF Mutation = "timer_leeway" /\ timer = ends /\ timer < own
+                               THEN {0, 1} ELSE {0}) do
+                    now := ends + late;
+                end with;
                 kernelEnded := kernelEnded \/ (timer = ends /\ timer < own);
                 moved := moved \/ (arm /\ prev # Never /\ Earliest < prev);
                 kernelAt := IF timer = ends THEN Never ELSE timer;

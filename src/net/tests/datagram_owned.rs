@@ -135,7 +135,9 @@ fn unix_datagram_owned_calls_arrive_whole() {
         let b = Handle::<UnixDatagram>::bind(&pb).unwrap();
         room_for_large(&a);
         room_for_large(&b);
-        for len in [0usize, 5, 3000, 60_000] {
+        // The largest as large as the system sends (FreeBSD's 8 KiB).
+        let largest = 60_000.min(crate::alone::largest_unix_datagram());
+        for len in [0usize, 5, 3000, largest] {
             let data = pattern(len);
             let recv = b.recv_from_owned(Vec::with_capacity(65_536));
             let send = async {

@@ -9,9 +9,13 @@ WDQ_seen_wait                  MC_DgramQuick        violated:NoSeenWait
 WDQ_held                       MC_DgramQuick        violated:NoHeldGot
 DS_safe                        MC_DgramQuickSend    pass
 DS_live                        MC_DgramQuickSend    pass
+DS_refuses_safe                MC_DgramQuickSend    pass
+DS_refuses_live                MC_DgramQuickSend    pass
 MDS_no_raise                   MC_DgramQuickSend    violated:Termination
 MDS_no_retry                   MC_DgramQuickSend    violated:Termination
 MDS_forget_wait                MC_DgramQuickSend    violated:Termination
+MDS_refusal_waits              MC_DgramQuickSend    violated:Termination
 WDS_quick                      MC_DgramQuickSend    violated:NoQuickSent
 WDS_skip                       MC_DgramQuickSend    violated:NoSkip
 WDS_wait                       MC_DgramQuickSend    violated:NoWait
+WDS_refused                    MC_DgramQuickSend    violated:NoRefusal

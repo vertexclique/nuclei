@@ -1,0 +1,10 @@
+# configuration                spec                 expected
+G_apfs                         MC_DirSync           pass
+G_no_full                      MC_DirSync           pass
+G_plain                        MC_DirSync           pass
+G_none                         MC_DirSync           pass
+G_error                        MC_DirSync           pass
+M_skip_barrier                 MC_DirSync           violated:StrongestMade
+M_fall_on_error                MC_DirSync           violated:ErrorStands
+M_ok_on_refusal                MC_DirSync           violated:NoOkWithoutSync
+W_weak_ok                      MC_DirSync           violated:NoWeakOk

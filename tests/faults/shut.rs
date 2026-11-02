@@ -67,10 +67,15 @@ fn delivered<S: Stream>(peer: &S::Std) {
     let _ = peer;
 }
 
-/// What std answers to a second shutdown of `how` on a stream it shut so already.
+/// What std answers to a second shutdown of `how` on a stream it shut so already, once its
+/// peer read to the end (see [`fin_settled`]: FreeBSD disconnects a TCP socket shut both ways
+/// once its FIN is acknowledged, and a shutdown then answers `ENOTCONN`).
 fn std_second_shutdown<S: Stream>(how: Shutdown) -> Answer {
-    let (ours, _peer) = S::std_pair(false);
+    let (ours, mut peer) = S::std_pair(false);
     S::shutdown_std(&ours, how).unwrap();
+    let (_, end) = std_read_until_end(&mut peer, 8192);
+    assert!(matches!(end, Ok(0)), "std's peer's end: {end:?}");
+    fin_settled(&ours);
     Answer::of(&S::shutdown_std(&ours, how), |_| 0)
 }
 
@@ -103,6 +108,7 @@ pub async fn shut_writing_delivers_every_byte_behind<S: Stream>() {
         let (peer, (got, end)) = joined(reader).await;
         same_bytes(&what, &got, &bytes);
         assert!(matches!(end, Ok(0)), "{what}: the peer's end: {end:?}");
+        fin_settled(&ours);
         let again = within(&what, ours.shut(how)).await;
         assert_eq!(
             Answer::of(&again, |_| 0),

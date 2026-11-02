@@ -851,8 +851,15 @@ fn a_thread_that_runs_no_shard_is_served_by_the_runtime() {
 #[cfg(unix)]
 #[test]
 fn a_datagram_larger_than_the_pool_allows_goes_whole_between_the_tasks_buffers() {
+    // As large as the system sends (FreeBSD's 8 KiB), past the pool's room: a class below it.
+    let size = (100 * 1024).min(crate::alone::largest_unix_datagram());
+    let room = *crate::buf::CLASSES
+        .iter()
+        .rev()
+        .find(|&&c| c < size)
+        .unwrap();
     let group = crate::rt::shard::least_buffer_cap() - crate::buf::CLASSES[0];
-    let rt = runtime(Some(group + 64 * 1024));
+    let rt = runtime(Some(group + room));
     let (a, b) = datagram_pair();
     // macOS refuses a datagram larger than the sender's buffer (2 KiB for a Unix socket by
     // default) and holds none larger than the receiver's.
@@ -876,7 +883,7 @@ fn a_datagram_larger_than_the_pool_allows_goes_whole_between_the_tasks_buffers()
     let a = Owned::new(a, DATAGRAM);
     let b = Owned::new(b, DATAGRAM);
     rt.block_on(async {
-        let big = pattern(100 * 1024);
+        let big = pattern(size);
         // Polled on a worker, whose pool has the cap.
         let (src, bytes) = (Arc::clone(&a.src), big.clone());
         let sent = within(crate::runtime::spawn(async move {

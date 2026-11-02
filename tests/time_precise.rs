@@ -45,21 +45,30 @@ fn a_precise_sleep_in_block_on_never_ends_early() {
     });
 }
 
+/// Runs of precise sleeps and of sleeps on the wheel take turns, so the other
+/// tests of this binary, running at once on a host of few cores, slow both
+/// alike: timed one after the other, the run that met them lost to the run
+/// that came after them (an Intel macOS runner, whose precise sleep of 300 us
+/// takes 370 us at the median when it runs alone).
 #[test]
 fn back_to_back_precise_sleeps_do_not_wait_for_the_wheel_millisecond() {
     let rt = runtime(1, false);
     let (precise, coarse) = rt.block_on(rt.spawn(async {
         let d = Duration::from_micros(300);
-        let start = std::time::Instant::now();
-        for _ in 0..30 {
-            time::sleep_precise(d).await;
+        let (mut precise, mut coarse) = (Duration::ZERO, Duration::ZERO);
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            for _ in 0..6 {
+                time::sleep_precise(d).await;
+            }
+            precise += start.elapsed();
+            let start = std::time::Instant::now();
+            for _ in 0..6 {
+                time::sleep(d).await;
+            }
+            coarse += start.elapsed();
         }
-        let precise = start.elapsed();
-        let start = std::time::Instant::now();
-        for _ in 0..30 {
-            time::sleep(d).await;
-        }
-        (precise, start.elapsed())
+        (precise, coarse)
     }));
     assert!(
         precise < coarse,

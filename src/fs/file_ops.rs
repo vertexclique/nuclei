@@ -131,12 +131,21 @@ impl Handle<File> {
     /// future dropped while the call is out leaves it to the file, which
     /// every later call of the handle waits for. On io_uring it is an
     /// operation of the shard's ring (`fallocate(2)`); elsewhere a job of the
-    /// blocking pool (`fcntl` on macOS, `DeviceIoControl` and
-    /// `SetFileInformationByHandle` on Windows).
+    /// blocking pool (`fcntl` on macOS, `posix_fallocate` and `fspacectl` on
+    /// FreeBSD, `DeviceIoControl` and `SetFileInformationByHandle` on
+    /// Windows).
     ///
-    /// A system that cannot do `mode` answers `Unsupported` (macOS cannot
-    /// zero a range in place), and a file system may refuse a mode as the
-    /// system says.
+    /// A system that cannot do `mode` answers `Unsupported`: macOS cannot
+    /// zero a range in place, and FreeBSD cannot reserve space past the end
+    /// of a file without growing it, so `KeepSize` there takes a range inside
+    /// the file only. A file system may refuse a mode as the system says:
+    /// FreeBSD's ZFS reserves no space, so `Extend` and `KeepSize` answer
+    /// `Unsupported` on it. On FreeBSD a file system that cannot free a range
+    /// (UFS) writes zeros over it for `PunchHole`: the range reads as zeros
+    /// and keeps its space. On macOS a reservation is made from the end of
+    /// what the file has allocated, so holes inside the file are not
+    /// reserved, and HFS+ frees what was reserved past the end of the file
+    /// when the file is closed.
     ///
     /// # Errors
     ///

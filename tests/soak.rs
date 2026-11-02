@@ -15,6 +15,8 @@
 //! `NUCLEI_SOAK_SECS=3600 cargo test --release --test soak -- --ignored --nocapture`
 //! (the length defaults to an hour; `NUCLEI_BACKEND` picks the backend).
 
+mod handles_support;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nuclei::io::{AsyncReadExt, AsyncWriteExt};
-use nuclei::net::{TcpListener, TcpStream, UdpSocket};
+use nuclei::net::{TcpListener, TcpStream, UdpSocket, UdpSocketBuilder};
 
 struct Live;
 
@@ -305,13 +307,29 @@ async fn stream(mut dice: Dice, totals: Arc<Totals>) {
     assert_eq!(read, at, "soak: a stream's reader read another count");
 }
 
+/// The socket buffers the soak's datagram sockets ask for, as an application that sends large
+/// datagrams sets them: macOS and FreeBSD refuse a datagram larger than the sender's buffer
+/// (`EMSGSIZE`; 9216 bytes for UDP by default, `net.inet.udp.maxdgram`, and 2048 for a Unix
+/// socket on macOS, `net.local.dgram.maxdgram`), and FreeBSD drops one its receiver's 42 080
+/// bytes have no room for, with its sender's address; std's sockets take the system's sizes
+/// as nuclei's do.
+const DATAGRAM_BUFFERS: u32 = 256 * 1024;
+
+/// A UDP socket on loopback whose buffers hold the largest datagram the soak sends.
+fn udp_socket() -> UdpSocket {
+    let socket = UdpSocketBuilder::new_v4().unwrap();
+    socket.set_send_buffer_size(DATAGRAM_BUFFERS).unwrap();
+    socket.set_recv_buffer_size(DATAGRAM_BUFFERS).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap()
+}
+
 /// Datagrams over UDP, each checked whole by the number and length it
 /// carries. A receive given up on loses nothing: the datagram it would have
 /// taken comes to the next one, so a receive may get an earlier datagram,
 /// never one twice and never out of order on loopback.
 async fn datagrams(mut dice: Dice, totals: Arc<Totals>) {
-    let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a = udp_socket();
+    let b = udp_socket();
     let to = b.local_addr().unwrap();
     let mut next = 0u64;
     let mut last: Option<u64> = None;
@@ -357,7 +375,24 @@ async fn datagrams(mut dice: Dice, totals: Arc<Totals>) {
 /// Datagrams over a Unix socket, which loses none: each arrives, in order.
 #[cfg(unix)]
 async fn unix_datagrams(mut dice: Dice, totals: Arc<Totals>) {
+    use std::os::fd::AsRawFd;
     let (a, b) = nuclei::net::UnixDatagram::pair().unwrap();
+    for fd in [a.get_ref().as_raw_fd(), b.get_ref().as_raw_fd()] {
+        for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            let size = DATAGRAM_BUFFERS as libc::c_int;
+            // SAFETY: a plain option set on our own socket, with a value of its size.
+            let set = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&raw const size).cast(),
+                    size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(set, 0, "{}", io::Error::last_os_error());
+        }
+    }
     let mut seq = 0u64;
     while totals.going() {
         let len = 1 + dice.below(4000) as usize;
@@ -483,31 +518,12 @@ fn count(dir: &str) -> Option<usize> {
     std::fs::read_dir(dir).ok().map(|d| d.count())
 }
 
-/// The descriptors open: from `/proc` on Linux, `/dev/fd` on macOS and the
-/// BSDs; on Windows the process's handles.
-#[cfg(unix)]
-fn fds() -> Option<usize> {
-    count("/proc/self/fd").or_else(|| count("/dev/fd"))
-}
-
-#[cfg(windows)]
-fn fds() -> Option<usize> {
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
-    }
-    let mut n = 0u32;
-    // SAFETY: the pseudo handle of this process, and a place for the count.
-    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
-    (ok != 0).then_some(n as usize)
-}
-
 fn sample(start: Instant, totals: &Totals) -> Sample {
     Sample {
         secs: start.elapsed().as_secs(),
         rss: rss(),
         heap: LIVE.load(Ordering::Relaxed),
-        fds: fds(),
+        fds: Some(handles_support::open_handles()),
         threads: count("/proc/self/task"),
         bytes: totals.bytes.load(Ordering::Relaxed),
     }

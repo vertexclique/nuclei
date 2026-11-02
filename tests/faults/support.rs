@@ -136,15 +136,17 @@ impl Answer {
 /// macOS also `NotConnected`: its `sendfile(2)` checks the connection before
 /// it sends, and a Unix stream's send does too (bsd/kern/uipc_usrreq.c,
 /// `uipc_send`), so either answers `ENOTCONN` once the reset disconnected the
-/// socket, where a write that saw it first answers `EPIPE`.
-#[cfg(target_vendor = "apple")]
+/// socket, where a write that saw it first answers `EPIPE`. FreeBSD's
+/// `sendfile(2)` does as well on a Unix stream (sys/kern/uipc_usrreq.c,
+/// `uipc_sendfile_wait`), where its write answers `EPIPE`.
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
 pub const RESET_WRITE: &[io::ErrorKind] = &[
     io::ErrorKind::ConnectionReset,
     io::ErrorKind::BrokenPipe,
     io::ErrorKind::ConnectionAborted,
     io::ErrorKind::NotConnected,
 ];
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "freebsd")))]
 pub const RESET_WRITE: &[io::ErrorKind] = &[
     io::ErrorKind::ConnectionReset,
     io::ErrorKind::BrokenPipe,
@@ -281,11 +283,11 @@ macro_rules! stream_calls {
 /// The socket buffers a case of small buffers asks for: for a Unix socket
 /// the least the system allows, which Linux rounds 1 up to a few KiB; for
 /// TCP a few pages, since at its least the kernel moves a MiB in a minute on
-/// loopback, std's sockets as much as nuclei's. macOS keeps a Unix stream's
-/// 1 as it is, so each call moves one byte, and a case that polls a transfer
-/// once per byte it moves would run for hours: there it is a page, about
-/// Linux's least.
-pub const TINY: u32 = if cfg!(target_vendor = "apple") {
+/// loopback, std's sockets as much as nuclei's. macOS and FreeBSD keep a
+/// Unix stream's 1 as it is, so each call moves one byte, and a case that
+/// polls a transfer once per byte it moves would run for hours: there it is
+/// a page, about Linux's least.
+pub const TINY: u32 = if cfg!(any(target_vendor = "apple", target_os = "freebsd")) {
     4096
 } else {
     1
@@ -293,9 +295,11 @@ pub const TINY: u32 = if cfg!(target_vendor = "apple") {
 pub const TINY_TCP: u32 = 8192;
 
 /// The buffers a Unix stream of the system's own size gets on macOS, which
-/// gives it 8 KiB each way (`net.local.stream.sendspace` and `recvspace`)
-/// where a case's peer writes up to 100 000 bytes before anyone reads: about
-/// the 208 KiB Linux's default holds. Elsewhere the system's sizing stays.
+/// gives it 8 KiB each way (`net.local.stream.sendspace` and `recvspace`),
+/// and on FreeBSD, which holds 64 KiB of one nobody reads (its receive
+/// buffer, `net.local.stream.recvspace`: a send goes straight there), where
+/// a case's peer writes up to 100 000 bytes before anyone reads: about the
+/// 208 KiB Linux's default holds. Elsewhere the system's sizing stays.
 #[cfg(unix)]
 pub const UNIX_ROOM: u32 = 256 * 1024;
 
@@ -358,17 +362,20 @@ fn set_buffer<S: std::os::fd::AsRawFd>(s: &S, opt: libc::c_int, size: u32) {
     assert_eq!(rc, 0, "{}", io::Error::last_os_error());
 }
 
-/// What a macOS receive buffer holds of a datagram's sender with it: an
-/// IPv4 address, or the unnamed address of a socket pair's end, is 16 bytes.
-#[cfg(target_vendor = "apple")]
+/// What a macOS or FreeBSD socket buffer holds of a datagram's sender with
+/// it: an IPv4 address, or the unnamed address of a socket pair's end, is 16
+/// bytes.
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
 const DATAGRAM_ADDRESS: u32 = 16;
 
 /// Shrinks a datagram socket's buffers to the least that passes a datagram
-/// of `largest` bytes. macOS refuses one larger than the send buffer
-/// (`EMSGSIZE`) and drops one the receive buffer has no room for with its
-/// sender's address, so there it is exactly that room; elsewhere an empty
-/// buffer takes a datagram of any size, and it is the least the system
-/// allows.
+/// of `largest` bytes. macOS and FreeBSD refuse one larger than the send
+/// buffer (`EMSGSIZE`) and drop one the receive buffer has no room for with
+/// its sender's address, so there it is exactly that room; FreeBSD holds a
+/// Unix socket pair's datagram, address and all, in its sender's buffer until
+/// it is read, and refuses it there (`ENOBUFS`), so its send buffer gets the
+/// address's room too. Elsewhere an empty buffer takes a datagram of any
+/// size, and it is the least the system allows.
 #[cfg(unix)]
 pub fn set_tiny_datagram<S: std::os::fd::AsRawFd>(s: &S, largest: usize) {
     #[cfg(target_vendor = "apple")]
@@ -376,7 +383,12 @@ pub fn set_tiny_datagram<S: std::os::fd::AsRawFd>(s: &S, largest: usize) {
         set_buffer(s, libc::SO_SNDBUF, largest as u32);
         set_buffer(s, libc::SO_RCVBUF, largest as u32 + DATAGRAM_ADDRESS);
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        set_buffer(s, libc::SO_SNDBUF, largest as u32 + DATAGRAM_ADDRESS);
+        set_buffer(s, libc::SO_RCVBUF, largest as u32 + DATAGRAM_ADDRESS);
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "freebsd")))]
     {
         let _ = largest;
         set_tiny(s);
@@ -384,13 +396,13 @@ pub fn set_tiny_datagram<S: std::os::fd::AsRawFd>(s: &S, largest: usize) {
 }
 
 /// Gives a datagram socket the send buffer a datagram of `largest` bytes
-/// needs on macOS, which refuses one larger than it (`EMSGSIZE`; 9216 bytes
-/// for UDP by default, `net.inet.udp.maxdgram`). Elsewhere the system takes
-/// it as the socket is.
+/// needs on macOS and FreeBSD, which refuse one larger than it (`EMSGSIZE`;
+/// 9216 bytes for UDP by default, `net.inet.udp.maxdgram`). Elsewhere the
+/// system takes it as the socket is.
 pub fn room_to_send(s: &nuclei::net::UdpSocket, largest: usize) {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
     set_buffer(s.get_ref(), libc::SO_SNDBUF, largest as u32);
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "freebsd")))]
     let _ = (s, largest);
 }
 
@@ -450,9 +462,9 @@ impl Stream for TcpStream {
     }
 
     fn std_send_file(s: &Self::Std) -> Option<Answer> {
-        #[cfg(target_vendor = "apple")]
+        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
         return Some(send_file_oracle(std::os::fd::AsRawFd::as_raw_fd(s)));
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(target_vendor = "apple", target_os = "freebsd")))]
         {
             let _ = s;
             None
@@ -477,7 +489,7 @@ impl Stream for nuclei::net::UnixStream {
         if tiny {
             set_tiny(&a);
             set_tiny(&b);
-        } else if cfg!(target_vendor = "apple") {
+        } else if cfg!(any(target_vendor = "apple", target_os = "freebsd")) {
             set_buffers(&a, UNIX_ROOM);
             set_buffers(&b, UNIX_ROOM);
         }
@@ -510,9 +522,9 @@ impl Stream for nuclei::net::UnixStream {
     }
 
     fn std_send_file(s: &Self::Std) -> Option<Answer> {
-        #[cfg(target_vendor = "apple")]
+        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
         return Some(send_file_oracle(std::os::fd::AsRawFd::as_raw_fd(s)));
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(target_vendor = "apple", target_os = "freebsd")))]
         {
             let _ = s;
             None
@@ -522,16 +534,18 @@ impl Stream for nuclei::net::UnixStream {
     stream_calls!();
 }
 
-/// What macOS's `sendfile(2)` answers sending one byte of a file to the
+/// What the system's `sendfile(2)` answers sending one byte of a file to the
 /// socket `fd`, as a write's answer is compared (a count is 0).
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
 fn send_file_oracle(fd: std::os::fd::RawFd) -> Answer {
     use std::os::fd::AsRawFd;
     let file = TempFile::with("send-file-oracle", b"x");
     let opened = std::fs::File::open(&file.0).unwrap();
+    #[cfg(target_vendor = "apple")]
     let mut len: libc::off_t = 1;
     // SAFETY: the kernel reads one byte of our open file and writes the
     // socket the caller holds; `len` is ours, and there is no header.
+    #[cfg(target_vendor = "apple")]
     let rc = unsafe {
         libc::sendfile(
             opened.as_raw_fd(),
@@ -539,6 +553,21 @@ fn send_file_oracle(fd: std::os::fd::RawFd) -> Answer {
             0,
             &mut len,
             core::ptr::null_mut(),
+            0,
+        )
+    };
+    #[cfg(target_os = "freebsd")]
+    let mut sent: libc::off_t = 0;
+    // SAFETY: as above; `sent` is ours.
+    #[cfg(target_os = "freebsd")]
+    let rc = unsafe {
+        libc::sendfile(
+            opened.as_raw_fd(),
+            fd,
+            0,
+            1,
+            core::ptr::null_mut(),
+            &mut sent,
             0,
         )
     };
@@ -738,6 +767,51 @@ pub fn std_read_until_end<R: TimedRead>(r: &mut R, chunk: usize) -> (Vec<u8>, io
     (got, end)
 }
 
+/// Waits, for a TCP stream of std's or nuclei's, until its peer acknowledged its FIN (its
+/// state past `FIN_WAIT_1`); nothing for a Unix stream, and nothing off FreeBSD. FreeBSD
+/// disconnects a socket there whose reading half is shut, and one that a second shutdown of
+/// its writing half finds there (sys/netinet/tcp_input.c `tcp_do_segment`, and
+/// sys/netinet/tcp_usrreq.c `tcp_usrclosed`): its reads then end at once, what comes is
+/// dropped, and a shutdown after answers `ENOTCONN`. A case and its oracle each take the step
+/// after their shutdown only once there, so both meet the state the acknowledgement makes and
+/// not whichever its timing gave.
+pub fn fin_settled<T: 'static>(s: &T) {
+    #[cfg(target_os = "freebsd")]
+    {
+        use std::os::fd::AsRawFd;
+        let any = s as &dyn std::any::Any;
+        let fd = match (
+            any.downcast_ref::<std::net::TcpStream>(),
+            any.downcast_ref::<TcpStream>(),
+        ) {
+            (Some(std), _) => std.as_raw_fd(),
+            (None, Some(ours)) => ours.get_ref().as_raw_fd(),
+            (None, None) => return,
+        };
+        /// `TCPS_FIN_WAIT_2` (netinet/tcp_fsm.h): the states from it on have the FIN acknowledged.
+        const FIN_WAIT_2: u8 = 9;
+        eventually("the FIN acknowledged", || {
+            // SAFETY: plain data, all zeroes valid; the kernel fills it.
+            let mut info: libc::tcp_info = unsafe { core::mem::zeroed() };
+            let mut len = size_of::<libc::tcp_info>() as libc::socklen_t;
+            // SAFETY: the kernel writes the connection's state into our own struct.
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_INFO,
+                    (&raw mut info).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+            info.tcpi_state >= FIN_WAIT_2
+        });
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    let _ = s;
+}
+
 /// A connected TCP pair of nuclei's, through its own connect and accept.
 pub async fn tcp_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -860,29 +934,7 @@ async fn woken(what: &str, count: &Arc<Counting>, seen: usize) {
     .await;
 }
 
-/// The descriptors (on Windows the handles) this process holds open.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn open_handles() -> usize {
-    std::fs::read_dir("/proc/self/fd").unwrap().count()
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-pub fn open_handles() -> usize {
-    std::fs::read_dir("/dev/fd").unwrap().count()
-}
-
-#[cfg(windows)]
-pub fn open_handles() -> usize {
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
-    }
-    let mut count = 0u32;
-    // SAFETY: the pseudo handle of this process, and a place for the count.
-    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
-    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
-    count as usize
-}
+pub use crate::handles_support::open_handles;
 
 /// The threads of this process, where the system lists them.
 #[cfg(any(target_os = "linux", target_os = "android"))]

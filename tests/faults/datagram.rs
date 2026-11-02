@@ -462,11 +462,15 @@ mod unix {
     /// The largest datagram a Unix flood sends.
     const LARGEST: usize = 4096;
 
-    /// A send the system refused because the receiver has no room: macOS's
-    /// answer, which std's send gives too, where Linux holds the send until
-    /// there is room. The refused datagram never arrives.
+    /// Whether the system refuses a send the receiver has no room for, as
+    /// macOS and FreeBSD do (`ENOBUFS`), std's blocking send too, where Linux
+    /// holds the send until there is room.
+    const REFUSES: bool = cfg!(any(target_vendor = "apple", target_os = "freebsd"));
+
+    /// A send the system refused because the receiver has no room (see
+    /// [`REFUSES`]). The refused datagram never arrives.
     fn refused(err: &io::Error) -> bool {
-        cfg!(target_vendor = "apple") && err.raw_os_error() == Some(libc::ENOBUFS)
+        REFUSES && err.raw_os_error() == Some(libc::ENOBUFS)
     }
 
     /// A Unix datagram socket loses none the kernel took: a flood into the
@@ -536,7 +540,7 @@ mod unix {
         .await;
         let got = within(&what, receiver).await;
         assert_eq!(got, sent, "{what}: the datagrams the kernel took, in order");
-        if !cfg!(target_vendor = "apple") {
+        if !REFUSES {
             assert_eq!(sent.len(), count as usize, "{what}: a send was refused");
         }
     }

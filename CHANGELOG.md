@@ -35,6 +35,46 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
+- **`allocate` on FreeBSD makes every change of space the system has a call for.** Only `Extend`
+  worked there; every other mode answered `Unsupported`. `PunchHole` and `ZeroRange` are now
+  `fspacectl(2)`'s `SPACECTL_DEALLOC` (FreeBSD 14 on, looked up when first used, so a program
+  still starts on an older system, where these two answer `Unsupported`), which frees the range
+  where the file system can (ZFS, tmpfs) and writes zeros over it where it cannot (UFS).
+  `ZeroRange` then grows a file shorter than the range with a write of one zero at the range's
+  last byte, through a descriptor that does not append, so a write of another's past the range
+  is never cut, as a truncate to the range's end would cut it. `KeepSize` reserves a range inside
+  the file with `posix_fallocate`; a range that ends past the end answers `Unsupported`, since no
+  FreeBSD call reserves space there and keeps the length. ZFS reserves no space, so `Extend` and
+  `KeepSize` answer its `EOPNOTSUPP` there as `Unsupported` (`proofs/tla/space/Space.tla`).
+- **FreeBSD is tested, not only linted.** CI runs the suite in a FreeBSD 15 VM, and its file
+  tests once more on UFS, since the VM's own ZFS reserves no space. The tests read FreeBSD's own
+  limits where they differ from Linux's: a Unix datagram is at most `net.local.dgram.maxdgram`
+  (8 KiB) whatever its buffers, and a send to a full peer is refused (`ENOBUFS`) as on macOS; a
+  UDP datagram needs a send buffer its size; a TCP or Unix stream nobody reads holds 160 or
+  64 KiB, so a case that writes before its peer reads sizes its buffers as on macOS, and a Unix
+  stream's buffer of one byte moves one byte a call; `sendfile(2)` on a Unix stream whose peer
+  went answers `ENOTCONN` where a write answers `EPIPE`; a TCP socket whose FIN was acknowledged
+  is disconnected by a second shutdown of its writing half, or at once if its reading half is
+  shut too, so its reads end and a shutdown after answers `ENOTCONN`, and the oracles of those
+  cases now shut where the cases do; and FreeBSD has the keepalive timing options a test said it
+  lacks. The tests that hold a process's descriptors flat counted three there, since FreeBSD's
+  `/dev/fd` lists only the first three without `fdescfs`; they count them with the kernel's own
+  count (`kern.proc.nfds`) now, the soak's too.
+- **`allocate` on macOS says what a reservation covers.** `F_PREALLOCATE` reserves from the end
+  of what the file has allocated, so a hole inside the file (as a `set_len` that grew it leaves)
+  is not reserved, and HFS+ frees what was reserved past the end of the file at its close, with
+  `F_ALLOCATEPERSIST` or without; APFS keeps it. The rustdoc and the Learn page say so, and a
+  test pins APFS's reservation past the end across a close and a reopen.
+- **`sync_dir` on Apple's systems says what it made.** A file system that refuses `F_FULLFSYNC`
+  for a directory got a plain `fsync`, and an `Ok` that read as a full flush. It now gets
+  `F_BARRIERFSYNC` first, which keeps the order of the writes around it, and `fsync` only if
+  that is refused too; the rustdoc says that neither flushes the drive's cache, so a power loss
+  may still lose the entries there (`proofs/tla/dirsync/DirSync.tla`).
+- **The soak sizes its datagram sockets.** It sent UDP datagrams of up to 60 KB and Unix ones of
+  up to 4000 bytes into sockets of the system's own size, which macOS and FreeBSD refuse past
+  9216 bytes for UDP and macOS past 2048 for a Unix socket (`EMSGSIZE`), as std's sockets do:
+  nuclei sizes no socket, as std does not. Its sockets now ask for buffers of 256 KiB, as an
+  application that sends large datagrams does, so every system carries the same datagrams.
 
 ### Changed
 
