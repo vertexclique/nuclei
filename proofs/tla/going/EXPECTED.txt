@@ -36,3 +36,11 @@ L_background      Linger  pass
 L_bound           Linger  pass
 LM_bound_drops    Linger  violated:AllSent
 LW_bound          Linger  violated:NoBoundOut
+VC_ring           Locals  pass
+VC_reapable       Locals  pass
+VC_quiet          Locals  pass
+VM_no_catch       Locals  violated:GoesToTheEnd
+VM_no_catch_reapable Locals  violated:NoWriteIntoFreed
+VM_one_catch      Locals  violated:NoAbort
+VM_values_first   Locals  violated:ValuesAfterSettle
+VM_before         Locals  violated:NoWriteIntoFreed

@@ -1628,6 +1628,22 @@ running a linger of its list; the task with the handle held by the write as its 
 another thread draining its wake after the write counted itself out; the drop's bound running
 out before every byte went).
 
+`Locals` (`tla/going/Locals.tla`) checks a worker's shard that goes for good holding
+`shard_local!` values whose drops panic, with a file operation out on its ring (`Shard::go` and
+`drop_locals` in `src/rt/shard/going.rs`). The ring settles first: on a ring only the shard reaps,
+the shard waits for the operation (past a bounded wait it keeps its memory for good); on a ring
+another thread can reap, it cancels it and, at the end, hands the ring and what is still out to a
+keeper, which frees the buffer once the kernel is done. Only then do the values go, each in a
+catch of its own, so a panic is logged, the next value still goes, and the shard's going reaches
+its end. 8 configurations: 3 that must pass (both values panicking, on each kind of ring, and none
+panicking), with the kernel never writing into a freed buffer, no abort, the going reaching its
+end, every value dropped and every panic logged, and the values dropped only once the ring is
+settled; 5 mutations (no catch, which leaves the tasks undropped, `GoesToTheEnd`, and on a
+reapable ring drops the ring with the operation out, `NoWriteIntoFreed`; one catch around both
+values, whose second panic comes during the first one's unwind, `NoAbort`; the values first, as
+before, `ValuesAfterSettle`; and the code before this fix, the values first with no catch, whose
+panic drops the ring before it settles, `NoWriteIntoFreed`).
+
 ## A blocking job of a Windows handle
 
 `job` (`tla/job/Job.tla`) checks the cancel of a pool thread's call on a Windows handle opened
