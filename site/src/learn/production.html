@@ -50,7 +50,7 @@ nuclei::runtime::Builder::on_after_task_poll
 nuclei::runtime::Builder::on_task_terminate
 nuclei::runtime::Builder::on_long_poll
 -->
-<p>A hook runs in the middle of the runtime's work: keep it short, and never panic in one. Task hooks get a <code>TaskMeta</code>: the task's <code>id()</code>, and its <code>name()</code> when <code>task::Builder</code> gave one.</p>
+<p>A hook runs in the middle of the runtime's work: keep it short. A thread hook that panics loses nothing: the panic is caught where the runtime calls it, once the panic hook reported it, and the thread goes on with the shard, tasks or jobs it holds. A task hook must never panic: one that does aborts the process, as it runs in the middle of a task's change of state. Task hooks get a <code>TaskMeta</code>: the task's <code>id()</code>, and its <code>name()</code> when <code>task::Builder</code> gave one.</p>
 <p><code>on_long_poll</code> finds the task that holds a worker up: it is called, on the watch's own thread, for each poll that runs past <code>handoff_after</code> (<a href="tasks.html#handoff">Tasks</a>).</p>
 <!--example prod_long_poll-->
 
