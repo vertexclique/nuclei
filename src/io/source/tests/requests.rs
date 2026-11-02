@@ -1010,23 +1010,24 @@ fn the_wait_for_acks_ends_once_the_peer_acknowledged() {
 fn the_wait_for_acks_ends_at_its_deadline() {
     use crate::io::handle::wait_for_acks;
     let rt = runtime(None);
-    let (mut writer, peer) = tcp_pair();
-    let size: libc::c_int = 4096;
-    for fd in [writer.as_raw_fd(), peer.as_raw_fd()] {
-        for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-            // SAFETY: `fd` is open for the call and `size` is a `c_int` of the length given.
-            let ret = unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    opt,
-                    (&raw const size).cast(),
-                    size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-            assert_eq!(ret, 0, "{}", io::Error::last_os_error());
-        }
-    }
+    let set_buf = |fd: libc::c_int, opt: libc::c_int, size: libc::c_int| {
+        // SAFETY: `fd` is open for the call and `size` is a `c_int` of the length given.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (&raw const size).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    set_buf(listener.as_raw_fd(), libc::SO_RCVBUF, 4096);
+    let mut writer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    set_buf(writer.as_raw_fd(), libc::SO_SNDBUF, 256 * 1024);
     writer.set_nonblocking(true).unwrap();
     loop {
         match writer.write(&[0u8; 4096]) {
@@ -1046,6 +1047,10 @@ fn the_wait_for_acks_ends_at_its_deadline() {
     if !counts {
         return;
     }
+    assert!(
+        sys::unacked(fd).is_some_and(|n| n > 0),
+        "bytes the peer has not taken"
+    );
     let start = Instant::now();
     rt.block_on(wait_for_acks(fd, Duration::from_millis(200)));
     let took = start.elapsed();
@@ -1054,5 +1059,9 @@ fn the_wait_for_acks_ends_at_its_deadline() {
         "returned early: {took:?}"
     );
     assert!(took < Duration::from_secs(5), "returned late: {took:?}");
+    assert!(
+        sys::unacked(fd).is_some_and(|n| n > 0),
+        "the deadline, not the acknowledgements, ended the wait"
+    );
     drop(peer);
 }
