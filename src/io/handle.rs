@@ -402,7 +402,7 @@ async fn deliver_file(file: &Arc<FileIo>) {
         Err(_) => {
             crate::rt::counters::write_behind_lost(1);
             log::warn!(
-                "bytes a file handle had accepted were not written within {linger:?}, and were given up"
+                "bytes a file handle had accepted were not all written within {linger:?}: those still waiting were given up"
             );
         }
     }
