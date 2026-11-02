@@ -9,3 +9,7 @@ M_skip_relook                  MC_OnceCell          violated:NoInitAfterPublish
 M_fail_keeps_turn              MC_OnceCell          violated:EveryCallEnds
 M_set_without_turn             MC_OnceCell          violated:OneWriter
 W_lost_to_racer                MC_OnceCell          violated:NoLostPublish
+M_close_before_publish         MC_OnceCell          violated:OneValue
+SO_safe                        MC_SetOnce           pass
+MSO_event_before_publish       MC_SetOnce           violated:EventMeansValue
+MSO_no_event                   MC_SetOnce           violated:WaitsEnd
