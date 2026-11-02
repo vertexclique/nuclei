@@ -1,4 +1,17 @@
 # configuration                spec                 expected
 U_safe                         MC_Unbounded         pass
 U_live                         MC_Unbounded         pass
+U_close                        MC_Unbounded         pass
+U_wake                         MC_Unbounded         pass
+U_try_drop                     MC_Unbounded         pass
+U_drop                         MC_Unbounded         pass
 MU_no_undo_wake                MC_Unbounded         deadlock
+MU_admit_ignores_close         MC_Unbounded         violated:EndAfterAll
+MU_finish_early                MC_Unbounded         violated:EndAfterAll
+MU_rx_no_recheck               MC_Unbounded         violated:Ends
+MU_push_no_wake                MC_Unbounded         violated:Ends
+MU_raise_after_look            MC_Unbounded         violated:Ends
+MU_flag_before_write           MC_Unbounded         violated:Ends
+MU_upgrade_from_zero           MC_Unbounded         violated:EndAfterAll
+MU_last_drop_no_wake           MC_Unbounded         violated:Ends
+MU_pop_no_second_look          MC_Unbounded         violated:EndAfterAll
