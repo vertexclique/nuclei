@@ -13,6 +13,7 @@ M_no_attempt                   MC_Clock             violated:TimersFire
 W_jump                         MC_Clock             violated:NoJumpW
 C_rearm                        MC_Clock             pass
 C_post_wakes                   MC_Clock             pass
+C_post_own                     MC_Clock             pass
 M_post_no_wake                 MC_Clock             violated:TimersFire
 M_uncounted_shard              MC_Clock             violated:TimersFire
 M_detached_uncounted           MC_Clock             violated:NoBadJump

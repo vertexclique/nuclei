@@ -561,7 +561,7 @@ work as it is about to sleep, waits for an advance in progress before it reads t
 flight on no shard (a blocking job, or the rest of a poll the handoff took from its thread)
 wakes its task before it counts itself out, then tries the advance too. A timer op another
 thread posts (a removal, a cancel) wakes a parked shard, which is not idle while it holds the op.
-The family checks seven configurations of it that must pass. Four check
+The family checks eight configurations of it that must pass. Four check
 `ClockNeverPassesArmed` (no jump leaves an armed timer behind) and
 `NoBadJump` (every jump comes over a moment, between its two looks, at which every shard was
 idle, with no work in flight) at full size: two shards with a pusher and work in flight, in two
@@ -569,11 +569,12 @@ runs by where the pusher's one item goes; two shards with a timer each, the scen
 below need; three shards. With no blocking job
 the shards are alike, so those two (and the races' own runs) check each state once up to the
 shards' names (a symmetry set), and every run forgets a value nobody reads again (whether a
-shard's own timer came due, the shard a push went to) once it was read. Three smaller ones
+shard's own timer came due, the shard a push went to) once it was read. Four smaller ones
 check both and, over every behaviour, the liveness property `TimersFire` (every armed timer
 fires: no runtime hangs with its shards asleep and a timer armed): two shards with the blocking
-job alone; two shards with the pusher alone, whose timers the tasks they wake arm again; and two
-shards with one item of work and a timer op posted to either. A timer on each of two shards, or
+job alone; two shards with the pusher alone, whose timers the tasks they wake arm again; two
+shards with one item of work and a timer op posted to the one without the timer; and one shard
+with a timer op posted to it. A timer on each of two shards, or
 three shards, are too many states to check every behaviour, so `TimersFire` is checked where one
 shard arms its timers. Then one mutation per rule (a deadline published after the park, a busy path
 that does not wait for the advance, one look instead of two, a woken shard that does not wait,
