@@ -263,8 +263,8 @@ impl RingPoller {
         if self.wake_armed {
             return;
         }
-        let sqe =
-            Sqe::read(self.wake.as_raw_fd(), WAKE_SINK.as_ptr().cast(), 8, 0).user_data(self.wake_id);
+        let sqe = Sqe::read(self.wake.as_raw_fd(), WAKE_SINK.as_ptr().cast(), 8, 0)
+            .user_data(self.wake_id);
         // Past a full queue the wake waits first in line, and a wait that may
         // sleep hands it to the kernel before it does (see `wait`).
         if self.ring.push(&sqe).is_err() {
