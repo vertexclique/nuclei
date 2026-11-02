@@ -3,8 +3,10 @@
 //!
 //! A runtime has room for a set number of workers over its life, fixed when
 //! it is built (four times the workers it starts with unless set
-//! otherwise). Slots fill in order as workers start, and a slot once filled
-//! keeps its shard, so placement reads them without a lock. A worker asked
+//! otherwise). Slots are claimed in order as workers start, and filled once
+//! a worker's thread started, so placement never finds a shard no thread
+//! will run; a slot once filled keeps its shard, so placement reads them
+//! without a lock. A worker asked
 //! to stop takes no new task from then on, runs the ones it has to their
 //! end, and exits; its slot is not filled again.
 //!
@@ -36,6 +38,14 @@ thread_local! {
     /// The runtime and the shard the spawns of this thread (one that is not
     /// that runtime's worker) went to last.
     static HOME: Cell<Option<(u64, usize)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The next runtime thread this thread asks for does not start, as when
+    /// the system has no room for one, once what is set here ran in its place.
+    pub(crate) static THREAD_FAILS: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::RefCell::new(None) };
 }
 
 /// How a worker is started.
@@ -230,8 +240,8 @@ impl Workers {
             workers.claimed.fetch_sub(1, Ordering::AcqRel);
             return Ok(false);
         }
-        // A shard that cannot be made leaves its slot empty; placement
-        // skips it.
+        // A shard that cannot be made, or whose thread cannot start, leaves
+        // its slot empty; placement skips it.
         let mut limits = workers.start.limits;
         if workers.monitor.is_some() {
             limits.backend = limits.backend.handed_over();
@@ -245,8 +255,6 @@ impl Workers {
         )?;
         let shared = Arc::clone(&shard.shared);
         shared.set_runtime(Arc::downgrade(inner));
-        let _ = workers.slots[index].set(Arc::clone(&shared));
-        workers.running.fetch_add(1, Ordering::AcqRel);
         let life = Arc::new(Life::new());
         let slot = workers.monitor.as_ref().map(|monitor| {
             let slot = monitor.slot();
@@ -265,18 +273,15 @@ impl Workers {
             shard: Owned(shard),
             slot,
         };
-        match Self::spawn_thread(inner, run, life) {
-            Ok(()) => {
-                Self::start_monitor(inner)?;
-                Ok(true)
-            }
-            Err((err, _)) => {
-                // The shard went with the run; its slot takes no tasks.
-                shared.stop();
-                workers.running.fetch_sub(1, Ordering::AcqRel);
-                Err(err)
-            }
-        }
+        // Published once its thread started, so a task placed on the shard
+        // always has a thread to run it: a shard whose thread could not start
+        // goes with its run, holding no task (proofs/tla/placement/Publish.tla,
+        // `NoSilentLoss`).
+        Self::spawn_thread(inner, run, life).map_err(|(err, _)| err)?;
+        let _ = workers.slots[index].set(shared);
+        workers.running.fetch_add(1, Ordering::AcqRel);
+        Self::start_monitor(inner)?;
+        Ok(true)
     }
 
     /// Starts the monitor's thread, with the handoff on, once.
@@ -329,14 +334,25 @@ impl Workers {
         let handed = Arc::new(Handed(AtomicPtr::new(Box::into_raw(Box::new(run)))));
         let (taken, thread_inner, thread_life) =
             (Arc::clone(&handed), Arc::clone(inner), Arc::clone(&life));
-        let spawned = std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name((workers.start.name)())
-            .stack_size(workers.start.stack)
-            .spawn(move || {
-                if let Some(run) = taken.take() {
-                    runner(&thread_inner, run, &thread_life);
-                }
-            });
+            .stack_size(workers.start.stack);
+        let body = move || {
+            if let Some(run) = taken.take() {
+                runner(&thread_inner, run, &thread_life);
+            }
+        };
+        #[cfg(test)]
+        let spawned = match THREAD_FAILS.with(|fails| fails.borrow_mut().take()) {
+            Some(meanwhile) => {
+                meanwhile();
+                drop(body);
+                Err(io::Error::other("no thread could start"))
+            }
+            None => thread.spawn(body),
+        };
+        #[cfg(not(test))]
+        let spawned = thread.spawn(body);
         match spawned {
             Ok(thread) => {
                 lock(&workers.threads).push((thread, life));

@@ -1,12 +1,15 @@
-//! A runtime's drop and timed shutdown against its monitor's last pass, and
-//! a worker still running (proofs/tla/teardown).
+//! A runtime's drop and timed shutdown against its monitor's last pass, a
+//! worker still running, and a worker whose thread cannot start
+//! (proofs/tla/teardown, proofs/tla/placement/Publish.tla).
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use super::Builder;
-use crate::rt::workers::Workers;
+use crate::rt::workers::{THREAD_FAILS, Workers};
 
 /// Waits for `done` with a deadline of `within`; whether it came.
 fn within(within: Duration, mut done: impl FnMut() -> bool) -> bool {
@@ -73,6 +76,41 @@ fn a_timed_shutdown_waits_for_a_running_worker_past_an_exit_left_from_before() {
     assert!(
         done.load(Ordering::SeqCst),
         "the timed shutdown returned while a worker still ran its task"
+    );
+}
+
+/// A worker's shard was published to placement before its thread was asked
+/// for: a spawn in between queued its task there, the thread did not start,
+/// and the shard was stopped and dropped with the task. The shard is published
+/// only once its thread took its run, so the spawn goes where tasks run.
+#[test]
+fn a_worker_whose_thread_cannot_start_drops_no_task_placed_meanwhile() {
+    let rt = Builder::new()
+        .worker_threads(0)
+        .max_worker_threads(1)
+        .pin_workers(false)
+        .build()
+        .unwrap();
+    let handle = rt.handle();
+    let placed = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&placed);
+    THREAD_FAILS.with(|fails| {
+        *fails.borrow_mut() = Some(Box::new(move || {
+            *slot.borrow_mut() = Some(handle.spawn(async { 5u32 }));
+        }));
+    });
+    assert!(
+        Workers::start(rt.inner(), 1).is_err(),
+        "the thread start did not fail"
+    );
+    let task = placed
+        .borrow_mut()
+        .take()
+        .expect("no spawn ran as the start failed");
+    let out = rt.block_on(crate::time::timeout(Duration::from_secs(10), task.join()));
+    assert!(
+        matches!(out, Ok(Ok(5))),
+        "the task placed as the thread start failed was dropped unrun"
     );
 }
 
