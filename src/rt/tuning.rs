@@ -112,6 +112,27 @@ fn call_caught(hook: &Hook) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
 }
 
+/// The name of a thread the runtime starts where nobody waits for a panic
+/// of the user's name function (a runner the monitor starts, a blocking-pool
+/// thread): `name`'s, or `fallback` once a panic in it was let go of, after
+/// the panic hook reported it. The run or count the start holds then is not
+/// lost (proofs/tla/hooks, proofs/tla/pool/Start.tla).
+#[cold]
+#[inline(never)]
+pub(crate) fn name_caught(name: &(dyn Fn() -> String + Send + Sync), fallback: &str) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(name))
+        .map_or_else(|_| fallback.to_string(), spawnable)
+}
+
+/// `name` as a thread takes it: cut at its first NUL byte, which no system's
+/// thread name holds and on which a thread's spawn panics.
+pub(crate) fn spawnable(mut name: String) -> String {
+    if let Some(at) = name.find('\0') {
+        name.truncate(at);
+    }
+    name
+}
+
 /// Calls a thread's stop hook when it drops.
 pub(crate) struct Stopping(Option<Hook>);
 

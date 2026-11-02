@@ -235,6 +235,9 @@ impl Workers {
     /// Starts a worker in the next free slot; `false` when none is left.
     fn start_one(inner: &Arc<Inner>) -> io::Result<bool> {
         let workers = &inner.workers;
+        // Before anything is claimed: a name function that panics reaches the
+        // caller with nothing held.
+        let name = super::tuning::spawnable((workers.start.name)());
         let index = workers.claimed.fetch_add(1, Ordering::AcqRel);
         if index >= workers.slots.len() {
             workers.claimed.fetch_sub(1, Ordering::AcqRel);
@@ -277,7 +280,7 @@ impl Workers {
         // always has a thread to run it: a shard whose thread could not start
         // goes with its run, holding no task (proofs/tla/placement/Publish.tla,
         // `NoSilentLoss`).
-        Self::spawn_thread(inner, run, life).map_err(|(err, _)| err)?;
+        Self::spawn_thread(inner, name, run, life).map_err(|(err, _)| err)?;
         let _ = workers.slots[index].set(shared);
         workers.running.fetch_add(1, Ordering::AcqRel);
         Self::start_monitor(inner)?;
@@ -312,7 +315,8 @@ impl Workers {
         gift: Gift,
         life: Arc<Life>,
     ) -> Result<(), Gift> {
-        Self::spawn_thread(inner, Run::from(gift), life).map_err(|(_, run)| Gift {
+        let name = super::tuning::name_caught(&*inner.workers.start.name, "nuclei-worker");
+        Self::spawn_thread(inner, name, Run::from(gift), life).map_err(|(_, run)| Gift {
             place: run.place,
             shard: run.shard,
             slot: run.slot.unwrap_or_else(|| inner.workers.monitor_slot()),
@@ -326,8 +330,14 @@ impl Workers {
             .map_or_else(|| Arc::new(Slot::new(true)), |monitor| monitor.slot())
     }
 
-    /// Starts a runner thread for `run`; on failure the error and the run.
-    fn spawn_thread(inner: &Arc<Inner>, run: Run, life: Arc<Life>) -> Result<(), (io::Error, Run)> {
+    /// Starts a runner thread named `name` for `run`; on failure the error
+    /// and the run.
+    fn spawn_thread(
+        inner: &Arc<Inner>,
+        name: String,
+        run: Run,
+        life: Arc<Life>,
+    ) -> Result<(), (io::Error, Run)> {
         let workers = &inner.workers;
         // The run waits here until the thread takes it, so a thread that
         // cannot start hands it back.
@@ -335,7 +345,7 @@ impl Workers {
         let (taken, thread_inner, thread_life) =
             (Arc::clone(&handed), Arc::clone(inner), Arc::clone(&life));
         let thread = std::thread::Builder::new()
-            .name((workers.start.name)())
+            .name(name)
             .stack_size(workers.start.stack);
         let body = move || {
             if let Some(run) = taken.take() {

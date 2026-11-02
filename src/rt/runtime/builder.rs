@@ -198,14 +198,22 @@ impl Builder {
     }
 
     /// The name of every thread the runtime starts (default `nuclei-worker`
-    /// and `nuclei-blocking`).
+    /// and `nuclei-blocking`), up to its first NUL byte, which no thread's
+    /// name holds.
     pub fn thread_name(mut self, name: impl Into<String>) -> Self {
         let name: String = name.into();
         self.thread_name = Some(Arc::new(move || name.clone()));
         self
     }
 
-    /// A function naming each thread the runtime starts.
+    /// A function naming each thread the runtime starts, each name taken up
+    /// to its first NUL byte. A panic in it as a worker starts (in
+    /// [`build`](Self::build), or `spawn_more_threads`) reaches that caller
+    /// before anything is claimed. One where the runtime starts a thread of
+    /// its own accord (a blocking-pool thread, a runner for a shard the
+    /// handoff took) is caught once the panic hook reported it, and the
+    /// thread takes the default name: the job or shard it was started for
+    /// runs on it.
     pub fn thread_name_fn(mut self, f: impl Fn() -> String + Send + Sync + 'static) -> Self {
         self.thread_name = Some(Arc::new(f));
         self
