@@ -68,6 +68,8 @@ P_solo_many == [s \in {1} |-> <<Send, Res(2, 1)>>]
 P_give_hold == [s \in {1} |-> <<Res(1, 0), Hold>>]
 \* A late-cancelled request for one slot against two sends, on a full channel.
 P_late_cancel == [s \in {1, 2} |-> IF s = 1 THEN <<LateCancel(1)>> ELSE <<Send, Send>>]
+\* The same against one send, for the liveness run.
+P_late_cancel_one == [s \in {1, 2} |-> IF s = 1 THEN <<LateCancel(1)>> ELSE <<Send>>]
 \* A try for no slot, and a reserve of none, against two sends on one slot.
 P_try_zero == [s \in {1, 2} |-> IF s = 1 THEN <<Send, Send>> ELSE <<Try(0, 0), Res(0, 0)>>]
 
