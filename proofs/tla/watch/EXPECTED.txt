@@ -13,3 +13,13 @@ M_count_before_notified        MC_Watch             violated:ProducerEnds
 W_change_seen                  MC_Watch             violated:NoChangeSeen
 W_cas_retry                    MC_Watch             violated:NoRetry
 W_borrow_ahead                 MC_Watch             violated:NeverAhead
+L_replace                      MC_Watch             pass
+L_replace_panic                MC_Watch             pass
+M_replace_clone_first          MC_Watch             violated:StoresAnnounced
+L_wait_for                     MC_Watch             pass
+L_wait_for_close               MC_Watch             pass
+M_wait_for_value_first         MC_Watch             violated:WaitForErrOnNewest
+L_subscribe                    MC_Watch             pass
+M_subscribe_from_zero          MC_Watch             violated:SubSeesOnlyNewer
+L_clone                        MC_Watch             pass
+M_clone_counts_late            MC_Watch             violated:NoSendPastClose
