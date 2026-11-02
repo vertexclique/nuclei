@@ -184,6 +184,15 @@ S_spend:
             goto S_pick;
         end if;
     end if;
+S_give_back:
+    \* The give back's pass (`Lock::give_back`): the lock goes to a thread that queued for it
+    \* meanwhile. MUTATION give_back_no_serve: the lock goes back free, and the queued thread
+    \* is left waiting.
+    if Mutation # "give_back_no_serve" then
+        Serve();
+    end if;
+    giveBack := FALSE;
+    goto S_pick;
 S_enq:
     \* The acquire queues (`FairWait::poll_admitted`'s enqueue): the pass of its own queueing
     \* grants it the lock if the lock is free now and nobody waits ahead, which happens when
@@ -209,15 +218,6 @@ S_enq:
         runq := Append(runq, "hot");        \* not granted: the task goes behind the others
         goto S_pick;
     end if;
-S_give_back:
-    \* The give back's pass (`Lock::give_back`): the lock goes to a thread that queued for it
-    \* meanwhile. MUTATION give_back_no_serve: the lock goes back free, and the queued thread
-    \* is left waiting.
-    if Mutation # "give_back_no_serve" then
-        Serve();
-    end if;
-    giveBack := FALSE;
-    goto S_pick;
 S_unlock:
     \* The hot task's critical section ends: the lock is released.
     free := free + 1;

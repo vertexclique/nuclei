@@ -420,20 +420,6 @@ S_fresh:
     else
         status[req] := "trying";            \* it will queue
     end if;
-S_refuse:
-    \* The refused attempt gives its slots back (`Chan::give_back`): one release, which hands
-    \* them to any waiter ...
-    refusedOnce := TRUE;                    \* the next attempt is a plain reserve
-    call Release(left);                     \* back to the word, and on to any waiter
-S_refuse_wake:
-    \* ... then the receiver is woken if that left a closed channel idle. MUTATION
-    \* refuse_no_idle_wake: the slots go back with a bare release, which wakes no receiver.
-    left := 0;                              \* nothing left to give back
-    if Finished /\ Mutation # "refuse_no_idle_wake" then wake_rx(); end if;
-S_refused:-
-    \* The task was woken for its budget, but only its code can poll the future again, which
-    \* nothing makes it do: this step is not fair. Polled, it is a fresh reserve.
-    goto S_fresh;
 S_push:
     \* `Wait::enqueue`: a node asking for n slots goes on the arrival stack.
     arrivals := Append(arrivals, req);      \* pushed on the stack ...
@@ -541,6 +527,20 @@ S_cancel_wake:
     wasGranted := FALSE;                    \* and whether a grant came first is no longer asked
     if Finished then wake_rx(); end if;
     goto S_op_done;
+S_refuse:
+    \* The refused attempt gives its slots back (`Chan::give_back`): one release, which hands
+    \* them to any waiter ...
+    refusedOnce := TRUE;                    \* the next attempt is a plain reserve
+    call Release(left);                     \* back to the word, and on to any waiter
+S_refuse_wake:
+    \* ... then the receiver is woken if that left a closed channel idle. MUTATION
+    \* refuse_no_idle_wake: the slots go back with a bare release, which wakes no receiver.
+    left := 0;                              \* nothing left to give back
+    if Finished /\ Mutation # "refuse_no_idle_wake" then wake_rx(); end if;
+S_refused:-
+    \* The task was woken for its budget, but only its code can poll the future again, which
+    \* nothing makes it do: this step is not fair. Polled, it is a fresh reserve.
+    goto S_fresh;
 S_use:
     \* With its slots in hand, the operation puts `use` values in (a "cancel" puts none).
     left := IF OpOf(req).op = "cancel" THEN 0 ELSE OpOf(req).use;
