@@ -19,6 +19,9 @@ L_rescue              Handoff     pass
 M_leaf_no_check       Handoff     violated:Exclusive
 M_leaf_keeps_mark     Handoff     violated:Rescued
 W_leaf_back           Handoff     violated:NoLeafBack
+D_safe                Handoff     pass
+M_taken_cleared       Handoff     violated:DetachedStaysOut
+W_stale_back          Handoff     violated:NoStaleBack
 R_seqcst              Retarget    pass
 M_retarget_relaxed    Retarget    violated:WokenPolled
 W_old_wake            Retarget    violated:NoOldWake

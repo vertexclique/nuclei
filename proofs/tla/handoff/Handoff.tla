@@ -38,9 +38,18 @@
 (* shard with a compare-and-swap (pending to taken), unless the runner     *)
 (* cancelled first, and hands it to a spare thread with a fresh slot;      *)
 (* anything else, and it cancels. Neither side waits for the other: one of *)
-(* the two swaps wins. A runner that sees "taken" never touches the shard  *)
-(* again (it is detached), drains the bound tasks it created, then waits   *)
-(* as a spare itself.                                                      *)
+(* the two swaps wins. A runner that sees "taken" never goes into the      *)
+(* shard again (it is detached). Its task's code may still call into the   *)
+(* runtime before its stack unwinds: a call around a nested `block_on`     *)
+(* whose poll found the take ends, and puts the old slot back as the one   *)
+(* the code runs outside of (`Bracket`'s drop), so the next call, a leaf   *)
+(* push (`push_lifo_marked` reads that slot) or a bracket, marks the old   *)
+(* slot and reads its claim. That claim stays taken for good: `Slot::take` *)
+(* is its last write, the runner's `Slot::contest` swaps only from         *)
+(* pending, and the monitor hands the shard on with a fresh slot           *)
+(* (`Monitor::slot` in `monitor::take`) and never claims the old one       *)
+(* again; so each such call backs out and stays out. The detached runner   *)
+(* then drains the bound tasks it created and waits as a spare itself.     *)
 (*                                                                          *)
 (* What is modelled step by step: each thread's store buffer (in order),   *)
 (* the flush of a buffer's oldest store at any time, the heavy fence as    *)
@@ -60,6 +69,7 @@ CONSTANTS
     Pushes,        \* remote pushes of work to the shard
     Bounds,        \* tasks bound to the creating thread, pushed remotely
     BlockForever,  \* the first runner's first poll never returns
+    DetachedCalls, \* calls into the runtime a detached thread's code still makes
     Mode           \* "ok" or a mutation (see the configurations)
 
 Threads == {1, 2}
@@ -110,14 +120,18 @@ variables
     cancels = 0,
     detachedCalls = 0,
     runnerCancels = 0,                   \* (record) a runner cancelled a pending claim
-    leafBacks = 0;                       \* (record) a leaf push backed out on a claim
+    leafBacks = 0,                       \* (record) a leaf push backed out on a claim
+    gone = {},                           \* threads detached, not handed a shard since
+    staleBacks = 0;                      \* (record) a detached thread's leaf push backed out
 
 define
     \* At most one actor is inside the shard's owned part.
     Exclusive == Cardinality(inS) <= 1
     \* A thread that saw its shard taken stays out of it until handed it again.
+    \* Its calls into the runtime on the slot it was taken from included.
     DetachedStaysOut ==
-        \A t \in Threads : pc[t] \in {"D_unwind", "D_bound", "D_drain", "D_spare", "Spare"} => t \notin inS
+        /\ \A t \in Threads : pc[t] \in {"D_unwind", "D_bound", "D_drain", "D_spare", "Spare"} => t \notin inS
+        /\ \A t \in gone : t \notin inS
     \* A bound task runs on the thread that created it, never elsewhere.
     BoundOnCreator == boundBy \subseteq {Creator}
     \* Every remote push is run, the first runner blocked for good or not.
@@ -128,8 +142,9 @@ define
     NoDetachedCall == detachedCalls = 0
     NoRunnerCancel == runnerCancels = 0
     NoLeafBack == leafBacks = 0
+    NoStaleBack == staleBacks = 0
     \* The leaf push is part of the algorithm under these modes: the leaf and its mutations.
-    Leaf == Mode \in {"leaf", "leaf_no_check", "leaf_keeps_mark"}
+    Leaf == Mode \in {"leaf", "leaf_no_check", "leaf_keeps_mark", "taken_cleared"}
 end define;
 
 \* The memory: a buffer's oldest store reaches memory, at any time.
@@ -165,7 +180,8 @@ end process;
 fair process thread \in Threads
 \* sl: the slot the thread runs with; e: its poll's epoch; polls: polls this turn; c: the claim it
 \* read; br: calls this poll made; saved: the word a call read at its start, put back at its end.
-variables sl = 0, e = 0, polls = 0, c = NONE, br = 0, saved = 0;
+\* dc: the calls its code made while detached.
+variables sl = 0, e = 0, polls = 0, c = NONE, br = 0, saved = 0, dc = 0;
 begin
 T_begin:
     if self = 1 then
@@ -177,6 +193,7 @@ Spare:
     await assign[self] # 0;
     sl := assign[self];
     assign[self] := 0;
+    gone := gone \ {self};
     e := 0;
     polls := 0;
     inS := inS \cup {self};
@@ -240,7 +257,13 @@ B_cas:
     await buf[self] = <<>>;
     if claim[sl] = TAKEN then
         \* The call goes through the shard's remote paths instead.
+        \* (MUTATION taken_cleared: the detaching runner clears the taken claim, as a reset of its
+        \* slot would.)
+        if Mode = "taken_cleared" then
+            claim[sl] := NONE;
+        end if;
         detachedCalls := 1;
+        gone := gone \cup {self};
         goto D_unwind;
     else
         if claim[sl] = PENDING then
@@ -274,6 +297,10 @@ E_check:
 E_cas:
     await buf[self] = <<>>;
     if claim[sl] = TAKEN then
+        if Mode = "taken_cleared" then
+            claim[sl] := NONE;
+        end if;
+        gone := gone \cup {self};
         goto D_unwind;
     else
         if claim[sl] = PENDING then
@@ -300,6 +327,9 @@ L_check:
 L_claimed:
     \* A claim is up: the leaf never contests one, it backs out.
     leafBacks := 1;
+    if self \in gone then
+        staleBacks := 1;
+    end if;
     goto L_back;
 L_in:
     \* Inside: the push into the empty slot, or none (the slot holds a task, the shard is
@@ -327,8 +357,18 @@ L_back:
 Blocked:
     await FALSE;
 D_unwind:
-    \* Detached: the rest of the stack unwinds without touching the shard.
-    skip;
+    \* Detached: the rest of the stack unwinds, and its code may call into the runtime again on the
+    \* slot it was taken from (`Bracket`'s drop put it back): a leaf push or a bracket, each of
+    \* which reads that slot's claim, taken for good, and stays out (see the opening story).
+    if dc < DetachedCalls then
+        dc := dc + 1;
+        either
+            await Leaf;
+            goto L_store;
+        or
+            goto B_store;
+        end either;
+    end if;
 D_bound:
     \* The creator runs its bound tasks on a shard of its own.
     if self = Creator then
