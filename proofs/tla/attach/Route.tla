@@ -8,7 +8,7 @@
 (* src/io/source/read/ops.rs; `RingIo::issuer` in                         *)
 (* src/io/source/ring.rs), at the grain of the read side's holds; and the *)
 (* route's one fast check, `Source::via` with the registration's `here`,  *)
-(* published by `Source::attach_ring` and `install_ring` once the source  *)
+(* published by `Source::attach_ring` and `take_installs` once the source *)
 (* is registered with its ring, cleared by `detach` and `evict_now` before *)
 (* the registration goes (src/io/source.rs, ring.rs, requests.rs).        *)
 (*                                                                          *)

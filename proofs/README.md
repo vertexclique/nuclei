@@ -631,9 +631,10 @@ each with a mutation of the code that makes one of them fail.
 
 ## The side's guard biased to its owner
 
-`side_biased` (`tla/side_biased/SideBiased.tla`) checks the owner-biased guard (`Side::try_hold`,
-`Side::poll`, `Side::contend`, `Side::defer`, `Side::take_for_request` and
-`Held::release_or_again` in `src/io/side.rs`; the heavy fence is `heavy` and `heavy_retried` in
+`side_biased` (`tla/side_biased/SideBiased.tla`) checks the owner-biased guard (`Side::role`,
+`Side::try_biased`, `Side::take_foreign`, `Side::unserved`, `Side::poll`, `Side::poll_owner`,
+`Side::with_owner`, `Side::owned_by`, `Side::contend`, `Side::defer`, `Side::take_for_request`
+and `Held::release_or_again` in `src/io/side.rs`; the heavy fence is `heavy` and `heavy_retried` in
 `src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
 x86's do. A socket's side has an owner, the thread running its home shard, which serves the
 driver's edges. The owner takes the side with a plain store of its word `own`, a compiler fence
@@ -942,8 +943,10 @@ read, and nothing waits for it), and a ring only its own thread may reap copying
 ## A datagram's sender
 
 `sender` (`tla/sender/Sender.tla`) checks that a datagram receive names its sender
-(`unix_addr`, `unnamed` and `recv_from_udp_uninit` in `src/io/sys/unix.rs`, used by the
-receives of `src/io/source/read.rs` and `src/io/source/ring.rs`, and `poll_peek_sender` in
+(`unix_addr` and `unnamed` in `src/io/sys/unix/unix_addr.rs`, `recv_from_udp_uninit` in
+`src/io/sys/unix.rs`, used by the receives of `src/io/source/read.rs` (`ReadState::receive`,
+`receive_lent`), `src/io/source/read/datagram.rs` (`receive_now`) and `src/io/source/ring.rs`,
+and `poll_peek_sender` in
 `src/net/udp.rs`). A peer sends datagrams; a receive takes one from the kernel and then makes the
 sender's address for the task, while other code takes the process's last descriptors and gives
 them back. Once the kernel handed a datagram over it is the receive's, so naming its sender must
@@ -1257,7 +1260,7 @@ witness (a port's zero-byte look, then the task's own receive).
 
 `tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
-`reads_itself` in `src/io/source/read.rs`, `write`, `write_direct` and `writes_itself` in
+`reads_itself` in `src/io/source/read/direct.rs`, `write`, `write_direct` and `writes_itself` in
 `src/io/source/write.rs`; a ring write goes direct at every size, `WRITE_RING` of
 `src/io/source/direct.rs` being 0, and a reply of 16 KiB or more never takes a buffer, waiting for a
 poll as a starved writer does, see `tla/ring/RingSend.tla`). Three connections over a pool of two buffers, two of whose peers never
@@ -1294,7 +1297,8 @@ shard that goes with one, each with a mutation of the code that makes one of the
 
 `starve` (`tla/starve/FdStarve.tla`) checks the rule of `tla/ring/RingStarve.tla` on a readiness
 poller, epoll or kqueue (`serve`, `leaves_to_tasks`, `complete_fd`, `read_ahead`, `read`,
-`reads_itself`, `read_direct`, `look_again` and `unstarve` in `src/io/source/read.rs`). There no
+`look_again` and `unstarve` in `src/io/source/read.rs`, `reads_itself` and `read_direct` in
+`src/io/source/read/direct.rs`). There no
 receive waits in the kernel: a read too small to go straight into the task's buffer has the
 driver read ahead into a buffer of the pool, and a task that peeks and then stops reading keeps
 that buffer for as long as it waits. Two connections over a pool of one buffer, one of whose
@@ -1571,7 +1575,7 @@ registered, asks the side to submit through the same path (the fix of commit 4bc
 it a registration that lands between the route and the step finds no waiter, the step leaves one
 and asks with NotYet, and nothing ever submits. The route's fast check comes first: the
 registration's `here`, published last as the source is registered with its ring and cleared
-first as the registration goes (`attach_ring`, `install_ring`, `detach`, `evict_now`), names the
+first as the registration goes (`attach_ring`, `take_installs`, `detach`, `evict_now`), names the
 shard whose thread reaches the source Here, and only a thread of that shard takes the Here route
 from it; the model reads it from a thread that runs no shard and from another ring shard's
 thread. 9 configurations: 6 that must pass (the read during the registration and after it, from
