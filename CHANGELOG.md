@@ -44,6 +44,21 @@
   poll, now on a thread with no shard, then blocked the side on an edge that had already passed,
   and a write or a flush waited until the peer spoke again. A poll whose shard was taken now asks
   the kernel itself under its own hold (`proofs/tla/sendsnow/TakenFull.tla`).
+- **A shard handed off while its old thread sits in a wait no signal ends goes on with its polls
+  and its wakes** (Linux, io_uring). A watched worker's ring is not single-issuer, so the kernel
+  runs the completion of each request as work queued to the thread that submitted it, and a thread
+  in a killable wait (a `vfork` parent, a read of a slow disk, a stalled network file system) runs
+  none of it until it comes back. After a handoff, a stream read by readiness, a datagram's poll, a
+  write waiting for room, and the ring's own wake read, all armed by the old thread, then brought
+  nothing: the stream and the write waited, and a task spawned or woken from another thread did not
+  run, for as long as the old thread's wait lasted. The new runner now cancels each poll the old
+  thread armed, before its first drive, and its side arms another of the new runner's; the old one
+  stays until its own end, which goes to no side, and the ring's wake is armed again under an id of
+  its own (`proofs/tla/ring/RingHandoff.tla`). An operation that takes or gives bytes (a receive
+  into the ring's buffers, a send, a connect), a file's call, a child's exit watch and an accept
+  still complete only once the old thread comes back: an accept's poll is the first exclusive
+  waiter of its listener, which takes each connection's wake even once cancelled, so it cannot be
+  armed again from the new runner.
 
 ### Changed
 
