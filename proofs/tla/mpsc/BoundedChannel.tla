@@ -55,7 +55,13 @@ CONSTANTS
 (*       k = 1), put u values in through them, give the other k - u back;  *)
 (*   o = "try": the same with `try_reserve_many(k)`, which never waits;    *)
 (*   o = "cancel": start `reserve_many(k)`, poll it once, and drop it      *)
-(*       (if it was granted by then, its slots are given straight back).   *)
+(*       (if it was granted by then, its slots are given straight back);   *)
+(*   o = "refused": `reserve_many(k)` whose first attempt takes its slots  *)
+(*       and is refused for its poll's spent budget, so it gives them back *)
+(*       (`FairWait::poll_admitted`, `Chan::give_back`) and its task is    *)
+(*       woken; nothing makes the task's code poll that future again (a    *)
+(*       `select!` may keep it for later), so that poll is not fair. When  *)
+(*       polled again it is a "reserve".                                   *)
 
 \* The receiver's thread number: no sender uses 0.
 Rx == 0
@@ -375,7 +381,8 @@ variables
     req = NoReq,        \* that operation's request
     left = 0,           \* values still to put in, or slots still to give back
     sq = 0,             \* how many values this sender has put in so far
-    wasGranted = FALSE; \* the cancelled request had been granted first
+    wasGranted = FALSE, \* the cancelled request had been granted first
+    refusedOnce = FALSE; \* this "refused" operation was refused already: it is a "reserve" now
 begin
 S_next:
     \* The next operation, or the end of the program.
@@ -383,6 +390,7 @@ S_next:
         goto S_drop_sender;
     else
         req := <<self, i>>;                 \* this operation's request
+        refusedOnce := FALSE;               \* not refused yet
     end if;
 S_fresh:
     \* The attempt that does not queue (`try_acquire`): one compare-and-swap on the word.
@@ -395,16 +403,37 @@ S_fresh:
         goto S_failed;
     elsif (~queuedBit \/ Mutation = "try_ignores_queue") /\ free >= OpOf(req).n then
         free := free - OpOf(req).n;         \* the slots are free and nobody waits: take them
-        held[self] := held[self] + OpOf(req).n;   \* they are this sender's permits now
-        status[req] := "done";              \* (record) it has its slots
-        if closedBit then admittedAfterClose := TRUE; end if;   \* only a mutation gets here
-        goto S_use;
+        if OpOf(req).op = "refused" /\ ~refusedOnce then
+            inHand[self] := inHand[self] + OpOf(req).n;   \* the budget refuses: they go back
+            left := OpOf(req).n;            \* how many
+            status[req] := "returned";      \* (record) taken, then given back
+            goto S_refuse;
+        else
+            held[self] := held[self] + OpOf(req).n;   \* they are this sender's permits now
+            status[req] := "done";          \* (record) it has its slots
+            if closedBit then admittedAfterClose := TRUE; end if;   \* only a mutation gets here
+            goto S_use;
+        end if;
     elsif OpOf(req).op = "try" then
         status[req] := "refused";           \* `try_` never waits: Full
         goto S_op_done;
     else
         status[req] := "trying";            \* it will queue
     end if;
+S_refuse:
+    \* The refused attempt gives its slots back (`Chan::give_back`): one release, which hands
+    \* them to any waiter ...
+    refusedOnce := TRUE;                    \* the next attempt is a plain reserve
+    call Release(left);                     \* back to the word, and on to any waiter
+S_refuse_wake:
+    \* ... then the receiver is woken if that left a closed channel idle. MUTATION
+    \* refuse_no_idle_wake: the slots go back with a bare release, which wakes no receiver.
+    left := 0;                              \* nothing left to give back
+    if Finished /\ Mutation # "refuse_no_idle_wake" then wake_rx(); end if;
+S_refused:-
+    \* The task was woken for its budget, but only its code can poll the future again, which
+    \* nothing makes it do: this step is not fair. Polled, it is a fresh reserve.
+    goto S_fresh;
 S_push:
     \* `Wait::enqueue`: a node asking for n slots goes on the arrival stack.
     arrivals := Append(arrivals, req);      \* pushed on the stack ...
@@ -754,6 +783,10 @@ PerSenderOrder ==
 \* All the safety properties together.
 Safe == Conservation /\ FifoFair /\ CloseSemantics /\ CloseReturnsShare
         /\ EndMeansDrained /\ ExactlyOnce /\ PerSenderOrder
+
+\* The receiver's program ends, whether or not every sender's does: a sender whose future is
+\* never polled again must not keep the receiver of a closed, idle channel asleep.
+ReceiverEnds == <>(pc[Rx] = "Done")
 
 (***************************************************************************)
 (* Witnesses. Each one claims an interesting case never happens; a         *)

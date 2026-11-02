@@ -15,6 +15,9 @@ Send == Res(1, 1)
 Try(n, u) == [op |-> "try", n |-> n, use |-> u]
 \* `reserve_many(n)` polled once and then dropped (its slots, if any, given straight back).
 Cancel(n) == [op |-> "cancel", n |-> n, use |-> 0]
+\* `send(v)` whose first attempt takes its slot and is refused for the budget: the slot goes
+\* back, and the future may never be polled again.
+Refused == [op |-> "refused", n |-> 1, use |-> 1]
 
 \* ---- sender programs: [sender |-> its operations, in order] ----
 \* (P_many, P_cancel_many, P_cancel_one and P_large_small, four operations each, are run
@@ -59,6 +62,8 @@ P_solo_sends == [s \in {1} |-> <<Send, Send, Send>>]
 P_solo_cancel == [s \in {1} |-> <<Send, Cancel(1), Send>>]
 \* A send, then a request for both slots that waits for the slot the value holds.
 P_solo_many == [s \in {1} |-> <<Send, Res(2, 1)>>]
+\* A send refused for the budget after it took the one slot.
+P_solo_refused == [s \in {1} |-> <<Refused>>]
 
 \* ---- receiver programs ----
 
