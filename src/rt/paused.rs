@@ -142,21 +142,28 @@ fn attempt(inner: &Inner, me: Option<&Shared>) -> bool {
 /// A thread's shard counted among a runtime's shards while the thread is
 /// inside its `block_on` and its clock is paused. A poll the handoff took
 /// from one of the runtime's workers, still running on the thread, is
-/// counted by the guest meanwhile and not as work in flight (`taken`).
+/// counted by the guest meanwhile and not as work in flight ([`TAKEN`]).
 pub(crate) struct Guest<'a> {
     inner: &'a Arc<Inner>,
+    /// The shard's address, with [`TAKEN`] set if the join counted a taken
+    /// poll out.
     key: usize,
-    taken: bool,
 }
+
+/// The low bit of a guest's key, free in a shard's address: its join
+/// counted a taken poll out of flight.
+const TAKEN: usize = 1;
 
 impl<'a> Guest<'a> {
     /// Counts `shard` in `inner` if its clock is paused (or was ever
     /// altered, so a pause during the call is seen when it ends).
     #[inline]
     pub(crate) fn enter(inner: &'a Arc<Inner>, shard: &Arc<Shared>) -> Guest<'a> {
-        let key = Arc::as_ptr(shard) as usize;
-        let taken = inner.clock.is_paused() && Self::join(inner, key, shard);
-        Guest { inner, key, taken }
+        let mut key = Arc::as_ptr(shard) as usize;
+        if inner.clock.is_paused() {
+            key |= usize::from(Self::join(inner, key, shard));
+        }
+        Guest { inner, key }
     }
 
     /// Joins `shard`; answers whether a taken poll was counted out of flight,
@@ -204,13 +211,13 @@ impl Guest<'_> {
     #[inline(never)]
     fn leave(&self) {
         // In flight again before the shard stops counting it.
-        if self.taken {
+        if self.key & TAKEN != 0 {
             self.inner.workers.count_in_taken();
         }
         if self
             .inner
             .guests_made()
-            .is_some_and(|guests| guests.remove(&self.key).is_some())
+            .is_some_and(|guests| guests.remove(&(self.key & !TAKEN)).is_some())
         {
             self.inner.clock.member_changed();
             // The shards left may all be idle now.
