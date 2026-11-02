@@ -1403,20 +1403,23 @@ called by `run_shard` in `src/rt/workers.rs` before the new runner's first drive
 `src/io/source/ring.rs`; `setup_flags` in `src/syscore/linux/iouring/ring/mod.rs`). A watched
 worker's ring is not single-issuer, so the kernel runs a request's completion as work queued to
 the thread that submitted it, which a thread in a wait no signal ends never runs. The new runner
-cancels each poll the old runner armed (a stream's or a datagram's poll, a poll for room, the
-ring's wake read), tells its side it ended so the side arms another of its own, and keeps the old
-one as a zombie whose late completions go nowhere and whose end only frees it; a data operation
-and an accept are left as they are. An entry still waiting to reach the kernel is left alone (the
-new runner submits it), and the completions already posted are delivered before the zombies are
-made: both matter when one runner after another blocks at once, which one take cannot show, so
-`tests/cadence.rs` checks them. 13 configurations: 5 that must pass (the old runner asleep
-where a signal wakes it; in a wait no signal ends, for good and until it comes back; a data
-operation with the old runner asleep where a signal wakes it; an accept with the old runner coming
-back; with `OneOut`, the side has one request out as its own, `OwnEnds`, it takes only that
-request's completions, `IoRescued`, the reader gets the datum, and `ZombieFreed`), 5 mutations (no
-adopt, as before the fix, and a ring that runs a thread's completion work only at its next enter,
+cancels each poll the old runner armed (a datagram's poll, a poll for room, the ring's wake read)
+and each multishot receive (a stream's or a datagram's, into the ring's buffers), tells its side it
+ended so the side arms another of its own, and keeps the old one as a zombie whose end only frees
+it; a poll's zombie's late completions go nowhere, and a receive's zombie's bytes, which its old
+thread may still take after the cancel, reach the side in order, since every take and its
+completion are made under the ring's lock; a data operation and an accept are left as they are.
+An entry still waiting to reach the kernel is left alone (the new runner submits it), and the
+completions already posted are delivered before the zombies are made: both matter when one runner after another blocks at once, which one take cannot show, so
+`tests/cadence.rs` checks them. 18 configurations: 8 that must pass (the old runner asleep
+where a signal wakes it; in a wait no signal ends, for good and until it comes back; the same three
+with a multishot receive armed; a data operation with the old runner asleep where a signal wakes
+it; an accept with the old runner coming back; with `OneOut`, the side has one request out as
+its own, `OwnEnds`, it takes only that request's ends and edges, `IoRescued`, the reader gets the datum, and `ZombieFreed`), 7 mutations (no
+adopt, as before the fix, of a poll and of a multishot receive, a receive's zombie whose bytes go
+nowhere, and a ring that runs a thread's completion work only at its next enter,
 `IORING_SETUP_COOP_TASKRUN`, which the new runner asleep in its wait never reaches, each break
-`IoRescued`; a zombie's completions handed to the side break `OwnEnds`; an adopt that does not tell
+`IoRescued`; a zombie's completions handed to the side as its own break `OwnEnds`; an adopt that does not tell
 the side breaks `OneOut`; an adopt of an accept breaks `IoRescued` even once the old runner is back,
 since the cancelled accept stays its listener's first exclusive waiter until its thread ends it and
 takes the connection's wake), and 3 witnesses (the old runner posting late; a data operation, and an

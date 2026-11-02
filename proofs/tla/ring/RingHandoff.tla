@@ -5,8 +5,9 @@
 (* `ShardRing::adopt`, which the new runner calls before its first drive,  *)
 (* `run_shard` in src/rt/workers.rs; `RingPoller::adopt` in               *)
 (* src/rt/park/ring.rs for the ring's wake; the zombie's later completions *)
-(* in `ShardRing::complete`, `ShardRing::accepted` in                      *)
-(* src/rt/shard/ring/arrivals.rs and `ShardRing::bury`; the ring's setup   *)
+(* in `ShardRing::complete`, `ShardRing::arrived` and `ShardRing::accepted` *)
+(* in src/rt/shard/ring/arrivals.rs and `ShardRing::bury`; `RingMem::adopted` *)
+(* in src/io/source/ring.rs, which says what is adopted; the ring's setup  *)
 (* flags, `setup_flags` in src/syscore/linux/iouring/ring/mod.rs).         *)
 (*                                                                          *)
 (* Who acts. The old runner, the thread the monitor took the shard from,   *)
@@ -17,34 +18,45 @@
 (* a peer, which sends one datum on the socket.                           *)
 (*                                                                          *)
 (* What can happen. The old runner armed a request before it blocked: a    *)
-(* poll (a stream read by readiness, a datagram's poll, a poll for room,  *)
-(* the ring's own wake read: what it brings late is only an edge or a     *)
-(* wake), a data operation (a receive, a send: what it takes or gives     *)
-(* cannot be done twice), or an accept, whose poll in the kernel is an    *)
+(* poll (a datagram's poll, a poll for room, the ring's own wake read:    *)
+(* what it brings late is only an edge or a wake), a multishot receive    *)
+(* (a stream's or a datagram's, into the ring's buffers: it stays armed,  *)
+(* and each of its completions takes what the socket holds), a data       *)
+(* operation (a one-shot receive, a send: what it takes or gives cannot   *)
+(* be done twice), or an accept, whose poll in the kernel is an           *)
 (* exclusive waiter of its listener: a connection's wake goes to the      *)
 (* first such waiter alone, which takes it even once cancelled, until its *)
 (* own thread ends it. The datum's arrival queues the request's           *)
 (* completion to the old runner's thread. A thread in an interruptible    *)
 (* wait is woken to run it; one in a wait no signal ends (a killable wait, *)
 (* a disk read) runs it only once it comes back. So the new runner,       *)
-(* before anything else, cancels each poll the old runner armed, tells    *)
-(* its side that poll ended (the side then arms another, submitted by the *)
-(* new runner, whose completion runs on the new runner), and keeps the old *)
-(* one as a zombie: whatever the zombie still posts, whenever its old     *)
-(* thread runs it, goes nowhere, and its last completion only frees it.   *)
-(* A data operation and an accept are left as they are: their completions *)
-(* wait for the old runner.                                                *)
+(* before anything else, cancels each poll and multishot receive the old *)
+(* runner armed, tells its side it ended (the side then arms another,     *)
+(* submitted by the new runner, whose completion runs on the new runner), *)
+(* and keeps the old one as a zombie: whatever a poll's zombie still      *)
+(* posts, whenever its old thread runs it, goes nowhere, and its last     *)
+(* completion only frees it. A receive's zombie may still take bytes: its *)
+(* old thread's work looks at the cancel before it takes the ring's lock, *)
+(* so a take may follow the cancel. Those bytes still reach the side, and *)
+(* in order: every take and its completion are made under the ring's      *)
+(* lock, so the completion queue holds the socket's bytes in the order    *)
+(* the socket gave them, whichever request took them. A data operation    *)
+(* and an accept are left as they are: their completions wait for the    *)
+(* old runner.                                                             *)
 (*                                                                          *)
 (* What must never happen. The reader never gets the datum (`IoRescued`), *)
-(* the guard against a ring whose task work waits for its thread's next   *)
-(* enter (`IORING_SETUP_COOP_TASKRUN`) included: the new runner sleeps in  *)
-(* its wait and would never run its own requests' completions. The side   *)
+(* which a receive's zombie's bytes must reach too, and which guards       *)
+(* against a ring whose task work waits for its thread's next enter       *)
+(* (`IORING_SETUP_COOP_TASKRUN`): the new runner sleeps in its wait and    *)
+(* would never run its own requests' completions. The side                 *)
 (* has two requests out as its own (`OneOut`), or takes a completion of a  *)
 (* request it no longer has out (`OwnEnds`).                               *)
 (*                                                                          *)
 (* What is abstract. One socket side, one datum, one take (the monitor's  *)
 (* take is the model's start: proofs/tla/handoff checks it). A multishot  *)
 (* request stays armed across its edges; a data operation is one shot.    *)
+(* A completion's step is atomic, as the ring's lock makes a take and its *)
+(* completion, so one datum stands for the order of many.                 *)
 (* The cancel marks the request at once and queues its completion to its *)
 (* own submitter, as the kernel does for a poll it cancels. The old        *)
 (* request is in the kernel at the take: the adopt leaves an entry still  *)
@@ -59,7 +71,7 @@ EXTENDS Integers, Sequences, FiniteSets, TLC                                 \* 
 CONSTANTS                                                                    \* what each configuration sets:
     Block,      \* how the old runner waits: "interruptible" (a signal wakes it) or "uninterruptible"
     Ends,       \* TRUE: the old runner's wait ends in the end, and it comes back
-    Kind,       \* the request the old runner armed: "poll" (readiness, the wake), "data" or "accept"
+    Kind,       \* the request the old runner armed: "poll" (readiness, the wake), "recv" (a multishot receive), "data" or "accept"
     Mutation    \* "none", or the name of the one rule this run takes away
 
 Old == "W1"                                                                  \* the old runner
@@ -84,7 +96,7 @@ variables                                                                    \* 
     buried = FALSE;                         \* the zombie's last completion freed it
 
 define                                                                       \* names the properties use:
-    \* The side takes only the completions of the request it has out.
+    \* The side takes only the ends and edges of the request it has out (a receive's zombie's bytes are the stream's).
     OwnEnds == ~stray                                                        \* never another's
     \* The side has at most one request out as its own.
     OneOut == Cardinality({r \in Reqs : live[r] /\ ~zombie[r]}) <= 1         \* one at most
@@ -100,19 +112,30 @@ define                                                                       \* 
                ELSE Mutation # "coop_taskrun" \/ cq # <<>>                   \* the new one: woken by the work, or (coop) only by a completion
 end define;                                                                  \* end of the names
 
-\* The kernel's completion work for a request: the datum's edge for a poll, the datum for a data operation or an
-\* accept, the end of a cancelled one.
-macro complete(r) begin                                                      \* its steps:
-    if cancelled[r] then                                                     \* cancelled:
+\* The kernel's completion work for request `r`, queued to thread `t`, taken off its queue: the datum's edge for a
+\* poll, the datum for a receive, a data operation or an accept, the end of a cancelled one. A cancelled receive's
+\* work may still take the datum first (its look at the cancel came before the ring's lock), and stays queued for its
+\* end.
+macro complete(t, r) begin                                                   \* its steps:
+    if cancelled[r] /\ (Kind # "recv" \/ data = 0) then                      \* cancelled, with nothing a receive could take:
+        tw[t] := tw[t] \ {r};                                                \* its work done,
         live[r] := FALSE;                                                    \* it leaves the kernel,
         cq := Append(cq, <<r, "end">>);                                      \* with its last completion
     elsif Kind = "poll" then                                                 \* a poll:
+        tw[t] := tw[t] \ {r};                                                \* its work done,
         cq := Append(cq, <<r, "edge">>);                                     \* an edge, and it stays armed
+    elsif Kind = "recv" /\ data > 0 then                                     \* a multishot receive, with the datum there:
+        tw[t] := IF cancelled[r] THEN tw[t] ELSE tw[t] \ {r};               \* its work done, but a cancelled one's end still to come,
+        data := 0;                                                           \* it takes it under the ring's lock,
+        cq := Append(cq, <<r, "data">>);                                     \* posts it under the same lock, and stays armed
     elsif data > 0 then                                                      \* a data operation or an accept, with the datum there:
+        tw[t] := tw[t] \ {r};                                                \* its work done,
         data := 0;                                                           \* it takes it,
         live[r] := FALSE;                                                    \* ends,
         cq := Append(cq, <<r, "data">>);                                     \* and posts it
-    end if;                                                                  \* (no datum: nothing to do)
+    else                                                                     \* no datum:
+        tw[t] := tw[t] \ {r};                                                \* nothing to do
+    end if;                                                                  \* the work ran
 end macro;                                                                   \* end of the completion work
 
 \* The peer: it sends one datum (a connection, for an accept), and the kernel wakes the requests waiting on the
@@ -138,8 +161,7 @@ W1_loop:                                                                     \* 
         either                                                               \* its queued completion work runs:
             await Runs(Old) /\ tw[Old] # {};                                 \* while its wait allows
             with r \in tw[Old] do                                            \* one request's
-                tw[Old] := tw[Old] \ {r};                                    \* taken
-                complete(r);                                                 \* and done
+                complete(Old, r);                                            \* taken and done
             end with;                                                        \* the next
         or                                                                   \* or its wait ends:
             await Ends /\ ~back;                                             \* where it does
@@ -155,7 +177,8 @@ W2_adopt:                                                                    \* 
     \* MUTATION no_adopt: the new runner leaves the old runner's requests as they are, as before the fix.
     \* MUTATION adopt_accepts: the new runner cancels and arms again an accept too.
     if Mutation # "no_adopt" /\ live[1]                                      \* a request of the old runner's that is
-       /\ (Kind = "poll" \/ (Kind = "accept" /\ Mutation = "adopt_accepts")) then   \* a poll:
+       /\ (Kind \in {"poll", "recv"}                                         \* a poll or a multishot receive:
+           \/ (Kind = "accept" /\ Mutation = "adopt_accepts")) then
         cancelled[1] := TRUE;                                                \* cancelled from here,
         \* MUTATION two_out: the side is not told the old request ended, and has both out as its own.
         if Mutation # "two_out" then zombie[1] := TRUE; end if;              \* no side's any more,
@@ -169,15 +192,20 @@ W2_loop:                                                                     \* 
         either                                                               \* its own queued completion work runs:
             await Runs(New) /\ tw[New] # {};                                 \* as its wait allows
             with r \in tw[New] do                                            \* one request's
-                tw[New] := tw[New] \ {r};                                    \* taken
-                complete(r);                                                 \* and done
+                complete(New, r);                                            \* taken and done
             end with;                                                        \* the next
         or                                                                   \* or a completion is reaped:
             await cq # <<>>;                                                 \* one is there
             if Head(cq)[1] = 1 then oldPosted := TRUE; end if;               \* (record) the old request's
             \* MUTATION zombie_reaches_side: the zombie's completions are handed to the side as its own.
             if zombie[Head(cq)[1]] /\ Mutation # "zombie_reaches_side" then  \* a zombie's (`ShardRing::bury` at its last):
-                if Head(cq)[2] = "end" then buried := TRUE; end if;          \* its last frees it; the rest goes nowhere
+                if Head(cq)[2] = "end" then                                  \* its last
+                    buried := TRUE;                                          \* frees it
+                \* MUTATION zombie_drops_data: a receive's zombie hands its bytes nowhere, as a poll's zombie its edges.
+                elsif Head(cq)[2] = "data" /\ Kind = "recv"                  \* a receive's zombie's bytes
+                      /\ Mutation # "zombie_drops_data" then                 \* (`ShardRing::arrived`):
+                    delivered := TRUE;                                       \* the stream's, in order: the reader has them
+                end if;                                                      \* the rest goes nowhere
             else                                                             \* the side's own request's:
                 if Head(cq)[1] # out then stray := TRUE; end if;             \* (a request the side does not have out)
                 if Head(cq)[2] = "edge" then                                 \* an edge:
