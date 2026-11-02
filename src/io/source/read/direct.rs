@@ -299,20 +299,13 @@ impl ReadState {
                 return None;
             }
             true
-        } else if super::super::direct::worth(io, len, false)
-            || peek
-            || self.starved
-            || self.through_receive()
-        {
-            // A read big enough, a peek, a starved side's read, and a side that reads through
-            // the receive go straight in only as they always did.
-            if !self.reads_itself(io, kind, len, peek) {
-                return None;
-            }
+        } else if self.reads_itself(io, kind, len, peek) {
+            // A read big enough and a starved side's read go straight in as they always did.
             false
-        } else if self.inq_wanted(kind) {
+        } else if !peek && !self.through_receive() && self.inq_wanted(kind) {
             // A smaller read of a stream whose kernel counts what a read leaves goes by
-            // readiness (proofs/tla/ring/RingPoll.tla).
+            // readiness, unless the side reads through the receive
+            // (proofs/tla/ring/RingPoll.tla).
             if self.waits_for_poll() {
                 return None;
             }
