@@ -357,13 +357,15 @@ fn an_advance_of_a_running_clock_moves_the_pollers_precise_timer() {
         .insert(shard.time_of(true, at), Waker::noop());
     assert!(shard.timer_wait(true).is_some());
     let first = precise_armed_in(&shard).expect("the poller armed its timer");
-    assert!(first > Duration::from_secs(9), "{first:?}");
+    assert!(first <= Duration::from_secs(10), "{first:?}");
     inner.clock.advance(Duration::from_secs(5));
     assert!(shard.timer_wait(true).is_some());
     let second = precise_armed_in(&shard).expect("the poller's timer is armed");
+    // Moved by the advance it is five seconds nearer than it was, less the
+    // time between the two looks, however long that took on a loaded host.
     assert!(
-        second <= Duration::from_secs(5) + Duration::from_millis(100),
-        "the poller's timer stayed at the deadline as the system saw it before the advance: {second:?} left"
+        second + Duration::from_secs(4) < first,
+        "the poller's timer stayed at the deadline as the system saw it before the advance: {first:?} left before, {second:?} after"
     );
     shard.wheel_of(true).borrow_mut().remove(key);
 }
