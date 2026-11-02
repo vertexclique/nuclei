@@ -16,6 +16,9 @@ pub enum Allocate {
     /// answers `Unsupported`. On macOS as for `Extend`, and HFS+ frees what
     /// was reserved past the end of the file when the file is closed (APFS
     /// keeps it).
+    /// On Windows (NTFS) the space reserved past the end of the file is
+    /// held while a handle to the file is open: the system frees it when the
+    /// file's last handle closes, as it frees any allocation past the end.
     KeepSize,
     /// Frees the disk space of the range, which then reads as zeros, and
     /// leaves the file's length as it is. A range that ends past the end of

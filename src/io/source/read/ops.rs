@@ -395,7 +395,7 @@ impl ReadState {
                     }
                 }
             }
-            Outcome::RecvLentFrom(buf, answer) => {
+            Outcome::RecvLentFrom(buf, answer, cut) => {
                 if let Some(lent) = self.lent.as_mut().filter(|l| l.out && !stale) {
                     lent.buf = buf;
                     lent.out = false;
@@ -404,6 +404,7 @@ impl ReadState {
                         Answer::Done(Ok((n, from))) => {
                             lent.done = Some(Ok(n));
                             lent.peer = Some(from);
+                            lent.cut = cut;
                         }
                         Answer::Done(Err(err)) => lent.done = Some(Err(err)),
                     }

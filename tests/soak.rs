@@ -74,6 +74,16 @@ static ALLOCATOR: Live = Live;
 
 /// How long one step of any workload may take before the soak fails as hung.
 const DEADLINE: Duration = Duration::from_secs(120);
+/// On Windows, the pause before each short connection, which paces them; it waits for nothing.
+/// The short connections all go to one server, and Windows keeps a closed connection's port pair
+/// in TIME_WAIT for two minutes on both of its sides: a server's TIME_WAIT pins the pair too, so
+/// no connect toward the server gets that client port meanwhile. Its dynamic range holds 16384
+/// ports: an unpaced run had 13455 pairs in TIME_WAIT when its connect failed (`WSAEADDRINUSE`,
+/// after 168 seconds), and with the clients reading to the server's close, 7567 on the server's
+/// side and 6004 on the clients' (after 382 seconds). Eight churn tasks at four connections a
+/// second and the fault thread at under ten keep about 5000 (3594 at the end of a 20-minute run).
+#[cfg(windows)]
+const WINDOWS_CONNECT_PAUSE: Duration = Duration::from_millis(250);
 /// How often what the process holds is sampled.
 const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 
@@ -185,6 +195,8 @@ async fn serve(listener: TcpListener, totals: Arc<Totals>) {
 /// some reset part way, some give up part way, some read through timeouts.
 async fn churn(addr: std::net::SocketAddr, mut dice: Dice, totals: Arc<Totals>) {
     while totals.going() {
+        #[cfg(windows)]
+        nuclei::time::sleep(WINDOWS_CONNECT_PAUSE).await;
         let seed = dice.next();
         let len = 1 + dice.below(256 * 1024) as usize;
         let mut conn = within("a connect", TcpStream::connect(addr)).await.unwrap();
@@ -242,6 +254,14 @@ async fn churn(addr: std::net::SocketAddr, mut dice: Dice, totals: Arc<Totals>) 
                 }
                 Ok(Err(err)) => panic!("soak: an answer failed: {err}"),
             }
+        }
+        // The server's close comes first, so its side holds the connection's TIME_WAIT, not this
+        // client's port (see `WINDOWS_CONNECT_PAUSE`).
+        let mut end = [0u8; 1];
+        match within("the answer's end", conn.read(&mut end)).await {
+            Ok(0) => {}
+            Ok(_) => panic!("soak: bytes came past the answer"),
+            Err(err) => panic!("soak: the answer's end failed: {err}"),
         }
         totals.checked(len * 2);
         totals.connections.fetch_add(1, Ordering::Relaxed);
@@ -605,6 +625,8 @@ fn everything_at_once_for_a_long_time_holds_steady_and_checks_every_byte() {
                     _ => drop(conn),
                 }
                 std::thread::sleep(Duration::from_millis(dice.below(20)));
+                #[cfg(windows)]
+                std::thread::sleep(WINDOWS_CONNECT_PAUSE / 2);
             }
         })
     };

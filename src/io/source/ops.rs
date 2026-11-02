@@ -220,7 +220,8 @@ pub(crate) enum Outcome {
     },
     RecvLent(OwnedBuf, Answer<usize>),
     RecvFrom(PoolBuf, Answer<(usize, Addr)>),
-    RecvLentFrom(OwnedBuf, Answer<(usize, Addr)>),
+    /// A datagram received into a lent buffer, and whether the kernel cut it to the buffer.
+    RecvLentFrom(OwnedBuf, Answer<(usize, Addr)>, bool),
     Connect(Dial, Answer<()>),
     Send(PoolBuf, Answer<usize>),
     SendLent(OwnedBuf, Answer<usize>),
@@ -353,6 +354,8 @@ impl Source {
         // registration, that raises its flag and then looks at the count
         // (see `retire`, `waits_for_ops`).
         let idle = self.ops_out.fetch_sub(1, Ordering::SeqCst) == 1;
+        #[cfg(port)]
+        let read = done.read;
         if idle
             && self.ask.awaits_ops.load(Ordering::SeqCst)
             && let Some(waker) = self.ask.retire_waker.take()
@@ -404,6 +407,14 @@ impl Source {
                 .defer(super::write_work::LOOK, &mut after, &hooks);
         }
         self.settle(after);
+        // A source left on the port it could not move off: once none of its operations is out,
+        // or its send ended (a read left out is cancelled as the eviction goes), it is evicted
+        // and registered again where its tasks poll, and the move is made
+        // (proofs/tla/port/PortKeep.tla, `Duplex`).
+        #[cfg(port)]
+        if (idle || !read) && self.moving() {
+            self.evict();
+        }
     }
 
     /// A registration with a port could not bind the source's handle:

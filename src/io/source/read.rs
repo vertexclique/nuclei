@@ -141,6 +141,9 @@ struct Lent {
     orphan: bool,
     /// The sender, once a datagram was read into the buffer.
     peer: Option<Addr>,
+    /// The kernel cut that datagram to the buffer: one whose task went away is dropped, not
+    /// handed on (`abandon_lent`).
+    cut: bool,
 }
 
 /// The longest datagram UDP carries, by its length field: what a datagram
@@ -712,18 +715,23 @@ impl ReadState {
             return;
         };
         let spare = lent.buf.spare_capacity_mut();
+        // With whether the kernel cut it, which a buffer whose task goes away needs to know.
         let result = match kind {
-            Kind::UnixDatagram => sys::ready(sys::recv_from_unix_uninit(fd, spare, false))
-                .inspect(tally::received)
-                .map(|r| r.map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a))))),
-            _ => sys::ready(sys::recv_from_udp_uninit(fd, spare, false))
-                .inspect(tally::received)
-                .map(|r| r.map(|(n, a)| (n, Addr::Inet(a)))),
+            Kind::UnixDatagram => sys::ready(sys::recv_lent_from_unix(fd, spare)).map(|r| {
+                r.map(|(n, a, cut)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)), cut))
+            }),
+            _ => sys::ready(sys::recv_lent_from_udp(fd, spare))
+                .map(|r| r.map(|(n, a, cut)| (n, Addr::Inet(a), cut))),
         };
         let Some(result) = result else {
             self.blocked = true;
             return;
         };
+        let result = result.map(|(n, from, cut)| {
+            lent.cut = cut;
+            (n, from)
+        });
+        tally::received(&result);
         lent.done = Some(result.map(|(n, from)| {
             // SAFETY: the kernel wrote the first `n` bytes of the spare
             // capacity.
@@ -861,7 +869,7 @@ impl ReadState {
             }
             None => {
                 #[cfg(port)]
-                if let Some(result) = self.read_starved(io, out, peek) {
+                if let Some(result) = self.read_starved(io, kind, out, peek, after) {
                     return Poll::Ready(result);
                 }
                 self.wait(waker, out.len());
@@ -879,8 +887,10 @@ impl ReadState {
     fn read_starved(
         &mut self,
         io: Io<'_>,
+        kind: Kind,
         out: &mut [u8],
         peek: bool,
+        after: &mut After,
     ) -> Option<io::Result<usize>> {
         if !self.starved
             || !self.readable
@@ -894,6 +904,9 @@ impl ReadState {
         }
         let Via::Ops(route) = io.via;
         let result = crate::io::sys::recv_ready(route.socket()?, out, peek);
+        if self.taken_by_another(&result, io, kind, out.len(), after) {
+            return None;
+        }
         if !peek {
             tally::reading(&result);
         }
@@ -924,7 +937,7 @@ impl ReadState {
             None => {
                 #[cfg(port)]
                 if let Some(first) = bufs.iter_mut().find(|b| !b.is_empty())
-                    && let Some(result) = self.read_starved(io, first, false)
+                    && let Some(result) = self.read_starved(io, kind, first, false, after)
                 {
                     return Poll::Ready(result);
                 }
@@ -974,6 +987,7 @@ impl ReadState {
                 out: false,
                 orphan: false,
                 peer: None,
+                cut: false,
             });
         }
         // The task polls, so the driver's read needs no wake for it.
@@ -1049,6 +1063,7 @@ impl ReadState {
                 out: false,
                 orphan: false,
                 peer: None,
+                cut: false,
             });
         }
         let old = self.lent.as_mut().and_then(|l| l.waker.take());
@@ -1104,8 +1119,12 @@ impl ReadState {
         }
         match lent.done {
             None => {}
-            // A datagram, even an empty one, is received whole: the next
-            // receive takes it.
+            // A datagram the kernel cut to this buffer is dropped, and counted: the next receive
+            // would take its first bytes for the whole of it (proofs/tla/lent/LentOrphan.tla).
+            Some(Ok(_)) if lent.peer.is_some() && lent.cut => {
+                crate::rt::counters::cut_datagram_dropped();
+            }
+            // One that came whole, even an empty one, the next receive takes.
             Some(Ok(_)) if lent.peer.is_some() => {
                 if let Some(peer) = lent.peer {
                     self.datagrams.push_back((
@@ -1277,7 +1296,7 @@ impl ReadState {
             }
             None => {
                 #[cfg(port)]
-                if let Some(result) = self.receive_starved(io, out, peek) {
+                if let Some(result) = self.receive_starved(io, kind, out, peek, after) {
                     return Poll::Ready(result);
                 }
                 self.wait(waker, out.len());
@@ -1295,8 +1314,10 @@ impl ReadState {
     fn receive_starved(
         &mut self,
         io: Io<'_>,
+        kind: Kind,
         out: &mut [u8],
         peek: bool,
+        after: &mut After,
     ) -> Option<io::Result<(usize, Addr)>> {
         if !self.starved
             || !self.readable
@@ -1309,11 +1330,35 @@ impl ReadState {
         }
         let Via::Ops(route) = io.via;
         let result = crate::io::sys::recv_from_ready(route.socket()?, out, peek);
+        if self.taken_by_another(&result, io, kind, out.len(), after) {
+            return None;
+        }
         if !peek {
             tally::received(&result);
         }
         self.readable = peek && result.is_ok();
         Some(result.map(|(n, from)| (n, Addr::Inet(from))))
+    }
+
+    /// On a port, whether a call made once a zero-byte look said bytes came found none
+    /// (`WSAEWOULDBLOCK`: another took them first, the socket being non-blocking): the side then
+    /// looks again, and the call waits for that look as for the first.
+    #[cfg(port)]
+    #[cold]
+    fn taken_by_another<T>(
+        &mut self,
+        result: &io::Result<T>,
+        io: Io<'_>,
+        kind: Kind,
+        len: usize,
+        after: &mut After,
+    ) -> bool {
+        if !matches!(result, Err(err) if err.kind() == io::ErrorKind::WouldBlock) {
+            return false;
+        }
+        self.readable = false;
+        self.complete(io, kind, len, after);
+        true
     }
 
     /// What the side holds, as a line, for a test that failed.

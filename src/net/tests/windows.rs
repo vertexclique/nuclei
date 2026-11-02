@@ -153,3 +153,157 @@ fn a_stream_left_with_a_send_out_goes_on_from_another_thread() {
         sent.len()
     );
 }
+
+/// A socket nuclei takes over answers `WouldBlock` where it would block, as a unix descriptor
+/// does: std's own calls through `get_ref` never block the shard.
+#[test]
+fn an_adopted_socket_does_not_block() {
+    let rt = runtime();
+    rt.block_on(async {
+        let udp = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let err = udp.get_ref().recv_from(&mut [0u8; 16]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let listener = Handle::<TcpListener>::bind("127.0.0.1:0").await.unwrap();
+        let err = listener.get_ref().accept().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    });
+}
+
+/// Each datagram's send answers what the kernel says of that datagram: a refused one (a
+/// broadcast with `SO_BROADCAST` off) fails its own call, and the calls around it succeed.
+#[test]
+fn a_datagram_send_answers_its_own_verdict() {
+    let rt = runtime();
+    rt.block_on(async {
+        let a = Handle::<UdpSocket>::bind("0.0.0.0:0").await.unwrap();
+        let b = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let to = b.local_addr().unwrap();
+        let port = a.local_addr().unwrap().port();
+        assert_eq!(within(a.send_to(b"one", to)).await.unwrap(), 3);
+        let refused = within(a.send_to(b"all", ("255.255.255.255", port))).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(within(a.send_to(b"two", to)).await.unwrap(), 3);
+        let mut buf = [0u8; 8];
+        for want in [&b"one"[..], b"two"] {
+            let (n, _) = within(b.recv_from(&mut buf)).await.unwrap();
+            assert_eq!(&buf[..n], want);
+        }
+    });
+}
+
+/// A burst of datagrams through a socket with no send buffer: each send from the task either
+/// goes or, finding no room, waits for the port's poll of the socket and tries again; every one
+/// arrives, whole and in order.
+#[test]
+fn a_burst_of_datagram_sends_waits_for_room_and_loses_none() {
+    const COUNT: usize = 400;
+    const LEN: usize = 1200;
+    let rt = runtime();
+    rt.block_on(async {
+        let a = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let b = Handle::<UdpSocket>::bind("127.0.0.1:0").await.unwrap();
+        let raw = |s: &Handle<UdpSocket>| s.get_ref().as_raw_socket();
+        crate::net::opt::set_size(
+            raw(&a),
+            crate::net::opt::SOL_SOCKET,
+            crate::net::opt::SO_SNDBUF,
+            0,
+        )
+        .unwrap();
+        crate::net::opt::set_size(
+            raw(&b),
+            crate::net::opt::SOL_SOCKET,
+            crate::net::opt::SO_RCVBUF,
+            8 << 20,
+        )
+        .unwrap();
+        let to = b.local_addr().unwrap();
+        let datagram = |i: usize| -> Vec<u8> { (0..LEN).map(|j| (i * 7 + j) as u8).collect() };
+        for i in 0..COUNT {
+            assert_eq!(within(a.send_to(&datagram(i), to)).await.unwrap(), LEN);
+        }
+        let mut buf = vec![0u8; 2 * LEN];
+        for i in 0..COUNT {
+            let (n, _) = within(b.recv_from(&mut buf)).await.unwrap();
+            assert!(buf[..n] == datagram(i)[..], "datagram {i} differs");
+        }
+    });
+}
+
+/// A stream whose send, never cancelled, waits for a peer that reads only after it heard from
+/// us: `block_on` returns with that send out, and the source is let go with it. The next read
+/// is served all the same, on the thread's own shard again (whose port the handle is bound to)
+/// or on a runtime's worker (another port, which the handle cannot move to while its send is
+/// out: it stays on its old port, whose keeper drains it, until the send ended), and every byte
+/// of the send reaches the peer.
+#[test]
+fn a_moved_stream_reads_while_its_send_waits_for_the_peer() {
+    for on_worker in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = listener.local_addr().unwrap();
+        let small = |raw| {
+            crate::net::opt::set_size(
+                raw,
+                crate::net::opt::SOL_SOCKET,
+                crate::net::opt::SO_RCVBUF,
+                1024,
+            )
+            .unwrap();
+        };
+        small(listener.as_raw_socket());
+        let sent: Vec<u8> = (0..48 * 1024).map(|i| (i % 251) as u8).collect();
+        let (heard_tx, heard_rx) = std::sync::mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.write_all(b"ping").unwrap();
+            // It reads nothing until we read its ping.
+            heard_rx.recv().unwrap();
+            let mut got = Vec::new();
+            peer.read_to_end(&mut got).unwrap();
+            got
+        });
+        let mut stream = crate::block_on(within(Handle::<TcpStream>::connect(to))).unwrap();
+        crate::net::opt::set_size(
+            stream.as_raw_socket(),
+            crate::net::opt::SOL_SOCKET,
+            crate::net::opt::SO_SNDBUF,
+            1024,
+        )
+        .unwrap();
+        // The bytes are taken, most of them behind, in a send the peer does not take yet.
+        crate::block_on(within(write_all_unflushed(&mut stream, &sent)));
+        let read = |mut stream: Handle<TcpStream>| async move {
+            let mut ping = [0u8; 4];
+            within(read_exact(&mut stream, &mut ping)).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            stream
+        };
+        let mut stream = if on_worker {
+            // On a worker: another shard, another port.
+            let rt = runtime();
+            rt.block_on(rt.spawn(read(stream)))
+        } else {
+            crate::block_on(read(stream))
+        };
+        heard_tx.send(()).unwrap();
+        crate::block_on(within(close(&mut stream))).unwrap();
+        drop(stream);
+        let got = peer.join().unwrap();
+        assert!(
+            got == sent,
+            "{} of {} bytes reached the peer, or not in order",
+            got.len(),
+            sent.len()
+        );
+    }
+}
+
+/// Writes all of `bytes`, waiting for none of them to leave the write-behind.
+async fn write_all_unflushed<W: AsyncWrite + Unpin>(w: &mut W, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let n = poll_fn(|cx| Pin::new(&mut *w).poll_write(cx, bytes))
+            .await
+            .unwrap();
+        bytes = &bytes[n..];
+    }
+}

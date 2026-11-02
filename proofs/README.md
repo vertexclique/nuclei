@@ -1161,7 +1161,14 @@ kernel takes the task's datagrams in the order it sent them; and `Termination` w
 mutations (the old queue-and-answer breaks `OwnResult`; a call that goes to the kernel with the
 lent send of a task that went still out overtakes it, breaking `InOrder`; a poll that wakes
 nobody breaks `Termination`), and 3 witnesses (a call that waits for room, a refusal answered by
-its own call, a call that waits behind the lent send of a task that went).
+its own call, a call that waits behind the lent send of a task that went). A Windows completion port
+(`Backend = "port"`) sends from the task too (`send_now_port` in `src/io/source/write/datagram.rs`),
+on a socket made non-blocking, and a call that finds no room waits for the port's poll of the socket
+(an AFD poll for room to send, `start_poll` in `src/io/source/port.rs`). Its datagrams include one
+the kernel refuses only as it sends it (no route), which a call of the task's own hears at once. 4
+more configurations: 2 that must pass (`OwnResult` and `InOrder`; `Termination` and `Delivered`),
+and 2 mutations (the port's old copy, queue and answer breaks `OwnResult`, as a refusal reaches the
+next call; a poll for room that wakes nobody breaks `Termination`).
 
 The same model checks a stream's writes (`Stream`: `write_direct`, `wait_for_room` and `write` in
 `src/io/source/write.rs`). The task writes small chunks and large ones (16 KiB or more,
@@ -1605,7 +1612,42 @@ drainer and no failed registration, every packet delivered and the source regist
 whether the shard runs again or not), 6 mutations (no keeper and no wait for the evictions
 strand packets, `AllDelivered`; no wait for the keeper and a keeper that ignores being called
 off break `OneDrainer`; no look at the count after the flag breaks `Registers`; a bind failure
-that fails the registration breaks `NoFailure`), and 4 witnesses.
+that fails the registration breaks `NoFailure`), and 4 witnesses. With `Duplex` the operation out is a TCP
+send into a full socket whose peer reads only after it got what it waits for from us, and the send is
+never cancelled (`may_cancel`). A registration that finds the handle unable to move keeps the source
+on its old port, registered with its new shard: its reads go to the old port, whose keeper drains it
+while a source waits to move (`Port::keep`, `hand_off_port`), and the move is made once none of its
+operations is out (`waits_for_ops`'s flag has it made again). The task reads twice. 5 more
+configurations: 2 that must pass (the old shard gone, and able to run again, with `ReadServed`,
+every read served, `Registers` and `AllDelivered`, and `OneDrainer`), and 3 mutations (the
+registration that waits unregistered for the send, as it did, breaks `ReadServed`: both ends waited
+for good; a keeper that leaves once none is out though a source waits to move breaks `ReadServed`,
+the read made after the send ended never delivered; a move never made again breaks `Registers`). A
+registration with the shard whose port the handle is bound to already (its thread's next
+`block_on`) moves nothing and binds nothing; a bind there all the same fails with the send out and
+waits for good (`MK_no_here`, `ReadServed` broken).
+
+`tla/port/PortFile.tla` checks a Windows disk file's reads and writes, made by threads of the
+blocking pool (`read_at`, `write_all_at`, `at` and `finished` in `src/io/sys/windows.rs`), on a
+handle opened for overlapped IO (as a database opens its log, with `FILE_FLAG_NO_BUFFERING` and
+`FILE_FLAG_WRITE_THROUGH`) or for synchronous IO. A cursor write and a positional write run at once;
+each names an `OVERLAPPED` in its own frame, and on an overlapped handle may come back pending. The
+call then waits on its own event (the calling thread's, its low bit set so no completion goes to a
+port) for its own end, and answers what the kernel said of it. 5 configurations: 2 that must pass
+(both kinds of handle, with `NoDeadWrite`, the kernel never writes into a frame its call left,
+`OwnResult` and `Returns`), 2 mutations (a pending call that answers ERROR_IO_PENDING as its error
+and returns, as it did, and one that waits on the handle's own signal, which the other call's end
+sets, break `NoDeadWrite`), and a witness (a call that waits for its own end).
+
+`tla/port/PortLook.tla` checks a read on a port whose pool has no buffer for it, made by the task
+straight from the socket once a zero-byte look said bytes came (`read_starved`, `receive_starved`
+and `taken_by_another` in `src/io/source/read.rs`), when a call outside the side (std's own read
+through `get_ref`, another handle on the socket) takes the bytes first. On a socket nuclei makes
+non-blocking the task's read then finds none (`WSAEWOULDBLOCK`), marks the side unreadable, sends
+another look and waits for it; before, it would have blocked the shard's thread. 4 configurations: 1
+that must pass (`NoSpuriousError`, no read answers an error for bytes another call took, and
+`Served`), 2 mutations (the WouldBlock answered as an error breaks `NoSpuriousError`; a wait with no
+look sent breaks `Served`), and a witness (the announced bytes taken, the next read).
 
 ## Idle peers on a completion port
 

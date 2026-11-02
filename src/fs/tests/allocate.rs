@@ -608,3 +608,64 @@ fn a_range_call_is_an_operation_of_the_ring() {
         .await;
     });
 }
+
+/// The space the file system holds for the file.
+#[cfg(windows)]
+fn allocation(file: &File) -> i64 {
+    use crate::syscore::windows::{
+        FILE_STANDARD_INFO, FILE_STANDARD_INFO_CLASS, GetFileInformationByHandleEx,
+    };
+    use std::os::windows::io::AsRawHandle;
+    let mut info = FILE_STANDARD_INFO {
+        AllocationSize: 0,
+        EndOfFile: 0,
+        NumberOfLinks: 0,
+        DeletePending: 0,
+        Directory: 0,
+    };
+    // SAFETY: the call writes a `FILE_STANDARD_INFO` into our own.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FILE_STANDARD_INFO_CLASS,
+            core::ptr::from_mut(&mut info).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    assert!(ok != 0, "{}", io::Error::last_os_error());
+    info.AllocationSize
+}
+
+#[cfg(windows)]
+#[test]
+fn keep_size_past_the_end_is_held_while_a_handle_is_open() {
+    const RANGE: i64 = 1 << 20;
+    let rt = runtime();
+    let tmp = Temp::new("alloc-keep-open");
+    let path = tmp.file("data");
+    let data = pattern(100);
+    std::fs::write(&path, &data).unwrap();
+    let other = rt.block_on(async {
+        let file = Handle::new(open_rw(&path)).unwrap();
+        within(file.allocate(0, RANGE as u64, Allocate::KeepSize))
+            .await
+            .unwrap();
+        open_rw(&path)
+    });
+    assert!(allocation(&other) >= RANGE);
+    assert_eq!(length(&path), 100);
+    drop(other);
+    // Once the last handle closed, NTFS frees what lies past the end, as `Allocate::KeepSize`
+    // says. The handle's own close may still be on its way.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pause = Duration::from_millis(1);
+    while allocation(&open_rw(&path)) >= RANGE {
+        assert!(
+            Instant::now() < deadline,
+            "the space past the end outlived the file's last handle"
+        );
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(100));
+    }
+    assert!(std::fs::read(&path).unwrap() == data);
+}

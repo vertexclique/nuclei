@@ -263,3 +263,60 @@ impl WriteNow for &File {
         std::io::Write::write_all(&mut self, bytes).unwrap();
     }
 }
+
+/// A disk file opened for overlapped IO, with no buffering and its writes through, as a
+/// database opens its log: its calls run on the pool's threads, and each one the handle answers
+/// pending (ERROR_IO_PENDING) waits for its own end, so none answers a false error and the
+/// kernel writes into no frame or buffer the call left. Cursor writes of whole pages and
+/// positional writes of other pages at once, a sync, and every byte read back.
+#[test]
+fn an_overlapped_unbuffered_file_writes_and_reads_every_byte() {
+    use crate::io::AlignedBuf;
+    /// Opening flags of a file the system neither caches nor holds its writes for.
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+    const PAGE: usize = 4096;
+    const PAGES: usize = 16;
+    let page = |i: usize| -> AlignedBuf {
+        let mut buf = AlignedBuf::new(PAGE, PAGE).unwrap();
+        let bytes: Vec<u8> = (0..PAGE)
+            .map(|j| (i * 131 + j * 7 + j / 251) as u8)
+            .collect();
+        assert_eq!(buf.extend_from_slice(&bytes), PAGE);
+        buf
+    };
+    let dir = Temp::new("overlapped");
+    let path = dir.file("log");
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH)
+        .open(&path)
+        .unwrap();
+    let rt = runtime();
+    rt.block_on(async {
+        let file = Handle::new(opened).unwrap();
+        let cursor = async {
+            for i in 0..PAGES {
+                let (wrote, _) = within(file.write_owned(page(i))).await;
+                assert_eq!(wrote.unwrap(), PAGE, "cursor page {i}");
+            }
+        };
+        let positional = async {
+            for i in PAGES..2 * PAGES {
+                let (wrote, _) = within(file.write_at_owned(page(i), (i * PAGE) as u64)).await;
+                assert_eq!(wrote.unwrap(), PAGE, "positional page {i}");
+            }
+        };
+        crate::join!(cursor, positional);
+        within(file.sync_all()).await.unwrap();
+        for i in 0..2 * PAGES {
+            let (read, got) =
+                within(file.read_at_owned(AlignedBuf::new(PAGE, PAGE).unwrap(), (i * PAGE) as u64))
+                    .await;
+            assert_eq!(read.unwrap(), PAGE, "page {i}");
+            assert!(got[..] == page(i)[..], "page {i} differs");
+        }
+    });
+}

@@ -171,3 +171,89 @@ fn unix_datagram_owned_calls_arrive_whole() {
         std::fs::remove_dir_all(&dir).unwrap();
     });
 }
+
+/// The datagrams the process dropped because an owned receive given up had them cut.
+fn cut_dropped() -> u64 {
+    let stats = crate::stats();
+    stats.off_shard_errors.cut_datagrams_dropped
+        + stats
+            .shards
+            .iter()
+            .map(|s| s.errors.cut_datagrams_dropped)
+            .sum::<u64>()
+}
+
+/// Whether the driver receives a datagram into the buffer an owned receive lent it. A ring's UDP
+/// side has its task receive it itself, or receives it ahead whole into the ring's group, so a
+/// receive given up leaves it whole for the next.
+fn driver_fills_lent() -> bool {
+    crate::proactor::Proactor::backend() != crate::IoBackend::IoUring
+}
+
+/// A waker that only says it was woken.
+struct Flag(std::sync::atomic::AtomicBool);
+
+impl std::task::Wake for Flag {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// An owned receive into 16 bytes, given up once the side woke it for a datagram of `len`: the
+/// driver received the datagram into its buffer, or (on a ring) the socket said it holds one.
+/// Then a datagram of 4 bytes. What the next receive gets: the first datagram whole if it fit or
+/// stayed on the socket, else the second, the first dropped and counted.
+async fn given_up_then_received(
+    a: &Handle<UdpSocket>,
+    b: &Handle<UdpSocket>,
+    len: usize,
+) -> Vec<u8> {
+    let b_addr = b.local_addr().unwrap();
+    let flag = std::sync::Arc::new(Flag(std::sync::atomic::AtomicBool::new(false)));
+    let waker = std::task::Waker::from(std::sync::Arc::clone(&flag));
+    let mut waiting = Box::pin(b.recv_from_owned(Vec::with_capacity(16)));
+    let first = waiting
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(&waker));
+    assert!(first.is_pending());
+    within(a.send_to(&pattern(len), b_addr)).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !flag.0.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the side never woke the receive"
+        );
+        crate::time::sleep(Duration::from_millis(1)).await;
+    }
+    drop(waiting);
+    within(a.send_to(b"next", b_addr)).await.unwrap();
+    let mut got = vec![0u8; 64 * 1024];
+    let (n, _) = within(b.recv_from(&mut got)).await.unwrap();
+    got.truncate(n);
+    got
+}
+
+#[test]
+fn a_given_up_owned_receive_drops_a_cut_datagram_and_hands_on_a_whole_one() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (a, b) = udp_pair().await;
+        let before = cut_dropped();
+        // A datagram that fills the buffer exactly came whole: the next receive takes it.
+        assert_eq!(given_up_then_received(&a, &b, 16).await, pattern(16));
+        assert_eq!(within(b.recv_from(&mut [0u8; 64])).await.unwrap().0, 4);
+        assert_eq!(cut_dropped(), before);
+        // One longer than the buffer was cut: dropped and counted, and the next receive takes
+        // the one after it.
+        // Where the task receives it itself, it stays whole for the next.
+        let got = given_up_then_received(&a, &b, 100).await;
+        if driver_fills_lent() {
+            assert_eq!(got, b"next");
+            assert_eq!(cut_dropped(), before + 1);
+        } else {
+            assert_eq!(got, pattern(100));
+            assert_eq!(within(b.recv_from(&mut [0u8; 64])).await.unwrap().0, 4);
+            assert_eq!(cut_dropped(), before);
+        }
+    });
+}

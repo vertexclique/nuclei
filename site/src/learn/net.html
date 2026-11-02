@@ -79,7 +79,7 @@ nuclei::io::Handle::set_quickack
 <p>std's methods reach the socket through the handle, and the handle's own methods of the same name take their place where it has them (<code>connect</code>, <code>send</code>, <code>linger</code>, ...). A few of std's go around the bytes the handle read ahead and wrote behind, or block its shard:</p>
 <ul>
 <li><code>shutdown(how)</code> shuts the halves at once, ahead of the bytes still behind; <a href="#shut"><code>shut</code></a> waits for them.</li>
-<li><code>set_nonblocking(false)</code> makes the driver's own calls on the socket block the shard's thread, and every task of the shard with them.</li>
+<li><code>set_nonblocking(false)</code> makes the driver's own calls on the socket block the shard's thread, and every task of the shard with them. A socket nuclei takes over is non-blocking on Windows too, as on unix.</li>
 <li><code>take_error</code> takes the socket's pending error, which the handle's connect in progress or its next operation would have answered.</li>
 <li>std's <code>Read</code> and <code>Write</code> on a shared reference to the socket read past the bytes read ahead, write ahead of the bytes written behind, and answer <code>WouldBlock</code> where the handle's own calls wait.</li>
 <li><code>UdpSocket::connect(addr)</code> makes a new connected socket. <code>socket.connect(addr)</code> on a socket you have is std's: it connects that socket in place and looks a name up with a blocking call on the shard's thread, so give it a numeric address, or look the name up first with <code>net::lookup_host</code>.</li>

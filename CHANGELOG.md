@@ -75,6 +75,53 @@
   9216 bytes for UDP and macOS past 2048 for a Unix socket (`EMSGSIZE`), as std's sockets do:
   nuclei sizes no socket, as std does not. Its sockets now ask for buffers of 256 KiB, as an
   application that sends large datagrams does, so every system carries the same datagrams.
+- **A Windows connect binds its port as before: `SO_REUSE_UNICASTPORT` is not set.** The option
+  would have had a connect's explicit bind (which `ConnectEx` needs) share a port across
+  destinations, as the bind std's connect makes itself does. On the CI runners' Windows it reads
+  back unset after a set of either width, and a bind made with it still takes its port at once
+  rather than leave it to the connect, so nothing shows it taking effect, and it was taken out. The
+  soak's `WSAEADDRINUSE` it was meant for was TIME_WAIT toward the soak's one server (13455 of the
+  16384 ephemeral ports), which no sharing across destinations helps.
+- **A Windows datagram send answers what the kernel says of its own datagram.** A `send_to` on
+  Windows copied its datagram, queued it for the completion port and answered taken at once, so a
+  refusal the kernel made as it sent it (no route) reached the next call, whose own datagram was
+  never sent. The task now hands its datagram to the kernel itself, as on unix, on a socket nuclei
+  makes non-blocking (`FIONBIO`, which std's own calls on the socket then answer with `WouldBlock`,
+  as on unix); a send that finds no room waits for an AFD poll of the socket that says there is,
+  on the port, and tries again (`proofs/tla/ring/RingSend.tla`, `Backend = "port"`). Each send costs
+  one call and no copy into a buffer of the pool, where it cost a copy and a completion.
+- **A Windows socket whose send waits for its peer moves to another shard without a hang.** A TCP
+  send is never cancelled, and a handle cannot move to another port while one is out: a stream let
+  go by its shard with a send out (a `block_on` that returned) could not register again until the
+  send ended, and when its peer read only after it heard from it, both ends waited for good. A
+  source that cannot move now stays on the port its handle is bound to, registered with its new
+  shard: its operations go there, the port's keeper drains it while a source waits to move, and
+  once none of its operations is out, or its send ended, it is registered again and the move is
+  made (`proofs/tla/port/PortKeep.tla`, `Duplex`). One registering again with the shard whose port
+  its handle is bound to (its thread's next `block_on`) needs no move.
+- **A datagram an owned receive given up had cut is dropped, not handed on.** A `recv_from_owned`
+  whose future was dropped after the driver received a datagram into its buffer hands the datagram
+  to the next receive; one longer than that buffer was cut to it, and the next receive took its
+  first bytes for the whole datagram. The kernel says whether it cut one (`MSG_TRUNC` on unix,
+  `STATUS_BUFFER_OVERFLOW` on Windows): a cut one is now dropped and counted in
+  `ErrorCounts::cut_datagrams_dropped`, and one that came whole, filling the buffer exactly or not,
+  goes on as before (`proofs/tla/lent/LentOrphan.tla`). On epoll and kqueue the driver's receive
+  into a lent buffer is a `recvmsg`, to read that flag.
+- **A Windows file opened for overlapped IO is read and written as one opened for synchronous
+  IO.** A disk file opened with `FILE_FLAG_OVERLAPPED` (a log's `FILE_FLAG_OVERLAPPED |
+  FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`) was driven as a synchronous one: a `ReadFile`
+  or `WriteFile` the system answered `ERROR_IO_PENDING` returned that as the call's error while the
+  kernel still held it, and the kernel later wrote the call's end into an `OVERLAPPED` on a stack
+  frame that had returned, and moved bytes into or out of a buffer the caller had dropped. Each
+  read and write at an offset, and each `DeviceIoControl` (a sparse file, a zeroed range), now
+  names the calling thread's own event, and one answered pending is waited out on it
+  (`GetOverlappedResult`) before the call returns; the event's low bit keeps the end off the port
+  the handle is bound to (`proofs/tla/port/PortFile.tla`). A test writes such a file at its cursor
+  and at offsets at once, syncs it and reads every byte back.
+- **`Allocate::KeepSize` says what it keeps on Windows.** NTFS holds the space reserved past a
+  file's end only while a handle to the file is open, and frees it when the last one closes (a
+  1 MiB reservation read back 1 MiB with a handle open and 0 once reopened after the last close);
+  the docs promised it as a lasting reservation. A test checks both on Windows.
 
 ### Changed
 

@@ -130,7 +130,7 @@ impl WriteState {
         let Some(issuer) = route.issuer(after) else {
             return;
         };
-        #[cfg(ring)]
+        #[cfg(completion)]
         if self.poll_first {
             self.polling = true;
             self.out = Some(issuer.issue(Want::Ready { read: false }, kind, self.epoch, after));
@@ -159,10 +159,7 @@ impl WriteState {
 
     /// Whether the next operation waits for the socket to be ready first.
     fn not_ready_first(&self) -> bool {
-        #[cfg(ring)]
-        return self.poll_first;
-        #[cfg(not(ring))]
-        false
+        self.poll_first
     }
 
     /// The kernel gave an operation back because the socket was not ready
@@ -181,10 +178,7 @@ impl WriteState {
     /// source's descriptor, for a connect's end.
     pub(crate) fn op_done(&mut self, done: Done, fd: Option<Raw>, after: &mut After) {
         self.out = None;
-        #[cfg(ring)]
-        {
-            self.polling = false;
-        }
+        self.polling = false;
         // An operation of a descriptor that is gone: what it holds is
         // dropped.
         let stale = done.epoch != self.epoch;
@@ -263,8 +257,19 @@ impl WriteState {
                 let result = result.and_then(|()| fd.map_or(Ok(()), sys::adopt_connected));
                 self.connected(result);
             }
-            #[cfg(ring)]
+            // A poll for room ended (a port's ends once its socket has room, or with the
+            // socket's error, which the call's next try hears from the socket itself).
             Outcome::Ready(answer) => {
+                #[cfg(port)]
+                if !stale && let Answer::Done(result) = answer {
+                    self.poll_first = false;
+                    // A poll the system refused is the next call's error, so no call waits on
+                    // it for good nor tries again in a loop.
+                    if let Err(err) = result {
+                        self.error = Some(err);
+                    }
+                }
+                #[cfg(ring)]
                 if !stale && let Answer::Done(_) = answer {
                     self.poll_first = false;
                     if self.user_fd {
