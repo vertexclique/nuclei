@@ -1,130 +1,199 @@
 ------------------------------- MODULE Clock -------------------------------
 (***************************************************************************)
-(* A paused clock that moves by itself (src/rt/paused.rs, the park path in *)
-(* src/rt/shard.rs, the job count in src/rt/blocking.rs), at the grain of  *)
-(* the atomic steps of the protocol.                                       *)
+(* A paused clock that moves by itself (src/rt/paused.rs: `try_advance`,   *)
+(* `attempt`; src/rt/shard/run.rs: `Shard::run_loop`, the park path;       *)
+(* src/rt/shard/timers.rs: `before_park`, `timer_wait`, `after_park`,      *)
+(* `fire_timers`; src/rt/shard.rs: `Shared::post_timer`, `Shared::idle`;   *)
+(* src/time/sleep.rs: `TimerOp::needs_wake`; src/rt/blocking.rs: the job   *)
+(* count; src/rt/handoff/monitor.rs: `take`, the count of polls taken from *)
+(* their thread; src/rt/workers.rs: `finish_home`, `Workers::on_own`;      *)
+(* src/rt/shard/run.rs: `finish_on_own`), at the grain of the atomic steps *)
+(* of the protocol.                                                        *)
 (*                                                                          *)
 (* In plain words: each shard runs its work and fires its due timer. With  *)
 (* nothing left it publishes its timer's deadline and counts a park, then  *)
 (* says it parks and looks for work once more. Parked, it tries to move    *)
-(* the clock: it claims the advance, looks at every shard (each must be    *)
-(* parked with nothing pushed, noting each one's park count and deadline), *)
-(* looks again (the same, unchanged), moves the clock to the earliest      *)
-(* deadline, wakes the shards whose timers are due and lets the advance    *)
-(* go. Then it sleeps until it is woken, unless its own timer came due. A  *)
-(* shard that wakes, or that found work when it was about to sleep, waits  *)
-(* for an advance in progress to end before it runs. A pusher gives a      *)
-(* shard work and wakes it; a blocking job gives shard 1 work, wakes it,   *)
-(* counts itself out of the jobs in flight and then tries the advance too. *)
+(* the clock: it claims the advance and looks at the jobs in flight, looks *)
+(* at every shard the clock counts (each must be parked with nothing       *)
+(* pushed or posted to it, noting each one's park count and deadline),    *)
+(* looks at the jobs again and at the shards again (the same, unchanged),  *)
+(* moves the clock to the earliest deadline, wakes the shards whose timers *)
+(* are due and lets the advance go. Then it sleeps until it is woken,      *)
+(* unless its own timer came due. A shard that wakes, or that found work   *)
+(* when it was about to sleep, waits for an advance in progress to end     *)
+(* before it runs. A pusher gives a shard work and wakes it. A poster      *)
+(* gives a shard a timer op (a removal or a cancel, posted by a thread     *)
+(* that is not the shard's) and wakes it too: a shard holding an op is not *)
+(* idle, so a parked one left holding it would hold every jump up. Work in *)
+(* flight on no shard the clock counts (a blocking job, or the rest of a   *)
+(* poll the handoff took from its thread, counted alike) gives shard 1     *)
+(* work, wakes it, counts itself out of the work in flight and then tries  *)
+(* the advance too. A taken poll's thread that goes on to its own shard    *)
+(* (`finish_on_own`, `finish_home`) makes the shard a guest before it      *)
+(* counts the poll out, and counts it in again before the guest leaves:    *)
+(* the work is in the count or on a counted shard that is not idle at      *)
+(* every moment, as the job's item pushed before the job counts out is.    *)
+(*                                                                          *)
+(* What must never happen: the clock jumps past an armed timer, or jumps   *)
+(* while some shard has work or work is in flight; and an armed timer      *)
+(* never fires.                                                            *)
+(*                                                                          *)
+(* A shard the clock does not look at (`Late`) is a witness of an open     *)
+(* question, not fixed: a thread's own shard inside `block_on` since       *)
+(* before a pause from another thread, whose timer then never fires.       *)
 (*                                                                          *)
 (* What is modelled step by step: every load and store the protocol makes, *)
-(* the look at each shard one at a time, the wake (a parked flag swapped   *)
-(* back and a notification left). What is abstract: a shard's work is a    *)
-(* count; running one item may arm the shard's timer (at most `Timers`     *)
-(* times) some delay after the clock; the clock moves only by the jump.    *)
+(* the look at each shard one at a time (ending at the first that is not   *)
+(* idle, as the code's loops return), the wake (a parked flag swapped back *)
+(* and a notification left). What is abstract: a shard's work is a count;  *)
+(* running one item may arm the shard's timer (at most `Timers` times)     *)
+(* some delay after the clock; the clock moves only by the jump; a timer   *)
+(* op is a count, which the shard's next look applies and which arms       *)
+(* nothing. Steps that touch only the attempt's own variables are merged   *)
+(* with the shared access next to them; a claim of the advance that finds  *)
+(* jobs in flight lets it go at once, which no other step can tell from    *)
+(* never claiming it.                                                      *)
 (*                                                                          *)
 (* What is forgotten: a value no step reads again before it is next        *)
 (* written goes back to its start once read for the last time (whether a   *)
-(* shard's own timer came due, once it has slept; the shard a push went    *)
-(* to, once it was woken). Two states that differ only there have the same *)
-(* futures, so TLC walks one of them; every check sees what it saw before. *)
+(* shard's own timer came due, once it has slept; the shard a push or a    *)
+(* post went to, once it was woken; the deadline a shard published, once  *)
+(* it woke: an attempt that looks at a shard that is not parked ends       *)
+(* there, without its deadline, and a woken shard waits for the attempt to *)
+(* end before it parks again). Two states that differ only there have the  *)
+(* same futures, so TLC walks one of them; every check sees what it saw    *)
+(* before.                                                                 *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, Sequences, TLC
 
 CONSTANTS
-    Shards,    \* the shards of the runtime, numbered 1, 2, ...
+    Shards,    \* the shards that run the runtime's tasks, numbered 1, 2, ... or model values
+    Late,      \* those the clock does not count (does not look at): {} for none
     Pushes,    \* work items a pusher gives to the shards
-    Job,       \* TRUE: a blocking job is in flight at the start
+    PushTo,    \* the shards the pusher may give an item to
+    Posts,     \* timer ops another thread posts to the shards
+    PostTo,    \* the shards the poster may post an op to
+    Job,       \* TRUE: work is in flight at the start, which ends by giving shard 1 an item
     Delays,    \* the delays a timer may be armed with
     Timers,    \* timers each shard may arm in all
     Mutation   \* "none", or the name of the one rule this run takes away
 
+\* No deadline: past every time the model reaches.
 Inf == 1000
+\* The attempt of a thread that runs no shard (the blocking job's).
 NoShard == 0
+\* The smaller and the larger of two numbers.
 Min2(a, b) == IF a < b THEN a ELSE b
 Max2(a, b) == IF a > b THEN a ELSE b
+\* The shards the clock looks at: the runtime's workers and its counted guests.
+Counted == Shards \ Late
 
 (* --algorithm Clock
 variables
-    clock = 0,
-    deadline = [s \in Shards |-> Inf],   \* the shard's armed timer
-    armed = [s \in Shards |-> 0],        \* timers armed so far
-    parked = [s \in Shards |-> FALSE],
+    clock = 0,                           \* the paused clock's time
+    deadline = [s \in Shards |-> Inf],   \* the shard's armed timer, Inf for none
+    armed = [s \in Shards |-> 0],        \* timers the shard armed so far
+    parked = [s \in Shards |-> FALSE],   \* the shard said it parks (its park flag)
     notified = [s \in Shards |-> FALSE], \* a notification left on the shard's poller
-    inbox = [s \in Shards |-> 0],
-    parks = [s \in Shards |-> 0],
+    inbox = [s \in Shards |-> 0],        \* work items pushed to the shard, not run yet
+    ops = [s \in Shards |-> 0],          \* timer ops posted to the shard, not applied yet
+    parks = [s \in Shards |-> 0],        \* parks the shard began
     timerAt = [s \in Shards |-> Inf],    \* the deadline the shard published
     due = [s \in Shards |-> FALSE],      \* the shard's own attempt made its timer due
-    advancing = FALSE,
-    jobs = IF Job THEN 1 ELSE 0,
-    pushed = 0,
-    badJump = FALSE,                     \* the clock jumped while work was in flight
-    jumped = FALSE;
+    advancing = FALSE,                   \* an attempt holds the advance
+    \* the count of work in flight an attempt reads. MUTATION detached_uncounted: a poll the
+    \* handoff took from its thread is left out of it, as before the fix.
+    jobs = IF Job /\ Mutation # "detached_uncounted" THEN 1 ELSE 0,
+    inFlight = Job,                      \* (ghost) the work is in flight, counted or not
+    pushed = 0,                          \* items the pusher gave so far
+    posted = 0,                          \* ops the poster posted so far
+    badJump = FALSE,                     \* (record) the clock jumped while something was busy
+    jumped = FALSE;                      \* (record) the clock jumped at all
 
 define
-    Idle(t) == parked[t] /\ inbox[t] = 0
+    \* Idle: parked, with nothing pushed or posted to it (`Shared::idle`).
+    Idle(t) == parked[t] /\ inbox[t] = 0 /\ ops[t] = 0
     \* No armed timer was left behind by a jump: the clock is never past one.
     ClockNeverPassesArmed == \A s \in Shards : clock <= deadline[s]
-    \* Every jump came over a moment, between its two looks, at which every shard was idle,
-    \* and with no blocking job in flight.
+    \* Every jump came over a moment, between its two looks, at which every shard was idle
+    \* (counted or not), and with no work in flight.
     NoBadJump == ~badJump
     \* Witness: the clock jumps at all.
     NoJumpW == ~jumped
 end define;
 
+\* `paused::attempt`, by shard `me` (or by the job, `NoShard`), the advance claimed first.
 procedure Attempt(me)
 variables todo = {}, snap = [t \in Shards |-> 0], earliest = Inf, abort = FALSE,
     idleMid = FALSE;
 begin
-A1:
+A1: \* claim the advance (one attempt at a time), and look at the jobs in flight: with one,
+    \* the advance is let go at once, as if never claimed
     await ~advancing;
-    advancing := TRUE || abort := FALSE || earliest := Inf || todo := Shards;
-A2:
-    if jobs # 0 /\ Mutation # "no_job_check" then goto A9 end if;
-A3: \* the first look, one shard at a time
+    if jobs # 0 /\ Mutation # "no_job_check" then
+        return;
+    else
+        advancing := TRUE || todo := Counted;
+    end if;
+A3: \* the first look, one shard at a time: each must be idle; its park count and deadline
+    \* noted; the look ends at the first that is not idle
     while todo # {} do
         with t \in todo do
-            abort := abort \/ ~Idle(t) || snap[t] := parks[t]
-                || earliest := Min2(earliest, timerAt[t]) || todo := todo \ {t};
+            abort := ~Idle(t) || snap[t] := parks[t]
+                || earliest := Min2(earliest, timerAt[t])
+                || todo := IF Idle(t) THEN todo \ {t} ELSE {};
         end with;
     end while;
-A4: \* (ghost) between the two looks: is every shard idle at this moment?
+A4: \* (ghost) between the looks: is every shard idle at this moment, counted or not? Then a
+    \* shard not idle, or no deadline to move to, ends the attempt; else the jobs once more
+    \* (before the second look, as the code's `unchanged` reads them first)
     idleMid := \A t \in Shards : Idle(t);
-    if abort \/ earliest = Inf then goto A9 end if;
-A4b:
-    todo := Shards;
-A5: \* the second look: the same shards, still idle, no new park
-    if Mutation = "no_recheck" then goto A6 end if;
-A5b:
+    if abort \/ earliest = Inf \/ (jobs # 0 /\ Mutation # "no_job_check") then
+        goto A9;
+    elsif Mutation = "no_recheck" then
+        goto A6;
+    else
+        todo := Counted;
+    end if;
+A5: \* the second look: the same shards, still idle, no new park; it ends at the first change
     while todo # {} do
         with t \in todo do
-            abort := abort \/ ~Idle(t) \/ parks[t] # snap[t] || todo := todo \ {t};
+            abort := ~Idle(t) \/ parks[t] # snap[t]
+                || todo := IF Idle(t) /\ parks[t] = snap[t] THEN todo \ {t} ELSE {};
         end with;
     end while;
-A5c:
-    if abort \/ (jobs # 0 /\ Mutation # "no_job_check") then goto A9 end if;
-A6:
-    badJump := badJump \/ jobs # 0 \/ ~idleMid;
-    jumped := jumped \/ earliest > clock;
-    clock := Max2(clock, earliest);
-    todo := {t \in Shards : timerAt[t] <= earliest /\ t # me};
-A7: \* wake the shards whose timers came due
+A6: \* a change seen ends the attempt; else the jump: the clock moves to the earliest deadline
+    if abort then
+        goto A9;
+    else
+        badJump := badJump \/ inFlight \/ ~idleMid;
+        jumped := jumped \/ earliest > clock;
+        clock := Max2(clock, earliest);
+        todo := Counted \ {me};
+    end if;
+A7: \* wake each counted shard whose published deadline came due, read as the wake reaches it
     while todo # {} do
         with t \in todo do
-            if parked[t] then parked[t] := FALSE || notified[t] := TRUE end if;
+            if parked[t] /\ timerAt[t] <= earliest then
+                parked[t] := FALSE || notified[t] := TRUE;
+            end if;
             todo := todo \ {t};
         end with;
     end while;
-A8:
-    if me # NoShard then due[me] := timerAt[me] <= earliest end if;
-A9:
+A8: \* the attempting shard, if counted, notes whether its own timer came due; the advance goes
+    if me \in Counted then due[me] := timerAt[me] <= earliest end if;
+    advancing := FALSE;
+    return;
+A9: \* an attempt that did not jump lets the advance go
     advancing := FALSE;
     return;
 end procedure;
 
 fair process Shard \in Shards
 begin
-S_run: \* run what is there: an item of work, or the due timer firing
+S_run: \* the look: the ops posted to it applied (they arm nothing), then what is there run:
+       \* an item of work, or the due timer firing
+    ops[self] := 0;
     if inbox[self] > 0 then
         inbox[self] := inbox[self] - 1;
         goto S_arm;
@@ -135,23 +204,21 @@ S_run: \* run what is there: an item of work, or the due timer firing
 S_publish: \* the deadline published and the park counted before the shard says it parks
     if Mutation # "publish_late" then timerAt[self] := deadline[self] end if;
     parks[self] := parks[self] + 1;
-S_park:
+S_park: \* the shard says it parks
     parked[self] := TRUE;
-S_recheck: \* one more look for work
-    if inbox[self] > 0 then
+S_recheck: \* one more look for work pushed or posted; a shard that found some runs again
+    if inbox[self] > 0 \/ ops[self] > 0 then
         parked[self] := FALSE;
         if Mutation = "busy_no_wait" then goto S_run else goto S_wait end if;
+    elsif Mutation = "publish_late" then
+        \* MUTATION publish_late: the deadline published only now, after the park.
+        timerAt[self] := deadline[self];
     end if;
-S_late:
-    if Mutation = "publish_late" then timerAt[self] := deadline[self] end if;
 S_try: \* parked: try to move the clock, unless the own timer is due already
     if deadline[self] <= clock then
         due[self] := TRUE;
     elsif Mutation # "no_attempt" then
-        due[self] := FALSE;
         call Attempt(self);
-    else
-        due[self] := FALSE;
     end if;
 S_sleep: \* until a notification (a shard with nothing left sleeps here for good)
     if ~due[self] then await notified[self] end if;
@@ -159,8 +226,8 @@ S_sleep: \* until a notification (a shard with nothing left sleeps here for good
     \* Whether the own timer came due is read here for the last time before the next
     \* attempt sets it again: forgotten, so two states that differ only in it are one.
     due[self] := FALSE;
-S_end:
-    parked[self] := FALSE;
+S_end: \* the park ends; the deadline it published is read by no one any more (forgotten)
+    parked[self] := FALSE || timerAt[self] := Inf;
 S_wait: \* an advance in progress ends before the shard reads the clock
     if Mutation # "no_wait_advance" then await ~advancing end if;
     goto S_run;
@@ -178,9 +245,9 @@ end process;
 fair process Pusher = -1
 variable target = 0;
 begin
-P1:
+P1: \* give one item of work to one of the shards it may push to
     while pushed < Pushes do
-        with t \in Shards do
+        with t \in PushTo do
             inbox[t] := inbox[t] + 1 || pushed := pushed + 1 || target := t;
         end with;
 P2: \* the wake: the parked flag swapped back, a notification left
@@ -191,448 +258,43 @@ P2: \* the wake: the parked flag swapped back, a notification left
     end while;
 end process;
 
+fair process Poster = -3
+variable dest = 0;
+begin
+Q1: \* post a timer op (a removal or a cancel) to one of the shards it may post to
+    while posted < Posts do
+        with t \in PostTo do
+            ops[t] := ops[t] + 1 || posted := posted + 1 || dest := t;
+        end with;
+Q2: \* the wake, as for an arm request (`TimerOp::needs_wake` while a clock is paused)
+        \* MUTATION post_no_wake: today's rule before the fix, a removal or a cancel waking nobody.
+        if Mutation # "post_no_wake" /\ parked[dest] then
+            parked[dest] := FALSE || notified[dest] := TRUE;
+        end if;
+        \* The shard just posted to is not read again before the next post picks one:
+        \* forgotten, so two states that differ only in it are one.
+        dest := 0;
+    end while;
+end process;
+
 fair process BlockingJob = -2
 begin
-J1:
-    if ~Job then goto Done end if;
-J1b: \* the job ends, waking the task that awaits it on shard 1
-    inbox[1] := inbox[1] + 1;
-J2:
+J1: \* the work ends (if there is any), waking the task that awaits it on shard 1: pushed there
+    if ~Job then goto Done else inbox[1] := inbox[1] + 1 end if;
+J2: \* the wake of shard 1
     if parked[1] then parked[1] := FALSE || notified[1] := TRUE end if;
-J3: \* counted out after the wake
-    jobs := 0;
-J4:
+J3: \* counted out after the wake, and out of flight
+    jobs := 0 || inFlight := FALSE;
+J4: \* then it tries the advance itself
     call Attempt(NoShard);
 end process;
 end algorithm; *)
+\* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
+\* proofs/tla/run_tlc.sh runs it on a temporary copy before every check, so the tree never
+\* holds a translation that could fall out of date with the algorithm above.
 \* BEGIN TRANSLATION
-CONSTANT defaultInitValue
-VARIABLES clock, deadline, armed, parked, notified, inbox, parks, timerAt, 
-          due, advancing, jobs, pushed, badJump, jumped, pc, stack
-
-(* define statement *)
-Idle(t) == parked[t] /\ inbox[t] = 0
-
-ClockNeverPassesArmed == \A s \in Shards : clock <= deadline[s]
-
-
-NoBadJump == ~badJump
-
-NoJumpW == ~jumped
-
-VARIABLES me, todo, snap, earliest, abort, idleMid, target
-
-vars == << clock, deadline, armed, parked, notified, inbox, parks, timerAt, 
-           due, advancing, jobs, pushed, badJump, jumped, pc, stack, me, todo, 
-           snap, earliest, abort, idleMid, target >>
-
-ProcSet == (Shards) \cup {-1} \cup {-2}
-
-Init == (* Global variables *)
-        /\ clock = 0
-        /\ deadline = [s \in Shards |-> Inf]
-        /\ armed = [s \in Shards |-> 0]
-        /\ parked = [s \in Shards |-> FALSE]
-        /\ notified = [s \in Shards |-> FALSE]
-        /\ inbox = [s \in Shards |-> 0]
-        /\ parks = [s \in Shards |-> 0]
-        /\ timerAt = [s \in Shards |-> Inf]
-        /\ due = [s \in Shards |-> FALSE]
-        /\ advancing = FALSE
-        /\ jobs = IF Job THEN 1 ELSE 0
-        /\ pushed = 0
-        /\ badJump = FALSE
-        /\ jumped = FALSE
-        (* Procedure Attempt *)
-        /\ me = [ self \in ProcSet |-> defaultInitValue]
-        /\ todo = [ self \in ProcSet |-> {}]
-        /\ snap = [ self \in ProcSet |-> [t \in Shards |-> 0]]
-        /\ earliest = [ self \in ProcSet |-> Inf]
-        /\ abort = [ self \in ProcSet |-> FALSE]
-        /\ idleMid = [ self \in ProcSet |-> FALSE]
-        (* Process Pusher *)
-        /\ target = 0
-        /\ stack = [self \in ProcSet |-> << >>]
-        /\ pc = [self \in ProcSet |-> CASE self \in Shards -> "S_run"
-                                        [] self = -1 -> "P1"
-                                        [] self = -2 -> "J1"]
-
-A1(self) == /\ pc[self] = "A1"
-            /\ ~advancing
-            /\ /\ abort' = [abort EXCEPT ![self] = FALSE]
-               /\ advancing' = TRUE
-               /\ earliest' = [earliest EXCEPT ![self] = Inf]
-               /\ todo' = [todo EXCEPT ![self] = Shards]
-            /\ pc' = [pc EXCEPT ![self] = "A2"]
-            /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                            parks, timerAt, due, jobs, pushed, badJump, jumped, 
-                            stack, me, snap, idleMid, target >>
-
-A2(self) == /\ pc[self] = "A2"
-            /\ IF jobs # 0 /\ Mutation # "no_job_check"
-                  THEN /\ pc' = [pc EXCEPT ![self] = "A9"]
-                  ELSE /\ pc' = [pc EXCEPT ![self] = "A3"]
-            /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                            parks, timerAt, due, advancing, jobs, pushed, 
-                            badJump, jumped, stack, me, todo, snap, earliest, 
-                            abort, idleMid, target >>
-
-A3(self) == /\ pc[self] = "A3"
-            /\ IF todo[self] # {}
-                  THEN /\ \E t \in todo[self]:
-                            /\ abort' = [abort EXCEPT ![self] = abort[self] \/ ~Idle(t)]
-                            /\ earliest' = [earliest EXCEPT ![self] = Min2(earliest[self], timerAt[t])]
-                            /\ snap' = [snap EXCEPT ![self][t] = parks[t]]
-                            /\ todo' = [todo EXCEPT ![self] = todo[self] \ {t}]
-                       /\ pc' = [pc EXCEPT ![self] = "A3"]
-                  ELSE /\ pc' = [pc EXCEPT ![self] = "A4"]
-                       /\ UNCHANGED << todo, snap, earliest, abort >>
-            /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                            parks, timerAt, due, advancing, jobs, pushed, 
-                            badJump, jumped, stack, me, idleMid, target >>
-
-A4(self) == /\ pc[self] = "A4"
-            /\ idleMid' = [idleMid EXCEPT ![self] = \A t \in Shards : Idle(t)]
-            /\ IF abort[self] \/ earliest[self] = Inf
-                  THEN /\ pc' = [pc EXCEPT ![self] = "A9"]
-                  ELSE /\ pc' = [pc EXCEPT ![self] = "A4b"]
-            /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                            parks, timerAt, due, advancing, jobs, pushed, 
-                            badJump, jumped, stack, me, todo, snap, earliest, 
-                            abort, target >>
-
-A4b(self) == /\ pc[self] = "A4b"
-             /\ todo' = [todo EXCEPT ![self] = Shards]
-             /\ pc' = [pc EXCEPT ![self] = "A5"]
-             /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                             parks, timerAt, due, advancing, jobs, pushed, 
-                             badJump, jumped, stack, me, snap, earliest, abort, 
-                             idleMid, target >>
-
-A5(self) == /\ pc[self] = "A5"
-            /\ IF Mutation = "no_recheck"
-                  THEN /\ pc' = [pc EXCEPT ![self] = "A6"]
-                  ELSE /\ pc' = [pc EXCEPT ![self] = "A5b"]
-            /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                            parks, timerAt, due, advancing, jobs, pushed, 
-                            badJump, jumped, stack, me, todo, snap, earliest, 
-                            abort, idleMid, target >>
-
-A5b(self) == /\ pc[self] = "A5b"
-             /\ IF todo[self] # {}
-                   THEN /\ \E t \in todo[self]:
-                             /\ abort' = [abort EXCEPT ![self] = abort[self] \/ ~Idle(t) \/ parks[t] # snap[self][t]]
-                             /\ todo' = [todo EXCEPT ![self] = todo[self] \ {t}]
-                        /\ pc' = [pc EXCEPT ![self] = "A5b"]
-                   ELSE /\ pc' = [pc EXCEPT ![self] = "A5c"]
-                        /\ UNCHANGED << todo, abort >>
-             /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                             parks, timerAt, due, advancing, jobs, pushed, 
-                             badJump, jumped, stack, me, snap, earliest, 
-                             idleMid, target >>
-
-A5c(self) == /\ pc[self] = "A5c"
-             /\ IF abort[self] \/ (jobs # 0 /\ Mutation # "no_job_check")
-                   THEN /\ pc' = [pc EXCEPT ![self] = "A9"]
-                   ELSE /\ pc' = [pc EXCEPT ![self] = "A6"]
-             /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                             parks, timerAt, due, advancing, jobs, pushed, 
-                             badJump, jumped, stack, me, todo, snap, earliest, 
-                             abort, idleMid, target >>
-
-A6(self) == /\ pc[self] = "A6"
-            /\ badJump' = (badJump \/ jobs # 0 \/ ~idleMid[self])
-            /\ jumped' = (jumped \/ earliest[self] > clock)
-            /\ clock' = Max2(clock, earliest[self])
-            /\ todo' = [todo EXCEPT ![self] = {t \in Shards : timerAt[t] <= earliest[self] /\ t # me[self]}]
-            /\ pc' = [pc EXCEPT ![self] = "A7"]
-            /\ UNCHANGED << deadline, armed, parked, notified, inbox, parks, 
-                            timerAt, due, advancing, jobs, pushed, stack, me, 
-                            snap, earliest, abort, idleMid, target >>
-
-A7(self) == /\ pc[self] = "A7"
-            /\ IF todo[self] # {}
-                  THEN /\ \E t \in todo[self]:
-                            /\ IF parked[t]
-                                  THEN /\ /\ notified' = [notified EXCEPT ![t] = TRUE]
-                                          /\ parked' = [parked EXCEPT ![t] = FALSE]
-                                  ELSE /\ TRUE
-                                       /\ UNCHANGED << parked, notified >>
-                            /\ todo' = [todo EXCEPT ![self] = todo[self] \ {t}]
-                       /\ pc' = [pc EXCEPT ![self] = "A7"]
-                  ELSE /\ pc' = [pc EXCEPT ![self] = "A8"]
-                       /\ UNCHANGED << parked, notified, todo >>
-            /\ UNCHANGED << clock, deadline, armed, inbox, parks, timerAt, due, 
-                            advancing, jobs, pushed, badJump, jumped, stack, 
-                            me, snap, earliest, abort, idleMid, target >>
-
-A8(self) == /\ pc[self] = "A8"
-            /\ IF me[self] # NoShard
-                  THEN /\ due' = [due EXCEPT ![me[self]] = timerAt[me[self]] <= earliest[self]]
-                  ELSE /\ TRUE
-                       /\ due' = due
-            /\ pc' = [pc EXCEPT ![self] = "A9"]
-            /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                            parks, timerAt, advancing, jobs, pushed, badJump, 
-                            jumped, stack, me, todo, snap, earliest, abort, 
-                            idleMid, target >>
-
-A9(self) == /\ pc[self] = "A9"
-            /\ advancing' = FALSE
-            /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
-            /\ todo' = [todo EXCEPT ![self] = Head(stack[self]).todo]
-            /\ snap' = [snap EXCEPT ![self] = Head(stack[self]).snap]
-            /\ earliest' = [earliest EXCEPT ![self] = Head(stack[self]).earliest]
-            /\ abort' = [abort EXCEPT ![self] = Head(stack[self]).abort]
-            /\ idleMid' = [idleMid EXCEPT ![self] = Head(stack[self]).idleMid]
-            /\ me' = [me EXCEPT ![self] = Head(stack[self]).me]
-            /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
-            /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                            parks, timerAt, due, jobs, pushed, badJump, jumped, 
-                            target >>
-
-Attempt(self) == A1(self) \/ A2(self) \/ A3(self) \/ A4(self) \/ A4b(self)
-                    \/ A5(self) \/ A5b(self) \/ A5c(self) \/ A6(self)
-                    \/ A7(self) \/ A8(self) \/ A9(self)
-
-S_run(self) == /\ pc[self] = "S_run"
-               /\ IF inbox[self] > 0
-                     THEN /\ inbox' = [inbox EXCEPT ![self] = inbox[self] - 1]
-                          /\ pc' = [pc EXCEPT ![self] = "S_arm"]
-                          /\ UNCHANGED deadline
-                     ELSE /\ IF deadline[self] <= clock
-                                THEN /\ deadline' = [deadline EXCEPT ![self] = Inf]
-                                     /\ pc' = [pc EXCEPT ![self] = "S_arm"]
-                                ELSE /\ pc' = [pc EXCEPT ![self] = "S_publish"]
-                                     /\ UNCHANGED deadline
-                          /\ inbox' = inbox
-               /\ UNCHANGED << clock, armed, parked, notified, parks, timerAt, 
-                               due, advancing, jobs, pushed, badJump, jumped, 
-                               stack, me, todo, snap, earliest, abort, idleMid, 
-                               target >>
-
-S_publish(self) == /\ pc[self] = "S_publish"
-                   /\ IF Mutation # "publish_late"
-                         THEN /\ timerAt' = [timerAt EXCEPT ![self] = deadline[self]]
-                         ELSE /\ TRUE
-                              /\ UNCHANGED timerAt
-                   /\ parks' = [parks EXCEPT ![self] = parks[self] + 1]
-                   /\ pc' = [pc EXCEPT ![self] = "S_park"]
-                   /\ UNCHANGED << clock, deadline, armed, parked, notified, 
-                                   inbox, due, advancing, jobs, pushed, 
-                                   badJump, jumped, stack, me, todo, snap, 
-                                   earliest, abort, idleMid, target >>
-
-S_park(self) == /\ pc[self] = "S_park"
-                /\ parked' = [parked EXCEPT ![self] = TRUE]
-                /\ pc' = [pc EXCEPT ![self] = "S_recheck"]
-                /\ UNCHANGED << clock, deadline, armed, notified, inbox, parks, 
-                                timerAt, due, advancing, jobs, pushed, badJump, 
-                                jumped, stack, me, todo, snap, earliest, abort, 
-                                idleMid, target >>
-
-S_recheck(self) == /\ pc[self] = "S_recheck"
-                   /\ IF inbox[self] > 0
-                         THEN /\ parked' = [parked EXCEPT ![self] = FALSE]
-                              /\ IF Mutation = "busy_no_wait"
-                                    THEN /\ pc' = [pc EXCEPT ![self] = "S_run"]
-                                    ELSE /\ pc' = [pc EXCEPT ![self] = "S_wait"]
-                         ELSE /\ pc' = [pc EXCEPT ![self] = "S_late"]
-                              /\ UNCHANGED parked
-                   /\ UNCHANGED << clock, deadline, armed, notified, inbox, 
-                                   parks, timerAt, due, advancing, jobs, 
-                                   pushed, badJump, jumped, stack, me, todo, 
-                                   snap, earliest, abort, idleMid, target >>
-
-S_late(self) == /\ pc[self] = "S_late"
-                /\ IF Mutation = "publish_late"
-                      THEN /\ timerAt' = [timerAt EXCEPT ![self] = deadline[self]]
-                      ELSE /\ TRUE
-                           /\ UNCHANGED timerAt
-                /\ pc' = [pc EXCEPT ![self] = "S_try"]
-                /\ UNCHANGED << clock, deadline, armed, parked, notified, 
-                                inbox, parks, due, advancing, jobs, pushed, 
-                                badJump, jumped, stack, me, todo, snap, 
-                                earliest, abort, idleMid, target >>
-
-S_try(self) == /\ pc[self] = "S_try"
-               /\ IF deadline[self] <= clock
-                     THEN /\ due' = [due EXCEPT ![self] = TRUE]
-                          /\ pc' = [pc EXCEPT ![self] = "S_sleep"]
-                          /\ UNCHANGED << stack, me, todo, snap, earliest, 
-                                          abort, idleMid >>
-                     ELSE /\ IF Mutation # "no_attempt"
-                                THEN /\ due' = [due EXCEPT ![self] = FALSE]
-                                     /\ /\ me' = [me EXCEPT ![self] = self]
-                                        /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "Attempt",
-                                                                                 pc        |->  "S_sleep",
-                                                                                 todo      |->  todo[self],
-                                                                                 snap      |->  snap[self],
-                                                                                 earliest  |->  earliest[self],
-                                                                                 abort     |->  abort[self],
-                                                                                 idleMid   |->  idleMid[self],
-                                                                                 me        |->  me[self] ] >>
-                                                                             \o stack[self]]
-                                     /\ todo' = [todo EXCEPT ![self] = {}]
-                                     /\ snap' = [snap EXCEPT ![self] = [t \in Shards |-> 0]]
-                                     /\ earliest' = [earliest EXCEPT ![self] = Inf]
-                                     /\ abort' = [abort EXCEPT ![self] = FALSE]
-                                     /\ idleMid' = [idleMid EXCEPT ![self] = FALSE]
-                                     /\ pc' = [pc EXCEPT ![self] = "A1"]
-                                ELSE /\ due' = [due EXCEPT ![self] = FALSE]
-                                     /\ pc' = [pc EXCEPT ![self] = "S_sleep"]
-                                     /\ UNCHANGED << stack, me, todo, snap, 
-                                                     earliest, abort, idleMid >>
-               /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, 
-                               parks, timerAt, advancing, jobs, pushed, 
-                               badJump, jumped, target >>
-
-S_sleep(self) == /\ pc[self] = "S_sleep"
-                 /\ IF ~due[self]
-                       THEN /\ notified[self]
-                       ELSE /\ TRUE
-                 /\ notified' = [notified EXCEPT ![self] = FALSE]
-                 /\ pc' = [pc EXCEPT ![self] = "S_end"]
-                 /\ UNCHANGED << clock, deadline, armed, parked, inbox, parks, 
-                                 timerAt, due, advancing, jobs, pushed, 
-                                 badJump, jumped, stack, me, todo, snap, 
-                                 earliest, abort, idleMid, target >>
-
-S_end(self) == /\ pc[self] = "S_end"
-               /\ parked' = [parked EXCEPT ![self] = FALSE]
-               /\ pc' = [pc EXCEPT ![self] = "S_wait"]
-               /\ UNCHANGED << clock, deadline, armed, notified, inbox, parks, 
-                               timerAt, due, advancing, jobs, pushed, badJump, 
-                               jumped, stack, me, todo, snap, earliest, abort, 
-                               idleMid, target >>
-
-S_wait(self) == /\ pc[self] = "S_wait"
-                /\ IF Mutation # "no_wait_advance"
-                      THEN /\ ~advancing
-                      ELSE /\ TRUE
-                /\ pc' = [pc EXCEPT ![self] = "S_run"]
-                /\ UNCHANGED << clock, deadline, armed, parked, notified, 
-                                inbox, parks, timerAt, due, advancing, jobs, 
-                                pushed, badJump, jumped, stack, me, todo, snap, 
-                                earliest, abort, idleMid, target >>
-
-S_arm(self) == /\ pc[self] = "S_arm"
-               /\ \/ /\ TRUE
-                     /\ UNCHANGED <<deadline, armed>>
-                  \/ /\ armed[self] < Timers /\ deadline[self] = Inf
-                     /\ \E d \in Delays:
-                          /\ armed' = [armed EXCEPT ![self] = armed[self] + 1]
-                          /\ deadline' = [deadline EXCEPT ![self] = clock + d]
-               /\ pc' = [pc EXCEPT ![self] = "S_run"]
-               /\ UNCHANGED << clock, parked, notified, inbox, parks, timerAt, 
-                               due, advancing, jobs, pushed, badJump, jumped, 
-                               stack, me, todo, snap, earliest, abort, idleMid, 
-                               target >>
-
-Shard(self) == S_run(self) \/ S_publish(self) \/ S_park(self)
-                  \/ S_recheck(self) \/ S_late(self) \/ S_try(self)
-                  \/ S_sleep(self) \/ S_end(self) \/ S_wait(self)
-                  \/ S_arm(self)
-
-P1 == /\ pc[-1] = "P1"
-      /\ IF pushed < Pushes
-            THEN /\ \E t \in Shards:
-                      /\ inbox' = [inbox EXCEPT ![t] = inbox[t] + 1]
-                      /\ pushed' = pushed + 1
-                      /\ target' = t
-                 /\ pc' = [pc EXCEPT ![-1] = "P2"]
-            ELSE /\ pc' = [pc EXCEPT ![-1] = "Done"]
-                 /\ UNCHANGED << inbox, pushed, target >>
-      /\ UNCHANGED << clock, deadline, armed, parked, notified, parks, timerAt, 
-                      due, advancing, jobs, badJump, jumped, stack, me, todo, 
-                      snap, earliest, abort, idleMid >>
-
-P2 == /\ pc[-1] = "P2"
-      /\ IF parked[target]
-            THEN /\ /\ notified' = [notified EXCEPT ![target] = TRUE]
-                    /\ parked' = [parked EXCEPT ![target] = FALSE]
-            ELSE /\ TRUE
-                 /\ UNCHANGED << parked, notified >>
-      /\ pc' = [pc EXCEPT ![-1] = "P1"]
-      /\ UNCHANGED << clock, deadline, armed, inbox, parks, timerAt, due, 
-                      advancing, jobs, pushed, badJump, jumped, stack, me, 
-                      todo, snap, earliest, abort, idleMid, target >>
-
-Pusher == P1 \/ P2
-
-J1 == /\ pc[-2] = "J1"
-      /\ IF ~Job
-            THEN /\ pc' = [pc EXCEPT ![-2] = "Done"]
-            ELSE /\ pc' = [pc EXCEPT ![-2] = "J1b"]
-      /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, parks, 
-                      timerAt, due, advancing, jobs, pushed, badJump, jumped, 
-                      stack, me, todo, snap, earliest, abort, idleMid, target >>
-
-J1b == /\ pc[-2] = "J1b"
-       /\ inbox' = [inbox EXCEPT ![1] = inbox[1] + 1]
-       /\ pc' = [pc EXCEPT ![-2] = "J2"]
-       /\ UNCHANGED << clock, deadline, armed, parked, notified, parks, 
-                       timerAt, due, advancing, jobs, pushed, badJump, jumped, 
-                       stack, me, todo, snap, earliest, abort, idleMid, target >>
-
-J2 == /\ pc[-2] = "J2"
-      /\ IF parked[1]
-            THEN /\ /\ notified' = [notified EXCEPT ![1] = TRUE]
-                    /\ parked' = [parked EXCEPT ![1] = FALSE]
-            ELSE /\ TRUE
-                 /\ UNCHANGED << parked, notified >>
-      /\ pc' = [pc EXCEPT ![-2] = "J3"]
-      /\ UNCHANGED << clock, deadline, armed, inbox, parks, timerAt, due, 
-                      advancing, jobs, pushed, badJump, jumped, stack, me, 
-                      todo, snap, earliest, abort, idleMid, target >>
-
-J3 == /\ pc[-2] = "J3"
-      /\ jobs' = 0
-      /\ pc' = [pc EXCEPT ![-2] = "J4"]
-      /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, parks, 
-                      timerAt, due, advancing, pushed, badJump, jumped, stack, 
-                      me, todo, snap, earliest, abort, idleMid, target >>
-
-J4 == /\ pc[-2] = "J4"
-      /\ /\ me' = [me EXCEPT ![-2] = NoShard]
-         /\ stack' = [stack EXCEPT ![-2] = << [ procedure |->  "Attempt",
-                                                pc        |->  "Done",
-                                                todo      |->  todo[-2],
-                                                snap      |->  snap[-2],
-                                                earliest  |->  earliest[-2],
-                                                abort     |->  abort[-2],
-                                                idleMid   |->  idleMid[-2],
-                                                me        |->  me[-2] ] >>
-                                            \o stack[-2]]
-      /\ todo' = [todo EXCEPT ![-2] = {}]
-      /\ snap' = [snap EXCEPT ![-2] = [t \in Shards |-> 0]]
-      /\ earliest' = [earliest EXCEPT ![-2] = Inf]
-      /\ abort' = [abort EXCEPT ![-2] = FALSE]
-      /\ idleMid' = [idleMid EXCEPT ![-2] = FALSE]
-      /\ pc' = [pc EXCEPT ![-2] = "A1"]
-      /\ UNCHANGED << clock, deadline, armed, parked, notified, inbox, parks, 
-                      timerAt, due, advancing, jobs, pushed, badJump, jumped, 
-                      target >>
-
-BlockingJob == J1 \/ J1b \/ J2 \/ J3 \/ J4
-
-(* Allow infinite stuttering to prevent deadlock on termination. *)
-Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
-               /\ UNCHANGED vars
-
-Next == Pusher \/ BlockingJob
-           \/ (\E self \in ProcSet: Attempt(self))
-           \/ (\E self \in Shards: Shard(self))
-           \/ Terminating
-
-Spec == /\ Init /\ [][Next]_vars
-        /\ \A self \in Shards : WF_vars(Shard(self)) /\ WF_vars(Attempt(self))
-        /\ WF_vars(Pusher)
-        /\ WF_vars(BlockingJob) /\ WF_vars(Attempt(-2))
-
-Termination == <>(\A self \in ProcSet: pc[self] = "Done")
-
 \* END TRANSLATION
+
 \* Every armed timer eventually fires: a runtime whose shards all sleep with a timer armed and
 \* nothing to wake them hangs, and breaks this. (A quiet runtime, every shard asleep with no timer,
 \* is a final state: the configurations do not check deadlock.)

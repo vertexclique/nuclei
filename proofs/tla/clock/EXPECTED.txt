@@ -1,5 +1,6 @@
 # configuration                spec                 expected
 C_safe                         MC_Clock             pass
+C_safe_other                   MC_Clock             pass
 C_safe_live                    MC_Clock             pass
 C_three                        MC_Clock             pass
 C_pair                         MC_Clock             pass
@@ -11,3 +12,12 @@ M_no_job_check                 MC_Clock             violated:NoBadJump
 M_no_attempt                   MC_Clock             violated:TimersFire
 W_jump                         MC_Clock             violated:NoJumpW
 C_rearm                        MC_Clock             pass
+C_post_wakes                   MC_Clock             pass
+M_post_no_wake                 MC_Clock             violated:TimersFire
+M_uncounted_shard              MC_Clock             violated:TimersFire
+M_detached_uncounted           MC_Clock             violated:NoBadJump
+C_read                         MC_ClockRead         pass
+M_check_then_read              MC_ClockRead         violated:ReaderMonotonic
+M_pause_reads_first            MC_ClockRead         violated:ReaderMonotonic
+W_one_wheel                    MC_OneWheel          violated:NeverEarly
+W_foreign_arm                  MC_ForeignArm        violated:ForeignNeverPassed
