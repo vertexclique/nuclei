@@ -60,8 +60,7 @@
   waiter of its listener, which takes each connection's wake even once cancelled, so it cannot be
   armed again from the new runner.
 - **A call whose heavy fence fails no longer waits for good on a side whose claimant cannot serve
-  it** (Linux, Windows: where a process has a heavy fence, under memory pressure that makes it
-  fail). Such a call leaves its work in a biased side and nudges the shard that claimed the side,
+  it** (Linux, whose heavy fence, `membarrier`, can fail under memory pressure). Such a call leaves its work in a biased side and nudges the shard that claimed the side,
   which does it at its next take. The claim stayed with the first shard that claimed it, so once a
   source left that shard (a thread's own shard whose `block_on` returned, a worker that went), the
   nudge reached a shard that ran nothing, and once the source was homed on another shard the
