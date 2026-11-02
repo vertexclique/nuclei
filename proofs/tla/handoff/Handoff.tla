@@ -180,12 +180,13 @@ define
     \* the heavy fence the runner needs none. `leaf` says whether the look is the leaf push's
     \* (`Slot::mark_unless_claimed`), whose fence the mutation `no_leaf_fence` removes;
     \* `no_runner_fence` removes the other one (`Slot::enter`, behind a poll's end and a call's
-    \* mark).
+    \* mark). Written as a chain of IFs, so TLC weighs it once: a disjunction in a step's guard
+    \* makes it one successor for each disjunct that holds, all of them the same state.
     MayLook(a, leaf) ==
-        \/ Fence # "full"
-        \/ (leaf /\ Mode = "no_leaf_fence")
-        \/ (~leaf /\ Mode = "no_runner_fence")
-        \/ buf[a] = <<>>
+        IF Fence # "full" THEN TRUE
+        ELSE IF leaf /\ Mode = "no_leaf_fence" THEN TRUE
+        ELSE IF ~leaf /\ Mode = "no_runner_fence" THEN TRUE
+        ELSE buf[a] = <<>>
 end define;
 
 \* The memory: a buffer's oldest store reaches memory, at any time.
