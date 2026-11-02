@@ -407,6 +407,12 @@ unsafe extern "system" {
         lpName: *const u16,
     ) -> HANDLE;
     pub(crate) fn SetEvent(hEvent: HANDLE) -> BOOL;
+    pub(crate) fn GetOverlappedResult(
+        hFile: HANDLE,
+        lpOverlapped: *mut OVERLAPPED,
+        lpNumberOfBytesTransferred: *mut DWORD,
+        bWait: BOOL,
+    ) -> BOOL;
     pub(crate) fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> BOOL;
     pub(crate) fn CreateIoCompletionPort(
         FileHandle: HANDLE,
