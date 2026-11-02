@@ -36,6 +36,22 @@
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
 
+- **A Windows connect binds a port other destinations may share, as std's connect does.** A
+  connect binds its socket to port 0 before `ConnectEx`, and an explicit bind gets a port no other
+  connection holds at all, where the bind a connect makes itself (std's) shares a port with
+  connections to other destinations. A client that made many short connections ran out of ports
+  while they waited out TIME_WAIT, and its connect failed with `WSAEADDRINUSE` (the soak, after
+  552 seconds). The bind now sets `SO_REUSE_UNICASTPORT` first; a system without the option binds
+  as before (`proofs/tla/connect/ConnectPort.tla`).
+- **A datagram an owned receive given up had cut is dropped, not handed on.** A `recv_from_owned`
+  whose future was dropped after the driver received a datagram into its buffer hands the datagram
+  to the next receive; one longer than that buffer was cut to it, and the next receive took its
+  first bytes for the whole datagram. The kernel says whether it cut one (`MSG_TRUNC` on unix,
+  `STATUS_BUFFER_OVERFLOW` on Windows): a cut one is now dropped and counted in
+  `ErrorCounts::cut_datagrams_dropped`, and one that came whole, filling the buffer exactly or not,
+  goes on as before (`proofs/tla/lent/LentOrphan.tla`). On epoll and kqueue the driver's receive
+  into a lent buffer is a `recvmsg`, to read that flag.
+
 ### Changed
 
 - **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix
