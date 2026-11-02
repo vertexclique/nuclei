@@ -1,24 +1,30 @@
 ------------------------------ MODULE AbortAcks ------------------------------
 (***************************************************************************)
-(* A TCP stream a task set to zero linger and dropped with bytes still in  *)
-(* its write-behind (src/io/handle.rs: the handle's drop and `linger`;     *)
-(* src/io/sys: `unacked`, the kernel's count of the bytes it holds that    *)
-(* the peer has not acknowledged).                                         *)
+(* A TCP stream a task set to zero linger and dropped, with bytes still  *)
+(* in its write-behind, or with none behind but bytes the kernel holds    *)
+(* unacknowledged (src/io/handle.rs: the handle's drop and `linger`;      *)
+(* src/io/source.rs: `Source::waits_for_acks`; src/io/sys: `unacked`, the *)
+(* kernel's count of the bytes it holds that the peer has not             *)
+(* acknowledged).                                                          *)
 (*                                                                          *)
-(* Who acts. A linger task drains the write-behind into the kernel's send  *)
-(* queue. The writer's kernel sends what it holds onto the wire, one byte  *)
-(* a segment, in order. The reader's kernel takes each segment and         *)
-(* acknowledges it. Then the linger task closes the socket with no linger: *)
-(* the kernel drops what it has not sent and sends a reset. On a loopback  *)
-(* the reset may overtake the data still on the wire (macOS's does): the   *)
+(* Who acts. The handle drops: with bytes behind, or bytes in the kernel   *)
+(* not acknowledged yet, a linger task takes the socket over; with neither *)
+(* it closes at once. The linger task drains the write-behind into the     *)
+(* kernel's send queue. The writer's kernel sends what it holds onto the   *)
+(* wire, one byte a segment, in order. The reader's kernel takes each      *)
+(* segment and acknowledges it. Then the socket closes with no linger: the *)
+(* kernel drops what it has not sent and sends a reset. On a loopback the  *)
+(* reset may overtake the data still on the wire (macOS's does): the       *)
 (* reader then takes the reset for a stale one, answers with a challenge   *)
 (* ACK, and the writer's closed port answers nothing (the runner drops     *)
 (* resets for closed ports), so the reset is lost and the reader waits for *)
 (* good. A clock may end the linger's time at any moment.                  *)
 (*                                                                          *)
-(* The fix. After the drain the linger waits until the kernel holds no     *)
-(* byte the peer has not acknowledged, or the linger's time ran out, and   *)
-(* only then closes: nothing is on the wire for the reset to overtake.     *)
+(* The fix. A handle dropped with nothing behind but bytes the kernel      *)
+(* holds unacknowledged goes to the linger task too. After the drain the   *)
+(* linger waits until the kernel holds no byte the peer has not            *)
+(* acknowledged, or the linger's time ran out, and only then closes:       *)
+(* nothing is on the wire for the reset to overtake.                       *)
 (*                                                                          *)
 (* What must never happen. The reader neither takes the reset nor saw the  *)
 (* linger's time run out: a stream left open for good. And a reset that    *)
@@ -32,13 +38,15 @@ EXTENDS Integers, Sequences, TLC                                            \* n
 
 CONSTANTS                                                                   \* what each configuration sets:
     Bytes,      \* bytes in the write-behind as the handle drops
+    Kernel,     \* bytes the task's writes handed the kernel before the drop, not sent yet (at most Room)
     Room,       \* bytes the writer kernel's send queue holds, sent or not
-    Mutation    \* "none", or "close_at_drain": the close comes as the drain ends, as before the fix
+    Mutation    \* "none"; "close_at_drain": the close comes as the drain ends, as before the fix;
+                \* "close_at_once": a drop with nothing behind closes at once, as before this change
 
 (* --algorithm AbortAcks                                                      \* the algorithm, in PlusCal
 variables                                                                   \* the shared state:
     behind = Bytes,       \* bytes still in the write-behind
-    queued = 0,           \* bytes in the writer kernel's queue, not sent yet
+    queued = Kernel,      \* bytes in the writer kernel's queue, not sent yet
     unacked = 0,          \* bytes sent and not acknowledged yet
     sent = 0,             \* bytes the writer's kernel sent
     wire = <<>>,          \* the data segments in flight to the reader, in order
@@ -49,9 +57,14 @@ variables                                                                   \* t
     lost = FALSE,         \* the reader dropped the reset, which overtook data
     expired = FALSE;      \* the linger's time ran out
 
-\* The linger task: drains the write-behind, waits for the acknowledgements, and closes.
+\* The handle's drop, then the linger task: drains the write-behind, waits for the acknowledgements, and closes.
 fair process linger = "linger"                                              \* weakly fair, like the other actors
 begin                                                                       \* the linger's steps:
+L_drop:                                                                     \* the handle drops, the kernel's count read once
+    \* MUTATION close_at_once: a drop with nothing behind closes at once, whatever the kernel still holds.
+    if behind = 0 /\ (Mutation = "close_at_once" \/ queued + unacked = 0) then \* nothing behind, and nothing unacknowledged:
+        goto L_close;                                                       \* the socket closes at once, no task takes it
+    end if;                                                                 \* else the linger task takes the socket over
 L_drain:                                                                    \* the drain
     while behind > 0 /\ ~expired do                                         \* while bytes are behind and time is left
         await queued + unacked < Room \/ expired;                           \* room in the kernel, or the time ran out
@@ -131,7 +144,7 @@ end algorithm; *)                                                           \* e
 ResetOrDeadline == <>(reset \/ expired)                                     \* sometime, one or the other
 
 \* A reset that came with time left comes after every byte the task wrote.
-WholeBeforeReset == (reset /\ ~expired) => got = Bytes                      \* every byte, then the reset
+WholeBeforeReset == (reset /\ ~expired) => got = Bytes + Kernel             \* every byte, then the reset
 
 (***************************************************************************)
 (* Witnesses: each claims an interesting case never happens and must be     *)

@@ -20,3 +20,5 @@ W_port_filled     ShutRead  violated:AsStd
 A_wait            AbortAcks pass
 M_close_at_drain  AbortAcks violated:ResetOrDeadline
 W_deadline_loss   AbortAcks violated:NoDeadlineLoss
+A_wait_on_wire    AbortAcks pass
+M_close_at_once   AbortAcks violated:ResetOrDeadline
