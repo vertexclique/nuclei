@@ -47,6 +47,16 @@
 
 ### Changed
 
+- **Every sync primitive and timer path has a model.** The waker cell, the single-shard
+  channel and one-shot channel, `SetOnce`, the broadcast channel's waits, a blocking wait's park
+  loop, the wake list, the timer wheel, intervals, timeouts and the clock's read path now have
+  TLA+ models, and the unbounded channel's model covers its senders, weak upgrade, pop and
+  receives. Notify's model passes in the code's order with two notifiers, the waiter model's
+  cancel no longer takes back an owed mark the code keeps, and each guard the audit found
+  without one (in the bounded channel, the semaphore, the reader-writer lock, Notify, the
+  one-shot channel, the remote timer and the paused clock) has a configuration that removes it
+  and must fail. The owner-named lock, which nothing used, is gone (`proofs/README.md`, "More
+  sync and time models").
 - **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix
   stream read into the task's own buffer, under 16 KiB, on a socket whose kernel counts what a
   read leaves, reads straight from the socket as on epoll, with the count and its floor; a read
