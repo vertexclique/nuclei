@@ -431,13 +431,16 @@ pub(crate) fn listen_raw(signum: c_int) -> io::Result<()> {
 /// Makes sure a pump serves listeners polled here: one on the shard this
 /// thread runs, or the one on a runtime worker.
 pub(crate) fn ensure_pump() {
-    let place = crate::rt::context::current(|shard| {
-        shard.map(|shard| Place::Shard(Arc::clone(&shard.shared)))
-    })
-    .unwrap_or(Place::Service);
-    if place.flag().swap(true, Ordering::SeqCst) {
+    // Only the poll that raises the flag takes the place along: the others
+    // look at the flag in place, as a listener's every wait does.
+    let place = crate::rt::context::current(|shard| match shard {
+        Some(shard) => (!shard.shared.signal_pump.swap(true, Ordering::SeqCst))
+            .then(|| Place::Shard(Arc::clone(&shard.shared))),
+        None => (!SERVICE_PUMP.swap(true, Ordering::SeqCst)).then_some(Place::Service),
+    });
+    let Some(place) = place else {
         return;
-    }
+    };
     let made = wake().and_then(|wake| {
         // SAFETY: the wake descriptor is never closed, so the borrow is
         // good for the process.
