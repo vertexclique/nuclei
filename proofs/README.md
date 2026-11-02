@@ -668,7 +668,8 @@ The claimant may never take the side again. Its shard may let go of the source f
 claim up after its last hold, with a locked instruction, and looks once more for work a fenceless
 call left before that, which it does through the word (`Side::give_up`, called from
 `Source::give_up_claims` as `src/rt/shard/going.rs` lets go of the sources). A fenceless call that
-finds the claim given up takes the side itself; one that left its work looks at the claim again
+finds the claim given up takes the side itself; one that left its work looks at the claim, and at
+the mode (the claimant may have switched the side as it let go, and looked for work then), again
 after a full fence of its own (`Side::claim_given_up`), so one of the two looks sees the other's
 store. Or the source may be homed elsewhere while the claimant's thread still runs it (`Rehomed`):
 its own calls are then foreign ones, and when its fence fails it reads its own `own`, which needs
@@ -696,7 +697,7 @@ never reaches the owner each end in a deadlock, a lost wake; a release that find
 not take the side again breaks `NoLostWork`; an owner that never switches on UNFENCED leaves the
 poll failing its fence for ever, breaking `Termination`; a claim kept as its shard lets go of the
 source, a give-up with no look for work left before it, and a fenceless poll that does not look at
-the claim again after it left its work each end in a deadlock; a claimant's own fenceless call,
+the claim and the mode again after it left its work each end in a deadlock; a claimant's own fenceless call,
 the source homed elsewhere, that leaves its work to itself nudges itself for good, breaking
 `Termination`), and 9 witnesses (a foreign call that
 leaves its work to the owner, a switch to shared mode, a handoff, the owner's release taking the
