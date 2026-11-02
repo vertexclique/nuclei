@@ -2104,7 +2104,8 @@ flushed at once), reads the word again and takes with the opposite compare-and-s
 the shard to a spare with a fresh slot. 20 configurations: 4 that must pass (two handoffs, a
 remote push and a bound task: at most one thread inside the shard, `Exclusive`, a detached thread
 staying out, a bound task on its creator only; a first poll that makes a call and then never
-returns, every remote push run anyway, `Rescued`; both again with the call a leaf push); 11
+returns, every remote push run anyway, `Rescued`; both again, with one handoff and one poll, with
+the call a leaf push); 11
 mutations, each of which must break a property (no heavy fence, no second read of the word, no
 look at the claim at a poll's end or in a call into the runtime, a call that looks at its claim
 with no mark first, a leaf push that goes in with no look at its claim, the old runner's slot
