@@ -19,13 +19,14 @@ async fn tcp_pair() -> (Handle<TcpStream>, Handle<TcpStream>) {
 }
 
 /// Gives `s` a send buffer of 4 MiB, and with `receive` a receive buffer too, on macOS, whose
-/// TCP buffers stay at 128 KiB while nothing is read: a write that must fit before the peer
-/// reads needs the room Linux's buffers grow to. Elsewhere the system's own sizing stays (a
-/// size set on Linux caps the buffer and stops it growing).
-#[cfg(target_vendor = "apple")]
+/// TCP buffers stay at 128 KiB while nothing is read, and on FreeBSD, whose hold 160 KiB of a
+/// connection nobody reads: a write that must fit before the peer reads needs the room Linux's
+/// buffers grow to. Elsewhere the system's own sizing stays (a size set on Linux caps the
+/// buffer and stops it growing).
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
 fn roomy(s: &Handle<TcpStream>, receive: bool) {
     use std::os::fd::AsRawFd;
-    let size: libc::c_int = 4 << 20;
+    let size: libc::c_int = (4 << 20).min(largest_buffer());
     let options = if receive {
         &[libc::SO_SNDBUF, libc::SO_RCVBUF][..]
     } else {
@@ -46,7 +47,34 @@ fn roomy(s: &Handle<TcpStream>, receive: bool) {
     }
 }
 
-#[cfg(not(target_vendor = "apple"))]
+/// The largest socket buffer the system takes.
+#[cfg(target_vendor = "apple")]
+fn largest_buffer() -> libc::c_int {
+    libc::c_int::MAX
+}
+
+/// FreeBSD takes none past `kern.ipc.maxsockbuf` less what it keeps for the
+/// headers of the mbufs it holds (`BUF_MAX_ADJ` in sys/kern/uipc_sockbuf.c,
+/// with an `MSIZE` of 256 and an `MCLBYTES` of 2048): 2 MiB by default.
+#[cfg(target_os = "freebsd")]
+fn largest_buffer() -> libc::c_int {
+    let mut max: libc::c_ulong = 0;
+    let mut len = size_of::<libc::c_ulong>();
+    // SAFETY: the kernel writes the limit, an unsigned long, into our own.
+    let got = unsafe {
+        libc::sysctlbyname(
+            c"kern.ipc.maxsockbuf".as_ptr(),
+            (&raw mut max).cast(),
+            &mut len,
+            core::ptr::null(),
+            0,
+        )
+    };
+    assert_eq!(got, 0, "{}", io::Error::last_os_error());
+    libc::c_int::try_from(max * 2048 / (256 + 2048)).unwrap_or(libc::c_int::MAX)
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "freebsd")))]
 fn roomy(_: &Handle<TcpStream>, _: bool) {}
 
 /// Reads `len` bytes into one buffer, with owned reads.
