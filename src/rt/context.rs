@@ -380,10 +380,27 @@ fn detach_here() {
 pub(crate) fn unmark_call() {
     let here = local();
     let slot = here.slot.get();
+    debug_assert!(here.out.get().is_null(), "a call ended that no mark began");
+    debug_assert!(
+        !slot.is_null(),
+        "a marked call polled: its thread lost the shard in it"
+    );
     here.out.set(slot);
     // SAFETY: as in `Bracket::take`; the call ran no poll, so the thread still runs the shard
     // whose slot this is.
     unsafe { &*slot }.unmark(here.saved.get());
+}
+
+/// [`unmark_call`] for a marked step that unwinds, unless its settle ended the call already
+/// (a panic in a wake it ran after): the call is still marked while `out` is null on the slot
+/// the thread still runs.
+#[cold]
+#[inline(never)]
+pub(crate) fn unmark_unwound() {
+    let here = local();
+    if here.out.get().is_null() && !here.slot.get().is_null() {
+        unmark_call();
+    }
 }
 
 /// What [`current_held`] found: the shard, while it lives.

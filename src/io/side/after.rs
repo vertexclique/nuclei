@@ -320,6 +320,13 @@ impl Drop for After {
             self.held & UNMARK == 0 || std::thread::panicking(),
             "a marked step dropped unsettled"
         );
+        // A marked step unwinding (a panic in it, which the task's code may catch) ends its call
+        // first, as its settle does: else the poll's word says inside for the rest of the poll,
+        // which the monitor then never takes (proofs/tla/handoff, `M_marked_unwind`).
+        if self.held & UNMARK != 0 {
+            self.held &= !UNMARK;
+            crate::rt::context::unmark_unwound();
+        }
         if parking() {
             self.park();
         } else {

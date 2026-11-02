@@ -155,3 +155,43 @@ fn buffers_and_forgotten_wakers_go_with_no_wake() {
         "only the test's own wakers are left"
     );
 }
+
+/// A step marked into a watched shard (`After::enter`) that unwinds, a panic in it that the
+/// task's code catches (a waker's clone that panics), ends its call as its settle would: the
+/// poll's word is back, so the poll is still seen outside and taken if it blocks after, and the
+/// next step marks its call again (proofs/tla/handoff, `M_marked_unwind`).
+#[test]
+fn a_marked_step_that_unwinds_ends_its_call() {
+    use crate::rt::context::{self, Marked};
+    use crate::rt::handoff::slot::{self, Slot};
+    let shard = crate::rt::shard::Shard::new(crate::rt::shard::Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let slot = Slot::new(false);
+    let _entered = context::enter_watched(&shard, Some(&slot));
+    let (_, polled) = context::poll(&shard.shared, || {
+        let word = slot.word();
+        assert!(slot::is_outside(word), "the poll is outside its shard");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut after = After::default();
+            assert!(after.enter(), "the step found no shard");
+            assert!(
+                !slot::is_outside(slot.word()),
+                "the step's call is not marked"
+            );
+            std::panic::resume_unwind(Box::new("a waker's clone panicked in the step"));
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(slot.word(), word, "the unwound step left its call marked");
+        assert!(
+            matches!(context::mark_call(), Marked::In),
+            "the next step found its call still marked"
+        );
+        context::unmark_call();
+        assert_eq!(slot.word(), word);
+    });
+    assert_eq!(polled, context::Polled::In);
+}
