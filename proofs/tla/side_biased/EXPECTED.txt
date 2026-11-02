@@ -53,3 +53,9 @@ R_rehome_live                  MC_Retire            pass
 MR_rehome_early_submit         MC_Retire            violated:NoLostUpdate
 MR_rehome_no_fence             MC_Retire            violated:NoLostUpdate
 WR_rehome_waits                MC_Retire            violated:NoRehomeWait
+C_claims                       MC_Claim             pass
+MCL_claim_store                MC_Claim             violated:Exclusive
+MCL_owner_any                  MC_Claim             violated:Exclusive
+MCL_nested_as_owner            MC_Claim             violated:Exclusive
+MCL_home_unchecked             MC_Claim             violated:HomeClaims
+WCL_early_claim                MC_Claim             violated:NoEarlyClaim

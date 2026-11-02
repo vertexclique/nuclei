@@ -77,7 +77,9 @@ end define;
 fair process attacher = "attacher"
 begin
 A_attach:
-    if ~stopped /\ ~closed then
+    \* MUTATION attach_stopped: the attach does not look at whether the shard stopped.
+    \* MUTATION attach_closed: the attach does not look at whether the handle closed.
+    if (~stopped \/ Mutation = "attach_stopped") /\ (~closed \/ Mutation = "attach_closed") then
         reg := "registering";
         ops := TRUE;
         token := "t0";
@@ -136,6 +138,10 @@ P_perform:
     elsif "evict" \in reqs then
         \* `evict_now`: an attach under way is undone, a registration goes.
         if reg = "registering" /\ ops /\ Mutation # "no_abandon" then
+            reg := "unreg" || ops := FALSE || token := "none" || home := "none"
+                || evicted := TRUE;
+        \* MUTATION evict_keeps_slot: the evict of a registered source posts no detach, and its slot stays in the table.
+        elsif reg = "registered" /\ Mutation = "evict_keeps_slot" then
             reg := "unreg" || ops := FALSE || token := "none" || home := "none"
                 || evicted := TRUE;
         elsif reg = "registered" then

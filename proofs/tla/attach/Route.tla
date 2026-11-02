@@ -74,7 +74,8 @@ define                                                                       \* 
     \* What the route says once the registration is in place, for the reader: the ring's thread submits.
     Fresh == IF reg = "registered" THEN "elsewhere" ELSE "notyet"            \* the reader's route read now
     \* A kick is needed: a waiter with no operation out, and a route that reaches the ring.
-    Wants == waiter /\ submits = 0                                           \* the side wants an operation
+    \* MUTATION want_ignores_out: the side wants an operation though one went in for its waiter already.
+    Wants == waiter /\ (submits = 0 \/ Mutation = "want_ignores_out")       \* the side wants an operation
 end define;                                                                  \* end of the names
 
 \* The reader (`Source::with_io`, then `Side::poll` and the step).

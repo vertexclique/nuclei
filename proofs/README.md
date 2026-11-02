@@ -585,15 +585,20 @@ the waiting bit; if that showed the side free, it takes the side once more, else
 the holder wakes it. Letting go is one compare-and-swap from the word the holder took to zero;
 when flags came meanwhile it fails, and the holder takes them with one swap, still holding: the
 ready bit, it does the driver's part (and its own step again if it waited); the waiting bit, it
-takes the contended wakers, which it wakes once it has let go.
+takes the contended wakers, which it wakes once it has let go. Another thread may leave
+side-local work (`Side::defer`, a buffer that came back or a ring's completion): its bits go into
+the side's deferred word first, then the deferred bit with its fetch-or of busy, and a holder
+whose release fails on that bit does the work it finds in the word (`Held::run_deferred`).
 
-16 configurations: 3 that must pass (two and three bytes with `Conservation`, no byte lost or
-made up, and `Exclusive`, one holder at a time; and liveness under weak fairness), 7 mutations
+18 configurations: 4 that must pass (two and three bytes with `Conservation`, no byte lost or
+made up, and `Exclusive`, one holder at a time; liveness under weak fairness; and two bytes with
+work deferred once, with `DeferDone`, the work is done whoever holds the side), 8 mutations
 (a driver that drops an edge on a held side, one that flags in a step of its own after looking,
 a holder that lets go without serving the ready bit, an edge that leaves the cache blocked, a
 holder that wakes nobody for the waiting bit, and a contended reader that sleeps without looking
 whether the side came free each end in a deadlock; a take that refuses a free side carrying a
-flag breaks `Termination`), and 6 witnesses (a flag, a reader doing the driver's part, a read
+flag breaks `Termination`; a deferrer that raises its bit before its work is in the word breaks
+`DeferDone`), and 6 witnesses (a flag, a reader doing the driver's part, a read
 the driver completes on an edge, a reader's submit that runs the driver's read at once, a
 contended reader woken by the holder, and a contended reader that finds the side free and takes
 it). Bytes are a count and there is one reader: several tasks waiting on one side share its
@@ -695,10 +700,24 @@ after the foreign thread's heavy fence, so the two form a store-buffering pair, 
 read puts the fence on the owner's side, only on the release in flight when the first foreign
 thread arrives (every later owner take falls back to today's word).
 
-`Retire.tla`, in the same family, checks the planned plain operation count on a ring, before its
-code is written (today `Source::op_out` and `op_done` in `src/io/source/ops.rs` still change
-`ops_out` with sequentially consistent read-modify-writes, against the flag of `Source::retire`
-in `src/io/source/requests.rs`). A ring's submit stores the count plus one and hands the operation to
+`Claim.tla`, in the same family, checks who takes a biased side as its owner (`Side::role` and
+`Side::claim` in `src/io/side.rs`, `SourceHooks::owner` in `src/io/source/hooks.rs`), on memory
+that is sequentially consistent: the home shard's thread, another shard's and a thread that runs
+no shard poll the side while the registration homes the source. A thread's candidate is the shard
+it runs while the source is homed there or not homed yet; the first candidate's compare-and-swap
+from zero claims the side, and a claimant takes it biased only while it does not hold it
+already, so a call it makes under its own hold is foreign. 6 configurations: 1 that must pass
+(with `Exclusive`, one hold at a time, and `HomeClaims`, no shard but the home claims the side
+once the source is homed), 4 mutations (a claim made with a plain store, a role that leaves out
+the claim's compare, and a role that leaves out its look at `own`, each break `Exclusive`; an
+owner look that leaves out the home check breaks `HomeClaims`) and 1 witness (another shard
+claims the side before the source is homed, and keeps it).
+
+`Retire.tla`, in the same family, checks a design that keeps the operation count plain on a ring,
+which was not built: `Source::op_out` and `op_done` in `src/io/source/ops.rs` change `ops_out`
+with sequentially consistent read-modify-writes, against the flag of `Source::retire` in
+`src/io/source/requests.rs`, as `ring/RingOp.tla`'s retire checks, and the model stays as the
+check a plain count would have to pass. A ring's submit stores the count plus one and hands the operation to
 the kernel; its `op_done`, on the ring the operation went to, stores the count minus one and
 then, with a compiler fence only, reads the waiters' flags, and with the count at zero and a flag
 up takes that waiter's waker and wakes it. A plain count needs one writer at a time, so a
@@ -1561,7 +1580,10 @@ attach to another shard), 4 mutations (2 that leak the file into the table of a 
 `NoLeak`; a look and a taking by the token alone, which hand the source registered with the other
 shard a slot of this ring's table, `NoForeignSlot`; an attach with no lease, closed between the
 ring's look and its install, which puts a closed number's file into the table,
-`NoClosedInstall`), and 4 witnesses.
+`NoClosedInstall`; an `attach_now` that does not refuse a shard that stopped, which leaves the
+source registered with a shard that evicted it, `NoLeak`; one that does not refuse a handle that
+closed, `NoClosedInstall`; an evict of a registered source that posts no detach, whose slot stays
+in the table, `TableFollows`), and 4 witnesses.
 
 `tla/attach/Route.tla`, in the same family, checks a read of a ring source from a thread that
 runs no shard, or another shard, while the source's registration finishes (`Source::with_io` with `Source::via`
@@ -1581,10 +1603,11 @@ from it; the model reads it from a thread that runs no shard and from another ri
 thread. 9 configurations: 6 that must pass (the read during the registration and after it, from
 no shard and from another shard, each with `OneSubmit`, one submit for the waiter, and no
 deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`,
-the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the home), 2
+the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the home), 3
 mutations (no look after the step breaks `Served`; a fast check that drops its compare with the
-thread's own shard issues on the other shard's ring and breaks `OnlyHomeIssues`), and 1 witness
-(the late look asks for the submit).
+thread's own shard issues on the other shard's ring and breaks `OnlyHomeIssues`; a side that
+wants an operation though one went in for its waiter breaks `OneSubmit`), and 1 witness (the
+late look asks for the submit).
 
 ## A shard that goes
 
@@ -2152,12 +2175,20 @@ passes over a write edge only when the side was only ever held by its own thread
 shared, no foreign thread came) and that thread's last release said idle. A foreign writer makes
 the side shared with a plain store before its locked take of the word, so once it holds, the
 driver's look sees the side shared, even while its own not-idle store still waits in its buffer.
-5 configurations: 2 that must pass (a biased side and a side made shared, each with an edge for
-nobody first and a foreign write the socket may refuse, with `WriteGoes`, the write goes out in the
-end, and no deadlock), 2 mutations that must deadlock (a look at `write_idle` alone passes over
-the edge a refused write waits for while its writer still holds the side; a look that leaves out
-the side's mode passes over it on a side made shared, which has no `intent` to raise), and 1
-witness (the edge for nobody is passed over).
+The owner's own writes run on the driver's thread between its events: a write the socket takes
+leaves the side idle with no look, and one it refuses publishes that an edge is wanted. A side
+whose claim stayed with a thread that no longer runs the driver (its home moved) is never passed
+over, since `biased_to` compares the claim with the driver's own thread, which never reads that
+thread's stale idle. 10 configurations: 4 that must pass (a biased side and a side made shared, each with an edge for
+nobody first and a foreign write the socket may refuse; the owner's own write; a write by a claim
+left on another thread; each with `WriteGoes`, the write goes out in the end, and no deadlock), 5
+mutations that must deadlock (a look at `write_idle` alone passes over the edge a refused write
+waits for while its writer still holds the side; a look that leaves out the side's mode passes
+over it on a side made shared, which has no `intent` to raise; an owner's release that publishes
+idle though its write was refused, and one that takes the `published` shortcut after a refusal,
+pass over the edge its write waits for; a look that leaves out the claim's compare reads the
+stale idle of a claim left on another thread), and 1 witness (the edge for nobody is passed
+over).
 
 ## A stream write its owner sends on one bit
 

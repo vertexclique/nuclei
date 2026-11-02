@@ -21,3 +21,7 @@ MT_no_resubmit        MC_Route    violated:Served
 WT_late               MC_Route    violated:NoLateResubmit
 M_no_lease                     MC_Attach            violated:NoClosedInstall
 M_here_any            MC_Route    violated:OnlyHomeIssues
+M_attach_stopped               MC_Attach            violated:NoLeak
+M_attach_closed                MC_Attach            violated:NoClosedInstall
+M_evict_keeps_slot             MC_Attach            violated:TableFollows
+MT_want_ignores_out   MC_Route    violated:OneSubmit

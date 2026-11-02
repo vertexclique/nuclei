@@ -20,3 +20,5 @@ WCM_stopped_empty              MC_CallerMode        violated:NoStoppedEmpty
 CW_safe                        MC_CallerWrite       pass
 CW_live                        MC_CallerWrite       pass
 MCW_no_flush_wait              MC_CallerWrite       violated:OutOrder
+CW_tight                       MC_CallerWrite       pass
+MCW_no_write_tick              MC_CallerWrite       violated:AllOut
