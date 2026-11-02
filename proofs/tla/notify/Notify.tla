@@ -18,6 +18,19 @@
 (* `notify_one` (or `notify_last`) passes it on with a `notify_one` (or a *)
 (* `notify_last`).                                                         *)
 (*                                                                          *)
+(* The pass in the code's order (`Policy for Notify`, `pass`): it expires  *)
+(* the queued waiters from the front while the front's generation is not  *)
+(* the one it read (every node a pass leaves queued carries that pass's    *)
+(* generation, so the front reaches them all), then checks each arrival on *)
+(* its own (an older one is granted, a current one queued), lets withdrawn *)
+(* nodes go only from the ends or in a sweep (`List::tidy`, which runs     *)
+(* only past half: here it may run or not), and serves the owed wakes one *)
+(* front (or back) node at a time: a node that withdrew between the look  *)
+(* and the grant (`WakeList::grant` answering false) is not counted.       *)
+(* QUEUED is cleared on the way out only when the list is empty, withdrawn *)
+(* nodes included. Two notifiers can call at once (Watch's `send` runs    *)
+(* `notify_waiters` from every sender).                                   *)
+(*                                                                          *)
 (* What is modelled step by step: the state word's PERMIT, QUEUED and the  *)
 (* drain role's DRAINING and DIRTY, the generation, the owed counts, the   *)
 (* arrival stack and the waiting list, each node's phase and payload, each *)
@@ -30,6 +43,7 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 CONSTANTS
     Waiters,   \* per waiter: "await" (polled until done) or "drop" (polled once, then dropped)
     Notifier,  \* the notifier's calls in order: "one", "last" or "waiters"
+    Notifier2, \* a second notifier's calls, at the same time (<<>>: no second notifier)
     NotifyAfterQueued, \* the notifier starts once every waiter has queued (or is done)
     Mutation   \* "none", or the name of the one rule this run takes away
 
@@ -40,6 +54,8 @@ BY_FIRST == -1
 BY_LAST == -2
 Range(s) == {s[i] : i \in DOMAIN s}
 Without(s, S) == SelectSeq(s, LAMBDA x : x \notin S)
+\* The calls of notifier `n`.
+Calls(n) == IF n = NT THEN Notifier ELSE Notifier2
 
 (* --algorithm Notify
 variables
@@ -72,11 +88,31 @@ define
     NoOverServe == servedByOne <= ones
     \* With the drain role free, no waiter whose enqueue happened is left on the arrival stack.
     NoStrandedArrival == \A w \in Range(arrivals) : enqueued[w] => draining
+    \* With the drain role free, every waiter still queued carries one generation: the one the
+    \* last pass read. That is what lets a pass expire them all from the front.
+    QueuedOneGeneration ==
+        ~draining => \A a, b \in {x \in Range(list) : phase[x] = "waiting"} : payload[a] = payload[b]
+    \* The list with its withdrawn nodes at the front let go (`List::front`).
+    RECURSIVE PopCancelled(_)
+    PopCancelled(l) == IF l # <<>> /\ phase[Head(l)] = "cancelled" THEN PopCancelled(Tail(l)) ELSE l
+    \* The list with its expired front let go: withdrawn nodes, and waiting ones of a generation
+    \* other than `gen`, up to the first waiting node of `gen`.
+    \* The same at the back (`List::back`).
+    RECURSIVE PopCancelledBack(_)
+    PopCancelledBack(l) ==
+        IF l # <<>> /\ phase[l[Len(l)]] = "cancelled" THEN PopCancelledBack(SubSeq(l, 1, Len(l) - 1)) ELSE l
+    RECURSIVE Unexpired(_, _)
+    Unexpired(l, gen) ==
+        IF l # <<>> /\ (phase[Head(l)] = "cancelled" \/ payload[Head(l)] # gen)
+        THEN Unexpired(Tail(l), gen) ELSE l
     \* Every waiter made before the last notify_waiters, and still awaiting, ends done.
     AwaitersMadeBeforeAWaitersCallEnd ==
         <>[](\A w \in W : Waiters[w] = "await" /\ made[w] /\ wGen[w] # generation => done[w])
     \* With as many notify_one calls as awaiting waiters, made after them all, every one ends.
     EveryAwaiterEnds == <>[](\A w \in W : Waiters[w] = "await" => done[w])
+    \* Once every thread is done, a notify_one that no waiter took is kept as the permit.
+    OneIsKept ==
+        (\A p \in W \cup {NT, NT + 1} : pc[p] = "Done") => (permit \/ servedByOne > 0 \/ ones = 0)
     \* Witnesses.
     NoPermitStored == ~permit
     NoPassOn == ~passedOn
@@ -93,7 +129,7 @@ macro claimOrDirty(claimed) begin
 end macro;
 
 procedure Drain()
-variables g = 0, first = 0, last = 0, gone = {}, wl = {}, n = NoNode;
+variables g = 0, first = 0, last = 0, wl = {}, n = NoNode, arr = <<>>;
 begin
 D_clear:
     dirty := FALSE;
@@ -103,64 +139,106 @@ D_take:
         g := generation;
     end if;
 D_absorb:
-    gone := {x \in Range(arrivals) : phase[x] = "cancelled"};
-    list := list \o Without(arrivals, gone);
+    \* The arrival stack is taken whole (`WaitQueue::take`), then the generation is read.
+    arr := arrivals;
     arrivals := <<>>;
     if Mutation # "generation_first" then
         g := generation;
     end if;
 D_expire:
-    \* Every queued waiter of an older generation is granted; then the arrivals of one.
-    gone := {x \in Range(list) : phase[x] = "cancelled"};
-    wl := {x \in Range(list) : phase[x] = "waiting" /\ payload[x] # g};
+    \* From the front, while the front is withdrawn or of another generation: a withdrawn
+    \* node is let go, a waiting one granted. Then each arrival on its own: a withdrawn one is
+    \* let go, one of another generation granted, one of this generation queued.
+    \* MUTATION arrivals_unchecked: every arrival still waiting is queued, whatever its
+    \* generation, so an older one can sit behind a newer front that stops the expiry.
+    wl := {x \in Range(list) \ Range(Unexpired(list, g)) : phase[x] = "waiting"}
+          \cup {x \in Range(arr) : phase[x] = "waiting" /\ payload[x] # g
+                                  /\ Mutation # "arrivals_unchecked"};
     phase := [x \in W |-> IF x \in wl THEN "granted" ELSE phase[x]];
-    list := Without(list, gone \cup wl);
+    list := Unexpired(list, g) \o SelectSeq(arr, LAMBDA x : phase[x] = "waiting" /\ x \notin wl);
+D_tidy:
+    \* `List::tidy` sweeps every withdrawn node only once enough of them piled up: here it
+    \* may sweep or not.
+    either
+        list := SelectSeq(list, LAMBDA x : phase[x] # "cancelled");
+    or
+        skip;
+    end either;
 D_owed:
     first := pendingFirst;
     pendingFirst := 0;
     last := pendingLast;
     pendingLast := 0;
 D_permit:
-    \* A stored permit is a wake for the front.
-    if list # <<>> /\ permit then
+    \* A stored permit is a wake for the front: `List::front` lets the withdrawn nodes at the
+    \* front go, and with a waiting one there the permit is taken.
+    \* MUTATION permit_not_converted: the permit stays where it is.
+    if PopCancelled(list) # <<>> /\ permit /\ Mutation # "permit_not_converted" then
         permit := FALSE;
         first := first + 1;
     end if;
+    list := PopCancelled(list);
 D_first:
-    if first > 0 /\ list # <<>> then
-        n := Head(list);
-        list := Tail(list);
-        if phase[n] = "waiting" then
-            phase[n] := "granted";
-            payload[n] := BY_FIRST;
-            wl := wl \cup {n};
-            first := first - 1;
-        end if;
-        goto D_first;
-    end if;
-D_last:
-    if last > 0 /\ list # <<>> then
-        n := list[Len(list)];
-        list := SubSeq(list, 1, Len(list) - 1);
-        if phase[n] = "waiting" then
-            phase[n] := "granted";
-            payload[n] := BY_LAST;
-            wl := wl \cup {n};
-            last := last - 1;
+    \* While a wake is owed: the front waiting node, the withdrawn ones before it let go
+    \* (`List::front`); with none left the loop ends.
+    if first > 0 /\ PopCancelled(list) # <<>> then
+        n := Head(PopCancelled(list));
+        list := Tail(PopCancelled(list));
+    else
+        if first > 0 then
+            list := <<>>;          \* `List::front` let every withdrawn node go and found none
         end if;
         goto D_last;
     end if;
+D_first_grant:
+    \* `WakeList::grant`: a node that withdrew since the look is not granted, and the owed
+    \* wake is not counted as served.
+    \* MUTATION count_withdrawn_grant: the wake is counted as served all the same.
+    if phase[n] = "waiting" then
+        phase[n] := "granted";
+        payload[n] := BY_FIRST;
+        wl := wl \cup {n};
+        first := first - 1;
+    elsif Mutation = "count_withdrawn_grant" then
+        first := first - 1;
+    end if;
+    goto D_first;
+D_last:
+    \* The same from the back (`List::back`).
+    if last > 0 /\ PopCancelledBack(list) # <<>> then
+        n := PopCancelledBack(list)[Len(PopCancelledBack(list))];
+        list := SubSeq(PopCancelledBack(list), 1, Len(PopCancelledBack(list)) - 1);
+    else
+        if last > 0 then
+            list := <<>>;          \* `List::back` let every withdrawn node go and found none
+        end if;
+        goto D_leftover;
+    end if;
+D_last_grant:
+    \* As at the front: a node that withdrew since the look is not counted.
+    if phase[n] = "waiting" then
+        phase[n] := "granted";
+        payload[n] := BY_LAST;
+        wl := wl \cup {n};
+        last := last - 1;
+    elsif Mutation = "count_withdrawn_grant" then
+        last := last - 1;
+    end if;
+    goto D_last;
 D_leftover:
     \* What nobody could take is a permit again.
-    if first + last > 0 then
+    \* MUTATION leftover_lost: it is dropped.
+    if first + last > 0 /\ Mutation # "leftover_lost" then
         permit := TRUE;
     end if;
 D_exit:
+    \* The way out: with the dirty bit up another pass runs; else the role goes, and QUEUED
+    \* with it when the pass left the list empty, withdrawn nodes included.
     if dirty /\ Mutation # "exit_ignores_dirty" then
         goto D_clear;
     else
         draining := FALSE;
-        if \A k \in 1..Len(list) : phase[list[k]] = "cancelled" then
+        if list = <<>> then
             queuedBit := FALSE;
         end if;
     end if;
@@ -216,17 +294,17 @@ NW_drain:
     end if;
 end procedure;
 
-fair process notifier = NT
+fair process notifier \in {NT, NT + 1}
 variables i = 1;
 begin
 T_start:
     await ~NotifyAfterQueued \/ \A w \in W : enqueued[w] \/ done[w];
 T_call:
-    while i <= Len(Notifier) do
-        if Notifier[i] = "waiters" then
+    while i <= Len(Calls(self)) do
+        if Calls(self)[i] = "waiters" then
             call NotifyWaiters();
         else
-            call NotifyWith(Notifier[i]);
+            call NotifyWith(Calls(self)[i]);
         end if;
 T_next:
         i := i + 1;
