@@ -262,11 +262,12 @@ SCHEDULED while the runnable waits (`RunnableScheduled`), so adding RUNNING less
 turns the one flag into the other whatever else the word holds; a run that then finds the task
 cancelled in the queue clears RUNNING after dropping the future.
 
-The TLA+ family checks 32 configurations: 12 that must pass (the handle awaiting, detaching,
+The TLA+ family checks 34 configurations: 12 that must pass (the handle awaiting, detaching,
 dropped or cancelling, with one or two runners, wakes by value and by reference, a future that
 wakes itself, a waker dropped without a wake, a handle polled once without a wake, and liveness
-under weak fairness), 14 mutations
-that each take one rule away (a wake during the poll that schedules a second runnable breaks
+under weak fairness), 15 mutations
+that each take one rule away (a handle that answers None for a closed task without waiting for
+its future breaks `CancelWaits`; a wake during the poll that schedules a second runnable breaks
 `OnePoll`, and `RunnableScheduled` too: the second run would start on a running task, where the
 addition carries into the next flag; a run that finds the task cancelled in the queue and leaves
 RUNNING set ends in a deadlock, the cancelling handle waiting for ever for a future it thinks is
@@ -280,9 +281,12 @@ breaks `FreedAfterFuture`; a run that lets go of its reference only after the co
 exchange, as it once did, lets a handle polled in between take the output and go, and frees the
 task itself, and a Pending run that drops its reference in a step of its own, as it once did,
 frees the task after another runner completed it and the handle went, both of which break
-`RunnerFreesNoAwaited`), and 6 witnesses: a wake during the poll, a cancel during the poll,
+`RunnerFreesNoAwaited`), and 7 witnesses: a wake during the poll, a cancel during the poll,
 a cancel found in the queue, a registration of the handle's waker meeting a notification, the
-last waker closing an idle task, and the handle woken from its sleep.
+last waker closing an idle task, the handle woken from its sleep, and a cancel that answers None
+while the run has yet to drop the output it took out (`OutputGoneAtNone` fails: the run takes a
+cancelled task's output out before the exchange that clears RUNNING and drops it after; whether
+to close that window is an open question, so it is a witness, not a property).
 
 The Lean file proves, for every sequence of operations and any number of wakers: the count of
 references is exactly the runnable plus the wakers; the future is dropped at most once, and a
@@ -343,14 +347,18 @@ swaps the flag back and notifies, so only the first of a burst of wakes notifies
 of the pair is sequentially consistent, so whichever publication comes second, the look after
 it sees the other: the shard finds the work, or the waker finds the shard parked.
 
-The family checks 21 configurations. `Park.tla`: 6 that must pass (one waker, three wakers
-racing, liveness under weak fairness, a timer of the shard's own, its liveness, and a
-`Proactor::wake` that ends a `Proactor::wait` wherever it lands), 4 mutations that must
-deadlock (the shard sleeping without its look after publishing; a waker looking before it
-pushes; the drive waiting on the poller after a timer it fired; a `Proactor::wake` that
-notifies only a shard that parks already), and 4 witnesses (a notification, a look that finds
-the work, a notification that lands while the shard is awake, a timer fired on the way to
-park). `ShardStop.tla` checks a shard that stops while other threads push to it: a pusher
+The family checks 32 configurations. `Park.tla`: 9 that must pass (one waker, three wakers
+racing, liveness under weak fairness, a timer of the shard's own, its liveness, a
+`Proactor::wake` that ends a `Proactor::wait` wherever it lands, a ring whose submission queue
+is full and its liveness, and two wakers whose first two notifications fail, which the waker
+that took the flag back tries again), 8 mutations (the shard sleeping without its look after
+publishing; a waker looking before it pushes; the drive waiting on the poller after a timer it
+fired; a `Proactor::wake` that notifies only a shard that parks already; a `Proactor::wait`
+made inside a task or a `block_on` that `WAITING` does not hold, `unregistered_wait`; a failed
+notification dropped, `notify_swallowed`: these deadlock; and the two enters that leave the
+wake's read out behind a full queue, which break `SleepSeesWake`), and 5 witnesses (a
+notification, a look that finds the work, a notification that lands while the shard is awake,
+a timer fired on the way to park, the future's timer fired with the wake's read out). `ShardStop.tla` checks a shard that stops while other threads push to it: a pusher
 that sees the shard stopped drops what its inbox holds, and the stopping shard drains pass
 after pass until nothing more comes (a timer's waker, a channel its tasks held), so no
 runnable is left to keep itself and the shard for good. The inbox has one taker at a time:
@@ -2023,6 +2031,16 @@ delivery (`SeesAll`: the handler writing before it counts, a pump looking before
 listener sleeping without its second look), and 2 witnesses (deliveries coalesced into one
 item, a pump's wake).
 
+`SignalPump.tla` checks the pumps as they start and go (`ensure_pump`, `pump`, `Pumping`). A
+listener that waits registers its waker, then raises its place's flag (the shard's, or the one
+of the pump on a worker) and starts a pump if it was down, then looks once more. A pump's task
+may be dropped without ending, with the shard that runs it: its drop lowers the flag, then wakes
+every listener, so each polls again and starts a pump where none serves it. 6 configurations: 2
+that must pass (one pump at most at a time; every delivery seen, a pump dropped or not), 3
+mutations that break `SeesAll` (a drop that leaves the flag raised, as the thread's flag was; a
+drop that wakes nobody; a drop that wakes before it lowers the flag), and 1 witness (a pump
+started again after a drop).
+
 ## Child processes
 
 `process` (`tla/process/ExitWatch.tla`, `tla/process/KillReap.tla`) checks how a child's exit
@@ -2032,10 +2050,16 @@ watch is a `WAITID` that reaps the child itself, so a second watch would find EC
 that stops running cancels its watch and lets the child go only at that watch's completion; a
 waiter registers its waker, has its shard watch the child unless one does (a `try_wait` before
 may have, with no waker), and looks again before it sleeps; a dropped `Child`'s child is
-watched elsewhere. `KillReap`: a kill by pid and a reap by pid exclude each other through the
-child's state, so no signal goes by pid after the reap. 12 configurations: 4 that must pass, 4
-mutations (letting go at the cancel breaks `OneWatch`; no second look and an unwatched orphan
-break `Settles`; a killer that only looks breaks `NoKillAfterReap`), and 4 witnesses.
+watched elsewhere. A `try_wait` peeks: it stores the status of a child that exited, unreaped,
+so only the watcher's own outcome ends the need for a watch. The `Child` goes in steps (it says
+it is gone, claims the watch if none is held, lets go of its reference); a shard that lets the
+child go clears its watch, then looks whether the `Child` went and claims the watch if so.
+`KillReap`: a kill by pid and a reap by pid exclude each other through the child's state, so no
+signal goes by pid after the reap. 15 configurations: 4 that must pass, 6 mutations (letting go
+at the cancel breaks `OneWatch`; no second look, an unwatched orphan, an orphan read off the
+count of the exit's holders before the watch is cleared, and a peeked status counted as the
+watcher's own break `Settles`; a killer that only looks breaks `NoKillAfterReap`), and 5
+witnesses (the last a waiter that takes a peeked status).
 
 ## The broadcast channel
 
@@ -2348,7 +2372,37 @@ or a multiple of `QUARTZ_EVERY`), one decrement a run: the same runs, counted. 4
 every `2N - 1` turns, `BoundedGap`), 1 mutation (not counting the future's own turns lets a
 future that keeps waking itself starve the driver, breaking `BoundedGap`: the bug a test
 caught, where IO such a future waited on never completed), and 2 witnesses (a look that came
-from the future's turns; `2N - 2` turns without a look, so the bound is the tightest).
+from the future's turns; `2N - 2` turns without a look, so the bound is the tightest). With
+`Mode = "turn"` it checks a turn driven by hand (`Shard::turn`, `run_ready`, which
+`Proactor::wait` calls): each of its two runs of tasks takes at most `N`, so between two looks
+at most `2N` tasks run (`TurnGap`); 3 more configurations: the bound, a `run_ready` with no
+bound (a task that keeps yielding holds the turn for good, breaking `TurnGap`), and a witness
+that `2N` is reached.
+
+## The order a shard takes its runnables in
+
+`sched` (`tla/sched/Sched.tla`) checks the order of `Shard::next` (`src/rt/shard/order.rs`) and
+the `owed` rule of `Shard::run_loop` (`src/rt/shard/run.rs`). Work waits in five places: the
+LIFO slot (the task the running task woke last), the local queue, the inbox (tasks other
+threads woke), the home (tasks bound to the thread that runs the shard, which other threads
+woke) and a `block_on` future. Each turn the future is polled if it was woken and owes the
+tasks nothing; then one runnable is taken: every `I`th turn first from the inbox (the home if
+the inbox is empty); otherwise the slot (at most `L` times in a row while others wait), the
+local queue, the inbox, the home. A future that yields owes the tasks queued at that moment one
+run each. Other threads keep the inbox and the home full as they like and the tasks wake each
+other and yield as they like; every place that holds work must be served within `2I - 1`
+turns (`Served`).
+
+Today's code looks at the home only once the inbox is empty, and starves it while other threads
+keep the inbox full: the `home_after_empty` mutation is today's code. The GREEN configurations
+check a proposed fix that is not in the code (an interval turn that finds inbox work, every
+other time, runs a home's runnable first and puts the inbox's at the local queue's front): it
+waits for a decision, as every variant measured moved a row of the op-count gate. 7
+configurations: 2 that must pass (with and without a `block_on` future), 4 mutations that break
+`Served` (no cap on the slot's runs starves the local queue; no interval turn starves the inbox;
+the home looked at only once the inbox is empty starves the home; a future that owes a run for
+each runnable a run pushes starves the future), and 1 witness (a home served while the inbox
+holds work).
 
 ## How long queued IO waits on a busy shard
 

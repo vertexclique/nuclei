@@ -363,6 +363,41 @@
   its runtime and counted by it, so a drop waits for it; that thread also takes the lingers handed
   where no runtime runs, which each started a thread and a runtime of their own
   (`proofs/tla/going/Unworked.tla`).
+- **A child whose exit a `try_wait` saw is still reaped** (unix). `try_wait` stores the status of
+  a child that exited without reaping it, but that status counted as the watcher's own: once the
+  shard watching the child let it go (the thread's own shard at the end of its `block_on`) before
+  its driver reported the exit, neither the waiter nor the `Child`'s drop had it watched again,
+  and the child stayed a zombie. Only the watcher's outcome now ends the need for a watch, and a
+  wait or `try_wait` that takes a peeked status has the child watched, so it is reaped. A `Child`
+  dropped while its shard let the child go could also leave it unwatched: the shard read whether
+  the `Child` was gone off the count of the exit's holders before clearing its watch, the
+  `Child` found the watch held and let go. The `Child` now says it is gone before it claims the
+  watch, and the shard clears its watch before it looks, so one of the two always has the child
+  watched (`proofs/tla/process/ExitWatch.tla`, the `count_orphan` and `outcome_settles`
+  mutations).
+- **`Proactor::wake` ends a `Proactor::wait` made inside a task or a `block_on`.** The wake reaches
+  the shards waiting in `Proactor::wait`, but only a wait on a thread that runs no shard entered
+  its shard among them: a wait on a thread that runs one (a task's, a `block_on`'s) ran its turn
+  unseen, and waited until IO came (`proofs/tla/park/Park.tla`, `unregistered_wait`).
+- **A turn driven by hand runs a bounded number of tasks.** `Proactor::wait` ran every task ready,
+  and the ones they woke, before it looked at its timers or its poller: a task that kept yielding
+  (waiting for a flag a timer's task sets) held the call for good at full CPU. Each of the turn's
+  two runs of tasks now takes at most `event_interval` of them (`proofs/tla/loop/RunLoop.tla`,
+  `Mode = "turn"`).
+- **A dropped signal pump no longer leaves its listeners without one** (unix). A listener's poll
+  starts a pump where its flag says none runs, and only a pump that ended on a read error lowered
+  that flag. The flag was the thread's (or, for listeners polled where no shard runs, a static),
+  while the pump is a task of a shard, which the handoff moves to another thread and which goes
+  with its runtime: a pump dropped with its runtime left the flag raised, and a listener polled
+  there was never woken. The flag is now the shard's, and the pump's drop lowers it, then wakes
+  every listener, so each polls again and starts a pump where none serves it any more
+  (`proofs/tla/signal/SignalPump.tla`).
+- **A notification of a sleeping worker that fails is tried again** (macOS, the BSDs, Windows).
+  `kevent` and `PostQueuedCompletionStatus` can fail for want of a resource, and the failure was
+  dropped. The waker that takes a sleeping shard's flag back is the only one that notifies it, so
+  the shard slept on with its new work. The notification is now tried again until the kernel
+  takes it, and after 64 failures in a row reported as an error (`proofs/tla/park/Park.tla`,
+  `notify_swallowed`).
 
 ### Changed
 

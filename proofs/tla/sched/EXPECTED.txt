@@ -1,0 +1,8 @@
+# configuration                spec                 expected
+S_fair                         MC_Sched             pass
+S_fair_future                  MC_Sched             pass
+M_no_lifo_cap                  MC_Sched             violated:Served
+M_no_inbox_interval            MC_Sched             violated:Served
+M_home_after_empty             MC_Sched             violated:Served
+M_owed_grows                   MC_Sched             violated:Served
+W_home_over_inbox              MC_Sched             violated:NoHomeOverInbox

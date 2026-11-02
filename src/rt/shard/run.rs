@@ -259,11 +259,12 @@ impl Shard {
         parks
     }
 
-    /// One turn of the shard, for a caller driving it by hand: runs every
-    /// task ready now, waits once on the poller (up to `wait`, at once if
-    /// work is ready; at most `max` events) and runs what the IO woke.
-    /// Returns how many IO events it handled; none once the shard was taken
-    /// from this thread during the turn.
+    /// One turn of the shard, for a caller driving it by hand: runs the
+    /// tasks ready now, waits once on the poller (up to `wait`, at once if
+    /// work is ready; at most `max` events) and runs what the IO woke, each
+    /// run of tasks bounded by [`run_ready`](Self::run_ready). Returns how
+    /// many IO events it handled; none once the shard was taken from this
+    /// thread during the turn.
     pub(crate) fn turn(&self, max: usize, wait: Option<Duration>) -> std::io::Result<usize> {
         if self.run_ready() == Polled::Detached {
             return Ok(0);
@@ -304,10 +305,14 @@ impl Shard {
         Ok(events)
     }
 
-    /// Runs every task that is ready now, and the ones they wake, until the
-    /// shard is taken from this thread.
+    /// Runs the tasks that are ready now, and the ones they wake, at most
+    /// the driver interval of them, or until the shard is taken from this
+    /// thread: tasks that keep waking each other leave the turn to its look
+    /// at the timers and the poller, and to its return
+    /// (proofs/tla/loop/RunLoop.tla, `Mode = "turn"`).
     pub(super) fn run_ready(&self) -> Polled {
-        while let Some(runnable) = self.next() {
+        for _ in 0..self.tuning.driver_interval {
+            let Some(runnable) = self.next() else { break };
             let polled = self.run(runnable);
             if polled == Polled::Detached {
                 return polled;

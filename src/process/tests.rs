@@ -304,6 +304,74 @@ mod unix {
         });
     }
 
+    /// Waits until `pid` is reaped, or fails the test.
+    fn wait_reaped(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut backoff = Duration::from_millis(1);
+        while !reaped(pid) {
+            assert!(Instant::now() < deadline, "the child was never reaped");
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(50));
+        }
+    }
+
+    /// A child whose exit a `try_wait` saw, whose watch was let go before
+    /// the watching shard's driver reported the exit (the thread's own
+    /// shard leaves as its `block_on` ends), is reaped once its `Child` goes.
+    #[test]
+    fn a_child_try_wait_saw_exit_is_reaped_after_its_watch_went() {
+        let child = crate::block_on(async {
+            let mut child = Command::new("true").spawn().unwrap();
+            // No yield: the shard's driver never runs meanwhile, so only the
+            // `try_wait` sees the exit.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "the child never exited");
+                std::thread::yield_now();
+            }
+            child
+        });
+        let pid = child.id();
+        crate::block_on(async move {
+            drop(child);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !reaped(pid) {
+                assert!(Instant::now() < deadline, "the child was never reaped");
+                crate::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    /// The `Child` goes on another thread while its shard lets the child
+    /// go, at the step of the let-go its drop races: the child is still
+    /// watched, by a worker of the runtime that runs, and reaped.
+    #[test]
+    fn a_child_whose_child_goes_during_its_let_go_is_reaped() {
+        let rt = crate::runtime::Runtime::builder()
+            .worker_threads(1)
+            .pin_workers(false)
+            .build()
+            .unwrap();
+        let pid = crate::block_on(async {
+            let mut child = sh("sleep 1").spawn().unwrap();
+            let pid = child.id();
+            // The thread's own shard watches it from now on.
+            assert!(child.try_wait().unwrap().is_none());
+            crate::process::exit::AT_LET_GO.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::thread::spawn(move || drop(child)).join().unwrap();
+                }));
+            });
+            pid
+        });
+        assert!(
+            crate::process::exit::AT_LET_GO.with(|hook| hook.borrow().is_none()),
+            "the shard never let the child go"
+        );
+        wait_reaped(pid);
+        drop(rt);
+    }
+
     /// Children Linux gave no pidfd are reaped on `SIGCHLD`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]

@@ -106,6 +106,139 @@ fn a_timer_fired_on_the_way_to_park_runs_its_task_rather_than_parking() {
     assert!(woke, "the task the timer woke never ran");
 }
 
+/// A turn driven by hand runs a bounded number of tasks: a task that yields
+/// again and again (waiting for a flag a timer's task sets) would otherwise
+/// keep the turn from ever looking at its timers or returning.
+#[test]
+fn a_turn_runs_a_bounded_number_of_tasks() {
+    crate::block_on(async {
+        let runs = std::rc::Rc::new(core::cell::Cell::new(0u32));
+        let counted = std::rc::Rc::clone(&runs);
+        crate::runtime::spawn_local(async move {
+            // A cap of its own, so a turn that never stops still ends the test.
+            while counted.get() < 100_000 {
+                counted.set(counted.get() + 1);
+                crate::task::yield_now().await;
+            }
+        })
+        .detach();
+        crate::Proactor::get()
+            .wait(64, Some(Duration::ZERO))
+            .unwrap();
+        assert!(
+            runs.get() <= 2 * super::DRIVER_INTERVAL,
+            "one turn ran the yielding task {} times",
+            runs.get()
+        );
+    });
+}
+
+/// A notification of a sleeping shard that fails is tried again, so the
+/// shard wakes for its work all the same. Only kqueue's `kevent` and the
+/// port's `PostQueuedCompletionStatus` can fail; Linux's eventfd write
+/// cannot. Each round's sender waits for the shard to say it parks, then
+/// sends with its next notification failing; a round whose send found the
+/// shard awake (its notification not made) is run again.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[test]
+fn a_failed_notification_is_tried_again() {
+    let shared = Arc::clone(&context::own_shard().unwrap().shared);
+    for _ in 0..50 {
+        let (tx, rx) = crate::sync::oneshot::channel::<u32>();
+        let sender = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut backoff = Duration::from_micros(50);
+                while !shared.is_parked() {
+                    assert!(Instant::now() < deadline, "the shard never parked");
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(5));
+                }
+                // Into its wait on the kernel, past its last look.
+                std::thread::sleep(Duration::from_millis(20));
+                crate::rt::park::fail_notifies(1);
+                tx.send(7).unwrap();
+                crate::rt::park::fail_notifies(0) == 0
+            })
+        };
+        let start = Instant::now();
+        let got = crate::block_on(crate::time::timeout(Duration::from_secs(10), rx));
+        let took = start.elapsed();
+        let failed_one = sender.join().unwrap();
+        assert_eq!(got.ok().and_then(Result::ok), Some(7));
+        if failed_one {
+            assert!(
+                took < Duration::from_secs(5),
+                "the failed notification was lost: the shard slept {took:?}"
+            );
+            return;
+        }
+    }
+    panic!("no round's notification found the shard asleep");
+}
+
+/// The tasks bound to the thread that runs a shard are taken while other
+/// threads keep its inbox full. Today the home is looked at only once the
+/// inbox is empty (proofs/tla/sched/Sched.tla `home_after_empty`), and the
+/// fix waits for a decision on its op-count cost: ignored until it lands.
+#[test]
+#[ignore = "fails until the home's turn lands: a bound task waits behind a full inbox"]
+fn a_home_is_served_while_the_inbox_stays_full() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::rt::sched::Sched;
+
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let _current = context::enter(&shard);
+    let interval = shard.tuning.inbox_interval;
+    // More runnables in the inbox than the runs the home may wait.
+    let mut tasks = Vec::new();
+    for _ in 0..4 * interval {
+        // SAFETY: the schedule sends the task back to this shard, whose
+        // thread runs it here; the future is 'static.
+        let (runnable, task) = unsafe {
+            crate::rt::task::spawn_unchecked(
+                async {},
+                Sched::counted(Arc::clone(&shard.shared), None, None),
+            )
+        };
+        shard.shared.push_remote(runnable);
+        tasks.push(task);
+    }
+    let ran = Arc::new(AtomicBool::new(false));
+    let home = shard.own_home();
+    let bound = {
+        let ran = Arc::clone(&ran);
+        // SAFETY: as above; the task is bound to the shard's own home.
+        let (runnable, task) = unsafe {
+            crate::rt::task::spawn_unchecked(
+                async move { ran.store(true, Ordering::SeqCst) },
+                Sched::counted(Arc::clone(&shard.shared), Some(Arc::clone(&home)), None),
+            )
+        };
+        // A wake of the bound task from another thread.
+        home.push(runnable);
+        task
+    };
+    let mut runs = 0;
+    while !ran.load(Ordering::SeqCst) && runs < 2 * interval {
+        let runnable = shard.next().expect("work is queued");
+        shard.run(runnable);
+        runs += 1;
+    }
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the bound task waited {runs} runs behind a full inbox"
+    );
+    drop((bound, tasks));
+}
+
 /// A waker that holds a shard's `Shared`, as the one of a worker's loop
 /// does.
 struct Holds(#[allow(dead_code)] Arc<super::Shared>);

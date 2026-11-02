@@ -6,6 +6,9 @@ MW_no_recheck                  MC_ExitWatch         violated:Settles
 MW_unwatched_orphan            MC_ExitWatch         violated:Settles
 WW_rewatch                     MC_ExitWatch         violated:NoRewatch
 WW_seen_on_b                   MC_ExitWatch         violated:NoSeenOnB
+MW_count_orphan                MC_ExitWatch         violated:Settles
+MW_outcome_settles             MC_ExitWatch         violated:Settles
+WW_peek_taken                  MC_ExitWatch         violated:NoPeekTaken
 PK_safe                        MC_KillReap          pass
 PK_live                        MC_KillReap          pass
 MK_no_busy                     MC_KillReap          violated:NoKillAfterReap
