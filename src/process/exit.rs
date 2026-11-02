@@ -146,6 +146,8 @@ impl Exit {
     /// waiter's next poll watches it again, wherever it runs; with no
     /// waiter (the `Child` is gone), a runtime worker watches it now.
     pub(crate) fn unwatched(self: &Arc<Self>, orphan: bool) {
+        #[cfg(test)]
+        at_let_go();
         self.watched.store(false, Ordering::SeqCst);
         if orphan {
             if !crate::rt::shard::watch_exit_elsewhere(self) {
@@ -380,6 +382,21 @@ fn waitid_pidfd(fd: std::os::fd::RawFd, options: libc::c_int) -> Option<Result<E
             .unwrap_or(libc::EIO)));
     }
     status_of(&info).map(Ok)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test runs inside a let-go of the child, at the step its race
+    /// with the `Child`'s drop falls on.
+    pub(crate) static AT_LET_GO: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn at_let_go() {
+    if let Some(hook) = AT_LET_GO.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
