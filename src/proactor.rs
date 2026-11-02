@@ -199,4 +199,41 @@ mod tests {
             start.elapsed()
         );
     }
+
+    /// A wake ends a wait made inside a `block_on`, on a thread that runs a
+    /// shard: the waker keeps waking until the wait returns, so a wake that
+    /// came before the wait began is followed by one that ends it.
+    #[test]
+    fn a_wake_ends_a_wait_on_a_thread_that_runs_a_shard() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::Proactor;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let waker = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut backoff = Duration::from_micros(50);
+                while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    Proactor::get().wake();
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(10));
+                }
+            })
+        };
+        let start = Instant::now();
+        crate::block_on(async {
+            Proactor::get()
+                .wait(64, Some(Duration::from_secs(10)))
+                .unwrap()
+        });
+        let took = start.elapsed();
+        done.store(true, Ordering::SeqCst);
+        waker.join().unwrap();
+        assert!(
+            took < Duration::from_secs(5),
+            "the wake did not end the wait: it ran {took:?}"
+        );
+    }
 }
