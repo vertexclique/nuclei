@@ -17,6 +17,8 @@ MCM_no_held_check              MC_CallerMode        violated:InOrder
 MCM_no_wake                    MC_CallerMode        violated:AllTaken
 WCM_busy                       MC_CallerMode        violated:NoBusy
 WCM_stopped_empty              MC_CallerMode        violated:NoStoppedEmpty
+CM_ring_poll                   MC_CallerMode        pass
+MCM_poll_not_stopped           MC_CallerMode        violated:AllTaken
 CW_safe                        MC_CallerWrite       pass
 CW_live                        MC_CallerWrite       pass
 MCW_no_flush_wait              MC_CallerWrite       violated:OutOrder

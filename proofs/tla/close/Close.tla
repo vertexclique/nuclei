@@ -26,7 +26,10 @@
 (* drops the write-behind and asks for the close with no linger: the close *)
 (* resets the connection (an RST) and the kernel drops its queue. A linger *)
 (* whose time runs out with bytes still behind gives them up and resets    *)
-(* the connection too.                                                     *)
+(* the connection too. A Unix stream (`Kind = "unix"`) has no reset: its  *)
+(* linger closes it plainly, and its peer reads the end after the bytes   *)
+(* that reached it (`W_unix_cut`, which `FinMeansWhole` must fail: a      *)
+(* stream with no way to say it was cut).                                  *)
 (*                                                                          *)
 (* What must never happen. The peer gets a FIN while a byte the task wrote *)
 (* never reached it: it would take a cut stream for a whole one. An abort  *)
@@ -45,6 +48,7 @@ CONSTANTS                                                                    \* 
     Room,      \* the bytes the kernel's send queue holds
     Ends,      \* the ends the task may choose: a set of "shut_write", "shut_both", "shut_read", "abort", "drop"
     Peer,      \* "reads": the peer takes what comes; "stalls": it never reads
+    Kind,      \* "tcp", or "unix": a Unix stream, which has no reset
     Mutation   \* "none", or the one rule this run takes away
 
 (* --algorithm Close                                                          \* the algorithm, in PlusCal
@@ -159,7 +163,7 @@ L_drain:                                                                     \* 
             expired := TRUE;                                                 \* (record) it ran out
             \* The bytes behind are given up, and SO_LINGER 0 tells the peer so.
             \* MUTATION expiry_fin: the linger closes as a plain close, which ends with a FIN.
-            if Mutation # "expiry_fin" then                                  \* (not the mutation):
+            if Mutation # "expiry_fin" /\ Kind = "tcp" then                  \* (not the mutation; a Unix stream has none):
                 zero := TRUE;                                                \* the close resets
             end if;                                                          \* set
             lost := lost + behind;                                           \* the bytes behind are given up

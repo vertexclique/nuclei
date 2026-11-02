@@ -606,6 +606,15 @@ waker list, which the driver wakes whole. The loom models in `src/io/side/loom_t
 the code's word with two calibrations that must strand a thread (a driver's part that forgets
 the reader's wake, and a contended poll that is never woken).
 
+`WakerSet.tla`, in the same family, checks the contended set those wakers wait in (`WakerSet`
+in `src/io/side.rs`, of `SIDE_SLOTS` slots): a poll that finds the side held keeps its waker in
+its own slot, else a free one, else the last, waking the waker it displaces; it looks once more
+and sleeps until woken, and the holder wakes every waker in the set as it lets go. With more
+tasks than slots the displaced task polls again and displaces another, which costs time only. 4
+configurations: 2 that must pass (three tasks and one slot, four tasks and two, with `AllTook`,
+every task takes the side in the end), 1 mutation (a displaced waker dropped, not woken, breaks
+`AllTook`) and 1 witness (a registration displaces another's waker).
+
 `Requests.tla`, in the same family, checks the work that needs both sides of a source, a
 dropped handle's close in particular (`src/io/source/requests.rs`), against a holder on each
 side that loads the descriptor and uses it. The dropper raises the close in the source's request
@@ -1040,16 +1049,21 @@ backend.
 The same family checks a socket's side turning from the handle's own IO to its caller's calls
 (`try_io`, `async_io` on the sockets; `CallerMode.tla`, `CallerWrite.tla`). On the read side the
 task reads once through the handle, which reads ahead and, on io_uring, keeps a multishot
-receive out; then its own calls fail while the handle holds data read ahead (the handle's reads
-take it first), stop a receive still out and wait for it to end, and from then on follow the
-edges and polls as above. On the write side the bytes the handle wrote behind go out before a
-send of the caller's. 11 more configurations: 6 that must pass (edges and the ring, four writes,
-with `InOrder`, every byte taken once in the order written, and `AllTaken`; four bytes behind and
-three of the task's own with `OutOrder` and `AllOut`), 3 mutations (a call with data read ahead
-breaks `InOrder`; a stopped receive that ends with the side ready and wakes nobody breaks
-`AllTaken`; a send with bytes still behind breaks `OutOrder`), and 2 witnesses (a call that finds
-data read ahead, a stop that ends the receive with nothing brought). `tests/net_caller.rs` runs
-each case on both Linux backends, and the three code mutations fail it.
+receive out, or, for a ring's stream read by readiness, reads its byte from the socket with a
+multishot poll armed; then its own calls fail while the handle holds data read ahead (the
+handle's reads take it first), stop a receive or a poll still out and wait for it to end, and
+from then on follow the edges and polls as above. On the write side the bytes the handle wrote
+behind go out before a send of the caller's, and a send the socket refuses clears the side only
+if no edge came since its look, the peer's read bringing the edge. 15 more configurations: 8
+that must pass (edges and the ring, four writes, with `InOrder`, every byte taken once in the
+order written, and `AllTaken`; the ring's read by readiness with both; four bytes behind and
+three of the task's own with `OutOrder` and `AllOut`, and a socket that holds one unread byte
+with both), 5 mutations (a call with data read ahead breaks `InOrder`; a stopped receive that
+ends with the side ready and wakes nobody, and a switch that leaves the stream's poll armed,
+break `AllTaken`; a send with bytes still behind breaks `OutOrder`; a refused send's clear that
+does not look at the count breaks `AllOut`), and 2 witnesses (a call that finds data read
+ahead, a stop that ends the receive with nothing brought). `tests/net_caller.rs` runs each case
+on both Linux backends, and the three code mutations fail it.
 
 ## A source's operations on its shard's ring
 
@@ -1478,16 +1492,19 @@ them to the kernel, whose send queue holds one until the peer takes it; then it 
 one of five ways: a shut of the writing half, of both halves or of the reading half, each
 followed by the handle's drop, an abort, or a drop at once. A handle dropped with bytes behind
 hands them to a linger task, which drains them for at most the runtime's linger time; the close is
-performed by the driver. The peer reads, or never reads. 10 configurations: 2 that must pass (a
+performed by the driver. The peer reads, or never reads. A Unix stream (`Kind = "unix"`) has no
+reset: its expired linger closes it plainly. 11 configurations: 2 that must pass (a
 peer that reads, with every end; a peer that never reads, with an abort or a drop whose linger
 runs out), with `FinMeansWhole`, a FIN reaches the peer only after every byte the task wrote;
 `AbortResets`, an abort's stream ends with a reset; `AbortDoesNotDrain`, an abort never hands the
 bytes behind to a linger; `Conserved`; and `Termination`; 5 mutations (a shut of the writing half
 or of both that does not wait for the write-behind, an abort that closes without `SO_LINGER` 0,
 and a linger whose time ran out that closes plainly, as the code did, each break
-`FinMeansWhole`; an abort that drops the handle as a drop does breaks `AbortDoesNotDrain`); and 3
+`FinMeansWhole`; an abort that drops the handle as a drop does breaks `AbortDoesNotDrain`); and 4
 witnesses (an abort's reset reaches the peer; a linger runs out of time; a shut waits for bytes
-behind).
+behind; a Unix stream's expired linger closes plainly and its peer reads the end after a cut
+stream, which `FinMeansWhole` fails: a Unix stream has no way to say it was cut, as
+`Builder::write_behind_linger` says).
 
 `ShutRead` (`tla/close/ShutRead.tla`) checks a shut of the reading half (`Handle::shut` with `Read`
 or `Both`, then `Source::poll_drop_ahead` and `ReadState::drop_ahead` where the kernel drops its
@@ -1574,9 +1591,9 @@ handle's until the ring's thread is done with the attach (no copy of it is made)
 thread puts the file into its table and hands the slot back as a request, which whoever performs
 it (both sides held) keeps if the attach is still wanted, or lets go. After the evict the source
 may attach to another shard under a token of the same number (every shard numbers its own), so
-the ring's look and the install's taking check the registration's shard with its token. 13
+the ring's look and the install's taking check the registration's shard with its token. 16
 configurations: 5 that must pass (a close, an evict, both, liveness, and an evict followed by an
-attach to another shard), 4 mutations (2 that leak the file into the table of a closed source,
+attach to another shard), 7 mutations (2 that leak the file into the table of a closed source,
 `NoLeak`; a look and a taking by the token alone, which hand the source registered with the other
 shard a slot of this ring's table, `NoForeignSlot`; an attach with no lease, closed between the
 ring's look and its install, which puts a closed number's file into the table,

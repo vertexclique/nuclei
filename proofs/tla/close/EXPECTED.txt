@@ -9,6 +9,7 @@ M_expiry_fin      Close     violated:FinMeansWhole
 W_reset           Close     violated:NoReset
 W_expiry          Close     violated:NoExpiry
 W_shut_waits      Close     violated:NoShutWait
+W_unix_cut        Close     violated:FinMeansWhole
 R_linux           ShutRead  pass
 R_other           ShutRead  pass
 M_keep_ahead      ShutRead  violated:AsStd

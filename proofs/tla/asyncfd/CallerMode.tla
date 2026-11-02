@@ -16,6 +16,16 @@
 (* clears the readiness only if no edge came since its look. Every byte   *)
 (* must be taken once, in the order it was written.                        *)
 (*                                                                          *)
+(* With `FirstRead = "ready"` (a ring's stream read by readiness,         *)
+(* src/io/source/read/direct.rs), the handle's own read takes its byte     *)
+(* straight from the socket and leaves the rest there, and the side keeps *)
+(* a multishot poll armed (`ReadyStream`) instead of a receive. The switch *)
+(* to the caller's calls stops that poll as it stops a receive            *)
+(* (`submit_ops` in src/io/source/read/ops.rs), since a call of the        *)
+(* caller's waits for every operation of the driver's to end, and a poll  *)
+(* that stays armed never does; its end brings nothing, and the caller's  *)
+(* calls take the socket's bytes.                                         *)
+(*                                                                          *)
 (* What is abstract: the task's waits are on `woken`, set by whatever     *)
 (* wakes it in the code (an edge, a poll's end, the wake after a stopped   *)
 (* receive ends with the side ready); a call takes every byte there is.   *)
@@ -25,6 +35,7 @@ EXTENDS Integers, Sequences, TLC
 CONSTANTS
     Writes,    \* bytes the peer writes, one per write
     Ring,      \* TRUE: io_uring; FALSE: epoll and kqueue
+    FirstRead, \* "ahead": the handle reads ahead (a ring's receive stays out); "ready": a ring's read by readiness
     Mutation   \* "none", or the name of the one rule this run takes away
 
 (* --algorithm CallerMode
@@ -37,6 +48,7 @@ variables
     ready = TRUE,       \* the side may be ready (caller's calls)
     edges = 0,
     recvOut = FALSE,    \* ring: the handle's multishot receive is out
+    streamPoll = FALSE, \* ring: the handle's multishot poll of a stream read by readiness is out
     stopping = FALSE,   \* it is being stopped
     pollOut = FALSE,    \* ring: the caller's poll is out
     waiting = FALSE,    \* the task waits on the side
@@ -100,6 +112,22 @@ R_loop:
                 pollOut := TRUE;
             end if;
         or
+            \* The stream's multishot poll says the socket holds bytes: the side may be ready.
+            await streamPoll /\ ~stopping /\ sock # <<>>;
+            ready := TRUE;
+            edges := edges + 1;
+        or
+            \* Stopped, the stream's poll ends; it brought nothing, the bytes are in the socket.
+            await streamPoll /\ stopping;
+            streamPoll := FALSE;
+            stopping := FALSE;
+            stoppedEmpty := TRUE;
+            if AfterEnd(waiting, ready) then
+                woken := TRUE;
+            elsif caller /\ waiting then
+                pollOut := TRUE;
+            end if;
+        or
             \* The caller's poll ends once the socket holds bytes.
             await pollOut /\ sock # <<>>;
             pollOut := FALSE;
@@ -117,13 +145,21 @@ T_first:
     \* One read of the handle's own: the driver reads ahead all there is,
     \* the read takes one byte, and on a ring the receive stays out.
     await sock # <<>>;
-    with all = held \o sock do
-        taken := Append(taken, Head(all));
-        held := Tail(all);
-    end with;
-    sock := <<>>;
-    if Ring then
-        recvOut := TRUE;
+    if Ring /\ FirstRead = "ready" then
+        \* A ring's stream read by readiness: one byte straight from the socket, the rest left
+        \* there, and the multishot poll stays armed.
+        taken := Append(taken, Head(sock));
+        sock := Tail(sock);
+        streamPoll := TRUE;
+    else
+        with all = held \o sock do
+            taken := Append(taken, Head(all));
+            held := Tail(all);
+        end with;
+        sock := <<>>;
+        if Ring then
+            recvOut := TRUE;
+        end if;
     end if;
 T_loop:
     while Len(taken) < Writes do
@@ -142,8 +178,9 @@ T_drain:
         else
             caller := TRUE;
 T_stop:
-            if recvOut then
-                stopping := TRUE;
+            if recvOut \/ streamPoll then
+                \* MUTATION poll_not_stopped: the switch stops a receive but leaves the stream's poll armed.
+                stopping := ~(streamPoll /\ Mutation = "poll_not_stopped");
                 waiting := TRUE;
                 woken := FALSE;
 T_wait_stop:

@@ -29,3 +29,7 @@ MQ_write_holder_takes_read     MC_Requests          violated:Termination
 MQ_linger_forgets              MC_Requests          violated:Termination
 WQ_linger_waits                MC_Requests          violated:NoLingerWait
 MQ_ignore_leases               MC_Requests          violated:NoUseOfClosed
+WS_three_one                   MC_WakerSet          pass
+WS_four_two                    MC_WakerSet          pass
+MWS_displace_no_wake           MC_WakerSet          violated:AllTook
+WWS_displace                   MC_WakerSet          violated:NoDisplace

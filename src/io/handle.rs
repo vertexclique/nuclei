@@ -370,7 +370,9 @@ impl<T> Drop for Handle<T> {
 /// object itself (whose descriptor is `own`), then closes it. Bytes still
 /// behind as the drain ends (its time ran out, or it failed) are given up,
 /// and a TCP stream resets: its peer must not read the end of the stream
-/// after a cut one.
+/// after a cut one. A Unix stream has no reset: it closes, and its peer
+/// reads the end after the bytes that reached it (proofs/tla/close,
+/// `W_unix_cut`).
 async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
     let drain = core::future::poll_fn(|cx| source.poll_drain(cx));
     let _ = crate::time::timeout(crate::rt::linger::time(), drain).await;
