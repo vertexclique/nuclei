@@ -45,6 +45,8 @@ use crate::io::sys;
 use crate::rt::counters::tally;
 
 mod calls;
+#[cfg(all(test, unix))]
+pub(crate) use calls::AFTER_FULL_SEND;
 mod datagram;
 mod lent;
 #[cfg(completion)]

@@ -5,6 +5,14 @@ use super::*;
 use crate::buf::owned::{IoBuf, OwnedBuf};
 use crate::io::side::OwnerPoll;
 
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Runs once on this thread, for a test, between an owner's straight send that found the socket
+    /// full and the rest of its poll.
+    pub(crate) static AFTER_FULL_SEND: core::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::Cell::new(None) };
+}
+
 impl Source {
     /// A caller's descriptor: `Ready` with the write side's edge count while
     /// it may be ready to write.
@@ -97,6 +105,10 @@ impl Source {
                 #[cfg(unix)]
                 if let Some(result) = self.send_as_owner(bufs, &mut asked) {
                     return Poll::Ready(result);
+                }
+                #[cfg(all(test, unix))]
+                if asked && let Some(then) = AFTER_FULL_SEND.take() {
+                    then();
                 }
                 #[cfg(not(unix))]
                 let asked = false;

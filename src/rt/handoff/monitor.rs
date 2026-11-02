@@ -680,6 +680,100 @@ mod tests {
         assert_eq!(polled, context::Polled::Detached);
     }
 
+    /// An owner's straight send finds the socket full, and the shard is taken before the rest of
+    /// the same poll; the peer reads meanwhile, and the shard's driver, on whatever thread runs it
+    /// now, passes over the write edge that room brings, since the side still says it was only ever
+    /// held by its owner and idle. The rest of the poll then goes the way of any other thread, and
+    /// must ask the kernel again: told the socket was full, it would block the side on an edge
+    /// that already passed, and the byte would wait for good (proofs/tla/sendsnow/TakenFull.tla).
+    /// A readiness driver's: on a ring a side never blocks on an edge.
+    #[cfg(unix)]
+    #[test]
+    fn an_owners_full_send_whose_shard_is_taken_before_the_rest_of_its_poll_asks_again() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::task::{Context, Poll};
+
+        use crate::rt::context;
+        let shard = worker_shard();
+        if shard.shared.is_ring() {
+            eprintln!("skipping: a ring's side never waits for a write edge");
+            return;
+        }
+        let monitor = Arc::new(Monitor::new(Duration::from_millis(10), 1, Vec::new(), None));
+        let slot = monitor.slot();
+        let first = Runner {
+            slot: Arc::clone(&slot),
+            life: Arc::new(Life::new()),
+        };
+        monitor.started(0, &shard, first.clone());
+        let (a, mut b) = UnixStream::pair().unwrap();
+        b.set_nonblocking(true).unwrap();
+        let handle = crate::io::Handle::new(a).unwrap();
+        let src = Arc::clone(handle.source());
+        let fd = handle.get_ref().as_raw_fd();
+        let _entered = context::enter_watched(&shard, Some(&slot));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // A read that waits homes the source here; the owner then writes straight once, and its
+        // release says the write side holds nothing and waits for nothing.
+        let mut nothing = [0u8; 1];
+        let (read, _) = context::poll(&shard.shared, || {
+            src.poll_read(&mut cx, &mut nothing, false)
+        });
+        assert!(read.is_pending(), "{read:?}");
+        let (first_write, _) = context::poll(&shard.shared, || src.poll_write(&mut cx, b"x"));
+        assert!(matches!(first_write, Poll::Ready(Ok(1))), "{first_write:?}");
+        let mut one = [0u8; 1];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while b.read(&mut one).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first byte never came"
+            );
+            std::thread::yield_now();
+        }
+        // The socket fills, behind the side's back.
+        let chunk = [0u8; 4096];
+        // SAFETY: a plain send of our own buffer on our own socket.
+        while unsafe { libc::send(fd, chunk.as_ptr().cast(), chunk.len(), libc::MSG_DONTWAIT) } > 0
+        {
+        }
+        let gift = std::rc::Rc::new(core::cell::Cell::new(None));
+        let (keep, peer, turn_on, taker, old) = (
+            std::rc::Rc::clone(&gift),
+            b.try_clone().unwrap(),
+            Arc::clone(&shard),
+            Arc::clone(&monitor),
+            Arc::clone(&slot),
+        );
+        crate::io::source::write::AFTER_FULL_SEND.set(Some(Box::new(move || {
+            // The take, between the straight send and the rest of the poll.
+            let word = old.word();
+            let mut watch = Watch {
+                runner: first.clone(),
+                last: word,
+                streak: STREAK,
+                longest: 0,
+                reported: slot::inside(0),
+            };
+            let place = taker.places[0].get().unwrap();
+            keep.set(take(&taker, &Weak::new(), place, 0, &mut watch, word));
+            // The peer reads all: room comes, and the edge it brings is passed over.
+            let mut sink = [0u8; 4096];
+            while (&peer).read(&mut sink).is_ok_and(|n| n > 0) {}
+            let _ = turn_on.turn(64, Some(Duration::ZERO));
+        })));
+        let (second, polled) = context::poll(&shard.shared, || src.poll_write(&mut cx, b"y"));
+        assert!(gift.take().is_some(), "the shard was not taken in the poll");
+        assert_eq!(polled, context::Polled::Detached);
+        assert!(matches!(second, Poll::Ready(Ok(1))), "{second:?}");
+        assert!(
+            matches!(b.read(&mut one), Ok(1)) && one == *b"y",
+            "the byte waits behind a side blocked on an edge its driver passed over"
+        );
+    }
+
     /// A take that succeeds holds the shard in its gift, so the runner's
     /// letting go of its own reference as it finds the shard taken leaves
     /// the shard to its next runner.
