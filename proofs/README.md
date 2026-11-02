@@ -2280,14 +2280,20 @@ result swaps GONE in, and unlocks the file itself if the word was HELD; a job th
 when the future is dropped is cancelled. The model has each step: the word and its swap and
 compare-and-swap, the job's claim, the kernel's lock and each unlock, the drop at any point and
 its three steps, and the future taking the result. The kernel's lock is one flag: other holders
-of the file, and how long the blocking lock waits, are the kernel's. 7 configurations: 2 that
-must pass (a lock that always succeeds, and one that may fail, each with the future dropped at any
-point), with the file locked, once both are done, only if the caller holds the lock
-(`NoOwnerlessLock`), a lock handed to the caller held, and both parties always ending; 3
+of the file, and how long the blocking lock waits, are the kernel's, but for one other process
+that holds the file's lock at first and may never let it go (`Outsider`): the job then waits in
+the kernel on a thread of the pool, and a dropped future cannot reach it there. 9
+configurations: 3 that must pass (a lock that always succeeds, and one that may fail, each with
+the future dropped at any point, with the file locked, once both are done, only if the caller
+holds the lock (`NoOwnerlessLock`), a lock handed to the caller held, and both parties always
+ending; and an outsider with a pool of two threads, where a write of the file made once the
+future is gone runs, `WriteServed`); 3
 mutations (a job that writes HELD without looking for GONE, a drop that finds HELD and does not
-unlock, a drop that reads the word and writes GONE in two steps, each `NoOwnerlessLock`); and 2
-witnesses (the job gets the lock after its future was dropped, and a dropped future finds the
-lock held and gives it back itself).
+unlock, a drop that reads the word and writes GONE in two steps, each `NoOwnerlessLock`); and 3
+witnesses (the job gets the lock after its future was dropped; a dropped future finds the lock
+held and gives it back itself; with an outsider that never lets go and a pool of one thread, the
+dropped lock's job keeps that thread, and the write made after the drop never runs, which
+`WriteServed` fails: how a dropped job is to let go of its thread is an open decision).
 
 ## Many reads in one call
 
