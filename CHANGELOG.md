@@ -60,6 +60,11 @@
   lacks. The tests that hold a process's descriptors flat counted three there, since FreeBSD's
   `/dev/fd` lists only the first three without `fdescfs`; they count them with the kernel's own
   count (`kern.proc.nfds`) now, the soak's too.
+- **`sync_dir` on Apple's systems says what it made.** A file system that refuses `F_FULLFSYNC`
+  for a directory got a plain `fsync`, and an `Ok` that read as a full flush. It now gets
+  `F_BARRIERFSYNC` first, which keeps the order of the writes around it, and `fsync` only if
+  that is refused too; the rustdoc says that neither flushes the drive's cache, so a power loss
+  may still lose the entries there (`proofs/tla/dirsync/DirSync.tla`).
 - **The soak sizes its datagram sockets.** It sent UDP datagrams of up to 60 KB and Unix ones of
   up to 4000 bytes into sockets of the system's own size, which macOS and FreeBSD refuse past
   9216 bytes for UDP and macOS past 2048 for a Unix socket (`EMSGSIZE`), as std's sockets do:
