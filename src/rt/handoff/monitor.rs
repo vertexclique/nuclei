@@ -793,6 +793,21 @@ mod tests {
             matches!(b.read(&mut one), Ok(1)) && one == *b"y",
             "the byte waits behind a side blocked on an edge its driver passed over"
         );
+    }
+
+    /// A take that succeeds holds the shard in its gift, so the runner's
+    /// letting go of its own reference as it finds the shard taken leaves
+    /// the shard to its next runner.
+    #[test]
+    fn a_taken_shard_outlives_its_runner_letting_go() {
+        let shard = worker_shard();
+        let (monitor, slot, mut watch) = watched(&shard);
+        let gift = take_outside(&monitor, &mut watch).expect("the runner was outside");
+        assert_eq!(slot.come_back(1), slot::Back::Taken);
+        drop(shard);
+        assert_eq!(Arc::strong_count(&gift.shard.0), 1);
+    }
+
     /// A take whose heavy fence fails relies on nothing the fence was to order: it cancels its
     /// claim, takes nothing, and counts the failure on the shard, so a watch that can no longer
     /// rescue a blocked poll is seen in the stats (proofs/tla/handoff, `F_fail`).
@@ -815,18 +830,5 @@ mod tests {
         let stats = shard.shared.counters.read(0);
         assert_eq!((stats.handoffs, stats.handoffs_failed), (1, 1));
         drop(gift);
-    }
-
-    /// A take that succeeds holds the shard in its gift, so the runner's
-    /// letting go of its own reference as it finds the shard taken leaves
-    /// the shard to its next runner.
-    #[test]
-    fn a_taken_shard_outlives_its_runner_letting_go() {
-        let shard = worker_shard();
-        let (monitor, slot, mut watch) = watched(&shard);
-        let gift = take_outside(&monitor, &mut watch).expect("the runner was outside");
-        assert_eq!(slot.come_back(1), slot::Back::Taken);
-        drop(shard);
-        assert_eq!(Arc::strong_count(&gift.shard.0), 1);
     }
 }
