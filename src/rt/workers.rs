@@ -20,7 +20,7 @@ use super::rng::random_below;
 use core::cell::Cell;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use super::context;
@@ -72,7 +72,7 @@ pub(crate) struct Workers {
     threads: Mutex<Vec<(JoinHandle<()>, Arc<Life>)>>,
     /// The monitor's thread, joined apart from the others: before them.
     monitor_thread: Mutex<Option<JoinHandle<()>>>,
-    exits: kovan_channel::unbounded::Sender<()>,
+    exits: kovan_channel::unbounded::Sender<ThreadId>,
     /// The watch over the workers, with the handoff on.
     monitor: Option<Arc<Monitor>>,
     monitor_started: OnceLock<()>,
@@ -101,7 +101,7 @@ impl Workers {
         capacity: usize,
         min: usize,
         start: Start,
-        exits: kovan_channel::unbounded::Sender<()>,
+        exits: kovan_channel::unbounded::Sender<ThreadId>,
     ) -> Self {
         let monitor = start
             .handoff_after
@@ -436,13 +436,14 @@ impl Workers {
     }
 }
 
-/// Reports a runtime thread's exit, once what it held is dropped, even when
-/// it ends by a panic.
-struct Exit(kovan_channel::unbounded::Sender<()>);
+/// Reports a runtime thread's exit, naming it, once what it held is dropped,
+/// even when it ends by a panic: the last the thread does before it reads as
+/// finished.
+struct Exit(kovan_channel::unbounded::Sender<ThreadId>);
 
 impl Drop for Exit {
     fn drop(&mut self) {
-        self.0.send(());
+        self.0.send(std::thread::current().id());
     }
 }
 

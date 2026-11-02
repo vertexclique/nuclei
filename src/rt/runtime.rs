@@ -23,7 +23,7 @@ use core::future::Future;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, OnceLock};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use kovan_channel::flavors::RecvDeadline;
@@ -92,8 +92,8 @@ pub(crate) struct Inner {
 /// so nothing they accepted is lost.
 pub struct Runtime {
     inner: Arc<Inner>,
-    /// One message per worker that exited.
-    exits: kovan_channel::unbounded::Receiver<()>,
+    /// One message per runtime thread that exited, naming it.
+    exits: kovan_channel::unbounded::Receiver<ThreadId>,
 }
 
 /// A cloneable handle to a [`Runtime`], to spawn on it from anywhere. It
@@ -191,18 +191,25 @@ impl Runtime {
         // shard and start a runner for it. Once it ended, the list taken next
         // holds every thread to wait for, a detached one marked so
         // (proofs/tla/teardown, `JoinsNoDetached`, `StartedJoined`).
+        let mut exited = Vec::new();
         if let Some(monitor) = self.inner.workers.take_monitor() {
-            self.join(vec![monitor], deadline);
+            self.join(vec![monitor], deadline, &mut exited);
         }
         let threads = self.inner.workers.take_threads();
-        self.join(threads, deadline);
+        self.join(threads, deadline, &mut exited);
     }
 
     /// Waits for `threads` to exit, never for the calling thread's own (a
     /// runtime dropped in one of its own tasks would join itself:
     /// proofs/tla/teardown, `NoSelfJoin`); with a `deadline`, until it
-    /// passes, a thread still running then left to exit on its own.
-    fn join(&self, threads: Vec<JoinHandle<()>>, deadline: Option<std::time::Instant>) {
+    /// passes, a thread still running then left to exit on its own, and
+    /// `exited` the threads whose exit came, kept from one call to the next.
+    fn join(
+        &self,
+        threads: Vec<JoinHandle<()>>,
+        deadline: Option<std::time::Instant>,
+        exited: &mut Vec<ThreadId>,
+    ) {
         let me = std::thread::current().id();
         let threads = threads
             .into_iter()
@@ -214,16 +221,21 @@ impl Runtime {
             return;
         };
         let threads: Vec<_> = threads.collect();
-        // Workers that exited already sent theirs; one message each.
-        for thread in &threads {
-            if thread.is_finished() {
-                continue;
-            }
-            if !matches!(self.exits.recv_deadline(deadline), RecvDeadline::Msg(())) {
-                break;
+        // Until each thread read as finished or its exit came, which it sends
+        // just before: a message only wakes the wait, as it may be another
+        // thread's (a detached one's, one that exited before), and one that
+        // came while an earlier list was waited for counts too
+        // (proofs/tla/teardown/Join.tla, `WaitsForAll`, `Returns`).
+        while threads
+            .iter()
+            .any(|thread| !thread.is_finished() && !exited.contains(&thread.thread().id()))
+        {
+            match self.exits.recv_deadline(deadline) {
+                RecvDeadline::Msg(id) => exited.push(id),
+                _ => break,
             }
         }
-        // A worker that did not exit in time is left to exit on its own.
+        // A thread that did not exit in time is left to exit on its own.
         for thread in threads {
             if thread.is_finished() {
                 let _ = thread.join();

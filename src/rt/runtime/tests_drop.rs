@@ -1,10 +1,12 @@
-//! A runtime's drop against its monitor's last pass (proofs/tla/teardown).
+//! A runtime's drop and timed shutdown against its monitor's last pass, and
+//! a worker still running (proofs/tla/teardown).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use super::Builder;
+use crate::rt::workers::Workers;
 
 /// Waits for `done` with a deadline of `within`; whether it came.
 fn within(within: Duration, mut done: impl FnMut() -> bool) -> bool {
@@ -33,6 +35,45 @@ impl Gate {
     fn open(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
+}
+
+/// `shutdown_timeout` received one exit message per worker not finished, from
+/// whichever thread sent it: an exit left from a worker stopped before (or the
+/// monitor's, or a detached thread's) counted for a worker still running its
+/// task, and the shutdown returned while that worker ran on. It waits for each
+/// worker to end, messages only waking it.
+#[test]
+fn a_timed_shutdown_waits_for_a_running_worker_past_an_exit_left_from_before() {
+    let rt = Builder::new()
+        .worker_threads(1)
+        .max_worker_threads(2)
+        .pin_workers(false)
+        .handoff_after(None)
+        .build()
+        .unwrap();
+    assert_eq!(Workers::start(rt.inner(), 1).unwrap(), 1);
+    assert!(rt.inner().workers.stop_one(), "the second worker stops");
+    assert!(
+        within(Duration::from_secs(10), || !rt.exits.is_empty()),
+        "the stopped worker never sent its exit"
+    );
+    let (started, began) = std::sync::mpsc::channel();
+    let done = Arc::new(AtomicBool::new(false));
+    let (inner, ran) = (Arc::clone(rt.inner()), Arc::clone(&done));
+    rt.spawn(async move {
+        started.send(()).unwrap();
+        // Still running once the shutdown began.
+        within(Duration::from_secs(10), || inner.lingering().is_closing());
+        std::thread::sleep(Duration::from_millis(50));
+        ran.store(true, Ordering::SeqCst);
+    })
+    .detach();
+    began.recv_timeout(Duration::from_secs(10)).unwrap();
+    rt.shutdown_timeout(Duration::from_secs(20));
+    assert!(
+        done.load(Ordering::SeqCst),
+        "the timed shutdown returned while a worker still ran its task"
+    );
 }
 
 /// What a round of the late take saw.
