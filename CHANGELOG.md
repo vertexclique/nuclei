@@ -16,10 +16,11 @@
   every chunk the receive brought was read and its end came (`proofs/tla/ring/RingPoll.tla`,
   and `FdStarve.tla` with the ring's poll). Owned and lent reads, larger reads and datagrams keep
   their ring operations. A round trip on io_uring runs about 11% fewer user instructions (tcp
-  3349 to 2970, 3146 to 2800 under fat LTO; tcp_asyncrw, tcp_many and unix_stream alike) for
-  about 3% more in the kernel, where each read is now a system call of its own (unix_stream
-  about 8%); tcp_split, whose bytes run ahead, keeps the receive (0.8% more in user space, 2 to
-  3% in the kernel). The read on epoll is built apart from the ring's, and runs 8 to 16 fewer.
+  3349 to 2977, 3146 to 2806 under fat LTO; tcp_asyncrw, tcp_many and unix_stream alike) for
+  about 3% more in the kernel, where each read is now a system call of its own (unix_stream 8
+  to 11%); tcp_split, whose bytes run ahead, keeps the receive (0.6% more in user space, up to
+  3% in the kernel). The hangup the poll reports comes on its own edge, so datagrams pay nothing
+  for it. The read on epoll is built apart from the ring's, and runs 8 to 16 fewer.
 - **A stream read the kernel's last count covers asks for no new count** (Linux, epoll). A read
   into the task's own buffer asks the kernel how many bytes it leaves (`TCP_INQ`, `SO_INQ`), with
   `recvmsg` and its control message, to know without another call whether the socket is empty.
