@@ -397,6 +397,12 @@ impl Ring {
         self.sq.ready()
     }
 
+    /// Hands `f` the user data of each entry queued that the kernel has not consumed yet (see
+    /// [`queue::Sq::pending`]).
+    pub(crate) fn pending(&self, f: impl FnMut(u64)) {
+        self.sq.pending(f);
+    }
+
     /// Queues `sqe`; nothing reaches the kernel until [`Ring::submit`] or [`Ring::submit_and_wait`].
     pub(crate) fn push(&mut self, sqe: &Sqe) -> Result<(), SqFull> {
         self.sq.push(sqe)

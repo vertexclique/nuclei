@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use super::Notifier;
 use crate::syscore::linux::iouring::ops::{NOT_AN_OP, WAKE_LOW};
-use crate::syscore::linux::iouring::ring::sys::IORING_SETUP_SINGLE_ISSUER;
+use crate::syscore::linux::iouring::ring::sys::{IORING_SETUP_SINGLE_ISSUER, IORING_SETUP_SQPOLL};
 use crate::syscore::linux::iouring::ring::{IoUringCqe, Ring, RingConfig, SqFull, Sqe};
 
 /// Where a wait puts the completions it reaps, and how many it may.
@@ -221,14 +221,29 @@ impl RingPoller {
         }
     }
 
+    /// Whether the ring has a kernel submission thread, which issues every request and so runs
+    /// every completion's work, whatever thread runs the shard.
+    pub(crate) fn sqpoll(&self) -> bool {
+        self.ring.flags() & IORING_SETUP_SQPOLL != 0
+    }
+
+    /// Hands `f` the user data of each entry queued here that the kernel has not taken yet: the
+    /// thread that enters the kernel next submits it.
+    pub(crate) fn pending(&self, mut f: impl FnMut(u64)) {
+        self.ring.pending(&mut f);
+        self.waiting.iter().for_each(|sqe| f(sqe.data()));
+    }
+
     /// The calling thread takes the ring over from a runner the monitor took its shard from
-    /// (`ShardRing::adopt`): the wake read that runner armed completes as work queued to it, which
-    /// a thread in a wait no signal ends never runs, so a wake from another thread would end no
-    /// wait of this one. That read is cancelled (the cancel's own completion carries `ignored`), and
-    /// the next wait arms one of this thread's, under the next wake id: the old one's completion,
-    /// whenever its thread runs it, is a wake and no more (proofs/tla/ring/RingHandoff.tla).
-    pub(crate) fn adopt(&mut self, ignored: u64) {
-        if !self.wake_armed {
+    /// (`ShardRing::adopt`), before it enters the kernel: the wake read that runner submitted
+    /// completes as work queued to it, which a thread in a wait no signal ends never runs, so a
+    /// wake from another thread would end no wait of this one. A read in the kernel (not among
+    /// `pending`, which this thread submits) is cancelled (the cancel's own completion carries
+    /// `ignored`), and the next wait arms one of this thread's, under the next wake id: the old
+    /// one's completion, whenever its thread runs it, is a wake and no more
+    /// (proofs/tla/ring/RingHandoff.tla).
+    pub(crate) fn adopt(&mut self, ignored: u64, pending: &[u64]) {
+        if !self.wake_armed || pending.binary_search(&self.wake_id).is_ok() {
             return;
         }
         self.push(Sqe::async_cancel(self.wake_id).user_data(ignored));

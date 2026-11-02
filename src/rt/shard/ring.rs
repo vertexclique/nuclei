@@ -700,20 +700,42 @@ impl ShardRing {
     /// room), and the ring's wake read, would then bring nothing for as long. Each is cancelled from
     /// here and its side told it ended, so the side arms another, submitted by this thread; the old
     /// one stays in the slab as a zombie, which points at no memory, hands its side nothing and is
-    /// buried at its own end (`bury`), whenever its old thread runs it. Everything else is left as
-    /// it is, its completion waiting for that thread: an operation that takes or gives bytes, a
+    /// buried at its own end (`bury`), whenever its old thread runs it. An entry still waiting to
+    /// reach the kernel is this thread's, which submits it, and stays as it is; what the kernel
+    /// posted already goes to its side first, so an edge in the queue is not lost with its zombie
+    /// (tests/cadence.rs, each runner blocking at once). Everything else is left as it is, its
+    /// completion waiting for that thread: an operation that takes or gives bytes, a
     /// file's call and a child's exit watch, whose work cannot be done again, and an accept,
     /// whose poll is an exclusive waiter of its listener, the first of which takes each
     /// connection's wake (see `RingMem::adopted`; proofs/tla/ring/RingHandoff.tla).
     #[cold]
     #[inline(never)]
     pub(crate) fn adopt(&self, shard: Option<&Shard>) {
-        self.poller.borrow_mut().adopt(IGNORED);
+        // With a kernel submission thread every request is that thread's.
+        if self.poller.borrow().sqpoll() {
+            return;
+        }
+        // What waits to reach the kernel this thread submits at its next enter: its own.
+        let mut pending = Vec::new();
+        self.poller
+            .borrow()
+            .pending(|user_data| pending.push(user_data));
+        pending.sort_unstable();
+        let old: Vec<u64> = self
+            .ops
+            .borrow()
+            .keys()
+            .filter(|user_data| pending.binary_search(user_data).is_err())
+            .collect();
+        self.poller.borrow_mut().adopt(IGNORED, &pending);
+        // The completions the kernel posted already go to their sides first: a poll's edge in
+        // the queue is delivered, not lost with its zombie. A failure is the first drive's to
+        // report, as it meets it again.
+        let _ = self.wait(shard, Some(Duration::ZERO));
         let mut ended = Vec::new();
         {
-            let keys: Vec<u64> = self.ops.borrow().keys().collect();
             let mut ops = self.ops.borrow_mut();
-            for user_data in keys {
+            for user_data in old {
                 let Some(op) = ops.get_mut(user_data) else {
                     continue;
                 };
