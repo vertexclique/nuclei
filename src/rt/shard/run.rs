@@ -5,9 +5,10 @@
 //! Each poll the loop makes, of a task or of its future, runs through
 //! [`context::poll`]: outside the shard, then back in. A poll may end with
 //! the shard taken from the thread (`rt::handoff`); the frame of the loop
-//! that made it then touches the shard no more. A worker's loop ends; a
-//! `block_on` moves its future to the thread's own shard, its waker aimed
-//! there first, and finishes it there.
+//! that made it then touches the shard no more, even where that poll
+//! finished its future (proofs/tla/handoff, `N_safe`). A worker's loop ends;
+//! a `block_on` returns that output, or moves its future to the thread's own
+//! shard, its waker aimed there first, and finishes it there.
 
 use core::future::Future;
 use core::pin::{Pin, pin};
@@ -23,8 +24,9 @@ use crate::rt::task::Runnable;
 use crate::rt::tuning::QUARTZ_EVERY;
 use crate::sync::internal::Ordering;
 
-/// The shard was taken from this thread while the loop ran.
-pub(crate) struct Detached;
+/// The shard was taken from this thread while the loop ran; the future's output, when the poll
+/// that found the take finished it.
+pub(crate) struct Detached<T>(Option<T>);
 
 /// How a worker's loop ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,7 +59,9 @@ impl Shard {
                     self.keep_signal(signal);
                     output
                 }
-                Err(Detached) => finish_on_own(future, &signal),
+                // The shard is another thread's now: its cell keeps no waker of this call.
+                Err(Detached(Some(output))) => output,
+                Err(Detached(None)) => finish_on_own(future, &signal),
             }
         })
     }
@@ -76,7 +80,8 @@ impl Shard {
         let signal = self.signal();
         match self.run_loop(stopped, &signal) {
             Ok(()) => Worked::Stopped,
-            Err(Detached) => Worked::Detached,
+            // Stopped in the poll that found the take or not, the thread lost the shard.
+            Err(Detached(_)) => Worked::Detached,
         }
     }
 
@@ -119,7 +124,8 @@ impl Shard {
         let _leaving = Leaving(self);
         loop {
             // A thread's own shard is never taken: nobody watches it.
-            if let Ok(output) = self.run_loop(future.as_mut(), signal) {
+            if let Ok(output) | Err(Detached(Some(output))) = self.run_loop(future.as_mut(), signal)
+            {
                 return output;
             }
         }
@@ -127,12 +133,14 @@ impl Shard {
 
     /// The loop: polls `future` when it is woken and, between its polls, runs
     /// the shard's tasks, timers and poller, until `future` is ready or the
-    /// shard is taken from this thread.
+    /// shard is taken from this thread. A poll that finished `future` and found
+    /// the take answers [`Detached`] with the output: the caller touches the
+    /// shard no more either way.
     fn run_loop<F: Future>(
         &self,
         mut future: Pin<&mut F>,
         signal: &Arc<Signal>,
-    ) -> Result<F::Output, Detached> {
+    ) -> Result<F::Output, Detached<F::Output>> {
         let waker = Signal::waker(signal);
         let mut cx = Context::from_waker(&waker);
         // Turns in which the future woke itself and no task ran.
@@ -153,10 +161,13 @@ impl Shard {
                     poll
                 });
                 if let Poll::Ready(output) = poll {
+                    if polled == Polled::Detached {
+                        return Err(Detached(Some(output)));
+                    }
                     return Ok(output);
                 }
                 if polled == Polled::Detached {
-                    return Err(Detached);
+                    return Err(Detached(None));
                 }
                 if signal.woken.load(Ordering::Relaxed) {
                     owed = self.queued();
@@ -165,7 +176,7 @@ impl Shard {
             if let Some(runnable) = self.next() {
                 owed = owed.saturating_sub(1);
                 if self.run(runnable) == Polled::Detached {
-                    return Err(Detached);
+                    return Err(Detached(None));
                 }
                 // One decrement a run; the runs that weigh a look are the
                 // count's stops.
