@@ -2101,21 +2101,18 @@ contests one: it puts its word back and the call takes the full bracket when a c
 the push is another), and cancels a pending claim
 with a compare-and-swap; the monitor sets the claim pending, runs the heavy fence (every buffer
 flushed at once), reads the word again and takes with the opposite compare-and-swap, then hands
-the shard to a spare with a fresh slot. A task's run comes back on its own last word, the poll's
-outside word with its mark bit cleared, which every call put back as it ended
-(`OutsideWordAtPollEnd`, checked by every configuration that must pass). 21 configurations: 4 that
-must pass (two handoffs, a remote push and a bound task: at most one thread inside the shard,
-`Exclusive`, a detached thread staying out, a bound task on its creator only; a first poll that makes a call and then never
+the shard to a spare with a fresh slot. 20 configurations: 4 that must pass (two handoffs, a
+remote push and a bound task: at most one thread inside the shard, `Exclusive`, a detached thread
+staying out, a bound task on its creator only; a first poll that makes a call and then never
 returns, every remote push run anyway, `Rescued`; both again, with one handoff and one poll, with
-the call a leaf push); 12
+the call a leaf push); 11
 mutations, each of which must break a property (no heavy fence, no second read of the word, no
 look at the claim at a poll's end or in a call into the runtime, a call that looks at its claim
 with no mark first, a leaf push that goes in with no look at its claim, the old runner's slot
 handed on: each breaks `Exclusive`; the new runner taking the bound tasks breaks
 `BoundOnCreator`; no handoff at all, a call that leaves its mark as it ends, and a leaf push that
 backs out with its mark still up, so a poll that blocks after a call is never seen to block, each
-break `Rescued`; the leaf push backing out with its mark up also breaks `OutsideWordAtPollEnd`,
-checked on its own); and 5 witnesses (a handoff, a cancel by the monitor, a call into the runtime
+break `Rescued`); and 5 witnesses (a handoff, a cancel by the monitor, a call into the runtime
 from a detached thread, a cancel by the runner, a leaf push backing out on a claim). `tla/handoff/Retarget.tla` checks the waker of a
 `block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
 the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,

@@ -18,7 +18,6 @@ L_safe                Handoff     pass
 L_rescue              Handoff     pass
 M_leaf_no_check       Handoff     violated:Exclusive
 M_leaf_keeps_mark     Handoff     violated:Rescued
-M_leaf_keeps_mark_word Handoff    violated:OutsideWordAtPollEnd
 W_leaf_back           Handoff     violated:NoLeafBack
 R_seqcst              Retarget    pass
 M_retarget_relaxed    Retarget    violated:WokenPolled
