@@ -36,3 +36,6 @@ L_background      Linger  pass
 L_bound           Linger  pass
 LM_bound_drops    Linger  violated:AllSent
 LW_bound          Linger  violated:NoBoundOut
+B_deaf            Behind  pass
+MB_no_drain_time  Behind  violated:DrainEnds
+W_drain_timeout   Behind  violated:NoDrainTimeout

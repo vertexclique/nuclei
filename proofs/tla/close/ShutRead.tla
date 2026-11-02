@@ -25,9 +25,15 @@
 (*                                                                          *)
 (* What is abstract. The bytes are counted; Windows answers a read after   *)
 (* the shutdown with an error where the others answer the end, which is    *)
-(* the kernel's own answer to both (`eof` stands for either); a receive a  *)
-(* completion port already filled before the shutdown, its completion not  *)
-(* yet taken, is not modelled: its bytes come after the drop.              *)
+(* the kernel's own answer to both (`eof` stands for either).              *)
+(*                                                                          *)
+(* With `PortFilled` set, a completion port's receive (Windows) takes      *)
+(* bytes from the kernel's queue into a buffer of the pool before the      *)
+(* shutdown, and its completion reaches the side only after the drop of    *)
+(* the read-ahead: its bytes become read-ahead after the shut, and a read  *)
+(* returns them where std's answers the end (`W_port_filled`, which        *)
+(* `AsStd` must fail: the code as it is; how the shut is to drop them is   *)
+(* the operator's to decide).                                              *)
 (***************************************************************************)
 EXTENDS Integers, TLC                                                        \* numbers and TLC's helpers
 
@@ -35,6 +41,7 @@ CONSTANTS                                                                    \* 
     Sent,      \* the bytes the peer sent that the task has not read
     Ahead,     \* of them, the bytes the handle read ahead before the shut
     Platform,  \* "linux", or "other": a kernel that drops its queue as it shuts the half
+    PortFilled, \* TRUE: a completion port's receive took bytes before the shutdown, its completion not taken yet
     Mutation   \* "none", or the one rule this run takes away
 
 \* What std reads after the same shutdown with all `Sent` bytes still in its kernel.
@@ -54,7 +61,8 @@ variables                                                                    \* 
     gone = 0,              \* (record) bytes the handle's drop of its read-ahead dropped
     returned = FALSE,      \* the task's shut returned
     readAfter = 0,         \* bytes the task read after its shut returned
-    eof = FALSE;           \* a read after the shut answered the end
+    eof = FALSE,           \* a read after the shut answered the end
+    filled = 0;            \* bytes a port's receive took from the queue, its completion not taken yet
 
 \* The task: shuts the reading half, then reads until the end.
 fair process task = "task"                                                   \* one task
@@ -82,7 +90,7 @@ T_read:                                                                      \* 
             ahead := ahead - 1;                                              \* the read takes it
             readAfter := readAfter + 1;                                      \* after the shut returned
         or                                                                   \* the end:
-            await ahead = 0 /\ queue = 0;                                    \* nothing ahead nor queued
+            await ahead = 0 /\ queue = 0 /\ filled = 0;                      \* nothing ahead, queued nor coming
             eof := TRUE;                                                     \* the shut half answers the end
         end either;                                                          \* one of the two
     end while;                                                               \* the end came
@@ -93,8 +101,14 @@ fair process driver = "driver"                                               \* 
 begin                                                                        \* the driver's steps:
 D_loop:                                                                      \* one byte per step
     while ~eof do                                                            \* until the task saw the end
-        await queue > 0 \/ eof;                                              \* a byte queued, or the end came
-        if queue > 0 then                                                    \* a byte:
+        await queue > 0 \/ eof \/ (filled > 0 /\ returned);                  \* a byte queued, a late completion, or the end
+        if filled > 0 /\ returned then                                       \* the port's completion, taken after the drop:
+            ahead := ahead + filled;                                         \* its bytes are read-ahead now
+            filled := 0;
+        elsif PortFilled /\ ~shut /\ queue > 0 then                          \* a port's receive before the shutdown:
+            filled := filled + queue;                                        \* takes what is queued, its completion later
+            queue := 0;
+        elsif queue > 0 then                                                 \* a byte:
             queue := queue - 1;                                              \* it leaves the kernel's queue
             ahead := ahead + 1;                                              \* into the read-ahead
         end if;                                                              \* moved

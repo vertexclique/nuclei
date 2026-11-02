@@ -1515,12 +1515,14 @@ stream, which `FinMeansWhole` fails: a Unix stream has no way to say it was cut,
 or `Both`, then `Source::poll_drop_ahead` and `ReadState::drop_ahead` where the kernel drops its
 receive queue; the ring's shutdown entry in `src/fs/ring.rs`): two bytes the peer sent are unread,
 one read ahead, one in the kernel's queue; the task shuts the half and reads to the end while the
-driver reads ahead. 6 configurations: 2 that must pass (Linux, which keeps its queue readable, and
+driver reads ahead. 7 configurations: 2 that must pass (Linux, which keeps its queue readable, and
 a kernel that drops it), with `AsStd`, the reads after the shut answer exactly what std's reads
 answer after its shutdown, and `Termination`; 3 mutations (keeping the read-ahead where the kernel
 drops its queue, dropping it on Linux, and dropping it before the kernel's shutdown, which lets
-the driver read the queued byte ahead in between: all break `AsStd`); and 1 witness (the drop of
-the read-ahead drops a byte).
+the driver read the queued byte ahead in between: all break `AsStd`); and 2 witnesses (the drop
+of the read-ahead drops a byte; on Windows a completion port's receive that took a byte before the
+shutdown, its completion reaching the side after the drop, makes it read-ahead after the shut,
+which `AsStd` fails: the code as it is, how the shut is to drop it being an open decision).
 
 The Rust tests `shut::*` in `tests/faults/shut.rs` hold a real stream to the same rules: the peer
 reads every byte behind before the end, reads after a shut answer as std's, writes go on after a
@@ -1665,12 +1667,18 @@ shard hands a source that still holds bytes to a drain task on a worker. The tas
 time it is woken: with nothing left it ends; registered nowhere with nothing out, it registers
 the source with its worker, whose driver writes the bytes out; with an operation still out (a
 port's TCP send, which the eviction never cancels, or a ring's send it cancels, which may come
-back undone) it waits for that operation's end, which wakes it. 7 configurations: 3 that must
+back undone) it waits for that operation's end, which wakes it. The drain runs for at most a
+dropped handle's linger (`drain` with `linger::time`), and gives the rest up when that time runs
+out, which is the only end a peer that never reads leaves it. 10 configurations: 4 that must
 pass (a readiness poller with every byte behind, a port with a send out, a ring with a send
-cancelled), with `Conserved`, no byte lost or sent twice, `AllSent`, every byte reaches the
-kernel, and `DrainEnds`; 3 mutations (no drain task, as before, which left the peer waiting for
-good, `AllSent`; a drain task that does not register the source, `AllSent`; an operation's end
-that wakes nobody, `AllSent`); and 1 witness (the drain task moves the source to the worker).
+cancelled, with `Conserved`, no byte lost or sent twice, `AllSent`, every byte reaches the
+kernel, and `DrainEnds`; a port whose peer never reads, with `DrainEnds`); 4 mutations (no drain
+task, as before, which left the peer waiting for good, `AllSent`; a drain task that does not
+register the source, `AllSent`; an operation's end that wakes nobody, `AllSent`; a drain with no
+time limit waits for a peer that never reads for good, `DrainEnds`); and 2 witnesses (the drain
+task moves the source to the worker; the drain's time runs out with bytes held). `Going`'s wait
+for the eviction is an `await`: the code spins on `yield_now` with no bound until a holder of a
+side lets go, which the model assumes.
 
 `Linger` (`tla/going/Linger.tla`) checks what a dropped handle leaves when its runtime drops
 (`src/rt/linger.rs`, `Runtime::drop` and `finish_lingering` in `src/rt/runtime.rs`,
@@ -2733,9 +2741,9 @@ shows each check is needed and in its place.
   refusal to rebind a handle with operations out to a bind that fails while any are; the
   broadcast model leaves the wake to `Notify` (checked with the sync primitives) and the
   reclamation of nodes to kovan; the close models take a linger's time and a connect's pause
-  as steps that may come at any moment, and leave out a receive a completion port filled
-  before a shutdown of the reading half, whose bytes a read after the shut may still return
-  on Windows.
+  as steps that may come at any moment. A receive a completion port filled before a shutdown
+  of the reading half, whose bytes a read after the shut may still return on Windows, is
+  `ShutRead`'s witness `W_port_filled`: it is not fixed.
 - **How soon.** `Termination` says every waiter is eventually served under weak fairness; it
   says nothing about how long that takes, and nothing about a thread the scheduler stops for
   good.
