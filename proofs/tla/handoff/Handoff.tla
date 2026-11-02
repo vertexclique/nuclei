@@ -51,6 +51,28 @@
 (* again; so each such call backs out and stays out. The detached runner   *)
 (* then drains the bound tasks it created and waits as a spare itself.     *)
 (*                                                                          *)
+(* With `Nested`, a call may run a nested `block_on` on the same shard and *)
+(* slot (`Shard::block_on` in src/rt/shard/run.rs, from `block_on_here` in *)
+(* src/rt/runtime.rs): its loop polls the nested future outside the shard  *)
+(* in a new epoch and comes back as any poll's end does. A future may      *)
+(* finish in the very poll that found its shard taken: the loop then       *)
+(* answers "detached" with the output (`run_loop`'s                        *)
+(* `Detached(Some(output))`), so `block_on` keeps no waker on the shard it *)
+(* lost (`keep_signal`) and a worker's loop never answers "stopped" for a  *)
+(* shard that was taken (`run_worker`). With `Fence = "full"` the process  *)
+(* has no heavy fence (`Monitor::full_fence` in src/rt/handoff/monitor.rs: *)
+(* macOS, the BSDs, a Linux without membarrier): both sides take a         *)
+(* sequentially consistent fence instead, the runner between its word and *)
+(* its claim (`Slot::enter`, `Slot::mark_unless_claimed` in                *)
+(* src/rt/handoff/slot.rs), the monitor between its claim and its look at  *)
+(* the word (`take`). With `Fence = "failing"` the heavy fence may fail    *)
+(* (`fence::heavy` false, src/rt/handoff/fence.rs): `take` then cancels    *)
+(* its claim, takes nothing, and counts it (`Counters::handoff_failed`).   *)
+(* A call may also unwind (a panic in it that the task's code catches):    *)
+(* its guard ends it as its normal end does (`Bracket`'s drop in           *)
+(* src/rt/context.rs; `After`'s drop in src/io/side/after.rs, through      *)
+(* `context::unmark_unwound`).                                             *)
+(*                                                                          *)
 (* What is modelled step by step: each thread's store buffer (in order),   *)
 (* the flush of a buffer's oldest store at any time, the heavy fence as    *)
 (* the flush of every buffer at once, each store and load of the protocol, *)
@@ -70,6 +92,9 @@ CONSTANTS
     Bounds,        \* tasks bound to the creating thread, pushed remotely
     BlockForever,  \* the first runner's first poll never returns
     DetachedCalls, \* calls into the runtime a detached thread's code still makes
+    MaxBrackets,   \* calls into the runtime one poll makes
+    Nested,        \* a call may run a nested `block_on`, and a poll's future may finish
+    Fence,         \* "heavy" (membarrier), "failing" (one that may fail) or "full" (none)
     Mode           \* "ok" or a mutation (see the configurations)
 
 Threads == {1, 2}
@@ -85,8 +110,6 @@ PENDING == 1
 TAKEN == 2
 \* A store buffer holds this many stores; a store into a full one waits, as a CPU's does.
 BufCap == 2
-\* Calls into the runtime one poll makes.
-MaxBrackets == 1
 
 \* What actor `a` reads at (kind, slot): its own newest buffered store, else memory.
 Newest(sq, k, s) ==
@@ -122,7 +145,9 @@ variables
     runnerCancels = 0,                   \* (record) a runner cancelled a pending claim
     leafBacks = 0,                       \* (record) a leaf push backed out on a claim
     gone = {},                           \* threads detached, not handed a shard since
-    staleBacks = 0;                      \* (record) a detached thread's leaf push backed out
+    staleBacks = 0,                      \* (record) a detached thread's leaf push backed out
+    stopped = {},                        \* threads whose worker loop answered "stopped"
+    fenceFails = 0;                      \* (record) a heavy fence failed and the take was cancelled
 
 define
     \* At most one actor is inside the shard's owned part.
@@ -134,6 +159,9 @@ define
         /\ \A t \in gone : t \notin inS
     \* A bound task runs on the thread that created it, never elsewhere.
     BoundOnCreator == boundBy \subseteq {Creator}
+    \* A worker's loop whose shard was taken says so ("detached"), even when the poll that found
+    \* the take finished its future: it never answers "stopped" for a shard it no longer runs.
+    TakenReportsDetached == \A t \in stopped : t \notin gone
     \* Every remote push is run, the first runner blocked for good or not.
     Rescued == <>(ran = Pushes)
     \* Witnesses.
@@ -143,8 +171,20 @@ define
     NoRunnerCancel == runnerCancels = 0
     NoLeafBack == leafBacks = 0
     NoStaleBack == staleBacks = 0
+    NoFenceFailed == fenceFails = 0
     \* The leaf push is part of the algorithm under these modes: the leaf and its mutations.
-    Leaf == Mode \in {"leaf", "leaf_no_check", "leaf_keeps_mark", "taken_cleared"}
+    Leaf == Mode \in {"leaf", "leaf_no_check", "leaf_keeps_mark", "taken_cleared", "no_leaf_fence"}
+    \* Whether runner `a` may look at its claim now. With no heavy fence (`Fence = "full"`) the
+    \* look comes after a full fence, which waits until every store `a` made reached memory; with
+    \* the heavy fence the runner needs none. `leaf` says whether the look is the leaf push's
+    \* (`Slot::mark_unless_claimed`), whose fence the mutation `no_leaf_fence` removes;
+    \* `no_runner_fence` removes the other one (`Slot::enter`, behind a poll's end and a call's
+    \* mark).
+    MayLook(a, leaf) ==
+        \/ Fence # "full"
+        \/ (leaf /\ Mode = "no_leaf_fence")
+        \/ (~leaf /\ Mode = "no_runner_fence")
+        \/ buf[a] = <<>>
 end define;
 
 \* The memory: a buffer's oldest store reaches memory, at any time.
@@ -180,8 +220,8 @@ end process;
 fair process thread \in Threads
 \* sl: the slot the thread runs with; e: its poll's epoch; polls: polls this turn; c: the claim it
 \* read; br: calls this poll made; saved: the word a call read at its start, put back at its end.
-\* dc: the calls its code made while detached.
-variables sl = 0, e = 0, polls = 0, c = NONE, br = 0, saved = 0, dc = 0;
+\* dc: the calls its code made while detached; nests: the nested `block_on`s it ran (one at most).
+variables sl = 0, e = 0, polls = 0, c = NONE, br = 0, saved = 0, dc = 0, nests = 0;
 begin
 T_begin:
     if self = 1 then
@@ -194,6 +234,7 @@ Spare:
     sl := assign[self];
     assign[self] := 0;
     gone := gone \ {self};
+    stopped := stopped \ {self};
     e := 0;
     polls := 0;
     inS := inS \cup {self};
@@ -246,6 +287,8 @@ B_store:
         buf[self] := Append(buf[self], <<"word", sl, 0>>);
     end if;
 B_check:
+    \* With no heavy fence, a full fence first (`MayLook`).
+    await MayLook(self, FALSE);
     c := ReadAt(claim, buf[self], "claim", sl);
     if c = NONE \/ Mode = "no_bracket_check" then
         inS := inS \cup {self};
@@ -255,7 +298,9 @@ B_cas:
     \* A claim is up: cancel it if still pending (a locked instruction, so the
     \* buffer drains first), or leave a shard that is taken.
     await buf[self] = <<>>;
-    if claim[sl] = TAKEN then
+    \* (MUTATION blind_contest: the runner's cancel is a plain store, not a compare-and-swap from
+    \* pending: it clears a taken claim too, and goes into the shard the monitor took.)
+    if claim[sl] = TAKEN /\ Mode # "blind_contest" then
         \* The call goes through the shard's remote paths instead.
         \* (MUTATION taken_cleared: the detaching runner clears the taken claim, as a reset of its
         \* slot would.)
@@ -274,21 +319,95 @@ B_cas:
     end if;
 B_in:
     \* The runtime's work, inside the shard; then the call ends (`Slot::unmark`).
-    inS := inS \ {self};
+    either
+        inS := inS \ {self};
+    or
+        \* The call unwinds: a panic in it, which the task's code catches. Its guard ends it as
+        \* its normal end does (`Bracket`'s drop; `After`'s drop for an IO owner's step), the
+        \* branch above, so only the mutation needs a branch of its own.
+        \* (MUTATION marked_unwind: the call has no guard, as an IO owner's step had none: the
+        \* unwind skips its end, so the word says loop for the rest of the poll.)
+        await Mode = "marked_unwind";
+        inS := inS \ {self};
+        goto R_task;
+    or
+        \* The call runs a nested `block_on` on this shard (`Shard::block_on`), whose loop polls
+        \* its future on the same slot.
+        await Nested /\ nests < 1;
+        nests := nests + 1;
+        goto N_out;
+    end either;
 B_out:
     \* word := the word the call read at its start, a release store: outside the shard again.
+    \* A thread whose nested poll found the shard taken stores it into the slot it was taken
+    \* from (`Bracket`'s drop), which the monitor never reads again, and unwinds.
     \* (MUTATION call_stays_marked: the call leaves its mark, so the word says loop for the rest
     \* of the poll.)
     if Mode # "call_stays_marked" then
         await Len(buf[self]) < BufCap;
         buf[self] := Append(buf[self], <<"word", sl, saved>>);
     end if;
-    goto R_task;
+    if self \in gone then
+        goto D_unwind;
+    else
+        goto R_task;
+    end if;
+N_out:
+    \* The nested poll: word := (task, a new epoch), a release store (`poll_watched`); the
+    \* nested future's code runs outside the shard.
+    await Len(buf[self]) < BufCap;
+    e := e + 1;
+    buf[self] := Append(buf[self], <<"word", sl, e>>);
+    inS := inS \ {self};
+N_store:
+    \* The nested poll ends (`come_back`): word := loop, a compiler fence only.
+    await Len(buf[self]) < BufCap;
+    buf[self] := Append(buf[self], <<"word", sl, 0>>);
+N_check:
+    await MayLook(self, FALSE);
+    c := ReadAt(claim, buf[self], "claim", sl);
+    if c = NONE then
+        \* Back in: the nested loop runs inside until its future is done, and the call ends.
+        inS := inS \cup {self};
+        goto B_in;
+    end if;
+N_cas:
+    await buf[self] = <<>>;
+    if claim[sl] = TAKEN /\ Mode # "blind_contest" then
+        gone := gone \cup {self};
+    else
+        if claim[sl] = PENDING then
+            runnerCancels := 1;
+        end if;
+        claim[sl] := NONE;
+        inS := inS \cup {self};
+        goto B_in;
+    end if;
+N_after:
+    \* The nested poll found the shard taken. Its future either waits on (it finishes on the
+    \* thread's own shard, `finish_on_own`) or finished in that poll; either way the loop answers
+    \* "detached" and `block_on` touches the lost shard no more.
+    either
+        skip;
+    or
+        \* The future finished in the poll that found the take.
+        \* (MUTATION ready_first: the loop answers the future's output before it looks at the
+        \* take, as `run_loop` did: `block_on` keeps its waker in the lost shard's cell, a write
+        \* into the shard another thread now runs.)
+        if Mode = "ready_first" then
+            inS := inS \cup {self};
+        end if;
+    end either;
+N_left:
+    \* Whatever the write, the thread is out of the shard again; then the call's end.
+    inS := inS \ {self};
+    goto B_out;
 E_store:
     \* The poll ends: word := loop, a compiler fence only.
     await Len(buf[self]) < BufCap;
     buf[self] := Append(buf[self], <<"word", sl, 0>>);
 E_check:
+    await MayLook(self, FALSE);
     c := ReadAt(claim, buf[self], "claim", sl);
     if c = NONE \/ Mode = "no_poll_check" then
         inS := inS \cup {self};
@@ -296,12 +415,27 @@ E_check:
     end if;
 E_cas:
     await buf[self] = <<>>;
-    if claim[sl] = TAKEN then
+    if claim[sl] = TAKEN /\ Mode # "blind_contest" then
         if Mode = "taken_cleared" then
             claim[sl] := NONE;
         end if;
         gone := gone \cup {self};
-        goto D_unwind;
+        \* With `Nested`, the poll that found the take may be the worker loop's own future
+        \* (`Shared::stopped`), finished in it. The loop answers "detached" all the same
+        \* (`run_worker`), so the thread's bound tasks and its life are seen to: the same step as
+        \* any poll's, so only the mutation needs a branch of its own.
+        \* (MUTATION stopped_on_take: the loop answers the future's "stopped" first, as it did:
+        \* the runner skips what a detached thread does and waits as a spare.)
+        if Nested /\ Mode = "stopped_on_take" then
+            either
+                goto D_unwind;
+            or
+                stopped := stopped \cup {self};
+                goto D_spare;
+            end either;
+        else
+            goto D_unwind;
+        end if;
     else
         if claim[sl] = PENDING then
             runnerCancels := 1;
@@ -317,8 +451,9 @@ L_store:
     saved := ReadAt(word, buf[self], "word", sl);
     buf[self] := Append(buf[self], <<"word", sl, 0>>);
 L_check:
-    \* It reads its claim: none, and it goes in.
+    \* It reads its claim: none, and it goes in. With no heavy fence, a full fence first.
     \* (MUTATION leaf_no_check: it goes in without reading the claim.)
+    await MayLook(self, TRUE);
     c := ReadAt(claim, buf[self], "claim", sl);
     if c = NONE \/ Mode = "leaf_no_check" then
         inS := inS \cup {self};
@@ -395,11 +530,41 @@ M_claim:
         await Len(buf[Mon]) < BufCap;
         buf[Mon] := Append(buf[Mon], <<"claim", ms, PENDING>>);
 M_fence:
-        \* membarrier: every thread's buffered stores reach memory.
-        if Mode # "no_fence" then
-            word := Apply(Apply(word, buf[1], "word"), buf[2], "word");
-            claim := Apply(claim, buf[Mon], "claim");
-            buf := [a \in Actors |-> <<>>];
+        if Fence = "full" then
+            \* No heavy fence: a full fence of the monitor's own (`fence(SeqCst)`), so its claim
+            \* reaches memory before it looks at the word; the runners' stores are their own
+            \* fences' to order (`MayLook`).
+            \* (MUTATION no_fence: no fence between the claim and the look.)
+            if Mode # "no_fence" then
+                claim := Apply(claim, buf[Mon], "claim");
+                buf[Mon] := <<>>;
+            end if;
+        else
+            either
+                \* membarrier: every thread's buffered stores reach memory.
+                \* (MUTATION no_fence: the monitor takes the shard with no heavy fence.)
+                if Mode # "no_fence" then
+                    word := Apply(Apply(word, buf[1], "word"), buf[2], "word");
+                    claim := Apply(claim, buf[Mon], "claim");
+                    buf := [a \in Actors |-> <<>>];
+                end if;
+            or
+                \* With `Fence = "failing"`, the heavy fence fails (`fence::heavy` is false): no
+                \* take may rely on it. The monitor cancels its claim, a compare-and-swap from
+                \* pending (a locked instruction: its buffer drains first), counts the failure
+                \* and takes nothing.
+                \* (MUTATION fail_takes: the monitor looks at the word and takes as if the fence
+                \* had run.)
+                await Fence = "failing";
+                fenceFails := 1;
+                if Mode # "fail_takes" then
+                    with cl = Apply(claim, buf[Mon], "claim") do
+                        claim := [cl EXCEPT ![ms] = IF cl[ms] = PENDING THEN NONE ELSE cl[ms]];
+                    end with;
+                    buf[Mon] := <<>>;
+                    goto M_tick;
+                end if;
+            end either;
         end if;
 M_check:
         if ReadAt(word, buf[Mon], "word", ms) # mv /\ Mode # "no_recheck" then
@@ -413,8 +578,9 @@ M_check:
         end if;
 M_take:
         \* Pending to taken, a compare-and-swap: lost when the runner cancelled first.
+        \* (MUTATION blind_take: a plain store of taken, which overwrites the runner's cancel.)
         await buf[Mon] = <<>>;
-        if claim[ms] = PENDING then
+        if claim[ms] = PENDING \/ Mode = "blind_take" then
             claim[ms] := TAKEN;
             inS := inS \cup {Mon};
         else

@@ -2185,23 +2185,37 @@ the shard to a spare with a fresh slot. A detached runner's code may still call 
 on the slot it was taken from, once a call around a nested `block_on` whose poll found the take
 ends (`Bracket`'s drop puts that slot back): each such call, a leaf push or a bracket, reads that
 slot's claim, which stays taken for good (`Slot::take` is its last write, `Slot::contest` swaps
-only from pending, and the monitor never claims the old slot again), and stays out. 23
-configurations: 5 that must pass (two handoffs, a remote push and a bound task: at most one thread
-inside the shard, `Exclusive`, a detached thread staying out, `DetachedStaysOut`, a bound task on
-its creator only; a first poll that makes a call and then never returns, every remote push run
-anyway, `Rescued`; both again, with one handoff and one poll, with the call a leaf push; and the
-leaf push's run with one poll a turn, the taken runner's code making one more call on its old
-slot, `D_safe`); 12
-mutations, each of which must break a property (no heavy fence, no second read of the word, no
-look at the claim at a poll's end or in a call into the runtime, a call that looks at its claim
-with no mark first, a leaf push that goes in with no look at its claim, the old runner's slot
-handed on: each breaks `Exclusive`; a runner that clears the taken claim as it detaches, so its
-code's next call goes into the shard the monitor took, breaks `DetachedStaysOut`; the new runner
-taking the bound tasks breaks `BoundOnCreator`; no handoff at all, a call that leaves its mark as it ends, and a leaf push that
-backs out with its mark still up, so a poll that blocks after a call is never seen to block, each
-break `Rescued`); and 6 witnesses (a handoff, a cancel by the monitor, a call into the runtime
-from a detached thread, a cancel by the runner, a leaf push backing out on a claim, a detached
-thread's leaf push backing out on its old slot's claim). `tla/handoff/Retarget.tla` checks the waker of a
+only from pending, and the monitor never claims the old slot again), and stays out. A call may run
+a nested `block_on` on the same shard and slot (`Nested`), whose future may finish in the very poll
+that found the take: the loop answers detached with the output (`run_loop`), so `block_on` keeps
+no waker on the lost shard and a worker's loop never answers stopped for it. With no heavy fence
+(`Fence = "full"`: macOS, the BSDs, a Linux without membarrier) both sides take a full fence, the
+runner between its word and its claim, the monitor between its claim and its look; a heavy fence
+may also fail (`Fence = "failing"`), and the take is then cancelled and counted. A call that
+unwinds ends as it would have (`Bracket`'s drop, `After`'s drop). 39 configurations: 10 that must
+pass (two handoffs, a remote push and a bound task: at most one thread inside the shard,
+`Exclusive`, a detached thread staying out, `DetachedStaysOut`, a bound task on its creator only; a
+first poll that makes a call and then never returns, every remote push run anyway, `Rescued`; both
+again, with one handoff and one poll, with the call a leaf push; the leaf push's run with one poll
+a turn, the taken runner's code making one more call on its old slot, `D_safe`; the nested poll,
+`N_safe`, with `TakenReportsDetached`; the full fence, `F_safe`; a failing heavy fence, `F_fail`;
+two calls in one poll, `L_two`, and with two more on the old slot, `D_two`); 21 mutations, each of
+which must break a property (no heavy fence, no second read of the word, no look at the claim at a
+poll's end or in a call into the runtime, a call that looks at its claim with no mark first, a
+leaf push that goes in with no look at its claim, the old runner's slot handed on, a take by a
+plain store of taken, a runner's cancel by a plain store of none, with no heavy fence the runner's
+full fence gone from its way back, from the leaf push or the monitor's, a take after a failed
+heavy fence: each breaks `Exclusive`; a runner that clears the taken claim as it detaches, so its
+code's next call goes into the shard the monitor took, and a nested `block_on` answering its
+future's output before it looks at the take, which keeps its waker in the lost shard, each break
+`DetachedStaysOut`; a worker's loop answering stopped for a shard taken in that poll breaks
+`TakenReportsDetached`; the new runner taking the bound tasks breaks `BoundOnCreator`; no handoff
+at all, a call that leaves its mark as it ends, a call that unwinds with no guard to end it, and a
+leaf push that backs out with its mark still up, so a poll that blocks after a call is never seen
+to block, each break `Rescued`); and 8 witnesses (a handoff, a cancel by the monitor, a call into
+the runtime from a detached thread, a cancel by the runner, a leaf push backing out on a claim, a
+detached thread's leaf push backing out on its old slot's claim, a handoff with no heavy fence, a
+failed heavy fence). `tla/handoff/Retarget.tla` checks the waker of a
 `block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
 the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
 1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old
