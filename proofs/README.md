@@ -631,10 +631,11 @@ each with a mutation of the code that makes one of them fail.
 
 ## The side's guard biased to its owner
 
-`side_biased` (`tla/side_biased/SideBiased.tla`) checks the owner-biased guard (`Side::try_hold`,
-`Side::poll`, `Side::contend`, `Side::defer`, `Side::take_for_request` and
-`Held::release_or_again` in `src/io/side.rs`; the heavy fence is `heavy` and `heavy_retried` in
-`src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
+`side_biased` (`tla/side_biased/SideBiased.tla`) checks the owner-biased guard (`Side::role`,
+`Side::claim`, `Side::try_biased`, `Side::take_foreign`, `Side::poll`, `Side::contend`,
+`Side::defer`, `Side::take_for_request`, `Held::release_or_again`, `Side::release_biased`,
+`Side::unserved` and `Side::give_up` in `src/io/side.rs`; the heavy fence is `heavy` and
+`heavy_retried` in `src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
 x86's do. A socket's side has an owner, the thread running its home shard, which serves the
 driver's edges. The owner takes the side with a plain store of its word `own`, a compiler fence
 and a plain load of the foreign word `intent`: zero, it holds; one, it undoes `own` and takes
@@ -662,7 +663,19 @@ takes the side next anyway). The owner, letting go of `own` at its fallback or i
 switches the side to shared when it sees UNFENCED (`Side::switch_if_unfenced`), so the woken poll
 takes through the word.
 
-40 configurations: 19 that must pass (the owner and one foreign thread polling twice; one making a
+The claimant may never take the side again. Its shard may let go of the source for good
+(`ClaimStops`: a thread's own shard whose `block_on` returned, a worker that went): it gives its
+claim up after its last hold, with a locked instruction, and looks once more for work a fenceless
+call left before that, which it does through the word (`Side::give_up`, called from
+`Source::give_up_claims` as `src/rt/shard/going.rs` lets go of the sources). A fenceless call that
+finds the claim given up takes the side itself; one that left its work looks at the claim again
+after a full fence of its own (`Side::claim_given_up`), so one of the two looks sees the other's
+store. Or the source may be homed elsewhere while the claimant's thread still runs it (`Rehomed`):
+its own calls are then foreign ones, and when its fence fails it reads its own `own`, which needs
+no fence, holds nothing, and takes the side itself (`Side::none_holds_biased`). A claimant that
+gave its claim up claims the side again at its next take as its owner.
+
+51 configurations: 25 that must pass (the owner and one foreign thread polling twice; one making a
 defer and a request; the owner and two foreign threads polling, and making requests; a handoff
 mid-run beside a foreign thread; a handoff after which the old owner polls and makes a request;
 fences that may fail, with one and two edges, a defer and a request, and a handoff; every fence
@@ -671,7 +684,9 @@ one holder at a time, `NoSpin`, no thread waits for another except asleep until 
 `NoLostWork`, every edge served and no left bit up once everything is finished, and
 `SharedAbsorbing`, shared mode for good, with no deadlock; and `Termination` under weak fairness,
 without and with a handoff, with fences that may fail, and with every fence failing with and
-without an owner), 13 mutations (no heavy fence on the foreign path, an owner that holds without
+without an owner; a claimant shard that lets go of the source for good, with every fence failing
+and with fences that may fail, and its liveness; the source homed elsewhere, with fences that never
+fail and with every fence failing, and its liveness), 17 mutations (no heavy fence on the foreign path, an owner that holds without
 reading `intent`, an owner that trusts a mode still biased over `intent`, a foreign thread that
 holds through its intent alone without switching, a move of the shard while its owner is inside
 a take, a move that leaves the old owner's stores in its buffer, a call that reads `own` after a
@@ -679,10 +694,15 @@ failed fence, and a switch stored before the owner's `own := 0` each break `Excl
 that never looks for left work, one that reads the flag word with a plain load, and a nudge that
 never reaches the owner each end in a deadlock, a lost wake; a release that finds work but does
 not take the side again breaks `NoLostWork`; an owner that never switches on UNFENCED leaves the
-poll failing its fence for ever, breaking `Termination`), and 8 witnesses (a foreign call that
+poll failing its fence for ever, breaking `Termination`; a claim kept as its shard lets go of the
+source, a give-up with no look for work left before it, and a fenceless poll that does not look at
+the claim again after it left its work each end in a deadlock; a claimant's own fenceless call,
+the source homed elsewhere, that leaves its work to itself nudges itself for good, breaking
+`Termination`), and 9 witnesses (a foreign call that
 leaves its work to the owner, a switch to shared mode, a handoff, the owner's release taking the
 side again to wake a waiting poll, and to do a deferred bit a foreign defer left, a failed fence
-the owner's switch serves, a failed fence with no owner that goes shared, a nudge served). The
+the owner's switch serves, a failed fence with no owner that goes shared, a nudge served, a fenceless call that finds the
+claim given up). The
 switch stored before `own := 0` breaks `Exclusive` because the model's hold lasts until that store;
 on x86 the owner touches nothing between them, so it shows the rule rather than a lost update.
 
