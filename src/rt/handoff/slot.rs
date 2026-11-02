@@ -142,6 +142,15 @@ impl Slot {
         self.enter(inside(epoch))
     }
 
+    /// [`come_back`](Self::come_back) from the poll whose outside word is the runner's own last
+    /// store (every call the poll made put it back as it ended, and a call that found the shard
+    /// taken left it inside): that word, inside. Keeps no epoch across the poll.
+    #[inline]
+    pub(crate) fn come_back_from_poll(&self) -> Back {
+        let word = self.word.load(Ordering::Relaxed);
+        self.enter(word & !1)
+    }
+
     /// The runner, in a task's code, calls into its shard: the word says
     /// inside the poll again, as at the poll's end, before the runner looks
     /// at the claim. Answers the word it left, which [`unmark`](Self::unmark)

@@ -262,7 +262,10 @@ B_out:
     end if;
     goto R_task;
 E_store:
-    \* The poll ends: word := loop, a compiler fence only.
+    \* The poll ends: word := loop, a compiler fence only. A task's run computes it from its own
+    \* last store, the poll's word with its mark bit cleared (`Slot::come_back_from_poll`): every
+    \* call put that word back as it ended, so it is the same "loop" a run that kept its epoch
+    \* would write.
     await Len(buf[self]) < BufCap;
     buf[self] := Append(buf[self], <<"word", sl, 0>>);
 E_check:
@@ -404,4 +407,11 @@ end algorithm; *)
 \* holds a translation that could fall out of date with the algorithm above.
 \* BEGIN TRANSLATION
 \* END TRANSLATION
+
+\* A poll that ends, as it comes back, finds its own newest word still the poll's outside word:
+\* every call it made put that word back. The run's come-back writes that word with its mark bit
+\* cleared (`Slot::come_back_from_poll`), so it writes the poll's "loop". (Here, past the
+\* translation, since it reads each thread's own variables.)
+OutsideWordAtPollEnd ==
+    \A t \in Threads : pc[t] = "E_store" => ReadAt(word, buf[t], "word", sl[t]) = e[t]
 =============================================================================

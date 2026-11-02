@@ -637,7 +637,15 @@ fn run_task_watched(here: &'static Here, run: impl FnOnce()) {
     slot.go_out(epoch);
     super::task::abort_on_panic(run);
     here.out.set(core::ptr::null());
-    if slot.come_back(epoch) == Back::Taken {
+    // The poll's own word back inside: its epoch is not kept across the run, so the run's frame
+    // holds one register less. Every call of the poll put its outside word back as it ended, or
+    // left it marked when it found the shard taken (proofs/tla/handoff, OutsideWordAtPollEnd).
+    debug_assert_eq!(
+        slot.word() | 1,
+        super::handoff::slot::outside(epoch),
+        "a call of the poll left another word"
+    );
+    if slot.come_back_from_poll() == Back::Taken {
         here.detach();
     }
     here.in_task.set(in_task);
