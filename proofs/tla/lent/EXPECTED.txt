@@ -126,3 +126,7 @@ PF_sync_clone                  MC_LentFile          pass
 PF_sync_clone_live             MC_LentFile          pass
 MF_sticky_unshared             MC_LentFile          violated:SyncCovers
 WF_clone_race                  MC_LentFile          violated:SyncCovers
+PF_sync_iopoll                 MC_LentFile          pass
+PF_sync_iopoll_live            MC_LentFile          pass
+MF_iopoll_refusal_ends         MC_LentFile          violated:NothingRefused
+WF_remade                      MC_LentFile          violated:NoRemade

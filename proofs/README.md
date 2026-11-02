@@ -840,6 +840,9 @@ from where they stopped.
   (`try_clone`), with its own state and sync calls, the same kernel error cursor and the same
   record. In sync_clone the clone syncs first and the handle's sync is called once it is done; in
   sync_clone_race the two go at once.
+- **sync_iopoll**: as sync, on a ring made to poll for its completions (`IORING_SETUP_IOPOLL`),
+  which refuses a sync and a write of a file not opened for direct IO; a refused call is made
+  again on the blocking pool, as one cancelled because its shard went.
 - **direct**: the file is opened for direct IO: a read job reads exactly the cell asked for, and
   each copied write is one kernel write of exactly its bytes, which waits for the write in
   flight instead of joining the write-behind.
@@ -863,16 +866,17 @@ every write a good sync covers (accepted, or returned for a positional one, befo
 is durable; `NoSyncAfterFailure`, no sync called after one failed succeeds; `NoFalseFailure`, a
 sync whose own call succeeded, none before it failing, does not fail; `DirectExact`, on a direct
 file every kernel read and write is exactly one a caller made; `NoCallOnClosed`, no job's call
-runs on a descriptor that closed; and liveness (`Termination`).
+runs on a descriptor that closed; `NothingRefused`, no call a polled ring refuses ends as a
+failure; and liveness (`Termination`).
 
-65 configurations. 23 must pass: tasks that may go away and tasks that stay, a file opened to
+69 configurations. 25 must pass: tasks that may go away and tasks that stay, a file opened to
 append, positional calls, the generation, syncs that may fail (with their tasks staying, and
 going away with a call out), a write the kernel fails beside two syncs, a sync of a clone that
-fails before the handle's, and a direct file, each with its
+fails before the handle's, calls a polled ring refuses, and a direct file, each with its
 safety properties; a handle dropped or handed back with cursor jobs, and with a positional write
 left by its task, still out, with `NoCallOnClosed` beside them; and liveness for the cursor,
-append, positional, generation, sync (both ways), lost write, clone and direct scenarios. 28
-mutations must break the property
+append, positional, generation, sync (both ways), lost write, clone, polled ring and direct
+scenarios. 29 mutations must break the property
 their rule protects: a result that counts on the cursor alone breaks `NoStaleRead`, through the
 seek back; a lent write that goes in flight over the one there, a lent write cancelled when its
 task goes away, a write cut short on the ring that counts as done, and a write on the ring
@@ -896,19 +900,21 @@ to one, and the other's task looks first), a sync that reads only whether a sync
 before (`sync_forgets_loss`: the writer's flush reports a lost write and forgets it, and the
 next sync's call answers success for it), and a clone that keeps a record of its own
 (`sticky_unshared`: the clone's sync takes the kernel's error, and the handle's, called after,
-finds none); a failed sync forgotten once reported breaks
+finds none); a refusal of the polled ring that ends the call (`iopoll_refusal_ends`) breaks
+`NothingRefused`; a failed sync forgotten once reported breaks
 `NoSyncAfterFailure`; a sync that fails for any failure, a later call's too
 (`sync_any_failure`), breaks `NoFalseFailure`; a direct read through the read-ahead and a direct write that joins
 the write-behind break `DirectExact`; a descriptor closed at the drop with a job out, and an
 `into_inner` that does not wait for the jobs, each with a cursor job and with a positional write
-left by its task, break `NoCallOnClosed`. 14 witnesses must be proved wrong: a read that reads
+left by its task, break `NoCallOnClosed`. 15 witnesses must be proved wrong: a read that reads
 again, the lent write of a task that went away landing, a read after the seek that counts the
 lent write's value, a write on the ring landing in two parts, one cut short whose shard went
 finished on the pool, an append after the seek landing at the end, a read that reads again only
 because a positional write ended, a buffered read asking the kernel for more than its caller (the
 read-ahead the direct rule takes away), the positional write of a task that went away landing, a
 sync that fails, a sync that takes the end of a call whose task went away, a cursor job and a
-positional write still out as their handle drops, and (`WF_clone_race`, a gap the record leaves
+positional write still out as their handle drops, a call the polled ring refused made again on
+the pool, and (`WF_clone_race`, a gap the record leaves
 for the operator to decide) the syncs of a handle and of its clone at once, where the clone's
 call takes the kernel's error and the handle's call, made beside it, answers success.
 

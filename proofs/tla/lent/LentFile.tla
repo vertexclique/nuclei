@@ -86,6 +86,13 @@
 (* kernel error cursor, and the same record; it syncs first, the first    *)
 (* sync once it is done. Scenario "sync_clone_race" lets the two syncs go  *)
 (* at once, which the record does not cover (a witness of that gap).      *)
+(* Scenario "sync_iopoll": as "sync", on a ring made to poll for its      *)
+(* completions (`IORING_SETUP_IOPOLL`), which refuses a sync and a write   *)
+(* of a file not opened for direct IO: the call's end says so, and        *)
+(* `FileOp::complete` (src/fs/ring.rs) makes the call again on the        *)
+(* blocking pool, as it does a call cancelled because its shard went. A   *)
+(* read and a change of a range's space, refused the same way, are made   *)
+(* again the same way (not run here).                                      *)
 (*                                                                          *)
 (* Scenario "direct": the file is opened for direct IO: a read job reads   *)
 (* exactly the cell asked for (no read-ahead), and a copied write is one   *)
@@ -147,7 +154,7 @@ PWriters == IF Scenario \in {"positional", "generation"} THEN {"pw"} ELSE {}
 \* The task that reads at an offset of its own.
 PReaders == IF Scenario = "positional" THEN {"pr"} ELSE {}
 \* The scenarios in which two tasks sync.
-SyncScenarios == {"sync", "sync_lost", "sync_clone", "sync_clone_race"}
+SyncScenarios == {"sync", "sync_lost", "sync_clone", "sync_clone_race", "sync_iopoll"}
 \* The tasks that sync, once each.
 Syncers == IF Scenario \in SyncScenarios THEN {"sy1", "sy2"} ELSE {}
 \* Whether the kernel may fail one cursor write the handle accepted.
@@ -158,6 +165,8 @@ Cloned == Scenario \in {"sync_clone", "sync_clone_race"}
 Handles == {"a", "b"}
 \* The handle a sync task syncs through.
 HandleOf(q) == IF Cloned /\ q = "sy2" THEN "b" ELSE "a"
+\* Whether the shard's ring polls for its completions, refusing a sync and a write of a buffered file.
+IoPoll == Scenario = "sync_iopoll"
 \* Whether the file is opened for direct IO.
 Direct == Scenario = "direct"
 \* The cells the positional writer writes, one after the other, and their values.
@@ -207,6 +216,8 @@ variables
     wfailed = FALSE,                   \* the state's failure of a write, until a flush reports it
     lostRec = [h \in Handles |-> FALSE], \* each handle's record of a write lost, kept for good (failed calls: `Sticky`)
     writeLost = FALSE,                 \* (record) the kernel failed a cursor write the handle had accepted
+    refused = FALSE,                   \* (record) a call the polled ring refused ended as a failure
+    remade = FALSE,                    \* (record) a call the polled ring refused was made again on the pool
     kerr = FALSE,                      \* the kernel holds a write-back error no call reported yet
     devFailed = FALSE,                 \* the device failed a write-back (once at most)
     lost = [c \in Cells |-> FALSE],    \* the cells whose write-back failed: the device never gets them
@@ -256,6 +267,9 @@ define
     WriteWheres == IF Appending THEN {"pool"} ELSE Wheres
     \* A job its runner may make now: the pool's always, the ring's while the shard runs.
     Runs(j) == j.on = "pool" \/ ~shut
+    \* A call the shard's ring refuses: on a polled ring, every call of a buffered file but a read
+    \* or a write of direct IO (scenario "sync_iopoll" has none of those).
+    Refuses(j) == IoPoll /\ j.on = "ring"
     \* Every task is done.
     AllDone == \A p \in Tasks : pc[p] = "Done"
     \* The positional writes that ended for their task: returned, or left when it went away.
@@ -410,7 +424,7 @@ P_loop:
             /\ (djob = NoJob \/ djob.ran) /\ (pjob = NoJob \/ pjob.ran)
             /\ (prjob = NoJob \/ prjob.ran) /\ \A q \in Syncers : sjobs[q].seq = 0 \/ sjobs[q].ran) do
         either
-            await InFlight /\ Runs(writing);
+            await InFlight /\ Runs(writing) /\ ~Refuses(writing);
             either
                 \* All of the write, or the rest of one cut short; an append at the end.
                 \* MUTATION append_at_cursor: an append lands where the cursor was.
@@ -448,6 +462,19 @@ P_loop:
                 writeLost := TRUE;
             end either;
         or
+            \* The polled ring refuses the write (`EOPNOTSUPP`), before any byte moved: it is made
+            \* again on the blocking pool (`FileOp::complete`).
+            \* MUTATION iopoll_refusal_ends: the refusal is the write's end, a failure.
+            await InFlight /\ Runs(writing) /\ Refuses(writing);
+            if Mutation = "iopoll_refusal_ends" then
+                writing.ran := TRUE;
+                wbad := TRUE;
+                refused := TRUE;
+            else
+                writing.on := "pool";
+                remade := TRUE;
+            end if;
+        or
             \* A reader's job reads its cell.
             with r \in {q \in Readers : jobs[q] # NoJob /\ ~jobs[q].ran /\ Runs(jobs[q])} do
                 if ~objOpen then usedClosed := TRUE; end if;
@@ -482,6 +509,7 @@ P_loop:
             \* and is cleared; else the device keeps every cell but a lost one. A call put on the
             \* ring with a drain (the mutation) starts only once the ring's writes ended.
             with q \in {r \in Syncers : /\ sjobs[r].seq # 0 /\ ~sjobs[r].checked /\ Runs(sjobs[r])
+                                        /\ ~Refuses(sjobs[r])
                                         /\ (sjobs[r].drain /\ sjobs[r].on = "ring"
                                               => ~(InFlight /\ writing.on = "ring"))} do
                 if ~objOpen then usedClosed := TRUE; end if;
@@ -491,6 +519,20 @@ P_loop:
                 else
                     sjobs[q].checked := TRUE;
                     durable := [c \in Cells |-> IF lost[c] THEN durable[c] ELSE file[c]];
+                end if;
+            end with;
+        or
+            \* The polled ring refuses a sync call (`EINVAL`), which wrote nothing back: it is made
+            \* again on the blocking pool (`FileOp::complete`).
+            \* MUTATION iopoll_refusal_ends: the refusal is the call's end, a failure.
+            with q \in {r \in Syncers : /\ sjobs[r].seq # 0 /\ ~sjobs[r].checked /\ Runs(sjobs[r])
+                                        /\ Refuses(sjobs[r])} do
+                if Mutation = "iopoll_refusal_ends" then
+                    sjobs[q].ok := FALSE || sjobs[q].checked := TRUE;
+                    refused := TRUE;
+                else
+                    sjobs[q].on := "pool";
+                    remade := TRUE;
                 end if;
             end with;
         or
@@ -1073,6 +1115,10 @@ DirectExact == Direct => (kreads \subseteq creads /\ kwrites \subseteq cwrites)
 \* No job's call ever runs on a descriptor that closed (or that another file took since).
 NoCallOnClosed == ~usedClosed
 
+\* No call a ring refuses for the way it was made (a polled ring's) ends as a failure: a valid sync
+\* or write is never refused.
+NothingRefused == ~refused
+
 \* `Termination` (every process ends) is the one the translator writes for the fair processes.
 
 (***************************************************************************)
@@ -1104,4 +1150,6 @@ NoSyncFailure == ~failedOnce
 NoLeftTaken == ~leftTaken
 \* A job is still out when the handle was dropped: the job closes its object.
 NoJobAfterDrop == ~(gone /\ Leases > 0)
+\* A call the polled ring refused is made again on the blocking pool.
+NoRemade == ~remade
 =============================================================================
