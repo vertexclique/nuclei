@@ -435,9 +435,6 @@ fn take(
     } else if !super::fence::heavy() {
         // The heavy fence failed, which `available` said it would not: no
         // take may rely on it. Counted, so a watch that cannot rescue a
-        // The rest of the poll runs on its thread on no shard: in flight, before
-        // the shard's next runner can park it idle.
-        monitor.count_in();
         // blocked poll shows (proofs/tla/handoff, `F_fail`).
         old.slot.cancel();
         place.shared.counters.handoff_failed();
@@ -457,6 +454,9 @@ fn take(
         return None;
     }
     // The shard is the monitor's, its reference held since before the claim.
+    // The rest of the poll runs on its thread on no shard: in flight, before
+    // the shard's next runner can park it idle.
+    monitor.count_in();
     // The runner may be back from its poll already: its life's back and this
     // detach add up whichever comes first (proofs/tla/handoff/TakeRef.tla).
     old.life.detach();
