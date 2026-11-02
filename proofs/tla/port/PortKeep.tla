@@ -99,7 +99,9 @@ macro Deliver(who) begin
         readsDone := readsDone + 1;
     end if;
     if who = "keeper" then kept := TRUE; end if;
-    if Out = 0 /\ flag then
+    \* Out still counts the packet this step dequeued (an operator of the define block reads the
+    \* state before the step): one left is the last one, as `op_done`'s `fetch_sub(1) == 1`.
+    if Out = 1 /\ flag then
         flag := FALSE;
         looked := TRUE;
     end if;
