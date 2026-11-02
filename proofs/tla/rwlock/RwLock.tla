@@ -51,6 +51,7 @@ Without(s, S) == SelectSeq(s, LAMBDA x : x \notin S)
 \* The kind an operation first asks for.
 KindOf(op) == CASE op = "read" -> "read" [] op = "drop_read" -> "read"
                 [] op = "write" -> "write" [] op = "drop_write" -> "write" [] op = "downgrade" -> "write"
+                [] op = "downgrade_hold" -> "write"
                 [] OTHER -> "upg"
 
 (* --algorithm RwLock
@@ -83,10 +84,13 @@ define
               upgrading |-> upgrading]
     \* The word of a free lock: where a pass's sharing walk starts from, before it walks.
     FreeWord == [readers |-> 0, writer |-> FALSE, upgradable |-> FALSE, upgrading |-> FALSE]
+    \* MUTATION write_ignores_upgradable: a write enters past an upgradable read.
+    \* MUTATION upg_ignores_upgradable: an upgradable read enters past another.
     Admits(k, s) ==
         CASE k = "read" -> ~s.writer /\ (~s.upgrading \/ Mutation = "read_ignores_upgrading")
-          [] k = "write" -> ~s.writer /\ ~s.upgradable /\ s.readers = 0
-          [] OTHER -> ~s.writer /\ ~s.upgradable
+          [] k = "write" -> ~s.writer /\ (~s.upgradable \/ Mutation = "write_ignores_upgradable")
+                            /\ s.readers = 0
+          [] OTHER -> ~s.writer /\ (~s.upgradable \/ Mutation = "upg_ignores_upgradable")
     Enter(k, s) ==
         CASE k = "read" -> [s EXCEPT !.readers = @ + 1]
           [] k = "write" -> [s EXCEPT !.writer = TRUE]
@@ -267,7 +271,9 @@ D_exit:
     if dirty /\ Mutation # "exit_ignores_dirty" then
         noneLeft := FALSE;    \* read: the next pass computes it again
         goto D_clear;
-    elsif ~noneLeft /\ wakeFront then
+    \* MUTATION exit_ignores_wake_front: a release's request to wake the front, which came while
+    \* the pass ran, does not send the drain round again.
+    elsif ~noneLeft /\ wakeFront /\ Mutation # "exit_ignores_wake_front" then
         goto D_clear;
     else
         draining := FALSE;
@@ -551,11 +557,12 @@ procedure Downgrade()
 variables claimed = FALSE;
 begin
 W_down:
+    \* MUTATION downgrade_no_wake: the waiters are not told the lock is shared now.
     writer := FALSE;
     readers := readers + 1;
     held[self] := "read";
     downgraded := TRUE;
-    if queuedBit then
+    if queuedBit /\ Mutation # "downgrade_no_wake" then
         wakeFront := TRUE;
         claimed := ~draining;
         draining := TRUE;
@@ -581,10 +588,13 @@ T_then:
             goto T_next;
         elsif op = "upgrade" then
             call Upgrade(<<self, j + 100>>);
-        elsif op = "downgrade" then
+        elsif op \in {"downgrade", "downgrade_hold"} then
             call Downgrade();
         end if;
 T_release:
+        \* "downgrade_hold": the downgraded read is held until another task reads beside it,
+        \* or every other task ended (no step of its own: the release waits for it).
+        await op # "downgrade_hold" \/ readers >= 2 \/ \A t \in Tasks \ {self} : pc[t] = "Done";
         if held[self] # "none" then
             call Unlock(held[self], TRUE);
         end if;

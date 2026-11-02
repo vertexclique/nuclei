@@ -17,4 +17,10 @@ UpgUpg == <<<<"upg">>, <<"upg">>>>
 DropWrite == <<<<"read">>, <<"drop_write">>, <<"read">>>>
 DropWriteTwo == <<<<"read">>, <<"drop_write">>>>
 BargeWriter == <<<<"read", "read", "read">>, <<"write">>>>
+\* An upgradable read takes the lock, a writer tries it.
+UpgWrite == <<<<"upg">>, <<"write">>>>
+\* A write downgraded and held until a reader joins it, against that reader.
+DowngradeHoldRead == <<<<"downgrade_hold">>, <<"read">>>>
+\* An upgrade against a reader and a writer queued behind it.
+UpgradeReadWrite == <<<<"upgrade">>, <<"read">>, <<"write">>>>
 =============================================================================
