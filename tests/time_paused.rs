@@ -133,7 +133,10 @@ fn an_interval_whose_next_tick_is_past_the_clock_ticks_once_then_waits() {
             assert!(next.is_err(), "no second tick within the hour ({missed:?})");
             every.reset();
             let next = time::timeout(Duration::from_secs(3600), every.tick()).await;
-            assert!(next.is_err(), "no tick within the hour of a reset ({missed:?})");
+            assert!(
+                next.is_err(),
+                "no tick within the hour of a reset ({missed:?})"
+            );
         }
     });
 }
