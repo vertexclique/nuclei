@@ -23,3 +23,7 @@ RWW_refusal                    MC_ReentrantRwLock   violated:NoRefusal
 RWW_downgrade                  MC_ReentrantRwLock   violated:NoDowngrade
 RWW_reuse                      MC_ReentrantRwLock   violated:NoReuse
 RWW_lost_claim                 MC_ReentrantRwLock   violated:NoLostClaim
+RR_nested                      MC_ReentrantRaw      pass
+RR_drop                        MC_ReentrantRaw      pass
+MRR_reenter_takes_share        MC_ReentrantRaw      violated:NoWaitWhileHolding
+MRR_drop_keeps_grant           MC_ReentrantRaw      violated:AllEnd
