@@ -287,9 +287,10 @@
   bound tasks and stayed marked as blocked. Both now look whether the thread was detached before
   they touch the shard (`proofs/tla/handoff`, `N_safe`; the `ready_first` and `stopped_on_take`
   mutations), at no cost to the outermost `block_on`, whose shard nobody takes. A poll on a shard
-  nobody watches no longer looks whether it was taken, which it never is: each task run costs 6
-  fewer user instructions with the watch off (a spawn and its join 600 instead of 612 on
-  io_uring, a TCP round trip 2864 instead of 2890).
+  nobody watches no longer looks whether it was taken, which it never is: about 7 fewer user
+  instructions for each task run with the watch off, counted as CI's gate counts them (a spawn and
+  its join 598 instead of 612 on io_uring, a TCP round trip 2858 instead of 2890, a bounded channel
+  round 503 instead of 510; `block_on` 308 as before, and no row above what it was).
 - **A runtime drop waits for a thread back from a blocked poll** (handoff on). The monitor stored
   "detached" after its take and the thread stored "back" once its bound tasks were done: a thread
   back before the monitor's store stayed marked as blocked for good, so every later drop skipped
