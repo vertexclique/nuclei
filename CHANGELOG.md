@@ -4,6 +4,22 @@
 
 ### Changed
 
+- **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix
+  stream read into the task's own buffer, under 16 KiB, on a socket whose kernel counts what a
+  read leaves, reads straight from the socket as on epoll, with the count and its floor; a read
+  that finds the socket empty arms the ring's multishot poll, which stays armed while the task
+  reads, and a poll that ends is armed again by the next wait. A count that leaves more than
+  another read takes means the bytes run ahead of the reads: the side then reads through the
+  multishot receive, its poll stopped and the kernel's count turned off, so the receive's
+  batching serves a stream that runs ahead; after four arrivals in a row that each come to a
+  reader waiting with nothing read ahead and fit its read, it reads by readiness again, once
+  every chunk the receive brought was read and its end came (`proofs/tla/ring/RingPoll.tla`,
+  and `FdStarve.tla` with the ring's poll). Owned and lent reads, larger reads and datagrams keep
+  their ring operations. A round trip on io_uring runs about 11% fewer user instructions (tcp
+  3349 to 2970, 3146 to 2800 under fat LTO; tcp_asyncrw, tcp_many and unix_stream alike) for
+  about 3% more in the kernel, where each read is now a system call of its own (unix_stream
+  about 8%); tcp_split, whose bytes run ahead, keeps the receive (0.8% more in user space, 2 to
+  3% in the kernel). The read on epoll is built apart from the ring's, and runs 8 to 16 fewer.
 - **A stream read the kernel's last count covers asks for no new count** (Linux, epoll). A read
   into the task's own buffer asks the kernel how many bytes it leaves (`TCP_INQ`, `SO_INQ`), with
   `recvmsg` and its control message, to know without another call whether the socket is empty.
