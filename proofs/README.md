@@ -130,12 +130,13 @@ The properties:
 | `ExactlyOnce` | every value put in is received once, or is still in the queue, or was thrown away by the receiver's drop |
 | `PerSenderOrder` | each sender's values come out in the order it put them in |
 | `Termination` (under weak fairness of every thread) | every thread finishes: no waiter whose request can be served sleeps forever, so no wakeup is lost; checked with the waiter's park and the grant's wake modelled step by step |
+| `ReceiverEnds` (under weak fairness of every step but a refused future's next poll) | the receiver's program ends even if a send refused for the budget is never polled again: its give-back wakes a receiver whose closed channel it left idle |
 | deadlock freedom (TLC's own check, on every configuration that must pass) | no state where some thread is stuck while every other one is done |
 
-The 48 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
+The 50 configurations, listed with their expected result in `tla/mpsc/EXPECTED.txt` (each
 `.cfg` file says in its first lines what it checks, and why its size is enough):
 
-- **14 that must pass.** Ten check every safety property and deadlock freedom: three sends from
+- **15 that must pass.** Ten check every safety property and deadlock freedom: three sends from
   two senders on one slot; a request for both slots racing the other sender's two sends; the
   same request putting nothing in, so both slots go on to the sends behind it; a request for
   both slots that is dropped after one poll, racing two sends; a single send that is dropped,
@@ -147,8 +148,10 @@ The 48 configurations, listed with their expected result in `tla/mpsc/EXPECTED.t
   run guards against. Four check `Termination` under weak fairness, on smaller programs, as a
   liveness check costs far more per state: one sender's three sends on one slot; one sender's
   send, dropped send and send; a request for both slots racing one send; one sender's send and
-  request for both slots, with the receiver closing.
-- **20 mutation runs that must fail.** Each of 18 mutations takes one rule out of the
+  request for both slots, with the receiver closing. One checks `ReceiverEnds`: a send takes the
+  one slot and is refused for its poll's spent budget, the receiver closes and waits for the slot,
+  and the send's next poll is not fair (nothing makes its task's code poll it again).
+- **21 mutation runs that must fail.** Each of 19 mutations takes one rule out of the
   algorithm and must break the property that rule protects: `try_ignores_queue` and
   `skip_unfit_front` (an attempt, or a pass, that serves a later request first) break
   `FifoFair`; `drop_pass_on` (a leaving waiter's share is dropped) breaks `Conservation`;
@@ -164,7 +167,8 @@ The 48 configurations, listed with their expected result in `tla/mpsc/EXPECTED.t
   receiver before it writes, so a receiver that looked in between sleeps through the value),
   `flag_before_write` (a send looks at the receiver's flag before it writes) and
   `raise_after_look` (the receiver says it waits only after its look again) end in a
-  deadlock; `double_delivery` breaks `ExactlyOnce`.
+  deadlock; `double_delivery` breaks `ExactlyOnce`; `refuse_no_idle_wake` (the refused send
+  gives its slot back with a bare release) breaks `ReceiverEnds`.
 - **14 witnesses that must fail.** Each claims an interesting case never happens, and must be
   proved wrong, which shows the search really reaches it: a share held between passes; a
   waiter that withdraws at the very moment a pass grants it; a grant that its future never
@@ -2220,20 +2224,27 @@ request behind a large front is never served first by a nudge.
 `src/sync/queue.rs`) at the grain of its atomic steps: the stored permit, `QUEUED` and the drain
 role's bits; the generation and the owed counts of `notify_one` and `notify_last`; the arrival
 stack and the waiting list; each node's phase and payload; and each transition, pass and grant,
-with a waiter's first look (a moved generation, or the permit with nobody queued), its enqueue
-and its drop. The node's waker handshake and the list's sweep are abstract, as in the semaphore
-model. 12 configurations: 6 that must pass (two waiters and a `notify_waiters`, and a
+with a waiter's first look at the generation, its take of the permit with nobody queued (a
+second step, after which a moved generation passes the permit on with a `notify_one`), its
+enqueue and its drop. The node's waker handshake and the list's sweep are abstract, as in the
+semaphore model. 15 configurations: 7 that must pass (two waiters and a `notify_waiters`, and a
 `notify_one` then a `notify_waiters`, in any order, where every waiter made before the last
 `notify_waiters` ends; two queued waiters and two `notify_one` calls, and a `notify_last` then a
 `notify_one`, where both end; the same calls in any order, safety only, since two calls before
-anybody waits store one permit; a waiter dropped beside one that awaits, which ends), with no
+anybody waits store one permit; a waiter dropped beside one that awaits, which ends; a waiter
+made before a `notify_waiters` and a `notify_one` beside one made after both, which ends and finds
+the permit, `LateAwaiterEnds`, with no waiter the broadcast owed keeping the permit,
+`NoPermitEatenByOwed`), with no
 waiter done without a notification made since its `Notified` was (`NoSpuriousWake`), no
 `notify_one` serving more than one waiter, and no waiter left on the arrival stack once the role
-is free; 4 mutations (a `notify_waiters` that asks for no pass leaves its waiters,
+is free; 6 mutation runs (a `notify_waiters` that asks for no pass leaves its waiters,
 `AwaitersMadeBeforeAWaitersCallEnd`; a pass that reads the generation before it takes the
 arrivals wakes a newer arrival, `NoSpuriousWake`; a dropped waiter keeping a `notify_one`'s grant
 leaves the other waiting, `EveryAwaiterEnds`; a drain giving up its role over a change made
-during its pass strands an arrival, `NoStrandedArrival`); and 2 witnesses (a permit stored; a
+during its pass strands an arrival, `NoStrandedArrival`; a waiter that does not look at the
+generation again after its take keeps a permit the broadcast between its look and its take made
+someone else's, `NoPermitEatenByOwed`, and the waiter made after the calls waits for good,
+`LateAwaiterEnds`); and 2 witnesses (a permit stored; a
 grant passed on). `lean/Nuclei/Notify.lean` proves the pass's accounting of owed wakes for every
 line and count (each served or left over for the permit, no more served than wait, something
 left over only once every waiter was served) and that a masked generation is never one of the two
@@ -2243,15 +2254,18 @@ grant markers.
 
 `barrier` (`tla/barrier/Barrier.tla`) checks the reusable barrier (`src/sync/barrier.rs`, on the
 drain role of `src/sync/queue.rs`) at the grain of its atomic steps: the arrival count's
-`fetch_add` (an arrival's generation, and whether it leads), the leader's transition, each
-waiter's enqueue and drop, and each pass, which reads the current generation from the count after
-it took the arrivals. The node's waker handshake and the list's sweep are abstract, as in the other
-models of the drain role. 8 configurations: 3 that must pass (two tasks waiting twice at a barrier
+`fetch_add` (an arrival's generation, and whether it leads), the leader's transition, a poll of
+the leader's finished wait, each waiter's enqueue and drop, and each pass, which reads the current
+generation from the count after it took the arrivals. The node's waker handshake and the list's
+sweep are abstract, as in the other models of the drain role. 9 configurations: 3 that must pass
+(two tasks waiting twice at a barrier
 of two, two generations; three tasks at a barrier of two, the third waiting for a second
 generation by design; a wait dropped, its arrival still counted), with no wait completing before
-its generation had every arrival (`NoEarlyRelease`), one leader per generation, no waiter left on
-the arrival stack, and every wait of a finished generation that was not dropped completing; 4
-mutations (a leader that asks for no pass leaves its generation waiting, `ReleasedTogether`; a
+its generation had every real arrival (`NoEarlyRelease`), one leader per generation, no waiter
+left on the arrival stack, and every wait of a finished generation that was not dropped
+completing; 5 mutations (a leader that asks for no pass leaves its generation waiting,
+`ReleasedTogether`; a leader's wait that keeps no mark it led arrives again when polled after it
+completed, so the next generation completes a real arrival short, `NoEarlyRelease`; a
 pass that reads the count before it takes the arrivals, and one that grants arrivals of the
 current generation, release a wait early, `NoEarlyRelease`; a drain giving up its role over a
 change strands an arrival, `NoStrandedArrival`); and 1 witness (a wait of the second generation
@@ -2342,22 +2356,31 @@ and release, with the semaphore under it abstract (its protocol is the semaphore
 writer id, the write depth, each record's owner and reads, each lookup, a claim's look and its
 compare-and-swap (which a racing claim can beat, and whose walk may miss a record freed behind
 it), the push, and the plain lock's shares, with the plain lock abstract (its protocol is the
-rwlock family's). 24 configurations: 5 that must pass (two owners that lock two deep, let one go
+rwlock family's). Both also run an owner with two requests out at once (`join!`), queued behind
+another owner: every poll of a request looks for its owner first, queued or not. 34
+configurations: 9 that must pass (two owners that lock two deep, let one go
 and lock again; one three deep beside one that locks twice; a writer that reads inside and lets
 the write go first, a downgrade, beside a reader two deep; a writer that lets its read go first
-beside a reader refused the write; two readers whose claims race for a freed record), with one
+beside a reader refused the write; two readers whose claims race for a freed record; a join of two
+locks, whose younger enters once the older did; a join of a write and a read, whose read reads in
+the write; a join of two reads granted together, whose younger reads on the older's record and
+gives its share back; a write that queued while its owner then read, refused when polled again),
+with one
 holder at a time and its depth its guards, a lock again only ever the holder's, a writer alone,
 the plain lock's shares exactly the owners', every guard covered by a share, one record per
-reading owner holding its read guards, the lock free at the end, and every owner ending; 13
+reading owner holding its read guards, the lock free at the end, and every owner ending; 17
 mutations (the permit given back before the id is cleared, and every unlock clearing it,
 `AllOwnersEnd`; the id never cleared, `Exclusion`, `FreeAtEnd` and `NoFalseReenter`; a lock again
 that leaves the depth, `DepthMatches`; the last write given back though its owner reads,
 `GuardsCovered`; the last read giving a share back under its owner's write, `SharesMatch`; a
 reading owner's write not refused, `AllOwnersEnd`; a read taking no share beside any writer,
 `Exclusion`; a claim without its compare-and-swap, `ReadsMatch`; a read that does not look for
-its own record, `OneRecordEach`; the writer id kept, `FreeAtEnd`); and 6 witnesses (two deep; a
-wait behind the holder; a refusal; a downgrade; a record claimed again; a claim beaten by a
-racing one). `lean/Nuclei/Reentrant.lean` proves, for one owner at every depth (the TLA+ model
+its own record, `OneRecordEach`; the writer id kept, `FreeAtEnd`; a queued lock, a queued read
+and a queued write that only look at their node, so the owner waits on itself, `AllOwnersEnd`; a
+granted queued read that records itself as a first read, `OneRecordEach`); and 7 witnesses (two
+deep; a wait behind the holder; a refusal; a downgrade; a record claimed again; a claim beaten by
+a racing one; a join that polls its younger lock before the older entered, which nothing wakes
+again, so the owner waits on itself: a gap the code leaves open, `AllOwnersEnd`). `lean/Nuclei/Reentrant.lean` proves, for one owner at every depth (the TLA+ model
 checks a few levels), that the mutex's owner holds the permit exactly while its depth is above
 zero, and that the reader-writer lock's owner holds exactly the share its read and write depths
 call for after any steps, a write being refused exactly when the owner reads without writing.
@@ -2774,6 +2797,22 @@ results back in the order reads end, and one that sends reads before the write b
 break `ResultInPlace`; one that does not move on to the next read breaks `EachOnce`); and 1 witness
 (a read ends before one named before it).
 
+## A waiter that is never polled again
+
+`stall` (`tla/stall/Stall.tla`) checks what the other sync models assume: that every waiter is
+polled again. A lock held at the start is let go once and handed to the front of a line, as the
+semaphore's pass wakes its front waiter and serves nobody else until it acts (`Policy::pass` for
+`RawSemaphore`, `wants_drain` in `src/sync/queue.rs`). A waiter in `Stalls` is never polled again
+once it queued (a `join!` branch while its task blocks elsewhere, a future kept or forgotten, a
+bound task leaked when its home thread is gone, `src/rt/handoff/home.rs`); a pair in `Nest` is a
+nested blocking wait on one thread (`blocking` in `src/sync/internal.rs`, a `Shard::block_on`
+frame in `src/rt/shard/run.rs` that polls only its own future), whose outer waiter is polled only
+once the inner one ended. 4 configurations: 1 that must pass (two waiters always polled again:
+one at a time, and both end, `OthersEnd`); 1 mutation (a release that hands the lock to nobody,
+`OthersEnd`); and 2 witnesses of what the code leaves open, for the operator to decide: a stalled
+front keeps the waiter behind it waiting for good, and a nested frame under the waiter behind it
+leaves both waiting with the lock free (`OthersEnd` broken in both).
+
 ## The cooperative budget in channels and locks
 
 `coop` (`tla/coop/Coop.tla`, `lean/Nuclei/Coop.lean`, the loom models in
@@ -2784,9 +2823,11 @@ break `ResultInPlace`; one that does not move on to the next read breaks `EachOn
 that completes spends one, and one that finds the budget spent completes nothing, wakes its task
 behind the shard's other tasks and returns `Pending`. A receive looks at the budget before it
 takes a value. An acquire takes first and looks after, so a refused one gives the lock back
-through the release's pass, which hands it to a thread that queued for it in between. The TLA+
-family runs a hot task whose channel always has a value and whose lock is free whenever it asks,
-the other task of its shard, and a thread on another core that takes the lock once, and checks 13
+through the release's pass, which hands it to a thread that queued for it in between. An acquire
+whose first attempt fails queues, and a grant in the poll that queued it (its own queueing's pass,
+or its retry) spends one too. The TLA+ family runs a hot task whose channel always has a value and
+whose lock is free whenever it asks, the other task of its shard, and a thread on another core
+that takes the lock once, and checks 15
 configurations: 5 that must pass (three receives, three acquires, both kinds in one poll, and
 liveness for the first two), with `NoValueLost`, `Conservation` (the lock's permit is free, held
 or handed over), `BoundedPoll` (a poll completes at most its budget), `OtherWaitsOneBudget` (the
@@ -2794,8 +2835,9 @@ other task waits for at most one budget of the hot task's operations) and `NoIdl
 mutations (a receive that takes its value before it looks at the budget breaks `NoValueLost`; an
 operation that spends nothing breaks `BoundedPoll`; a refusal that does not wake its task breaks
 `Termination`; a refused acquire that keeps the lock breaks `Conservation`; a give back that
-serves nobody breaks `NoIdleWhileQueued`), and 3 witnesses (a refusal, the other task running
-between two polls of the hot task, the give back serving the queued thread). The loom models run
+serves nobody breaks `NoIdleWhileQueued`; a grant to the poll that queued spending nothing breaks
+`BoundedPoll`), and 4 witnesses (a refusal, the other task running between two polls of the hot
+task, the give back serving the queued thread, an acquire granted as it queued). The loom models run
 the real `RawSemaphore` and `FairSemaphore` with a refusal handed in at the place the budget's
 answer lands, against a thread that queues for the permit, and count the runs where it had queued
 by the refusal; a calibration that drops the give back must deadlock. The Lean file proves the
@@ -3196,3 +3238,8 @@ witness (a caught panic). A blocking-pool thread's start hook and name are `tla/
 - **How soon.** `Termination` says every waiter is eventually served under weak fairness; it
   says nothing about how long that takes, and nothing about a thread the scheduler stops for
   good.
+- **A waiter that is never polled again.** Every sync model but `stall` makes each waiter a fair
+  process. The code does not promise that a queued future is polled again (a `join!` branch
+  while its task blocks, a nested blocking frame under another, a forgotten future, a leaked
+  bound task); `stall` shows the queue behind such a waiter waiting for good, which is left for
+  a decision, not checked as fixed.

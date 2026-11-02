@@ -86,6 +86,14 @@ impl<T: ?Sized> ReentrantMutex<T> {
     /// Waits for the lock, at once if `owner` already holds it. A
     /// contended wait is lock-free, not wait-free: see
     /// [Progress](super#progress).
+    ///
+    /// Every poll looks for `owner` first, so a wait that queued before
+    /// `owner` took the lock through another of its requests (two locks in
+    /// one `join!`) leaves the queue and enters at its next poll. Nothing
+    /// wakes it for that: a wait last polled before the other request
+    /// entered (the `join!` polls it first, or it is in another task of the
+    /// same owner) waits as another owner's would, so holding the lock until
+    /// it completes waits on itself.
     pub fn lock<'a>(&'a self, owner: &'a Owner) -> ReentrantMutexLock<'a, T> {
         ReentrantMutexLock {
             mutex: self,
@@ -208,7 +216,11 @@ impl<'a, T: ?Sized> Future for ReentrantMutexLock<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReentrantMutexGuard<'a, T>> {
         let this = self.get_mut();
-        if !this.wait.is_queued() && this.mutex.reenter(this.owner) {
+        if this.mutex.reenter(this.owner) {
+            // The owner took the lock through another request since this one
+            // queued: this one leaves the queue, which cannot have granted it
+            // the permit the owner holds.
+            this.wait.cancel(&this.mutex.sem, 1);
             // Completed at once: it spends one operation of the poll's
             // budget, or, the budget spent, the level goes and it yields.
             let guard = ReentrantMutexGuard::new(this.mutex);
@@ -285,6 +297,23 @@ mod tests {
             });
         });
         drop(guard);
+    }
+
+    #[test]
+    fn a_queued_lock_of_the_owner_that_took_the_lock_meanwhile_enters_at_once() {
+        let lock = ReentrantMutex::new(());
+        let (me, other) = (Owner::new(), Owner::new());
+        let theirs = lock.try_lock(&other).expect("free");
+        let mut first = Polled::new(lock.lock(&me));
+        let mut second = Polled::new(lock.lock(&me));
+        first.pending();
+        second.pending();
+        drop(theirs);
+        let a = first.ready();
+        let b = second.ready();
+        drop((a, b));
+        assert_eq!(lock.sem.linked(), 0, "the second lock left the queue");
+        assert!(lock.try_lock(&other).is_some(), "both levels went");
     }
 
     #[test]

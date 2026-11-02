@@ -1,0 +1,5 @@
+# configuration                spec                 expected
+S_fair                         MC_Stall             pass
+M_release_no_grant             MC_Stall             violated:OthersEnd
+W_never_polled                 MC_Stall             violated:OthersEnd
+W_nested_frames                MC_Stall             violated:OthersEnd

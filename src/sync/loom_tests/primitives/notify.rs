@@ -67,6 +67,45 @@ fn an_older_notified_queued_behind_a_newer_one_gets_the_broadcast() {
     );
 }
 
+/// A `Notified` made before a `notify_waiters` passes its generation check
+/// and is held up before it looks for a permit; the broadcast runs, then a
+/// `notify_one` stores a permit with nobody queued. The older one is owed
+/// the broadcast, so the permit is a newer waiter's: a newer `Notified`
+/// made after both calls must find it once the older one is done.
+#[test]
+fn a_permit_stored_after_a_broadcast_is_not_eaten_by_a_waiter_it_owed() {
+    explore(
+        "a_permit_stored_after_a_broadcast_is_not_eaten_by_a_waiter_it_owed",
+        3,
+        5,
+        || {
+            let notify = Arc::new(Notify::new());
+            let created = Arc::new(AtomicBool::new(false));
+            let older = {
+                let (notify, created) = (Arc::clone(&notify), Arc::clone(&created));
+                thread::spawn(move || {
+                    let waiting = notify.notified();
+                    created.store(true, Ordering::Release);
+                    block_on(waiting);
+                })
+            };
+            wait_for(&created);
+            notify.notify_waiters();
+            notify.notify_one();
+            // Made after both calls: only the permit can complete it.
+            let mut newer = Box::pin(notify.notified());
+            older.join().expect("older");
+            let polled = newer
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()));
+            assert!(
+                polled.is_ready(),
+                "the permit was taken by a waiter the broadcast owed"
+            );
+        },
+    );
+}
+
 #[test]
 fn a_dropped_notified_passes_its_notify_one_on() {
     // SHRUNK: one preemption where there were two (1.2 million interleavings,

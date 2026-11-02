@@ -13,6 +13,7 @@ BC_live_sends                  MC_BoundedChannel    pass
 BC_live_cancel                 MC_BoundedChannel    pass
 BC_live_many                   MC_BoundedChannel    pass
 BC_live_close                  MC_BoundedChannel    pass
+BC_live_refuse                 MC_BoundedChannel    pass
 M_try_ignores_queue            MC_BoundedChannel    violated:FifoFair
 M_skip_unfit_front             MC_BoundedChannel    violated:FifoFair
 M_drop_pass_on                 MC_BoundedChannel    violated:Conservation
@@ -33,6 +34,7 @@ M_flag_before_write            MC_BoundedChannel    deadlock
 M_raise_after_look             MC_BoundedChannel    deadlock
 ML_park_no_look                MC_BoundedChannel    violated:Termination
 ML_grant_no_wake               MC_BoundedChannel    violated:Termination
+ML_refuse_no_idle_wake         MC_BoundedChannel    violated:ReceiverEnds
 W_share_held                   MC_BoundedChannel    violated:NoShareHeldBetweenPasses
 W_withdraw_at_grant            MC_BoundedChannel    violated:NoWithdrawAtGrant
 W_grant_then_drop              MC_BoundedChannel    violated:NoGrantThenDrop

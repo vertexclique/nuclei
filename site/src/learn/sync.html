@@ -20,6 +20,7 @@
 
 <h2 id="reentrant">Reentrant locks</h2>
 <p><code>ReentrantMutex</code> and <code>ReentrantRwLock</code> may be taken again by the holder that has them. The holder is an <a href="api:nuclei::sync::Owner"><code>Owner</code></a> token, not a thread: a task can move between threads, and many tasks can share one.</p>
+<p>An owner may have two requests out at once, as in a <code>join!</code>. Each poll of a request looks for its owner first, so one that queued before its owner took the lock through the other enters when it is next polled.</p>
 <!--example sync_reentrant-->
 
 <h2 id="semaphore">Semaphore</h2>
@@ -47,10 +48,10 @@
 <p>The locks and the semaphore let a caller take what is free even while others wait, so a release never waits for a sleeping task to run. A waiter that loses <a href="api:nuclei::sync::MAX_BYPASS"><code>MAX_BYPASS</code></a> times is owed a handoff: nobody gets in ahead of it, and the next release goes to it directly. Fairness is counted, never timed.</p>
 
 <h2 id="budget">The task's budget</h2>
-<p>On a Nuclei shard, a lock or a semaphore acquire that completes spends one operation of the task's <a href="tasks.html#yield">budget</a>, as IO does, and so do a channel receive that completes and a bounded send that completes at its first try. Once the budget is spent the call completes nothing: it wakes its task and answers <code>Pending</code>, so the task goes behind the shard's other tasks.</p>
+<p>On a Nuclei shard, a lock or a semaphore acquire that completes spends one operation of the task's <a href="tasks.html#yield">budget</a>, as IO does, and so do a channel receive that completes and a bounded send that completes in the poll that began it. Once the budget is spent the call completes nothing: it wakes its task and answers <code>Pending</code>, so the task goes behind the shard's other tasks.</p>
 <!--example sync_budget-->
 <ul>
-<li>A wait that queued and was then granted spends nothing, so it keeps what it waited for.</li>
+<li>A wait that queued in an earlier poll and was then granted spends nothing, so it keeps what it waited for. One granted in the poll that queued it spends, as a first try does.</li>
 <li>The <code>try_</code> forms never spend. <code>Notify</code>, <code>Event</code>, <code>Latch</code>, <code>Barrier</code> and the once-cells keep no budget.</li>
 <li>Off a Nuclei shard, under another executor, there is no budget, and these calls never yield for it.</li>
 <li><a href="api:nuclei::task::coop::unconstrained"><code>coop::unconstrained</code></a> runs a future with no budget, and <a href="api:nuclei::stats::ShardStats::budget_yields"><code>budget_yields</code></a> counts how often a shard's tasks yielded for it.</li>

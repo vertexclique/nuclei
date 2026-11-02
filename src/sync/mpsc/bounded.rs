@@ -758,7 +758,10 @@ impl<T> Future for Sending<'_, T> {
         if this.value.is_none() {
             polled_after_completion();
         }
-        let granted = core::task::ready!(this.wait.poll(&this.chan.limit.sem, 1, cx.waker()));
+        let chan = this.chan;
+        let granted = core::task::ready!(this.wait.poll(&chan.limit.sem, 1, cx.waker(), |n| {
+            chan.give_back(n);
+        }));
         let Some(value) = this.value.take() else {
             polled_after_completion();
         };
@@ -815,8 +818,9 @@ impl<T> Future for Reserve<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        let chan = this.chan;
         this.wait
-            .poll(&this.chan.limit.sem, this.n, cx.waker())
+            .poll(&chan.limit.sem, this.n, cx.waker(), |n| chan.give_back(n))
             .map(|taken| {
                 this.taken = taken.is_ok();
                 taken.map_err(|_| SendError(()))
@@ -836,7 +840,7 @@ impl<T> Drop for Reserve<'_, T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::sync::test_support::Polled;
+    use crate::sync::test_support::{Polled, hooked, with_budget_spent};
 
     #[test]
     fn the_free_slots_plus_the_queued_values_are_the_buffer() {
@@ -848,6 +852,66 @@ mod tests {
         assert_eq!(tx.capacity() + rx.len(), 4);
         rx.try_recv().unwrap();
         assert_eq!(tx.capacity() + rx.len(), 4);
+    }
+
+    #[test]
+    fn a_send_granted_as_it_queues_spends_the_budget() {
+        let (tx, rx) = channel::<u32>(1);
+        tx.try_send(0).unwrap();
+        let rx = std::rc::Rc::new(core::cell::RefCell::new(rx));
+        let frees = std::rc::Rc::clone(&rx);
+        // The send finds no slot; between that look and its queueing, the
+        // receiver takes the value, so the queueing's own pass grants it.
+        let waker = hooked(
+            Some(Box::new(move || {
+                assert_eq!(frees.borrow_mut().try_recv(), Ok(0));
+            })),
+            None,
+        );
+        let mut send = Box::pin(tx.send(1));
+        let mut cx = Context::from_waker(&waker);
+        let polled = with_budget_spent(|| send.as_mut().poll(&mut cx));
+        assert!(
+            polled.is_pending(),
+            "a send completed past the spent budget"
+        );
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(rx.borrow_mut().try_recv(), Ok(1));
+        assert_eq!(tx.capacity(), 1);
+    }
+
+    #[test]
+    fn a_send_refused_for_the_budget_wakes_a_receiver_its_give_back_finishes() {
+        let (tx, rx) = channel::<u32>(1);
+        let rx = std::rc::Rc::new(core::cell::RefCell::new(rx));
+        let receiver = Polled::new(core::future::pending::<()>());
+        let rx_waker = receiver.waker();
+        let closes = std::rc::Rc::clone(&rx);
+        // The send takes the free slot and is refused for the budget; at the
+        // refusal's wake, the receiver closes and waits for the slot to come
+        // back, which the refusal then gives back.
+        let waker = hooked(
+            None,
+            Some(Box::new(move || {
+                let mut rx = closes.borrow_mut();
+                rx.close();
+                // The receiver's own poll, with a budget of its own.
+                let looked =
+                    crate::coop::outside(|| rx.poll_recv(&mut Context::from_waker(&rx_waker)));
+                assert!(looked.is_pending(), "a slot is still out");
+            })),
+        );
+        let mut send = Box::pin(tx.send(1));
+        let mut cx = Context::from_waker(&waker);
+        let polled = with_budget_spent(|| send.as_mut().poll(&mut cx));
+        assert!(polled.is_pending(), "the send was refused for the budget");
+        assert_eq!(tx.capacity(), 1, "the refused send gave its slot back");
+        assert_eq!(receiver.wakes(), 1, "and the closed receiver was told");
+        let ended = rx
+            .borrow_mut()
+            .poll_recv(&mut Context::from_waker(&receiver.waker()));
+        assert!(matches!(ended, Poll::Ready(None)));
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
     }
 
     #[test]

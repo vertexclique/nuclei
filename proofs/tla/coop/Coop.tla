@@ -3,7 +3,8 @@
 (* The cooperative budget of nuclei::sync's receives and acquires          *)
 (* (src/coop.rs: `exhausted`, `spent_one`, `spend`, `try_spend`;           *)
 (* src/sync/mpsc/chan.rs: `Chan::poll_recv`; src/sync/contend.rs:          *)
-(* `taken_at_once`; src/sync/fair_semaphore.rs: `FairWait::poll_admitted`;  *)
+(* `taken_at_once`; src/sync/fair_semaphore.rs: `FairWait::poll_admitted`,  *)
+(* its first attempt and the grant of its own queueing;                    *)
 (* src/rt/task/raw.rs: `RawTask::run`, which gives each poll its budget).  *)
 (*                                                                         *)
 (* In plain words: one shard runs its tasks one poll at a time, from a     *)
@@ -16,7 +17,11 @@
 (* receive looks at the budget before it takes a value, so a refused one   *)
 (* takes nothing. An acquire takes the lock first and looks after, so a    *)
 (* refused one gives the lock back, and serves whoever queued for it in    *)
-(* between: a thread on another core, which may come at any moment.       *)
+(* between: a thread on another core, which may come at any moment. An    *)
+(* acquire whose first attempt fails queues, and the pass its own queueing *)
+(* runs may grant it the lock at once, if the other thread let go of it in *)
+(* between: that grant completes the acquire in the same poll, so it       *)
+(* spends one too, and a refused one gives the lock back the same way.     *)
 (*                                                                         *)
 (* What must never happen: a value taken and lost by a refused receive, a  *)
 (* lock lost by a refused acquire, a thread left queued while the lock is  *)
@@ -28,8 +33,10 @@
 (* src/sync/loom_tests check that handshake with a refusal in it); the     *)
 (* lock is a semaphore of one permit whose line holds only the other       *)
 (* thread, and its release and its pass are one step each (the semaphore  *)
-(* family checks the line); a hot acquire that finds the lock taken yields *)
-(* and tries again on its next poll, where the code waits in the line.     *)
+(* family checks the line); a hot acquire that finds the lock taken and is *)
+(* not granted as it queues yields and tries again on its next poll, where *)
+(* the code waits in the line (a grant to a wait that queued in an earlier *)
+(* poll spends nothing: that wait yielded).                                *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, TLC
 
@@ -63,7 +70,8 @@ variables
     whileOtherWaits = 0,         \* operations the hot task completed while the other task waited for its turn
     refused = FALSE,             \* (record) an operation was refused for the budget
     giveBack = FALSE,            \* (record) a refused acquire gave the lock back while the thread was queued
-    servedByGiveBack = FALSE;    \* (record) the lock a refused acquire gave back went to the queued thread
+    servedByGiveBack = FALSE,    \* (record) the lock a refused acquire gave back went to the queued thread
+    enqGrant = FALSE;            \* (record) an acquire was granted by the pass of its own queueing
 
 define
     \* The hot task ran its whole program.
@@ -143,13 +151,12 @@ S_recv:
     end if;
 S_acq:
     \* An acquire's first attempt (`Contend`, `FairWait`): it takes the lock if nobody waits for
-    \* it and it is free; otherwise the task yields and tries again on its next poll.
+    \* it and it is free; otherwise it queues.
     if ~wQueued /\ free > 0 then
         free := free - 1;
         hotHolds := TRUE;
     else
-        runq := Append(runq, "hot");
-        goto S_pick;
+        goto S_enq;
     end if;
 S_spend:
     \* Taken at once: one operation is spent (`taken_at_once`, `coop::spend`).
@@ -176,6 +183,31 @@ S_spend:
         else
             goto S_pick;
         end if;
+    end if;
+S_enq:
+    \* The acquire queues (`FairWait::poll_admitted`'s enqueue): the pass of its own queueing
+    \* grants it the lock if the lock is free now and nobody waits ahead, which happens when
+    \* the other thread let go of it since the first attempt. Granted, the acquire completes
+    \* in this poll and spends one like an acquire taken at once. MUTATION enqueue_grant_free:
+    \* the grant completes the acquire and spends nothing, as a grant to a wait that yielded.
+    \* Not granted, the task yields and tries again on its next poll.
+    if ~wQueued /\ free > 0 then
+        free := free - 1;                   \* the pass hands the free permit to the new waiter
+        hotHolds := TRUE;                   \* the hot task holds the lock
+        enqGrant := TRUE;                   \* (record) granted as it queued
+        if Mutation = "enqueue_grant_free" then
+            inPoll := inPoll + 1;           \* the acquire completes in this poll ...
+            next := next + 1;               \* ... and the program moves on ...
+            if ~otherDone then
+                whileOtherWaits := whileOtherWaits + 1;   \* ... while the other task waits
+            end if;
+            goto S_unlock;                  \* ... with nothing spent
+        else
+            goto S_spend;                   \* it spends one, or is refused, as a take at once is
+        end if;
+    else
+        runq := Append(runq, "hot");        \* not granted: the task goes behind the others
+        goto S_pick;
     end if;
 S_give_back:
     \* The give back's pass (`Lock::give_back`): the lock goes to a thread that queued for it
@@ -263,4 +295,6 @@ NoRefusal == ~refused
 NoOtherBetween == ~(otherDone /\ next > 1 /\ ~HotDone)
 \* A refused acquire gives the lock back to the thread that queued while the hot task held it.
 NoServeByGiveBack == ~servedByGiveBack
+\* An acquire is granted by the pass of its own queueing, in the poll that queued it.
+NoGrantAtEnqueue == ~enqGrant
 =============================================================================
