@@ -1,0 +1,6 @@
+# configuration                spec                 expected
+W_safe                         MC_Wheel             pass
+MW_no_generation               MC_Wheel             violated:KeyIsolation
+MW_cascade_fires_all           MC_Wheel             violated:NeverEarly
+MW_insert_passed_links         MC_Wheel             violated:NeverLate
+MW_no_elapsed_max              MC_Wheel             violated:NeverLate
