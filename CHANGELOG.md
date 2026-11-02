@@ -25,6 +25,13 @@
   that held the sleep before, and the task that held it now was never woken. The poll now looks
   at the mark after it registers (`proofs/tla/timer`, the `recheck_fired_only` mutation), and no
   more before it.
+- **A clock read as it is paused never goes back.** A reading of a clock nobody paused yet
+  leaves no trace, and read the system's time after it found the clock unpaused, while a pause
+  read the time it stops at before it marked the clock: a reading taken between the two could be
+  later than the paused time, and the next reading earlier than it. A reading now takes the
+  system's time before it looks at the mark, and a pause marks the clock before it reads its time
+  (`proofs/tla/clock/ClockRead.tla`); a clock that was paused or advanced reads the system's time
+  once per reading, as before.
 
 ### Changed
 

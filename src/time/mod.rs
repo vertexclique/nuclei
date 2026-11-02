@@ -45,7 +45,7 @@ use core::time::Duration;
 /// is moved, by [`advance`] or by itself whenever every shard of the runtime is
 /// idle with a timer armed, no blocking job runs and no poll the handoff took
 /// from its worker still runs (it jumps to the earliest timer). A paused clock
-/// stays paused.
+/// stays paused, and never reads earlier than a time it gave before the pause.
 ///
 /// ```
 /// use std::time::Duration;
