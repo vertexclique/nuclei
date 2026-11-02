@@ -29,3 +29,7 @@ M_holder_fails                 MC_Merged            violated:NoSpuriousError
 M_requester_fails              MC_Merged            violated:NoSpuriousError
 W_merged                       MC_Merged            violated:NoMerged
 W_late_refusal                 MC_Merged            violated:NoLateRefusal
+M_attach_stopped               MC_Attach            violated:NoLeak
+M_attach_closed                MC_Attach            violated:NoClosedInstall
+M_evict_keeps_slot             MC_Attach            violated:TableFollows
+MT_want_ignores_out   MC_Route    violated:OneSubmit

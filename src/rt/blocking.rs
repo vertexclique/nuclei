@@ -69,6 +69,8 @@ pub(crate) struct PoolConfig {
     pub(crate) name: Arc<dyn Fn() -> String + Send + Sync>,
     /// The mask the runtime was built with; a pool thread runs on it.
     pub(crate) cpu_mask: Option<super::runtime::CpuMask>,
+    /// The runtime's `io_buffer_cap`: what a pool thread's own IO buffers may hold.
+    pub(crate) buffer_cap: usize,
 }
 
 /// A slot's states.
@@ -411,6 +413,7 @@ impl Pool {
         if let Some(mask) = &self.config.cpu_mask {
             super::runtime::apply_mask(mask);
         }
+        crate::buf::serve_with_cap(self.config.buffer_cap);
         let _stopping = self.config.hooks.started();
         let mut me = self.claim_slot();
         loop {
@@ -587,6 +590,7 @@ mod tests {
             stack_size: None,
             name: Arc::new(|| "test-blocking".to_string()),
             cpu_mask: None,
+            buffer_cap: crate::buf::DEFAULT_CAP,
         })
     }
 

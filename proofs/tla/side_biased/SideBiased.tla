@@ -12,6 +12,8 @@
 (* `Source::give_up_claims` in src/io/source/requests.rs as its shard     *)
 (* lets go of the source, src/rt/shard/going.rs); the fence is            *)
 (* `heavy_retried` in src/rt/handoff/fence.rs; the shard's move is         *)
+(* Who the owner is (`Side::claim`, `SourceHooks::owner`) is also       *)
+(* checked in Claim.tla.                                                   *)
 (* `Slot::claim`, `Slot::take` and `Slot::come_back` in                    *)
 (* src/rt/handoff/slot.rs, driven by src/rt/handoff/monitor.rs).           *)
 (*                                                                          *)

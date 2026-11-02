@@ -93,6 +93,62 @@ impl SourceHooks<'_> {
     }
 }
 
+/// The read side's deferred work that only a hangup, a returned buffer, a lent buffer's
+/// abandon or a caller's clear left.
+#[cfg(unix)]
+const READ_RARE: u8 =
+    read_work::UNSURE | read_work::UNSTARVE | read_work::ABANDON | read_work::CLEAR;
+#[cfg(not(unix))]
+const READ_RARE: u8 = read_work::UNSURE | read_work::UNSTARVE | read_work::ABANDON;
+/// As [`READ_RARE`], of the write side.
+#[cfg(unix)]
+const WRITE_RARE: u8 = write_work::UNSTARVE | write_work::ABANDON | write_work::CLEAR;
+#[cfg(not(unix))]
+const WRITE_RARE: u8 = write_work::UNSTARVE | write_work::ABANDON;
+
+impl SourceHooks<'_> {
+    #[cold]
+    #[inline(never)]
+    fn read_rare(&self, st: &mut ReadState, bits: u8, after: &mut After) {
+        if bits & read_work::UNSURE != 0 {
+            st.short_reads_unsure();
+        }
+        if bits & read_work::UNSTARVE != 0 {
+            st.unstarve(after);
+        }
+        if bits & read_work::ABANDON != 0 {
+            st.abandon_lent(after);
+        }
+        #[cfg(unix)]
+        if bits & read_work::CLEAR != 0
+            && let Some(tick) = self.src.read_clear.take()
+        {
+            st.fd_clear(tick);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write_rare(&self, st: &mut WriteState, bits: u8, after: &mut After) {
+        if bits & write_work::UNSTARVE != 0 {
+            st.unstarve(after);
+        }
+        if bits & write_work::ABANDON != 0 {
+            st.abandon_lent(after);
+            #[cfg(completion)]
+            if let Some(user_data) = st.withdrawal() {
+                self.src.cancel_op(user_data);
+            }
+        }
+        #[cfg(unix)]
+        if bits & write_work::CLEAR != 0
+            && let Some(tick) = self.src.write_clear.take()
+        {
+            st.fd_clear(tick);
+        }
+    }
+}
+
 impl Hooks<ReadState> for SourceHooks<'_> {
     /// Every take of the side looks at the epoch, so the look stays in its caller and the
     /// discard of a state of a descriptor that is gone goes out of line.
@@ -115,14 +171,9 @@ impl Hooks<ReadState> for SourceHooks<'_> {
     }
 
     fn deferred(&self, st: &mut ReadState, bits: u8, after: &mut After) {
-        if bits & read_work::UNSURE != 0 {
-            st.short_reads_unsure();
-        }
-        if bits & read_work::UNSTARVE != 0 {
-            st.unstarve(after);
-        }
-        if bits & read_work::ABANDON != 0 {
-            st.abandon_lent(after);
+        // The rare bits, looked at with one test: an operation's end comes far more often.
+        if bits & READ_RARE != 0 {
+            self.read_rare(st, bits, after);
         }
         #[cfg(completion)]
         {
@@ -205,15 +256,9 @@ impl Hooks<WriteState> for SourceHooks<'_> {
     }
 
     fn deferred(&self, st: &mut WriteState, bits: u8, after: &mut After) {
-        if bits & write_work::UNSTARVE != 0 {
-            st.unstarve(after);
-        }
-        if bits & write_work::ABANDON != 0 {
-            st.abandon_lent(after);
-            #[cfg(completion)]
-            if let Some(user_data) = st.withdrawal() {
-                self.src.cancel_op(user_data);
-            }
+        // As the read side's.
+        if bits & WRITE_RARE != 0 {
+            self.write_rare(st, bits, after);
         }
         #[cfg(completion)]
         {

@@ -751,6 +751,33 @@ impl<S> Side<S> {
         held.release(after, hooks);
     }
 
+    /// Runs `step` under the side if it is free, else leaves side-local work `bits` for its
+    /// holder as [`defer`](Self::defer) does, once `leave` stored what that work needs: a step
+    /// that waits for nothing is never lost to a held side, and costs a free side what a poll's
+    /// does.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub(crate) fn run_or_defer(
+        &self,
+        bits: u8,
+        after: &mut After,
+        hooks: &impl Hooks<S>,
+        step: impl FnOnce(&mut S),
+        leave: impl FnOnce(),
+    ) {
+        match self.take_as(self.role(hooks), 0, hooks) {
+            Take::Held(mut held) => {
+                hooks.taken(held.get(), after);
+                step(held.get());
+                held.release(after, hooks);
+            }
+            Take::Busy | Take::Left | Take::Unserved => {
+                leave();
+                self.defer(bits, after, hooks);
+            }
+        }
+    }
+
     /// The biased hold, if `role` is the owner's and no foreign thread came.
     fn hold_biased(&self, role: Role) -> Option<Held<'_, S>> {
         if role == Role::Owner {
@@ -1010,8 +1037,10 @@ impl<S> Held<'_, S> {
 }
 
 impl<S> Drop for Held<'_, S> {
-    /// Only a panic under the guard gets here: the side goes free, and the
-    /// polls waiting on it are woken to look again.
+    /// Only a panic under the guard gets here (a user's waker clone, as a
+    /// step registers it): the side goes free, the polls waiting on it are
+    /// woken to look again, and the work others left for the holder stays
+    /// in the word for the next one (proofs/tla/side/Side.tla, `Panics`).
     fn drop(&mut self) {
         if self.biased() {
             // Own goes down; work others left stays in the word for the next
@@ -1026,7 +1055,11 @@ impl<S> Drop for Held<'_, S> {
             }
             return;
         }
-        let flags = self.side.state.swap(0, Ordering::AcqRel);
+        // READY, DEFER and REQ stay: the next holder's release fails on them and does the work.
+        let flags = self
+            .side
+            .state
+            .fetch_and(!(BUSY | WAITING), Ordering::AcqRel);
         if flags & WAITING != 0 {
             // Dropped, not run: during unwinding the wakes are parked.
             let mut after = After::default();

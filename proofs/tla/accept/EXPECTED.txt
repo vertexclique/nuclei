@@ -16,6 +16,9 @@ A_resets_other                 MC_AcceptStream      pass
 M_end_on_reset                 MC_AcceptStream      violated:EndsOnlyForOther
 M_skip_stalls                  MC_AcceptStream      violated:AllServed
 W_skip_serves                  MC_AcceptStream      violated:NoSkipServes
+A_ring_emfile                  MC_AcceptStream      pass
+A_ahead_other                  MC_AcceptStream      pass
+M_error_first                  MC_AcceptStream      violated:NoneLeftQueued
 R_readiness_accept             MC_AcceptReset       pass
 R_readiness_multi              MC_AcceptReset       pass
 R_completion_accept            MC_AcceptReset       pass

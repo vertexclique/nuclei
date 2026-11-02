@@ -24,6 +24,17 @@
 (* wait for it for good. What must happen: both parties always end         *)
 (* (`EveryoneEnds`).                                                       *)
 (*                                                                          *)
+(* With `Outsider` set, another process holds the file's lock when the job *)
+(* starts and may never let it go (nothing in nuclei makes it), and the    *)
+(* pool has `Threads` threads. The job waits in the kernel on a pool       *)
+(* thread. Dropping the future swaps GONE, but nothing reaches the job in  *)
+(* the kernel: it keeps its thread for as long as the other process holds *)
+(* the lock. With `Write` set, a write of the same file is made as a job   *)
+(* of the pool once the future is gone; with one thread it never runs     *)
+(* (`W_lock_keeps_pool`, which `WriteServed` must fail: this is the code   *)
+(* as it is, and how a dropped job is to let go of its thread is the       *)
+(* operator's to decide).                                                  *)
+(*                                                                          *)
 (* What is modelled step by step: the shared word and each swap or         *)
 (* compare-and-swap on it, the job's claim (start or cancel), the kernel's *)
 (* lock and each unlock, the future's drop at any point before it takes    *)
@@ -31,12 +42,16 @@
 (* separate steps), and the future taking the result. What is abstract:    *)
 (* the kernel's lock is one flag (`locked`), because one file and one      *)
 (* call are enough to show who unlocks; other holders of the file, and the *)
-(* time the blocking lock waits, are the kernel's.                         *)
+(* time the blocking lock waits, are the kernel's, but for the one         *)
+(* outsider; the pool is a count of free threads.                          *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 
 CONSTANTS
     CanFail,   \* TRUE: the job's blocking lock may fail (then nothing is locked); FALSE: it always gets the lock
+    Outsider,  \* TRUE: another process holds the file's lock at first, and may never let it go
+    Threads,   \* the threads of the blocking pool
+    Write,     \* TRUE: a write of the same file is made as a job of the pool once the future is gone
     Mutation   \* "none", or the name of the one rule this run takes away
 
 (* --algorithm FileLock
@@ -47,11 +62,15 @@ variables
     jobOk = FALSE,          \* the job's blocking lock succeeded
     returned = FALSE,       \* the future handed the lock to its caller
     lockAfterGone = FALSE,  \* record: the job got the lock when the word already said GONE
-    dropUnlocked = FALSE;   \* record: a dropped future found HELD and unlocked the file itself
+    dropUnlocked = FALSE,   \* record: a dropped future found HELD and unlocked the file itself
+    outside = Outsider,     \* the other process holds the file's lock now
+    free = Threads,         \* threads of the pool that run no job
+    dropped = FALSE,        \* the future was dropped before it took the result
+    written = FALSE;        \* the write job ran
 
 define
-    \* Both parties finished (a finished process sits at the label Done).
-    AllDone == \A p \in DOMAIN pc : pc[p] = "Done"
+    \* Both parties, the caller's future and the job, finished (a finished process sits at the label Done).
+    AllDone == pc[1] = "Done" /\ pc[2] = "Done"
     \* Once both are done, a locked file means a caller really holds the lock.
     NoOwnerlessLock == AllDone => (locked => returned)
     \* A lock handed to the caller really is held.
@@ -62,6 +81,8 @@ define
     NoDropUnlock == ~dropUnlocked
     \* Both parties always end.
     EveryoneEnds == <>AllDone
+    \* Once the lock's future is gone, the write of the file made then runs in the end.
+    WriteServed == (Write /\ dropped) ~> written
 end define;
 
 fair process caller = 1                 \* the future of the `lock_file` call
@@ -78,6 +99,7 @@ C_poll:
         goto Done;                      \* a returned future is not dropped as an owner any more
     end either;
 C_swap:
+    dropped := TRUE;                    \* the future is gone
     if Mutation = "drop_reads_then_writes" then   \* the broken drop: reads the word...
         old := st;                      \* ...in one step...
     else                                \* the real drop: one atomic swap
@@ -102,13 +124,16 @@ end process;
 fair process job = 2                    \* the job of the blocking pool
 begin
 J_begin:
+    await free > 0 \/ jobState # "queued";   \* a thread of the pool is free, or the job was cancelled
     if jobState = "queued" then         \* the pool thread claims the job...
         jobState := "running";          \* ...and it runs
+        free := free - 1;               \* on that thread
     else                                \* it was cancelled before it started
         goto Done;                      \* it never locks
     end if;
 J_lock:
     either                              \* the blocking lock succeeds
+        await ~outside;                 \* once the other process let go: until then it waits in the kernel
         locked := TRUE;                 \* the file is locked
         jobOk := TRUE;                  \* the job says so
         if st = "GONE" then             \* the future was dropped in the meantime
@@ -132,10 +157,34 @@ J_cas:
     end if;                             \* a failed lock goes on to the end
 J_end:
     jobState := "done";                 \* the result is there for the future
+    free := free + 1;                   \* its thread is the pool's again
     goto Done;                          \* the job is finished
 J_unlock:
     locked := FALSE;                    \* the job unlocks the file (not blocking)
     goto J_end;                         \* and ends
+end process;
+
+process outsider = 3                    \* the other process; not fair: it may never let go
+begin
+O_let_go:
+    if outside then                     \* it holds the lock
+O_unlock:
+        outside := FALSE;               \* and lets go, if it ever does
+    end if;
+end process;
+
+fair process writer = 4                 \* a write of the same file, as a job of the pool
+begin
+W_submit:
+    if Write then                       \* in the runs that have one
+        await dropped;                  \* made once the lock's future is gone
+W_run:
+        await free > 0;                 \* it waits for a thread of the pool
+        free := free - 1;               \* runs on it
+W_done:
+        written := TRUE;                \* writes
+        free := free + 1;               \* and gives the thread back
+    end if;
 end process;
 end algorithm; *)
 =============================================================================

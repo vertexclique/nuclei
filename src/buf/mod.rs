@@ -502,9 +502,30 @@ impl Drop for Pool {
 }
 
 thread_local! {
-    /// The pool of a thread that runs no shard (a task of another executor
-    /// writing to a handle), made on first need.
-    static FALLBACK: Pool = Pool::new(DEFAULT_CAP);
+    /// What the pool of this thread, which runs no shard, may hold, once the thread said which
+    /// runtime it serves ([`serve_with_cap`]).
+    static FALLBACK_CAP: Cell<Option<usize>> = const { Cell::new(None) };
+    /// The pool of a thread that runs no shard (a blocking pool's, one whose shard was handed
+    /// over, a task of another executor writing to a handle), made on first need and held to
+    /// the cap of the runtime it serves ([`fallback_cap`]), as a worker's is
+    /// (proofs/tla/bufcap/BufCap.tla).
+    static FALLBACK: Pool = Pool::new(fallback_cap());
+}
+
+/// Holds the pool of this thread, which serves a runtime and runs no shard (a blocking pool's),
+/// to that runtime's `io_buffer_cap`. Called before the thread does any IO.
+pub(crate) fn serve_with_cap(cap: usize) {
+    FALLBACK_CAP.set(Some(cap));
+}
+
+/// What a pool of a thread that runs no shard may hold: the cap of the runtime it serves, its
+/// blocking pool's or the one it is inside, else of the default runtime if that runs, else the
+/// default.
+fn fallback_cap() -> usize {
+    FALLBACK_CAP
+        .get()
+        .or_else(|| crate::rt::runtime::running_inner().map(|inner| inner.buffer_cap))
+        .unwrap_or(DEFAULT_CAP)
 }
 
 /// Runs `f` with this thread's pool: the pool of the shard it runs (a call

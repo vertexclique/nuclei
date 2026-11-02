@@ -80,6 +80,9 @@ pub(crate) struct Inner {
     lingering: super::linger::Lingering,
     /// What the runtime's handles read of its builder.
     pub(crate) io: io_knobs::IoKnobs,
+    /// What each worker's IO buffers may hold, and the pool of a thread that serves the
+    /// runtime but runs no shard (`buf::with_pool`).
+    pub(crate) buffer_cap: usize,
 }
 
 /// A runtime: worker shards and a blocking pool. Dropping it stops the

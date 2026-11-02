@@ -238,6 +238,30 @@
   the claimant's own thread with nothing held, takes the side itself. The shard claims the side
   again at its next take as its owner (`proofs/tla/side_biased/SideBiased.tla`, `ClaimStops` and
   `Rehomed`).
+- **A caller's clear of readiness made while another holds the side is kept** (epoll, kqueue,
+  io_uring). `AsyncFdReadyGuard::clear_ready`, and the clear of a socket's `try_io` and
+  `async_io` after a call that would block, went through a poll of the side; one that found the
+  side held for a moment (another task's look at it, the driver serving an edge) was dropped, so
+  the task found the side ready again with no edge since and called again, and again, for as
+  long as the other tasks kept the side busy. A clear that finds the side held now leaves its
+  tick for the holder, who clears the side as it lets go, before any look can see it ready; of
+  ticks left at once the newest is kept, the only one that can still clear. A free side costs
+  what it did (`proofs/tla/asyncfd/AsyncFd.tla`, the `drop_held_clear` and `clear_last_wins`
+  mutations).
+- **Work left for a socket's holder whose poll panicked is done by the next holder.** A poll
+  registers its task's waker while it holds the side, which clones the waker: a clone that
+  panicked unwound the guard, whose drop swapped the side's word to zero, and the edge, the
+  completion or the request another thread had left for that holder was lost (a read waited for
+  an edge that had come, a ring completion went unapplied, a dropped handle's close never ran).
+  The drop now lets the side go and wakes the polls waiting on it as before, and leaves that work
+  in the word, where the next holder does it (`proofs/tla/side/Side.tla`, `Panics`, the
+  `unwind_clears` mutation).
+- **The IO buffers of a thread that runs no shard hold no more than its runtime's
+  `io_buffer_cap`.** A thread of the blocking pool, one inside a runtime with `enter`, and a
+  worker whose shard was handed over take their buffers from a pool of their own, which held up
+  to the 64 MiB default whatever the runtime's `io_buffer_cap` said. That pool now takes the cap
+  of the runtime the thread serves, and a thread that serves none the default runtime's
+  (`proofs/tla/bufcap/BufCap.tla`).
 
 ### Changed
 

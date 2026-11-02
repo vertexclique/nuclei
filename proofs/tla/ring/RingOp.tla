@@ -1,8 +1,8 @@
 ------------------------------ MODULE RingOp ------------------------------
 (***************************************************************************)
-(* A side of a source on its shard's ring (src/io/source/write/ring.rs,   *)
-(* src/io/source/ring.rs, src/rt/shard/ring.rs), with the side held from  *)
-(* another thread, and a retire.                                          *)
+(* A side of a source on its shard's ring (src/io/source/write/ops.rs,    *)
+(* src/io/source/write.rs, src/io/source/ring.rs, src/rt/shard/ring.rs),  *)
+(* with the side held from another thread, and a retire.                  *)
 (*                                                                          *)
 (* In plain words: a task on another thread writes twice. Each write is   *)
 (* accepted into the side; the side's operation goes to the ring, one at  *)

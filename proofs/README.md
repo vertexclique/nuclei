@@ -585,21 +585,40 @@ the waiting bit; if that showed the side free, it takes the side once more, else
 the holder wakes it. Letting go is one compare-and-swap from the word the holder took to zero;
 when flags came meanwhile it fails, and the holder takes them with one swap, still holding: the
 ready bit, it does the driver's part (and its own step again if it waited); the waiting bit, it
-takes the contended wakers, which it wakes once it has let go.
+takes the contended wakers, which it wakes once it has let go. Another thread may leave
+side-local work (`Side::defer`, a buffer that came back or a ring's completion): its bits go into
+the side's deferred word first, then the deferred bit with its fetch-or of busy, and a holder
+whose release fails on that bit does the work it finds in the word (`Held::run_deferred`). A
+step may panic under the guard as it registers its waker (a user's waker clone): the guard's
+drop lets the side go, wakes the contended polls and leaves the work others left in the word for
+the next holder (`Held::drop`).
 
-16 configurations: 3 that must pass (two and three bytes with `Conservation`, no byte lost or
-made up, and `Exclusive`, one holder at a time; and liveness under weak fairness), 7 mutations
+20 configurations: 5 that must pass (two and three bytes with `Conservation`, no byte lost or
+made up, and `Exclusive`, one holder at a time; liveness under weak fairness; two bytes with
+work deferred once, with `DeferDone`, the work is done whoever holds the side; and the same with
+the reader's step panicking once), 9 mutations
 (a driver that drops an edge on a held side, one that flags in a step of its own after looking,
 a holder that lets go without serving the ready bit, an edge that leaves the cache blocked, a
 holder that wakes nobody for the waiting bit, and a contended reader that sleeps without looking
 whether the side came free each end in a deadlock; a take that refuses a free side carrying a
-flag breaks `Termination`), and 6 witnesses (a flag, a reader doing the driver's part, a read
+flag breaks `Termination`; a deferrer that raises its bit before its work is in the word, and a
+guard's drop that swaps the whole word to zero as a panic unwinds, as it did, break `DeferDone`),
+and 6 witnesses (a flag, a reader doing the driver's part, a read
 the driver completes on an edge, a reader's submit that runs the driver's read at once, a
 contended reader woken by the holder, and a contended reader that finds the side free and takes
 it). Bytes are a count and there is one reader: several tasks waiting on one side share its
 waker list, which the driver wakes whole. The loom models in `src/io/side/loom_tests.rs` check
 the code's word with two calibrations that must strand a thread (a driver's part that forgets
 the reader's wake, and a contended poll that is never woken).
+
+`WakerSet.tla`, in the same family, checks the contended set those wakers wait in (`WakerSet`
+in `src/io/side.rs`, of `SIDE_SLOTS` slots): a poll that finds the side held keeps its waker in
+its own slot, else a free one, else the last, waking the waker it displaces; it looks once more
+and sleeps until woken, and the holder wakes every waker in the set as it lets go. With more
+tasks than slots the displaced task polls again and displaces another, which costs time only. 4
+configurations: 2 that must pass (three tasks and one slot, four tasks and two, with `AllTook`,
+every task takes the side in the end), 1 mutation (a displaced waker dropped, not woken, breaks
+`AllTook`) and 1 witness (a registration displaces another's waker).
 
 `Requests.tla`, in the same family, checks the work that needs both sides of a source, a
 dropped handle's close in particular (`src/io/source/requests.rs`), against a holder on each
@@ -636,6 +655,10 @@ each with a mutation of the code that makes one of them fail.
 `Side::defer`, `Side::take_for_request`, `Held::release_or_again`, `Side::release_biased`,
 `Side::unserved` and `Side::give_up` in `src/io/side.rs`; the heavy fence is `heavy` and
 `heavy_retried` in `src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
+`Side::try_biased`, `Side::take_foreign`, `Side::unserved`, `Side::poll`, `Side::poll_owner`,
+`Side::with_owner`, `Side::owned_by`, `Side::contend`, `Side::defer`, `Side::take_for_request`
+and `Held::release_or_again` in `src/io/side.rs`; the heavy fence is `heavy` and `heavy_retried` in
+`src/rt/handoff/fence.rs`), on a machine whose stores wait in a store buffer of two entries, as
 x86's do. A socket's side has an owner, the thread running its home shard, which serves the
 driver's edges. The owner takes the side with a plain store of its word `own`, a compiler fence
 and a plain load of the foreign word `intent`: zero, it holds; one, it undoes `own` and takes
@@ -714,10 +737,24 @@ after the foreign thread's heavy fence, so the two form a store-buffering pair, 
 read puts the fence on the owner's side, only on the release in flight when the first foreign
 thread arrives (every later owner take falls back to today's word).
 
-`Retire.tla`, in the same family, checks the planned plain operation count on a ring, before its
-code is written (today `Source::op_out` and `op_done` in `src/io/source/ops.rs` still change
-`ops_out` with sequentially consistent read-modify-writes, against the flag of `Source::retire`
-in `src/io/source/requests.rs`). A ring's submit stores the count plus one and hands the operation to
+`Claim.tla`, in the same family, checks who takes a biased side as its owner (`Side::role` and
+`Side::claim` in `src/io/side.rs`, `SourceHooks::owner` in `src/io/source/hooks.rs`), on memory
+that is sequentially consistent: the home shard's thread, another shard's and a thread that runs
+no shard poll the side while the registration homes the source. A thread's candidate is the shard
+it runs while the source is homed there or not homed yet; the first candidate's compare-and-swap
+from zero claims the side, and a claimant takes it biased only while it does not hold it
+already, so a call it makes under its own hold is foreign. 6 configurations: 1 that must pass
+(with `Exclusive`, one hold at a time, and `HomeClaims`, no shard but the home claims the side
+once the source is homed), 4 mutations (a claim made with a plain store, a role that leaves out
+the claim's compare, and a role that leaves out its look at `own`, each break `Exclusive`; an
+owner look that leaves out the home check breaks `HomeClaims`) and 1 witness (another shard
+claims the side before the source is homed, and keeps it).
+
+`Retire.tla`, in the same family, checks a design that keeps the operation count plain on a ring,
+which was not built: `Source::op_out` and `op_done` in `src/io/source/ops.rs` change `ops_out`
+with sequentially consistent read-modify-writes, against the flag of `Source::retire` in
+`src/io/source/requests.rs`, as `ring/RingOp.tla`'s retire checks, and the model stays as the
+check a plain count would have to pass. A ring's submit stores the count plus one and hands the operation to
 the kernel; its `op_done`, on the ring the operation went to, stores the count minus one and
 then, with a compiler fence only, reads the waiters' flags, and with the count at zero and a flag
 up takes that waiter's waker and wakes it. A plain count needs one writer at a time, so a
@@ -977,8 +1014,10 @@ read, and nothing waits for it), and a ring only its own thread may reap copying
 ## A datagram's sender
 
 `sender` (`tla/sender/Sender.tla`) checks that a datagram receive names its sender
-(`unix_addr`, `unnamed` and `recv_from_udp_uninit` in `src/io/sys/unix.rs`, used by the
-receives of `src/io/source/read.rs` and `src/io/source/ring.rs`, and `poll_peek_sender` in
+(`unix_addr` and `unnamed` in `src/io/sys/unix/unix_addr.rs`, `recv_from_udp_uninit` in
+`src/io/sys/unix.rs`, used by the receives of `src/io/source/read.rs` (`ReadState::receive`,
+`receive_lent`), `src/io/source/read/datagram.rs` (`receive_now`) and `src/io/source/ring.rs`,
+and `poll_peek_sender` in
 `src/net/udp.rs`). A peer sends datagrams; a receive takes one from the kernel and then makes the
 sender's address for the task, while other code takes the process's last descriptors and gives
 them back. Once the kernel handed a datagram over it is the receive's, so naming its sender must
@@ -1031,29 +1070,43 @@ receives (UDP and Unix), and waits for room on a full Unix datagram peer, on eac
 state for a caller's descriptor (`Kind::Fd`), at the grain of each atomic access. A peer writes;
 on epoll and kqueue each write brings an edge that marks the side ready and counts it, and on
 io_uring a poll armed while the side is not ready and a task waits completes once the socket
-holds bytes. The task waits until the side is ready, notes the count (its guard's tick) and
+holds bytes. A task waits until the side is ready, notes the count (its guard's tick) and
 makes its own call; a call that would block clears the side only if the count is still the
-tick, since an edge after the call is the only one it gets. 5 configurations: 3 that must pass
-(edges and the ring's poll with `AllTaken`, every byte taken, and edges with `Counted`), a
-mutation that breaks `AllTaken` (a clear that does not look at the count), and a witness (a
-clear that finds a newer edge and keeps the side ready). The unit tests in
-`src/io/async_fd.rs` place an edge between the call and the clear on each side (the mutation
-fails both), and `tests/async_fd.rs` reads every byte of a peer that writes while the caller
-reads, on each backend.
+tick, since an edge after the call is the only one it gets. With more than one task a look
+holds the side's guard for a moment, and a clear that finds the side held leaves its tick for
+the holder, who clears the side as it lets go (`Source::fd_clear_read` and `fd_clear_write`
+with `Side::run_or_defer`, the tick in `LeftClear` of `src/io/source/clear.rs`); of ticks left
+at once the newest is kept, the only one that can still clear. 10 configurations: 6 that must
+pass (one task on edges and on the ring's poll with `AllTaken`, every byte taken, and edges with
+`Counted`; two tasks on edges and on the ring with `NoSpuriousReady`, no task finds the side
+ready with no edge since its own clear, and `AllTaken`; three tasks with `NoSpuriousReady`), 3
+mutations (a clear that does not look at the count breaks `AllTaken`; a clear dropped when the
+side is held, the code before the fix, and a tick left that replaces a newer one break
+`NoSpuriousReady`), and a witness (a clear that finds a newer edge and keeps the side ready).
+The unit tests in `src/io/async_fd.rs` place an edge between the call and the clear on each
+side (the mutation fails both), `src/io/source/tests/caller_clear.rs` clears each side while
+another holds it and keeps the newest of the ticks left (both clears fail before the fix), and
+`tests/async_fd.rs` reads every byte of a peer that writes while the caller reads, on each
+backend.
 
 The same family checks a socket's side turning from the handle's own IO to its caller's calls
 (`try_io`, `async_io` on the sockets; `CallerMode.tla`, `CallerWrite.tla`). On the read side the
 task reads once through the handle, which reads ahead and, on io_uring, keeps a multishot
-receive out; then its own calls fail while the handle holds data read ahead (the handle's reads
-take it first), stop a receive still out and wait for it to end, and from then on follow the
-edges and polls as above. On the write side the bytes the handle wrote behind go out before a
-send of the caller's. 11 more configurations: 6 that must pass (edges and the ring, four writes,
-with `InOrder`, every byte taken once in the order written, and `AllTaken`; four bytes behind and
-three of the task's own with `OutOrder` and `AllOut`), 3 mutations (a call with data read ahead
-breaks `InOrder`; a stopped receive that ends with the side ready and wakes nobody breaks
-`AllTaken`; a send with bytes still behind breaks `OutOrder`), and 2 witnesses (a call that finds
-data read ahead, a stop that ends the receive with nothing brought). `tests/net_caller.rs` runs
-each case on both Linux backends, and the three code mutations fail it.
+receive out, or, for a ring's stream read by readiness, reads its byte from the socket with a
+multishot poll armed; then its own calls fail while the handle holds data read ahead (the
+handle's reads take it first), stop a receive or a poll still out and wait for it to end, and
+from then on follow the edges and polls as above. On the write side the bytes the handle wrote
+behind go out before a send of the caller's, and a send the socket refuses clears the side only
+if no edge came since its look, the peer's read bringing the edge. 15 more configurations: 8
+that must pass (edges and the ring, four writes, with `InOrder`, every byte taken once in the
+order written, and `AllTaken`; the ring's read by readiness with both; four bytes behind and
+three of the task's own with `OutOrder` and `AllOut`, and a socket that holds one unread byte
+with both), 5 mutations (a call with data read ahead breaks `InOrder`; a stopped receive that
+ends with the side ready and wakes nobody, and a switch that leaves the stream's poll armed,
+break `AllTaken`; a send with bytes still behind breaks `OutOrder`; a refused send's clear that
+does not look at the count breaks `AllOut`), and 2 witnesses (a call that finds data read
+ahead, a stop that ends the receive with nothing brought). `tests/net_caller.rs` runs each case
+on both Linux backends, and the three code mutations fail it.
 
 ## A source's operations on its shard's ring
 
@@ -1271,7 +1324,7 @@ witness (a port's zero-byte look, then the task's own receive).
 
 `tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
-`reads_itself` in `src/io/source/read.rs`, `write`, `write_direct` and `writes_itself` in
+`reads_itself` in `src/io/source/read/direct.rs`, `write`, `write_direct` and `writes_itself` in
 `src/io/source/write.rs`; a ring write goes direct at every size, `WRITE_RING` of
 `src/io/source/direct.rs` being 0, and a reply of 16 KiB or more never takes a buffer, waiting for a
 poll as a starved writer does, see `tla/ring/RingSend.tla`). Three connections over a pool of two buffers, two of whose peers never
@@ -1341,7 +1394,8 @@ shard that goes with one, each with a mutation of the code that makes one of the
 
 `starve` (`tla/starve/FdStarve.tla`) checks the rule of `tla/ring/RingStarve.tla` on a readiness
 poller, epoll or kqueue (`serve`, `leaves_to_tasks`, `complete_fd`, `read_ahead`, `read`,
-`reads_itself`, `read_direct`, `look_again` and `unstarve` in `src/io/source/read.rs`). There no
+`look_again` and `unstarve` in `src/io/source/read.rs`, `reads_itself` and `read_direct` in
+`src/io/source/read/direct.rs`). There no
 receive waits in the kernel: a read too small to go straight into the task's buffer has the
 driver read ahead into a buffer of the pool, and a task that peeks and then stops reading keeps
 that buffer for as long as it waits. Two connections over a pool of one buffer, one of whose
@@ -1384,6 +1438,23 @@ has no buffer for goes straight from the task's buffer too (`writes_bytes` in
 `src/io/source/write.rs`), on epoll and kqueue as on a ring, as a socket's always does there; the
 pipe test of `tests/idle_peers.rs` checks it on every backend.
 
+## A thread's IO buffers with no shard
+
+`bufcap` (`tla/bufcap/BufCap.tla`) checks what the IO buffers of a thread that runs no shard may
+hold (`with_pool`, the `FALLBACK` pool and `fallback_cap` in `src/buf/mod.rs`, `serve_with_cap`,
+called first by a blocking pool's thread in `src/rt/blocking.rs`). A runtime's worker and the
+threads that serve it with no shard (its blocking pool's, one inside it with `enter`, a worker
+whose shard was handed over) each take buffers from a pool of their own, which counts every buffer
+it holds, in use, free, handed to another thread or on its way back, and takes none past its cap.
+The pool of such a thread takes the cap of the runtime it serves, as a worker's does; before the
+fix it took the 64 MiB default whatever `io_buffer_cap` said. 3 configurations: 1 that must pass
+(a worker and two threads asking for three buffers each from pools of two, with `PerPool`, no pool
+holds more than the runtime's cap, `Total`, `Counted`, and `AllGiven`, every buffer asked for is
+given in the end), and 2 mutations (a pool made with the default, the code before the fix, and a
+pool thread that needs a buffer before it says which runtime it serves, break `PerPool`). The unit
+tests of `src/buf/tests/fallback.rs` build a runtime with a small cap and look at the pool of a
+blocking pool's thread and of a thread inside the runtime (both fail before the fix).
+
 ## A listener's stream of connections
 
 `accept` (`tla/accept/AcceptStream.tla`) checks the stream `TcpListener::accept_multi` gives
@@ -1402,21 +1473,29 @@ ends the stream. On macOS an accept that fails for want of a descriptor closes t
 took off the backlog (`Drops`), so after one the side first copies the listener's descriptor and
 closes the copy: none free, it answers EMFILE and takes nothing; one free, it accepts, though the
 rest of the process may take the last descriptor in between. The side hands an error over once and
-the connections queued before it first, so a retry asks the listener afresh. Time is the ticks left
-on the timer. 17 configurations: 7 that must pass (two and three connections across two outages,
+the connections queued before it first, so a retry asks the listener afresh. With `Ahead` the side
+takes connections ahead of the stream's polls into a queue of two, as a ring's multishot accept does
+for every connection that comes, and keeps the error it meets after them: running out of
+descriptors ends the ring's accept with EMFILE, and the stream yields the queued connections, then
+pauses, and its next poll asks for another accept. Time is the ticks left on the timer. 20
+configurations: 9 that must pass (two and three connections across two outages,
 with `NoBusyLoop`, at most one EMFILE between two ticks, `FirstWaitLeast`, the first pause after an
 accept the least, `LostPerOutage`, no more connections closed than outages began,
 `EndsOnlyForOther`, only the listener's own error ends the stream, and `AllServed`, every kept
 connection accepted once descriptors are free again or closed by a failed accept; the same on
 macOS, where a failed accept closes the connection it took; an outage followed by another error of
 the listener, with `OtherEnds`, the stream ends, and `NothingAfterEnd`; and the same three with
-connections reset in the backlog among the kept ones), 7 mutations (the stream that ended on
+connections reset in the backlog among the kept ones; a ring's multishot accept across an outage,
+with `NoneLeftQueued`, the stream never ends with connections taken ahead still queued, and
+`AllServed`; connections taken ahead and then the listener's other error, with `NoneLeftQueued`
+and `OtherEnds`), 8 mutations (the stream that ended on
 EMFILE, as it did before, breaks `AllServed`; a retry with no timer breaks `NoBusyLoop`; a pause
 that does not start over after an accept breaks `FirstWaitLeast`; on macOS a retry with no check
 for a free descriptor, as before, and a failed accept that does not mark the side for that check,
 break `LostPerOutage`; a reset connection's error that ends the stream, as WSAECONNRESET did on
 Windows, breaks `EndsOnlyForOther`; a skip that asks the listener nothing more until another
-connection comes breaks `AllServed`), and 3 witnesses (a retry after a pause that accepts a
+connection comes breaks `AllServed`; an error handed over before the connections taken ahead of
+it breaks `NoneLeftQueued`), and 3 witnesses (a retry after a pause that accepts a
 connection; a check that found a descriptor free and an accept that still closed a connection, the
 race the check cannot close; a kept connection accepted after a skip).
 
@@ -1503,27 +1582,32 @@ them to the kernel, whose send queue holds one until the peer takes it; then it 
 one of five ways: a shut of the writing half, of both halves or of the reading half, each
 followed by the handle's drop, an abort, or a drop at once. A handle dropped with bytes behind
 hands them to a linger task, which drains them for at most the runtime's linger time; the close is
-performed by the driver. The peer reads, or never reads. 10 configurations: 2 that must pass (a
+performed by the driver. The peer reads, or never reads. A Unix stream (`Kind = "unix"`) has no
+reset: its expired linger closes it plainly. 11 configurations: 2 that must pass (a
 peer that reads, with every end; a peer that never reads, with an abort or a drop whose linger
 runs out), with `FinMeansWhole`, a FIN reaches the peer only after every byte the task wrote;
 `AbortResets`, an abort's stream ends with a reset; `AbortDoesNotDrain`, an abort never hands the
 bytes behind to a linger; `Conserved`; and `Termination`; 5 mutations (a shut of the writing half
 or of both that does not wait for the write-behind, an abort that closes without `SO_LINGER` 0,
 and a linger whose time ran out that closes plainly, as the code did, each break
-`FinMeansWhole`; an abort that drops the handle as a drop does breaks `AbortDoesNotDrain`); and 3
+`FinMeansWhole`; an abort that drops the handle as a drop does breaks `AbortDoesNotDrain`); and 4
 witnesses (an abort's reset reaches the peer; a linger runs out of time; a shut waits for bytes
-behind).
+behind; a Unix stream's expired linger closes plainly and its peer reads the end after a cut
+stream, which `FinMeansWhole` fails: a Unix stream has no way to say it was cut, as
+`Builder::write_behind_linger` says).
 
 `ShutRead` (`tla/close/ShutRead.tla`) checks a shut of the reading half (`Handle::shut` with `Read`
 or `Both`, then `Source::poll_drop_ahead` and `ReadState::drop_ahead` where the kernel drops its
 receive queue; the ring's shutdown entry in `src/fs/ring.rs`): two bytes the peer sent are unread,
 one read ahead, one in the kernel's queue; the task shuts the half and reads to the end while the
-driver reads ahead. 6 configurations: 2 that must pass (Linux, which keeps its queue readable, and
+driver reads ahead. 7 configurations: 2 that must pass (Linux, which keeps its queue readable, and
 a kernel that drops it), with `AsStd`, the reads after the shut answer exactly what std's reads
 answer after its shutdown, and `Termination`; 3 mutations (keeping the read-ahead where the kernel
 drops its queue, dropping it on Linux, and dropping it before the kernel's shutdown, which lets
-the driver read the queued byte ahead in between: all break `AsStd`); and 1 witness (the drop of
-the read-ahead drops a byte).
+the driver read the queued byte ahead in between: all break `AsStd`); and 2 witnesses (the drop
+of the read-ahead drops a byte; on Windows a completion port's receive that took a byte before the
+shutdown, its completion reaching the side after the drop, makes it read-ahead after the shut,
+which `AsStd` fails: the code as it is, how the shut is to drop it being an open decision).
 
 The Rust tests `shut::*` in `tests/faults/shut.rs` hold a real stream to the same rules: the peer
 reads every byte behind before the end, reads after a shut answer as std's, writes go on after a
@@ -1547,6 +1631,24 @@ connect and breaks `OkMeansQueued`); and 1 witness (a connect that met the full 
 once a place frees). The Rust tests in `tests/net_unix_connect.rs` check the same on a real
 listener: the connect waits, connects its own socket, and a dropped one leaves the pool's one
 thread free and no connection behind.
+
+## A TCP connect on every backend
+
+`connect` (`tla/connect/TcpConnect.tla`) also checks a TCP connect on each backend
+(`WriteState::connect` and `push_fd` in `src/io/source/write.rs`; the dial `submit_ops` sends and
+its end in `op_done`, `src/io/source/write/ops.rs`; the ring's answers in `src/io/source/ring.rs`;
+the port's `ConnectEx` in `src/io/source/port.rs`). The caller polls its connect and may drop it
+between polls; the kernel decides the handshake once, connected or refused. On epoll and kqueue the
+side calls connect(2) itself and waits for the write edge, then asks the socket its error; on a
+ring it sends a connect operation, which waits in the kernel for the decision, and a move of the
+source to another shard cancels it: the side keeps its dial and sends it again, which finds the
+socket still connecting (EALREADY: it polls for the socket to be writable and asks its error),
+connected (EISCONN) or refused; on a port `ConnectEx` ends with the decision. 9 configurations: 5
+that must pass (each backend, and the ring with a move, with `OneResult`, the caller hears its own
+socket's verdict, and `Termination`, a caller that keeps polling hears it; the ring with a move and
+drops, with `OneResult`), 3 mutations (EALREADY taken as the connect's error breaks `OneResult`; an
+end that wakes nobody, and a dial the cancel gave back that is not kept, break `Termination`), and 1
+witness (a dial sent again finds the socket still connecting).
 
 ## The timer wheel
 
@@ -1581,13 +1683,16 @@ handle's until the ring's thread is done with the attach (no copy of it is made)
 thread puts the file into its table and hands the slot back as a request, which whoever performs
 it (both sides held) keeps if the attach is still wanted, or lets go. After the evict the source
 may attach to another shard under a token of the same number (every shard numbers its own), so
-the ring's look and the install's taking check the registration's shard with its token. 13
+the ring's look and the install's taking check the registration's shard with its token. 16
 configurations: 5 that must pass (a close, an evict, both, liveness, and an evict followed by an
-attach to another shard), 4 mutations (2 that leak the file into the table of a closed source,
+attach to another shard), 7 mutations (2 that leak the file into the table of a closed source,
 `NoLeak`; a look and a taking by the token alone, which hand the source registered with the other
 shard a slot of this ring's table, `NoForeignSlot`; an attach with no lease, closed between the
 ring's look and its install, which puts a closed number's file into the table,
-`NoClosedInstall`), and 4 witnesses.
+`NoClosedInstall`; an `attach_now` that does not refuse a shard that stopped, which leaves the
+source registered with a shard that evicted it, `NoLeak`; one that does not refuse a handle that
+closed, `NoClosedInstall`; an evict of a registered source that posts no detach, whose slot stays
+in the table, `TableFollows`), and 4 witnesses.
 
 `tla/attach/Route.tla`, in the same family, checks a read of a ring source from a thread that
 runs no shard, or another shard, while the source's registration finishes (`Source::with_io` with `Source::via`
@@ -1601,16 +1706,17 @@ registered, asks the side to submit through the same path (the fix of commit 4bc
 it a registration that lands between the route and the step finds no waiter, the step leaves one
 and asks with NotYet, and nothing ever submits. The route's fast check comes first: the
 registration's `here`, published last as the source is registered with its ring and cleared
-first as the registration goes (`attach_ring`, `install_ring`, `detach`, `evict_now`), names the
+first as the registration goes (`attach_ring`, `take_installs`, `detach`, `evict_now`), names the
 shard whose thread reaches the source Here, and only a thread of that shard takes the Here route
 from it; the model reads it from a thread that runs no shard and from another ring shard's
 thread. 9 configurations: 6 that must pass (the read during the registration and after it, from
 no shard and from another shard, each with `OneSubmit`, one submit for the waiter, and no
 deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`,
-the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the home), 2
+the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the home), 3
 mutations (no look after the step breaks `Served`; a fast check that drops its compare with the
-thread's own shard issues on the other shard's ring and breaks `OnlyHomeIssues`), and 1 witness
-(the late look asks for the submit).
+thread's own shard issues on the other shard's ring and breaks `OnlyHomeIssues`; a side that
+wants an operation though one went in for its waiter breaks `OneSubmit`), and 1 witness (the
+late look asks for the submit).
 
 `tla/attach/Merged.tla`, in the same family, checks requests that wait for the sides together
 and are performed in one go (`perform`, `attach_now`, `is_refused_for_now` in
@@ -1683,12 +1789,18 @@ shard hands a source that still holds bytes to a drain task on a worker. The tas
 time it is woken: with nothing left it ends; registered nowhere with nothing out, it registers
 the source with its worker, whose driver writes the bytes out; with an operation still out (a
 port's TCP send, which the eviction never cancels, or a ring's send it cancels, which may come
-back undone) it waits for that operation's end, which wakes it. 7 configurations: 3 that must
+back undone) it waits for that operation's end, which wakes it. The drain runs for at most a
+dropped handle's linger (`drain` with `linger::time`), and gives the rest up when that time runs
+out, which is the only end a peer that never reads leaves it. 10 configurations: 4 that must
 pass (a readiness poller with every byte behind, a port with a send out, a ring with a send
-cancelled), with `Conserved`, no byte lost or sent twice, `AllSent`, every byte reaches the
-kernel, and `DrainEnds`; 3 mutations (no drain task, as before, which left the peer waiting for
-good, `AllSent`; a drain task that does not register the source, `AllSent`; an operation's end
-that wakes nobody, `AllSent`); and 1 witness (the drain task moves the source to the worker).
+cancelled, with `Conserved`, no byte lost or sent twice, `AllSent`, every byte reaches the
+kernel, and `DrainEnds`; a port whose peer never reads, with `DrainEnds`); 4 mutations (no drain
+task, as before, which left the peer waiting for good, `AllSent`; a drain task that does not
+register the source, `AllSent`; an operation's end that wakes nobody, `AllSent`; a drain with no
+time limit waits for a peer that never reads for good, `DrainEnds`); and 2 witnesses (the drain
+task moves the source to the worker; the drain's time runs out with bytes held). `Going`'s wait
+for the eviction is an `await`: the code spins on `yield_now` with no bound until a holder of a
+side lets go, which the model assumes.
 
 `Linger` (`tla/going/Linger.tla`) checks what a dropped handle leaves when its runtime drops
 (`src/rt/linger.rs`, `Runtime::drop` and `finish_lingering` in `src/rt/runtime.rs`,
@@ -2244,16 +2356,29 @@ connections, the cap of a ring of 2048 entries beside its 256-buffer group, fill
 receives that waited for their peers, and the next accept waited in room behind them for good,
 leaving every connection past them unaccepted. It counted every operation of a side that writes
 too, so sends to peers that never read could fill the cap the same way and hold every other
-connection's reply, and every file call, in room for good. 9 configurations: 1 that must pass (the
+connection's reply, and every file call, in room for good. A side that reads by readiness keeps a
+multishot poll armed (`ReadyMulti`, `ReadyStream` in `src/io/source/read/ops.rs`), and the ring
+cancels operations of its own (`ShardRing::cancel`): neither the polls' edges nor the cancels'
+completions have room kept, so the queue may need more than its slots for them. A multishot
+poll's edge that finds the queue full ends the poll (Linux posts a multishot operation's edges
+only into room; older kernels held them past the queue too), and the next task of its side to
+wait arms another, whose first look reports bytes already there. 12 configurations: 2 that must
+pass (the
 group cut to half the queue, long-lived operations of every kind not counted: a finite operation
 never waits in room while none is in the kernel, `NoRoomDeadlock`, and arrivals plus finite
-completions fit the queue, `CqNeverOverfull`), 4 mutations (the group not cut breaks
+completions fit the queue, `CqNeverOverfull`; and with two armed polls and a cancel beside them,
+both again and `EndedRearmed`, every poll ended for want of room armed again), 5 mutations (the
+group not cut breaks
 `CqNeverOverfull`; multishot operations counted, one-shot ones of a side that reads counted, and a
 side that writes counted, as they were, let idle or deaf peers use the cap and break
-`NoRoomDeadlock`), and 4 witnesses (a finite operation does wait in room; a multishot one, a
-one-shot one, and a write side's is let in past the cap). An accept's connections and the end of
-each long-lived operation are not modelled: no room is kept for them, and past the queue the kernel
-holds them (`IORING_FEAT_NODROP`) until the shard takes them. `tests/idle_peers.rs` fills the cap
+`NoRoomDeadlock`; a poll ended for want of room taken as its side's last word breaks
+`EndedRearmed`), and 5 witnesses (a finite operation does wait in room; a multishot one, a
+one-shot one, and a write side's is let in past the cap; the polls' edges and a cancel's completion
+held past the queue, on a kernel that holds a multishot edge there). An accept's connections and
+the end of each long-lived operation are not modelled: no room is kept for them, and past the
+queue the kernel holds them (`IORING_FEAT_NODROP`) until the shard takes them; a kernel that cannot
+allocate an entry to hold one drops it and the next wait answers EBADR, which ends the shard
+loudly, the lost completion being one no task could be given. `tests/idle_peers.rs` fills the cap
 of the smallest ring with receives of idle peers, and then with sends to peers that never read, and
 checks every other peer is still accepted and answered.
 
@@ -2283,12 +2408,20 @@ passes over a write edge only when the side was only ever held by its own thread
 shared, no foreign thread came) and that thread's last release said idle. A foreign writer makes
 the side shared with a plain store before its locked take of the word, so once it holds, the
 driver's look sees the side shared, even while its own not-idle store still waits in its buffer.
-5 configurations: 2 that must pass (a biased side and a side made shared, each with an edge for
-nobody first and a foreign write the socket may refuse, with `WriteGoes`, the write goes out in the
-end, and no deadlock), 2 mutations that must deadlock (a look at `write_idle` alone passes over
-the edge a refused write waits for while its writer still holds the side; a look that leaves out
-the side's mode passes over it on a side made shared, which has no `intent` to raise), and 1
-witness (the edge for nobody is passed over).
+The owner's own writes run on the driver's thread between its events: a write the socket takes
+leaves the side idle with no look, and one it refuses publishes that an edge is wanted. A side
+whose claim stayed with a thread that no longer runs the driver (its home moved) is never passed
+over, since `biased_to` compares the claim with the driver's own thread, which never reads that
+thread's stale idle. 10 configurations: 4 that must pass (a biased side and a side made shared, each with an edge for
+nobody first and a foreign write the socket may refuse; the owner's own write; a write by a claim
+left on another thread; each with `WriteGoes`, the write goes out in the end, and no deadlock), 5
+mutations that must deadlock (a look at `write_idle` alone passes over the edge a refused write
+waits for while its writer still holds the side; a look that leaves out the side's mode passes
+over it on a side made shared, which has no `intent` to raise; an owner's release that publishes
+idle though its write was refused, and one that takes the `published` shortcut after a refusal,
+pass over the edge its write waits for; a look that leaves out the claim's compare reads the
+stale idle of a claim left on another thread), and 1 witness (the edge for nobody is passed
+over).
 
 ## A stream write its owner sends on one bit
 
@@ -2460,14 +2593,20 @@ result swaps GONE in, and unlocks the file itself if the word was HELD; a job th
 when the future is dropped is cancelled. The model has each step: the word and its swap and
 compare-and-swap, the job's claim, the kernel's lock and each unlock, the drop at any point and
 its three steps, and the future taking the result. The kernel's lock is one flag: other holders
-of the file, and how long the blocking lock waits, are the kernel's. 7 configurations: 2 that
-must pass (a lock that always succeeds, and one that may fail, each with the future dropped at any
-point), with the file locked, once both are done, only if the caller holds the lock
-(`NoOwnerlessLock`), a lock handed to the caller held, and both parties always ending; 3
+of the file, and how long the blocking lock waits, are the kernel's, but for one other process
+that holds the file's lock at first and may never let it go (`Outsider`): the job then waits in
+the kernel on a thread of the pool, and a dropped future cannot reach it there. 9
+configurations: 3 that must pass (a lock that always succeeds, and one that may fail, each with
+the future dropped at any point, with the file locked, once both are done, only if the caller
+holds the lock (`NoOwnerlessLock`), a lock handed to the caller held, and both parties always
+ending; and an outsider with a pool of two threads, where a write of the file made once the
+future is gone runs, `WriteServed`); 3
 mutations (a job that writes HELD without looking for GONE, a drop that finds HELD and does not
-unlock, a drop that reads the word and writes GONE in two steps, each `NoOwnerlessLock`); and 2
-witnesses (the job gets the lock after its future was dropped, and a dropped future finds the
-lock held and gives it back itself).
+unlock, a drop that reads the word and writes GONE in two steps, each `NoOwnerlessLock`); and 3
+witnesses (the job gets the lock after its future was dropped; a dropped future finds the lock
+held and gives it back itself; with an outsider that never lets go and a pool of one thread, the
+dropped lock's job keeps that thread, and the write made after the drop never runs, which
+`WriteServed` fails: how a dropped job is to let go of its thread is an open decision).
 
 ## Many reads in one call
 
@@ -2824,9 +2963,9 @@ shows each check is needed and in its place.
   refusal to rebind a handle with operations out to a bind that fails while any are; the
   broadcast model leaves the wake to `Notify` (checked with the sync primitives) and the
   reclamation of nodes to kovan; the close models take a linger's time and a connect's pause
-  as steps that may come at any moment, and leave out a receive a completion port filled
-  before a shutdown of the reading half, whose bytes a read after the shut may still return
-  on Windows.
+  as steps that may come at any moment. A receive a completion port filled before a shutdown
+  of the reading half, whose bytes a read after the shut may still return on Windows, is
+  `ShutRead`'s witness `W_port_filled`: it is not fixed.
 - **How soon.** `Termination` says every waiter is eventually served under weak fairness; it
   says nothing about how long that takes, and nothing about a thread the scheduler stops for
   good.

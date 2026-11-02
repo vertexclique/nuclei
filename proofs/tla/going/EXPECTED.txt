@@ -44,3 +44,6 @@ PM_no_attach_wait Pending violated:NoLeaseLeft
 PM_take_first     Pending violated:NoLeaseLeft
 PM_gen_reset      Pending violated:NoForeignRelease
 PW_late_release   Pending violated:NoLateRelease
+B_deaf            Behind  pass
+MB_no_drain_time  Behind  violated:DrainEnds
+W_drain_timeout   Behind  violated:NoDrainTimeout

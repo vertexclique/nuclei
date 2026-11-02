@@ -8,7 +8,7 @@
 (* src/io/source/read/ops.rs; `RingIo::issuer` in                         *)
 (* src/io/source/ring.rs), at the grain of the read side's holds; and the *)
 (* route's one fast check, `Source::via` with the registration's `here`,  *)
-(* published by `Source::attach_ring` and `install_ring` once the source  *)
+(* published by `Source::attach_ring` and `take_installs` once the source *)
 (* is registered with its ring, cleared by `detach` and `evict_now` before *)
 (* the registration goes (src/io/source.rs, ring.rs, requests.rs).        *)
 (*                                                                          *)
@@ -74,7 +74,8 @@ define                                                                       \* 
     \* What the route says once the registration is in place, for the reader: the ring's thread submits.
     Fresh == IF reg = "registered" THEN "elsewhere" ELSE "notyet"            \* the reader's route read now
     \* A kick is needed: a waiter with no operation out, and a route that reaches the ring.
-    Wants == waiter /\ submits = 0                                           \* the side wants an operation
+    \* MUTATION want_ignores_out: the side wants an operation though one went in for its waiter already.
+    Wants == waiter /\ (submits = 0 \/ Mutation = "want_ignores_out")       \* the side wants an operation
 end define;                                                                  \* end of the names
 
 \* The reader (`Source::with_io`, then `Side::poll` and the step).

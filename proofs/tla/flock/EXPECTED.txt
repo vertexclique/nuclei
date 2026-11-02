@@ -6,3 +6,5 @@ M_drop_ignores_held            MC_FileLock          violated:NoOwnerlessLock
 M_drop_reads_then_writes       MC_FileLock          violated:NoOwnerlessLock
 W_lock_after_gone              MC_FileLock          violated:NoLockAfterGone
 W_drop_unlocks                 MC_FileLock          violated:NoDropUnlock
+L_lock_released                MC_FileLock          pass
+W_lock_keeps_pool              MC_FileLock          violated:WriteServed
