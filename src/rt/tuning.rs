@@ -79,10 +79,37 @@ impl ThreadHooks {
     /// when the thread ends by a panic.
     pub(crate) fn started(&self) -> Stopping {
         if let Some(start) = &self.start {
-            start();
+            call_caught(start);
         }
         Stopping(self.stop.clone())
     }
+
+    /// Calls the park hook: the worker is about to sleep.
+    #[inline(always)]
+    pub(crate) fn parked(&self) {
+        if let Some(park) = &self.park {
+            call_caught(park);
+        }
+    }
+
+    /// Calls the unpark hook: the worker woke from its sleep.
+    #[inline(always)]
+    pub(crate) fn unparked(&self) {
+        if let Some(unpark) = &self.unpark {
+            call_caught(unpark);
+        }
+    }
+}
+
+/// Calls a thread hook; one that panics is let go of once the panic hook
+/// reported it, and the thread goes on. The thread holds what the runtime
+/// cannot lose (a shard and the tasks it queues, a pool thread's count, a
+/// park under way), and nothing waits for the hook to hand its panic to
+/// (proofs/tla/hooks, proofs/tla/pool/Start.tla).
+#[cold]
+#[inline(never)]
+fn call_caught(hook: &Hook) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
 }
 
 /// Calls a thread's stop hook when it drops.
@@ -91,7 +118,7 @@ pub(crate) struct Stopping(Option<Hook>);
 impl Drop for Stopping {
     fn drop(&mut self) {
         if let Some(stop) = &self.0 {
-            stop();
+            call_caught(stop);
         }
     }
 }

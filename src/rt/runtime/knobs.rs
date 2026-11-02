@@ -8,26 +8,31 @@ use super::{Builder, RngSeed, TaskMeta, UnhandledPanic};
 
 impl Builder {
     /// Called on each thread the runtime starts (workers and blocking-pool
-    /// threads), on that thread, before it does anything else.
+    /// threads), on that thread, before it does anything else. A panic in it
+    /// is caught (after the panic hook reported it) and the thread goes on,
+    /// as it does for every thread hook: the thread still holds what it was
+    /// started for.
     pub fn on_thread_start(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.tuning.hooks.start = Some(Arc::new(f));
         self
     }
 
     /// Called on each thread the runtime starts, on that thread, as it ends
-    /// (after a panic too).
+    /// (after a panic too). A panic in it is caught.
     pub fn on_thread_stop(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.tuning.hooks.stop = Some(Arc::new(f));
         self
     }
 
     /// Called on a worker thread just before it sleeps with nothing to run.
+    /// A panic in it is caught, and the worker sleeps all the same.
     pub fn on_thread_park(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.tuning.hooks.park = Some(Arc::new(f));
         self
     }
 
-    /// Called on a worker thread just after it wakes from a sleep.
+    /// Called on a worker thread just after it wakes from a sleep. A panic
+    /// in it is caught, and the worker runs on.
     pub fn on_thread_unpark(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.tuning.hooks.unpark = Some(Arc::new(f));
         self
