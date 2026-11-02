@@ -171,11 +171,13 @@ S_park:
                 armedFor := IF arm THEN key ELSE armedFor;
                 clockArmed := IF arm THEN Earliest ELSE clockArmed;
             or
-                \* Another thread wakes the shard before its wait ends, and its task advances
-                \* the running clock: the clock moves on by one or two units, to a time before
-                \* every deadline still pending; the system's time stays, and the skew grows.
+                \* Another thread wakes the shard before its wait ends, within three units as the
+                \* wake above, and its task advances the running clock: the clock moves on by one
+                \* or two units, to a time before every deadline still pending; the system's time
+                \* stays, and the skew grows. (Bounded as the wake above is: with nothing pending
+                \* the wait has no end, and an unbounded wake would carry the clock past `Never`.)
                 await Skews /\ ~skewed /\ now + 1 < ends;
-                with w \in now + 1 .. ends - 1, k \in 1..2 do
+                with w \in now + 1 .. Min(ends - 1, now + 3), k \in 1..2 do
                     await \A s \in Pending : w + k < Due(s);
                     now := w + k;
                     skew := skew + k;
