@@ -58,9 +58,18 @@
   `proofs/tla/handoff`, the leaf push, whose mutations go in with no look at the claim and back
   out with the mark still up). With the default watch on io_uring, default release build, user
   instructions per operation: a spawn and its join 790 before, 756 now (631 with the watch off);
-  a oneshot round 1017, 983 (858 off); a bounded channel round 607, 590 (526 off); under fat
+  a oneshot round 1017, 983 (858 off); a bounded channel round 611, 594 (530 off); under fat
   LTO 757, 715; 864, 822; 530, 509. With the watch off the rows cost what they did, but for the
-  file read (6 more, of 2621): its read calls `After::run` where it inlined it.
+  file read (about 3 more, of 2606): its read's frame spills one more register.
+- **Still behind: the watch's cost of a task's run.** A watched worker still runs each task out
+  of line (`run_task_watched`: 33 instructions, about 14 of them its frame) where an unwatched one
+  runs it inline, two runs to a spawn and its join. Two ways were measured for 0.5.4 and left
+  out, each costing a row with the watch off: the worker's loop compiled once for a watched slot
+  and once for none, its watched runs inline (a spawn and its join 737 with the watch on, but
+  each stream and datagram row 29 to 38 more with it off under fat LTO and with one codegen
+  unit), and the run coming back on its own last word with its mark bit cleared, keeping no
+  epoch and one register less (746 with the watch on, but the file read about 4 more with it off,
+  one more spill in its read's frame).
 
 ## 0.5.3
 
