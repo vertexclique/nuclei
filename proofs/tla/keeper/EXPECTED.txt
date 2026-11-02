@@ -1,0 +1,11 @@
+# configuration                spec                 expected
+K_register                     MC_Kept              pass
+K_detach                       MC_Kept              pass
+KM_keeper_drops                MC_Kept              violated:NoStuckRegistration
+KM_no_flag                     MC_Kept              violated:Ends
+KM_no_look                     MC_Kept              violated:Ends
+KM_post_no_look                MC_Kept              violated:NoStuckRegistration
+KM_buf_with_poller             MC_Kept              violated:NoWriteAfterFree
+KM_buf_stray                   MC_Kept              violated:NoWriteAfterFree
+KW_post_wake                   MC_Kept              violated:NoPostWake
+KW_late_read                   MC_Kept              violated:NoLateRead

@@ -1263,6 +1263,28 @@ impl Source {
         )
     }
 
+    /// Claims the registration, as `register` does before it posts it: for a test that posts it
+    /// by hand.
+    #[cfg(ring)]
+    pub(crate) fn claim_registration(&self) -> bool {
+        self.reg
+            .state
+            .compare_exchange(
+                UNREGISTERED,
+                REGISTERING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Whether the registration is claimed and not made yet.
+    #[cfg(ring)]
+    pub(crate) fn is_registering(&self) -> bool {
+        self.reg.state.load(Ordering::SeqCst) == REGISTERING
+    }
+
+
     /// The read side as a line, for a test that failed: its guard's words,
     /// and what it holds unless it is held.
     pub(crate) fn read_report(self: &Arc<Self>) -> String {

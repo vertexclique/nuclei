@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- **A shard's ring kept past its shard wakes for what is posted to it, and lets go of every post**
+  (io_uring). A worker that goes with a zero-copy notification still out hands its ring to a
+  keeper, which waited for the ring's next completion without saying it sleeps, so a post from
+  another thread woke nothing: a holder's detach, whose cancel is what ends the operation out,
+  could wait for good, keeping a pool thread, the socket and the ring's memory. The keeper now
+  takes part in the park handshake, so a post finds it parked and its wake ends the wait. What it
+  could not apply it dropped: a source's registration posted by a thread that runs no shard
+  stayed claimed, so no later wait registered it and its task waited for good, and a child's exit
+  watch was never made. It now goes as for a shard that went: the registration is made where the
+  task polls next, the watch where its user polls next. (`proofs/tla/keeper/Kept.tla`).
 - **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
   `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
   for a connection its peer reset in the backlog before or while the accept took it. That error is

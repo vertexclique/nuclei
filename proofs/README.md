@@ -1607,6 +1607,35 @@ running a linger of its list; the task with the handle held by the write as its 
 another thread draining its wake after the write counted itself out; the drop's bound running
 out before every byte went).
 
+## A ring kept past its shard
+
+`keeper` (`tla/keeper/`) checks what happens to a shard's ring after the shard went.
+
+`Kept` (`tla/keeper/Kept.tla`) checks the keeper's mailbox (`Shard::go` and `keep_ring` in
+`src/rt/shard/going.rs`, `hand_off`, `Kept::keep` and `apply_mailbox` in
+`src/rt/shard/ring/keeper.rs`, `Shared::post_io`, `close_io` and `IoOp::gone` in `src/rt/shard.rs`,
+`ParkState` in `src/rt/handshake.rs`, and the wake's read of the ring's eventfd in
+`src/rt/park/ring.rs`). A shard goes with one operation in the kernel; it applies its mailbox once
+and hands its ring to a keeper, which applies the ring's completions and the mailbox until nothing
+is out, then lets go of the ring and closes the mailbox. Another thread posts a registration it
+claimed, or a ring source's detach whose cancel is what ends the operation out: it pushes, looks
+whether the mailbox closed (then it lets go of the post itself), and wakes the shard only if the
+park handshake's flag is up. The keeper says it sleeps and looks once more before each wait. The
+wake writes the ring's eventfd, whose read stays armed in a ring the kernel may keep past its
+poller, and a waker that saw the flag up, or a thread that kept the notifier, may write it after the
+keeper let go. 10 configurations: 2 that must pass (a registration and a detach posted at any
+moment, each with a stray waker), with `NoWriteAfterFree`, the wake's read never writes freed
+memory, `NoStuckRegistration`, no registration is left claimed, `NoStranded`, nothing is left in
+the mailbox, and `Ends`; 6 mutations (a keeper that drops a registration, as before, and a poster
+that never looks whether the mailbox closed break `NoStuckRegistration`; a keeper that never says
+it sleeps, as before, and one that does not look after it says so break `Ends`; the read's memory
+freed with the poller, as before, breaks `NoWriteAfterFree`, through the handshake's late waker and
+through a stray one); and 2 witnesses (a post wakes the keeper while the operation is out; the
+wake's read completes after the poller went).
+
+`src/rt/shard/ring/tests_zc.rs` checks that a registration posted to a kept ring is let go of at
+once.
+
 ## A blocking job of a Windows handle
 
 `job` (`tla/job/Job.tla`) checks the cancel of a pool thread's call on a Windows handle opened

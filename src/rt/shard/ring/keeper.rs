@@ -9,14 +9,18 @@
 //! is what needs it most: its notification frees it only once the peer acknowledged the bytes,
 //! which may be long after its shard went, and every `Released` still resolves. The keeper also
 //! applies what the shard's mailbox still gets (a source's holder on another thread leaves its
-//! detach or cancel there), so a closed socket's file leaves the ring's table and its sends end.
-//! Nothing takes the ring back: its shard is gone.
+//! detach or cancel there), so a closed socket's file leaves the ring's table and its sends end;
+//! what it cannot apply goes as `IoOp::gone` lets it (a registration asked of the shard is made
+//! where its task polls next). It takes the shard's part in the park handshake, so a post finds it
+//! parked and wakes it at once, not at the ring's next completion. Nothing takes the ring back:
+//! its shard is gone.
 //!
 //! On a single-issuer ring with deferred task work the kernel runs an operation's completion
 //! only when the ring's own thread enters it, and refuses any other thread's enter, so no keeper
 //! can take such a ring. It sends no zero-copy, and its shard waits a bounded time for what it
 //! cancelled ([`ShardRing::shut_down`]): an operation still out after that keeps its memory for
-//! good, and is counted. `proofs/tla/lent/LentZc.tla` checks the keeper's part.
+//! good, and is counted. `proofs/tla/lent/LentZc.tla` checks the keeper's completions and
+//! `proofs/tla/keeper/Kept.tla` its mailbox.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,12 +171,19 @@ pub(crate) fn hand_off(ring: ShardRing, shared: Arc<Shared>) {
 
 impl Kept {
     /// Applies the ring's completions, and what the shard's mailbox still gets, until no
-    /// operation is out; then lets go of the ring.
+    /// operation is out; then lets go of the ring. Before each wait it says it sleeps and looks at
+    /// the mailbox once more (`ParkState::begin_park`): a post then either is seen here, or finds
+    /// the flag up and notifies the ring's wake, which ends the wait.
     fn keep(self) {
         let Kept { ring, shared } = self;
         while ring.in_flight() > 0 {
             apply_mailbox(&ring, &shared);
-            if ring.wait(None, None).is_err() {
+            if !shared.park.begin_park(|| shared.io_ops.holds_any()) {
+                continue;
+            }
+            let waited = ring.wait(None, None);
+            shared.park.end_park();
+            if waited.is_err() {
                 // A ring that cannot be waited on: what is still out keeps its memory for good.
                 ring.forget_stuck();
                 break;
@@ -187,13 +198,14 @@ impl Kept {
 
 /// What the shard's mailbox got for its ring after the shard went: a source's holder on another
 /// thread leaves its detach or its cancel there. Nothing registers with a shard that went, nor
-/// runs on it, so the rest only goes.
+/// runs on it, so the rest goes as `IoOp::gone` lets it: a registration asked of the shard is
+/// made where its task polls next, a child's watch where its user polls next.
 fn apply_mailbox(ring: &ShardRing, shared: &Shared) {
     shared.io_ops.take_all(|op| match op {
         IoOp::RingDetach(slot, out, lease) => ring.detach(slot, out, lease),
         IoOp::RingCancel(user_data) => {
             ring.cancel(user_data);
         }
-        other => drop(other),
+        other => other.gone(),
     });
 }
