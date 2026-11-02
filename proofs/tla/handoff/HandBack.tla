@@ -80,10 +80,11 @@
 (* ShardLocal.tla). A cancel changes only the task's state: its poll and   *)
 (* its future's drop run as the poll's code. A thread's bound task is a    *)
 (* borrower of its own (`BT`, thread 1's), run on its stack only when its  *)
-(* wait runs tasks (a mutation). A detached thread ends once its poll      *)
-(* does (in the code it finishes its bound tasks, which ask for the shard  *)
-(* as its poll does, then waits as a spare); a spare that runs the shard   *)
-(* is a fresh thread with a fresh slot.                                    *)
+(* wait runs tasks (a mutation). After its poll, a detached thread         *)
+(* finishes its bound tasks, one of which may ask for the shard as its     *)
+(* poll did (`BoundOf`, a request of its own), then it ends (in the code   *)
+(* it waits as a spare); a spare that runs the shard is a fresh thread     *)
+(* with a fresh slot.                                                      *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC                                           \* numbers, sets, TLC's helpers
 
@@ -99,6 +100,7 @@ CONSTANTS                                                                   \* w
     NestedBlockOn,\* the threads whose tasks' code may call `block_on`, nesting the shard's loop
     BlockSecond,  \* the second runner's first poll of its own may never return
     Ends,         \* how a borrower's closure may end besides returning: {"panic", "block"}
+    BoundWiths,   \* the threads whose bound tasks, finished after their poll lost the shard, call `with`
     Cancels,      \* a waiting borrower's task may be cancelled meanwhile
     Close,        \* the runtime may shut down
     Drain,        \* the worker may be stopped: it takes no new work and exits once drained
@@ -108,9 +110,14 @@ Threads == 1..NThreads                \* the threads that run the shard, in turn
 Mon == NThreads + 1                   \* the monitor
 Pusher == NThreads + 2                \* a thread that pushes work to the shard
 Closer == NThreads + 3                \* the runtime's shutdown
-BT == NThreads + 4                    \* thread 1's bound task, a borrower of its own
+BT == NThreads + 4                    \* thread 1's bound task, run inside its wait (a mutation)
 Drainer == NThreads + 5               \* the worker's stop
-Borrowers == Threads \cup {BT}        \* who may ask for the shard
+BoundOf(t) == 100 + t                 \* the request of thread t's bound task, after its poll
+\* The request a call of thread t makes: its poll's ("task") or its bound task's ("bound").
+Req(t, w) == IF w = "bound" THEN BoundOf(t) ELSE t
+ThreadOf(u) == IF u > 100 THEN u - 100 ELSE u   \* the thread a request waits on
+WretOf(u) == IF u > 100 THEN "bound" ELSE "task" \* whose call the request is
+Borrowers == Threads \cup {BT} \cup {BoundOf(t) : t \in Threads}  \* every request, each its own
 Slots == 1..(1 + MaxHandoffs)         \* slot 1 is thread 1's; each handoff makes a fresh one
 
 NONE == 0                             \* no claim: the shard is its runner's
@@ -139,7 +146,7 @@ variables
     lends = {},                       \* the borrowers whose lend task waits in the shard's queues
     lendOf = [t \in Threads |-> 0],   \* the borrower whose lend task thread t polls now, 0 for none
     loan = [u \in Borrowers |-> "none"], \* each borrower's request: none, asked, lent, back or gone
-    cancelled = [t \in Threads |-> FALSE], \* the borrower's task was cancelled while it waited
+    cancelled = [u \in Borrowers |-> FALSE], \* the waiting request's task was cancelled
     closed = FALSE,                   \* the runtime shut down
     draining = FALSE,                 \* the worker was stopped: it takes no new work
     handoffs = 0,                     \* the handoffs made
@@ -153,6 +160,7 @@ variables
     casLost = 0,                      \* (record) a lend lost its compare-and-swap to a shutdown
     panics = 0,                       \* (record) a closure on a lent shard panicked
     drainLoans = 0,                   \* (record) a loan served while the worker drained
+    boundLoans = 0,                   \* (record) a bound task's call ran on a lent shard
     loansServed = 0;                  \* (record) a borrower's call ran on the shard lent to it
 
 define                                                                       \* the properties:
@@ -160,19 +168,13 @@ define                                                                       \* 
     Exclusive == Cardinality(inS) <= 1                                       \* one at most
     \* At most one thread holds the shard's value.
     ExclusiveValue == Cardinality(holders) <= 1                              \* one at most
-    \* A detached thread is inside the shard only while the shard is lent to it.
-    DetachedStaysOut == \A t \in Threads : (det[t] /\ t \in inS) => loan[t] = "lent"
-    \* A detached thread holds the value only while the shard is lent to it.
-    DetachedHoldsOnlyLent == \A t \in Threads : (det[t] /\ t \in holders) => loan[t] = "lent"
     \* A request is never lost: its lend task waits in the shard's queues or is being polled.
     LendHeld == \A u \in Borrowers :
                     loan[u] = "asked" => (u \in lends \/ \E r \in Threads : lendOf[r] = u)
-    \* A shard lent to a thread finds it in its loan.
-    LentHasBorrower == \A t \in Threads : loan[t] = "lent" => pc[t] \in LoanSteps
     \* No `with` is answered with an error while the runtime runs.
     NoFailedWith == ~failed                                                  \* never
     \* Every request ends: the call ran on the shard, or the runtime shut down.
-    HandBackDone == \A t \in Threads : loan[t] = "asked" ~> loan[t] \in {"back", "gone"}
+    HandBackDone == \A u \in Borrowers \ {BT} : loan[u] = "asked" ~> loan[u] \in {"back", "gone"}
     \* Every remote push runs.
     Rescued == <>(ran = Pushes)                                              \* in the end
     \* The spare the monitor hands the shard to: the lowest-numbered (spares are alike).
@@ -182,15 +184,16 @@ define                                                                       \* 
     NoLoan == loansServed = 0                                                \* no call ran on a lent shard
     NoDefer == defers = 0                                                    \* no lend task deferred
     NoLendTaken == lendTaken = 0                                             \* no lend task found the shard taken
-    NoGone == \A t \in Threads : loan[t] # "gone"                            \* no borrower told of a shutdown
+    NoGone == \A u \in Borrowers : loan[u] # "gone"                          \* no borrower told of a shutdown
     NoLeafBack == leafBacks = 0                                              \* no leaf push backed out
     NoDetachedCall == detachedCalls = 0                                      \* no call found its shard taken
     NoNestedDetach == nestedDetach = 0                                       \* no shard lost in a nested poll
     NoNestedLoan == nestedLoans = 0                                          \* no loan from a nested loop
     NoCasLost == casLost = 0                                                 \* no lend lost to a shutdown
     NoPanicLoan == panics = 0                                                \* no closure panicked on a lent shard
-    NoCancelWait == \A t \in Threads : ~(cancelled[t] /\ loan[t] = "back")   \* no cancelled waiter served
+    NoCancelWait == \A u \in Borrowers : ~(cancelled[u] /\ loan[u] = "back") \* no cancelled waiter served
     NoDrainLoan == drainLoans = 0                                            \* no loan while draining
+    NoBoundLoan == boundLoans = 0                                            \* no bound task served
 end define;
 
 \* Another thread pushes work to the shard (its `Shared`), whoever runs it; a stopped worker
@@ -227,9 +230,10 @@ fair process thread \in Threads
 \* polls: its own polls this turn; calls: the calls its poll made; saved: the word a call read
 \* at its start, put back at its end; nsaved: the same for a nested `block_on`'s bracket; b: the
 \* borrower whose lend task it polls; nret: where that lend task's poll returns.
-\* nb: the polls of a nested `block_on`'s future.
+\* nb: the polls of a nested `block_on`'s future; wret: whose call asks for the shard, the poll's
+\* ("task") or, after the poll, a bound task's ("bound").
 variables sl = 0, e = 0, ep = 0, polls = 0, calls = 0, saved = 0, nsaved = 0, b = 0, nret = "loop",
-          nb = 0;
+          nb = 0, wret = "task";
 begin
 T_begin:
     if self = 1 then                                                         \* thread 1 runs the shard first
@@ -489,13 +493,13 @@ W_ask:
     \* MUTATION drain_refuses: a draining shard refuses it). Once the runtime is gone, gone at once.
     if Mode = "no_handback" \/ (Mode = "drain_refuses" /\ draining) then     \* the access error:
         failed := TRUE;                                                      \* answered so
-        goto R_task;                                                         \* the task's code goes on
+        goto W_done;                                                         \* the code goes on
     elsif closed then                                                        \* the runtime shut down:
-        loan[self] := "gone";                                                \* the call answers so
-        goto R_task;                                                         \* the task's code goes on
+        loan[Req(self, wret)] := "gone";                                                \* the call answers so
+        goto W_done;                                                         \* the code goes on
     else
-        lends := lends \cup {self};                                          \* the lend task queued
-        loan[self] := "asked";                                               \* the request made
+        lends := lends \cup {Req(self, wret)};                                          \* the lend task queued
+        loan[Req(self, wret)] := "asked";                                               \* the request made
     end if;
 W_wait:
     \* Parked, running nothing, until the shard is lent to it, or the runtime shuts down; then a
@@ -504,7 +508,7 @@ W_wait:
     \* borrow_no_wait: in at once). Its task may be cancelled meanwhile: the wait goes on. (MUTATION
     \* wait_runs_tasks: the wait runs thread 1's bound task, which asks for the shard too.)
     either
-        await loan[self] = "lent" \/ Mode = "borrow_no_wait";                \* lent
+        await loan[Req(self, wret)] = "lent" \/ Mode = "borrow_no_wait";                \* lent
         inS := inS \cup {self};                                              \* inside the shard
         holders := holders \cup {self};                                      \* the value lent to it
         if draining then                                                     \* while the worker drains:
@@ -512,15 +516,15 @@ W_wait:
         end if;
     or
         await closed /\ Mode # "close_no_wake"                               \* woken by the close,
-              /\ (loan[self] = "asked" \/ Mode = "gone_no_cas");             \* still asked:
-        loan[self] := "gone";                                                \* gone
-        goto R_task;                                                         \* the call answers so
+              /\ (loan[Req(self, wret)] = "asked" \/ Mode = "gone_no_cas");             \* still asked:
+        loan[Req(self, wret)] := "gone";                                                \* gone
+        goto W_done;                                                         \* the call answers so
     or
-        await Cancels /\ ~cancelled[self] /\ loan[self] = "asked";           \* a cancel from elsewhere
-        cancelled[self] := TRUE;                                             \* the task's state changes
+        await Cancels /\ ~cancelled[Req(self, wret)] /\ loan[Req(self, wret)] = "asked";           \* a cancel from elsewhere
+        cancelled[Req(self, wret)] := TRUE;                                             \* the task's state changes
         goto W_wait;                                                         \* the wait goes on
     or
-        await Mode = "wait_runs_tasks" /\ self = 1 /\ loan[BT] = "none";     \* MUTATION wait_runs_tasks:
+        await Mode = "wait_runs_tasks" /\ self = 1 /\ wret = "task" /\ loan[BT] = "none";     \* MUTATION wait_runs_tasks:
         lends := lends \cup {BT};                                            \* the bound task asks too
         loan[BT] := "asked";                                                 \* from this thread's stack
         goto BT_wait;                                                        \* and waits, nested
@@ -557,19 +561,33 @@ W_back:
     \* The closure returns; the borrower leaves the shard and gives it back.
     holders := holders \ {self};                                             \* the value let go of
     inS := inS \ {self};                                                     \* out of the shard
-    loan[self] := "back";                                                    \* given back
+    loan[Req(self, wret)] := "back";                                                    \* given back
     loansServed := 1;                                                        \* (record)
-    goto R_task;                                                             \* the task's code goes on
+    if wret = "bound" then                                                   \* a bound task's call:
+        boundLoans := 1;                                                     \* (record)
+    end if;
+    goto W_done;                                                             \* the code goes on
 W_panic:
     \* The unwind: the loan's guard leaves the shard and gives it back (MUTATION panic_keeps_loan:
     \* it leaves, and never gives it back). The panic ends the poll, caught by the task's run.
     holders := holders \ {self};                                             \* the value let go of
     inS := inS \ {self};                                                     \* out of the shard
     if Mode # "panic_keeps_loan" then                                        \* the guard:
-        loan[self] := "back";                                                \* given back
+        loan[Req(self, wret)] := "back";                                                \* given back
     end if;
     panics := 1;                                                             \* (record)
-    goto E_store;                                                            \* the poll ends
+    if wret = "bound" then                                                   \* a bound task's poll:
+        goto D_bound;                                                        \* it ends, the thread goes on
+    else
+        goto E_store;                                                        \* the poll ends
+    end if;
+W_done:
+    \* The call is over: back to the code that made it, the poll's or a bound task's.
+    if wret = "bound" then                                                   \* a bound task's:
+        goto D_bound;                                                        \* the thread goes on
+    else
+        goto R_task;                                                         \* the poll's code goes on
+    end if;
 W_block:
     \* The closure never returns: the shard stays lent, as a pinned `with` holds it today.
     await FALSE;                                                             \* for good
@@ -655,7 +673,7 @@ E_check:
     \* Its claim: taken, and the thread is detached for good; else back in its loop.
     if claim[sl] = TAKEN then                                                \* the shard was taken:
         det[self] := TRUE;                                                   \* detached
-        goto Gone;                                                           \* it runs no shard
+        goto D_bound;                                                        \* it runs no shard
     else
         claim[sl] := NONE;                                                   \* a pending claim cancelled
         inS := inS \cup {self};                                              \* inside
@@ -663,6 +681,14 @@ E_check:
     end if;
 Blocked:
     await FALSE;                                                             \* never returns
+D_bound:
+    \* A detached thread finishes its bound tasks on its own shard (`finish_home`): one of them may
+    \* call `with`, which asks for the shard back as the poll's call did (the shard counts the bound
+    \* task among its live ones, so a stopped worker waits for it).
+    if self \in BoundWiths /\ wret = "task" then                             \* a bound task's `with`:
+        wret := "bound";                                                     \* its call
+        goto W_ask;                                                          \* asks for the shard
+    end if;
 Gone:
     skip;                                                                    \* this thread runs the shard no more
 end process;
@@ -730,4 +756,17 @@ OutsideWordAtPollEnd ==
 
 \* A runner waiting for the shard back waits on a loan that was made. (Here for the same reason.)
 LenderHasLoan == \A r \in Threads : pc[r] = "N_wait" => loan[b[r]] \in {"lent", "back"}
+
+\* A detached thread is inside the shard only while the shard is lent to its call.
+DetachedStaysOut ==
+    \A t \in Threads : (det[t] /\ t \in inS) => loan[Req(t, wret[t])] = "lent"
+
+\* A detached thread holds the value only while the shard is lent to its call.
+DetachedHoldsOnlyLent ==
+    \A t \in Threads : (det[t] /\ t \in holders) => loan[Req(t, wret[t])] = "lent"
+
+\* A shard lent to a request finds its call in its loan, on its thread.
+LentHasBorrower ==
+    \A u \in Borrowers \ {BT} :
+        loan[u] = "lent" => (pc[ThreadOf(u)] \in LoanSteps /\ wret[ThreadOf(u)] = WretOf(u))
 =============================================================================

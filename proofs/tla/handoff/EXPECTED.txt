@@ -71,3 +71,4 @@ W_nested_loan         HandBack    violated:NoNestedLoan
 W_panic_loan          HandBack    violated:NoPanicLoan
 W_cancel_wait         HandBack    violated:NoCancelWait
 W_drain_loan          HandBack    violated:NoDrainLoan
+W_bound_loan          HandBack    violated:NoBoundLoan
