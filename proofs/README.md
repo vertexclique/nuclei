@@ -1492,6 +1492,24 @@ once a place frees). The Rust tests in `tests/net_unix_connect.rs` check the sam
 listener: the connect waits, connects its own socket, and a dropped one leaves the pool's one
 thread free and no connection behind.
 
+## A TCP connect on every backend
+
+`connect` (`tla/connect/TcpConnect.tla`) also checks a TCP connect on each backend
+(`WriteState::connect` and `push_fd` in `src/io/source/write.rs`; the dial `submit_ops` sends and
+its end in `op_done`, `src/io/source/write/ops.rs`; the ring's answers in `src/io/source/ring.rs`;
+the port's `ConnectEx` in `src/io/source/port.rs`). The caller polls its connect and may drop it
+between polls; the kernel decides the handshake once, connected or refused. On epoll and kqueue the
+side calls connect(2) itself and waits for the write edge, then asks the socket its error; on a
+ring it sends a connect operation, which waits in the kernel for the decision, and a move of the
+source to another shard cancels it: the side keeps its dial and sends it again, which finds the
+socket still connecting (EALREADY: it polls for the socket to be writable and asks its error),
+connected (EISCONN) or refused; on a port `ConnectEx` ends with the decision. 9 configurations: 5
+that must pass (each backend, and the ring with a move, with `OneResult`, the caller hears its own
+socket's verdict, and `Termination`, a caller that keeps polling hears it; the ring with a move and
+drops, with `OneResult`), 3 mutations (EALREADY taken as the connect's error breaks `OneResult`; an
+end that wakes nobody, and a dial the cancel gave back that is not kept, break `Termination`), and 1
+witness (a dial sent again finds the socket still connecting).
+
 ## The timer wheel
 
 `lean/Nuclei/Wheel.lean` checks the arithmetic of each shard's timing wheel
