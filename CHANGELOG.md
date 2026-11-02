@@ -48,6 +48,20 @@
   fat LTO (1 more, in the general read's frame). Counted as the ops gate counts them, every row is
   at or below what it was, and CI's budgets in `ci/op_budget.txt` were lowered to match.
 
+- **A spawn or wake from a task's code on a watched worker pushes as a leaf.** Such a call put
+  the task on its shard through a bracket out of line: the call's mark, the push and the mark's
+  end, in a function that saved six registers to do it. A push into the shard's empty LIFO slot,
+  the usual one, now first tries a leaf (`context::push_lifo_marked`): the call marked and its
+  claim read as a bracket does, the task put in the slot and the poll's word put back. A claim
+  up, a slot that holds a task or a task of another shard puts the word back as it found it and
+  takes the full bracket, which settles the claim (`Slot::mark_unless_claimed`;
+  `proofs/tla/handoff`, the leaf push, whose mutations go in with no look at the claim and back
+  out with the mark still up). With the default watch on io_uring, default release build, user
+  instructions per operation: a spawn and its join 790 before, 756 now (631 with the watch off);
+  a oneshot round 1017, 983 (858 off); a bounded channel round 607, 590 (526 off); under fat
+  LTO 757, 715; 864, 822; 530, 509. With the watch off the rows cost what they did, but for the
+  file read (6 more, of 2621): its read calls `After::run` where it inlined it.
+
 ## 0.5.3
 
 ### Fixed
