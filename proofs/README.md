@@ -1634,7 +1634,7 @@ through a stray one); and 2 witnesses (a post wakes the keeper while the operati
 wake's read completes after the poller went).
 
 `src/rt/shard/ring/tests_zc.rs` checks that a registration posted to a kept ring is let go of at
-once.
+once, and `src/rt/park/ring.rs` that a wake after the poller went writes no freed memory.
 
 ## A blocking job of a Windows handle
 

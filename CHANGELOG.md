@@ -14,6 +14,12 @@
   stayed claimed, so no later wait registered it and its task waited for good, and a child's exit
   watch was never made. It now goes as for a shard that went: the registration is made where the
   task polls next, the watch where its user polls next. (`proofs/tla/keeper/Kept.tla`).
+- **A ring's wake never writes memory its shard freed** (io_uring). The read of the eventfd that
+  wakes a ring stayed armed as its shard went, and landed in a buffer the shard freed; the kernel
+  keeps the ring past its shard while a receive group's copy of the ring's descriptor holds it, so
+  a waker that saw the shard parked just before, or a thread that kept its notifier, could have
+  the kernel write 8 bytes into freed memory. The read now lands in memory that lives as long as
+  the process (`proofs/tla/keeper/Kept.tla`).
 - **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
   `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
   for a connection its peer reset in the backlog before or while the accept took it. That error is

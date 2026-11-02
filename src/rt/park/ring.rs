@@ -10,6 +10,7 @@
 //! all to the kernel first, so the wake's read is always in when it sleeps.
 
 use core::mem::MaybeUninit;
+use core::sync::atomic::AtomicU64;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -89,13 +90,17 @@ impl CqeSink for CqeBatch {
     }
 }
 
+/// Where every ring's armed read of its eventfd lands. Nothing reads it, and it lives as long as
+/// the process: the read may complete after its poller went, on a ring the kernel keeps (a receive
+/// group's copy of the ring's descriptor holds it, or a group kept for good), when a waker that
+/// saw the shard parked, or a thread that kept its notifier, writes the eventfd then; so its 8
+/// bytes never land in memory that was freed (`proofs/tla/keeper/Kept.tla`).
+static WAKE_SINK: AtomicU64 = AtomicU64::new(0);
+
 /// A shard's ring.
 pub(crate) struct RingPoller {
     ring: Ring,
     wake: Arc<OwnedFd>,
-    /// Where the armed read of the eventfd lands; boxed, so it stays put
-    /// while the read is out.
-    wake_buf: Box<u64>,
     wake_armed: bool,
     /// Entries that found the submission queue full, in order.
     waiting: VecDeque<Sqe>,
@@ -140,7 +145,6 @@ impl RingPoller {
         Ok(Self {
             ring,
             wake: Arc::new(wake),
-            wake_buf: Box::new(0),
             wake_armed: false,
             waiting: VecDeque::new(),
             enabled: false,
@@ -221,13 +225,8 @@ impl RingPoller {
         if self.wake_armed {
             return;
         }
-        let sqe = Sqe::read(
-            self.wake.as_raw_fd(),
-            core::ptr::from_mut(&mut *self.wake_buf).cast(),
-            8,
-            0,
-        )
-        .user_data(NOT_AN_OP);
+        let sqe =
+            Sqe::read(self.wake.as_raw_fd(), WAKE_SINK.as_ptr().cast(), 8, 0).user_data(NOT_AN_OP);
         // Past a full queue the wake waits first in line, and a wait that may
         // sleep hands it to the kernel before it does (see `wait`).
         if self.ring.push(&sqe).is_err() {
@@ -375,6 +374,48 @@ mod tests {
         // Re-armed: a second wake ends a second wait.
         p.notifier().notify();
         assert!(p.wait(Some(Duration::from_secs(10)), &mut out).unwrap());
+    }
+
+    /// The wake's read is still armed as its poller goes, on a ring the kernel keeps (as a receive
+    /// group's copy of its descriptor keeps it), and a waker that kept the notifier writes the
+    /// eventfd after: the read completes and writes its 8 bytes, none of them into memory the
+    /// poller freed. The memory the allocator hands out next is what such a write would hit;
+    /// under a sanitizer's allocator, which hands out no freed memory, the test sees nothing
+    /// (`proofs/tla/keeper/Kept.tla`).
+    #[test]
+    fn a_wake_after_its_poller_went_writes_no_memory_the_poller_freed() {
+        let Ok(mut p) = RingPoller::new(&RingConfig::new(8).handed_over(), 0) else {
+            eprintln!("skipping: io_uring unavailable");
+            return;
+        };
+        p.enable().unwrap();
+        let mut out = Vec::new();
+        // The look arms the wake's read and hands it to the kernel.
+        assert!(!p.wait(Some(Duration::ZERO), &mut out).unwrap());
+        // SAFETY: a plain syscall on our own ring's descriptor; the copy is owned at once.
+        let kept = unsafe {
+            let fd = libc::dup(p.ring.as_raw_fd());
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        };
+        let notifier = p.notifier();
+        drop(p);
+        const MARK: u64 = 0x5eed_5eed_5eed_5eed;
+        let fresh: Vec<Box<u64>> = (0..64).map(|_| Box::new(MARK)).collect();
+        notifier.notify();
+        let mut ready = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&kept),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd of our own.
+        let n = unsafe { libc::poll(&mut ready, 1, 10_000) };
+        assert_eq!(n, 1, "the wake's read never completed");
+        for each in &fresh {
+            // SAFETY: our own live box, read as the kernel may have written it.
+            let now = unsafe { core::ptr::read_volatile(&**each) };
+            assert_eq!(now, MARK, "the wake's read wrote memory its poller freed");
+        }
     }
 
     #[test]
