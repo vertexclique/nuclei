@@ -1189,7 +1189,13 @@ kernel takes the task's datagrams in the order it sent them; and `Termination` w
 mutations (the old queue-and-answer breaks `OwnResult`; a call that goes to the kernel with the
 lent send of a task that went still out overtakes it, breaking `InOrder`; a poll that wakes
 nobody breaks `Termination`), and 3 witnesses (a call that waits for room, a refusal answered by
-its own call, a call that waits behind the lent send of a task that went).
+its own call, a call that waits behind the lent send of a task that went). A Windows completion port
+(`Backend = "port"`, `poll_send` in `src/io/source/write.rs` and `send_queued` in
+`src/io/source/write/datagram.rs`) still copies and queues a datagram and answers taken at once:
+one too large for any socket is refused at once (`datagram_too_long`), but one the kernel refuses
+only as it sends it (no route) has its refusal reach the next call, whose own datagram is never
+sent. A witness of that defect (`WRS_port_queued`, `OwnResult` broken) stands until a port's send
+answers what the kernel says of its own datagram.
 
 The same model checks a stream's writes (`Stream`: `write_direct`, `wait_for_room` and `write` in
 `src/io/source/write.rs`). The task writes small chunks and large ones (16 KiB or more,

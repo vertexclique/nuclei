@@ -7,7 +7,12 @@
 (* `submit_ops` and its end in `op_done`, src/io/source/write/ops.rs. On   *)
 (* epoll and kqueue the same call waits for the socket's edge instead of   *)
 (* the poll (`serve` wakes it, and writes the write-behind out in          *)
-(* `push_fd`): the poll's end here stands for either.                      *)
+(* `push_fd`): the poll's end here stands for either. On a Windows         *)
+(* completion port (`Backend = "port"`, `poll_send` in write.rs and        *)
+(* `send_queued` in write/datagram.rs) a datagram is copied and queued for *)
+(* the port and its call answers taken at once; one too large for any      *)
+(* socket is refused at once (`datagram_too_long`), and any other refusal  *)
+(* the kernel makes of it reaches the next call.                           *)
 (*                                                                          *)
 (* In plain words: a task sends datagrams one call after another. The     *)
 (* first may be its own buffer lent to a send the ring makes (`send_owned` *)
@@ -34,7 +39,8 @@
 (* What must never happen: a call answers anything but the kernel's own    *)
 (* verdict on its datagram (the bug the size sweep found: a datagram too   *)
 (* large for the kernel was taken as sent, its error left for the next     *)
-(* call); the task's datagrams or chunks reach the peer out of the order   *)
+(* call, as a port's refusal still is); the task's datagrams or chunks     *)
+(* reach the peer out of the order                                         *)
 (* it sent them; a call waits forever; a large chunk is copied.            *)
 (*                                                                          *)
 (* What is abstract: the side's guard (a step here runs whole under it;    *)
@@ -45,6 +51,7 @@
 EXTENDS Integers, Sequences, TLC
 
 CONSTANTS
+    Backend,   \* "unix" (an io_uring ring, epoll, kqueue) or "port" (a Windows completion port)
     Lent,      \* TRUE: the first datagram is lent to a send of the ring's, and its task may go
     Stream,    \* TRUE: the task writes a stream's chunks instead of sending datagrams
     Mutation   \* "none", or the name of the one rule this run takes away
@@ -52,7 +59,10 @@ CONSTANTS
 \* What each datagram is, in call order: "ok", or "big" (no socket takes it). A refused one
 \* between two the kernel takes; with no lent send, one more, so a borrowed call meets a full
 \* socket after one it filled itself.
-Datagrams == IF Lent THEN <<"ok", "big", "ok">> ELSE <<"ok", "big", "ok", "ok">>
+\* A port's: one too large, refused at once, and one the kernel refuses only as it sends it ("unreach",
+\* no route), between two it takes.
+Datagrams == IF Backend = "port" THEN <<"ok", "big", "unreach", "ok">>
+             ELSE IF Lent THEN <<"ok", "big", "ok">> ELSE <<"ok", "big", "ok", "ok">>
 \* What each chunk of a stream is, in write order: "small", which may go into the write-behind,
 \* or "large", which never does. A small one first, which the full socket sends behind; a large
 \* one while that is still ahead of it; then one of each again.
@@ -66,10 +76,14 @@ Room == 1
 N == Len(Sends)
 \* Whether the kernel refuses datagram k whatever room there is.
 Big(k) == Sends[k] = "big"
+\* Whether the kernel refuses datagram k: too large, or with no route as it sends it.
+Fails(k) == Sends[k] \in {"big", "unreach"}
+\* Whether the call copies its datagram and queues it, answering taken: a port's, or (mutated) any.
+Queues == Mutation = "behind" \/ Backend = "port"
 \* Whether chunk k is large: it waits for the socket rather than being copied.
 Large(k) == Sends[k] = "large"
 \* The kernel's own verdict on datagram or chunk k, which its call must answer.
-Verdict(k) == IF Big(k) THEN "err" ELSE "ok"
+Verdict(k) == IF Fails(k) THEN "err" ELSE "ok"
 
 (* --algorithm RingSend
 variables
@@ -127,8 +141,8 @@ R_loop:
             end if;
         or
             \* A datagram's send: refused at once if too large, else taken once there is room.
-            await out \in 1..N /\ (Big(out) \/ Len(socket) < Room);
-            if ~Big(out) then
+            await out \in 1..N /\ (Fails(out) \/ Len(socket) < Room);
+            if ~Fails(out) then
                 \* The kernel takes it: the socket holds it behind the others.
                 socket := Append(socket, out);
             end if;
@@ -137,8 +151,8 @@ R_loop:
                 if ~orphaned then
                     result[1] := Verdict(1);
                 end if;
-            elsif Big(out) then
-                \* (mutation behind) A queued datagram's error, kept for the next call.
+            elsif Fails(out) then
+                \* A queued datagram's error, kept for the next call (a port's; mutation behind).
                 deferred := "err";
             end if;
             \* The send ended; every call waiting on the side is woken.
@@ -239,13 +253,16 @@ T_lent:
                 orphaned := TRUE;
             end either;
             at := 2;
-        elsif Mutation = "behind" then
+        elsif Queues then
 T_behind:
             \* MUTATION behind: the call copies its datagram, queues it and answers taken at once,
-            \* or answers the error the last queued datagram left.
+            \* or answers the error the last queued datagram left, as a port's call does.
             if deferred # "none" then
                 result[at] := deferred;
                 deferred := "none";
+            elsif Backend = "port" /\ Big(at) then
+                \* A port refuses a datagram too large for the socket at once, as std's call does.
+                result[at] := "err";
             else
                 \* One datagram queued at a time: the call waits until the ring took it.
                 await queued = 0;
