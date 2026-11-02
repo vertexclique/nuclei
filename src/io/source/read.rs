@@ -1473,15 +1473,13 @@ impl ReadState {
             }
             // The ring's edge: a task that found the socket empty receives again
             // (`receive_now`), and one made with no guard that saw the count before it asks again.
-            super::ring::Arrival::Ready => {
+            super::ring::Arrival::Ready { unsure } => {
                 self.poll_first = false;
                 self.edges = self.edges.wrapping_add(1);
-            }
-            // As a poller's hangup edge: a count of none no longer says the socket is empty.
-            super::ring::Arrival::Hangup => {
-                self.poll_first = false;
-                self.edges = self.edges.wrapping_add(1);
-                self.short_reads_unsure();
+                // As a poller's hangup edge: a count of none no longer says the socket is empty.
+                if unsure {
+                    self.short_reads_unsure();
+                }
             }
         }
         self.want = 0;
