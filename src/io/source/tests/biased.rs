@@ -442,3 +442,41 @@ fn a_foreign_read_without_a_fence_is_served_through_the_worker() {
         "a source made after the failure is biased"
     );
 }
+
+/// A read side its owner's shard claimed, a thread's own whose `block_on` returned: the shard left,
+/// and runs nothing until the thread's next `block_on`. A read from another thread's shard, whose
+/// heavy fence fails, must not leave its work to that claimant and wait for it
+/// (proofs/tla/side_biased/SideBiased.tla, `ClaimStops`).
+#[test]
+fn a_fenceless_read_on_a_side_whose_claimant_left_is_served() {
+    let (a, b) = pair();
+    // A read that waits claims the side for this thread's own shard; the `block_on` ends, and the
+    // shard lets go of the source.
+    crate::block_on(async {
+        let mut one = [0u8; 1];
+        poll_fn(|cx| Poll::Ready(a.src.poll_read(cx, &mut one, false).is_pending())).await
+    });
+    // Only a side still biased has a claim to give up: on a ring the completion of the read went
+    // through a take that is no owner's, which made it shared.
+    if !fenced() || a.src.read.is_shared() {
+        return;
+    }
+    send(b.io(), b"z");
+    let src = Arc::clone(&a.src);
+    let got = std::thread::spawn(move || {
+        crate::rt::handoff::fence::inject_failure(true);
+        let got = crate::block_on(async {
+            let mut one = [0u8; 1];
+            let n = crate::time::timeout(Duration::from_secs(10), read(&src, &mut one)).await;
+            (n.map(|n| n.ok()), one)
+        });
+        crate::rt::handoff::fence::inject_failure(false);
+        got
+    })
+    .join()
+    .unwrap();
+    assert!(
+        matches!(got, (Ok(Some(1)), [b'z'])),
+        "{got:?}: the read waited for a claimant that left"
+    );
+}
