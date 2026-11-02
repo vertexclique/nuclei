@@ -28,7 +28,7 @@ pub(super) const READ_READINESS: usize = 16 << 10;
 const WRITE_READINESS: usize = 0;
 /// Ring reads.
 #[cfg(ring)]
-const READ_RING: usize = 16 << 10;
+pub(super) const READ_RING: usize = 16 << 10;
 /// Ring writes.
 #[cfg(ring)]
 const WRITE_RING: usize = 0;

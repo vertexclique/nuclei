@@ -205,7 +205,7 @@ impl ShardRing {
                 RingMem::ReadyMulti => {
                     let (source, epoch) = (Arc::as_ptr(&op.source), op.epoch);
                     drop(ops);
-                    self.readied(shard, source, epoch);
+                    self.readied(shard, source, epoch, res);
                     return;
                 }
                 _ => return,
@@ -238,7 +238,17 @@ impl ShardRing {
     /// The multishot poll of `source`, issued in `epoch`, says its socket may
     /// be readable: the side gets the edge as an arrival, with nothing
     /// borrowed, so it may submit at once.
-    fn readied(&self, shard: Option<&Shard>, source: *const crate::io::source::Source, epoch: u32) {
+    fn readied(
+        &self,
+        shard: Option<&Shard>,
+        source: *const crate::io::source::Source,
+        epoch: u32,
+        res: i32,
+    ) {
+        // The events the poll reported: a hangup or an error beside the bytes leave a stream's
+        // count unsure of the end.
+        let shaky = (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) as i32;
+        let unsure = res >= 0 && res & shaky != 0;
         // The view below is taken inside the batch's `Unwound` (`wait`), which drops after it.
         let mut after = After::default();
         {
@@ -247,7 +257,7 @@ impl ShardRing {
             // returns, and nothing removes the entry while the view lives (a cancel only queues
             // an entry). The wakes run after the view is gone; it is never dropped as an `Arc`.
             let source = core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(source) });
-            source.ring_arrival(Arrival::Ready, epoch, shard, &mut after);
+            source.ring_arrival(Arrival::Ready { unsure }, epoch, shard, &mut after);
         }
         if let Err(after) = after.settle_light() {
             after.run();

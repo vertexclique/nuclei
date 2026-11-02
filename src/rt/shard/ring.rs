@@ -1136,6 +1136,8 @@ mod tests_end;
 #[cfg(test)]
 mod tests_inc;
 #[cfg(test)]
+mod tests_ready;
+#[cfg(test)]
 mod tests_recv;
 #[cfg(test)]
 mod tests_reserve;
