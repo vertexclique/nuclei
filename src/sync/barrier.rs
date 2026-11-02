@@ -179,8 +179,8 @@ impl BarrierWaitResult {
 enum Arrival {
     /// Not arrived yet.
     Before,
-    /// Arrived, waiting in this generation.
-    In(usize),
+    /// Arrived, waiting in its generation.
+    In,
     /// Arrived and completed its generation as its leader.
     Led,
 }
@@ -216,14 +216,14 @@ impl Future for BarrierWait<'_> {
                     Poll::Ready(BarrierWaitResult { leader: true })
                 }
                 Err(generation) => {
-                    this.arrival = Arrival::In(generation);
+                    this.arrival = Arrival::In;
                     barrier.enqueue(&mut this.wait, generation, cx.waker());
                     this.wait
                         .poll(&barrier.queue, None)
                         .map(|_| BarrierWaitResult { leader: false })
                 }
             },
-            Arrival::In(_) => this
+            Arrival::In => this
                 .wait
                 .poll(&barrier.queue, Some(cx.waker()))
                 .map(|_| BarrierWaitResult { leader: false }),
