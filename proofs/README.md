@@ -262,11 +262,12 @@ SCHEDULED while the runnable waits (`RunnableScheduled`), so adding RUNNING less
 turns the one flag into the other whatever else the word holds; a run that then finds the task
 cancelled in the queue clears RUNNING after dropping the future.
 
-The TLA+ family checks 32 configurations: 12 that must pass (the handle awaiting, detaching,
+The TLA+ family checks 34 configurations: 12 that must pass (the handle awaiting, detaching,
 dropped or cancelling, with one or two runners, wakes by value and by reference, a future that
 wakes itself, a waker dropped without a wake, a handle polled once without a wake, and liveness
-under weak fairness), 14 mutations
-that each take one rule away (a wake during the poll that schedules a second runnable breaks
+under weak fairness), 15 mutations
+that each take one rule away (a handle that answers None for a closed task without waiting for
+its future breaks `CancelWaits`; a wake during the poll that schedules a second runnable breaks
 `OnePoll`, and `RunnableScheduled` too: the second run would start on a running task, where the
 addition carries into the next flag; a run that finds the task cancelled in the queue and leaves
 RUNNING set ends in a deadlock, the cancelling handle waiting for ever for a future it thinks is
@@ -280,9 +281,12 @@ breaks `FreedAfterFuture`; a run that lets go of its reference only after the co
 exchange, as it once did, lets a handle polled in between take the output and go, and frees the
 task itself, and a Pending run that drops its reference in a step of its own, as it once did,
 frees the task after another runner completed it and the handle went, both of which break
-`RunnerFreesNoAwaited`), and 6 witnesses: a wake during the poll, a cancel during the poll,
+`RunnerFreesNoAwaited`), and 7 witnesses: a wake during the poll, a cancel during the poll,
 a cancel found in the queue, a registration of the handle's waker meeting a notification, the
-last waker closing an idle task, and the handle woken from its sleep.
+last waker closing an idle task, the handle woken from its sleep, and a cancel that answers None
+while the run has yet to drop the output it took out (`OutputGoneAtNone` fails: the run takes a
+cancelled task's output out before the exchange that clears RUNNING and drops it after; whether
+to close that window is an open question, so it is a witness, not a property).
 
 The Lean file proves, for every sequence of operations and any number of wakers: the count of
 references is exactly the runnable plus the wakers; the future is dropped at most once, and a

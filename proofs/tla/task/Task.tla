@@ -63,7 +63,8 @@ variables
     slot = FALSE,      \* the awaiter cell holds the handle's waker
     queue = 1,         \* runnables waiting in the run queue
     future = "live",   \* the future: "live" or "dropped"
-    output = "none",   \* "none", "stored", "taken" (by the handle) or "dropped"
+    output = "none",   \* "none", "stored", "taken" (by the handle), "out" (taken out by the
+                       \* run, to be dropped once its exchange is done) or "dropped"
     fired = FALSE,     \* the waker thread set what the future waits for
     held = FALSE,      \* the waker thread holds a waker of the task (one reference)
     selfWoken = FALSE, \* the future already woke itself (SelfWake)
@@ -319,12 +320,12 @@ R_claim_cell:
     end if;
 R_out:
     \* With no handle, or a handle that cancelled during the poll, the run takes the output
-    \* out of the task, while its reference still holds it (the code drops it once the task
-    \* is let go of, before the awaiter's wake: what the model leaves in this step).
+    \* out of the task, while its reference still holds it; it drops it once the task is let
+    \* go of (R_out_drop), before the awaiter's wake.
     \* MUTATION complete_leaks_output: it leaves the output behind.
     touch();
     if (~tsk \/ clo) /\ ~outDropped /\ Mutation # "complete_leaks_output" then
-        useOutput("dropped");
+        useOutput("out");
         outDropped := TRUE;
     end if;
 R_complete:
@@ -359,6 +360,10 @@ R_complete:
             refs := refs - 1;
         end if;
     end if;
+R_out_drop:
+    \* The output taken out is dropped, outside the task: the exchange cleared RUNNING
+    \* already, so a cancel that looks now answers None while it still lives.
+    if output = "out" then output := "dropped"; end if;
 R_complete_wake:
     \* The awaiter is woken; nothing of the task is touched any more.
     if took[self] then handleWoken := TRUE; took[self] := FALSE; end if;
@@ -555,7 +560,9 @@ H_poll:
     \* `poll_task`.
     touch();
     if clo then
-        if sch \/ run then
+        \* MUTATION closed_no_wait: a closed task answers None at once, its future perhaps
+        \* still in a run queue or a poll.
+        if (sch \/ run) /\ Mutation # "closed_no_wait" then
             call Register();
             goto H_closed_recheck;
         else
@@ -700,10 +707,19 @@ RunnerFreesNoAwaited == freer = "runner" => ~awaitedAtComplete
 \* run's first exchange be one addition that turns SCHEDULED into RUNNING.
 RunnableScheduled == \A r \in Runners : pc[r] = "R_start" => (sch /\ ~run)
 
+\* A handle that answers None does so once the future is gone: a cancel that returns has
+\* nothing of the task's future left running.
+CancelWaits == handleGot = "none" => future = "dropped"
+
+\* A handle that answers None does so once the output is gone too. The code takes a cancelled
+\* run's output out before the exchange that clears RUNNING and drops it after, so this
+\* fails today (W_none_while_output_lives): whether to close that window is open.
+OutputGoneAtNone == handleGot = "none" => output # "out"
+
 \* All the safety properties together.
 Safe == OnePoll /\ FutureOnce /\ NoPollAfterDrop /\ NothingAfterFree /\ OutputOnce
         /\ FreedAfterFuture /\ CleanEnd /\ AwaitGetsOutput /\ RunnerFreesNoAwaited
-        /\ RunnableScheduled
+        /\ RunnableScheduled /\ CancelWaits
 
 (***************************************************************************)
 (* Witnesses. Each one claims an interesting case never happens; a         *)

@@ -25,9 +25,11 @@ M_pending_two_steps            MC_Task              violated:RunnerFreesNoAwaite
 M_pending_drops_woken          MC_Task              violated:NothingAfterFree
 M_closed_keeps_running         MC_Task              deadlock
 M_wake_running_entry           MC_Task              violated:RunnableScheduled
+M_closed_no_wait               MC_Task              violated:CancelWaits
 W_wake_while_running           MC_Task              violated:NoWakeWhileRunning
 W_cancel_while_running         MC_Task              violated:NoCancelWhileRunning
 W_cancel_in_queue              MC_Task              violated:NoCancelInQueue
 W_register_meets_notify        MC_Task              violated:NoRegisterMeetsNotify
 W_last_waker_close             MC_Task              violated:NoLastWakerClose
 W_park_woken                   MC_Task              violated:NoParkWoken
+W_none_while_output_lives      MC_Task              violated:OutputGoneAtNone
