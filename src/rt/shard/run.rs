@@ -5,9 +5,10 @@
 //! Each poll the loop makes, of a task or of its future, runs through
 //! [`context::poll`]: outside the shard, then back in. A poll may end with
 //! the shard taken from the thread (`rt::handoff`); the frame of the loop
-//! that made it then touches the shard no more. A worker's loop ends; a
-//! `block_on` moves its future to the thread's own shard, its waker aimed
-//! there first, and finishes it there.
+//! that made it then touches the shard no more, even where that poll
+//! finished its future (proofs/tla/handoff, `N_safe`). A worker's loop ends;
+//! a `block_on` returns that output, or moves its future to the thread's own
+//! shard, its waker aimed there first, and finishes it there.
 
 use core::future::Future;
 use core::pin::{Pin, pin};
@@ -54,7 +55,11 @@ impl Shard {
             let signal = self.signal();
             match self.run_loop(future.as_mut(), &signal) {
                 Ok(output) => {
-                    self.keep_signal(signal);
+                    // The poll that finished the future may have found the shard taken: it is
+                    // another thread's then, and its cell keeps no waker of this call.
+                    if !context::detached_from(&self.shared) {
+                        self.keep_signal(signal);
+                    }
                     output
                 }
                 Err(Detached) => finish_on_own(future, &signal),
@@ -75,8 +80,10 @@ impl Shard {
         let stopped = pin!(self.shared.stopped());
         let signal = self.signal();
         match self.run_loop(stopped, &signal) {
-            Ok(()) => Worked::Stopped,
-            Err(Detached) => Worked::Detached,
+            // Stopped in the very poll that found the take, the thread lost the shard all the
+            // same: its bound tasks and its life are seen to as a detached thread's.
+            Ok(()) if !context::detached_from(&self.shared) => Worked::Stopped,
+            Ok(()) | Err(Detached) => Worked::Detached,
         }
     }
 
@@ -127,7 +134,10 @@ impl Shard {
 
     /// The loop: polls `future` when it is woken and, between its polls, runs
     /// the shard's tasks, timers and poller, until `future` is ready or the
-    /// shard is taken from this thread.
+    /// shard is taken from this thread. A poll may do both: it answers the
+    /// output, and a caller on a shard that can be taken (`block_on`,
+    /// `run_worker`, not the thread's own) looks at the take before it touches
+    /// the shard ([`context::detached_from`]).
     fn run_loop<F: Future>(
         &self,
         mut future: Pin<&mut F>,

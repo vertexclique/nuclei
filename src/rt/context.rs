@@ -398,10 +398,27 @@ fn detach_here() {
 pub(crate) fn unmark_call() {
     let here = local();
     let slot = here.slot.get();
+    debug_assert!(here.out.get().is_null(), "a call ended that no mark began");
+    debug_assert!(
+        !slot.is_null(),
+        "a marked call polled: its thread lost the shard in it"
+    );
     here.out.set(slot);
     // SAFETY: as in `Bracket::take`; the call ran no poll, so the thread still runs the shard
     // whose slot this is.
     unsafe { &*slot }.unmark(here.saved.get());
+}
+
+/// [`unmark_call`] for a marked step that unwinds, unless its settle ended the call already
+/// (a panic in a wake it ran after): the call is still marked while `out` is null on the slot
+/// the thread still runs.
+#[cold]
+#[inline(never)]
+pub(crate) fn unmark_unwound() {
+    let here = local();
+    if here.out.get().is_null() && !here.slot.get().is_null() {
+        unmark_call();
+    }
 }
 
 /// What [`current_held`] found: the shard, while it lives.
@@ -569,15 +586,18 @@ pub(crate) enum Polled {
 pub(crate) fn poll<R>(shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
     let here = local();
     if here.slot.get().is_null() {
-        return poll_unwatched(here, shared, poll);
+        return poll_unwatched(here, poll);
     }
     poll_watched(here, shared, poll)
 }
 
 /// [`poll`] on a shard no monitor watches: no slot to go out of and come
-/// back into, and no call from the poll needs a bracket.
+/// back into, and no call from the poll needs a bracket. Such a poll is never
+/// taken: only a watched slot's claim detaches a thread, and a thread runs a
+/// shard it was detached from only once handed it again, with a slot
+/// (`enter_watched`); so it ends `In`, with no look.
 #[inline(always)]
-fn poll_unwatched<R>(here: &Here, shared: &Shared, poll: impl FnOnce() -> R) -> (R, Polled) {
+fn poll_unwatched<R>(here: &Here, poll: impl FnOnce() -> R) -> (R, Polled) {
     /// Back into the shard, by return or unwind.
     struct Back<'a>(&'a Here, bool);
     impl Drop for Back<'_> {
@@ -589,7 +609,7 @@ fn poll_unwatched<R>(here: &Here, shared: &Shared, poll: impl FnOnce() -> R) -> 
     let back = Back(here, here.in_task.replace(true));
     let result = poll();
     drop(back);
-    (result, polled(here, shared))
+    (result, Polled::In)
 }
 
 /// [`poll`] on a shard the monitor watches through this thread's slot. A
@@ -642,7 +662,7 @@ fn poll_watched<R>(here: &'static Here, shared: &Shared, poll: impl FnOnce() -> 
 pub(crate) fn run_task(shared: &Shared, run: impl FnOnce()) -> Polled {
     let here = local();
     if here.slot.get().is_null() {
-        return poll_unwatched(here, shared, run).1;
+        return poll_unwatched(here, run).1;
     }
     run_task_watched(here, run);
     polled(here, shared)
@@ -666,6 +686,15 @@ fn run_task_watched(here: &'static Here, run: impl FnOnce()) {
         here.detach();
     }
     here.in_task.set(in_task);
+}
+
+/// Whether this thread was detached from the shard of `shared`: a poll on it found it taken, and
+/// the shard was not handed back to the thread since (`enter_watched`). For a caller whose loop
+/// on a watched shard ended with its future's output, which the poll that found the take may have
+/// made.
+#[inline]
+pub(crate) fn detached_from(shared: &Shared) -> bool {
+    polled(local(), shared) == Polled::Detached
 }
 
 /// What a poll on the shard of `shared` found as it ended.
