@@ -475,6 +475,8 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
         shard: Owned(shard),
         slot,
     } = run;
+    // Dropped before `shard`, on every way out: a call of this thread then asks it back no more.
+    let lost = context::ForgetLost;
     let cores = &workers.start.cores;
     if !cores.is_empty() {
         super::runtime::pin_to(cores[place % cores.len()]);
@@ -499,6 +501,7 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
     // While the runtime is still this thread's: what the shard hands on as it
     // goes (a port's keeper) goes there. Its last drop runs where its last
     // holder lets go.
+    drop(lost);
     drop(shard);
     worked
 }

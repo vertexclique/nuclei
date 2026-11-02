@@ -325,11 +325,13 @@ impl Builder {
     /// with every other task, timer and IO of it, goes to another thread on
     /// the same core, and the blocked task carries on once its poll returns.
     /// At least 1 ms; [`build`](Self::build) fails with `InvalidInput` below.
-    /// Tasks that `spawn_local` keeps on the blocked thread wait for it. The
-    /// watch costs each poll two plain stores and a load, and each call a
-    /// task makes into its worker (a wake, a spawn, a send or a receive) two
-    /// loads and two stores; with it on, an io_uring worker's ring takes
-    /// submissions from any thread.
+    /// Tasks that `spawn_local` keeps on the blocked thread wait for it. A
+    /// [`ShardLocal`](crate::runtime::ShardLocal) value that the rest of that
+    /// poll or those tasks use is reached through the shard, lent back to
+    /// each call by its new thread. The watch costs each poll two plain
+    /// stores and a load, and each call a task makes into its worker (a
+    /// wake, a spawn, a send or a receive) two loads and two stores; with it
+    /// on, an io_uring worker's ring takes submissions from any thread.
     pub fn handoff_after(mut self, after: Option<Duration>) -> Self {
         self.handoff_after = Some(after);
         self

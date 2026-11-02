@@ -27,6 +27,8 @@ mod bell;
 pub(crate) mod fence;
 pub(crate) mod home;
 pub(crate) mod life;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod loan;
 mod monitor;
 pub(crate) mod slot;
 pub(crate) mod target;

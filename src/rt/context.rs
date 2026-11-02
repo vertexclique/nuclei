@@ -28,6 +28,11 @@ use super::runtime::Inner;
 use super::shard::{Limits, Shard, Shared};
 use super::task::{Runnable, ScheduleInfo};
 
+mod lent;
+pub(crate) use lent::{ForgetLost, Unlent, lent_back};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use lent::{lends_a_value, without_shard};
+
 /// The nesting a thread's own shard allows unless its runtime says
 /// otherwise.
 pub(crate) const DEFAULT_MAX_NESTING: usize = 256;
@@ -74,6 +79,13 @@ pub(crate) struct Here {
     own: Cell<*const Shard>,
     /// The shard this thread lets go of as its runner (`letting_go`), null for none.
     letting_go: Cell<*const Arc<Shared>>,
+    /// The shard this thread was detached from, null for none: kept alive by the frame of
+    /// `run_shard` that ran it (src/rt/workers.rs), which clears it before it lets go. Only
+    /// its `Shared` and its monitor are followed, until a call asks for it back
+    /// ([`lent_back`]).
+    lost: Cell<*const Shard>,
+    /// The shard lent to this thread's call now ([`lent_back`]), null for none.
+    lent: Cell<*const Shard>,
 }
 
 impl Here {
@@ -93,15 +105,21 @@ impl Here {
             runtime: Cell::new(core::ptr::null()),
             own: Cell::new(core::ptr::null()),
             letting_go: Cell::new(core::ptr::null()),
+            lost: Cell::new(core::ptr::null()),
+            lent: Cell::new(core::ptr::null()),
         }
     }
 
-    /// The thread found its shard taken: it runs no shard from now on.
+    /// The thread found its shard taken: it runs no shard from now on. Until it ends what it
+    /// runs of the shard's (its poll, then its bound tasks), it counts among the shard's live
+    /// tasks, so a stopped worker stays up to lend the shard back to it ([`ForgetLost`]).
     #[cold]
     fn detach(&self) {
         // SAFETY: `current` points at a shard while its `Entered` lives.
         if let Some(shard) = unsafe { self.current.get().as_ref() } {
             self.detached.set(shard.shared_addr());
+            self.lost.set(shard);
+            shard.shared.detached_began();
         }
         self.current.set(core::ptr::null());
         self.slot.set(core::ptr::null());

@@ -65,6 +65,7 @@ use crate::time::wheel::Wheel;
 use spin::Spin;
 
 mod children;
+mod detached;
 mod going;
 pub(crate) mod locals;
 mod made;
@@ -103,6 +104,10 @@ pub(crate) struct Shared {
     notifier: Notifier,
     /// Live tasks placed on the shard: what placement compares.
     pub(crate) load: AtomicUsize,
+    /// Threads whose poll lost the shard and that still run what they ran of it (the poll,
+    /// then their bound tasks): a stopped worker stays up for them, to lend them the shard
+    /// back (`handoff::loan`).
+    detached: AtomicUsize,
     /// The shard stopped: it takes no new task and runs no more.
     stopped: AtomicBool,
     /// The shard stops once its live tasks are done, and takes no new one.
@@ -436,13 +441,14 @@ impl Shared {
         // Pairs with the fence of `last_task_done`: either this sees the
         // count at zero, or the last task sees the flag.
         crate::sync::internal::fence(Ordering::SeqCst);
-        if self.load.load(Ordering::Relaxed) == 0 {
+        if self.nothing_live() {
             self.stop_waker.wake();
         }
         self.unpark();
     }
 
-    /// The shard's last live task is done: a draining worker may exit.
+    /// The shard's last live task is done, or the last thread that lost it: a draining worker
+    /// may exit.
     pub(crate) fn last_task_done(&self) {
         crate::sync::internal::fence(Ordering::SeqCst);
         if self.draining.load(Ordering::Relaxed) {
@@ -461,7 +467,7 @@ impl Shared {
         // (`runtime::placement`): either it sees the drain, or this sees its
         // task counted (proofs/tla/placement).
         crate::sync::internal::fence(Ordering::SeqCst);
-        self.load.load(Ordering::Acquire) == 0
+        self.nothing_live()
     }
 
     /// Completes once the shard is stopped, or drained of its tasks: the

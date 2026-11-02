@@ -148,6 +148,7 @@ impl Shard {
             park: ParkState::new(),
             notifier: notifier,
             load: AtomicUsize::new(0),
+            detached: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             stop_waker: AtomicWaker::new(),
