@@ -1,0 +1,17 @@
+TLC run of every configuration in proofs/tla/sendfile, as CI ran them: TLA+ run 41452470703 on
+9bdde6f1, 2026-11-02, one worker each (the share jobs of .github/workflows/tla.yml). Version 2.19
+of 08 August 2024.
+
+configuration                generated   distinct    sec  result                                expected                              match
+SF_safe                            402        156      1  pass                                  pass                                  yes
+SF_live                            402        156      1  pass                                  pass                                  yes
+M_no_place                         233         98      1  violated:WireOrder                    violated:WireOrder                    yes
+M_clear_at_drop                    194         89      1  violated:WireOrder                    violated:WireOrder                    yes
+M_clear_unended                    363        156      1  violated:WireOrder                    violated:WireOrder                    yes
+M_job_no_clear                     434        172      0  violated:FrameSent                    violated:FrameSent                    yes
+M_drop_no_clear                    434        172      1  violated:FrameSent                    violated:FrameSent                    yes
+M_task_no_clear                    440        178      1  violated:FrameSent                    violated:FrameSent                    yes
+M_unrun_forgets                    278        107      1  violated:FrameSent                    violated:FrameSent                    yes
+W_late_chunk                         6          5      1  violated:NoLateChunk                  violated:NoLateChunk                  yes
+
+results matching EXPECTED.txt: 10 of 10

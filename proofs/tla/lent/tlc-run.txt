@@ -74,3 +74,67 @@ WZ_keeper_notif                   7532       2349      5  violated:NoKeeperNotif
 WZ_failed                           10         10      3  violated:NoFailed                     violated:NoFailed                     yes
 
 results matching EXPECTED.txt: 69 of 69
+
+Rechecked since, as CI ran them: TLA+ run 41452470703 on 9bdde6f1, 2026-11-02, one worker each
+(the share jobs of .github/workflows/tla.yml), with a handle's sync calls kept by its file state,
+one at a time. Every configuration of LentFile.tla; these times replace the ones above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+PF_leave                       1052603     297755      7  pass                                  pass                                  yes
+PF_stay                         620908     222070      6  pass                                  pass                                  yes
+PF_live                        1052603     297755     25  pass                                  pass                                  yes
+MF_no_epoch_check               237173      89003      4  violated:NoStaleRead                  violated:NoStaleRead                  yes
+MF_lent_skips_wait              603717     223001      6  violated:AllLanded                    violated:AllLanded                    yes
+MF_orphan_cancelled              47604      17333      2  violated:AllLanded                    violated:AllLanded                    yes
+MF_no_continuation              535685     192064      5  violated:AllLanded                    violated:AllLanded                    yes
+MF_cancel_ends                  583788     219935      8  violated:AllLanded                    violated:AllLanded                    yes
+WF_redo                           1921       1019      1  violated:NoRedo                       violated:NoRedo                       yes
+WF_orphan_landed                  8303       3525      1  violated:NoOrphanLanded               violated:NoOrphanLanded               yes
+WF_read_of_lent                 484141     176772      4  violated:NoReadOfLent                 violated:NoReadOfLent                 yes
+WF_short_write                      17         15      2  violated:NoShortWrite                 violated:NoShortWrite                 yes
+WF_moved_mid                        55         40      1  violated:NoMovedMid                   violated:NoMovedMid                   yes
+PF_append                       422320     118926      4  pass                                  pass                                  yes
+PF_append_live                  422320     118926     11  pass                                  pass                                  yes
+MF_append_at_cursor              31016      12364      2  violated:NoOverwrite                  violated:NoOverwrite                  yes
+MF_cursor_stays                   5626       2561      1  violated:CursorAtEnd                  violated:CursorAtEnd                  yes
+WF_append_past_cursor             1922        953      1  violated:NoAppendPastCursor           violated:NoAppendPastCursor           yes
+PF_drop                        1058021     301169      5  pass                                  pass                                  yes
+PF_into_inner                  1057427     300971      5  pass                                  pass                                  yes
+MF_close_at_drop                121085      40467      4  violated:NoCallOnClosed               violated:NoCallOnClosed               yes
+MF_into_inner_early             121088      40467      3  violated:NoCallOnClosed               violated:NoCallOnClosed               yes
+WF_job_outlives_drop             79512      27440      2  violated:NoJobAfterDrop               violated:NoJobAfterDrop               yes
+PF_pos                          162170      54648      3  pass                                  pass                                  yes
+PF_pos_live                     162170      54648      9  pass                                  pass                                  yes
+PF_gen                          369048      94740      3  pass                                  pass                                  yes
+PF_gen_live                     236930      63948     13  pass                                  pass                                  yes
+PF_sync                          72507      24685      2  pass                                  pass                                  yes
+PF_sync_live                     72507      24685      4  pass                                  pass                                  yes
+PF_direct                       100412      40998      2  pass                                  pass                                  yes
+PF_direct_live                  100412      40998      5  pass                                  pass                                  yes
+MF_pos_skips_wait               130797      43680      2  violated:PositionalOrder              violated:PositionalOrder              yes
+MF_pos_bumps_epoch                  90         55      1  violated:PositionalKeepsCursor        violated:PositionalKeepsCursor        yes
+MF_no_gen_check                  70154      19786      1  violated:NoStaleRead                  violated:NoStaleRead                  yes
+MF_ahead_no_gen                  46414      13459      1  violated:NoStaleRead                  violated:NoStaleRead                  yes
+MF_orphan_unordered             117931      43593      3  violated:PositionalOrder              violated:PositionalOrder              yes
+MF_orphan_no_gen                 78730      21225      3  violated:NoStaleRead                  violated:NoStaleRead                  yes
+MF_pr_skips_wait                   478        245      1  violated:PosReadSees                  violated:PosReadSees                  yes
+MF_sync_no_flush                 14109       5777      2  violated:SyncCovers                   violated:SyncCovers                   yes
+MF_sync_drain                    11630       4610      3  violated:SyncCovers                   violated:SyncCovers                   yes
+MF_sync_forgets                  65129      23027      2  violated:NoSyncAfterFailure           violated:NoSyncAfterFailure           yes
+PF_sync_leave                   132493      42481      3  pass                                  pass                                  yes
+PF_sync_leave_live              132493      42481      9  pass                                  pass                                  yes
+MF_sync_task_records             52690      17563      3  violated:SyncCovers                   violated:SyncCovers                   yes
+MF_sync_unserialized             52567      19407      2  violated:SyncCovers                   violated:SyncCovers                   yes
+MF_sync_any_failure              35448      12428      2  violated:NoFalseFailure               violated:NoFalseFailure               yes
+MF_direct_through_ahead             19         15      1  violated:DirectExact                  violated:DirectExact                  yes
+MF_direct_through_behind           799        455      2  violated:DirectExact                  violated:DirectExact                  yes
+WF_pos_redo                      10961       3445      2  violated:NoPosRedo                    violated:NoPosRedo                    yes
+WF_read_ahead                       24         17      2  violated:NoReadAhead                  violated:NoReadAhead                  yes
+WF_pos_orphan                     1342        665      1  violated:NoPosOrphanLanded            violated:NoPosOrphanLanded            yes
+WF_sync_fail                     16039       5857      2  violated:NoSyncFailure                violated:NoSyncFailure                yes
+WF_sync_left                     11060       4179      1  violated:NoLeftTaken                  violated:NoLeftTaken                  yes
+PF_pos_drop                     166851      57617      2  pass                                  pass                                  yes
+PF_pos_into_inner               166346      57432      3  pass                                  pass                                  yes
+MF_pos_close_at_drop            123273      44033      2  violated:NoCallOnClosed               violated:NoCallOnClosed               yes
+MF_pos_into_inner_early         123275      44033      2  violated:NoCallOnClosed               violated:NoCallOnClosed               yes
+WF_pos_outlives_drop             97857      36085      3  violated:NoJobAfterDrop               violated:NoJobAfterDrop               yes
