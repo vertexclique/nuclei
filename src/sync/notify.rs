@@ -305,15 +305,7 @@ impl Core {
                 // An `enable` has no waker to register: it only looks.
                 None => self.wait.granted(&notify.queue).is_some(),
             }
-        } else if notify.generation() != self.generation {
-            true
-        } else if notify.take_permit() {
-            // A `notify_waiters` between the look at the generation and the
-            // take already owed this future its wake: the permit is the next
-            // waiter's.
-            if notify.generation() != self.generation {
-                notify.notify_one();
-            }
+        } else if notify.generation() != self.generation || notify.take_permit() {
             true
         } else {
             notify.enqueue(
