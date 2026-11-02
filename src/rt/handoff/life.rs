@@ -1,13 +1,20 @@
 //! A runtime thread as the monitor and a shutdown see it: whether its shard
 //! was taken from it while it was blocked (a shutdown does not wait for such
 //! a thread), and its id, to let it off its core.
+//!
+//! The monitor says a take succeeded, after its compare-and-swap, and the
+//! thread says it is back as soon as the poll the take found it in returns;
+//! the two may come in either order, so each is an add, one up and one down,
+//! never a store that could undo the other (proofs/tla/handoff/TakeRef.tla).
 
-use crate::sync::internal::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::internal::{AtomicU32, AtomicU64, Ordering};
 
 /// A worker or spare thread of a runtime.
 pub(crate) struct Life {
-    /// Its shard was taken while it was in one poll; it has not come back.
-    detached: AtomicBool,
+    /// Above zero, read as signed, while its shard was taken in one poll it
+    /// has not come back from: the monitor's detach adds one, the thread's
+    /// back takes one off (wrapping, so a back first reads as -1).
+    detached: AtomicU32,
     /// The OS id of the thread (Linux, Windows), 0 until it starts.
     id: AtomicU64,
 }
@@ -15,7 +22,7 @@ pub(crate) struct Life {
 impl Life {
     pub(crate) fn new() -> Self {
         Self {
-            detached: AtomicBool::new(false),
+            detached: AtomicU32::new(0),
             id: AtomicU64::new(0),
         }
     }
@@ -25,19 +32,21 @@ impl Life {
         self.id.store(os_thread_id(), Ordering::Release);
     }
 
-    /// The thread's shard was taken from it (the monitor).
+    /// The thread's shard was taken from it (the monitor, once its take
+    /// succeeded): before or after the thread's [`back`](Self::back) of the
+    /// same take.
     pub(crate) fn detach(&self) {
-        self.detached.store(true, Ordering::Release);
+        self.detached.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// The thread came back from the poll it was blocked in.
+    /// The thread came back from the poll it was blocked in, its shard taken.
     pub(crate) fn back(&self) {
-        self.detached.store(false, Ordering::Release);
+        self.detached.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Whether the thread is out on a blocked poll, its shard taken.
     pub(crate) fn is_detached(&self) -> bool {
-        self.detached.load(Ordering::Acquire)
+        self.detached.load(Ordering::Acquire).cast_signed() > 0
     }
 
     /// Lets the thread run on any of `cores` (the process's own): a blocked
@@ -107,3 +116,40 @@ fn os_thread_id() -> u64 {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 fn unpin(_id: u64, _cores: &[usize]) {}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::Life;
+
+    /// The monitor says a thread's shard was taken after its take succeeded, and the thread
+    /// says it is back as soon as the poll the take found it in returns: the two come in either
+    /// order, and a back that came first is not undone by the detach of the same take
+    /// (proofs/tla/handoff/TakeRef.tla, `M_life_stored`).
+    #[test]
+    fn a_back_before_the_detach_of_its_take_leaves_the_thread_back() {
+        let life = Life::new();
+        assert!(!life.is_detached());
+        life.detach();
+        assert!(life.is_detached(), "a taken thread was not detached");
+        life.back();
+        assert!(
+            !life.is_detached(),
+            "a thread back from its poll stayed detached"
+        );
+        life.back();
+        assert!(
+            !life.is_detached(),
+            "a back ahead of its detach said detached"
+        );
+        life.detach();
+        assert!(
+            !life.is_detached(),
+            "the detach of a take the thread was already back from left it detached"
+        );
+        life.detach();
+        assert!(
+            life.is_detached(),
+            "the next take did not detach the thread"
+        );
+    }
+}

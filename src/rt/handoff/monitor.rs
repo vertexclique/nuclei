@@ -410,6 +410,8 @@ fn take(
         return None;
     }
     // The shard is the monitor's, its reference held since before the claim.
+    // The runner may be back from its poll already: its life's back and this
+    // detach add up whichever comes first (proofs/tla/handoff/TakeRef.tla).
     old.life.detach();
     old.life.unpin(&monitor.cores);
     shard.hand_over_queues();

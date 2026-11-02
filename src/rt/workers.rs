@@ -14,7 +14,8 @@
 //! own shard, and waits as a spare for the next shard the monitor hands
 //! over. Spares never exit while the runtime runs (a thread that exits
 //! cancels the ring requests it submitted), and a shutdown waits for every
-//! thread but the ones still blocked in the poll their shard was taken in.
+//! thread but the ones still blocked in the poll their shard was taken in: a
+//! thread back from that poll, running its bound tasks, is waited for.
 
 use super::rng::random_below;
 use core::cell::Cell;
@@ -455,9 +456,7 @@ fn runner(inner: &Arc<Inner>, first: Run, life: &Arc<Life>) {
         .map(|_| Spare::here(Arc::clone(life)));
     let mut next = Some(first);
     while let Some(run) = next.take() {
-        if run_shard(inner, run) == Worked::Detached {
-            life.back();
-        }
+        run_shard(inner, run, life);
         // A spare now, with the handoff on; else the thread is done.
         if let (Some(monitor), Some(spare)) = (&workers.monitor, &spare) {
             next = monitor.wait_for_shard(spare).map(Run::from);
@@ -467,8 +466,11 @@ fn runner(inner: &Arc<Inner>, first: Run, life: &Arc<Life>) {
 
 /// Runs the shard of `run` as its worker's runner until it stops or is
 /// taken from this thread; then, taken, the thread's bound tasks on its own
-/// shard, until none is live or the runtime shuts down.
-fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
+/// shard, until none is live or the runtime shuts down. The thread says it is
+/// back (`life`) as soon as the poll the take found it in returned, before its
+/// bound tasks: a shutdown meanwhile waits for it as for any runtime thread
+/// (proofs/tla/handoff/TakeRef.tla, `LifeMeansBlocked`).
+fn run_shard(inner: &Arc<Inner>, run: Run, life: &Life) {
     let workers = &inner.workers;
     let Run {
         place,
@@ -491,16 +493,16 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
         let _current = context::enter_watched(&shard, slot.as_deref());
         shard.run_worker()
     };
-    if worked == Worked::Detached
-        && let Some(monitor) = &workers.monitor
-    {
-        finish_home(monitor, &home);
+    if worked == Worked::Detached {
+        life.back();
+        if let Some(monitor) = &workers.monitor {
+            finish_home(monitor, &home);
+        }
     }
     // While the runtime is still this thread's: what the shard hands on as it
     // goes (a port's keeper) goes there. Its last drop runs where its last
     // holder lets go.
     drop(shard);
-    worked
 }
 
 /// A thread whose shard was taken: its bound tasks finish on its own shard,
