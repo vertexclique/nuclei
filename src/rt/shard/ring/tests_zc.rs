@@ -549,6 +549,45 @@ fn a_registration_posted_to_a_kept_ring_is_let_go_of_at_once() {
     assert!(read.join().unwrap() == data);
 }
 
+/// A zero-copy send that waits only for its notification, given up on as its shard goes (no
+/// keeper could be had for its ring): it ended for its side at its first completion and counted
+/// out then, so it ends nothing again and a retire of its source returns, while its buffer stays
+/// with the kernel for good (`proofs/tla/keeper/Forgot.tla`, `F_held`).
+#[test]
+fn a_held_zero_copy_send_given_up_on_ends_nothing_twice() {
+    let Some(shard) = ring_shard() else { return };
+    if !zc_available(&shard) {
+        return;
+    }
+    let (_mine, src, _peer) = held_back_source();
+    let data = pattern(SEND_ZC_MIN);
+    let released = {
+        let _current = context::enter(&shard);
+        let (result, released) = shard.block_on(src.write_zero_copy(data.clone()));
+        assert_eq!(result.unwrap(), data.len());
+        let ring = shard.ring().expect("a ring shard");
+        assert!(ring.in_flight() > 0, "no send waits for its notification");
+        ring.forget_stuck();
+        released
+    };
+    drop(shard);
+    drop(released);
+    let (done, retired) = std::sync::mpsc::channel();
+    let retiring = {
+        let src = Arc::clone(&src);
+        std::thread::spawn(move || {
+            src.retire();
+            let _ = done.send(());
+        })
+    };
+    assert!(
+        retired.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the retire waits: the held send counted out twice: {}",
+        src.write_report()
+    );
+    retiring.join().unwrap();
+}
+
 /// A ring only its own thread may reap copies a zero-copy write: no keeper could take its
 /// notifications, so the buffer is back at once.
 #[test]

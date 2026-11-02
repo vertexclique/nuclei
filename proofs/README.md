@@ -1663,12 +1663,14 @@ keeper can take (`ShardRing::shut_down`, `settle` and `forget_stuck` in
 `src/rt/shard/ring/keeper.rs`, `Source::op_done` in `src/io/source/ops.rs`, `FileOp::forsake` in
 `src/fs/ring.rs`, `Source::retire`). The shard cancels the operation and waits a bounded time; the
 kernel may end it in time, late, or never. One still out when the wait ends is given up on: it ends
-with an error and counts out, its memory kept for good. A task waits for its end, and another
-thread retires its source. 6 configurations: 2 that must pass (an operation that ignores the
-cancel, and one the kernel ends in time or late), with `NoScribble`, the kernel never writes the
-operation's memory after it was freed, `EndsOnce`, and `Ends`, the task and the retire both end; 2
-mutations (an operation forgotten with no end, as before, breaks `Ends`; one whose end lets go of
-its memory breaks `NoScribble`); and 2 witnesses (an operation that ended while the kernel still
+with an error and counts out, its memory kept for good; a zero-copy send that waits only for its
+notification ended for its side already, and only keeps its buffer. A task waits for its end, and
+another thread retires its source. 8 configurations: 3 that must pass (an operation that ignores
+the cancel, one the kernel ends in time or late, and a held send), with `NoScribble`, the kernel
+never writes the operation's memory after it was freed, `EndsOnce`, an operation ends once and its
+count never goes below zero, and `Ends`, the task and the retire both end; 3 mutations (an
+operation forgotten with no end, as before, breaks `Ends`; one whose end lets go of its memory
+breaks `NoScribble`; a held send that ends again breaks `EndsOnce`); and 2 witnesses (an operation that ended while the kernel still
 holds it; a slow one that completes after the shard gave up on it).
 
 `src/rt/shard/ring/tests_zc.rs` checks that a registration posted to a kept ring is let go of at

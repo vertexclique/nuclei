@@ -11,7 +11,9 @@ KW_post_wake                   MC_Kept              violated:NoPostWake
 KW_late_read                   MC_Kept              violated:NoLateRead
 F_stuck                        MC_Forgot            pass
 F_slow                         MC_Forgot            pass
+F_held                         MC_Forgot            pass
 FM_forget_silent               MC_Forgot            violated:Ends
 FM_forget_frees                MC_Forgot            violated:NoScribble
+FM_end_twice                   MC_Forgot            violated:EndsOnce
 FW_given_up                    MC_Forgot            violated:NoGivenUp
 FW_late                        MC_Forgot            violated:NoLate

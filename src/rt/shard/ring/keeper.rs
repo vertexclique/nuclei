@@ -67,7 +67,9 @@ fn given_up() -> io::Error {
 }
 
 /// An operation of a source given up on: its side gets [`given_up`] for its end, and the
-/// operation counts out, while its memory is kept for good.
+/// operation counts out, while its memory is kept for good. A zero-copy send that waits only for
+/// its notification ended for its side, and counted out, at its first completion: it only keeps
+/// its buffer.
 fn forsake(op: RingOp) {
     let RingOp {
         source,
@@ -76,7 +78,11 @@ fn forsake(op: RingOp) {
         mem,
         ..
     } = op;
+    let ended = matches!(mem, RingMem::ZcHeld(_));
     keep_for_good(Box::new(mem));
+    if ended {
+        return;
+    }
     source.op_done(
         Done {
             outcome: Outcome::Forsaken(given_up()),

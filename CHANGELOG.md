@@ -27,8 +27,9 @@
   operation still out then was forgotten with no end: its task waited for good, a later `get_mut`
   or `into_inner` of its handle waited for good for it to count out, and a file call's task never
   heard of it. It now ends with an error ("the shard went before the kernel ended the operation")
-  and counts out, while the memory the kernel may still write is kept for good, as before; the
-  receive group is kept only when a receive that draws from it is out
+  and counts out, while the memory the kernel may still write is kept for good, as before (a
+  zero-copy send that waits only for its notification ended at its first completion, and only
+  keeps its buffer); the receive group is kept only when a receive that draws from it is out
   (`proofs/tla/keeper/Forgot.tla`).
 - **A thread's own shard that leaves waits for an attach another thread still has to perform**
   (io_uring; every backend for the stale token). A source registered in a thread's `block_on`

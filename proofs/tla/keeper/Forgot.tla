@@ -23,6 +23,9 @@
 (* another thread retires the source (`get_mut`, `into_inner`), which      *)
 (* waits until none of its operations is counted out. The operation given  *)
 (* up on ends for both: its end is an error, and it is no longer counted.  *)
+(* A zero-copy send whose first completion came ended for its side then,  *)
+(* and was counted out: it stays in the ring only to hold its buffer until *)
+(* its notification, so one given up on keeps its buffer and ends nothing.  *)
 (*                                                                          *)
 (* What must never happen: the kernel writing the operation's memory after *)
 (* it was freed (NoScribble), and the operation ending twice (EndsOnce);   *)
@@ -36,6 +39,7 @@ EXTENDS Integers, TLC
 
 CONSTANTS
     Stuck,     \* the operation ignores the cancel: the kernel ends it only after the shard gave up, if ever
+    Held,      \* the operation ended for its side already, and only holds its memory (a zero-copy send)
     Mutation   \* "none", or the name of the one rule this run takes away
 
 VARIABLES
@@ -53,8 +57,8 @@ vars == <<op, spc, out, ends, freed, scribbled, rpc, tpc>>   \* every variable
 Init ==
     /\ op = "kernel"           \* the operation is in the kernel
     /\ spc = "cancel"          \* the shard is going
-    /\ out = 1                 \* counted out on its source
-    /\ ends = 0                \* it has not ended
+    /\ out = IF Held THEN 0 ELSE 1   \* counted out on its source, unless its end came
+    /\ ends = IF Held THEN 1 ELSE 0  \* it has not ended, unless it only holds its memory
     /\ freed = FALSE           \* its memory is in place
     /\ scribbled = FALSE       \* nothing wrote freed memory
     /\ rpc = "ask"             \* the retire is about to be asked
@@ -71,13 +75,14 @@ SCancel ==
     /\ UNCHANGED <<op, out, ends, freed, scribbled, rpc, tpc>>
 
 \* The wait applies the operation's completion: its side gets the end, the count falls, and its
-\* memory goes back. Nothing is out then, and the ring goes.
+\* memory goes back (a held send's notification only lets go of its memory). Nothing is out
+\* then, and the ring goes.
 SApply ==
     /\ spc = "settle"                                       \* the shard waits
     /\ op = "posted"                                        \* and the completion came
     /\ op' = "applied"                                      \* it is applied
-    /\ out' = out - 1                                       \* not counted out any more
-    /\ ends' = ends + 1                                     \* the end reaches its side
+    /\ out' = IF Held THEN out ELSE out - 1                 \* not counted out any more
+    /\ ends' = IF Held THEN ends ELSE ends + 1              \* the end reaches its side
     /\ freed' = TRUE                                        \* the memory goes back
     /\ spc' = "gone"                                        \* the ring goes
     /\ UNCHANGED <<scribbled, rpc, tpc>>
@@ -87,15 +92,17 @@ SApply ==
 \* MUTATION forget_silent: the operation is forgotten with no end and still counted (the code
 \* before): its task and the retire wait for good.
 \* MUTATION forget_frees: its end lets go of its memory too, which the kernel may still write.
+\* MUTATION end_twice: a held send given up on ends for its side again (and counts out again).
 SGiveUp ==
     /\ spc = "settle"                                       \* the shard waits
     /\ op = "kernel"                                        \* and the operation is still out
     /\ spc' = "gone"                                        \* the wait ran out: the ring goes
-    /\ IF Mutation = "forget_silent"                        \* the planted bug
-       THEN UNCHANGED <<out, ends, freed>>                  \* nothing ends, nothing counts it out
-       ELSE /\ out' = out - 1                               \* not counted out any more
-            /\ ends' = ends + 1                             \* the error reaches its side or slot
-            /\ freed' = (Mutation = "forget_frees")         \* the memory stays, but in the bug
+    /\ LET again == ~Held \/ Mutation = "end_twice"         \* its end is still to come (or the bug)
+       IN IF Mutation = "forget_silent"                     \* the planted bug
+          THEN UNCHANGED <<out, ends, freed>>               \* nothing ends, nothing counts it out
+          ELSE /\ out' = IF again THEN out - 1 ELSE out     \* not counted out any more
+               /\ ends' = IF again THEN ends + 1 ELSE ends  \* the error reaches its side or slot
+               /\ freed' = (Mutation = "forget_frees")      \* the memory stays, but in the bug
     /\ UNCHANGED <<op, scribbled, rpc, tpc>>
 
 (***************************************************************************)
@@ -161,8 +168,8 @@ Spec == Init /\ [][Next]_vars /\ Fairness                   \* the behaviours ch
 \* The kernel never writes the operation's memory after it was freed.
 NoScribble == ~scribbled
 
-\* The operation ends at most once for its side or slot.
-EndsOnce == ends <= 1
+\* The operation ends at most once for its side or slot, and its count never goes below zero.
+EndsOnce == ends <= 1 /\ out >= 0
 
 \* The task gets the operation's end, and the retire returns.
 Ends == <>(tpc = "done" /\ rpc = "done")
