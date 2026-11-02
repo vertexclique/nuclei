@@ -40,4 +40,8 @@ R_close_keep == <<"close">>
 R_close_recv == <<"close", "recv">>
 \* Drop the receiver.
 R_drop == <<"drop">>
+\* Close the channel, then drop the handle: the drop runs on the note the close wrote.
+R_close_drop == <<"close", "drop">>
+\* Close twice, then drop: the second close must change nothing.
+R_reclose_drop == <<"close", "close", "drop">>
 =============================================================================

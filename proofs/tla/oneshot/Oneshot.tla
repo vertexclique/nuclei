@@ -2,7 +2,9 @@
 (***************************************************************************)
 (* The one-shot channel of nuclei::sync::oneshot (src/sync/oneshot.rs on   *)
 (* the waker cells of src/sync/atomic_waker.rs), at the grain of its       *)
-(* atomic steps.                                                           *)
+(* atomic steps. The functions: `Sender::send`, `Sender::poll_closed`,    *)
+(* `Drop for Sender`, `Receiver::close`, `Receiver::try_recv`, `Future    *)
+(* for Receiver` (`poll`), `Drop for Receiver`, `Inner::resolve`.         *)
 (*                                                                          *)
 (* In plain words: a channel carries one value from one sender to one       *)
 (* receiver. The sender writes the value into a cell and then raises two    *)
@@ -236,7 +238,8 @@ end process;
 (* handle, destroying a value it still owns.                               *)
 (***************************************************************************)
 fair process receiver = Rx
-variables ri = 1;   \* the receiver's operation
+variables ri = 1,          \* the receiver's operation
+          closeSeen = FALSE; \* what a separate look before the close saw (only a mutation looks)
 begin
 R_next:
     \* The next operation, or the end of the program.
@@ -311,17 +314,32 @@ R_sleep:
     rxWoken := FALSE;              \* the wake is used up
     goto R_look;                   \* the poll after a wake starts at the look
 R_close:
-    \* `Receiver::close`: one fetch_or(RX_CLOSED) and the note of what it saw.
-    if ~rxAlive \/ rxClose # "open" then
+    \* `Receiver::close`: a completed receiver, or one whose note says it closed
+    \* already, does nothing. The note is the receiver's own field, so this look
+    \* races nobody.
+    \* MUTATION reclose: a second close runs the fetch_or again and writes a new
+    \* note from what it sees then.
+    if ~rxAlive \/ (rxClose # "open" /\ Mutation # "reclose") then
         goto R_op_done;            \* completed, or closed already: nothing to do
+    elsif Mutation = "close_note_stale" then
+        goto R_close_peek;         \* only the mutation looks before the fetch_or
     else
-        rxClosed := TRUE;          \* the bit goes up ...
-        rxClose := IF valueSent THEN "withValue" ELSE "empty";  \* ... with the note
-        if ~txDropped then
-            wake_tx();             \* a live sender waiting in closed() is told
-        end if;
-        goto R_op_done;
+        goto R_close_or;
     end if;
+R_close_peek:
+    \* MUTATION close_note_stale: a plain load of the word before the fetch_or,
+    \* whose VALUE_SENT bit the note is then taken from.
+    closeSeen := valueSent;
+R_close_or:
+    \* One fetch_or(RX_CLOSED); the note comes from the word it returned, so it
+    \* says whether the value was sent before the bit went up.
+    rxClosed := TRUE;          \* the bit goes up ...
+    rxClose := IF (IF Mutation = "close_note_stale" THEN closeSeen ELSE valueSent)
+               THEN "withValue" ELSE "empty";  \* ... with the note
+    if ~txDropped then
+        wake_tx();             \* a live sender waiting in closed() is told
+    end if;
+    goto R_op_done;
 R_dclose:
     \* The receiver handle's drop: the same fetch_or when the note is still
     \* open (a closed receiver already did it), then the value below.
