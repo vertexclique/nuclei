@@ -68,7 +68,7 @@ use std::time::Duration;
 use super::raw::Raw;
 use super::source::{Kind, Source};
 use super::sys;
-use crate::fs::file::FileIo;
+use crate::fs::file::{FileIo, Lost};
 
 mod sealed {
     /// Only nuclei says what an [`IoObject`](super::IoObject) is.
@@ -175,6 +175,10 @@ pub struct Handle<T> {
     pub(crate) source: Arc<Source>,
     /// A regular file's IO state, made on its first operation.
     pub(crate) file: OnceLock<Arc<FileIo>>,
+    /// A regular file's record of a byte it accepted that may not be on the
+    /// device: kept across the IO states `get_mut` ends, and shared with
+    /// the handle's clones.
+    pub(crate) lost: OnceLock<Arc<Lost>>,
 }
 
 impl<T: IoObject> Handle<T> {
@@ -210,6 +214,7 @@ impl<T: IoObject> Handle<T> {
             io: ManuallyDrop::new(io),
             source,
             file: OnceLock::new(),
+            lost: OnceLock::new(),
         }
     }
 
@@ -222,6 +227,7 @@ impl<T: IoObject> Handle<T> {
             io: ManuallyDrop::new(io),
             source,
             file: OnceLock::new(),
+            lost: OnceLock::new(),
         }
     }
 
@@ -231,8 +237,13 @@ impl<T: IoObject> Handle<T> {
         if let Some(file) = self.file.get() {
             return Ok(file);
         }
-        let file = FileIo::new(self.source().lease()?)?;
+        let file = FileIo::new(self.source().lease()?, Arc::clone(self.lost()))?;
         Ok(self.file.get_or_init(|| file))
+    }
+
+    /// The record a regular file's syncs answer, made now on its first use.
+    pub(crate) fn lost(&self) -> &Arc<Lost> {
+        self.lost.get_or_init(Arc::default)
     }
 
     /// The source, with the object's descriptor in place: after a
@@ -278,6 +289,7 @@ impl<T> Handle<T> {
         unsafe {
             drop(core::ptr::read(&this.source));
             drop(core::ptr::read(&this.file));
+            drop(core::ptr::read(&this.lost));
             ManuallyDrop::take(&mut this.io)
         }
     }
@@ -319,14 +331,15 @@ impl<T> Handle<T> {
         let mut this = ManuallyDrop::new(self);
         // SAFETY: `this` is never used or dropped again; each field is moved
         // out once.
-        let (io, source, file) = unsafe {
+        let (io, source, file, lost) = unsafe {
             (
                 ManuallyDrop::take(&mut this.io),
                 core::ptr::read(&this.source),
                 core::ptr::read(&this.file),
+                core::ptr::read(&this.lost),
             )
         };
-        drop(file);
+        drop((file, lost));
         source.close(io);
     }
 }

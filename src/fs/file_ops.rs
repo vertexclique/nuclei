@@ -12,6 +12,7 @@ use core::pin::Pin;
 use std::fs::{File, FileTimes, Metadata, Permissions};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures_io::AsyncWrite;
@@ -72,14 +73,20 @@ impl Handle<File> {
     /// # Errors
     ///
     /// A write that failed (reported here as by a flush), or the sync's own
-    /// failure. Once a sync of the handle failed, every sync called later
-    /// fails with that error: the system reports a failure to write data
-    /// back once, so a later sync that succeeded would not mean the data
-    /// reached the device. Open the file again to start over. The handle
-    /// makes one sync call at a time (a sync called while another's call is
-    /// out waits for that call's end, and fails if it failed), and a call
-    /// whose future was dropped (a timeout) still counts: the next sync
-    /// takes its end and fails with its failure.
+    /// failure. Once a sync of the handle failed, or a write the handle had
+    /// accepted failed (reported by a flush, by another call of the handle,
+    /// or by nobody, the handle dropped or handed back), every sync called
+    /// later fails with that error: the system reports a failure to write
+    /// data back once, so a later sync that succeeded would not mean the data
+    /// reached the device. A clone ([`try_clone`](Self::try_clone)) shares
+    /// this with the handle, as it shares the open file. Opening the file
+    /// again starts over, and says nothing of whether the earlier writes
+    /// landed. The handle makes one sync call at a time (a sync called while
+    /// another's call is out waits for that call's end, and fails if it
+    /// failed), and a call whose future was dropped (a timeout) still counts:
+    /// the next sync takes its end and fails with its failure. A sync of the
+    /// handle made while a sync of its clone is out is not ordered with it:
+    /// the system may report a lost write-back to the clone's call alone.
     pub async fn sync_all(&self) -> io::Result<()> {
         if !self.is_regular() {
             return self.on_pool(File::sync_all).await;
@@ -189,9 +196,15 @@ impl Handle<File> {
 
     /// A second handle to the same open file, with a cursor of its own
     /// starting where the file's offset is (writes in flight landed first).
+    /// The two share what their syncs answer: once a sync of either failed,
+    /// or a write either accepted failed, every later sync of both fails (see
+    /// [`sync_all`](Self::sync_all)), since the system reports a lost
+    /// write-back of the open file to one call only.
     pub async fn try_clone(&self) -> io::Result<Handle<File>> {
         let file = self.on_pool(File::try_clone).await?;
-        Handle::new(file)
+        let clone = Handle::new(file)?;
+        let _ = clone.lost.set(Arc::clone(self.lost()));
+        Ok(clone)
     }
 
     /// Runs `call` on the blocking pool once the writes in flight landed, on

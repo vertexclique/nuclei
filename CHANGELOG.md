@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- **A write lost after it was accepted fails every later sync** (every backend). A write the
+  handle accepted into its write-behind, which the kernel then failed (no space, an IO error, a
+  file too large), was reported once, by whichever call took the failure first: a flush, the
+  flush a sync starts with, `metadata`, `set_len`, `set_permissions`, `set_times`,
+  `set_modified`, `try_clone`, `get_mut`, `into_inner` or the drop. The next sync then made a
+  call, which the kernel answered with no error, and said the file held bytes that never reached
+  it. Positional writes left by their tasks, and lent writes whose futures went away, were
+  forgotten the same way. The handle now keeps every such failure, and every sync call that
+  failed, in one record no report forgets: every later sync fails with it, with no call. The
+  record outlives `get_mut`, and a clone made with `try_clone` shares it, since the kernel reports
+  a lost write-back of the open file to one of the two only
+  (`proofs/tla/lent/LentFile.tla`, scenarios "sync_lost" and "sync_clone":
+  `MF_sync_forgets_loss`, `MF_sticky_unshared`).
 - **A failed sync is no longer forgotten by a dropped or a concurrent sync**
   (every backend). The kernel reports a lost write-back to one sync call only, and the handle
   kept the failure only once the failing call's task took its end. A sync whose future was
