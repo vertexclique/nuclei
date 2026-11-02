@@ -487,19 +487,23 @@ its mailbox and lets go of its wheel, and every timer it held for a cell, armed 
 for, orphans the cell (`RemoteTimer::orphan`, through the wheel's `Armed` hold), whose waker is
 woken, so the cell never keeps the task's waker for good while the task keeps the cell; a request
 posted to a shard that went is drained by its poster the same way. The sleep, polled again, lets
-the orphaned cell go and arms the timer where it is polled, here a second shard. The family
-checks 17 configurations: 8 that must pass (awaited and dropped, with the shard staying and with
-it free to go, each with every safety property and with liveness), 5 mutations (a fire that
-leaves its entry in the wheel and a cancel that does not remove it break `NothingLeft`; a drop
-that leaves its waker in the cell breaks `NoWakeAfterDrop`; a shard that goes and wakes nobody
-breaks `NoStrandedWaker`, the cycle that kept a dropped runtime's shards after a handoff; a sleep
-that waits on its orphaned cell breaks `Termination`), and 4 witnesses (a drop after the timer
-was armed, a drop before the shard applied the arm request, a fire that wakes the task, a timer
-armed again on the second shard after the first went). A dropped sleep's deadline may
+the orphaned cell go and arms the timer where it is polled, here a second shard. The sleep may
+move to a second task between two polls: the cell holds the first task's waker until the second
+task's poll registers its own, so the poll looks at the orphan mark only after it registers. The
+family checks 21 configurations: 10 that must pass (awaited and dropped, with the shard staying
+and with it free to go, each with every safety property and with liveness, and the sleep moving
+to a second task as the shard goes, dropped and awaited), 6 mutations (a fire that leaves its
+entry in the wheel and a cancel that does not remove it break `NothingLeft`; a drop that leaves
+its waker in the cell breaks `NoWakeAfterDrop`; a shard that goes and wakes nobody breaks
+`NoStrandedWaker`, the cycle that kept a dropped runtime's shards after a handoff; a sleep that
+waits on its orphaned cell, and a poll that looks only at `fired` after it registers, break
+`Termination`), and 5 witnesses (a drop after the timer was armed, a drop before the shard
+applied the arm request, a fire that wakes the task, a timer armed again on the second shard
+after the first went, and, an open question, a first shard nobody drives, which a runtime with no
+worker taking tasks hands out, where the sleep never ends). A dropped sleep's deadline may
 never come within a run, so a cancel that did not remove its entry shows as a leak, as it would
-be for a far deadline. The waker slot's register-then-look-again handshake guards a waker that
-changed between polls; one task cannot show that, and it is checked by the loom models of the
-sync module's waker cell. A precise sleep polled off a shard goes through the same cell and the
+be for a far deadline. The waker slot's own register-then-look-again handshake is checked by the
+loom models of the sync module's waker cell. A precise sleep polled off a shard goes through the same cell and the
 same mailbox (`TimerOp::Insert`, `Remove` and `Cancel` carry which wheel the timer is in, the
 cell's `precise` flag), so the protocol checked here is its protocol too.
 
@@ -516,16 +520,20 @@ timeout counts milliseconds, so there the poller arms a timerfd for the precise 
 whenever the earliest one changes, and kqueue adds a one-shot `EVFILT_TIMER` in nanoseconds
 (critical on Apple's systems, so it is not coalesced) to the wait itself. A precise sleep may
 come while the shard waits: another thread wakes it, its task arms the sleep. A paused clock
-publishes the earliest deadline of either wheel before the shard parks, and jumps there. The
-family checks 13 configurations: 5 that must pass (a backend whose wait is precise, one that
-counts ticks, a paused clock, and liveness for the last two), with `NeverEarly` (no sleep ends
+publishes the earliest deadline of either wheel before the shard parks, and jumps there. A task
+may advance the running clock while the poller's timer is armed: the timer counts the system's
+time, so it is armed for the deadline as the system sees it and armed again when an advance
+moves that. The family checks 17 configurations: 7 that must pass (a backend whose wait is
+precise, one that counts ticks, one that counts ticks with the running clock advanced once, a
+paused clock, and liveness for the last three), with `NeverEarly` (no sleep ends
 before its deadline) and `OnTime` (a precise sleep ends at its deadline, a sleep of the
 millisecond wheel at its tick), every choice of the deadlines from 1 to 9 and of when the second
-precise sleep comes; 5 mutations (the poller's own timer never armed, armed once and never moved,
-a wait that looks at the millisecond wheel alone, and a paused shard that publishes the
-millisecond wheel alone each break `OnTime`; a shard that never fires its microsecond wheel
-breaks `Termination`), and 3 witnesses (the poller's timer ends a park, it is moved to an earlier
-deadline, a paused clock jumps to a precise deadline). The model has a tick of four units and no
+precise sleep comes; 6 mutations (the poller's own timer never armed, armed once and never moved,
+kept by the deadline on the clock so an advance does not move it, a wait that looks at the
+millisecond wheel alone, and a paused shard that publishes the millisecond wheel alone each break
+`OnTime`; a shard that never fires its microsecond wheel breaks `Termination`), and 4 witnesses
+(the poller's timer ends a park, it is moved to an earlier deadline, a paused clock jumps to a
+precise deadline, the timer armed again for the same deadline on the clock after an advance). The model has a tick of four units and no
 wake latency, and its "coarse" backend stands for both pollers that arm a timer. The Lean file
 proves the rounding the wheels rest on, for every deadline and clock reading: a deadline armed
 rounded up and a clock read rounded down never fire a timer early, on either wheel; a precise
@@ -543,30 +551,50 @@ the millisecond one with another unit, so `Wheel.lean` covers its placement and 
 
 `clock` (`tla/clock/Clock.tla`) checks how a runtime's paused clock jumps to the earliest
 armed timer when the runtime has nothing else to do (`src/rt/paused.rs`, the park path of
-`src/rt/shard.rs`, the job count of `src/rt/blocking.rs`). Each shard publishes its deadline
-and counts a park before it says it parks; parked, it claims the advance, looks at every shard
-(parked with nothing pushed, noting its park count and deadline), looks again (the same,
-unchanged), moves the clock to the earliest deadline and wakes the shards whose timers came
-due. A shard that wakes, or that finds work as it is about to sleep, waits for an advance in
-progress before it reads the clock. A blocking job wakes its task before it counts itself out
-of the jobs in flight, then tries the advance too. The family checks five configurations that
-must pass. Three check `ClockNeverPassesArmed` (no jump leaves an armed timer behind) and
+`src/rt/shard/run.rs` and `src/rt/shard/timers.rs`, the job count of `src/rt/blocking.rs`, the
+count of polls the handoff took in `src/rt/handoff/monitor.rs`). Each shard publishes its
+deadline and counts a park before it says it parks; parked, it claims the advance, looks at the
+work in flight, looks at every shard the clock counts (parked with nothing pushed or posted,
+noting its park count and deadline), looks again (the same, unchanged), moves the clock to the
+earliest deadline and wakes the shards whose timers came due. A shard that wakes, or that finds
+work as it is about to sleep, waits for an advance in progress before it reads the clock. Work in
+flight on no shard (a blocking job, or the rest of a poll the handoff took from its thread)
+wakes its task before it counts itself out, then tries the advance too. A timer op another
+thread posts (a removal, a cancel) wakes a parked shard, which is not idle while it holds the op.
+The family checks seven configurations of it that must pass. Four check
+`ClockNeverPassesArmed` (no jump leaves an armed timer behind) and
 `NoBadJump` (every jump comes over a moment, between its two looks, at which every shard was
-idle, with no job in flight) at full size: two shards with a pusher and a blocking job; two
-shards with a timer each, the scenario the races below need; three shards. With no blocking job
+idle, with no work in flight) at full size: two shards with a pusher and work in flight, in two
+runs by where the pusher's one item goes; two shards with a timer each, the scenario the races
+below need; three shards. With no blocking job
 the shards are alike, so those two (and the races' own runs) check each state once up to the
 shards' names (a symmetry set), and every run forgets a value nobody reads again (whether a
-shard's own timer came due, the shard a push went to) once it was read. Two smaller ones
+shard's own timer came due, the shard a push went to) once it was read. Three smaller ones
 check both and, over every behaviour, the liveness property `TimersFire` (every armed timer
 fires: no runtime hangs with its shards asleep and a timer armed): two shards with the blocking
-job alone, and two shards with the pusher alone, whose timers the tasks they wake arm again. A
-timer on each of two shards, or three shards, are too many states to check every behaviour, so
-`TimersFire` is checked where one shard arms its timers. Then one mutation per rule (a deadline
-published after the park, a busy path that does not wait for the advance, one look instead of
-two, a woken shard that does not wait, no look at the jobs, no attempt at the park); and a
-witness that the clock jumps at all. Writing the model found the first two of those races in the
-first version of the code (a deadline published after the park, a busy path that did not wait);
-the code was fixed before it was committed.
+job alone; two shards with the pusher alone, whose timers the tasks they wake arm again; and two
+shards with one item of work and a timer op posted to either. A timer on each of two shards, or
+three shards, are too many states to check every behaviour, so `TimersFire` is checked where one
+shard arms its timers. Then one mutation per rule (a deadline published after the park, a busy path
+that does not wait for the advance, one look instead of two, a woken shard that does not wait,
+no look at the work in flight, no attempt at the park, a posted op that wakes nobody, a shard
+the clock does not count, which is a thread's own shard that the handoff left its bound tasks on
+with no guest, and a taken poll left out of the count); and a witness that the clock jumps at
+all. Writing the model found the first two of those races in the first version of the code (a
+deadline published after the park, a busy path that did not wait); the code was fixed before it
+was committed. A shard the clock does not count is also what today's code gives a thread inside
+`block_on` since before another thread paused the clock, an open question.
+
+Three smaller modules sit beside it. `ClockRead.tla` checks that no thread's readings of a clock
+go back as it is paused (`Clock::now`, `Clock::now_nanos`, `Clock::pause`): a reading of a clock
+nobody paused leaves no trace, so it reads the system's time before it looks at the mark, and
+the pause marks the clock before it reads its time; one run must pass, and a mutation for each
+of the two orders breaks `ReaderMonotonic`. `OneWheel.tla` and `ForeignArm.tla` are witnesses of
+open questions, what today's code does: a thread's own shard serving two runtimes' `block_on`
+reads one wheel through the inner runtime's clock, so a paused and advanced clock fires the
+other's sleep early (`NeverEarly` broken); and a sleep made and polled on a thread outside the
+runtime races the jump, which may pass its deadline before its arm request lands
+(`ForeignNeverPassed` broken).
 
 ## The guard of an IO source's side
 
@@ -1434,7 +1462,9 @@ a timer again from its slot's start puts it on a lower level, so it always reach
 a deadline in the next top window goes to a slot the code reads as the next window's, which
 starts no later than the deadline. It computes a worked example: the wheel at 1000 and a timer
 due at 70000 go through level 2, slot 17 (from 69632), level 1, slot 5 (from 69952), and fire
-at 70000. Every theorem rests on `propext` and `Quot.sound` only.
+at 70000. A timer's key carries its entry's generation, which each release of the entry moves on
+by one modulo 2^64: the file proves a key stays stale for fewer than 2^64 releases of its entry,
+and that the bound is exact. Every theorem rests on `propext` and `Quot.sound` only.
 
 The code finds a timer's level with one exclusive-or and a count of leading zeros; the Lean
 file states the level by its definition, and a property test checks the two agree. The slot
