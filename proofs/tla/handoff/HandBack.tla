@@ -495,11 +495,11 @@ W_ask:
         failed := TRUE;                                                      \* answered so
         goto W_done;                                                         \* the code goes on
     elsif closed then                                                        \* the runtime shut down:
-        loan[Req(self, wret)] := "gone";                                                \* the call answers so
+        loan[Req(self, wret)] := "gone";                                     \* the call answers so
         goto W_done;                                                         \* the code goes on
     else
-        lends := lends \cup {Req(self, wret)};                                          \* the lend task queued
-        loan[Req(self, wret)] := "asked";                                               \* the request made
+        lends := lends \cup {Req(self, wret)};                               \* the lend task queued
+        loan[Req(self, wret)] := "asked";                                    \* the request made
     end if;
 W_wait:
     \* Parked, running nothing, until the shard is lent to it, or the runtime shuts down; then a
@@ -508,7 +508,7 @@ W_wait:
     \* borrow_no_wait: in at once). Its task may be cancelled meanwhile: the wait goes on. (MUTATION
     \* wait_runs_tasks: the wait runs thread 1's bound task, which asks for the shard too.)
     either
-        await loan[Req(self, wret)] = "lent" \/ Mode = "borrow_no_wait";                \* lent
+        await loan[Req(self, wret)] = "lent" \/ Mode = "borrow_no_wait";     \* lent
         inS := inS \cup {self};                                              \* inside the shard
         holders := holders \cup {self};                                      \* the value lent to it
         if draining then                                                     \* while the worker drains:
@@ -516,15 +516,17 @@ W_wait:
         end if;
     or
         await closed /\ Mode # "close_no_wake"                               \* woken by the close,
-              /\ (loan[Req(self, wret)] = "asked" \/ Mode = "gone_no_cas");             \* still asked:
-        loan[Req(self, wret)] := "gone";                                                \* gone
+              /\ (loan[Req(self, wret)] = "asked" \/ Mode = "gone_no_cas");  \* still asked:
+        loan[Req(self, wret)] := "gone";                                     \* gone
         goto W_done;                                                         \* the call answers so
     or
-        await Cancels /\ ~cancelled[Req(self, wret)] /\ loan[Req(self, wret)] = "asked";           \* a cancel from elsewhere
-        cancelled[Req(self, wret)] := TRUE;                                             \* the task's state changes
+        \* a cancel from elsewhere
+        await Cancels /\ ~cancelled[Req(self, wret)] /\ loan[Req(self, wret)] = "asked";
+        cancelled[Req(self, wret)] := TRUE;                                  \* the task's state changes
         goto W_wait;                                                         \* the wait goes on
     or
-        await Mode = "wait_runs_tasks" /\ self = 1 /\ wret = "task" /\ loan[BT] = "none";     \* MUTATION wait_runs_tasks:
+        \* MUTATION wait_runs_tasks:
+        await Mode = "wait_runs_tasks" /\ self = 1 /\ wret = "task" /\ loan[BT] = "none";
         lends := lends \cup {BT};                                            \* the bound task asks too
         loan[BT] := "asked";                                                 \* from this thread's stack
         goto BT_wait;                                                        \* and waits, nested
@@ -561,7 +563,7 @@ W_back:
     \* The closure returns; the borrower leaves the shard and gives it back.
     holders := holders \ {self};                                             \* the value let go of
     inS := inS \ {self};                                                     \* out of the shard
-    loan[Req(self, wret)] := "back";                                                    \* given back
+    loan[Req(self, wret)] := "back";                                         \* given back
     loansServed := 1;                                                        \* (record)
     if wret = "bound" then                                                   \* a bound task's call:
         boundLoans := 1;                                                     \* (record)
@@ -573,7 +575,7 @@ W_panic:
     holders := holders \ {self};                                             \* the value let go of
     inS := inS \ {self};                                                     \* out of the shard
     if Mode # "panic_keeps_loan" then                                        \* the guard:
-        loan[Req(self, wret)] := "back";                                                \* given back
+        loan[Req(self, wret)] := "back";                                     \* given back
     end if;
     panics := 1;                                                             \* (record)
     if wret = "bound" then                                                   \* a bound task's poll:
