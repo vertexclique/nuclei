@@ -2,6 +2,21 @@
 
 ## 0.5.4
 
+### Fixed
+
+- **A failed sync is no longer forgotten by a dropped or a concurrent sync**
+  (every backend). The kernel reports a lost write-back to one sync call only, and the handle
+  kept the failure only once the failing call's task took its end. A sync whose future was
+  dropped (a timeout) after its call failed, and before its task looked, left nothing, so the
+  next sync made a call of its own, which the kernel answered with no error. Two syncs at once had
+  the same gap: the second call, made after the first failed, succeeded, and its task looking
+  first answered `Ok`. A handle's sync calls are now the file state's, one at a time: a sync
+  called while another's call is out waits for that call's end, a call whose future went away
+  stays in the state, and the next sync takes its end, failure and all. A sync fails for its own
+  call's failure and for one of a call made before its own, never for a later one's
+  (`proofs/tla/lent/LentFile.tla`, scenario "sync": `MF_sync_task_records`,
+  `MF_sync_unserialized`, `MF_sync_any_failure`).
+
 ### Changed
 
 - **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix

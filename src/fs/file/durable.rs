@@ -15,9 +15,18 @@
 //!
 //! A write that failed is reported by the sync, as by a flush (and then
 //! forgotten, as a flush forgets it). A failed sync is reported, and every
-//! later sync of the handle fails with the same error without a call: the
-//! kernel reports a write-back error to one sync only, so a later sync that
-//! succeeded would say nothing of the data that did not reach the device.
+//! sync of the handle called after it fails with the same error without a
+//! call: the kernel reports a write-back error to one call only, so a later
+//! call that succeeded would say nothing of the data that did not reach the
+//! device. So that no failure the kernel reports goes unseen, the calls are
+//! the file state's, not their tasks' ([`Syncs`]): the handle makes one at a
+//! time, a sync whose call would go beside another's waiting for that one's
+//! end (two at once, the kernel could report the error to one and the other's
+//! task look first, `MF_sync_unserialized`), and a task that goes away with
+//! its call out (a timeout dropped its future) leaves the call to the state,
+//! whose next sync takes its end and its failure (`MF_sync_task_records`). A
+//! sync fails for its own call's failure and for one of a call made before
+//! its own, never for a later call's (`MF_sync_any_failure`).
 //!
 //! A sync of a range of the file (`sync_range`) is the same call with
 //! another kind: on Linux `sync_file_range(2)` (an `IORING_OP_SYNC_FILE_RANGE`
@@ -27,15 +36,18 @@
 //! the others do, and its failure is the handle's sticky one: the kernel
 //! reports a write-back error it meets to that call alone.
 
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 use std::io;
 use std::sync::Arc;
 
 use super::FileIo;
 #[cfg(ring)]
-use super::work::Work;
+use crate::fs::call::SlotJob;
 use crate::io::source::Failure;
 use crate::io::source::requests::Lease;
+use crate::rt::task::Join;
 
 /// What a sync writes through.
 #[derive(Clone, Copy)]
@@ -58,18 +70,18 @@ impl FileIo {
     /// Writes what `kind` says through, once every write it covers landed.
     pub(crate) async fn sync(self: &Arc<Self>, kind: SyncKind) -> io::Result<()> {
         poll_fn(|cx| self.poll_flush(cx)).await?;
-        if let Some(failed) = self.sync_failed.get() {
-            return Err(failed.error());
-        }
-        let result = self.sync_call(kind).await;
-        if let Err(err) = &result {
-            let _ = self.sync_failed.set(Failure::of(err));
-        }
-        // A sync that ended after another failed says nothing either.
-        result.and_then(|()| self.sync_failed.get().map_or(Ok(()), |f| Err(f.error())))
+        let mut mine = 0;
+        poll_fn(|cx| {
+            self.with_state(cx, |st, io, waker, _| {
+                st.syncs.poll(io, kind, &mut mine, waker)
+            })
+        })
+        .await
     }
 
-    async fn sync_call(&self, kind: SyncKind) -> io::Result<()> {
+    /// A sync call of `kind`: on the ring of this thread's shard where it
+    /// runs one, else a job of the blocking pool.
+    fn sync_call(&self, kind: SyncKind) -> SyncCall {
         #[cfg(ring)]
         if self.on_ring() {
             let job = match kind {
@@ -82,12 +94,114 @@ impl FileIo {
                 },
             };
             if let Ok(job) = job {
-                let mut work = Work::Slot(job);
-                return poll_fn(|cx| work.poll(cx.waker())).await;
+                return SyncCall::Slot(job);
             }
         }
         let fd = self.fd.clone();
-        crate::rt::blocking::call(move || sync_on(&fd, kind)).await
+        #[cfg(test)]
+        let fails = self.sync_fails();
+        SyncCall::Pool(
+            crate::runtime::spawn_blocking(move || {
+                #[cfg(test)]
+                if fails {
+                    return Err(io::Error::other("the device lost a write-back"));
+                }
+                sync_on(&fd, kind)
+            })
+            .join(),
+        )
+    }
+}
+
+/// The handle's sync calls, kept by the file state rather than by the tasks
+/// that make them: one out at a time, and the number of the first that
+/// failed (`proofs/tla/lent/LentFile.tla`, scenario "sync").
+#[derive(Default)]
+pub(super) struct Syncs {
+    /// The call out, or ended and not taken yet, and its number.
+    out: Option<(u64, SyncCall)>,
+    /// How many calls were made: the number of the last one.
+    made: u64,
+    /// The number of the last call whose end was taken.
+    ended: u64,
+    /// The first call that failed, and its failure: every sync whose own
+    /// call came after it, or was it, fails, and so does every sync called
+    /// after it, without a call.
+    failed: Option<(u64, Failure)>,
+}
+
+/// A sync call in flight: an operation of the ring that ends in a slot, or a
+/// job of the blocking pool.
+enum SyncCall {
+    Pool(Join<io::Result<()>>),
+    #[cfg(ring)]
+    Slot(SlotJob<io::Result<()>>),
+}
+
+impl SyncCall {
+    /// The call's end once it came, its error counted for `stats`; one the
+    /// runtime lost before it ended is a failure whose call may have run.
+    fn poll(&mut self, waker: &Waker) -> Poll<io::Result<()>> {
+        let end = match self {
+            SyncCall::Pool(job) => match Pin::new(job).poll(&mut Context::from_waker(waker)) {
+                Poll::Ready(Ok(end)) => end,
+                Poll::Ready(Err(lost)) => return Poll::Ready(Err(lost.into())),
+                Poll::Pending => return Poll::Pending,
+            },
+            #[cfg(ring)]
+            SyncCall::Slot(job) => core::task::ready!(job.poll(waker)),
+        };
+        Poll::Ready(end.inspect_err(crate::rt::counters::io_error))
+    }
+}
+
+impl Syncs {
+    /// A sync of `kind` whose own call is numbered `mine` (0 until it made
+    /// one), under the file state: first the end of the call out, whoever's,
+    /// is taken (`waker` is woken when it comes); then the sync answers if
+    /// its own call ended, fails if a call failed, or makes its call.
+    pub(super) fn poll(
+        &mut self,
+        io: &FileIo,
+        kind: SyncKind,
+        mine: &mut u64,
+        waker: &Waker,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if *mine != 0 && self.ended >= *mine {
+                return Poll::Ready(match self.failed {
+                    Some((at, failure)) if at <= *mine => Err(failure.error()),
+                    _ => Ok(()),
+                });
+            }
+            if self.out.is_some() {
+                core::task::ready!(self.take(waker));
+                continue;
+            }
+            if let Some((_, failure)) = self.failed {
+                return Poll::Ready(Err(failure.error()));
+            }
+            self.made += 1;
+            *mine = self.made;
+            self.out = Some((self.made, io.sync_call(kind)));
+        }
+    }
+
+    /// Takes the end of the call out once it came, keeping its failure if
+    /// it is the first.
+    fn take(&mut self, waker: &Waker) -> Poll<()> {
+        let Some((at, call)) = self.out.as_mut() else {
+            return Poll::Ready(());
+        };
+        let end = core::task::ready!(call.poll(waker));
+        self.ended = *at;
+        if let Err(err) = end
+            && self.failed.is_none()
+        {
+            self.failed = Some((*at, Failure::of(&err)));
+        }
+        self.out = None;
+        Poll::Ready(())
     }
 }
 

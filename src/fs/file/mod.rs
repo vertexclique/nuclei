@@ -69,7 +69,7 @@ mod work;
 use crate::buf::owned::OwnedBuf;
 use core::task::{Context, Poll, Waker};
 use std::io::{self, SeekFrom};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::Wake;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -130,8 +130,6 @@ pub(crate) struct FileIo {
     generation: AtomicU64,
     /// Positional writes left by their tasks, for the state to take.
     orphans: Orphans,
-    /// The first sync that failed: every later sync fails with it.
-    sync_failed: OnceLock<Failure>,
     /// The file was opened to append.
     append: bool,
     /// The file was opened for direct IO.
@@ -140,6 +138,10 @@ pub(crate) struct FileIo {
     /// holds the pool to keep a call in flight.
     #[cfg(test)]
     on_pool: AtomicBool,
+    /// How many of the next sync calls on the blocking pool fail without a
+    /// call, for a test of a write-back the device lost.
+    #[cfg(test)]
+    fail_syncs: core::sync::atomic::AtomicU32,
 }
 
 /// What the file state's holder does for the work others left it.
@@ -203,6 +205,9 @@ struct FileState {
     sizing: Option<crate::rt::task::Task<io::Result<u64>>>,
     /// Positional writes left by their tasks, out until they land.
     orphans: Vec<Orphan>,
+    /// The handle's sync calls: one at a time, kept here rather than by
+    /// their tasks, with the first that failed.
+    syncs: durable::Syncs,
     /// Whether a lent read at the cursor tries the page cache first.
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     cache: cached::Cache,
@@ -226,11 +231,12 @@ impl FileIo {
             cursor: AtomicU64::new(cursor),
             generation: AtomicU64::new(0),
             orphans: Orphans::new(),
-            sync_failed: OnceLock::new(),
             append: mode.append,
             direct: mode.direct,
             #[cfg(test)]
             on_pool: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_syncs: core::sync::atomic::AtomicU32::new(0),
         }))
     }
 
@@ -267,6 +273,21 @@ impl FileIo {
         });
         after.run();
         cached::has_call() && held.is_some_and(|cache| cache != cached::Cache::Never)
+    }
+
+    /// Fails the next `n` sync calls made on the blocking pool, as a device
+    /// that lost a write-back would, without a call.
+    #[cfg(test)]
+    pub(crate) fn fail_next_syncs(&self, n: u32) {
+        self.fail_syncs.store(n, Ordering::Relaxed);
+    }
+
+    /// Whether the sync call made now is one [`fail_next_syncs`] fails.
+    #[cfg(test)]
+    fn sync_fails(&self) -> bool {
+        self.fail_syncs
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
     }
 
     /// Sends this file's calls to the shard's ring again, where it runs one.
