@@ -529,22 +529,28 @@ fn run_shard(inner: &Arc<Inner>, run: Run) -> Worked {
     if worked == Worked::Detached
         && let Some(monitor) = &workers.monitor
     {
-        finish_home(monitor, &home);
+        finish_taken(inner, monitor, &home, shard);
+        return worked;
     }
     // While the runtime is still this thread's: what the shard hands on as it
     // goes (a port's keeper) goes there. Its last drop runs where its last
     // holder lets go.
     drop(shard);
-    // The taken poll and all it led to on this thread are over, its bound
-    // tasks too: out of flight, which may be all a paused clock waited for
-    // (proofs/tla/clock, `M_detached_uncounted`).
-    if worked == Worked::Detached
-        && let Some(monitor) = &workers.monitor
-    {
-        monitor.count_out();
-        super::paused::try_advance(inner, None);
-    }
     worked
+}
+
+/// The end of a thread whose shard was taken, out of the worker's loop: its
+/// bound tasks finish, its reference to the shard goes as `run_shard`'s
+/// would, and then the taken poll and all it led to on this thread are over,
+/// out of flight, which may be all a paused clock waited for
+/// (proofs/tla/clock, `M_detached_uncounted`).
+#[cold]
+#[inline(never)]
+fn finish_taken(inner: &Arc<Inner>, monitor: &Monitor, home: &Home, shard: Arc<Shard>) {
+    finish_home(monitor, home);
+    drop(shard);
+    monitor.count_out();
+    super::paused::try_advance(inner, None);
 }
 
 /// A thread whose shard was taken: its bound tasks finish on its own shard,
