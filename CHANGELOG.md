@@ -59,6 +59,18 @@
   still complete only once the old thread comes back: an accept's poll is the first exclusive
   waiter of its listener, which takes each connection's wake even once cancelled, so it cannot be
   armed again from the new runner.
+- **A call whose heavy fence fails no longer waits for good on a side whose claimant cannot serve
+  it** (Linux, Windows: where a process has a heavy fence, under memory pressure that makes it
+  fail). Such a call leaves its work in a biased side and nudges the shard that claimed the side,
+  which does it at its next take. The claim stayed with the first shard that claimed it, so once a
+  source left that shard (a thread's own shard whose `block_on` returned, a worker that went), the
+  nudge reached a shard that ran nothing, and once the source was homed on another shard the
+  claimant's own calls, foreign now, nudged themselves without end; the call waited until something
+  else took the side. A shard now gives its claim up as it lets go of its sources, doing any work a
+  fenceless call left before, and a fenceless call that finds the claim given up, or that runs on
+  the claimant's own thread with nothing held, takes the side itself. The shard claims the side
+  again at its next take as its owner (`proofs/tla/side_biased/SideBiased.tla`, `ClaimStops` and
+  `Rehomed`).
 
 ### Changed
 
