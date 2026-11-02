@@ -2303,7 +2303,9 @@ handed to another thread (`take` in `src/rt/handoff/monitor.rs`). A spawn looks 
 sequentially consistent fence and looks at `draining` again, dropping the task unrun and refusing
 with `InvalidInput` if it is up now; only then does it push the task to the shard's inbox, look at
 `stopped` (`push_remote`) and answer Ok. The worker's loop polls what its shard queues, or looks
-whether it may exit: `draining` first, then `load` in a second load; up and zero, it stops and
+whether it may exit: `draining` first, then `load` in a second load (with the count of threads
+that lost the shard to a handoff, `Shared::nothing_live` in `src/rt/shard/detached.rs`, which
+`tla/handoff/HandBack.tla` checks); up and zero, it stops and
 drops whatever it still queues. A task's count goes when it completes or is dropped. The monitor
 may hand the shard to the spare while its runner is in a task's poll: that poll ends on the old
 thread, and a Pending task's wake goes back to the shard's inbox, which moved with the shard.
@@ -2361,7 +2363,8 @@ threads that run no shard.
 `is_pinned`, `go_out`, `come_back`, `claim`, `take` and `cancel` in `src/rt/handoff/slot.rs`; the
 monitor's `take` in `src/rt/handoff/monitor.rs`). A task's `with` comes back into the shard as
 any call into the runtime does (the word inside, then a look at the claim: a taken claim detaches
-the thread, and `with` answers its access error), pins the slot and lends the value to its
+the thread, and its `with` asks for the shard back, which `tla/handoff/HandBack.tla` checks),
+pins the slot and lends the value to its
 closure, which may run a nested `block_on` whose poll goes outside the shard again; then it
 unpins and goes outside. The monitor claims, fences, reads the word again and then the pins, and
 takes only if the word is unchanged and nothing is pinned, so a value lent across a nested poll
