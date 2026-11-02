@@ -1,0 +1,18 @@
+TLC run of every configuration in proofs/tla/localsemaphore, as CI ran them: TLA+ run 41461594872 on 608d5671, 2026-11-02.
+Rows written by proofs/tla/run_tlc.sh in the share jobs of .github/workflows/tla.yml, gathered from the run's log.
+Version 2.19 of 08 August 2024. Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3480 s each.
+
+configuration                generated   distinct    sec  result                                expected                              match
+L_safe                             220        160      1  pass                                  pass                                  yes
+L_mixed                            257        175      1  pass                                  pass                                  yes
+L_try                              141        103      1  pass                                  pass                                  yes
+L_live                             257        175      1  pass                                  pass                                  yes
+M_try_barges                        26         24      0  violated:FifoFair                     violated:FifoFair                     yes
+M_cancel_front_no_serve             51         47      1  violated:NoIdleFront                  violated:NoIdleFront                  yes
+M_cancel_granted_keeps              47         44      1  violated:Conservation                 violated:Conservation                 yes
+M_release_no_serve                  16         16      1  violated:NoIdleFront                  violated:NoIdleFront                  yes
+W_pass_on                           47         44      1  violated:NoPassOn                     violated:NoPassOn                     yes
+W_front_served                      51         47      1  violated:NoFrontServed                violated:NoFrontServed                yes
+W_set_aside                          6          6      1  violated:NoSetAside                   violated:NoSetAside                   yes
+
+results matching EXPECTED.txt: 11 of 11
