@@ -46,7 +46,13 @@
 (* take is the model's start: proofs/tla/handoff checks it). A multishot  *)
 (* request stays armed across its edges; a data operation is one shot.    *)
 (* The cancel marks the request at once and queues its completion to its *)
-(* own submitter, as the kernel does for a poll it cancels.               *)
+(* own submitter, as the kernel does for a poll it cancels. The old        *)
+(* request is in the kernel at the take: the adopt leaves an entry still  *)
+(* waiting to reach the kernel alone (the new runner submits it, so it is *)
+(* the new runner's), and delivers the completions the kernel posted      *)
+(* already before it makes zombies; both matter when one runner after     *)
+(* another blocks at once, each new one taking over what the last one     *)
+(* queued, which one take cannot show: tests/cadence.rs checks them.      *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC                                 \* numbers, sequences (the completion queue), set sizes, TLC's helpers
 

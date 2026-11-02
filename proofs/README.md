@@ -1295,7 +1295,10 @@ the thread that submitted it, which a thread in a wait no signal ends never runs
 cancels each poll the old runner armed (a stream's or a datagram's poll, a poll for room, the
 ring's wake read), tells its side it ended so the side arms another of its own, and keeps the old
 one as a zombie whose late completions go nowhere and whose end only frees it; a data operation
-and an accept are left as they are. 13 configurations: 5 that must pass (the old runner asleep
+and an accept are left as they are. An entry still waiting to reach the kernel is left alone (the
+new runner submits it), and the completions already posted are delivered before the zombies are
+made: both matter when one runner after another blocks at once, which one take cannot show, so
+`tests/cadence.rs` checks them. 13 configurations: 5 that must pass (the old runner asleep
 where a signal wakes it; in a wait no signal ends, for good and until it comes back; a data
 operation with the old runner asleep where a signal wakes it; an accept with the old runner coming
 back; with `OneOut`, the side has one request out as its own, `OwnEnds`, it takes only that
