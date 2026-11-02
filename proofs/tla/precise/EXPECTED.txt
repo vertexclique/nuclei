@@ -12,3 +12,7 @@ M_publish_tick_only            MC_Precise           violated:OnTime
 W_kernel_end                   MC_Precise           violated:NoKernelEnd
 W_move                         MC_Precise           violated:NoMove
 W_jump_precise                 MC_Precise           violated:NoJumpToPrecise
+G_skew                         MC_Precise           pass
+G_live_skew                    MC_Precise           pass
+M_key_on_clock                 MC_Precise           violated:OnTime
+W_skew_rearm                   MC_Precise           violated:NoSkewRearm

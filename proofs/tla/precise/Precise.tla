@@ -26,16 +26,28 @@
 (* precise sleep that ends after it, a sleep on the tick wheel that ends   *)
 (* off its tick, or a sleep that never ends.                               *)
 (*                                                                         *)
+(* A running clock may be advanced (`time::advance` from a task, once      *)
+(* here, `Skews`): the clock moves on, the system's time does not, and the *)
+(* clock's skew, the clock's reading less the system's, grows. The         *)
+(* poller's own timer counts the system's time, so it is armed for a       *)
+(* deadline as the system sees it, the clock's deadline less the skew, and *)
+(* armed again whenever that changes: after an advance the same deadline   *)
+(* on the clock is an earlier one for the system.                          *)
+(*                                                                         *)
 (* What is abstract: time is a count of the finest unit and a tick is four *)
 (* of them; the shard does nothing but its timers, and wakes exactly when *)
 (* its wait ends (no latency); kqueue's timer is the timerfd's twin, so    *)
-(* the model's "coarse" backend stands for both pollers that arm one.      *)
+(* the model's "coarse" backend stands for both pollers that arm one; an  *)
+(* advance moves the clock to a time before every deadline still pending, *)
+(* so the sleeps it would pass (which fire at once, by design) are not in *)
+(* the run.                                                                *)
 (***************************************************************************)
 EXTENDS Integers, TLC
 
 CONSTANTS
     Paused,    \* TRUE: the clock is paused, and moves only by jumps to the earliest deadline
     Backend,   \* "fine": the wait itself ends to the finest unit; "coarse": it counts ticks
+    Skews,     \* TRUE: a task may advance the running clock once
     Mutation   \* "none", or the name of the one rule this run takes away
 
 \* A tick of the coarse wheel, in units of the fine one.
@@ -58,8 +70,13 @@ variables
     armed = [s \in Sleeps |-> s # "p2"],  \* the sleep is in its wheel: the second precise one comes later
     done = [s \in Sleeps |-> FALSE],      \* the sleep ended
     doneAt = [s \in Sleeps |-> 0],        \* when it ended
-    kernelAt = Never,               \* the deadline the poller's own timer is armed for, until it fires
+    skew = 0,                       \* the clock's reading less the system's
+    kernelAt = Never,               \* the system's time the poller's own timer is armed to end at, until it fires
+    armedFor = Never,               \* the deadline the poller keeps as the one it armed for (`armed_for`)
+    clockArmed = Never,             \* (ghost) the clock's deadline the timer was last armed for
     woken = FALSE,                  \* another thread woke the shard once, and its task armed the second precise sleep
+    skewed = FALSE,                 \* the running clock was advanced
+    skewRearmed = FALSE,            \* (record) the timer was armed again for the same deadline on the clock, after an advance
     kernelEnded = FALSE,            \* (record) a park was ended by the poller's own timer
     moved = FALSE,                  \* (record) that timer was moved to an earlier deadline
     jumpedToPrecise = FALSE;        \* (record) a paused clock jumped to a precise deadline
@@ -121,16 +138,22 @@ S_park:
     else
         \* The real clock. The wait's own timeout ends at the earliest deadline, rounded up to a
         \* tick where the backend counts ticks, and never before now; there a precise earliest
-        \* deadline arms the poller's own timer, moved when the deadline is another one
+        \* deadline arms the poller's own timer for that deadline as the system sees it (the
+        \* clock's less the skew), armed again when the deadline the poller keeps is another one
         \* (`arm_precise`). MUTATION no_arm: the poller's own timer is never armed.
         \* MUTATION stale_arm: it is armed only when none is, and never moved.
+        \* MUTATION key_on_clock: the poller keeps the deadline on the clock, as before the fix,
+        \* so after an advance it finds the deadline it armed for and arms nothing.
         with own = (IF Earliest = Never THEN Never
                     ELSE IF Backend = "fine" THEN Earliest ELSE OnTick(Earliest)),
+             key = (IF Mutation = "key_on_clock" THEN Earliest ELSE Earliest - skew),
              arm = (Backend = "coarse" /\ EarliestIsPrecise /\ Mutation # "no_arm"
-                    /\ kernelAt # Earliest
-                    /\ ~(Mutation = "stale_arm" /\ kernelAt # Never)),
-             prev = kernelAt,
-             timer = (IF arm THEN Earliest ELSE kernelAt),
+                    /\ armedFor # key
+                    /\ ~(Mutation = "stale_arm" /\ armedFor # Never)),
+             prev = armedFor,
+             \* where the poller's timer ends, in the system's time, and then on the clock
+             timerSys = (IF arm THEN Earliest - skew ELSE kernelAt),
+             timer = (IF timerSys = Never THEN Never ELSE timerSys + skew),
              ends = (IF Min(own, timer) < now THEN now ELSE Min(own, timer)) do
             either
                 \* Another thread wakes the shard before its wait ends, and its task arms the
@@ -142,16 +165,38 @@ S_park:
                 end with;
                 armed["p2"] := TRUE;
                 woken := TRUE;
-                moved := moved \/ (arm /\ prev # Never /\ Earliest < prev);
-                kernelAt := timer;
+                moved := moved \/ (arm /\ prev # Never /\ key < prev);
+                skewRearmed := skewRearmed \/ (arm /\ clockArmed = Earliest);
+                kernelAt := timerSys;
+                armedFor := IF arm THEN key ELSE armedFor;
+                clockArmed := IF arm THEN Earliest ELSE clockArmed;
+            or
+                \* Another thread wakes the shard before its wait ends, and its task advances
+                \* the running clock: the clock moves on by one or two units, to a time before
+                \* every deadline still pending; the system's time stays, and the skew grows.
+                await Skews /\ ~skewed /\ now + 1 < ends;
+                with w \in now + 1 .. ends - 1, k \in 1..2 do
+                    await \A s \in Pending : w + k < Due(s);
+                    now := w + k;
+                    skew := skew + k;
+                end with;
+                skewed := TRUE;
+                moved := moved \/ (arm /\ prev # Never /\ key < prev);
+                skewRearmed := skewRearmed \/ (arm /\ clockArmed = Earliest);
+                kernelAt := timerSys;
+                armedFor := IF arm THEN key ELSE armedFor;
+                clockArmed := IF arm THEN Earliest ELSE clockArmed;
             or
                 \* The wait ends by itself. The poller's own timer, if it ended it, fired and is
-                \* armed no more; else it stays armed for its deadline.
+                \* armed no more (the poller forgets the deadline it kept); else it stays armed.
                 await ends < Never;
                 now := ends;
                 kernelEnded := kernelEnded \/ (timer = ends /\ timer < own);
-                moved := moved \/ (arm /\ prev # Never /\ Earliest < prev);
-                kernelAt := IF timer = ends THEN Never ELSE timer;
+                moved := moved \/ (arm /\ prev # Never /\ key < prev);
+                skewRearmed := skewRearmed \/ (arm /\ clockArmed = Earliest);
+                kernelAt := IF timer = ends THEN Never ELSE timerSys;
+                armedFor := IF timer = ends THEN Never ELSE IF arm THEN key ELSE armedFor;
+                clockArmed := IF timer = ends THEN Never ELSE IF arm THEN Earliest ELSE clockArmed;
             end either;
         end with;
         goto S_fire;
@@ -186,4 +231,7 @@ NoKernelEnd == ~kernelEnded
 NoMove == ~moved
 \* A paused clock jumps to a precise deadline.
 NoJumpToPrecise == ~jumpedToPrecise
+\* After an advance of the running clock, the poller's timer is armed again for a deadline on the
+\* clock it was armed for already: the deadline moved for the system alone.
+NoSkewRearm == ~skewRearmed
 =============================================================================
