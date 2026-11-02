@@ -39,6 +39,11 @@
   the shards waiting in `Proactor::wait`, but only a wait on a thread that runs no shard entered
   its shard among them: a wait on a thread that runs one (a task's, a `block_on`'s) ran its turn
   unseen, and waited until IO came (`proofs/tla/park/Park.tla`, `unregistered_wait`).
+- **A turn driven by hand runs a bounded number of tasks.** `Proactor::wait` ran every task ready,
+  and the ones they woke, before it looked at its timers or its poller: a task that kept yielding
+  (waiting for a flag a timer's task sets) held the call for good at full CPU. Each of the turn's
+  two runs of tasks now takes at most `event_interval` of them (`proofs/tla/loop/RunLoop.tla`,
+  `Mode = "turn"`).
 - **A notification of a sleeping worker that fails is tried again** (macOS, the BSDs, Windows).
   `kevent` and `PostQueuedCompletionStatus` can fail for want of a resource, and the failure was
   dropped. The waker that takes a sleeping shard's flag back is the only one that notifies it, so
