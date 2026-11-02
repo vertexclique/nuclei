@@ -188,35 +188,38 @@ fn driver_fills_lent() -> bool {
     crate::proactor::Proactor::backend() != crate::IoBackend::IoUring
 }
 
-/// An owned receive into 16 bytes, given up once the driver received a datagram of `len` into
-/// its buffer; then a datagram of 4 bytes. What the next receive gets: the first datagram whole
-/// if it fit, else the second, the first dropped and counted.
+/// A waker that only says it was woken.
+struct Flag(std::sync::atomic::AtomicBool);
+
+impl std::task::Wake for Flag {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// An owned receive into 16 bytes, given up once the side woke it for a datagram of `len`: the
+/// driver received the datagram into its buffer, or (on a ring) the socket said it holds one.
+/// Then a datagram of 4 bytes. What the next receive gets: the first datagram whole if it fit or
+/// stayed on the socket, else the second, the first dropped and counted.
 async fn given_up_then_received(
     a: &Handle<UdpSocket>,
     b: &Handle<UdpSocket>,
     len: usize,
 ) -> Vec<u8> {
     let b_addr = b.local_addr().unwrap();
+    let flag = std::sync::Arc::new(Flag(std::sync::atomic::AtomicBool::new(false)));
+    let waker = std::task::Waker::from(std::sync::Arc::clone(&flag));
     let mut waiting = Box::pin(b.recv_from_owned(Vec::with_capacity(16)));
-    assert!(
-        within(poll_fn(|cx| Poll::Ready(
-            waiting.as_mut().poll(cx).is_pending()
-        )))
-        .await
-    );
+    let first = waiting
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(&waker));
+    assert!(first.is_pending());
     within(a.send_to(&pattern(len), b_addr)).await.unwrap();
-    // Until the driver took the datagram off the socket into the lent buffer.
-    b.get_ref().set_nonblocking(true).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while driver_fills_lent()
-        && !matches!(
-            b.get_ref().peek_from(&mut [0u8; 1]),
-            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock
-        )
-    {
+    while !flag.0.load(std::sync::atomic::Ordering::SeqCst) {
         assert!(
             std::time::Instant::now() < deadline,
-            "the driver never took the datagram"
+            "the side never woke the receive"
         );
         crate::time::sleep(Duration::from_millis(1)).await;
     }
