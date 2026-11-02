@@ -5,6 +5,7 @@
 use core::mem::ManuallyDrop;
 use std::sync::Arc;
 
+use super::caught::{self, Panic};
 use super::context::{self, Bracketed};
 use super::handoff::home::Home;
 use super::shard::Shared;
@@ -115,28 +116,39 @@ unsafe impl Schedule for Sched {
     }
 
     #[inline]
-    fn after_poll(&self, id: super::task::Id) {
-        if let Some(hooks) = &*self.hooks {
-            super::tuning::call(hooks.after_poll.as_ref(), id);
+    fn after_poll(&self, id: super::task::Id) -> Option<Panic> {
+        match &*self.hooks {
+            Some(hooks) => super::tuning::call_caught(hooks.after_poll.as_ref(), id),
+            None => None,
         }
     }
 
     #[inline]
-    fn terminated(&self, id: super::task::Id) {
-        if let Some(hooks) = &*self.hooks {
-            super::tuning::call(hooks.terminate.as_ref(), id);
+    fn terminated(&self, id: super::task::Id) -> Option<Panic> {
+        match &*self.hooks {
+            Some(hooks) => super::tuning::call_caught(hooks.terminate.as_ref(), id),
+            None => None,
         }
     }
 
     fn panicked(&self, _id: super::task::Id) {
-        let runtime = self
-            .hooks
-            .as_ref()
-            .and_then(|hooks| hooks.shutdown.as_ref());
-        if let Some(runtime) = runtime.and_then(std::sync::Weak::upgrade) {
-            // In the middle of the task's change of state: nothing here may
-            // unwind.
-            super::task::abort_on_panic(|| runtime.shut_down_on_panic());
+        // In the middle of the task's change of state, nothing here may
+        // unwind: not the shutdown, nor the drop of the last handle of the
+        // runtime that may come with it.
+        let shut = caught::catch(|| {
+            let runtime = self
+                .hooks
+                .as_ref()
+                .and_then(|hooks| hooks.shutdown.as_ref());
+            if let Some(runtime) = runtime.and_then(std::sync::Weak::upgrade) {
+                runtime.shut_down_on_panic();
+            }
+        });
+        if let Some(panic) = shut {
+            caught::lost(
+                format_args!("the runtime's shutdown after a task's panic panicked"),
+                panic,
+            );
         }
     }
 }

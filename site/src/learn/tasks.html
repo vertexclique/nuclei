@@ -1,7 +1,7 @@
 <!--title Tasks-->
 <!--lede Spawn work, wait for it, cancel it, and run what is not Send or not async.-->
 <h2 id="spawn">Spawn and await</h2>
-<p><code>nuclei::spawn</code> takes a future that is <code>Send + 'static</code> and returns a <code>Task&lt;T&gt;</code>. A task is a future itself: awaiting it gives the task's output. If the task panics, awaiting it resumes the panic.</p>
+<p><code>nuclei::spawn</code> takes a future that is <code>Send + 'static</code> and returns a <code>Task&lt;T&gt;</code>. A task is a future itself: awaiting it gives the task's output. If the task panics, awaiting it resumes the panic. So does a future that panics as it is dropped, once it completed or as it was cancelled: the panic is the task's outcome, even for a handle that cancelled it. A panic no handle can take is logged at error; the runtime and its other tasks run on.</p>
 <!--example tasks_spawn-->
 
 <h2 id="lifetime">Dropping, detaching, cancelling</h2>

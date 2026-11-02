@@ -18,6 +18,14 @@
 //!   (its last waker went during or just after the poll). A cancel, or the
 //!   last waker, that finds the task idle schedules it once more instead, so
 //!   the future of a task bound to one thread is dropped on that thread.
+//! - **No transition unwinds.** The task's own code that runs outside its
+//!   poll's catch (its future's drop, a hook, an output nobody takes, the
+//!   drop of what the memory holds) has its panic caught where it happens.
+//!   A panic of the poll, a hook or the future's drop is the task's outcome
+//!   for its handle, even a handle that cancelled: a cancel whose future's
+//!   drop panicked ends as a completion with that panic, closed no more
+//!   ([`settle`](RawTask::settle)). With no handle left, a panic is logged
+//!   at error (`proofs/tla/task/Task.tla`).
 //! - **The memory lives while anything refers to it.** The count holds the
 //!   `Runnable` and every `Waker`, the [`TASK`] flag the handle; the last of
 //!   them to go frees the memory, after the future and the output are gone.
@@ -31,31 +39,26 @@ use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::header::Header;
 use super::state::{
     AWAITER, CLOSED, COMPLETED, FLAGS, NOTIFYING, REFERENCE, REGISTERING, RUNNING, SCHEDULED, TASK,
 };
-use super::{Runnable, Schedule, ScheduleInfo, abort_on_panic};
+use super::{Id, Runnable, Schedule, ScheduleInfo, abort_on_panic};
+use crate::rt::caught;
+pub(crate) use crate::rt::caught::Panic;
 use crate::sync::internal::{Ordering, UnsafeCell};
-
-/// What a poll that panicked left: the payload, handed to whoever awaits
-/// the task.
-pub(crate) type Panic = Box<dyn Any + Send + 'static>;
 
 /// The typed functions of one kind of task, reached through its header.
 pub(super) struct TaskVTable {
     /// Hands a `Runnable` the caller made for the task to its schedule.
     pub(super) schedule: unsafe fn(*const (), ScheduleInfo),
-    /// Drops the future.
-    pub(super) drop_future: unsafe fn(*const ()),
+    /// Drops a runnable that is not run: the task closes, its future goes.
+    pub(super) drop_runnable: unsafe fn(*const ()),
     /// Moves the output out, into the `Result<T, Panic>` the second pointer
     /// points to.
     pub(super) read_output: unsafe fn(*const (), *mut ()),
-    /// Drops one reference.
-    pub(super) drop_ref: unsafe fn(*const ()),
     /// Frees the memory.
     pub(super) destroy: unsafe fn(*const ()),
     /// Polls the future once; true when the task woke itself and was
@@ -89,9 +92,8 @@ where
 {
     const VTABLE: TaskVTable = TaskVTable {
         schedule: Self::schedule,
-        drop_future: Self::drop_future,
+        drop_runnable: Self::drop_runnable,
         read_output: Self::read_output,
-        drop_ref: Self::drop_ref,
         destroy: Self::destroy,
         run: Self::run,
         waker: RawWakerVTable::new(
@@ -252,7 +254,7 @@ where
             let new = header.state.fetch_sub(REFERENCE, Ordering::AcqRel) - REFERENCE;
             if new & !FLAGS == 0 && new & TASK == 0 {
                 if new & (COMPLETED | CLOSED) == 0 {
-                    Self::drop_future(ptr);
+                    Self::drop_unawaited(ptr);
                 }
                 Self::destroy(ptr);
             }
@@ -271,28 +273,164 @@ where
         }
     }
 
-    unsafe fn drop_future(ptr: *const ()) {
+    /// [`drop_future_here`](Self::drop_future_here) out of line, for a cancel.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the live future.
+    unsafe fn drop_future(ptr: *const ()) -> Option<Panic> {
         // SAFETY: the caller's contract.
         unsafe { Self::drop_future_here(ptr) }
     }
 
-    /// [`drop_future`](Self::drop_future), inline where a run completes.
+    /// Drops the future of a task nobody can wake or await any more: a
+    /// panic of the drop is logged.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the live future.
+    unsafe fn drop_unawaited(ptr: *const ()) {
+        // SAFETY: the caller's contract, and its reference keeps the task.
+        unsafe {
+            if let Some(panic) = Self::drop_future(ptr) {
+                lost_ending(Self::cell(ptr).header.id, panic);
+            }
+        }
+    }
+
+    /// Drops the future, then tells the schedule; inline where a run
+    /// completes. A panic of the drop, or of the terminate hook after it, is
+    /// caught and returned: the drop's, the hook's then logged.
     ///
     /// # Safety
     ///
     /// The caller owns the live future.
     #[inline(always)]
-    unsafe fn drop_future_here(ptr: *const ()) {
+    unsafe fn drop_future_here(ptr: *const ()) -> Option<Panic> {
         // SAFETY: the caller owns the live future.
         unsafe {
             let cell = Self::cell(ptr);
+            let mut dropped = None;
             cell.schedule.drop_future(|| {
-                abort_on_panic(|| {
+                dropped = caught::catch(|| {
                     cell.core
                         .with_mut(|core| ManuallyDrop::drop(&mut (*core).future))
-                })
+                });
             });
-            cell.schedule.terminated(cell.header.id);
+            match (dropped, cell.schedule.terminated(cell.header.id)) {
+                (None, hook) => hook,
+                (dropped, None) => dropped,
+                (Some(dropped), Some(hook)) => {
+                    lost_again(cell.header.id, hook);
+                    Some(dropped)
+                }
+            }
+        }
+    }
+
+    /// The exchange that ends a cancel once the future is gone: clears
+    /// `clear` from the word and returns the word before. `panic`: the
+    /// future's drop panicked, and [`settle_panicked`](Self::settle_panicked)
+    /// hands the panic on.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds a reference and dropped the future.
+    #[inline(always)]
+    unsafe fn settle(ptr: *const (), clear: usize, panic: Option<Panic>) -> usize {
+        // SAFETY: the caller's contract.
+        unsafe {
+            match panic {
+                None => Self::cell(ptr)
+                    .header
+                    .state
+                    .fetch_and(!clear, Ordering::AcqRel),
+                Some(panic) => Self::settle_panicked(ptr, clear, panic),
+            }
+        }
+    }
+
+    /// [`settle`](Self::settle) after a drop that panicked: the one exchange
+    /// also completes the task with the panic, closed no more, while its
+    /// handle is there, so whoever awaits the handle resumes it. With no
+    /// handle left the panic is logged.
+    ///
+    /// # Safety
+    ///
+    /// As [`settle`](Self::settle).
+    #[cold]
+    #[inline(never)]
+    unsafe fn settle_panicked(ptr: *const (), clear: usize, panic: Panic) -> usize {
+        // SAFETY: the caller's reference keeps the task. The future is gone,
+        // and nothing reads the cell until the exchange says it holds an
+        // output, or after the exchange if it does not.
+        unsafe {
+            let cell = Self::cell(ptr);
+            let header = &cell.header;
+            cell.core
+                .with_mut(|core| (*core).output = ManuallyDrop::new(Err(panic)));
+            let mut state = header.state.load(Ordering::Acquire);
+            loop {
+                let new = if state & TASK != 0 {
+                    (state & !clear & !CLOSED) | COMPLETED
+                } else {
+                    state & !clear
+                };
+                match header.state.compare_exchange_weak(
+                    state,
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => state = actual,
+                }
+            }
+            if state & TASK == 0
+                && let Err(panic) = cell
+                    .core
+                    .with_mut(|core| ManuallyDrop::take(&mut (*core).output))
+            {
+                lost_ending(header.id, panic);
+            }
+            state
+        }
+    }
+
+    /// A runnable dropped without running (`Runnable`'s drop): the task
+    /// closes unless it completed, the future the runnable owns goes, and so
+    /// does the runnable's reference.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is the task of the runnable, whose reference this takes.
+    unsafe fn drop_runnable(ptr: *const ()) {
+        // SAFETY: the runnable's reference keeps the task until `drop_ref`.
+        unsafe {
+            let header = &Self::cell(ptr).header;
+            let mut state = header.state.load(Ordering::Acquire);
+            loop {
+                if state & (COMPLETED | CLOSED) != 0 {
+                    break;
+                }
+                match header.state.compare_exchange_weak(
+                    state,
+                    state | CLOSED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => state = actual,
+                }
+            }
+            // A runnable exists only for a task that has not completed, so
+            // its future is there, and the runnable owns it now.
+            let panic = Self::drop_future(ptr);
+            let state = Self::settle(ptr, SCHEDULED, panic);
+            if state & AWAITER != 0 {
+                header.notify(None);
+            }
+            Self::drop_ref(ptr);
         }
     }
 
@@ -316,7 +454,11 @@ where
             super::names::forget(header.id);
             let owner = header.owner;
             let cell = ptr.cast_mut().cast::<Cell<F, S>>();
-            abort_on_panic(|| core::ptr::drop_in_place(cell));
+            // What the memory holds (the schedule, a stored waker) may panic
+            // as it goes: the memory is freed all the same.
+            if let Some(panic) = caught::catch(|| core::ptr::drop_in_place(cell)) {
+                lost_freeing(panic);
+            }
             // SAFETY: the memory came from `mem::alloc` with the cell's
             // layout and `owner`, and nothing uses it now.
             crate::mem::free(
@@ -367,8 +509,8 @@ where
             debug_assert_eq!(state & (SCHEDULED | RUNNING), SCHEDULED);
             if state & CLOSED != 0 {
                 // Cancelled while it waited in the queue.
-                Self::drop_future(ptr);
-                let state = header.state.fetch_and(!RUNNING, Ordering::AcqRel);
+                let panic = Self::drop_future(ptr);
+                let state = Self::settle(ptr, RUNNING, panic);
                 Self::finish(ptr, state);
                 return false;
             }
@@ -377,13 +519,17 @@ where
             // ones before them put back after it (a `block_on` inside a task
             // polls other tasks in between).
             let entered = crate::coop::enter_task(header.id);
-            // Each schedule's hooks are a check of its own, inline.
-            cell.schedule.before_poll(header.id);
+            // Each schedule's hooks are a check of its own, inline; a hook
+            // that panics panics the poll.
             let poll = catch_unwind(AssertUnwindSafe(|| {
+                cell.schedule.before_poll(cell.header.id);
                 cell.core
                     .with_mut(|core| F::poll(Pin::new_unchecked(&mut *(*core).future), cx))
             }));
-            cell.schedule.after_poll(header.id);
+            let poll = match cell.schedule.after_poll(header.id) {
+                None => poll,
+                Some(panic) => hooked(header.id, poll, panic),
+            };
             crate::coop::leave_task(entered);
             // The poll may have woken the task, cloned its waker, or a handle
             // may have registered meanwhile: the word is read again rather
@@ -397,86 +543,24 @@ where
             };
             match output {
                 Some(output) => {
+                    let output = match Self::drop_future_here(ptr) {
+                        None => output,
+                        Some(panic) => outcome_with(header.id, output, panic),
+                    };
                     let panicked = output.is_err();
-                    Self::drop_future_here(ptr);
                     cell.core
                         .with_mut(|core| (*core).output = ManuallyDrop::new(output));
-                    // Before the exchange below, which may hand the memory to
-                    // the handle: the hook, and the awaiter, taken with the
-                    // notifier's flag held across the exchange (a registration
-                    // that meets it wakes its own waker).
+                    // Before the exchange, which may hand the memory to the
+                    // handle.
                     if panicked {
                         cell.schedule.panicked(header.id);
+                        return Self::complete_panicked(ptr, state);
                     }
-                    let mut awaiter = None;
-                    let mut claimed = false;
-                    let mut unclaimed = None;
-                    let last = loop {
-                        // A waker stored, its cell free, and not the run's yet:
-                        // claimed first, so the exchange clears its flags. One a
-                        // registration or a notification holds is theirs to wake.
-                        if !claimed
-                            && state & AWAITER != 0
-                            && state & (NOTIFYING | REGISTERING) == 0
-                        {
-                            let (waker, ours, now) = header.claim();
-                            if ours {
-                                awaiter = waker;
-                                claimed = true;
-                            }
-                            state = now;
-                        }
-                        // With no handle left, or a handle that cancelled, nobody
-                        // takes the output: the run takes it out, while its
-                        // reference still holds the task, and drops it once the
-                        // task is let go of (a detached blocking job's end so
-                        // follows its free: `fs::call::Ending`).
-                        if (state & TASK == 0 || state & CLOSED != 0) && unclaimed.is_none() {
-                            unclaimed = Some(
-                                cell.core
-                                    .with_mut(|core| ManuallyDrop::take(&mut (*core).output)),
-                            );
-                        }
-                        // Completed, closed too with no handle, and the run's
-                        // reference gone in the same exchange: a handle that
-                        // sees the completion holds the last reference, so its
-                        // drop frees the task where the handle is.
-                        let mut new = (state & !RUNNING & !SCHEDULED) | COMPLETED;
-                        if state & TASK == 0 {
-                            new |= CLOSED;
-                        }
-                        if claimed {
-                            new &= !(NOTIFYING | AWAITER);
-                        }
-                        new -= REFERENCE;
-                        match header.state.compare_exchange_weak(
-                            state,
-                            new,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => break new & !FLAGS == 0 && new & TASK == 0,
-                            Err(actual) => state = actual,
-                        }
-                    };
-                    // Nothing of the task is touched from here on, unless the
-                    // run's reference was the last one, with no handle.
-                    if last {
-                        Self::destroy(ptr);
-                    }
-                    // Before the awaiter learns of the end: what a cancel waits
-                    // for is gone by then.
-                    if let Some(output) = unclaimed {
-                        abort_on_panic(|| drop(output));
-                    }
-                    if let Some(waker) = awaiter {
-                        abort_on_panic(|| waker.wake());
-                    }
-                    false
+                    Self::complete::<false>(ptr, state)
                 }
                 None => loop {
                     if state & CLOSED != 0 {
-                        return Self::end_closed(ptr, state);
+                        return Self::end_closed(ptr);
                     }
                     // Neither woken nor closed: the run's reference goes in
                     // the same exchange, so no later run of the task (woken
@@ -503,7 +587,7 @@ where
                             // The last reference, with no handle: nothing can
                             // wake or await the task again.
                             if new & !FLAGS == 0 && new & TASK == 0 {
-                                Self::drop_future(ptr);
+                                Self::drop_unawaited(ptr);
                                 Self::destroy(ptr);
                             }
                             return false;
@@ -515,31 +599,208 @@ where
         }
     }
 
+    /// The end of a run whose poll gave the task its outcome, in the cell:
+    /// the awaiter claimed, then one exchange completes the task and drops
+    /// the run's reference; then the output nobody takes is dropped and the
+    /// awaiter woken. `PANICKED`: the outcome is a panic, which stays for a
+    /// handle, even one that cancelled (closed no more), and is taken out
+    /// and logged only with no handle left. A value stays for a handle that
+    /// did not cancel.
+    ///
+    /// # Safety
+    ///
+    /// The run's reference, and the outcome written in the cell.
+    #[inline(always)]
+    unsafe fn complete<const PANICKED: bool>(ptr: *const (), mut state: usize) -> bool {
+        // SAFETY: the run's reference is live until the exchange drops it,
+        // and nothing of the task is touched after it unless it was the last.
+        unsafe {
+            let cell = Self::cell(ptr);
+            let header = &cell.header;
+            // The hook, and the awaiter, taken with the notifier's flag held
+            // across the exchange (a registration that meets it wakes its own
+            // waker).
+            let mut awaiter = None;
+            let mut claimed = false;
+            let mut unclaimed = None;
+            let last = loop {
+                // A waker stored, its cell free, and not the run's yet:
+                // claimed first, so the exchange clears its flags. One a
+                // registration or a notification holds is theirs to wake.
+                if !claimed && state & AWAITER != 0 && state & (NOTIFYING | REGISTERING) == 0 {
+                    let (waker, ours, now) = header.claim();
+                    if ours {
+                        awaiter = waker;
+                        claimed = true;
+                    }
+                    state = now;
+                }
+                // With no handle left, or a value for a handle that cancelled,
+                // nobody takes the output: the run takes it out, while its
+                // reference still holds the task, and drops it once the task
+                // is let go of (a detached blocking job's end so follows its
+                // free: `fs::call::Ending`).
+                if (state & TASK == 0 || (!PANICKED && state & CLOSED != 0)) && unclaimed.is_none()
+                {
+                    unclaimed = Some(
+                        cell.core
+                            .with_mut(|core| ManuallyDrop::take(&mut (*core).output)),
+                    );
+                }
+                // Completed, closed too with no handle, and the run's
+                // reference gone in the same exchange: a handle that sees the
+                // completion holds the last reference, so its drop frees the
+                // task where the handle is.
+                let mut new = (state & !RUNNING & !SCHEDULED) | COMPLETED;
+                if state & TASK == 0 {
+                    new |= CLOSED;
+                } else if PANICKED {
+                    new &= !CLOSED;
+                }
+                if claimed {
+                    new &= !(NOTIFYING | AWAITER);
+                }
+                new -= REFERENCE;
+                match header.state.compare_exchange_weak(
+                    state,
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break new & !FLAGS == 0 && new & TASK == 0,
+                    Err(actual) => state = actual,
+                }
+            };
+            // Nothing of the task is touched from here on, unless the run's
+            // reference was the last one, with no handle.
+            if last {
+                Self::destroy(ptr);
+            }
+            // Before the awaiter learns of the end: what a cancel waits for is
+            // gone by then.
+            if let Some(output) = unclaimed {
+                drop_unclaimed(output);
+            }
+            if let Some(waker) = awaiter {
+                abort_on_panic(|| waker.wake());
+            }
+            false
+        }
+    }
+
+    /// [`complete`](Self::complete) for a panic: out of line.
+    ///
+    /// # Safety
+    ///
+    /// As [`complete`](Self::complete).
+    #[cold]
+    #[inline(never)]
+    unsafe fn complete_panicked(ptr: *const (), state: usize) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe { Self::complete::<true>(ptr, state) }
+    }
+
     /// The end of a Pending run that finds the task cancelled during the
     /// poll: the canceller left the future to the run, which drops it, then
     /// clears RUNNING (and a wake's SCHEDULED) and lets go as `finish` does.
     #[cold]
     #[inline(never)]
-    unsafe fn end_closed(ptr: *const (), mut state: usize) -> bool {
+    unsafe fn end_closed(ptr: *const ()) -> bool {
         // SAFETY: the run's reference is live until `finish`, and the future
         // is the run's to drop.
         unsafe {
-            Self::drop_future(ptr);
-            let header = &Self::cell(ptr).header;
-            loop {
-                match header.state.compare_exchange_weak(
-                    state,
-                    state & !RUNNING & !SCHEDULED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        Self::finish(ptr, state);
-                        return false;
-                    }
-                    Err(actual) => state = actual,
-                }
-            }
+            let panic = Self::drop_future(ptr);
+            let state = Self::settle(ptr, RUNNING | SCHEDULED, panic);
+            Self::finish(ptr, state);
+            false
         }
     }
+}
+
+/// The outcome of a run whose future's drop panicked with `panic`: the
+/// poll's own panic if it had one, the drop's then logged; else the drop's,
+/// the value dropped (a panic of that drop logged).
+#[cold]
+#[inline(never)]
+fn outcome_with<T>(id: Id, output: Result<T, Panic>, panic: Panic) -> Result<T, Panic> {
+    match output {
+        Ok(value) => {
+            if let Some(again) = caught::catch(|| drop(value)) {
+                lost_again(id, again);
+            }
+            Err(panic)
+        }
+        Err(first) => {
+            lost_again(id, panic);
+            Err(first)
+        }
+    }
+}
+
+/// The poll's result once its after-poll hook panicked with `panic`: the
+/// task completes with that panic, as with [`outcome_with`].
+#[cold]
+#[inline(never)]
+fn hooked<T>(id: Id, poll: Result<Poll<T>, Panic>, panic: Panic) -> Result<Poll<T>, Panic> {
+    match poll {
+        Ok(Poll::Pending) => Err(panic),
+        Ok(Poll::Ready(value)) => outcome_with(id, Ok(value), panic).map(Poll::Ready),
+        Err(first) => outcome_with::<T>(id, Err(first), panic).map(Poll::Ready),
+    }
+}
+
+/// Drops the output of a task nobody awaits: a panic as its outcome, and a
+/// panic of a value's drop, are logged.
+#[inline(always)]
+fn drop_unclaimed<T>(output: Result<T, Panic>) {
+    match output {
+        Ok(value) => {
+            if let Some(panic) = caught::catch(|| drop(value)) {
+                lost_output(panic);
+            }
+        }
+        Err(panic) => lost_unawaited(panic),
+    }
+}
+
+/// Logs the panic of a task nobody awaits.
+#[cold]
+#[inline(never)]
+pub(super) fn lost_unawaited(panic: Panic) {
+    caught::lost(format_args!("a task panicked and nobody awaited it"), panic);
+}
+
+/// Logs the panic of the drop of an output nobody took.
+#[cold]
+#[inline(never)]
+fn lost_output(panic: Panic) {
+    caught::lost(
+        format_args!("a task's output panicked as it was dropped"),
+        panic,
+    );
+}
+
+/// Logs the panic of task `id`'s future's drop (or its terminate hook) that
+/// nobody awaits.
+#[cold]
+#[inline(never)]
+fn lost_ending(id: Id, panic: Panic) {
+    caught::lost(format_args!("task {id} panicked as it ended"), panic);
+}
+
+/// Logs a panic of task `id` that came after the one its outcome holds.
+#[cold]
+#[inline(never)]
+fn lost_again(id: Id, panic: Panic) {
+    caught::lost(format_args!("task {id} panicked again as it ended"), panic);
+}
+
+/// Logs the panic of the drop of what a task's memory held as it was freed.
+#[cold]
+#[inline(never)]
+fn lost_freeing(panic: Panic) {
+    caught::lost(
+        format_args!("a task panicked as its memory was freed"),
+        panic,
+    );
 }

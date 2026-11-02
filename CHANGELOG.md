@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- **A panic of a task's own code outside its poll no longer aborts the process.** A future that
+  panicked as it was dropped (on completion, on a cancel, in a runnable the shutdown dropped, or as
+  its last waker went), an output nobody took that panicked as it was dropped, the drop of what a
+  task's memory held as it was freed, a task hook (`on_before_task_poll`, `on_after_task_poll`,
+  `on_task_terminate`, `on_task_spawn`) and the shutdown on a task's panic each aborted. Each panic
+  is now caught where it happens, the task completes or is cancelled cleanly, and the runtime and
+  its other tasks run on. A panic of the future's drop, or of a poll or terminate hook, is the
+  task's outcome: awaiting the handle resumes it, and `join` answers it as a panicked `JoinError`
+  (the poll's own panic, if it had one, stays the outcome). A panic nobody can take is logged at
+  error. A spawn hook's panic unwinds out of the spawn, and the task is cancelled before it runs
+  (`proofs/tla/task/Task.tla`, `Panics` and `Shutdown`).
 - **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
   `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
   for a connection its peer reset in the backlog before or while the accept took it. That error is
@@ -38,6 +49,12 @@
 
 ### Changed
 
+- **A task's panic stays for its handle after a cancel, and a panic nobody awaits is logged.** A
+  task cancelled while its poll panicked, or whose future panicked as the cancel dropped it, now
+  completes with that panic for the handle that cancelled it: `cancel().await` resumes it and
+  `join` answers a panicked `JoinError`, where they answered no output before. A panic no handle
+  takes (a detached task's, or one a handle let go of unawaited) is logged at error, where it was
+  dropped after the panic hook printed it.
 - **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix
   stream read into the task's own buffer, under 16 KiB, on a socket whose kernel counts what a
   read leaves, reads straight from the socket as on epoll, with the count and its floor; a read

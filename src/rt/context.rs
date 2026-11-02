@@ -617,9 +617,9 @@ fn poll_watched<R>(here: &'static Here, shared: &Shared, poll: impl FnOnce() -> 
 }
 
 /// [`poll`] for a task's run, `run`, which never unwinds: each part of it that runs the task's
-/// own code (its future, its hooks, its drops) catches a panic or aborts on one
-/// (`rt::task::raw`). On a shard the monitor watches, the run then keeps no guard to come back
-/// in by: an unwind there would be the runtime's own bug, and aborts.
+/// own code (its future, its hooks, its drops) catches a panic (`rt::task::raw`), and a waker
+/// that panics in a transition aborts. On a shard the monitor watches, the run then keeps no
+/// guard to come back in by: an unwind there would be the runtime's own bug, and aborts.
 #[inline(always)]
 pub(crate) fn run_task(shared: &Shared, run: impl FnOnce()) -> Polled {
     let here = local();

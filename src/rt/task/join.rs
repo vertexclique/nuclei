@@ -10,7 +10,7 @@ use core::task::{Context, Poll};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use super::header::Header;
-use super::raw::Panic;
+use super::raw::{Panic, lost_unawaited};
 use super::state::{AWAITER, CLOSED, COMPLETED, FLAGS, REFERENCE, RUNNING, SCHEDULED, TASK};
 use crate::sync::internal::Ordering;
 
@@ -88,7 +88,7 @@ impl<T> Task<T> {
     /// the exchange above needs no frame.
     #[inline(never)]
     fn detach_late(&mut self) {
-        drop(self.set_detached());
+        let_go(self.set_detached());
     }
 
     /// Cancels the task and waits for its future to be dropped. Returns the
@@ -303,13 +303,15 @@ impl<T> Task<T> {
         loop {
             if state & CLOSED != 0 {
                 // The future may still be in a run queue or a poll: wait for
-                // it to be dropped.
+                // it to be dropped, then look again, as a cancel whose drop
+                // panicked ends as a completion with the panic.
                 if state & (SCHEDULED | RUNNING) != 0 {
                     header.register(cx.waker());
                     state = header.state.load(Ordering::Acquire);
                     if state & (SCHEDULED | RUNNING) != 0 {
                         return Poll::Pending;
                     }
+                    continue;
                 }
                 header.notify(Some(cx.waker()));
                 return Poll::Ready(None);
@@ -365,7 +367,16 @@ impl<T> Task<T> {
     #[inline(never)]
     fn cancel_and_let_go(&mut self) {
         self.set_canceled();
-        drop(self.set_detached());
+        let_go(self.set_detached());
+    }
+}
+
+/// Drops what a handle that let go of its task took out: a panic, which
+/// nobody awaits now, is logged; a value is dropped here, by the handle's
+/// caller.
+fn let_go<T>(output: Option<Result<T, Panic>>) {
+    if let Some(Err(panic)) = output {
+        lost_unawaited(panic);
     }
 }
 
@@ -487,7 +498,9 @@ impl<T> fmt::Debug for Join<T> {
 }
 
 /// Why a task gave no output: it was cancelled (by its handle, an
-/// [`AbortHandle`], or its runtime shutting down), or its future panicked.
+/// [`AbortHandle`], or its runtime shutting down), or its code panicked: its
+/// future's poll, a task hook around it, or the future's drop, after it
+/// completed or as it was cancelled.
 pub struct JoinError {
     id: super::Id,
     panic: Option<Panic>,
@@ -537,11 +550,7 @@ impl fmt::Display for JoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.panic {
             None => write!(f, "task {} was cancelled", self.id),
-            Some(panic) => match panic
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            {
+            Some(panic) => match crate::rt::caught::message(panic) {
                 Some(message) => write!(f, "task {} panicked: {message}", self.id),
                 None => write!(f, "task {} panicked", self.id),
             },
