@@ -270,6 +270,7 @@ impl RingMem {
                 Outcome::RecvFrom(buf, answer)
             }
             RingMem::RecvLentFrom(mut msg, mut buf) => {
+                let cut = msg.hdr.msg_flags & libc::MSG_TRUNC != 0;
                 let answer = match read_of(res) {
                     Answer::Done(Ok(n)) => {
                         // SAFETY: the kernel wrote the first `n` bytes of the
@@ -280,7 +281,7 @@ impl RingMem {
                     Answer::Done(Err(err)) => Answer::Done(Err(err)),
                     Answer::Undone { not_ready } => Answer::Undone { not_ready },
                 };
-                Outcome::RecvLentFrom(buf, answer)
+                Outcome::RecvLentFrom(buf, answer, cut)
             }
             RingMem::Connect(dial, _) => Outcome::Connect(
                 dial,

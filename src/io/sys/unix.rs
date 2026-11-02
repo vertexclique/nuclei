@@ -626,6 +626,58 @@ fn recv_from_raw(
     Ok((n, len))
 }
 
+/// `recvmsg(2)` of a datagram into `buf`, its sender's address into `storage`: how many bytes,
+/// the address's length, and whether the kernel cut the datagram to `buf` (`MSG_TRUNC`).
+fn recv_msg_raw(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+    storage: &mut libc::sockaddr_storage,
+) -> io::Result<(usize, libc::socklen_t, bool)> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    msg.msg_name = core::ptr::from_mut(storage).cast();
+    msg.msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    // SAFETY: the kernel writes at most `buf.len()` bytes into `buf` and at most the storage's
+    // size into it, both ours; the header lives for the call.
+    let n = retry(|| cvt(unsafe { libc::recvmsg(fd, &raw mut msg, 0) }))?;
+    Ok((n, msg.msg_namelen, msg.msg_flags & libc::MSG_TRUNC != 0))
+}
+
+/// A datagram from a UDP socket into a buffer lent to the driver, with its sender and whether
+/// the kernel cut it to the buffer: one whose task went away is handed on only if it came whole.
+pub(crate) fn recv_lent_from_udp(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+) -> io::Result<(usize, SocketAddr, bool)> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let (n, len, cut) = recv_msg_raw(fd, buf, &mut storage)?;
+    if len == 0 || libc::c_int::from(storage.ss_family) == libc::AF_UNSPEC {
+        return no_sender(fd, n).map(|(n, from)| (n, from, cut));
+    }
+    Ok((n, inet_addr(&storage, len)?, cut))
+}
+
+/// As [`recv_lent_from_udp`], for a Unix datagram socket.
+pub(crate) fn recv_lent_from_unix(
+    fd: RawFd,
+    buf: &mut [core::mem::MaybeUninit<u8>],
+) -> io::Result<(usize, unix::SocketAddr, bool)> {
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut storage: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let (n, len, cut) = recv_msg_raw(fd, buf, &mut storage)?;
+    // SAFETY: an `AF_UNIX` address fits `sockaddr_un`, which the storage is
+    // at least as large as.
+    let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };
+    Ok((n, unix_addr(un, len)?, cut))
+}
+
 /// `sendto(2)` of `buf` to the `len` bytes of address at `addr`, with `SEND_FLAGS`; made as a
 /// system call on Linux (see [`syscall`]).
 ///

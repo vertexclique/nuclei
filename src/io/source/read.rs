@@ -141,6 +141,9 @@ struct Lent {
     orphan: bool,
     /// The sender, once a datagram was read into the buffer.
     peer: Option<Addr>,
+    /// The kernel cut that datagram to the buffer: one whose task went away is dropped, not
+    /// handed on (`abandon_lent`).
+    cut: bool,
 }
 
 /// The longest datagram UDP carries, by its length field: what a datagram
@@ -759,18 +762,23 @@ impl ReadState {
             return;
         };
         let spare = lent.buf.spare_capacity_mut();
+        // With whether the kernel cut it, which a buffer whose task goes away needs to know.
         let result = match kind {
-            Kind::UnixDatagram => sys::ready(sys::recv_from_unix_uninit(fd, spare, false))
-                .inspect(tally::received)
-                .map(|r| r.map(|(n, a)| (n, Addr::Unix(crate::buf::spare::Spare::new(a))))),
-            _ => sys::ready(sys::recv_from_udp_uninit(fd, spare, false))
-                .inspect(tally::received)
-                .map(|r| r.map(|(n, a)| (n, Addr::Inet(a)))),
+            Kind::UnixDatagram => sys::ready(sys::recv_lent_from_unix(fd, spare)).map(|r| {
+                r.map(|(n, a, cut)| (n, Addr::Unix(crate::buf::spare::Spare::new(a)), cut))
+            }),
+            _ => sys::ready(sys::recv_lent_from_udp(fd, spare))
+                .map(|r| r.map(|(n, a, cut)| (n, Addr::Inet(a), cut))),
         };
         let Some(result) = result else {
             self.blocked = true;
             return;
         };
+        let result = result.map(|(n, from, cut)| {
+            lent.cut = cut;
+            (n, from)
+        });
+        tally::received(&result);
         lent.done = Some(result.map(|(n, from)| {
             // SAFETY: the kernel wrote the first `n` bytes of the spare
             // capacity.
@@ -1021,6 +1029,7 @@ impl ReadState {
                 out: false,
                 orphan: false,
                 peer: None,
+                cut: false,
             });
         }
         // The task polls, so the driver's read needs no wake for it.
@@ -1096,6 +1105,7 @@ impl ReadState {
                 out: false,
                 orphan: false,
                 peer: None,
+                cut: false,
             });
         }
         let old = self.lent.as_mut().and_then(|l| l.waker.take());
@@ -1151,8 +1161,12 @@ impl ReadState {
         }
         match lent.done {
             None => {}
-            // A datagram, even an empty one, is received whole: the next
-            // receive takes it.
+            // A datagram the kernel cut to this buffer is dropped, and counted: the next receive
+            // would take its first bytes for the whole of it (proofs/tla/lent/LentOrphan.tla).
+            Some(Ok(_)) if lent.peer.is_some() && lent.cut => {
+                crate::rt::counters::cut_datagram_dropped();
+            }
+            // One that came whole, even an empty one, the next receive takes.
             Some(Ok(_)) if lent.peer.is_some() => {
                 if let Some(peer) = lent.peer {
                     self.datagrams.push_back((

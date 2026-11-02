@@ -453,7 +453,7 @@ impl PortIssuer<'_> {
                 inner.issued_at = None;
             }
             // SAFETY: the call did not take the slot.
-            unsafe { finish(slot, Some(code), 0, None) };
+            unsafe { finish(slot, Some(code), 0, false, None) };
         }
         id
     }
@@ -945,6 +945,9 @@ pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY, shard: Option<&crate::rt
     // SAFETY: the caller's: the slot is of a live source (its reference
     // was held for the kernel), and the kernel or the job is done with it.
     let slot = unsafe { &*entry.lpOverlapped.cast::<Slot>().cast_const() };
+    // A datagram cut to its buffer completes as a success with this status (`status_error`).
+    let cut = entry.lpCompletionKey != JOB
+        && entry.Internal as i32 == crate::syscore::windows::STATUS_BUFFER_OVERFLOW;
     let code = if entry.lpCompletionKey == JOB {
         // SAFETY: as above; the job wrote its end before the packet.
         unsafe { (*slot.inner.get()).job_code.take() }
@@ -952,7 +955,15 @@ pub(crate) unsafe fn complete(entry: &OVERLAPPED_ENTRY, shard: Option<&crate::rt
         status_error(entry.Internal as i32)
     };
     // SAFETY: as above.
-    unsafe { finish(slot, code, entry.dwNumberOfBytesTransferred as usize, shard) };
+    unsafe {
+        finish(
+            slot,
+            code,
+            entry.dwNumberOfBytesTransferred as usize,
+            cut,
+            shard,
+        )
+    };
 }
 
 /// Ends the operation of `slot`, which failed with `code` or ran (`None`)
@@ -966,6 +977,7 @@ unsafe fn finish(
     slot: &Slot,
     code: Option<i32>,
     bytes: usize,
+    cut: bool,
     shard: Option<&crate::rt::shard::Shard>,
 ) {
     // SAFETY: the caller's: the slot is this thread's until the outcome is
@@ -988,7 +1000,7 @@ unsafe fn finish(
     {
         port.time(kind, at);
     }
-    let outcome = outcome(inner, mem, code, bytes);
+    let outcome = outcome(inner, mem, code, bytes, cut);
     source.op_done(
         Done {
             outcome,
@@ -1001,7 +1013,7 @@ unsafe fn finish(
 
 /// The outcome of an operation on `mem`, from what the kernel left in the
 /// slot.
-fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> Outcome {
+fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize, cut: bool) -> Outcome {
     // Made once: an error is counted as it is made.
     let answer = match mem {
         PortMem::Ready | PortMem::RecvRoom | PortMem::Recv(_) | PortMem::RecvLent(_) => {
@@ -1076,7 +1088,7 @@ fn outcome(inner: &mut Inner, mem: PortMem, code: Option<i32>, bytes: usize) -> 
                 Answer::Done(Err(err)) => Answer::Done(Err(err)),
                 Answer::Undone { not_ready } => Answer::Undone { not_ready },
             };
-            Outcome::RecvLentFrom(buf, answer)
+            Outcome::RecvLentFrom(buf, answer, cut)
         }
         PortMem::NoAccept => Outcome::Accept(match answer {
             Answer::Done(Ok(_)) => Answer::Done(Err(io::ErrorKind::Other.into())),

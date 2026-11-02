@@ -223,7 +223,8 @@ pub(crate) enum Outcome {
     },
     RecvLent(OwnedBuf, Answer<usize>),
     RecvFrom(PoolBuf, Answer<(usize, Addr)>),
-    RecvLentFrom(OwnedBuf, Answer<(usize, Addr)>),
+    /// A datagram received into a lent buffer, and whether the kernel cut it to the buffer.
+    RecvLentFrom(OwnedBuf, Answer<(usize, Addr)>, bool),
     Connect(Dial, Answer<()>),
     Send(PoolBuf, Answer<usize>),
     SendLent(OwnedBuf, Answer<usize>),

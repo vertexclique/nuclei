@@ -450,6 +450,7 @@ struct Errors {
     by_kind: [AtomicU64; KINDS.len()],
     refused_registrations: AtomicU64,
     accepts_out_of_descriptors: AtomicU64,
+    cut_datagrams_dropped: AtomicU64,
 }
 
 impl Errors {
@@ -458,6 +459,7 @@ impl Errors {
             by_kind: [const { AtomicU64::new(0) }; KINDS.len()],
             refused_registrations: AtomicU64::new(0),
             accepts_out_of_descriptors: AtomicU64::new(0),
+            cut_datagrams_dropped: AtomicU64::new(0),
         }
     }
 
@@ -466,6 +468,7 @@ impl Errors {
             by_kind: core::array::from_fn(|i| self.by_kind[i].load(Ordering::Relaxed)),
             refused_registrations: self.refused_registrations.load(Ordering::Relaxed),
             accepts_out_of_descriptors: self.accepts_out_of_descriptors.load(Ordering::Relaxed),
+            cut_datagrams_dropped: self.cut_datagrams_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -501,6 +504,13 @@ pub(crate) fn io_error(err: &io::Error) {
     let at = kind_index(err.kind());
     errors_here(|errors| {
         errors.by_kind[at].fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// A datagram an owned receive whose task went away had cut to its buffer was dropped.
+pub(crate) fn cut_datagram_dropped() {
+    errors_here(|errors| {
+        errors.cut_datagrams_dropped.fetch_add(1, Ordering::Relaxed);
     });
 }
 

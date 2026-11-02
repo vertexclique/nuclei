@@ -228,7 +228,7 @@ impl core::fmt::Debug for Histogram {
     }
 }
 
-/// IO errors counted by [`io::ErrorKind`], and two kinds of failure
+/// IO errors counted by [`io::ErrorKind`], and three kinds of failure
 /// counted apart.
 ///
 /// An error counted is one an operation on a socket, pipe or file ended
@@ -244,6 +244,10 @@ pub struct ErrorCounts {
     /// Accepts that failed because the process or the system had no file
     /// descriptor left (counted among the errors by kind too).
     pub accepts_out_of_descriptors: u64,
+    /// Datagrams dropped because an owned receive given up before it took
+    /// its datagram had it cut to its buffer: handed on, the next receive
+    /// would take its first bytes for the whole of it.
+    pub cut_datagrams_dropped: u64,
 }
 
 impl ErrorCounts {
@@ -270,6 +274,7 @@ impl Default for ErrorCounts {
             by_kind: [0; KINDS.len()],
             refused_registrations: 0,
             accepts_out_of_descriptors: 0,
+            cut_datagrams_dropped: 0,
         }
     }
 }
@@ -283,6 +288,7 @@ impl core::fmt::Debug for ErrorCounts {
                 "accepts_out_of_descriptors",
                 &self.accepts_out_of_descriptors,
             )
+            .field("cut_datagrams_dropped", &self.cut_datagrams_dropped)
             .finish()
     }
 }
