@@ -2,10 +2,11 @@
 (***************************************************************************)
 (* A file handle's reads, writes, syncs and seeks (src/fs/file/mod.rs:    *)
 (* `read_owned`, `write_owned`, `fill`, `write`, `write_direct`,           *)
-(* `poll_writes`, `poll_orphans`, `counts`, `seek`; src/fs/file/           *)
+(* `poll_writes`, `poll_orphans`, `fail`, `counts`, `seek`; src/fs/file/   *)
 (* positional.rs: `read_at`, `write_at`, `poll_ordered`, `Out`, `orphan`;  *)
 (* src/fs/file/orphans.rs: `Orphans`; src/fs/file/durable.rs: `sync`,    *)
-(* `Syncs::poll`, `Syncs::take`, `sync_call`;                              *)
+(* `Syncs::poll`, `Syncs::take`, `sync_call`, `Lost`; src/fs/file_ops.rs:  *)
+(* `try_clone`, which shares the handle's `Lost`;                         *)
 (* src/fs/file/work.rs: `bounce`, `pwrite_owned`), on the file's jobs,    *)
 (* made on the blocking pool or on the ring of the task's shard            *)
 (* (src/fs/ring.rs). A vectored write at the cursor (src/fs/mod.rs:        *)
@@ -73,6 +74,19 @@
 (* yet durable for good, and the kernel reports the error to the first    *)
 (* call that looks after it, to that call alone, as Linux does.           *)
 (*                                                                          *)
+(* Scenario "sync_lost": as "sync", and the kernel fails one cursor write  *)
+(* the handle had accepted: none of its bytes land, the write-behind      *)
+(* after it is dropped, and the failure waits in the state until a flush   *)
+(* reports it (the writer's own flush, or the one a sync starts with),    *)
+(* which forgets it, as a stream does. So the state also keeps a record    *)
+(* that never forgets (src/fs/file/mod.rs `FileState::fail`, the one      *)
+(* place a failure is kept): every later sync fails with it, with no call. *)
+(* Scenario "sync_clone": the second sync is made on a clone of the       *)
+(* handle (`try_clone`): its own state, its own sync calls, the same       *)
+(* kernel error cursor, and the same record; it syncs first, the first    *)
+(* sync once it is done. Scenario "sync_clone_race" lets the two syncs go  *)
+(* at once, which the record does not cover (a witness of that gap).      *)
+(*                                                                          *)
 (* Scenario "direct": the file is opened for direct IO: a read job reads   *)
 (* exactly the cell asked for (no read-ahead), and a copied write is one   *)
 (* kernel write of exactly its bytes, which waits for the write in flight  *)
@@ -105,7 +119,7 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 CONSTANTS
     MayLeave,    \* whether a task may go away while its job is out
     Appending,   \* whether the file was opened to append
-    Scenario,    \* which tasks run: "cursor", "positional", "generation", "sync" or "direct"
+    Scenario,    \* which tasks run: "cursor", "positional", "generation", "direct", or one of SyncScenarios
     SyncMayFail, \* whether the device may fail a sync
     Ending,      \* how the handle ends once no task borrows it: "none" (it outlives the run), "drop", "into_inner"
     Mutation     \* "none", or the name of the one rule this run takes away
@@ -132,15 +146,25 @@ BReads == IF Scenario = "generation" THEN 2 ELSE 1
 PWriters == IF Scenario \in {"positional", "generation"} THEN {"pw"} ELSE {}
 \* The task that reads at an offset of its own.
 PReaders == IF Scenario = "positional" THEN {"pr"} ELSE {}
+\* The scenarios in which two tasks sync.
+SyncScenarios == {"sync", "sync_lost", "sync_clone", "sync_clone_race"}
 \* The tasks that sync, once each.
-Syncers == IF Scenario = "sync" THEN {"sy1", "sy2"} ELSE {}
+Syncers == IF Scenario \in SyncScenarios THEN {"sy1", "sy2"} ELSE {}
+\* Whether the kernel may fail one cursor write the handle accepted.
+WriteMayFail == Scenario = "sync_lost"
+\* Whether the second sync is made on a clone of the handle, and whether the two may go at once.
+Cloned == Scenario \in {"sync_clone", "sync_clone_race"}
+\* The handles: the one the writer writes through ("a"), and its clone ("b").
+Handles == {"a", "b"}
+\* The handle a sync task syncs through.
+HandleOf(q) == IF Cloned /\ q = "sy2" THEN "b" ELSE "a"
 \* Whether the file is opened for direct IO.
 Direct == Scenario = "direct"
 \* The cells the positional writer writes, one after the other, and their values.
 PCells == IF Scenario = "generation" THEN <<1>> ELSE <<0>>
 PVals == IF Scenario = "generation" THEN <<7>> ELSE <<4>>
 \* The values of the cursor writer's copied writes after its first one, each accepted at once.
-Behinds == CASE Scenario = "direct" -> <<6, 8>> [] Scenario = "sync" -> <<6>> [] OTHER -> <<>>
+Behinds == CASE Scenario = "direct" -> <<6, 8>> [] Scenario \in SyncScenarios -> <<6>> [] OTHER -> <<>>
 \* The cells a buffered read job reads at least (the read-ahead).
 ReadAhead == 2
 \* Every task (the pool, which makes the jobs' calls, is not one).
@@ -177,8 +201,12 @@ variables
     prBefore = FALSE,                  \* (record) a cursor write to its cell came before the positional read
     prGot = None,                      \* (record) what the positional read returned
     sjobs = [s \in Syncers |-> NoSync], \* each sync's call: [seq, checked, ran, ok, taken, on, drain]; it outlives its task
-    made = 0,                          \* how many sync calls the handle made: the next one's number is one more
-    sfailed = 0,                       \* the number of the first call whose failure the state took (0: none)
+    made = 0,                          \* how many sync calls were made: the next one's number is one more
+    sfailed = [h \in Handles |-> 0],   \* each handle's first call whose failure its state took (0: none)
+    wbad = FALSE,                      \* the cursor write in flight failed: none of its bytes landed
+    wfailed = FALSE,                   \* the state's failure of a write, until a flush reports it
+    lostRec = [h \in Handles |-> FALSE], \* each handle's record of a write lost, kept for good (failed calls: `Sticky`)
+    writeLost = FALSE,                 \* (record) the kernel failed a cursor write the handle had accepted
     kerr = FALSE,                      \* the kernel holds a write-back error no call reported yet
     devFailed = FALSE,                 \* the device failed a write-back (once at most)
     lost = [c \in Cells |-> FALSE],    \* the cells whose write-back failed: the device never gets them
@@ -256,21 +284,37 @@ define
     SyncOut(q) == sjobs[q].seq # 0 /\ ~sjobs[q].taken
     \* The sync calls whose ends reached their slots and the state has not taken.
     SyncEnded == {q \in Syncers : sjobs[q].seq # 0 /\ sjobs[q].ran /\ ~sjobs[q].taken}
+    \* The records once a write of handle `h` is lost: a clone shares its handle's record.
+    \* MUTATION sticky_unshared: each handle keeps a record of its own.
+    Recorded(h) == [g \in Handles |-> lostRec[g] \/ g = h \/ Mutation # "sticky_unshared"]
+    \* Whether a sync call whose failure handle `h`'s record holds failed: a call of any handle (a
+    \* clone shares its handle's record), or (the mutation) of `h` alone.
+    SyncFailed(h) == IF Mutation = "sticky_unshared" THEN sfailed[h] # 0
+                     ELSE \E g \in Handles : sfailed[g] # 0
+    \* What a sync of handle `h` reads before it makes a call: the record of a write lost or a sync
+    \* call failed, which no report forgets.
+    \* MUTATION sync_forgets_loss: it reads only whether a sync call of the handle failed, as before the
+    \* fix, so a write lost and reported once by a flush is never answered again.
+    Sticky(h) == IF Mutation = "sync_forgets_loss" THEN sfailed[h] # 0 ELSE lostRec[h] \/ SyncFailed(h)
 end define;
 
 \* What a sync takes under the guard, before anything else (`Syncs::poll`): the end of every sync
-\* call that reached its slot, its own or another's, a task's that went away among them. The first
-\* failed one's number stays: every sync it came before or was its own fails.
+\* call of its handle that reached its slot, its own or another's, a task's that went away among
+\* them. The first failed one's number stays: every sync it came before or was its own fails. The
+\* record every later sync of the handle and of its clones reads holds it too (`Syncs::take`;
+\* `SyncFailed` above).
 \* MUTATION sync_task_records: a call's failure counts only for its own task, as when the task
 \* kept its call's result: the end of one whose task went away is taken and its failure dropped.
 macro TakeSyncEnds() begin
-    with counted = {q \in SyncEnded : q = self \/ Mutation # "sync_task_records"},
+    with h = HandleOf(self),
+         ended = {q \in SyncEnded : HandleOf(q) = h},
+         counted = {q \in ended : q = self \/ Mutation # "sync_task_records"},
          failed = {q \in counted : ~sjobs[q].ok} do
-        if sfailed = 0 /\ failed # {} then
-            sfailed := sjobs[CHOOSE q \in failed : \A r \in failed : sjobs[q].seq <= sjobs[r].seq].seq;
+        if sfailed[h] = 0 /\ failed # {} then
+            sfailed[h] := sjobs[CHOOSE q \in failed : \A r \in failed : sjobs[q].seq <= sjobs[r].seq].seq;
         end if;
-        if \E q \in SyncEnded : q # self /\ pc[q] = "Done" then leftTaken := TRUE; end if;
-        sjobs := [q \in Syncers |-> IF q \in SyncEnded THEN [sjobs[q] EXCEPT !.taken = TRUE] ELSE sjobs[q]];
+        if \E q \in ended : q # self /\ pc[q] = "Done" then leftTaken := TRUE; end if;
+        sjobs := [q \in Syncers |-> IF q \in ended THEN [sjobs[q] EXCEPT !.taken = TRUE] ELSE sjobs[q]];
     end with;
 end macro;
 
@@ -306,15 +350,24 @@ macro PollWrites(seekTo) begin
     \* The write-behind goes out once no write is in flight and no positional write left by its
     \* task is out; it goes where the shard's calls go.
     \* MUTATION orphan_unordered: it goes out while a positional write left by its task is out.
-    with free = (writing = NoJob \/ writing.ran),
+    \* A write the kernel failed is the state's failure (`FileState::fail`): kept until a flush
+    \* reports it, the write-behind after it dropped, and put into the handle's record for good.
+    with failing = (writing # NoJob /\ writing.ran /\ wbad),
+         free = (writing = NoJob \/ writing.ran),
          go = /\ behind # NoBehind
+              /\ ~failing
               /\ (writing = NoJob \/ writing.ran)
               /\ (porphan # "orphan" \/ Mutation = "orphan_unordered") do
+        if failing then
+            wfailed := TRUE;
+            wbad := FALSE;
+            lostRec := Recorded("a");
+        end if;
         writing := IF go THEN [at |-> behind.at, vals |-> behind.vals, lent |-> FALSE, ran |-> FALSE,
                                on |-> IF shut \/ Appending THEN "pool" ELSE "ring", part |-> 0]
                    ELSE IF free THEN NoJob ELSE writing;
         kwrites := IF go THEN kwrites \cup {<<behind.at, Len(behind.vals)>>} ELSE kwrites;
-        behind := IF go THEN NoBehind ELSE behind;
+        behind := IF go \/ failing THEN NoBehind ELSE behind;
     end with;
 end macro;
 
@@ -385,6 +438,14 @@ P_loop:
                 else
                     writing.part := 1;
                 end if;
+            or
+                \* The kernel fails the write (once, scenario "sync_lost"): none of its bytes land, and
+                \* its end says so.
+                await WriteMayFail /\ ~writeLost;
+                if ~objOpen then usedClosed := TRUE; end if;
+                writing.ran := TRUE;
+                wbad := TRUE;
+                writeLost := TRUE;
             end either;
         or
             \* A reader's job reads its cell.
@@ -672,22 +733,30 @@ variables claimed = {},     \* the writes this sync must make durable
 begin
 S_call:
     \* Called once the writer accepted its copied writes: what was accepted, and the positional
-    \* writes that returned, are what it covers.
-    await pc["writer"] \notin {"W_copy", "W_b_hold", "W_b_accept", "W_b_wait"};
-    claimed := written \cup {<<PCells[j], PVals[j]>> : j \in preturned};
+    \* writes that returned, are what it covers. A sync of the clone covers none of them (the clone
+    \* wrote nothing); in scenario "sync_clone" the first sync is called once the clone's is done.
+    await /\ pc["writer"] \notin {"W_copy", "W_b_hold", "W_b_accept", "W_b_wait"}
+          /\ (Scenario = "sync_clone" /\ self = "sy1") => pc["sy2"] = "Done";
+    claimed := IF HandleOf(self) = "a" THEN written \cup {<<PCells[j], PVals[j]>> : j \in preturned}
+               ELSE {};
     afterFail := failedOnce;
 S_hold:
+    \* (The clone's own state guard is abstract: its steps take the same one, which orders nothing
+    \* the clone's state needs.) Only the writer's handle has writes to drive.
     await holder = "none";
     holder := self;
-    PollWrites(-1);
+    if HandleOf(self) = "a" then
+        PollWrites(-1);
+    end if;
     TakeSyncEnds();
 S_go:
     if sjobs[self].seq # 0 /\ sjobs[self].taken then
-        \* Its call ended: it fails if the first failed call came before it or was its own.
+        \* Its call ended: it fails if its handle's first failed call came before it or was its own.
         \* MUTATION sync_any_failure: it fails if any call failed, one made after its own too.
         holder := "none";
-        if sfailed # 0 /\ (sfailed <= sjobs[self].seq \/ Mutation = "sync_any_failure") then
-            if sjobs[self].ok /\ sfailed > sjobs[self].seq then falseFail := TRUE; end if;
+        if /\ sfailed[HandleOf(self)] # 0
+           /\ (sfailed[HandleOf(self)] <= sjobs[self].seq \/ Mutation = "sync_any_failure") then
+            if sjobs[self].ok /\ sfailed[HandleOf(self)] > sjobs[self].seq then falseFail := TRUE; end if;
             goto S_failed;
         else
             goto S_ok;
@@ -696,28 +765,37 @@ S_go:
         \* Its call is out: it waits for the end.
         holder := "none";
         goto S_wait;
-    elsif sfailed # 0 then
-        \* A sync failed before: this one fails too, with no call.
-        holder := "none";
-        goto S_failed;
-    elsif /\ Pending
+    elsif /\ HandleOf(self) = "a"
+          /\ Pending
           \* MUTATION sync_no_flush: the sync goes with writes still behind or in flight.
           /\ Mutation # "sync_no_flush"
           \* MUTATION sync_drain: the sync goes once the write-behind went out, its order left to
           \* the ring's drain.
           /\ ~(Mutation = "sync_drain" /\ behind = NoBehind) then
-        \* It waits for the writes accepted before it to land.
+        \* It waits for the writes accepted before it to land (the flush it starts with).
         holder := "none";
 S_wait_writes:
         await Progress;
         goto S_hold;
-    elsif (\E q \in Syncers : SyncOut(q)) /\ Mutation # "sync_unserialized" then
-        \* Another sync's call is out, its task maybe gone: this one waits for that call's end,
-        \* which it then takes.
+    elsif HandleOf(self) = "a" /\ wfailed then
+        \* Its flush reports the failure of a write, and forgets it, as a flush does.
+        wfailed := FALSE;
+        holder := "none";
+        goto S_failed;
+    elsif Sticky(HandleOf(self)) then
+        \* A write was lost, or a sync of the handle (or of its clone) failed, before: this one fails
+        \* too, with no call.
+        holder := "none";
+        goto S_failed;
+    elsif /\ \E q \in Syncers : HandleOf(q) = HandleOf(self) /\ SyncOut(q)
+          /\ Mutation # "sync_unserialized" then
+        \* Another sync's call of the handle is out, its task maybe gone: this one waits for that
+        \* call's end, which it then takes.
         \* MUTATION sync_unserialized: it makes its call beside the other.
         holder := "none";
 S_wait_other:
-        await \A q \in Syncers : sjobs[q].seq = 0 \/ sjobs[q].ran \/ sjobs[q].taken;
+        await \A q \in Syncers : \/ HandleOf(q) # HandleOf(self)
+                                 \/ sjobs[q].seq = 0 \/ sjobs[q].ran \/ sjobs[q].taken;
         goto S_hold;
     else
         \* Its call goes on the ring of its shard, or to the pool; the state keeps it.
@@ -739,10 +817,13 @@ S_wait:
         goto Done;
     end either;
 S_failed:
-    \* It returns the failure; the state keeps it for every sync called later.
+    \* It returns the failure; the record keeps it for every sync called later.
     \* MUTATION sync_forgets: the failure is forgotten once reported.
     failedOnce := TRUE;
-    if Mutation = "sync_forgets" then sfailed := 0; end if;
+    if Mutation = "sync_forgets" then
+        sfailed[HandleOf(self)] := 0;
+        lostRec[HandleOf(self)] := FALSE;
+    end if;
     goto Done;
 S_ok:
     \* It returns success: every write it covers is said to be durable.
@@ -781,6 +862,10 @@ W_b_accept:
 W_b_wait:
         await Progress;
         goto W_b_hold;
+    elsif wfailed then
+        \* A write before it failed: this one fails with that failure, accepted nowhere.
+        holder := "none";
+        goto W_hold;
     else
         AcceptCopy(Behinds[b]);
         b := b + 1;
@@ -891,6 +976,8 @@ W_flush_wait:
         await Progress;
         goto W_flush;
     else
+        \* The flush reports a write's failure, and forgets it.
+        wfailed := FALSE;
         holder := "none";
     end if;
 end process;
@@ -938,8 +1025,9 @@ NoStaleRead == ~stale
 NoTornRead == ~torn
 
 \* Once every task is done and no write is in flight, every cursor write accepted is in the file:
-\* at its cell (one no positional write reaches), or anywhere for an append (-1).
-AllLanded == (AllDone /\ ~InFlight) =>
+\* at its cell (one no positional write reaches), or anywhere for an append (-1); unless the kernel
+\* failed a write, whose bytes, and those behind it, never land.
+AllLanded == (AllDone /\ ~InFlight /\ ~writeLost) =>
     \A w \in written : IF w[1] >= 0 THEN Shared(w[1]) \/ file[w[1]] = w[2]
                        ELSE \E c \in Cells : file[c] = w[2]
 
@@ -967,7 +1055,8 @@ PositionalKeepsCursor ==
 PosReadSees == (PReaders # {} /\ pc["pr"] = "Done" /\ prBefore) => prGot # 0
 
 \* Every write a sync that succeeded covers (accepted, or returned for a positional one, before it
-\* was called) is durable.
+\* was called) is durable: so a write the kernel failed after the handle accepted it, reported once
+\* or never, is never covered by a sync that answers success.
 SyncCovers == \A w \in okClaims : w[1] >= 0 => durable[w[1]] = w[2]
 
 \* Once a sync returned a failure, no sync called after it says it succeeded.
