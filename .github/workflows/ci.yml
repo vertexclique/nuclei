@@ -173,6 +173,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: aarch64-apple-darwin, x86_64-pc-windows-msvc, x86_64-unknown-freebsd
 
       - name: fmt
         run: cargo fmt --all -- --check
@@ -180,6 +181,15 @@ jobs:
       # Every feature on, `io-stats` and `recycle` included.
       - name: clippy
         run: cargo clippy --all --all-targets --all-features -- -D warnings
+
+      # The other systems' code, checked from here with nothing linked: their own jobs build and
+      # test it but do not lint it. The crates only, as the examples and benches pull in C
+      # libraries that do not cross-build.
+      - name: clippy for macOS, Windows and FreeBSD
+        run: |
+          for target in aarch64-apple-darwin x86_64-pc-windows-msvc x86_64-unknown-freebsd; do
+            cargo clippy -p nuclei -p nuclei-macros --target "$target" --lib --tests --all-features -- -D warnings
+          done
 
       # Doc warnings stay visible but not fatal while the legacy runtime is
       # in the tree; it is on its way out and its doc nits go with it.

@@ -15,6 +15,14 @@
   `tcp_split` on epoll runs 452 user instructions per operation instead of 468 (394 instead of
   415 under fat LTO) and 6% fewer in the kernel, and the other stream rows on epoll (`tcp`,
   `tcp_asyncrw`, `unix_stream`, `tcp_many`, `bulk`) 10 to 20 fewer in user space.
+- **A shard is made where it lives.** Its fields, and those of its shared half, are written
+  straight into the `Arc` or `Rc` that holds it: a start no longer copies the 7.8 KB shard three
+  or four times over, each of its two timer wheels level by level, and its driver several times.
+  What is left is one copy of each wheel from a constant and one move of a ring from its
+  constructor into its place. A short run that starts a runtime counts it: `file_read` runs 34 to
+  45 fewer instructions per operation (2470 instead of 2514 on epoll) and `bulk` 8 to 12 fewer.
+  A thread's own shard, once made, is taken with no result to look at, which takes 2 off each
+  `block_on`.
 - **A read that takes part of a ring's chunk bounds it once.** What a read takes off a chunk of
   the receive group is bounded by what the chunk holds, with no saturating steps: `tcp_split` on
   io_uring runs 3 fewer instructions per operation (401 of 404 under fat LTO). CI's budgets in

@@ -686,11 +686,11 @@ fn make_own_shard() -> io::Result<Rc<Shard>> {
         if let Some(shard) = own.borrow().as_ref() {
             return Ok(Rc::clone(shard));
         }
-        let shard = Rc::new(Shard::new(Limits {
+        let shard = Shard::new_rc(Limits {
             max_nesting: DEFAULT_MAX_NESTING,
             buffer_cap: crate::buf::DEFAULT_CAP,
             backend: super::backend::chosen()?,
-        })?);
+        })?;
         *own.borrow_mut() = Some(Rc::clone(&shard));
         local().own.set(Rc::as_ptr(&shard));
         Ok(shard)

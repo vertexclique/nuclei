@@ -67,6 +67,7 @@ use spin::Spin;
 mod children;
 mod going;
 pub(crate) mod locals;
+mod made;
 #[cfg(port)]
 mod port;
 mod run;
@@ -658,40 +659,6 @@ pub(crate) struct Shard {
 }
 
 impl Shard {
-    pub(crate) fn new(limits: Limits) -> io::Result<Self> {
-        Self::made(limits, None)
-    }
-
-    /// The shard of worker `index` of runtime `runtime`, run as `tuning`
-    /// says.
-    pub(crate) fn worker(
-        limits: Limits,
-        tuning: super::tuning::Tuning,
-        runtime: u64,
-        index: usize,
-        monitor: Option<Arc<super::handoff::Monitor>>,
-    ) -> io::Result<Self> {
-        let mut shard = Self::made(limits, Some((runtime, index)))?;
-        #[cfg(feature = "io-stats")]
-        if tuning.count_io {
-            shard.shared.counters.count_io();
-        }
-        if tuning.record_latencies {
-            shard.shared.counters.record_latencies();
-            #[cfg(all(completion, feature = "io-stats"))]
-            shard.time_io();
-        }
-        shard.until_inbox.set(tuning.inbox_interval);
-        shard.count_drive_from(0, tuning.driver_interval);
-        #[cfg(ring)]
-        if let Some(ring) = shard.ring() {
-            ring.set_zero_copy_min(tuning.zero_copy_min);
-        }
-        shard.tuning = tuning;
-        shard.monitor = monitor;
-        Ok(shard)
-    }
-
     /// The shard's buffer pool.
     pub(crate) fn pool(&self) -> &Pool {
         &self.pool
@@ -720,123 +687,6 @@ impl Shard {
         if let Some(monitor) = &self.monitor {
             monitor.worker_woke();
         }
-    }
-
-    /// A shard, worker `owner` (a runtime and a place) if it is one. Its
-    /// counters know the place before `stats` can list it.
-    fn made(limits: Limits, owner: Option<(u64, usize)>) -> io::Result<Self> {
-        #[cfg(readiness)]
-        let poller = || -> io::Result<_> {
-            let poller = Poller::new()?;
-            let (notifier, registrar) = (poller.notifier(), poller.registrar());
-            Ok((
-                Driver::Poll(RefCell::new(poller)),
-                notifier,
-                Some(registrar),
-            ))
-        };
-        #[cfg(port)]
-        let poller = || -> io::Result<_> {
-            let poller = Poller::new()?;
-            let (notifier, port) = (poller.notifier(), Arc::clone(poller.port()));
-            Ok((Driver::Poll(RefCell::new(poller)), notifier, port))
-        };
-        let pool = Pool::new(limits.buffer_cap);
-        // The receive group asked for is charged before it is made; what the
-        // ring made in the end is less on a ring made smaller, and nothing on
-        // the poller, and the rest is given back below.
-        let reserved = reserve_group(&pool, limits.backend)?;
-        // The poller's registrar, or the port its handles bind to.
-        let (driver, notifier, kernel) = match limits.backend {
-            Backend::Poll => poller()?,
-            #[cfg(ring)]
-            Backend::Ring(cfg) | Backend::RingOrPoll(cfg) => {
-                // Under a tight memory limit the ring gets fewer entries; one
-                // `auto` chose runs the poller if even the least finds none.
-                match ring::ShardRing::for_shard(cfg) {
-                    Ok(ring) => {
-                        let notifier = ring.notifier();
-                        (Driver::Ring(ring), notifier, None)
-                    }
-                    // The choice of `auto` checked the kernel already (see
-                    // `backend::usable`); a shard that still finds the ring
-                    // refused, or no memory, runs the poller rather than fail.
-                    Err(err)
-                        if matches!(limits.backend, Backend::RingOrPoll(_))
-                            && (err.raw_os_error() == Some(libc::ENOMEM)
-                                || err.kind() == io::ErrorKind::Unsupported) =>
-                    {
-                        poller()?
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-        };
-        let made = match &driver {
-            #[cfg(ring)]
-            Driver::Ring(ring) => ring.recv_reservation(),
-            #[cfg(ring)]
-            Driver::Gone => 0,
-            Driver::Poll(_) => 0,
-        };
-        pool.unreserve(reserved.saturating_sub(made));
-        let shared = Arc::new(Shared {
-            inbox: Inbox::new(),
-            park: ParkState::new(),
-            notifier,
-            load: AtomicUsize::new(0),
-            stopped: AtomicBool::new(false),
-            draining: AtomicBool::new(false),
-            stop_waker: AtomicWaker::new(),
-            timer_ops: Counted::new(),
-            #[cfg(readiness)]
-            registrar: kernel,
-            #[cfg(port)]
-            port: kernel,
-            io_ops: Counted::new(),
-            io_closed: AtomicBool::new(false),
-            counters: Counters::new(driver.backend(), pool.cap(), owner),
-            runtime: std::sync::OnceLock::new(),
-            runtime_addr: AtomicUsize::new(0),
-            writes: AtomicUsize::new(0),
-            released: AtomicBool::new(false),
-            timer_at: AtomicU64::new(u64::MAX),
-            parks: AtomicU64::new(0),
-        });
-        counters::register(&shared);
-        Ok(Self {
-            shared,
-            queue: RefCell::new(VecDeque::new()),
-            lifo: Cell::new(None),
-            lifo_streak: Cell::new(0),
-            until_inbox: Cell::new(super::tuning::Tuning::default().inbox_interval),
-            drive_left: Cell::new(1),
-            drive_at: Cell::new(1),
-            last_drive: Cell::new(super::quartz::Quartz::now()),
-            polls: Cell::new(0),
-            sleeps: Cell::new(0),
-            slept: Cell::new(Duration::ZERO),
-            remote_wakes: Cell::new(0),
-            looks: Cell::new(0),
-            spin: Spin::new(),
-            owner: Cell::new(owner),
-            monitor: None,
-            home: core::cell::OnceCell::new(),
-            limits,
-            tuning: super::tuning::Tuning::default(),
-            driver,
-            wheel: RefCell::new(Wheel::new()),
-            precise: RefCell::new(Wheel::new()),
-            epoch: crate::time::clock::origin(),
-            fired: RefCell::new(Vec::new()),
-            signal: Cell::new(None),
-            sources: RefCell::new(Sources::default()),
-            children: RefCell::new(children::Children::default()),
-            pool,
-            locals: locals::Locals::default(),
-            #[cfg(port)]
-            keeper: RefCell::new(None),
-        })
     }
 
     /// The values of the `shard_local!` statics: a worker's alone.
@@ -1189,6 +1039,8 @@ impl Shard {
 
 #[cfg(all(test, not(loom)))]
 mod tests;
+#[cfg(all(test, not(loom)))]
+mod tests_made;
 #[cfg(all(test, not(loom)))]
 mod tests_pool;
 #[cfg(all(test, not(loom)))]

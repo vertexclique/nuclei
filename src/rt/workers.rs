@@ -234,17 +234,13 @@ impl Workers {
         if workers.monitor.is_some() {
             limits.backend = limits.backend.handed_over();
         }
-        #[expect(
-            clippy::arc_with_non_send_sync,
-            reason = "the count is what is shared: the shard itself moves between threads only at a hand-over (`rt::handoff`)"
-        )]
-        let shard = Arc::new(Shard::worker(
+        let shard = Shard::worker(
             limits,
             workers.start.tuning.clone(),
             inner.id(),
             index,
             workers.monitor.clone(),
-        )?);
+        )?;
         let shared = Arc::clone(&shard.shared);
         shared.set_runtime(Arc::downgrade(inner));
         let _ = workers.slots[index].set(Arc::clone(&shared));
