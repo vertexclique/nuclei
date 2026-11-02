@@ -119,7 +119,8 @@ impl ReadState {
         // after the next "not now" submits nothing.
         #[cfg(ring)]
         if self.poll_first {
-            let want = if (kind.datagrams() && !issuer.multishot_datagrams(kind))
+            let datagrams = kind.datagrams() && !issuer.multishot_datagrams(kind);
+            let want = if datagrams
                 || (kind.counts_left()
                     && self.inq_wanted(kind)
                     && !self.recv_mode
@@ -127,7 +128,7 @@ impl ReadState {
             {
                 self.multi = true;
                 self.armed = true;
-                Want::ReadyMulti
+                Want::ReadyMulti { stream: !datagrams }
             } else {
                 Want::Ready { read: true }
             };

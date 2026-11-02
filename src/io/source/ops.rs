@@ -38,11 +38,12 @@ pub(crate) enum Want {
     #[cfg(completion)]
     Ready { read: bool },
     /// Wait, until stopped, for the socket of a side that receives its
-    /// datagrams itself to be readable: each time it may be, the side is told
-    /// with an arrival ([`Arrival::Ready`](crate::io::source::ring::Arrival)),
-    /// and the poll stays armed (its end as [`Outcome::ReadyMultiEnd`]).
+    /// datagrams itself, or of a stream read by readiness (`stream`), to be readable: each time
+    /// it may be, the side is told with an arrival
+    /// ([`Arrival::Ready`](crate::io::source::ring::Arrival)), and the poll stays armed (its end
+    /// as [`Outcome::ReadyMultiEnd`]).
     #[cfg(ring)]
-    ReadyMulti,
+    ReadyMulti { stream: bool },
     /// Accept a connection.
     Accept,
     /// Accept connections as they come, until the accept is stopped: each
@@ -109,7 +110,9 @@ impl Want {
             | Want::RecvFrom(_)
             | Want::RecvLentFrom(_) => true,
             #[cfg(ring)]
-            Want::RecvMulti | Want::AcceptMulti | Want::RecvFromMulti | Want::ReadyMulti => true,
+            Want::RecvMulti | Want::AcceptMulti | Want::RecvFromMulti | Want::ReadyMulti { .. } => {
+                true
+            }
             Want::Connect(_)
             | Want::Send(_)
             | Want::SendLent(..)

@@ -1070,7 +1070,7 @@ next wait. A switch to the multishot receive cancels the poll and arms the recei
 ended; a switch back cancels the receive and reads from the socket again only once every chunk it
 brought was read and its end came, its first read looking at the socket. A peer that closes after
 its messages leaves an end the kernel's count may not tell (a Unix stream's leaves it out): the
-poll reports the hangup (`POLLRDHUP` is asked for, and `Arrival::Ready` carries it), which marks
+poll reports the hangup (`POLLRDHUP` is asked for, and the edge comes as `Arrival::Hangup`), which marks
 the side unsure, as a poller's hangup edge does, and an unsure side reads again
 on a count of none and finds the end. 11 configurations: 4 that
 must pass (three messages read one at a time with the kernel's count, two at a time by length,

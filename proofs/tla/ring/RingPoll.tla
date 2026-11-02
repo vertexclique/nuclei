@@ -33,7 +33,7 @@
 (*                                                                          *)
 (* With `Close` the peer closes the socket after its messages, and the     *)
 (* kernel's count leaves the pending end out, as a Unix stream's does: the *)
-(* poll reports the hangup, which marks the side unsure (`Arrival::Ready`, *)
+(* poll reports the hangup, which marks the side unsure (`Arrival::Hangup`,*)
 (* `short_reads_unsure`), and an unsure side reads again on a count of     *)
 (* none, finding the end. A side that does not mark it waits for a poll    *)
 (* that said everything already.                                           *)

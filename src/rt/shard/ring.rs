@@ -369,7 +369,7 @@ impl ShardRing {
             self.counts.set((armed + 1, arrived, dry));
         }
         #[cfg(test)]
-        if matches!(op.mem, RingMem::ReadyMulti) {
+        if matches!(op.mem, RingMem::ReadyMulti | RingMem::ReadyStream) {
             self.polls_armed.set(self.polls_armed.get() + 1);
         }
         let write = counts_as_write(&op);
@@ -939,6 +939,7 @@ fn ends_plain(op: &RingOp) -> bool {
             | RingMem::RecvFromMulti { .. }
             | RingMem::AcceptMulti { .. }
             | RingMem::ReadyMulti
+            | RingMem::ReadyStream
     )
 }
 
