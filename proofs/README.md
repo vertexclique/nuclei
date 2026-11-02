@@ -1561,10 +1561,9 @@ same number while the shard waits; a holder's eviction).
 
 `Pending` (`tla/going/Pending.tla`) checks a thread's own shard that leaves while the attach of a
 source it registered is still a request another thread holds (`Shard::leave` and
-`wait_for_evictions` in `src/rt/shard/going.rs`, `attach_now`, `name_ring_attach`,
-`attach_asked_of`, `evict_now` and `abandon_ring_attach` in `src/io/source/requests.rs`,
-`attach_ring` and `ring_attach_failed` in `src/io/source/ring.rs`, `Tokens::drain_tokens` in
-`src/rt/sources.rs`). The holder performs the attach and then the eviction as it lets go: on a ring,
+`wait_for_evictions` in `src/rt/shard/going.rs`, `attach_now`, `attach_asked_of`, `evict_now`
+and `abandon_ring_attach` in `src/io/source/requests.rs`, `attach_ring` and `ring_attach_failed`
+in `src/io/source/ring.rs`, `Tokens::drain_tokens` in `src/rt/sources.rs`). The holder performs the attach and then the eviction as it lets go: on a ring,
 off the shard's thread, the attach posts the file's install with a lease that keeps the handle's
 object open, and the eviction abandons it with a release of the slot; elsewhere the holder
 registers the source itself; an attach that finds the handle closed posts a release. The shard

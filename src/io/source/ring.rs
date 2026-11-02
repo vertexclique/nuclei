@@ -1020,11 +1020,8 @@ impl Source {
             here.filter(|s| s.is(&shard))
                 .and_then(|s| s.ring().map(|ring| ring.attach(fd)))
         });
+        // The shard and the token are named already (`attach_now`).
         self.reg.ops.store(true, Ordering::Release);
-        self.reg
-            .home
-            .store(Arc::as_ptr(&shard) as usize, Ordering::Release);
-        self.reg.token.store(token, Ordering::Release);
         match here {
             Some(Ok(slot)) => {
                 self.reg.slot.store(slot, Ordering::Release);
