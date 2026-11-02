@@ -38,6 +38,13 @@
   saw it before, up to a millisecond late, or the advance late. It is now armed for the deadline
   as the system sees it (`proofs/tla/precise`, the `key_on_clock` mutation). A clock nobody
   paused or advanced pays nothing for it.
+- **A timer's key never reaches a later timer in its place.** Each entry of a timer wheel counts
+  its reuses in a generation a key carries, which was 32 bits: a key held while its entry was
+  let go of and taken again 2^32 times reached the timer in the entry then, as a sleep that fired
+  and was not polled for minutes might on a shard cancelling millions of timeouts a second, and
+  set that timer's waker or removed it. The generation is now 64 bits, which takes centuries to
+  come round at one reuse a nanosecond (`proofs/lean/Nuclei/Wheel.lean`,
+  `stale_key_stays_stale`). An entry of the wheel takes 56 bytes instead of 48.
 
 ### Changed
 
