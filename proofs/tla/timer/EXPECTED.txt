@@ -16,3 +16,6 @@ T_live_goes_drop               MC_Timer             pass
 M_no_orphan                    MC_Timer             violated:NoStrandedWaker
 M_no_rearm                     MC_Timer             violated:Termination
 W_orphan_rearm                 MC_Timer             violated:NoRearm
+MT_post_no_stop_check          MC_Timer             violated:NoStrandedWaker
+MT_post_check_first            MC_Timer             violated:NoStrandedWaker
+MT_orphan_ignores_cancel       MC_Timer             violated:NoWakeAfterDrop

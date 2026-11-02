@@ -67,7 +67,8 @@ variables
     gone = FALSE,       \* the first shard went
     \* records
     wokeDead = FALSE,   \* a wake reached a task whose sleep was dropped
-    rearmed = FALSE;    \* the sleep armed its timer again on the second shard
+    rearmed = FALSE,    \* the sleep armed its timer again on the second shard
+    orphanFired = FALSE; \* (record) an orphan met a cell that had fired
 
 define
     AllDone == \A p \in {ForeignT, ClockT} \cup Shards : pc[p] = "Done"
@@ -79,14 +80,28 @@ end define;
 \* `RemoteTimer::orphan`: the cell's shard let go of it unfired. Unless it fired or was cancelled,
 \* it is marked orphaned and its waker taken and woken.
 macro Orphan() begin
-    if ~fired /\ ~cancelled then
+    orphanFired := orphanFired \/ fired;
+    \* MUTATION orphan_ignores_cancel: a cancelled cell is orphaned and woken too.
+    if ~fired /\ (~cancelled \/ Mutation = "orphan_ignores_cancel") then
         orphaned := TRUE;
         if slot then
             slot := FALSE;
             woken := TRUE;
-            if ~alive then wokeDead := TRUE; end if;
+            \* (record) a wake once the drop began (its cancel is its first step)
+            if ~alive \/ cancelled then wokeDead := TRUE; end if;
         end if;
     end if;
+end macro;
+
+\* `Shared::drain_timer_ops`: every op in the first shard's mailbox goes; an arm request
+\* orphans its cell.
+macro DrainFirst() begin
+    \* MUTATION no_orphan: the drain lets the request go and wakes nobody.
+    if (\E i \in 1..Len(mailbox[ShardT]) : mailbox[ShardT][i] = "insert")
+       /\ Mutation # "no_orphan" then
+        Orphan();
+    end if;
+    mailbox[ShardT] := <<>>;
 end macro;
 
 fair process clock = ClockT
@@ -102,18 +117,31 @@ C_pass:
 end process;
 
 fair process foreign = ForeignT
+variables sawGone = FALSE;    \* what the mutated post read of the flag before its push
 begin
 F_poll:
-    \* First poll: register the waker in the cell, then post the arm request to the first shard.
-    \* One that went drains what is posted to it at once: the arm request orphans the cell.
-    if gone /\ Mutation # "no_orphan" then
-        \* The waker registered, then taken and woken by the drain.
-        orphaned := TRUE || woken := TRUE;
-    elsif gone then
-        \* MUTATION no_orphan: the drain lets the request go and wakes nobody.
-        slot := TRUE;
+    \* First poll: register the waker in the cell, then `Shared::post_timer`: the arm request
+    \* pushed to the first shard's mailbox, a fence, then the look at its `stopped` flag.
+    \* MUTATION post_check_first: the flag is read before the push (what the fence stops).
+    slot := TRUE;
+    if Mutation = "post_check_first" then
+        sawGone := gone;
     else
-        slot := TRUE || mailbox[ShardT] := Append(mailbox[ShardT], "insert");
+        mailbox[ShardT] := Append(mailbox[ShardT], "insert");
+    end if;
+F_post_check:
+    \* A shard that stopped applies nothing more: the poster drains what reached it.
+    \* MUTATION post_no_stop_check: the poster never looks at the flag.
+    if Mutation = "post_check_first" then
+        \* The push comes now; a flag seen up before it drains it with the rest.
+        if sawGone then
+            if Mutation # "no_orphan" then Orphan(); end if;
+            mailbox[ShardT] := <<>>;
+        else
+            mailbox[ShardT] := Append(mailbox[ShardT], "insert");
+        end if;
+    elsif gone /\ Mutation # "post_no_stop_check" then
+        DrainFirst();
     end if;
 F_wait:
     \* Await the fire, or drop the sleep.
@@ -155,14 +183,19 @@ F_rearm:
     end if;
     goto F_wait;
 F_drop:
-    \* `release`: mark cancelled, take the waker out, post the cancel (drained at once by a
-    \* shard that went).
+    \* `release_armed`: mark cancelled, ...
     cancelled := TRUE;
+F_drop_waker:
+    \* ... take the waker out ...
     \* MUTATION drop_keeps_waker: the drop leaves the waker in the cell.
     if Mutation # "drop_keeps_waker" then slot := FALSE; end if;
     alive := FALSE;
+F_drop_post:
+    \* ... and post the cancel (drained at once by a shard that went: a cancel does nothing).
     if ~(armedOn = ShardT /\ gone) then
         mailbox[armedOn] := Append(mailbox[armedOn], "cancel");
+    elsif Mutation # "post_no_stop_check" then
+        DrainFirst();
     end if;
 F_done:
     skip;
@@ -226,16 +259,19 @@ S_wake:
     end if;
     goto S_loop;
 S_go:
-    \* The first shard goes (its drop): its mailbox is drained and its wheel lets go of its
-    \* entry; a timer it held for the cell, armed or asked for, orphans the cell.
-    \* MUTATION no_orphan: it lets go of them and wakes nobody.
-    if HeldByFirst /\ Mutation # "no_orphan" then
+    \* The first shard goes (its drop): its `stopped` flag goes up first, then a fence ...
+    gone := TRUE;
+S_go_wheel:
+    \* ... its wheel lets go of its entry: a timer it held armed orphans the cell ...
+    \* MUTATION no_orphan: it lets go of what it held and wakes nobody.
+    if entry[self] = "armed" /\ Mutation # "no_orphan" then
         Orphan();
     end if;
-    gone := TRUE;
     entry[self] := "none";
     keyStored[self] := FALSE;
-    mailbox[self] := <<>>;
+S_go_drain:
+    \* ... and its last drain of the mailbox: an arm request there orphans the cell too.
+    DrainFirst();
 end process;
 end algorithm; *)
 \* The PlusCal translator writes the TLA+ form of the algorithm between the next two lines.
@@ -257,6 +293,13 @@ NoWakeAfterDrop == ~wokeDead
 \* Once the first shard went, no cell of a timer it held keeps the task's waker unwoken: the
 \* task and the cell never keep each other for good.
 NoStrandedWaker == ~(gone /\ armedOn = ShardT /\ slot /\ ~orphaned /\ ~fired /\ ~cancelled)
+
+\* An orphan never meets a cell that fired: the fired half of `orphan`'s check never decides
+\* anything (the shard that fires a cell is the one that would orphan it).
+NoOrphanAfterFire == ~orphanFired
+
+\* Once every thread is done, no arm request is left in a mailbox nobody will drain.
+NoStrandedOp == AllDone => \A s \in Shards : mailbox[s] = <<>>
 
 Safe == NothingLeft /\ NoWakeAfterDrop /\ NoStrandedWaker
 
