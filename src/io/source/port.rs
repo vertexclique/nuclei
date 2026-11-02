@@ -109,10 +109,11 @@ pub(crate) struct PortState {
     /// the jobs making its calls hold. Set as the source registers, with
     /// both sides held; read with one.
     sync: UnsafeCell<Option<Arc<OwnedHandle>>>,
-    /// The port the handle's completions go to, where its operations are issued: its shard's,
-    /// or, while it waits to move (`moving`), the port it could not move off. Written with both
-    /// sides held; read with one.
-    bound: UnsafeCell<Option<Arc<Port>>>,
+    /// The port the handle's completions go to, with the handle it was bound for (a revival
+    /// brings another, bound nowhere yet): where its operations are issued, its shard's, or, while
+    /// it waits to move (`moving`), the port it could not move off. Written with both sides
+    /// held; read with one.
+    bound: UnsafeCell<Option<(Raw, Arc<Port>)>>,
     /// The source is registered with a shard whose port its handle could not move to, with an
     /// operation out that is never cancelled (a TCP send): its operations go to `bound`, whose
     /// keeper drains it, until none is out and the move is made again (`attach_port`).
@@ -353,8 +354,8 @@ impl<'a> PortIo<'a> {
         match self {
             PortIo::Here { source } => source.home_held().map(|home| PortIssuer {
                 source,
-                // SAFETY: a side is held, so no writer (which holds both) is at work.
-                port: unsafe { (*source.port.bound.get()).clone() }
+                port: source
+                    .bound_port()
                     .unwrap_or_else(|| Arc::clone(home.port())),
             }),
             PortIo::NotYet => None,
@@ -1333,8 +1334,11 @@ impl Source {
                 .map(|()| None),
             _ => shard.port().bind(fd as usize as HANDLE).map(|()| None),
         };
+        // The port this handle is bound to, if any (a revival's new handle is bound nowhere).
         // SAFETY: both sides are held.
-        let old = unsafe { (*self.port.bound.get()).clone() };
+        let old = unsafe { (*self.port.bound.get()).clone() }
+            .filter(|(bound, _)| *bound == fd)
+            .map(|(_, port)| port);
         // Bound to this shard's port already (its thread's `block_on` again): nothing moves, and
         // a bind would fail with a send of the handle's still out.
         let here = old
@@ -1372,7 +1376,7 @@ impl Source {
             if !self.port.moving.load(Ordering::Acquire) {
                 // The handle's completions go to this shard's port now (a byte stream's calls
                 // made on the pool, to whichever port its packets are posted).
-                let old = (*self.port.bound.get()).replace(Arc::clone(shard.port()));
+                let old = (*self.port.bound.get()).replace((fd, Arc::clone(shard.port())));
                 if sync.is_some() {
                     *self.port.bound.get() = None;
                 }
@@ -1391,6 +1395,16 @@ impl Source {
         Ok(())
     }
 
+    /// The port the source's handle is bound to, for its operations; `None` for a handle bound
+    /// nowhere yet. The caller holds a side.
+    fn bound_port(&self) -> Option<Arc<Port>> {
+        let fd = self.fd.load(Ordering::Acquire);
+        // SAFETY: a side is held, so no writer (which holds both) is at work.
+        unsafe { (*self.port.bound.get()).as_ref() }
+            .filter(|(bound, _)| *bound == fd)
+            .map(|(_, port)| Arc::clone(port))
+    }
+
     /// Whether the source waits to move off the port its handle is bound to (see
     /// [`attach_port`](Self::attach_port)).
     pub(super) fn moving(&self) -> bool {
@@ -1406,7 +1420,7 @@ impl Source {
         // handle stays bound there until a registration moves it).
         if self.port.moving.swap(false, Ordering::AcqRel)
             // SAFETY: both sides are held.
-            && let Some(old) = unsafe { (*self.port.bound.get()).as_ref() }
+            && let Some((_, old)) = unsafe { (*self.port.bound.get()).as_ref() }
         {
             old.moved();
         }
