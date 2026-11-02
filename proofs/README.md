@@ -1649,7 +1649,20 @@ configurations: 2 that must pass (the old shard gone, and able to run again, wit
 every read served, `Registers` and `AllDelivered`, and `OneDrainer`), and 3 mutations (the
 registration that waits unregistered for the send, as it did, breaks `ReadServed`: both ends waited
 for good; a keeper that leaves once none is out though a source waits to move breaks `ReadServed`,
-the read made after the send ended never delivered; a move never made again breaks `Registers`).
+the read made after the send ended never delivered; a move never made again breaks `Registers`). A
+registration with the shard whose port the handle is bound to already (its thread's next
+`block_on`) moves nothing and binds nothing; a bind there all the same fails with the send out and
+waits for good (`MK_no_here`, `ReadServed` broken).
+
+`tla/port/PortLook.tla` checks a read on a port whose pool has no buffer for it, made by the task
+straight from the socket once a zero-byte look said bytes came (`read_starved`, `receive_starved`
+and `taken_by_another` in `src/io/source/read.rs`), when a call outside the side (std's own read
+through `get_ref`, another handle on the socket) takes the bytes first. On a socket nuclei makes
+non-blocking the task's read then finds none (`WSAEWOULDBLOCK`), marks the side unreadable, sends
+another look and waits for it; before, it would have blocked the shard's thread. 4 configurations: 1
+that must pass (`NoSpuriousError`, no read answers an error for bytes another call took, and
+`Served`), 2 mutations (the WouldBlock answered as an error breaks `NoSpuriousError`; a wait with no
+look sent breaks `Served`), and a witness (the announced bytes taken, the next read).
 
 ## Idle peers on a completion port
 

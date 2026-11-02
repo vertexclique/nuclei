@@ -45,3 +45,8 @@ PK_duplex_back                 MC_PortKeep          pass
 MK_duplex                      MC_PortKeep          violated:ReadServed
 MK_keeper_leaves               MC_PortKeep          violated:ReadServed
 MK_no_rebind                   MC_PortKeep          violated:Registers
+MK_no_here                     MC_PortKeep          violated:ReadServed
+PL_look                        MC_PortLook          pass
+MPL_errors                     MC_PortLook          violated:NoSpuriousError
+MPL_waits                      MC_PortLook          violated:Served
+WPL_taken                      MC_PortLook          violated:NoTaken

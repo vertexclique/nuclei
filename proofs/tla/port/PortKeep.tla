@@ -74,7 +74,8 @@ variables
     pending = FALSE,      \* (Duplex) the source is registered with its new shard, its operations on the old port
     readIn = 0,           \* (Duplex) the task's read the kernel holds, on the old port
     readQueued = 0,       \* (Duplex) its packet on the old port, not dequeued
-    readsDone = 0;        \* (Duplex) the task's reads that completed
+    readsDone = 0,        \* (Duplex) the task's reads that completed
+    same = FALSE;         \* the registration is with the shard whose port the handle is bound to
 
 define
     \* The source's operations not delivered: the port's count, and the source's.
@@ -231,8 +232,18 @@ fair process task = "task"
 begin
 T_bind:
     await handedOff /\ evicted;
+    \* The task polls where it runs: on the old shard again, if it runs again, or on another.
+    with here \in (IF running THEN {TRUE, FALSE} ELSE {FALSE}) do
+        same := here;
+    end with;
+T_here:
+    \* Bound to that shard's port already: nothing moves, and the registration is made at once.
+    \* MUTATION no_here: it binds all the same, which fails with an operation of the handle out.
+    if same /\ Mutation # "no_here" then
+        registered := TRUE;
+        goto T_read;
     \* The bind fails while the kernel holds an operation of the handle.
-    if inKernel + readIn = 0 then
+    elsif inKernel + readIn = 0 then
         registered := TRUE;
         if pending then                                                      \* a move that waited is made:
             pending := FALSE;                                                \* the source is on its new port
@@ -247,7 +258,7 @@ T_bind:
 T_pend:
     \* The source stays on its old port, registered with its new shard: its operations go there.
     \* MUTATION wait_for_move: it waits unregistered for its operations to end, as it did.
-    if Duplex /\ Mutation # "wait_for_move" then
+    if Duplex /\ ~same /\ Mutation # "wait_for_move" then
         pending := TRUE;
     end if;
 T_idle:
