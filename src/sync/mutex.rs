@@ -709,7 +709,7 @@ impl<T: ?Sized> fmt::Debug for LockOwned<T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::sync::test_support::{Polled, block_on};
+    use crate::sync::test_support::{Polled, block_on, hooked, with_budget_spent};
 
     const ITERATIONS: usize = if cfg!(miri) { 20 } else { 5_000 };
 
@@ -729,6 +729,32 @@ mod tests {
         assert_eq!(waiter.wakes(), 1);
         *waiter.ready() += 1;
         assert_eq!(mutex.spin_rounds(), 0, "the mutex never spins");
+    }
+
+    #[test]
+    fn a_lock_granted_in_the_poll_that_queued_it_spends_the_budget() {
+        let mutex = Arc::new(Mutex::new(0u8));
+        let held = Arc::clone(&mutex).try_lock_owned().expect("free");
+        // The lock finds the mutex held; between that look and its queueing,
+        // the holder lets go, so the retry in the poll that queued it wins.
+        let waker = hooked(Some(Box::new(move || drop(held))), None);
+        let mut lock = Box::pin(mutex.lock());
+        let mut cx = Context::from_waker(&waker);
+        let polled = with_budget_spent(|| lock.as_mut().poll(&mut cx));
+        assert!(
+            polled.is_pending(),
+            "a lock completed past the spent budget"
+        );
+        assert!(
+            mutex.try_lock().is_ok(),
+            "the refused lock gave the mutex back"
+        );
+        let Poll::Ready(mut guard) = lock.as_mut().poll(&mut cx) else {
+            panic!("the lock is free");
+        };
+        *guard += 1;
+        drop(guard);
+        assert_eq!(*mutex.try_lock().expect("free"), 1);
     }
 
     #[test]

@@ -270,9 +270,10 @@ impl FairWait {
     /// node.
     ///
     /// A first poll that completes spends one operation of the poll's budget
-    /// (see `coop`); with the budget spent, permits it took go back through
-    /// `give_back` and it yields. A grant to a queued wait spends nothing:
-    /// that wait yielded.
+    /// (see `coop`), whether it took the permits itself or its queueing's own
+    /// pass granted them; with the budget spent, permits it got go back
+    /// through `give_back` and it yields. A grant to a wait that queued in an
+    /// earlier poll spends nothing: that wait yielded.
     pub(super) fn poll(
         &mut self,
         sem: &FairSemaphore,
@@ -315,7 +316,15 @@ impl FairWait {
                 Err(_) => {}
             }
             sem.enqueue(&mut self.wait, n, waker);
-            self.wait.poll(&sem.queue, None)
+            match self.wait.poll(&sem.queue, None) {
+                Poll::Ready(payload) if !admit() => {
+                    if payload != CLOSED_GRANT {
+                        give_back(n);
+                    }
+                    return Poll::Pending;
+                }
+                granted => granted,
+            }
         };
         granted.map(|payload| {
             if payload == CLOSED_GRANT {

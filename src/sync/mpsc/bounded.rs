@@ -839,10 +839,8 @@ impl<T> Drop for Reserve<'_, T> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use core::task::Waker;
-
     use super::*;
-    use crate::sync::test_support::Polled;
+    use crate::sync::test_support::{Polled, hooked, with_budget_spent};
 
     #[test]
     fn the_free_slots_plus_the_queued_values_are_the_buffer() {
@@ -854,70 +852,6 @@ mod tests {
         assert_eq!(tx.capacity() + rx.len(), 4);
         rx.try_recv().unwrap();
         assert_eq!(tx.capacity() + rx.len(), 4);
-    }
-
-    /// A waker that runs `on_clone` at its first clone and `on_wake` at its
-    /// first wake by reference: what another thread could do at those
-    /// moments of a send's poll.
-    struct Hook {
-        on_clone: core::cell::Cell<Option<Box<dyn FnOnce()>>>,
-        on_wake: core::cell::Cell<Option<Box<dyn FnOnce()>>>,
-    }
-
-    static HOOK: core::task::RawWakerVTable =
-        core::task::RawWakerVTable::new(hook_clone, hook_wake, hook_wake_by_ref, hook_drop);
-
-    // Each of the four functions below is the vtable entry of a waker built
-    // from `Rc::into_raw` of a `Hook`, which is their contract; the tests use
-    // it on their own thread only.
-    unsafe fn hook_clone(data: *const ()) -> core::task::RawWaker {
-        // SAFETY: `data` came from `Rc::into_raw` of a `Hook` and is live.
-        let hook = unsafe { &*(data as *const Hook) };
-        if let Some(run) = hook.on_clone.take() {
-            run();
-        }
-        // SAFETY: `data` is a live `Rc` pointer; this adds the clone's count.
-        unsafe { std::rc::Rc::increment_strong_count(data as *const Hook) };
-        core::task::RawWaker::new(data, &HOOK)
-    }
-
-    unsafe fn hook_wake(data: *const ()) {
-        // SAFETY: `data` is a live `Rc` pointer, whose count this consumes.
-        unsafe { hook_wake_by_ref(data) };
-        // SAFETY: as above.
-        unsafe { hook_drop(data) };
-    }
-
-    unsafe fn hook_wake_by_ref(data: *const ()) {
-        // SAFETY: `data` came from `Rc::into_raw` of a `Hook` and is live.
-        let hook = unsafe { &*(data as *const Hook) };
-        if let Some(run) = hook.on_wake.take() {
-            run();
-        }
-    }
-
-    unsafe fn hook_drop(data: *const ()) {
-        // SAFETY: consumes the count this waker owns.
-        drop(unsafe { std::rc::Rc::from_raw(data as *const Hook) });
-    }
-
-    fn hooked(on_clone: Option<Box<dyn FnOnce()>>, on_wake: Option<Box<dyn FnOnce()>>) -> Waker {
-        let hook = std::rc::Rc::new(Hook {
-            on_clone: core::cell::Cell::new(on_clone),
-            on_wake: core::cell::Cell::new(on_wake),
-        });
-        let data = std::rc::Rc::into_raw(hook) as *const ();
-        // SAFETY: the vtable's contract is met by a pointer from `Rc::into_raw`.
-        unsafe { Waker::from_raw(core::task::RawWaker::new(data, &HOOK)) }
-    }
-
-    /// Runs `poll` inside a poll whose budget is spent.
-    fn with_budget_spent<R>(poll: impl FnOnce() -> R) -> R {
-        let saved = crate::coop::enter();
-        while crate::coop::try_spend() {}
-        let result = poll();
-        crate::coop::leave(saved);
-        result
     }
 
     #[test]

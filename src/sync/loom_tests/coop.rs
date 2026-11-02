@@ -165,16 +165,11 @@ fn a_send_refused_for_the_budget_hands_its_slot_to_a_queued_send() {
                 },
                 |n| sem.release(n),
             );
-            match refused {
-                // Refused, or queued behind the other send: a queued wait leaves the
-                // line, passing on whatever was granted to it.
-                core::task::Poll::Pending => wait.cancel(&sem, 1),
-                // Queued and granted at once by the other send's release.
-                core::task::Poll::Ready(taken) => {
-                    assert!(taken.is_ok(), "the semaphore never closes here");
-                    sem.release(1);
-                }
-            }
+            // Refused, or queued behind the other send: the budget refuses a
+            // grant at queueing too, so nothing completes. A queued wait
+            // leaves the line, passing on whatever was granted to it.
+            assert!(refused.is_pending(), "a completion past the spent budget");
+            wait.cancel(&sem, 1);
             sender.join().expect("sender");
             assert_eq!(sem.available(), 1, "a slot was lost or made up");
         },

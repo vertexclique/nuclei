@@ -183,10 +183,11 @@ fn spin_take<L: Lock>(lock: &L, need: usize, mut seen: usize) -> bool {
     false
 }
 
-/// A first poll took `need` without waiting: it spends one operation of the
-/// poll's budget (see `coop`), or, with the budget spent, gives `need` back
-/// and yields. A grant to a queued waiter spends nothing: that wait yielded,
-/// and giving the grant back would cost it its place.
+/// A first poll took `need` without waiting, by its own attempt or by a grant
+/// or retry in the poll that queued it: it spends one operation of the poll's
+/// budget (see `coop`), or, with the budget spent, gives `need` back and
+/// yields. A grant to a waiter that queued in an earlier poll spends nothing:
+/// that wait yielded, and giving the grant back would cost it its place.
 #[inline]
 pub(super) fn taken_at_once<L: Lock + ?Sized>(
     lock: &L,
@@ -273,6 +274,10 @@ impl Contend {
         seen: Option<usize>,
     ) -> Poll<Result<(), Closed>> {
         let queue = lock.queue();
+        // Whether the wait queued in this poll: what it gets before the poll
+        // ends it did not yield for, so it spends from the budget as a take
+        // at once does.
+        let mut queued_now = false;
         let mut park = if self.wait.is_queued() {
             self.wait.park(queue, Some(waker))
         } else {
@@ -299,6 +304,7 @@ impl Contend {
                 }
             }
             lock.enqueue(&mut self.wait, need, waker);
+            queued_now = true;
             self.wait.park(queue, None)
         };
         loop {
@@ -306,11 +312,17 @@ impl Contend {
                 Park::Granted(payload) => {
                     // A nudge may have been pending when the grant came.
                     queue.consume_nudge();
-                    return Poll::Ready(if payload == CLOSED_GRANT {
-                        Err(Closed)
-                    } else {
-                        Ok(())
-                    });
+                    if payload == CLOSED_GRANT {
+                        return if !queued_now || crate::coop::spend(waker) {
+                            Poll::Ready(Err(Closed))
+                        } else {
+                            Poll::Pending
+                        };
+                    }
+                    if queued_now {
+                        return taken_at_once(lock, need, waker);
+                    }
+                    return Poll::Ready(Ok(()));
                 }
                 Park::Pending => return Poll::Pending,
                 // A nudge means something was freed after this waiter
@@ -334,6 +346,9 @@ impl Contend {
                                 queue.spin.won(0);
                             }
                             self.cancel(lock, need);
+                            if queued_now {
+                                return taken_at_once(lock, need, waker);
+                            }
                             return Poll::Ready(Ok(()));
                         }
                         // Never past the bound: a waiter that is owed, was
