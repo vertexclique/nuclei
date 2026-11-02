@@ -179,7 +179,9 @@ pub struct Handle<T> {
 
 impl<T: IoObject> Handle<T> {
     /// Takes `io` over: what kind of object it is (a socket, a file, a
-    /// pipe) decides how its IO runs. On unix it is made non-blocking.
+    /// pipe) decides how its IO runs. On unix it is made non-blocking, and
+    /// so is a socket on Windows (`FIONBIO`): std's own calls on it answer
+    /// `WouldBlock` where they would block.
     ///
     /// # Errors
     ///

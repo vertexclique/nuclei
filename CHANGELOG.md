@@ -43,6 +43,23 @@
   while they waited out TIME_WAIT, and its connect failed with `WSAEADDRINUSE` (the soak, after
   552 seconds). The bind now sets `SO_REUSE_UNICASTPORT` first; a system without the option binds
   as before (`proofs/tla/connect/ConnectPort.tla`).
+- **A Windows datagram send answers what the kernel says of its own datagram.** A `send_to` on
+  Windows copied its datagram, queued it for the completion port and answered taken at once, so a
+  refusal the kernel made as it sent it (no route) reached the next call, whose own datagram was
+  never sent. The task now hands its datagram to the kernel itself, as on unix, on a socket nuclei
+  makes non-blocking (`FIONBIO`, which std's own calls on the socket then answer with `WouldBlock`,
+  as on unix); a send that finds no room waits for an AFD poll of the socket that says there is,
+  on the port, and tries again (`proofs/tla/ring/RingSend.tla`, `Backend = "port"`). Each send costs
+  one call and no copy into a buffer of the pool, where it cost a copy and a completion.
+- **A Windows socket whose send waits for its peer moves to another shard without a hang.** A TCP
+  send is never cancelled, and a handle cannot move to another port while one is out: a stream let
+  go by its shard with a send out (a `block_on` that returned) could not register again until the
+  send ended, and when its peer read only after it heard from it, both ends waited for good. A
+  source that cannot move now stays on the port its handle is bound to, registered with its new
+  shard: its operations go there, the port's keeper drains it while a source waits to move, and
+  once none of its operations is out, or its send ended, it is registered again and the move is
+  made (`proofs/tla/port/PortKeep.tla`, `Duplex`). One registering again with the shard whose port
+  its handle is bound to (its thread's next `block_on`) needs no move.
 - **A datagram an owned receive given up had cut is dropped, not handed on.** A `recv_from_owned`
   whose future was dropped after the driver received a datagram into its buffer hands the datagram
   to the next receive; one longer than that buffer was cut to it, and the next receive took its
