@@ -21,15 +21,23 @@ impl Source {
     }
 
     /// A caller's descriptor would block on a read: the side waits for its
-    /// next edge, unless one came after `tick`.
+    /// next edge, unless one came after `tick`. A side held by another
+    /// (another task's look, the driver's edge) has its holder clear it as
+    /// it lets go, before any look of the caller's can see it ready.
     #[cfg(unix)]
     pub(crate) fn fd_clear_read(self: &Arc<Self>, tick: u32) {
-        // Nothing to wait for and nothing to fail: a registration that
-        // failed is the next readiness call's to report.
-        let _ = self.poll_read_side(Waker::noop, false, |st, _io, _waker, _after| {
-            st.fd_clear(tick);
-            Poll::Ready(Ok(()))
+        let mut after = After::default();
+        // Nothing to fail: a registration that failed is the next readiness call's to report.
+        let _ = self.with_io(|io| {
+            self.read.run_or_defer(
+                super::super::read_work::CLEAR,
+                &mut after,
+                &self.hooks_in(io.shard),
+                |st| st.fd_clear(tick),
+                || self.read_clear.leave(tick),
+            );
         });
+        self.settle(after);
     }
 
     /// Drops what the side read ahead of a stream and holds still

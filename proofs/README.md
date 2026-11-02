@@ -996,15 +996,24 @@ receives (UDP and Unix), and waits for room on a full Unix datagram peer, on eac
 state for a caller's descriptor (`Kind::Fd`), at the grain of each atomic access. A peer writes;
 on epoll and kqueue each write brings an edge that marks the side ready and counts it, and on
 io_uring a poll armed while the side is not ready and a task waits completes once the socket
-holds bytes. The task waits until the side is ready, notes the count (its guard's tick) and
+holds bytes. A task waits until the side is ready, notes the count (its guard's tick) and
 makes its own call; a call that would block clears the side only if the count is still the
-tick, since an edge after the call is the only one it gets. 5 configurations: 3 that must pass
-(edges and the ring's poll with `AllTaken`, every byte taken, and edges with `Counted`), a
-mutation that breaks `AllTaken` (a clear that does not look at the count), and a witness (a
-clear that finds a newer edge and keeps the side ready). The unit tests in
-`src/io/async_fd.rs` place an edge between the call and the clear on each side (the mutation
-fails both), and `tests/async_fd.rs` reads every byte of a peer that writes while the caller
-reads, on each backend.
+tick, since an edge after the call is the only one it gets. With more than one task a look
+holds the side's guard for a moment, and a clear that finds the side held leaves its tick for
+the holder, who clears the side as it lets go (`Source::fd_clear_read` and `fd_clear_write`
+with `Side::run_or_defer`, the tick in `LeftClear` of `src/io/source/clear.rs`); of ticks left
+at once the newest is kept, the only one that can still clear. 10 configurations: 6 that must
+pass (one task on edges and on the ring's poll with `AllTaken`, every byte taken, and edges with
+`Counted`; two tasks on edges and on the ring with `NoSpuriousReady`, no task finds the side
+ready with no edge since its own clear, and `AllTaken`; three tasks with `NoSpuriousReady`), 3
+mutations (a clear that does not look at the count breaks `AllTaken`; a clear dropped when the
+side is held, the code before the fix, and a tick left that replaces a newer one break
+`NoSpuriousReady`), and a witness (a clear that finds a newer edge and keeps the side ready).
+The unit tests in `src/io/async_fd.rs` place an edge between the call and the clear on each
+side (the mutation fails both), `src/io/source/tests/caller_clear.rs` clears each side while
+another holds it and keeps the newest of the ticks left (both clears fail before the fix), and
+`tests/async_fd.rs` reads every byte of a peer that writes while the caller reads, on each
+backend.
 
 The same family checks a socket's side turning from the handle's own IO to its caller's calls
 (`try_io`, `async_io` on the sockets; `CallerMode.tla`, `CallerWrite.tla`). On the read side the

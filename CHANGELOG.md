@@ -35,6 +35,16 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
+- **A caller's clear of readiness made while another holds the side is kept** (epoll, kqueue,
+  io_uring). `AsyncFdReadyGuard::clear_ready`, and the clear of a socket's `try_io` and
+  `async_io` after a call that would block, went through a poll of the side; one that found the
+  side held for a moment (another task's look at it, the driver serving an edge) was dropped, so
+  the task found the side ready again with no edge since and called again, and again, for as
+  long as the other tasks kept the side busy. A clear that finds the side held now leaves its
+  tick for the holder, who clears the side as it lets go, before any look can see it ready; of
+  ticks left at once the newest is kept, the only one that can still clear. A free side costs
+  what it did (`proofs/tla/asyncfd/AsyncFd.tla`, the `drop_held_clear` and `clear_last_wins`
+  mutations).
 
 ### Changed
 

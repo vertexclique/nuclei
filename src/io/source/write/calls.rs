@@ -22,15 +22,22 @@ impl Source {
     }
 
     /// A caller's descriptor would block on a write: the side waits for its
-    /// next edge, unless one came after `tick`.
+    /// next edge, unless one came after `tick`; as
+    /// [`fd_clear_read`](Self::fd_clear_read) for a held side.
     #[cfg(unix)]
     pub(crate) fn fd_clear_write(self: &Arc<Self>, tick: u32) {
-        // Nothing to wait for and nothing to fail: a registration that
-        // failed is the next readiness call's to report.
-        let _ = self.poll_write_side(Waker::noop, false, |st, _io, _waker, _after| {
-            st.fd_clear(tick);
-            Poll::Ready(Ok(()))
+        let mut after = After::default();
+        // Nothing to fail: a registration that failed is the next readiness call's to report.
+        let _ = self.with_io(|io| {
+            self.write.run_or_defer(
+                super::super::write_work::CLEAR,
+                &mut after,
+                &self.hooks_in(io.shard),
+                |st| st.fd_clear(tick),
+                || self.write_clear.leave(tick),
+            );
         });
+        self.settle(after);
     }
 
     /// Ready once a write would be taken at once (see `WriteState::ready`);

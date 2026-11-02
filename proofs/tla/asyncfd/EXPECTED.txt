@@ -4,6 +4,11 @@ AF_edges_safe                  MC_AsyncFd           pass
 AF_ring                        MC_AsyncFd           pass
 MAF_no_tick                    MC_AsyncFd           violated:AllTaken
 WAF_kept                       MC_AsyncFd           violated:NoKept
+AF_two                         MC_AsyncFd           pass
+AF_two_ring                    MC_AsyncFd           pass
+AF_three                       MC_AsyncFd           pass
+MAF_drop_held_clear            MC_AsyncFd           violated:NoSpuriousReady
+MAF_clear_last_wins            MC_AsyncFd           violated:NoSpuriousReady
 CM_edges_safe                  MC_CallerMode        pass
 CM_edges                       MC_CallerMode        pass
 CM_ring_safe                   MC_CallerMode        pass

@@ -79,6 +79,8 @@ macro_rules! owner_poll {
 }
 
 #[cfg(unix)]
+mod clear;
+#[cfg(unix)]
 mod direct;
 mod hooks;
 #[cfg(completion)]
@@ -195,6 +197,9 @@ mod read_work {
     pub(super) const UNSTARVE: u8 = 2;
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 4;
+    /// A caller's clear found the side held (`Source::read_clear` holds its tick).
+    #[cfg(unix)]
+    pub(super) const CLEAR: u8 = 128;
     /// The side's ring operation completed (its mailbox holds it).
     #[cfg(completion)]
     pub(super) const DONE: u8 = 8;
@@ -217,6 +222,9 @@ mod write_work {
     pub(super) const UNSTARVE: u8 = 1;
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 2;
+    /// As the read side's (`Source::write_clear`).
+    #[cfg(unix)]
+    pub(super) const CLEAR: u8 = 32;
     /// The side's ring operation completed (its mailbox holds it).
     #[cfg(completion)]
     pub(super) const DONE: u8 = 4;
@@ -488,6 +496,11 @@ pub(crate) struct Source {
     /// A datagram socket's words for the calls made with no guard.
     #[cfg(unix)]
     quick: quick::Quick,
+    /// The ticks of a caller's clears that found a side held, for its holder.
+    #[cfg(unix)]
+    read_clear: clear::LeftClear,
+    #[cfg(unix)]
+    write_clear: clear::LeftClear,
     /// A TCP listener's: whether it asked its kernel to count what reads leave
     /// (`passes_inq`).
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -602,6 +615,10 @@ impl Source {
             addr_of_mut!((*slot).unsent).write(AtomicU8::new(0));
             #[cfg(unix)]
             addr_of_mut!((*slot).quick).write(quick::Quick::new(kind));
+            #[cfg(unix)]
+            addr_of_mut!((*slot).read_clear).write(clear::LeftClear::default());
+            #[cfg(unix)]
+            addr_of_mut!((*slot).write_clear).write(clear::LeftClear::default());
             #[cfg(any(target_os = "linux", target_os = "android"))]
             addr_of_mut!((*slot).inq_children).write(AtomicU8::new(INQ_UNASKED));
             #[cfg(completion)]
@@ -635,6 +652,10 @@ impl Source {
             unsent: _,
             #[cfg(unix)]
                 quick: _,
+            #[cfg(unix)]
+                read_clear: _,
+            #[cfg(unix)]
+                write_clear: _,
             #[cfg(any(target_os = "linux", target_os = "android"))]
                 inq_children: _,
             #[cfg(completion)]

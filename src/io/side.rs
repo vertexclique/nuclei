@@ -675,6 +675,33 @@ impl<S> Side<S> {
         held.release(after, hooks);
     }
 
+    /// Runs `step` under the side if it is free, else leaves side-local work `bits` for its
+    /// holder as [`defer`](Self::defer) does, once `leave` stored what that work needs: a step
+    /// that waits for nothing is never lost to a held side, and costs a free side what a poll's
+    /// does.
+    #[cfg(unix)]
+    #[inline(always)]
+    pub(crate) fn run_or_defer(
+        &self,
+        bits: u8,
+        after: &mut After,
+        hooks: &impl Hooks<S>,
+        step: impl FnOnce(&mut S),
+        leave: impl FnOnce(),
+    ) {
+        match self.take_as(self.role(hooks), 0, hooks) {
+            Take::Held(mut held) => {
+                hooks.taken(held.get(), after);
+                step(held.get());
+                held.release(after, hooks);
+            }
+            Take::Busy | Take::Left | Take::Unserved => {
+                leave();
+                self.defer(bits, after, hooks);
+            }
+        }
+    }
+
     /// The biased hold, if `role` is the owner's and no foreign thread came.
     fn hold_biased(&self, role: Role) -> Option<Held<'_, S>> {
         if role == Role::Owner {
