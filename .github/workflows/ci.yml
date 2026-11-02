@@ -15,10 +15,14 @@ jobs:
         include:
           - toolchain: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          # The macOS runners are Apple Silicon: the aarch64 toolchain runs
-          # natively there (an x86_64 one cannot run on the arm64 hosts).
+          - toolchain: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # macos-latest is Apple Silicon, where only the aarch64 toolchain
+          # runs natively; macos-15-intel is the Intel host for x86_64.
           - toolchain: aarch64-apple-darwin
             os: macos-latest
+          - toolchain: x86_64-apple-darwin
+            os: macos-15-intel
           # The completion port backend.
           - toolchain: x86_64-pc-windows-msvc
             os: windows-latest
@@ -58,6 +62,29 @@ jobs:
         run: cargo test --all --features nuclei/io-stats --no-fail-fast
         env:
           NUCLEI_BACKEND: epoll
+
+  # The kqueue backend on FreeBSD, tested in a FreeBSD VM on a Linux runner (the cross-target
+  # clippy below only lints it). The crates only: the examples pull in C libraries.
+  freebsd:
+    name: stable - x86_64-unknown-freebsd
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: tests in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          copyback: false
+          prepare: |
+            pkg install -y curl
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            cargo test -p nuclei -p nuclei-macros --no-fail-fast
+            cargo test -p nuclei -p nuclei-macros --features nuclei/io-stats --no-fail-fast
 
   # `#[nuclei::bench]` expands to a benchmark, which only nightly's test
   # harness takes: built and run here, each benchmark's body once.
