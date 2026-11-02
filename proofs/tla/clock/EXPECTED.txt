@@ -13,3 +13,4 @@ W_jump                         MC_Clock             violated:NoJumpW
 C_rearm                        MC_Clock             pass
 CJ_join                        MC_ClockJoin         pass
 MCJ_no_members_recheck         MC_ClockJoin         violated:ClockNeverPassesArmed
+W_read_across_pause            MC_ClockRead         violated:ReadsMonotonic
