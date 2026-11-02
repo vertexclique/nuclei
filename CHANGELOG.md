@@ -56,9 +56,12 @@
 - **The IO buffers of a thread that runs no shard hold no more than its runtime's
   `io_buffer_cap`.** A thread of the blocking pool, one inside a runtime with `enter`, and a
   worker whose shard was handed over take their buffers from a pool of their own, which held up
-  to the 64 MiB default whatever the runtime's `io_buffer_cap` said. That pool now takes the cap
-  of the runtime the thread serves, and a thread that serves none the default runtime's
-  (`proofs/tla/bufcap/BufCap.tla`).
+  to the 64 MiB default whatever the runtime's `io_buffer_cap` said. That pool is now held to the
+  cap of the runtime the thread serves as it starts serving (a pool thread and a worker before
+  their first job, a thread at `enter`, whose pool frees its idle buffers past the cap at once and
+  takes no new memory until it is back under it); a thread that serves no runtime keeps the
+  default. The IO steps that
+  reach the pool cost what they did (`proofs/tla/bufcap/BufCap.tla`).
 
 ### Changed
 

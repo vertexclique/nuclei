@@ -272,7 +272,8 @@ impl Builder {
     /// so a worker's IO memory never grows past it. A thread that serves the
     /// runtime and runs no shard (one of its blocking pool, one inside it with
     /// [`enter`](crate::Runtime::enter), a worker whose shard was handed over)
-    /// holds as much at most in a pool of its own. On io_uring the worker's
+    /// holds as much at most in a pool of its own (one that held more before
+    /// `enter` takes no new memory until it is back under the cap). On io_uring the worker's
     /// receive buffers count against the cap too
     /// ([`recv_buffers`](crate::config::IoUringConfiguration::recv_buffers) of
     /// [`recv_buffer_size`](crate::config::IoUringConfiguration::recv_buffer_size)

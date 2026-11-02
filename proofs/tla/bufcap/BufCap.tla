@@ -1,9 +1,11 @@
 ------------------------------ MODULE BufCap ------------------------------
 (***************************************************************************)
 (* What the IO buffers of a thread that runs no shard may hold             *)
-(* (src/buf/mod.rs: `with_pool`, the `FALLBACK` pool made on first need    *)
-(* with `fallback_cap`, `serve_with_cap`; `Pool::charge` and `make_room`;  *)
-(* src/rt/blocking.rs `Pool::work`, which calls `serve_with_cap` first).   *)
+(* (src/buf/mod.rs: `with_pool`, the `FALLBACK` pool made on first need,   *)
+(* `serve_with_cap` and `Pool::hold_to`; `Pool::charge` and `make_room`;   *)
+(* the threads that serve a runtime call `serve_with_cap` as they start:   *)
+(* `Pool::work` in src/rt/blocking.rs, `runner` in src/rt/workers.rs, and  *)
+(* `enter` in src/rt/runtime/enter.rs).                                    *)
 (*                                                                          *)
 (* In plain words: a runtime's workers each have a pool of IO buffers that *)
 (* holds at most the runtime's `io_buffer_cap`. A thread that runs no      *)
@@ -17,12 +19,15 @@
 (* it goes back to its own pool's return list, still counted, and the     *)
 (* pool takes it back the next time it needs one.                          *)
 (*                                                                          *)
-(* The pool of such a thread takes the cap of the runtime it serves. A     *)
-(* pool thread says which runtime it serves before it runs any job; a      *)
-(* thread inside a runtime is inside it before its IO. Before the fix the *)
-(* pool took the 64 MiB default whatever the runtime said, so a runtime   *)
-(* built to hold 1 MiB of IO buffers per thread held 64 MiB on each of its *)
-(* pool threads.                                                           *)
+(* A thread that serves a runtime holds its pool to the runtime's cap as   *)
+(* it starts serving: a pool thread and a worker before their first job,   *)
+(* so the pool is fresh and holds nothing past the cap, ever. Before the  *)
+(* fix the pool kept the 64 MiB default whatever the runtime said, so a    *)
+(* runtime built to hold 1 MiB of IO buffers per thread held 64 MiB on     *)
+(* each of its pool threads. A thread that held its pool's buffers before  *)
+(* it began serving (`enter` after IO of its own: `MB_late_cap`) frees its *)
+(* idle buffers past the cap at once and takes no new memory until it is  *)
+(* back under it; a thread that serves no runtime keeps the default.       *)
 (*                                                                          *)
 (* What must never happen: a pool of a thread that serves the runtime     *)
 (* holds more than the runtime's cap (`PerPool`); all of them together     *)
@@ -45,6 +50,8 @@ CONSTANTS                                                                    \* 
 Workers == {0}                                                               \* the runtime's worker, whose pool is its shard's
 Others == 1..Threads                                                         \* the threads that run no shard
 Pools == Workers \cup Others                                                 \* every pool, one per thread
+Min(a, b) == IF a < b THEN a ELSE b                                          \* the smaller of two numbers
+Max(a, b) == IF a > b THEN a ELSE b                                          \* the larger of two numbers
 Sum(f, S) == LET F[T \in SUBSET S] == IF T = {} THEN 0 ELSE LET x == CHOOSE y \in T : TRUE IN f[x] + F[T \ {x}] IN F[S] \* the sum of f over S
 
 (* --algorithm BufCap
@@ -62,21 +69,24 @@ variables
 define
     \* Buffers of the thread's pool that are free on its own free list.
     Free(t) == charged[t] - inUse[t] - away[t] - back[t]
-    \* The cap the thread's pool has, or gets now if this is its first need.
-    \* MUTATION default_cap: the pool takes the default whatever the runtime said, as it did before.
-    Made(t) == IF made[t] # 0 THEN made[t]
-               ELSE IF Mutation = "default_cap" THEN Default ELSE Cap
+    \* The cap the thread's pool has, or gets now if this is its first need: the default.
+    Made(t) == IF made[t] # 0 THEN made[t] ELSE Default
 end define;
 
 fair process thread \in Pools
 begin
 T_serve:
-    \* MUTATION late_cap: a pool thread's first job needs a buffer before the thread says which runtime it
-    \* serves: the pool is made with the default.
+    \* `serve_with_cap` as the thread starts serving: its pool, fresh, is held to the runtime's cap.
+    \* MUTATION default_cap: nothing holds it, and it keeps the default, as it did before.
+    \* MUTATION late_cap: the thread's first job comes before it says which runtime it serves.
     if self \in Others /\ Mutation = "late_cap" then
-        made[self] := Default;                                               \* (mutated) made before the cap is known
+        skip;                                                                \* (mutated) it serves later
+    else
+        served[self] := TRUE;                                                \* it serves the runtime
+        if ~(self \in Others /\ Mutation = "default_cap") then
+            made[self] := Cap;                                               \* `hold_to` the runtime's cap
+        end if;
     end if;
-    served[self] := TRUE;                                                    \* `serve_with_cap`, or `enter`, before any IO
 T_loop:
     while asked[self] < Takes \/ inUse[self] > 0 \/ away[self] > 0 do
         either                                                               \* the thread's side asks for a buffer:
@@ -94,6 +104,11 @@ T_loop:
                 charged[self] := charged[self] + 1;
                 inUse[self] := inUse[self] + 1;
             end if;
+        or                                                                   \* (late_cap) the serve after the first job:
+            await ~served[self] /\ asked[self] > 0;
+            served[self] := TRUE;                                            \* it serves the runtime now
+            made[self] := Cap;                                               \* `hold_to`: the cap from now on,
+            charged[self] := charged[self] - Min(Free(self), Max(0, charged[self] - Cap)); \* its idle buffers past it freed
         or                                                                   \* a side is done with one, on this thread:
             await inUse[self] > 0;
             inUse[self] := inUse[self] - 1;                                  \* back to the free list, still counted
