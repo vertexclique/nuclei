@@ -594,14 +594,15 @@ S_give_wake:
     \* `Chan::give_back`: wake a receiver whose closed channel just went idle.
     left := 0;                              \* nothing left to give back
     if Finished /\ Mutation # "no_idle_wake" then wake_rx(); end if;
-S_hold:
-    \* "hold": the handle is kept until the receiver's program is over, so only the close
-    \* can end the channel meanwhile.
-    await pc[Rx] = "Done";
 S_op_done:
     \* On to the next operation.
     i := i + 1;                             \* the next position in the program
     goto S_next;
+S_hold:
+    \* "hold": the handle is kept until the receiver's program is over, so only the close
+    \* can end the channel meanwhile.
+    await pc[Rx] = "Done";
+    goto S_op_done;
 S_drop_sender:
     \* The sender handle's drop: one fetch_sub on the sender count ...
     txCount := txCount - 1;

@@ -20,7 +20,6 @@ L_upgrade_writer               MC_RwLock            pass
 M_write_ignores_upgradable     MC_RwLock            violated:Exclusion
 M_upg_ignores_upgradable       MC_RwLock            violated:Exclusion
 M_downgrade_no_wake            MC_RwLock            violated:AllTasksEnd
-M_no_upgrade_ready             MC_RwLock            violated:AllTasksEnd
 M_exit_ignores_wake_front      MC_RwLock            violated:AllTasksEnd
 L_upgrade_drop                 MC_RwLock            pass
 L_drop_upg                     MC_RwLock            pass

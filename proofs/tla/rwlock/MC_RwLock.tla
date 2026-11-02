@@ -21,8 +21,8 @@ BargeWriter == <<<<"read", "read", "read">>, <<"write">>>>
 UpgWrite == <<<<"upg">>, <<"write">>>>
 \* A write downgraded and held until a reader joins it, against that reader.
 DowngradeHoldRead == <<<<"downgrade_hold">>, <<"read">>>>
-\* An upgrade against a reader and a writer queued behind it.
-UpgradeReadWrite == <<<<"upgrade">>, <<"read">>, <<"write">>>>
+\* An upgrade against a task that reads, then writes: the write queues behind the upgrade.
+UpgradeReadWrite == <<<<"upgrade">>, <<"read", "write">>>>
 \* An upgrade dropped while it waits for a reader, against that reader and one more read.
 UpgradeDropRead == <<<<"upgrade_drop">>, <<"read", "read">>>>
 \* An upgradable read dropped while it waits, against an upgradable read and a reader.
