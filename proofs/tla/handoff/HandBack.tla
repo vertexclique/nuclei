@@ -720,13 +720,14 @@ variables ms = 0, mv = 0;                                                    \* 
 begin
 M_tick:
     while handoffs < MaxHandoffs do                                          \* while a handoff is left
+        \* One read of the runner's word, outside, with a spare to give to; the word it saw is the
+        \* one it keeps (`run`'s read, `watch.last`): a word read inside never starts a take.
         await closed \/ (word[runnerSlot] > 0 /\ \E t \in Threads : pc[t] = "Spare");  \* outside, a spare
+        ms := runnerSlot;                                                    \* the runner's slot
+        mv := word[runnerSlot];                                              \* the word seen, in the same read
         if closed then                                                       \* the runtime shut down:
             goto M_done;                                                     \* the watch ends
         end if;
-M_look:
-        ms := runnerSlot;                                                    \* the runner's slot
-        mv := word[runnerSlot];                                              \* the word seen
 M_claim:
         claim[ms] := PENDING;                                                \* the claim
 M_check:
