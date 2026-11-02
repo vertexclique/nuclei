@@ -1,0 +1,18 @@
+# configuration          spec       expected
+T_safe                   Teardown   pass
+T_runner                 Teardown   pass
+M_snapshot_first         Teardown   violated:JoinsNoDetached
+M_snapshot_first_runner  Teardown   violated:StartedJoined
+M_no_detached_filter     Teardown   violated:JoinsNoDetached
+M_self_join              Teardown   violated:NoSelfJoin
+M_park_first             Teardown   deadlock
+M_dead_spare_drop        Teardown   violated:LastDropInRuntime
+W_late_take              Teardown   violated:NoLateTake
+W_dead_gift              Teardown   violated:NoDeadGift
+Q_detached_last_ref      Teardown   violated:DropDropsTasks
+Q_close_abandons         Teardown   violated:BoundNeverLost
+J_safe                   Join       pass
+MJ_count_messages        Join       violated:WaitsForAll
+MJ_finished_only         Join       violated:Returns
+MJ_forget_exits          Join       violated:Returns
+WJ_message_first         Join       violated:NoMessageFirst

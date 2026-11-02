@@ -2581,6 +2581,43 @@ time is not modelled (one caller makes that start here). The spec is written fro
 documentation, and most of the code's checks agree with it by construction: the mutations are what
 shows each check is needed and in its place.
 
+## A runtime's drop and its monitor
+
+`teardown` (`tla/teardown/Teardown.tla`) checks a runtime's drop while its monitor may still take
+a shard and hand it on (`Runtime::drop`, `stop_and_join` and `join` in `src/rt/runtime.rs`;
+`stop_all`, `take_monitor`, `take_threads` and `runner` in `src/rt/workers.rs`; `run`, `take`,
+`give`, `let_go`, `close` and `wait_for_shard` in `src/rt/handoff/monitor.rs`). The monitor's loop
+looks at the close only at its head, so a pass under way as the close comes may still take a
+shard from a thread blocked in one poll and start a runner for it. The drop took its list of
+threads first: it then waited on the thread blocked in the taken poll (which may never return),
+and never joined the runner it started. It joins the monitor's thread first, and takes the list
+after: every thread started but one detached by then, and never the dropping thread's own (a
+runtime dropped in one of its own tasks joined itself, a failed join that panics, or a wait for
+good on Windows). A spare that saw the close and left may still be on the queue for the last
+pass's hand-off, whose reference to it is then the last: it is let go of inside the runtime. 12
+configurations: 2 that must pass (the drop on a user's thread and on a runner of the runtime's
+own: `JoinsNoDetached`, `StartedJoined`, `NoSelfJoin`, `LastDropInRuntime`, `DropReturns` and no
+deadlock), 6 mutations (the list taken while the monitor runs, breaking `JoinsNoDetached` and, run
+again, `StartedJoined`; a detached thread kept in the list, breaking `JoinsNoDetached`; the
+dropping thread's own kept, breaking `NoSelfJoin`; a spare that parks before its first look at the
+close, a deadlock; a popped spare dropped plainly, breaking `LastDropInRuntime`), 2 witnesses (a
+take after the close; a gift to a spare that had left), and 2 that state today's design for the
+operator to settle: the drop returns while a detached thread still holds the taken shard, whose
+tasks it drops only when its poll returns (`DropDropsTasks`), and the detached thread's bound
+tasks are left live at the close (`BoundNeverLost`).
+
+`tla/teardown/Join.tla`, in the same family, checks the wait of `Runtime::shutdown_timeout`
+(`stop_and_join` and `join`, and `Exit` in `src/rt/workers.rs`): every runtime thread sends its
+exit message, naming itself, just before it reads as finished, and threads outside the list (a
+detached one, one that exited earlier) send theirs too. The wait took one message for each thread
+not finished as it reached it, whoever sent it, and returned while a worker still ran. It waits,
+for the monitor and then for the workers, until each listed thread read as finished or its
+message came (one that came during the monitor's wait counts too), messages only waking it, or
+until the deadline. 5 configurations: one that must pass (`WaitsForAll`, `Returns` with a deadline
+that may never pass), 3 mutations (today's count of messages, breaking `WaitsForAll`; a message
+counting for nothing, and the monitor's messages forgotten, each a wait for good, breaking
+`Returns`), and a witness (a message received before its thread reads as finished).
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the
