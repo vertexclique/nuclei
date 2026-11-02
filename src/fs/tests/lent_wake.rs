@@ -10,7 +10,7 @@ use super::owned::{hold_the_pool, one_blocking_thread, pends};
 use super::*;
 
 /// A waker that only records it was woken.
-struct Flag(AtomicBool);
+pub(super) struct Flag(pub(super) AtomicBool);
 
 impl Wake for Flag {
     fn wake(self: Arc<Self>) {
@@ -19,7 +19,7 @@ impl Wake for Flag {
 }
 
 /// Waits, the pause doubling up to 5 ms, until `flag` was woken.
-async fn woken(flag: &Flag, what: &str) {
+pub(super) async fn woken(flag: &Flag, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut pause = Duration::from_micros(50);
     while !flag.0.load(Ordering::SeqCst) {

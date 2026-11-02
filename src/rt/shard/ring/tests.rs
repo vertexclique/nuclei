@@ -281,3 +281,69 @@ fn a_shard_short_of_memory_for_a_ring_runs_the_poller_under_auto() {
     };
     assert_eq!(err.raw_os_error(), Some(libc::ENOMEM), "{err}");
 }
+
+/// A source whose fixed file the kernel refuses to take out of the table as it retires (no
+/// memory for the update): the slot stays held with the file in it, and the ring's next wait,
+/// which a timer brings though nothing else is out, takes the file out, so the peer sees the end
+/// once the object closed. Before, the refusal was ignored and the slot released: the table kept
+/// the file open and the peer never saw the end (proofs/tla/ring/RingClose.tla,
+/// `MC_update_ignored`). Gated on a kernel that lets go of a file out of the table at once (Linux
+/// 6.13): before, the ring's armed wake read alone keeps it open.
+#[test]
+fn a_refused_take_out_is_tried_again_until_the_file_leaves_the_table() {
+    use std::time::Instant;
+
+    use super::REFUSE_TAKE_OUT_FOR_TEST;
+
+    if !crate::syscore::linux::iouring::files::release_at_once() {
+        eprintln!("skipping: this kernel lets go of a file out of the table only late");
+        return;
+    }
+    let Some(shard) = ring_shard(1) else { return };
+    let _current = context::enter(&shard);
+    let (mine, src, peer) = source_pair();
+    shard.block_on(write_through(&src, &peer, b"fixed"));
+    let ring = shard.ring().expect("a ring shard");
+    assert_eq!(ring.files_in_use(), (1, 0), "the source took no fixed file");
+    REFUSE_TAKE_OUT_FOR_TEST.with(|n| n.set(1));
+    src.retire();
+    REFUSE_TAKE_OUT_FOR_TEST.with(|n| n.set(0));
+    assert_eq!(
+        ring.files_in_use(),
+        (1, 0),
+        "the slot was released with its file still in the table"
+    );
+    drop(mine);
+    peer.set_nonblocking(true).unwrap();
+    let (saw, seen) = crate::sync::oneshot::channel();
+    let looker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pause = Duration::from_micros(50);
+        let ended = loop {
+            match (&peer).read(&mut [0u8; 8]) {
+                Ok(0) => break true,
+                Ok(n) => panic!("the peer read {n} bytes after the retire"),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("the peer's read failed: {err}"),
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(5));
+        };
+        let _ = saw.send(ended);
+    });
+    // The shard waits for nothing but the looker's answer: only the retry's timer wakes its ring.
+    let ended = shard.block_on(seen).unwrap();
+    looker.join().unwrap();
+    assert!(
+        ended,
+        "the peer never saw the end: the ring's table kept the file"
+    );
+    assert_eq!(
+        ring.files_in_use(),
+        (0, 0),
+        "the retried slot was never freed"
+    );
+}

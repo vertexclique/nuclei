@@ -122,6 +122,49 @@
   file's end only while a handle to the file is open, and frees it when the last one closes (a
   1 MiB reservation read back 1 MiB with a handle open and 0 once reopened after the last close);
   the docs promised it as a lasting reservation. A test checks both on Windows.
+- **A failed sync is no longer forgotten by a dropped or a concurrent sync**
+  (every backend). The kernel reports a lost write-back to one sync call only, and the handle
+  kept the failure only once the failing call's task took its end. A sync whose future was
+  dropped (a timeout) after its call failed, and before its task looked, left nothing, so the
+  next sync made a call of its own, which the kernel answered with no error. Two syncs at once had
+  the same gap: the second call, made after the first failed, succeeded, and its task looking
+  first answered `Ok`. A handle's sync calls are now the file state's, one at a time: a sync
+  called while another's call is out waits for that call's end, a call whose future went away
+  stays in the state, and the next sync takes its end, failure and all. A sync fails for its own
+  call's failure and for one of a call made before its own, never for a later one's
+  (`proofs/tla/lent/LentFile.tla`, scenario "sync": `MF_sync_task_records`,
+  `MF_sync_unserialized`, `MF_sync_any_failure`).
+- **The first read after `get_mut` no longer answers `NotConnected` on a valid handle** (every
+  backend). A registration asked while another thread held a side of the source is left to that
+  holder, and so is the retire `get_mut` asks; the holder performs the two at once, the retire
+  first, so the attach found no descriptor, and its refusal failed both sides as a failed
+  registration does. A registration posted to a shard from a thread that runs none, which the
+  shard made only after the retire, was refused the same way and kept as the source's failure.
+  Either way the next read or write of the handle answered `NotConnected`. An attach refused
+  because a retire or a close took the descriptor out now fails nothing, as one refused because
+  its shard stopped: the source is unregistered, and its next wait registers it again
+  (`proofs/tla/attach/Merged.tla`).
+- **A write after a dropped `send_file` no longer lands before its last chunk** (Linux, Android,
+  macOS, FreeBSD). Each chunk of a file sent in the kernel is a `sendfile(2)` call on the blocking
+  pool, made on the stream's descriptor outside its write side, which held nothing for it. A call
+  dropped (a timeout) while a chunk's call was out, on a page that was not cached say, left the
+  side idle: the handle's next write, an error frame for instance, went out at once, and the chunk
+  landed after it, so the peer read the file's prefix, the frame, then the chunk. While a chunk's
+  call is out the write side now holds its place, a lent write that no driver writes, so every
+  write after it waits for the chunk, as after any lent write; whichever of the call's job and its
+  task ends second clears the place (`proofs/tla/sendfile/SendFile.tla`: `M_no_place`,
+  `M_clear_at_drop`, `M_clear_unended`, and the four that leave the place held). Windows sent its
+  chunks through the write side already.
+- **A closed socket leaves a ring's table though the kernel once refused to take it out**
+  (Linux, io_uring). A source that goes takes its file out of the ring's table of fixed files at
+  once, so the kernel closes it as soon as its requests let go. When the kernel had no memory for
+  that update, the failure was ignored and the slot released with the file still in the table:
+  the socket stayed open (a dropped listener kept accepting and kept its port) until another
+  source happened to take the slot. A refused take-out now keeps the slot held with the file in
+  it, so no other source gets the slot meanwhile, and is tried again after the ring's next wait,
+  which a 10 ms timer of the ring's own brings though nothing else is out
+  (`proofs/tla/ring/RingClose.tla`: `MC_update_ignored`, `MC_update_frees`,
+  `MC_update_no_wake`; `proofs/lean/Nuclei/Files.lean`: `refused_release_keeps_the_slot`).
 
 ### Changed
 

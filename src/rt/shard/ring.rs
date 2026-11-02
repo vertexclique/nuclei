@@ -77,7 +77,7 @@ use crate::syscore::linux::iouring::files::Files;
 use crate::syscore::linux::iouring::ops::Ops;
 use crate::syscore::linux::iouring::ring::sys::{
     IORING_CQE_F_BUF_MORE, IORING_CQE_F_BUFFER, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF,
-    IOSQE_FIXED_FILE, cqe_buffer_id,
+    IOSQE_FIXED_FILE, KernelTimespec, cqe_buffer_id,
 };
 use crate::syscore::linux::iouring::ring::{IoUringCqe, RingConfig, Sqe};
 use exits::ExitOp;
@@ -566,15 +566,49 @@ impl ShardRing {
 
     /// The source of `slot` went and no entry naming the slot waits to reach
     /// the kernel: a fixed file leaves the table, the slot is released (free
-    /// once its entries completed), and the source's object may close.
+    /// once its entries completed), and the source's object may close. A
+    /// take-out from the table the kernel refuses (it has no memory for the
+    /// update) keeps the slot held with the file in it, since another source
+    /// given the slot would have its own file taken out by the retry; the
+    /// retry comes after the ring's next wait, which a timer makes come
+    /// though nothing else is out (proofs/tla/ring/RingClose.tla,
+    /// `MC_update_ignored`, `MC_update_frees`, `MC_update_no_wake`).
     fn take_out(&self, slot: u32, lease: Option<Lease>) {
-        if self.files.borrow().is_fixed(slot) {
-            // A failure leaves the file in the slot, reserved, until its next
-            // source replaces it.
-            let _ = self.poller.borrow().update_file(slot, -1);
+        if self.files.borrow().is_fixed(slot)
+            && let Err(err) = self.take_file_out(slot)
+        {
+            self.retry_take_out(slot, &err);
+        } else {
+            self.files.borrow_mut().release(slot);
         }
-        self.files.borrow_mut().release(slot);
         drop(lease);
+    }
+
+    /// Takes the file of fixed slot `slot` out of the kernel's table.
+    fn take_file_out(&self, slot: u32) -> io::Result<()> {
+        #[cfg(test)]
+        if REFUSE_TAKE_OUT_FOR_TEST.with(|n| n.replace(n.get().saturating_sub(1))) > 0 {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
+        self.poller.borrow().update_file(slot, -1)
+    }
+
+    /// The kernel refused to take the file of `slot` out of its table: the
+    /// slot waits on `leaving` for the next wait's end to try again, and a
+    /// timer of the ring's own makes that wait come.
+    #[cold]
+    #[inline(never)]
+    fn retry_take_out(&self, slot: u32, err: &io::Error) {
+        static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "io_uring could not take a closed file out of its table ({err}); trying again shortly."
+            );
+        }
+        self.leaving.borrow_mut().push((slot, None));
+        self.poller
+            .borrow_mut()
+            .push(Sqe::timeout(&RETRY_TAKE_OUT).user_data(IGNORED));
     }
 
     /// Slots of sources that went, waiting for their entries to reach the
@@ -965,6 +999,21 @@ const ACCEPT_CAP: usize = 256;
 /// to anyone: no operation of the slab has it (its index is the one the
 /// slab never hands out), and it is not the wake's.
 const IGNORED: u64 = u32::MAX as u64;
+
+/// How long a ring waits before it tries again to take a file out of its
+/// table, once the kernel refused: static, as the kernel reads it after the
+/// entry is queued.
+static RETRY_TAKE_OUT: KernelTimespec = KernelTimespec {
+    tv_sec: 0,
+    tv_nsec: 10_000_000,
+};
+
+#[cfg(test)]
+thread_local! {
+    /// How many of the next take-outs from a table the kernel refuses on
+    /// this thread, for a test of a kernel with no memory for the update.
+    pub(crate) static REFUSE_TAKE_OUT_FOR_TEST: Cell<u32> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 impl ShardRing {

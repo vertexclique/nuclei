@@ -130,3 +130,32 @@ MRR_ring_task_sized                336        186      1  violated:NoCut        
 WRR_port_look                       42         27      1  violated:NoLook                       violated:NoLook                       yes
 
 results matching EXPECTED.txt: 136 of 136
+results matching EXPECTED.txt: 84 of 84
+
+Rechecked since, as CI ran them: TLA+ run 41452470703 on 9bdde6f1, 2026-11-02, one worker each
+(the share jobs of .github/workflows/tla.yml), with a take-out the kernel refuses. Every
+configuration of RingClose.tla; these times replace any above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+RC_own_here                         19         11      1  pass                                  pass                                  yes
+RC_own_elsewhere                    22         13      1  pass                                  pass                                  yes
+RC_own_busy                         23         13      1  pass                                  pass                                  yes
+RC_own_elsewhere_busy               26         15      1  pass                                  pass                                  yes
+RC_fixed_here                       19         11      1  pass                                  pass                                  yes
+RC_fixed_elsewhere_busy             26         15      1  pass                                  pass                                  yes
+RC_own_live                         26         15      1  pass                                  pass                                  yes
+RC_fixed_live                       23         13      1  pass                                  pass                                  yes
+MC_close_before_flush               21         13      1  violated:NoStray                      violated:NoStray                      yes
+MC_no_submit                         3          3      1  violated:ClosedAtDrop                 violated:ClosedAtDrop                 yes
+MC_table_until_done                  3          3      1  violated:ClosedAtDrop                 violated:ClosedAtDrop                 yes
+MC_free_at_release                   3          3      1  violated:SlotReserved                 violated:SlotReserved                 yes
+WC_leaves                            3          3      1  violated:NoLeaving                    violated:NoLeaving                    yes
+WC_reuse                            10          7      1  violated:NoReuse                      violated:NoReuse                      yes
+RC_update_retry                     48         26      1  pass                                  pass                                  yes
+RC_update_retry_elsewhere           57         30      1  pass                                  pass                                  yes
+RC_update_retry_live                48         26      1  pass                                  pass                                  yes
+RC_update_retry_elsewhere_live          57         30      1  pass                                  pass                                  yes
+MC_update_ignored                   35         20      1  violated:AllClosed                    violated:AllClosed                    yes
+MC_update_frees                     12          9      1  violated:SlotEmpty                    violated:SlotEmpty                    yes
+MC_update_no_wake                   28         17      1  violated:AllClosed                    violated:AllClosed                    yes
+WC_refused                           4          4      1  violated:NoRefusal                    violated:NoRefusal                    yes

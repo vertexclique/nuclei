@@ -110,6 +110,14 @@ MC_table_until_done            MC_RingClose         violated:ClosedAtDrop
 MC_free_at_release             MC_RingClose         violated:SlotReserved
 WC_leaves                      MC_RingClose         violated:NoLeaving
 WC_reuse                       MC_RingClose         violated:NoReuse
+RC_update_retry                MC_RingClose         pass
+RC_update_retry_elsewhere      MC_RingClose         pass
+RC_update_retry_live           MC_RingClose         pass
+RC_update_retry_elsewhere_live MC_RingClose         pass
+MC_update_ignored              MC_RingClose         violated:AllClosed
+MC_update_frees                MC_RingClose         violated:SlotEmpty
+MC_update_no_wake              MC_RingClose         violated:AllClosed
+WC_refused                     MC_RingClose         violated:NoRefusal
 RE_safe                        MC_RingEnd           pass
 RE_live                        MC_RingEnd           pass
 RE_sqpoll_safe                 MC_RingEnd           pass

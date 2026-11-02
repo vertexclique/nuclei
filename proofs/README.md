@@ -822,10 +822,15 @@ from where they stopped.
   went away), the file's generation moves on, and a cursor read counts a job's result, or hands
   out cells read ahead, only of the generation it began in.
 - **sync**: the cursor writer's second copied write waits in the write-behind while the first is
-  in flight, and a task syncs twice once both were accepted. A sync waits until the write-behind
-  went out and every write in flight landed, then its job makes what the file holds durable, or
-  fails (the device may fail it); a failed sync makes every later one fail, with no call. The
-  sync of a range (`sync_range`) is such a sync with another call.
+  in flight, and two tasks each sync once both were accepted. A sync waits until the write-behind
+  went out and every write in flight landed. The handle makes one sync call at a time, kept by
+  the file state, not by its task: a sync whose call would go beside another's waits for that
+  one's end, and a task may go away with its call out, which the next sync then takes. The
+  kernel's call writes back and looks for an error in one step, and its end reaches the slot in
+  another; a write-back the device fails loses every cell not yet durable, and the kernel reports
+  the error to the first call that looks, to it alone. A sync fails for its own call's failure or
+  one of a call made before its own, and one called after a failure fails with no call. The sync
+  of a range (`sync_range`) is such a sync with another call.
 - **direct**: the file is opened for direct IO: a read job reads exactly the cell asked for, and
   each copied write is one kernel write of exactly its bytes, which waits for the write in
   flight instead of joining the write-behind.
@@ -846,15 +851,17 @@ one, unless a cursor write raced it); `PositionalKeepsCursor`, an action propert
 positional call moves the cursor or the epoch; `PosReadSees`, a positional read made after a
 cursor write to its cell was accepted never reads what the cell held before it; `SyncCovers`,
 every write a good sync covers (accepted, or returned for a positional one, before it was called)
-is durable; `NoSyncAfterFailure`, no sync succeeds after one failed; `DirectExact`, on a direct
+is durable; `NoSyncAfterFailure`, no sync called after one failed succeeds; `NoFalseFailure`, a
+sync whose own call succeeded, none before it failing, does not fail; `DirectExact`, on a direct
 file every kernel read and write is exactly one a caller made; `NoCallOnClosed`, no job's call
 runs on a descriptor that closed; and liveness (`Termination`).
 
-52 configurations. 17 must pass: tasks that may go away and tasks that stay, a file opened to
-append, positional calls, the generation, syncs that may fail and a direct file, each with its
+58 configurations. 19 must pass: tasks that may go away and tasks that stay, a file opened to
+append, positional calls, the generation, syncs that may fail (with their tasks staying, and
+going away with a call out) and a direct file, each with its
 safety properties; a handle dropped or handed back with cursor jobs, and with a positional write
 left by its task, still out, with `NoCallOnClosed` beside them; and liveness for the cursor,
-append, positional, generation, sync and direct scenarios. 23 mutations must break the property
+append, positional, generation, sync (both ways) and direct scenarios. 26 mutations must break the property
 their rule protects: a result that counts on the cursor alone breaks `NoStaleRead`, through the
 seek back; a lent write that goes in flight over the one there, a lent write cancelled when its
 task goes away, a write cut short on the ring that counts as done, and a write on the ring
@@ -870,17 +877,22 @@ break `PositionalOrder`; a positional write that moves the epoch on breaks
 it is out breaks `PosReadSees`; a sync made with a write still in the write-behind or in flight
 (`sync_no_flush`), and one made once the write-behind went out but ordered after the writes only
 by the ring's drain (`sync_drain`: a write the shard handed to the blocking pool is not the
-ring's, so the drain does not order it) break `SyncCovers`; a failed sync forgotten once reported
-breaks `NoSyncAfterFailure`; a direct read through the read-ahead and a direct write that joins
+ring's, so the drain does not order it) break `SyncCovers`, and so do a call's failure that
+counts only for its own task (`sync_task_records`: the next sync takes the end of one whose task
+went away and drops its failure, then makes a call the kernel answers with no error) and a sync
+that makes its call beside another's (`sync_unserialized`: the kernel reports the lost write-back
+to one, and the other's task looks first); a failed sync forgotten once reported breaks
+`NoSyncAfterFailure`; a sync that fails for any failure, a later call's too
+(`sync_any_failure`), breaks `NoFalseFailure`; a direct read through the read-ahead and a direct write that joins
 the write-behind break `DirectExact`; a descriptor closed at the drop with a job out, and an
 `into_inner` that does not wait for the jobs, each with a cursor job and with a positional write
-left by its task, break `NoCallOnClosed`. 12 witnesses must be proved wrong: a read that reads
+left by its task, break `NoCallOnClosed`. 13 witnesses must be proved wrong: a read that reads
 again, the lent write of a task that went away landing, a read after the seek that counts the
 lent write's value, a write on the ring landing in two parts, one cut short whose shard went
 finished on the pool, an append after the seek landing at the end, a read that reads again only
 because a positional write ended, a buffered read asking the kernel for more than its caller (the
 read-ahead the direct rule takes away), the positional write of a task that went away landing, a
-sync that fails, and a cursor job and a positional write still out as their handle drops.
+sync that fails, a sync that takes the end of a call whose task went away, and a cursor job and a positional write still out as their handle drops.
 
 The model shows why a sync waits for the writes before it rather than relying on io_uring's
 `IOSQE_IO_DRAIN` (`MF_sync_drain`): the drain orders an entry after the ring's earlier entries
@@ -1130,16 +1142,26 @@ which stays reserved until the accept's end is taken; a lease keeps the handle's
 until no entry naming its number waits to reach the kernel: where the kernel holds completions it
 has no room for, until the ring's next wait, and for a drop on another thread, until the ring's
 thread applies the detach from its mailbox. Someone opening a file meanwhile gets the number once
-the object closed. 14 configurations: 8 that must pass (each kind of slot, dropped on the ring's
+the object closed. The kernel may refuse the take-out from the table once (`UpdateFails`, no memory
+for the update): the slot then stays held with the file in it, and the take-out is tried again
+after the ring's next wait, which a timer the refusal arms brings though nothing else is out. 22
+configurations: 12 that must pass (each kind of slot, dropped on the ring's
 thread or another, with the kernel taking everything or busy, with `NoStray`, no entry reaches
 the kernel on a number another file took; `SlotReserved`, a slot is free only once no entry names
 it; `ClosedAtDrop`, dropped on the ring's thread with the kernel taking everything, nothing holds
-the file when the drop returns; and liveness, `AllClosed` and `Termination`), 4 mutations (no
+the file when the drop returns, unless the kernel refused the take-out; `SlotEmpty`, a free slot
+holds no file in the table; and liveness, `AllClosed` and `Termination`; 4 of them with the
+refused take-out), 7 mutations (no
 lease, so the object closes with an entry naming its number still queued, breaks `NoStray`; the
 cancel left to the ring's next wait, and the file kept in the table until the slot frees, the two
 halves of the bug a listener dropped with an accept out still accepting after, break
-`ClosedAtDrop`; a slot free at its release breaks `SlotReserved`), and 2 witnesses (a detach left
-to the next wait; the number taken by another file). `tests/faults/drops.rs` drops a listener
+`ClosedAtDrop`; a slot free at its release breaks `SlotReserved`; a refused take-out ignored and
+the slot released, as before the fix, and one tried again with no timer to wake an idle ring,
+break `AllClosed`; one tried again but with the slot released at once breaks `SlotEmpty`), and 3
+witnesses (a detach left to the next wait; the number taken by another file; a refused take-out
+tried again). `src/rt/shard/ring/tests.rs` has the kernel refuse a retiring source's take-out and
+checks the slot stays held and the peer sees the end with the shard waiting on nothing else.
+`tests/faults/drops.rs` drops a listener
 with an accept out and checks a connect is refused when the drop returns, and drops a stream with
 a read out from a thread that then blocks and checks its peer reads the end.
 
@@ -1254,7 +1276,11 @@ no entry naming it, so an entry on its way never reaches the next source's file
 (`taken_slot_is_unnamed`); that a free slot is never freed again (`no_double_free`); that a slot an
 entry names is never free, so it stays reserved after its source went (`named_slot_is_not_free`);
 and that a release takes the file out of the table whatever entries still name the slot
-(`release_takes_the_file_out`); and it computes the worked example of a slot released with a read
+(`release_takes_the_file_out`); that a take-out the kernel refused keeps the slot held, so never
+free, with its file in the table until a later release takes it out
+(`refused_release_keeps_the_slot`), while releasing the slot anyway, as the code once did, leaves
+a free slot holding the gone source's file (`ignoring_a_refusal_frees_a_slot_with_its_file`); and
+it computes the worked example of a slot released with a read
 out and handed out again only once the read completed (`example_reuse_waits`). The Rust tests in
 `src/rt/shard/ring/tests.rs` run sources past a full table, a retire with a read out and a
 shard that goes with one, each with a mutation of the code that makes one of them fail.
@@ -1391,6 +1417,30 @@ witness (a second close on macOS answered ENOTCONN). The Rust test
 `half_close::*::our_shutdown_delivers_every_byte_and_reads_go_on` in `tests/faults/half_close.rs`
 compares a second close with std's on a real stream.
 
+## A file sent in the kernel, and the stream's next write
+
+`sendfile` (`tla/sendfile/SendFile.tla`) checks a `send_file` chunk the blocking pool sends with
+`sendfile(2)` on the stream's own descriptor, outside its write side (`send_file_in_kernel` in
+`src/net/send_file.rs`; `Source::send_outside`, `WriteState::lend_outside`,
+`WriteState::end_outside`, `Left` and `Ended` in `src/io/source/write/outside.rs`; `push_lent` in
+`src/io/source/write/lent.rs`, which writes no outside call's place). A task sends a chunk, and
+may be dropped (a timeout) while the chunk's call is out; a writer then writes the handle's next
+bytes; something else may make the side look at what it holds at any moment (a buffer back to the
+pool). Before the job goes to the pool, the side holds the chunk's place, a lent write that is
+out, so every write after it waits; the job records its end and the task that it went, one bit
+each of one word, and whichever comes second has the side clear the place, which looks that the
+call ended first. 10 configurations: 2 that must pass (`WireOrder`, the chunk reaches the stream
+before a write made after the call returned or was dropped; and liveness, `FrameSent`, that write
+goes out in the end, and `Termination`), 7 mutations (no place held, as before the fix; the place
+cleared at the drop; a clear that does not look that the call ended, which a buffer's return then
+makes while the chunk is out: each breaks `WireOrder`; and the four ways to leave the place held
+for good, the job's end or the task's drop that comes second clearing nothing, a task that takes
+the answer and records nothing, a job the pool drops unrun that records no end: each breaks
+`FrameSent`), and 1 witness (the task dropped with its chunk still on its way). The Rust test
+`a_write_after_a_dropped_send_file_goes_after_its_chunk` in `src/net/tests/send_file.rs` stalls
+a chunk's call as on a page that is not cached, drops the call, writes, and checks the peer reads
+the chunk, then the write.
+
 ## A stream's shut and abort
 
 `close` (`tla/close/Close.tla`) checks a TCP stream's ends (`Handle::shut` and `Handle::abort` in
@@ -1509,6 +1559,22 @@ the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the h
 mutations (no look after the step breaks `Served`; a fast check that drops its compare with the
 thread's own shard issues on the other shard's ring and breaks `OnlyHomeIssues`), and 1 witness
 (the late look asks for the submit).
+
+`tla/attach/Merged.tla`, in the same family, checks requests that wait for the sides together
+and are performed in one go (`perform`, `attach_now`, `is_refused_for_now` in
+`src/io/source/requests.rs`; `Source::register` and `revive` in `src/io/source.rs`;
+`Shard::register_source` and `apply_io_ops` in `src/rt/shard.rs`). A task's poll registers a
+source and asks the attach, at once on its own shard or by posting it to a shard from a thread
+that runs none; its future is dropped, and `get_mut` asks the retire. A holder of the read side
+performs every request pending as it lets go, the retire first, so an attach it performs with
+the retire finds no descriptor; a posted attach the shard makes after the retire finds none
+either. Such a refusal fails nothing, as one for a shard that stopped: the registration is back
+to none, and the first read after `get_mut`, on the same descriptor, registers the source again
+and reads. 8 configurations: 4 that must pass (an attach left to the holder, and one posted,
+each with `NoSpuriousError`, that read answers no error, and with `Termination`), 2 mutations (a
+holder's refusal that fails the sides, and a shard that takes its own refusal for a registration's
+failure, each break `NoSpuriousError`), and 2 witnesses (the retire and the attach performed
+together; a posted attach refused after the retire).
 
 ## A shard that goes
 

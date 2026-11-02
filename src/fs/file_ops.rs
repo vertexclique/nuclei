@@ -72,10 +72,14 @@ impl Handle<File> {
     /// # Errors
     ///
     /// A write that failed (reported here as by a flush), or the sync's own
-    /// failure. Once a sync of the handle failed, every later one fails with
-    /// that error: the system reports a failure to write data back once, so
-    /// a later sync that succeeded would not mean the data reached the
-    /// device. Open the file again to start over.
+    /// failure. Once a sync of the handle failed, every sync called later
+    /// fails with that error: the system reports a failure to write data
+    /// back once, so a later sync that succeeded would not mean the data
+    /// reached the device. Open the file again to start over. The handle
+    /// makes one sync call at a time (a sync called while another's call is
+    /// out waits for that call's end, and fails if it failed), and a call
+    /// whose future was dropped (a timeout) still counts: the next sync
+    /// takes its end and fails with its failure.
     pub async fn sync_all(&self) -> io::Result<()> {
         if !self.is_regular() {
             return self.on_pool(File::sync_all).await;

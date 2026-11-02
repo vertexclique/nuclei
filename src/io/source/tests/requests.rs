@@ -755,3 +755,91 @@ fn a_runtime_dropped_under_a_waiting_stream_closes_it_as_its_owner() {
         "the teardown took a side as a foreign thread"
     );
 }
+
+/// The source's request word once it differs from `before`: a request was raised meanwhile.
+fn until_requested(src: &Source, before: u8, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pause = Duration::from_micros(50);
+    while src.requests.load(Ordering::Acquire) == before {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(5));
+    }
+}
+
+/// The first read after a retire, on the same descriptor, reads the peer's bytes.
+fn reads_after_the_retire(rt: &Runtime, a: &Owned<Stream>, b: &Owned<Stream>) {
+    a.src.revive(a.io().raw());
+    send(b.io(), b"after");
+    rt.block_on(async {
+        let mut buf = [0u8; 16];
+        let n = within(read(&a.src, &mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"after");
+    });
+}
+
+/// An attach left to a holder of the read side, then a retire (`get_mut`) left to the same holder:
+/// the holder performs both at once, the retire first, so the attach finds the descriptor out of
+/// the source. That refusal fails nothing, as one for a shard that stopped: the source is
+/// unregistered, and the first read after the retire registers it again and reads. Before, the
+/// refusal failed both sides as a failed registration does, and that read answered NotConnected
+/// on a valid handle (`proofs/tla/attach/Merged.tla`, `M_holder_fails`).
+#[test]
+fn an_attach_performed_with_a_retire_fails_no_read_after_it() {
+    let rt = runtime(None);
+    let (a, b) = pair();
+    let held = a.src.read.try_hold().expect("the side is free");
+    let src = Arc::clone(&a.src);
+    rt.block_on(rt.spawn(async move { src.register() }))
+        .unwrap();
+    assert_eq!(
+        a.src.reg.state.load(Ordering::Acquire),
+        super::super::REGISTERING,
+        "the attach did not wait for the holder"
+    );
+    let attach = a.src.requests.load(Ordering::Acquire);
+    let src = Arc::clone(&a.src);
+    let retirer = std::thread::spawn(move || src.retire());
+    until_requested(&a.src, attach, "the retire was never asked");
+    let mut after = After::default();
+    held.release(&mut after, &a.src.hooks());
+    after.run();
+    retirer.join().unwrap();
+    assert_eq!(
+        a.src.reg.state.load(Ordering::Acquire),
+        super::super::UNREGISTERED,
+        "the refused attach left the source registering"
+    );
+    reads_after_the_retire(&rt, &a, &b);
+}
+
+/// A registration posted to a shard by a thread that runs none, which the shard makes only after
+/// a retire: the shard performs the attach itself and hears it refused for the missing
+/// descriptor, which is no registration failure: the first read after the retire registers the
+/// source again and reads. Before, the shard left the refusal for the sides as a failure, and
+/// that read answered it (`proofs/tla/attach/Merged.tla`, `M_requester_fails`).
+#[test]
+fn a_registration_made_after_a_retire_fails_no_read_after_it() {
+    use crate::rt::shard::{IoOp, Limits, Shard};
+    let (a, b) = pair();
+    a.src
+        .reg
+        .state
+        .store(super::super::REGISTERING, Ordering::Release);
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    shard.shared.post_io(IoOp::Register(Arc::clone(&a.src)));
+    a.src.retire();
+    shard.block_on(crate::task::yield_now());
+    assert_eq!(
+        a.src.reg.state.load(Ordering::Acquire),
+        super::super::UNREGISTERED,
+        "the shard never made the registration"
+    );
+    drop(shard);
+    reads_after_the_retire(&runtime(None), &a, &b);
+}

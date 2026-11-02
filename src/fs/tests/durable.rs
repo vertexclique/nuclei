@@ -1,9 +1,23 @@
 //! Syncing a file: on the shard's ring where it runs one, after every write
 //! the sync covers, and a failure that stays.
 
-#[cfg(target_os = "linux")]
-use super::owned::hold_the_pool;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::task::{Context, Waker};
+
+use super::lent_wake::{Flag, woken};
+use super::owned::{hold_the_pool, one_blocking_thread};
 use super::*;
+
+/// Polls `fut` once with a waker of its own: it must wait. The flag says when
+/// it was woken.
+fn pend_flagged<F: Future + Unpin>(fut: &mut F, what: &str) -> Arc<Flag> {
+    let flag = Arc::new(Flag(AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&flag));
+    let polled = Pin::new(fut).poll(&mut Context::from_waker(&waker));
+    assert!(polled.is_pending(), "{what} did not wait");
+    flag
+}
 
 /// A runtime of one worker and one blocking thread whose shard never goes
 /// to another thread, so a call made from a task's poll always finds the
@@ -148,6 +162,106 @@ fn a_failed_sync_fails_every_later_one() {
                 ring_calls().map(|(n, _)| n),
                 before,
                 "a later sync made a call"
+            );
+            hold.send(()).unwrap();
+            within(busy).await;
+        }))
+        .await;
+    });
+}
+
+/// A sync whose future went away (a timeout dropped it) after its call failed
+/// leaves that failure to the next sync, which fails with it: the system
+/// reports a lost write-back once, to the call that failed, so a call made
+/// after it would answer that all is well.
+#[test]
+fn a_sync_dropped_after_its_call_failed_fails_the_next_one() {
+    let rt = one_blocking_thread();
+    let tmp = Temp::new("sync-dropped");
+    let path = tmp.file("data");
+    rt.block_on(async {
+        let mut file = Handle::new(read_write(&path)).unwrap();
+        within(write_all(&mut file, b"durable")).await.unwrap();
+        within(flush(&mut file)).await.unwrap();
+        let io = file.file().unwrap();
+        io.keep_on_pool();
+        io.fail_next_syncs(1);
+        let (release, busy) = hold_the_pool();
+        let mut dropped = Box::pin(file.sync_all());
+        let flag = pend_flagged(&mut dropped, "the sync on the held pool");
+        release.send(()).unwrap();
+        within(busy).await;
+        woken(&flag, "the sync's call never ended").await;
+        drop(dropped);
+        for later in [
+            within(file.sync_data()).await,
+            within(file.sync_all()).await,
+        ] {
+            let err = later.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
+        }
+    });
+}
+
+/// Two syncs at once make one call at a time: the second waits for the
+/// first's call, and once that failed, fails too, though its task looks
+/// first. Two calls beside each other would let the kernel report the lost
+/// write-back to one only, and the other answer that all is well.
+#[test]
+fn a_sync_beside_one_whose_call_fails_fails_too() {
+    let rt = one_blocking_thread();
+    let tmp = Temp::new("sync-beside");
+    let path = tmp.file("data");
+    rt.block_on(async {
+        let mut file = Handle::new(read_write(&path)).unwrap();
+        within(write_all(&mut file, b"durable")).await.unwrap();
+        within(flush(&mut file)).await.unwrap();
+        let io = file.file().unwrap();
+        io.keep_on_pool();
+        io.fail_next_syncs(1);
+        let (release, busy) = hold_the_pool();
+        let mut first = Box::pin(file.sync_all());
+        let mut second = Box::pin(file.sync_data());
+        let _ = pend_flagged(&mut first, "the first sync on the held pool");
+        let woke = pend_flagged(&mut second, "the second sync on the held pool");
+        release.send(()).unwrap();
+        within(busy).await;
+        woken(&woke, "the second sync was never woken").await;
+        let err = within(second).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
+        let err = within(first).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
+    });
+}
+
+/// On the ring as on the pool: a sync dropped after its call failed (procfs
+/// has no sync) leaves its failure, and the next sync answers it with no call
+/// of its own.
+#[cfg(ring)]
+#[test]
+fn a_sync_dropped_after_its_ring_call_failed_fails_the_next_with_no_call() {
+    let rt = one_blocking_thread_kept();
+    rt.block_on(async {
+        within(spawn(async move {
+            if ring_calls().is_none() {
+                eprintln!("skipping: the shard runs no ring (NUCLEI_BACKEND or no io_uring)");
+                return;
+            }
+            let file = within(Handle::<File>::open("/proc/self/status"))
+                .await
+                .unwrap();
+            let mut dropped = Box::pin(file.sync_all());
+            let flag = pend_flagged(&mut dropped, "the sync on the ring");
+            woken(&flag, "the sync's ring call never ended").await;
+            drop(dropped);
+            let before = ring_calls().map(|(n, _)| n);
+            let (hold, busy) = hold_the_pool();
+            let err = within(file.sync_data()).await.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "{err:?}");
+            assert_eq!(
+                ring_calls().map(|(n, _)| n),
+                before,
+                "the next sync made a call of its own"
             );
             hold.send(()).unwrap();
             within(busy).await;

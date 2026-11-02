@@ -213,7 +213,8 @@ mod read_work {
 
 /// Side-local work of the write side (its deferred word).
 mod write_work {
-    /// A buffer came back to the pool the side ran out of.
+    /// A buffer came back to the pool the side ran out of, or a call outside
+    /// the side ended, whose place it held (`WriteState::unstarve`).
     pub(super) const UNSTARVE: u8 = 1;
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 2;
@@ -1030,9 +1031,10 @@ impl Source {
             })
         });
         match registered {
-            // Refused for its stop, here or by the attach (which set the
-            // registration back to none): the tasks look again.
-            Some(Err(err)) if requests::is_stopped_shard(&err) => {
+            // Refused for its stop, here or by the attach, or for a
+            // descriptor a retire took out (the attach set the registration
+            // back to none): the tasks look again.
+            Some(Err(err)) if requests::is_refused_for_now(&err) => {
                 self.look_again();
                 Ok(())
             }
