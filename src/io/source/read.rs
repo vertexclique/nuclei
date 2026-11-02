@@ -799,8 +799,12 @@ impl ReadState {
                 Some(Err(err)) => {
                     crate::rt::counters::accept_error(&err);
                     self.short_of_fds = crate::rt::counters::out_of_descriptors(&err);
-                    self.error = Some(err);
-                    break;
+                    // A connection reset in the backlog: the listener takes the next one. Each
+                    // takes one off the backlog, which the kernel bounds.
+                    if !crate::rt::counters::lost_before_accept(&err) {
+                        self.error = Some(err);
+                        break;
+                    }
                 }
             }
         }
@@ -1214,9 +1218,10 @@ impl ReadState {
         let taken = match self.accepted.pop_front() {
             Some((conn, Peer::Known(peer))) => Some(Ok((conn, peer))),
             #[cfg(ring)]
-            Some((conn, Peer::Ask)) => {
-                Some(super::ring::peer_of(&conn, kind).map(|peer| (conn, peer)))
-            }
+            Some((conn, Peer::Ask)) => match super::ring::peer_of(&conn, kind) {
+                Ok(peer) => Some(Ok((conn, peer))),
+                Err(err) => self.peer_gone(io, kind, err, after),
+            },
             None => self.error.take().map(Err),
         };
         match taken {
@@ -1229,6 +1234,33 @@ impl ReadState {
                 Poll::Pending
             }
         }
+    }
+
+    /// An accept whose connection, one a multishot accept brought, could not name its peer
+    /// (`err`): one its peer reset before it was taken is closed and the next one taken, the
+    /// driver accepting again once none is held (`lost_before_accept`).
+    #[cfg(ring)]
+    #[cold]
+    #[inline(never)]
+    fn peer_gone(
+        &mut self,
+        io: Io<'_>,
+        kind: Kind,
+        mut err: io::Error,
+        after: &mut After,
+    ) -> Option<io::Result<(Owned, Addr)>> {
+        while crate::rt::counters::lost_before_accept(&err) {
+            self.complete(io, kind, 0, after);
+            match self.accepted.pop_front() {
+                Some((conn, Peer::Known(peer))) => return Some(Ok((conn, peer))),
+                Some((conn, Peer::Ask)) => match super::ring::peer_of(&conn, kind) {
+                    Ok(peer) => return Some(Ok((conn, peer))),
+                    Err(next) => err = next,
+                },
+                None => return self.error.take().map(Err),
+            }
+        }
+        Some(Err(err))
     }
 
     /// An accept that takes no address, for a stream of connections: on a

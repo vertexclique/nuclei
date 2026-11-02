@@ -154,6 +154,26 @@ impl Slot {
         (word, self.enter(word & !1))
     }
 
+    /// [`mark`](Self::mark) for a call that backs out rather than contest a claim: the word it
+    /// left, the call marked, while no claim is up; with one up, `None` and the word put back
+    /// as it was, for the caller to take the full mark instead. Never waits.
+    #[inline(always)]
+    pub(crate) fn mark_unless_claimed(&self) -> Option<u64> {
+        let word = self.word.load(Ordering::Relaxed);
+        self.word.store(word & !1, Ordering::Relaxed);
+        if self.full_fence {
+            fence(Ordering::SeqCst);
+        } else {
+            // As in `enter`.
+            compiler_fence(Ordering::SeqCst);
+        }
+        if self.claim.load(Ordering::Relaxed) == NONE {
+            return Some(word);
+        }
+        self.unmark(word);
+        None
+    }
+
     /// The runner's call into its shard ends: the word it left the call
     /// with, outside again. Release, as [`go_out`](Self::go_out).
     #[inline(always)]

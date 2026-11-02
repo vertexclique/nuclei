@@ -128,3 +128,10 @@ MRP_edge_in_switch             MC_RingPoll          violated:Termination
 MRP_hangup_ignored             MC_RingPoll          violated:Termination
 WRP_rearm                      MC_RingPoll          violated:NoRearm
 WRP_switch                     MC_RingPoll          violated:NoSwitchBack
+RR_port_udp                    MC_RingRecv          pass
+RR_port_udp_live               MC_RingRecv          pass
+RR_port_udp_starved            MC_RingRecv          pass
+RR_port_udp_starved_live       MC_RingRecv          pass
+MR_port_task_sized             MC_RingRecv          violated:NoCut
+MRR_ring_task_sized            MC_RingRecv          violated:NoCut
+WRR_port_look                  MC_RingRecv          violated:NoLook

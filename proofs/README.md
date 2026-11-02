@@ -1211,8 +1211,9 @@ copied into the write-behind).
 `tla/ring/RingRecv.tla` checks a datagram socket's receives (`receive_now` and
 `datagram_ready` in `src/io/source/read/datagram.rs`, the bound in `datagram_want` and the ring's
 poll armed in `submit_ops`, `src/io/source/read/ops.rs`, its arrivals in `take_arrival`, the edge
-in `serve`), on epoll or kqueue and on a ring. The same multishot poll serves a stream read by
-readiness on a ring, which `tla/ring/RingPoll.tla` checks.
+in `serve`; on a port `receive`, `receive_starved` and `PortMem::RecvFrom` in
+`src/io/source/port.rs`), on epoll or kqueue, on a ring and on a Windows completion port. The same
+multishot poll serves a stream read by readiness on a ring, which `tla/ring/RingPoll.tla` checks.
 A peer sends a small datagram and then the largest the socket carries, which for a Unix socket
 is more than the pool's largest buffer holds; the task receives each into a buffer that holds
 it, maybe asking first whether the socket is readable. The task receives a datagram itself into
@@ -1235,7 +1236,15 @@ the pool's largest buffer, a ring's UDP receive ahead into a buffer below the la
 and a ring that receives a Unix datagram ahead for a task that receives it itself break `NoCut`;
 a poll, and an edge, that wake nobody, and a call that waits behind the armed poll as behind an
 operation out, break `Termination`), and 2 witnesses (a call that waits for the poll, a datagram
-received ahead and taken).
+received ahead and taken). A port receives UDP ahead too, into a buffer of the pool that holds the
+largest datagram whatever the call that waits asked for, a cut datagram completing as a success
+(`STATUS_BUFFER_OVERFLOW`); with no such buffer in the pool it looks with a zero-byte receive that
+leaves the datagram queued, and the task receives it itself once the look said one came. 7 more
+configurations: 4 that must pass (UDP on a port received ahead, and on a port the pool has no
+buffer for, with `NoCut` and `InOrder`, and `Termination` for each), 2 mutations (a receive ahead
+into a buffer as large as the call that waits asked for, as a port's was, and a ring's into the pool
+once its group ran dry, cuts the largest datagram for a look at the sender, breaking `NoCut`), and a
+witness (a port's zero-byte look, then the task's own receive).
 
 `tla/ring/RingStarve.tla` checks stream reads and replies that share one shard's pool of IO
 buffers on a ring (`submit_ops` and `op_done` in `src/io/source/read/ops.rs`, `read_direct` and
@@ -1320,31 +1329,68 @@ pipe test of `tests/idle_peers.rs` checks it on every backend.
 ## A listener's stream of connections
 
 `accept` (`tla/accept/AcceptStream.tla`) checks the stream `TcpListener::accept_multi` gives
-(`TcpStreamGenerator::poll_next` in `src/net/tcp.rs`, `out_of_descriptors` in
-`src/rt/counters.rs`), and the accept under it on a readiness poller (`ReadState::accept_ahead`
-and `accept_checked` in `src/io/source/read.rs`), when the process runs out of descriptors.
-Peers connect into the backlog; the rest of the process may take every free descriptor for a
-while and gives them back in the end. A poll asks the listener for the next connection: one
-there and a descriptor free, it is accepted and the stream's pause starts over at its least; out
-of descriptors (EMFILE or ENFILE), the stream waits on a timer for its pause, which then doubles
-up to its most, and asks again when the timer fires; any other error ends the stream. On macOS an
-accept that fails for want of a descriptor closes the connection it took off the backlog
-(`Drops`), so after one the side first copies the listener's descriptor and closes the copy: none
-free, it answers EMFILE and takes nothing; one free, it accepts, though the rest of the process
-may take the last descriptor in between. The side hands an error over once and the connections
-queued before it first, so a retry asks the listener afresh. Time is the ticks left on the timer.
-11 configurations: 4 that must pass (two and three connections across two outages, with
-`NoBusyLoop`, at most one EMFILE between two ticks, `FirstWaitLeast`, the first pause after an
-accept the least, `LostPerOutage`, no more connections closed than outages began, and
-`AllServed`, every connection accepted once descriptors are free again or closed by a failed
-accept; the same on macOS, where a failed accept closes the connection it took; and an outage
-followed by another error of the listener, with `OtherEnds`, the stream ends, and
-`NothingAfterEnd`), 5 mutations (the stream that ended on EMFILE, as it did before, breaks
-`AllServed`; a retry with no timer breaks `NoBusyLoop`; a pause that does not start over after an
-accept breaks `FirstWaitLeast`; on macOS a retry with no check for a free descriptor, as before,
-and a failed accept that does not mark the side for that check, break `LostPerOutage`), and 2
-witnesses (a retry after a pause that accepts a connection; a check that found a descriptor free
-and an accept that still closed a connection, the race the check cannot close).
+(`TcpStreamGenerator::poll_next` in `src/net/tcp.rs`, `out_of_descriptors` and
+`lost_before_accept` in `src/rt/counters.rs`), and the accept under it on a readiness poller
+(`ReadState::accept_ahead` and `accept_checked` in `src/io/source/read.rs`), when the process runs
+out of descriptors and when peers reset their connections in the backlog. Peers connect into the
+backlog, some resetting theirs while it waits there; the rest of the process may take every free
+descriptor for a while and gives them back in the end. A poll asks the listener for the next
+connection: one there and a descriptor free, it is accepted and the stream's pause starts over at
+its least; one its peer reset, the listener answers with that connection's error, which the side
+skips, asking again at once; out of descriptors (EMFILE or ENFILE, on Windows WSAEMFILE,
+WSAENOBUFS or ERROR_NO_SYSTEM_RESOURCES), the stream waits on a timer for
+its pause, which then doubles up to its most, and asks again when the timer fires; any other error
+ends the stream. On macOS an accept that fails for want of a descriptor closes the connection it
+took off the backlog (`Drops`), so after one the side first copies the listener's descriptor and
+closes the copy: none free, it answers EMFILE and takes nothing; one free, it accepts, though the
+rest of the process may take the last descriptor in between. The side hands an error over once and
+the connections queued before it first, so a retry asks the listener afresh. Time is the ticks left
+on the timer. 17 configurations: 7 that must pass (two and three connections across two outages,
+with `NoBusyLoop`, at most one EMFILE between two ticks, `FirstWaitLeast`, the first pause after an
+accept the least, `LostPerOutage`, no more connections closed than outages began,
+`EndsOnlyForOther`, only the listener's own error ends the stream, and `AllServed`, every kept
+connection accepted once descriptors are free again or closed by a failed accept; the same on
+macOS, where a failed accept closes the connection it took; an outage followed by another error of
+the listener, with `OtherEnds`, the stream ends, and `NothingAfterEnd`; and the same three with
+connections reset in the backlog among the kept ones), 7 mutations (the stream that ended on
+EMFILE, as it did before, breaks `AllServed`; a retry with no timer breaks `NoBusyLoop`; a pause
+that does not start over after an accept breaks `FirstWaitLeast`; on macOS a retry with no check
+for a free descriptor, as before, and a failed accept that does not mark the side for that check,
+break `LostPerOutage`; a reset connection's error that ends the stream, as WSAECONNRESET did on
+Windows, breaks `EndsOnlyForOther`; a skip that asks the listener nothing more until another
+connection comes breaks `AllServed`), and 3 witnesses (a retry after a pause that accepts a
+connection; a check that found a descriptor free and an accept that still closed a connection, the
+race the check cannot close; a kept connection accepted after a skip).
+
+`tla/accept/AcceptReset.tla` checks the side under those accepts when a peer resets its
+connection, on every backend and through both ways of accepting: `accept` and `incoming`
+(`ReadState::accept`, and `peer_gone` for a connection a multishot accept brought) and
+`accept_multi` (`ReadState::accept_stream`, `TcpStreamGenerator::poll_next`). The peers reset a
+connection in the backlog before any accept takes it, under the accept out that took it, or after
+a multishot accept took it and before the task asks its peer; the listener may fail once with its
+own error. A readiness side's loop (`accept_ahead`, run by the task's poll and by `serve` on an
+edge) skips a reset connection's ECONNABORTED and accepts the next at once; a completion side
+(`op_done` and `submit_ops` in `src/io/source/read/ops.rs`, the kernel's answers being `outcome` in
+`src/io/source/port.rs` for `AcceptEx` and `RingMem::complete_rest` and `ShardRing::accepted` for
+io_uring) keeps nothing of an accept, or a multishot accept's end, that met one, and wakes its
+task, whose poll sends the next accept; a task that finds a multishot accept's connection gone
+(ENOTCONN) takes the next one, the side accepting again when it holds none. Linux, and any kernel
+the reset reaches after the accept, hands the connection over as it is. 27 configurations: 12 that
+must pass (each backend, readiness, completion and multishot, with each way of accepting, with two
+reset connections and a kept one, with `AllKeptServed`, every kept connection served, and
+`NoLostToCaller`, no task sees a reset connection's error nor a stream ends for one; and again with
+the listener's own error, with `ErrSurfaces`, it reaches the task), 11 mutations (a reset
+connection's error kept for the task breaks `NoLostToCaller` in a readiness side's loop, in a
+completed accept, as the soak's server met on Windows, in a plain accept's look at a multishot
+accept's connection, and in a multishot accept's end; a skip that stalls, as a readiness loop
+that stops unmarked, a completion or a multishot end that wakes nobody, and a look that sends no
+accept, breaks `AllKeptServed`; the listener's own error skipped as a reset connection's breaks
+`ErrSurfaces` on a readiness side, a completion side and a multishot accept's end), and 4
+witnesses (a kept connection served after each kind of skip). The accept tests of
+`src/net/tests/reset.rs` reset a connection in the backlog before a kept one on every backend,
+with the accept waiting and not, through `accept`, `incoming` and `accept_multi`, and check every
+byte of the kept one; `src/io/source/tests/lost_accept.rs` hands a completion side each system's
+errors of both kinds.
 
 ## A stream's close
 
@@ -2129,19 +2175,33 @@ a runner leaves its shard for a task's poll (a release store of its word), comes
 poll's end and at each call into the runtime from the task, every owner's path a task's code
 takes included (a store of its word, the compiler's fence, a load of its claim: a call reads the
 word it left first and puts it back, a release store, as it ends; an IO owner's step ends its
-call as it settles what it left, before its wakes), and cancels a pending claim
+call as it settles what it left, before its wakes; the push of a task into the shard's empty
+LIFO slot tries a leaf first, which marks the call and reads its claim as a call does but never
+contests one: it puts its word back and the call takes the full bracket when a claim is up or
+the push is another), and cancels a pending claim
 with a compare-and-swap; the monitor sets the claim pending, runs the heavy fence (every buffer
 flushed at once), reads the word again and takes with the opposite compare-and-swap, then hands
-the shard to a spare with a fresh slot. 15 configurations: 2 that must pass (two handoffs, a
-remote push and a bound task: at most one thread inside the shard, `Exclusive`, a detached thread
-staying out, a bound task on its creator only; a first poll that makes a call and then never
-returns, every remote push run anyway, `Rescued`); 9 mutations, each of which must break a
-property (no heavy fence, no second read of the word, no look at the claim at a poll's end or in
-a call into the runtime, a call that looks at its claim with no mark first, the old runner's slot
-handed on: each breaks `Exclusive`; the new runner taking the bound tasks breaks
-`BoundOnCreator`; no handoff at all, and a call that leaves its mark as it ends, so a poll that
-blocks after a call is never seen to block, each break `Rescued`); and 4 witnesses (a handoff, a
-cancel by the monitor, a call into the runtime from a detached thread, a cancel by the runner). `tla/handoff/Retarget.tla` checks the waker of a
+the shard to a spare with a fresh slot. A detached runner's code may still call into the runtime
+on the slot it was taken from, once a call around a nested `block_on` whose poll found the take
+ends (`Bracket`'s drop puts that slot back): each such call, a leaf push or a bracket, reads that
+slot's claim, which stays taken for good (`Slot::take` is its last write, `Slot::contest` swaps
+only from pending, and the monitor never claims the old slot again), and stays out. 23
+configurations: 5 that must pass (two handoffs, a remote push and a bound task: at most one thread
+inside the shard, `Exclusive`, a detached thread staying out, `DetachedStaysOut`, a bound task on
+its creator only; a first poll that makes a call and then never returns, every remote push run
+anyway, `Rescued`; both again, with one handoff and one poll, with the call a leaf push; and the
+leaf push's run with one poll a turn, the taken runner's code making one more call on its old
+slot, `D_safe`); 12
+mutations, each of which must break a property (no heavy fence, no second read of the word, no
+look at the claim at a poll's end or in a call into the runtime, a call that looks at its claim
+with no mark first, a leaf push that goes in with no look at its claim, the old runner's slot
+handed on: each breaks `Exclusive`; a runner that clears the taken claim as it detaches, so its
+code's next call goes into the shard the monitor took, breaks `DetachedStaysOut`; the new runner
+taking the bound tasks breaks `BoundOnCreator`; no handoff at all, a call that leaves its mark as it ends, and a leaf push that
+backs out with its mark still up, so a poll that blocks after a call is never seen to block, each
+break `Rescued`); and 6 witnesses (a handoff, a cancel by the monitor, a call into the runtime
+from a detached thread, a cancel by the runner, a leaf push backing out on a claim, a detached
+thread's leaf push backing out on its old slot's claim). `tla/handoff/Retarget.tla` checks the waker of a
 `block_on` future moved to its thread's own shard: the waker sets its flag and reads its target,
 the mover sets the target and looks at the flag, both sequentially consistent (1 that must pass,
 1 mutation with relaxed accesses that loses the wake, 1 witness of a wake that went to the old

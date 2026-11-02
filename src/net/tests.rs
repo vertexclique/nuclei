@@ -1002,7 +1002,11 @@ mod datagram_owned;
 #[cfg(unix)]
 mod emfile;
 
+mod reset;
+
 mod send_file;
+
+mod udp_ahead;
 
 mod zero_copy;
 

@@ -4,6 +4,37 @@
 
 ### Fixed
 
+- **A connection reset before it was accepted no longer ends a listener's accepts** (Windows; and
+  `accept` on every system). `AcceptEx` completes with `WSAECONNRESET`, or `ERROR_NETNAME_DELETED`,
+  for a connection its peer reset in the backlog before or while the accept took it. That error is
+  the connection's, but the side kept it for the listener's task: `accept` returned it, and
+  `accept_multi`'s stream ended with it, so the soak's server, whose peers reset with zero linger,
+  stopped serving within its first seconds on Windows. Every backend now tells such an error from
+  the listener's own (`lost_before_accept`) and skips the connection: a readiness side accepts the
+  next one at once, a completion side keeps nothing and its task's poll sends the next accept, and a
+  plain accept on io_uring that finds a connection a multishot accept brought gone (`ENOTCONN` from
+  its peer) takes the next one. `accept`, `incoming` and `UnixListener::accept` skip `ECONNABORTED`
+  as well, which they returned before (on macOS and the BSDs, for a connection reset in the
+  backlog), as `accept_multi` already skipped it on unix; Linux hands such a connection over as it
+  is, unchanged. The listener's own errors (out of descriptors or memory, not listening) still reach
+  `accept` and end the stream (`proofs/tla/accept/AcceptReset.tla`, and `AcceptStream.tla` with
+  reset connections).
+- **`accept_multi` on Windows pauses for a socket the system has no room for, as for one it has no
+  descriptor for.** Windows answers a socket it cannot make, the one an accept takes its connection
+  into among them, with `WSAENOBUFS` as well as `WSAEMFILE`, and an `AcceptEx` that ends for want of
+  system resources with `ERROR_NO_SYSTEM_RESOURCES`. Only `WSAEMFILE` paused the stream; the other
+  two ended it for good, though the backlog would be served once resources came back. All three
+  now pause it, as `EMFILE` and `ENFILE` do on unix.
+- **A datagram received ahead is never cut** (Windows; and io_uring once its receive group ran
+  dry). A port receives a UDP datagram ahead into a buffer of the pool for the call that waits, and
+  sized that buffer by the call's length: a look at the sender (`peek_sender`, which asks for no
+  bytes on Windows) or a short peek took a 1400-byte datagram into 512 bytes, the cut completed as
+  a success, and the next `recv_from` got the first 512 bytes as the whole datagram. The buffer of
+  a receive ahead now holds the largest UDP datagram whatever the call asked for, as the ring's
+  receive group does; a pool with no such buffer has the port look with a zero-byte receive and the
+  task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
+  "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
+  buffer of the pool while it waits, where it held one of its own length.
 - **`allocate` on FreeBSD makes every change of space the system has a call for.** Only `Extend`
   worked there; every other mode answered `Unsupported`. `PunchHole` and `ZeroRange` are now
   `fspacectl(2)`'s `SPACECTL_DEALLOC` (FreeBSD 14 on, looked up when first used, so a program
@@ -97,6 +128,37 @@
   `After::run` where it inlined it; its count moves by ten from run to run), and `tcp_many` under
   fat LTO (1 more, in the general read's frame). Counted as the ops gate counts them, every row is
   at or below what it was, and CI's budgets in `ci/op_budget.txt` were lowered to match.
+
+- **A spawn or wake from a task's code on a watched worker pushes as a leaf.** Such a call put
+  the task on its shard through a bracket out of line: the call's mark, the push and the mark's
+  end, in a function that saved six registers to do it. A push into the shard's empty LIFO slot,
+  the usual one, now first tries a leaf (`context::push_lifo_marked`): the call marked and its
+  claim read as a bracket does, the task put in the slot and the poll's word put back. A claim
+  up, a slot that holds a task or a task of another shard puts the word back as it found it and
+  takes the full bracket, which settles the claim (`Slot::mark_unless_claimed`;
+  `proofs/tla/handoff`, the leaf push, whose mutations go in with no look at the claim and back
+  out with the mark still up). With the default watch on io_uring, default release build, user
+  instructions per operation: a spawn and its join 790 before, 756 now (631 with the watch off);
+  a oneshot round 1017, 983 (858 off); a bounded channel round 611, 594 (530 off); under fat
+  LTO 757, 715; 864, 822; 530, 509. With the watch off the rows cost what they did, but for the
+  file read, whose read's frame spills one more register: about 3 more of 2606 on a read the page
+  cache serves, and about 4 more of 3692 on io_uring on one it misses, the same on epoll (counted
+  on a 16 MiB file read in 64 KiB pieces, its cached pages dropped with
+  `posix_fadvise(POSIX_FADV_DONTNEED)` before each read).
+- **Still behind: the watch's cost of a task's run, and the file read's spilled register.** A
+  watched worker still runs each task out of line (`run_task_watched`: 33 instructions, about 14
+  of them its frame) where an unwatched one runs it inline, two runs to a spawn and its join: with
+  the watch on, a spawn and its join costs 756 to the 631 of one with it off. Three ways were
+  measured for 0.5.4 and left out, each for what it cost with the watch off. The worker's loop
+  compiled once for a watched slot and once for none, its watched runs inline: a spawn and its
+  join 737 with the watch on, but each stream and datagram row 29 to 38 more with it off under fat
+  LTO and with one codegen unit. The run coming back on its own last word with its mark bit
+  cleared, keeping no epoch and one register less: 746 with the watch on, but with it off the file
+  read about 4 more on a page cache hit and about 10 more on an io_uring miss. The file read's
+  rarer steps (its job in flight, its wait for a write before it, its job's submit) out of line,
+  so a read the page cache serves spills nothing: 2617 to 2596 per read on io_uring, but each read
+  that misses the cache 35 more on io_uring and 75 more on epoll, and with only the submit and the
+  wait out of line still about 20 more on io_uring.
 
 ## 0.5.3
 

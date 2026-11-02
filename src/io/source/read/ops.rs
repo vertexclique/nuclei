@@ -22,6 +22,7 @@ use crate::io::source::Io;
 use crate::io::source::ops::{Answer, Done, Outcome, Want};
 use crate::io::source::route::Route;
 use crate::io::sys;
+use crate::rt::counters::lost_before_accept;
 
 impl ReadState {
     /// Whether [`submit_wanted`](Self::submit_wanted) has anything to do: a task waits, or a lent
@@ -163,7 +164,7 @@ impl ReadState {
             let multi = !self.dry && issuer.multishot_datagrams(kind);
             #[cfg(not(ring))]
             let multi = false;
-            match self.datagram_want(multi, len, after) {
+            match self.datagram_want(multi, after) {
                 Some(want) => want,
                 // No buffer of the pool: a poll that holds none, and the task
                 // receives into its own buffer (`task_receives`).
@@ -224,9 +225,9 @@ impl ReadState {
     }
 
     /// The datagram receive to go out: a multishot one into the receive
-    /// group (`multi`), or one into a buffer of the pool that holds `len`
-    /// whole; `None` while the pool has none.
-    fn datagram_want(&mut self, multi: bool, len: usize, after: &mut After) -> Option<Want> {
+    /// group (`multi`), or one into a buffer of the pool that holds any UDP
+    /// datagram whole; `None` while the pool has none.
+    fn datagram_want(&mut self, multi: bool, after: &mut After) -> Option<Want> {
         #[cfg(ring)]
         if multi {
             self.multi = true;
@@ -235,10 +236,11 @@ impl ReadState {
         #[cfg(not(ring))]
         let _ = multi;
         // Only UDP is received ahead, and no UDP datagram is longer than its
-        // length field counts: a larger buffer of the task's needs no larger
-        // one of the pool.
-        self.buffer(len.min(UDP_MAX), true, after)
-            .map(Want::RecvFrom)
+        // length field counts. What comes ahead may go to another call than
+        // the one that asked (a look at the sender asks for none, a receive
+        // may be given up), and a cut datagram completes as a success: so the
+        // buffer holds the largest, whatever was asked (proofs/tla/ring/RingRecv.tla).
+        self.buffer(UDP_MAX, true, after).map(Want::RecvFrom)
     }
 
     /// A receive into a buffer of the pool completed.
@@ -272,7 +274,8 @@ impl ReadState {
 
     /// The side's operation completed: what it brought goes where the tasks
     /// take it, and they are woken. One given back undone brought nothing,
-    /// and is asked again. `fd` is the source's descriptor (a listener's,
+    /// and is asked again, as is an accept that met a connection its peer
+    /// reset in the backlog. `fd` is the source's descriptor (a listener's,
     /// for the accepted connection to take its context from).
     pub(crate) fn op_done(&mut self, done: Done, fd: Option<Raw>, after: &mut After) {
         self.out = None;
@@ -431,7 +434,12 @@ impl ReadState {
                     match answer {
                         // Its connections came as arrivals.
                         Answer::Done(Ok(())) => {}
-                        Answer::Done(Err(err)) => self.error = Some(err),
+                        Answer::Done(Err(err)) if !lost_before_accept(&err) => {
+                            self.error = Some(err);
+                        }
+                        // A connection reset in the backlog ended it: the tasks woken below ask
+                        // for the next one.
+                        Answer::Done(Err(_)) => {}
                         Answer::Undone { not_ready } => self.not_ready(not_ready),
                     }
                 }
@@ -444,7 +452,12 @@ impl ReadState {
                     Err(err) => self.error = Some(err),
                 }
             }
-            Outcome::Accept(Answer::Done(Err(err))) => self.error = Some(err),
+            Outcome::Accept(Answer::Done(Err(err))) if !lost_before_accept(&err) => {
+                self.error = Some(err);
+            }
+            // A connection reset in the backlog, closed already: the tasks woken below ask for
+            // the next one (proofs/tla/accept).
+            Outcome::Accept(Answer::Done(Err(_))) => {}
             Outcome::RecvFrom(buf, _) if stale => after.drop_buf(buf),
             Outcome::RecvFrom(buf, answer) => {
                 // The group may have buffers again: the next receive tries.
