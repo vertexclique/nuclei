@@ -83,12 +83,23 @@ async fn transfer<S: Stream>(
     same_bytes(&what, &got, &bytes);
 }
 
+/// The largest transfer through TCP's smallest buffers to and from std. FreeBSD's TCP, with
+/// a buffer smaller than one of loopback's 16 KiB segments and a reader that takes 777 bytes at
+/// a time, opens its window only once half the buffer is free and waits for its delayed
+/// acknowledgement to say so, and its sender, short of half the window, waits for its persist
+/// timer (sys/netinet/tcp_output.c): 256 KiB took 11 to 46 s there, where 64 KiB took 0.3 s.
+const LARGEST_TCP_TO_STD: usize = if cfg!(target_os = "freebsd") {
+    65_537
+} else {
+    262_144
+};
+
 /// The same with the peer std's, reading or writing in pieces of its own.
 async fn against_std<S: Stream>() {
     use std::io::Write;
     for size in SIZES
         .into_iter()
-        .filter(|&s| s <= 262_144 || S::NAME != "tcp")
+        .filter(|&s| s <= LARGEST_TCP_TO_STD || S::NAME != "tcp")
     {
         let bytes = pattern(size as u64 + 5, size);
         let what = format!("{}: {size} bytes to and from std, tiny", S::NAME);
