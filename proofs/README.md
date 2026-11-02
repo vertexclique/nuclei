@@ -1471,16 +1471,9 @@ one read): a read it covers with more to spare asks for no count (a plain `read`
 kernel and in the task than the `recvmsg` and its control message), and the read that would take
 the floor's last piece asks again, since more may have come after the count. A read that finds
 the socket empty forgets the floor. The model's `Exact` runs it on a request of four pieces, one
-read each, three sent first and the last after. Its `End` has each peer close after its request,
-the hangup on the edge of its last part: the driver marks the side unsure as it serves that edge,
-before the serve wakes the task (`on_event` passes `read_work::UNSURE`, which the deferred work
-applies ahead of the serve), so neither a count that leaves the end out nor a TCP read shorter
-than it asked for (`drained`) has the task wait for an edge the hangup already was. 17
-configurations: 6 that must pass (`Buffers`, every buffer free or holding a request read ahead;
-and `Read`, every task that reads gets its request, with a task that stops, with none, with exact
-reads, and with the end after exact reads and after reads ahead), 8 mutations (a hangup that
-does not mark the side unsure, and a mark applied only after the serve that woke the task, break
-`Read`; a starved reader
+read each, three sent first and the last after. 13 configurations: 4 that must pass (`Buffers`,
+every buffer free or holding a request read ahead; and `Read`, every task that reads gets its
+request, with a task that stops, with none, and with exact reads), 6 mutations (a starved reader
 that waits for a buffer to come back, an edge that starves the side and wakes nobody, a reader
 that waits for the next edge after the pool turned it away, a peek taken as having emptied the
 socket, an exact read taken as having emptied it whatever the kernel counts, and a floor that

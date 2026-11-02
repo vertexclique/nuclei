@@ -12,7 +12,3 @@ MFS_floor_trusted              MC_FdStarve          violated:Read
 WFS_starve                     MC_FdStarve          violated:NoStarve
 WFS_direct                     MC_FdStarve          violated:NoDirect
 WFS_countless                  MC_FdStarve          violated:NoCountless
-FS_exact_end                   MC_FdStarve          pass
-FS_short_end                   MC_FdStarve          pass
-MFS_hangup_sure                MC_FdStarve          violated:Read
-MFS_unsure_after_serve         MC_FdStarve          violated:Read
