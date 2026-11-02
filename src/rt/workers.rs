@@ -638,7 +638,7 @@ fn run_shard(inner: &Arc<Inner>, run: Run, life: &Life) {
     if worked == Worked::Detached {
         life.back();
         if let Some(monitor) = &workers.monitor {
-            finish_taken(inner, monitor, &home, shard);
+            finish_taken(inner, monitor, &home, lost, shard);
             return;
         }
     }
@@ -650,14 +650,21 @@ fn run_shard(inner: &Arc<Inner>, run: Run, life: &Life) {
 }
 
 /// The end of a thread whose shard was taken, out of the worker's loop: its
-/// bound tasks finish, its reference to the shard goes as `run_shard`'s
-/// would, and then the taken poll and all it led to on this thread are over,
-/// out of flight, which may be all a paused clock waited for
-/// (proofs/tla/clock, `M_detached_uncounted`).
+/// bound tasks finish, it forgets the shard (`lost`) and its reference to the
+/// shard goes as `run_shard`'s would, and then the taken poll and all it led
+/// to on this thread are over, out of flight, which may be all a paused clock
+/// waited for (proofs/tla/clock, `M_detached_uncounted`).
 #[cold]
 #[inline(never)]
-fn finish_taken(inner: &Arc<Inner>, monitor: &Monitor, home: &Home, shard: Arc<Shard>) {
+fn finish_taken(
+    inner: &Arc<Inner>,
+    monitor: &Monitor,
+    home: &Home,
+    lost: context::ForgetLost,
+    shard: Arc<Shard>,
+) {
     finish_home(monitor, home);
+    drop(lost);
     drop(shard);
     monitor.count_out();
     super::paused::try_advance(inner, None);
