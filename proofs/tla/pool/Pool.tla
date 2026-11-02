@@ -21,7 +21,9 @@
 (*                                                                          *)
 (* What is abstract: the queue is a count (one taker at a time, as the     *)
 (* inbox's role makes it), a thread's park is its wait for its slot, and  *)
-(* a start hands a token to a thread not running.                         *)
+(* a start hands a token to a thread not running; a start never fails     *)
+(* here (tla/pool/Start.tla checks one that fails, and a start hook that   *)
+(* panics).                                                                *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
