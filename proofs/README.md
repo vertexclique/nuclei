@@ -869,7 +869,7 @@ file every kernel read and write is exactly one a caller made; `NoCallOnClosed`,
 runs on a descriptor that closed; `NothingRefused`, no call a polled ring refuses ends as a
 failure; and liveness (`Termination`).
 
-69 configurations. 25 must pass: tasks that may go away and tasks that stay, a file opened to
+70 configurations. 25 must pass: tasks that may go away and tasks that stay, a file opened to
 append, positional calls, the generation, syncs that may fail (with their tasks staying, and
 going away with a call out), a write the kernel fails beside two syncs, a sync of a clone that
 fails before the handle's, calls a polled ring refuses, and a direct file, each with its
@@ -906,7 +906,7 @@ finds none); a refusal of the polled ring that ends the call (`iopoll_refusal_en
 (`sync_any_failure`), breaks `NoFalseFailure`; a direct read through the read-ahead and a direct write that joins
 the write-behind break `DirectExact`; a descriptor closed at the drop with a job out, and an
 `into_inner` that does not wait for the jobs, each with a cursor job and with a positional write
-left by its task, break `NoCallOnClosed`. 15 witnesses must be proved wrong: a read that reads
+left by its task, break `NoCallOnClosed`. 16 witnesses must be proved wrong: a read that reads
 again, the lent write of a task that went away landing, a read after the seek that counts the
 lent write's value, a write on the ring landing in two parts, one cut short whose shard went
 finished on the pool, an append after the seek landing at the end, a read that reads again only
@@ -914,7 +914,9 @@ because a positional write ended, a buffered read asking the kernel for more tha
 read-ahead the direct rule takes away), the positional write of a task that went away landing, a
 sync that fails, a sync that takes the end of a call whose task went away, a cursor job and a
 positional write still out as their handle drops, a call the polled ring refused made again on
-the pool, and (`WF_clone_race`, a gap the record leaves
+the pool, a direct write answered before it landed (`WF_direct_ok_early`, the code as it is,
+for the operator to decide how a write polled again is told apart from a new one), and
+(`WF_clone_race`, a gap the record leaves
 for the operator to decide) the syncs of a handle and of its clone at once, where the clone's
 call takes the kernel's error and the handle's call, made beside it, answers success.
 

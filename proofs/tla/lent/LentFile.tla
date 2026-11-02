@@ -97,7 +97,10 @@
 (* Scenario "direct": the file is opened for direct IO: a read job reads   *)
 (* exactly the cell asked for (no read-ahead), and a copied write is one   *)
 (* kernel write of exactly its bytes, which waits for the write in flight  *)
-(* instead of joining the write-behind.                                    *)
+(* instead of joining the write-behind. Such a write is accepted as it is  *)
+(* submitted, as every cursor write from a copy is: its caller is told it  *)
+(* is done before it landed (`DirectWriteLanded`, a witness of that, for   *)
+(* the operator's decision on how a write polled again is told apart).     *)
 (*                                                                          *)
 (* Every call runs on the handle's own descriptor (src/fs/file/mod.rs,     *)
 (* `FileIo::new`; src/io/source/requests.rs, `Lease`): no copy of it is    *)
@@ -217,6 +220,7 @@ variables
     lostRec = [h \in Handles |-> FALSE], \* each handle's record of a write lost, kept for good (failed calls: `Sticky`)
     writeLost = FALSE,                 \* (record) the kernel failed a cursor write the handle had accepted
     refused = FALSE,                   \* (record) a call the polled ring refused ended as a failure
+    directEarly = FALSE,               \* (record) a direct write was answered before it landed
     remade = FALSE,                    \* (record) a call the polled ring refused was made again on the pool
     kerr = FALSE,                      \* the kernel holds a write-back error no call reported yet
     devFailed = FALSE,                 \* the device failed a write-back (once at most)
@@ -410,6 +414,8 @@ macro AcceptCopy(v) begin
     end if;
     cwrites := cwrites \cup {<<cursor, 1>>};
     written := written \cup {<<IF Appending THEN -1 ELSE cursor, v>>};
+    \* A direct write's caller is told it is done here, before its kernel write landed.
+    if Direct then directEarly := TRUE; end if;
     PosHistory(cursor, v);
     cursor := cursor + 1;
     epoch := epoch + 1;
@@ -1152,4 +1158,7 @@ NoLeftTaken == ~leftTaken
 NoJobAfterDrop == ~(gone /\ Leases > 0)
 \* A call the polled ring refused is made again on the blocking pool.
 NoRemade == ~remade
+\* A direct write's caller is told it is done only once its kernel write landed: false today, each
+\* cursor write from a copy being accepted as it is submitted (WF_direct_ok_early).
+DirectWriteLanded == ~directEarly
 =============================================================================

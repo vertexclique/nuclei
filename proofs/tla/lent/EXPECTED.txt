@@ -130,3 +130,4 @@ PF_sync_iopoll                 MC_LentFile          pass
 PF_sync_iopoll_live            MC_LentFile          pass
 MF_iopoll_refusal_ends         MC_LentFile          violated:NothingRefused
 WF_remade                      MC_LentFile          violated:NoRemade
+WF_direct_ok_early             MC_LentFile          violated:DirectWriteLanded
