@@ -47,11 +47,30 @@
 (* finite completions take more than the queue's C slots: the room the cap *)
 (* keeps is for them.                                                      *)
 (*                                                                         *)
+(* A side that reads by readiness (a stream read straight into the task's  *)
+(* buffer, a datagram socket whose task receives itself) keeps a multishot *)
+(* poll armed (`ReadyMulti`, `ReadyStream` in src/io/source/read/ops.rs),  *)
+(* and each of its edges is an entry of the queue; the ring's own cancels  *)
+(* (`ShardRing::cancel`) each complete with one too. Neither has room kept: *)
+(* their number follows the sides and their peers, not the cap, so the     *)
+(* queue may need more than its C slots for them, and the kernel holds the *)
+(* rest past it as it holds an accept's connections. A multishot poll's    *)
+(* edge that finds the queue full ends the poll instead (Linux posts the   *)
+(* edges of a multishot operation only into room, and ends it otherwise:   *)
+(* `Kernel = "ends"`; kernels before that held them past the queue too:    *)
+(* `"overflows"`). Its end wakes the side's tasks, and the next one that   *)
+(* waits arms another (`ReadyMultiEnd` in `ReadState::op_done`), whose     *)
+(* first look at the socket reports bytes already there, so no edge is     *)
+(* lost. What must happen: a poll the kernel ended is armed again          *)
+(* (`EndedRearmed`).                                                       *)
+(*                                                                         *)
 (* What is modelled: the queue size, the group size, the cap, multishot    *)
 (* long-lived operations that never end by themselves, one-shot ones of    *)
 (* each side that end when their peer acts, finite operations that come    *)
 (* and complete, the line of room, data arriving in the group and being    *)
-(* taken. What is abstract: what the operations do, time, and the entries  *)
+(* taken, the multishot polls' edges, their end on a full queue and their  *)
+(* arming again, the ring's cancels, and the entries the kernel holds past *)
+(* the queue. What is abstract: what the operations do, time, and the entries  *)
 (* no room is kept for: an accept's connections and the end of each        *)
 (* long-lived operation. Past the queue the kernel holds those             *)
 (* (IORING_FEAT_NODROP, which the poller requires) until the shard takes   *)
@@ -65,6 +84,10 @@ CONSTANTS
     G,         \* receive buffers the configuration asks for (a power of two)
     MaxLong,   \* long-lived operations of each kind the environment may start
     MaxFin,    \* finite operations the environment may start
+    Polls,     \* multishot polls of sides that read by readiness, armed from the start
+    MaxEdges,  \* edges the polls bring over the run
+    MaxCancel, \* cancels the ring makes of its own
+    Kernel,    \* "ends": a multishot edge that finds the queue full ends its poll; "overflows": it is held past the queue
     Mode       \* "ok", or the name of the one rule this run takes away
 
 Min(a, b) == IF a < b THEN a ELSE b
@@ -90,7 +113,14 @@ variables
     fin = 0,       \* finite operations in the kernel
     room = 0,      \* finite operations waiting for room
     made = 0,      \* finite operations started so far
-    arr = 0;       \* arrivals in the queue, one per group buffer in use
+    arr = 0,       \* arrivals in the queue, one per group buffer in use
+    polls = Polls, \* multishot polls in the kernel
+    ended = 0,     \* polls the kernel ended for want of room, not armed again yet
+    pedges = 0,    \* poll edges in the queue
+    brought = 0,   \* edges the polls brought so far
+    cancels = 0,   \* the ring's cancels' completions in the queue
+    cancelled = 0, \* cancels the ring made so far
+    over = 0;      \* entries the kernel holds past the queue (`IORING_FEAT_NODROP`)
 
 define
     \* Operations the ring counts against the cap.
@@ -99,6 +129,8 @@ define
     Counted == fin + (IF Mode = "no_long_exemption" THEN long ELSE 0)
                    + (IF Mode = "once_counted" THEN once ELSE 0)
                    + (IF Mode = "sends_counted" THEN sends ELSE 0)
+    \* Entries in the queue now, the finite operations counted as if they all completed.
+    Used == arr + fin + pedges + cancels
     \* No finite operation waits while none is in the kernel to free room.
     NoRoomDeadlock == ~(room > 0 /\ fin = 0)
     \* The queue holds no more waiting entries than it has slots.
@@ -108,6 +140,8 @@ define
     LongWithinCap == long <= Cap
     OnceWithinCap == once <= Cap
     SendsWithinCap == sends <= Cap
+    \* Witness: the queue never needs more than its slots, so the kernel holds nothing past it.
+    NoOverflow == over = 0
 end define;
 
 fair process ring = 1
@@ -164,10 +198,60 @@ Step:
             \* A reader takes an arrival and the buffer goes back to the group.
             await arr > 0;
             arr := arr - 1;
+        or
+            \* An armed poll's socket became ready: its edge goes into the queue if there is room. A full
+            \* queue ends the poll (its end, which the kernel holds past the queue, wakes the side), or on
+            \* an older kernel holds the edge past the queue.
+            await polls > 0 /\ brought < MaxEdges;
+            brought := brought + 1;
+            if Used < C then
+                pedges := pedges + 1;
+            elsif Kernel = "ends" then
+                polls := polls - 1;
+                ended := ended + 1;
+            else
+                over := over + 1;
+            end if;
+        or
+            \* The shard takes a poll edge: the side reads.
+            await pedges > 0;
+            pedges := pedges - 1;
+        or
+            \* The ring cancels one of its operations: the cancel's completion goes into the queue, or past it.
+            await cancelled < MaxCancel;
+            cancelled := cancelled + 1;
+            if Used < C then
+                cancels := cancels + 1;
+            else
+                over := over + 1;
+            end if;
+        or
+            \* The shard takes a cancel's completion, which it ignores.
+            await cancels > 0;
+            cancels := cancels - 1;
+        or
+            \* The queue has room again: the shard takes an entry the kernel held past it.
+            await over > 0 /\ Used < C;
+            over := over - 1;
         end either;
+    end while;
+end process;
+
+\* The sides whose poll the kernel ended: the end wakes their tasks, and the next to wait arms another.
+fair process sides = 2
+begin
+S_rearm:
+    while TRUE do
+        \* MUTATION no_rearm_after_full: an end that came for want of room is taken as the side's last word.
+        await ended > 0 /\ Mode /= "no_rearm_after_full";
+        ended := ended - 1;
+        polls := polls + 1;
     end while;
 end process;
 end algorithm; *)
 \* BEGIN TRANSLATION
-\* END TRANSLATION 
+\* END TRANSLATION
+
+\* Every poll the kernel ended for want of room is armed again.
+EndedRearmed == (ended > 0) ~> (ended = 0)
 =============================================================================

@@ -8,3 +8,6 @@ M_once_counted                 MC_Admission         violated:NoRoomDeadlock
 W_once_past_cap                MC_Admission         violated:OnceWithinCap
 M_sends_counted                MC_Admission         violated:NoRoomDeadlock
 W_sends_past_cap               MC_Admission         violated:SendsWithinCap
+G_polls_overflow               MC_Admission         pass
+M_no_rearm_after_full          MC_Admission         violated:EndedRearmed
+W_poll_edges_past_queue        MC_Admission         violated:NoOverflow

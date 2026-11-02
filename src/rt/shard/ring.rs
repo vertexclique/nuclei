@@ -46,10 +46,14 @@
 //! otherwise hold the room another connection's reply, the next accept or a
 //! file call needs (proofs/tla/admission). The multishot receives' arrivals
 //! are bounded by the group's buffers, which the queue keeps room for. An
-//! accept's connections (up to [`ACCEPT_CAP`] each) and the completion of
-//! each of these operations have no room kept: past the queue the kernel
-//! holds them (`IORING_FEAT_NODROP`, which the poller requires) until the
-//! poller takes them, and none is lost.
+//! accept's connections (up to [`ACCEPT_CAP`] each), the edges of a
+//! multishot poll armed by a side that reads by readiness, the ring's own
+//! cancels and the completion of each of these operations have no room
+//! kept: past the queue the kernel holds them (`IORING_FEAT_NODROP`, which
+//! the poller requires) until the poller takes them, and none is lost. A
+//! multishot poll's edge that finds the queue full ends the poll instead,
+//! and the next task of its side to wait arms another, whose first look
+//! sees bytes already there (proofs/tla/admission, `EndedRearmed`).
 
 use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;

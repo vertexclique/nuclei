@@ -2070,16 +2070,29 @@ connections, the cap of a ring of 2048 entries beside its 256-buffer group, fill
 receives that waited for their peers, and the next accept waited in room behind them for good,
 leaving every connection past them unaccepted. It counted every operation of a side that writes
 too, so sends to peers that never read could fill the cap the same way and hold every other
-connection's reply, and every file call, in room for good. 9 configurations: 1 that must pass (the
+connection's reply, and every file call, in room for good. A side that reads by readiness keeps a
+multishot poll armed (`ReadyMulti`, `ReadyStream` in `src/io/source/read/ops.rs`), and the ring
+cancels operations of its own (`ShardRing::cancel`): neither the polls' edges nor the cancels'
+completions have room kept, so the queue may need more than its slots for them. A multishot
+poll's edge that finds the queue full ends the poll (Linux posts a multishot operation's edges
+only into room; older kernels held them past the queue too), and the next task of its side to
+wait arms another, whose first look reports bytes already there. 12 configurations: 2 that must
+pass (the
 group cut to half the queue, long-lived operations of every kind not counted: a finite operation
 never waits in room while none is in the kernel, `NoRoomDeadlock`, and arrivals plus finite
-completions fit the queue, `CqNeverOverfull`), 4 mutations (the group not cut breaks
+completions fit the queue, `CqNeverOverfull`; and with two armed polls and a cancel beside them,
+both again and `EndedRearmed`, every poll ended for want of room armed again), 5 mutations (the
+group not cut breaks
 `CqNeverOverfull`; multishot operations counted, one-shot ones of a side that reads counted, and a
 side that writes counted, as they were, let idle or deaf peers use the cap and break
-`NoRoomDeadlock`), and 4 witnesses (a finite operation does wait in room; a multishot one, a
-one-shot one, and a write side's is let in past the cap). An accept's connections and the end of
-each long-lived operation are not modelled: no room is kept for them, and past the queue the kernel
-holds them (`IORING_FEAT_NODROP`) until the shard takes them. `tests/idle_peers.rs` fills the cap
+`NoRoomDeadlock`; a poll ended for want of room taken as its side's last word breaks
+`EndedRearmed`), and 5 witnesses (a finite operation does wait in room; a multishot one, a
+one-shot one, and a write side's is let in past the cap; the polls' edges and a cancel's completion
+held past the queue, on a kernel that holds a multishot edge there). An accept's connections and
+the end of each long-lived operation are not modelled: no room is kept for them, and past the
+queue the kernel holds them (`IORING_FEAT_NODROP`) until the shard takes them; a kernel that cannot
+allocate an entry to hold one drops it and the next wait answers EBADR, which ends the shard
+loudly, the lost completion being one no task could be given. `tests/idle_peers.rs` fills the cap
 of the smallest ring with receives of idle peers, and then with sends to peers that never read, and
 checks every other peer is still accepted and answered.
 
