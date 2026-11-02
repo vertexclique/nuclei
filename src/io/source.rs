@@ -1238,18 +1238,6 @@ impl Source {
 
 #[cfg(test)]
 impl Source {
-    /// Has a stream read by readiness on a ring read through the multishot receive from its first
-    /// read, as one whose bytes ran ahead of its reads does: for a test of the receive.
-    #[cfg(ring)]
-    pub(crate) fn read_through_receive(self: &Arc<Self>) {
-        if let Some(mut held) = self.read.try_hold() {
-            held.get().read_through_receive();
-            let mut after = crate::io::side::After::default();
-            held.release(&mut after, &self.hooks());
-            after.run();
-        }
-    }
-
     /// Whether the read side and the write side went to shared mode.
     pub(crate) fn shared(&self) -> (bool, bool) {
         (self.read.is_shared(), self.write.is_shared())

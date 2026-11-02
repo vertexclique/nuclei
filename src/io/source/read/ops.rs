@@ -115,21 +115,14 @@ impl ReadState {
         };
         // Only a ring gives an operation back because the socket was not
         // ready: the next one waits for it to be. A side whose task receives every datagram
-        // itself (any but a UDP one's the ring receives ahead), or reads a stream by readiness
-        // (`read_direct`, proofs/tla/ring/RingPoll.tla), arms a poll that stays, so a wait
+        // itself (any but a UDP one's the ring receives ahead) arms a poll that stays, so a wait
         // after the next "not now" submits nothing.
         #[cfg(ring)]
         if self.poll_first {
-            let datagrams = kind.datagrams() && !issuer.multishot_datagrams(kind);
-            let want = if datagrams
-                || (kind.counts_left()
-                    && self.inq_wanted(kind)
-                    && !self.recv_mode
-                    && len < super::super::direct::READ_RING)
-            {
+            let want = if kind.datagrams() && !issuer.multishot_datagrams(kind) {
                 self.multi = true;
                 self.armed = true;
-                Want::ReadyMulti { stream: !datagrams }
+                Want::ReadyMulti
             } else {
                 Want::Ready { read: true }
             };

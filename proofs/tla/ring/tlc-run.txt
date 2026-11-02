@@ -121,17 +121,6 @@ RE_sqpoll_live                     563        260      1  pass                  
 MRE_no_look                         71         44      1  violated:Termination                  violated:Termination                  yes
 MRE_look_unissued                  493        230      1  violated:Termination                  violated:Termination                  yes
 WRE_end_stop                        40         28      1  violated:NoEndStop                    violated:NoEndStop                    yes
-RP_exact                          1117        492      2  pass                                  pass                                  yes
-RP_length                         1169        507      1  pass                                  pass                                  yes
-RP_switch                        11282       4369      2  pass                                  pass                                  yes
-RP_close                           491        249      1  pass                                  pass                                  yes
-MRP_no_rearm                       791        353      1  violated:Termination                  violated:Termination                  yes
-MRP_drained_after_fire             169         82      2  violated:Termination                  violated:Termination                  yes
-MRP_direct_before_ahead            416        231      1  violated:InOrder                      violated:InOrder                      yes
-MRP_edge_in_switch                4988       1961      1  violated:Termination                  violated:Termination                  yes
-MRP_hangup_ignored                 147         80      1  violated:Termination                  violated:Termination                  yes
-WRP_rearm                           65         47      2  violated:NoRearm                      violated:NoRearm                      yes
-WRP_switch                          14         12      1  violated:NoSwitchBack                 violated:NoSwitchBack                 yes
 RR_port_udp                        413        220      1  pass                                  pass                                  yes
 RR_port_udp_live                   413        220      1  pass                                  pass                                  yes
 RR_port_udp_starved                361        174      1  pass                                  pass                                  yes
