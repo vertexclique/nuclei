@@ -100,9 +100,7 @@ use self::hooks::SourceHooks;
 
 use core::cell::UnsafeCell;
 use core::ptr::addr_of_mut;
-#[cfg(completion)]
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::io;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -476,6 +474,10 @@ pub(crate) struct Source {
     /// The epoch a retire left, which one revival moves on.
     retired_epoch: AtomicU32,
     kind: Kind,
+    /// Set to zero linger through nuclei (`set_zero_linger`, or `set_linger` under a second), so a
+    /// drop with nothing behind asks the kernel whether bytes are still unacknowledged
+    /// (`waits_for_acks`).
+    zero_linger: AtomicBool,
     read: Side<ReadState>,
     write: Side<WriteState>,
     /// The shards that claimed the sides as their owner.
@@ -591,6 +593,7 @@ impl Source {
             addr_of_mut!((*slot).epoch).write(AtomicU32::new(0));
             addr_of_mut!((*slot).retired_epoch).write(AtomicU32::new(0));
             addr_of_mut!((*slot).kind).write(kind);
+            addr_of_mut!((*slot).zero_linger).write(AtomicBool::new(false));
             addr_of_mut!((*slot).read).write(Side::biased(read));
             addr_of_mut!((*slot).write).write(Side::biased(WriteState::default()));
             addr_of_mut!((*slot).read_owner).write(owner::Owner::new());
@@ -643,6 +646,7 @@ impl Source {
             epoch: _,
             retired_epoch: _,
             kind: _,
+            zero_linger: _,
             read: _,
             write: _,
             read_owner: _,
@@ -675,6 +679,25 @@ impl Source {
 
     pub(crate) fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// Marks the stream as set to zero linger through nuclei, or not.
+    pub(crate) fn set_zero_linger(&self, on: bool) {
+        self.zero_linger.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the stream was set to zero linger through nuclei.
+    pub(crate) fn zero_linger(&self) -> bool {
+        self.zero_linger.load(Ordering::Relaxed)
+    }
+
+    /// Whether a drop with nothing behind still hands the stream to a linger task: it was set to
+    /// zero linger through nuclei and its kernel holds bytes the peer has not acknowledged, which
+    /// the reset could overtake (proofs/tla/close/AbortAcks.tla, `L_drop`).
+    pub(crate) fn waits_for_acks(&self, fd: Raw) -> bool {
+        self.kind == Kind::Tcp
+            && self.zero_linger.load(Ordering::Relaxed)
+            && crate::io::sys::unacked(fd).is_some_and(|n| n > 0)
     }
 
     /// Whether a connection this TCP listener accepts now starts with its kernel counting what

@@ -4,16 +4,20 @@
 
 ### Fixed
 
-- **A stream set to zero linger and dropped with bytes behind resets its peer** (macOS, and every
-  system that counts a socket's unacknowledged bytes). The drop's linger task delivers the bytes
-  written behind and then closes with no linger, which resets the connection. On macOS's loopback
-  that reset could overtake the last data still on its way: the peer took it for a stale one and
-  answered with a challenge ACK the closed port never answered, so the peer's stream stayed open
-  for good, a read waiting forever (`tests/net_streams.rs`'s resetting peer, about one run in two
-  on CI's macOS). The linger now waits, after the drain, until the kernel holds no byte the peer
-  has not acknowledged (`SO_NWRITE` on macOS, `FIONWRITE` on FreeBSD, `SIOCOUTQ` on Linux), within
-  `Builder::write_behind_linger`, and only then resets (`proofs/tla/close/AbortAcks.tla`). A
-  zero-linger handle dropped with nothing behind closes at once, as before.
+- **A stream set to zero linger and dropped while its data is still on its way resets its peer**
+  (macOS, and every system that counts a socket's unacknowledged bytes). A close with no linger
+  resets the connection, and on macOS's loopback that reset could overtake the last data still on
+  its way: the peer took it for a stale one and answered with a challenge ACK the closed port never
+  answered, so the peer's stream stayed open for good, a read waiting forever
+  (`tests/net_streams.rs`'s resetting peer, about one run in two on CI's macOS). A handle dropped
+  while its kernel holds bytes the peer has not acknowledged (`SO_NWRITE` on macOS, `FIONWRITE` on
+  FreeBSD, `SIOCOUTQ` on Linux) now goes to a linger task, after the bytes written behind if there
+  are any, which waits until the peer acknowledged them, within `Builder::write_behind_linger`, and
+  only then resets (`proofs/tla/close/AbortAcks.tla`); a peer that stopped reading holds the reset
+  back until that time runs out, as it holds back a drain. A drop knows of a zero linger set through
+  `set_zero_linger` or `set_linger` (of the stream, or of the `TcpSocket` it was connected or
+  accepted from); one set on the descriptor another way waits only when bytes are behind. Unchanged
+  on Windows, which has no such count.
 
 - **A shard's ring kept past its shard wakes for what is posted to it, and lets go of every post**
   (io_uring). A worker that goes with a zero-copy notification still out hands its ring to a

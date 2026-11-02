@@ -118,8 +118,12 @@ impl Handle<TcpListener> {
     /// When the listener's descriptor cannot be copied.
     pub async fn accept_multi(&self) -> io::Result<TcpStreamGenerator> {
         let listener = self.get_ref().try_clone()?;
+        let listener = Handle::adopt(listener, Kind::TcpListener)?;
+        listener
+            .source()
+            .set_zero_linger(self.source().zero_linger());
         Ok(TcpStreamGenerator {
-            listener: Handle::adopt(listener, Kind::TcpListener)?,
+            listener,
             error: None,
             done: false,
             backoff: None,
@@ -131,12 +135,15 @@ impl Handle<TcpListener> {
 /// A connection `listener` accepted, set up already.
 fn stream(fd: crate::io::raw::Owned, listener: &crate::io::Source) -> Handle<TcpStream> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if listener.passes_inq() {
-        return Handle::from_nonblocking_counting(TcpStream::from(fd), Kind::Tcp);
-    }
+    let stream = if listener.passes_inq() {
+        Handle::from_nonblocking_counting(TcpStream::from(fd), Kind::Tcp)
+    } else {
+        Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp)
+    };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let _ = listener;
-    Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp)
+    let stream = Handle::from_nonblocking(TcpStream::from(fd), Kind::Tcp);
+    stream.source().set_zero_linger(listener.zero_linger());
+    stream
 }
 
 fn inet(addr: Addr) -> io::Result<SocketAddr> {
@@ -290,19 +297,22 @@ impl Handle<TcpStream> {
 
     /// Sets `SO_LINGER`: with `Some(time)` a close waits up to `time` (whole
     /// seconds) for unsent data; with `None` it returns at once and the
-    /// system sends what is left.
+    /// system sends what is left. A time under a second is zero: as `set_zero_linger`.
     pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
-        super::opt::set_linger_time(self.raw_io(), linger)
+        super::opt::set_linger_time(self.raw_io(), linger)?;
+        self.source().set_zero_linger(super::opt::aborts(linger));
+        Ok(())
     }
 
-    /// Sets `SO_LINGER` to zero: the close drops unsent data and resets the
-    /// connection.
+    /// Sets `SO_LINGER` to zero: the close drops unsent data and resets the connection.
     ///
-    /// A handle dropped with bytes still written behind first delivers them, then waits until the
-    /// peer acknowledged what the kernel holds (within the runtime's `write_behind_linger`), and
-    /// only then resets, so the reset never overtakes the data still on its way.
+    /// A handle dropped while its kernel holds bytes the peer has not acknowledged, or with bytes
+    /// still written behind (delivered first), waits until the peer acknowledged them, within the
+    /// runtime's `write_behind_linger`, and only then resets, so the reset never overtakes data
+    /// still on its way. A peer that stopped reading holds the reset back until that time runs
+    /// out. Not on Windows, which has no count of those bytes: there it closes at once.
     pub fn set_zero_linger(&self) -> io::Result<()> {
-        super::opt::set_linger_time(self.raw_io(), Some(Duration::ZERO))
+        self.set_linger(Some(Duration::ZERO))
     }
 }
 

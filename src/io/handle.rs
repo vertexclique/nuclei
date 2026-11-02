@@ -378,15 +378,16 @@ impl<T> Drop for Handle<T> {
             .source
             .raw_fd()
             .ok()
-            .filter(|_| self.source.has_unsent())
+            .filter(|&fd| self.source.has_unsent() || self.source.waits_for_acks(fd))
         else {
             // The registration goes before the descriptor closes.
             self.source.close(io);
             return;
         };
         // The object itself stays with a task until the unsent bytes are
-        // out, and closes then: the drain needs no descriptor of its own
-        // (and on Windows, closing a socket would cancel its sends).
+        // out and, for a stream set to zero linger, acknowledged, and closes
+        // then: the drain needs no descriptor of its own (and on Windows,
+        // closing a socket would cancel its sends).
         self.source.linger(own);
         crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io), own));
     }
@@ -421,9 +422,9 @@ async fn deliver_file(file: &Arc<FileIo>) {
 /// and a TCP stream resets: its peer must not read the end of the stream
 /// after a cut one. A Unix stream has no reset: it closes, and its peer
 /// reads the end after the bytes that reached it (proofs/tla/close,
-/// `W_unix_cut`). A TCP stream set to zero linger whose bytes all went out first waits for the
-/// peer to acknowledge them (`wait_for_acks`), within the same time, so its reset cannot
-/// overtake them.
+/// `W_unix_cut`). A TCP stream set to zero linger waits for the peer to acknowledge what it
+/// sent (`wait_for_acks`), within the same time, so its reset cannot overtake it, whether it was
+/// dropped with bytes behind or with none behind but bytes its kernel holds unacknowledged.
 async fn linger(source: Arc<Source>, kept: Kept, own: Raw) {
     let budget = crate::rt::linger::time();
     let start = std::time::Instant::now();

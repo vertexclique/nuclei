@@ -1005,11 +1005,10 @@ fn the_wait_for_acks_ends_once_the_peer_acknowledged() {
     }
 }
 
+/// A loopback pair whose peer's window is closed from the handshake on, the writer's kernel left
+/// holding bytes the peer has not taken.
 #[cfg(unix)]
-#[test]
-fn the_wait_for_acks_ends_at_its_deadline() {
-    use crate::io::handle::wait_for_acks;
-    let rt = runtime(None);
+fn tcp_pair_with_a_closed_window() -> (std::net::TcpStream, std::net::TcpStream, usize) {
     let set_buf = |fd: libc::c_int, opt: libc::c_int, size: libc::c_int| {
         // SAFETY: `fd` is open for the call and `size` is a `c_int` of the length given.
         let ret = unsafe {
@@ -1029,13 +1028,23 @@ fn the_wait_for_acks_ends_at_its_deadline() {
     let (peer, _) = listener.accept().unwrap();
     set_buf(writer.as_raw_fd(), libc::SO_SNDBUF, 256 * 1024);
     writer.set_nonblocking(true).unwrap();
+    let mut written = 0;
     loop {
         match writer.write(&[0u8; 4096]) {
-            Ok(_) => {}
+            Ok(n) => written += n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => panic!("{e}"),
         }
     }
+    (writer, peer, written)
+}
+
+#[cfg(unix)]
+#[test]
+fn the_wait_for_acks_ends_at_its_deadline() {
+    use crate::io::handle::wait_for_acks;
+    let rt = runtime(None);
+    let (writer, peer, _) = tcp_pair_with_a_closed_window();
     let fd = writer.as_raw_fd();
     let counts = cfg!(any(
         target_os = "linux",
@@ -1064,4 +1073,113 @@ fn the_wait_for_acks_ends_at_its_deadline() {
         "the deadline, not the acknowledgements, ended the wait"
     );
     drop(peer);
+}
+
+#[cfg(unix)]
+const COUNTS_UNACKED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+));
+
+#[cfg(unix)]
+#[test]
+fn a_zero_linger_mark_follows_the_linger_set() {
+    let rt = runtime(None);
+    rt.block_on(async {
+        let (a, _b) = tcp_pair();
+        let handle = Handle::new(a).unwrap();
+        assert!(!handle.source().zero_linger());
+        handle.set_zero_linger().unwrap();
+        assert!(handle.source().zero_linger());
+        handle.set_linger(None).unwrap();
+        assert!(!handle.source().zero_linger());
+        handle.set_linger(Some(Duration::from_millis(500))).unwrap();
+        assert!(handle.source().zero_linger());
+        handle.set_linger(Some(Duration::from_secs(1))).unwrap();
+        assert!(!handle.source().zero_linger());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_socket_set_to_zero_linger_passes_it_to_its_streams() {
+    use crate::net::TcpSocket;
+    use futures_core::Stream;
+    let rt = runtime(None);
+    rt.block_on(async {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_zero_linger().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let listener = socket.listen(16).unwrap();
+        assert!(listener.source().zero_linger());
+
+        let marked = TcpSocket::new_v4().unwrap();
+        marked.set_zero_linger().unwrap();
+        let client = marked.connect(addr).await.unwrap();
+        assert!(client.source().zero_linger());
+        let (accepted, _) = listener.accept().await.unwrap();
+        assert!(accepted.source().zero_linger());
+
+        let plain = TcpSocket::new_v4().unwrap().connect(addr).await.unwrap();
+        assert!(!plain.source().zero_linger());
+        let (accepted, _) = listener.accept().await.unwrap();
+        assert!(accepted.source().zero_linger());
+
+        let mut multi = core::pin::pin!(listener.accept_multi().await.unwrap());
+        let _third = TcpSocket::new_v4().unwrap().connect(addr).await.unwrap();
+        let taken = core::future::poll_fn(|cx| multi.as_mut().poll_next(cx))
+            .await
+            .unwrap();
+        assert!(taken.source().zero_linger());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn waits_for_acks_asks_the_kernel_only_for_a_marked_stream() {
+    let rt = runtime(None);
+    let (writer, peer, _) = tcp_pair_with_a_closed_window();
+    let fd = writer.as_raw_fd();
+    rt.block_on(async {
+        let handle = Handle::new(writer).unwrap();
+        assert!(!handle.source().waits_for_acks(fd));
+        handle.set_zero_linger().unwrap();
+        assert_eq!(handle.source().waits_for_acks(fd), COUNTS_UNACKED);
+        handle.set_linger(None).unwrap();
+        assert!(!handle.source().waits_for_acks(fd));
+    });
+    drop(peer);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_zero_linger_stream_dropped_with_nothing_behind_delivers_what_its_kernel_holds_then_resets() {
+    let rt = runtime(None);
+    let (writer, mut peer, written) = tcp_pair_with_a_closed_window();
+    if !COUNTS_UNACKED {
+        assert!(sys::unacked(writer.as_raw_fd()).is_none());
+        return;
+    }
+    rt.block_on(async {
+        let handle = Handle::new(writer).unwrap();
+        handle.set_zero_linger().unwrap();
+        drop(handle);
+    });
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut sum = 0;
+    loop {
+        match peer.read(&mut buf) {
+            Ok(0) => panic!("an end, not a reset"),
+            Ok(n) => sum += n,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(sum, written, "every byte the kernel held, then the reset");
+    drop(rt);
 }
