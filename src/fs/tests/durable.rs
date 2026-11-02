@@ -381,11 +381,11 @@ fn a_polled_ring_makes_the_calls_it_refuses_on_the_pool() {
     let data = pattern(200_017);
     let expected = data.clone();
     let read_path = path.clone();
-    rt.block_on(async {
+    let ran = rt.block_on(async {
         within(spawn(async move {
             if ring_calls().is_none() {
                 eprintln!("skipping: the shard runs no ring (NUCLEI_BACKEND or no io_uring)");
-                return;
+                return false;
             }
             let mut file = Handle::new(read_write(&path)).unwrap();
             within(write_all(&mut file, &data)).await.unwrap();
@@ -401,8 +401,11 @@ fn a_polled_ring_makes_the_calls_it_refuses_on_the_pool() {
             assert!(back == data, "the bytes read back are not the ones written");
             let (_, entries) = ring_calls().unwrap();
             assert!(!entries.is_empty(), "no call went to the polled ring");
+            true
         }))
-        .await;
+        .await
     });
-    assert!(std::fs::read(&read_path).unwrap() == expected);
+    if ran {
+        assert!(std::fs::read(&read_path).unwrap() == expected);
+    }
 }
