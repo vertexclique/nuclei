@@ -85,10 +85,29 @@ pub(super) fn stopped_shard() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, StoppedShard)
 }
 
-/// Whether `err` is an attach refused because its shard stopped first.
-pub(crate) fn is_stopped_shard(err: &io::Error) -> bool {
+/// What an attach answers when the source has no descriptor: a retire
+/// (`get_mut`, `into_inner`) or a close took it out first. Performed with the
+/// retire, or made by a shard after it, the attach is refused for that alone:
+/// the handle's next wait brings the descriptor back and registers it again
+/// (`proofs/tla/attach/Merged.tla`).
+#[derive(Debug)]
+struct NoDescriptor;
+
+impl core::fmt::Display for NoDescriptor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the handle was retired or closed before its registration")
+    }
+}
+
+impl std::error::Error for NoDescriptor {}
+
+/// Whether `err` is an attach refused for now, which fails no IO of the
+/// source: its shard stopped first, or the source had no descriptor. The
+/// registration is back to none, and the tasks waiting on the source look
+/// again, to register it where they poll next.
+pub(crate) fn is_refused_for_now(err: &io::Error) -> bool {
     err.get_ref()
-        .is_some_and(|inner| inner.is::<StoppedShard>())
+        .is_some_and(|inner| inner.is::<StoppedShard>() || inner.is::<NoDescriptor>())
 }
 
 /// What pending requests carry. Each field is written by its requester
@@ -287,7 +306,9 @@ impl Source {
     /// Performs every pending request; both sides are held by the caller.
     /// Returns how an attach went, if one was pending: to the requester,
     /// when it is the one performing (`here`); else a failed attach fails
-    /// the tasks waiting on the source, as a failed registration does.
+    /// the tasks waiting on the source, as a failed registration does, but
+    /// for one refused for now (`is_refused_for_now`), as a retire performed
+    /// in the same go refuses it: the tasks look again.
     fn perform(
         self: &Arc<Self>,
         read: &mut ReadState,
@@ -365,7 +386,7 @@ impl Source {
             self.ops_registered(read, write, after);
         }
         if !here && let Some(Err(err)) = &attached {
-            if is_stopped_shard(err) {
+            if is_refused_for_now(err) {
                 read.wake_all(after);
                 write.wake_all(after);
             } else {
@@ -519,10 +540,7 @@ impl Source {
         // Stored before the shard, which the swap above acquired.
         let token = self.ask.attach_token.load(Ordering::Relaxed);
         let result = match self.fd.load(Ordering::Acquire) {
-            NO_FD => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "the handle closed before its registration",
-            )),
+            NO_FD => Err(io::Error::new(io::ErrorKind::NotConnected, NoDescriptor)),
             _ if shard.is_stopped() => Err(stopped_shard()),
             #[cfg(ring)]
             fd if shard.is_ring() => return self.attach_ring(shard, token, fd),

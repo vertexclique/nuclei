@@ -255,7 +255,8 @@ impl<T> Handle<T> {
     /// first (this waits for them), then the handle's IO stops, and every
     /// call still out on its descriptor ends; its next operation takes the
     /// object as it is then (another descriptor discards what the old one
-    /// left).
+    /// left), and registers it again where it runs: a registration still
+    /// under way when the IO stopped is given up, and fails nothing.
     pub fn get_mut(&mut self) -> &mut T {
         self.deliver_unsent();
         self.hand_file_back();

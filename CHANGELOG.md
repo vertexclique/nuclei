@@ -16,6 +16,16 @@
   call's failure and for one of a call made before its own, never for a later one's
   (`proofs/tla/lent/LentFile.tla`, scenario "sync": `MF_sync_task_records`,
   `MF_sync_unserialized`, `MF_sync_any_failure`).
+- **The first read after `get_mut` no longer answers `NotConnected` on a valid handle** (every
+  backend). A registration asked while another thread held a side of the source is left to that
+  holder, and so is the retire `get_mut` asks; the holder performs the two at once, the retire
+  first, so the attach found no descriptor, and its refusal failed both sides as a failed
+  registration does. A registration posted to a shard from a thread that runs none, which the
+  shard made only after the retire, was refused the same way and kept as the source's failure.
+  Either way the next read or write of the handle answered `NotConnected`. An attach refused
+  because a retire or a close took the descriptor out now fails nothing, as one refused because
+  its shard stopped: the source is unregistered, and its next wait registers it again
+  (`proofs/tla/attach/Merged.tla`).
 
 ### Changed
 

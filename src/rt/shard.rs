@@ -733,9 +733,10 @@ impl Shard {
             match op {
                 IoOp::Register(source) => match self.register_source(&source) {
                     Ok(()) => {}
-                    // The shard stopped: no failure, the attach set the
+                    // The shard stopped, or a retire took the descriptor out
+                    // before the attach: no failure, the attach set the
                     // registration back to none, and its tasks look again.
-                    Err(err) if crate::io::source::requests::is_stopped_shard(&err) => {
+                    Err(err) if crate::io::source::requests::is_refused_for_now(&err) => {
                         source.look_again();
                     }
                     Err(err) => source.registration_failed(&err),

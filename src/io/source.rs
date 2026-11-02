@@ -1030,9 +1030,10 @@ impl Source {
             })
         });
         match registered {
-            // Refused for its stop, here or by the attach (which set the
-            // registration back to none): the tasks look again.
-            Some(Err(err)) if requests::is_stopped_shard(&err) => {
+            // Refused for its stop, here or by the attach, or for a
+            // descriptor a retire took out (the attach set the registration
+            // back to none): the tasks look again.
+            Some(Err(err)) if requests::is_refused_for_now(&err) => {
                 self.look_again();
                 Ok(())
             }
