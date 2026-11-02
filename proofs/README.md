@@ -2306,22 +2306,29 @@ stack and the waiting list; each node's phase and payload; and each transition, 
 with a waiter's first look at the generation, its take of the permit with nobody queued (a
 second step, after which a moved generation passes the permit on with a `notify_one`), its
 enqueue and its drop. The node's waker handshake and the list's sweep are abstract, as in the
-semaphore model. 15 configurations: 7 that must pass (two waiters and a `notify_waiters`, and a
+semaphore model. 23 configurations: 11 that must pass (two waiters and a `notify_waiters`, and a
 `notify_one` then a `notify_waiters`, in any order, where every waiter made before the last
 `notify_waiters` ends; two queued waiters and two `notify_one` calls, and a `notify_last` then a
 `notify_one`, where both end; the same calls in any order, safety only, since two calls before
 anybody waits store one permit; a waiter dropped beside one that awaits, which ends; a waiter
 made before a `notify_waiters` and a `notify_one` beside one made after both, with no waiter the
-broadcast owed keeping the permit it took, `NoPermitEatenByOwed`), with no
+broadcast owed keeping the permit it took, `NoPermitEatenByOwed`; two notifiers at once, two
+`notify_waiters` or a `notify_one` and a `notify_waiters`, with waiters made at any moment
+around them, liveness on one waiter and safety on two; a waiter dropped as a `notify_one` comes,
+whose notification ends as the permit), with no
 waiter done without a notification made since its `Notified` was (`NoSpuriousWake`), no
 `notify_one` serving more than one waiter, and no waiter left on the arrival stack once the role
-is free; 5 mutations (a `notify_waiters` that asks for no pass leaves its waiters,
+is free; 9 mutations (a `notify_waiters` that asks for no pass leaves its waiters,
 `AwaitersMadeBeforeAWaitersCallEnd`; a pass that reads the generation before it takes the
 arrivals wakes a newer arrival, `NoSpuriousWake`; a dropped waiter keeping a `notify_one`'s grant
 leaves the other waiting, `EveryAwaiterEnds`; a drain giving up its role over a change made
 during its pass strands an arrival, `NoStrandedArrival`; a waiter that does not look at the
 generation again after its take keeps a permit the broadcast between its look and its take made
-someone else's, `NoPermitEatenByOwed`); and 3 witnesses (a gap the code leaves open: a pass that
+someone else's, `NoPermitEatenByOwed`; a pass that queues every arrival whatever its generation
+leaves the queue of two generations, `QueuedOneGeneration`; a pass that leaves a stored permit
+past a queued waiter, and one that counts an owed wake as served on a node that withdrew, each
+leave a waiter for good, `EveryAwaiterEnds`; an owed wake that found nobody and is dropped
+instead of stored, `OneIsKept`); and 3 witnesses (a gap the code leaves open: a pass that
 read the generation before a broadcast serves the `notify_one` after it to a waiter the broadcast
 woke, so the waiter made after both calls waits for good, `LateAwaiterEnds`; a permit stored; a
 grant passed on). `lean/Nuclei/Notify.lean` proves the pass's accounting of owed wakes for every
