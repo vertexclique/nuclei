@@ -13,12 +13,18 @@
 //! of the ring, a multishot receive among them, which may never end
 //! (`proofs/tla/lent/LentFile.tla`, scenario "sync", `MF_sync_drain`).
 //!
-//! A write that failed is reported by the sync, as by a flush (and then
-//! forgotten, as a flush forgets it). A failed sync is reported, and every
-//! sync of the handle called after it fails with the same error without a
-//! call: the kernel reports a write-back error to one call only, so a later
-//! call that succeeded would say nothing of the data that did not reach the
-//! device. So that no failure the kernel reports goes unseen, the calls are
+//! A write that failed is reported by the sync, as by a flush (which then
+//! forgets it, as a stream does). A failed sync is reported, and every sync of
+//! the handle called after it fails with the same error without a call: the
+//! kernel reports a write-back error to one call only, so a later call that
+//! succeeded would say nothing of the data that did not reach the device. Both
+//! are kept in the handle's [`Lost`], which no report forgets: a write the
+//! handle accepted and the kernel then failed (whoever took its failure: a
+//! flush, a call beside the reads and writes, `get_mut`, the drop), and a sync
+//! call that failed. Every sync reads it before it makes a call, and fails with
+//! it. The handle keeps it across `get_mut`, and its clones (`try_clone`, the
+//! same open file, whose error the kernel reports to one of them) share it.
+//! So that no failure the kernel reports goes unseen, the calls are
 //! the file state's, not their tasks' ([`Syncs`]): the handle makes one at a
 //! time, a sync whose call would go beside another's waiting for that one's
 //! end (two at once, the kernel could report the error to one and the other's
@@ -126,8 +132,28 @@ pub(super) struct Syncs {
     ended: u64,
     /// The first call that failed, and its failure: every sync whose own
     /// call came after it, or was it, fails, and so does every sync called
-    /// after it, without a call.
+    /// after it, without a call (through the handle's [`Lost`]).
     failed: Option<(u64, Failure)>,
+}
+
+/// What a handle's syncs answer once a byte it accepted may not be on the
+/// device: the first write the kernel failed after the handle accepted it,
+/// or the first sync call that failed. Kept for good, by the handle across
+/// `get_mut` and by its clones, which share one (`proofs/tla/lent/LentFile.tla`,
+/// scenarios "sync_lost" and "sync_clone").
+#[derive(Default)]
+pub(crate) struct Lost(std::sync::OnceLock<Failure>);
+
+impl Lost {
+    /// Keeps `failure`, unless one is kept already.
+    pub(crate) fn keep(&self, failure: Failure) {
+        let _ = self.0.set(failure);
+    }
+
+    /// The failure kept, if any.
+    pub(crate) fn get(&self) -> Option<Failure> {
+        self.0.get().copied()
+    }
 }
 
 /// A sync call in flight: an operation of the ring that ends in a slot, or a
@@ -175,10 +201,10 @@ impl Syncs {
                 });
             }
             if self.out.is_some() {
-                core::task::ready!(self.take(waker));
+                core::task::ready!(self.take(io, waker));
                 continue;
             }
-            if let Some((_, failure)) = self.failed {
+            if let Some(failure) = io.lost.get() {
                 return Poll::Ready(Err(failure.error()));
             }
             self.made += 1;
@@ -188,8 +214,8 @@ impl Syncs {
     }
 
     /// Takes the end of the call out once it came, keeping its failure if
-    /// it is the first.
-    fn take(&mut self, waker: &Waker) -> Poll<()> {
+    /// it is the first, in the handle's record too.
+    fn take(&mut self, io: &FileIo, waker: &Waker) -> Poll<()> {
         let Some((at, call)) = self.out.as_mut() else {
             return Poll::Ready(());
         };
@@ -198,7 +224,9 @@ impl Syncs {
         if let Err(err) = end
             && self.failed.is_none()
         {
-            self.failed = Some((*at, Failure::of(&err)));
+            let failure = Failure::of(&err);
+            self.failed = Some((*at, failure));
+            io.lost.keep(failure);
         }
         self.out = None;
         Poll::Ready(())

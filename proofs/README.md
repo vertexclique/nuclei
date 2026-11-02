@@ -945,6 +945,18 @@ from where they stopped.
   the error to the first call that looks, to it alone. A sync fails for its own call's failure or
   one of a call made before its own, and one called after a failure fails with no call. The sync
   of a range (`sync_range`) is such a sync with another call.
+- **sync_lost**: as sync, and the kernel fails one cursor write the handle had accepted: none of
+  its bytes land and the write-behind after it is dropped. The failure waits in the state until a
+  flush reports it (the writer's, or the one a sync starts with), which forgets it as a stream
+  does; the handle also keeps a record of it that nothing forgets, and every later sync fails
+  with it, with no call.
+- **sync_clone** and **sync_clone_race**: the second sync is made on a clone of the handle
+  (`try_clone`), with its own state and sync calls, the same kernel error cursor and the same
+  record. In sync_clone the clone syncs first and the handle's sync is called once it is done; in
+  sync_clone_race the two go at once.
+- **sync_iopoll**: as sync, on a ring made to poll for its completions (`IORING_SETUP_IOPOLL`),
+  which refuses a sync and a write of a file not opened for direct IO; a refused call is made
+  again on the blocking pool, as one cancelled because its shard went.
 - **direct**: the file is opened for direct IO: a read job reads exactly the cell asked for, and
   each copied write is one kernel write of exactly its bytes, which waits for the write in
   flight instead of joining the write-behind.
@@ -968,14 +980,17 @@ every write a good sync covers (accepted, or returned for a positional one, befo
 is durable; `NoSyncAfterFailure`, no sync called after one failed succeeds; `NoFalseFailure`, a
 sync whose own call succeeded, none before it failing, does not fail; `DirectExact`, on a direct
 file every kernel read and write is exactly one a caller made; `NoCallOnClosed`, no job's call
-runs on a descriptor that closed; and liveness (`Termination`).
+runs on a descriptor that closed; `NothingRefused`, no call a polled ring refuses ends as a
+failure; and liveness (`Termination`).
 
-58 configurations. 19 must pass: tasks that may go away and tasks that stay, a file opened to
+70 configurations. 25 must pass: tasks that may go away and tasks that stay, a file opened to
 append, positional calls, the generation, syncs that may fail (with their tasks staying, and
-going away with a call out) and a direct file, each with its
+going away with a call out), a write the kernel fails beside two syncs, a sync of a clone that
+fails before the handle's, calls a polled ring refuses, and a direct file, each with its
 safety properties; a handle dropped or handed back with cursor jobs, and with a positional write
 left by its task, still out, with `NoCallOnClosed` beside them; and liveness for the cursor,
-append, positional, generation, sync (both ways) and direct scenarios. 26 mutations must break the property
+append, positional, generation, sync (both ways), lost write, clone, polled ring and direct
+scenarios. 29 mutations must break the property
 their rule protects: a result that counts on the cursor alone breaks `NoStaleRead`, through the
 seek back; a lent write that goes in flight over the one there, a lent write cancelled when its
 task goes away, a write cut short on the ring that counts as done, and a write on the ring
@@ -995,18 +1010,29 @@ ring's, so the drain does not order it) break `SyncCovers`, and so do a call's f
 counts only for its own task (`sync_task_records`: the next sync takes the end of one whose task
 went away and drops its failure, then makes a call the kernel answers with no error) and a sync
 that makes its call beside another's (`sync_unserialized`: the kernel reports the lost write-back
-to one, and the other's task looks first); a failed sync forgotten once reported breaks
+to one, and the other's task looks first), a sync that reads only whether a sync call failed
+before (`sync_forgets_loss`: the writer's flush reports a lost write and forgets it, and the
+next sync's call answers success for it), and a clone that keeps a record of its own
+(`sticky_unshared`: the clone's sync takes the kernel's error, and the handle's, called after,
+finds none); a refusal of the polled ring that ends the call (`iopoll_refusal_ends`) breaks
+`NothingRefused`; a failed sync forgotten once reported breaks
 `NoSyncAfterFailure`; a sync that fails for any failure, a later call's too
 (`sync_any_failure`), breaks `NoFalseFailure`; a direct read through the read-ahead and a direct write that joins
 the write-behind break `DirectExact`; a descriptor closed at the drop with a job out, and an
 `into_inner` that does not wait for the jobs, each with a cursor job and with a positional write
-left by its task, break `NoCallOnClosed`. 13 witnesses must be proved wrong: a read that reads
+left by its task, break `NoCallOnClosed`. 16 witnesses must be proved wrong: a read that reads
 again, the lent write of a task that went away landing, a read after the seek that counts the
 lent write's value, a write on the ring landing in two parts, one cut short whose shard went
 finished on the pool, an append after the seek landing at the end, a read that reads again only
 because a positional write ended, a buffered read asking the kernel for more than its caller (the
 read-ahead the direct rule takes away), the positional write of a task that went away landing, a
-sync that fails, a sync that takes the end of a call whose task went away, and a cursor job and a positional write still out as their handle drops.
+sync that fails, a sync that takes the end of a call whose task went away, a cursor job and a
+positional write still out as their handle drops, a call the polled ring refused made again on
+the pool, a direct write answered before it landed (`WF_direct_ok_early`, the code as it is,
+for the operator to decide how a write polled again is told apart from a new one), and
+(`WF_clone_race`, a gap the record leaves
+for the operator to decide) the syncs of a handle and of its clone at once, where the clone's
+call takes the kernel's error and the handle's call, made beside it, answers success.
 
 The model shows why a sync waits for the writes before it rather than relying on io_uring's
 `IOSQE_IO_DRAIN` (`MF_sync_drain`): the drain orders an entry after the ring's earlier entries
@@ -1881,18 +1907,30 @@ shutdown waits for nothing, and its lingers all run on threads of their own. A s
 is blocked in a task's poll after the shard was handed on drops what its inbox holds only once
 that poll returns, which the drop does not wait for. The drop's run has a bound of its own (the
 runtime's linger time): once it runs out, a linger the run was still running goes on on a thread
-of its own (`RunAll`'s drop). 20 configurations: 4 that must pass
+of its own (`RunAll`'s drop). The process default runtime is never dropped: the process exits
+instead, which kills its workers and their lingers, so a file's linger is counted from its hand
+to its end wherever it runs (`Tracked`), and the exit (an `atexit` hook, `wait_at_exit`) waits
+until none is left, or its own bound ran out, which it says. A file dropped on a thread that is
+no worker delivers its write-behind before its drop returns (`deliver_file`). A linger whose
+write fails or whose time runs out gives the rest up and says so, at warn and in `stats`. 30
+configurations: 10 that must pass
 (`DropWaits`, the drop returns only once every byte reached the peer, `NoDefault`, no runtime is
 started for a linger, and `TypeOK`; liveness, `AllSent` and `Termination`; a background
 shutdown, with `NoDefault`, `AllSent` and `Termination`; and a drop whose bound runs out, with the
-same), 10 mutations (a drop whose bound drops the linger it was running, as `RunAll` did, breaks
+same; at the exit, `ExitDelivers`, the process exits with every byte delivered or said lost, and
+liveness; a drop off a worker, with `OffWorkerDelivers`, the drop returns once every byte went,
+and liveness; a linger that may give up, with `GiveUpSaid`, and liveness), 13 mutations (an exit
+that waits for no linger breaks `ExitDelivers`; a drop off a worker that hands its linger to a
+worker and returns breaks `OffWorkerDelivers`; a linger that gives up without a word breaks
+`GiveUpSaid`; a drop whose bound drops the linger it was running, as `RunAll` did, breaks
 `AllSent`; a drop that does not run its list; one that runs only what its list
 holds as it looks (the fix's first form, which left a file's last writes unlanded); a linger's
 task lost as its worker stops; a linger handed to the stopping shard of its thread, which never
 runs it; the held task dropped outside its runtime, its linger to a thread of its own; a write
 counted out before its wake went; a drop that does not wait for its workers' writes; and one that
 does not wait for a stopped inbox to be drained: all break `DropWaits`; a linger handed to the
-process default runtime, which starts for it, breaks `NoDefault`), and 6 witnesses (a linger's
+process default runtime, which starts for it, breaks `NoDefault`), and 7 witnesses (the exit
+waiting for a linger still out as main returned, which then delivers; a linger's
 task handed back as its worker stops; one held by the write and handed back later; the drop
 running a linger of its list; the task with the handle held by the write as its worker stops;
 another thread draining its wake after the write counted itself out; the drop's bound running

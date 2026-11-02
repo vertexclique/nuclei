@@ -17,13 +17,18 @@
 //! jobs of the blocking pool on the other backends (see `file`). A file
 //! opened for direct IO (`O_DIRECT`, `FILE_FLAG_NO_BUFFERING`) is read and
 //! written with exactly the caller's lengths and offsets, never through the
-//! handle's read-ahead or write-behind. On Windows one opened for overlapped
-//! IO (`FILE_FLAG_OVERLAPPED`) is read and written as one opened for
-//! synchronous IO: a call the system answers pending is waited out before it
-//! returns. A `File` that is not a regular file (a FIFO, a terminal, a pipe)
-//! is a byte stream the shard's driver serves like a socket (on Windows,
-//! through the completion port, or through jobs of the blocking pool for a
-//! handle opened for synchronous IO). Reads and
+//! handle's read-ahead, and no write at its cursor joins another. Such a
+//! write, from a copy of the caller's bytes as every
+//! `AsyncWrite` one is, is accepted as it is submitted: its error is answered
+//! by the handle's next call, and `flush` waits until it landed.
+//! `write_owned`, `write_at` and their forms return only once their own write
+//! landed, with its own result. On Windows one opened for overlapped IO
+//! (`FILE_FLAG_OVERLAPPED`) is read and written as one opened for synchronous
+//! IO: a call the system answers pending is waited out before it returns. A
+//! `File` that is not a regular file (a FIFO, a terminal, a pipe) is a byte
+//! stream the shard's driver serves like a socket (on Windows, through the
+//! completion port, or through jobs of the blocking pool for a handle opened
+//! for synchronous IO). Reads and
 //! writes at the cursor are `AsyncRead` and `AsyncWrite` on the handle and
 //! on a shared reference to it (both share the cursor, as `&File` shares its
 //! offset); `AsyncBufRead` and `AsyncSeek` are on the handle. `read_owned`,
@@ -76,6 +81,18 @@ pub use self::sync_dir::sync_dir;
 
 /// A file: std's `File` in a [`Handle`], with async reads, writes, seeks and
 /// calls.
+///
+/// A write is accepted into the handle's write-behind and lands after. A
+/// file dropped with bytes there never loses them unsaid: dropped on a worker,
+/// a task writes them, and the runtime's drop and the process's exit wait for
+/// it (the process default runtime's included); dropped on any other thread
+/// (`block_on`'s, the blocking pool's, one of the application's), the drop
+/// writes them before it returns. Bytes that cannot be written, a write that
+/// failed or the runtime's
+/// [`write_behind_linger`](crate::runtime::Builder::write_behind_linger) run
+/// out, are said at warn and counted in
+/// [`Stats::write_behind_lost`](crate::stats::Stats::write_behind_lost). To be
+/// told of a failure yourself, flush or sync before the drop.
 pub type File = Handle<std::fs::File>;
 
 use core::pin::Pin;

@@ -344,6 +344,7 @@ mod direct;
 mod durable;
 mod job_end;
 mod lent_wake;
+mod linger;
 mod lock;
 mod many;
 mod owned;

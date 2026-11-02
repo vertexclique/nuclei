@@ -269,3 +269,140 @@ fn a_sync_dropped_after_its_ring_call_failed_fails_the_next_with_no_call() {
         .await;
     });
 }
+
+/// A write the handle accepted, which the kernel then fails (the file is open
+/// for reading only), is reported once by a flush, which forgets it; every
+/// sync after that still fails, with no call: the kernel has nothing to say
+/// of bytes it never took.
+#[test]
+fn a_write_lost_after_it_was_accepted_fails_every_later_sync() {
+    let rt = runtime();
+    let tmp = Temp::new("sync-lost-write");
+    let path = tmp.file("data");
+    std::fs::write(&path, b"read only").unwrap();
+    rt.block_on(async {
+        let mut file = within(Handle::<File>::open(&path)).await.unwrap();
+        within(write_all(&mut file, b"lost")).await.unwrap();
+        within(flush(&mut file)).await.unwrap_err();
+        within(flush(&mut file)).await.unwrap();
+        for (what, later) in [
+            ("sync_all", within(file.sync_all()).await),
+            ("sync_data", within(file.sync_data()).await),
+            ("sync_range", within(file.sync_range(0, 0)).await),
+        ] {
+            assert!(later.is_err(), "{what} answered success after a lost write");
+        }
+    });
+}
+
+/// A lost write taken by a call beside the reads and writes (`metadata`), or by
+/// `get_mut`, which ends the handle's IO state, still fails every later sync.
+#[test]
+fn a_lost_write_taken_by_another_call_still_fails_the_syncs() {
+    let rt = runtime();
+    let tmp = Temp::new("sync-lost-taken");
+    let path = tmp.file("data");
+    std::fs::write(&path, b"read only").unwrap();
+    rt.block_on(async {
+        let mut file = within(Handle::<File>::open(&path)).await.unwrap();
+        within(write_all(&mut file, b"lost")).await.unwrap();
+        within(file.metadata()).await.unwrap_err();
+        assert!(
+            within(file.sync_all()).await.is_err(),
+            "a sync answered success after metadata took a lost write"
+        );
+
+        let mut file = within(Handle::<File>::open(&path)).await.unwrap();
+        within(write_all(&mut file, b"lost")).await.unwrap();
+        let _ = file.get_mut();
+        assert!(
+            within(file.sync_data()).await.is_err(),
+            "a sync answered success after get_mut took a lost write"
+        );
+    });
+}
+
+/// A clone shares what the handle's syncs answer: after a write the handle
+/// lost, and after a sync of the handle failed, the clone's syncs fail too
+/// (the system reports a lost write-back of the open file to one call only).
+#[test]
+fn a_clone_fails_its_syncs_for_the_handle_s_lost_write_and_failed_sync() {
+    let rt = runtime();
+    let tmp = Temp::new("sync-clone");
+    let read_only = tmp.file("read-only");
+    std::fs::write(&read_only, b"read only").unwrap();
+    let path = tmp.file("data");
+    rt.block_on(async {
+        let mut file = within(Handle::<File>::open(&read_only)).await.unwrap();
+        let clone = within(file.try_clone()).await.unwrap();
+        within(write_all(&mut file, b"lost")).await.unwrap();
+        within(flush(&mut file)).await.unwrap_err();
+        assert!(
+            within(clone.sync_all()).await.is_err(),
+            "the clone's sync answered success after the handle lost a write"
+        );
+
+        let mut file = Handle::new(read_write(&path)).unwrap();
+        within(write_all(&mut file, b"durable")).await.unwrap();
+        let clone = within(file.try_clone()).await.unwrap();
+        let io = file.file().unwrap();
+        io.keep_on_pool();
+        io.fail_next_syncs(1);
+        let err = within(file.sync_all()).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
+        let err = within(clone.sync_data()).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
+    });
+}
+
+/// On a ring made to poll for its completions (`IORING_SETUP_IOPOLL`), which
+/// refuses a write and a read of a buffered file, a sync, a range's write-back
+/// and a change of a range's space, each refused call is made again on the
+/// blocking pool: every byte lands and reads back, and every sync succeeds.
+/// io_uring only: no other backend has such a ring.
+#[cfg(ring)]
+#[test]
+fn a_polled_ring_makes_the_calls_it_refuses_on_the_pool() {
+    let built = Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .handoff_after(None)
+        .io_uring(crate::config::IoUringConfiguration::io_poll(256))
+        .build();
+    let rt = match built {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("skipping: no runtime on a polled ring here ({err})");
+            return;
+        }
+    };
+    let tmp = Temp::new("sync-iopoll");
+    let path = tmp.file("data");
+    let data = pattern(200_017);
+    let expected = data.clone();
+    let read_path = path.clone();
+    rt.block_on(async {
+        within(spawn(async move {
+            if ring_calls().is_none() {
+                eprintln!("skipping: the shard runs no ring (NUCLEI_BACKEND or no io_uring)");
+                return;
+            }
+            let mut file = Handle::new(read_write(&path)).unwrap();
+            within(write_all(&mut file, &data)).await.unwrap();
+            within(flush(&mut file)).await.unwrap();
+            within(file.allocate(0, 1 << 20, crate::fs::Allocate::KeepSize))
+                .await
+                .unwrap();
+            within(file.sync_range(0, 4096)).await.unwrap();
+            within(file.sync_data()).await.unwrap();
+            within(file.sync_all()).await.unwrap();
+            within(seek(&mut file, SeekFrom::Start(0))).await.unwrap();
+            let back = within(read_to_end(&mut file)).await.unwrap();
+            assert!(back == data, "the bytes read back are not the ones written");
+            let (_, entries) = ring_calls().unwrap();
+            assert!(!entries.is_empty(), "no call went to the polled ring");
+        }))
+        .await;
+    });
+    assert!(std::fs::read(&read_path).unwrap() == expected);
+}

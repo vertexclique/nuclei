@@ -53,3 +53,13 @@ MU_own_shard      Unworked violated:AllSent
 MU_list_first     Unworked violated:AllSent
 MU_thread_uncounted Unworked violated:DropWaits
 WU_waited         Unworked violated:NoWaited
+L_exit            Linger  pass
+L_exit_live       Linger  pass
+LM_no_exit_wait   Linger  violated:ExitDelivers
+LW_exit_wait      Linger  violated:NoExitWait
+L_off_worker      Linger  pass
+L_off_worker_live Linger  pass
+LM_off_worker_hands Linger violated:OffWorkerDelivers
+L_exit_fail       Linger  pass
+L_exit_fail_live  Linger  pass
+LM_silent_give_up Linger  violated:GiveUpSaid

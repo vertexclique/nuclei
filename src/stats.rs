@@ -40,6 +40,13 @@ pub struct Stats {
     /// (most often the locked-memory limit); their reads use the pool's
     /// buffers instead.
     pub receive_buffers_missing: u64,
+    /// Files whose bytes written behind were given up with no caller left
+    /// to answer: a dropped handle's write that failed or whose
+    /// [`write_behind_linger`](crate::runtime::Builder::write_behind_linger)
+    /// ran out, one handed back by `get_mut` or `into_inner` the same way, or
+    /// one still out when the process exited. Each is also said once at
+    /// warn.
+    pub write_behind_lost: u64,
 }
 
 /// One shard's counters. Those marked "published" are as the shard last

@@ -160,6 +160,44 @@
   file's end only while a handle to the file is open, and frees it when the last one closes (a
   1 MiB reservation read back 1 MiB with a handle open and 0 once reopened after the last close);
   the docs promised it as a lasting reservation. A test checks both on Windows.
+- **The docs no longer say a direct file's writes have no write-behind** (every backend). A
+  cursor write through `AsyncWrite` on a file opened for direct IO is one kernel write of exactly
+  the caller's bytes, joined with no other, but it is accepted as it is submitted, from a copy,
+  and its error is answered by the next call; `flush` waits for it. The crate docs and the Learn
+  page now say so, and point to `write_owned`, `write_at` and `write_all_at`, which return only
+  once their own write landed (`proofs/tla/lent/LentFile.tla`, `WF_direct_ok_early`).
+- **A file dropped with bytes written behind no longer loses them unsaid** (every backend). The
+  drop handed its write-behind to a task, and the process default runtime, which is never
+  dropped, never waited for it: a file written and dropped in `nuclei::block_on`, or on a worker,
+  just before `main` returned came out short, with no error anywhere. A linger whose write failed,
+  or whose `write_behind_linger` ran out, gave the rest up without a word. A file dropped on a
+  thread that is no worker now writes its write-behind before its drop returns; one dropped on a
+  worker leaves its task, which is counted wherever it runs, and the process's exit (an `atexit`
+  hook) waits for every such task, for at most the default runtime's linger time. Bytes given up
+  with nobody left to answer, there or at `get_mut` and `into_inner`, are said at warn and counted
+  in the new `Stats::write_behind_lost` (`proofs/tla/going/Linger.tla`: `LM_no_exit_wait`,
+  `LM_off_worker_hands`, `LM_silent_give_up`).
+- **A write lost after it was accepted fails every later sync** (every backend). A write the
+  handle accepted into its write-behind, which the kernel then failed (no space, an IO error, a
+  file too large), was reported once, by whichever call took the failure first: a flush, the
+  flush a sync starts with, `metadata`, `set_len`, `set_permissions`, `set_times`,
+  `set_modified`, `try_clone`, `get_mut`, `into_inner` or the drop. The next sync then made a
+  call, which the kernel answered with no error, and said the file held bytes that never reached
+  it. Positional writes left by their tasks, and lent writes whose futures went away, were
+  forgotten the same way. The handle now keeps every such failure, and every sync call that
+  failed, in one record no report forgets: every later sync fails with it, with no call. The
+  record outlives `get_mut`, and a clone made with `try_clone` shares it, since the kernel reports
+  a lost write-back of the open file to one of the two only
+  (`proofs/tla/lent/LentFile.tla`, scenarios "sync_lost" and "sync_clone":
+  `MF_sync_forgets_loss`, `MF_sticky_unshared`).
+- **A polled ring no longer refuses a file's sync, nor a buffered file's reads and writes**
+  (Linux, io_uring with `IoUringConfiguration::io_poll`). A ring made to poll for its completions
+  (`IORING_SETUP_IOPOLL`) takes only the reads and writes of direct IO: the kernel answers a sync,
+  a `sync_range` and an `allocate` with `EINVAL`, and a buffered read or write with `EOPNOTSUPP`.
+  Those answers were the calls' own, so a valid sync failed, and the failure stayed the handle's
+  for good. A call the ring refuses this way is now made again on the blocking pool, as one
+  cancelled because its shard went (`proofs/tla/lent/LentFile.tla`, scenario "sync_iopoll":
+  `MF_iopoll_refusal_ends`).
 - **A failed sync is no longer forgotten by a dropped or a concurrent sync**
   (every backend). The kernel reports a lost write-back to one sync call only, and the handle
   kept the failure only once the failing call's task took its end. A sync whose future was

@@ -79,7 +79,10 @@ pub struct IoUringConfiguration {
 
     /// Busy-waits for file completions instead of taking interrupts (default
     /// `false`): lower latency for more CPU, and only for files opened with
-    /// `O_DIRECT` on file systems that support polling.
+    /// `O_DIRECT` on file systems that support polling. Such a ring takes
+    /// only those reads and writes: a file's other calls (its syncs,
+    /// `sync_range`, `allocate`, and the reads and writes of a buffered file),
+    /// which the kernel refuses on it, are made on the blocking pool.
     pub iopoll_enabled: bool,
 
     /// Buffers in each shard's group for multishot receives (default 256, or
@@ -245,7 +248,8 @@ impl IoUringConfiguration {
     }
 
     /// Busy-waits for file completions ([`iopoll_enabled`](Self::iopoll_enabled)):
-    /// low-latency IO on files opened with `O_DIRECT`.
+    /// low-latency IO on files opened with `O_DIRECT`; a file's calls the ring
+    /// refuses are made on the blocking pool.
     pub fn io_poll(queue_len: u32) -> Self {
         Self {
             queue_len,
