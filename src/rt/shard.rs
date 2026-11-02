@@ -234,8 +234,10 @@ impl Shared {
     }
 
     /// Hands work on the timer wheel to the shard. An arm request wakes the
-    /// shard, which may sleep past the new deadline otherwise. A shard that
-    /// stopped applies nothing more: what reaches it then is drained here.
+    /// shard, which may sleep past the new deadline otherwise, and so does
+    /// any op while a clock is paused or advanced (`TimerOp::needs_wake`).
+    /// A shard that stopped applies nothing more: what reaches it then is
+    /// drained here.
     pub(crate) fn post_timer(&self, op: TimerOp) {
         let wake = op.needs_wake();
         self.timer_ops.push(op);

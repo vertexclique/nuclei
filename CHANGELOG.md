@@ -2,6 +2,15 @@
 
 ## 0.5.4
 
+### Fixed
+
+- **A timer cancelled from another thread no longer stops a paused clock.** A sleep armed on a
+  shard and dropped, or polled again, on another thread posts its removal to the shard, and only
+  an arm request woke a parked shard; a shard holding a posted op is not idle, and a paused clock
+  jumps only while every shard is, so a removal posted to a parked shard held every jump of the
+  runtime, and every sleeper on it waited for good. While a clock is paused or advanced every
+  timer op now wakes its shard (`proofs/tla/clock`, the `post_no_wake` mutation).
+
 ### Changed
 
 - **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix

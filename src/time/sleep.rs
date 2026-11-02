@@ -472,10 +472,13 @@ pub(crate) enum TimerOp {
 }
 
 impl TimerOp {
-    /// Whether the shard must look at the op now (an arm moves its next
-    /// deadline); a removal can wait for its next look.
+    /// Whether the shard must look at the op now: an arm moves its next
+    /// deadline, and while a clock is paused or advanced any op does, since
+    /// a shard holding one is not idle and a paused clock jumps only while
+    /// every shard is (proofs/tla/clock, `M_post_no_wake`). Otherwise a
+    /// removal can wait for the shard's next look.
     pub(crate) fn needs_wake(&self) -> bool {
-        matches!(self, Self::Insert { .. })
+        matches!(self, Self::Insert { .. }) || super::clock::any_altered()
     }
 
     /// The op's shard went and applies it never: an arm request orphans its

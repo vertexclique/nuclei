@@ -202,3 +202,6 @@ impl Guest<'_> {
         }
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod tests;
