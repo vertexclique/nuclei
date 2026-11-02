@@ -148,6 +148,8 @@ fn a_stream_lingers_as_set() {
 const KEEPALIVE_TIMING: bool = cfg!(any(
     target_os = "linux",
     target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
     target_vendor = "apple",
     windows
 ));
