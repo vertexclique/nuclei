@@ -304,6 +304,8 @@ pub(crate) const ERROR_IO_PENDING: i32 = 997;
 pub(crate) const ERROR_HANDLE_EOF: i32 = 38;
 /// What `RtlNtStatusToDosError` makes of a connection reset or dropped under an operation.
 pub(crate) const ERROR_NETNAME_DELETED: i32 = 64;
+/// What `RtlNtStatusToDosError` makes of an operation the system had no resources for.
+pub(crate) const ERROR_NO_SYSTEM_RESOURCES: i32 = 1450;
 pub(crate) const ERROR_BROKEN_PIPE: i32 = 109;
 pub(crate) const WAIT_TIMEOUT: i32 = 258;
 /// `WaitForSingleObject`: the object is signalled (a process: it ended).

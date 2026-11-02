@@ -45,6 +45,40 @@ fn the_listeners() -> Vec<io::Error> {
     codes.map(io::Error::from_raw_os_error).into()
 }
 
+/// The errors of a socket the system cannot make for an accept, which pause `accept_multi`'s
+/// stream until one can be made, and errors of the connection or of the listener, which do not.
+#[test]
+fn a_socket_the_system_cannot_make_is_out_of_descriptors() {
+    use crate::rt::counters::out_of_descriptors;
+    #[cfg(unix)]
+    let (out, not) = (
+        [libc::EMFILE, libc::ENFILE].as_slice(),
+        [libc::ECONNABORTED, libc::EINVAL, libc::EBADF].as_slice(),
+    );
+    #[cfg(windows)]
+    let (out, not) = {
+        use crate::syscore::windows::{
+            ERROR_NO_SYSTEM_RESOURCES, WSAECONNRESET, WSAEINVAL, WSAEMFILE, WSAENOBUFS, WSAENOTSOCK,
+        };
+        (
+            [WSAEMFILE, WSAENOBUFS, ERROR_NO_SYSTEM_RESOURCES].as_slice(),
+            [WSAECONNRESET, WSAEINVAL, WSAENOTSOCK].as_slice(),
+        )
+    };
+    for &code in out {
+        assert!(
+            out_of_descriptors(&io::Error::from_raw_os_error(code)),
+            "{code}"
+        );
+    }
+    for &code in not {
+        assert!(
+            !out_of_descriptors(&io::Error::from_raw_os_error(code)),
+            "{code}"
+        );
+    }
+}
+
 #[test]
 fn a_reset_connections_error_is_told_from_the_listeners() {
     for err in lost() {

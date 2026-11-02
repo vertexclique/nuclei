@@ -99,17 +99,19 @@ impl Handle<TcpListener> {
     /// The connections as they come, from a stream that owns its own copy of
     /// the listener, so it may outlive this handle. A connection reset before
     /// it was taken is skipped, as [`accept`](Self::accept) skips it, and so
-    /// is the process having no descriptor left to accept into: the stream
+    /// is the process having no descriptor left to accept into (on Windows,
+    /// no socket for want of descriptors or buffer space): the stream
     /// waits, with a growing pause, until there is one, and the connections
     /// wait in the listener's backlog (on macOS but for the one the first
     /// accept to find none took, which the system closes, as
     /// [`accept`](Self::accept) says). Any other error ends the stream, and
     /// [`TcpStreamGenerator::take_error`] says what it was.
     ///
-    /// On io_uring the stream keeps one accept armed for every connection
-    /// that comes, so it takes connections ahead of its polls; those it took
-    /// and never yielded close when it drops, as a listener's own backlog
-    /// does when the last copy of the listener closes.
+    /// The stream takes connections ahead of its polls: on io_uring it keeps
+    /// one accept armed for every connection that comes, elsewhere it has at
+    /// most one accept out or a few taken ahead for its waiting poll. Those
+    /// it took and never yielded close when it drops, though the listener's
+    /// other copies still listen: their peers see the connection closed.
     ///
     /// # Errors
     ///

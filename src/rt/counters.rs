@@ -516,12 +516,18 @@ pub(crate) fn accept_error(err: &io::Error) {
     }
 }
 
-/// Whether `err` says the process or the system has no descriptor left.
+/// Whether `err` says the process or the system has no descriptor left. Windows answers a socket
+/// it cannot make for that, the one an accept takes a connection into among them, with
+/// `WSAEMFILE` or `WSAENOBUFS` (`WSASocketW`), and an `AcceptEx` that ends for want of system
+/// resources with the status `status_error` names `ERROR_NO_SYSTEM_RESOURCES`.
 pub(crate) fn out_of_descriptors(err: &io::Error) -> bool {
     #[cfg(unix)]
     let codes = [libc::EMFILE, libc::ENFILE];
     #[cfg(windows)]
-    let codes = [crate::syscore::windows::WSAEMFILE];
+    let codes = {
+        use crate::syscore::windows::{ERROR_NO_SYSTEM_RESOURCES, WSAEMFILE, WSAENOBUFS};
+        [WSAEMFILE, WSAENOBUFS, ERROR_NO_SYSTEM_RESOURCES]
+    };
     err.raw_os_error().is_some_and(|code| codes.contains(&code))
 }
 
