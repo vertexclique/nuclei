@@ -697,6 +697,7 @@ mod tests {
 
         use crate::rt::context;
         let shard = worker_shard();
+        #[cfg(ring)]
         if shard.shared.is_ring() {
             eprintln!("skipping: a ring's side never waits for a write edge");
             return;
