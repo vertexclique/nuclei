@@ -178,6 +178,66 @@ fn a_failed_notification_is_tried_again() {
     panic!("no round's notification found the shard asleep");
 }
 
+/// The tasks bound to the thread that runs a shard are taken while other
+/// threads keep its inbox full: every other interval's turn looks at the
+/// home first, where before the home was looked at only once the inbox was
+/// empty (proofs/tla/sched/Sched.tla `home_after_empty`).
+#[test]
+fn a_home_is_served_while_the_inbox_stays_full() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::rt::sched::Sched;
+
+    let shard = Shard::new(Limits {
+        max_nesting: 8,
+        buffer_cap: crate::buf::DEFAULT_CAP,
+        backend: crate::rt::backend::chosen().unwrap(),
+    })
+    .unwrap();
+    let _current = context::enter(&shard);
+    let interval = shard.tuning.inbox_interval;
+    // More runnables in the inbox than the runs the home may wait.
+    let mut tasks = Vec::new();
+    for _ in 0..4 * interval {
+        // SAFETY: the schedule sends the task back to this shard, whose
+        // thread runs it here; the future is 'static.
+        let (runnable, task) = unsafe {
+            crate::rt::task::spawn_unchecked(
+                async {},
+                Sched::counted(Arc::clone(&shard.shared), None, None),
+            )
+        };
+        shard.shared.push_remote(runnable);
+        tasks.push(task);
+    }
+    let ran = Arc::new(AtomicBool::new(false));
+    let home = shard.own_home();
+    let bound = {
+        let ran = Arc::clone(&ran);
+        // SAFETY: as above; the task is bound to the shard's own home.
+        let (runnable, task) = unsafe {
+            crate::rt::task::spawn_unchecked(
+                async move { ran.store(true, Ordering::SeqCst) },
+                Sched::counted(Arc::clone(&shard.shared), Some(Arc::clone(&home)), None),
+            )
+        };
+        // A wake of the bound task from another thread.
+        home.push(runnable);
+        task
+    };
+    let mut runs = 0;
+    while !ran.load(Ordering::SeqCst) && runs < 2 * interval {
+        let runnable = shard.next().expect("work is queued");
+        shard.run(runnable);
+        runs += 1;
+    }
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the bound task waited {runs} runs behind a full inbox"
+    );
+    drop((bound, tasks));
+}
+
 /// A waker that holds a shard's `Shared`, as the one of a worker's loop
 /// does.
 struct Holds(#[allow(dead_code)] Arc<super::Shared>);

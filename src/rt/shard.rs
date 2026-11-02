@@ -14,8 +14,10 @@
 //! [`Shard::block_on`] polls one future and, between its polls, runs the
 //! shard's tasks: the LIFO slot first (a task woken by the task that just
 //! ran, at most [`LIFO_MAX`] times in a row), then the local queue, then the
-//! inbox (first every [`INBOX_INTERVAL`] runs, so remote work is not
-//! starved). Every [`DRIVER_INTERVAL`] runs, and every [`DRIVER_INTERVAL`]
+//! inbox, then the home (the tasks bound to the thread that runs it). Every
+//! [`INBOX_INTERVAL`] runs the remote work comes first, every other time the
+//! home's before the inbox's, so neither starves the other or is starved
+//! (`order`). Every [`DRIVER_INTERVAL`] runs, and every [`DRIVER_INTERVAL`]
 //! turns in which only the future ran (it keeps waking itself), it fires
 //! due timers and polls the poller without waiting, as does every
 //! [`QUARTZ_EVERY`](super::tuning::QUARTZ_EVERY)th run once the coarse clock says
@@ -45,7 +47,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::inbox::{Inbox, Pop};
+use super::inbox::Inbox;
 use counted::Counted;
 
 use super::backend::Backend;
@@ -68,6 +70,7 @@ mod children;
 mod going;
 pub(crate) mod locals;
 mod made;
+mod order;
 #[cfg(port)]
 mod port;
 mod run;
@@ -602,6 +605,8 @@ pub(crate) struct Shard {
     lifo_streak: Cell<u32>,
     /// Runs left before the inbox is looked at first (`tuning.inbox_interval` at the start).
     until_inbox: Cell<u32>,
+    /// The last of those turns looked at the home first (`order`).
+    homes_first: Cell<bool>,
     /// The runs since timers and the poller were last looked at, as a count
     /// down to the next run that weighs a look (`drive_at`, the next multiple
     /// of `QUARTZ_EVERY` or `tuning.driver_interval`): `drive_at - drive_left`
@@ -826,63 +831,6 @@ impl Shard {
             }
         }
         Err(runnable)
-    }
-
-    /// The next runnable, in the loop's order.
-    #[inline(always)]
-    fn next(&self) -> Option<Runnable> {
-        let left = self.until_inbox.get().wrapping_sub(1);
-        if left == 0 {
-            self.until_inbox.set(self.tuning.inbox_interval);
-            if let Some(r) = self.pop_inbox() {
-                return Some(r);
-            }
-        } else {
-            self.until_inbox.set(left);
-        }
-        if let Some(r) = self.lifo.take() {
-            if self.lifo_streak.get() < LIFO_MAX {
-                self.lifo_streak.set(self.lifo_streak.get() + 1);
-                return Some(r);
-            }
-            // The slot's task ran enough times in a row: to the back, which
-            // is the front when nothing else is queued.
-            let mut queue = self.queue.borrow_mut();
-            if queue.is_empty() {
-                self.lifo_streak.set(0);
-                return Some(r);
-            }
-            queue.push_back(r);
-        }
-        self.lifo_streak.set(0);
-        let local = self.queue.borrow_mut().pop_front();
-        // A match, not `or_else`: a closure's call can stay out of line, which every run that
-        // finds the local queue empty would pay.
-        match local {
-            Some(r) => Some(r),
-            None => self.pop_inbox(),
-        }
-    }
-
-    // Inlined into the run loop's `next`, whichever codegen unit holds it: it is looked at on
-    // every run that finds the local queue empty.
-    #[inline(always)]
-    fn pop_inbox(&self) -> Option<Runnable> {
-        // SAFETY: the shard holds the inbox's taker's role until it goes
-        // (`stop` lets go of it, last).
-        let popped = match unsafe { self.shared.inbox.pop() } {
-            Pop::Item(runnable) => Some(runnable),
-            // A push under way counts as work: the loop comes back. Then the
-            // bound tasks of the thread that runs the shard: a runner's, or
-            // the ones of this shard, a thread's own.
-            Pop::Empty | Pop::Busy => super::context::pop_home().or_else(|| {
-                // SAFETY: an own shard runs on its thread only, its home's.
-                self.home.get().and_then(|home| unsafe { home.pop() })
-            }),
-        };
-        let runnable = popped?;
-        self.remote_wakes.set(self.remote_wakes.get() + 1);
-        Some(runnable)
     }
 
     /// Whether other threads handed the shard work it has not taken yet, as

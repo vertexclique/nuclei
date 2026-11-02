@@ -44,6 +44,13 @@
   (waiting for a flag a timer's task sets) held the call for good at full CPU. Each of the turn's
   two runs of tasks now takes at most `event_interval` of them (`proofs/tla/loop/RunLoop.tla`,
   `Mode = "turn"`).
+- **The tasks bound to a worker's thread run while its inbox stays full.** A worker took its
+  thread's bound tasks only once its inbox was empty, so other threads that kept waking its tasks
+  held them off for as long as they did. Every `global_queue_interval` runs, which look at the work
+  other threads woke first, every other one now looks at the bound tasks first
+  (`proofs/tla/sched/Sched.tla`, which checks every place work waits in is served within a bound
+  of runs: the LIFO slot's cap, the inbox interval, the home's turn and the `block_on` future's
+  owed runs).
 - **A notification of a sleeping worker that fails is tried again** (macOS, the BSDs, Windows).
   `kevent` and `PostQueuedCompletionStatus` can fail for want of a resource, and the failure was
   dropped. The waker that takes a sleeping shard's flag back is the only one that notifies it, so
