@@ -102,6 +102,7 @@ impl Runtime {
         self.inner.workers.stop_all();
         // Detached: dropping the handles does not wait. `Drop` finds none
         // left to join, and no lingering to wait for.
+        drop(self.inner.workers.take_monitor());
         drop(self.inner.workers.take_threads());
         lingering.end();
     }

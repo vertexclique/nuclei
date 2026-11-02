@@ -23,6 +23,7 @@ use core::future::Future;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use kovan_channel::flavors::RecvDeadline;
@@ -182,38 +183,49 @@ impl Runtime {
     }
 
     fn stop_and_join(&mut self, timeout: Option<Duration>) {
+        let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
         // Lingers handed from now on wait for this drop, never for a worker.
         self.inner.lingering.close();
         self.inner.workers.stop_all();
-        // Never the dropping thread's own: a runtime dropped in one of its own
-        // tasks would join itself (proofs/tla/teardown, `NoSelfJoin`).
+        // The monitor first: a pass under way as it closed may still take a
+        // shard and start a runner for it. Once it ended, the list taken next
+        // holds every thread to wait for, a detached one marked so
+        // (proofs/tla/teardown, `JoinsNoDetached`, `StartedJoined`).
+        if let Some(monitor) = self.inner.workers.take_monitor() {
+            self.join(vec![monitor], deadline);
+        }
+        let threads = self.inner.workers.take_threads();
+        self.join(threads, deadline);
+    }
+
+    /// Waits for `threads` to exit, never for the calling thread's own (a
+    /// runtime dropped in one of its own tasks would join itself:
+    /// proofs/tla/teardown, `NoSelfJoin`); with a `deadline`, until it
+    /// passes, a thread still running then left to exit on its own.
+    fn join(&self, threads: Vec<JoinHandle<()>>, deadline: Option<std::time::Instant>) {
         let me = std::thread::current().id();
-        let threads: Vec<_> = self
-            .inner
-            .workers
-            .take_threads()
+        let threads = threads
             .into_iter()
-            .filter(|thread| thread.thread().id() != me)
-            .collect();
-        if let Some(timeout) = timeout {
-            let deadline = std::time::Instant::now() + timeout;
-            // Workers that exited already sent theirs; one message each.
-            for thread in &threads {
-                if thread.is_finished() {
-                    continue;
-                }
-                if !matches!(self.exits.recv_deadline(deadline), RecvDeadline::Msg(())) {
-                    break;
-                }
-            }
-            // A worker that did not exit in time is left to exit on its own.
+            .filter(|thread| thread.thread().id() != me);
+        let Some(deadline) = deadline else {
             for thread in threads {
-                if thread.is_finished() {
-                    let _ = thread.join();
-                }
+                let _ = thread.join();
             }
-        } else {
-            for thread in threads {
+            return;
+        };
+        let threads: Vec<_> = threads.collect();
+        // Workers that exited already sent theirs; one message each.
+        for thread in &threads {
+            if thread.is_finished() {
+                continue;
+            }
+            if !matches!(self.exits.recv_deadline(deadline), RecvDeadline::Msg(())) {
+                break;
+            }
+        }
+        // A worker that did not exit in time is left to exit on its own.
+        for thread in threads {
+            if thread.is_finished() {
                 let _ = thread.join();
             }
         }
@@ -226,6 +238,9 @@ impl Runtime {
         &self.inner
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod tests_drop;
 
 impl Drop for Runtime {
     fn drop(&mut self) {

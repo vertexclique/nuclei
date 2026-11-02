@@ -208,6 +208,12 @@ impl Monitor {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// The life of the first runner of place `index`.
+    #[cfg(test)]
+    pub(crate) fn first_life(&self, index: usize) -> Option<Arc<Life>> {
+        Some(Arc::clone(&self.places.get(index)?.get()?.first.life))
+    }
+
     /// Waits, as spare `me`, for a shard to run: `None` once the runtime
     /// shuts down.
     pub(crate) fn wait_for_shard(&self, me: &Arc<Spare>) -> Option<Gift> {

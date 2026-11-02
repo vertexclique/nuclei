@@ -68,9 +68,10 @@ pub(crate) struct Workers {
     /// The fewest workers a stop leaves running.
     min: usize,
     start: Start,
-    /// Every thread the runtime started for its workers (and its monitor),
-    /// with its life.
+    /// Every thread the runtime started for its workers, with its life.
     threads: Mutex<Vec<(JoinHandle<()>, Arc<Life>)>>,
+    /// The monitor's thread, joined apart from the others: before them.
+    monitor_thread: Mutex<Option<JoinHandle<()>>>,
     exits: kovan_channel::unbounded::Sender<()>,
     /// The watch over the workers, with the handoff on.
     monitor: Option<Arc<Monitor>>,
@@ -120,6 +121,7 @@ impl Workers {
             min,
             start,
             threads: Mutex::new(Vec::new()),
+            monitor_thread: Mutex::new(None),
             exits,
             monitor,
             monitor_started: OnceLock::new(),
@@ -294,7 +296,7 @@ impl Workers {
                 let _exit = exit;
                 super::handoff::run(&monitor, &runtime);
             })?;
-        lock(&workers.threads).push((thread, Arc::new(Life::new())));
+        *lock(&workers.monitor_thread) = Some(thread);
         Ok(())
     }
 
@@ -400,6 +402,26 @@ impl Workers {
             monitor.close();
         }
         self.shards().for_each(|s| s.stop());
+    }
+
+    /// The monitor's thread, taken for joining, if it started. Once it ended,
+    /// no take marks a thread detached and no runner starts: a shutdown joins
+    /// it before it takes the other threads (proofs/tla/teardown).
+    pub(crate) fn take_monitor(&self) -> Option<JoinHandle<()>> {
+        lock(&self.monitor_thread).take()
+    }
+
+    /// The threads listed for a shutdown to join, for a test to see the
+    /// list taken.
+    #[cfg(test)]
+    pub(crate) fn threads_listed(&self) -> usize {
+        lock(&self.threads).len()
+    }
+
+    /// The life of the first runner of place `index`, as the monitor knows it.
+    #[cfg(test)]
+    pub(crate) fn monitor_first_life(&self, index: usize) -> Option<Arc<Life>> {
+        self.monitor.as_ref()?.first_life(index)
     }
 
     /// The runtime's threads started so far, taken for joining: every one
