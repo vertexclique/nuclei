@@ -46,7 +46,7 @@
   context where it kept its waker), the file read (2 more in its own code, which calls
   `After::run` where it inlined it; its count moves by ten from run to run), and `tcp_many` under
   fat LTO (1 more, in the general read's frame). Counted as the ops gate counts them, every row is
-  at or below what it was.
+  at or below what it was, and CI's budgets in `ci/op_budget.txt` were lowered to match.
 
 ## 0.5.3
 
