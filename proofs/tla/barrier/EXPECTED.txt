@@ -6,4 +6,5 @@ M_leader_no_pass               MC_Barrier           violated:ReleasedTogether
 M_count_first                  MC_Barrier           violated:NoEarlyRelease
 M_grant_current                MC_Barrier           violated:NoEarlyRelease
 M_exit_ignores_dirty           MC_Barrier           violated:NoStrandedArrival
+M_leader_unfused               MC_Barrier           violated:NoEarlyRelease
 W_second_generation            MC_Barrier           violated:NoSecondGeneration
