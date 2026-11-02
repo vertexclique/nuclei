@@ -132,7 +132,8 @@ impl WriteState {
     /// and the write-behind's own path stays small without it.
     #[inline(never)]
     pub(super) fn push_lent(&mut self, fd: RawFd, kind: Kind, after: &mut After) -> bool {
-        let Some(lent) = self.lent.as_mut() else {
+        // One that is out is the place of a call outside the side, which writes it itself.
+        let Some(lent) = self.lent.as_mut().filter(|l| !l.out) else {
             return false;
         };
         let mut progress = false;

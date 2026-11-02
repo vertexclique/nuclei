@@ -16,7 +16,10 @@
 //! The calls run on the stream's and the file's own descriptors, each job
 //! holding a lease on both for as long as it runs: a chunk still on its way
 //! when the future is dropped keeps them open until it ends, and no call
-//! needs a descriptor of its own.
+//! needs a descriptor of its own. While a chunk's call is out the stream's
+//! write side holds its place (`Source::send_outside`), so a write the
+//! handle makes after the future was dropped goes out after the chunk
+//! (`proofs/tla/sendfile/SendFile.tla`).
 
 use std::io;
 use std::net::TcpStream;
@@ -78,7 +81,9 @@ macro_rules! send_file {
             /// got a prefix of the range, in order and whole, and a chunk of
             /// at most the runtime's
             /// [`send_file_chunk`](crate::runtime::Builder::send_file_chunk)
-            /// (one MiB by default) may still be on its way.
+            /// (one MiB by default) may still be on its way: it lands before
+            /// anything written to the stream after the drop, which waits
+            /// for it.
             ///
             /// # Errors
             ///
@@ -121,10 +126,14 @@ macro_rules! send_file {
                     let (out, src) = (sock.clone(), from.clone());
                     // The socket's `WouldBlock` is an answer, not a failure
                     // to count: it rides out inside the `Ok`.
-                    let step = crate::rt::blocking::call(move || {
-                        Ok(crate::io::sys::send_file(out.raw(), src.raw(), at, want))
-                    })
-                    .await?;
+                    let step = self
+                        .source()
+                        .send_outside(move || {
+                            #[cfg(test)]
+                            stall::cold_page(out.raw());
+                            crate::io::sys::send_file(out.raw(), src.raw(), at, want)
+                        })
+                        .await?;
                     match step {
                         Ok(0) => break,
                         Ok(n) => {
@@ -217,3 +226,43 @@ macro_rules! send_file {
 send_file!(TcpStream);
 #[cfg(unix)]
 send_file!(UnixStream);
+
+/// A chunk's call that waits as on a page that is not cached, for a test: the
+/// next call on a stream's descriptor says it started, then waits to be let
+/// go.
+#[cfg(all(test, unix))]
+pub(crate) mod stall {
+    use std::os::fd::RawFd;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+
+    /// The descriptor whose next call stalls, what it says it started on, and
+    /// what lets it go.
+    type Stall = (RawFd, Sender<()>, Receiver<()>);
+
+    static STALL: Mutex<Option<Stall>> = Mutex::new(None);
+
+    /// Stalls the next chunk's call on `fd`: the first receiver hears it
+    /// started, and a send on the sender lets it go.
+    pub(crate) fn next_on(fd: RawFd) -> (Receiver<()>, Sender<()>) {
+        let (started, heard) = channel();
+        let (release, held) = channel();
+        if let Ok(mut stall) = STALL.lock() {
+            *stall = Some((fd, started, held));
+        }
+        (heard, release)
+    }
+
+    /// Called by each chunk's job before its call: stalls it if it is on the
+    /// descriptor a test named.
+    pub(crate) fn cold_page(fd: RawFd) {
+        let mine = STALL
+            .lock()
+            .ok()
+            .and_then(|mut stall| stall.take_if(|(of, ..)| *of == fd));
+        if let Some((_, started, held)) = mine {
+            let _ = started.send(());
+            let _ = held.recv();
+        }
+    }
+}

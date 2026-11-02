@@ -49,6 +49,8 @@ mod datagram;
 mod lent;
 #[cfg(completion)]
 mod ops;
+#[cfg(unix)]
+mod outside;
 #[cfg(ring)]
 mod pinned;
 
@@ -162,6 +164,10 @@ pub(super) struct WriteState {
     connected: Option<io::Result<()>>,
     /// The source's epoch this state is of.
     epoch: u32,
+    /// A call outside the side writes the stream (a `send_file` chunk on the
+    /// blocking pool): `lent` holds its place until it ended (`outside`).
+    #[cfg(unix)]
+    outside: Option<Arc<outside::Outside>>,
     /// Edges (and, on a ring, polls that completed) since the source was
     /// made, as the read side counts them (proofs/tla/asyncfd).
     #[cfg(unix)]
@@ -1073,7 +1079,10 @@ impl WriteState {
         } else {
             self.error = Some(failure.error());
         }
-        if let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none()) {
+        // A call outside the side keeps its place: only its end clears it.
+        if !self.outside_out()
+            && let Some(lent) = self.lent.as_mut().filter(|l| l.done.is_none())
+        {
             lent.done = Some(Err(failure.error()));
             if let Some(w) = lent.waker.take() {
                 after.wake_one(w);
@@ -1082,12 +1091,21 @@ impl WriteState {
         after.wake(&mut self.waiters);
     }
 
-    /// A buffer came back to the pool a write found empty.
+    /// No call writes the stream outside the side on this system.
+    #[cfg(not(unix))]
+    fn outside_out(&self) -> bool {
+        false
+    }
+
+    /// A buffer came back to the pool a write found empty, or a call outside
+    /// the side may have ended, whose place then goes (`outside`).
     pub(super) fn unstarve(&mut self, after: &mut After) {
         if self.starved {
             self.starved = false;
             after.wake(&mut self.waiters);
         }
+        #[cfg(unix)]
+        self.end_outside(after);
     }
 
     /// Every waiting task looks again.
@@ -1117,6 +1135,10 @@ impl WriteState {
         }
         if let Some(w) = self.lent.take().and_then(|l| l.waker) {
             after.forget_one(w);
+        }
+        #[cfg(unix)]
+        {
+            self.outside = None;
         }
         self.failed = None;
         self.error = None;

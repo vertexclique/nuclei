@@ -26,6 +26,17 @@
   because a retire or a close took the descriptor out now fails nothing, as one refused because
   its shard stopped: the source is unregistered, and its next wait registers it again
   (`proofs/tla/attach/Merged.tla`).
+- **A write after a dropped `send_file` no longer lands before its last chunk** (Linux, Android,
+  macOS, FreeBSD). Each chunk of a file sent in the kernel is a `sendfile(2)` call on the blocking
+  pool, made on the stream's descriptor outside its write side, which held nothing for it. A call
+  dropped (a timeout) while a chunk's call was out, on a page that was not cached say, left the
+  side idle: the handle's next write, an error frame for instance, went out at once, and the chunk
+  landed after it, so the peer read the file's prefix, the frame, then the chunk. While a chunk's
+  call is out the write side now holds its place, a lent write that no driver writes, so every
+  write after it waits for the chunk, as after any lent write; whichever of the call's job and its
+  task ends second clears the place (`proofs/tla/sendfile/SendFile.tla`: `M_no_place`,
+  `M_clear_at_drop`, `M_clear_unended`, and the four that leave the place held). Windows sent its
+  chunks through the write side already.
 - **A closed socket leaves a ring's table though the kernel once refused to take it out**
   (Linux, io_uring). A source that goes takes its file out of the ring's table of fixed files at
   once, so the kernel closes it as soon as its requests let go. When the kernel had no memory for

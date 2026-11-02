@@ -223,7 +223,7 @@ impl Source {
     /// Polls the write side with `step` for the handle's own writes, given
     /// the way this thread reaches the descriptor.
     #[inline(always)]
-    fn poll_writing<R>(
+    pub(super) fn poll_writing<R>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
         step: impl FnMut(&mut WriteState, Io<'_>, &Waker, &mut After) -> Poll<io::Result<R>>,

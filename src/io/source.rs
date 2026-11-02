@@ -213,7 +213,8 @@ mod read_work {
 
 /// Side-local work of the write side (its deferred word).
 mod write_work {
-    /// A buffer came back to the pool the side ran out of.
+    /// A buffer came back to the pool the side ran out of, or a call outside
+    /// the side ended, whose place it held (`WriteState::unstarve`).
     pub(super) const UNSTARVE: u8 = 1;
     /// The future of a lent buffer went away.
     pub(super) const ABANDON: u8 = 2;

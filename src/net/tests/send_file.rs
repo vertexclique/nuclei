@@ -184,3 +184,63 @@ fn send_file_on_a_unix_stream_and_on_something_that_is_no_file() {
         assert!(within(tx.send_file(&dir, 0, 10)).await.is_err());
     });
 }
+
+/// A `send_file` dropped while its chunk's call is out (stalled as on a page that is not cached):
+/// a write made after the drop goes out after the chunk, so the peer reads the chunk whole, then
+/// the write. Before, the stream's write side held nothing for the chunk, the write went out at
+/// once, and the chunk landed after it (proofs/tla/sendfile/SendFile.tla, `M_no_place`). Unix
+/// only: elsewhere a chunk goes through the write side (`TransmitFile`) or is copied.
+#[cfg(unix)]
+#[test]
+fn a_write_after_a_dropped_send_file_goes_after_its_chunk() {
+    use std::os::fd::AsRawFd;
+
+    if !crate::io::sys::SENDS_FILES {
+        eprintln!("skipping: this system sends no file in the kernel");
+        return;
+    }
+    let rt = Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .send_file_chunk(4096)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (path, data) = file_of("sf-late", 4096);
+        let file = File::open(&path).await.unwrap();
+        let (tx, rx) = tcp_pair().await;
+        let reader = std::thread::spawn(move || {
+            let mut rx = rx;
+            let mut got = Vec::new();
+            rx.read_to_end(&mut got).unwrap();
+            got
+        });
+        let (started, release) = crate::net::send_file::stall::next_on(tx.get_ref().as_raw_fd());
+        {
+            let mut call = Box::pin(tx.send_file(&file, 0, 4096));
+            let polled = poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await;
+            assert!(polled.is_pending(), "the call ended with its chunk stalled");
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the chunk's call never started");
+        }
+        let mut tx_ref = &tx;
+        let mut frame = Box::pin(write_all(&mut tx_ref, b"frame"));
+        let first = poll_fn(|cx| Poll::Ready(frame.as_mut().poll(cx))).await;
+        release.send(()).unwrap();
+        match first {
+            Poll::Ready(wrote) => wrote.unwrap(),
+            Poll::Pending => within(frame.as_mut()).await.unwrap(),
+        }
+        drop(frame);
+        within(close(&mut tx_ref)).await.unwrap();
+        let want = [&data[..], &b"frame"[..]].concat();
+        let got = reader.join().unwrap();
+        assert!(
+            got == want,
+            "the write went out before the chunk: {} bytes, the frame at {:?}",
+            got.len(),
+            got.windows(5).position(|w| w == b"frame")
+        );
+    });
+}
