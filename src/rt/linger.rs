@@ -27,11 +27,19 @@
 //! runtime's drop is over, runs on a thread of its own with a runtime of its
 //! own: no runtime is started behind the user's back
 //! (proofs/tla/going/Linger.tla).
+//!
+//! A runtime that is never dropped (the process default one, or one kept for
+//! good) never runs that wait, and the process's exit kills its workers with
+//! their lingers. So a file's linger ([`hand_file`]) is counted from its hand
+//! to its end, wherever it runs ([`Tracked`]), and the first one hands the
+//! process an `atexit` hook ([`wait_at_exit`]) that waits until none is out,
+//! for at most the default runtime's linger time, and says what it gave up.
 
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool as ExitFlag, AtomicUsize as ExitCount};
 use core::task::{Context, Poll};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Condvar, Mutex, Once, PoisonError, Weak};
 
 use kovan_queue::seg_queue::SegQueue;
 
@@ -58,6 +66,98 @@ where
     match super::runtime::running_inner() {
         Some(inner) => inner.take_linger(work),
         None => alone(work),
+    }
+}
+
+/// A file's linger: as [`hand`], counted until it ends, which the process's
+/// exit waits for.
+pub(crate) fn hand_file<F>(work: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    HOOKED.call_once(|| {
+        // SAFETY: `wait_at_exit` is a plain function that never unwinds.
+        if unsafe { atexit(wait_at_exit) } != 0 {
+            log::warn!(
+                "the process could not be set to wait at its exit for files dropped with bytes written behind"
+            );
+        }
+    });
+    FILES_OUT.fetch_add(1, Ordering::SeqCst);
+    hand(Tracked(work));
+}
+
+unsafe extern "C" {
+    /// The C library's `atexit`: on unix through libc, on Windows the CRT's.
+    fn atexit(callback: extern "C" fn()) -> core::ffi::c_int;
+}
+
+/// The exit's hook is handed once.
+static HOOKED: Once = Once::new();
+/// Files' lingers handed and not ended, whichever runtime or thread runs
+/// them.
+static FILES_OUT: ExitCount = ExitCount::new(0);
+/// The exit's wait began: the last linger to end wakes it.
+static EXITING: ExitFlag = ExitFlag::new(false);
+/// The exit's wait, and its wake; plain std, which needs no thread-local of
+/// the exiting thread (glibc drops those before the `atexit` hooks run).
+static EXIT_LOCK: Mutex<()> = Mutex::new(());
+static EXIT_WAKE: Condvar = Condvar::new();
+
+/// A file's linger, counted until it is dropped, done or not: moved between
+/// runtimes and threads it stays counted, and a linger nobody will run ends
+/// its count where it is dropped.
+struct Tracked<F>(F);
+
+impl<F> Future for Tracked<F>
+where
+    F: Future<Output = ()>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the future is never moved out of its pin.
+        unsafe { self.map_unchecked_mut(|this| &mut this.0) }.poll(cx)
+    }
+}
+
+impl<F> Drop for Tracked<F> {
+    fn drop(&mut self) {
+        // SeqCst with the exit's: either the exit sees naught, or this sees
+        // the exit waiting, and wakes it under its lock.
+        if FILES_OUT.fetch_sub(1, Ordering::SeqCst) == 1 && EXITING.load(Ordering::SeqCst) {
+            let _held = EXIT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            EXIT_WAKE.notify_all();
+        }
+    }
+}
+
+/// The process's `atexit` hook: waits until no file's linger is out, for at
+/// most the default runtime's linger time (the lingers run on their own
+/// threads meanwhile: `exit` stops none before its hooks), and says what is
+/// still out then (proofs/tla/going/Linger.tla, `M_wait`).
+extern "C" fn wait_at_exit() {
+    let bound = super::runtime::exit_linger();
+    let mut held = EXIT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    EXITING.store(true, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let out = FILES_OUT.load(Ordering::SeqCst);
+        if out == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            crate::rt::counters::write_behind_lost(out as u64);
+            log::warn!(
+                "{out} dropped files still had bytes written behind when the process exited, after waiting {bound:?}: those bytes were not written"
+            );
+            return;
+        }
+        held = EXIT_WAKE
+            .wait_timeout(held, deadline - now)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
     }
 }
 

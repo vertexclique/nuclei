@@ -73,6 +73,18 @@ pub use self::sync_dir::sync_dir;
 
 /// A file: std's `File` in a [`Handle`], with async reads, writes, seeks and
 /// calls.
+///
+/// A write is accepted into the handle's write-behind and lands after. A
+/// file dropped with bytes there never loses them unsaid: dropped on a worker,
+/// a task writes them, and the runtime's drop and the process's exit wait for
+/// it (the process default runtime's included); dropped on any other thread
+/// (`block_on`'s, the blocking pool's, one of the application's), the drop
+/// writes them before it returns. Bytes that cannot be written, a write that
+/// failed or the runtime's
+/// [`write_behind_linger`](crate::runtime::Builder::write_behind_linger) run
+/// out, are said at warn and counted in
+/// [`Stats::write_behind_lost`](crate::stats::Stats::write_behind_lost). To be
+/// told of a failure yourself, flush or sync before the drop.
 pub type File = Handle<std::fs::File>;
 
 use core::pin::Pin;

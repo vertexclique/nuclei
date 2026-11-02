@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- **A file dropped with bytes written behind no longer loses them unsaid** (every backend). The
+  drop handed its write-behind to a task, and the process default runtime, which is never
+  dropped, never waited for it: a file written and dropped in `nuclei::block_on`, or on a worker,
+  just before `main` returned came out short, with no error anywhere. A linger whose write failed,
+  or whose `write_behind_linger` ran out, gave the rest up without a word. A file dropped on a
+  thread that is no worker now writes its write-behind before its drop returns; one dropped on a
+  worker leaves its task, which is counted wherever it runs, and the process's exit (an `atexit`
+  hook) waits for every such task, for at most the default runtime's linger time. Bytes given up
+  with nobody left to answer, there or at `get_mut` and `into_inner`, are said at warn and counted
+  in the new `Stats::write_behind_lost` (`proofs/tla/going/Linger.tla`: `LM_no_exit_wait`,
+  `LM_off_worker_hands`, `LM_silent_give_up`).
 - **A write lost after it was accepted fails every later sync** (every backend). A write the
   handle accepted into its write-behind, which the kernel then failed (no space, an IO error, a
   file too large), was reported once, by whichever call took the failure first: a flush, the

@@ -15,12 +15,18 @@ const ALONE: &str = "NUCLEI_TEST_ALONE";
 /// and checks that it ran and passed there. Returns true in that process,
 /// where the caller then runs its case.
 pub(crate) fn alone(name: &str) -> bool {
+    alone_with(name, &[])
+}
+
+/// As [`alone`], the new process given the environment variables `vars`.
+pub(crate) fn alone_with(name: &str, vars: &[(&str, &std::ffi::OsStr)]) -> bool {
     if std::env::var_os(ALONE).is_some() {
         return true;
     }
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--test-threads=1"])
         .env(ALONE, "1")
+        .envs(vars.iter().copied())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();

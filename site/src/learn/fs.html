@@ -9,6 +9,7 @@
 <!--example fs_file-->
 <ul>
 <li><code>flush</code> waits until the system has the bytes written behind; <code>sync_all</code> and <code>sync_data</code> put them on the device (<a href="#durable">Surviving a crash</a>).</li>
+<li>A file dropped with bytes written behind never loses them unsaid. Dropped on a worker, a task writes them, and the runtime's drop and the process's exit wait for it (the default runtime included); dropped on any other thread, the drop writes them before it returns. Bytes that cannot be written (a write that failed, or <code>write_behind_linger</code> run out) are said at warn and counted in <code>Stats::write_behind_lost</code>; to be told yourself, flush or sync before the drop.</li>
 <li><code>metadata</code>, <code>set_len</code>, <code>set_permissions</code>, <code>set_times</code> and <code>set_modified</code> work on the open file; <code>try_clone</code> gives a second handle with a cursor of its own.</li>
 <li>A read at the cursor sees the changes made beside it: bytes it read ahead before a positional write, a cut by <code>set_len</code>, an <code>allocate</code> or a copy into the file are never handed out after the change.</li>
 </ul>

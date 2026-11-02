@@ -46,6 +46,15 @@
 //! stream's then resets its connection, so the peer never reads a cut stream
 //! as a whole one (`proofs/tla/close`). A runtime that drops waits for those
 //! tasks (see `rt::linger`), and none starts a runtime to run them.
+//!
+//! A file dropped on a worker leaves such a task too, and the process's exit
+//! waits for it as well (the process default runtime is never dropped); a
+//! file dropped on any other thread (`block_on`'s, the blocking pool's, one
+//! of the application's) writes its write-behind before its drop returns.
+//! Bytes a file's write-behind gives up with nobody left to answer (a write
+//! that failed, a linger's time run out) are said at warn and counted in
+//! [`Stats::write_behind_lost`](crate::stats::Stats::write_behind_lost)
+//! (`proofs/tla/going/Linger.tla`).
 
 /// How long a dropped handle's unsent bytes may take to reach the kernel, by
 /// default (see [`Builder::write_behind_linger`](crate::runtime::Builder::write_behind_linger)).
@@ -318,10 +327,7 @@ impl<T> Handle<T> {
             ));
         }
         if let Some(file) = self.file.get().filter(|f| f.has_unsent()) {
-            let _ = crate::sync::internal::blocking(crate::time::timeout(
-                crate::rt::linger::time(),
-                core::future::poll_fn(|cx| file.poll_flush(cx)),
-            ));
+            crate::sync::internal::blocking(deliver_file(file));
         }
     }
 
@@ -345,20 +351,19 @@ impl<T> Handle<T> {
 }
 
 impl<T> Drop for Handle<T> {
-    /// Never waits: the source closes the object once no call can use its
-    /// descriptor (at once, or as the last lease or the driver lets go of
-    /// it).
+    /// Waits only for a file's write-behind, off a worker: the source closes
+    /// the object once no call can use its descriptor (at once, or as the
+    /// last lease or the driver lets go of it).
     fn drop(&mut self) {
         // A file's writes in flight hold leases on its descriptor; what waits
-        // behind them is handed to a task, the file's state with its lease.
+        // behind them goes before the drop returns, or, on a worker, which
+        // must not wait, is handed to a task, the file's state with its lease.
         if let Some(file) = self.file.take().filter(|f| f.has_unsent()) {
-            crate::rt::linger::hand(async move {
-                let _ = crate::time::timeout(
-                    crate::rt::linger::time(),
-                    core::future::poll_fn(|cx| file.poll_flush(cx)),
-                )
-                .await;
-            });
+            if crate::runtime::worker_index().is_some() {
+                crate::rt::linger::hand_file(async move { deliver_file(&file).await });
+            } else {
+                crate::sync::internal::blocking(deliver_file(&file));
+            }
         }
         // SAFETY: taken once, here; the field is never used again.
         let io = unsafe { ManuallyDrop::take(&mut self.io) };
@@ -377,6 +382,29 @@ impl<T> Drop for Handle<T> {
         // (and on Windows, closing a socket would cancel its sends).
         self.source.linger(own);
         crate::rt::linger::hand(linger(Arc::clone(&self.source), Kept::new(io), own));
+    }
+}
+
+/// Writes what `file`'s write-behind holds, for at most the linger's time.
+/// A failure, or the time running out, is said at warn and counted: nobody
+/// is left to answer it (the handle's syncs would, but it was dropped or
+/// handed back).
+async fn deliver_file(file: &Arc<FileIo>) {
+    let linger = crate::rt::linger::time();
+    let flushed =
+        crate::time::timeout(linger, core::future::poll_fn(|cx| file.poll_flush(cx))).await;
+    match flushed {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            crate::rt::counters::write_behind_lost(1);
+            log::warn!("bytes a file handle had accepted could not be written: {err}");
+        }
+        Err(_) => {
+            crate::rt::counters::write_behind_lost(1);
+            log::warn!(
+                "bytes a file handle had accepted were not written within {linger:?}, and were given up"
+            );
+        }
     }
 }
 

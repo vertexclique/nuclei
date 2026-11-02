@@ -476,6 +476,14 @@ static OFF_SHARD: Errors = Errors::new();
 /// Shards that started without their receive group for want of memory.
 static GROUPS_MISSING: AtomicU64 = AtomicU64::new(0);
 
+/// Files whose bytes written behind were given up with no caller to answer.
+static WRITE_BEHIND_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// A file's bytes written behind were given up with no caller to answer.
+pub(crate) fn write_behind_lost(files: u64) {
+    WRITE_BEHIND_LOST.fetch_add(files, Ordering::Relaxed);
+}
+
 /// A shard started without its receive group for want of memory.
 #[cfg(ring)]
 pub(crate) fn receive_buffers_missing() {
@@ -579,6 +587,7 @@ pub(crate) fn snapshot() -> Stats {
         blocking_queue_depth: super::blocking::queued_everywhere(),
         off_shard_errors: OFF_SHARD.read(),
         receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
+        write_behind_lost: WRITE_BEHIND_LOST.load(Ordering::Relaxed),
     }
 }
 
@@ -596,6 +605,7 @@ pub(crate) fn runtime_snapshot(
         blocking_queue_depth: queued,
         off_shard_errors: OFF_SHARD.read(),
         receive_buffers_missing: GROUPS_MISSING.load(Ordering::Relaxed),
+        write_behind_lost: WRITE_BEHIND_LOST.load(Ordering::Relaxed),
     }
 }
 
