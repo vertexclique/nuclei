@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **The docs no longer say a direct file's writes have no write-behind** (every backend). A
+  cursor write through `AsyncWrite` on a file opened for direct IO is one kernel write of exactly
+  the caller's bytes, joined with no other, but it is accepted as it is submitted, from a copy,
+  and its error is answered by the next call; `flush` waits for it. The crate docs and the Learn
+  page now say so, and point to `write_owned`, `write_at` and `write_all_at`, which return only
+  once their own write landed (`proofs/tla/lent/LentFile.tla`, `WF_direct_ok_early`).
 - **A file dropped with bytes written behind no longer loses them unsaid** (every backend). The
   drop handed its write-behind to a task, and the process default runtime, which is never
   dropped, never waited for it: a file written and dropped in `nuclei::block_on`, or on a worker,
