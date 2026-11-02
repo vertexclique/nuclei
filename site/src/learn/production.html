@@ -68,7 +68,7 @@ nuclei::config::IoUringConfiguration::per_numa_bounded_worker_count
 nuclei::config::IoUringConfiguration::per_numa_unbounded_worker_count
 nuclei::config::IoUringConfiguration::aggressive_poll
 -->
-<p>Four presets fill the struct from a queue length: <code>interrupt_driven</code> (the one to pick when unsure), <code>low_latency_driven</code> and <code>kernel_poll_only</code> (a kernel submission thread), and <code>io_poll</code>. <code>NucleiConfig::backend</code> is the backend of every runtime that names none.</p>
+<p>Four presets fill the struct from a queue length: <code>interrupt_driven</code> (the one to pick when unsure), <code>low_latency_driven</code> and <code>kernel_poll_only</code> (a kernel submission thread), and <code>io_poll</code>, whose ring takes only the reads and writes of files opened with <code>O_DIRECT</code>: a file's syncs, <code>sync_range</code>, <code>allocate</code> and a buffered file's reads and writes, which the kernel refuses there, are made on the blocking pool. <code>NucleiConfig::backend</code> is the backend of every runtime that names none.</p>
 <p>The sizes are checked where they take effect: <code>queue_len</code> at least 64, <code>recv_buffers</code> 0 or a power of two below twice <code>queue_len</code>, and <code>recv_buffer_size</code> from 512 bytes to 1 GiB while there are receive buffers. A value outside fails the first runtime built with it, with <code>InvalidInput</code> naming the setting.</p>
 
 <h2 id="stats">Counters</h2>

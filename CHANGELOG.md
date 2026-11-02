@@ -17,6 +17,14 @@
   a lost write-back of the open file to one of the two only
   (`proofs/tla/lent/LentFile.tla`, scenarios "sync_lost" and "sync_clone":
   `MF_sync_forgets_loss`, `MF_sticky_unshared`).
+- **A polled ring no longer refuses a file's sync, nor a buffered file's reads and writes**
+  (Linux, io_uring with `IoUringConfiguration::io_poll`). A ring made to poll for its completions
+  (`IORING_SETUP_IOPOLL`) takes only the reads and writes of direct IO: the kernel answers a sync,
+  a `sync_range` and an `allocate` with `EINVAL`, and a buffered read or write with `EOPNOTSUPP`.
+  Those answers were the calls' own, so a valid sync failed, and the failure stayed the handle's
+  for good. A call the ring refuses this way is now made again on the blocking pool, as one
+  cancelled because its shard went (`proofs/tla/lent/LentFile.tla`, scenario "sync_iopoll":
+  `MF_iopoll_refusal_ends`).
 - **A failed sync is no longer forgotten by a dropped or a concurrent sync**
   (every backend). The kernel reports a lost write-back to one sync call only, and the handle
   kept the failure only once the failing call's task took its end. A sync whose future was

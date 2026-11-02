@@ -354,3 +354,55 @@ fn a_clone_fails_its_syncs_for_the_handle_s_lost_write_and_failed_sync() {
         assert_eq!(err.kind(), io::ErrorKind::Other, "{err:?}");
     });
 }
+
+/// On a ring made to poll for its completions (`IORING_SETUP_IOPOLL`), which
+/// refuses a write and a read of a buffered file, a sync, a range's write-back
+/// and a change of a range's space, each refused call is made again on the
+/// blocking pool: every byte lands and reads back, and every sync succeeds.
+/// io_uring only: no other backend has such a ring.
+#[cfg(ring)]
+#[test]
+fn a_polled_ring_makes_the_calls_it_refuses_on_the_pool() {
+    let built = Builder::new()
+        .worker_threads(1)
+        .pin_workers(false)
+        .handoff_after(None)
+        .io_uring(crate::config::IoUringConfiguration::io_poll(256))
+        .build();
+    let rt = match built {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("skipping: no runtime on a polled ring here ({err})");
+            return;
+        }
+    };
+    let tmp = Temp::new("sync-iopoll");
+    let path = tmp.file("data");
+    let data = pattern(200_017);
+    let expected = data.clone();
+    let read_path = path.clone();
+    rt.block_on(async {
+        within(spawn(async move {
+            if ring_calls().is_none() {
+                eprintln!("skipping: the shard runs no ring (NUCLEI_BACKEND or no io_uring)");
+                return;
+            }
+            let mut file = Handle::new(read_write(&path)).unwrap();
+            within(write_all(&mut file, &data)).await.unwrap();
+            within(flush(&mut file)).await.unwrap();
+            within(file.allocate(0, 1 << 20, crate::fs::Allocate::KeepSize))
+                .await
+                .unwrap();
+            within(file.sync_range(0, 4096)).await.unwrap();
+            within(file.sync_data()).await.unwrap();
+            within(file.sync_all()).await.unwrap();
+            within(seek(&mut file, SeekFrom::Start(0))).await.unwrap();
+            let back = within(read_to_end(&mut file)).await.unwrap();
+            assert!(back == data, "the bytes read back are not the ones written");
+            let (_, entries) = ring_calls().unwrap();
+            assert!(!entries.is_empty(), "no call went to the polled ring");
+        }))
+        .await;
+    });
+    assert!(std::fs::read(&read_path).unwrap() == expected);
+}
