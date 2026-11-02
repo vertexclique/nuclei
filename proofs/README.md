@@ -1629,7 +1629,7 @@ registration's `here`, published last as the source is registered with its ring 
 first as the registration goes (`attach_ring`, `take_installs`, `detach`, `evict_now`), names the
 shard whose thread reaches the source Here, and only a thread of that shard takes the Here route
 from it; the model reads it from a thread that runs no shard and from another ring shard's
-thread. 9 configurations: 6 that must pass (the read during the registration and after it, from
+thread. 10 configurations: 6 that must pass (the read during the registration and after it, from
 no shard and from another shard, each with `OneSubmit`, one submit for the waiter, and no
 deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`,
 the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the home), 3

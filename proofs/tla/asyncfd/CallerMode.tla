@@ -112,8 +112,9 @@ R_loop:
                 pollOut := TRUE;
             end if;
         or
-            \* The stream's multishot poll says the socket holds bytes: the side may be ready.
-            await streamPoll /\ ~stopping /\ sock # <<>>;
+            \* The stream's multishot poll says the socket holds bytes: the side may be ready (an edge, once
+            \* per time it was not).
+            await streamPoll /\ ~stopping /\ sock # <<>> /\ ~ready;
             ready := TRUE;
             edges := edges + 1;
         or
