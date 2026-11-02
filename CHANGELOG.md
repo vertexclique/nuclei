@@ -35,6 +35,10 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
+- **`Proactor::wake` ends a `Proactor::wait` made inside a task or a `block_on`.** The wake reaches
+  the shards waiting in `Proactor::wait`, but only a wait on a thread that runs no shard entered
+  its shard among them: a wait on a thread that runs one (a task's, a `block_on`'s) ran its turn
+  unseen, and waited until IO came (`proofs/tla/park/Park.tla`, `unregistered_wait`).
 - **A notification of a sleeping worker that fails is tried again** (macOS, the BSDs, Windows).
   `kevent` and `PostQueuedCompletionStatus` can fail for want of a resource, and the failure was
   dropped. The waker that takes a sleeping shard's flag back is the only one that notifies it, so

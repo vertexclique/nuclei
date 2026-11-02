@@ -343,14 +343,18 @@ swaps the flag back and notifies, so only the first of a burst of wakes notifies
 of the pair is sequentially consistent, so whichever publication comes second, the look after
 it sees the other: the shard finds the work, or the waker finds the shard parked.
 
-The family checks 21 configurations. `Park.tla`: 6 that must pass (one waker, three wakers
-racing, liveness under weak fairness, a timer of the shard's own, its liveness, and a
-`Proactor::wake` that ends a `Proactor::wait` wherever it lands), 4 mutations that must
-deadlock (the shard sleeping without its look after publishing; a waker looking before it
-pushes; the drive waiting on the poller after a timer it fired; a `Proactor::wake` that
-notifies only a shard that parks already), and 4 witnesses (a notification, a look that finds
-the work, a notification that lands while the shard is awake, a timer fired on the way to
-park). `ShardStop.tla` checks a shard that stops while other threads push to it: a pusher
+The family checks 32 configurations. `Park.tla`: 9 that must pass (one waker, three wakers
+racing, liveness under weak fairness, a timer of the shard's own, its liveness, a
+`Proactor::wake` that ends a `Proactor::wait` wherever it lands, a ring whose submission queue
+is full and its liveness, and two wakers whose first two notifications fail, which the waker
+that took the flag back tries again), 8 mutations (the shard sleeping without its look after
+publishing; a waker looking before it pushes; the drive waiting on the poller after a timer it
+fired; a `Proactor::wake` that notifies only a shard that parks already; a `Proactor::wait`
+made inside a task or a `block_on` that `WAITING` does not hold, `unregistered_wait`; a failed
+notification dropped, `notify_swallowed`: these deadlock; and the two enters that leave the
+wake's read out behind a full queue, which break `SleepSeesWake`), and 5 witnesses (a
+notification, a look that finds the work, a notification that lands while the shard is awake,
+a timer fired on the way to park, the future's timer fired with the wake's read out). `ShardStop.tla` checks a shard that stops while other threads push to it: a pusher
 that sees the shard stopped drops what its inbox holds, and the stopping shard drains pass
 after pass until nothing more comes (a timer's waker, a channel its tasks held), so no
 runnable is left to keep itself and the shard for good. The inbox has one taker at a time:

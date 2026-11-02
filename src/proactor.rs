@@ -52,20 +52,24 @@ fn wake_all(waiting: &Waiting) {
     }
 }
 
-/// A thread's shard in [`WAITING`] while its `Proactor::wait` lasts.
-struct InWait(usize);
+/// A thread's shard in [`WAITING`] while its `Proactor::wait` lasts: the
+/// outermost wait on a shard enters it and takes it out, a wait nested in
+/// it (a task the turn runs waiting too) finds it there and leaves it.
+struct InWait(Option<usize>);
 
 impl InWait {
     fn new(shard: &Arc<Shared>) -> Self {
         let key = Arc::as_ptr(shard) as usize;
-        waiting().insert(key, Arc::clone(shard));
-        Self(key)
+        let entered = waiting().insert_if_absent(key, Arc::clone(shard)).is_none();
+        Self(entered.then_some(key))
     }
 }
 
 impl Drop for InWait {
     fn drop(&mut self) {
-        waiting().remove(&self.0);
+        if let Some(key) = self.0 {
+            waiting().remove(&key);
+        }
     }
 }
 
@@ -112,9 +116,13 @@ impl Proactor {
     }
 
     /// Drives the calling thread's shard once: runs its ready tasks, waits
-    /// for IO (up to `duration`; `None` until some comes or [`wake`]),
-    /// handling at most `max_event_size` events, and runs the tasks the IO
-    /// woke. Returns how many IO events it handled.
+    /// for IO (up to `duration`; `None` until some comes or [`wake`], which
+    /// ends a wait made inside a task or a `block_on` too), handling at most
+    /// `max_event_size` events, and runs the tasks the IO woke. Each of the
+    /// two runs of tasks takes at most the runtime's
+    /// [`event_interval`](crate::Builder::event_interval) of them, so tasks
+    /// that keep waking each other cannot hold the call. Returns how many IO
+    /// events it handled.
     ///
     /// [`wake`]: Self::wake
     ///
@@ -122,9 +130,14 @@ impl Proactor {
     ///
     /// When the thread's shard cannot start, or its poller fails.
     pub fn wait(&self, max_event_size: usize, duration: Option<Duration>) -> io::Result<usize> {
-        if let Some(events) =
-            context::current(|current| current.map(|s| s.turn(max_event_size, duration)))
-        {
+        // Inside a task or a `block_on`: the turn is the running shard's, which a wake must
+        // reach as it reaches a thread's own (proofs/tla/park/Park.tla `unregistered_wait`).
+        if let Some(events) = context::current(|current| {
+            current.map(|s| {
+                let _waiting = InWait::new(&s.shared);
+                s.turn(max_event_size, duration)
+            })
+        }) {
             return events;
         }
         let shard = context::own_shard()?;

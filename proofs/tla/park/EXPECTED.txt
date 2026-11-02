@@ -20,6 +20,7 @@ M_no_submit_first_remote       MC_Park              violated:SleepSeesWake
 W_out_fire                     MC_Park              violated:NoOutFire
 P_notify_fails                 MC_Park              pass
 M_notify_swallowed             MC_Park              deadlock
+M_unregistered_wait            MC_Park              deadlock
 PS_safe                        MC_ShardStop         pass
 PS_live                        MC_ShardStop         pass
 MS_check_first                 MC_ShardStop         violated:NothingLeft

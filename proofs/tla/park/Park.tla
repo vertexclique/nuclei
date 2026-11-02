@@ -20,7 +20,10 @@
 (* A `Proactor::wake` (src/proactor.rs) pushes no work: it ends the wait  *)
 (* of a thread inside `Proactor::wait` by leaving a notification on its   *)
 (* shard's poller whether the shard parks yet or not, so a wait that has  *)
-(* not begun ends as soon as it does.                                      *)
+(* not begun ends as soon as it does. It reaches the shards in `WAITING`, *)
+(* which `Proactor::wait` enters its shard into (`InWait`) on both of its *)
+(* paths: a thread that runs no shard, and one inside a task or a          *)
+(* `block_on`, whose shard runs the turn.                                  *)
 (*                                                                          *)
 (* A notification is a kernel call that may fail (kqueue's `kevent`, the  *)
 (* port's `PostQueuedCompletionStatus`; an eventfd's write cannot):        *)
@@ -216,9 +219,14 @@ fair process proactor = ProactorT
 begin
 P_wake:
     if ProactorWake then
+        \* MUTATION unregistered_wait: the wait made on a thread that runs a shard (inside a
+        \* task or a `block_on`) is not entered into `WAITING`, so the wake, which walks
+        \* `WAITING`, ends nothing.
+        if Mutation = "unregistered_wait" then
+            skip;
         \* MUTATION handshake_wake: the wake goes through the handshake, so it
         \* notifies only a shard that parks already.
-        if Mutation # "handshake_wake" then
+        elsif Mutation # "handshake_wake" then
             pending := TRUE;
         elsif parked then
             parked := FALSE;
