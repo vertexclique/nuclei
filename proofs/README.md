@@ -1640,11 +1640,16 @@ whether the shard runs again or not), 6 mutations (no keeper and no wait for the
 strand packets, `AllDelivered`; no wait for the keeper and a keeper that ignores being called
 off break `OneDrainer`; no look at the count after the flag breaks `Registers`; a bind failure
 that fails the registration breaks `NoFailure`), and 4 witnesses. With `Duplex` the operation out is a TCP
-send into a full socket whose peer reads only after it got what it waits for from us: the send is
-never cancelled (`may_cancel`), the registration waits for it, and the task's read on the other
-port waits for the registration, so both ends wait for good. `PK_read` (a move whose operation ends
-on its own: the read is served, `ReadServed`) passes, and `MK_duplex` pins the defect
-(`ReadServed` broken) until a moved source's reads go on with its send still out.
+send into a full socket whose peer reads only after it got what it waits for from us, and the send is
+never cancelled (`may_cancel`). A registration that finds the handle unable to move keeps the source
+on its old port, registered with its new shard: its reads go to the old port, whose keeper drains it
+while a source waits to move (`Port::keep`, `hand_off_port`), and the move is made once none of its
+operations is out (`waits_for_ops`'s flag has it made again). The task reads twice. 5 more
+configurations: 2 that must pass (the old shard gone, and able to run again, with `ReadServed`,
+every read served, `Registers` and `AllDelivered`, and `OneDrainer`), and 3 mutations (the
+registration that waits unregistered for the send, as it did, breaks `ReadServed`: both ends waited
+for good; a keeper that leaves once none is out though a source waits to move breaks `ReadServed`,
+the read made after the send ended never delivered; a move never made again breaks `Registers`).
 
 ## Idle peers on a completion port
 

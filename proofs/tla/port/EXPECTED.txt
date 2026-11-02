@@ -40,4 +40,8 @@ MPV_pipe_park                  MC_PortStarve        violated:Served
 MPV_pipe_park_write            MC_PortStarve        violated:Served
 WPV_room                       MC_PortStarve        violated:NoRoom
 PK_read                        MC_PortKeep          pass
+PK_duplex                      MC_PortKeep          pass
+PK_duplex_back                 MC_PortKeep          pass
 MK_duplex                      MC_PortKeep          violated:ReadServed
+MK_keeper_leaves               MC_PortKeep          violated:ReadServed
+MK_no_rebind                   MC_PortKeep          violated:Registers
