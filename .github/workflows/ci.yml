@@ -85,6 +85,15 @@ jobs:
             . "$HOME/.cargo/env"
             cargo test -p nuclei -p nuclei-macros --no-fail-fast
             cargo test -p nuclei -p nuclei-macros --features nuclei/io-stats --no-fail-fast
+            # The file tests again on UFS, in a memory disk: the VM's own file system is ZFS,
+            # which reserves no space, so `allocate`'s reservations, and the zeros UFS writes
+            # where it cannot free a range, run there.
+            mdconfig -a -t swap -s 1g -u 9
+            newfs -U /dev/md9 > /dev/null
+            mkdir -p /mnt/ufs
+            mount /dev/md9 /mnt/ufs
+            chmod 1777 /mnt/ufs
+            TMPDIR=/mnt/ufs cargo test -p nuclei --lib --no-fail-fast fs::
 
   # `#[nuclei::bench]` expands to a benchmark, which only nightly's test
   # harness takes: built and run here, each benchmark's body once.
