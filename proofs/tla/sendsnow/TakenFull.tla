@@ -66,8 +66,8 @@ variables                                                                    \* 
     skipped = FALSE;          \* (record) the driver passed over an edge
 
 define                                                                       \* names the properties use:
-    \* The side waits for an edge only while one is owed, queued or left for its holder.
-    BlockedOwed == blocked => (refused \/ edge \/ ready)                      \* a blocked side has an edge to come
+    \* The side waits for an edge only while one is owed, queued, in the driver's hands, or left for its holder.
+    BlockedOwed == blocked => (refused \/ edge \/ pc["D"] = "D_look" \/ ready)   \* a blocked side has an edge to come
     \* The byte goes out in the end.
     Sent == <>sent                                                           \* eventually sent
     \* Witness: the driver passes over an edge.
