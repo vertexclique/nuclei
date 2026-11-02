@@ -35,7 +35,43 @@
   task receive into its own buffer, as before (`proofs/tla/ring/RingRecv.tla`, `Backend =
   "port"`, the `task_sized` mutation). A side that waits for a datagram on Windows holds a 64 KiB
   buffer of the pool while it waits, where it held one of its own length.
-
+- **A reentrant lock request that queued before its owner took the lock enters at its next
+  poll.** A `ReentrantMutex` lock, or a `ReentrantRwLock` read, looked for its owner only on its
+  first poll; once queued it only looked at its place in line. So an owner with two requests out
+  at once (`join!(lock.write(&me), lock.read(&me))` behind another owner) took the write with the
+  first and left the second waiting for a share its own write kept out, and the join, which held
+  the write until the read ended, hung. A queued `ReentrantRwLock` write whose owner read
+  meanwhile waited for that read instead of failing with `ReadHeldByOwner`, and two queued reads
+  of one owner granted together claimed two records. Every poll now looks for the owner first,
+  queued or not: a request whose owner holds the lock leaves the line, passing on a share it was
+  granted, and enters on the owner's record; a write whose owner reads is refused. A request is
+  not woken for that, so one last polled before its sibling entered (a `join!` that polls it
+  first, or another task of the same owner) still waits as another owner's would
+  (`proofs/tla/reentrant`, `L_join`, `RW_join_write_read`, `RW_join_reads`,
+  `RW_write_queued_read`, and the witness `W_join_young_first`).
+- **A `Notify` permit is never kept by a waiter a broadcast already owed.** A `Notified` looks at
+  the generation, then takes a stored permit, in two steps. A `notify_waiters` and a `notify_one`
+  between them left a waiter the broadcast had served holding the permit too, so a waiter made
+  after the `notify_one` found none and waited for good. A waiter that took the permit looks at
+  the generation again and passes the permit on when it moved (`proofs/tla/notify/Notify.tla`,
+  `L_owed_permit`; one load more on the path that takes a permit).
+- **A barrier leader's wait polled again after it completed counts no second arrival.** The
+  leader's `BarrierWait` kept no mark that it led, so a poll after its `Ready` arrived again: the
+  phantom stood in for a real arrival, the next generation completed one task short, and a wait
+  returned before its group met. The wait is now fused: polled again, it is ready with the same
+  result (`proofs/tla/barrier/Barrier.tla`, the `leader_unfused` mutation).
+- **An acquire, lock or bounded send granted in the poll that queued it spends the task's
+  budget.** A wait whose first attempt failed queued, and the pass of its own queueing (or its
+  retry after a nudge) could grant it at once; that grant completed without spending, so a hot
+  task under contention ran past `coop::BUDGET` in one poll. It now spends one as a take at once
+  does, and with the budget spent it gives what it got back and yields; a grant to a wait that
+  queued in an earlier poll still spends nothing (`proofs/tla/coop/Coop.tla`, the
+  `enqueue_grant_free` mutation).
+- **A bounded send refused for the budget wakes a receiver waiting for its closed channel to go
+  idle.** The refusal gave its slot back with a bare release; if the receiver had closed and was
+  waiting for the last slot, nothing told it until the refused send was polled again or dropped,
+  which nothing makes happen. The give-back now wakes it as every other give-back does
+  (`proofs/tla/mpsc/BoundedChannel.tla`, `BC_live_refuse` and `ML_refuse_no_idle_wake`).
 ### Changed
 
 - **A ring's stream reads by readiness while its reads keep up** (Linux, io_uring). A TCP or Unix
