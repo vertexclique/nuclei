@@ -1,16 +1,53 @@
-TLC run of every configuration in proofs/tla/going, 2026-10-30 19:54 UTC.
+TLC run of every configuration in proofs/tla/going, 2026-11-02 14:39 UTC.
 Written by proofs/tla/run_tlc.sh, not by hand. Version 2.19 of 08 August 2024.
-Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3600 s each.
+Java -Xmx8g; -workers auto, or 1 worker where a violation is expected. Limit: 3480 s each.
+CI's TLA+ run 41454975548, on bd82ae77: the rows of its 16 shares.
 
 configuration                generated   distinct    sec  result                                expected                              match
-G_alone                             49         26      4  pass                                  pass                                  yes
-G_held                              42         28      3  pass                                  pass                                  yes
-G_failed                            30         16      4  pass                                  pass                                  yes
-G_failed_held                      127         67      4  pass                                  pass                                  yes
-M_token_only                        47         26      4  violated:AllEnd                       violated:AllEnd                       yes
-M_keep_home                         13          8      3  violated:AllEnd                       violated:AllEnd                       yes
-M_no_wait                           12         10      5  violated:NoStrandedOp                 violated:NoStrandedOp                 yes
-W_collision                         19         13      3  violated:NoCollision                  violated:NoCollision                  yes
-W_held                               5          5      3  violated:NoHolderEvict                violated:NoHolderEvict                yes
+G_alone                             49         26      0  pass                                  pass                                  yes
+G_held                              48         32      1  pass                                  pass                                  yes
+G_failed                            30         16      1  pass                                  pass                                  yes
+G_failed_held                      149         73      1  pass                                  pass                                  yes
+M_token_only                        47         26      1  violated:AllEnd                       violated:AllEnd                       yes
+M_keep_home                         13          8      1  violated:AllEnd                       violated:AllEnd                       yes
+M_no_wait                           12         10      1  violated:NoStrandedOp                 violated:NoStrandedOp                 yes
+M_end_first                         18         14      1  violated:NoStrandedDetach             violated:NoStrandedDetach             yes
+W_collision                         19         13      1  violated:NoCollision                  violated:NoCollision                  yes
+W_held                               5          5      1  violated:NoHolderEvict                violated:NoHolderEvict                yes
+B_poller                             8          8      1  pass                                  pass                                  yes
+B_port                              15         12      1  pass                                  pass                                  yes
+B_ring                              24         17      1  pass                                  pass                                  yes
+M_no_drain                           8          6      1  violated:AllSent                      violated:AllSent                      yes
+M_no_register                        4          4      1  violated:AllSent                      violated:AllSent                      yes
+M_no_wake                           13         11      1  violated:AllSent                      violated:AllSent                      yes
+W_moves                              4          4      1  violated:NoMove                       violated:NoMove                       yes
+L_safe                             807        378      1  pass                                  pass                                  yes
+L_live                             807        378      2  pass                                  pass                                  yes
+LM_no_wait                         124         80      1  violated:DropWaits                    violated:DropWaits                    yes
+LM_no_rehand                       463        227      1  violated:DropWaits                    violated:DropWaits                    yes
+LM_spawn_on_stopping               443        226      1  violated:DropWaits                    violated:DropWaits                    yes
+LM_to_default                        8          8      1  violated:NoDefault                    violated:NoDefault                    yes
+LW_rehand                           18         15      1  violated:NoRehand                     violated:NoRehand                     yes
+LW_from_list                        61         43      1  violated:NoFromList                   violated:NoFromList                   yes
+LM_list_only                       138         88      1  violated:DropWaits                    violated:DropWaits                    yes
+LW_held                             19         16      1  violated:NoHeld                       violated:NoHeld                       yes
+LM_no_context                      619        301      1  violated:DropWaits                    violated:DropWaits                    yes
+LM_count_before_wake               231        135      1  violated:DropWaits                    violated:DropWaits                    yes
+LM_no_call_wait                    137         87      1  violated:DropWaits                    violated:DropWaits                    yes
+LM_no_inbox_wait                   576        283      1  violated:DropWaits                    violated:DropWaits                    yes
+LW_task_held                         9          9      1  violated:NoTaskHeld                   violated:NoTaskHeld                   yes
+LW_late_drain                      143         89      1  violated:NoLateDrain                  violated:NoLateDrain                  yes
+L_background                      1471        565      2  pass                                  pass                                  yes
+L_bound                           1867        812      2  pass                                  pass                                  yes
+LM_bound_drops                    1799        827      1  violated:AllSent                      violated:AllSent                      yes
+LW_bound                            62         44      1  violated:NoBoundOut                   violated:NoBoundOut                   yes
+P_ring                             113         71      1  pass                                  pass                                  yes
+P_ring_fails                       166        101      1  pass                                  pass                                  yes
+P_poller                           184        111      1  pass                                  pass                                  yes
+P_poller_fails                     247        152      1  pass                                  pass                                  yes
+PM_no_attach_wait                  109         66      1  violated:NoLeaseLeft                  violated:NoLeaseLeft                  yes
+PM_take_first                       74         51      1  violated:NoLeaseLeft                  violated:NoLeaseLeft                  yes
+PM_gen_reset                        97         69      1  violated:NoForeignRelease             violated:NoForeignRelease             yes
+PW_late_release                     72         52      1  violated:NoLateRelease                violated:NoLateRelease                yes
 
-results matching EXPECTED.txt: 9 of 9
+results matching EXPECTED.txt: 45 of 45
