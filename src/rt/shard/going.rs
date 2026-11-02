@@ -64,9 +64,8 @@ impl Shard {
     fn let_go_of_sources(&self) {
         let gone: Vec<(u64, Arc<Source>)> = self.sources.borrow_mut().drain_tokens().collect();
         evict_all(&gone, self.shared_addr());
-        // On a worker, or with none on this thread's shard, which runs it at
-        // the thread's next `block_on`, as any task spawned here; a runtime
-        // that drops waits for it (`rt::linger`).
+        // On a worker, or with none on the linger thread; a runtime that
+        // drops waits for it (`rt::linger`).
         drain_unsent(&gone, |source| crate::rt::linger::hand(drain(source)));
     }
 
@@ -225,8 +224,8 @@ impl Shard {
         // registers where it is polled next.
         let gone: Vec<(u64, Arc<Source>)> = self.sources.get_mut().drain_tokens().collect();
         evict_all(&gone, self.shared_addr());
-        // A worker that takes tasks drains them; with none the runtime is
-        // going, and its drop does (`rt::linger`).
+        // A worker that takes tasks drains them, or with none the linger
+        // thread; once the runtime's drop began, its drop does (`rt::linger`).
         drain_unsent(&gone, |source| crate::rt::linger::hand(drain(source)));
         self.let_go_of_children();
         // The ring's operations still out are cancelled, and their completions waited for or

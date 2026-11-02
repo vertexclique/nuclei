@@ -371,27 +371,15 @@ pub(crate) fn running_inner() -> Option<Arc<Inner>> {
     running()
 }
 
-/// Spawns a linger on `inner`: on a worker that takes tasks, else (with
-/// `here`) on the shard of this thread (which runs it at its next
-/// `block_on`); the linger back where neither can take it.
-pub(crate) fn spawn_linger(
-    inner: &Arc<Inner>,
-    linger: super::linger::Guarded,
-    here: bool,
-) -> Result<(), super::linger::Guarded> {
-    if let Some(shard) = inner.workers.place(inner.id, inner.local_margin) {
-        spawn_on(inner, shard, linger).detach();
-        return Ok(());
+/// Spawns a linger on `inner`: on a worker that takes tasks, else on the
+/// linger thread, still counted by `inner` until it ends; never on this
+/// thread's own shard, which runs only at the thread's next `block_on`, if
+/// one ever comes (proofs/tla/going/Unworked.tla).
+pub(crate) fn spawn_linger(inner: &Arc<Inner>, linger: super::linger::Guarded) {
+    match inner.workers.place(inner.id, inner.local_margin) {
+        Some(shard) => spawn_on(inner, shard, linger).detach(),
+        None => super::linger::on_thread(linger),
     }
-    // With no workers, the thread's own shard, if it has one: one is never
-    // made here (a thread on its way out may hand a linger).
-    let running = context::current(|current| current.is_some());
-    if here && (running || context::own_shard_if_made().is_some()) {
-        let _runtime = context::set_runtime(inner);
-        spawn_here(linger, false).detach();
-        return Ok(());
-    }
-    Err(linger)
 }
 
 /// A shard to serve a thread that runs none, of the runtime this thread is

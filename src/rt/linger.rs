@@ -7,8 +7,10 @@
 //! the process default runtime, if it runs):
 //!
 //! - while one of its workers takes tasks, as a task there;
-//! - with none, on the shard of the thread that hands it, which runs it at
-//!   its next `block_on`;
+//! - with none, on the linger thread, inside the runtime there and counted
+//!   by it until it ends: never on the handing thread's own shard, which runs
+//!   only at that thread's next `block_on`, if one ever comes
+//!   (proofs/tla/going/Unworked.tla);
 //! - once the runtime's drop began, in the runtime's list, which the drop
 //!   runs on its own thread before it returns.
 //!
@@ -24,8 +26,9 @@
 //! is left, no file write its workers issued is still to wake its task
 //! (`fs::call::WriteCall`), and no task woken on a worker's stopped shard is
 //! still to be dropped. One handed where no runtime runs, or after a
-//! runtime's drop is over, runs on a thread of its own with a runtime of its
-//! own: no runtime is started behind the user's back
+//! runtime's drop is over, runs on the linger thread: one for the process,
+//! started at the first linger it is handed, with a runtime of its own that
+//! runs every linger as a task. No runtime is started behind the user's back
 //! (proofs/tla/going/Linger.tla).
 
 use core::future::Future;
@@ -220,22 +223,19 @@ impl Inner {
     /// drop began; from then on into the list the drop runs.
     pub(crate) fn take_linger(self: &Arc<Self>, work: Work) {
         self.lingering().active.fetch_add(1, Ordering::SeqCst);
-        self.route_linger(work, true);
+        self.route_linger(work);
     }
 
-    /// Where a linger of this runtime goes now (`here`: this thread's shard
-    /// may take it).
-    fn route_linger(self: &Arc<Self>, work: Work, here: bool) {
+    /// Where a linger of this runtime goes now: a worker, or the linger
+    /// thread, until the runtime's drop began; the list from then on.
+    fn route_linger(self: &Arc<Self>, work: Work) {
         let lingering = self.lingering();
         if !lingering.is_closing() {
             let guarded = Guarded {
                 work: Some(work),
                 owner: Arc::downgrade(self),
             };
-            match super::runtime::spawn_linger(self, guarded, here) {
-                Ok(()) => return,
-                Err(guarded) => return guarded.into_list(),
-            }
+            return super::runtime::spawn_linger(self, guarded);
         }
         lingering.push(work);
     }
@@ -246,19 +246,6 @@ impl Inner {
 pub(crate) struct Guarded {
     work: Option<Work>,
     owner: Weak<Inner>,
-}
-
-impl Guarded {
-    /// What is left goes to the runtime's list, or alone with no runtime.
-    fn into_list(mut self) {
-        let Some(work) = self.work.take() else {
-            return;
-        };
-        match self.owner.upgrade() {
-            Some(inner) => inner.lingering().push(work),
-            None => alone(work),
-        }
-    }
 }
 
 impl Future for Guarded {
@@ -285,39 +272,82 @@ impl Drop for Guarded {
         let Some(work) = self.work.take() else {
             return;
         };
-        // Never on this thread's shard: it may be the one going.
+        // Never on this thread's shard (it may be the one going): a worker
+        // that takes tasks, the linger thread, or the list.
         match self.owner.upgrade() {
-            Some(inner) => inner.route_linger(work, false),
+            Some(inner) => inner.route_linger(work),
             None => alone(work),
         }
     }
 }
 
-/// Runs `work` on a thread of its own, with a runtime of its own (no worker,
-/// its blocking pool for a file's calls); where no thread can start, on this
-/// one, as a last resort said once.
-// vertexia: a thread per linger handed where no runtime runs; one thread for
-// them all if that is ever common.
+/// Runs `linger`, one no worker of its runtime takes, on the linger thread:
+/// polled inside its runtime there (its clock, its blocking pool for a file's
+/// calls), and counted by it until it ends, so a drop of that runtime waits
+/// for it (proofs/tla/going/Unworked.tla, `DropWaits`).
+pub(crate) fn on_thread(linger: Guarded) {
+    alone(Box::pin(OnThread(linger)));
+}
+
+/// A linger of a runtime, run on the linger thread with that runtime set.
+struct OnThread(Guarded);
+
+impl Future for OnThread {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let guarded = &mut self.get_mut().0;
+        let owner = guarded.owner.upgrade();
+        let _runtime = owner.as_ref().map(super::context::set_runtime);
+        Pin::new(guarded).poll(cx)
+    }
+}
+
+/// Runs `work` on the linger thread; where that thread cannot start, on
+/// this one, as a last resort said each time.
 pub(crate) fn alone(work: Work) {
-    let (give, take) = crate::sync::oneshot::channel::<Work>();
+    let unsent = match linger_thread() {
+        Some(thread) => thread.send(work).err().map(|unsent| unsent.0),
+        None => Some(work),
+    };
+    if let Some(work) = unsent {
+        run_with_own_runtime(work);
+    }
+}
+
+/// The linger thread's inbox, the thread started now if it is not running:
+/// one thread for the process, whose runtime (no worker) runs every work it
+/// is sent as a task of its shard, inside a `block_on` that never returns;
+/// `None` where no thread can start.
+fn linger_thread() -> Option<&'static crate::sync::mpsc::UnboundedSender<Work>> {
+    static THREAD: std::sync::OnceLock<crate::sync::mpsc::UnboundedSender<Work>> =
+        std::sync::OnceLock::new();
+    if let Some(thread) = THREAD.get() {
+        return Some(thread);
+    }
+    let (send, mut works) = crate::sync::mpsc::unbounded_channel::<Work>();
     let started = std::thread::Builder::new()
         .name("nuclei-linger".into())
         .spawn(move || {
-            if let Ok(work) = take.blocking_recv() {
-                run_with_own_runtime(work);
-            }
+            run_with_own_runtime(Box::pin(async move {
+                while let Some(work) = works.recv().await {
+                    crate::spawn(work).detach();
+                }
+            }));
         });
-    let unsent = match started {
-        Ok(_) => give.send(work).err(),
+    match started {
+        // Two hand-offs that started a thread at once: the one set wins, and
+        // the other's ends as its inbox's sender goes, here.
+        Ok(_) => {
+            let _ = THREAD.set(send);
+            THREAD.get()
+        }
         Err(err) => {
             log::warn!(
                 "no thread could start to deliver the bytes a dropped handle left ({err}): they are delivered on the thread that dropped it"
             );
-            Some(work)
+            None
         }
-    };
-    if let Some(work) = unsent {
-        run_with_own_runtime(work);
     }
 }
 
