@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use nuclei::Handle;
+use nuclei::io::AsyncWriteExt;
 use nuclei::runtime::{Builder, Runtime};
 
 /// How long the gate holds at most: far past anything a working handoff needs.
@@ -187,18 +188,53 @@ fn a_receive_the_old_runner_armed_gets_its_bytes_while_it_cannot_be_interrupted(
             // The first byte came through what this shard's first thread armed.
             got_first.store(true, Ordering::SeqCst);
         }
-        got
+        (got, stream)
     });
     let (mut peer, _) = listener.accept().unwrap();
     peer.write_all(b"x").unwrap();
     eventually("the first byte", || first.load(Ordering::SeqCst));
     let (gate, blocked, _) = block_and_hand_off(&rt);
     peer.write_all(b"abcd").unwrap();
-    let got = rt.block_on(reader);
+    let (got, stream) = rt.block_on(reader);
     gate.release_after("the receive");
     rt.block_on(blocked);
     assert_eq!(got, b"xabcd");
+    // The old runner, back, ends what it armed; the stream's operations all ended, so it hands its
+    // socket out.
+    let (done, retired) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(stream.into_inner()).unwrap());
+    retired
+        .recv_timeout(SAFETY)
+        .expect("the stream waited for good for an operation of its old runner's");
     drop(peer);
+}
+
+#[test]
+fn a_write_waiting_for_room_the_old_runner_armed_goes_on_while_it_cannot_be_interrupted() {
+    let rt = runtime();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let full = Arc::new(AtomicBool::new(false));
+    let waits = Arc::clone(&full);
+    let data: Vec<u8> = (0..8u32 << 20).map(|i| (i % 251) as u8).collect();
+    let sent = data.clone();
+    let writer = rt.spawn(async move {
+        let mut stream = Handle::<TcpStream>::connect(addr).await.unwrap();
+        waits.store(true, Ordering::SeqCst);
+        stream.write_all(&sent).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+    let (peer, _) = listener.accept().unwrap();
+    // The socket fills while nobody reads: the write waits for room on this shard's first thread.
+    eventually("the write", || full.load(Ordering::SeqCst));
+    std::thread::sleep(Duration::from_millis(50));
+    let (gate, blocked, _) = block_and_hand_off(&rt);
+    let mut got = Vec::with_capacity(data.len());
+    std::io::Read::read_to_end(&mut std::io::Read::take(&peer, data.len() as u64), &mut got).unwrap();
+    rt.block_on(writer);
+    gate.release_after("the write");
+    rt.block_on(blocked);
+    assert!(got == data, "the bytes were damaged or misordered");
 }
 
 #[test]
