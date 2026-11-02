@@ -69,7 +69,9 @@ fn int_option(raw: Raw, name: i32) -> io::Result<i32> {
 }
 
 /// No count of a socket's unacknowledged bytes is asked on Windows, so the wait before a
-/// zero-linger close is skipped there, as before.
+/// zero-linger close is skipped there, as before. Unverified: nothing here shows that Windows
+/// orders a close's reset after the data still on its way, or takes a reset that overtook it;
+/// the resetting peer of `tests/net_streams.rs` passes on CI's Windows runner without the wait.
 pub(crate) fn unacked(_raw: Raw) -> Option<usize> {
     None
 }
