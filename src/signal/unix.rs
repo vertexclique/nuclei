@@ -15,19 +15,27 @@
 //! delivery whose write the pump read is in the counts it sees, and a later
 //! one writes again. A listener polled where no shard runs is served by a
 //! pump on a runtime worker.
+//!
+//! A flag of the shard (or the one of the pump on a worker) says a pump
+//! serves listeners polled there; it moves with the shard when the shard is
+//! handed to another thread. A pump's task may be dropped without ending,
+//! with the shard that runs it (its runtime dropped): the drop lowers the
+//! flag, then wakes every listener, so each polls again and starts a pump
+//! where none serves it any more (`proofs/tla/signal/SignalPump.tla`).
 
-use core::cell::{Cell, UnsafeCell};
+use core::cell::UnsafeCell;
 use core::ffi::{c_int, c_void};
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
 use std::os::fd::{BorrowedFd, RawFd};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use super::{Listener, SLOTS};
 use crate::io::Handle;
+use crate::rt::shard::Shared;
 
 /// A unix signal a [`Signal`] listens to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -381,13 +389,37 @@ fn errno_location() -> *mut c_int {
     unsafe { libc::___errno() }
 }
 
-thread_local! {
-    /// The shard this thread runs has a pump.
-    static PUMPING: Cell<bool> = const { Cell::new(false) };
-}
-
 /// A pump on a runtime worker serves listeners polled where no shard runs.
 static SERVICE_PUMP: AtomicBool = AtomicBool::new(false);
+
+/// Where a pump serves listeners: the shard it runs on, or (for listeners
+/// polled where no shard runs) the runtime worker it runs on.
+enum Place {
+    Shard(Arc<Shared>),
+    Service,
+}
+
+impl Place {
+    /// The flag that says a pump serves listeners polled here.
+    fn flag(&self) -> &AtomicBool {
+        match self {
+            Place::Shard(shared) => &shared.signal_pump,
+            Place::Service => &SERVICE_PUMP,
+        }
+    }
+}
+
+/// A pump's hold on its place's flag. It goes with the pump's task, however
+/// that ends: the flag is lowered, then every listener woken, so each polls
+/// again and starts a pump where none serves it any more.
+struct Pumping(Place);
+
+impl Drop for Pumping {
+    fn drop(&mut self) {
+        self.0.flag().store(false, Ordering::SeqCst);
+        super::wake_every_listener();
+    }
+}
 
 /// Installs the handler of `signum` with no listener: for the process
 /// module's `SIGCHLD` reaper, which the dispatch calls.
@@ -399,13 +431,11 @@ pub(crate) fn listen_raw(signum: c_int) -> io::Result<()> {
 /// Makes sure a pump serves listeners polled here: one on the shard this
 /// thread runs, or the one on a runtime worker.
 pub(crate) fn ensure_pump() {
-    let on_shard = crate::rt::context::current(|shard| shard.is_some());
-    let started = if on_shard {
-        PUMPING.try_with(|p| p.replace(true)).unwrap_or(true)
-    } else {
-        SERVICE_PUMP.swap(true, Ordering::SeqCst)
-    };
-    if started {
+    let place = crate::rt::context::current(|shard| {
+        shard.map(|shard| Place::Shard(Arc::clone(&shard.shared)))
+    })
+    .unwrap_or(Place::Service);
+    if place.flag().swap(true, Ordering::SeqCst) {
         return;
     }
     let made = wake().and_then(|wake| {
@@ -414,24 +444,16 @@ pub(crate) fn ensure_pump() {
         Handle::new(unsafe { BorrowedFd::borrow_raw(wake.read) })
     });
     match made {
-        Ok(handle) => crate::rt::runtime::spawn_service(pump(handle, on_shard)),
+        Ok(handle) => crate::rt::runtime::spawn_service(pump(handle, Pumping(place))),
         // No pump: the next poll tries again (a listener only misses its
         // wakes meanwhile, never a delivery, which its count keeps).
-        Err(_) => pump_ended(on_shard),
-    }
-}
-
-fn pump_ended(on_shard: bool) {
-    if on_shard {
-        let _ = PUMPING.try_with(|p| p.set(false));
-    } else {
-        SERVICE_PUMP.store(false, Ordering::SeqCst);
+        Err(_) => place.flag().store(false, Ordering::SeqCst),
     }
 }
 
 /// Reads the wake descriptor, then dispatches, for as long as the shard
-/// runs it.
-async fn pump(wake: Handle<BorrowedFd<'static>>, on_shard: bool) {
+/// runs it; `pumping` goes with it.
+async fn pump(wake: Handle<BorrowedFd<'static>>, pumping: Pumping) {
     let mut buf = [0u8; 64];
     loop {
         let read = core::future::poll_fn(|cx| wake.source().poll_read(cx, &mut buf, false)).await;
@@ -440,5 +462,5 @@ async fn pump(wake: Handle<BorrowedFd<'static>>, on_shard: bool) {
             break;
         }
     }
-    pump_ended(on_shard);
+    drop(pumping);
 }

@@ -165,6 +165,8 @@ impl Shard {
             released: AtomicBool::new(false),
             timer_at: AtomicU64::new(u64::MAX),
             parks: AtomicU64::new(0),
+            #[cfg(unix)]
+            signal_pump: std::sync::atomic::AtomicBool::new(false),
         });
         // SAFETY: every field was just written.
         let shared = unsafe { shared.assume_init() };

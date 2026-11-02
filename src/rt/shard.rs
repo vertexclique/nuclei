@@ -149,6 +149,10 @@ pub(crate) struct Shared {
     /// Parks the shard began: a paused clock tells a shard that slept
     /// throughout from one that woke and parked again.
     parks: AtomicU64,
+    /// A signal pump serves the listeners polled on the shard
+    /// (`signal::unix`).
+    #[cfg(unix)]
+    pub(crate) signal_pump: std::sync::atomic::AtomicBool,
 }
 
 /// A registration change another thread asks of a shard.

@@ -44,6 +44,14 @@
   (waiting for a flag a timer's task sets) held the call for good at full CPU. Each of the turn's
   two runs of tasks now takes at most `event_interval` of them (`proofs/tla/loop/RunLoop.tla`,
   `Mode = "turn"`).
+- **A dropped signal pump no longer leaves its listeners without one** (unix). A listener's poll
+  starts a pump where its flag says none runs, and only a pump that ended on a read error lowered
+  that flag. The flag was the thread's (or, for listeners polled where no shard runs, a static),
+  while the pump is a task of a shard, which the handoff moves to another thread and which goes
+  with its runtime: a pump dropped with its runtime left the flag raised, and a listener polled
+  there was never woken. The flag is now the shard's, and the pump's drop lowers it, then wakes
+  every listener, so each polls again and starts a pump where none serves it any more
+  (`proofs/tla/signal/SignalPump.tla`).
 - **The tasks bound to a worker's thread run while its inbox stays full.** A worker took its
   thread's bound tasks only once its inbox was empty, so other threads that kept waking its tasks
   held them off for as long as they did. Every `global_queue_interval` runs, which look at the work

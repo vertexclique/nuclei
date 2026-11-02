@@ -1690,6 +1690,16 @@ delivery (`SeesAll`: the handler writing before it counts, a pump looking before
 listener sleeping without its second look), and 2 witnesses (deliveries coalesced into one
 item, a pump's wake).
 
+`SignalPump.tla` checks the pumps as they start and go (`ensure_pump`, `pump`, `Pumping`). A
+listener that waits registers its waker, then raises its place's flag (the shard's, or the one
+of the pump on a worker) and starts a pump if it was down, then looks once more. A pump's task
+may be dropped without ending, with the shard that runs it: its drop lowers the flag, then wakes
+every listener, so each polls again and starts a pump where none serves it. 6 configurations: 2
+that must pass (one pump at most at a time; every delivery seen, a pump dropped or not), 3
+mutations that break `SeesAll` (a drop that leaves the flag raised, as the thread's flag was; a
+drop that wakes nobody; a drop that wakes before it lowers the flag), and 1 witness (a pump
+started again after a drop).
+
 ## Child processes
 
 `process` (`tla/process/ExitWatch.tla`, `tla/process/KillReap.tla`) checks how a child's exit
