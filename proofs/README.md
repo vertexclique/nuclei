@@ -1619,6 +1619,18 @@ running a linger of its list; the task with the handle held by the write as its 
 another thread draining its wake after the write counted itself out; the drop's bound running
 out before every byte went).
 
+`Unworked` (`tla/going/Unworked.tla`) checks a linger handed to a runtime with no worker taking
+tasks (none built, or every one stopping): `spawn_linger` in `src/rt/runtime.rs`, `route_linger`,
+`OnThread`, `alone` and `linger_thread` in `src/rt/linger.rs`. Such a linger went to the handing
+thread's own shard, which runs only at that thread's next `block_on`, or, the thread having none,
+to the runtime's list, which only a drop runs: with neither coming, the bytes never reached the
+peer and the handle's socket stayed open. It goes to the linger thread, one for the process,
+still counted by its runtime until it ends, so a drop that comes waits for it. 6 configurations:
+2 that must pass (`AllSent` with a runtime never dropped and the handing thread never running its
+shard again; the same with a drop, and `DropWaits` for a linger handed before the drop began), 3
+mutations (the own shard and the list, each breaking `AllSent`; the linger thread's linger left
+uncounted, breaking `DropWaits`), and a witness (a drop that waited for such a linger).
+
 ## A blocking job of a Windows handle
 
 `job` (`tla/job/Job.tla`) checks the cancel of a pool thread's call on a Windows handle opened

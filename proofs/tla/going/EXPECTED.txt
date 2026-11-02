@@ -36,3 +36,9 @@ L_background      Linger  pass
 L_bound           Linger  pass
 LM_bound_drops    Linger  violated:AllSent
 LW_bound          Linger  violated:NoBoundOut
+U_alive           Unworked pass
+U_drop            Unworked pass
+MU_own_shard      Unworked violated:AllSent
+MU_list_first     Unworked violated:AllSent
+MU_thread_uncounted Unworked violated:DropWaits
+WU_waited         Unworked violated:NoWaited
