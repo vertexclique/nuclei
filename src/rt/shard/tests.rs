@@ -106,6 +106,33 @@ fn a_timer_fired_on_the_way_to_park_runs_its_task_rather_than_parking() {
     assert!(woke, "the task the timer woke never ran");
 }
 
+/// A turn driven by hand runs a bounded number of tasks: a task that yields
+/// again and again (waiting for a flag a timer's task sets) would otherwise
+/// keep the turn from ever looking at its timers or returning.
+#[test]
+fn a_turn_runs_a_bounded_number_of_tasks() {
+    crate::block_on(async {
+        let runs = std::rc::Rc::new(core::cell::Cell::new(0u32));
+        let counted = std::rc::Rc::clone(&runs);
+        crate::runtime::spawn_local(async move {
+            // A cap of its own, so a turn that never stops still ends the test.
+            while counted.get() < 100_000 {
+                counted.set(counted.get() + 1);
+                crate::task::yield_now().await;
+            }
+        })
+        .detach();
+        crate::Proactor::get()
+            .wait(64, Some(Duration::ZERO))
+            .unwrap();
+        assert!(
+            runs.get() <= 2 * super::DRIVER_INTERVAL,
+            "one turn ran the yielding task {} times",
+            runs.get()
+        );
+    });
+}
+
 /// A waker that holds a shard's `Shared`, as the one of a worker's loop
 /// does.
 struct Holds(#[allow(dead_code)] Arc<super::Shared>);
