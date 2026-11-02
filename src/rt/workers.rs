@@ -586,6 +586,7 @@ fn runner(inner: &Arc<Inner>, first: Run, life: &Arc<Life>) {
     let _stopping = workers.start.tuning.hooks.started();
     life.here();
     let _runtime = context::set_runtime(inner);
+    crate::buf::serve_with_cap(inner.buffer_cap);
     let spare = workers
         .monitor
         .as_ref()

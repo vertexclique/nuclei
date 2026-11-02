@@ -113,8 +113,9 @@ code (a compare-and-swap, a fetch-and-add, a load), named after the Rust functio
 for, with two exceptions the spec's header explains: the pass's look past withdrawn waiters at
 the head of the line is one step, and so is the receiver's look at the queue and the sender
 count. The message queue is a sequence of cells in the order sends claimed them: a send claims
-its cell in one step and writes its value in a later one, as in kovan's segment queue, so the
-receiver can find the oldest cell claimed and not written yet. It then takes nothing, reads the
+its cell in one step and writes its value in a later one, as the channel's ring and radix queues
+do (src/sync/mpsc/queue/ring.rs and radix.rs), so the receiver can find the oldest cell claimed
+and not written yet. It then takes nothing, reads the
 sender count, which that send keeps above zero, and waits for that send's wake, which comes
 after the write. Every line carries a comment.
 
@@ -299,6 +300,27 @@ most once and only after the future and the output are gone; freed memory is nev
 again (every operation needs a reference or the handle, and none is left); and memory nobody
 refers to is freed. The loom models in `src/rt/task/loom_tests.rs` run the real code under
 weak memory orderings, with a calibration that loses a wake and must fail.
+
+The task's own code that panics outside its poll's catch is in the TLA+ model too (`Panics`):
+the future's drop (and the terminate hook after it), an output nobody takes, what the memory holds
+as it is freed, a hook around the poll, and the shutdown on a task's panic. Each panic is caught
+where it happens. A panic of a hook or of the future's drop is the task's outcome for its handle,
+even one that cancelled: a cancel whose future's drop panicked ends as a completion with that
+panic, closed no more (`RawTask::settle_panicked`), and a completion with a panic keeps it for a
+handle that cancelled during the poll; a handle that waited for a closed task's future looks again
+once it is gone. With no handle left, a panic is logged. With `Shutdown`, a runner may drop a
+runnable instead of running it (`drop_runnable`). 22 more configurations: 8 that must pass
+(awaiting, cancelling, dropping and detaching handles with every kind of panic, hooks, the
+shutdown dropping the runnable, and liveness), checking besides the properties above that no panic
+aborts (`NoAbort`), that every panic is told (`PanicTold`), and that a handle that awaits or
+cancels and waits gets the panic (`AwaiterGetsPanic`); 12 mutations (each abort the code once made
+on a panic of the future's drop, an output's drop, the free, a hook and the shutdown, `NoAbort`; a
+free whose panic skips the free, `CleanEnd`; a cancel that logs the panic though the handle waits,
+a handle that answers "no output" without looking again, and a completion that keeps the value
+over the drop's panic, `AwaiterGetsPanic`; a completion with the panic for no handle,
+`FreedAfterFuture`; an unclaimed panic, and one a handle let go of, dropped unlogged,
+`PanicTold`); and 2 witnesses (a cancel ending as a completion with a panic; the shutdown dropping
+a runnable).
 
 What the models leave out: the Lean model runs one whole operation at a time, so a poll is
 never seen in progress (that is TLA+'s part); the TLA+ model treats the future as one step per
@@ -746,7 +768,8 @@ The claimant may never take the side again. Its shard may let go of the source f
 claim up after its last hold, with a locked instruction, and looks once more for work a fenceless
 call left before that, which it does through the word (`Side::give_up`, called from
 `Source::give_up_claims` as `src/rt/shard/going.rs` lets go of the sources). A fenceless call that
-finds the claim given up takes the side itself; one that left its work looks at the claim again
+finds the claim given up takes the side itself; one that left its work looks at the claim, and at
+the mode (the claimant may have switched the side as it let go, and looked for work then), again
 after a full fence of its own (`Side::claim_given_up`), so one of the two looks sees the other's
 store. Or the source may be homed elsewhere while the claimant's thread still runs it (`Rehomed`):
 its own calls are then foreign ones, and when its fence fails it reads its own `own`, which needs
@@ -774,7 +797,7 @@ never reaches the owner each end in a deadlock, a lost wake; a release that find
 not take the side again breaks `NoLostWork`; an owner that never switches on UNFENCED leaves the
 poll failing its fence for ever, breaking `Termination`; a claim kept as its shard lets go of the
 source, a give-up with no look for work left before it, and a fenceless poll that does not look at
-the claim again after it left its work each end in a deadlock; a claimant's own fenceless call,
+the claim and the mode again after it left its work each end in a deadlock; a claimant's own fenceless call,
 the source homed elsewhere, that leaves its work to itself nudges itself for good, breaking
 `Termination`), and 9 witnesses (a foreign call that
 leaves its work to the owner, a switch to shared mode, a handoff, the owner's release taking the
@@ -943,6 +966,18 @@ from where they stopped.
   the error to the first call that looks, to it alone. A sync fails for its own call's failure or
   one of a call made before its own, and one called after a failure fails with no call. The sync
   of a range (`sync_range`) is such a sync with another call.
+- **sync_lost**: as sync, and the kernel fails one cursor write the handle had accepted: none of
+  its bytes land and the write-behind after it is dropped. The failure waits in the state until a
+  flush reports it (the writer's, or the one a sync starts with), which forgets it as a stream
+  does; the handle also keeps a record of it that nothing forgets, and every later sync fails
+  with it, with no call.
+- **sync_clone** and **sync_clone_race**: the second sync is made on a clone of the handle
+  (`try_clone`), with its own state and sync calls, the same kernel error cursor and the same
+  record. In sync_clone the clone syncs first and the handle's sync is called once it is done; in
+  sync_clone_race the two go at once.
+- **sync_iopoll**: as sync, on a ring made to poll for its completions (`IORING_SETUP_IOPOLL`),
+  which refuses a sync and a write of a file not opened for direct IO; a refused call is made
+  again on the blocking pool, as one cancelled because its shard went.
 - **direct**: the file is opened for direct IO: a read job reads exactly the cell asked for, and
   each copied write is one kernel write of exactly its bytes, which waits for the write in
   flight instead of joining the write-behind.
@@ -966,14 +1001,17 @@ every write a good sync covers (accepted, or returned for a positional one, befo
 is durable; `NoSyncAfterFailure`, no sync called after one failed succeeds; `NoFalseFailure`, a
 sync whose own call succeeded, none before it failing, does not fail; `DirectExact`, on a direct
 file every kernel read and write is exactly one a caller made; `NoCallOnClosed`, no job's call
-runs on a descriptor that closed; and liveness (`Termination`).
+runs on a descriptor that closed; `NothingRefused`, no call a polled ring refuses ends as a
+failure; and liveness (`Termination`).
 
-58 configurations. 19 must pass: tasks that may go away and tasks that stay, a file opened to
+70 configurations. 25 must pass: tasks that may go away and tasks that stay, a file opened to
 append, positional calls, the generation, syncs that may fail (with their tasks staying, and
-going away with a call out) and a direct file, each with its
+going away with a call out), a write the kernel fails beside two syncs, a sync of a clone that
+fails before the handle's, calls a polled ring refuses, and a direct file, each with its
 safety properties; a handle dropped or handed back with cursor jobs, and with a positional write
 left by its task, still out, with `NoCallOnClosed` beside them; and liveness for the cursor,
-append, positional, generation, sync (both ways) and direct scenarios. 26 mutations must break the property
+append, positional, generation, sync (both ways), lost write, clone, polled ring and direct
+scenarios. 29 mutations must break the property
 their rule protects: a result that counts on the cursor alone breaks `NoStaleRead`, through the
 seek back; a lent write that goes in flight over the one there, a lent write cancelled when its
 task goes away, a write cut short on the ring that counts as done, and a write on the ring
@@ -993,18 +1031,29 @@ ring's, so the drain does not order it) break `SyncCovers`, and so do a call's f
 counts only for its own task (`sync_task_records`: the next sync takes the end of one whose task
 went away and drops its failure, then makes a call the kernel answers with no error) and a sync
 that makes its call beside another's (`sync_unserialized`: the kernel reports the lost write-back
-to one, and the other's task looks first); a failed sync forgotten once reported breaks
+to one, and the other's task looks first), a sync that reads only whether a sync call failed
+before (`sync_forgets_loss`: the writer's flush reports a lost write and forgets it, and the
+next sync's call answers success for it), and a clone that keeps a record of its own
+(`sticky_unshared`: the clone's sync takes the kernel's error, and the handle's, called after,
+finds none); a refusal of the polled ring that ends the call (`iopoll_refusal_ends`) breaks
+`NothingRefused`; a failed sync forgotten once reported breaks
 `NoSyncAfterFailure`; a sync that fails for any failure, a later call's too
 (`sync_any_failure`), breaks `NoFalseFailure`; a direct read through the read-ahead and a direct write that joins
 the write-behind break `DirectExact`; a descriptor closed at the drop with a job out, and an
 `into_inner` that does not wait for the jobs, each with a cursor job and with a positional write
-left by its task, break `NoCallOnClosed`. 13 witnesses must be proved wrong: a read that reads
+left by its task, break `NoCallOnClosed`. 16 witnesses must be proved wrong: a read that reads
 again, the lent write of a task that went away landing, a read after the seek that counts the
 lent write's value, a write on the ring landing in two parts, one cut short whose shard went
 finished on the pool, an append after the seek landing at the end, a read that reads again only
 because a positional write ended, a buffered read asking the kernel for more than its caller (the
 read-ahead the direct rule takes away), the positional write of a task that went away landing, a
-sync that fails, a sync that takes the end of a call whose task went away, and a cursor job and a positional write still out as their handle drops.
+sync that fails, a sync that takes the end of a call whose task went away, a cursor job and a
+positional write still out as their handle drops, a call the polled ring refused made again on
+the pool, a direct write answered before it landed (`WF_direct_ok_early`, the code as it is,
+for the operator to decide how a write polled again is told apart from a new one), and
+(`WF_clone_race`, a gap the record leaves
+for the operator to decide) the syncs of a handle and of its clone at once, where the clone's
+call takes the kernel's error and the handle's call, made beside it, answers success.
 
 The model shows why a sync waits for the writes before it rather than relying on io_uring's
 `IOSQE_IO_DRAIN` (`MF_sync_drain`): the drain orders an entry after the ring's earlier entries
@@ -1403,20 +1452,23 @@ called by `run_shard` in `src/rt/workers.rs` before the new runner's first drive
 `src/io/source/ring.rs`; `setup_flags` in `src/syscore/linux/iouring/ring/mod.rs`). A watched
 worker's ring is not single-issuer, so the kernel runs a request's completion as work queued to
 the thread that submitted it, which a thread in a wait no signal ends never runs. The new runner
-cancels each poll the old runner armed (a stream's or a datagram's poll, a poll for room, the
-ring's wake read), tells its side it ended so the side arms another of its own, and keeps the old
-one as a zombie whose late completions go nowhere and whose end only frees it; a data operation
-and an accept are left as they are. An entry still waiting to reach the kernel is left alone (the
-new runner submits it), and the completions already posted are delivered before the zombies are
-made: both matter when one runner after another blocks at once, which one take cannot show, so
-`tests/cadence.rs` checks them. 13 configurations: 5 that must pass (the old runner asleep
-where a signal wakes it; in a wait no signal ends, for good and until it comes back; a data
-operation with the old runner asleep where a signal wakes it; an accept with the old runner coming
-back; with `OneOut`, the side has one request out as its own, `OwnEnds`, it takes only that
-request's completions, `IoRescued`, the reader gets the datum, and `ZombieFreed`), 5 mutations (no
-adopt, as before the fix, and a ring that runs a thread's completion work only at its next enter,
+cancels each poll the old runner armed (a datagram's poll, a poll for room, the ring's wake read)
+and each multishot receive (a stream's or a datagram's, into the ring's buffers), tells its side it
+ended so the side arms another of its own, and keeps the old one as a zombie whose end only frees
+it; a poll's zombie's late completions go nowhere, and a receive's zombie's bytes, which its old
+thread may still take after the cancel, reach the side in order, since every take and its
+completion are made under the ring's lock; a data operation and an accept are left as they are.
+An entry still waiting to reach the kernel is left alone (the new runner submits it), and the
+completions already posted are delivered before the zombies are made: both matter when one runner after another blocks at once, which one take cannot show, so
+`tests/cadence.rs` checks them. 18 configurations: 8 that must pass (the old runner asleep
+where a signal wakes it; in a wait no signal ends, for good and until it comes back; the same three
+with a multishot receive armed; a data operation with the old runner asleep where a signal wakes
+it; an accept with the old runner coming back; with `OneOut`, the side has one request out as
+its own, `OwnEnds`, it takes only that request's ends and edges, `IoRescued`, the reader gets the datum, and `ZombieFreed`), 7 mutations (no
+adopt, as before the fix, of a poll and of a multishot receive, a receive's zombie whose bytes go
+nowhere, and a ring that runs a thread's completion work only at its next enter,
 `IORING_SETUP_COOP_TASKRUN`, which the new runner asleep in its wait never reaches, each break
-`IoRescued`; a zombie's completions handed to the side break `OwnEnds`; an adopt that does not tell
+`IoRescued`; a zombie's completions handed to the side as its own break `OwnEnds`; an adopt that does not tell
 the side breaks `OneOut`; an adopt of an accept breaks `IoRescued` even once the old runner is back,
 since the cancelled accept stays its listener's first exclusive waiter until its thread ends it and
 takes the connection's wake), and 3 witnesses (the old runner posting late; a data operation, and an
@@ -1489,17 +1541,22 @@ pipe test of `tests/idle_peers.rs` checks it on every backend.
 ## A thread's IO buffers with no shard
 
 `bufcap` (`tla/bufcap/BufCap.tla`) checks what the IO buffers of a thread that runs no shard may
-hold (`with_pool`, the `FALLBACK` pool and `fallback_cap` in `src/buf/mod.rs`, `serve_with_cap`,
-called first by a blocking pool's thread in `src/rt/blocking.rs`). A runtime's worker and the
-threads that serve it with no shard (its blocking pool's, one inside it with `enter`, a worker
-whose shard was handed over) each take buffers from a pool of their own, which counts every buffer
-it holds, in use, free, handed to another thread or on its way back, and takes none past its cap.
-The pool of such a thread takes the cap of the runtime it serves, as a worker's does; before the
-fix it took the 64 MiB default whatever `io_buffer_cap` said. 3 configurations: 1 that must pass
-(a worker and two threads asking for three buffers each from pools of two, with `PerPool`, no pool
-holds more than the runtime's cap, `Total`, `Counted`, and `AllGiven`, every buffer asked for is
-given in the end), and 2 mutations (a pool made with the default, the code before the fix, and a
-pool thread that needs a buffer before it says which runtime it serves, break `PerPool`). The unit
+hold (`with_pool`, the `FALLBACK` pool, `serve_with_cap` and `Pool::hold_to` in
+`src/buf/mod.rs`, called as a thread starts serving a runtime: `Pool::work` in
+`src/rt/blocking.rs`, `runner` in `src/rt/workers.rs`, `enter` in `src/rt/runtime/enter.rs`). A
+runtime's worker and the threads that serve it with no shard (its blocking pool's, one inside it
+with `enter`, a worker whose shard was handed over) each take buffers from a pool of their own,
+which counts every buffer it holds, in use, free, handed to another thread or on its way back, and
+takes none past its cap. Such a thread holds its pool to the runtime's cap as it starts serving,
+before its first job, as a worker's own pool is; before the fix the pool kept the 64 MiB default
+whatever `io_buffer_cap` said. The cap is applied there and not in the pool's lazy start, which the
+IO steps inline, so they cost what they did. 3 configurations: 1 that must pass (a worker and two
+threads asking for three buffers each from pools of two, with `PerPool`, no pool holds more than
+the runtime's cap, `Total`, `Counted`, and `AllGiven`, every buffer asked for is given in the end),
+and 2 mutations (nothing holding the pool to the cap, the code before the fix, and a serve that
+comes after the thread's first job, which frees only the idle buffers past the cap, break
+`PerPool`: a thread that enters a runtime after IO of its own holds more than the cap, taking no
+new memory, until it is back under it). The unit
 tests of `src/buf/tests/fallback.rs` build a runtime with a small cap and look at the pool of a
 blocking pool's thread and of a thread inside the runtime (both fail before the fix).
 
@@ -1772,7 +1829,7 @@ registration's `here`, published last as the source is registered with its ring 
 first as the registration goes (`attach_ring`, `take_installs`, `detach`, `evict_now`), names the
 shard whose thread reaches the source Here, and only a thread of that shard takes the Here route
 from it; the model reads it from a thread that runs no shard and from another ring shard's
-thread. 9 configurations: 6 that must pass (the read during the registration and after it, from
+thread. 10 configurations: 6 that must pass (the read during the registration and after it, from
 no shard and from another shard, each with `OneSubmit`, one submit for the waiter, and no
 deadlock, and with `Served`, a waiter's operation is submitted in the end, and `Termination`,
 the other shard's with `OnlyHomeIssues`, no operation issued on a ring not the home), 3
@@ -1884,22 +1941,62 @@ shutdown waits for nothing, and its lingers all run on threads of their own. A s
 is blocked in a task's poll after the shard was handed on drops what its inbox holds only once
 that poll returns, which the drop does not wait for. The drop's run has a bound of its own (the
 runtime's linger time): once it runs out, a linger the run was still running goes on on a thread
-of its own (`RunAll`'s drop). 20 configurations: 4 that must pass
+of its own (`RunAll`'s drop). The process default runtime is never dropped: the process exits
+instead, which kills its workers and their lingers, so a file's linger is counted from its hand
+to its end wherever it runs (`Tracked`), and the exit (an `atexit` hook, `wait_at_exit`) waits
+until none is left, or its own bound ran out, which it says. A file dropped on a thread that is
+no worker delivers its write-behind before its drop returns (`deliver_file`). A linger whose
+write fails or whose time runs out gives the rest up and says so, at warn and in `stats`. 30
+configurations: 10 that must pass
 (`DropWaits`, the drop returns only once every byte reached the peer, `NoDefault`, no runtime is
 started for a linger, and `TypeOK`; liveness, `AllSent` and `Termination`; a background
 shutdown, with `NoDefault`, `AllSent` and `Termination`; and a drop whose bound runs out, with the
-same), 10 mutations (a drop whose bound drops the linger it was running, as `RunAll` did, breaks
+same; at the exit, `ExitDelivers`, the process exits with every byte delivered or said lost, and
+liveness; a drop off a worker, with `OffWorkerDelivers`, the drop returns once every byte went,
+and liveness; a linger that may give up, with `GiveUpSaid`, and liveness), 13 mutations (an exit
+that waits for no linger breaks `ExitDelivers`; a drop off a worker that hands its linger to a
+worker and returns breaks `OffWorkerDelivers`; a linger that gives up without a word breaks
+`GiveUpSaid`; a drop whose bound drops the linger it was running, as `RunAll` did, breaks
 `AllSent`; a drop that does not run its list; one that runs only what its list
 holds as it looks (the fix's first form, which left a file's last writes unlanded); a linger's
 task lost as its worker stops; a linger handed to the stopping shard of its thread, which never
 runs it; the held task dropped outside its runtime, its linger to a thread of its own; a write
 counted out before its wake went; a drop that does not wait for its workers' writes; and one that
 does not wait for a stopped inbox to be drained: all break `DropWaits`; a linger handed to the
-process default runtime, which starts for it, breaks `NoDefault`), and 6 witnesses (a linger's
+process default runtime, which starts for it, breaks `NoDefault`), and 7 witnesses (the exit
+waiting for a linger still out as main returned, which then delivers; a linger's
 task handed back as its worker stops; one held by the write and handed back later; the drop
 running a linger of its list; the task with the handle held by the write as its worker stops;
 another thread draining its wake after the write counted itself out; the drop's bound running
 out before every byte went).
+
+`Unworked` (`tla/going/Unworked.tla`) checks a linger handed to a runtime with no worker taking
+tasks (none built, or every one stopping): `spawn_linger` in `src/rt/runtime.rs`, `route_linger`,
+`OnThread`, `alone` and `linger_thread` in `src/rt/linger.rs`. Such a linger went to the handing
+thread's own shard, which runs only at that thread's next `block_on`, or, the thread having none,
+to the runtime's list, which only a drop runs: with neither coming, the bytes never reached the
+peer and the handle's socket stayed open. It goes to the linger thread, one for the process,
+still counted by its runtime until it ends, so a drop that comes waits for it. 6 configurations:
+2 that must pass (`AllSent` with a runtime never dropped and the handing thread never running its
+shard again; the same with a drop, and `DropWaits` for a linger handed before the drop began), 3
+mutations (the own shard and the list, each breaking `AllSent`; the linger thread's linger left
+uncounted, breaking `DropWaits`), and a witness (a drop that waited for such a linger).
+
+`Locals` (`tla/going/Locals.tla`) checks a worker's shard that goes for good holding
+`shard_local!` values whose drops panic, with a file operation out on its ring (`Shard::go` and
+`drop_locals` in `src/rt/shard/going.rs`). The ring settles first: on a ring only the shard reaps,
+the shard waits for the operation (past a bounded wait it keeps its memory for good); on a ring
+another thread can reap, it cancels it and, at the end, hands the ring and what is still out to a
+keeper, which frees the buffer once the kernel is done. Only then do the values go, each in a
+catch of its own, so a panic is logged, the next value still goes, and the shard's going reaches
+its end. 8 configurations: 3 that must pass (both values panicking, on each kind of ring, and none
+panicking), with the kernel never writing into a freed buffer, no abort, the going reaching its
+end, every value dropped and every panic logged, and the values dropped only once the ring is
+settled; 5 mutations (no catch, which leaves the tasks undropped, `GoesToTheEnd`, and on a
+reapable ring drops the ring with the operation out, `NoWriteIntoFreed`; one catch around both
+values, whose second panic comes during the first one's unwind, `NoAbort`; the values first, as
+before, `ValuesAfterSettle`; and the code before this fix, the values first with no catch, whose
+panic drops the ring before it settles, `NoWriteIntoFreed`).
 
 ## A ring kept past its shard
 
@@ -1946,17 +2043,6 @@ holds it; a slow one that completes after the shard gave up on it).
 once, `src/rt/park/ring.rs` that a wake after the poller went writes no freed memory, and
 `src/rt/shard/ring/tests.rs` that a read and a file's call given up on end with an error and let a
 retire return.
-`Unworked` (`tla/going/Unworked.tla`) checks a linger handed to a runtime with no worker taking
-tasks (none built, or every one stopping): `spawn_linger` in `src/rt/runtime.rs`, `route_linger`,
-`OnThread`, `alone` and `linger_thread` in `src/rt/linger.rs`. Such a linger went to the handing
-thread's own shard, which runs only at that thread's next `block_on`, or, the thread having none,
-to the runtime's list, which only a drop runs: with neither coming, the bytes never reached the
-peer and the handle's socket stayed open. It goes to the linger thread, one for the process,
-still counted by its runtime until it ends, so a drop that comes waits for it. 6 configurations:
-2 that must pass (`AllSent` with a runtime never dropped and the handing thread never running its
-shard again; the same with a drop, and `DropWaits` for a linger handed before the drop began), 3
-mutations (the own shard and the list, each breaking `AllSent`; the linger thread's linger left
-uncounted, breaking `DropWaits`), and a witness (a drop that waited for such a linger).
 
 ## A blocking job of a Windows handle
 
@@ -2233,24 +2319,31 @@ stack and the waiting list; each node's phase and payload; and each transition, 
 with a waiter's first look at the generation, its take of the permit with nobody queued (a
 second step, after which a moved generation passes the permit on with a `notify_one`), its
 enqueue and its drop. The node's waker handshake and the list's sweep are abstract, as in the
-semaphore model. 15 configurations: 7 that must pass (two waiters and a `notify_waiters`, and a
+semaphore model. 23 configurations: 11 that must pass (two waiters and a `notify_waiters`, and a
 `notify_one` then a `notify_waiters`, in any order, where every waiter made before the last
 `notify_waiters` ends; two queued waiters and two `notify_one` calls, and a `notify_last` then a
 `notify_one`, where both end; the same calls in any order, safety only, since two calls before
 anybody waits store one permit; a waiter dropped beside one that awaits, which ends; a waiter
-made before a `notify_waiters` and a `notify_one` beside one made after both, which ends and finds
-the permit, `LateAwaiterEnds`, with no waiter the broadcast owed keeping the permit,
-`NoPermitEatenByOwed`), with no
+made before a `notify_waiters` and a `notify_one` beside one made after both, with no waiter the
+broadcast owed keeping the permit it took, `NoPermitEatenByOwed`; two notifiers at once, two
+`notify_waiters` or a `notify_one` and a `notify_waiters`, with waiters made at any moment
+around them, liveness on one waiter and safety on two; a waiter dropped as a `notify_one` comes,
+whose notification ends as the permit), with no
 waiter done without a notification made since its `Notified` was (`NoSpuriousWake`), no
 `notify_one` serving more than one waiter, and no waiter left on the arrival stack once the role
-is free; 6 mutation runs (a `notify_waiters` that asks for no pass leaves its waiters,
+is free; 9 mutations (a `notify_waiters` that asks for no pass leaves its waiters,
 `AwaitersMadeBeforeAWaitersCallEnd`; a pass that reads the generation before it takes the
 arrivals wakes a newer arrival, `NoSpuriousWake`; a dropped waiter keeping a `notify_one`'s grant
 leaves the other waiting, `EveryAwaiterEnds`; a drain giving up its role over a change made
 during its pass strands an arrival, `NoStrandedArrival`; a waiter that does not look at the
 generation again after its take keeps a permit the broadcast between its look and its take made
-someone else's, `NoPermitEatenByOwed`, and the waiter made after the calls waits for good,
-`LateAwaiterEnds`); and 2 witnesses (a permit stored; a
+someone else's, `NoPermitEatenByOwed`; a pass that queues every arrival whatever its generation
+leaves the queue of two generations, `QueuedOneGeneration`; a pass that leaves a stored permit
+past a queued waiter, and one that counts an owed wake as served on a node that withdrew, each
+leave a waiter for good, `EveryAwaiterEnds`; an owed wake that found nobody and is dropped
+instead of stored, `OneIsKept`); and 3 witnesses (a gap the code leaves open: a pass that
+read the generation before a broadcast serves the `notify_one` after it to a waiter the broadcast
+woke, so the waiter made after both calls waits for good, `LateAwaiterEnds`; a permit stored; a
 grant passed on). `lean/Nuclei/Notify.lean` proves the pass's accounting of owed wakes for every
 line and count (each served or left over for the permit, no more served than wait, something
 left over only once every waiter was served) and that a masked generation is never one of the two
@@ -3214,6 +3307,51 @@ with it; it is caught, and the runner takes the default name. 6 configurations: 
 name's and the start, park and unpark hooks' panics left uncaught, each breaking `NoLoss`), and a
 witness (a caught panic). A blocking-pool thread's start hook and name are `tla/pool/Start.tla`'s.
 
+## More sync and time models
+
+Each family below has GREEN configurations and a RED one per guard, listed in its
+`EXPECTED.txt`; each `.tla` header names the Rust it stands for.
+
+- **`tla/atomicwaker`**: the waker cell's register, displacing register and take. A
+  registration that found the cell in use, or that a wake met, has its own waker woken
+  (`SelfWoken`); a displacing registration wakes the waker it replaced, even when a wake met it;
+  a take only ever lowers its own bit, so its `fetch_and` is the same as a store.
+- **`tla/localchan`**: the single-shard bounded channel (`LocalChan.tla`: slots, reservations,
+  `closed()`, the receiver's end only with no slot reserved) and one-shot channel
+  (`LocalOneshot.tla`), one task step at a time.
+- **`tla/oncecell/SetOnce.tla`**: `SetOnce`'s set (publish, then the event) and wait (look,
+  wait for the event, look again); `M_close_before_publish` is the once-cell's own order.
+- **`tla/watch`** also runs `send_replace` (published before the clone, which may panic),
+  `wait_for`, `subscribe` and the sender's clone.
+- **`tla/broadcast/BroadcastWait.tla`**: a receive's `Notified` made before its look, the
+  closed flag read before the tail, `Sender::closed` and the last receiver's wake, and
+  `subscribe`.
+- **`tla/notify`** now passes in the code's order (expiry from the front, arrivals checked one
+  by one, withdrawn nodes swept only now and then, QUEUED cleared only with the list empty) and
+  runs two notifiers at once.
+- **`tla/unbounded`**: see the channel above.
+- **`tla/waiter/WakeList.tla`**: a pass's wake list, its walk and the `WakeRest` that wakes
+  the rest after a waker panics; `Waiter.tla`'s cancel no longer takes an owed mark back, as
+  `Wait::cancel` never does.
+- **`tla/blocking`**: a blocking wait's park loop on a plain thread, and wasm32's error for a
+  wait that would park its only thread.
+- **`tla/wheel`**: the timer wheel as a data structure, shrunk to two slots and two levels:
+  placement, the advance and its cascade, the span's edge, and keys whose generation keeps a
+  stale removal off the entry's next timer (the generation is unbounded here: its `u32` wrap is
+  a stated ceiling).
+- **`tla/interval`** and **`tla/timeout`**: an interval's three ways to treat a late tick and
+  a deadline past the clock's range, and a timeout's race of its future against its sleep.
+- **`tla/timer`** also checks a post against a shard that stopped (the fence between the push
+  and the look at `stopped`) and a drop's cancel against an orphan; **`tla/clock`** adds a
+  guest joining while a jump is decided (`ClockJoin.tla`).
+- **`tla/reentrant/ReentrantRaw.tla`**: a nested read never queues behind the plain lock's
+  owed handoff, and a dropped read's share goes back.
+- **`tla/rwlock`** adds a dropped upgrade, a dropped upgradable read, the reader bound, an
+  upgrade with a queued writer and a downgrade held until a reader joins it; **`tla/semaphore`**
+  adds the close with an owed waiter, a dropped weighted wait and a sweep that runs only now
+  and then; **`tla/mpsc`** adds a sender that holds its handle, so the idle wake of a closed
+  channel is checked on its own.
+
 ## What is not checked
 
 - **Sizes beyond the configurations.** TLC checks every order of steps, but only for the
@@ -3222,16 +3360,20 @@ witness (a caught panic). A blocking-pool thread's start hook and name are `tla/
   Lean covers every size, but only one whole operation at a time.
 - **The message queue.** The TLA+ model treats it as a sequence of cells in claim order, each
   claimed by a send before it is written, so `PerSenderOrder` is proved for a queue that hands
-  cells out in claim order. Its lock-free implementation is kovan's, checked there (kovan's
-  own TLA+ model of the segment queue checks that order).
+  cells out in claim order: the ring's (src/sync/mpsc/queue/ring.rs), checked in `tla/chanring`.
+  A channel past the ring's size uses the radix queue (src/sync/mpsc/queue/radix.rs), whose
+  receiver may take a written cell ahead of a stalled one; `tla/radix` checks that take-ahead
+  and that each sender's order survives it.
 - **The receiver's waker cell.** The TLA+ model treats it as one flag that a wake empties; its
   own handshake is covered by the loom models.
 - **Memory ordering.** A TLA+ step is atomic and seen by every thread at once. Whether the
   orderings the Rust code gives its atomics are strong enough is what the loom models check,
   for small cases; neither TLA+ nor Lean says anything about it.
-- **The rest of the channel.** The unbounded channel, weak senders and their upgrade,
-  `Sender::closed`, `recv_many`, the waiter nodes' recycling, the waiting list's sweep of
-  withdrawn nodes, and the destructors of values are not in these models.
+- **The rest of the channel.** `tla/unbounded` checks the unbounded channel's admission,
+  senders, clone, weak upgrade, `Chan::pop` with its second look, `recv_many`, `try_recv` and
+  the receiver's drop, on the `Chan` code the bounded channel shares. `Sender::closed` (an
+  `Event`), the waiter nodes' recycling (`tla/waiter`) and the destructors of values are not
+  in the bounded channel's model.
 - **The newer families' abstractions.** The signal model leaves out the handler's
   async-signal-safety and its errno (code review and the signal tests' part); the process
   models abstract the kernel's reap to one step; the port model abstracts Windows'

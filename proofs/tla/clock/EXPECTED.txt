@@ -22,3 +22,5 @@ M_check_then_read              MC_ClockRead         violated:ReaderMonotonic
 M_pause_reads_first            MC_ClockRead         violated:ReaderMonotonic
 W_one_wheel                    MC_OneWheel          violated:NeverEarly
 W_foreign_arm                  MC_ForeignArm        violated:ForeignNeverPassed
+CJ_join                        MC_ClockJoin         pass
+MCJ_no_members_recheck         MC_ClockJoin         violated:ClockNeverPassesArmed

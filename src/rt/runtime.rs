@@ -403,6 +403,14 @@ pub(crate) fn running_inner() -> Option<Arc<Inner>> {
     running()
 }
 
+/// How long the process's exit waits for files' lingers: the default
+/// runtime's linger time, or the default's default.
+pub(crate) fn exit_linger() -> std::time::Duration {
+    DEFAULT
+        .get()
+        .map_or(crate::io::handle::LINGER, |rt| rt.inner.io.linger)
+}
+
 /// Spawns a linger on `inner`: on a worker that takes tasks, else on the
 /// linger thread, still counted by `inner` until it ends; never on this
 /// thread's own shard, which runs only at the thread's next `block_on`, if

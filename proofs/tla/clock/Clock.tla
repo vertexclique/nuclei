@@ -53,7 +53,12 @@
 (* nothing. Steps that touch only the attempt's own variables are merged   *)
 (* with the shared access next to them; a claim of the advance that finds  *)
 (* jobs in flight lets it go at once, which no other step can tell from    *)
-(* never claiming it.                                                      *)
+(* never claiming it. A shard's park count and the attempt's note of it    *)
+(* are one flag per shard (`still`): the attempt's first look at the shard *)
+(* raises it and a park lowers it, so the second look finds it lowered     *)
+(* exactly when the code finds the count changed; one attempt looks at a   *)
+(* time (it holds the advance), and the flags go back to their start as it *)
+(* ends.                                                                   *)
 (*                                                                          *)
 (* What is forgotten: a value no step reads again before it is next        *)
 (* written goes back to its start once read for the last time (whether a   *)
@@ -98,7 +103,8 @@ variables
     notified = [s \in Shards |-> FALSE], \* a notification left on the shard's poller
     inbox = [s \in Shards |-> 0],        \* work items pushed to the shard, not run yet
     ops = [s \in Shards |-> 0],          \* timer ops posted to the shard, not applied yet
-    parks = [s \in Shards |-> 0],        \* parks the shard began
+    \* the running attempt's first look found the shard idle, and it began no park since
+    still = [s \in Shards |-> FALSE],
     timerAt = [s \in Shards |-> Inf],    \* the deadline the shard published
     due = [s \in Shards |-> FALSE],      \* the shard's own attempt made its timer due
     advancing = FALSE,                   \* an attempt holds the advance
@@ -125,8 +131,7 @@ end define;
 
 \* `paused::attempt`, by shard `me` (or by the job, `NoShard`), the advance claimed first.
 procedure Attempt(me)
-variables todo = {}, snap = [t \in Shards |-> 0], earliest = Inf, abort = FALSE,
-    idleMid = FALSE;
+variables todo = {}, earliest = Inf, abort = FALSE, idleMid = FALSE;
 begin
 A1: \* claim the advance (one attempt at a time), and look at the jobs in flight: with one,
     \* the advance is let go at once, as if never claimed
@@ -136,11 +141,11 @@ A1: \* claim the advance (one attempt at a time), and look at the jobs in flight
     else
         advancing := TRUE || todo := Counted;
     end if;
-A3: \* the first look, one shard at a time: each must be idle; its park count and deadline
-    \* noted; the look ends at the first that is not idle
+A3: \* the first look, one shard at a time: each must be idle; its park count (its flag
+    \* raised) and deadline noted; the look ends at the first that is not idle
     while todo # {} do
         with t \in todo do
-            abort := ~Idle(t) || snap[t] := parks[t]
+            abort := ~Idle(t) || still[t] := TRUE
                 || earliest := Min2(earliest, timerAt[t])
                 || todo := IF Idle(t) THEN todo \ {t} ELSE {};
         end with;
@@ -159,8 +164,8 @@ A4: \* (ghost) between the looks: is every shard idle at this moment, counted or
 A5: \* the second look: the same shards, still idle, no new park; it ends at the first change
     while todo # {} do
         with t \in todo do
-            abort := ~Idle(t) \/ parks[t] # snap[t]
-                || todo := IF Idle(t) /\ parks[t] = snap[t] THEN todo \ {t} ELSE {};
+            abort := ~Idle(t) \/ ~still[t]
+                || todo := IF Idle(t) /\ still[t] THEN todo \ {t} ELSE {};
         end with;
     end while;
 A6: \* a change seen ends the attempt; else the jump: the clock moves to the earliest deadline
@@ -181,12 +186,13 @@ A7: \* wake each counted shard whose published deadline came due, read as the wa
             todo := todo \ {t};
         end with;
     end while;
-A8: \* the attempting shard, if counted, notes whether its own timer came due; the advance goes
+A8: \* the attempting shard, if counted, notes whether its own timer came due; the advance goes,
+    \* and its notes of the park counts with it (forgotten)
     if me \in Counted then due[me] := timerAt[me] <= earliest end if;
-    advancing := FALSE;
+    advancing := FALSE || still := [s \in Shards |-> FALSE];
     return;
-A9: \* an attempt that did not jump lets the advance go
-    advancing := FALSE;
+A9: \* an attempt that did not jump lets the advance go, its notes of the park counts with it
+    advancing := FALSE || still := [s \in Shards |-> FALSE];
     return;
 end procedure;
 
@@ -204,7 +210,7 @@ S_run: \* the look: the ops posted to it applied (they arm nothing), then what i
     end if;
 S_publish: \* the deadline published and the park counted before the shard says it parks
     if Mutation # "publish_late" then timerAt[self] := deadline[self] end if;
-    parks[self] := parks[self] + 1;
+    still[self] := FALSE;
 S_park: \* the shard says it parks
     parked[self] := TRUE;
 S_recheck: \* one more look for work pushed or posted; a shard that found some runs again

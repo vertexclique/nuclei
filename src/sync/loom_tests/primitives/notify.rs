@@ -72,6 +72,11 @@ fn an_older_notified_queued_behind_a_newer_one_gets_the_broadcast() {
 /// `notify_one` stores a permit with nobody queued. The older one is owed
 /// the broadcast, so the permit is a newer waiter's: a newer `Notified`
 /// made after both calls must find it once the older one is done.
+///
+/// Fails today: the older one may queue and run the pass that reads the
+/// generation before the broadcast; that pass serves the `notify_one` to it,
+/// and the permit is gone (the witness `W_owed_to_woken` of
+/// proofs/tla/notify). Kept running until the pass is fixed.
 #[test]
 fn a_permit_stored_after_a_broadcast_is_not_eaten_by_a_waiter_it_owed() {
     explore(

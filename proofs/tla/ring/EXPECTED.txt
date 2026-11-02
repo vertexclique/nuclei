@@ -149,3 +149,8 @@ WRH_data_waits                 MC_RingHandoff       violated:IoRescued
 RH_accept_ends                 MC_RingHandoff       pass
 MRH_adopt_accepts              MC_RingHandoff       violated:IoRescued
 WRH_accept_waits               MC_RingHandoff       violated:IoRescued
+RH_recv_uninterruptible        MC_RingHandoff       pass
+RH_recv_interruptible          MC_RingHandoff       pass
+RH_recv_ends                   MC_RingHandoff       pass
+MRH_recv_no_adopt              MC_RingHandoff       violated:IoRescued
+MRH_zombie_drops_data          MC_RingHandoff       violated:IoRescued

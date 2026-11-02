@@ -13,8 +13,12 @@
 //! was built on:
 //!
 //! - A poll that panics completes the task with the panic, and awaiting the
-//!   handle resumes it; a detached task's panic is dropped (the panic hook
-//!   has already reported it).
+//!   handle resumes it. So does a hook around the poll that panics, and a
+//!   future that panics as it is dropped, whether the task completed or was
+//!   cancelled: the panic stays for the handle even after a cancel. A panic
+//!   nobody can take (the handle is gone), and a panic of an output's drop
+//!   or of the task's memory as it is freed, are logged at error. No panic
+//!   of the task's own code unwinds out of a run or aborts.
 //! - Dropping the handle cancels the task: its future is dropped by the next
 //!   run, or right away by the runnable's drop. [`Task::detach`] lets it run
 //!   to the end instead, and [`Task::cancel`] cancels and returns the output
@@ -99,16 +103,23 @@ pub(crate) unsafe trait Schedule {
         drop();
     }
 
-    /// Just before each poll of the task's future.
+    /// Just before each poll of the task's future, inside the poll's catch:
+    /// a panic here is the poll's.
     fn before_poll(&self, _id: Id) {}
 
-    /// Just after each poll of the task's future.
-    fn after_poll(&self, _id: Id) {}
+    /// Just after each poll of the task's future; the panic it caught, which
+    /// the task then completes with.
+    fn after_poll(&self, _id: Id) -> Option<crate::rt::caught::Panic> {
+        None
+    }
 
-    /// The task's future was dropped: it completed or was cancelled.
-    fn terminated(&self, _id: Id) {}
+    /// The task's future was dropped: it completed or was cancelled. The
+    /// panic it caught, which goes as a panic of the future's drop does.
+    fn terminated(&self, _id: Id) -> Option<crate::rt::caught::Panic> {
+        None
+    }
 
-    /// A poll of the task's future panicked, its outcome now.
+    /// The task's outcome is a panic. Never unwinds.
     fn panicked(&self, _id: Id) {}
 }
 
@@ -195,35 +206,9 @@ impl Runnable {
 
 impl Drop for Runnable {
     fn drop(&mut self) {
-        use self::state::{AWAITER, CLOSED, COMPLETED, SCHEDULED};
         let ptr = self.ptr.as_ptr().cast_const();
-        let header = self.header();
-        let mut state = header.state.load(crate::sync::internal::Ordering::Acquire);
-        loop {
-            if state & (COMPLETED | CLOSED) != 0 {
-                break;
-            }
-            match header.state.compare_exchange_weak(
-                state,
-                state | CLOSED,
-                crate::sync::internal::Ordering::AcqRel,
-                crate::sync::internal::Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => state = actual,
-            }
-        }
-        // SAFETY: a runnable exists only for a task that has not completed,
-        // so its future is there, and the runnable owns it now.
-        unsafe { (header.vtable.drop_future)(ptr) };
-        let state = header
-            .state
-            .fetch_and(!SCHEDULED, crate::sync::internal::Ordering::AcqRel);
-        if state & AWAITER != 0 {
-            header.notify(None);
-        }
-        // SAFETY: the runnable's reference.
-        unsafe { (header.vtable.drop_ref)(ptr) };
+        // SAFETY: the runnable's reference goes to the drop.
+        unsafe { (self.header().vtable.drop_runnable)(ptr) };
     }
 }
 
@@ -267,9 +252,9 @@ where
     unsafe { (Runnable::from_raw(ptr), Task::from_raw(ptr)) }
 }
 
-/// Runs `f`, aborting the process if it panics: what a destructor or a waker
-/// that panics inside a task transition gets, as unwinding there would leave
-/// the state word half done.
+/// Runs `f`, aborting the process if it panics: what a waker that panics
+/// inside a task transition gets, as unwinding there would leave the state
+/// word half done.
 #[inline]
 pub(crate) fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
     struct Abort;

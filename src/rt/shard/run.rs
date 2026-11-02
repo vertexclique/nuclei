@@ -135,9 +135,10 @@ impl Shard {
     /// The loop: polls `future` when it is woken and, between its polls, runs
     /// the shard's tasks, timers and poller, until `future` is ready or the
     /// shard is taken from this thread. A poll may do both: it answers the
-    /// output, and a caller on a shard that can be taken (`block_on`,
-    /// `run_worker`, not the thread's own) looks at the take before it touches
-    /// the shard ([`context::detached_from`]).
+    /// output, and a caller whose shard may be watched (`block_on`,
+    /// `run_worker`) looks at the take before it touches the shard
+    /// ([`context::detached_from`]); `run_then_leave`'s, a thread's own, is
+    /// never taken.
     fn run_loop<F: Future>(
         &self,
         mut future: Pin<&mut F>,

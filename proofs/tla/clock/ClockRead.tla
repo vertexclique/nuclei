@@ -45,7 +45,7 @@
 EXTENDS Integers, TLC
 
 CONSTANTS
-    Readers,   \* the threads that read the clock
+    Readers,   \* the threads that read the clock, numbered 1, 2, ...
     Reads,     \* how many readings each thread takes
     MaxTime,   \* the last time the system's clock reaches in a run
     Mutation   \* "none", or the name of the one rule this run takes away
@@ -68,7 +68,8 @@ define
     ReaderMonotonic == ~back
 end define;
 
-fair process Time = "time"
+\* Process names are numbers, as the readers' are: TLC compares them with one another.
+fair process Time = -1
 begin
 T_tick: \* the system's clock moves on, one unit at a time, up to the end of the run
     while sys < MaxTime do
@@ -110,7 +111,7 @@ R_give: \* the reading handed out; one earlier than the thread's last is recorde
     end while;
 end process;
 
-fair process Pauser = "pauser"
+fair process Pauser = -2
 variables now = 0, seen = 0;
 begin
 P_first: \* `Clock::pause`

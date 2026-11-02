@@ -351,7 +351,9 @@ fn a_dropped_positional_write_lands_after_its_handle_went() {
         let mut out = Box::pin(file.write_at_owned(data, 0));
         pends(&mut out).await;
         drop(out);
-        drop(file);
+        // Dropped on a worker: off one, the drop would wait for the write,
+        // which the held pool keeps from running.
+        within(spawn(async move { drop(file) })).await;
         release.send(()).unwrap();
         within(busy).await;
     });

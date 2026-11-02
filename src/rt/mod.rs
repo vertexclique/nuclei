@@ -3,6 +3,7 @@
 
 pub(crate) mod backend;
 pub(crate) mod blocking;
+pub(crate) mod caught;
 pub(crate) mod context;
 pub(crate) mod counters;
 pub(crate) mod handoff;

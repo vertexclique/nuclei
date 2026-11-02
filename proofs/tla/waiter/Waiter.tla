@@ -84,7 +84,7 @@ define
     AllEnd == []<>AllDone
     \* No party acts on the node after it let go of its reference.
     FutureLabels == {"F_settle", "F_poll", "F_spin", "F_park1", "F_write", "F_arm2",
-                     "F_owe", "F_cancel", "F_withdraw", "F_cancelRead", "F_releaseF"}
+                     "F_owe", "F_withdraw", "F_cancelRead", "F_releaseF"}
     NoStaleAccess ==
         /\ \A f \in Futures : pc[f] \in FutureLabels => "F" \in refs /\ round = f /\ ~freed
         /\ \A w \in WakeLists : pc[w] \in {"W_take", "W_cas"} =>
@@ -141,7 +141,10 @@ macro release(bit) begin
     if bit = "Q" /\ owed /\ Mutation # "release_forgets_owed" then
         owedCount := owedCount - 1;
     end if;
-    if refs = {bit} \/ (bit = "Q" /\ Mutation = "free_on_queue_release") then
+    \* MUTATION free_on_queue_release, free_on_wake_release: the queue's (or a wake list's)
+    \* release returns the node to the pool whoever else holds it.
+    if refs = {bit} \/ (bit = "Q" /\ Mutation = "free_on_queue_release")
+                    \/ (bit = "W" /\ Mutation = "free_on_wake_release") then
         refs := {};
         freed := TRUE;
         slot := [i \in 0..1 |-> 0];
@@ -180,7 +183,7 @@ F_next:
             goto F_poll;
         or
             await Cancel;
-            goto F_cancel;
+            goto F_withdraw;
         end either;
     end if;
 F_owe:
@@ -202,7 +205,7 @@ F_wait:
         goto F_poll;
     or
         await Cancel;
-        goto F_cancel;
+        goto F_withdraw;
     end either;
 F_poll:
     \* `begin_spin`: an armed waker is disarmed for the spin.
@@ -254,14 +257,10 @@ F_arm2:
         armed := TRUE;
     end if;
     goto F_next;
-F_cancel:
-    \* `unowe`, while it still waits.
-    if owing /\ phase = "W" /\ owed then
-        owed := FALSE;
-        owedCount := owedCount - 1;
-    end if;
 F_withdraw:
-    \* `withdraw`: granted already, or cancelled, its armed waker taken back.
+    \* `Wait::cancel`, then `withdraw`: granted already, or cancelled, its armed waker taken
+    \* back. The cancel takes no owed mark back: a node that leaves owed keeps the mark until
+    \* the queue lets the node go and settles it (`release`).
     if phase = "G" then
         res := "granted";
         goto F_releaseF;

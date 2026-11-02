@@ -19,7 +19,8 @@
 //! one job going. A read waits for the writes before it, so it sees them; a
 //! write or a seek moves the epoch on, and a read job of an older epoch is
 //! thrown away. A write that fails keeps its error: every later write fails
-//! with it until a flush reports it.
+//! with it until a flush reports it, and the handle's record of it (see
+//! `durable`) fails every later sync.
 //!
 //! A file opened to append writes at its end whatever its cursor says: its
 //! write jobs call `write(2)` (on Windows, a write at the end), since
@@ -85,7 +86,7 @@ use crate::io::sys;
 pub(crate) use self::copy::COPY_CHUNK;
 #[cfg(ring)]
 pub(crate) use self::durable::sync_on;
-pub(crate) use self::durable::{SyncKind, sync_file};
+pub(crate) use self::durable::{Lost, SyncKind, sync_file};
 #[cfg(test)]
 pub(crate) use self::many::MANY_AT_ONCE;
 pub(crate) use self::space::range_end;
@@ -130,6 +131,9 @@ pub(crate) struct FileIo {
     generation: AtomicU64,
     /// Positional writes left by their tasks, for the state to take.
     orphans: Orphans,
+    /// The handle's record of a byte it accepted that may not be on the
+    /// device, which every sync answers.
+    lost: Arc<Lost>,
     /// The file was opened to append.
     append: bool,
     /// The file was opened for direct IO.
@@ -164,7 +168,7 @@ impl Hooks<FileState> for FileHooks<'_> {
             st.consumed(n, after);
         }
         if bits & deferred::ABANDON != 0 {
-            st.abandon_lent(&Waker::from(Arc::clone(self.io)), after);
+            st.abandon_lent(self.io, &Waker::from(Arc::clone(self.io)), after);
         }
         if bits & deferred::ORPHAN != 0 {
             self.io.orphans.take(&mut st.orphans);
@@ -215,8 +219,9 @@ struct FileState {
 
 impl FileIo {
     /// The IO state of the file `fd`, starting at its own offset (a file
-    /// opened by std and read some way already goes on from there).
-    pub(crate) fn new(fd: Lease) -> io::Result<Arc<Self>> {
+    /// opened by std and read some way already goes on from there), its
+    /// failures kept in `lost`.
+    pub(crate) fn new(fd: Lease, lost: Arc<Lost>) -> io::Result<Arc<Self>> {
         let cursor = sys::seek(fd.raw(), None)?;
         let mode = sys::file_mode(fd.raw())?;
         Ok(Arc::new(Self {
@@ -231,6 +236,7 @@ impl FileIo {
             cursor: AtomicU64::new(cursor),
             generation: AtomicU64::new(0),
             orphans: Orphans::new(),
+            lost,
             append: mode.append,
             direct: mode.direct,
             #[cfg(test)]
@@ -495,6 +501,17 @@ impl Wake for FileIo {
 }
 
 impl FileState {
+    /// A write the handle accepted failed: every later write fails with it
+    /// until a flush reports it, and every later sync of the handle, and of
+    /// its clones, for good (`proofs/tla/lent/LentFile.tla`, scenario
+    /// "sync_lost").
+    #[cold]
+    #[inline(never)]
+    fn fail(&mut self, io: &FileIo, failure: Failure) {
+        self.failed = Some(failure);
+        io.lost.keep(failure);
+    }
+
     /// Bytes read ahead, and reads in flight, are of the file as it was.
     fn invalidate(&mut self, after: &mut After) {
         if let Some(ahead) = self.ahead.take() {
@@ -580,7 +597,7 @@ impl FileState {
                     self.cursor = end;
                 }
                 if let Some(failure) = failure {
-                    self.failed = Some(failure);
+                    self.fail(io, failure);
                     if let Some(behind) = self.behind.take() {
                         after.drop_buf(behind);
                     }
@@ -618,16 +635,19 @@ impl FileState {
             return Poll::Ready(());
         }
         let before = self.orphans.len();
-        let failed = &mut self.failed;
+        let mut failed = None;
         self.orphans.retain_mut(|orphan| match orphan.poll(waker) {
             Poll::Pending => true,
             Poll::Ready(err) => {
                 if let Some(err) = err {
-                    *failed = Some(Failure::of(&err));
+                    failed = Some(Failure::of(&err));
                 }
                 false
             }
         });
+        if let Some(failure) = failed {
+            self.fail(io, failure);
+        }
         let landed = before - self.orphans.len();
         if landed > 0 {
             // Release: pairs with the Acquire of `FileIo::generation`.
@@ -777,10 +797,10 @@ impl FileState {
 
     /// The task of a submitted write from its own buffer went away: the
     /// write still lands, and an error nobody took is the write's failure.
-    fn abandon_lent(&mut self, waker: &Waker, after: &mut After) {
+    fn abandon_lent(&mut self, io: &FileIo, waker: &Waker, after: &mut After) {
         match core::mem::take(&mut self.lent) {
             Lent::Out => self.lent = Lent::Orphan,
-            Lent::Done(Err(err), _) => self.failed = Some(Failure::of(&err)),
+            Lent::Done(Err(err), _) => self.fail(io, Failure::of(&err)),
             _ => {}
         }
         after.wake_one(waker.clone());

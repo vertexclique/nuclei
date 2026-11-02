@@ -608,3 +608,5 @@ fn a_detached_task_whose_last_waker_goes_during_its_poll_drops_its_future() {
     );
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
+
+mod panics;

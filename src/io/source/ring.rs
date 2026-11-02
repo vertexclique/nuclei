@@ -71,7 +71,6 @@ pub(crate) enum RingMem {
     RecvFromMulti {
         held: usize,
         stopping: bool,
-        #[expect(dead_code, reason = "the kernel reads it until the last completion")]
         msg: RecvHdr,
     },
     RecvLent(OwnedBuf),
@@ -107,6 +106,16 @@ pub(crate) enum RingMem {
     /// told its side it ended (`RingMem::adopted`, `ShardRing::adopt`): it is no side's, points at
     /// no memory, and only waits for its own end, which runs on its old thread.
     Zombie,
+    /// A multishot receive a runner that lost its shard submitted, cancelled by the shard's new
+    /// runner, which told its side it ended (`RingMem::adopted`). Its old thread may still take
+    /// bytes into the group's buffers before it sees the cancel; they go to the side as any
+    /// arrival does, in order, since the kernel takes and posts each under the ring's lock. Its
+    /// end is no side's. `held` and `msg` as in `RecvMulti` and `RecvFromMulti` (`msg`: a
+    /// datagram receive's header).
+    RecvZombie {
+        held: usize,
+        msg: Option<RecvHdr>,
+    },
 }
 
 /// The least a `write_zero_copy` must have left to send for its next chunk to go out zero-copy
@@ -179,17 +188,32 @@ impl RingMem {
     }
 
     /// What a shard's new runner makes of this operation of the old runner's, cancelled from the
-    /// new one (`ShardRing::adopt`): a poll gives the zombie that stays in its place until its own
-    /// end, and the end its side is told now, so it submits another; anything else comes back as
-    /// it is. An operation that takes or gives bytes cannot be done again; an accept's poll is an
-    /// exclusive waiter of its listener, the first of which takes each connection's wake, so a
-    /// cancelled one its old thread has not ended would take them all from the new one
-    /// (proofs/tla/ring/RingHandoff.tla, `adopt_accepts`).
+    /// new one (`ShardRing::adopt`): a poll or a multishot receive gives the zombie that stays in
+    /// its place until its own end, and the end its side is told now, so it submits another;
+    /// anything else comes back as it is. A one-shot operation that takes or gives bytes cannot be
+    /// done again; an accept's poll is an exclusive waiter of its listener, the first of which
+    /// takes each connection's wake, so a cancelled one its old thread has not ended would take
+    /// them all from the new one (proofs/tla/ring/RingHandoff.tla, `adopt_accepts`).
     pub(crate) fn adopted(self, kind: Kind) -> Result<(RingMem, Outcome), RingMem> {
+        // What the side is told of a receive: as its own end with the cancel would say.
+        let ended = || Outcome::RecvMultiEnd {
+            answer: Answer::Undone { not_ready: false },
+            dry: false,
+        };
         match self {
             RingMem::Ready | RingMem::ReadyMulti => {
                 Ok((RingMem::Zombie, self.complete(-libc::ECANCELED, kind)))
             }
+            RingMem::RecvMulti { held, .. } => {
+                Ok((RingMem::RecvZombie { held, msg: None }, ended()))
+            }
+            RingMem::RecvFromMulti { held, msg, .. } => Ok((
+                RingMem::RecvZombie {
+                    held,
+                    msg: Some(msg),
+                },
+                ended(),
+            )),
             other => Err(other),
         }
     }
@@ -316,7 +340,9 @@ impl RingMem {
             RingMem::SendZc { .. } | RingMem::ZcHeld(_) => Outcome::SendPinned(answer(res)),
             // Never a side's: its end is buried (`ShardRing::bury`), and this is what a cancelled
             // poll's would be.
-            RingMem::Zombie => Outcome::Ready(Answer::Undone { not_ready: false }),
+            RingMem::Zombie | RingMem::RecvZombie { .. } => {
+                Outcome::Ready(Answer::Undone { not_ready: false })
+            }
             RingMem::Recv(_)
             | RingMem::Send(_)
             | RingMem::SendLent(_)

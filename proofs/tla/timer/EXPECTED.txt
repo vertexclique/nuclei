@@ -20,3 +20,10 @@ T_live_move_goes               MC_Timer             pass
 T_move_goes_drop               MC_Timer             pass
 M_recheck_fired_only           MC_Timer             violated:Termination
 W_undriven_own                 MC_Timer             violated:SleepEnds
+MT_post_no_stop_check          MC_Timer             violated:NoStrandedWaker
+MT_post_check_first            MC_Timer             violated:NoStrandedWaker
+MT_orphan_ignores_cancel       MC_Timer             violated:NoWakeAfterDrop
+TL_move                        MC_TimerLocal        pass
+TL_drop                        MC_TimerLocal        pass
+MTL_remove_not_posted          MC_TimerLocal        violated:NothingLeft
+MTL_going_keeps_wakers         MC_TimerLocal        violated:Completes

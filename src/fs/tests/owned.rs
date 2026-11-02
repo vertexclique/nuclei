@@ -330,7 +330,9 @@ fn a_dropped_handle_still_lands_a_started_lent_write() {
         let mut lent = Box::pin(file.write_owned(data));
         pends(&mut lent).await;
         drop(lent);
-        drop(file);
+        // Dropped on a worker: off one, the drop would wait for the write,
+        // which the held pool keeps from running.
+        within(spawn(async move { drop(file) })).await;
         // The write's job runs only now, after its future and its handle went.
         release.send(()).unwrap();
         within(busy).await;

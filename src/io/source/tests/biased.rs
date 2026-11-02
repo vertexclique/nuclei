@@ -446,7 +446,9 @@ fn a_foreign_read_without_a_fence_is_served_through_the_worker() {
 /// A read side its owner's shard claimed, a thread's own whose `block_on` returned: the shard left,
 /// and runs nothing until the thread's next `block_on`. A read from another thread's shard, whose
 /// heavy fence fails, must not leave its work to that claimant and wait for it
-/// (proofs/tla/side_biased/SideBiased.tla, `ClaimStops`).
+/// (proofs/tla/side_biased/SideBiased.tla, `ClaimStops`). Not on Windows, whose heavy fence
+/// (`FlushProcessWriteBuffers`) cannot fail; where there is none every side starts shared.
+#[cfg(not(windows))]
 #[test]
 fn a_fenceless_read_on_a_side_whose_claimant_left_is_served() {
     let (a, b) = pair();

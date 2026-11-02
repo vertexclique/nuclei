@@ -716,7 +716,7 @@ impl ShardRing {
         let Some(op) = self.ops.borrow_mut().remove(cqe.user_data) else {
             return;
         };
-        if let RingMem::Zombie = op.mem {
+        if let RingMem::Zombie | RingMem::RecvZombie { .. } = op.mem {
             return self.bury(cqe.user_data, op);
         }
         if counts_as_write(&op) {
@@ -734,15 +734,19 @@ impl ShardRing {
     /// single-issuer, so the kernel runs the completion of each request as work queued to the
     /// thread that submitted it, at its next return from the kernel: a thread in a wait no signal
     /// ends (a killable wait, a read of a slow disk) runs none of it meanwhile. A poll the old
-    /// runner armed (a stream's or a datagram's multishot poll, a one-shot poll for readiness or
-    /// room), and the ring's wake read, would then bring nothing for as long. Each is cancelled from
-    /// here and its side told it ended, so the side arms another, submitted by this thread; the old
-    /// one stays in the slab as a zombie, which points at no memory, hands its side nothing and is
-    /// buried at its own end (`bury`), whenever its old thread runs it. An entry still waiting to
+    /// runner armed (a datagram's multishot poll, a one-shot poll for readiness or room), a
+    /// multishot receive (a stream's or a datagram's), and the ring's wake read, would then bring
+    /// nothing for as long. Each is cancelled from here and its side told it ended, so the side
+    /// arms another, submitted by this thread; the old one stays in the slab as a zombie and is
+    /// buried at its own end (`bury`), whenever its old thread runs it. A poll's zombie points at
+    /// no memory and hands its side nothing. A receive's zombie still hands its side what its old
+    /// thread takes before that thread sees the cancel: the kernel takes each arrival and posts
+    /// it under the ring's lock, so the arrivals of both receives come in the stream's order
+    /// (`RingMem::RecvZombie`). An entry still waiting to
     /// reach the kernel is this thread's, which submits it, and stays as it is; what the kernel
     /// posted already goes to its side first, so an edge in the queue is not lost with its zombie
     /// (tests/cadence.rs, each runner blocking at once). Everything else is left as it is, its
-    /// completion waiting for that thread: an operation that takes or gives bytes, a
+    /// completion waiting for that thread: a one-shot operation that takes or gives bytes, a
     /// file's call and a child's exit watch, whose work cannot be done again, and an accept,
     /// whose poll is an exclusive waiter of its listener, the first of which takes each
     /// connection's wake (see `RingMem::adopted`; proofs/tla/ring/RingHandoff.tla).
@@ -1057,8 +1061,11 @@ fn group_entries(configured: u16, cq_entries: u32) -> u16 {
 /// is still in flight.
 #[inline(always)]
 fn release_charge(ops: &mut Ops<RingOp>, user_data: u64, charged: usize) {
-    if let Some(RingMem::RecvMulti { held, .. } | RingMem::RecvFromMulti { held, .. }) =
-        ops.get_mut(user_data).map(|op| &mut op.mem)
+    if let Some(
+        RingMem::RecvMulti { held, .. }
+        | RingMem::RecvFromMulti { held, .. }
+        | RingMem::RecvZombie { held, .. },
+    ) = ops.get_mut(user_data).map(|op| &mut op.mem)
     {
         *held = held.saturating_sub(charged);
     }
@@ -1078,6 +1085,7 @@ fn ends_plain(op: &RingOp) -> bool {
             | RingMem::AcceptMulti { .. }
             | RingMem::ReadyMulti
             | RingMem::Zombie
+            | RingMem::RecvZombie { .. }
     )
 }
 

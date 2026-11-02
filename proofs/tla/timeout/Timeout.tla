@@ -43,6 +43,7 @@ variables
     futRegistered = FALSE,   \* the inner future holds the task's waker
     timerRegistered = FALSE, \* the timer holds the task's waker
     woken = TRUE,            \* the task is to be polled (the first poll is due)
+    made = FALSE,            \* the timeout was made (the clock starts then)
     result = "none",         \* (record) "ok", "elapsed", or "none" yet
     readyLost = FALSE,       \* (record) Elapsed answered with the future ready at that poll
     pastRange = FALSE;       \* (record) a deadline past the clock's range
@@ -60,6 +61,9 @@ end define;
 \* The clock moves on; a timer whose deadline passed wakes the task it holds.
 fair process clock = "clock"
 begin
+C_start:
+    \* The run starts as the timeout is made: the clock moves from then on.
+    await made;
 C_tick:
     while now < Horizon do
         with step \in 1..MaxStep do
@@ -96,6 +100,7 @@ T_make:
         deadline := now + Duration;
         pastRange := now + Duration > Range;
     end if;
+    made := TRUE;
 T_poll:
     \* Woken (or the first poll): the inner future first, then the sleep.
     \* MUTATION sleep_first: the sleep is polled first.

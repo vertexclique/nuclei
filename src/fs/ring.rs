@@ -12,7 +12,12 @@
 //! on its shard until its end's wake went (`call::WriteCall`). An operation
 //! cancelled because its shard went finishes its call on the blocking pool
 //! (or, on a thread inside no runtime, there), so a write that started still
-//! lands.
+//! lands. So does a call the ring refused for the way the ring was made: a
+//! ring that polls for its completions (`IORING_SETUP_IOPOLL`) takes only the
+//! reads and writes of direct IO, and answers a sync, a range's write-back or
+//! space with `EINVAL` and a buffered read or write with `EOPNOTSUPP`, before
+//! the call did anything (`proofs/tla/lent/LentFile.tla`, scenario
+//! "sync_iopoll").
 
 use core::task::Waker;
 use std::io;
@@ -353,7 +358,13 @@ impl FileOp {
             return Some(self);
         }
         let result = match res {
-            r if r < 0 => Err(io::Error::from_raw_os_error(-r)),
+            r if r < 0 => {
+                if self.refused_as_polled(r) {
+                    self.finish_on_pool();
+                    return None;
+                }
+                Err(io::Error::from_raw_os_error(-r))
+            }
             r => Ok(r as usize),
         };
         let outcome = match self.mem {
@@ -381,6 +392,26 @@ impl FileOp {
         // Once the wake went: a task it dropped handed what it left first.
         drop(self.write.take());
         None
+    }
+
+    /// Whether the kernel's `res` is how a ring that polls for its completions
+    /// refuses this call, which it never began: the blocking pool makes it.
+    /// Elsewhere such an answer is the call's own, which the pool's call gives
+    /// again.
+    // vertexia: each such call goes to a polled ring first, every time; sending
+    // a buffered file's calls to the pool at submission on a polled ring is the
+    // upgrade if buffered files on one ever matter.
+    #[cold]
+    #[inline(never)]
+    fn refused_as_polled(&self, res: i32) -> bool {
+        match self.mem {
+            FileMem::Call(_) => res == -libc::EINVAL,
+            FileMem::Read { .. }
+            | FileMem::ReadLent(_)
+            | FileMem::Write { .. }
+            | FileMem::WriteLent { .. } => res == -libc::EOPNOTSUPP,
+            FileMem::Shutdown(_) => false,
+        }
     }
 
     /// The call's `res` bytes are counted, if it read or wrote any; for a
