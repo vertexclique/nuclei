@@ -48,3 +48,53 @@ L_safe                          3520908     936806     12  pass                 
 L_rescue                         433576     120736     12  pass                                  pass                                  yes
 H_safe                         17520147    4903665     28  pass                                  pass                                  yes
 H_rescue                        2278013     619991     51  pass                                  pass                                  yes
+
+Added and rechecked since, as CI ran them: TLA+ run 41451876799 on 6f04231, 2026-11-02, one
+worker each (the share jobs of .github/workflows/tla.yml): the hand-back (HandBack.tla), with
+its hand-over of the shard's queues. These times replace any above.
+
+configuration                generated   distinct    sec  result                                expected                              match
+HB_safe                          97471      28136     17  pass                                  pass                                  yes
+HB_chain                       1968569     459112      8  pass                                  pass                                  yes
+HB_nested                       150355      43911     27  pass                                  pass                                  yes
+HB_end                           27091       8812      7  pass                                  pass                                  yes
+HB_block_loan                    29358       8906      2  pass                                  pass                                  yes
+HB_close                         41047      11792      6  pass                                  pass                                  yes
+HB_drain                         34827       9624      5  pass                                  pass                                  yes
+HB_two                         1016585     244584      8  pass                                  pass                                  yes
+HB_two_done                      15784       4466      7  pass                                  pass                                  yes
+HB_chain_done                    48195      12957     12  pass                                  pass                                  yes
+HB_bound                         13862       4326      5  pass                                  pass                                  yes
+M_no_handback                      663        309      1  violated:NoFailedWith                 violated:NoFailedWith                 yes
+M_lend_no_mark                   28550       9309      3  violated:Exclusive                    violated:Exclusive                    yes
+M_lend_no_check                  28532       9305      2  violated:Exclusive                    violated:Exclusive                    yes
+M_lend_no_wait                    6020       2044      2  violated:Exclusive                    violated:Exclusive                    yes
+M_borrow_no_wait                   879        392      2  violated:Exclusive                    violated:Exclusive                    yes
+M_lend_pinned                     9432       3052      2  violated:ExclusiveValue               violated:ExclusiveValue               yes
+M_lend_from_borrower            457737     113176      5  violated:ExclusiveValue               violated:ExclusiveValue               yes
+M_lend_lost_on_take              28532       9305      2  violated:LendHeld                     violated:LendHeld                     yes
+M_defer_drops                     8465       2802      2  violated:LendHeld                     violated:LendHeld                     yes
+M_close_no_wake                  35521      10056     13  violated:HandBackDone                 violated:HandBackDone                 yes
+M_lend_no_cas                    22372       6792      3  violated:LentHasBorrower              violated:LentHasBorrower              yes
+M_gone_no_cas                    22476       6794      2  violated:LenderHasLoan                violated:LenderHasLoan                yes
+M_panic_keeps_loan                8149       2676      1  violated:LentHasBorrower              violated:LentHasBorrower              yes
+M_drain_early                    27255       7464      8  violated:HandBackDone                 violated:HandBackDone                 yes
+M_drain_refuses                   3692       1440      2  violated:NoFailedWith                 violated:NoFailedWith                 yes
+M_wait_runs_tasks                 6269       2140      1  violated:LentHasBorrower              violated:LentHasBorrower              yes
+M_lend_keeps_queues              11220       3554      2  violated:BoundOnCreator               violated:BoundOnCreator               yes
+M_back_keeps_queues              10769       3407      2  violated:BoundOnCreator               violated:BoundOnCreator               yes
+W_loan                            7911       2601      2  violated:NoLoan                       violated:NoLoan                       yes
+W_defer                           8808       2949      2  violated:NoDefer                      violated:NoDefer                      yes
+W_lend_taken                     29643       9761      2  violated:NoLendTaken                  violated:NoLendTaken                  yes
+W_gone                            5032       1787      2  violated:NoGone                       violated:NoGone                       yes
+W_cas_lost                       23158       7081      2  violated:NoCasLost                    violated:NoCasLost                    yes
+W_hb_stale_back                   2352        993      2  violated:NoStaleBack                  violated:NoStaleBack                  yes
+W_hb_detached_call                 490        235      1  violated:NoDetachedCall               violated:NoDetachedCall               yes
+W_nested_detach                   3288       1379      2  violated:NoNestedDetach               violated:NoNestedDetach               yes
+W_nested_loan                    57305      18242      2  violated:NoNestedLoan                 violated:NoNestedLoan                 yes
+W_panic_loan                      8715       2909      2  violated:NoPanicLoan                  violated:NoPanicLoan                  yes
+W_cancel_wait                     9532       3146      2  violated:NoCancelWait                 violated:NoCancelWait                 yes
+W_drain_loan                     34502      10383      2  violated:NoDrainLoan                  violated:NoDrainLoan                  yes
+W_bound_loan                      8651       2827      2  violated:NoBoundLoan                  violated:NoBoundLoan                  yes
+
+results matching EXPECTED.txt: 42 of 42
