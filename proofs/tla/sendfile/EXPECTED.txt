@@ -1,0 +1,11 @@
+# configuration                spec                 expected
+SF_safe                        MC_SendFile          pass
+SF_live                        MC_SendFile          pass
+M_no_place                     MC_SendFile          violated:WireOrder
+M_clear_at_drop                MC_SendFile          violated:WireOrder
+M_clear_unended                MC_SendFile          violated:WireOrder
+M_job_no_clear                 MC_SendFile          violated:FrameSent
+M_drop_no_clear                MC_SendFile          violated:FrameSent
+M_task_no_clear                MC_SendFile          violated:FrameSent
+M_unrun_forgets                MC_SendFile          violated:FrameSent
+W_late_chunk                   MC_SendFile          violated:NoLateChunk

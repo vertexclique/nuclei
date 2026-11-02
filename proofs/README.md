@@ -1391,6 +1391,30 @@ witness (a second close on macOS answered ENOTCONN). The Rust test
 `half_close::*::our_shutdown_delivers_every_byte_and_reads_go_on` in `tests/faults/half_close.rs`
 compares a second close with std's on a real stream.
 
+## A file sent in the kernel, and the stream's next write
+
+`sendfile` (`tla/sendfile/SendFile.tla`) checks a `send_file` chunk the blocking pool sends with
+`sendfile(2)` on the stream's own descriptor, outside its write side (`send_file_in_kernel` in
+`src/net/send_file.rs`; `Source::send_outside`, `WriteState::lend_outside`,
+`WriteState::end_outside`, `Left` and `Ended` in `src/io/source/write/outside.rs`; `push_lent` in
+`src/io/source/write/lent.rs`, which writes no outside call's place). A task sends a chunk, and
+may be dropped (a timeout) while the chunk's call is out; a writer then writes the handle's next
+bytes; something else may make the side look at what it holds at any moment (a buffer back to the
+pool). Before the job goes to the pool, the side holds the chunk's place, a lent write that is
+out, so every write after it waits; the job records its end and the task that it went, one bit
+each of one word, and whichever comes second has the side clear the place, which looks that the
+call ended first. 10 configurations: 2 that must pass (`WireOrder`, the chunk reaches the stream
+before a write made after the call returned or was dropped; and liveness, `FrameSent`, that write
+goes out in the end, and `Termination`), 7 mutations (no place held, as before the fix; the place
+cleared at the drop; a clear that does not look that the call ended, which a buffer's return then
+makes while the chunk is out: each breaks `WireOrder`; and the four ways to leave the place held
+for good, the job's end or the task's drop that comes second clearing nothing, a task that takes
+the answer and records nothing, a job the pool drops unrun that records no end: each breaks
+`FrameSent`), and 1 witness (the task dropped with its chunk still on its way). The Rust test
+`a_write_after_a_dropped_send_file_goes_after_its_chunk` in `src/net/tests/send_file.rs` stalls
+a chunk's call as on a page that is not cached, drops the call, writes, and checks the peer reads
+the chunk, then the write.
+
 ## A stream's shut and abort
 
 `close` (`tla/close/Close.tla`) checks a TCP stream's ends (`Handle::shut` and `Handle::abort` in
