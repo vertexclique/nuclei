@@ -249,8 +249,11 @@ impl Workers {
     /// once a shutdown took the threads.
     fn start_one(inner: &Arc<Inner>) -> io::Result<bool> {
         let workers = &inner.workers;
-        // Before anything is claimed: a name function that panics reaches the
-        // caller with nothing held.
+        // Named only while a slot is free, and before anything is claimed: a
+        // name function that panics reaches the caller with nothing held.
+        if workers.claimed.load(Ordering::Acquire) >= workers.slots.len() {
+            return Ok(false);
+        }
         let name = super::tuning::spawnable((workers.start.name)());
         let index = workers.claimed.fetch_add(1, Ordering::AcqRel);
         if index >= workers.slots.len() {
