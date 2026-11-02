@@ -2,9 +2,9 @@
 //! out of reach off a worker, dropped with the runtime, moving with a shard at
 //! a handoff, keeping the shard where it is while a `with` runs, and lent back
 //! to a `with` whose poll lost the shard, never while the lender's own `with`
-//! runs. A poll that stalls past the watch (a preemption, a long loop) may lose
-//! its shard before any call in it: every test here passes whether or not that
-//! happens.
+//! runs, each thread's bound tasks kept on it. A poll that stalls past the
+//! watch (a preemption, a long loop) may lose its shard before any call in it:
+//! every test here passes whether or not that happens.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -17,6 +17,8 @@ use nuclei::runtime::{Runtime, worker_index};
 const SAFETY: Duration = Duration::from_secs(10);
 /// How long a call that holds a value watches for a loan that must not come meanwhile.
 const WINDOW: Duration = Duration::from_millis(100);
+/// Tasks bound to a lender that keep yielding through its loan.
+const BOUND_TASKS: usize = 4;
 
 nuclei::shard_local! {
     static COUNT: Cell<u64> = Cell::new(0);
@@ -73,6 +75,8 @@ nuclei::shard_local! {
     static LENT_LOOP: Cell<u64> = Cell::new(0);
     static HELD_BY_RUNNER: Cell<u64> = Cell::new(0);
     static HELD_BY_BORROWER: Cell<u64> = Cell::new(0);
+    static KEPT_OFF: Cell<u64> = Cell::new(0);
+    static SPAWNED_IN: Cell<u64> = Cell::new(0);
 }
 
 fn runtime(workers: usize) -> Runtime {
@@ -812,4 +816,99 @@ fn a_borrower_whose_with_awaits_in_a_nested_block_on_lends_the_shard_to_no_other
         .recv_timeout(SAFETY)
         .expect("the second call's with never ran");
     assert_eq!(seen, 101, "the second call's with after the first's");
+}
+
+#[test]
+fn a_runner_lending_its_shard_keeps_the_tasks_bound_to_it_off_the_borrowers_loop() {
+    let rt = on();
+    let h = rt.handle();
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let alive = Arc::new(AtomicUsize::new(0));
+    let (stop, astray) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let alive_then = Arc::clone(&alive);
+    let (stalled, started) = stall_then(&rt, &gate, move || {
+        KEPT_OFF.with(|_| {
+            // A nested loop on the lent shard: it runs whatever the shard's own queues hold.
+            let alive = alive_then.load(Ordering::SeqCst);
+            nuclei::block_on(async {
+                for _ in 0..8 {
+                    nuclei::task::yield_now().await;
+                }
+            });
+            alive
+        })
+    });
+    wait_for_the_take(&rt, &started, before);
+    // Tasks bound to the shard's new runner, each yielding until told to stop: they are in the
+    // shard's own queues as the runner lends it.
+    let (told, off, spawned) = (Arc::clone(&stop), Arc::clone(&astray), Arc::clone(&alive));
+    let spawner = h
+        .spawn_on_worker(0, async move {
+            let home = std::thread::current().id();
+            for _ in 0..BOUND_TASKS {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                let (stop, off, alive) =
+                    (Arc::clone(&told), Arc::clone(&off), Arc::clone(&spawned));
+                nuclei::spawn_local(async move {
+                    let deadline = Instant::now() + SAFETY;
+                    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        if std::thread::current().id() != home {
+                            off.fetch_add(1, Ordering::SeqCst);
+                        }
+                        nuclei::task::yield_now().await;
+                    }
+                    alive.fetch_sub(1, Ordering::SeqCst);
+                })
+                .detach();
+            }
+        })
+        .unwrap();
+    rt.block_on(spawner);
+    gate.release_after("the take");
+    let alive_in_call = rt.block_on(stalled);
+    stop.store(true, Ordering::SeqCst);
+    wait_for("the bound tasks' ends", || {
+        alive.load(Ordering::SeqCst) == 0
+    });
+    assert_eq!(
+        alive_in_call, BOUND_TASKS,
+        "the bound tasks ended before the loan"
+    );
+    assert_eq!(
+        astray.load(Ordering::SeqCst),
+        0,
+        "a task bound to the lender ran on the borrower's thread"
+    );
+}
+
+#[test]
+fn a_task_spawned_local_in_a_lent_call_runs_on_the_borrowers_thread() {
+    let rt = on();
+    let before = rt.stats().shards[0].handoffs;
+    let gate = Arc::new(Gate::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (stalled, started) = stall_then(&rt, &gate, move || {
+        SPAWNED_IN.with(|v| {
+            v.set(v.get() + 1);
+            // Queued on the lent shard and bound to this thread: it must not be left in the
+            // queues the lender runs once the shard is back.
+            nuclei::spawn_local(async move {
+                let _ = tx.send(std::thread::current().id());
+            })
+            .detach();
+        });
+        std::thread::current().id()
+    });
+    wait_for_the_take(&rt, &started, before);
+    gate.release_after("the take");
+    let borrower = rt.block_on(stalled);
+    let ran_on = rx.recv_timeout(SAFETY).expect("the bound task never ran");
+    assert_eq!(
+        ran_on, borrower,
+        "a task bound to the borrower ran on the lender's thread"
+    );
 }
