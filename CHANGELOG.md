@@ -26,6 +26,16 @@
   because a retire or a close took the descriptor out now fails nothing, as one refused because
   its shard stopped: the source is unregistered, and its next wait registers it again
   (`proofs/tla/attach/Merged.tla`).
+- **A closed socket leaves a ring's table though the kernel once refused to take it out**
+  (Linux, io_uring). A source that goes takes its file out of the ring's table of fixed files at
+  once, so the kernel closes it as soon as its requests let go. When the kernel had no memory for
+  that update, the failure was ignored and the slot released with the file still in the table:
+  the socket stayed open (a dropped listener kept accepting and kept its port) until another
+  source happened to take the slot. A refused take-out now keeps the slot held with the file in
+  it, so no other source gets the slot meanwhile, and is tried again after the ring's next wait,
+  which a 10 ms timer of the ring's own brings though nothing else is out
+  (`proofs/tla/ring/RingClose.tla`: `MC_update_ignored`, `MC_update_frees`,
+  `MC_update_no_wake`; `proofs/lean/Nuclei/Files.lean`: `refused_release_keeps_the_slot`).
 
 ### Changed
 
