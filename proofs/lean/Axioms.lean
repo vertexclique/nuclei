@@ -78,6 +78,8 @@ open Nuclei.FairSemaphore
 #print axioms Nuclei.Wheel.level_zero_exact
 #print axioms Nuclei.Wheel.cascade_lowers
 #print axioms Nuclei.Wheel.next_window_wraps
+#print axioms Nuclei.Wheel.stale_key_stays_stale
+#print axioms Nuclei.Wheel.stale_key_matches_after_all
 #print axioms Nuclei.Wheel.example_seventy_thousand
 
 -- A ring's file slots: every operation keeps a free slot unheld, unnamed and with no file;

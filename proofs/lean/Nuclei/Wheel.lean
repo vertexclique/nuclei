@@ -144,6 +144,37 @@ theorem next_window_wraps (e w : Nat) (hnext : win 5 w = win 5 e + 1)
     | (exfalso; wheel_arith)
     | (refine ⟨h, ?_, ?_⟩ <;> wheel_arith)
 
+/-! ## Keys
+
+The slab's entries are reused: an entry let go of (its timer fired or removed) goes to a free
+list, and the next timer armed may take it. Each entry holds a generation, a 64-bit count the
+code moves on by one, wrapping, every time the entry is let go of. A key is the entry's place
+and the generation the entry had when the key's timer was armed; the key reaches the entry only
+while the two generations are equal. Here a generation is a number below `2^64`, and letting go
+of the entry adds one to it modulo `2^64`.
+-/
+
+/-- How many generations there are: the code's generation is a `u64`. -/
+def generations : Nat := 2 ^ 64
+
+/-- The generation of an entry whose generation was `g`, once it was let go of `k` times. -/
+def after (g k : Nat) : Nat := (g + k) % generations
+
+/-- A stale key stays stale: once the key's entry was let go of at least once, and fewer than
+`2^64` times, the entry's generation is not the key's, so the key reaches no timer that took the
+entry since. -/
+theorem stale_key_stays_stale (g k : Nat) (hk : 0 < k) (hk' : k < generations) :
+    after g k ≠ g := by
+  simp only [after, generations, Nat.reducePow] at *
+  omega
+
+/-- That bound is exact: let go of `2^64` times, the entry has the key's generation again. A key
+held unlooked at for that many reuses of its one entry would reach the entry's timer then. -/
+theorem stale_key_matches_after_all (g : Nat) (hg : g < generations) :
+    after g generations = g := by
+  simp only [after, generations, Nat.reducePow] at *
+  omega
+
 /-! ## The worked example -/
 
 /-- The wheel at 1000, a timer due at 70000: level 2, slot 17, starting at 69632; from there
