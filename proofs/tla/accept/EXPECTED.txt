@@ -32,10 +32,10 @@ RM_keep_lost_readiness         MC_AcceptReset       violated:NoLostToCaller
 RM_keep_lost_completion        MC_AcceptReset       violated:NoLostToCaller
 RM_keep_lost_peer              MC_AcceptReset       violated:NoLostToCaller
 RM_keep_lost_end               MC_AcceptReset       violated:NoLostToCaller
-RM_skip_stalls_readiness       MC_AcceptReset       violated:AllKeptServed
-RM_skip_stalls_completion      MC_AcceptReset       violated:AllKeptServed
-RM_skip_stalls_peer            MC_AcceptReset       violated:AllKeptServed
-RM_skip_stalls_end             MC_AcceptReset       violated:AllKeptServed
+RM_stall_readiness             MC_AcceptReset       violated:AllKeptServed
+RM_stall_completion            MC_AcceptReset       violated:AllKeptServed
+RM_stall_peer                  MC_AcceptReset       violated:AllKeptServed
+RM_stall_end                   MC_AcceptReset       violated:AllKeptServed
 RM_skip_listener_readiness     MC_AcceptReset       violated:ErrSurfaces
 RM_skip_listener_completion    MC_AcceptReset       violated:ErrSurfaces
 RM_skip_listener_end           MC_AcceptReset       violated:ErrSurfaces

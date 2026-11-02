@@ -100,6 +100,18 @@ define                                                                       \* 
     \* The kinds of connection that may be at the head of the backlog: one of each kind it holds.
     Heads == {k \in Kinds : CASE k = "kept" -> keptQ > 0 [] k = "doomed" -> doomedQ > 0 [] OTHER -> resetQ > 0}
     Ask == Backend = "multishot"                                             \* held connections have no address yet
+    \* The one place whose skip a mutation takes away: "ahead" (`accept_ahead`), "op" (`op_done` of an accept),
+    \* "multiEnd" (`op_done` of a multishot accept's end), "peer" (`peer_gone`), or "none".
+    KeepAt == CASE Mutation = "keep_lost_ahead" -> "ahead"                   \* keeps the error in the loop
+              [] Mutation = "keep_lost_op" -> "op"                           \* in a completed accept
+              [] Mutation = "keep_lost_end" -> "multiEnd"                    \* in a multishot accept's end
+              [] Mutation = "keep_lost_peer" -> "peer"                       \* in a look at a connection's peer
+              [] OTHER -> "none"                                             \* nowhere
+    StallAt == CASE Mutation = "stall_ahead" -> "ahead"                      \* stalls the loop
+               [] Mutation = "stall_op" -> "op"                              \* a completed accept
+               [] Mutation = "stall_end" -> "multiEnd"                       \* a multishot accept's end
+               [] Mutation = "stall_peer" -> "peer"                          \* a look at a connection's peer
+               [] OTHER -> "none"                                            \* nowhere
 end define;                                                                  \* end of the names
 
 \* `ReadState::op_done`: the accept out ended with `answer`, a connection or an error, met at `at`.
@@ -111,13 +123,13 @@ macro op_done(answer, at) begin                                              \* 
     elsif answer = "reset" then heldReset := heldReset + 1;                  \* one handed over though reset
     elsif Lost(answer) then                                                  \* a reset connection's error:
         skippedAt := skippedAt \union {at};                                  \* (record) skipped here
-        \* MUTATION keep_lost: the side keeps the reset connection's error for its task, as before.
-        if Mutation = "keep_lost" then error := answer; end if;              \* (mutated) kept for the task
+        \* MUTATION keep_lost_op, keep_lost_end: the side keeps the reset connection's error for its task, as before.
+        if KeepAt = at then error := answer; end if;                         \* (mutated) kept for the task
     else                                                                     \* the listener's own error:
         error := answer;                                                     \* kept for the task
     end if;                                                                  \* what came is in place
-    \* MUTATION skip_stalls: a skip wakes nobody, so no accept goes out for the task that waits.
-    if ~(Lost(answer) /\ Mutation = "skip_stalls") then waiting := FALSE; end if; \* the task is woken
+    \* MUTATION stall_op, stall_end: a skip wakes nobody, so no accept goes out for the task that waits.
+    if ~(Lost(answer) /\ StallAt = at) then waiting := FALSE; end if;       \* the task is woken
 end macro;                                                                   \* end of the completion
 
 \* `ReadState::accept_ahead`: a readiness side accepts until it holds a connection, an error ends it, or the listener
@@ -152,11 +164,12 @@ AA_loop:                                                                     \* 
                         heldReset := heldReset + 1;                          \* held for the task
                     or                                                       \* macOS, the BSDs: ECONNABORTED
                         skippedAt := skippedAt \union {"ahead"};             \* (record) skipped here
-                        if Mutation = "keep_lost" then                       \* (mutated) kept for the task:
+                        \* MUTATION keep_lost_ahead: the loop keeps the reset connection's error, as before.
+                        if KeepAt = "ahead" then                             \* (mutated) kept for the task:
                             error := "lost";                                 \* the reset one's error
                             stop := TRUE;                                    \* ends the loop
-                        \* MUTATION skip_stalls: the skip ends the loop with nothing held, no error, and not blocked.
-                        elsif Mutation = "skip_stalls" then                  \* (mutated) the loop gives up:
+                        \* MUTATION stall_ahead: the skip ends the loop with nothing held, no error, and not blocked.
+                        elsif StallAt = "ahead" then                         \* (mutated) the loop gives up:
                             stop := TRUE;                                    \* until an edge that may never come
                         end if;                                              \* else the next accept at once
                     end either;                                              \* the reset one is dealt with
@@ -333,11 +346,12 @@ T_take:                                                                      \* 
             await heldReset > 0 /\ Ask /\ Form = "accept";                   \* `peer_of` says ENOTCONN
             heldReset := heldReset - 1;                                      \* it is closed
             skippedAt := skippedAt \union {"peer"};                          \* (record) skipped here (`peer_gone`)
-            if Mutation = "keep_lost" then                                   \* (mutated) the error to the task:
+            \* MUTATION keep_lost_peer: the look returns the reset connection's error to the task, as before.
+            if KeepAt = "peer" then                                          \* (mutated) the error to the task:
                 lostToCaller := TRUE;                                        \* as before
                 held := FALSE;                                               \* the guard let go
-            \* MUTATION skip_stalls: the skip takes from what is held, and sends no accept for an empty side.
-            elsif Mutation = "skip_stalls" then                              \* (mutated) no accept first:
+            \* MUTATION stall_peer: the skip takes from what is held, and sends no accept for an empty side.
+            elsif StallAt = "peer" then                                      \* (mutated) no accept first:
                 goto T_take;                                                 \* only what is held
             else                                                             \* `peer_gone`:
                 goto T_complete;                                             \* the side accepts again, then the next
